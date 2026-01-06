@@ -1,0 +1,294 @@
+{
+  "dashboard": {
+    "title": "RepoGraph Stage 1 Overview",
+    "tags": ["repograph", "stage1", "overview"],
+    "timezone": "browser",
+    "schemaVersion": 27,
+    "version": 1,
+    "refresh": "30s",
+    "panels": [
+      {
+        "id": 1,
+        "title": "System Health",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+        "targets": [
+          {
+            "expr": "up{job=\"repograph\"}",
+            "legendFormat": "Uptime"
+          }
+        ],
+        "options": {
+          "colorMode": "background",
+          "graphMode": "none",
+          "textMode": "value_and_name"
+        }
+      },
+      {
+        "id": 2,
+        "title": "Total Operations (24h)",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+        "targets": [
+          {
+            "expr": "sum(increase(repograph_index_operations_total[24h]))",
+            "legendFormat": "Total Ops"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Error Rate",
+        "type": "gauge",
+        "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+        "targets": [
+          {
+            "expr": "sum(rate(repograph_index_failures_total[5m])) / sum(rate(repograph_index_operations_total[5m])) * 100",
+            "legendFormat": "Error %"
+          }
+        ],
+        "options": {
+          "showThresholdLabels": false,
+          "showThresholdMarkers": true
+        },
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 5, "color": "yellow"},
+                {"value": 10, "color": "red"}
+              ]
+            },
+            "unit": "percent",
+            "max": 100,
+            "min": 0
+          }
+        }
+      },
+      {
+        "id": 4,
+        "title": "Total Cost (24h)",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+        "targets": [
+          {
+            "expr": "sum(increase(repograph_cost_dollars_total[24h]))",
+            "legendFormat": "Cost $"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "currencyUSD"
+          }
+        }
+      },
+      {
+        "id": 5,
+        "title": "Index Latency (p50, p95, p99)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, rate(repograph_index_duration_seconds_bucket[5m]))",
+            "legendFormat": "p50"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(repograph_index_duration_seconds_bucket[5m]))",
+            "legendFormat": "p95"
+          },
+          {
+            "expr": "histogram_quantile(0.99, rate(repograph_index_duration_seconds_bucket[5m]))",
+            "legendFormat": "p99"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Duration"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true},
+        "lines": true,
+        "fill": 1
+      },
+      {
+        "id": 6,
+        "title": "Query Latency (p50, p95, p99)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, rate(repograph_query_duration_seconds_bucket[5m]))",
+            "legendFormat": "p50"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(repograph_query_duration_seconds_bucket[5m]))",
+            "legendFormat": "p95"
+          },
+          {
+            "expr": "histogram_quantile(0.99, rate(repograph_query_duration_seconds_bucket[5m]))",
+            "legendFormat": "p99"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Duration"},
+          {"format": "short"}
+        ],
+        "alert": {
+          "name": "Query p95 Alert",
+          "conditions": [
+            {
+              "evaluator": {"type": "gt", "params": [2.0]},
+              "query": {"params": ["B", "5m", "now"]}
+            }
+          ]
+        }
+      },
+      {
+        "id": 7,
+        "title": "Cache Hit Rate",
+        "type": "graph",
+        "gridPos": {"h": 6, "w": 12, "x": 0, "y": 12},
+        "targets": [
+          {
+            "expr": "sum(rate(repograph_query_cache_hits_total[5m])) / (sum(rate(repograph_query_cache_hits_total[5m])) + sum(rate(repograph_query_cache_misses_total[5m]))) * 100",
+            "legendFormat": "Query Cache"
+          },
+          {
+            "expr": "avg(repograph_cache_hit_rate)",
+            "legendFormat": "Overall Cache"
+          }
+        ],
+        "yaxes": [
+          {"format": "percent", "max": 100, "min": 0},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 8,
+        "title": "Tokens Consumed by Operation",
+        "type": "graph",
+        "gridPos": {"h": 6, "w": 12, "x": 12, "y": 12},
+        "targets": [
+          {
+            "expr": "sum by (operation_type) (rate(repograph_tokens_consumed_total[5m]))",
+            "legendFormat": "{{operation_type}}"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Tokens/sec"},
+          {"format": "short"}
+        ],
+        "stack": true
+      },
+      {
+        "id": 9,
+        "title": "Cost by Model",
+        "type": "piechart",
+        "gridPos": {"h": 6, "w": 8, "x": 0, "y": 18},
+        "targets": [
+          {
+            "expr": "sum by (model) (increase(repograph_cost_dollars_total[24h]))",
+            "legendFormat": "{{model}}"
+          }
+        ]
+      },
+      {
+        "id": 10,
+        "title": "Fixes Applied vs Failed",
+        "type": "graph",
+        "gridPos": {"h": 6, "w": 8, "x": 8, "y": 18},
+        "targets": [
+          {
+            "expr": "sum(rate(repograph_fixes_applied_total[5m]))",
+            "legendFormat": "Applied"
+          },
+          {
+            "expr": "sum(rate(repograph_fixes_failed_total[5m]))",
+            "legendFormat": "Failed"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Fixes/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 11,
+        "title": "Violations Detected vs Prevented",
+        "type": "graph",
+        "gridPos": {"h": 6, "w": 8, "x": 16, "y": 18},
+        "targets": [
+          {
+            "expr": "sum(rate(repograph_violations_detected_total[5m]))",
+            "legendFormat": "Detected"
+          },
+          {
+            "expr": "sum(rate(repograph_violations_prevented_total[5m]))",
+            "legendFormat": "Prevented"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Violations/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 12,
+        "title": "Active Queries",
+        "type": "graph",
+        "gridPos": {"h": 6, "w": 12, "x": 0, "y": 24},
+        "targets": [
+          {
+            "expr": "sum by (query_type) (repograph_active_queries)",
+            "legendFormat": "{{query_type}}"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Active Queries"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 13,
+        "title": "Model Escalations",
+        "type": "graph",
+        "gridPos": {"h": 6, "w": 12, "x": 12, "y": 24},
+        "targets": [
+          {
+            "expr": "sum by (escalated_model) (rate(repograph_model_escalations_total[5m]))",
+            "legendFormat": "To {{escalated_model}}"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Escalations/sec"},
+          {"format": "short"}
+        ]
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "datasource",
+          "type": "datasource",
+          "query": "prometheus"
+        },
+        {
+          "name": "repository",
+          "type": "query",
+          "datasource": "${datasource}",
+          "query": "label_values(repograph_index_operations_total, repository)",
+          "multi": true,
+          "includeAll": true
+        }
+      ]
+    },
+    "time": {
+      "from": "now-6h",
+      "to": "now"
+    },
+    "timepicker": {
+      "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h"]
+    }
+  }
+}

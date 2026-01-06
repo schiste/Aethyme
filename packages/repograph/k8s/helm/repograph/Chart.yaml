@@ -1,0 +1,27 @@
+apiVersion: v2
+name: repograph
+description: RepoGraph - AI-ready code graph analysis platform
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.28.0-0"
+
+keywords:
+  - repograph
+  - code-analysis
+  - graph
+  - ai-ops
+
+home: https://github.com/your-org/repograph
+sources:
+  - https://github.com/your-org/repograph
+
+maintainers:
+  - name: RepoGraph Team
+    email: team@repograph.dev
+
+dependencies: []
+
+annotations:
+  category: Development
+  licenses: Apache-2.0

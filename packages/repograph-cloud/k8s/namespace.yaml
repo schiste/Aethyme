@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: repograph-cloud
+  labels:
+    name: repograph-cloud
+    environment: production

@@ -1,0 +1,169 @@
+# Service Level Objectives (SLOs) for RepoGraph
+# These define our reliability targets and error budgets
+
+slos:
+  # Availability SLO
+  - name: api_availability
+    description: API availability for all endpoints
+    target: 99.9%  # Three nines
+    measurement_window: 30d
+    error_budget:
+      total_minutes_per_month: 43.2  # (1 - 0.999) * 30 * 24 * 60
+      alert_on_burn_rate: 0.5  # Alert when 50% of budget consumed
+
+    sli:
+      type: availability
+      success_criteria: "http_response_code < 500"
+      query: |
+        sum(rate(http_requests_total{job="repograph",code!~"5.."}[5m]))
+        /
+        sum(rate(http_requests_total{job="repograph"}[5m]))
+
+  # Latency SLO
+  - name: query_latency_p95
+    description: 95th percentile query latency
+    target: 2000  # milliseconds
+    target_description: "95% of queries complete within 2 seconds"
+    measurement_window: 30d
+    error_budget:
+      allowable_slow_queries_percent: 5
+      alert_threshold: 7.5  # Alert if >7.5% slow (50% of budget)
+
+    sli:
+      type: latency
+      percentile: 95
+      query: |
+        histogram_quantile(0.95,
+          sum(rate(query_duration_seconds_bucket{job="repograph"}[5m])) by (le)
+        ) * 1000
+
+  # Error Rate SLO
+  - name: request_error_rate
+    description: HTTP 5xx error rate
+    target: 1%  # Less than 1% of requests should error
+    measurement_window: 30d
+    error_budget:
+      allowable_error_percent: 1
+      alert_threshold: 2  # Alert if >2% errors
+
+    sli:
+      type: error_rate
+      query: |
+        sum(rate(http_requests_total{job="repograph",code=~"5.."}[5m]))
+        /
+        sum(rate(http_requests_total{job="repograph"}[5m]))
+
+  # Index Freshness SLO
+  - name: index_freshness
+    description: Index staleness - time since last update
+    target: 72  # hours (3 days)
+    target_description: "Indexes should be updated at least every 72 hours"
+    measurement_window: 7d
+
+    sli:
+      type: freshness
+      query: |
+        (time() - index_last_updated_timestamp{job="repograph"}) / 3600
+
+  # Data Durability SLO
+  - name: backup_success_rate
+    description: Backup success rate
+    target: 99%
+    measurement_window: 30d
+
+    sli:
+      type: success_rate
+      query: |
+        sum(rate(backup_success_total{job="repograph"}[24h]))
+        /
+        sum(rate(backup_attempts_total{job="repograph"}[24h]))
+
+# Error Budget Policies
+error_budget_policy:
+  # When error budget is exhausted
+  policy_levels:
+    - budget_remaining: 100-75
+      status: healthy
+      actions:
+        - Continue normal development
+        - Deploy features as planned
+        - No special restrictions
+
+    - budget_remaining: 75-50
+      status: warning
+      actions:
+        - Increase monitoring
+        - Review recent changes
+        - Slow down feature rollout
+        - Focus on reliability improvements
+
+    - budget_remaining: 50-25
+      status: critical
+      actions:
+        - Freeze non-critical deployments
+        - Incident response mode
+        - Root cause analysis required
+        - Reliability work prioritized
+
+    - budget_remaining: 25-0
+      status: emergency
+      actions:
+        - All deployments frozen except rollbacks
+        - All hands on reliability
+        - Daily incident reviews
+        - Executive escalation
+
+    - budget_remaining: 0
+      status: exhausted
+      actions:
+        - Complete deployment freeze
+        - Fix forward only for P0 incidents
+        - Comprehensive post-mortem required
+        - Recovery plan presented to leadership
+
+  # Burn rate alerts
+  burn_rate_alerts:
+    - window: 1h
+      burn_rate: 14.4  # Exhausts 30-day budget in 2 days
+      severity: page
+      action: Immediate investigation
+
+    - window: 6h
+      burn_rate: 6  # Exhausts 30-day budget in 5 days
+      severity: ticket
+      action: Schedule investigation
+
+    - window: 24h
+      burn_rate: 3  # Exhausts 30-day budget in 10 days
+      severity: warning
+      action: Review in daily standup
+
+# SLO Compliance Reporting
+reporting:
+  frequency: weekly
+  recipients:
+    - platform-team@repograph.io
+    - engineering-leads@repograph.io
+
+  metrics:
+    - SLO compliance percentage
+    - Error budget remaining
+    - Trend analysis (improving/degrading)
+    - Top error contributors
+    - Actionable recommendations
+
+# Review Schedule
+review:
+  frequency: quarterly
+  owner: Platform Team
+  participants:
+    - Engineering Leads
+    - Product Management
+    - Customer Success
+
+  agenda:
+    - Review SLO targets (are they appropriate?)
+    - Assess error budget policies
+    - Evaluate measurement windows
+    - Identify reliability investments
+    - Plan for next quarter

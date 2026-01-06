@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1.19
+FROM python:3.11-slim
+
+# OCI Image Labels
+LABEL org.opencontainers.image.title="RepoGraph Cloud API (Development)"
+LABEL org.opencontainers.image.description="FastAPI backend for RepoGraph Cloud - Development environment with hot reload"
+LABEL org.opencontainers.image.vendor="Aeptus"
+LABEL org.opencontainers.image.source="https://github.com/Aeptus/mockup"
+LABEL org.opencontainers.image.version="1.0.0"
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for development
+RUN groupadd -r devuser && useradd -r -g devuser -m -s /bin/bash devuser
+
+# Copy requirements
+COPY --link requirements.txt .
+
+# Install Python dependencies with cache mount
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip==25.3 setuptools==80.9.0 wheel==0.45.1 && \
+    pip install -r requirements.txt
+
+# Create directories for logs and temp files with correct ownership
+RUN install -d -o devuser -g devuser /app/logs /app/tmp
+
+# Copy application code and set ownership
+COPY --link --chown=devuser:devuser . .
+
+# Switch to non-root user
+USER devuser
+
+# Expose port
+EXPOSE 8000
+
+# Development server with hot reload
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

@@ -1,0 +1,39 @@
+{{- if .Values.postgresql.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "repograph.fullname" . }}-postgres
+  labels:
+    {{- include "repograph.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: postgres
+    protocol: TCP
+  selector:
+    {{- include "repograph.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "repograph.fullname" . }}-postgres-headless
+  labels:
+    {{- include "repograph.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: postgres
+    protocol: TCP
+  selector:
+    {{- include "repograph.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+{{- end }}

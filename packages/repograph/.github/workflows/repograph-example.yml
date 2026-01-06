@@ -1,0 +1,93 @@
+name: RepoGraph Scorecard
+
+# Example workflow demonstrating how to use the RepoGraph Scorecard Action
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  scorecard:
+    name: Run AI-Readiness Scorecard
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run RepoGraph Scorecard
+        id: scorecard
+        uses: ./.github/actions/repograph-scorecard
+        with:
+          api-key: ${{ secrets.REPOGRAPH_API_KEY }}
+          org-id: ${{ secrets.REPOGRAPH_ORG_ID }}
+          repo-path: '.'
+          fail-on-blockers: 'true'
+          min-score: '70'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          format: 'both'
+
+      - name: Display Scorecard Results
+        run: |
+          echo "Score: ${{ steps.scorecard.outputs.score }}/100"
+          echo "Blockers: ${{ steps.scorecard.outputs.blockers }}"
+          echo "Warnings: ${{ steps.scorecard.outputs.warnings }}"
+          echo "Info: ${{ steps.scorecard.outputs.info }}"
+
+      - name: Upload Scorecard Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorecard-report
+          path: ${{ steps.scorecard.outputs.report-path }}
+
+  scorecard-with-fixes:
+    name: Run Scorecard and Apply Fixes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run RepoGraph Scorecard with Autofixes
+        id: scorecard_fixes
+        uses: ./.github/actions/repograph-scorecard
+        with:
+          api-key: ${{ secrets.REPOGRAPH_API_KEY }}
+          org-id: ${{ secrets.REPOGRAPH_ORG_ID }}
+          repo-path: '.'
+          apply-fixes: 'true'
+          create-pr: 'true'
+          pr-branch: 'repograph-autofixes-${{ github.run_id }}'
+          fail-on-blockers: 'false'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Comment on Fix PR
+        if: steps.scorecard_fixes.outputs.blockers > 0 || steps.scorecard_fixes.outputs.warnings > 0
+        run: |
+          echo "Autofixes were applied and a PR was created"
+
+  scorecard-scheduled:
+    name: Scheduled Scorecard Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Weekly Scorecard
+        uses: ./.github/actions/repograph-scorecard
+        with:
+          api-key: ${{ secrets.REPOGRAPH_API_KEY }}
+          org-id: ${{ secrets.REPOGRAPH_ORG_ID }}
+          fail-on-blockers: 'false'
+          min-score: '60'
+
+# Optional: Run on a schedule (weekly)
+# Uncomment the lines below to enable scheduled runs
+#  schedule:
+#    - cron: '0 0 * * 0'  # Every Sunday at midnight

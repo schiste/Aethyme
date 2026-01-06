@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: repograph-worker
+  namespace: repograph-cloud
+  labels:
+    app: repograph-worker
+    component: worker
+    version: v1.0.0
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: repograph-worker
+  template:
+    metadata:
+      labels:
+        app: repograph-worker
+        component: worker
+        version: v1.0.0
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+      containers:
+      - name: worker
+        image: repograph/cloud-api:1.0.0
+        imagePullPolicy: IfNotPresent
+        command: ["celery", "-A", "app.core.celery_app", "worker"]
+        args:
+        - "--loglevel=info"
+        - "--concurrency=4"
+        - "--max-tasks-per-child=1000"
+
+        envFrom:
+        - configMapRef:
+            name: repograph-config
+
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: url
+        - name: JWT_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: jwt-secrets
+              key: secret-key
+        - name: ENCRYPTION_KEY
+          valueFrom:
+            secretKeyRef:
+              name: encryption-key
+              key: key
+        - name: SENTRY_DSN
+          valueFrom:
+            secretKeyRef:
+              name: sentry-dsn
+              key: dsn
+              optional: true
+
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 3Gi
+
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+            - ALL
+
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 60

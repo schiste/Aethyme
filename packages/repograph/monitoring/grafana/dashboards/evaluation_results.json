@@ -1,0 +1,331 @@
+{
+  "dashboard": {
+    "title": "RepoGraph Evaluation Results",
+    "tags": ["repograph", "evaluations", "quality"],
+    "timezone": "browser",
+    "schemaVersion": 27,
+    "version": 1,
+    "refresh": "1m",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Retrieval Precision & Recall",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "targets": [
+          {
+            "expr": "retrieval_eval_precision",
+            "legendFormat": "Precision"
+          },
+          {
+            "expr": "retrieval_eval_recall",
+            "legendFormat": "Recall"
+          },
+          {
+            "expr": "retrieval_eval_f1_score",
+            "legendFormat": "F1 Score"
+          }
+        ],
+        "yaxes": [
+          {"format": "percent", "max": 100, "min": 0, "label": "Score"},
+          {"format": "short"}
+        ],
+        "alert": {
+          "name": "Retrieval Precision Alert",
+          "conditions": [
+            {
+              "evaluator": {"type": "lt", "params": [85.0]},
+              "query": {"params": ["A", "5m", "now"]}
+            }
+          ]
+        }
+      },
+      {
+        "id": 2,
+        "title": "Retrieval MRR & nDCG",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+        "targets": [
+          {
+            "expr": "retrieval_eval_mrr",
+            "legendFormat": "MRR"
+          },
+          {
+            "expr": "retrieval_eval_ndcg",
+            "legendFormat": "nDCG"
+          }
+        ],
+        "yaxes": [
+          {"format": "percentunit", "max": 1, "min": 0},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Autofix Success Rate",
+        "type": "gauge",
+        "gridPos": {"h": 6, "w": 8, "x": 0, "y": 8},
+        "targets": [
+          {
+            "expr": "autofix_eval_correctness_rate",
+            "legendFormat": "Correctness"
+          }
+        ],
+        "options": {
+          "showThresholdLabels": false,
+          "showThresholdMarkers": true
+        },
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 80, "color": "yellow"},
+                {"value": 95, "color": "green"}
+              ]
+            },
+            "unit": "percent",
+            "max": 100,
+            "min": 0
+          }
+        }
+      },
+      {
+        "id": 4,
+        "title": "Autofix Safety Rate",
+        "type": "gauge",
+        "gridPos": {"h": 6, "w": 8, "x": 8, "y": 8},
+        "targets": [
+          {
+            "expr": "autofix_eval_safety_pass_rate",
+            "legendFormat": "Safety"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 95, "color": "yellow"},
+                {"value": 99, "color": "green"}
+              ]
+            },
+            "unit": "percent",
+            "max": 100,
+            "min": 0
+          }
+        }
+      },
+      {
+        "id": 5,
+        "title": "Autofix No-Regression Rate",
+        "type": "gauge",
+        "gridPos": {"h": 6, "w": 8, "x": 16, "y": 8},
+        "targets": [
+          {
+            "expr": "autofix_eval_no_regression_rate",
+            "legendFormat": "No Regression"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 90, "color": "yellow"},
+                {"value": 98, "color": "green"}
+              ]
+            },
+            "unit": "percent",
+            "max": 100,
+            "min": 0
+          }
+        }
+      },
+      {
+        "id": 6,
+        "title": "Scorecard Precision & Recall",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+        "targets": [
+          {
+            "expr": "scorecard_eval_precision",
+            "legendFormat": "Precision"
+          },
+          {
+            "expr": "scorecard_eval_recall",
+            "legendFormat": "Recall"
+          },
+          {
+            "expr": "scorecard_eval_f1_score",
+            "legendFormat": "F1 Score"
+          }
+        ],
+        "yaxes": [
+          {"format": "percent", "max": 100, "min": 0},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Scorecard False Positive/Negative Rates",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+        "targets": [
+          {
+            "expr": "scorecard_eval_false_positive_rate",
+            "legendFormat": "False Positive Rate"
+          },
+          {
+            "expr": "scorecard_eval_false_negative_rate",
+            "legendFormat": "False Negative Rate"
+          }
+        ],
+        "yaxes": [
+          {"format": "percent", "max": 100, "min": 0},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 8,
+        "title": "Evaluation Test Counts",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 22},
+        "targets": [
+          {
+            "expr": "retrieval_eval_total_queries",
+            "legendFormat": "Retrieval Tests"
+          }
+        ],
+        "options": {
+          "colorMode": "value",
+          "graphMode": "none",
+          "textMode": "value_and_name"
+        }
+      },
+      {
+        "id": 9,
+        "title": "Autofix Test Counts",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 6, "y": 22},
+        "targets": [
+          {
+            "expr": "autofix_eval_total_test_cases",
+            "legendFormat": "Autofix Tests"
+          }
+        ]
+      },
+      {
+        "id": 10,
+        "title": "Scorecard Test Counts",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 12, "y": 22},
+        "targets": [
+          {
+            "expr": "scorecard_eval_total_test_cases",
+            "legendFormat": "Scorecard Tests"
+          }
+        ]
+      },
+      {
+        "id": 11,
+        "title": "Overall Eval Pass Rate",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 18, "y": 22},
+        "targets": [
+          {
+            "expr": "(retrieval_eval_f1_score + autofix_eval_correctness_rate + scorecard_eval_f1_score) / 3",
+            "legendFormat": "Overall Score"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 80, "color": "yellow"},
+                {"value": 90, "color": "green"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 12,
+        "title": "Benchmark Performance Trends",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 26},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(repograph_index_duration_seconds_bucket[5m]))",
+            "legendFormat": "Index p95"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(repograph_query_duration_seconds_bucket[5m]))",
+            "legendFormat": "Query p95"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(repograph_operation_latency_seconds_bucket[5m]))",
+            "legendFormat": "Operation p95"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Latency"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 13,
+        "title": "Evaluation Run History",
+        "type": "table",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 34},
+        "targets": [
+          {
+            "expr": "eval_run_timestamp",
+            "format": "table",
+            "instant": true
+          }
+        ],
+        "transformations": [
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {},
+              "indexByName": {},
+              "renameByName": {
+                "Time": "Timestamp",
+                "eval_type": "Type",
+                "result": "Result",
+                "score": "Score"
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "annotations": {
+      "list": [
+        {
+          "datasource": "-- Grafana --",
+          "enable": true,
+          "hide": false,
+          "iconColor": "rgba(0, 211, 255, 1)",
+          "name": "Evaluation Runs",
+          "type": "tags"
+        }
+      ]
+    },
+    "time": {
+      "from": "now-7d",
+      "to": "now"
+    },
+    "timepicker": {
+      "refresh_intervals": ["30s", "1m", "5m", "15m", "30m", "1h"]
+    }
+  }
+}
