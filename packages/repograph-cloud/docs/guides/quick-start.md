@@ -20,7 +20,7 @@ This guide will help you start the RepoGraph Cloud platform locally and test the
 ### Step 1: Start Infrastructure Services
 
 ```bash
-cd /Users/christophehenner/Downloads/Mockup/packages/repograph-cloud
+cd Mockup/packages/repograph-cloud
 
 # Start PostgreSQL, Redis, Elasticsearch
 docker-compose up -d
@@ -70,7 +70,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ```bash
 # Open new terminal
-cd /Users/christophehenner/Downloads/Mockup/packages/repograph-cloud/apps/web
+cd Mockup/packages/repograph-cloud/apps/web
 
 # Install dependencies
 pnpm install
@@ -92,7 +92,7 @@ pnpm dev
 
 ```bash
 # Open new terminal
-cd /Users/christophehenner/Downloads/Mockup/packages/repograph-cloud/apps/api
+cd Mockup/packages/repograph-cloud/apps/api
 source venv/bin/activate
 
 # Start Celery worker
@@ -255,7 +255,7 @@ curl http://localhost:9202
 **Error: `ModuleNotFoundError: No module named 'app'`**
 ```bash
 # Make sure you're in the right directory
-cd /Users/christophehenner/Downloads/Mockup/packages/repograph-cloud/apps/api
+cd Mockup/packages/repograph-cloud/apps/api
 
 # Make sure venv is activated
 source venv/bin/activate

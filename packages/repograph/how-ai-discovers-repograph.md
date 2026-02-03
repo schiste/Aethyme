@@ -37,7 +37,7 @@ cat > ~/.config/claude/mcp_servers.json << 'EOF'
 {
   "repograph": {
     "command": "node",
-    "args": ["/Users/christophehenner/Downloads/Mockup/packages/repograph/mcp-server.js"],
+    "args": ["Mockup/packages/repograph/mcp-server.js"],
     "env": {
       "REPOGRAPH_API_URL": "http://localhost:8001",
       "REPOGRAPH_TOKEN": "your-token-here"

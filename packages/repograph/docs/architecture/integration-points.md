@@ -65,7 +65,7 @@ graph TB
 
 ## A. AI Onboarding System Integration
 
-**Reference:** `/Users/christophehenner/Downloads/Mockup/docs/AI_ONBOARDING_CUTTING_EDGE_IDEAS.md`
+**Reference:** `Mockup/docs/AI_ONBOARDING_CUTTING_EDGE_IDEAS.md`
 
 **Integration Goal:** Use RepoGraph's AI-readiness features to enhance agent onboarding workflow.
 

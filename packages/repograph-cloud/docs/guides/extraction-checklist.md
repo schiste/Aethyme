@@ -80,7 +80,7 @@ When ready to extract to separate repository:
 ### Step 1: Create Extraction Branch
 
 ```bash
-cd /Users/christophehenner/Downloads/Mockup
+cd Mockup
 
 # Create branch for extraction
 git checkout -b extract-repograph-cloud
@@ -95,7 +95,7 @@ pnpm build
 ### Step 2: Extract with Git History
 
 ```bash
-cd /Users/christophehenner/Downloads/Mockup
+cd Mockup
 
 # Extract subdirectory with full history
 git subtree split -P packages/repograph-cloud -b repograph-cloud-extraction
@@ -107,7 +107,7 @@ git subtree split -P packages/repograph-cloud -b repograph-cloud-extraction
 
 ```bash
 # Create new directory
-cd /Users/christophehenner/Downloads/
+cd 
 mkdir repograph-cloud
 cd repograph-cloud
 
@@ -154,7 +154,7 @@ curl https://api.repograph.io/health
 ### Step 6: Cleanup Mockup Repository
 
 ```bash
-cd /Users/christophehenner/Downloads/Mockup
+cd Mockup
 
 # Remove repograph-cloud (or keep as archive)
 git checkout main

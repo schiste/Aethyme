@@ -9,7 +9,8 @@ echo "AI-Readiness Scorecard - Verification Script"
 echo "======================================================================"
 echo ""
 
-REPO_ROOT="/Users/christophehenner/Downloads/Mockup/packages/repograph"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$SCRIPT_DIR/../../../Mockup/packages/repograph"
 cd "$REPO_ROOT"
 
 # Color codes

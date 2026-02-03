@@ -373,7 +373,7 @@ See [week-11-plan.md](week-11-plan.md) for complete implementation details.
 
 1. Move files to dashboard group:
    ```bash
-   cd /Users/christophehenner/Downloads/Mockup/packages/repograph-cloud/apps/web/app
+   cd Mockup/packages/repograph-cloud/apps/web/app
 
    # Move search
    mv search (dashboard)/search

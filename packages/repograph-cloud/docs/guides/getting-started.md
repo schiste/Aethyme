@@ -17,7 +17,7 @@ Ensure you have these installed:
 ### Step 1: Install Dependencies
 
 ```bash
-cd /Users/christophehenner/Downloads/Mockup/packages/repograph-cloud
+cd Mockup/packages/repograph-cloud
 
 # Install all dependencies (frontend + backend tools)
 pnpm install

@@ -216,7 +216,7 @@
 
 ### 1. Load Test Fixtures
 ```bash
-cd /Users/christophehenner/Downloads/Mockup/packages/repograph
+cd Mockup/packages/repograph
 
 # Load test data into database
 psql -U repograph -d repograph -f tests/queries/fixtures/graph_data.sql

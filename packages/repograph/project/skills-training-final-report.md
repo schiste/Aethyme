@@ -516,7 +516,7 @@ Successfully completed comprehensive skills gap analysis and training program de
 
 ## Appendix: Files Created
 
-All files are located in `/Users/christophehenner/Downloads/Mockup/packages/repograph/project/`:
+All files are located in `Mockup/packages/repograph/project/`:
 
 1. **SKILLS_INVENTORY.md** - Complete skills gap analysis
 2. **TRAINING_PLAN.md** - 4-week training program
@@ -524,7 +524,7 @@ All files are located in `/Users/christophehenner/Downloads/Mockup/packages/repo
 4. **NEW_DEVELOPER_ONBOARDING.md** - Fast onboarding checklist
 5. **KNOWLEDGE_BASE.md** - Comprehensive FAQ
 
-All priority skills located in `/Users/christophehenner/Downloads/Mockup/Agents/skills/`:
+All priority skills located in `Mockup/Agents/skills/`:
 
 6. **rate-limiting/skill.md** - API rate limiting
 7. **api-keys-management/skill.md** - API key lifecycle

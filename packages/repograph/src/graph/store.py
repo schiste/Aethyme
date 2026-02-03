@@ -83,10 +83,10 @@ class GraphStore:
         """
         query = """
             INSERT INTO repograph.nodes (
-                id, tenant_id, repository_id, symbol, file_path,
+                id, display_id, tenant_id, repository_id, symbol, file_path,
                 line_number, column_number, kind, language,
                 signature, documentation, metadata
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (tenant_id, repository_id, symbol, file_path, line_number, column_number)
             DO UPDATE SET
                 signature = EXCLUDED.signature,
@@ -98,6 +98,7 @@ class GraphStore:
         params_list = [
             (
                 node.id,
+                node.display_id,
                 self.tenant_id,
                 repository_id,
                 node.symbol,

@@ -407,7 +407,7 @@
 
 ```bash
 # Create new repository (separate from Mockup)
-cd /Users/christophehenner/Downloads/
+cd 
 mkdir repograph-cloud
 cd repograph-cloud
 git init

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import hashlib
 from enum import Enum
+from urllib.parse import quote
 
 
 class NodeKind(str, Enum):
@@ -49,17 +50,31 @@ class Node:
 
     # Computed fields
     id: str = field(init=False)
+    display_id: str = field(init=False)
 
     def __post_init__(self):
         """Generate unique ID for the node."""
         self.id = self._generate_id()
+        self.display_id = self._generate_display_id()
+
+    def _canonical_str(self) -> str:
+        """Create a canonical string from node properties."""
+        return f"{self.symbol}:{self.file_path}:{self.line_number}:{self.column_number}:{self.kind}"
 
     def _generate_id(self) -> str:
         """Generate a unique ID based on node properties."""
-        # Create a unique string from node properties
-        unique_str = f"{self.symbol}:{self.file_path}:{self.line_number}:{self.column_number}:{self.kind}"
-        # Generate SHA256 hash and truncate to 64 chars
+        unique_str = self._canonical_str()
         return hashlib.sha256(unique_str.encode()).hexdigest()[:64]
+
+    def _generate_display_id(self) -> str:
+        """Generate a deterministic, human-readable ID for display."""
+        safe_symbol = quote(self.symbol, safe="/._-")
+        safe_path = quote(self.file_path, safe="/._-")
+        short_hash = self.id[:10]
+        return (
+            f"{self.kind}:{safe_symbol}@{safe_path}:"
+            f"{self.line_number}:{self.column_number}~{short_hash}"
+        )
 
     @classmethod
     def create_definition(
@@ -108,6 +123,7 @@ class Node:
         """Convert node to dictionary."""
         return {
             "id": self.id,
+            "display_id": self.display_id,
             "symbol": self.symbol,
             "file_path": self.file_path,
             "line_number": self.line_number,

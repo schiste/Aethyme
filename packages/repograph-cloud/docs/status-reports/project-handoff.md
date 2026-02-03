@@ -26,7 +26,7 @@ RepoGraph Cloud is a code intelligence platform that provides repository managem
 
 ```bash
 # Navigate to project
-cd /Users/christophehenner/Downloads/Mockup/packages/repograph-cloud
+cd Mockup/packages/repograph-cloud
 
 # Start database & cache (Docker)
 docker-compose up -d
