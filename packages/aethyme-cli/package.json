@@ -1,0 +1,12 @@
+{
+  "name": "@aethyme/cli",
+  "version": "0.1.0",
+  "description": "Aethyme CLI for generating repository graphs",
+  "bin": {
+    "aethyme": "bin/aethyme.js"
+  },
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  }
+}
