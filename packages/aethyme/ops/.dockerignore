@@ -1,0 +1,176 @@
+# =============================================================================
+# .dockerignore for aethyme ops directory
+# =============================================================================
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+__pypackages__/
+
+# Python type checking and linting
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+.virtualenv/
+
+# Logs and databases
+*.log
+*.db
+*.sqlite
+*.sqlite3
+db.sqlite3-journal
+logs/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Git files
+.git/
+.gitignore
+.gitattributes
+.gitmodules
+
+# Documentation
+docs/
+*.md
+!README.md
+README.md
+LICENSE
+CHANGELOG.md
+CONTRIBUTING.md
+
+# Testing files
+tests/
+test_*.py
+*_test.py
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.hypothesis/
+coverage.xml
+*.cover
+.pytest_cache/
+
+# CI/CD files
+.github/workflows/
+.gitlab-ci.yml
+.circleci/
+.travis.yml
+azure-pipelines.yml
+Jenkinsfile
+.buildkite/
+.drone.yml
+
+# Terraform files
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars
+*.tfvars
+.terraformrc
+terraform.rc
+
+# Large archive files
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.iso
+*.rar
+*.7z
+*.gz
+*.bz2
+*.xz
+
+# Cache directories
+.cache/
+.pip-cache/
+.npm/
+.yarn/
+.pnpm-store/
+pip-cache/
+npm-cache/
+
+# Environment files
+.env
+.env.*
+!.env.example
+.envrc
+secrets/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Development and build artifacts
+node_modules/
+npm-debug.log
+yarn-error.log
+yarn-debug.log
+dist/
+build/
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Docker files (meta - don't copy Docker files into Docker builds)
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Static files (if serving separately)
+staticfiles/
+media/
+static/
+
+# OS-specific files
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Monitoring and profiling
+*.prof
+*.pstats
+.profiling/
+
+# Backup files
+*.bak
+*.backup
+*.old
+*~
+
+# Keep essential files (whitelist)
+!requirements.txt
+!pyproject.toml
+!setup.py
+!setup.cfg
+!entrypoint.sh
+!prometheus.yml

@@ -1,0 +1,19 @@
+{{- if .Values.redis.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aethyme.fullname" . }}-redis
+  labels:
+    {{- include "aethyme.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cache
+spec:
+  type: ClusterIP
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: redis
+    protocol: TCP
+  selector:
+    {{- include "aethyme.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: cache
+{{- end }}

@@ -1,0 +1,317 @@
+name: Evaluation Tests
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main]
+  schedule:
+    # Run evals daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      run_benchmarks:
+        description: 'Run performance benchmarks'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  TELEM_EVAL_V1: 'true'
+
+jobs:
+  retrieval-eval:
+    name: Retrieval Evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        working-directory: packages/aethyme
+        run: |
+          pip install -e ".[dev,test]"
+
+      - name: Generate retrieval test set
+        working-directory: packages/aethyme
+        run: |
+          python -c "from tests.evals.retrieval_eval import generate_golden_test_set; generate_golden_test_set('tests/evals/data/retrieval_test_set.json')"
+
+      - name: Run retrieval evaluation
+        working-directory: packages/aethyme
+        run: |
+          python -m pytest tests/evals/test_retrieval.py -v --junitxml=test-results/retrieval-eval.xml
+
+      - name: Check precision threshold
+        working-directory: packages/aethyme
+        run: |
+          python -c "
+          import json
+          with open('test-results/retrieval_metrics.json') as f:
+              metrics = json.load(f)
+          precision = metrics['metrics']['precision']
+          recall = metrics['metrics']['recall']
+          print(f'Precision: {precision:.2f}%, Recall: {recall:.2f}%')
+          if precision < 85.0:
+              print('ERROR: Precision below threshold (85%)')
+              exit(1)
+          if recall < 80.0:
+              print('WARNING: Recall below threshold (80%)')
+          "
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: retrieval-eval-results
+          path: packages/aethyme/test-results/
+
+  autofix-eval:
+    name: Autofix Evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        working-directory: packages/aethyme
+        run: |
+          pip install -e ".[dev,test]"
+
+      - name: Generate autofix test set
+        working-directory: packages/aethyme
+        run: |
+          python -c "from tests.evals.autofix_eval import generate_autofix_test_set; generate_autofix_test_set('tests/evals/data/autofix_test_set.json')"
+
+      - name: Run autofix evaluation
+        working-directory: packages/aethyme
+        run: |
+          python -m pytest tests/evals/test_autofix.py -v --junitxml=test-results/autofix-eval.xml
+
+      - name: Check correctness threshold
+        working-directory: packages/aethyme
+        run: |
+          python -c "
+          import json
+          with open('test-results/autofix_metrics.json') as f:
+              metrics = json.load(f)
+          correctness = metrics['metrics']['correctness_rate']
+          safety = metrics['metrics']['safety_pass_rate']
+          print(f'Correctness: {correctness:.2f}%, Safety: {safety:.2f}%')
+          if correctness < 90.0:
+              print('ERROR: Correctness below threshold (90%)')
+              exit(1)
+          if safety < 95.0:
+              print('ERROR: Safety below threshold (95%)')
+              exit(1)
+          "
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: autofix-eval-results
+          path: packages/aethyme/test-results/
+
+  scorecard-eval:
+    name: Scorecard Evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        working-directory: packages/aethyme
+        run: |
+          pip install -e ".[dev,test]"
+
+      - name: Generate scorecard test set
+        working-directory: packages/aethyme
+        run: |
+          python -c "from tests.evals.scorecard_eval import generate_scorecard_test_set; generate_scorecard_test_set('tests/evals/data/scorecard_test_set.json')"
+
+      - name: Run scorecard evaluation
+        working-directory: packages/aethyme
+        run: |
+          python -m pytest tests/evals/test_scorecard.py -v --junitxml=test-results/scorecard-eval.xml
+
+      - name: Check precision threshold
+        working-directory: packages/aethyme
+        run: |
+          python -c "
+          import json
+          with open('test-results/scorecard_metrics.json') as f:
+              metrics = json.load(f)
+          precision = metrics['metrics']['precision']
+          fpr = metrics['metrics']['false_positive_rate']
+          print(f'Precision: {precision:.2f}%, FPR: {fpr:.2f}%')
+          if precision < 85.0:
+              print('ERROR: Precision below threshold (85%)')
+              exit(1)
+          if fpr > 10.0:
+              print('ERROR: False positive rate too high (>10%)')
+              exit(1)
+          "
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: scorecard-eval-results
+          path: packages/aethyme/test-results/
+
+  performance-benchmarks:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'schedule' || github.event.inputs.run_benchmarks == 'true'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        working-directory: packages/aethyme
+        run: |
+          pip install -e ".[dev,test]"
+
+      - name: Run end-to-end benchmarks
+        working-directory: packages/aethyme
+        run: |
+          python benchmarks/comprehensive/end_to_end_benchmark.py
+
+      - name: Run load benchmarks
+        working-directory: packages/aethyme
+        run: |
+          python benchmarks/comprehensive/load_benchmark.py
+
+      - name: Check for regressions
+        working-directory: packages/aethyme
+        run: |
+          python benchmarks/comprehensive/regression_detection.py
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: benchmark-results
+          path: packages/aethyme/benchmarks/results/
+
+  publish-results:
+    name: Publish Evaluation Results
+    runs-on: ubuntu-latest
+    needs: [retrieval-eval, autofix-eval, scorecard-eval]
+    if: always() && github.event_name == 'pull_request'
+
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v3
+
+      - name: Combine results
+        run: |
+          mkdir -p combined-results
+          find . -name "*.json" -exec cp {} combined-results/ \;
+
+      - name: Generate PR comment
+        id: comment
+        run: |
+          cat > pr-comment.md << 'EOF'
+          ## Evaluation Results
+
+          ### Retrieval Evaluation
+          - Precision: $(cat retrieval-eval-results/retrieval_metrics.json | jq -r '.metrics.precision')%
+          - Recall: $(cat retrieval-eval-results/retrieval_metrics.json | jq -r '.metrics.recall')%
+          - MRR: $(cat retrieval-eval-results/retrieval_metrics.json | jq -r '.metrics.mrr')
+
+          ### Autofix Evaluation
+          - Correctness: $(cat autofix-eval-results/autofix_metrics.json | jq -r '.metrics.correctness_rate')%
+          - Safety Pass Rate: $(cat autofix-eval-results/autofix_metrics.json | jq -r '.metrics.safety_pass_rate')%
+          - No Regression Rate: $(cat autofix-eval-results/autofix_metrics.json | jq -r '.metrics.no_regression_rate')%
+
+          ### Scorecard Evaluation
+          - Precision: $(cat scorecard-eval-results/scorecard_metrics.json | jq -r '.metrics.precision')%
+          - Recall: $(cat scorecard-eval-results/scorecard_metrics.json | jq -r '.metrics.recall')%
+          - False Positive Rate: $(cat scorecard-eval-results/scorecard_metrics.json | jq -r '.metrics.false_positive_rate')%
+
+          ---
+          Generated with [Claude Code](https://claude.com/claude-code)
+          EOF
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const comment = fs.readFileSync('pr-comment.md', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  regression-detection:
+    name: Regression Detection
+    runs-on: ubuntu-latest
+    needs: [retrieval-eval, autofix-eval, scorecard-eval]
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download evaluation results
+        uses: actions/download-artifact@v3
+
+      - name: Check for quality regressions
+        run: |
+          python -c "
+          import json
+          import sys
+
+          # Load current results
+          with open('retrieval-eval-results/retrieval_metrics.json') as f:
+              retrieval = json.load(f)['metrics']
+
+          # Check against baseline (hardcoded for now, should load from file)
+          baseline_precision = 90.0
+          current_precision = retrieval['precision']
+
+          degradation = baseline_precision - current_precision
+          if degradation > 5.0:
+              print(f'REGRESSION: Precision degraded by {degradation:.2f}%')
+              sys.exit(1)
+
+          print('No significant regressions detected')
+          "

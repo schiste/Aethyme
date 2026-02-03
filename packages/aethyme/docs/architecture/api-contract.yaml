@@ -1,0 +1,798 @@
+openapi: 3.0.3
+info:
+  title: Aethyme API
+  version: 1.0.0
+  description: |
+    Aethyme API for code intelligence and AI-readiness.
+
+    **Stage 1 Features:**
+    - Repository indexing (SCIP + fallback)
+    - Graph queries (search, ego, impact)
+    - AI-readiness scorecard
+    - Safe autofixers
+    - Guardrails and telemetry
+
+    **Authentication:**
+    - JWT Bearer tokens (OIDC)
+    - API keys (X-API-Key header)
+
+    **Multi-tenancy:**
+    - All resources scoped to organizations
+    - Automatic tenant isolation via RLS
+  contact:
+    name: Aethyme Team
+    email: aethyme@aethyme.com
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://api.aethyme.com/api/v1
+    description: Production
+  - url: https://api.staging.aethyme.com/api/v1
+    description: Staging
+  - url: http://localhost:8000/api/v1
+    description: Local development
+
+tags:
+  - name: auth
+    description: Authentication endpoints
+  - name: repos
+    description: Repository management
+  - name: query
+    description: Code intelligence queries
+  - name: ai-ready
+    description: AI-readiness scorecard
+  - name: autofix
+    description: Safe autofixers
+  - name: status
+    description: System status
+
+security:
+  - BearerAuth: []
+  - ApiKeyAuth: []
+
+paths:
+  # ============================================================================
+  # AUTHENTICATION
+  # ============================================================================
+  /auth/register:
+    post:
+      tags: [auth]
+      summary: Register new user and organization
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, org_name]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                  minLength: 8
+                org_name:
+                  type: string
+      responses:
+        '201':
+          description: User created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Login with email/password
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                password:
+                  type: string
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: Get current user
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+
+  # ============================================================================
+  # REPOSITORIES
+  # ============================================================================
+  /repos:
+    get:
+      tags: [repos]
+      summary: List repositories
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, indexing, completed, failed]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: List of repositories
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Repository'
+                  total:
+                    type: integer
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+
+    post:
+      tags: [repos]
+      summary: Register a repository
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, url, provider]
+              properties:
+                name:
+                  type: string
+                url:
+                  type: string
+                  format: uri
+                provider:
+                  type: string
+                  enum: [github, gitlab, bitbucket, other]
+                default_branch:
+                  type: string
+                  default: main
+                auto_index:
+                  type: boolean
+                  default: true
+      responses:
+        '201':
+          description: Repository created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Repository'
+
+  /repos/{repo_id}:
+    get:
+      tags: [repos]
+      summary: Get repository details
+      parameters:
+        - $ref: '#/components/parameters/repo_id'
+      responses:
+        '200':
+          description: Repository details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Repository'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [repos]
+      summary: Delete repository
+      parameters:
+        - $ref: '#/components/parameters/repo_id'
+      responses:
+        '204':
+          description: Repository deleted
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /repos/{repo_id}/index:
+    post:
+      tags: [repos]
+      summary: Trigger repository indexing
+      parameters:
+        - $ref: '#/components/parameters/repo_id'
+      responses:
+        '202':
+          description: Indexing job queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+
+  /repos/{repo_id}/status:
+    get:
+      tags: [repos]
+      summary: Get indexing status
+      parameters:
+        - $ref: '#/components/parameters/repo_id'
+      responses:
+        '200':
+          description: Indexing status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [pending, indexing, completed, failed]
+                  symbol_count:
+                    type: integer
+                  last_indexed_at:
+                    type: string
+                    format: date-time
+                  error_message:
+                    type: string
+                    nullable: true
+
+  # ============================================================================
+  # QUERY
+  # ============================================================================
+  /query/search:
+    get:
+      tags: [query]
+      summary: Search symbols
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Search query
+        - name: kind
+          in: query
+          schema:
+            type: string
+            enum: [function, class, method, variable]
+          description: Filter by symbol kind
+        - name: language
+          in: query
+          schema:
+            type: string
+          description: Filter by language
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Symbol'
+                  total:
+                    type: integer
+                  query_time_ms:
+                    type: integer
+
+  /query/ego:
+    get:
+      tags: [query]
+      summary: Get ego graph (N-hop neighbors)
+      parameters:
+        - name: symbol
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Symbol name
+        - name: depth
+          in: query
+          schema:
+            type: integer
+            default: 2
+            minimum: 1
+            maximum: 5
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 1000
+      responses:
+        '200':
+          description: Ego graph
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Graph'
+
+  /query/impact:
+    get:
+      tags: [query]
+      summary: Impact analysis (reverse dependencies)
+      parameters:
+        - name: symbol
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: depth
+          in: query
+          schema:
+            type: integer
+            default: 3
+      responses:
+        '200':
+          description: Impact analysis
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Graph'
+
+  /query/semantic:
+    post:
+      tags: [query]
+      summary: Semantic search (vector search)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query:
+                  type: string
+                  description: Natural language query
+                limit:
+                  type: integer
+                  default: 20
+      responses:
+        '200':
+          description: Semantic search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        symbol:
+                          $ref: '#/components/schemas/Symbol'
+                        similarity:
+                          type: number
+                          minimum: 0
+                          maximum: 1
+
+  # ============================================================================
+  # AI-READINESS
+  # ============================================================================
+  /ai-ready/{repo_id}:
+    post:
+      tags: [ai-ready]
+      summary: Run AI-readiness scorecard
+      parameters:
+        - $ref: '#/components/parameters/repo_id'
+      responses:
+        '202':
+          description: Scorecard job queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+
+  /ai-ready/{repo_id}/results:
+    get:
+      tags: [ai-ready]
+      summary: Get latest scorecard results
+      parameters:
+        - $ref: '#/components/parameters/repo_id'
+      responses:
+        '200':
+          description: Scorecard results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Scorecard'
+
+  # ============================================================================
+  # AUTOFIX
+  # ============================================================================
+  /autofix/{repo_id}:
+    post:
+      tags: [autofix]
+      summary: Run autofixers
+      parameters:
+        - $ref: '#/components/parameters/repo_id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              properties:
+                mode:
+                  type: string
+                  enum: [dry_run, apply, pr]
+                categories:
+                  type: array
+                  items:
+                    type: string
+                    enum: [docs, links, selectors, i18n]
+      responses:
+        '202':
+          description: Autofix job queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+
+  # ============================================================================
+  # STATUS
+  # ============================================================================
+  /health:
+    get:
+      tags: [status]
+      summary: Health check
+      security: []
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [healthy]
+
+  /health/ready:
+    get:
+      tags: [status]
+      summary: Readiness check
+      security: []
+      responses:
+        '200':
+          description: Service ready
+        '503':
+          description: Service not ready
+
+  /jobs/{job_id}:
+    get:
+      tags: [status]
+      summary: Get job status
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+
+# ============================================================================
+# COMPONENTS
+# ============================================================================
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT access token from OIDC provider
+
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API key for programmatic access
+
+  parameters:
+    repo_id:
+      name: repo_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    AuthResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+        user:
+          $ref: '#/components/schemas/User'
+
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        name:
+          type: string
+        org_id:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum: [owner, admin, member, readonly]
+
+    Repository:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        org_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        url:
+          type: string
+        provider:
+          type: string
+        status:
+          type: string
+        symbol_count:
+          type: integer
+        last_indexed_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    Symbol:
+      type: object
+      properties:
+        id:
+          type: string
+        symbol_name:
+          type: string
+        kind:
+          type: string
+        language:
+          type: string
+        file_path:
+          type: string
+        line_number:
+          type: integer
+        signature:
+          type: string
+        docstring:
+          type: string
+
+    Graph:
+      type: object
+      properties:
+        nodes:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              symbol:
+                type: string
+              kind:
+                type: string
+              file:
+                type: string
+              line:
+                type: integer
+              depth:
+                type: integer
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              from:
+                type: string
+              to:
+                type: string
+              type:
+                type: string
+                enum: [calls, imports, extends, implements]
+        metadata:
+          type: object
+          properties:
+            cached:
+              type: boolean
+            query_time_ms:
+              type: integer
+
+    Scorecard:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        repo_id:
+          type: string
+          format: uuid
+        score:
+          type: integer
+          minimum: 0
+          maximum: 100
+        summary:
+          type: object
+          properties:
+            total_violations:
+              type: integer
+            blockers:
+              type: integer
+            warnings:
+              type: integer
+            info:
+              type: integer
+        violations:
+          type: array
+          items:
+            type: object
+            properties:
+              severity:
+                type: string
+                enum: [blocker, warning, info]
+              category:
+                type: string
+              message:
+                type: string
+              file:
+                type: string
+              line:
+                type: integer
+        created_at:
+          type: string
+          format: date-time
+
+    Job:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        job_type:
+          type: string
+        status:
+          type: string
+          enum: [pending, running, completed, failed]
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+        result:
+          type: object
+        error_message:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+        details:
+          type: object
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    Forbidden:
+      description: Forbidden
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        X-RateLimit-Limit:
+          schema:
+            type: integer
+        X-RateLimit-Remaining:
+          schema:
+            type: integer
+        X-RateLimit-Reset:
+          schema:
+            type: integer
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'

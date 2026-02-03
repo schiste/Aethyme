@@ -1,0 +1,263 @@
+# Aethyme Cloud - Local Development Stack
+# Completely independent from parent Mockup repository
+
+# Use profiles to run specific service groups:
+# docker compose --profile dev up      # All development services
+# docker compose --profile core up     # Core services only (no workers)
+# docker compose --profile workers up  # Core + workers
+#
+# Enable watch mode: docker compose watch
+# - Code changes auto-sync (no rebuild)
+# - Dependency changes trigger rebuild
+
+services:
+  # PostgreSQL Database (multi-tenant)
+  postgres:
+    image: postgres:15
+    container_name: aethyme-cloud-postgres
+    profiles: ["dev", "core"]
+    environment:
+      POSTGRES_DB: aethyme_cloud
+      POSTGRES_USER: aethyme
+      POSTGRES_PASSWORD: aethyme
+    ports:
+      - "5434:5432"  # Different port from Mockup (5432, 5433)
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aethyme"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Redis (cache + queue)
+  redis:
+    image: redis:8-alpine
+    container_name: aethyme-cloud-redis
+    profiles: ["dev", "core"]
+    ports:
+      - "6381:6379"  # Different port from Mockup (6379, 6380)
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Elasticsearch (code search)
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    container_name: aethyme-cloud-elasticsearch
+    profiles: ["dev", "core"]
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9202:9200"  # Different port from Mockup (9200, 9201)
+      - "9302:9300"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # API (FastAPI)
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile.dev
+    container_name: aethyme-cloud-api
+    profiles: ["dev", "core"]
+    environment:
+      DATABASE_URL: postgresql://aethyme:aethyme@postgres:5432/aethyme_cloud
+      REDIS_URL: redis://redis:6379/0
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./apps/api:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    develop:
+      watch:
+        - action: sync
+          path: ./apps/api/app
+          target: /app/app
+          ignore:
+            - __pycache__
+        - action: rebuild
+          path: ./apps/api/requirements.txt
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Web Dashboard (Next.js)
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile.dev
+    container_name: aethyme-cloud-web
+    profiles: ["dev", "core"]
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXTAUTH_URL: http://localhost:3000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./apps/web:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - api
+    command: pnpm dev
+    develop:
+      watch:
+        - action: sync
+          path: ./apps/web/src
+          target: /app/src
+          ignore:
+            - node_modules
+        - action: sync
+          path: ./apps/web/app
+          target: /app/app
+          ignore:
+            - node_modules
+        - action: rebuild
+          path: ./apps/web/package.json
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Celery Worker (indexing)
+  worker:
+    build:
+      context: ./apps/workers
+      dockerfile: Dockerfile.dev
+    container_name: aethyme-cloud-worker
+    profiles: ["dev", "workers"]
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+      DATABASE_URL: postgresql://aethyme:aethyme@postgres:5432/aethyme_cloud
+    volumes:
+      - ./apps/workers:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A tasks worker --loglevel=info
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres-data:
+  redis-data:
+  elasticsearch-data:
+
+networks:
+  default:
+    name: aethyme-cloud-network

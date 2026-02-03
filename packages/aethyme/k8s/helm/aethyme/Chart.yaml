@@ -1,0 +1,27 @@
+apiVersion: v2
+name: aethyme
+description: Aethyme - AI-ready code graph analysis platform
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.28.0-0"
+
+keywords:
+  - aethyme
+  - code-analysis
+  - graph
+  - ai-ops
+
+home: https://github.com/your-org/aethyme
+sources:
+  - https://github.com/your-org/aethyme
+
+maintainers:
+  - name: Aethyme Team
+    email: team@aethyme.com
+
+dependencies: []
+
+annotations:
+  category: Development
+  licenses: Apache-2.0

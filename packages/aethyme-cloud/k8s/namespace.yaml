@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aethyme-cloud
+  labels:
+    name: aethyme-cloud
+    environment: production

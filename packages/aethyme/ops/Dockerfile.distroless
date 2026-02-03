@@ -1,0 +1,146 @@
+# syntax=docker/dockerfile:1.19
+# ==============================================================================
+# Aethyme Ops API - Distroless Production Dockerfile
+# Minimal attack surface with Google's Distroless base image
+# ==============================================================================
+#
+# BENEFITS:
+# - No shell → Prevents shell-based attacks and remote code execution via shell
+# - No package manager → Cannot install malicious packages at runtime
+# - Minimal dependencies → ~80% smaller than slim images, faster pulls/deployments
+# - Runs as nonroot user by default (UID 65532) → Enhanced security
+# - Only contains Python runtime and app dependencies → Minimal attack surface
+#
+# LIMITATIONS:
+# - No shell access → Cannot kubectl/docker exec for debugging
+# - Cannot install packages at runtime → All dependencies must be at build time
+# - Limited debugging → Use logs, metrics, and external debugging tools
+# - No bash scripts → Must use Python entrypoints instead of shell scripts
+# - See /docs/docker/DISTROLESS.md for debugging strategies
+#
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Stage 1: Builder - Install dependencies with build tools
+# ------------------------------------------------------------------------------
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+# Install system dependencies needed for building Python packages
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy only dependency files first for better layer caching
+COPY --link pyproject.toml .
+
+# Install dependencies with cache mount for pip
+# Install to /opt/venv to copy to runtime stage
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m venv /opt/venv && \
+    /opt/venv/bin/pip install --upgrade pip setuptools wheel && \
+    /opt/venv/bin/pip install gunicorn uvicorn[standard]
+
+# Copy source code now (required for editable install)
+COPY --link src/ src/
+
+# Now install the package in editable mode with all dependencies
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /opt/venv/bin/pip install -e .
+
+# Copy additional files needed at runtime
+COPY --link pyproject.toml .
+COPY --link migrations/ migrations/
+
+# ------------------------------------------------------------------------------
+# Stage 2: Distroless Runtime - Minimal production image
+# ------------------------------------------------------------------------------
+FROM gcr.io/distroless/python3-debian12:nonroot
+
+# OCI Image Labels
+LABEL org.opencontainers.image.title="Aethyme Ops API (Distroless)"
+LABEL org.opencontainers.image.description="Python API service for Aethyme - Hardened Distroless Image"
+LABEL org.opencontainers.image.vendor="Aeptus"
+LABEL org.opencontainers.image.source="https://github.com/Aeptus/mockup"
+LABEL org.opencontainers.image.version="1.0.0-distroless"
+LABEL maintainer="Aeptus Engineering <engineering@aeptus.com>"
+
+# Set working directory
+WORKDIR /app
+
+# Set environment variables
+# Distroless images use env vars for Python configuration
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    ENVIRONMENT=production \
+    LOG_LEVEL=INFO
+
+# Copy virtual environment from builder
+# Distroless Python looks for packages in standard locations
+COPY --link --from=builder /opt/venv /opt/venv
+
+# Copy application code
+COPY --link --from=builder /app/src src/
+COPY --link --from=builder /app/pyproject.toml .
+COPY --link --from=builder /app/migrations migrations/
+
+# Update PATH to include venv binaries
+# Note: ENV in distroless works differently, so we rely on explicit paths in CMD
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Already runs as nonroot user (UID 65532, GID 65532)
+# No need to create user or switch - distroless:nonroot handles this
+
+# Expose API port
+EXPOSE 8001
+
+# Note: No HEALTHCHECK - distroless has no shell, no curl
+# Use Kubernetes livenessProbe with httpGet instead:
+#   livenessProbe:
+#     httpGet:
+#       path: /health
+#       port: 8001
+#     initialDelaySeconds: 5
+#     periodSeconds: 30
+
+# Start application with production settings
+# Cannot use bash scripts (no shell), must use Python module directly
+# Distroless sets ENTRYPOINT to ["/usr/bin/python3"] so we use CMD
+CMD ["/opt/venv/bin/gunicorn", \
+     "--bind", "0.0.0.0:8001", \
+     "--workers", "4", \
+     "--worker-class", "uvicorn.workers.UvicornWorker", \
+     "--timeout", "60", \
+     "--keep-alive", "5", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-", \
+     "--log-level", "info", \
+     "src.api.main:app"]
+
+# Alternative: Use uvicorn directly (simpler, but no worker management)
+# CMD ["/opt/venv/bin/python3", "-m", "uvicorn", \
+#      "src.api.main:app", \
+#      "--host", "0.0.0.0", \
+#      "--port", "8001", \
+#      "--workers", "4"]
+
+# ==============================================================================
+# BUILD INSTRUCTIONS:
+# docker build -f Dockerfile.distroless -t aethyme-ops-api:distroless .
+#
+# RUN INSTRUCTIONS:
+# docker run -p 8001:8001 -e DATABASE_URL=... aethyme-ops-api:distroless
+#
+# SIZE COMPARISON:
+# Regular (python:3.11-slim): ~180-220MB
+# Distroless: ~60-90MB (60-75% reduction)
+#
+# MIGRATION NOTE:
+# The original Dockerfile used scripts/start-api.sh which cannot run in
+# distroless (no bash). This version calls gunicorn/uvicorn directly.
+# If start-api.sh contains critical startup logic, convert it to a Python
+# script and call it via: CMD ["/opt/venv/bin/python3", "scripts/startup.py"]
+# ==============================================================================

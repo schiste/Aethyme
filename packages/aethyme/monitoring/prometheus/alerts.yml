@@ -1,0 +1,207 @@
+groups:
+  - name: sprint1_auth_alerts
+    interval: 30s
+    rules:
+      - alert: HighAuthFailureRate
+        expr: |
+          rate(auth_failures_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "High authentication failure rate detected"
+          description: "Auth failure rate is {{ $value | humanizePercentage }} (>10%) over the last 5 minutes"
+          runbook: "Check logs for failed auth attempts, possible brute force attack"
+
+      - alert: AuthServiceDown
+        expr: |
+          up{job="aethyme-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "Authentication service is down"
+          description: "The API service is unreachable"
+          runbook: "Check service logs and restart if necessary"
+
+      - alert: RateLimitExceeded
+        expr: |
+          rate(rate_limit_exceeded_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+          category: capacity
+        annotations:
+          summary: "High rate limit violations"
+          description: "Rate limit exceeded {{ $value }} times/sec over last 5 minutes"
+          runbook: "Investigate client behavior, may need to adjust limits"
+
+  - name: sprint1_query_alerts
+    interval: 30s
+    rules:
+      - alert: SlowQueries
+        expr: |
+          histogram_quantile(0.95, rate(query_duration_seconds_bucket[5m])) > 2
+        for: 3m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "Query p95 latency exceeds target"
+          description: "Query p95 is {{ $value }}s (target: <2s)"
+          runbook: "Check slow query logs, database indexes, and cache hit rate"
+
+      - alert: VerySlowQueries
+        expr: |
+          histogram_quantile(0.95, rate(query_duration_seconds_bucket[5m])) > 5
+        for: 1m
+        labels:
+          severity: critical
+          category: performance
+        annotations:
+          summary: "Query p95 latency critically slow"
+          description: "Query p95 is {{ $value }}s (critically slow)"
+          runbook: "Immediate investigation required, possible database issue"
+
+      - alert: LowCacheHitRate
+        expr: |
+          rate(cache_hits_total[10m]) / (rate(cache_hits_total[10m]) + rate(cache_misses_total[10m])) < 0.6
+        for: 5m
+        labels:
+          severity: info
+          category: performance
+        annotations:
+          summary: "Cache hit rate below target"
+          description: "Cache hit rate is {{ $value | humanizePercentage }} (target: >60%)"
+          runbook: "Review cache configuration, TTLs, and invalidation logic"
+
+      - alert: HighQueryErrorRate
+        expr: |
+          rate(query_errors_total[5m]) / rate(query_requests_total[5m]) > 0.01
+        for: 2m
+        labels:
+          severity: warning
+          category: reliability
+        annotations:
+          summary: "High query error rate"
+          description: "Query error rate is {{ $value | humanizePercentage }} (>1%)"
+          runbook: "Check application logs for error patterns"
+
+  - name: sprint1_indexing_alerts
+    interval: 60s
+    rules:
+      - alert: IndexingStalled
+        expr: |
+          time() - index_last_success_timestamp_seconds > 3600
+        for: 5m
+        labels:
+          severity: warning
+          category: reliability
+        annotations:
+          summary: "No successful index in 1 hour"
+          description: "Last successful index was {{ $value | humanizeDuration }} ago"
+          runbook: "Check indexing service logs and queue status"
+
+      - alert: HighIndexingFailureRate
+        expr: |
+          rate(index_failures_total[30m]) / rate(index_attempts_total[30m]) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          category: reliability
+        annotations:
+          summary: "High indexing failure rate"
+          description: "Indexing failure rate is {{ $value | humanizePercentage }} (target: <5%)"
+          runbook: "Review failed repos, check SCIP parser logs"
+
+      - alert: SlowIndexing
+        expr: |
+          histogram_quantile(0.50, rate(index_duration_seconds_bucket[30m])) > 120
+        for: 15m
+        labels:
+          severity: info
+          category: performance
+        annotations:
+          summary: "Indexing median time exceeds target"
+          description: "Median index time is {{ $value }}s (target: <120s for medium repos)"
+          runbook: "Profile indexing performance, check for bottlenecks"
+
+  - name: system_alerts
+    interval: 30s
+    rules:
+      - alert: HighMemoryUsage
+        expr: |
+          (container_memory_usage_bytes / container_spec_memory_limit_bytes) > 0.9
+        for: 2m
+        labels:
+          severity: warning
+          category: resources
+        annotations:
+          summary: "Container memory usage is high"
+          description: "Memory usage is {{ $value | humanizePercentage }}"
+          runbook: "Check for memory leaks, consider scaling resources"
+
+      - alert: HighCPUUsage
+        expr: |
+          rate(container_cpu_usage_seconds_total[5m]) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          category: resources
+        annotations:
+          summary: "Container CPU usage is high"
+          description: "CPU usage is {{ $value | humanizePercentage }}"
+          runbook: "Check for inefficient code, consider scaling"
+
+      - alert: DatabaseConnectionPoolExhausted
+        expr: |
+          db_connections_active / db_connections_max > 0.9
+        for: 2m
+        labels:
+          severity: critical
+          category: resources
+        annotations:
+          summary: "Database connection pool nearly exhausted"
+          description: "Using {{ $value | humanizePercentage }} of connection pool"
+          runbook: "Increase pool size or investigate connection leaks"
+
+      - alert: DiskSpaceRunningLow
+        expr: |
+          (node_filesystem_avail_bytes / node_filesystem_size_bytes) < 0.1
+        for: 5m
+        labels:
+          severity: warning
+          category: resources
+        annotations:
+          summary: "Disk space running low"
+          description: "Only {{ $value | humanizePercentage }} disk space remaining"
+          runbook: "Clean up old data or expand disk"
+
+  - name: business_metrics
+    interval: 60s
+    rules:
+      - alert: NoRecentIndexing
+        expr: |
+          increase(index_attempts_total[1h]) == 0
+        for: 2h
+        labels:
+          severity: info
+          category: business
+        annotations:
+          summary: "No indexing activity detected"
+          description: "No repos have been indexed in the last hour"
+          runbook: "Check if this is expected (e.g., off-hours)"
+
+      - alert: HighTokenUsage
+        expr: |
+          increase(llm_tokens_total[1h]) > 1000000
+        for: 5m
+        labels:
+          severity: warning
+          category: cost
+        annotations:
+          summary: "High LLM token usage detected"
+          description: "Used {{ $value }} tokens in the last hour"
+          runbook: "Review model routing and context compaction settings"
