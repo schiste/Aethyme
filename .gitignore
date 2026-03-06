@@ -12,3 +12,4 @@ __pycache__/
 .env
 .env.*
 *.log
+packages/aethyme/rust/target/

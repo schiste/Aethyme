@@ -134,46 +134,33 @@ Auto-generated index of all documentation files.
 
 - [API Reference](reference/api.md)
 - [CLI Reference](reference/cli.md)
-- [Metrics](reference/metrics.md)
 
 ## Guides
 
-- [AI Integration](guides/ai-integration.md)
-- [AI Benefits](guides/ai-benefits.md)
 - [Testing](guides/testing.md)
 - [Troubleshooting](guides/troubleshooting.md)
+- [Python SDK](guides/python-sdk.md)
+- [Scorecard](../scorecard-guide.md)
+- [Autofixers](../autofixers-guide.md)
+
+## Authentication
+
+- [Auth Setup](../auth-setup.md)
+- [Auth Boundary](architecture/auth-boundary.md)
 
 ## Architecture
 
-- [Stage 1 Architecture](architecture/stage1-architecture.md)
-- [Security](architecture/security.md)
-- [Deployment](architecture/deployment.md)
-- [Integration Points](architecture/integration-points.md)
-- [Performance Budgets](architecture/performance-budgets.md)
-- [Migration Plan](architecture/migration-plan.md)
-- [Technical Assessment](architecture/technical-assessment.md)
+- [Core Architecture](architecture/core-architecture.md)
+- [API Contract](architecture/api-contract.yaml)
 
 ## Security
 
 - [Security Overview](security/security-overview.md)
-- [Privacy Policy](security/privacy-policy.md)
-- [Threat Model](security/threat-model.md)
 
 ## Runbooks
 
 - [Index Failure](runbooks/index-failure.md)
-- [Staleness Remediation](runbooks/staleness-remediation.md)
 - [Rollback Procedures](runbooks/rollback.md)
-- [Backup & Restore](runbooks/backup-restore.md)
-- [Performance Degradation](runbooks/performance-degradation.md)
-- [Security Incident](runbooks/security-incident.md)
-
-## Migrations
-
-- [Upgrading Guide](migrations/upgrading.md)
-- [Data Migration](migrations/data-migration.md)
-
-**Last Updated:** $(date +%Y-%m-%d)
 EOF
 
 echo -e "${GREEN}✓${NC} Documentation index written to docs/INDEX.md"

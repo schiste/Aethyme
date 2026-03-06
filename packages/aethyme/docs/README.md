@@ -1,20 +1,32 @@
 # Aethyme Core Docs
 
-This directory documents the code that is actually active in `packages/aethyme`.
+Last Updated: 2026-03-06
 
-## Start Here
-- [../../../docs/project-plan.md](/Users/christophehenner/Downloads/Repositories/Aethyme/docs/project-plan.md)
-- [../README.md](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/README.md)
-- [../roadmap.md](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/roadmap.md)
-- [getting-started/quickstart.md](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/docs/getting-started/quickstart.md)
+This directory documents the code that is active in `packages/aethyme`.
 
-## What Belongs Here
-- setup and onboarding for the current core
-- API and CLI reference for the supported flow
-- architecture and migration notes that still match the code
-- runbooks tied to the current backend
+## Canonical Docs
 
-## What Does Not Belong Here
-- removed module guides
-- aspirational feature docs for unmounted APIs
-- historical sprint paperwork
+- [`../../../docs/project-plan.md`](../../../docs/project-plan.md)
+- [`../README.md`](../README.md)
+- [`vision.md`](vision.md)
+- [`agent-navigation-spec.md`](agent-navigation-spec.md)
+- [`architecture/auth-boundary.md`](architecture/auth-boundary.md)
+- [`architecture/core-architecture.md`](architecture/core-architecture.md)
+- [`architecture/rust-transition.md`](architecture/rust-transition.md)
+- [`getting-started/quickstart.md`](getting-started/quickstart.md)
+- [`reference/api.md`](reference/api.md)
+- [`reference/cli.md`](reference/cli.md)
+- [`guides/testing.md`](guides/testing.md)
+- [`guides/troubleshooting.md`](guides/troubleshooting.md)
+
+## First Local Proof
+
+For the current local-first proof path, start with:
+
+1. [`getting-started/quickstart.md`](getting-started/quickstart.md)
+2. [`reference/cli.md`](reference/cli.md)
+3. [`agent-navigation-spec.md`](agent-navigation-spec.md)
+
+## Scope Rule
+
+If a feature is not active in the current core loop or explicit engine plan, it should not have a long-form guide here.

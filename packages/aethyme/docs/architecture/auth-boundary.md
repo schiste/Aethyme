@@ -1,4 +1,6 @@
-# Aethyme Auth Boundary
+# Auth Boundary
+
+Last Updated: 2026-03-06
 
 ## Principle
 
@@ -8,7 +10,6 @@
 
 - login and registration
 - password and session management
-- SSO and OIDC login UX
 - org, tenant, team, and user lifecycle
 - API key lifecycle UX
 
@@ -16,37 +17,21 @@
 
 - bearer token verification
 - API key verification
-- `org_id`, `tenant_id`, and `scopes` contract
-- authorization checks on graph, indexing, and scorecard operations
-- database isolation and RLS
+- `org`, `tenant_id`, and `scopes` enforcement
+- authorization checks on indexing, graph queries, and scorecard operations
+- tenant-scoped database isolation
 
-## Runtime Contract
+## Required Claims
 
-Protected Aethyme routes expect a bearer credential that resolves to:
+Protected core routes expect a credential that resolves to:
 
 - `sub`
-- `tenant_id`
 - `org`
+- `tenant_id`
 - `scopes`
-
-Core trusts the issuer and enforces the claims.
-
-Current bridge rule:
-
-- `packages/aethyme-cloud` does not yet model a separate tenant entity
-- cloud-issued access tokens currently map `organization_id` to both `org` and `tenant_id`
-- this is a temporary compatibility rule until cloud owns a real `Org > Tenant` model
-
-## What Core Does Not Expose
-
-The core API does not provide:
-
-- `/register`
-- `/login`
-- end-user password flows
-
-Those are SaaS concerns and belong in `packages/aethyme-cloud`.
 
 ## Local Development
 
-For local tests and direct operator workflows, scoped tokens can be minted through internal helpers or the cloud-only `POST /api/auth/dev/token` route for an existing active user. That is a development convenience, not a public product surface.
+For development only, cloud may mint a token for an existing active user through `POST /api/auth/dev/token`.
+
+That route is a convenience bridge. It does not change the core boundary.

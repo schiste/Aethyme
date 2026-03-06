@@ -1,45 +1,36 @@
-# Aethyme Onboarding
+# Onboarding
 
-`packages/aethyme` owns the backend product core.
+Last Updated: 2026-03-06
 
-## Business Loop
+## What Aethyme Core Is
 
-1. auth into org and tenant
-2. index a repository
-3. search or traverse the graph
-4. run scorecard analysis
-5. apply autofixes from the CLI when needed
+Aethyme Core is a backend for:
 
-## Important Paths
+1. indexing repositories into a graph
+2. querying that graph
+3. running scorecard analysis
+4. applying controlled autofixes from the CLI
 
-| Path | Purpose |
-|------|---------|
-| `src/indexer` | raw indexers and graph building |
-| `src/indexing` | shared indexing service and freshness helpers |
-| `src/graph` | graph persistence and query execution |
-| `src/scorecard` | repository assessment logic |
-| `src/autofixers` | CLI-driven safe fix tooling |
-| `src/api` | FastAPI surface |
-| `src/auth` | JWT and API key handling |
-| `tests/api` | API proof for the core loop |
-| `tests/queries` | seeded graph query coverage |
-| `tests/scorecard` | scorecard coverage |
-| `tests/autofixers` | fixer and safety coverage |
+## What To Read First
 
-## First Commands
+1. [`../README.md`](../README.md)
+2. [`quickstart.md`](quickstart.md)
+3. [`../architecture/auth-boundary.md`](../architecture/auth-boundary.md)
+4. [`../reference/api.md`](../reference/api.md)
+5. [`../guides/testing.md`](../guides/testing.md)
+
+## Working Rules
+
+- treat `Platform > Org > Tenant > Repository > Graph` as canonical
+- keep API and CLI on shared services
+- do not add customer identity flows to core
+- do not add new broad platform claims to docs
+
+## First Local Checks
 
 ```bash
 cd packages/aethyme
-python3 -m venv .venv
 . .venv/bin/activate
-pip install -e '.[dev]'
-docker compose -f docker-compose.dev.yml up -d postgres redis
-export DATABASE_URL='postgresql://aethyme:dev_password_change_me@localhost:5432/aethyme_dev'
-export TEST_DATABASE_URL='postgresql://aethyme:dev_password_change_me@localhost:5432/aethyme_test'
-bash scripts/migrate.sh
-pytest tests/api tests/queries tests/scorecard tests/autofixers -q
+python -m src.cli stats
+make test-unit
 ```
-
-## Rule
-
-If work does not strengthen the supported core loop, challenge whether it belongs in Aethyme Core right now.

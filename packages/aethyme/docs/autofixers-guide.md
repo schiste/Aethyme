@@ -1,47 +1,31 @@
 # Autofixers Guide
 
-Aethyme keeps autofixers as local repository tooling.
+Last Updated: 2026-03-06
 
-## Current Scope
+Autofixers are local operator tools. They are not a first-class API product surface.
 
-The active autofixer package provides:
-- safety evaluation
-- patch generation
-- docs regeneration
-- markdown link cleanup
-- selector insertion
-- JSX and Vue i18n scaffolding
-- formatting helpers
+## Supported Modes
 
-It does not currently expose a public HTTP API or approval workflow.
+- dry run
+- apply to disk
+- create PR flow
 
-## Local Usage
+## Supported Fix Types
 
-```python
-from pathlib import Path
+- docs
+- links
+- selectors
+- i18n
+- format
 
-from src.autofixers.patch import PatchGenerator
-from src.autofixers.safety import SafetyEngine
-from src.autofixers.fixers import DocsRegenerator
+## Entry Point
 
-repo_path = Path('/path/to/repo')
-patches = PatchGenerator(repo_path, SafetyEngine())
-
-for fix in DocsRegenerator(repo_path).create_folder_docs():
-    patches.add_patch(
-        fix['file_path'],
-        fix['original_content'],
-        fix['new_content'],
-        fix['fix_type'],
-    )
-
-preview = patches.dry_run()
-print(preview['summary'])
+```bash
+cd packages/aethyme
+. .venv/bin/activate
+python -m src.cli autofix /absolute/path/to/repo --dry-run
 ```
 
-## Rules
+## Rule
 
-- treat autofixes as local tooling, not product surface
-- run in dry-run mode first
-- keep generated-file detection enabled
-- only reintroduce a public API after the core loop is stable
+Keep autofixers narrow and testable. Do not market them as a broad autonomous platform.

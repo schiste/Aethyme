@@ -1,0 +1,10 @@
+[package]
+name = "aethyme-engine"
+version = "0.1.0"
+edition = "2024"
+description = "Deterministic engine components for Aethyme Core"
+license = "UNLICENSED"
+
+[lib]
+name = "aethyme_engine"
+path = "src/lib.rs"

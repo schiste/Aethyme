@@ -1,9 +1,34 @@
+import json
 import sys
 from pathlib import Path
 from typing import Any, TypeAlias, TypedDict, cast
 
 import click
 import structlog
+
+from src.eval.explain_repo import (
+    DEFAULT_TASK,
+    command_runner,
+    run_explain_repo_evaluation,
+)
+from src.indexing.engine import (
+    EngineError,
+    build_task_pack,
+    clear_repository_cache,
+    inspect_repository,
+    search_symbol,
+)
+from src.indexing.engine import (
+    dependency_frontier as rust_dependency_frontier,
+)
+from src.indexing.engine import (
+    explain_task as rust_explain_task,
+)
+from src.indexing.engine import (
+    impact_frontier as rust_impact_frontier,
+)
+from src.indexing.repository_snapshot import capture_snapshot
+from src.rendering.context_pack import render_pack_summary
 
 # Add src to path for module imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -217,6 +242,191 @@ def stats(ctx: click.Context) -> None:
     click.echo(f"Edge Types: {stats.get('edge_types', 0)}")
     click.echo(f"Total Files: {stats.get('total_files', 0):,}")
     click.echo(f"Languages: {stats.get('languages', 0)}")
+
+
+@cli.group()
+def repo() -> None:
+    """Local repository intake and inspection workflows."""
+
+
+@repo.command("ingest")
+@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+def repo_ingest(repo_path: Path) -> None:
+    """Capture local repository metadata for a local-first workflow."""
+    snapshot = capture_snapshot(repo_path)
+    click.echo(f"Repository: {snapshot.repo_name}")
+    click.echo(f"Path: {snapshot.repo_path}")
+    click.echo(f"Commit: {snapshot.commit or 'working-tree'}")
+    click.echo(f"Files: {snapshot.file_count}")
+    click.echo(f"Snapshot key: {snapshot.cache_key}")
+
+
+@repo.command("inspect")
+@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
+def repo_inspect(repo_path: Path, json_output: bool) -> None:
+    """Inspect the local repository map produced by the Rust engine."""
+    try:
+        result = inspect_repository(repo_path)
+    except EngineError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    snapshot = result["snapshot"]
+    click.echo(f"Root: {snapshot['root']}")
+    click.echo(f"Languages: {', '.join(snapshot['languages'])}")
+    click.echo(f"Top-level directories: {', '.join(snapshot['top_level_dirs'])}")
+    click.echo(f"Files: {len(snapshot['files'])}")
+    click.echo(f"Symbols: {len(result['symbols'])}")
+    click.echo(f"Edges: {len(result['edges'])}")
+
+
+@repo.command("clear-cache")
+@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+def repo_clear_cache(repo_path: Path) -> None:
+    """Clear cached local engine artifacts for the current repository snapshot."""
+    clear_repository_cache(repo_path)
+    click.echo(f"Cleared cache for {repo_path}")
+
+
+@cli.group()
+def query() -> None:
+    """Query the local Rust-backed navigation engine."""
+
+
+@query.command("symbol")
+@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument("symbol_query")
+@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
+def query_symbol(repo_path: Path, symbol_query: str, json_output: bool) -> None:
+    """Look up symbols in the local repository map."""
+    try:
+        results = search_symbol(repo_path, symbol_query)
+    except EngineError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        click.echo(json.dumps(results, indent=2))
+        return
+
+    for result in results:
+        click.echo(
+            f"- {result['name']} ({result['kind']}) at {result['file']}:{result['line']} "
+            f"[score={result['score']}]"
+        )
+
+
+@query.command("deps")
+@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument("target")
+def query_deps(repo_path: Path, target: str) -> None:
+    """Show dependency frontier for a target symbol or file."""
+    try:
+        results = rust_dependency_frontier(repo_path, target)
+    except EngineError as exc:
+        raise click.ClickException(str(exc)) from exc
+    for result in results:
+        click.echo(f"- {result}")
+
+
+@query.command("impact")
+@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument("target")
+def query_impact(repo_path: Path, target: str) -> None:
+    """Show reverse dependency frontier for a target symbol or file."""
+    try:
+        results = rust_impact_frontier(repo_path, target)
+    except EngineError as exc:
+        raise click.ClickException(str(exc)) from exc
+    for result in results:
+        click.echo(f"- {result}")
+
+
+@cli.group()
+def task() -> None:
+    """Task-context workflows over the local repository engine."""
+
+
+@task.command("pack")
+@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--task", "task_text", required=True, help="Task description")
+@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
+def task_pack(repo_path: Path, task_text: str, json_output: bool) -> None:
+    """Build a deterministic task-context pack."""
+    try:
+        pack = build_task_pack(repo_path, task_text)
+    except EngineError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        click.echo(json.dumps(pack, indent=2))
+        return
+
+    click.echo(render_pack_summary(pack))
+
+
+@task.command("explain")
+@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--task", "task_text", default=DEFAULT_TASK, show_default=True, help="Task description")
+def task_explain(repo_path: Path, task_text: str) -> None:
+    """Explain the repository using the deterministic Rust engine."""
+    try:
+        explanation = rust_explain_task(repo_path, task_text)
+    except EngineError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(explanation)
+
+
+@cli.group()
+def eval() -> None:
+    """Local evaluation harnesses for Aethyme Core."""
+
+
+@eval.command("explain-repo")
+@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--task", "task_text", default=DEFAULT_TASK, show_default=True, help="Task description")
+@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
+@click.option("--baseline-cmd", help="Command used for the baseline run")
+@click.option("--aethyme-cmd", help="Command used for the Aethyme-assisted run")
+def eval_explain_repo(
+    repo_path: Path,
+    task_text: str,
+    json_output: bool,
+    baseline_cmd: str | None,
+    aethyme_cmd: str | None,
+) -> None:
+    """Build the control artifacts for a local explain-repo benchmark."""
+    try:
+        baseline_runner = command_runner(baseline_cmd, working_directory=repo_path) if baseline_cmd else None
+        aethyme_runner = command_runner(aethyme_cmd, working_directory=repo_path) if aethyme_cmd else None
+        result = run_explain_repo_evaluation(
+            repo_path,
+            task_text,
+            baseline_runner=baseline_runner,
+            aethyme_runner=aethyme_runner,
+        )
+    except EngineError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    report = result["report"]
+    click.echo(f"Task: {result['task']}")
+    click.echo(f"Baseline prompt chars: {report['baseline_prompt_chars']}")
+    click.echo(f"Aethyme prompt chars: {report['aethyme_prompt_chars']}")
+    click.echo(f"Navigation items: {report['navigation_items']}")
+    click.echo(f"Risk items: {report['risk_items']}")
+    if report.get("baseline_run"):
+        click.echo(f"Baseline duration: {report['baseline_run']['duration_seconds']:.3f}s")
+    if report.get("aethyme_run"):
+        click.echo(f"Aethyme duration: {report['aethyme_run']['duration_seconds']:.3f}s")
+    click.echo("\nExplanation:\n")
+    click.echo(result["explanation"])
 
 
 @cli.command()

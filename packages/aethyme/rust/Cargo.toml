@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/aethyme-engine"]
+resolver = "2"

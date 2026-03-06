@@ -118,8 +118,10 @@ def test_required_documentation_exists(docs_dir: Path) -> None:
     required_docs = [
         "getting-started/quickstart.md",
         "getting-started/onboarding.md",
+        "architecture/auth-boundary.md",
         "reference/api.md",
         "reference/cli.md",
+        "guides/testing.md",
         "guides/troubleshooting.md",
         "runbooks/index-failure.md",
         "runbooks/rollback.md",
@@ -169,6 +171,4 @@ def test_documentation_has_last_updated(docs_dir: Path) -> None:
             missing_dates.append(str(md_file.relative_to(docs_dir)))
 
     if missing_dates:
-        print(f"\nWarning: {len(missing_dates)} docs missing 'Last Updated' date:")
-        for doc in missing_dates[:10]:
-            print(f"  {doc}")
+        pytest.fail("Missing last-updated metadata:\n  " + "\n  ".join(sorted(missing_dates)))

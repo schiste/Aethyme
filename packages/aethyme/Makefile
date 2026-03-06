@@ -1,4 +1,4 @@
-.PHONY: help dev dev-down dev-logs test test-unit test-integration test-full lint format type-check security migrate seed clean build install-dev check-all ci ps restart health metrics openapi
+.PHONY: help dev dev-down dev-logs test test-unit test-integration test-full lint format type-check security migrate seed clean build install-dev check-all ci ps restart health metrics openapi rust-test rust-fmt rust-check
 
 .DEFAULT_GOAL := help
 
@@ -114,3 +114,15 @@ metrics:
 ## openapi: Generate the OpenAPI spec
 openapi:
 	$(PYTHON) scripts/generate_openapi.py > openapi.json
+
+## rust-test: Run Rust engine tests
+rust-test:
+	cargo test --manifest-path rust/Cargo.toml
+
+## rust-fmt: Format Rust engine code
+rust-fmt:
+	cargo fmt --manifest-path rust/Cargo.toml --all
+
+## rust-check: Check Rust engine code
+rust-check:
+	cargo check --manifest-path rust/Cargo.toml

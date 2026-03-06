@@ -1,5 +1,7 @@
 # Aethyme Quick Start
 
+Last Updated: 2026-03-06
+
 ## 1. Install
 
 ```bash
@@ -17,7 +19,7 @@ export DATABASE_URL='postgresql://aethyme:dev_password_change_me@localhost:5432/
 export REDIS_URL='redis://localhost:6379/0'
 ```
 
-## 3. Migrate
+## 3. Apply Migrations
 
 ```bash
 bash scripts/migrate.sh
@@ -29,21 +31,23 @@ bash scripts/migrate.sh
 bash scripts/start-api.sh
 ```
 
-Docs: `http://localhost:8001/docs`
+Docs are served at `http://localhost:8001/docs`.
 
 ## 5. Provide A Trusted Credential
 
 Core does not expose login or registration routes.
 
-- in normal operation, use a bearer token issued by `packages/aethyme-cloud`
-- for machine access, use a scoped API key
-- for direct local verification, use the test helpers under [`tests/support/auth_db.py`](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/tests/support/auth_db.py) or run the API proof test
+Use one of these:
+
+- a bearer token issued by `packages/aethyme-cloud`
+- a scoped API key
+- the local test helpers in [`../../tests/support/auth_db.py`](../../tests/support/auth_db.py)
 
 ```bash
-export TOKEN="<trusted-bearer-token>"
+export TOKEN='<trusted-bearer-token>'
 ```
 
-## 6. Index A Repository Through The API
+## 6. Index A Repository
 
 ```bash
 curl -s -X POST http://localhost:8001/api/v1/index/repositories \
@@ -58,7 +62,7 @@ curl -s -X POST http://localhost:8001/api/v1/index/repositories \
   }'
 ```
 
-## 7. Query The Graph
+## 7. Search The Graph
 
 ```bash
 curl -s -X POST http://localhost:8001/api/v1/search/ \
@@ -76,9 +80,42 @@ curl -s -X POST http://localhost:8001/api/v1/scorecard/scan \
   -d '{"repository_id": "<repo-id>"}'
 ```
 
-## 9. Run The Verified Test Slice
+## 9. Run The Verified Test Slices
 
 ```bash
-export TEST_DATABASE_URL='postgresql://aethyme:dev_password_change_me@localhost:5432/aethyme_test'
-pytest tests/api tests/queries tests/scorecard tests/autofixers -q
+. .venv/bin/activate
+make test-unit
+TEST_DATABASE_URL='postgresql://aethyme:dev_password_change_me@localhost:5432/aethyme_test' make test-integration
 ```
+
+## 10. Run The Local-First Proof Path
+
+If you want to test Aethyme on one repository without any SaaS layer, use the CLI path directly.
+
+```bash
+. .venv/bin/activate
+
+aethyme repo ingest /absolute/path/to/repo
+aethyme repo inspect /absolute/path/to/repo --json-output
+aethyme repo clear-cache /absolute/path/to/repo
+aethyme query symbol /absolute/path/to/repo main
+aethyme task pack --repo /absolute/path/to/repo --task "Explain this repo" --json-output
+aethyme task explain --repo /absolute/path/to/repo
+aethyme eval explain-repo --repo /absolute/path/to/repo --json-output
+```
+
+This local-first path is the current shortest route to proving:
+
+1. deterministic repository mapping
+2. deterministic discoverability
+3. deterministic task-context packs
+4. explain-repo evaluation artifacts
+
+At this stage:
+
+- the Rust engine is executed as a built binary
+- local artifacts are cached by repository snapshot
+- Git repositories use commit plus dirty-state metadata for cache keys
+- `eval explain-repo` produces the control prompts, pack, explanation, and comparison report by default
+- it can execute real runs when `--baseline-cmd` and `--aethyme-cmd` are provided
+- the Aethyme-assisted prompt uses a compact rendered pack rather than the full raw pack payload

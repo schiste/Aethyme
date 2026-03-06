@@ -1,40 +1,34 @@
-# Python SDK Guide
+# Python SDK
 
-Guide for the current Aethyme Python SDK.
+Last Updated: 2026-03-06
 
-## Scope
+The Python SDK is a thin client for the active core API.
 
-The SDK tracks the mounted core API only:
-- search
-- ego graph
-- impact analysis
-- scorecard
-
-## Installation
+## Install
 
 ```bash
-pip install aethyme-sdk
+cd packages/aethyme/sdk/python
+python3 -m pip install -e .
 ```
 
-## Quick Start
+## Authenticate
 
 ```python
 from aethyme_sdk import AethymeClient
 
-with AethymeClient(token="your-bearer-token-or-api-key") as client:
-    results = client.query.search("run_service")
-    ego = client.query.ego_graph("run_service", depth=2)
-    impact = client.query.impact_analysis("run_service")
+client = AethymeClient(token="your-bearer-token-or-api-key")
 ```
 
-## API Reference
+## Use
 
-### Query API
-- `client.query.search(term, kind=None, lang=None, limit=20)`
-- `client.query.ego_graph(symbol, depth=2)`
-- `client.query.impact_analysis(symbol, max_depth=10)`
+```python
+from aethyme_sdk import AethymeClient
 
-### Scorecard API
-- `client.scorecard.scan(repo_id, checks=None)`
-- `client.scorecard.get_history(repo_id, limit=10)`
-- `client.scorecard.list_checks()`
+client = AethymeClient(token="your-bearer-token-or-api-key")
+search = client.search.query("GraphStore", limit=5)
+print(search)
+```
+
+## Scope Rule
+
+The SDK should stay minimal and only cover endpoints that are active in core.

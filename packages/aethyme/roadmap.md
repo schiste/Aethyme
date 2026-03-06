@@ -1,43 +1,58 @@
 # Aethyme Core Roadmap
 
+Last Updated: 2026-03-06
+
 ## Goal
 
-Make Aethyme Core a small, honest, verified backend for repository indexing, graph queries, scorecard analysis, and controlled autofix tooling.
+Keep Aethyme Core small, verified, and technically honest while moving its
+engine layers toward Rust.
 
-## Current Core
+## Current Focus
 
-The supported product loop is:
-
-1. auth
-2. repository indexing
-3. search / ego / impact
-4. scorecard
-5. CLI autofix
+1. establish the Rust engine boundary
+2. prove the first local-repo path end to end
+3. improve fallback indexing quality
+4. improve graph edge quality for ego and impact
+5. build deterministic context-pack assembly
+6. keep scorecard useful without overstating it
 
 ## Execution Order
 
-### 1. Keep The Model Stable
-- keep `Platform > Org > Tenant > Repository > Graph`
-- keep tenant as the runtime isolation boundary
-- keep one auth path and one schema direction
+### 1. Rust Engine First
+Move these first:
+- repository mapping
+- discoverability kernels
+- context-pack data structures and assembly
+- scope and risk types
+- indexing kernels
+- graph expansion kernels
+
+Keep these in Python for now:
+- API
+- CLI
+- auth enforcement
+- scorecard orchestration
+- SDKs
 
 ### 2. Defend The Core Loop
-- keep CLI and API indexing on the same service path
-- keep query behavior inside `src/graph/store.py`
-- keep API proof coverage for auth -> index -> search -> ego -> impact -> scorecard
+- verified local flow for repo ingest -> inspect -> query -> task pack -> explain-repo eval
+- shared indexing contract for API and CLI
+- graph store as the canonical query runtime until Rust kernels replace hot paths
+- verified API flow for index -> search -> ego -> impact -> scorecard
 
-### 3. Tighten Secondary Surfaces
-- keep autofixers limited to the fixers that are implemented and testable
-- do not reintroduce approval, guardrails, telemetry, agent-enablement, or efficiency until they are wired to the real loop
+### 3. Improve Graph Correctness
+- better import and symbol resolution in fallback mode
+- better cross-file edge construction
+- more indexing and graph-semantics tests
 
-### 4. Expand Only After Proof
-After the core loop is stable:
-- improve fallback indexing quality
-- improve autofix coverage
-- improve API ergonomics and SDKs
+### 4. Tighten Secondary Features
+- keep scorecard tied to real repo signals
+- keep autofixers as local tooling unless explicitly promoted
 
 ## Done Means
 
-1. the docs match the code
-2. the core loop is verified through the API and tests
-3. the codebase has no competing runtime stacks for the same job
+1. docs match code
+2. one runtime stack per job
+3. test suite proves the active flow
+4. Rust owns the deterministic engine layers that benefit from it
+5. Python remains a thin delivery and orchestration layer
