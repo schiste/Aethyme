@@ -9,6 +9,12 @@ Make Aethyme Core the verified backend for repository indexing, graph traversal,
 - `packages/aethyme` owns the backend product logic
 - `packages/aethyme-cloud` consumes that backend and handles SaaS concerns
 
+## Auth Boundary
+
+- `packages/aethyme-cloud` owns login, registration, sessions, and user lifecycle
+- `packages/aethyme` owns bearer token verification, API key verification, scopes, and tenant/org enforcement
+- core does not expose customer-facing identity routes
+
 ## Canonical Model
 
 `Platform > Org > Tenant > Repository > Graph`
@@ -56,7 +62,7 @@ The following areas are not part of the active core contract:
 
 ## Verified Product Flow
 
-1. register or login
+1. present a trusted bearer credential
 2. index a repository through the shared indexing service
 3. run search
 4. run ego graph

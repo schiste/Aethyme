@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from app.core.database import get_db
 from app.core.security import (
+    build_user_access_claims,
     get_password_hash,
     verify_password,
     create_access_token,
@@ -19,6 +20,8 @@ from app.core.config import settings
 from app.models.user import User
 from app.models.organization import Organization
 from app.schemas.user import (
+    DevTokenRequest,
+    DevTokenResponse,
     UserCreate,
     UserLogin,
     UserResponse,
@@ -77,7 +80,7 @@ async def register(
     await db.refresh(user)
 
     # Generate tokens
-    access_token = create_access_token(data={"sub": user.id})
+    access_token = create_access_token(data=build_user_access_claims(user))
     refresh_token = create_refresh_token(data={"sub": user.id})
 
     return TokenResponse(
@@ -126,7 +129,7 @@ async def login(
         )
 
     # Generate tokens
-    access_token = create_access_token(data={"sub": user.id})
+    access_token = create_access_token(data=build_user_access_claims(user))
     refresh_token = create_refresh_token(data={"sub": user.id})
 
     return TokenResponse(
@@ -178,7 +181,7 @@ async def refresh_token(
         )
 
     # Generate new tokens
-    access_token = create_access_token(data={"sub": user.id})
+    access_token = create_access_token(data=build_user_access_claims(user))
     new_refresh_token = create_refresh_token(data={"sub": user.id})
 
     return TokenResponse(
@@ -188,3 +191,41 @@ async def refresh_token(
         expires_in=settings.JWT_EXPIRATION_MINUTES * 60,
         user=UserResponse.model_validate(user),
     )
+
+
+if settings.ENVIRONMENT == "development":
+    @router.post("/dev/token", response_model=DevTokenResponse)
+    async def dev_token(
+        request: DevTokenRequest,
+        db: AsyncSession = Depends(get_db),
+    ):
+        """
+        Mint a development-only access token for an existing active user.
+
+        This endpoint never creates users or organizations. It exists only to
+        support local operator workflows when the full cloud auth UX is not in
+        use.
+        """
+        result = await db.execute(select(User).where(User.email == request.email))
+        user = result.scalar_one_or_none()
+
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found",
+            )
+
+        if not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User account is inactive",
+            )
+
+        access_token = create_access_token(data=build_user_access_claims(user))
+
+        return DevTokenResponse(
+            access_token=access_token,
+            token_type="bearer",
+            expires_in=settings.JWT_EXPIRATION_MINUTES * 60,
+            user=UserResponse.model_validate(user),
+        )

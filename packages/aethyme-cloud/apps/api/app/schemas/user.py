@@ -63,6 +63,19 @@ class TokenResponse(Token):
     user: UserResponse
 
 
+class DevTokenRequest(BaseModel):
+    """Schema for requesting a development-only access token."""
+
+    email: EmailStr
+
+
+class DevTokenResponse(Token):
+    """Development-only access token response."""
+
+    expires_in: int  # seconds
+    user: UserResponse
+
+
 class RefreshTokenRequest(BaseModel):
     """Schema for refresh token request."""
 

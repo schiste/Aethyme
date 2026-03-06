@@ -4,7 +4,6 @@ from datetime import timedelta
 from typing import Annotated, Any
 
 from fastapi import Depends
-from passlib.context import CryptContext
 
 from .api_keys import (
     APIKeyManager,
@@ -28,7 +27,6 @@ from .oidc import (
     oidc_client,
 )
 
-pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 RepoReadUser = Annotated[UserContext, Depends(require_scope("repo:read"))]
 RepoWriteUser = Annotated[UserContext, Depends(require_scope("repo:write"))]
 OrgAdminUser = Annotated[UserContext, Depends(require_scope("org:admin"))]
@@ -47,16 +45,6 @@ def create_access_token(
         email=data.get("email"),
         expires_delta=expires_delta,
     )
-
-
-def hash_password(password: str) -> str:
-    """Hash a password using the canonical local password scheme."""
-    return pwd_context.hash(password)
-
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a password against its hash."""
-    return pwd_context.verify(plain_password, hashed_password)
 
 
 async def jwt_or_api_key(user: CurrentUser) -> UserContext:
@@ -86,8 +74,6 @@ __all__ = [
     'UserContext',
     'User',
     'create_access_token',
-    'hash_password',
-    'verify_password',
     # API Keys
     'APIKeyManager',
     'generate_api_key',

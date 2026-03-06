@@ -31,17 +31,16 @@ bash scripts/start-api.sh
 
 Docs: `http://localhost:8001/docs`
 
-## 5. Register
+## 5. Provide A Trusted Credential
+
+Core does not expose login or registration routes.
+
+- in normal operation, use a bearer token issued by `packages/aethyme-cloud`
+- for machine access, use a scoped API key
+- for direct local verification, use the test helpers under [`tests/support/auth_db.py`](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/tests/support/auth_db.py) or run the API proof test
 
 ```bash
-curl -s -X POST http://localhost:8001/api/v1/auth/register \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "email": "dev@example.com",
-    "password": "password123",
-    "org_name": "Aethyme Dev",
-    "tenant_name": "default"
-  }'
+export TOKEN="<trusted-bearer-token>"
 ```
 
 ## 6. Index A Repository Through The API

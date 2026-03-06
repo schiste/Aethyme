@@ -15,20 +15,18 @@ class AethymeClient:
 
     def __init__(
         self,
-        api_key: str,
-        org_id: str,
+        token: str,
         base_url: str = "https://api.aethyme.com",
         timeout: float = 30.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        self.auth = AuthManager(api_key, org_id)
+        self.auth = AuthManager(token)
         self._client = httpx.Client(
             base_url=self.base_url,
             timeout=timeout,
             headers={
-                "Authorization": f"Bearer {api_key}",
-                "X-Organization-ID": org_id,
+                "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
                 "User-Agent": "aethyme-python-sdk/2.0.0",
             },
@@ -60,9 +58,6 @@ class AethymeClient:
 
     def get_health(self) -> dict[str, Any]:
         return self.get("/health")
-
-    def get_info(self) -> dict[str, Any]:
-        return self.get("/api/v1/info")
 
     def close(self) -> None:
         self._client.close()

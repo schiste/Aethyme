@@ -37,33 +37,15 @@ curl http://localhost:8001/health/detailed | jq .
 
 ## Core Product Loop
 
-### 1. Register
+### 1. Provide A Trusted Token
+
+Core does not expose login or registration routes. For local verification, use a token issued by the cloud identity layer or mint one through the test helpers:
 
 ```bash
-curl -X POST http://localhost:8001/api/v1/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{
-    "email": "test@example.com",
-    "password": "test12345",
-    "org_name": "Example Org",
-    "tenant_name": "default"
-  }' | jq .
+export TOKEN="<trusted-bearer-token>"
 ```
 
-Export the returned token:
-
-```bash
-export TOKEN="<access_token>"
-```
-
-### 2. Inspect Current User
-
-```bash
-curl http://localhost:8001/api/v1/auth/me \
-  -H "Authorization: Bearer $TOKEN" | jq .
-```
-
-### 3. Register and Index a Repository
+### 2. Register and Index a Repository
 
 ```bash
 curl -X POST http://localhost:8001/api/v1/index/repositories \
@@ -84,7 +66,7 @@ Save the returned `repository_id`:
 export REPOSITORY_ID="<repository_id>"
 ```
 
-### 4. Search
+### 3. Search
 
 ```bash
 curl -X POST http://localhost:8001/api/v1/search/ \
@@ -97,7 +79,7 @@ curl -X POST http://localhost:8001/api/v1/search/ \
   }' | jq .
 ```
 
-### 5. Ego Graph
+### 4. Ego Graph
 
 ```bash
 curl -X POST http://localhost:8001/api/v1/ego/ \
@@ -110,7 +92,7 @@ curl -X POST http://localhost:8001/api/v1/ego/ \
   }' | jq .
 ```
 
-### 6. Impact Analysis
+### 5. Impact Analysis
 
 ```bash
 curl -X POST http://localhost:8001/api/v1/impact/ \
@@ -123,7 +105,7 @@ curl -X POST http://localhost:8001/api/v1/impact/ \
   }' | jq .
 ```
 
-### 7. Scorecard
+### 6. Scorecard
 
 Trigger a scan:
 
@@ -147,5 +129,6 @@ curl http://localhost:8001/api/v1/scorecard/summary/${REPOSITORY_ID} \
 
 - Integration tests rebuild the test database from migrations.
 - Seed data lives in [tests/support/db_seed.py](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/tests/support/db_seed.py).
+- Scoped test tokens are created through [tests/support/auth_db.py](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/tests/support/auth_db.py).
 - Temporary repositories for scorecard and CLI tests are created on demand in [tests/support/repo_builders.py](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/tests/support/repo_builders.py).
 - Do not add checked-in fake repos, SQL fixture dumps, synthetic eval harnesses, or synthetic benchmarks back into the active test path.

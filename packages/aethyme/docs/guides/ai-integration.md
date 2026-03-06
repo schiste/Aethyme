@@ -255,13 +255,11 @@ npm install node-fetch
 chmod +x mcp-server.js
 ```
 
-**4. Get a token and update config:**
+**4. Configure a trusted token and update config:**
 
 ```bash
-# Get token
-TOKEN=$(curl -s -X POST http://localhost:8001/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email": "test@example.com", "password": "test1234"}' | jq -r .access_token)
+# Use a token issued by the cloud identity layer
+TOKEN="<trusted-bearer-token>"
 
 # Update MCP config with the token
 sed -i '' "s|your-token-here|$TOKEN|" ~/.config/claude/mcp_servers.json
@@ -679,12 +677,7 @@ class AethymeAgent:
 if __name__ == "__main__":
     import os
 
-    # Get token
-    login_response = requests.post(
-        f"{AETHYME_URL}/api/auth/login",
-        json={"email": "test@example.com", "password": "test1234"}
-    )
-    token = login_response.json()["access_token"]
+    token = os.environ["AETHYME_TOKEN"]
 
     # Create agent
     agent = AethymeAgent(
@@ -796,10 +789,8 @@ GOOD (with Aethyme):
 #### Quick Start Script
 
 ```bash
-# Get fresh token and generate prompt
-TOKEN=$(curl -s -X POST http://localhost:8001/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email": "test@example.com", "password": "test1234"}' | jq -r .access_token)
+# Use a trusted token and generate prompt
+TOKEN="<trusted-bearer-token>"
 
 echo "Copy this to start your AI conversation:"
 echo ""
@@ -1172,9 +1163,7 @@ You: grep -r "GraphStore"
 alias ask-claude='echo "Aethyme: http://localhost:8001, Token: $(get-token)" | pbcopy && open -a "Claude"'
 
 function get-token() {
-  curl -s -X POST http://localhost:8001/api/auth/login \
-    -H "Content-Type: application/json" \
-    -d '{"email": "test@example.com", "password": "test1234"}' | jq -r .access_token
+  printf "%s" "$AETHYME_TOKEN"
 }
 ```
 

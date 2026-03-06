@@ -1,11 +1,12 @@
 """FastAPI dependencies for authentication and authorization."""
 
-from typing import Optional, Union
-from fastapi import Depends, HTTPException, status, Request
+from datetime import UTC, datetime
+from typing import Optional
+
+from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, APIKeyHeader
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from datetime import datetime
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import decode_access_token
@@ -60,14 +61,14 @@ async def get_current_user(
         for api_key_record in api_key_records:
             if verify_api_key(api_key, api_key_record.key_hash):
                 # Check if key is expired
-                if api_key_record.expires_at and api_key_record.expires_at < datetime.utcnow():
+                if api_key_record.expires_at and api_key_record.expires_at < datetime.now(UTC):
                     raise HTTPException(
                         status_code=status.HTTP_401_UNAUTHORIZED,
                         detail="API key has expired"
                     )
 
                 # Update last_used_at timestamp
-                api_key_record.last_used_at = datetime.utcnow()
+                api_key_record.last_used_at = datetime.now(UTC)
                 await db.commit()
 
                 # Get the user associated with this API key's organization

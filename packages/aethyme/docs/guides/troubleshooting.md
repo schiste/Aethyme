@@ -210,10 +210,8 @@ date +%s
 
 **Solutions:**
 ```bash
-# Get new token
-TOKEN=$(curl -s -X POST http://localhost:8001/api/auth/login \
-  -d '{"email":"test@example.com","password":"test1234"}' \
-  | jq -r .access_token)
+# Use a new trusted token
+TOKEN="<trusted-bearer-token>"
 
 # Use API key instead
 export AETHYME_API_KEY="rg_live_..."

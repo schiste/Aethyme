@@ -14,6 +14,13 @@ Aethyme Core owns the backend product loop:
 
 Runtime isolation is tenant-scoped.
 
+## Auth Boundary
+
+- cloud owns login, registration, sessions, and user lifecycle
+- core validates bearer credentials and API keys
+- core enforces `org`, `tenant_id`, and `scopes`
+- local development can mint a cloud-issued token for an existing user via `POST /api/auth/dev/token`
+
 ## Active Surface
 
 ### Core Logic
@@ -59,7 +66,7 @@ The repo no longer treats agent-enablement, guardrails, telemetry, efficiency, o
 
 Only document and defend the verified path:
 
-- `POST /api/v1/auth/register`
+- trusted bearer token or API key required
 - `POST /api/v1/index/repositories`
 - `POST /api/v1/search/`
 - `POST /api/v1/ego/`

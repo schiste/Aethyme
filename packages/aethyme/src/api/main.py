@@ -17,9 +17,6 @@ from ..config import settings
 from ..graph.connection_pool import db_pool
 from .endpoints import index_status
 from .routes import (
-    auth as auth_routes,
-)
-from .routes import (
     ego,
     health,
     impact,
@@ -179,12 +176,6 @@ app.include_router(
     health.router,
     prefix="/health",
     tags=["health"],
-)
-
-app.include_router(
-    auth_routes.router,
-    prefix="/api/v1/auth",
-    tags=["authentication"],
 )
 
 app.include_router(

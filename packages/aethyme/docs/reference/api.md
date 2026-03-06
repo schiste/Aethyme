@@ -8,11 +8,10 @@ Base path: `http://localhost:8001`
 - `GET /health/ready`
 - `GET /health/detailed`
 
-## Auth
-- `POST /api/v1/auth/register`
-- `POST /api/v1/auth/login`
-- `POST /api/v1/auth/api-key`
-- `GET /api/v1/auth/me`
+## Authentication
+- protected routes require `Authorization: Bearer <token-or-api-key>`
+- bearer tokens are issued outside core by a trusted identity layer
+- core enforces `tenant_id`, `org`, and `scopes`
 
 ## Indexing
 - Canonical contract: [`src/indexing/service.py`](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/src/indexing/service.py)

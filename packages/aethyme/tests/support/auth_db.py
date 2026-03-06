@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from typing import Any, Protocol, TypedDict, cast
 
+from src.auth import create_access_token
 from src.graph.connection_pool import db_pool
 
 RUNTIME_ROLE = "aethyme_runtime_test"
@@ -16,6 +17,14 @@ RUNTIME_ROLE = "aethyme_runtime_test"
 class TenantRecord(TypedDict):
     org_id: str
     tenant_id: str
+
+
+class TokenContext(TypedDict):
+    user_id: str
+    org_id: str
+    tenant_id: str
+    token: str
+    headers: dict[str, str]
 
 
 DatabaseRow = dict[str, Any]
@@ -87,6 +96,48 @@ def create_org_and_tenant(prefix: str) -> TenantRecord:
 def delete_org(org_id: str) -> None:
     """Delete a test org and everything below it."""
     typed_db_pool.execute("DELETE FROM aethyme.orgs WHERE id = %s", (org_id,), fetch=False)
+
+
+def issue_token(
+    *,
+    tenant_id: str,
+    org_id: str | None,
+    scopes: list[str],
+    user_id: str | None = None,
+    email: str | None = None,
+) -> str:
+    """Mint a scoped JWT for tests without going through a login flow."""
+    resolved_user_id = user_id or str(uuid.uuid4())
+    return create_access_token(
+        {
+            "sub": resolved_user_id,
+            "tenant_id": tenant_id,
+            "org": org_id,
+            "email": email,
+            "scopes": scopes,
+        }
+    )
+
+
+def create_token_context(prefix: str, scopes: list[str]) -> TokenContext:
+    """Create an org/tenant pair and issue a scoped bearer token for it."""
+    tenant = create_org_and_tenant(prefix)
+    user_id = str(uuid.uuid4())
+    email = f"{prefix}-{user_id[:8]}@example.com"
+    token = issue_token(
+        tenant_id=tenant["tenant_id"],
+        org_id=tenant["org_id"],
+        scopes=scopes,
+        user_id=user_id,
+        email=email,
+    )
+    return {
+        "user_id": user_id,
+        "org_id": tenant["org_id"],
+        "tenant_id": tenant["tenant_id"],
+        "token": token,
+        "headers": {"Authorization": f"Bearer {token}"},
+    }
 
 
 def execute_as(

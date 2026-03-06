@@ -270,6 +270,6 @@ limiter = Limiter(
         f"{settings.RATE_LIMIT_PER_DAY}/day"
     ],
     storage_uri=str(settings.REDIS_URL),
-    strategy="fixed-window-elastic-expiry",
+    strategy="fixed-window",
     headers_enabled=True,
 )

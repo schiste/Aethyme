@@ -21,7 +21,7 @@ from app.models import User, Organization, Repository, APIKey
 from app.models.github_account import GitHubAccount
 
 from app.main import app
-from app.core.security import create_access_token, get_password_hash
+from app.core.security import build_user_access_claims, create_access_token, get_password_hash
 
 
 # Test database URL (use PostgreSQL test database)
@@ -179,11 +179,7 @@ async def test_user(db_session: AsyncSession, test_organization: Organization) -
 async def test_user_token(test_user: User) -> str:
     """Create test user access token."""
     return create_access_token(
-        data={
-            "sub": test_user.id,
-            "email": test_user.email,
-            "org_id": test_user.organization_id,
-        }
+        data=build_user_access_claims(test_user)
     )
 
 

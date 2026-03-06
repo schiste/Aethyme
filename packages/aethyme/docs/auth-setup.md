@@ -17,12 +17,19 @@ Complete guide for setting up authentication and authorization in Aethyme.
 
 Aethyme implements production-grade authentication and authorization with:
 
-- **JWT tokens** for user authentication
+- **JWT tokens** issued by a trusted identity layer
 - **OIDC integration** for enterprise SSO (Keycloak, Auth0, Okta)
 - **API keys** for CI/CD and automation
 - **Scoped permissions** (repo:read, repo:write, org:admin)
 - **Row-Level Security (RLS)** for multi-tenant isolation
 - **Rate limiting** to prevent abuse
+
+Identity boundary:
+
+- `packages/aethyme-cloud` owns login, registration, sessions, and user lifecycle
+- `packages/aethyme` verifies bearer credentials and enforces org, tenant, and scope boundaries
+- core does not expose customer-facing login or registration routes
+- cloud-issued access tokens currently map `organization_id` to both `org` and `tenant_id` until cloud has a separate tenant model
 
 ## OIDC Configuration
 
@@ -145,6 +152,7 @@ Aethyme uses JWT tokens with the following claims:
 {
   "sub": "user_id_12345",
   "org": "org_uuid_67890",
+  "tenant_id": "tenant_uuid_67890",
   "scopes": ["repo:read", "repo:write"],
   "email": "user@example.com",
   "exp": 1234567890,
@@ -156,7 +164,8 @@ Aethyme uses JWT tokens with the following claims:
 ### Required Claims
 
 - `sub` - Subject (user ID)
-- `org` - Organization/tenant ID
+- `org` - Organization ID
+- `tenant_id` - Runtime isolation boundary for core
 - `scopes` - Array of permission scopes
 - `exp` - Expiration timestamp
 - `iat` - Issued at timestamp

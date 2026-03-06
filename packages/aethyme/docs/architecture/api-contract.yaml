@@ -12,8 +12,9 @@ info:
     - Local autofixer tooling
 
     **Authentication:**
-    - JWT Bearer tokens (OIDC)
-    - API keys (X-API-Key header)
+    - Bearer credentials are issued outside core
+    - Core verifies bearer JWTs and API keys
+    - Core does not expose login or registration routes
 
     **Multi-tenancy:**
     - All resources scoped to organizations
@@ -31,8 +32,6 @@ servers:
     description: Local development
 
 tags:
-  - name: auth
-    description: Authentication endpoints
   - name: repos
     description: Repository management
   - name: query
@@ -49,79 +48,6 @@ security:
   - ApiKeyAuth: []
 
 paths:
-  # ============================================================================
-  # AUTHENTICATION
-  # ============================================================================
-  /auth/register:
-    post:
-      tags: [auth]
-      summary: Register new user and organization
-      security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [email, password, org_name]
-              properties:
-                email:
-                  type: string
-                  format: email
-                password:
-                  type: string
-                  minLength: 8
-                org_name:
-                  type: string
-      responses:
-        '201':
-          description: User created
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AuthResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-
-  /auth/login:
-    post:
-      tags: [auth]
-      summary: Login with email/password
-      security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [email, password]
-              properties:
-                email:
-                  type: string
-                password:
-                  type: string
-      responses:
-        '200':
-          description: Login successful
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AuthResponse'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-
-  /auth/me:
-    get:
-      tags: [auth]
-      summary: Get current user
-      responses:
-        '200':
-          description: Current user
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/User'
-
   # ============================================================================
   # REPOSITORIES
   # ============================================================================

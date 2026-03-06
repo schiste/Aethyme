@@ -15,6 +15,7 @@ State: partial implementation, not yet a validated end-to-end SaaS product.
 - models and migrations
 - repository, auth, search, OAuth, and AI-related code paths
 - worker/background task scaffolding
+- cloud-issued bearer tokens that now carry the core auth claims needed by `packages/aethyme`
 
 ## What Is Not Yet Claimed
 
@@ -28,7 +29,7 @@ Do not infer from this file that the package is:
 ## Current Priorities
 
 1. align cloud/backend contract with the repository’s real core
-2. verify API startup and one working request flow
+2. replace the temporary `organization_id -> tenant_id` token bridge with a real tenant model
 3. verify one minimal user flow in the cloud package
 4. remove stale status language from older docs
 

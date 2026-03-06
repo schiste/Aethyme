@@ -1,5 +1,5 @@
 """API routes for Aethyme."""
 
-from . import auth, ego, health, impact, search
+from . import ego, health, impact, search
 
-__all__ = ["auth", "ego", "health", "impact", "search"]
+__all__ = ["ego", "health", "impact", "search"]

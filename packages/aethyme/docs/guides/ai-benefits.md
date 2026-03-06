@@ -303,10 +303,8 @@ Total: 4 tool calls, 50 lines read, 5 seconds
 
 **Setup:**
 ```bash
-# Get auth token first
-export TOKEN=$(curl -X POST http://localhost:8001/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email": "test@example.com", "password": "test1234"}' | jq -r .access_token)
+# Provide a trusted bearer token or API key
+export TOKEN="<trusted-bearer-token>"
 ```
 
 **Test WITHOUT Aethyme (traditional approach):**

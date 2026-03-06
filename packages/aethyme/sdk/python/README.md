@@ -23,7 +23,7 @@ pip install aethyme-sdk
 ```python
 from aethyme_sdk import AethymeClient
 
-with AethymeClient(api_key="your-api-key", org_id="your-org-id") as client:
+with AethymeClient(token="your-bearer-token-or-api-key") as client:
     results = client.query.search("run_service")
     ego = client.query.ego_graph("run_service", depth=2)
     impact = client.query.impact_analysis("run_service")
@@ -32,7 +32,7 @@ with AethymeClient(api_key="your-api-key", org_id="your-org-id") as client:
 ## Scorecard
 
 ```python
-with AethymeClient(api_key="your-api-key", org_id="your-org-id") as client:
+with AethymeClient(token="your-bearer-token-or-api-key") as client:
     scan = client.scorecard.scan(repo_id="repo-id")
     print(scan.overall_score)
 ```

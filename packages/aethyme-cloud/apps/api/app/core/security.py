@@ -1,15 +1,19 @@
 """Security utilities for authentication and authorization."""
 
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
-from jose import JWTError, jwt
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
 import bcrypt
 from fastapi import WebSocket, Depends, HTTPException, status
+from jose import JWTError, jwt
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+
+if TYPE_CHECKING:
+    from app.models.user import User
 
 # OAuth2 password bearer for token extraction
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
@@ -34,6 +38,30 @@ def get_password_hash(password: str) -> str:
     return hashed.decode('utf-8')
 
 
+def build_user_access_claims(user: "User") -> Dict[str, Any]:
+    """Build a bearer token payload that Aethyme core can enforce.
+
+    Cloud does not yet model a separate tenant entity, so the organization id
+    temporarily serves as both the `org` and `tenant_id` claim.
+    """
+    scopes = ["repo:read", "repo:write"]
+    if user.is_superuser:
+        scopes.append("org:admin")
+
+    claims: Dict[str, Any] = {
+        "sub": user.id,
+        "email": user.email,
+        "scopes": scopes,
+    }
+
+    if user.organization_id:
+        claims["org"] = user.organization_id
+        claims["org_id"] = user.organization_id
+        claims["tenant_id"] = user.organization_id
+
+    return claims
+
+
 def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
     """
     Create a JWT access token.
@@ -47,12 +75,20 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
     """
     to_encode = data.copy()
 
+    now = datetime.now(UTC)
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = now + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=settings.JWT_EXPIRATION_MINUTES)
+        expire = now + timedelta(minutes=settings.JWT_EXPIRATION_MINUTES)
 
-    to_encode.update({"exp": expire, "type": "access"})
+    to_encode.update(
+        {
+            "exp": expire,
+            "iat": int(now.timestamp()),
+            "iss": "aethyme",
+            "type": "access",
+        }
+    )
     encoded_jwt = jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
     return encoded_jwt
 
@@ -68,9 +104,17 @@ def create_refresh_token(data: Dict[str, Any]) -> str:
         Encoded JWT refresh token string
     """
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRATION_DAYS)
+    now = datetime.now(UTC)
+    expire = now + timedelta(days=settings.REFRESH_TOKEN_EXPIRATION_DAYS)
 
-    to_encode.update({"exp": expire, "type": "refresh"})
+    to_encode.update(
+        {
+            "exp": expire,
+            "iat": int(now.timestamp()),
+            "iss": "aethyme",
+            "type": "refresh",
+        }
+    )
     encoded_jwt = jwt.encode(
         to_encode,
         settings.REFRESH_TOKEN_SECRET_KEY,

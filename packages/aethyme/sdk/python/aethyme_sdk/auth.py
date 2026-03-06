@@ -8,27 +8,21 @@ class AuthManager:
     Manages authentication for Aethyme API.
 
     Args:
-        api_key: Aethyme API key
-        org_id: Organization ID
+        token: Bearer credential issued by the trusted identity layer
     """
 
-    def __init__(self, api_key: str, org_id: str):
-        if not api_key:
-            raise AuthenticationError("API key is required")
-        if not org_id:
-            raise AuthenticationError("Organization ID is required")
+    def __init__(self, token: str):
+        if not token:
+            raise AuthenticationError("Bearer token or API key is required")
 
-        self.api_key = api_key
-        self.org_id = org_id
+        self.token = token
 
     def get_headers(self) -> dict[str, str]:
         """Get authentication headers."""
         return {
-            "Authorization": f"Bearer {self.api_key}",
-            "X-Organization-ID": self.org_id,
+            "Authorization": f"Bearer {self.token}",
         }
 
     def validate(self) -> bool:
-        """Validate credentials (placeholder for actual validation)."""
-        # In a real implementation, this would make an API call to validate
-        return bool(self.api_key and self.org_id)
+        """Validate credentials locally."""
+        return bool(self.token)

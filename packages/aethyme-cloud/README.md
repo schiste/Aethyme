@@ -25,6 +25,13 @@ The practical position is:
 - the package still needs alignment with the core backend contract
 - status claims should stay tied to verified working flows
 
+Current auth position:
+
+- cloud owns user login, registration, and refresh flows
+- cloud-issued access tokens are the normal bearer credentials for `packages/aethyme`
+- until cloud has a separate tenant model, `organization_id` is mapped to both `org` and `tenant_id` in core-facing access tokens
+- local development can mint a cloud-issued token for an existing active user via `POST /api/auth/dev/token`
+
 ## Primary Documents
 
 - [../../docs/project-plan.md](/Users/christophehenner/Downloads/Repositories/Aethyme/docs/project-plan.md)
