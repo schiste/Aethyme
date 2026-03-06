@@ -1,5 +1,13 @@
+use crate::area::AreaNode;
+use crate::class::ClassNode;
+use crate::config::ConfigNode;
 use crate::context_pack::{Anchor, ContextPack, DependencyEdge, ImpactItem, Snippet};
-use crate::edge::{Edge, EdgeConfidence, EdgeKind};
+use crate::directory::DirectoryNode;
+use crate::doc::DocNode;
+use crate::edge::{Edge, EdgeKind};
+use crate::file::{FileNode, FileRole};
+use crate::function::FunctionNode;
+use crate::graph::{GraphAnnotation, GraphNode, GraphNodeKind};
 use crate::map::RepositoryMap;
 use crate::repo::RepoSnapshot;
 use crate::risk::{RiskArea, RiskFlag, RiskLevel};
@@ -9,10 +17,7 @@ use crate::symbol::{Symbol, SymbolKind};
 use crate::task::{TaskInput, TaskKind};
 
 pub fn escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+    value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
 fn string(value: &str) -> String {
@@ -52,17 +57,15 @@ fn task_kind(kind: &TaskKind) -> &'static str {
 
 fn edge_kind(kind: &EdgeKind) -> &'static str {
     match kind {
+        EdgeKind::Contains => "contains",
+        EdgeKind::BelongsTo => "belongs_to",
+        EdgeKind::Defines => "defines",
         EdgeKind::Imports => "imports",
         EdgeKind::Calls => "calls",
-        EdgeKind::Defines => "defines",
-    }
-}
-
-fn edge_confidence(confidence: &EdgeConfidence) -> &'static str {
-    match confidence {
-        EdgeConfidence::Low => "low",
-        EdgeConfidence::Medium => "medium",
-        EdgeConfidence::High => "high",
+        EdgeKind::References => "references",
+        EdgeKind::Documents => "documents",
+        EdgeKind::Configures => "configures",
+        EdgeKind::EntrypointFor => "entrypoint_for",
     }
 }
 
@@ -85,6 +88,33 @@ fn risk_level(level: &RiskLevel) -> &'static str {
         RiskLevel::Low => "low",
         RiskLevel::Medium => "medium",
         RiskLevel::High => "high",
+    }
+}
+
+fn file_role(role: &FileRole) -> &'static str {
+    match role {
+        FileRole::Source => "source",
+        FileRole::Test => "test",
+        FileRole::Doc => "doc",
+        FileRole::Config => "config",
+        FileRole::Asset => "asset",
+        FileRole::Generated => "generated",
+        FileRole::Binary => "binary",
+        FileRole::Cache => "cache",
+        FileRole::Unknown => "unknown",
+    }
+}
+
+fn graph_node_kind(kind: &GraphNodeKind) -> &'static str {
+    match kind {
+        GraphNodeKind::Repo => "repo",
+        GraphNodeKind::Area => "area",
+        GraphNodeKind::Directory => "directory",
+        GraphNodeKind::File => "file",
+        GraphNodeKind::Class => "class",
+        GraphNodeKind::Function => "function",
+        GraphNodeKind::Doc => "doc",
+        GraphNodeKind::Config => "config",
     }
 }
 
@@ -218,11 +248,21 @@ pub fn string_list(items: &[String]) -> String {
 
 pub fn repository_map(map: &RepositoryMap) -> String {
     format!(
-        "{{\"snapshot\":{},\"symbols\":[{}],\"edges\":[{}],\"risk_flags\":[{}]}}",
+        "{{\"snapshot\":{},\"areas\":[{}],\"directories\":[{}],\"files\":[{}],\"classes\":[{}],\"functions\":[{}],\"docs\":[{}],\"configs\":[{}],\"symbols\":[{}],\"edges\":[{}],\"risk_flags\":[{}],\"graph\":{{\"nodes\":[{}],\"edges\":[{}],\"annotations\":[{}]}}}}",
         repo_snapshot(&map.snapshot),
+        map.areas.iter().map(area).collect::<Vec<_>>().join(","),
+        map.directories.iter().map(directory).collect::<Vec<_>>().join(","),
+        map.files.iter().map(file).collect::<Vec<_>>().join(","),
+        map.classes.iter().map(class).collect::<Vec<_>>().join(","),
+        map.functions.iter().map(function).collect::<Vec<_>>().join(","),
+        map.docs.iter().map(doc).collect::<Vec<_>>().join(","),
+        map.configs.iter().map(config).collect::<Vec<_>>().join(","),
         map.symbols.iter().map(symbol).collect::<Vec<_>>().join(","),
         map.edges.iter().map(edge).collect::<Vec<_>>().join(","),
         map.risk_flags.iter().map(risk_flag).collect::<Vec<_>>().join(","),
+        map.graph.nodes.iter().map(graph_node).collect::<Vec<_>>().join(","),
+        map.graph.edges.iter().map(edge).collect::<Vec<_>>().join(","),
+        map.graph.annotations.iter().map(annotation).collect::<Vec<_>>().join(","),
     )
 }
 
@@ -233,36 +273,158 @@ fn repo_snapshot(snapshot: &RepoSnapshot) -> String {
         string_array(&snapshot.languages),
         string_array(&snapshot.top_level_dirs),
         snapshot.readme_path.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
-        snapshot.files.iter().map(|file| {
-            format!(
-                "{{\"path\":{},\"language\":{},\"line_count\":{},\"size_bytes\":{}}}",
-                string(&file.path),
-                file.language.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
-                file.line_count,
-                file.size_bytes,
-            )
-        }).collect::<Vec<_>>().join(",")
+        snapshot
+            .files
+            .iter()
+            .map(|file| {
+                format!(
+                    "{{\"path\":{},\"language\":{},\"line_count\":{},\"size_bytes\":{}}}",
+                    string(&file.path),
+                    file.language.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+                    file.line_count,
+                    file.size_bytes,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn area(area: &AreaNode) -> String {
+    format!(
+        "{{\"id\":{},\"name\":{},\"path_prefix\":{},\"inferred\":{}}}",
+        string(&area.id),
+        string(&area.name),
+        string(&area.path_prefix),
+        if area.inferred { "true" } else { "false" },
+    )
+}
+
+fn directory(directory: &DirectoryNode) -> String {
+    format!(
+        "{{\"id\":{},\"path\":{},\"name\":{},\"area_id\":{}}}",
+        string(&directory.id),
+        string(&directory.path),
+        string(&directory.name),
+        directory.area_id.as_deref().map(string).unwrap_or_else(|| "null".to_string())
+    )
+}
+
+fn file(file: &FileNode) -> String {
+    format!(
+        "{{\"id\":{},\"path\":{},\"name\":{},\"language\":{},\"role\":{},\"line_count\":{},\"size_bytes\":{},\"generated\":{},\"area_id\":{}}}",
+        string(&file.id),
+        string(&file.path),
+        string(&file.name),
+        file.language.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        string(file_role(&file.role)),
+        file.line_count,
+        file.size_bytes,
+        if file.generated { "true" } else { "false" },
+        file.area_id.as_deref().map(string).unwrap_or_else(|| "null".to_string())
+    )
+}
+
+fn class(class: &ClassNode) -> String {
+    format!(
+        "{{\"id\":{},\"name\":{},\"qualified_name\":{},\"file_id\":{},\"file_path\":{},\"area_id\":{},\"language\":{},\"line\":{},\"signature\":{}}}",
+        string(&class.id),
+        string(&class.name),
+        string(&class.qualified_name),
+        string(&class.file_id),
+        string(&class.file_path),
+        class.area_id.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        string(&class.language),
+        class.line,
+        string(&class.signature)
+    )
+}
+
+fn function(function: &FunctionNode) -> String {
+    format!(
+        "{{\"id\":{},\"name\":{},\"qualified_name\":{},\"file_id\":{},\"file_path\":{},\"area_id\":{},\"parent_class_id\":{},\"language\":{},\"line\":{},\"signature\":{}}}",
+        string(&function.id),
+        string(&function.name),
+        string(&function.qualified_name),
+        string(&function.file_id),
+        string(&function.file_path),
+        function.area_id.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        function.parent_class_id.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        string(&function.language),
+        function.line,
+        string(&function.signature)
+    )
+}
+
+fn doc(doc: &DocNode) -> String {
+    format!(
+        "{{\"id\":{},\"file_id\":{},\"path\":{},\"title\":{},\"doc_type\":{},\"area_id\":{}}}",
+        string(&doc.id),
+        string(&doc.file_id),
+        string(&doc.path),
+        string(&doc.title),
+        string(&doc.doc_type),
+        doc.area_id.as_deref().map(string).unwrap_or_else(|| "null".to_string())
+    )
+}
+
+fn config(config: &ConfigNode) -> String {
+    format!(
+        "{{\"id\":{},\"file_id\":{},\"path\":{},\"config_type\":{},\"area_id\":{}}}",
+        string(&config.id),
+        string(&config.file_id),
+        string(&config.path),
+        string(&config.config_type),
+        config.area_id.as_deref().map(string).unwrap_or_else(|| "null".to_string())
     )
 }
 
 fn symbol(symbol: &Symbol) -> String {
     format!(
-        "{{\"id\":{},\"name\":{},\"kind\":{},\"file\":{},\"line\":{},\"signature\":{}}}",
+        "{{\"id\":{},\"name\":{},\"kind\":{},\"file\":{},\"line\":{},\"signature\":{},\"language\":{},\"area\":{}}}",
         string(&symbol.id),
         string(&symbol.name),
         string(symbol_kind(&symbol.kind)),
         string(&symbol.file),
         symbol.line,
         string(&symbol.signature),
+        symbol.language.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        symbol.area.as_deref().map(string).unwrap_or_else(|| "null".to_string())
     )
 }
 
 fn edge(edge: &Edge) -> String {
     format!(
-        "{{\"from\":{},\"to\":{},\"kind\":{},\"confidence\":{}}}",
+        "{{\"from\":{},\"to\":{},\"kind\":{},\"confidence\":{},\"source\":{}}}",
         string(&edge.from),
         string(&edge.to),
         string(edge_kind(&edge.kind)),
-        string(edge_confidence(&edge.confidence)),
+        edge.confidence,
+        string(&edge.source)
+    )
+}
+
+fn graph_node(node: &GraphNode) -> String {
+    format!(
+        "{{\"id\":{},\"kind\":{},\"label\":{},\"path\":{},\"language\":{},\"confidence\":{},\"source\":{}}}",
+        string(&node.id),
+        string(graph_node_kind(&node.kind)),
+        string(&node.label),
+        node.path.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        node.language.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        node.confidence,
+        string(&node.source)
+    )
+}
+
+fn annotation(annotation: &GraphAnnotation) -> String {
+    format!(
+        "{{\"target_id\":{},\"kind\":{},\"value\":{},\"confidence\":{},\"source\":{},\"reason\":{}}}",
+        string(&annotation.target_id),
+        string(&annotation.kind),
+        string(&annotation.value),
+        annotation.confidence,
+        string(&annotation.source),
+        string(&annotation.reason)
     )
 }

@@ -13,6 +13,8 @@ pub struct Symbol {
     pub file: String,
     pub line: usize,
     pub signature: String,
+    pub language: Option<String>,
+    pub area: Option<String>,
 }
 
 impl Symbol {
@@ -32,6 +34,14 @@ impl Symbol {
             file: resolved_file,
             line,
             signature: signature.into(),
+            language: None,
+            area: None,
         }
+    }
+
+    pub fn with_context(mut self, language: Option<String>, area: Option<String>) -> Self {
+        self.language = language;
+        self.area = area;
+        self
     }
 }

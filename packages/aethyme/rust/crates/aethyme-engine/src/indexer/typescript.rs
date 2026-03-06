@@ -1,4 +1,4 @@
-use crate::edge::{Edge, EdgeConfidence, EdgeKind};
+use crate::edge::{Edge, EdgeKind};
 use crate::symbol::{Symbol, SymbolKind};
 
 pub fn extract_symbols(path: &str, contents: &str) -> Vec<Symbol> {
@@ -10,13 +10,7 @@ pub fn extract_symbols(path: &str, contents: &str) -> Vec<Symbol> {
                 if let Some(name) = rest.split('(').next() {
                     let symbol_name = name.trim();
                     if !symbol_name.is_empty() {
-                        symbols.push(Symbol::new(
-                            symbol_name,
-                            SymbolKind::Function,
-                            path,
-                            index + 1,
-                            trimmed,
-                        ));
+                        symbols.push(Symbol::new(symbol_name, SymbolKind::Function, path, index + 1, trimmed));
                         break;
                     }
                 }
@@ -27,13 +21,7 @@ pub fn extract_symbols(path: &str, contents: &str) -> Vec<Symbol> {
                 if let Some(name) = rest.split(['{', '<', ' ']).next() {
                     let symbol_name = name.trim();
                     if !symbol_name.is_empty() {
-                        symbols.push(Symbol::new(
-                            symbol_name,
-                            SymbolKind::Class,
-                            path,
-                            index + 1,
-                            trimmed,
-                        ));
+                        symbols.push(Symbol::new(symbol_name, SymbolKind::Class, path, index + 1, trimmed));
                         break;
                     }
                 }
@@ -43,13 +31,7 @@ pub fn extract_symbols(path: &str, contents: &str) -> Vec<Symbol> {
             if let Some(name) = rest.split(['=', ':', ' ']).next() {
                 let symbol_name = name.trim();
                 if !symbol_name.is_empty() {
-                    symbols.push(Symbol::new(
-                        symbol_name,
-                        SymbolKind::Constant,
-                        path,
-                        index + 1,
-                        trimmed,
-                    ));
+                    symbols.push(Symbol::new(symbol_name, SymbolKind::Constant, path, index + 1, trimmed));
                 }
             }
         }
@@ -67,12 +49,7 @@ pub fn extract_import_edges(path: &str, contents: &str) -> Vec<Edge> {
             .and_then(|value| value.split(['\'', '"']).nth(1))
         {
             if !import_target.is_empty() {
-                edges.push(Edge::new(
-                    path,
-                    import_target,
-                    EdgeKind::Imports,
-                    EdgeConfidence::High,
-                ));
+                edges.push(Edge::new(path, import_target, EdgeKind::Imports, 900, "typescript-ast"));
             }
         }
     }

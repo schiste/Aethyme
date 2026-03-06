@@ -1,15 +1,14 @@
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EdgeKind {
+    Contains,
+    BelongsTo,
+    Defines,
     Imports,
     Calls,
-    Defines,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum EdgeConfidence {
-    Low,
-    Medium,
-    High,
+    References,
+    Documents,
+    Configures,
+    EntrypointFor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -17,7 +16,8 @@ pub struct Edge {
     pub from: String,
     pub to: String,
     pub kind: EdgeKind,
-    pub confidence: EdgeConfidence,
+    pub confidence: u16,
+    pub source: String,
 }
 
 impl Edge {
@@ -25,13 +25,15 @@ impl Edge {
         from: impl Into<String>,
         to: impl Into<String>,
         kind: EdgeKind,
-        confidence: EdgeConfidence,
+        confidence: u16,
+        source: impl Into<String>,
     ) -> Self {
         Self {
             from: from.into(),
             to: to.into(),
             kind,
             confidence,
+            source: source.into(),
         }
     }
 }

@@ -10,6 +10,7 @@ This directory documents the code that is active in `packages/aethyme`.
 - [`../README.md`](../README.md)
 - [`vision.md`](vision.md)
 - [`agent-navigation-spec.md`](agent-navigation-spec.md)
+- [`architecture/research-informed-architecture-memo.md`](architecture/research-informed-architecture-memo.md)
 - [`architecture/auth-boundary.md`](architecture/auth-boundary.md)
 - [`architecture/core-architecture.md`](architecture/core-architecture.md)
 - [`architecture/rust-transition.md`](architecture/rust-transition.md)

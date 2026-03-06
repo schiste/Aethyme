@@ -9,20 +9,19 @@ use crate::snippets::select_snippets;
 use crate::task::TaskInput;
 
 pub fn build_context_pack(root: &Path, map: &RepositoryMap, task: TaskInput) -> ContextPack {
-    let anchors = resolve_anchors(map, &task, 3);
-    let anchor_targets: Vec<String> = anchors
-        .iter()
-        .map(|anchor| anchor.file.clone().unwrap_or_else(|| anchor.id.clone()))
-        .collect();
+    let anchor_limit = if task.kind.is_explain_repo() { 5 } else { 3 };
+    let scope_limit = if task.kind.is_explain_repo() { 8 } else { 5 };
+    let anchors = resolve_anchors(map, &task, anchor_limit);
+    let anchor_targets: Vec<String> = anchors.iter().map(|anchor| anchor.id.clone()).collect();
     let mut dependencies = Vec::new();
     let mut impact = Vec::new();
 
     for target in &anchor_targets {
         for dependency in dependency_frontier(map, target) {
             dependencies.push(DependencyEdge {
-                from: target.clone(),
+                from: map.display_for(target),
                 to: dependency,
-                kind: "imports".to_string(),
+                kind: "related".to_string(),
             });
         }
         for item in impact_frontier(map, target) {
@@ -39,13 +38,25 @@ pub fn build_context_pack(root: &Path, map: &RepositoryMap, task: TaskInput) -> 
     impact.sort();
     impact.dedup();
 
-    let in_scope = build_in_scope(map, &anchors, 5);
+    let in_scope = build_in_scope(map, &anchors, scope_limit);
     let out_of_scope = build_out_of_scope(map, &anchors, &task.kind);
     let snippets = select_snippets(root, &anchors, 8);
     let navigation = navigation_order(&anchors);
 
-    let anchor_confidence = if anchors.is_empty() { 0.0 } else { 0.75 };
-    let scope_confidence = if in_scope.files.is_empty() { 0.0 } else { 0.70 };
+    let anchor_confidence = if anchors.is_empty() {
+        0.0
+    } else if task.kind.is_explain_repo() && anchors.len() >= 3 {
+        0.85
+    } else {
+        0.75
+    };
+    let scope_confidence = if in_scope.files.is_empty() && in_scope.areas.is_empty() {
+        0.0
+    } else if task.kind.is_explain_repo() && !in_scope.areas.is_empty() {
+        0.8
+    } else {
+        0.70
+    };
 
     let mut pack = ContextPack {
         task,
@@ -63,6 +74,8 @@ pub fn build_context_pack(root: &Path, map: &RepositoryMap, task: TaskInput) -> 
             scope_confidence,
         },
     };
+    pack.budget.max_anchors = anchor_limit;
+    pack.budget.max_files = scope_limit;
     pack.sort();
     pack
 }
@@ -88,6 +101,7 @@ mod tests {
 
         assert!(!pack.anchors.is_empty());
         assert!(pack.navigation_order.iter().any(|value| value == "README.md"));
+        assert!(pack.navigation_order.iter().any(|value| value == "src"));
         assert!(pack.out_of_scope.areas.is_empty());
         let _ = fs::remove_dir_all(&root);
     }
@@ -99,21 +113,15 @@ mod tests {
         fs::create_dir_all(root.join("src")).expect("create temp repo");
         fs::write(
             root.join("src/main.py"),
-            "from auth import validate_token\n\n"
-                .to_string()
-                + "def main():\n    return validate_token()\n",
+            "from auth import validate_token\n\n".to_string() + "def main():\n    return validate_token()\n",
         )
         .expect("write entrypoint");
-        fs::write(
-            root.join("src/auth.py"),
-            "def validate_token():\n    return True\n",
-        )
-        .expect("write source file");
+        fs::write(root.join("src/auth.py"), "def validate_token():\n    return True\n").expect("write source file");
 
         let map = RepositoryMap::build(&root).expect("build map");
         let pack = build_context_pack(&root, &map, TaskInput::from_task_text("Update validate_token flow"));
 
-        assert!(pack.anchors.iter().any(|anchor| anchor.id == "validate_token"));
+        assert!(pack.anchors.iter().any(|anchor| anchor.id.contains("validate_token")));
         assert!(pack.in_scope.files.iter().any(|item| item.value == "src/auth.py"));
 
         let _ = fs::remove_dir_all(&root);

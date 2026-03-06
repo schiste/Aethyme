@@ -83,7 +83,10 @@ fn print_explanation(map: &RepositoryMap, pack: &aethyme_engine::context_pack::C
     println!("Languages: {}", map.snapshot.languages.join(", "));
     println!("Top-level directories: {}", map.snapshot.top_level_dirs.join(", "));
     println!("Files indexed: {}", map.snapshot.files.len());
-    println!("Symbols indexed: {}", map.symbols.len());
+    println!("Functions indexed: {}", map.functions.len());
+    println!("Classes indexed: {}", map.classes.len());
+    println!("Docs indexed: {}", map.docs.len());
+    println!("Configs indexed: {}", map.configs.len());
     if let Some(readme) = &map.snapshot.readme_path {
         println!("README: {readme}");
     }

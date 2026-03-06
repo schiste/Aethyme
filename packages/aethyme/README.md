@@ -108,6 +108,7 @@ Runtime notes:
 - [`../../docs/project-plan.md`](../../docs/project-plan.md)
 - [`docs/vision.md`](docs/vision.md)
 - [`docs/agent-navigation-spec.md`](docs/agent-navigation-spec.md)
+- [`docs/architecture/research-informed-architecture-memo.md`](docs/architecture/research-informed-architecture-memo.md)
 - [`docs/architecture/rust-transition.md`](docs/architecture/rust-transition.md)
 - [`rust/README.md`](rust/README.md)
 - [`docs/getting-started/quickstart.md`](docs/getting-started/quickstart.md)

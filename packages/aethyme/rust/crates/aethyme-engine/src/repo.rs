@@ -33,6 +33,16 @@ pub struct RepoSnapshot {
     pub readme_path: Option<String>,
 }
 
+impl RepoSnapshot {
+    pub fn repo_name(&self) -> String {
+        Path::new(&self.root)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("repo")
+            .to_string()
+    }
+}
+
 pub fn discover_repo(root: &Path) -> Result<RepoSnapshot, String> {
     if !root.exists() {
         return Err(format!("Repository path does not exist: {}", root.display()));

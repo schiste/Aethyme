@@ -30,6 +30,12 @@ impl TaskInput {
     }
 }
 
+impl TaskKind {
+    pub fn is_explain_repo(&self) -> bool {
+        matches!(self, Self::ExplainRepo)
+    }
+}
+
 fn classify_task(normalized: &str) -> TaskKind {
     if normalized.contains("explain this repo") || normalized == "explain repo" {
         TaskKind::ExplainRepo

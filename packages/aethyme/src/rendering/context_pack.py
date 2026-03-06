@@ -28,53 +28,64 @@ def render_pack_summary(pack: dict[str, Any]) -> str:
 
 def render_prompt_pack(pack: dict[str, Any]) -> str:
     """Render a compact prompt-oriented view of a task-context pack."""
-    lines = [f"Task: {pack['task']['raw']}"]
+    lines: list[str] = []
 
     anchors = pack.get("anchors", [])
     if anchors:
-        lines.append("Start here:")
-        for anchor in anchors[:3]:
-            file_hint = f" @ {anchor['file']}" if anchor.get("file") else ""
-            lines.append(f"- {anchor['id']}{file_hint}: {anchor['reason']}")
+        lines.append(
+            "Start: "
+            + " | ".join(
+                [
+                    (
+                        f"{anchor['id']}@{anchor['file']}"
+                        if anchor.get("file") and anchor["file"] != anchor["id"]
+                        else anchor["id"]
+                    )
+                    for anchor in anchors[:4]
+                ]
+            )
+        )
 
     in_scope = pack.get("in_scope", {})
     in_scope_files = in_scope.get("files", [])
+    in_scope_areas = in_scope.get("areas", [])
+    scope_items = [item["value"] for item in in_scope_files[:3]] + [
+        item["value"] for item in in_scope_areas[:3]
+    ]
+    if scope_items:
+        lines.append("Scope: " + " | ".join(scope_items))
+
     if in_scope_files:
-        lines.append("In scope files:")
-        for item in in_scope_files[:5]:
-            lines.append(f"- {item['value']}")
+        lines.append(
+            "Read: "
+            + " | ".join(
+                [
+                    f"{snippet['file']}:{snippet['start_line']}-{snippet['end_line']}"
+                    for snippet in pack.get("snippets", [])[:3]
+                ]
+            )
+        )
 
     dependencies = pack.get("dependencies", [])
     if dependencies:
-        lines.append("Relevant dependencies:")
-        for dependency in dependencies[:5]:
-            lines.append(f"- {dependency['from']} -> {dependency['to']}")
-
-    snippets = pack.get("snippets", [])
-    if snippets:
-        lines.append("Read these snippets:")
-        for snippet in snippets[:5]:
-            lines.append(
-                f"- {snippet['file']}:{snippet['start_line']}-{snippet['end_line']} ({snippet['kind']})"
+        lines.append(
+            "Deps: "
+            + " | ".join(
+                [f"{dependency['from']}->{dependency['to']}" for dependency in dependencies[:3]]
             )
+        )
 
     out_of_scope = pack.get("out_of_scope", {})
     out_of_scope_areas = out_of_scope.get("areas", [])
     if out_of_scope_areas:
-        lines.append("Avoid unless needed:")
-        for item in out_of_scope_areas[:5]:
-            lines.append(f"- {item['value']}: {item['reason']}")
+        lines.append("Avoid: " + " | ".join([item["value"] for item in out_of_scope_areas[:3]]))
 
     risks = pack.get("risk_flags", [])
     if risks:
-        lines.append("High-risk areas:")
-        for risk in risks[:5]:
-            lines.append(f"- {risk['scope']} ({risk['area']})")
+        lines.append("Risk: " + " | ".join([risk["scope"] for risk in risks[:3]]))
 
     navigation = pack.get("navigation_order", [])
     if navigation:
-        lines.append("Navigation order:")
-        for item in navigation[:5]:
-            lines.append(f"- {item}")
+        lines.append("Order: " + " -> ".join(navigation[:4]))
 
     return "\n".join(lines)

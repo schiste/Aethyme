@@ -122,8 +122,8 @@ def test_aethyme_prompt_uses_compact_pack_rendering() -> None:
     prompt = build_aethyme_prompt(Path("/tmp/repo"), "Explain this repo", pack)
 
     assert "Pack: {" not in prompt
-    assert "Start here:" in prompt
-    assert "Avoid unless needed:" in prompt
+    assert "Start:" in prompt
+    assert "Avoid:" in prompt
 
 
 def test_capture_snapshot_uses_git_commit_when_clean(tmp_path: Path) -> None:

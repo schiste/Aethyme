@@ -14,6 +14,9 @@ It defines:
 
 This document is intentionally comprehensive. Shorter operational docs should point back to this one.
 
+Research context for the major architectural decisions in this spec is captured in:
+- [`architecture/research-informed-architecture-memo.md`](architecture/research-informed-architecture-memo.md)
+
 ## Executive Thesis
 Aethyme Core exists to be the primary repository navigation layer for AI coding agents.
 
@@ -170,6 +173,644 @@ This layering separates four different concerns that must not collapse into one 
 - policy and management
 
 Without this separation, the system will become hard to reason about and hard to evolve.
+
+## Canonical Repograph Architecture
+The repograph is the substrate beneath every higher layer.
+
+It should not be treated as "search index plus a few edges."
+The ultimate target is a layered, multi-resolution, function-centric repository graph with overlays for navigation, risk, policy, and performance.
+
+### Core Principle
+The graph should be:
+- function-centric for code semantics
+- file and area-centric for navigation
+- documentation and config aware for explanation
+- overlay-friendly for risk, policy, and task shaping
+
+That means the repograph must answer all of these:
+- what exists
+- where it lives
+- what it does
+- what depends on it
+- what explains it
+- what configures it
+- what is risky
+- what should be read first
+- what should not be touched
+
+### Graph Layers
+The final repograph should be modeled in distinct layers:
+
+| Graph layer | Meaning | Examples |
+|---|---|---|
+| Structural truth | Hard repository facts | repo, area, directory, file, contains |
+| Semantic truth | Code and runtime facts | function, class, imports, calls, references |
+| Inferred meaning | Useful but probabilistic structure | entrypoints, representative areas, doc links |
+| Control overlays | Human and system constraints | high-risk zones, policy rules, escalation requirements |
+| Task overlays | Task-specific graph slices | anchors, in-scope, out-of-scope, context pack |
+| Performance overlays | Measured execution data | token usage, retries, review burden, benchmark deltas |
+
+These layers must stay separate.
+Policy and task scope are not graph truth.
+
+### Canonical Node Taxonomy
+The ultimate node model should include:
+
+#### Structural nodes
+- `platform`
+- `org`
+- `tenant`
+- `repo`
+- `snapshot`
+- `workspace`
+- `area`
+- `directory`
+- `file`
+
+#### Code semantic nodes
+- `module`
+- `namespace`
+- `class`
+- `interface`
+- `trait`
+- `struct`
+- `enum`
+- `function`
+- `method`
+- `field`
+- `constant`
+- `type_alias`
+- `macro`
+- `test_case`
+
+#### Documentation nodes
+- `doc`
+- `doc_section`
+- `decision_record`
+- `runbook`
+- `spec`
+- `example`
+
+#### Config and runtime nodes
+- `config`
+- `manifest`
+- `dependency`
+- `service`
+- `runtime_target`
+- `build_target`
+- `pipeline`
+- `environment`
+
+#### Asset and content nodes
+- `asset`
+- `dataset`
+- `schema`
+- `template`
+- `content_object`
+
+#### Agent and task nodes
+- `task`
+- `context_pack`
+- `navigation_step`
+- `scope_boundary`
+- `risk_zone`
+- `policy_rule`
+- `permission_request`
+
+#### Execution and performance nodes
+- `agent_profile`
+- `agent_run`
+- `tool_call`
+- `patch`
+- `review`
+- `benchmark_case`
+- `benchmark_run`
+- `metric`
+
+### Canonical Edge Taxonomy
+The ultimate edge vocabulary should include:
+
+#### Structural edges
+- `contains`
+- `belongs_to`
+- `part_of`
+
+#### Code semantic edges
+- `defines`
+- `declares`
+- `imports`
+- `exports`
+- `references`
+- `calls`
+- `reads`
+- `writes`
+- `mutates`
+- `constructs`
+- `returns`
+- `raises`
+- `inherits`
+- `implements`
+- `specializes`
+- `tests`
+- `mocks`
+
+#### Documentation and config edges
+- `documents`
+- `describes`
+- `configures`
+- `builds`
+- `deploys`
+- `depends_on`
+- `uses`
+- `generates`
+- `transforms`
+
+#### Navigation and scope edges
+- `anchors`
+- `in_scope_for`
+- `out_of_scope_for`
+- `entrypoint_for`
+- `starting_point_for`
+- `relevant_to`
+- `irrelevant_to`
+
+#### Control edges
+- `high_risk_for`
+- `restricted_for`
+- `blocked_for`
+- `requires_escalation_for`
+- `allowed_for`
+
+#### Execution and performance edges
+- `used_in`
+- `produced`
+- `reviewed_by`
+- `measured_by`
+- `compared_to`
+
+### Canonical Graph Unit
+The smallest meaningful code node should be `function` or `method`.
+
+The main navigation backbone should be:
+- `repo -> area -> file -> function`
+
+This is the core balance:
+- function-level for change reasoning
+- file and area-level for navigation, scope, and control
+
+### Canonical Graph Record Shape
+Every graph node should ultimately follow a normalized property-graph shape:
+
+```ts
+type GraphNode = {
+  id: string
+  kind: string
+  label: string
+  layer: "truth" | "semantic" | "inferred" | "control" | "task" | "performance"
+  snapshot_id: string
+  path?: string
+  language?: string
+  span?: {
+    start_line: number
+    end_line: number
+    start_col?: number
+    end_col?: number
+  }
+  confidence: number
+  source: string
+  metadata: Record<string, unknown>
+}
+```
+
+Every graph edge should follow the same normalization discipline:
+
+```ts
+type GraphEdge = {
+  id: string
+  from: string
+  to: string
+  kind: string
+  layer: "truth" | "semantic" | "inferred" | "control" | "task" | "performance"
+  snapshot_id: string
+  confidence: number
+  source: string
+  metadata: Record<string, unknown>
+}
+```
+
+Annotations should remain explicit and separate:
+
+```ts
+type GraphAnnotation = {
+  id: string
+  target_id: string
+  kind: string
+  layer: "control" | "task" | "performance"
+  snapshot_id: string
+  confidence: number
+  source: string
+  value: string
+  metadata: Record<string, unknown>
+}
+```
+
+### Canonical Identity Strategy
+IDs must be deterministic, snapshot-aware, and stable under rereads.
+
+Examples:
+- `repo:ADD`
+- `snapshot:ADD:<commit-or-fingerprint>`
+- `area:ADD:GameEngine`
+- `file:ADD:GameEngine/rust/addgame/src/lib.rs`
+- `fn:ADD:tools/osm_to_hexmap.py:build_hex_map`
+- `doc:ADD:documentation/technical-architecture.md`
+- `cfg:ADD:GameEngine/rust/addgame/Cargo.toml`
+- `task:ADD:<task-hash>`
+- `pack:ADD:<task-hash>:<snapshot-id>`
+
+### Confidence Model
+Confidence must exist from the start:
+- `1.0` structural fact
+- `0.95` compiler or indexer-resolved semantic fact
+- `0.9` parser-derived semantic fact
+- `0.75` strong inference
+- `0.5` weak inference
+- `0.25` advisory heuristic only
+
+Higher layers must be able to distinguish truth from inference.
+
+## Canonical Extraction Passes
+The ultimate repograph should be built through explicit passes.
+
+### Pass 0. Repo Intake
+Creates the stable root context:
+- repo id
+- snapshot id
+- canonical root
+- build settings
+
+Output artifact: `RepoContext`
+
+### Pass 1. Filesystem Structure Extraction
+Builds structural coverage of the entire repo.
+
+Creates:
+- `repo`
+- `area` candidates
+- `directory`
+- `file`
+
+Creates edges:
+- `contains`
+
+Output artifact: `StructureGraph`
+
+### Pass 2. File Classification
+Classifies each file and determines whether it should get deep parsing.
+
+Output artifact: `ClassifiedFiles`
+
+Primary roles:
+- source
+- test
+- doc
+- config
+- manifest
+- build
+- asset
+- generated
+- binary
+- cache
+
+### Pass 3. Area Formation
+Creates stable repo zones for navigation.
+
+Output artifact: `AreaMap`
+
+This pass assigns files and directories to:
+- top-level areas
+- later inferred subsystem areas
+
+### Pass 4. Code Parsing
+Runs language-specific parsers against supported source files.
+
+Extracts:
+- functions
+- methods
+- classes
+- imports
+- raw code relations
+
+Output artifact: `ParsedCodeUnits`
+
+### Pass 5. Symbol Normalization
+Normalizes parser output into deterministic graph entities.
+
+Creates:
+- stable function nodes
+- stable class nodes
+- `defines` edges
+- normalized imports
+
+Output artifact: `NormalizedCodeGraph`
+
+### Pass 6. Code Relationship Resolution
+Resolves semantic relations between code entities.
+
+Creates:
+- `calls`
+- `references`
+- `inherits`
+- `implements`
+- `entrypoint_for` candidates later
+
+Output artifact: `ResolvedCodeRelations`
+
+### Pass 7. Documentation Extraction
+Makes documentation first-class.
+
+Creates:
+- `doc`
+- `doc_section` later
+
+Creates edges:
+- `documents`
+- `belongs_to`
+- `references`
+
+Output artifact: `DocumentationGraph`
+
+### Pass 8. Config / Manifest Extraction
+Makes manifests and config files first-class.
+
+Creates:
+- `config`
+- `manifest`
+
+Creates edges:
+- `configures`
+- `depends_on`
+- `entrypoint_for`
+
+Output artifact: `ConfigGraph`
+
+### Pass 9. Asset / Content Registration
+Registers non-code repo material as graph entities.
+
+Creates:
+- `asset`
+- later richer content nodes
+
+Output artifact: `AssetGraph`
+
+### Pass 10. Risk Annotation
+Attaches high-risk overlays to graph entities.
+
+Creates annotations for:
+- auth
+- permissions
+- migrations
+- infra
+- secrets
+- billing
+- shared-core
+- later user-defined risk zones
+
+Output artifact: `RiskOverlay`
+
+### Pass 11. Entry Point And Navigation Inference
+Infers useful starting points and representative entities.
+
+Creates:
+- `entrypoint_for`
+- `starting_point_for`
+- representative docs, files, and functions
+
+Output artifact: `NavigationOverlay`
+
+### Pass 12. Graph Normalization
+Sorts, deduplicates, validates, and stabilizes the graph.
+
+Output artifact: `NormalizedRepositoryGraph`
+
+### Pass 13. Persistence
+Stores normalized nodes, edges, and annotations.
+
+### Pass 14. Query And Navigation Views
+Builds the graph-derived views needed by higher layers:
+- repo overview
+- area overview
+- function neighborhood
+- impact frontier
+- task anchors
+- context packs later
+
+## Pass Data Contracts
+Each pass should consume one explicit artifact and emit one explicit artifact.
+
+### `RepoContext`
+```ts
+type RepoContext = {
+  repo_id: string
+  repo_path: string
+  snapshot_id: string
+  vcs?: {
+    commit?: string
+    dirty: boolean
+  }
+  settings: {
+    include_hidden: boolean
+    allowed_languages?: string[]
+  }
+}
+```
+
+### `StructureGraph`
+```ts
+type StructureGraph = {
+  repo_context: RepoContext
+  nodes: StructureNode[]
+  edges: StructureEdge[]
+}
+```
+
+### `ClassifiedFiles`
+```ts
+type ClassifiedFile = {
+  file_id: string
+  path: string
+  language?: string
+  role:
+    | "source"
+    | "test"
+    | "doc"
+    | "config"
+    | "manifest"
+    | "build"
+    | "asset"
+    | "generated"
+    | "binary"
+    | "cache"
+  generated: boolean
+  parseable: boolean
+  metadata: Record<string, unknown>
+}
+
+type ClassifiedFiles = {
+  repo_context: RepoContext
+  files: ClassifiedFile[]
+}
+```
+
+### `AreaMap`
+```ts
+type AreaMap = {
+  repo_context: RepoContext
+  areas: AreaNode[]
+  assignments: {
+    node_id: string
+    area_id: string
+    kind: "belongs_to"
+    confidence: number
+    source: string
+  }[]
+}
+```
+
+### `ParsedCodeUnits`
+```ts
+type ParsedCodeUnits = {
+  repo_context: RepoContext
+  classes: ParsedClass[]
+  functions: ParsedFunction[]
+  imports: ParsedImport[]
+}
+```
+
+### `NormalizedCodeGraph`
+```ts
+type NormalizedCodeGraph = {
+  repo_context: RepoContext
+  classes: ClassNode[]
+  functions: FunctionNode[]
+  defines: DefinesEdge[]
+  imports: GraphEdge[]
+}
+```
+
+### `ResolvedCodeRelations`
+```ts
+type ResolvedCodeRelations = {
+  repo_context: RepoContext
+  relations: {
+    from: string
+    to: string
+    kind: "calls" | "references" | "inherits" | "implements"
+    confidence: number
+    source: string
+    metadata?: Record<string, unknown>
+  }[]
+}
+```
+
+### `DocumentationGraph`
+```ts
+type DocumentationGraph = {
+  repo_context: RepoContext
+  docs: DocNode[]
+  relations: GraphEdge[]
+}
+```
+
+### `ConfigGraph`
+```ts
+type ConfigGraph = {
+  repo_context: RepoContext
+  configs: ConfigNode[]
+  relations: GraphEdge[]
+}
+```
+
+### `AssetGraph`
+```ts
+type AssetGraph = {
+  repo_context: RepoContext
+  assets: AssetNode[]
+}
+```
+
+### `RiskOverlay`
+```ts
+type RiskOverlay = {
+  repo_context: RepoContext
+  annotations: {
+    target_id: string
+    risk:
+      | "auth"
+      | "permissions"
+      | "migrations"
+      | "infra"
+      | "secrets"
+      | "billing"
+      | "shared-core"
+    level: "low" | "medium" | "high"
+    confidence: number
+    source: string
+    reason: string
+  }[]
+}
+```
+
+### `NavigationOverlay`
+```ts
+type NavigationOverlay = {
+  repo_context: RepoContext
+  hints: {
+    target_id: string
+    kind: "entrypoint" | "overview" | "representative" | "starting_point"
+    area_id?: string
+    confidence: number
+    source: string
+    reason: string
+  }[]
+}
+```
+
+### `NormalizedRepositoryGraph`
+```ts
+type NormalizedRepositoryGraph = {
+  repo_context: RepoContext
+  nodes: GraphNode[]
+  edges: GraphEdge[]
+  annotations: GraphAnnotation[]
+}
+```
+
+## Canonical Query Capabilities
+The final repograph should support queries like:
+
+### Repo navigation
+- what are the main areas of this repo
+- what are the representative entrypoints
+- which docs explain each area
+
+### Code change support
+- which function actually implements this behavior
+- who calls it
+- what does it call
+- what docs and configs shape it
+- what breaks if it changes
+
+### Scope and control
+- what is in scope for this task
+- what is likely out of scope
+- which areas are high-risk
+- what would later require escalation
+
+### Performance
+- did Aethyme reduce tokens on this benchmark
+- where did the agent drift outside expected scope
+- which graph signals correlated with retries or review burden
 
 ## Layer 0: Repo Intake
 ### Purpose

@@ -1,5 +1,4 @@
 use crate::map::RepositoryMap;
-use crate::symbol::SymbolKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchHit {
@@ -16,41 +15,57 @@ pub fn symbol_search(map: &RepositoryMap, query: &str, limit: usize) -> Vec<Sear
     let lowered_query = query.to_ascii_lowercase();
     let mut hits = Vec::new();
 
-    for symbol in &map.symbols {
-        let lowered_symbol = symbol.name.to_ascii_lowercase();
-        let score = if lowered_symbol == lowered_query {
-            300
-        } else if lowered_symbol.starts_with(&lowered_query) {
-            200
-        } else if lowered_symbol.contains(&lowered_query) {
-            100
-        } else {
-            continue;
-        };
-        hits.push(SearchHit {
-            id: symbol.id.clone(),
-            name: symbol.name.clone(),
-            kind: match symbol.kind {
-                SymbolKind::Function => "function",
-                SymbolKind::Class => "class",
-                SymbolKind::Constant => "constant",
-            }
-            .to_string(),
-            file: symbol.file.clone(),
-            line: symbol.line,
-            score,
-            reason: "symbol-name-match".to_string(),
-        });
+    for class in &map.classes {
+        if let Some(score) = score_name(&class.name, &lowered_query) {
+            hits.push(SearchHit {
+                id: class.id.clone(),
+                name: class.name.clone(),
+                kind: "class".to_string(),
+                file: class.file_path.clone(),
+                line: class.line,
+                score,
+                reason: "class-name-match".to_string(),
+            });
+        }
+    }
+
+    for function in &map.functions {
+        if let Some(score) = score_name(&function.name, &lowered_query) {
+            hits.push(SearchHit {
+                id: function.id.clone(),
+                name: function.name.clone(),
+                kind: "function".to_string(),
+                file: function.file_path.clone(),
+                line: function.line,
+                score,
+                reason: "function-name-match".to_string(),
+            });
+        }
     }
 
     hits.sort_by(|left, right| {
-        right.score.cmp(&left.score)
+        right
+            .score
+            .cmp(&left.score)
             .then_with(|| left.file.cmp(&right.file))
             .then_with(|| left.line.cmp(&right.line))
             .then_with(|| left.name.cmp(&right.name))
     });
     hits.truncate(limit);
     hits
+}
+
+fn score_name(name: &str, lowered_query: &str) -> Option<i32> {
+    let lowered_name = name.to_ascii_lowercase();
+    if lowered_name == lowered_query {
+        Some(300)
+    } else if lowered_name.starts_with(lowered_query) {
+        Some(200)
+    } else if lowered_name.contains(lowered_query) {
+        Some(100)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

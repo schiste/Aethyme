@@ -108,13 +108,11 @@ pub struct ContextPack {
 
 impl ContextPack {
     pub fn sort(&mut self) {
-        self.anchors.sort();
         self.in_scope.sort();
         self.out_of_scope.sort();
         self.dependencies.sort();
         self.impact.sort();
         self.snippets.sort();
         self.risk_flags.sort();
-        self.navigation_order.sort();
     }
 }

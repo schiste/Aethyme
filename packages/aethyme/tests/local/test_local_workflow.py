@@ -40,6 +40,9 @@ def test_local_repo_inspect_and_pack(tmp_path: Path) -> None:
     inspect_payload = json.loads(inspect_result.output)
     assert inspect_payload["snapshot"]["readme_path"] == "README.md"
     assert inspect_payload["symbols"]
+    assert inspect_payload["areas"]
+    assert inspect_payload["files"]
+    assert inspect_payload["graph"]["nodes"]
 
     pack_result = runner.invoke(
         cli,
@@ -50,6 +53,7 @@ def test_local_repo_inspect_and_pack(tmp_path: Path) -> None:
     assert pack_payload["task"]["kind"] == "explain_repo"
     assert pack_payload["anchors"]
     assert "README.md" in pack_payload["navigation_order"]
+    assert pack_payload["in_scope"]["areas"]
 
 
 def test_local_eval_explain_repo(tmp_path: Path) -> None:
