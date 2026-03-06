@@ -1,14 +1,14 @@
 """Tests for safety engine."""
 
-import pytest
 from pathlib import Path
-from src.autofixers.safety import SafetyEngine, GeneratedFileDetector, RiskLevel
+
+from src.autofixers.safety import GeneratedFileDetector, RiskLevel, SafetyEngine
 
 
 class TestGeneratedFileDetector:
     """Tests for generated file detection."""
 
-    def test_detects_lock_files(self, tmp_path):
+    def test_detects_lock_files(self, tmp_path: Path):
         """Should detect lock files."""
         detector = GeneratedFileDetector()
 
@@ -17,7 +17,7 @@ class TestGeneratedFileDetector:
 
         assert detector.is_generated(lock_file)
 
-    def test_detects_generated_pattern(self, tmp_path):
+    def test_detects_generated_pattern(self, tmp_path: Path):
         """Should detect files with .generated. pattern."""
         detector = GeneratedFileDetector()
 
@@ -26,7 +26,7 @@ class TestGeneratedFileDetector:
 
         assert detector.is_generated(gen_file)
 
-    def test_detects_build_directories(self, tmp_path):
+    def test_detects_build_directories(self, tmp_path: Path):
         """Should detect files in build directories."""
         detector = GeneratedFileDetector()
 
@@ -36,7 +36,7 @@ class TestGeneratedFileDetector:
 
         assert detector.is_generated(build_file)
 
-    def test_detects_generated_header(self, tmp_path):
+    def test_detects_generated_header(self, tmp_path: Path):
         """Should detect files with generated header."""
         detector = GeneratedFileDetector()
 
@@ -45,7 +45,7 @@ class TestGeneratedFileDetector:
 
         assert detector.is_generated(gen_file)
 
-    def test_does_not_detect_normal_files(self, tmp_path):
+    def test_does_not_detect_normal_files(self, tmp_path: Path):
         """Should not detect normal files as generated."""
         detector = GeneratedFileDetector()
 
@@ -54,7 +54,7 @@ class TestGeneratedFileDetector:
 
         assert not detector.is_generated(normal_file)
 
-    def test_filters_safe_files(self, tmp_path):
+    def test_filters_safe_files(self, tmp_path: Path):
         """Should filter list to safe files only."""
         detector = GeneratedFileDetector()
 
@@ -78,7 +78,7 @@ class TestGeneratedFileDetector:
 class TestSafetyEngine:
     """Tests for safety engine."""
 
-    def test_assess_low_risk_docs(self, tmp_path):
+    def test_assess_low_risk_docs(self, tmp_path: Path):
         """Should assess docs regeneration as low risk."""
         engine = SafetyEngine()
 
@@ -88,7 +88,7 @@ class TestSafetyEngine:
         risk = engine.assess_risk(doc_file, "docs_regen")
         assert risk == RiskLevel.LOW
 
-    def test_assess_high_risk_config(self, tmp_path):
+    def test_assess_high_risk_config(self, tmp_path: Path):
         """Should assess config files as high risk."""
         engine = SafetyEngine()
 
@@ -98,7 +98,7 @@ class TestSafetyEngine:
         risk = engine.assess_risk(config_file, "any_fix")
         assert risk == RiskLevel.HIGH
 
-    def test_assess_medium_risk_test(self, tmp_path):
+    def test_assess_medium_risk_test(self, tmp_path: Path):
         """Should assess test files as medium risk."""
         engine = SafetyEngine()
 
@@ -108,15 +108,18 @@ class TestSafetyEngine:
         risk = engine.assess_risk(test_file, "format_fix")
         assert risk == RiskLevel.MEDIUM
 
-    def test_rejects_generated_files(self, tmp_path):
+    def test_rejects_generated_files(self, tmp_path: Path):
         """Should raise error for generated files."""
         engine = SafetyEngine()
 
         gen_file = tmp_path / "schema.generated.ts"
         gen_file.touch()
 
-        with pytest.raises(ValueError, match="Cannot modify generated file"):
+        try:
             engine.assess_risk(gen_file, "any_fix")
+            raise AssertionError("Expected ValueError for generated file")
+        except ValueError as err:
+            assert "Cannot modify generated file" in str(err)
 
     def test_validates_safe_changes(self):
         """Should validate safe changes."""
@@ -154,7 +157,7 @@ class TestSafetyEngine:
         assert not validation["safe"]
         assert any("doubled" in w for w in validation["warnings"])
 
-    def test_should_skip_generated_file(self, tmp_path):
+    def test_should_skip_generated_file(self, tmp_path: Path):
         """Should skip generated files."""
         engine = SafetyEngine()
 

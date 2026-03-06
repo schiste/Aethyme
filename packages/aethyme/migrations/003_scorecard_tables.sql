@@ -47,9 +47,17 @@ ALTER TABLE aethyme.scorecard_scans ENABLE ROW LEVEL SECURITY;
 -- Policy: Users can only see scans for their tenant
 CREATE POLICY scorecard_scans_tenant_isolation ON aethyme.scorecard_scans
     FOR ALL
-    USING (tenant_id = current_setting('app.tenant_id')::UUID);
+    USING (tenant_id = current_setting('app.current_tenant', true)::UUID);
 
 -- Grant permissions
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aethyme_app') THEN
+        CREATE ROLE aethyme_app;
+    END IF;
+END $$;
+
+GRANT USAGE ON SCHEMA aethyme TO aethyme_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON aethyme.scorecard_scans TO aethyme_app;
 
 -- Add comment for documentation

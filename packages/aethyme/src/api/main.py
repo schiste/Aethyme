@@ -1,43 +1,84 @@
 """Main FastAPI application for Aethyme."""
 
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Dict, Any
+from typing import Any, TypeAlias, cast
+
+import structlog
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from prometheus_client import make_asgi_app
-import structlog
-import redis
+from slowapi.util import get_remote_address
 
 from ..config import settings
 from ..graph.connection_pool import db_pool
+from .endpoints import index_status
+from .routes import (
+    auth as auth_routes,
+)
 from .routes import (
     ego,
-    impact,
-    search,
     health,
-    auth as auth_routes,
+    impact,
     scorecard,
-    autofix,
-    telemetry,
-    guardrails,
-    unified,
+    search,
 )
-from .endpoints import index_status
 
 logger = structlog.get_logger(__name__)
+ASGIApp: TypeAlias = Callable[[Any, Any, Any], Awaitable[None]]
 
 
 # Rate limiting
 limiter = Limiter(key_func=get_remote_address)
 
 
+def create_redis_client(url: str) -> Any:
+    """Create a Redis client without leaking third-party partial types."""
+    from redis.utils import from_url as redis_from_url
+
+    typed_from_url = cast(Callable[..., Any], redis_from_url)
+    return typed_from_url(url, decode_responses=True)
+
+
+def create_metrics_app() -> ASGIApp:
+    """Create the Prometheus ASGI application."""
+    from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
+    async def metrics_app(scope: Any, receive: Any, send: Any) -> None:
+        del receive
+        if scope.get("type") != "http":
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 404,
+                    "headers": [(b"content-length", b"0")],
+                }
+            )
+            await send({"type": "http.response.body", "body": b""})
+            return
+
+        payload = generate_latest()
+        headers = [
+            (b"content-type", CONTENT_TYPE_LATEST.encode("ascii")),
+            (b"content-length", str(len(payload)).encode("ascii")),
+        ]
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": headers,
+            }
+        )
+        await send({"type": "http.response.body", "body": payload})
+
+    return metrics_app
+
+
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application lifecycle with proper cleanup."""
     # Startup
     logger.info("Starting Aethyme API")
@@ -45,11 +86,9 @@ async def lifespan(app: FastAPI):
     # Initialize Redis if configured
     if settings.redis_url_str:
         try:
-            app.state.redis = redis.Redis.from_url(
-                settings.redis_url_str,
-                decode_responses=True,
-            )
-            app.state.redis.ping()
+            redis_client = create_redis_client(settings.redis_url_str)
+            redis_client.ping()
+            app.state.redis = redis_client
             logger.info("Redis connected", url=settings.redis_url_str)
         except Exception as e:
             logger.warning("Redis not available, caching disabled", error=str(e))
@@ -108,7 +147,15 @@ app.add_middleware(
 
 # Rate limiting
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+def rate_limit_exception_handler(request: Request, exc: Exception) -> Response:
+    """Bridge slowapi's specific handler signature to FastAPI's generic contract."""
+    rate_limit_exc = cast(RateLimitExceeded, exc)
+    return _rate_limit_exceeded_handler(request, rate_limit_exc)
+
+
+app.add_exception_handler(RateLimitExceeded, rate_limit_exception_handler)
 
 
 # Exception handlers
@@ -169,35 +216,10 @@ app.include_router(
     tags=["scorecard"],
 )
 
-app.include_router(
-    autofix.router,
-    prefix="/api/v1/autofix",
-    tags=["autofix"],
-)
-
-app.include_router(
-    telemetry.router,
-    prefix="/api/v1/telemetry",
-    tags=["telemetry"],
-)
-
-app.include_router(
-    guardrails.router,
-    prefix="/api/v1/guardrails",
-    tags=["guardrails"],
-)
-
-app.include_router(
-    unified.router,
-    prefix="/api/v1",
-    tags=["system"],
-)
-
 
 # Mount Prometheus metrics endpoint
 if settings.metrics_enabled:
-    metrics_app = make_asgi_app()
-    app.mount("/metrics", metrics_app)
+    app.mount("/metrics", create_metrics_app())
 
 
 @app.get("/")

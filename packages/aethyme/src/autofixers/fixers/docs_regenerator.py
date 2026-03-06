@@ -1,13 +1,13 @@
 """Regenerates documentation files like FOLDER.md and index files."""
 
-import os
+import re
 from pathlib import Path
-from typing import Optional, List, Dict
-import structlog
+from typing import Any
 
+from .._log import get_logger
 from .base import BaseFixer
 
-logger = structlog.get_logger()
+logger = get_logger()
 
 
 class DocsRegenerator(BaseFixer):
@@ -23,13 +23,13 @@ class DocsRegenerator(BaseFixer):
         """This fixer creates new files, not modifies existing ones."""
         return False
 
-    def fix(self, file_path: Path, content: str) -> Optional[str]:
+    def fix(self, file_path: Path, content: str) -> str | None:
         """Not used - this fixer creates new files."""
         return None
 
-    def find_directories_missing_folder_doc(self) -> List[Path]:
+    def find_directories_missing_folder_doc(self) -> list[Path]:
         """Find directories that should have FOLDER.md but don't."""
-        missing = []
+        missing: list[Path] = []
 
         for dirpath in self.repo_path.rglob("*"):
             if not dirpath.is_dir():
@@ -65,8 +65,8 @@ class DocsRegenerator(BaseFixer):
     def generate_folder_doc(self, directory: Path) -> str:
         """Generate FOLDER.md content for a directory."""
         # Analyze directory contents
-        files = []
-        subdirs = []
+        files: list[Path] = []
+        subdirs: list[Path] = []
 
         for item in sorted(directory.iterdir()):
             if item.name.startswith('.'):
@@ -80,9 +80,8 @@ class DocsRegenerator(BaseFixer):
         # Get relative path from repo root
         try:
             rel_path = directory.relative_to(self.repo_path)
-            dir_name = str(rel_path).replace('/', ' > ')
         except ValueError:
-            dir_name = directory.name
+            rel_path = directory
 
         # Build documentation
         lines = [
@@ -98,7 +97,7 @@ class DocsRegenerator(BaseFixer):
 
         # List files by type
         if files:
-            files_by_ext = {}
+            files_by_ext: dict[str, list[Path]] = {}
             for f in files:
                 ext = f.suffix or "no extension"
                 if ext not in files_by_ext:
@@ -137,10 +136,10 @@ class DocsRegenerator(BaseFixer):
 
         return "\n".join(lines)
 
-    def _extract_file_purpose(self, file_path: Path) -> Optional[str]:
+    def _extract_file_purpose(self, file_path: Path) -> str | None:
         """Extract first comment/docstring from file."""
         try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            with open(file_path, encoding='utf-8', errors='ignore') as f:
                 lines = [f.readline() for _ in range(20)]  # First 20 lines
 
             content = ''.join(lines)
@@ -148,7 +147,6 @@ class DocsRegenerator(BaseFixer):
             # Python docstring
             if file_path.suffix == '.py':
                 # Look for module docstring
-                import re
                 match = re.search(r'"""(.*?)"""', content, re.DOTALL)
                 if match:
                     doc = match.group(1).strip()
@@ -161,7 +159,6 @@ class DocsRegenerator(BaseFixer):
 
             # JavaScript/TypeScript comment
             if file_path.suffix in {'.js', '.ts', '.tsx', '.jsx'}:
-                import re
                 match = re.search(r'/\*\*(.*?)\*/', content, re.DOTALL)
                 if match:
                     doc = match.group(1).strip()
@@ -172,15 +169,15 @@ class DocsRegenerator(BaseFixer):
                     )
                     return doc.split('\n')[0][:100]
 
-        except Exception:
-            pass
+        except OSError as exc:
+            logger.warning("Failed to inspect file purpose", path=str(file_path), error=str(exc))
 
         return None
 
-    def create_folder_docs(self) -> List[Dict[str, any]]:
+    def create_folder_docs(self) -> list[dict[str, Any]]:
         """Create FOLDER.md files for directories missing them."""
         missing_dirs = self.find_directories_missing_folder_doc()
-        created = []
+        created: list[dict[str, Any]] = []
 
         for directory in missing_dirs:
             try:
@@ -205,15 +202,15 @@ class DocsRegenerator(BaseFixer):
         self.files_processed = len(missing_dirs)
         return created
 
-    def update_existing_folder_docs(self) -> List[Dict[str, any]]:
+    def update_existing_folder_docs(self) -> list[dict[str, Any]]:
         """Update existing FOLDER.md files with fresh content."""
-        updated = []
+        updated: list[dict[str, Any]] = []
 
         for doc_path in self.repo_path.rglob(self.FOLDER_DOC_NAME):
             try:
                 directory = doc_path.parent
 
-                with open(doc_path, 'r', encoding='utf-8') as f:
+                with open(doc_path, encoding='utf-8') as f:
                     original_content = f.read()
 
                 new_content = self.generate_folder_doc(directory)

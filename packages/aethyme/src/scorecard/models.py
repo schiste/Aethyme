@@ -1,12 +1,13 @@
 """Data models for AI-Readiness Scorecard."""
 
-from enum import Enum
-from typing import List, Dict, Optional, Any
-from pydantic import BaseModel, Field
-from datetime import datetime
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import cast
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
-class Severity(str, Enum):
+class Severity(StrEnum):
     """Severity levels for findings."""
     BLOCKER = "blocker"
     WARNING = "warning"
@@ -15,39 +16,38 @@ class Severity(str, Enum):
 
 class Finding(BaseModel):
     """A single finding from a detector."""
+    model_config = ConfigDict(use_enum_values=True)
+
     detector: str = Field(..., description="Name of the detector that found this issue")
     severity: Severity = Field(..., description="Severity level")
     message: str = Field(..., description="Human-readable description")
     file_path: str = Field(..., description="File path where issue was found")
-    line_number: Optional[int] = Field(None, description="Line number if applicable")
-    evidence: Optional[str] = Field(None, description="Code snippet or evidence")
-    suggestion: Optional[str] = Field(None, description="Suggested fix")
-
-    class Config:
-        use_enum_values = True
+    line_number: int | None = Field(None, description="Line number if applicable")
+    evidence: str | None = Field(None, description="Code snippet or evidence")
+    suggestion: str | None = Field(None, description="Suggested fix")
 
 
 class DetectorResult(BaseModel):
     """Result from a single detector."""
     detector_name: str
-    findings: List[Finding] = Field(default_factory=list)
+    findings: list[Finding] = Field(default_factory=lambda: cast(list[Finding], []))
     execution_time_ms: float
-    error: Optional[str] = None
+    error: str | None = None
 
 
 class ScorecardReport(BaseModel):
     """Complete scorecard report."""
     scan_id: str
     repository_path: str
-    repository_id: Optional[str] = None
-    tenant_id: Optional[str] = None
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    repository_id: str | None = None
+    tenant_id: str | None = None
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     score: int = Field(..., ge=0, le=100, description="Overall AI-readiness score")
 
     # Findings by severity
-    blockers: List[Finding] = Field(default_factory=list)
-    warnings: List[Finding] = Field(default_factory=list)
-    info: List[Finding] = Field(default_factory=list)
+    blockers: list[Finding] = Field(default_factory=lambda: cast(list[Finding], []))
+    warnings: list[Finding] = Field(default_factory=lambda: cast(list[Finding], []))
+    info: list[Finding] = Field(default_factory=lambda: cast(list[Finding], []))
 
     # Summary statistics
     total_findings: int = 0
@@ -56,7 +56,7 @@ class ScorecardReport(BaseModel):
     info_count: int = 0
 
     # Detector results
-    detector_results: List[DetectorResult] = Field(default_factory=list)
+    detector_results: list[DetectorResult] = Field(default_factory=lambda: cast(list[DetectorResult], []))
 
     # Performance metrics
     total_scan_time_ms: float = 0.0
@@ -96,7 +96,7 @@ class ScorecardReport(BaseModel):
 class ScanSummary(BaseModel):
     """Summary view of a scan for API responses."""
     scan_id: str
-    repository_id: Optional[str]
+    repository_id: str | None
     timestamp: datetime
     score: int
     blocker_count: int

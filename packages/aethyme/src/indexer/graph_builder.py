@@ -1,16 +1,43 @@
 """Graph construction module for building code graphs from indexed data."""
 
-from typing import List, Dict, Any, Optional, Callable, Tuple, Set
 from collections import defaultdict
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, TypeAlias, TypedDict, cast
+
 import structlog
 
-from ..models.graph import Node, Edge, EdgeType, NodeKind
 from ..graph.store import GraphStore
-from .scip_wrapper import SCIPIndexer
-from .fallback_indexer import FallbackIndexer
+from ..models.graph import Edge, EdgeType, Node, NodeKind
 
 logger = structlog.get_logger(__name__)
+
+EdgeTuple: TypeAlias = tuple[str, str, str]
+
+
+class TopSymbol(TypedDict):
+    """Most referenced symbol entry."""
+
+    symbol: str
+    references: int
+
+
+class GraphAnalysis(TypedDict):
+    """Shape returned by analyze_graph."""
+
+    total_nodes: int
+    total_edges: int
+    node_types: dict[str, int]
+    edge_types: dict[str, int]
+    top_symbols: list[TopSymbol]
+    orphan_nodes: int
+    strongly_connected_components: int
+
+
+def _new_error_list() -> list[str]:
+    """Return a fresh error list for dataclass defaults."""
+    return []
 
 
 @dataclass
@@ -22,11 +49,7 @@ class GraphBuilderStats:
     definitions_found: int = 0
     references_found: int = 0
     files_processed: int = 0
-    errors: List[str] = None
-
-    def __post_init__(self):
-        if self.errors is None:
-            self.errors = []
+    errors: list[str] = field(default_factory=_new_error_list)
 
 
 class GraphBuilder:
@@ -36,7 +59,7 @@ class GraphBuilder:
         self,
         store: GraphStore,
         batch_size: int = 1000,
-        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        progress_callback: Callable[[int, int, str], None] | None = None,
     ):
         """
         Initialize graph builder.
@@ -51,14 +74,21 @@ class GraphBuilder:
         self.progress_callback = progress_callback
 
         # Track nodes and edges during building
-        self.nodes: List[Node] = []
-        self.edges: List[Edge] = []
-        self.symbol_to_def: Dict[str, str] = {}  # symbol -> node_id mapping
+        self.nodes: list[Node] = []
+        self.edges: list[Edge] = []
+        self.symbol_to_def: dict[str, str] = {}  # symbol -> node_id mapping
+        self.stats = GraphBuilderStats()
+
+    def _reset_state(self) -> None:
+        """Reset per-build state so one builder can safely handle multiple runs."""
+        self.nodes = []
+        self.edges = []
+        self.symbol_to_def = {}
         self.stats = GraphBuilderStats()
 
     def build_from_scip(
         self,
-        scip_data: Dict[str, Any],
+        scip_data: dict[str, Any],
         repository_id: str,
         language: str,
     ) -> GraphBuilderStats:
@@ -78,6 +108,8 @@ class GraphBuilder:
             repository_id=repository_id,
             language=language,
         )
+
+        self._reset_state()
 
         # Extract nodes from SCIP data
         for doc in scip_data.get("documents", []):
@@ -101,8 +133,8 @@ class GraphBuilder:
 
     def build_from_fallback(
         self,
-        nodes: List[Node],
-        edges: List[tuple],
+        nodes: list[Node],
+        edges: list[EdgeTuple],
         repository_id: str,
     ) -> GraphBuilderStats:
         """
@@ -122,6 +154,8 @@ class GraphBuilder:
             nodes_count=len(nodes),
             edges_count=len(edges),
         )
+
+        self._reset_state()
 
         self.nodes = nodes
         self.stats.nodes_processed = len(nodes)
@@ -145,6 +179,7 @@ class GraphBuilder:
             self.stats.edges_created += 1
 
         # Add additional edges
+        self._build_reference_edges()
         self._build_containment_edges()
         self._build_import_edges()
 
@@ -153,7 +188,7 @@ class GraphBuilder:
 
         return self.stats
 
-    def _process_scip_document(self, doc: Dict[str, Any], language: str) -> None:
+    def _process_scip_document(self, doc: dict[str, Any], language: str) -> None:
         """Process a single SCIP document."""
         file_path = doc.get("relative_path", "")
         if not file_path:
@@ -197,10 +232,10 @@ class GraphBuilder:
 
     def _create_node_from_occurrence(
         self,
-        occurrence: Dict[str, Any],
+        occurrence: dict[str, Any],
         file_path: str,
         language: str,
-    ) -> Optional[Node]:
+    ) -> Node | None:
         """Create a Node from a SCIP occurrence."""
         symbol = occurrence.get("symbol", "")
         if not symbol:
@@ -248,7 +283,7 @@ class GraphBuilder:
         self,
         symbol: str,
         is_definition: bool,
-        occurrence: Dict[str, Any],
+        occurrence: dict[str, Any],
     ) -> str:
         """Determine the specific kind of node."""
         if not is_definition:
@@ -278,11 +313,21 @@ class GraphBuilder:
 
     def _build_reference_edges(self) -> None:
         """Build edges from references to definitions."""
+        imports_by_file: dict[str, list[Node]] = defaultdict(list)
+        for node in self.nodes:
+            if node.kind == NodeKind.IMPORT:
+                imports_by_file[node.file_path].append(node)
+
+        seen_edges: set[tuple[str, str, str]] = set()
         for node in self.nodes:
             if node.kind == NodeKind.REFERENCE:
-                # Find the definition for this reference
-                def_node_id = self.symbol_to_def.get(node.symbol)
-                if def_node_id:
+                for def_node_id in self._resolve_reference_targets(
+                    node, imports_by_file.get(node.file_path, [])
+                ):
+                    edge_key = (node.id, def_node_id, EdgeType.INVOKE)
+                    if edge_key in seen_edges:
+                        continue
+                    seen_edges.add(edge_key)
                     edge = Edge.create(
                         from_node_id=node.id,
                         to_node_id=def_node_id,
@@ -291,9 +336,52 @@ class GraphBuilder:
                     self.edges.append(edge)
                     self.stats.edges_created += 1
 
+    def _resolve_reference_targets(
+        self,
+        reference_node: Node,
+        import_nodes: list[Node],
+    ) -> set[str]:
+        """Resolve a fallback reference node to candidate definitions."""
+        exact_match = self.symbol_to_def.get(reference_node.symbol)
+        if exact_match:
+            return {exact_match}
+
+        local_name = self._reference_local_name(reference_node.symbol)
+        qualifier = self._reference_qualifier(reference_node.symbol)
+        matches = self._match_local_definitions(reference_node.file_path, local_name)
+
+        for import_node in import_nodes:
+            import_mode = self._extract_import_mode(import_node)
+            imported_names = self._extract_imported_names(import_node)
+
+            if import_mode == "named":
+                if imported_names and local_name not in imported_names:
+                    continue
+            elif import_mode in {"module", "namespace"}:
+                if qualifier is None or (imported_names and qualifier not in imported_names):
+                    continue
+            elif import_mode == "default":
+                if imported_names and reference_node.symbol not in imported_names and qualifier not in imported_names:
+                    continue
+
+            import_targets = self._resolve_import_targets(import_node)
+            if import_mode == "default" and qualifier is None:
+                matches.update(import_targets)
+                continue
+
+            matches.update(self._filter_definition_targets(import_targets, local_name))
+
+        if matches:
+            return matches
+
+        global_matches = self._match_definitions_by_local_name(local_name)
+        if len(global_matches) == 1:
+            return global_matches
+        return set()
+
     def _build_containment_edges(self) -> None:
         """Build edges from files to their contained definitions."""
-        file_to_nodes: Dict[str, List[str]] = defaultdict(list)
+        file_to_nodes: dict[str, list[str]] = defaultdict(list)
 
         for node in self.nodes:
             if node.kind in [NodeKind.DEFINITION, NodeKind.CLASS, NodeKind.FUNCTION, NodeKind.METHOD]:
@@ -326,14 +414,14 @@ class GraphBuilder:
     def _build_import_edges(self) -> None:
         """Build edges for import relationships."""
         # Track imports by file
-        imports_by_file: Dict[str, Set[str]] = defaultdict(set)
+        imports_by_file: dict[str, list[Node]] = defaultdict(list)
 
         for node in self.nodes:
             if node.kind == NodeKind.IMPORT:
-                imports_by_file[node.file_path].add(node.symbol)
+                imports_by_file[node.file_path].append(node)
 
         # Create edges from importing file to imported symbols
-        for file_path, imported_symbols in imports_by_file.items():
+        for file_path, import_nodes in imports_by_file.items():
             # Find file node
             file_node = next(
                 (n for n in self.nodes if n.kind == NodeKind.FILE and n.file_path == file_path),
@@ -341,10 +429,8 @@ class GraphBuilder:
             )
 
             if file_node:
-                for symbol in imported_symbols:
-                    # Try to find definition of imported symbol
-                    def_node_id = self.symbol_to_def.get(symbol)
-                    if def_node_id:
+                for import_node in import_nodes:
+                    for def_node_id in self._resolve_import_targets(import_node):
                         edge = Edge.create(
                             from_node_id=file_node.id,
                             to_node_id=def_node_id,
@@ -352,6 +438,120 @@ class GraphBuilder:
                         )
                         self.edges.append(edge)
                         self.stats.edges_created += 1
+
+    def _resolve_import_targets(self, import_node: Node) -> set[str]:
+        """Resolve import nodes to definitions using module-path heuristics."""
+        symbol = import_node.symbol
+        direct_match = self.symbol_to_def.get(symbol)
+        if direct_match:
+            return {direct_match}
+
+        normalized = self._normalize_import_symbol(symbol)
+        normalized_stem = Path(normalized).with_suffix("").as_posix()
+        module_name = Path(normalized_stem).name
+        imported_names = self._extract_imported_names(import_node)
+        import_mode = self._extract_import_mode(import_node)
+
+        matches: set[str] = set()
+        for node in self.nodes:
+            if node.kind not in [NodeKind.DEFINITION, NodeKind.CLASS, NodeKind.FUNCTION, NodeKind.METHOD]:
+                continue
+            node_stem = Path(node.file_path).with_suffix("").as_posix()
+            symbol_name = node.symbol.rsplit(":", 1)[-1]
+            local_name = symbol_name.split(".")[-1]
+            if (
+                import_mode == "named"
+                and imported_names
+                and local_name not in imported_names
+                and symbol_name not in imported_names
+            ):
+                continue
+            if (
+                node_stem == normalized_stem
+                or node_stem.endswith(normalized_stem)
+                or Path(node_stem).name == module_name
+            ):
+                matches.add(node.id)
+
+        return matches
+
+    def _normalize_import_symbol(self, symbol: str) -> str:
+        """Normalize import symbols to repository-relative module paths."""
+        normalized = symbol.strip().strip("\"'")
+        while normalized.startswith("."):
+            normalized = normalized[1:]
+        normalized = normalized.removeprefix("./").removeprefix("/")
+        normalized = normalized.replace(".", "/")
+        return normalized
+
+    def _extract_imported_names(self, import_node: Node) -> list[str]:
+        """Return imported symbol names if present on an import node."""
+        metadata = import_node.metadata or {}
+        raw_names = metadata.get("imported_names", [])
+        if not isinstance(raw_names, list):
+            return []
+
+        names: list[str] = []
+        for raw_name in cast(list[object], raw_names):
+            if isinstance(raw_name, str) and raw_name:
+                names.append(raw_name)
+        return names
+
+    def _extract_import_mode(self, import_node: Node) -> str:
+        """Return the import mode carried by the fallback import node."""
+        metadata = import_node.metadata or {}
+        raw_mode = metadata.get("import_mode", "module")
+        if isinstance(raw_mode, str) and raw_mode:
+            return raw_mode
+        return "module"
+
+    def _reference_local_name(self, symbol: str) -> str:
+        """Return the local symbol name from a reference expression."""
+        return symbol.rsplit(".", 1)[-1]
+
+    def _reference_qualifier(self, symbol: str) -> str | None:
+        """Return the qualifier portion of a dotted reference expression."""
+        if "." not in symbol:
+            return None
+        return symbol.split(".", 1)[0]
+
+    def _definition_local_name(self, node: Node) -> str:
+        """Return the local symbol name for a definition node."""
+        symbol_name = node.symbol.rsplit(":", 1)[-1]
+        return symbol_name.split(".")[-1]
+
+    def _match_local_definitions(self, file_path: str, local_name: str) -> set[str]:
+        """Match definitions in the same file by local symbol name."""
+        matches: set[str] = set()
+        for node in self.nodes:
+            if node.file_path != file_path:
+                continue
+            if node.kind not in [NodeKind.DEFINITION, NodeKind.CLASS, NodeKind.FUNCTION, NodeKind.METHOD]:
+                continue
+            if self._definition_local_name(node) == local_name:
+                matches.add(node.id)
+        return matches
+
+    def _match_definitions_by_local_name(self, local_name: str) -> set[str]:
+        """Match definitions anywhere in the graph by local symbol name."""
+        matches: set[str] = set()
+        for node in self.nodes:
+            if node.kind not in [NodeKind.DEFINITION, NodeKind.CLASS, NodeKind.FUNCTION, NodeKind.METHOD]:
+                continue
+            if self._definition_local_name(node) == local_name:
+                matches.add(node.id)
+        return matches
+
+    def _filter_definition_targets(self, candidate_ids: set[str], local_name: str) -> set[str]:
+        """Filter candidate definition IDs by local symbol name."""
+        matches: set[str] = set()
+        candidate_set = set(candidate_ids)
+        for node in self.nodes:
+            if node.id not in candidate_set:
+                continue
+            if self._definition_local_name(node) == local_name:
+                matches.add(node.id)
+        return matches
 
     def _persist_graph(self, repository_id: str) -> None:
         """Persist nodes and edges to database in batches."""
@@ -388,13 +588,13 @@ class GraphBuilder:
 
         logger.info("Graph persisted successfully")
 
-    def analyze_graph(self) -> Dict[str, Any]:
+    def analyze_graph(self) -> GraphAnalysis:
         """Analyze the built graph for statistics and patterns."""
-        analysis = {
+        analysis: GraphAnalysis = {
             "total_nodes": len(self.nodes),
             "total_edges": len(self.edges),
-            "node_types": defaultdict(int),
-            "edge_types": defaultdict(int),
+            "node_types": {},
+            "edge_types": {},
             "top_symbols": [],
             "orphan_nodes": 0,
             "strongly_connected_components": 0,
@@ -402,14 +602,14 @@ class GraphBuilder:
 
         # Count node types
         for node in self.nodes:
-            analysis["node_types"][node.kind] += 1
+            analysis["node_types"][node.kind] = analysis["node_types"].get(node.kind, 0) + 1
 
         # Count edge types
         for edge in self.edges:
-            analysis["edge_types"][edge.edge_type] += 1
+            analysis["edge_types"][edge.edge_type] = analysis["edge_types"].get(edge.edge_type, 0) + 1
 
         # Find orphan nodes (nodes with no edges)
-        node_ids_with_edges = set()
+        node_ids_with_edges: set[str] = set()
         for edge in self.edges:
             node_ids_with_edges.add(edge.from_node_id)
             node_ids_with_edges.add(edge.to_node_id)
@@ -419,13 +619,13 @@ class GraphBuilder:
                 analysis["orphan_nodes"] += 1
 
         # Find most referenced symbols
-        reference_counts = defaultdict(int)
+        reference_counts: dict[str, int] = {}
         for edge in self.edges:
             if edge.edge_type == EdgeType.INVOKE:
-                reference_counts[edge.to_node_id] += 1
+                reference_counts[edge.to_node_id] = reference_counts.get(edge.to_node_id, 0) + 1
 
         # Get top 10 most referenced symbols
-        top_refs = sorted(
+        top_refs: list[tuple[str, int]] = sorted(
             reference_counts.items(),
             key=lambda x: x[1],
             reverse=True,
@@ -448,12 +648,12 @@ class StreamingGraphBuilder(GraphBuilder):
         self,
         store: GraphStore,
         batch_size: int = 1000,
-        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        progress_callback: Callable[[int, int, str], None] | None = None,
     ):
         """Initialize streaming graph builder."""
         super().__init__(store, batch_size, progress_callback)
-        self.current_batch_nodes: List[Node] = []
-        self.current_batch_edges: List[Edge] = []
+        self.current_batch_nodes: list[Node] = []
+        self.current_batch_edges: list[Edge] = []
 
     def add_node(self, node: Node, repository_id: str) -> None:
         """Add a node, flushing to database when batch is full."""

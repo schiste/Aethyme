@@ -5,19 +5,20 @@ Provides JSON-formatted structured logging with correlation IDs for tracing
 and comprehensive context for debugging.
 """
 
-import uuid
-import structlog
 import logging
 import sys
-from typing import Dict, Optional, Any
-from datetime import datetime
+import uuid
 from contextlib import contextmanager
+from datetime import datetime
+from typing import Any
+
+import structlog
 
 
 def setup_indexing_logging(
     log_level: str = "INFO",
     json_format: bool = True,
-):
+) -> None:
     """
     Configure structured logging for indexing operations.
 
@@ -33,7 +34,7 @@ def setup_indexing_logging(
     )
 
     # Configure structlog
-    processors = [
+    processors: list[Any] = [
         structlog.stdlib.filter_by_level,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
@@ -69,9 +70,9 @@ class IndexingLogger:
 
     def __init__(
         self,
-        repository_id: Optional[str] = None,
-        repository_name: Optional[str] = None,
-        correlation_id: Optional[str] = None,
+        repository_id: str | None = None,
+        repository_name: str | None = None,
+        correlation_id: str | None = None,
     ):
         """
         Initialize indexing logger.
@@ -97,7 +98,7 @@ class IndexingLogger:
         self,
         language: str,
         indexer_type: str,
-        additional_context: Optional[Dict[str, Any]] = None,
+        additional_context: dict[str, Any] | None = None,
     ):
         """
         Log start of indexing operation.
@@ -128,7 +129,7 @@ class IndexingLogger:
         node_count: int,
         edge_count: int,
         file_count: int,
-        additional_context: Optional[Dict[str, Any]] = None,
+        additional_context: dict[str, Any] | None = None,
     ):
         """
         Log completion of indexing operation.
@@ -166,7 +167,7 @@ class IndexingLogger:
         indexer_type: str,
         error: Exception,
         duration_seconds: float,
-        additional_context: Optional[Dict[str, Any]] = None,
+        additional_context: dict[str, Any] | None = None,
     ):
         """
         Log indexing failure.
@@ -197,7 +198,7 @@ class IndexingLogger:
         self,
         language: str,
         reason: str,
-        additional_context: Optional[Dict[str, Any]] = None,
+        additional_context: dict[str, Any] | None = None,
     ):
         """
         Log when fallback indexer is triggered.
@@ -226,7 +227,7 @@ class IndexingLogger:
         max_attempts: int,
         delay_seconds: float,
         error: Exception,
-        additional_context: Optional[Dict[str, Any]] = None,
+        additional_context: dict[str, Any] | None = None,
     ):
         """
         Log retry attempt.
@@ -257,8 +258,8 @@ class IndexingLogger:
 
     def log_language_breakdown(
         self,
-        language_stats: Dict[str, int],
-        additional_context: Optional[Dict[str, Any]] = None,
+        language_stats: dict[str, int],
+        additional_context: dict[str, Any] | None = None,
     ):
         """
         Log language breakdown.
@@ -284,7 +285,7 @@ class IndexingLogger:
         file_path: str,
         language: str,
         symbols_found: int,
-        additional_context: Optional[Dict[str, Any]] = None,
+        additional_context: dict[str, Any] | None = None,
     ):
         """
         Log processing of individual file.
@@ -314,7 +315,7 @@ class IndexingLogger:
         old_state: str,
         new_state: str,
         failure_count: int,
-        additional_context: Optional[Dict[str, Any]] = None,
+        additional_context: dict[str, Any] | None = None,
     ):
         """
         Log circuit breaker state change.
@@ -344,8 +345,8 @@ class IndexingLogger:
     def operation_context(
         self,
         operation_name: str,
-        **context_kwargs,
-    ):
+        **context_kwargs: Any,
+    ) -> Any:
         """
         Context manager for logging operation start/end.
 
@@ -359,7 +360,7 @@ class IndexingLogger:
                 pass
         """
         start_time = datetime.now()
-        context = {
+        context: dict[str, Any] = {
             "event": f"{operation_name}_start",
             "timestamp": start_time.isoformat(),
             **context_kwargs,
@@ -397,9 +398,9 @@ class IndexingLogger:
 
 
 def create_indexing_logger(
-    repository_id: Optional[str] = None,
-    repository_name: Optional[str] = None,
-    correlation_id: Optional[str] = None,
+    repository_id: str | None = None,
+    repository_name: str | None = None,
+    correlation_id: str | None = None,
 ) -> IndexingLogger:
     """
     Factory function to create an indexing logger.

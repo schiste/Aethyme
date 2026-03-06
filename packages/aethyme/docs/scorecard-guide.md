@@ -206,10 +206,10 @@ Each finding includes:
 3. **Use relative links** in documentation:
    ```markdown
    <!-- Good -->
-   See [API docs](./docs/api.md)
+   See [API docs](./reference/api.md)
 
    <!-- Bad -->
-   See [API docs](/Users/john/project/docs/api.md)
+   See [API docs](./reference/api.md)
    ```
 
 4. **Internationalize strings**:
@@ -406,5 +406,5 @@ A: Yes, both local paths and API-based scans support private repos.
 
 - [API Reference](./reference/api.md) - Full API documentation
 - [CLI Reference](./reference/cli.md) - Complete CLI command reference
-- [Autofixers Guide](./autofixer-guide.md) - Using autofixers with scorecard
-- [Architecture](./architecture.md) - Scorecard implementation details
+- [Autofixers Guide](./autofixers-guide.md) - Using autofixers with scorecard
+- [Security Architecture](./architecture/security.md) - Core security and isolation model

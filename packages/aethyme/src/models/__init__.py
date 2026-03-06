@@ -1,5 +1,5 @@
 """Data models for Aethyme."""
 
-from .graph import Node, Edge, Repository
+from .graph import Edge, Node, Repository
 
 __all__ = ["Node", "Edge", "Repository"]

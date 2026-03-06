@@ -1,11 +1,9 @@
 """Detector for missing internationalization."""
 
 import re
-from typing import List, Set
-from pathlib import Path
 
-from .base import BaseDetector
 from ..models import Finding, Severity
+from .base import BaseDetector
 
 
 class I18nGapsDetector(BaseDetector):
@@ -19,9 +17,9 @@ class I18nGapsDetector(BaseDetector):
     def description(self) -> str:
         return "Checks for hardcoded user-facing strings that should be internationalized"
 
-    def detect(self) -> List[Finding]:
+    def detect(self) -> list[Finding]:
         """Detect hardcoded strings in UI components."""
-        findings = []
+        findings: list[Finding] = []
 
         # Pattern for JSX/TSX strings
         jsx_string_patterns = [

@@ -1,11 +1,9 @@
 """Detector for missing data-ui test selectors."""
 
 import re
-from typing import List
-from pathlib import Path
 
-from .base import BaseDetector
 from ..models import Finding, Severity
+from .base import BaseDetector
 
 
 class DataUICoverageDetector(BaseDetector):
@@ -19,9 +17,9 @@ class DataUICoverageDetector(BaseDetector):
     def description(self) -> str:
         return "Checks for missing data-ui attributes in UI components"
 
-    def detect(self) -> List[Finding]:
+    def detect(self) -> list[Finding]:
         """Detect UI components without data-ui selectors."""
-        findings = []
+        findings: list[Finding] = []
 
         # Patterns for UI components
         component_patterns = [

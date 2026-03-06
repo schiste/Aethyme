@@ -1,17 +1,20 @@
 """Impact analysis API routes."""
 
-from typing import Dict, Any, List
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 import json
+from typing import TypeAlias, cast
 
+import structlog
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+from ...auth import RepoReadUser
 from ...graph.store import GraphStore
-from ..auth import jwt_or_api_key, User
 
+logger = structlog.get_logger(__name__)
 router = APIRouter()
-limiter = Limiter(key_func=get_remote_address)
+
+ImpactDepthMap: TypeAlias = dict[int, list[dict[str, str]]]
+BulkImpactEntry: TypeAlias = dict[str, int | str]
 
 
 class ImpactAnalysisRequest(BaseModel):
@@ -43,14 +46,14 @@ class ImpactAnalysisResponse(BaseModel):
     symbol: str
     total_impacted: int
     max_depth_reached: int
-    by_depth: Dict[int, List[Dict[str, str]]]
+    by_depth: ImpactDepthMap
     cached: bool = False
 
 
 @router.post("/", response_model=ImpactAnalysisResponse)
 async def analyze_impact(
     request: ImpactAnalysisRequest,
-    user: User = Depends(jwt_or_api_key),
+    user: RepoReadUser,
 ) -> ImpactAnalysisResponse:
     """
     Analyze the impact of changes to a symbol.
@@ -69,8 +72,8 @@ async def analyze_impact(
             cached = app.state.redis.get(cache_key)
             if cached:
                 cached_result = json.loads(cached)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Impact cache read failed", cache_key=cache_key, error=str(exc))
 
     if cached_result:
         return ImpactAnalysisResponse(
@@ -100,8 +103,8 @@ async def analyze_impact(
                 600,  # 10 minutes (longer cache for expensive query)
                 json.dumps(result, default=str),
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Impact cache write failed", cache_key=cache_key, error=str(exc))
 
     return ImpactAnalysisResponse(
         symbol=request.symbol,
@@ -115,10 +118,10 @@ async def analyze_impact(
 class BulkImpactRequest(BaseModel):
     """Request model for bulk impact analysis."""
 
-    symbols: List[str] = Field(
+    symbols: list[str] = Field(
         ...,
-        min_items=1,
-        max_items=50,
+        min_length=1,
+        max_length=50,
         description="List of symbols to analyze",
     )
     max_depth: int = Field(
@@ -132,15 +135,15 @@ class BulkImpactRequest(BaseModel):
 class BulkImpactResponse(BaseModel):
     """Response model for bulk impact analysis."""
 
-    results: Dict[str, Dict[str, Any]]
+    results: dict[str, BulkImpactEntry]
     total_unique_impacted: int
-    overlapping_impacts: List[str]
+    overlapping_impacts: list[str]
 
 
 @router.post("/bulk", response_model=BulkImpactResponse)
 async def bulk_impact_analysis(
     request: BulkImpactRequest,
-    user: User = Depends(jwt_or_api_key),
+    user: RepoReadUser,
 ) -> BulkImpactResponse:
     """
     Analyze impact for multiple symbols.
@@ -148,9 +151,9 @@ async def bulk_impact_analysis(
     Useful for understanding the combined impact of multiple changes.
     """
     store = GraphStore(tenant_id=user.tenant_id)
-    results = {}
-    all_impacted = set()
-    symbol_impacts = {}
+    results: dict[str, BulkImpactEntry] = {}
+    all_impacted: set[str] = set()
+    symbol_impacts: dict[str, set[str]] = {}
 
     for symbol in request.symbols:
         result = store.impact_analysis(
@@ -166,10 +169,24 @@ async def bulk_impact_analysis(
             }
 
             # Track impacted symbols
-            impacted = set()
-            for depth_nodes in result.get("by_depth", {}).values():
-                for node in depth_nodes:
-                    impacted.add(node["symbol"])
+            impacted: set[str] = set()
+            raw_by_depth = result.get("by_depth", {})
+            by_depth: dict[object, object]
+            if isinstance(raw_by_depth, dict):
+                by_depth = cast(dict[object, object], raw_by_depth)
+            else:
+                by_depth = {}
+            for raw_depth_nodes in by_depth.values():
+                if not isinstance(raw_depth_nodes, list):
+                    continue
+                depth_nodes = cast(list[object], raw_depth_nodes)
+                for raw_node in depth_nodes:
+                    if not isinstance(raw_node, dict):
+                        continue
+                    typed_node = cast(dict[str, object], raw_node)
+                    symbol_value = typed_node.get("symbol")
+                    if isinstance(symbol_value, str):
+                        impacted.add(symbol_value)
 
             symbol_impacts[symbol] = impacted
             all_impacted.update(impacted)
@@ -177,7 +194,7 @@ async def bulk_impact_analysis(
             results[symbol] = {"error": result["error"]}
 
     # Find overlapping impacts (symbols impacted by multiple changes)
-    overlapping = []
+    overlapping: list[str] = []
     for symbol in all_impacted:
         affecting_symbols = [
             s for s, impacts in symbol_impacts.items() if symbol in impacts

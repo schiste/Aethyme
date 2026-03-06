@@ -1,46 +1,28 @@
 """Aethyme API client."""
 
-from typing import Optional, Dict, Any, List
+from typing import Any
+
 import httpx
+
 from .auth import AuthManager
+from .exceptions import APIError
 from .query import QueryAPI
 from .scorecard import ScorecardAPI
-from .autofix import AutofixAPI
-from .telemetry import TelemetryAPI
-from .guardrails import GuardrailsAPI
-from .exceptions import APIError
 
 
 class AethymeClient:
-    """
-    Aethyme API client.
-
-    Args:
-        api_key: Aethyme API key
-        org_id: Organization ID
-        base_url: Base URL for API (defaults to production)
-        timeout: Request timeout in seconds (default: 30)
-
-    Example:
-        >>> client = AethymeClient(api_key="...", org_id="...")
-        >>> results = client.query.search("UserService")
-        >>> scorecard = client.scorecard.scan(repo_id="abc123")
-    """
+    """Thin client for the live Aethyme core API."""
 
     def __init__(
         self,
         api_key: str,
         org_id: str,
-        base_url: str = "https://api.aethyme.com/v1",
+        base_url: str = "https://api.aethyme.com",
         timeout: float = 30.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-
-        # Initialize auth manager
         self.auth = AuthManager(api_key, org_id)
-
-        # Initialize HTTP client
         self._client = httpx.Client(
             base_url=self.base_url,
             timeout=timeout,
@@ -52,84 +34,47 @@ class AethymeClient:
             },
         )
 
-        # Initialize API modules
         self.query = QueryAPI(self)
         self.scorecard = ScorecardAPI(self)
-        self.autofix = AutofixAPI(self)
-        self.telemetry = TelemetryAPI(self)
-        self.guardrails = GuardrailsAPI(self)
 
-    def request(
-        self,
-        method: str,
-        path: str,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """
-        Make an API request.
-
-        Args:
-            method: HTTP method (GET, POST, etc.)
-            path: API path (e.g., "/search")
-            **kwargs: Additional arguments for httpx request
-
-        Returns:
-            Response data as dictionary
-
-        Raises:
-            APIError: If request fails
-        """
-        url = f"{self.base_url}{path}"
-
+    def request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        """Make an API request and return decoded JSON."""
         try:
-            response = self._client.request(method, url, **kwargs)
+            response = self._client.request(method, path, **kwargs)
             response.raise_for_status()
             return response.json()
-        except httpx.HTTPStatusError as e:
+        except httpx.HTTPStatusError as exc:
             raise APIError(
-                f"API request failed: {e.response.status_code}",
-                status_code=e.response.status_code,
-                response=e.response.json() if e.response.text else None,
-            )
-        except httpx.RequestError as e:
-            raise APIError(f"Request error: {str(e)}")
+                f"API request failed: {exc.response.status_code}",
+                status_code=exc.response.status_code,
+                response=exc.response.json() if exc.response.text else None,
+            ) from exc
+        except httpx.RequestError as exc:
+            raise APIError(f"Request error: {exc}") from exc
 
-    def get(self, path: str, **kwargs: Any) -> Dict[str, Any]:
-        """Make a GET request."""
+    def get(self, path: str, **kwargs: Any) -> dict[str, Any]:
         return self.request("GET", path, **kwargs)
 
-    def post(self, path: str, **kwargs: Any) -> Dict[str, Any]:
-        """Make a POST request."""
+    def post(self, path: str, **kwargs: Any) -> dict[str, Any]:
         return self.request("POST", path, **kwargs)
 
-    def put(self, path: str, **kwargs: Any) -> Dict[str, Any]:
-        """Make a PUT request."""
-        return self.request("PUT", path, **kwargs)
-
-    def delete(self, path: str, **kwargs: Any) -> Dict[str, Any]:
-        """Make a DELETE request."""
-        return self.request("DELETE", path, **kwargs)
-
-    def get_version(self) -> Dict[str, Any]:
-        """Get API version information."""
-        return self.get("/version")
-
-    def get_health(self) -> Dict[str, Any]:
-        """Get API health status."""
+    def get_health(self) -> dict[str, Any]:
         return self.get("/health")
 
-    def get_status(self) -> Dict[str, Any]:
-        """Get overall system status."""
-        return self.get("/status")
+    def get_info(self) -> dict[str, Any]:
+        return self.get("/api/v1/info")
 
-    def close(self):
-        """Close the HTTP client."""
+    def close(self) -> None:
         self._client.close()
 
-    def __enter__(self):
-        """Context manager entry."""
+    def __enter__(self) -> "AethymeClient":
         return self
 
-    def __exit__(self, *args):
-        """Context manager exit."""
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: Any,
+    ) -> None:
+        del exc_type, exc, traceback
         self.close()

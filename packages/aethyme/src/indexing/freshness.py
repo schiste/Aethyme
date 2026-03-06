@@ -1,17 +1,33 @@
-"""
-Freshness Monitoring and Re-indexing Module
+"""Freshness monitoring and re-indexing support."""
 
-Tracks index staleness and triggers re-indexing when repositories become stale.
-Supports scheduled checks and webhook-based triggers for git push events.
-"""
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Protocol, TypedDict
 
 import structlog
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Callable
-from dataclasses import dataclass
-from enum import Enum
+
+from ..graph.connection_pool import DatabaseRow, SQLParams
 
 logger = structlog.get_logger(__name__)
+
+
+class DatabaseExecutor(Protocol):
+    """Minimal DB interface used by freshness tracking."""
+
+    def execute(
+        self,
+        query: str,
+        params: SQLParams | None = None,
+        fetch: bool = True,
+    ) -> list[DatabaseRow] | None: ...
+
+
+class WebhookPayload(TypedDict, total=False):
+    """Subset of webhook fields used by reindex triggers."""
+
+    ref: str
 
 
 class FreshnessStatus(Enum):
@@ -27,8 +43,8 @@ class FreshnessMetrics:
     """Metrics about repository freshness."""
     repository_id: str
     repository_name: str
-    last_indexed_at: Optional[datetime]
-    staleness_hours: Optional[float]
+    last_indexed_at: datetime | None
+    staleness_hours: float | None
     status: FreshnessStatus
     warning_threshold_hours: float
     critical_threshold_hours: float
@@ -44,10 +60,10 @@ class FreshnessMonitor:
 
     def __init__(
         self,
-        db_pool,
+        db_pool: DatabaseExecutor,
         warning_threshold_hours: float = 24.0,
         critical_threshold_hours: float = 72.0,
-    ):
+    ) -> None:
         """
         Initialize freshness monitor.
 
@@ -128,9 +144,9 @@ class FreshnessMonitor:
     def get_stale_repositories(
         self,
         tenant_id: str,
-        threshold_hours: Optional[float] = None,
+        threshold_hours: float | None = None,
         include_never_indexed: bool = True,
-    ) -> List[FreshnessMetrics]:
+    ) -> list[FreshnessMetrics]:
         """
         Get all stale repositories for a tenant.
 
@@ -145,8 +161,8 @@ class FreshnessMonitor:
         threshold_hours = threshold_hours or self.warning_threshold_hours
         threshold_time = datetime.now() - timedelta(hours=threshold_hours)
 
-        query_parts = []
-        params = [tenant_id]
+        query_parts: list[str] = []
+        params: list[str | datetime] = [tenant_id]
 
         if include_never_indexed:
             query_parts.append("last_indexed_at IS NULL")
@@ -157,17 +173,17 @@ class FreshnessMonitor:
         where_clause = " OR ".join(query_parts)
 
         results = self.db_pool.execute(
-            """
+            f"""
             SELECT id, name, last_indexed_at
             FROM aethyme.repositories
-            WHERE tenant_id = %s AND ({} )
+            WHERE tenant_id = %s AND ({where_clause} )
             ORDER BY last_indexed_at ASC NULLS FIRST
-            """.format(where_clause),
+            """,
             params,
         )
 
-        metrics_list = []
-        for repo in results:
+        metrics_list: list[FreshnessMetrics] = []
+        for repo in results or []:
             metrics = self.get_repository_freshness(str(repo["id"]), tenant_id)
             metrics_list.append(metrics)
 
@@ -183,7 +199,7 @@ class FreshnessMonitor:
         self,
         repository_id: str,
         tenant_id: str,
-    ):
+    ) -> None:
         """
         Mark that indexing has started for a repository.
 
@@ -212,8 +228,8 @@ class FreshnessMonitor:
         repository_id: str,
         tenant_id: str,
         success: bool = True,
-        error_message: Optional[str] = None,
-    ):
+        error_message: str | None = None,
+    ) -> None:
         """
         Mark that indexing completed for a repository.
 
@@ -244,7 +260,7 @@ class FreshnessMonitor:
             error=error_message,
         )
 
-    def get_freshness_summary(self, tenant_id: str) -> Dict[str, int]:
+    def get_freshness_summary(self, tenant_id: str) -> dict[str, int]:
         """
         Get summary of freshness status across all repositories.
 
@@ -270,7 +286,7 @@ class FreshnessMonitor:
             "never_indexed": 0,
         }
 
-        for repo in results:
+        for repo in results or []:
             metrics = self.get_repository_freshness(str(repo["id"]), tenant_id)
             summary[metrics.status.value] += 1
 
@@ -288,7 +304,7 @@ class ReindexTrigger:
         self,
         freshness_monitor: FreshnessMonitor,
         index_callback: Callable[[str, str], None],
-    ):
+    ) -> None:
         """
         Initialize re-index trigger.
 
@@ -303,9 +319,9 @@ class ReindexTrigger:
     async def reindex_stale_repos(
         self,
         tenant_id: str,
-        threshold_hours: Optional[float] = None,
+        threshold_hours: float | None = None,
         dry_run: bool = False,
-    ) -> List[str]:
+    ) -> list[str]:
         """
         Trigger re-indexing for all stale repositories.
 
@@ -328,7 +344,7 @@ class ReindexTrigger:
             dry_run=dry_run,
         )
 
-        reindexed = []
+        reindexed: list[str] = []
         for metrics in stale_repos:
             if dry_run:
                 self.logger.info(
@@ -362,8 +378,8 @@ class ReindexTrigger:
         repository_id: str,
         tenant_id: str,
         event_type: str,
-        payload: Dict,
-    ):
+        payload: WebhookPayload,
+    ) -> None:
         """
         Handle webhook event for repository changes.
 
@@ -410,7 +426,7 @@ class ReindexTrigger:
             )
 
 
-def format_staleness(staleness_hours: Optional[float]) -> str:
+def format_staleness(staleness_hours: float | None) -> str:
     """
     Format staleness duration in human-readable form.
 

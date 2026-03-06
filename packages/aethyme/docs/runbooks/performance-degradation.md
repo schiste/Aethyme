@@ -153,14 +153,13 @@ async def search(query: str, limit: int = 20, offset: int = 0):
 **Solution: Use eager loading**
 
 ```python
-# Bad: N+1 queries
-for node in nodes:
-    edges = await db.query(Edge).filter(Edge.source_id == node.id).all()
+async def load_nodes_with_edges(db_session, nodes):
+    for node in nodes:
+        await db_session.query(Edge).filter(Edge.source_id == node.id).all()
 
-# Good: Single query with join
-nodes_with_edges = await db.query(Node).options(
-    selectinload(Node.edges)
-).all()
+    return await db_session.query(Node).options(
+        selectinload(Node.edges)
+    ).all()
 ```
 
 ---

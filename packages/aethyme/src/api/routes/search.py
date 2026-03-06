@@ -1,16 +1,13 @@
 """Search API routes."""
 
-from typing import List, Dict, Any, Optional
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 
+from ...auth import RepoReadUser
+from ...graph.connection_pool import db_pool
 from ...graph.store import GraphStore
-from ..auth import jwt_or_api_key, User
 
 router = APIRouter()
-limiter = Limiter(key_func=get_remote_address)
 
 
 class SearchRequest(BaseModel):
@@ -44,14 +41,14 @@ class SearchResult(BaseModel):
     kind: str
     language: str
     score: float
-    documentation: Optional[str] = None
+    documentation: str | None = None
 
 
 class SearchResponse(BaseModel):
     """Response model for search queries."""
 
     query: str
-    results: List[SearchResult]
+    results: list[SearchResult]
     total_results: int
     search_type: str
 
@@ -59,7 +56,7 @@ class SearchResponse(BaseModel):
 @router.post("/", response_model=SearchResponse)
 async def search_symbols(
     request: SearchRequest,
-    user: User = Depends(jwt_or_api_key),
+    user: RepoReadUser,
 ) -> SearchResponse:
     """
     Search for symbols in the code graph.
@@ -78,7 +75,7 @@ async def search_symbols(
     )
 
     # Convert to response model
-    search_results = []
+    search_results: list[SearchResult] = []
     for result in results:
         search_results.append(
             SearchResult(
@@ -103,10 +100,10 @@ async def search_symbols(
 
 @router.get("/suggest")
 async def suggest_symbols(
+    user: RepoReadUser,
     prefix: str = Query(..., min_length=2, max_length=100),
     limit: int = Query(default=10, ge=1, le=50),
-    user: User = Depends(jwt_or_api_key),
-) -> List[str]:
+) -> list[str]:
     """
     Get symbol suggestions based on prefix.
 
@@ -136,15 +133,15 @@ class AdvancedSearchRequest(BaseModel):
         max_length=256,
         description="Search query",
     )
-    file_path_pattern: Optional[str] = Field(
+    file_path_pattern: str | None = Field(
         default=None,
         description="Filter by file path pattern (e.g., '*.py', 'src/*.ts')",
     )
-    kinds: Optional[List[str]] = Field(
+    kinds: list[str] | None = Field(
         default=None,
         description="Filter by node kinds (e.g., ['function', 'class'])",
     )
-    languages: Optional[List[str]] = Field(
+    languages: list[str] | None = Field(
         default=None,
         description="Filter by languages (e.g., ['python', 'typescript'])",
     )
@@ -158,7 +155,7 @@ class AdvancedSearchRequest(BaseModel):
 @router.post("/advanced", response_model=SearchResponse)
 async def advanced_search(
     request: AdvancedSearchRequest,
-    user: User = Depends(jwt_or_api_key),
+    user: RepoReadUser,
 ) -> SearchResponse:
     """
     Advanced search with filtering options.
@@ -167,7 +164,7 @@ async def advanced_search(
     """
     # Build SQL query with filters
     query_parts = ["SELECT * FROM aethyme.nodes WHERE tenant_id = %s"]
-    params = [user.tenant_id]
+    params: list[str | int] = [user.tenant_id]
 
     # Add search condition
     query_parts.append("AND (symbol ILIKE %s OR documentation ILIKE %s)")
@@ -192,13 +189,10 @@ async def advanced_search(
     query_parts.append("LIMIT %s")
     params.append(request.limit)
 
-    # Execute query
-    from ...graph.connection_pool import db_pool
-
     results = db_pool.execute(" ".join(query_parts), tuple(params))
 
     # Convert to response
-    search_results = []
+    search_results: list[SearchResult] = []
     for result in results or []:
         search_results.append(
             SearchResult(

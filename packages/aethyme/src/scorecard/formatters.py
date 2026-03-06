@@ -1,10 +1,9 @@
 """Formatters for scorecard reports."""
 
 import json
-from typing import Dict, Any
-from datetime import datetime
+from typing import Any
 
-from .models import ScorecardReport, Severity
+from .models import Finding, ScorecardReport
 
 
 class JSONFormatter:
@@ -23,7 +22,7 @@ class JSONFormatter:
         data = self._build_json_structure(report)
         return json.dumps(data, indent=2, default=str)
 
-    def _build_json_structure(self, report: ScorecardReport) -> Dict[str, Any]:
+    def _build_json_structure(self, report: ScorecardReport) -> dict[str, Any]:
         """Build JSON structure from report."""
         return {
             "scan_id": report.scan_id,
@@ -60,7 +59,7 @@ class JSONFormatter:
             },
         }
 
-    def _finding_to_dict(self, finding) -> Dict[str, Any]:
+    def _finding_to_dict(self, finding: Finding) -> dict[str, Any]:
         """Convert finding to dictionary."""
         return {
             "detector": finding.detector,
@@ -86,7 +85,7 @@ class MarkdownFormatter:
         Returns:
             Markdown string
         """
-        lines = []
+        lines: list[str] = []
 
         # Header
         lines.append("# AI-Readiness Scorecard Report")
@@ -171,9 +170,9 @@ class MarkdownFormatter:
 
         return "\n".join(lines)
 
-    def _format_finding(self, finding) -> list:
+    def _format_finding(self, finding: Finding) -> list[str]:
         """Format a single finding as Markdown lines."""
-        lines = []
+        lines: list[str] = []
 
         # Finding header
         location = f"{finding.file_path}"
@@ -186,10 +185,10 @@ class MarkdownFormatter:
         lines.append(f"- **Detector:** `{finding.detector}`")
 
         if finding.evidence:
-            lines.append(f"- **Evidence:**")
-            lines.append(f"  ```")
+            lines.append("- **Evidence:**")
+            lines.append("  ```")
             lines.append(f"  {finding.evidence}")
-            lines.append(f"  ```")
+            lines.append("  ```")
 
         if finding.suggestion:
             lines.append(f"- **Suggestion:** {finding.suggestion}")

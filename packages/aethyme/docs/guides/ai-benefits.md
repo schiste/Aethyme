@@ -399,13 +399,11 @@ To measure AI effectiveness with Aethyme, track:
 
 ### 1. **Context Efficiency**
 ```python
-# Without Aethyme
-context_tokens_used = count_tokens(all_files_read)
-
-# With Aethyme
-context_tokens_used = count_tokens(structured_graph_response)
-
-efficiency_gain = (without - with) / without * 100
+tokens_without_aethyme = count_tokens(all_files_read)
+tokens_with_aethyme = count_tokens(structured_graph_response)
+efficiency_gain = (
+    (tokens_without_aethyme - tokens_with_aethyme) / tokens_without_aethyme * 100
+)
 ```
 
 ### 2. **Task Completion Time**

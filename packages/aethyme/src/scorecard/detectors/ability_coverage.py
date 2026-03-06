@@ -1,11 +1,17 @@
 """Detector for permission/ability coverage."""
 
 import re
-from typing import List, Dict, Set
 from pathlib import Path
+from typing import TypedDict
 
-from .base import BaseDetector
 from ..models import Finding, Severity
+from .base import BaseDetector
+
+
+class ProtectedRoute(TypedDict):
+    file: Path
+    line: int
+    content: str
 
 
 class AbilityCoverageDetector(BaseDetector):
@@ -19,9 +25,9 @@ class AbilityCoverageDetector(BaseDetector):
     def description(self) -> str:
         return "Checks for missing authorization and permission definitions"
 
-    def detect(self) -> List[Finding]:
+    def detect(self) -> list[Finding]:
         """Detect missing ability/permission checks."""
-        findings = []
+        findings: list[Finding] = []
 
         # Find protected routes
         routes = self._find_protected_routes()
@@ -34,9 +40,9 @@ class AbilityCoverageDetector(BaseDetector):
 
         return findings
 
-    def _find_protected_routes(self) -> List[Dict]:
+    def _find_protected_routes(self) -> list[ProtectedRoute]:
         """Find routes that should have permission checks."""
-        routes = []
+        routes: list[ProtectedRoute] = []
 
         # Patterns for routes with auth
         auth_patterns = [
@@ -68,9 +74,9 @@ class AbilityCoverageDetector(BaseDetector):
 
         return routes
 
-    def _check_permission_definitions(self, routes: List[Dict]) -> List[Finding]:
+    def _check_permission_definitions(self, routes: list[ProtectedRoute]) -> list[Finding]:
         """Check if routes have permission checks."""
-        findings = []
+        findings: list[Finding] = []
 
         permission_patterns = [
             r'can\(',
@@ -82,8 +88,8 @@ class AbilityCoverageDetector(BaseDetector):
         ]
 
         for route in routes:
-            file_path = route['file']
-            line_num = route['line']
+            file_path = route["file"]
+            line_num = route["line"]
 
             content = self.read_file_safe(file_path)
             if not content:
@@ -115,15 +121,15 @@ class AbilityCoverageDetector(BaseDetector):
                     message="Protected route missing explicit permission check",
                     file_path=str(file_path.relative_to(self.repo_path)),
                     line_number=line_num,
-                    evidence=route['content'][:100],
+                    evidence=route["content"][:100],
                     suggestion="Add explicit permission check, e.g., check_permission('resource:action')"
                 ))
 
         return findings
 
-    def _check_authorization_checks(self) -> List[Finding]:
+    def _check_authorization_checks(self) -> list[Finding]:
         """Check for authorization model definitions."""
-        findings = []
+        findings: list[Finding] = []
 
         # Look for ability/permission definition files
         ability_files = list(self.repo_path.glob('**/abilities.py')) + \

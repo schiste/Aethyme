@@ -1,20 +1,20 @@
 """Tests for individual fixers."""
 
-import pytest
 from pathlib import Path
+
 from src.autofixers.fixers import (
     DocsRegenerator,
+    FormatFixer,
+    I18nScaffolder,
     LinkFixer,
     SelectorInserter,
-    I18nScaffolder,
-    FormatFixer,
 )
 
 
 class TestDocsRegenerator:
     """Tests for DocsRegenerator."""
 
-    def test_identifies_directories_missing_folder_doc(self, tmp_path):
+    def test_identifies_directories_missing_folder_doc(self, tmp_path: Path):
         """Should find directories missing FOLDER.md."""
         # Create directory with code files but no FOLDER.md
         code_dir = tmp_path / "src"
@@ -27,7 +27,7 @@ class TestDocsRegenerator:
 
         assert code_dir in missing
 
-    def test_skips_directories_with_folder_doc(self, tmp_path):
+    def test_skips_directories_with_folder_doc(self, tmp_path: Path):
         """Should skip directories that already have FOLDER.md."""
         code_dir = tmp_path / "src"
         code_dir.mkdir()
@@ -40,7 +40,7 @@ class TestDocsRegenerator:
 
         assert code_dir not in missing
 
-    def test_generates_folder_doc(self, tmp_path):
+    def test_generates_folder_doc(self, tmp_path: Path):
         """Should generate FOLDER.md content."""
         code_dir = tmp_path / "components"
         code_dir.mkdir()
@@ -56,7 +56,7 @@ class TestDocsRegenerator:
         assert "Input.tsx" in content
         assert "auto-generated" in content.lower()
 
-    def test_creates_folder_docs(self, tmp_path):
+    def test_creates_folder_docs(self, tmp_path: Path):
         """Should create FOLDER.md files."""
         code_dir = tmp_path / "utils"
         code_dir.mkdir()
@@ -74,7 +74,7 @@ class TestDocsRegenerator:
 class TestLinkFixer:
     """Tests for LinkFixer."""
 
-    def test_can_fix_markdown_files(self, tmp_path):
+    def test_can_fix_markdown_files(self, tmp_path: Path):
         """Should fix markdown files."""
         fixer = LinkFixer(tmp_path)
 
@@ -82,7 +82,7 @@ class TestLinkFixer:
         assert fixer.can_fix(Path("docs/guide.md"))
         assert not fixer.can_fix(Path("script.py"))
 
-    def test_fixes_absolute_links(self, tmp_path):
+    def test_fixes_absolute_links(self, tmp_path: Path):
         """Should convert absolute links to relative."""
         content = """# Documentation
 
@@ -93,7 +93,7 @@ class TestLinkFixer:
         fixer = LinkFixer(tmp_path)
         # Note: actual conversion depends on file structure
         # This test verifies the fixer processes the content
-        result = fixer.fix(Path("README.md"), content)
+        fixer.fix(Path("README.md"), content)
 
         # Should attempt to process links
         # Result may be None if no valid conversions found
@@ -122,7 +122,7 @@ class TestLinkFixer:
 class TestSelectorInserter:
     """Tests for SelectorInserter."""
 
-    def test_can_fix_react_files(self, tmp_path):
+    def test_can_fix_react_files(self, tmp_path: Path):
         """Should fix React/JSX files."""
         fixer = SelectorInserter(tmp_path)
 
@@ -131,7 +131,7 @@ class TestSelectorInserter:
         assert fixer.can_fix(Path("Component.vue"))
         assert not fixer.can_fix(Path("utils.py"))
 
-    def test_adds_data_ui_to_buttons(self, tmp_path):
+    def test_adds_data_ui_to_buttons(self, tmp_path: Path):
         """Should add data-ui to button elements."""
         content = """
 export function MyButton() {
@@ -157,20 +157,19 @@ export function MyButton() {
 
         assert result is None  # No changes needed
 
-    def test_generates_meaningful_selector_names(self, tmp_path):
+    def test_generates_meaningful_selector_names(self, tmp_path: Path):
         """Should generate descriptive selector names."""
         fixer = SelectorInserter(tmp_path)
+        content = """
+export function LoginForm() {
+  return <button type="submit">Continue</button>;
+}
+"""
+        result = fixer.fix(Path("LoginForm.tsx"), content)
+        assert result is not None
+        assert 'data-ui="login-form-button-submit"' in result
 
-        selector = fixer._generate_selector_name(
-            "button",
-            'type="submit"',
-            Path("LoginForm.tsx")
-        )
-
-        assert "button" in selector
-        # Should include file/component context
-
-    def test_find_missing_selectors(self, tmp_path):
+    def test_find_missing_selectors(self, tmp_path: Path):
         """Should find elements missing selectors."""
         file_path = tmp_path / "Component.tsx"
         file_path.write_text("""
@@ -189,15 +188,15 @@ export function Component() {
 class TestI18nScaffolder:
     """Tests for I18nScaffolder."""
 
-    def test_can_fix_source_files(self, tmp_path):
+    def test_can_fix_source_files(self, tmp_path: Path):
         """Should fix source code files."""
         fixer = I18nScaffolder(tmp_path)
 
         assert fixer.can_fix(Path("Component.tsx"))
-        assert fixer.can_fix(Path("views.py"))
+        assert fixer.can_fix(Path("Component.jsx"))
         assert not fixer.can_fix(Path("README.md"))
 
-    def test_finds_hardcoded_strings(self, tmp_path):
+    def test_finds_hardcoded_strings(self, tmp_path: Path):
         """Should find hardcoded user-facing strings."""
         file_path = tmp_path / "Greeting.tsx"
         file_path.write_text("""
@@ -228,36 +227,49 @@ export function Component() {
 
         assert result is None  # Already uses i18n
 
-    def test_generates_i18n_keys(self, tmp_path):
+    def test_generates_i18n_keys(self, tmp_path: Path):
         """Should generate meaningful i18n keys."""
         fixer = I18nScaffolder(tmp_path)
-
-        key = fixer._generate_i18n_key("Welcome Back", Path("UserGreeting.tsx"))
-
-        assert "usergreeting" in key.lower()
-        assert "welcome" in key.lower()
+        content = """
+export function UserGreeting() {
+  return <h1>Welcome Back</h1>;
+}
+"""
+        result = fixer.fix(Path("UserGreeting.tsx"), content)
+        assert result is not None
+        assert 't("usergreeting.welcome_back")' in result
 
     def test_is_likely_code(self):
-        """Should identify code vs user-facing text."""
+        """Should avoid scaffolding code-like strings while fixing user text."""
         fixer = I18nScaffolder(Path("/repo"))
 
-        assert fixer._is_likely_code("${variable}")
-        assert fixer._is_likely_code("function doSomething")
-        assert fixer._is_likely_code("camelCaseVariable")
-        assert not fixer._is_likely_code("Welcome to our app")
+        code_like = """
+export function Component() {
+  return <Widget label="camelCaseVariable" />;
+}
+"""
+        user_text = """
+export function Component() {
+  return <Widget label="Welcome to our app" />;
+}
+"""
+        assert fixer.fix(Path("Component.tsx"), code_like) is None
+        fixed = fixer.fix(Path("Component.tsx"), user_text)
+        assert fixed is not None
+        assert 'label={t("component.welcome_to_our_app")}' in fixed
 
 
 class TestFormatFixer:
     """Tests for FormatFixer."""
 
-    def test_can_fix_supported_languages(self, tmp_path):
+    def test_can_fix_supported_languages(self, tmp_path: Path):
         """Should fix supported language files."""
         fixer = FormatFixer(tmp_path)
 
         assert fixer.can_fix(Path("script.py")) or not fixer.can_fix(Path("script.py"))
         # Depends on whether formatters are available
 
-    def test_checks_available_tools(self, tmp_path):
+    def test_checks_available_tools(self, tmp_path: Path):
         """Should check for available formatting tools."""
         fixer = FormatFixer(tmp_path)
 
@@ -267,12 +279,12 @@ class TestFormatFixer:
         assert "languages_supported" in info
 
     def test_is_tool_available(self):
-        """Should check if tools are installed."""
+        """Should expose available tooling without private helper access."""
         fixer = FormatFixer(Path("/repo"))
-
-        # Python is usually available
-        result = fixer._is_tool_available("python")
-        assert isinstance(result, bool)
-
-        # Fake tool should not be available
-        assert not fixer._is_tool_available("nonexistent-formatter-12345")
+        info = fixer.get_formatter_info()
+        all_tools = {
+            tool
+            for tools in info["available_tools"].values()
+            for tool in tools
+        }
+        assert "nonexistent-formatter-12345" not in all_tools

@@ -1,40 +1,65 @@
 """Production-grade connection pooling for PostgreSQL."""
 
-import logging
+import os
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
-from typing import Generator, Optional, Any
+from typing import Any, Protocol, Self, TypeAlias, cast
+
 import psycopg2
+import structlog
 from psycopg2 import pool
 from psycopg2.extensions import connection as PGConnection
-from psycopg2.extras import RealDictCursor
-import structlog
+from psycopg2.extras import RealDictCursor, RealDictRow
 
 from ..config import settings
 
 logger = structlog.get_logger(__name__)
 
+DatabaseRow: TypeAlias = dict[str, Any]
+SQLParams: TypeAlias = Sequence[Any]
+
+
+class ConnectionPoolProtocol(Protocol):
+    """Typed subset of ThreadedConnectionPool used by this module."""
+
+    minconn: int
+    maxconn: int
+
+    def getconn(self, key: object | None = None) -> PGConnection: ...
+
+    def putconn(
+        self,
+        conn: PGConnection,
+        key: object | None = None,
+        close: bool = False,
+    ) -> None: ...
+
+    def closeall(self) -> None: ...
+
 
 class DatabasePool:
     """Thread-safe PostgreSQL connection pool with automatic management."""
 
-    _instance: Optional['DatabasePool'] = None
-    _pool: Optional[pool.ThreadedConnectionPool] = None
+    _instance: Self | None = None
+    _pool: ConnectionPoolProtocol | None = None
 
-    def __new__(cls) -> 'DatabasePool':
+    def __new__(cls) -> Self:
         """Singleton pattern for connection pool."""
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance._initialize_pool()
         return cls._instance
 
     def _initialize_pool(self) -> None:
         """Initialize the connection pool."""
         try:
-            self._pool = pool.ThreadedConnectionPool(
-                minconn=settings.db_pool_min_size,
-                maxconn=settings.db_pool_max_size,
-                dsn=settings.database_url_sync,
-                cursor_factory=RealDictCursor,
+            self._pool = cast(
+                ConnectionPoolProtocol,
+                pool.ThreadedConnectionPool(
+                    minconn=settings.db_pool_min_size,
+                    maxconn=settings.db_pool_max_size,
+                    dsn=os.getenv("DATABASE_URL", settings.database_url_sync),
+                    cursor_factory=RealDictCursor,
+                ),
             )
             logger.info(
                 "Database connection pool initialized",
@@ -56,11 +81,14 @@ class DatabasePool:
                     cur.execute("SELECT * FROM nodes")
         """
         if not self._pool:
-            raise RuntimeError("Connection pool not initialized")
+            self._initialize_pool()
 
-        conn = None
+        conn: PGConnection | None = None
         try:
-            conn = self._pool.getconn()
+            if self._pool is None:
+                raise RuntimeError("Database pool failed to initialize")
+            pool_ref = self._pool
+            conn = pool_ref.getconn()
             yield conn
             conn.commit()
         except Exception as e:
@@ -70,7 +98,19 @@ class DatabasePool:
             raise
         finally:
             if conn:
-                self._pool.putconn(conn)
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("RESET ROLE")
+                        cur.execute("RESET ALL")
+                    conn.commit()
+                    if self._pool is not None:
+                        self._pool.putconn(conn)
+                except Exception:
+                    try:
+                        conn.close()
+                    finally:
+                        if self._pool is not None:
+                            self._pool.putconn(conn, close=True)
 
     @contextmanager
     def transaction(self) -> Generator[PGConnection, None, None]:
@@ -86,7 +126,6 @@ class DatabasePool:
         with self.get_connection() as conn:
             try:
                 yield conn
-                conn.commit()
             except Exception:
                 conn.rollback()
                 raise
@@ -94,9 +133,9 @@ class DatabasePool:
     def execute(
         self,
         query: str,
-        params: Optional[tuple] = None,
-        fetch: bool = True
-    ) -> Optional[list[dict[str, Any]]]:
+        params: SQLParams | None = None,
+        fetch: bool = True,
+    ) -> list[DatabaseRow] | None:
         """
         Execute a query and return results.
 
@@ -112,47 +151,9 @@ class DatabasePool:
             with conn.cursor() as cur:
                 cur.execute(query, params)
                 if fetch:
-                    return cur.fetchall()
+                    rows = cast(list[RealDictRow], cur.fetchall())
+                    return [dict(row) for row in rows]
         return None
-
-    def execute_many(
-        self,
-        query: str,
-        params_list: list[tuple],
-        batch_size: int = 1000,
-    ) -> int:
-        """
-        Execute a query with multiple parameter sets efficiently.
-
-        Args:
-            query: SQL query to execute
-            params_list: List of parameter tuples
-            batch_size: Batch size for execution
-
-        Returns:
-            Number of affected rows
-        """
-        total_affected = 0
-        with self.get_connection() as conn:
-            with conn.cursor() as cur:
-                for i in range(0, len(params_list), batch_size):
-                    batch = params_list[i:i + batch_size]
-                    psycopg2.extras.execute_batch(
-                        cur, query, batch, page_size=batch_size
-                    )
-                    total_affected += cur.rowcount
-        return total_affected
-
-    def set_tenant_context(self, tenant_id: str) -> None:
-        """
-        Set tenant context for row-level security.
-
-        Args:
-            tenant_id: UUID of the tenant
-        """
-        with self.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SET app.current_tenant = %s", (tenant_id,))
 
     def health_check(self) -> dict[str, Any]:
         """
@@ -181,7 +182,7 @@ class DatabasePool:
             logger.info("All database connections closed")
             self._pool = None
 
-    def get_stats(self) -> dict[str, int]:
+    def get_stats(self) -> dict[str, int] | dict[str, str]:
         """
         Get connection pool statistics.
 
@@ -202,5 +203,5 @@ class DatabasePool:
         }
 
 
-# Global pool instance
+# Global pool instance; actual connections are initialized lazily on first use.
 db_pool = DatabasePool()

@@ -1,10 +1,8 @@
 """Detector for missing FOLDER.md documentation."""
 
-from typing import List
-from pathlib import Path
 
-from .base import BaseDetector
 from ..models import Finding, Severity
+from .base import BaseDetector
 
 
 class FolderDocsDetector(BaseDetector):
@@ -18,9 +16,9 @@ class FolderDocsDetector(BaseDetector):
     def description(self) -> str:
         return "Checks for missing FOLDER.md documentation in directories"
 
-    def detect(self) -> List[Finding]:
+    def detect(self) -> list[Finding]:
         """Detect directories without FOLDER.md."""
-        findings = []
+        findings: list[Finding] = []
 
         # Directories that should have FOLDER.md
         important_dirs = {

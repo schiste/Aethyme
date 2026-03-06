@@ -1,11 +1,9 @@
 """Detector for absolute links that should be relative."""
 
 import re
-from typing import List
-from pathlib import Path
 
-from .base import BaseDetector
 from ..models import Finding, Severity
+from .base import BaseDetector
 
 
 class RelativeLinksDetector(BaseDetector):
@@ -19,9 +17,9 @@ class RelativeLinksDetector(BaseDetector):
     def description(self) -> str:
         return "Checks for absolute file paths that should use relative links"
 
-    def detect(self) -> List[Finding]:
+    def detect(self) -> list[Finding]:
         """Detect absolute links in documentation and code."""
-        findings = []
+        findings: list[Finding] = []
 
         # Patterns for absolute file paths
         absolute_path_patterns = [

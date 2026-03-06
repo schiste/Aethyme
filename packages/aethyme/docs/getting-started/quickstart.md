@@ -1,270 +1,85 @@
-# Aethyme Quick Start for Developers
+# Aethyme Quick Start
 
-Note: Aethyme runs as a separate service on port 8001 and uses its own versioned API (`/api/*`). These examples intentionally reference `/api/`.
-
-**5-Minute Guide to Using Aethyme for Code Intelligence**
-
----
-
-## What is Aethyme?
-
-Aethyme is a **graph-based code indexing system** that provides instant search and relationship analysis for Python and TypeScript codebases. Instead of using `grep`, `find`, or reading multiple files, you query a knowledge graph.
-
-**Location:** `packages/aethyme/`
-
----
-
-## Quick Commands
-
-### Start Aethyme (One-Time Setup)
+## 1. Install
 
 ```bash
 cd packages/aethyme
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e '.[dev]'
+```
 
-# Option 1: Docker Compose (Recommended)
-docker-compose -f ops/docker-compose.yml up -d
+## 2. Start Local Services
 
-# Option 2: Local Development
+```bash
+docker compose -f docker-compose.dev.yml up -d postgres redis
+export DATABASE_URL='postgresql://aethyme:dev_password_change_me@localhost:5432/aethyme_dev'
+export REDIS_URL='redis://localhost:6379/0'
+```
+
+## 3. Migrate
+
+```bash
+bash scripts/migrate.sh
+```
+
+## 4. Run The API
+
+```bash
 bash scripts/start-api.sh
 ```
 
-**API:** http://localhost:8001
-**API Docs:** http://localhost:8001/docs
+Docs: `http://localhost:8001/docs`
 
----
-
-### Index This Repository
+## 5. Register
 
 ```bash
-cd packages/aethyme
-
-# Index the Aeptus codebase
-python -m src.cli index ../.. --name aeptus
-
-# Check status
-python -m src.cli stats
+curl -s -X POST http://localhost:8001/api/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "email": "dev@example.com",
+    "password": "password123",
+    "org_name": "Aethyme Dev",
+    "tenant_name": "default"
+  }'
 ```
 
----
+## 6. Index A Repository Through The API
 
-### Search Code Symbols
-
-#### CLI:
 ```bash
-python -m src.cli search "GraphStore"
-```
-
-#### API:
-```bash
-curl -X POST http://localhost:8001/api/search/ \
+curl -s -X POST http://localhost:8001/api/v1/index/repositories \
   -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "GraphStore", "limit": 10}'
+  -H 'Content-Type: application/json' \
+  -d '{
+    "repository_path": "/absolute/path/to/repo",
+    "repository_name": "example-repo",
+    "languages": ["python"],
+    "use_fallback": true,
+    "clear_existing": true
+  }'
 ```
 
-**Returns:** Exact file locations, line numbers, symbol types (class/function/method)
-
----
-
-### Get Code Relationships (Ego Graph)
+## 7. Query The Graph
 
 ```bash
-# CLI
-python -m src.cli ego "GraphStore" --depth 2
-
-# API
-curl -X POST http://localhost:8001/api/ego/ \
+curl -s -X POST http://localhost:8001/api/v1/search/ \
   -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"symbol": "graph/store.py:GraphStore", "depth": 2}'
+  -H 'Content-Type: application/json' \
+  -d '{"query": "GraphStore", "limit": 10, "search_type": "hybrid"}'
 ```
 
-**Returns:** All connected code organized by relationship depth
-
----
-
-### Impact Analysis
+## 8. Run Scorecard
 
 ```bash
-# CLI
-python -m src.cli impact "validateUser" --max-depth 10
-
-# API
-curl -X POST http://localhost:8001/api/impact/ \
+curl -s -X POST http://localhost:8001/api/v1/scorecard/scan \
   -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"symbols": ["auth/validators.py:validateUser"]}'
+  -H 'Content-Type: application/json' \
+  -d '{"repository_id": "<repo-id>"}'
 ```
 
-**Returns:** What code depends on this symbol and would be affected by changes
-
----
-
-## AI Integration
-
-### For Claude Desktop (MCP) ⭐ Recommended
+## 9. Run The Verified Test Slice
 
 ```bash
-# 1. Get authentication token
-cd packages/aethyme
-TOKEN=$(curl -s -X POST http://localhost:8001/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email": "test@example.com", "password": "test1234"}' | jq -r .access_token)
-
-# 2. Generate AI prompt
-./get-ai-prompt.sh
-
-# 3. Copy output and paste at start of AI conversation
+export TEST_DATABASE_URL='postgresql://aethyme:dev_password_change_me@localhost:5432/aethyme_test'
+pytest tests/api tests/queries tests/scorecard tests/autofixers -q
 ```
-
-**For full MCP setup:** See [HOW_AI_DISCOVERS_AETHYME.md](../../HOW_AI_DISCOVERS_AETHYME.md)
-
----
-
-## Why Use Aethyme?
-
-### Traditional Approach (Slow):
-```bash
-# Find a class
-grep -r "class GraphStore" .
-
-# Understand dependencies
-# ... read multiple files manually
-
-# Check impact
-# ... manual code review
-```
-
-**Problems:**
-- Slow (searches entire codebase)
-- Imprecise (regex matches)
-- Manual dependency tracing
-- No structured data
-
-### Aethyme Approach (Fast):
-
-```bash
-# Find a class
-curl POST /api/search/ -d '{"query": "GraphStore"}'
-# Returns: graph/store.py:17 (class)
-
-# Understand dependencies
-curl POST /api/ego/ -d '{"symbol": "graph/store.py:GraphStore", "depth": 2}'
-# Returns: Structured relationship graph
-
-# Check impact
-curl POST /api/impact/ -d '{"symbols": ["graph/store.py:GraphStore"]}'
-# Returns: All dependent code
-```
-
-**Benefits:**
-- ⚡ **10-100x faster** than grep
-- 🎯 **Precise results** (AST-based, not regex)
-- 🔗 **Relationship mapping** (what connects to what)
-- 📊 **Structured data** (JSON, not text)
-
----
-
-## Common Use Cases
-
-### 1. Find Where Something is Defined
-
-```bash
-# Instead of: grep -r "class UserProfile"
-python -m src.cli search "UserProfile"
-```
-
-### 2. Understand Dependencies
-
-```bash
-# Instead of: reading 10 files manually
-python -m src.cli ego "UserProfile" --depth 2
-```
-
-### 3. Refactoring Impact Analysis
-
-```bash
-# Before changing UserProfile class
-python -m src.cli impact "UserProfile"
-# Shows everything that would break
-```
-
-### 4. Code Navigation
-
-```bash
-# Find all methods in a class
-python -m src.cli ego "UserProfile.save" --depth 1
-```
-
----
-
-## Documentation
-
-- **Main README:** [README.md](../../README.md)
-- **AI Integration:** [AI_integration-guide.md](../../AI_integration-guide.md)
-- **How AI Uses It:** [HOW_AI_DISCOVERS_AETHYME.md](../../HOW_AI_DISCOVERS_AETHYME.md)
-- **Testing:** [TESTING.md](../../TESTING.md)
-
----
-
-## Troubleshooting
-
-### Aethyme Not Running
-
-```bash
-# Check status
-curl http://localhost:8001/health
-
-# Check Docker
-docker ps | grep aethyme
-
-# View logs
-docker logs aethyme-api
-```
-
-### No Results from Search
-
-```bash
-# Check if codebase is indexed
-python -m src.cli stats
-
-# Re-index if needed
-python -m src.cli index ../.. --name aeptus
-```
-
-### Authentication Errors
-
-```bash
-# Get new token
-TOKEN=$(curl -s -X POST http://localhost:8001/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email": "test@example.com", "password": "test1234"}' | jq -r .access_token)
-
-echo $TOKEN
-```
-
----
-
-## Performance Tips
-
-For large repositories (>10k files):
-
-1. Increase batch size: `INDEXING_BATCH_SIZE=5000`
-2. Use Redis caching (set `REDIS_URL` in `.env`)
-3. Increase DB connection pool: `DB_POOL_MAX_SIZE=50`
-
----
-
-## Next Steps
-
-1. **Start Aethyme:** `docker-compose -f ops/docker-compose.yml up -d`
-2. **Index codebase:** `python -m src.cli index ../.. --name aeptus`
-3. **Try search:** `python -m src.cli search "GraphStore"`
-4. **Set up AI integration:** `./get-ai-prompt.sh`
-
----
-
-**See Also:**
-- [Coding Standards](../../../../docs/development/codingstandards.md)
-- [Testing Strategy](../../../../docs/testing/strategy.md)
-- [Architecture Overview](../../../../docs/architecture/structure.md)

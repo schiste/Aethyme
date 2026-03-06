@@ -1,11 +1,19 @@
 """Detector for API route documentation coverage."""
 
 import re
-from typing import List, Dict, Set
 from pathlib import Path
+from typing import TypedDict
 
-from .base import BaseDetector
 from ..models import Finding, Severity
+from .base import BaseDetector
+
+
+class RouteDefinition(TypedDict):
+    method: str
+    path: str
+    file: Path
+    line: int
+    framework: str
 
 
 class RouteCoverageDetector(BaseDetector):
@@ -19,9 +27,9 @@ class RouteCoverageDetector(BaseDetector):
     def description(self) -> str:
         return "Checks for undocumented API routes and endpoints"
 
-    def detect(self) -> List[Finding]:
+    def detect(self) -> list[Finding]:
         """Detect undocumented API routes."""
-        findings = []
+        findings: list[Finding] = []
 
         # Find route definitions
         routes = self._find_routes()
@@ -31,9 +39,9 @@ class RouteCoverageDetector(BaseDetector):
 
         return findings
 
-    def _find_routes(self) -> List[Dict]:
+    def _find_routes(self) -> list[RouteDefinition]:
         """Find API route definitions."""
-        routes = []
+        routes: list[RouteDefinition] = []
 
         # FastAPI/Flask patterns
         fastapi_pattern = r'@(router|app)\.(get|post|put|delete|patch)\(["\']([^"\']+)["\']'
@@ -103,13 +111,13 @@ class RouteCoverageDetector(BaseDetector):
 
         return routes
 
-    def _check_route_documentation(self, routes: List[Dict]) -> List[Finding]:
+    def _check_route_documentation(self, routes: list[RouteDefinition]) -> list[Finding]:
         """Check if routes are documented."""
-        findings = []
+        findings: list[Finding] = []
 
         for route in routes:
-            file_path = route['file']
-            line_num = route['line']
+            file_path = route["file"]
+            line_num = route["line"]
 
             content = self.read_file_safe(file_path)
             if not content:

@@ -1,16 +1,19 @@
 """Scoring engine for AI-Readiness Scorecard."""
 
+import logging
 import time
 import uuid
 from pathlib import Path
-from typing import List, Optional
-import structlog
+from typing import TypeAlias
 
-from .models import ScorecardReport, DetectorResult, Finding
 from .detectors import ALL_DETECTORS
+from .detectors.base import BaseDetector
 from .formatters import JSONFormatter, MarkdownFormatter
+from .models import DetectorResult, Finding, ScorecardReport
 
-logger = structlog.get_logger(__name__)
+DetectorClass: TypeAlias = type[BaseDetector]
+
+logger = logging.getLogger(__name__)
 
 
 class ScanResult:
@@ -35,7 +38,7 @@ class ScanResult:
 class ScorecardEngine:
     """Engine for running AI-readiness scorecard scans."""
 
-    def __init__(self, repo_path: Path, repository_id: Optional[str] = None, tenant_id: Optional[str] = None):
+    def __init__(self, repo_path: Path, repository_id: str | None = None, tenant_id: str | None = None):
         """
         Initialize scorecard engine.
 
@@ -47,12 +50,12 @@ class ScorecardEngine:
         self.repo_path = Path(repo_path)
         self.repository_id = repository_id
         self.tenant_id = tenant_id
-        self.logger = logger.bind(repo_path=str(repo_path))
+        self.logger = logger
 
         if not self.repo_path.exists():
             raise ValueError(f"Repository path does not exist: {repo_path}")
 
-    def scan(self, detectors: Optional[List[str]] = None) -> ScanResult:
+    def scan(self, detectors: list[str] | None = None) -> ScanResult:
         """
         Run scorecard scan.
 
@@ -65,7 +68,7 @@ class ScorecardEngine:
         scan_id = str(uuid.uuid4())
         start_time = time.time()
 
-        self.logger.info("Starting scorecard scan", scan_id=scan_id)
+        self.logger.info("Starting scorecard scan %s", scan_id)
 
         # Initialize report
         report = ScorecardReport(
@@ -97,18 +100,18 @@ class ScorecardEngine:
         report.files_scanned = self._count_files()
 
         self.logger.info(
-            "Scorecard scan completed",
-            scan_id=scan_id,
-            score=report.score,
-            total_findings=report.total_findings,
-            blockers=report.blocker_count,
-            warnings=report.warning_count,
-            scan_time_ms=report.total_scan_time_ms,
+            "Scorecard scan completed %s score=%s total=%s blockers=%s warnings=%s scan_time_ms=%.2f",
+            scan_id,
+            report.score,
+            report.total_findings,
+            report.blocker_count,
+            report.warning_count,
+            report.total_scan_time_ms,
         )
 
         return ScanResult(report)
 
-    def _get_detectors(self, detector_names: Optional[List[str]]) -> List[type]:
+    def _get_detectors(self, detector_names: list[str] | None) -> list[DetectorClass]:
         """
         Get detector classes to run.
 
@@ -122,7 +125,7 @@ class ScorecardEngine:
             return ALL_DETECTORS
 
         # Filter detectors by name
-        detectors = []
+        detectors: list[DetectorClass] = []
         for detector_class in ALL_DETECTORS:
             detector = detector_class(self.repo_path)
             if detector.name in detector_names:
@@ -130,7 +133,7 @@ class ScorecardEngine:
 
         return detectors
 
-    def _run_detector(self, detector_class: type) -> DetectorResult:
+    def _run_detector(self, detector_class: DetectorClass) -> DetectorResult:
         """
         Run a single detector.
 
@@ -142,31 +145,26 @@ class ScorecardEngine:
         """
         detector = detector_class(self.repo_path)
 
-        self.logger.debug("Running detector", detector=detector.name)
+        self.logger.debug("Running detector %s", detector.name)
 
         start_time = time.time()
         error = None
-        findings = []
+        findings: list[Finding] = []
 
         try:
             findings = detector.detect()
         except Exception as e:
             error = str(e)
-            self.logger.error(
-                "Detector failed",
-                detector=detector.name,
-                error=error,
-                exc_info=True,
-            )
+            self.logger.exception("Detector failed %s error=%s", detector.name, error)
 
         end_time = time.time()
         execution_time_ms = (end_time - start_time) * 1000
 
         self.logger.debug(
-            "Detector completed",
-            detector=detector.name,
-            findings_count=len(findings),
-            execution_time_ms=execution_time_ms,
+            "Detector completed %s findings=%s execution_time_ms=%.2f",
+            detector.name,
+            len(findings),
+            execution_time_ms,
         )
 
         return DetectorResult(

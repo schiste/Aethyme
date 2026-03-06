@@ -1,32 +1,51 @@
-"""Safety engine for autofixers - Detects generated files and assesses risk."""
+"""Safety engine for autofixers."""
+
+from __future__ import annotations
 
 import re
 from enum import Enum
 from pathlib import Path
-from typing import List, Dict, Optional, Set
-import structlog
+from typing import TypedDict
 
-logger = structlog.get_logger()
+from ._log import get_logger
+
+logger = get_logger()
+
+
+class ValidationStats(TypedDict):
+    """Statistics about a proposed content change."""
+
+    original_lines: int
+    new_lines: int
+    lines_added: int
+    size_change_bytes: int
+
+
+class ValidationResult(TypedDict):
+    """Validation output for a proposed change."""
+
+    safe: bool
+    warnings: list[str]
+    stats: ValidationStats
 
 
 class RiskLevel(Enum):
     """Risk levels for autofix operations."""
 
-    LOW = "low"  # Safe to auto-apply
-    MEDIUM = "medium"  # Review recommended
-    HIGH = "high"  # Manual approval required
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
 
 
 class GeneratedFileDetector:
-    """Detects generated files that should not be modified."""
+    """Detect generated files that should not be modified."""
 
-    # File patterns that indicate generated files
     GENERATED_PATTERNS = [
         r"\.generated\.",
         r"\.gen\.",
         r"\.g\.",
-        r"\.pb\.",  # Protocol buffers
-        r"\.pb2\.",  # Python protobuf
+        r"\.pb\.",
+        r"\.pb2\.",
         r"_pb2\.py$",
         r"_pb2_grpc\.py$",
         r"-generated\.",
@@ -34,8 +53,6 @@ class GeneratedFileDetector:
         r"generated/",
         r"__generated__/",
     ]
-
-    # Lock files
     LOCK_FILES = [
         "package-lock.json",
         "yarn.lock",
@@ -47,8 +64,6 @@ class GeneratedFileDetector:
         "Cargo.lock",
         "go.sum",
     ]
-
-    # Build output directories
     BUILD_DIRS = [
         "node_modules",
         "dist",
@@ -67,8 +82,6 @@ class GeneratedFileDetector:
         "coverage",
         ".coverage",
     ]
-
-    # File header patterns
     GENERATED_HEADERS = [
         r"@generated",
         r"auto-generated",
@@ -82,59 +95,43 @@ class GeneratedFileDetector:
     ]
 
     def __init__(self):
-        self.compiled_patterns = [re.compile(p, re.IGNORECASE) for p in self.GENERATED_PATTERNS]
-        self.compiled_headers = [re.compile(p, re.IGNORECASE) for p in self.GENERATED_HEADERS]
+        self.compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.GENERATED_PATTERNS]
+        self.compiled_headers = [re.compile(pattern, re.IGNORECASE) for pattern in self.GENERATED_HEADERS]
 
     def is_generated(self, file_path: Path) -> bool:
         """Check if a file is generated and should be skipped."""
-        file_str = str(file_path)
-        file_name = file_path.name
+        file_str = file_path.as_posix()
 
-        # Check lock files
-        if file_name in self.LOCK_FILES:
-            logger.debug("File is a lock file", file=file_str)
+        if file_path.name in self.LOCK_FILES:
+            return True
+        if any(build_dir in file_path.parts for build_dir in self.BUILD_DIRS):
+            return True
+        if any(pattern.search(file_str) for pattern in self.compiled_patterns):
             return True
 
-        # Check build directories
-        parts = file_path.parts
-        for build_dir in self.BUILD_DIRS:
-            if build_dir in parts:
-                logger.debug("File in build directory", file=file_str, dir=build_dir)
-                return True
-
-        # Check file name patterns
-        for pattern in self.compiled_patterns:
-            if pattern.search(file_str):
-                logger.debug("File matches generated pattern", file=file_str, pattern=pattern.pattern)
-                return True
-
-        # Check file header (first 10 lines)
         if file_path.is_file():
             try:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    header = ''.join(f.readline() for _ in range(10))
-                    for pattern in self.compiled_headers:
-                        if pattern.search(header):
-                            logger.debug("File has generated header", file=file_str)
-                            return True
-            except Exception as e:
-                logger.warning("Could not read file header", file=file_str, error=str(e))
+                with open(file_path, encoding="utf-8", errors="ignore") as handle:
+                    header = "".join(handle.readline() for _ in range(10))
+                if any(pattern.search(header) for pattern in self.compiled_headers):
+                    return True
+            except Exception as err:
+                logger.warning("Could not read file header", file=file_str, error=str(err))
 
         return False
 
-    def get_safe_files(self, files: List[Path]) -> List[Path]:
-        """Filter list to only safe (non-generated) files."""
-        safe = [f for f in files if not self.is_generated(f)]
+    def get_safe_files(self, files: list[Path]) -> list[Path]:
+        """Filter list to only safe non-generated files."""
+        safe = [file_path for file_path in files if not self.is_generated(file_path)]
         skipped = len(files) - len(safe)
-        if skipped > 0:
+        if skipped:
             logger.info("Filtered generated files", total=len(files), safe=len(safe), skipped=skipped)
         return safe
 
 
 class SafetyEngine:
-    """Assesses risk and safety of autofix operations."""
+    """Assess risk and validate autofix changes."""
 
-    # High-risk file patterns (require manual approval)
     HIGH_RISK_PATTERNS = [
         r"\.env",
         r"\.env\.",
@@ -155,8 +152,6 @@ class SafetyEngine:
         r"Gemfile$",
         r"composer\.json$",
     ]
-
-    # Medium-risk patterns (review recommended)
     MEDIUM_RISK_PATTERNS = [
         r"migrations/",
         r"schema\.sql$",
@@ -167,109 +162,84 @@ class SafetyEngine:
         r"api/",
         r"\.test\.",
         r"\.spec\.",
-        r"test_",
+        r"(^|/)tests?/",
+        r"(^|/)test_[^/]+$",
         r"_test\.py$",
     ]
 
     def __init__(self):
         self.detector = GeneratedFileDetector()
-        self.high_risk = [re.compile(p, re.IGNORECASE) for p in self.HIGH_RISK_PATTERNS]
-        self.medium_risk = [re.compile(p, re.IGNORECASE) for p in self.MEDIUM_RISK_PATTERNS]
+        self.high_risk = [re.compile(pattern, re.IGNORECASE) for pattern in self.HIGH_RISK_PATTERNS]
+        self.medium_risk = [re.compile(pattern, re.IGNORECASE) for pattern in self.MEDIUM_RISK_PATTERNS]
 
     def assess_risk(self, file_path: Path, fix_type: str) -> RiskLevel:
         """Assess the risk level of applying a fix to a file."""
-        file_str = str(file_path)
+        file_str = file_path.as_posix()
 
-        # Generated files are always skipped (handled separately)
         if self.detector.is_generated(file_path):
-            logger.warning("Attempting to modify generated file", file=file_str)
             raise ValueError(f"Cannot modify generated file: {file_path}")
+        if any(pattern.search(file_str) for pattern in self.high_risk):
+            return RiskLevel.HIGH
+        if any(pattern.search(file_str) for pattern in self.medium_risk):
+            return RiskLevel.MEDIUM
 
-        # Check high-risk patterns
-        for pattern in self.high_risk:
-            if pattern.search(file_str):
-                logger.info("High-risk file detected", file=file_str, pattern=pattern.pattern)
-                return RiskLevel.HIGH
-
-        # Check medium-risk patterns
-        for pattern in self.medium_risk:
-            if pattern.search(file_str):
-                logger.info("Medium-risk file detected", file=file_str, pattern=pattern.pattern)
-                return RiskLevel.MEDIUM
-
-        # Fix-type specific risk assessment
-        risk_by_fix_type = {
+        return {
             "docs_regen": RiskLevel.LOW,
             "link_fix": RiskLevel.LOW,
-            "selector_insert": RiskLevel.MEDIUM,  # Modifies code
-            "i18n_scaffold": RiskLevel.MEDIUM,  # Modifies code
+            "selector_insert": RiskLevel.MEDIUM,
+            "i18n_scaffold": RiskLevel.MEDIUM,
             "format_fix": RiskLevel.LOW,
-        }
-
-        return risk_by_fix_type.get(fix_type, RiskLevel.MEDIUM)
+        }.get(fix_type, RiskLevel.MEDIUM)
 
     def validate_changes(
         self,
         original_content: str,
         new_content: str,
-        file_path: Path
-    ) -> Dict[str, any]:
+        file_path: Path,
+    ) -> ValidationResult:
         """Validate that changes are safe and reasonable."""
-        validation = {
-            "safe": True,
-            "warnings": [],
-            "stats": {},
-        }
-
-        # Basic stats
         orig_lines = original_content.splitlines()
         new_lines = new_content.splitlines()
-
-        validation["stats"] = {
-            "original_lines": len(orig_lines),
-            "new_lines": len(new_lines),
-            "lines_added": len(new_lines) - len(orig_lines),
-            "size_change_bytes": len(new_content) - len(original_content),
+        validation: ValidationResult = {
+            "safe": True,
+            "warnings": [],
+            "stats": {
+                "original_lines": len(orig_lines),
+                "new_lines": len(new_lines),
+                "lines_added": len(new_lines) - len(orig_lines),
+                "size_change_bytes": len(new_content) - len(original_content),
+            },
         }
+        warnings = validation["warnings"]
 
-        # Check for suspicious changes
         if len(new_content) > len(original_content) * 2:
-            validation["warnings"].append("File size doubled - review recommended")
+            warnings.append("File size doubled - review recommended")
+            validation["safe"] = False
+        if not new_lines and orig_lines:
+            warnings.append("All content removed - blocking change")
             validation["safe"] = False
 
-        if len(new_lines) == 0 and len(orig_lines) > 0:
-            validation["warnings"].append("All content removed - blocking change")
-            validation["safe"] = False
-
-        # Check for deletion of important patterns
         important_patterns = [
             (r"@[a-zA-Z]+\(", "decorators"),
             (r"def\s+\w+", "function definitions"),
             (r"class\s+\w+", "class definitions"),
             (r"export\s+(default\s+)?(class|function|const)", "exports"),
         ]
-
         for pattern, name in important_patterns:
             orig_count = len(re.findall(pattern, original_content))
             new_count = len(re.findall(pattern, new_content))
-
             if orig_count > new_count:
-                validation["warnings"].append(
-                    f"Reduced {name} from {orig_count} to {new_count}"
-                )
+                warnings.append(f"Reduced {name} from {orig_count} to {new_count}")
 
         return validation
 
     def should_skip_file(self, file_path: Path) -> bool:
-        """Determine if a file should be skipped entirely."""
         return self.detector.is_generated(file_path)
 
     def get_approval_required(self, risk_level: RiskLevel) -> bool:
-        """Determine if approval is required for this risk level."""
-        return risk_level in [RiskLevel.MEDIUM, RiskLevel.HIGH]
+        return risk_level in {RiskLevel.MEDIUM, RiskLevel.HIGH}
 
-    def get_skipped_patterns(self) -> Dict[str, List[str]]:
-        """Get all patterns used for safety checks."""
+    def get_skipped_patterns(self) -> dict[str, list[str]]:
         return {
             "generated_patterns": self.detector.GENERATED_PATTERNS,
             "lock_files": self.detector.LOCK_FILES,

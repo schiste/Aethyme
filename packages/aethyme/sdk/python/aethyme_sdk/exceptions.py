@@ -1,6 +1,6 @@
 """Aethyme SDK exceptions."""
 
-from typing import Optional, Dict, Any
+from typing import Any
 
 
 class AethymeError(Exception):
@@ -19,8 +19,8 @@ class APIError(AethymeError):
     def __init__(
         self,
         message: str,
-        status_code: Optional[int] = None,
-        response: Optional[Dict[str, Any]] = None,
+        status_code: int | None = None,
+        response: dict[str, Any] | None = None,
     ):
         super().__init__(message)
         self.status_code = status_code

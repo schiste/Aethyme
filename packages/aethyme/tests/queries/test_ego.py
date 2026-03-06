@@ -8,16 +8,21 @@ Tests cover:
 - Large ego graphs (>100 nodes)
 """
 
-import pytest
+from typing import TypeAlias, cast
+
 from src.graph.store import GraphStore
+from tests.support.db_seed import PRIMARY_TENANT_ID
+
+NodePayload: TypeAlias = dict[str, object]
+NodeDepthMap: TypeAlias = dict[int, list[NodePayload]]
 
 
 class TestEgoGraphBasic:
     """Test basic ego graph functionality."""
 
-    def test_ego_depth_0(self, test_tenant_id):
+    def test_ego_depth_0(self):
         """Test ego graph at depth 0 (just the symbol itself)."""
-        store = GraphStore(tenant_id=test_tenant_id)
+        store = GraphStore(tenant_id=PRIMARY_TENANT_ID)
         result = store.ego_graph(
             symbol="services/user.py:UserService",
             depth=0,
@@ -33,9 +38,9 @@ class TestEgoGraphBasic:
         assert 0 in result["nodes_by_depth"]
         assert len(result["nodes_by_depth"][0]) >= 1
 
-    def test_ego_depth_1(self, test_tenant_id):
+    def test_ego_depth_1(self):
         """Test ego graph at depth 1 (direct connections)."""
-        store = GraphStore(tenant_id=test_tenant_id)
+        store = GraphStore(tenant_id=PRIMARY_TENANT_ID)
         result = store.ego_graph(
             symbol="services/user.py:UserService",
             depth=1,
@@ -61,9 +66,9 @@ class TestEgoGraphBasic:
         # Should include at least some models or methods
         assert any("User" in s or "authenticate" in s for s in symbols)
 
-    def test_ego_depth_2(self, test_tenant_id):
+    def test_ego_depth_2(self):
         """Test ego graph at depth 2 (two hops)."""
-        store = GraphStore(tenant_id=test_tenant_id)
+        store = GraphStore(tenant_id=PRIMARY_TENANT_ID)
         result = store.ego_graph(
             symbol="services/user.py:UserService",
             depth=2,
@@ -82,9 +87,9 @@ class TestEgoGraphBasic:
         # - Database functions called by UserRepository
         # - Utilities called by UserService methods
 
-    def test_ego_depth_3(self, test_tenant_id):
+    def test_ego_depth_3(self):
         """Test ego graph at depth 3 (three hops)."""
-        store = GraphStore(tenant_id=test_tenant_id)
+        store = GraphStore(tenant_id=PRIMARY_TENANT_ID)
         result = store.ego_graph(
             symbol="services/order.py:OrderService",
             depth=3,
@@ -103,9 +108,9 @@ class TestEgoGraphBasic:
 class TestEgoGraphErrors:
     """Test error cases."""
 
-    def test_symbol_not_found(self, test_tenant_id):
+    def test_symbol_not_found(self):
         """Test ego graph for non-existent symbol returns error."""
-        store = GraphStore(tenant_id=test_tenant_id)
+        store = GraphStore(tenant_id=PRIMARY_TENANT_ID)
         result = store.ego_graph(
             symbol="non.existent:Symbol",
             depth=2,
@@ -115,9 +120,9 @@ class TestEgoGraphErrors:
         assert "error" in result
         assert "not found" in result["error"].lower()
 
-    def test_empty_symbol(self, test_tenant_id):
+    def test_empty_symbol(self):
         """Test ego graph with empty symbol."""
-        store = GraphStore(tenant_id=test_tenant_id)
+        store = GraphStore(tenant_id=PRIMARY_TENANT_ID)
         result = store.ego_graph(
             symbol="",
             depth=2,
@@ -126,9 +131,9 @@ class TestEgoGraphErrors:
 
         assert "error" in result
 
-    def test_invalid_depth_zero(self, test_tenant_id):
+    def test_invalid_depth_zero(self):
         """Test depth validation (depth must be >= 0)."""
-        store = GraphStore(tenant_id=test_tenant_id)
+        store = GraphStore(tenant_id=PRIMARY_TENANT_ID)
 
         # Depth 0 should work
         result = store.ego_graph(
@@ -142,9 +147,9 @@ class TestEgoGraphErrors:
 class TestEgoGraphCircular:
     """Test handling of circular dependencies."""
 
-    def test_circular_dependency_detection(self, test_tenant_id):
+    def test_circular_dependency_detection(self):
         """Test ego graph handles circular dependencies without infinite loop."""
-        store = GraphStore(tenant_id=test_tenant_id)
+        store = GraphStore(tenant_id=PRIMARY_TENANT_ID)
 
         # UserService and OrderService have circular reference in test data
         result = store.ego_graph(
@@ -158,15 +163,16 @@ class TestEgoGraphCircular:
         assert result["total_nodes"] > 0
 
         # All nodes should be unique (no duplicates from cycles)
-        all_node_ids = []
-        for depth_nodes in result["nodes_by_depth"].values():
-            all_node_ids.extend([n["id"] for n in depth_nodes])
+        all_node_ids: list[object] = []
+        nodes_by_depth = cast(NodeDepthMap, result["nodes_by_depth"])
+        for depth_nodes in nodes_by_depth.values():
+            all_node_ids.extend([node["id"] for node in depth_nodes])
 
         assert len(all_node_ids) == len(set(all_node_ids)), "Found duplicate nodes"
 
-    def test_self_referential_symbol(self, test_tenant_id):
+    def test_self_referential_symbol(self):
         """Test symbol that references itself."""
-        store = GraphStore(tenant_id=test_tenant_id)
+        store = GraphStore(tenant_id=PRIMARY_TENANT_ID)
 
         # Even if a symbol has a self-edge, it should only appear once
         result = store.ego_graph(
@@ -183,9 +189,9 @@ class TestEgoGraphCircular:
 class TestEgoGraphLarge:
     """Test large ego graphs."""
 
-    def test_large_graph_performance(self, test_tenant_id):
+    def test_large_graph_performance(self):
         """Test ego graph with many connected nodes."""
-        store = GraphStore(tenant_id=test_tenant_id)
+        store = GraphStore(tenant_id=PRIMARY_TENANT_ID)
 
         import time
         start = time.time()
@@ -206,9 +212,9 @@ class TestEgoGraphLarge:
         # Target: <1s for depth 2, <2s for depth 3
         assert duration < 3.0
 
-    def test_limit_enforcement(self, test_tenant_id):
+    def test_limit_enforcement(self):
         """Test that limit parameter is enforced."""
-        store = GraphStore(tenant_id=test_tenant_id)
+        store = GraphStore(tenant_id=PRIMARY_TENANT_ID)
 
         result_small = store.ego_graph(
             symbol="services/order.py:OrderService",
@@ -225,9 +231,9 @@ class TestEgoGraphLarge:
         assert result_small["total_nodes"] <= 10
         assert result_large["total_nodes"] >= result_small["total_nodes"]
 
-    def test_deep_traversal(self, test_tenant_id):
+    def test_deep_traversal(self):
         """Test deep graph traversal (depth 3)."""
-        store = GraphStore(tenant_id=test_tenant_id)
+        store = GraphStore(tenant_id=PRIMARY_TENANT_ID)
 
         result = store.ego_graph(
             symbol="api/routes/orders.py:create_order",
@@ -246,9 +252,9 @@ class TestEgoGraphLarge:
 class TestEgoGraphDepthLevels:
     """Test depth-specific behavior."""
 
-    def test_nodes_organized_by_depth(self, test_tenant_id):
+    def test_nodes_organized_by_depth(self):
         """Test that nodes are correctly organized by depth."""
-        store = GraphStore(tenant_id=test_tenant_id)
+        store = GraphStore(tenant_id=PRIMARY_TENANT_ID)
 
         result = store.ego_graph(
             symbol="services/user.py:UserService",
@@ -259,14 +265,15 @@ class TestEgoGraphDepthLevels:
         assert "error" not in result
 
         # Each depth level should be a list
-        for depth, nodes in result["nodes_by_depth"].items():
+        nodes_by_depth = cast(NodeDepthMap, result["nodes_by_depth"])
+        for _depth, nodes in nodes_by_depth.items():
             assert isinstance(nodes, list)
-            assert all(isinstance(n, dict) for n in nodes)
-            assert all("symbol" in n for n in nodes)
+            assert all(isinstance(node, dict) for node in nodes)
+            assert all("symbol" in node for node in nodes)
 
-    def test_depth_increments_correctly(self, test_tenant_id):
+    def test_depth_increments_correctly(self):
         """Test that depths increment correctly."""
-        store = GraphStore(tenant_id=test_tenant_id)
+        store = GraphStore(tenant_id=PRIMARY_TENANT_ID)
 
         result = store.ego_graph(
             symbol="services/user.py:UserService",
@@ -290,10 +297,7 @@ class TestEgoGraphRLS:
 
     def test_tenant_isolation(self):
         """Test ego graph respects tenant isolation."""
-        tenant1_id = "00000000-0000-0000-0000-000000000001"
-        tenant2_id = "00000000-0000-0000-0000-000000000002"
-
-        store1 = GraphStore(tenant_id=tenant1_id)
+        store1 = GraphStore(tenant_id=PRIMARY_TENANT_ID)
 
         # Try to query tenant2 symbol from tenant1 context
         result = store1.ego_graph(
@@ -305,9 +309,9 @@ class TestEgoGraphRLS:
         # Should not find the symbol due to RLS
         assert "error" in result
 
-    def test_ego_contains_only_tenant_nodes(self, test_tenant_id):
+    def test_ego_contains_only_tenant_nodes(self):
         """Test ego graph only includes nodes from same tenant."""
-        store = GraphStore(tenant_id=test_tenant_id)
+        store = GraphStore(tenant_id=PRIMARY_TENANT_ID)
 
         result = store.ego_graph(
             symbol="services/user.py:UserService",
@@ -319,17 +323,12 @@ class TestEgoGraphRLS:
 
         # All nodes should be from the same tenant
         # (tenant_id might not be in response, but we verify via search isolation)
-        all_symbols = []
-        for nodes in result["nodes_by_depth"].values():
-            all_symbols.extend([n["symbol"] for n in nodes])
+        all_symbols: list[str] = []
+        nodes_by_depth = cast(NodeDepthMap, result["nodes_by_depth"])
+        for nodes in nodes_by_depth.values():
+            all_symbols.extend(
+                [symbol for symbol in (node.get("symbol") for node in nodes) if isinstance(symbol, str)]
+            )
 
         # Should not contain any tenant2 symbols (BlogService, etc.)
         assert not any("BlogService" in s for s in all_symbols)
-
-
-# Fixtures
-
-@pytest.fixture
-def test_tenant_id():
-    """Return test tenant ID (org1)."""
-    return "00000000-0000-0000-0000-000000000001"

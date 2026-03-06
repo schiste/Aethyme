@@ -1,48 +1,31 @@
 # Aethyme CLI Reference
 
-Complete reference for the Aethyme command-line interface.
-
-## Installation
-
-```bash
-pip install aethyme
-```
+## Local Verification
+- `make test-unit`
+- `make test-integration`
+- `make test-full`
 
 ## Global Options
-
-- `--tenant-id` - Tenant ID for multi-tenant isolation
-- `--json` - Output in JSON format
-- `--verbose`, `-v` - Verbose output
-- `--version` - Show version
-- `--help` - Show help
+- `--tenant-id`
+- `--json`
+- `--verbose`
 
 ## Commands
 
-### Index Commands
-- `aethyme index repo --repo PATH` - Index repository
-- `aethyme index status` - Check indexing status
-- `aethyme index trigger REPO_ID` - Trigger re-indexing
+### Indexing
+- Canonical contract: [`src/indexing/service.py`](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/src/indexing/service.py)
+- `aethyme index PATH --name NAME --languages python,typescript --use-fallback`
+- `aethyme stats`
 
-### Query Commands
-- `aethyme query search TERM` - Search for symbols
-- `aethyme query ego SYMBOL` - Get ego graph
-- `aethyme query impact SYMBOL` - Impact analysis
+### Queries
+- `aethyme search TERM --limit 20 --type hybrid`
+- `aethyme ego SYMBOL --depth 2 --limit 100`
+- `aethyme impact SYMBOL --max-depth 10 --limit 1000`
 
-### AI-Readiness
-- `aethyme ai-ready` - Run scorecard
+### Scorecard
+- `aethyme ai-ready PATH`
 
 ### Autofix
-- `aethyme autofix dry-run` - Preview fixes
-- `aethyme autofix apply` - Apply fixes
-- `aethyme autofix pr` - Create PR with fixes
-
-### Configuration
-- `aethyme config show` - Show configuration
-- `aethyme config set KEY VALUE` - Set configuration
-- `aethyme login` - Authenticate
-
-### Metrics
-- `aethyme kpi` - Show KPI report
-- `aethyme stats` - Show graph statistics
-
-For detailed documentation, see the full CLI reference.
+- `aethyme autofix PATH --dry-run`
+- `aethyme autofix PATH --apply`
+- `aethyme autofix PATH --pr`

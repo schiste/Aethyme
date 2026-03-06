@@ -143,6 +143,7 @@ async def tenant_context_middleware(request: Request, call_next):
     async with db.begin() as conn:
         await conn.execute(text(f"SET app.current_org = '{org_id}'"))
 
+async def tenant_middleware(request, call_next):
     response = await call_next(request)
     return response
 ```
@@ -152,11 +153,14 @@ async def tenant_context_middleware(request: Request, call_next):
 ```python
 class BaseQuery:
     """Automatically filter by org_id."""
+
+    @staticmethod
     def filter_by_org(query, org_id: str):
         return query.filter(Table.org_id == org_id)
 
-# Usage:
-symbols = await db.query(Symbol).filter_by_org(request.state.org_id).all()
+
+async def load_symbols(db_session, request):
+    return await db_session.query(Symbol).filter_by_org(request.state.org_id).all()
 ```
 
 **Layer 3: Database (Row-Level Security)**
@@ -316,7 +320,10 @@ class EncryptedField:
 
 # Usage: OAuth tokens
 token_encrypted = encrypted_field.encrypt(github_token)
-await db.save_oauth_token(org_id, provider="github", token=token_encrypted)
+
+async def store_token(db_client, org_id: str, github_token: str) -> None:
+    token_encrypted = encrypted_field.encrypt(github_token)
+    await db_client.save_oauth_token(org_id, provider="github", token=token_encrypted)
 ```
 
 ### In Transit
@@ -428,11 +435,14 @@ await db.insert_audit_log({...})
 
 **Data Retention:**
 
-```python
+```sql
 # Auto-delete old audit logs
 DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL '90 days';
 
 # User deletion (right to be forgotten)
+```
+
+```python
 async def delete_user_data(user_id: str):
     """Delete all user data (GDPR right to erasure)."""
     await db.delete_user(user_id)

@@ -1,17 +1,19 @@
 """Ego graph API routes."""
 
-from typing import Dict, Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 import json
+from typing import Any, TypeAlias
 
+import structlog
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+from ...auth import RepoReadUser
 from ...graph.store import GraphStore
-from ..auth import jwt_or_api_key, User
 
+logger = structlog.get_logger(__name__)
 router = APIRouter()
-limiter = Limiter(key_func=get_remote_address)
+EgoGraphNode: TypeAlias = dict[str, Any]
+EgoDepthMap: TypeAlias = dict[int, list[EgoGraphNode]]
 
 
 class EgoGraphRequest(BaseModel):
@@ -41,8 +43,8 @@ class EgoGraphResponse(BaseModel):
     """Response model for ego graph queries."""
 
     symbol: str
-    definition: Optional[Dict[str, Any]]
-    nodes_by_depth: Dict[int, list]
+    definition: dict[str, Any] | None
+    nodes_by_depth: EgoDepthMap
     total_nodes: int
     cached: bool = False
 
@@ -50,7 +52,7 @@ class EgoGraphResponse(BaseModel):
 @router.post("/", response_model=EgoGraphResponse)
 async def get_ego_graph(
     request: EgoGraphRequest,
-    user: User = Depends(jwt_or_api_key),
+    user: RepoReadUser,
 ) -> EgoGraphResponse:
     """
     Get ego graph for a symbol.
@@ -68,8 +70,8 @@ async def get_ego_graph(
             cached = app.state.redis.get(cache_key)
             if cached:
                 cached_result = json.loads(cached)
-        except Exception:
-            pass  # Cache errors are non-fatal
+        except Exception as exc:
+            logger.warning("Ego cache read failed", cache_key=cache_key, error=str(exc))
 
     if cached_result:
         return EgoGraphResponse(
@@ -99,8 +101,8 @@ async def get_ego_graph(
                 300,  # 5 minutes
                 json.dumps(result, default=str),
             )
-        except Exception:
-            pass  # Cache errors are non-fatal
+        except Exception as exc:
+            logger.warning("Ego cache write failed", cache_key=cache_key, error=str(exc))
 
     return EgoGraphResponse(
         symbol=request.symbol,
@@ -114,8 +116,8 @@ async def get_ego_graph(
 @router.get("/definition/{symbol}")
 async def get_definition(
     symbol: str,
-    user: User = Depends(jwt_or_api_key),
-) -> Dict[str, Any]:
+    user: RepoReadUser,
+) -> dict[str, Any]:
     """
     Get definition node for a symbol.
 

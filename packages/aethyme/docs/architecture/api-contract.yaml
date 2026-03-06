@@ -9,8 +9,7 @@ info:
     - Repository indexing (SCIP + fallback)
     - Graph queries (search, ego, impact)
     - AI-readiness scorecard
-    - Safe autofixers
-    - Guardrails and telemetry
+    - Local autofixer tooling
 
     **Authentication:**
     - JWT Bearer tokens (OIDC)
@@ -28,8 +27,6 @@ info:
 servers:
   - url: https://api.aethyme.com/api/v1
     description: Production
-  - url: https://api.staging.aethyme.com/api/v1
-    description: Staging
   - url: http://localhost:8000/api/v1
     description: Local development
 

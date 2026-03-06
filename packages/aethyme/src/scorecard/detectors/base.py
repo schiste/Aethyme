@@ -1,13 +1,12 @@
 """Base detector class for AI-readiness checks."""
 
+import logging
 from abc import ABC, abstractmethod
-from typing import List, Optional
 from pathlib import Path
-import structlog
 
 from ..models import Finding
 
-logger = structlog.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class BaseDetector(ABC):
@@ -21,7 +20,7 @@ class BaseDetector(ABC):
             repo_path: Path to the repository to scan
         """
         self.repo_path = repo_path
-        self.logger = logger.bind(detector=self.name)
+        self.logger = logger
 
     @property
     @abstractmethod
@@ -36,7 +35,7 @@ class BaseDetector(ABC):
         pass
 
     @abstractmethod
-    def detect(self) -> List[Finding]:
+    def detect(self) -> list[Finding]:
         """
         Run detection and return findings.
 
@@ -74,7 +73,7 @@ class BaseDetector(ABC):
 
         return False
 
-    def read_file_safe(self, file_path: Path) -> Optional[str]:
+    def read_file_safe(self, file_path: Path) -> str | None:
         """
         Safely read file contents.
 
@@ -87,5 +86,5 @@ class BaseDetector(ABC):
         try:
             return file_path.read_text(encoding='utf-8')
         except (UnicodeDecodeError, PermissionError, FileNotFoundError) as e:
-            self.logger.debug("Failed to read file", path=str(file_path), error=str(e))
+            self.logger.debug("Failed to read file %s: %s", file_path, e)
             return None

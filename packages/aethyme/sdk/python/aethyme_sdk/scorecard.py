@@ -1,6 +1,7 @@
 """Scorecard API for Aethyme SDK."""
 
-from typing import List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
+
 from .models import ScorecardResult
 
 if TYPE_CHECKING:
@@ -20,7 +21,7 @@ class ScorecardAPI:
     def scan(
         self,
         repo_id: str,
-        checks: Optional[List[str]] = None,
+        checks: list[str] | None = None,
         include_suggestions: bool = True,
     ) -> ScorecardResult:
         """
@@ -39,7 +40,7 @@ class ScorecardAPI:
             >>> print(f"Score: {scorecard.overall_score}/100")
             >>> print(f"Violations: {len(scorecard.violations)}")
         """
-        data = {
+        data: dict[str, object] = {
             "repo_id": repo_id,
             "include_suggestions": include_suggestions,
         }
@@ -53,7 +54,7 @@ class ScorecardAPI:
         self,
         repo_id: str,
         limit: int = 10,
-    ) -> List[dict]:
+    ) -> list[dict[str, Any]]:
         """
         Get scorecard history for a repository.
 
@@ -73,9 +74,16 @@ class ScorecardAPI:
             f"/api/v1/scorecard/history/{repo_id}",
             params={"limit": limit},
         )
-        return response.get("history", [])
+        history = response.get("history", [])
+        if isinstance(history, list):
+            history_items: list[dict[str, Any]] = []
+            for item in cast(list[object], history):
+                if isinstance(item, dict):
+                    history_items.append(cast(dict[str, Any], item))
+            return history_items
+        return []
 
-    def list_checks(self) -> List[dict]:
+    def list_checks(self) -> list[dict[str, Any]]:
         """
         List all available scorecard checks.
 
@@ -88,4 +96,11 @@ class ScorecardAPI:
             ...     print(f"{check['name']}: {check['description']}")
         """
         response = self.client.get("/api/v1/scorecard/checks")
-        return response.get("checks", [])
+        checks = response.get("checks", [])
+        if isinstance(checks, list):
+            check_items: list[dict[str, Any]] = []
+            for item in cast(list[object], checks):
+                if isinstance(item, dict):
+                    check_items.append(cast(dict[str, Any], item))
+            return check_items
+        return []

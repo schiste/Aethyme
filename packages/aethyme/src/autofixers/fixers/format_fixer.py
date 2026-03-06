@@ -2,19 +2,19 @@
 
 import subprocess
 from pathlib import Path
-from typing import Optional, Dict, List
-import structlog
+from typing import Any
 
+from .._log import get_logger
 from .base import BaseFixer
 
-logger = structlog.get_logger()
+logger = get_logger()
 
 
 class FormatFixer(BaseFixer):
     """Applies automated formatting and linting fixes."""
 
     # Formatters by language
-    FORMATTERS = {
+    FORMATTERS: dict[str, list[str]] = {
         'python': ['black', 'autopep8', 'yapf'],
         'javascript': ['prettier'],
         'typescript': ['prettier'],
@@ -23,13 +23,13 @@ class FormatFixer(BaseFixer):
     }
 
     # Linters with auto-fix
-    LINTERS = {
+    LINTERS: dict[str, list[str]] = {
         'python': ['ruff', 'isort'],
         'javascript': ['eslint'],
         'typescript': ['eslint'],
     }
 
-    def __init__(self, repo_path: Path, formatter: Optional[str] = None):
+    def __init__(self, repo_path: Path, formatter: str | None = None):
         super().__init__(repo_path)
         self.formatter = formatter
         self.available_tools = self._check_available_tools()
@@ -58,7 +58,7 @@ class FormatFixer(BaseFixer):
         # Check if we have a formatter available
         return language in self.available_tools and len(self.available_tools[language]) > 0
 
-    def fix(self, file_path: Path, content: str) -> Optional[str]:
+    def fix(self, file_path: Path, content: str) -> str | None:
         """Apply formatting to content."""
         ext = file_path.suffix.lower()
 
@@ -100,9 +100,9 @@ class FormatFixer(BaseFixer):
 
         return None
 
-    def _check_available_tools(self) -> Dict[str, List[str]]:
+    def _check_available_tools(self) -> dict[str, list[str]]:
         """Check which formatting tools are available."""
-        available = {}
+        available: dict[str, list[str]] = {}
 
         for language, tools in self.FORMATTERS.items():
             available[language] = []
@@ -125,7 +125,7 @@ class FormatFixer(BaseFixer):
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return False
 
-    def _run_formatter(self, tool: str, file_path: Path, content: str) -> Optional[str]:
+    def _run_formatter(self, tool: str, file_path: Path, content: str) -> str | None:
         """Run a formatter and return formatted content."""
         if tool == 'black':
             return self._run_black(file_path, content)
@@ -146,7 +146,7 @@ class FormatFixer(BaseFixer):
 
         return None
 
-    def _run_black(self, file_path: Path, content: str) -> Optional[str]:
+    def _run_black(self, file_path: Path, content: str) -> str | None:
         """Run Black formatter."""
         try:
             result = subprocess.run(
@@ -164,7 +164,7 @@ class FormatFixer(BaseFixer):
 
         return None
 
-    def _run_prettier(self, file_path: Path, content: str) -> Optional[str]:
+    def _run_prettier(self, file_path: Path, content: str) -> str | None:
         """Run Prettier formatter."""
         try:
             # Determine parser from file extension
@@ -195,7 +195,7 @@ class FormatFixer(BaseFixer):
 
         return None
 
-    def _run_gofmt(self, file_path: Path, content: str) -> Optional[str]:
+    def _run_gofmt(self, file_path: Path, content: str) -> str | None:
         """Run gofmt formatter."""
         try:
             result = subprocess.run(
@@ -213,7 +213,7 @@ class FormatFixer(BaseFixer):
 
         return None
 
-    def _run_rustfmt(self, file_path: Path, content: str) -> Optional[str]:
+    def _run_rustfmt(self, file_path: Path, content: str) -> str | None:
         """Run rustfmt formatter."""
         try:
             result = subprocess.run(
@@ -231,7 +231,7 @@ class FormatFixer(BaseFixer):
 
         return None
 
-    def _run_autopep8(self, file_path: Path, content: str) -> Optional[str]:
+    def _run_autopep8(self, file_path: Path, content: str) -> str | None:
         """Run autopep8 formatter."""
         try:
             result = subprocess.run(
@@ -249,7 +249,7 @@ class FormatFixer(BaseFixer):
 
         return None
 
-    def _run_ruff(self, file_path: Path, content: str) -> Optional[str]:
+    def _run_ruff(self, file_path: Path, content: str) -> str | None:
         """Run ruff linter with auto-fix."""
         try:
             # Write to temp file since ruff needs file path
@@ -273,7 +273,7 @@ class FormatFixer(BaseFixer):
                 )
 
                 # Read fixed content
-                with open(temp_path, 'r', encoding='utf-8') as f:
+                with open(temp_path, encoding='utf-8') as f:
                     return f.read()
 
             finally:
@@ -284,7 +284,7 @@ class FormatFixer(BaseFixer):
 
         return None
 
-    def _run_isort(self, file_path: Path, content: str) -> Optional[str]:
+    def _run_isort(self, file_path: Path, content: str) -> str | None:
         """Run isort for import sorting."""
         try:
             result = subprocess.run(
@@ -302,7 +302,7 @@ class FormatFixer(BaseFixer):
 
         return None
 
-    def _run_eslint(self, file_path: Path, content: str) -> Optional[str]:
+    def _run_eslint(self, file_path: Path, content: str) -> str | None:
         """Run ESLint with auto-fix."""
         try:
             import tempfile
@@ -325,7 +325,7 @@ class FormatFixer(BaseFixer):
                 )
 
                 # Read fixed content
-                with open(temp_path, 'r', encoding='utf-8') as f:
+                with open(temp_path, encoding='utf-8') as f:
                     return f.read()
 
             finally:
@@ -336,7 +336,7 @@ class FormatFixer(BaseFixer):
 
         return None
 
-    def get_formatter_info(self) -> Dict[str, any]:
+    def get_formatter_info(self) -> dict[str, Any]:
         """Get information about available formatters."""
         return {
             "available_tools": self.available_tools,

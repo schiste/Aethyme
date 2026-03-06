@@ -1,14 +1,14 @@
 """GitHub integration for creating pull requests with autofixes."""
 
 import subprocess
-from pathlib import Path
-from typing import Dict, List, Optional
 from datetime import datetime
-import structlog
+from pathlib import Path
+from typing import Any
 
+from ._log import get_logger
 from .patch import PatchGenerator
 
-logger = structlog.get_logger()
+logger = get_logger()
 
 
 class GitHubIntegration:
@@ -19,7 +19,7 @@ class GitHubIntegration:
         self.use_gh_cli = use_gh_cli
         self.branch_prefix = "autofix"
 
-    def create_branch(self, branch_name: Optional[str] = None) -> str:
+    def create_branch(self, branch_name: str | None = None) -> str:
         """Create a new branch for autofixes."""
         if branch_name is None:
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -44,7 +44,7 @@ class GitHubIntegration:
     def commit_changes(
         self,
         message: str,
-        files: Optional[List[Path]] = None,
+        files: list[Path] | None = None,
     ) -> str:
         """Commit changes to current branch."""
         try:
@@ -119,10 +119,10 @@ class GitHubIntegration:
         title: str,
         body: str,
         base_branch: str = "main",
-        head_branch: Optional[str] = None,
-        labels: Optional[List[str]] = None,
-        reviewers: Optional[List[str]] = None,
-    ) -> Optional[Dict[str, any]]:
+        head_branch: str | None = None,
+        labels: list[str] | None = None,
+        reviewers: list[str] | None = None,
+    ) -> dict[str, Any] | None:
         """Create a pull request using GitHub CLI."""
         if not self.use_gh_cli:
             logger.warning("GitHub CLI not enabled")
@@ -175,8 +175,8 @@ class GitHubIntegration:
         self,
         patch_generator: PatchGenerator,
         base_branch: str = "main",
-        labels: Optional[List[str]] = None,
-    ) -> Optional[Dict[str, any]]:
+        labels: list[str] | None = None,
+    ) -> dict[str, Any] | None:
         """Create a complete autofix PR workflow."""
         summary = patch_generator.get_summary()
 
@@ -247,12 +247,17 @@ class GitHubIntegration:
                     cwd=self.repo_path,
                     capture_output=True,
                 )
-            except Exception:
-                pass
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Failed to clean up autofix branch after PR creation failure",
+                    branch=branch_name,
+                    base_branch=base_branch,
+                    error=str(cleanup_error),
+                )
 
             return None
 
-    def _generate_pr_title(self, summary: Dict[str, any]) -> str:
+    def _generate_pr_title(self, summary: dict[str, Any]) -> str:
         """Generate PR title from summary."""
         total = summary["total_files"]
         fix_types = list(summary["by_fix_type"].keys())
@@ -264,7 +269,7 @@ class GitHubIntegration:
 
     def _generate_pr_body(
         self,
-        summary: Dict[str, any],
+        summary: dict[str, Any],
         patch_generator: PatchGenerator
     ) -> str:
         """Generate PR body from summary."""
@@ -344,10 +349,11 @@ class GitHubIntegration:
                 text=True,
             )
             return len(result.stdout.strip()) == 0
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as exc:
+            logger.warning("Failed to inspect working tree status", error=str(exc))
             return False
 
-    def get_remote_info(self) -> Optional[Dict[str, str]]:
+    def get_remote_info(self) -> dict[str, str] | None:
         """Get GitHub repository info."""
         try:
             result = subprocess.run(
@@ -372,7 +378,7 @@ class GitHubIntegration:
                     "url": remote_url,
                 }
 
-        except subprocess.CalledProcessError:
-            pass
+        except subprocess.CalledProcessError as exc:
+            logger.warning("Failed to inspect git remote info", error=str(exc))
 
         return None

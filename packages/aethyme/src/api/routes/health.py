@@ -1,9 +1,8 @@
-"""Health check API routes."""
-
-from typing import Dict, Any
-from fastapi import APIRouter, status
-import psutil
 import datetime
+from typing import Any
+
+import psutil
+from fastapi import APIRouter, status
 
 from ...graph.connection_pool import db_pool
 from ...graph.store import GraphStore
@@ -12,7 +11,7 @@ router = APIRouter()
 
 
 @router.get("/", status_code=status.HTTP_200_OK)
-async def health_check() -> Dict[str, Any]:
+async def health_check() -> dict[str, Any]:
     """
     Basic health check endpoint.
 
@@ -20,12 +19,12 @@ async def health_check() -> Dict[str, Any]:
     """
     return {
         "status": "healthy",
-        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
     }
 
 
 @router.get("/live", status_code=status.HTTP_200_OK)
-async def liveness_probe() -> Dict[str, str]:
+async def liveness_probe() -> dict[str, str]:
     """
     Kubernetes liveness probe endpoint.
 
@@ -35,13 +34,13 @@ async def liveness_probe() -> Dict[str, str]:
 
 
 @router.get("/ready")
-async def readiness_probe() -> Dict[str, Any]:
+async def readiness_probe() -> dict[str, Any]:
     """
     Kubernetes readiness probe endpoint.
 
     Checks if all dependencies are ready.
     """
-    checks = {
+    checks: dict[str, bool | None] = {
         "database": False,
         "redis": False,
     }
@@ -75,15 +74,15 @@ async def readiness_probe() -> Dict[str, Any]:
 
 
 @router.get("/detailed")
-async def detailed_health() -> Dict[str, Any]:
+async def detailed_health() -> dict[str, Any]:
     """
     Detailed health check with system metrics.
 
     Includes database stats, memory usage, and graph statistics.
     """
-    health = {
+    health: dict[str, Any] = {
         "status": "healthy",
-        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         "database": {},
         "system": {},
         "graph": {},
@@ -123,13 +122,20 @@ async def detailed_health() -> Dict[str, Any]:
 
     # Graph statistics (from default tenant)
     try:
-        # Get default tenant ID
-        query = "SELECT id FROM aethyme.tenants WHERE name = 'aeptus' LIMIT 1"
-        result = db_pool.execute(query)
+        result = db_pool.execute(
+            """
+            SELECT t.id, t.org_id
+            FROM aethyme.tenants t
+            JOIN aethyme.orgs o ON o.id = t.org_id
+            WHERE o.slug = 'default' AND t.slug = 'default'
+            LIMIT 1
+            """
+        )
 
         if result:
             tenant_id = str(result[0]["id"])
-            store = GraphStore(tenant_id=tenant_id)
+            org_id = str(result[0]["org_id"])
+            store = GraphStore(tenant_id=tenant_id, org_id=org_id)
             stats = store.get_statistics()
             health["graph"] = stats
     except Exception as e:

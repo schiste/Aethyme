@@ -16,6 +16,22 @@ Procedures for backing up and restoring Aethyme data, including PostgreSQL datab
 
 ---
 
+## Symptoms
+
+- PostgreSQL data loss or corruption
+- Failed migration that requires rollback to a known-good snapshot
+- Region outage requiring restore into a fresh environment
+- Need to recover repositories, graph data, or user records after operator error
+
+## Diagnostic
+
+- Confirm the timestamp and integrity of the latest successful backup
+- Identify whether recovery is logical restore, physical restore, or point-in-time recovery
+- Verify target environment credentials, storage access, and available disk space
+- Confirm the application is drained or stopped before restore begins
+
+---
+
 ## Backup Strategy
 
 ### Backup Components

@@ -1,5 +1,15 @@
 # Index Failure Triage Runbook
 
+## Overview
+
+Triage and recovery procedure for failed repository indexing jobs in Aethyme.
+
+## Symptoms
+
+- Indexing jobs failing repeatedly
+- Repositories stuck in `pending` or `failed`
+- Search or graph results stale after code changes
+
 ## Quick Reference
 
 **Symptoms:** Indexing jobs failing, stale indexes, high error rates in indexer pods

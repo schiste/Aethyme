@@ -1,5 +1,22 @@
 # Emergency Rollback Runbook
 
+## Overview
+
+Emergency rollback procedure for reverting a bad deployment or configuration change in Aethyme.
+
+## Symptoms
+
+- Error rate spikes after deployment
+- User-facing failures or degraded latency
+- Data corruption or severe indexing regressions
+- Security regression introduced by the latest release
+
+## Diagnostic
+
+- Confirm the deployment or configuration change correlated with the incident
+- Check health probes, error rates, and rollback targets
+- Identify the last known-good release or revision before acting
+
 ## When to Rollback
 
 Initiate rollback immediately if:

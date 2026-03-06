@@ -1,33 +1,44 @@
-"""
-Index Status API Endpoint
-
-Provides endpoints for querying indexing status, freshness, and statistics.
-"""
-
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
-from typing import Dict, List, Optional
+import asyncio
 from datetime import datetime
+from pathlib import Path
+from typing import Protocol
 
-from src.api.auth import get_current_user
-from src.graph.connection_pool import db_pool
-from src.indexing.freshness import FreshnessMonitor, FreshnessStatus, format_staleness
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 
-router = APIRouter(prefix="/api/index", tags=["indexing"])
+from ...auth import RepoReadUser, RepoWriteUser
+from ...graph.connection_pool import db_pool
+from ...indexing.freshness import FreshnessMonitor, FreshnessStatus, format_staleness
+from ...indexing.service import (
+    IndexingResult,
+    RepositoryIndexRequest,
+)
+from ...indexing.service import (
+    run_indexing as run_repository_indexing,
+)
+
+router = APIRouter(prefix="/api/v1/index", tags=["indexing"])
+
+
+class IndexingUserContext(Protocol):
+    """Minimal authenticated context needed to create a service request."""
+
+    tenant_id: str
+    org_id: str | None
 
 
 class IndexStatusResponse(BaseModel):
     """Response model for index status."""
     repo_id: str = Field(..., description="Repository ID")
     repo_name: str = Field(..., description="Repository name")
-    last_indexed_at: Optional[datetime] = Field(None, description="Last successful index timestamp")
+    last_indexed_at: datetime | None = Field(None, description="Last successful index timestamp")
     is_stale: bool = Field(..., description="Whether index is stale")
     staleness_status: str = Field(..., description="Freshness status: fresh, stale, critical, never_indexed")
     staleness_human: str = Field(..., description="Human-readable staleness")
     symbol_count: int = Field(..., description="Total symbol count")
-    language_breakdown: Dict[str, int] = Field(..., description="Symbol counts by language")
-    errors: List[str] = Field(default_factory=list, description="Recent indexing errors")
-    duration_seconds: Optional[float] = Field(None, description="Last index duration")
+    language_breakdown: dict[str, int] = Field(..., description="Symbol counts by language")
+    errors: list[str] = Field(default_factory=list, description="Recent indexing errors")
+    duration_seconds: float | None = Field(None, description="Last index duration when tracked")
     index_status: str = Field(..., description="Current status: pending, indexing, completed, failed")
 
 
@@ -35,7 +46,7 @@ class RepositoryListItem(BaseModel):
     """List item for repositories."""
     repo_id: str
     repo_name: str
-    last_indexed_at: Optional[datetime]
+    last_indexed_at: datetime | None
     staleness_status: str
     symbol_count: int
 
@@ -48,20 +59,59 @@ class FreshnessSummaryResponse(BaseModel):
     stale_count: int
     critical_count: int
     never_indexed_count: int
-    stale_repositories: List[RepositoryListItem]
+    stale_repositories: list[RepositoryListItem]
+
+
+class IndexRepositoryRequest(BaseModel):
+    """Request to register and index a local repository."""
+
+    repository_path: str = Field(..., description="Absolute or relative path to the repository")
+    repository_name: str | None = Field(default=None, description="Optional repository display name")
+    languages: list[str] = Field(default_factory=lambda: ["python"], description="Languages to index")
+    use_fallback: bool = Field(default=False, description="Skip SCIP and use the regex fallback indexer")
+    clear_existing: bool = Field(default=True, description="Clear existing graph data before re-indexing")
+
+    def to_service_request(self, user: IndexingUserContext) -> RepositoryIndexRequest:
+        """Convert API payload into the canonical indexing service request."""
+        return RepositoryIndexRequest(
+            repo_path=Path(self.repository_path),
+            repo_name=self.repository_name,
+            languages=self.languages,
+            tenant_id=user.tenant_id,
+            org_id=user.org_id,
+            use_fallback=self.use_fallback,
+            clear_existing=self.clear_existing,
+        )
+
+
+class IndexRepositoryResponse(BaseModel):
+    """Response after a repository indexing run."""
+
+    repository_id: str
+    repository_name: str
+    repository_path: str
+    org_id: str | None
+    tenant_id: str
+    languages: list[str]
+    total_nodes: int
+    total_edges: int
+    total_files: int
+    graph_statistics: dict[str, int]
+    language_results: list[dict[str, str | int]]
+    errors: list[str]
 
 
 @router.get("/status/{repo_id}", response_model=IndexStatusResponse)
 async def get_index_status(
     repo_id: str,
-    user=Depends(get_current_user),
+    user: RepoReadUser,
 ):
     """
     Get indexing status for a specific repository.
 
     Returns current status, freshness metrics, symbol counts, and recent errors.
     """
-    tenant_id = user.get("tenant_id")
+    tenant_id = user.tenant_id
     if not tenant_id:
         raise HTTPException(status_code=400, detail="Tenant ID required")
 
@@ -99,20 +149,13 @@ async def get_index_status(
         (repo_id, tenant_id),
     )
 
-    language_breakdown = {}
+    language_breakdown: dict[str, int] = {}
     total_symbols = 0
-    for row in symbol_result:
+    for row in symbol_result or []:
         lang = row["language"]
         count = int(row["total_count"])
-        language_breakdown[lang] = count
+        language_breakdown[str(lang)] = count
         total_symbols += count
-
-    # Get recent errors (if any)
-    # For now, return empty list - can be extended to track errors in a separate table
-    errors = []
-
-    # Get last index duration (mock for now - could be stored in DB)
-    duration_seconds = None  # TODO: Track this in indexing process
 
     return IndexStatusResponse(
         repo_id=repo_id,
@@ -123,15 +166,32 @@ async def get_index_status(
         staleness_human=format_staleness(freshness.staleness_hours),
         symbol_count=total_symbols,
         language_breakdown=language_breakdown,
-        errors=errors,
-        duration_seconds=duration_seconds,
+        errors=[],
+        duration_seconds=None,
         index_status=repo["index_status"] or "unknown",
     )
 
 
+@router.post("/repositories", response_model=IndexRepositoryResponse)
+async def run_indexing(
+    request: IndexRepositoryRequest,
+    user: RepoWriteUser,
+):
+    """Register and index a repository inside the authenticated tenant."""
+    service_request = request.to_service_request(user)
+    repo_path = service_request.resolved_repo_path()
+    if not repo_path.exists():
+        raise HTTPException(status_code=404, detail=f"Repository path not found: {repo_path}")
+    if not repo_path.is_dir():
+        raise HTTPException(status_code=400, detail="Repository path must be a directory")
+
+    result = await asyncio.to_thread(run_repository_indexing, service_request)
+    return _to_index_response(result)
+
+
 @router.get("/freshness", response_model=FreshnessSummaryResponse)
 async def get_freshness_summary(
-    user=Depends(get_current_user),
+    user: RepoReadUser,
     include_stale_only: bool = Query(False, description="Only include stale repositories in list"),
 ):
     """
@@ -139,7 +199,7 @@ async def get_freshness_summary(
 
     Returns counts by freshness status and list of stale repositories.
     """
-    tenant_id = user.get("tenant_id")
+    tenant_id = user.tenant_id
     if not tenant_id:
         raise HTTPException(status_code=400, detail="Tenant ID required")
 
@@ -163,11 +223,11 @@ async def get_freshness_summary(
         )
         stale_repos = [
             monitor.get_repository_freshness(str(repo["id"]), tenant_id)
-            for repo in all_repos
+            for repo in (all_repos or [])
         ]
 
     # Get symbol counts for each repo
-    repo_list = []
+    repo_list: list[RepositoryListItem] = []
     for freshness in stale_repos:
         # Get symbol count
         symbol_result = db_pool.execute(
@@ -204,41 +264,5 @@ async def get_freshness_summary(
     )
 
 
-@router.post("/trigger/{repo_id}")
-async def trigger_reindex(
-    repo_id: str,
-    user=Depends(get_current_user),
-):
-    """
-    Manually trigger re-indexing for a repository.
-
-    Returns accepted status and queues the repository for indexing.
-    """
-    tenant_id = user.get("tenant_id")
-    if not tenant_id:
-        raise HTTPException(status_code=400, detail="Tenant ID required")
-
-    # Verify repository exists
-    repo_result = db_pool.execute(
-        """
-        SELECT id, name
-        FROM aethyme.repositories
-        WHERE id = %s AND tenant_id = %s
-        """,
-        (repo_id, tenant_id),
-    )
-
-    if not repo_result:
-        raise HTTPException(status_code=404, detail="Repository not found")
-
-    # Mark as pending indexing
-    monitor = FreshnessMonitor(db_pool)
-    monitor.mark_index_started(repo_id, tenant_id)
-
-    # TODO: Queue actual indexing job (would integrate with background worker)
-
-    return {
-        "status": "accepted",
-        "repo_id": repo_id,
-        "message": "Repository queued for indexing",
-    }
+def _to_index_response(result: IndexingResult) -> IndexRepositoryResponse:
+    return IndexRepositoryResponse(**result.to_dict())

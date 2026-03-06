@@ -1,17 +1,21 @@
 """Detector modules for AI-readiness scorecard."""
 
+from typing import TypeAlias
+
+from .ability_coverage import AbilityCoverageDetector
 from .base import BaseDetector
 from .data_ui_coverage import DataUICoverageDetector
 from .folder_docs import FolderDocsDetector
-from .relative_links import RelativeLinksDetector
-from .i18n_gaps import I18nGapsDetector
 from .generated_files import GeneratedFilesDetector
-from .schema_drift import SchemaDriftDetector
+from .i18n_gaps import I18nGapsDetector
+from .relative_links import RelativeLinksDetector
 from .route_coverage import RouteCoverageDetector
-from .ability_coverage import AbilityCoverageDetector
+from .schema_drift import SchemaDriftDetector
+
+DetectorClass: TypeAlias = type[BaseDetector]
 
 # Registry of all detectors
-ALL_DETECTORS = [
+ALL_DETECTORS: list[DetectorClass] = [
     DataUICoverageDetector,
     FolderDocsDetector,
     RelativeLinksDetector,

@@ -1,13 +1,14 @@
 """PostgreSQL-backed graph storage with production features."""
 
-from typing import Optional, List, Dict, Any, Tuple
 import json
 import os
-import structlog
-from psycopg2.extras import execute_batch, Json
+from typing import Any, cast
 
-from .connection_pool import db_pool
-from ..models.graph import Node, Edge, Repository
+import structlog
+from psycopg2.extras import Json, RealDictRow
+
+from ..models.graph import Edge, Node
+from .connection_pool import DatabaseRow, SQLParams, db_pool
 
 logger = structlog.get_logger(__name__)
 
@@ -15,7 +16,12 @@ logger = structlog.get_logger(__name__)
 class GraphStore:
     """PostgreSQL-backed graph storage with multi-tenant support."""
 
-    def __init__(self, tenant_id: Optional[str] = None, scopes: Optional[List[str]] = None):
+    def __init__(
+        self,
+        tenant_id: str | None = None,
+        org_id: str | None = None,
+        scopes: list[str] | None = None,
+    ):
         """
         Initialize graph store with optional tenant context.
 
@@ -23,10 +29,28 @@ class GraphStore:
             tenant_id: UUID of the tenant for row-level security
         """
         self.tenant_id = tenant_id
+        self.org_id = org_id or self._resolve_org_id(tenant_id)
         self.db_pool = db_pool
         self.scopes = self._resolve_scopes(scopes)
 
-    def _resolve_scopes(self, scopes: Optional[List[str]]) -> Optional[List[str]]:
+    def _resolve_org_id(self, tenant_id: str | None) -> str | None:
+        if tenant_id is None:
+            return None
+
+        try:
+            result = db_pool.execute(
+                "SELECT org_id FROM aethyme.tenants WHERE id = %s",
+                (tenant_id,),
+            )
+        except Exception:
+            return tenant_id
+
+        if result and result[0].get("org_id"):
+            return str(result[0]["org_id"])
+
+        return tenant_id
+
+    def _resolve_scopes(self, scopes: list[str] | None) -> list[str] | None:
         if scopes is not None:
             return scopes
         scopes_env = os.getenv("AETHYME_DB_SCOPES") or os.getenv("REPOGRAPH_DB_SCOPES")
@@ -36,47 +60,49 @@ class GraphStore:
         if not scopes_env:
             return None
         try:
-            scopes = json.loads(scopes_env)
+            parsed_scopes = json.loads(scopes_env)
         except json.JSONDecodeError as exc:
             raise ValueError(
                 "Invalid scopes JSON in AETHYME_DB_SCOPES/REPOGRAPH_DB_SCOPES"
             ) from exc
-        if not isinstance(scopes, list) or any(not isinstance(s, str) for s in scopes):
+        if not isinstance(parsed_scopes, list):
             raise ValueError(
                 "AETHYME_DB_SCOPES/REPOGRAPH_DB_SCOPES must be a JSON array of strings"
             )
-        return scopes
+        resolved_scopes: list[str] = []
+        for scope_value in cast(list[object], parsed_scopes):
+            if not isinstance(scope_value, str):
+                raise ValueError(
+                    "AETHYME_DB_SCOPES/REPOGRAPH_DB_SCOPES must be a JSON array of strings"
+                )
+            resolved_scopes.append(scope_value)
+        return resolved_scopes
 
-    def set_tenant(self, tenant_id: str) -> None:
-        """Set tenant context for all operations."""
-        self.tenant_id = tenant_id
-
-    def set_scopes(self, scopes: Optional[List[str]]) -> None:
-        """Set scope context for all operations."""
-        self.scopes = scopes
-
-    def apply_session(self, cur) -> None:
+    def apply_session(self, cur: Any) -> None:
         """Public wrapper for setting session variables."""
         self._apply_session(cur)
 
-    def _apply_session(self, cur) -> None:
+    def _apply_session(self, cur: Any) -> None:
         if self.tenant_id:
             cur.execute("SET app.current_tenant = %s", (self.tenant_id,))
+        if self.org_id:
+            cur.execute("SET app.current_org = %s", (self.org_id,))
         if self.scopes:
             cur.execute("SET app.current_scopes = %s", (json.dumps(self.scopes),))
 
     def _execute_with_session(
         self,
         query: str,
-        params: Optional[tuple] = None,
+        params: SQLParams | None = None,
         fetch: bool = True,
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> list[DatabaseRow] | None:
         with self.db_pool.get_connection() as conn:
             with conn.cursor() as cur:
                 self._apply_session(cur)
                 cur.execute(query, params)
                 if fetch:
-                    return cur.fetchall()
+                    rows = cast(list[RealDictRow], cur.fetchall())
+                    return [dict(row) for row in rows]
         return None
 
     # ============= Repository Management =============
@@ -85,12 +111,12 @@ class GraphStore:
         self,
         name: str,
         path: str,
-        languages: List[str] = None,
-    ) -> Dict[str, Any]:
+        languages: list[str] | None = None,
+    ) -> DatabaseRow:
         """Create or update a repository."""
         query = """
-            INSERT INTO aethyme.repositories (tenant_id, name, path, languages)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO aethyme.repositories (org_id, tenant_id, name, path, languages)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (tenant_id, name) DO UPDATE
             SET path = EXCLUDED.path,
                 languages = EXCLUDED.languages,
@@ -98,6 +124,7 @@ class GraphStore:
             RETURNING *
         """
         params = (
+            self.org_id,
             self.tenant_id,
             name,
             path,
@@ -108,9 +135,10 @@ class GraphStore:
             with conn.cursor() as cur:
                 self._apply_session(cur)
                 cur.execute(query, params)
-                return cur.fetchone()
+                row = cast(RealDictRow, cur.fetchone())
+                return dict(row)
 
-    def get_repository(self, name: str) -> Optional[Dict[str, Any]]:
+    def get_repository(self, name: str) -> DatabaseRow | None:
         """Get repository by name."""
         query = """
             SELECT * FROM aethyme.repositories
@@ -121,7 +149,7 @@ class GraphStore:
 
     # ============= Node Management =============
 
-    def insert_nodes(self, nodes: List[Node], repository_id: str) -> int:
+    def insert_nodes(self, nodes: list[Node], repository_id: str) -> int:
         """
         Bulk insert nodes with conflict resolution.
 
@@ -134,10 +162,10 @@ class GraphStore:
         """
         query = """
             INSERT INTO aethyme.nodes (
-                id, display_id, tenant_id, repository_id, symbol, file_path,
+                id, display_id, org_id, tenant_id, repository_id, symbol, file_path,
                 line_number, column_number, kind, language,
                 signature, documentation, metadata
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (tenant_id, repository_id, symbol, file_path, line_number, column_number)
             DO UPDATE SET
                 signature = EXCLUDED.signature,
@@ -150,6 +178,7 @@ class GraphStore:
             (
                 node.id,
                 node.display_id,
+                self.org_id,
                 self.tenant_id,
                 repository_id,
                 node.symbol,
@@ -160,7 +189,7 @@ class GraphStore:
                 node.language,
                 node.signature,
                 node.documentation,
-                Json(node.metadata) if node.metadata else None,
+                Json(node.metadata or {}),
             )
             for node in nodes
         ]
@@ -168,7 +197,7 @@ class GraphStore:
         with self.db_pool.transaction() as conn:
             with conn.cursor() as cur:
                 self._apply_session(cur)
-                execute_batch(cur, query, params_list, page_size=1000)
+                cur.executemany(query, params_list)
                 affected = cur.rowcount
 
         logger.info(
@@ -179,7 +208,7 @@ class GraphStore:
         )
         return affected
 
-    def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
+    def get_node(self, node_id: str) -> DatabaseRow | None:
         """Get a single node by ID."""
         query = """
             SELECT * FROM aethyme.nodes
@@ -188,7 +217,7 @@ class GraphStore:
         result = self._execute_with_session(query, (node_id, self.tenant_id))
         return result[0] if result else None
 
-    def find_definition(self, symbol: str) -> Optional[Dict[str, Any]]:
+    def find_definition(self, symbol: str) -> DatabaseRow | None:
         """Find definition node by symbol name."""
         query = """
             SELECT * FROM aethyme.nodes
@@ -203,7 +232,7 @@ class GraphStore:
 
     # ============= Edge Management =============
 
-    def insert_edges(self, edges: List[Edge], repository_id: str) -> int:
+    def insert_edges(self, edges: list[Edge], repository_id: str) -> int:
         """
         Bulk insert edges with conflict resolution.
 
@@ -216,9 +245,9 @@ class GraphStore:
         """
         query = """
             INSERT INTO aethyme.edges (
-                id, tenant_id, repository_id, from_node_id,
+                id, org_id, tenant_id, repository_id, from_node_id,
                 to_node_id, edge_type, weight, metadata
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (tenant_id, repository_id, from_node_id, to_node_id, edge_type)
             DO UPDATE SET
                 weight = EXCLUDED.weight,
@@ -228,13 +257,14 @@ class GraphStore:
         params_list = [
             (
                 edge.id,
+                self.org_id,
                 self.tenant_id,
                 repository_id,
                 edge.from_node_id,
                 edge.to_node_id,
                 edge.edge_type,
                 edge.weight,
-                Json(edge.metadata) if edge.metadata else None,
+                Json(edge.metadata or {}),
             )
             for edge in edges
         ]
@@ -242,7 +272,7 @@ class GraphStore:
         with self.db_pool.transaction() as conn:
             with conn.cursor() as cur:
                 self._apply_session(cur)
-                execute_batch(cur, query, params_list, page_size=1000)
+                cur.executemany(query, params_list)
                 affected = cur.rowcount
 
         logger.info(
@@ -260,7 +290,7 @@ class GraphStore:
         symbol: str,
         depth: int = 1,
         limit: int = 100,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Get ego graph using recursive CTE.
 
@@ -298,8 +328,14 @@ class GraphStore:
                     AND n.id != eg.id
                 )
                 WHERE eg.depth < %s
+            ),
+            deduped AS (
+                SELECT DISTINCT ON (id) *
+                FROM ego_graph
+                ORDER BY id, depth
             )
-            SELECT * FROM ego_graph
+            SELECT *
+            FROM deduped
             ORDER BY depth, symbol
             LIMIT %s
         """
@@ -312,23 +348,25 @@ class GraphStore:
                     query,
                     (self.tenant_id, symbol, self.tenant_id, self.tenant_id, depth, limit)
                 )
-                nodes = cur.fetchall()
+                rows = cast(list[RealDictRow], cur.fetchall())
+                nodes = [dict(row) for row in rows]
 
         if not nodes:
             return {"error": "Symbol not found", "symbol": symbol}
 
         # Structure response by depth
-        result = {
+        nodes_by_depth: dict[int, list[DatabaseRow]] = {}
+        result: dict[str, Any] = {
             "definition": nodes[0] if nodes[0]["depth"] == 0 else None,
-            "nodes_by_depth": {},
+            "nodes_by_depth": nodes_by_depth,
             "total_nodes": len(nodes),
         }
 
         for node in nodes:
-            node_depth = node["depth"]
-            if node_depth not in result["nodes_by_depth"]:
-                result["nodes_by_depth"][node_depth] = []
-            result["nodes_by_depth"][node_depth].append(node)
+            node_depth = cast(int, node["depth"])
+            if node_depth not in nodes_by_depth:
+                nodes_by_depth[node_depth] = []
+            nodes_by_depth[node_depth].append(node)
 
         return result
 
@@ -337,7 +375,7 @@ class GraphStore:
         symbol: str,
         max_depth: int = 10,
         limit: int = 1000,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Find all symbols impacted by changes using recursive CTE.
 
@@ -350,19 +388,21 @@ class GraphStore:
             Dictionary with impact analysis results
         """
         query = """
-            WITH RECURSIVE impact_tree AS (
-                -- Base: starting symbol
-                SELECT n.id, n.symbol, n.file_path, 0 as depth,
-                       ARRAY[n.id] as path, false as is_cycle
+            WITH RECURSIVE seed_node AS (
+                SELECT n.id, n.symbol, n.file_path
                 FROM aethyme.nodes n
                 WHERE n.tenant_id = %s
                   AND n.symbol = %s
                   AND n.kind IN ('def', 'class', 'function', 'method')
+                ORDER BY n.indexed_at DESC
                 LIMIT 1
-
+            ),
+            impact_tree AS (
+                SELECT id, symbol, file_path, 0 as depth,
+                       ARRAY[id]::VARCHAR[] as path, false as is_cycle
+                FROM seed_node
                 UNION ALL
 
-                -- Find all callers recursively
                 SELECT n.id, n.symbol, n.file_path, it.depth + 1,
                        it.path || n.id,
                        n.id = ANY(it.path) as is_cycle
@@ -394,25 +434,27 @@ class GraphStore:
                     query,
                     (self.tenant_id, symbol, self.tenant_id, self.tenant_id, max_depth, limit)
                 )
-                results = cur.fetchall()
+                rows = cast(list[RealDictRow], cur.fetchall())
+                results = [dict(row) for row in rows]
 
         if not results:
             return {"error": "Symbol not found", "symbol": symbol}
 
         # Group by depth for analysis
-        by_depth = {}
-        for row in results[1:]:  # Skip the root node
-            depth = row["depth"]
+        by_depth: dict[int, list[dict[str, str]]] = {}
+        impacted_rows = [row for row in results if row["depth"] > 0]
+        for row in impacted_rows:
+            depth = cast(int, row["depth"])
             if depth not in by_depth:
                 by_depth[depth] = []
             by_depth[depth].append({
-                "symbol": row["symbol"],
-                "file": row["file_path"],
+                "symbol": str(row["symbol"]),
+                "file": str(row["file_path"]),
             })
 
         return {
             "symbol": symbol,
-            "total_impacted": len(results) - 1,
+            "total_impacted": len(impacted_rows),
             "max_depth_reached": max(r["depth"] for r in results) if results else 0,
             "by_depth": by_depth,
         }
@@ -422,7 +464,7 @@ class GraphStore:
         query: str,
         limit: int = 20,
         search_type: str = "hybrid",
-    ) -> List[Dict[str, Any]]:
+    ) -> list[DatabaseRow]:
         """
         Search for symbols using PostgreSQL full-text search.
 
@@ -503,7 +545,7 @@ class GraphStore:
 
     # ============= Statistics =============
 
-    def get_statistics(self) -> Dict[str, Any]:
+    def get_statistics(self) -> dict[str, int]:
         """Get graph statistics for the current tenant."""
         stats_query = """
             SELECT
@@ -520,9 +562,19 @@ class GraphStore:
             (self.tenant_id,) * 6
         )
 
-        return result[0] if result else {}
+        if not result:
+            return {}
+        row = result[0]
+        return {
+            "total_nodes": int(row["total_nodes"]),
+            "total_edges": int(row["total_edges"]),
+            "node_types": int(row["node_types"]),
+            "edge_types": int(row["edge_types"]),
+            "total_files": int(row["total_files"]),
+            "languages": int(row["languages"]),
+        }
 
-    def clear_repository(self, repository_id: str) -> Dict[str, int]:
+    def clear_repository(self, repository_id: str) -> dict[str, int]:
         """Clear all data for a repository (for re-indexing)."""
         with self.db_pool.transaction() as conn:
             with conn.cursor() as cur:

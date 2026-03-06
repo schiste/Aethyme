@@ -1,7 +1,8 @@
 """Query API for Aethyme SDK."""
 
-from typing import List, Optional, TYPE_CHECKING
-from .models import SearchResult, EgoGraphResult, ImpactAnalysisResult
+from typing import TYPE_CHECKING
+
+from .models import EgoGraphResult, ImpactAnalysisResult, SearchResult
 
 if TYPE_CHECKING:
     from .client import AethymeClient
@@ -20,11 +21,11 @@ class QueryAPI:
     def search(
         self,
         term: str,
-        kind: Optional[str] = None,
-        lang: Optional[str] = None,
+        kind: str | None = None,
+        lang: str | None = None,
         limit: int = 20,
         search_type: str = "hybrid",
-    ) -> List[SearchResult]:
+    ) -> list[SearchResult]:
         """
         Search for symbols in the code graph.
 

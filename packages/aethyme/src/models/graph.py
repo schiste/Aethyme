@@ -1,14 +1,14 @@
 """Graph data models for Aethyme."""
 
-from typing import Optional, Dict, Any, List
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
-import hashlib
-from enum import Enum
+from enum import Enum, StrEnum
+from typing import Any, TypeAlias
 from urllib.parse import quote
 
 
-class NodeKind(str, Enum):
+class NodeKind(StrEnum):
     """Types of nodes in the code graph."""
     DEFINITION = "def"
     REFERENCE = "ref"
@@ -20,7 +20,7 @@ class NodeKind(str, Enum):
     IMPORT = "import"
 
 
-class EdgeType(str, Enum):
+class EdgeType(StrEnum):
     """Types of edges (relationships) in the code graph."""
     INVOKE = "invoke"  # Function/method call
     IMPORT = "import"  # Import relationship
@@ -30,6 +30,21 @@ class EdgeType(str, Enum):
     PROPS_FLOW = "props_flow"  # React props flow
     RETURN = "return"  # Return type
     PARAMETER = "parameter"  # Parameter type
+
+
+EdgeTuple: TypeAlias = tuple[str, str, str]
+
+
+def _default_languages() -> list[str]:
+    return ["python", "typescript"]
+
+
+def _empty_language_list() -> list[str]:
+    return []
+
+
+def _empty_count_map() -> dict[str, int]:
+    return {}
 
 
 @dataclass
@@ -44,16 +59,19 @@ class Node:
     language: str  # Programming language
 
     # Optional fields
-    signature: Optional[str] = None  # Function/method signature
-    documentation: Optional[str] = None  # Docstring or JSDoc
-    metadata: Optional[Dict[str, Any]] = None  # Additional metadata
+    signature: str | None = None  # Function/method signature
+    documentation: str | None = None  # Docstring or JSDoc
+    metadata: dict[str, Any] | None = None  # Additional metadata
 
     # Computed fields
     id: str = field(init=False)
     display_id: str = field(init=False)
 
-    def __post_init__(self):
-        """Generate unique ID for the node."""
+    def __post_init__(self) -> None:
+        """Normalize fields and generate unique IDs for the node."""
+        if isinstance(self.kind, Enum):
+            self.kind = self.kind.value
+        self.metadata = self.metadata or {}
         self.id = self._generate_id()
         self.display_id = self._generate_display_id()
 
@@ -85,8 +103,8 @@ class Node:
         column: int,
         language: str,
         kind: str = NodeKind.DEFINITION,
-        signature: Optional[str] = None,
-        documentation: Optional[str] = None,
+        signature: str | None = None,
+        documentation: str | None = None,
     ) -> "Node":
         """Factory method to create a definition node."""
         return cls(
@@ -119,7 +137,7 @@ class Node:
             language=language,
         )
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert node to dictionary."""
         return {
             "id": self.id,
@@ -146,13 +164,16 @@ class Edge:
 
     # Optional fields
     weight: float = 1.0  # Edge weight for ranking
-    metadata: Optional[Dict[str, Any]] = None  # Additional metadata
+    metadata: dict[str, Any] | None = None  # Additional metadata
 
     # Computed fields
     id: str = field(init=False)
 
-    def __post_init__(self):
-        """Generate unique ID for the edge."""
+    def __post_init__(self) -> None:
+        """Normalize fields and generate unique ID for the edge."""
+        if isinstance(self.edge_type, Enum):
+            self.edge_type = self.edge_type.value
+        self.metadata = self.metadata or {}
         self.id = self._generate_id()
 
     def _generate_id(self) -> str:
@@ -167,7 +188,7 @@ class Edge:
         to_node_id: str,
         edge_type: str,
         weight: float = 1.0,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> "Edge":
         """Factory method to create an edge."""
         return cls(
@@ -178,7 +199,7 @@ class Edge:
             metadata=metadata,
         )
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert edge to dictionary."""
         return {
             "id": self.id,
@@ -196,19 +217,24 @@ class Repository:
 
     name: str
     path: str
-    languages: List[str] = field(default_factory=lambda: ["python", "typescript"])
+    languages: list[str] = field(default_factory=_default_languages)
 
     # Optional fields
-    id: Optional[str] = None
-    tenant_id: Optional[str] = None
-    last_indexed_at: Optional[datetime] = None
+    id: str | None = None
+    org_id: str | None = None
+    tenant_id: str | None = None
+    last_indexed_at: datetime | None = None
     index_status: str = "pending"
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: dict[str, Any] | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def __post_init__(self) -> None:
+        self.metadata = self.metadata or {}
+
+    def to_dict(self) -> dict[str, Any]:
         """Convert repository to dictionary."""
         return {
             "id": self.id,
+            "org_id": self.org_id,
             "tenant_id": self.tenant_id,
             "name": self.name,
             "path": self.path,
@@ -226,12 +252,12 @@ class GraphStatistics:
     total_nodes: int = 0
     total_edges: int = 0
     total_files: int = 0
-    languages: List[str] = field(default_factory=list)
-    node_types: Dict[str, int] = field(default_factory=dict)
-    edge_types: Dict[str, int] = field(default_factory=dict)
-    last_updated: Optional[datetime] = None
+    languages: list[str] = field(default_factory=_empty_language_list)
+    node_types: dict[str, int] = field(default_factory=_empty_count_map)
+    edge_types: dict[str, int] = field(default_factory=_empty_count_map)
+    last_updated: datetime | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert statistics to dictionary."""
         return {
             "total_nodes": self.total_nodes,

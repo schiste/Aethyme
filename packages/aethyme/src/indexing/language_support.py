@@ -4,11 +4,11 @@ Language Support and Guardrails Module
 Provides language detection, allowlisting, and graceful handling of unsupported files.
 """
 
-import structlog
-from pathlib import Path
-from typing import Dict, List, Optional, Set
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
+
+import structlog
 
 logger = structlog.get_logger(__name__)
 
@@ -26,14 +26,14 @@ class LanguageConfig:
     """Configuration for a language."""
     name: str
     support_level: LanguageSupport
-    file_extensions: List[str]
+    file_extensions: list[str]
     scip_available: bool
     fallback_available: bool
     notes: str = ""
 
 
 # Language configuration registry
-LANGUAGE_REGISTRY: Dict[str, LanguageConfig] = {
+LANGUAGE_REGISTRY: dict[str, LanguageConfig] = {
     "python": LanguageConfig(
         name="python",
         support_level=LanguageSupport.FULL,
@@ -140,17 +140,19 @@ class LanguageDetector:
     Provides allowlist checking and graceful handling of unsupported files.
     """
 
-    def __init__(self, allowed_languages: Optional[List[str]] = None):
+    def __init__(self, allowed_languages: list[str] | None = None):
         """
         Initialize language detector.
 
         Args:
             allowed_languages: List of allowed language names. If None, all registered languages allowed.
         """
-        self.allowed_languages = set(allowed_languages) if allowed_languages else None
+        self.allowed_languages: set[str] | None = (
+            set(allowed_languages) if allowed_languages else None
+        )
         self.logger = logger.bind(component="LanguageDetector")
 
-    def detect_language(self, file_path: Path) -> Optional[str]:
+    def detect_language(self, file_path: Path) -> str | None:
         """
         Detect language from file extension.
 
@@ -193,7 +195,7 @@ class LanguageDetector:
 
         return config.support_level != LanguageSupport.UNSUPPORTED
 
-    def get_support_level(self, language: str) -> Optional[LanguageSupport]:
+    def get_support_level(self, language: str) -> LanguageSupport | None:
         """
         Get support level for a language.
 
@@ -206,7 +208,7 @@ class LanguageDetector:
         config = LANGUAGE_REGISTRY.get(language)
         return config.support_level if config else None
 
-    def get_language_config(self, language: str) -> Optional[LanguageConfig]:
+    def get_language_config(self, language: str) -> LanguageConfig | None:
         """
         Get full configuration for a language.
 
@@ -237,8 +239,8 @@ class LanguageDetector:
     def get_files_by_language(
         self,
         root_path: Path,
-        exclude_dirs: Optional[List[str]] = None,
-    ) -> Dict[str, List[Path]]:
+        exclude_dirs: list[str] | None = None,
+    ) -> dict[str, list[Path]]:
         """
         Scan directory and group files by detected language.
 
@@ -249,8 +251,8 @@ class LanguageDetector:
         Returns:
             Dict mapping language names to lists of file paths
         """
-        exclude_dirs = set(exclude_dirs or [])
-        files_by_language: Dict[str, List[Path]] = {}
+        excluded_dirs = set(exclude_dirs or [])
+        files_by_language: dict[str, list[Path]] = {}
 
         for file_path in root_path.rglob("*"):
             # Skip directories and excluded paths
@@ -258,7 +260,7 @@ class LanguageDetector:
                 continue
 
             # Check if in excluded directory
-            if any(excluded in file_path.parts for excluded in exclude_dirs):
+            if any(excluded in file_path.parts for excluded in excluded_dirs):
                 continue
 
             # Detect language
@@ -276,7 +278,7 @@ class LanguageDetector:
 
         return files_by_language
 
-    def validate_language_list(self, languages: List[str]) -> Dict[str, str]:
+    def validate_language_list(self, languages: list[str]) -> dict[str, str]:
         """
         Validate a list of language names.
 
@@ -286,7 +288,7 @@ class LanguageDetector:
         Returns:
             Dict mapping language name to validation message (empty if valid)
         """
-        validation_results = {}
+        validation_results: dict[str, str] = {}
 
         for language in languages:
             if language not in LANGUAGE_REGISTRY:
@@ -305,7 +307,7 @@ class LanguageDetector:
     def get_supported_languages(
         self,
         include_experimental: bool = False,
-    ) -> List[str]:
+    ) -> list[str]:
         """
         Get list of supported language names.
 
@@ -315,7 +317,7 @@ class LanguageDetector:
         Returns:
             List of language names
         """
-        languages = []
+        languages: list[str] = []
         for lang_name, config in LANGUAGE_REGISTRY.items():
             if config.support_level == LanguageSupport.UNSUPPORTED:
                 continue
@@ -325,7 +327,7 @@ class LanguageDetector:
 
         return sorted(languages)
 
-    def get_language_stats(self, file_paths: List[Path]) -> Dict[str, int]:
+    def get_language_stats(self, file_paths: list[Path]) -> dict[str, int]:
         """
         Get statistics on languages in a list of files.
 
@@ -335,7 +337,7 @@ class LanguageDetector:
         Returns:
             Dict mapping language names to file counts
         """
-        stats = {}
+        stats: dict[str, int] = {}
         for file_path in file_paths:
             language = self.detect_language(file_path)
             if language:
@@ -344,7 +346,7 @@ class LanguageDetector:
         return stats
 
 
-def get_recommended_languages_for_repo(repo_path: Path) -> List[str]:
+def get_recommended_languages_for_repo(repo_path: Path) -> list[str]:
     """
     Analyze a repository and recommend which languages to index.
 

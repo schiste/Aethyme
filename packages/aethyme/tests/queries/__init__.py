@@ -6,5 +6,4 @@ Test coverage:
 - Ego graph queries (depth 1-3, circular deps, large graphs)
 - Impact analysis (transitive deps, reverse impact)
 - Row-level security isolation
-- Performance benchmarks
 """

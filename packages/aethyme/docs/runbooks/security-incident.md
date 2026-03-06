@@ -12,6 +12,19 @@ Procedures for detecting, containing, and recovering from security incidents.
 
 **Response Time:** < 15 minutes for critical incidents
 
+## Symptoms
+
+- Sudden spike in failed logins or unauthorized API requests
+- Evidence of privilege escalation or suspicious admin actions
+- Indicators of compromise in logs, metrics, or infrastructure alerts
+- Suspected data exfiltration, malware, or remote code execution
+
+## Diagnostic
+
+- Confirm the incident class and affected systems
+- Preserve logs, request traces, and impacted credentials before containment
+- Identify active attacker access paths and blast radius
+
 ---
 
 ## Incident Classification

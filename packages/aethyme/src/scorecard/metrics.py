@@ -1,6 +1,61 @@
 """Prometheus metrics for scorecard operations."""
 
-from prometheus_client import Counter, Histogram, Gauge
+import importlib
+from collections.abc import Callable
+from typing import Protocol, cast
+
+from .models import ScorecardReport
+
+
+class _LabeledMetric(Protocol):
+    def inc(self, amount: float = 1) -> None: ...
+
+    def set(self, value: float) -> None: ...
+
+    def observe(self, value: float) -> None: ...
+
+
+class _Metric(Protocol):
+    def labels(self, **kwargs: str) -> _LabeledMetric: ...
+
+
+class _NoOpLabeledMetric:
+    def inc(self, amount: float = 1) -> None:
+        del amount
+
+    def set(self, value: float) -> None:
+        del value
+
+    def observe(self, value: float) -> None:
+        del value
+
+
+class _NoOpMetric:
+    def labels(self, **kwargs: str) -> _LabeledMetric:
+        del kwargs
+        return _NoOpLabeledMetric()
+
+
+MetricFactory = Callable[..., _Metric]
+
+
+def _load_prometheus_factories() -> tuple[MetricFactory, MetricFactory, MetricFactory]:
+    try:
+        prometheus_client = importlib.import_module("prometheus_client")
+    except ModuleNotFoundError:
+        def noop_factory(*args: object, **kwargs: object) -> _Metric:
+            del args, kwargs
+            return _NoOpMetric()
+
+        return noop_factory, noop_factory, noop_factory
+
+    counter = cast(MetricFactory, prometheus_client.Counter)
+    gauge = cast(MetricFactory, prometheus_client.Gauge)
+    histogram = cast(MetricFactory, prometheus_client.Histogram)
+    return counter, gauge, histogram
+
+
+Counter, Gauge, Histogram = _load_prometheus_factories()
 
 # Scan metrics
 scorecard_scans_total = Counter(
@@ -62,7 +117,11 @@ scorecard_files_scanned = Gauge(
 )
 
 
-def record_scan_metrics(report, tenant_id: str = None, repository_id: str = None):
+def record_scan_metrics(
+    report: ScorecardReport,
+    tenant_id: str | None = None,
+    repository_id: str | None = None,
+) -> None:
     """
     Record metrics from a completed scan.
 

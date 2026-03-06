@@ -4,16 +4,23 @@ API keys provide a secure way for CI/CD systems and automated tools
 to authenticate with Aethyme without using user credentials.
 """
 
-import secrets
 import hashlib
+import secrets
 import uuid
-from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast
+
 import structlog
 
 from ..graph.connection_pool import db_pool
 
 logger = structlog.get_logger(__name__)
+
+
+def _isoformat_or_none(value: object) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return None
 
 
 class APIKeyError(Exception):
@@ -67,8 +74,8 @@ def hash_api_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
-def verify_api_key(api_key: str) -> Optional[Dict[str, Any]]:
-    """Verify an API key and return its metadata.
+def get_api_key_record(api_key: str) -> dict[str, Any] | None:
+    """Return API key metadata for management flows.
 
     Args:
         api_key: API key to verify
@@ -83,7 +90,7 @@ def verify_api_key(api_key: str) -> Optional[Dict[str, Any]]:
     key_hash = hash_api_key(api_key)
 
     query = """
-        SELECT ak.*, t.name as tenant_name
+        SELECT ak.*, t.name as tenant_name, t.org_id
         FROM aethyme.api_keys ak
         JOIN aethyme.tenants t ON t.id = ak.tenant_id
         WHERE ak.key_hash = %s
@@ -101,7 +108,7 @@ def verify_api_key(api_key: str) -> Optional[Dict[str, Any]]:
         raise APIKeyRevokedError(f"API key has been revoked at {key_data['revoked_at']}")
 
     # Check if expired
-    if key_data['expires_at'] and key_data['expires_at'] < datetime.utcnow():
+    if key_data['expires_at'] and key_data['expires_at'] < datetime.now(UTC):
         raise APIKeyExpiredError(f"API key expired at {key_data['expires_at']}")
 
     # Update last used timestamp
@@ -122,10 +129,10 @@ class APIKeyManager:
     def create(
         tenant_id: str,
         name: str,
-        scopes: List[str],
-        expires_in_days: Optional[int] = None,
-        repo_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        scopes: list[str],
+        expires_in_days: int | None = None,
+        repo_id: str | None = None,
+    ) -> dict[str, Any]:
         """Create a new API key.
 
         Args:
@@ -145,15 +152,22 @@ class APIKeyManager:
         # Calculate expiration
         expires_at = None
         if expires_in_days:
-            expires_at = datetime.utcnow() + timedelta(days=expires_in_days)
+            expires_at = datetime.now(UTC) + timedelta(days=expires_in_days)
 
         # Store in database
         key_id = str(uuid.uuid4())
+        tenant_result = db_pool.execute(
+            "SELECT org_id FROM aethyme.tenants WHERE id = %s",
+            (tenant_id,),
+        )
+        if not tenant_result:
+            raise APIKeyError("Tenant not found")
+        org_id = str(tenant_result[0]["org_id"])
 
         query = """
             INSERT INTO aethyme.api_keys (
-                id, tenant_id, name, key_hash, scopes, expires_at, repo_id
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                id, org_id, tenant_id, name, key_hash, scopes, expires_at, repo_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id, created_at
         """
 
@@ -162,6 +176,7 @@ class APIKeyManager:
             query,
             (
                 key_id,
+                org_id,
                 tenant_id,
                 name,
                 key_hash,
@@ -170,10 +185,14 @@ class APIKeyManager:
                 repo_id,
             ),
         )
+        if not result:
+            raise APIKeyError("Failed to create API key record")
+        created_at = cast(datetime, result[0]["created_at"])
 
         logger.info(
             "API key created",
             key_id=key_id,
+            org_id=org_id,
             tenant_id=tenant_id,
             name=name,
             scopes=scopes,
@@ -186,11 +205,11 @@ class APIKeyManager:
             'name': name,
             'scopes': scopes,
             'expires_at': expires_at.isoformat() if expires_at else None,
-            'created_at': result[0]['created_at'].isoformat(),
+            'created_at': created_at.isoformat(),
         }
 
     @staticmethod
-    def list_keys(tenant_id: str) -> List[Dict[str, Any]]:
+    def list_keys(tenant_id: str) -> list[dict[str, Any]]:
         """List all API keys for a tenant.
 
         Note: The actual key values are not returned, only metadata.
@@ -216,23 +235,42 @@ class APIKeyManager:
             return []
 
         import json
-        keys = []
+        keys: list[dict[str, Any]] = []
         for row in results:
-            scopes = row['scopes']
-            if isinstance(scopes, str):
-                scopes = json.loads(scopes)
+            scopes_value = row['scopes']
+            scopes: list[str]
+            if isinstance(scopes_value, str):
+                loaded_scopes = json.loads(scopes_value)
+                if isinstance(loaded_scopes, list):
+                    scopes = [
+                        scope
+                        for scope in cast(list[object], loaded_scopes)
+                        if isinstance(scope, str)
+                    ]
+                else:
+                    scopes = []
+            elif isinstance(scopes_value, list):
+                scopes = [
+                    scope
+                    for scope in cast(list[object], scopes_value)
+                    if isinstance(scope, str)
+                ]
+            else:
+                scopes = []
 
             keys.append({
                 'key_id': str(row['id']),
                 'name': row['name'],
                 'scopes': scopes,
-                'last_used_at': row['last_used_at'].isoformat() if row['last_used_at'] else None,
-                'expires_at': row['expires_at'].isoformat() if row['expires_at'] else None,
-                'created_at': row['created_at'].isoformat(),
-                'revoked_at': row['revoked_at'].isoformat() if row['revoked_at'] else None,
+                'last_used_at': _isoformat_or_none(row['last_used_at']),
+                'expires_at': _isoformat_or_none(row['expires_at']),
+                'created_at': cast(datetime, row['created_at']).isoformat(),
+                'revoked_at': _isoformat_or_none(row['revoked_at']),
                 'repo_id': str(row['repo_id']) if row['repo_id'] else None,
                 'status': 'revoked' if row['revoked_at'] else (
-                    'expired' if row['expires_at'] and row['expires_at'] < datetime.utcnow() else 'active'
+                    'expired'
+                    if isinstance(row['expires_at'], datetime) and row['expires_at'] < datetime.now(UTC)
+                    else 'active'
                 ),
             })
 
@@ -285,8 +323,8 @@ class APIKeyManager:
     def rotate(
         key_id: str,
         tenant_id: str,
-        expires_in_days: Optional[int] = None,
-    ) -> Dict[str, Any]:
+        expires_in_days: int | None = None,
+    ) -> dict[str, Any]:
         """Rotate an API key by revoking the old one and creating a new one.
 
         Args:
@@ -303,7 +341,7 @@ class APIKeyManager:
         """
         # Get existing key metadata
         query = """
-            SELECT tenant_id, name, scopes, repo_id
+            SELECT tenant_id, org_id, name, scopes, repo_id
             FROM aethyme.api_keys
             WHERE id = %s
         """
@@ -348,7 +386,7 @@ class APIKeyManager:
     def update_scopes(
         key_id: str,
         tenant_id: str,
-        scopes: List[str],
+        scopes: list[str],
     ) -> bool:
         """Update scopes for an API key.
 
@@ -397,3 +435,6 @@ class APIKeyManager:
             return True
 
         return False
+
+
+verify_api_key = get_api_key_record

@@ -1,31 +1,35 @@
-"""
-Scorecard API Endpoints
-
-Provides endpoints for running AI-readiness scorecards and retrieving results.
-"""
-
-from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
-from pydantic import BaseModel, Field
-from typing import Dict, List, Optional
+import asyncio
+import json
+import uuid
 from datetime import datetime
 from pathlib import Path
-import uuid
-import structlog
+from typing import Any, TypeAlias, cast
 
-from ..auth import get_current_user
+import structlog
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
+from pydantic import BaseModel, Field
+
+from ...auth import RepoReadUser, RepoWriteUser
 from ...graph.connection_pool import db_pool
 from ...scorecard.engine import ScorecardEngine
-from ...scorecard.models import ScorecardReport, ScanSummary, Severity
 from ...scorecard.metrics import record_scan_metrics
+from ...scorecard.models import ScanSummary
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
+SummaryPayload: TypeAlias = dict[str, int]
+FindingPayload: TypeAlias = dict[str, Any]
+FindingsPayload: TypeAlias = dict[str, list[FindingPayload]]
+DetectorPayload: TypeAlias = dict[str, Any]
+PerformancePayload: TypeAlias = dict[str, float | int]
+HistoryEntry: TypeAlias = dict[str, str | int | datetime | None]
+DetectorInfo: TypeAlias = dict[str, str]
 
 
 class ScanRequest(BaseModel):
     """Request to trigger a scorecard scan."""
     repository_id: str = Field(..., description="Repository ID to scan")
-    detectors: Optional[List[str]] = Field(None, description="Specific detectors to run")
+    detectors: list[str] | None = Field(None, description="Specific detectors to run")
 
 
 class ScanResponse(BaseModel):
@@ -42,25 +46,73 @@ class ScorecardResultResponse(BaseModel):
     tenant_id: str
     timestamp: datetime
     score: int
-    summary: Dict[str, int]
-    findings: Dict[str, List[Dict]]
-    detectors: List[Dict]
-    performance: Dict[str, float]
+    summary: SummaryPayload
+    findings: FindingsPayload
+    detectors: list[DetectorPayload]
+    performance: PerformancePayload
+
+
+def _coerce_summary(data: object) -> SummaryPayload:
+    if not isinstance(data, dict):
+        return {}
+    typed_data = cast(dict[object, object], data)
+    summary: SummaryPayload = {}
+    for key, value in typed_data.items():
+        if isinstance(key, str) and isinstance(value, int):
+            summary[key] = value
+    return summary
+
+
+def _coerce_findings(data: object) -> FindingsPayload:
+    if not isinstance(data, dict):
+        return {}
+    typed_data = cast(dict[object, object], data)
+    findings: FindingsPayload = {}
+    for key, value in typed_data.items():
+        if not isinstance(key, str) or not isinstance(value, list):
+            continue
+        finding_items: list[FindingPayload] = []
+        for item in cast(list[object], value):
+            if isinstance(item, dict):
+                finding_items.append(dict(cast(dict[str, Any], item)))
+        findings[key] = finding_items
+    return findings
+
+
+def _coerce_detectors(data: object) -> list[DetectorPayload]:
+    if not isinstance(data, list):
+        return []
+    detectors: list[DetectorPayload] = []
+    for item in cast(list[object], data):
+        if isinstance(item, dict):
+            detectors.append(dict(cast(dict[str, Any], item)))
+    return detectors
+
+
+def _coerce_performance(data: object) -> PerformancePayload:
+    if not isinstance(data, dict):
+        return {}
+    typed_data = cast(dict[object, object], data)
+    performance: PerformancePayload = {}
+    for key, value in typed_data.items():
+        if isinstance(key, str) and isinstance(value, (int, float)):
+            performance[key] = value
+    return performance
 
 
 @router.post("/scan", response_model=ScanResponse)
 async def trigger_scan(
     request: ScanRequest,
     background_tasks: BackgroundTasks,
-    current_user: Dict = Depends(get_current_user),
-):
+    current_user: RepoWriteUser,
+) -> ScanResponse:
     """
     Trigger an AI-readiness scorecard scan for a repository.
 
     The scan runs asynchronously in the background. Use the scan_id
     to retrieve results via GET /api/scorecard/results/{scan_id}.
     """
-    tenant_id = current_user.get("tenant_id")
+    tenant_id = current_user.tenant_id
     if not tenant_id:
         raise HTTPException(status_code=400, detail="Tenant ID required")
 
@@ -123,8 +175,8 @@ async def run_scan_background(
     repo_path: str,
     repository_id: str,
     tenant_id: str,
-    detectors: Optional[List[str]] = None,
-):
+    detectors: list[str] | None = None,
+) -> None:
     """
     Run scorecard scan in background.
 
@@ -154,7 +206,7 @@ async def run_scan_background(
             tenant_id=tenant_id,
         )
 
-        result = engine.scan(detectors=detectors)
+        result = await asyncio.to_thread(engine.scan, detectors=detectors)
 
         # Store results
         db_pool.execute(
@@ -220,14 +272,14 @@ async def run_scan_background(
 @router.get("/results/{scan_id}", response_model=ScorecardResultResponse)
 async def get_scan_results(
     scan_id: str,
-    current_user: Dict = Depends(get_current_user),
-):
+    current_user: RepoReadUser,
+) -> ScorecardResultResponse:
     """
     Get results of a completed scorecard scan.
 
     Returns the full scorecard report including all findings.
     """
-    tenant_id = current_user.get("tenant_id")
+    tenant_id = current_user.tenant_id
     if not tenant_id:
         raise HTTPException(status_code=400, detail="Tenant ID required")
 
@@ -271,24 +323,50 @@ async def get_scan_results(
             detail=f"Scan failed: {scan.get('error', 'Unknown error')}",
         )
 
-    # Parse report JSON
-    import json
-    report_data = json.loads(scan["report_json"])
+    report_json = scan["report_json"]
+    if isinstance(report_json, str):
+        report_data = json.loads(report_json)
+    elif isinstance(report_json, dict):
+        report_data = cast(dict[str, object], report_json)
+    else:
+        report_data: dict[str, object] = {}
 
-    return ScorecardResultResponse(**report_data)
+    summary = _coerce_summary(report_data.get("summary"))
+    findings = _coerce_findings(report_data.get("findings"))
+    detectors = _coerce_detectors(report_data.get("detectors"))
+    performance = _coerce_performance(report_data.get("performance"))
+
+    return ScorecardResultResponse(
+        scan_id=scan["id"],
+        repository_id=scan["repository_id"],
+        tenant_id=scan["tenant_id"],
+        timestamp=scan["completed_at"] or scan["created_at"],
+        score=scan["score"],
+        summary=summary,
+        findings=findings,
+        detectors=detectors,
+        performance={
+            "total_scan_time_ms": float(
+                scan["scan_time_ms"] or performance.get("total_scan_time_ms", 0.0)
+            ),
+            "files_scanned": int(
+                scan["files_scanned"] or performance.get("files_scanned", 0)
+            ),
+        },
+    )
 
 
 @router.get("/summary/{repository_id}", response_model=ScanSummary)
 async def get_latest_summary(
     repository_id: str,
-    current_user: Dict = Depends(get_current_user),
-):
+    current_user: RepoReadUser,
+) -> ScanSummary:
     """
     Get summary of the latest scorecard scan for a repository.
 
     Returns high-level metrics without full findings details.
     """
-    tenant_id = current_user.get("tenant_id")
+    tenant_id = current_user.tenant_id
     if not tenant_id:
         raise HTTPException(status_code=400, detail="Tenant ID required")
 
@@ -341,15 +419,15 @@ async def get_latest_summary(
 @router.get("/history/{repository_id}")
 async def get_scan_history(
     repository_id: str,
-    current_user: Dict = Depends(get_current_user),
+    current_user: RepoReadUser,
     limit: int = Query(10, ge=1, le=100, description="Number of scans to return"),
-):
+) -> dict[str, str | list[HistoryEntry]]:
     """
     Get scan history for a repository.
 
     Returns a list of past scans with summary information.
     """
-    tenant_id = current_user.get("tenant_id")
+    tenant_id = current_user.tenant_id
     if not tenant_id:
         raise HTTPException(status_code=400, detail="Tenant ID required")
 
@@ -374,37 +452,42 @@ async def get_scan_history(
         (repository_id, tenant_id, limit),
     )
 
+    scan_history: list[HistoryEntry] = [
+        {
+            "scan_id": str(scan["id"]),
+            "status": scan["status"],
+            "score": scan["score"],
+            "blocker_count": scan["blocker_count"],
+            "warning_count": scan["warning_count"],
+            "info_count": scan["info_count"],
+            "total_findings": scan["total_findings"],
+            "created_at": scan["created_at"],
+            "completed_at": scan["completed_at"],
+        }
+        for scan in scans or []
+    ]
+
     return {
         "repository_id": repository_id,
-        "scans": [
-            {
-                "scan_id": str(scan["id"]),
-                "status": scan["status"],
-                "score": scan["score"],
-                "blocker_count": scan["blocker_count"],
-                "warning_count": scan["warning_count"],
-                "info_count": scan["info_count"],
-                "total_findings": scan["total_findings"],
-                "created_at": scan["created_at"],
-                "completed_at": scan["completed_at"],
-            }
-            for scan in scans
-        ],
+        "scans": scan_history,
     }
 
 
 @router.get("/checks")
-async def list_available_checks():
+async def list_available_checks(
+    current_user: RepoReadUser,
+) -> dict[str, int | list[DetectorInfo]]:
     """List all available scorecard detectors.
 
     Returns metadata about each available detector type.
     """
     from ...scorecard.detectors import ALL_DETECTORS
-    from pathlib import Path
+
+    del current_user
 
     # Create temporary detector instances to get metadata
     temp_path = Path(".")
-    detectors_info = []
+    detectors_info: list[DetectorInfo] = []
 
     for detector_class in ALL_DETECTORS:
         try:
@@ -413,8 +496,12 @@ async def list_available_checks():
                 "name": detector.name,
                 "description": detector.description,
             })
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Failed to load scorecard detector metadata",
+                detector_class=getattr(detector_class, "__name__", str(detector_class)),
+                error=str(exc),
+            )
 
     return {
         "detectors": detectors_info,

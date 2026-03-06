@@ -8,6 +8,19 @@ This runbook provides procedures for recovering Aethyme from various disaster sc
 - **RTO (Recovery Time Objective):** 1 hour
 - **RPO (Recovery Point Objective):** 1 hour (based on backup frequency)
 
+## Symptoms
+
+- Primary database or region unavailable
+- Persistent 5xx responses across the platform
+- Storage corruption or missing graph data
+- Control plane unavailable after infrastructure loss
+
+## Diagnostic
+
+- Identify the failed subsystem: database, region, storage, or complete platform loss
+- Confirm backup freshness and replica availability
+- Verify networking, DNS, and infrastructure-control access before recovery actions
+
 ## Table of Contents
 
 1. [Database Failure](#database-failure)

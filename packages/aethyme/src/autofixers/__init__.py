@@ -1,9 +1,8 @@
 """Autofixers for Aethyme - Safe automated code improvements."""
 
-from .safety import SafetyEngine, RiskLevel, GeneratedFileDetector
-from .patch import PatchGenerator, PatchMode
-from .approval import ApprovalWorkflow, ApprovalStatus
 from .github import GitHubIntegration
+from .patch import PatchGenerator, PatchMode
+from .safety import GeneratedFileDetector, RiskLevel, SafetyEngine
 
 __all__ = [
     "SafetyEngine",
@@ -11,7 +10,5 @@ __all__ = [
     "GeneratedFileDetector",
     "PatchGenerator",
     "PatchMode",
-    "ApprovalWorkflow",
-    "ApprovalStatus",
     "GitHubIntegration",
 ]

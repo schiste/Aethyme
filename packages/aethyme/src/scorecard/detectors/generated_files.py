@@ -1,11 +1,9 @@
 """Detector for edits to generated files."""
 
 import re
-from typing import List, Set
-from pathlib import Path
 
-from .base import BaseDetector
 from ..models import Finding, Severity
+from .base import BaseDetector
 
 
 class GeneratedFilesDetector(BaseDetector):
@@ -19,9 +17,9 @@ class GeneratedFilesDetector(BaseDetector):
     def description(self) -> str:
         return "Checks for manual edits to auto-generated files"
 
-    def detect(self) -> List[Finding]:
+    def detect(self) -> list[Finding]:
         """Detect files that appear to be generated but modified."""
-        findings = []
+        findings: list[Finding] = []
 
         # Generated file indicators
         generated_indicators = [
@@ -74,16 +72,13 @@ class GeneratedFilesDetector(BaseDetector):
             if is_generated_name or has_generated_marker:
                 # Check if file has been modified (heuristic: has non-comment custom code)
                 # This is a simplified check - could be enhanced with git history
-                has_custom_code = False
-
-                for line_num, line in enumerate(lines[20:], start=21):  # Skip header
+                for _line_num, line in enumerate(lines[20:], start=21):  # Skip header
                     line_stripped = line.strip()
                     if not line_stripped or line_stripped.startswith(('#', '//', '/*', '*')):
                         continue
 
                     # If we find substantive code, might be custom
                     if len(line_stripped) > 10:
-                        has_custom_code = True
                         break
 
                 if has_generated_marker:

@@ -1,6 +1,5 @@
 """Authentication management for Aethyme SDK."""
 
-from typing import Optional
 from .exceptions import AuthenticationError
 
 
@@ -22,7 +21,7 @@ class AuthManager:
         self.api_key = api_key
         self.org_id = org_id
 
-    def get_headers(self) -> dict:
+    def get_headers(self) -> dict[str, str]:
         """Get authentication headers."""
         return {
             "Authorization": f"Bearer {self.api_key}",

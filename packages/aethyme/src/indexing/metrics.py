@@ -6,15 +6,14 @@ Tracks duration, failures, symbol counts, and staleness.
 """
 
 import time
-import structlog
-from typing import Dict, Optional, Any
 from contextlib import contextmanager
+
+import structlog
 from prometheus_client import (
+    CollectorRegistry,
     Counter,
     Gauge,
     Histogram,
-    Info,
-    CollectorRegistry,
     generate_latest,
 )
 
@@ -148,7 +147,7 @@ class IndexingMetricsCollector:
 
         try:
             yield
-        except Exception as e:
+        except Exception:
             status = "failure"
             raise
         finally:

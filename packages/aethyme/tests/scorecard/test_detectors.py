@@ -1,205 +1,133 @@
 """Tests for scorecard detectors."""
 
-import pytest
 from pathlib import Path
 
+from src.scorecard.detectors.ability_coverage import AbilityCoverageDetector
 from src.scorecard.detectors.data_ui_coverage import DataUICoverageDetector
 from src.scorecard.detectors.folder_docs import FolderDocsDetector
-from src.scorecard.detectors.relative_links import RelativeLinksDetector
-from src.scorecard.detectors.i18n_gaps import I18nGapsDetector
 from src.scorecard.detectors.generated_files import GeneratedFilesDetector
-from src.scorecard.detectors.schema_drift import SchemaDriftDetector
+from src.scorecard.detectors.i18n_gaps import I18nGapsDetector
+from src.scorecard.detectors.relative_links import RelativeLinksDetector
 from src.scorecard.detectors.route_coverage import RouteCoverageDetector
-from src.scorecard.detectors.ability_coverage import AbilityCoverageDetector
-from src.scorecard.models import Severity
-
-
-@pytest.fixture
-def good_repo_path():
-    """Path to good test repository."""
-    return Path(__file__).parent / "fixtures" / "good_repo"
-
-
-@pytest.fixture
-def problematic_repo_path():
-    """Path to problematic test repository."""
-    return Path(__file__).parent / "fixtures" / "problematic_repo"
+from src.scorecard.detectors.schema_drift import SchemaDriftDetector
+from src.scorecard.models import Finding, Severity
+from tests.support.repo_builders import (
+    build_good_scorecard_repo,
+    build_problematic_scorecard_repo,
+)
 
 
 class TestDataUICoverageDetector:
-    """Test data-ui coverage detector."""
-
-    def test_detects_missing_selectors(self, problematic_repo_path):
-        """Test that detector finds missing data-ui selectors."""
-        detector = DataUICoverageDetector(problematic_repo_path)
+    def test_detects_missing_selectors(self, tmp_path: Path) -> None:
+        detector = DataUICoverageDetector(build_problematic_scorecard_repo(tmp_path))
         findings = detector.detect()
 
-        # Should find multiple missing selectors in BadButton.tsx
-        assert len(findings) > 0
+        assert findings
         assert any(f.severity == Severity.WARNING for f in findings)
         assert any("data-ui" in f.message.lower() for f in findings)
 
-    def test_no_findings_in_good_repo(self, good_repo_path):
-        """Test that good repo with selectors has no findings."""
-        detector = DataUICoverageDetector(good_repo_path)
-        findings = detector.detect()
-
-        # Good repo should have no missing selector findings
-        assert len(findings) == 0
+    def test_no_findings_in_good_repo(self, tmp_path: Path) -> None:
+        detector = DataUICoverageDetector(build_good_scorecard_repo(tmp_path))
+        assert detector.detect() == []
 
 
 class TestFolderDocsDetector:
-    """Test folder documentation detector."""
-
-    def test_detects_missing_folder_docs(self, problematic_repo_path):
-        """Test that detector finds missing FOLDER.md."""
-        detector = FolderDocsDetector(problematic_repo_path)
+    def test_detects_missing_folder_docs(self, tmp_path: Path) -> None:
+        detector = FolderDocsDetector(build_problematic_scorecard_repo(tmp_path))
         findings = detector.detect()
 
-        # Problematic repo missing documentation
-        assert len(findings) > 0
+        assert findings
         assert any(f.severity == Severity.WARNING for f in findings)
         assert any("FOLDER.md" in f.message for f in findings)
 
-    def test_good_repo_has_docs(self, good_repo_path):
-        """Test that good repo with FOLDER.md has fewer findings."""
-        detector = FolderDocsDetector(good_repo_path)
-        findings = detector.detect()
-
-        # Good repo should have fewer or no findings
-        # (May still have some for auto-generated folders)
-        assert len(findings) <= 1
+    def test_good_repo_has_docs(self, tmp_path: Path) -> None:
+        detector = FolderDocsDetector(build_good_scorecard_repo(tmp_path))
+        assert detector.detect() == []
 
 
 class TestRelativeLinksDetector:
-    """Test relative links detector."""
-
-    def test_detects_absolute_paths(self, problematic_repo_path):
-        """Test that detector finds absolute file paths."""
-        detector = RelativeLinksDetector(problematic_repo_path)
+    def test_detects_absolute_paths(self, tmp_path: Path) -> None:
+        detector = RelativeLinksDetector(build_problematic_scorecard_repo(tmp_path))
         findings = detector.detect()
 
-        # Should find absolute paths in README.md
-        assert len(findings) > 0
+        assert findings
         assert any(f.severity == Severity.WARNING for f in findings)
         assert any("absolute" in f.message.lower() for f in findings)
 
-    def test_relative_links_ok(self, good_repo_path):
-        """Test that good repo with relative links has no findings."""
-        detector = RelativeLinksDetector(good_repo_path)
-        findings = detector.detect()
-
-        # Good repo uses relative links
-        assert len(findings) == 0
+    def test_relative_links_ok(self, tmp_path: Path) -> None:
+        detector = RelativeLinksDetector(build_good_scorecard_repo(tmp_path))
+        assert detector.detect() == []
 
 
 class TestI18nGapsDetector:
-    """Test i18n gaps detector."""
-
-    def test_detects_hardcoded_strings(self, problematic_repo_path):
-        """Test that detector finds hardcoded user-facing strings."""
-        detector = I18nGapsDetector(problematic_repo_path)
+    def test_detects_hardcoded_strings(self, tmp_path: Path) -> None:
+        detector = I18nGapsDetector(build_problematic_scorecard_repo(tmp_path))
         findings = detector.detect()
 
-        # Should find hardcoded strings in BadButton.tsx
-        assert len(findings) > 0
+        assert findings
         assert any("hardcoded" in f.message.lower() or "text" in f.message.lower() for f in findings)
 
-    def test_i18n_usage_ok(self, good_repo_path):
-        """Test that good repo using i18n has no/fewer findings."""
-        detector = I18nGapsDetector(good_repo_path)
-        findings = detector.detect()
-
-        # Good repo uses t() function, should have no findings
-        assert len(findings) == 0
+    def test_i18n_usage_ok(self, tmp_path: Path) -> None:
+        detector = I18nGapsDetector(build_good_scorecard_repo(tmp_path))
+        assert detector.detect() == []
 
 
 class TestGeneratedFilesDetector:
-    """Test generated files detector."""
-
-    def test_detects_generated_files(self, problematic_repo_path):
-        """Test that detector finds generated files."""
-        detector = GeneratedFilesDetector(problematic_repo_path)
+    def test_detects_generated_files(self, tmp_path: Path) -> None:
+        detector = GeneratedFilesDetector(build_problematic_scorecard_repo(tmp_path))
         findings = detector.detect()
 
-        # Should find generated file with @generated marker
-        assert len(findings) > 0
+        assert findings
         assert any(f.severity == Severity.BLOCKER for f in findings)
         assert any("generated" in f.message.lower() for f in findings)
 
-    def test_no_generated_files(self, good_repo_path):
-        """Test that good repo has no generated files."""
-        detector = GeneratedFilesDetector(good_repo_path)
-        findings = detector.detect()
-
-        assert len(findings) == 0
+    def test_no_generated_files(self, tmp_path: Path) -> None:
+        detector = GeneratedFilesDetector(build_good_scorecard_repo(tmp_path))
+        assert detector.detect() == []
 
 
 class TestSchemaDriftDetector:
-    """Test schema drift detector."""
-
-    def test_detects_any_types(self, problematic_repo_path):
-        """Test that detector finds 'any' types in TypeScript."""
-        detector = SchemaDriftDetector(problematic_repo_path)
+    def test_detects_any_types(self, tmp_path: Path) -> None:
+        detector = SchemaDriftDetector(build_problematic_scorecard_repo(tmp_path))
         findings = detector.detect()
 
-        # Should find 'any' types in schema.ts
-        assert len(findings) > 0
+        assert findings
         assert any("any" in f.message.lower() for f in findings)
 
-    def test_proper_types(self, good_repo_path):
-        """Test that good repo with proper types has no findings."""
-        detector = SchemaDriftDetector(good_repo_path)
+    def test_proper_types(self, tmp_path: Path) -> None:
+        detector = SchemaDriftDetector(build_good_scorecard_repo(tmp_path))
         findings = detector.detect()
 
-        # Good repo uses specific types
-        # May have INFO findings about missing validators
         assert all(f.severity != Severity.BLOCKER for f in findings)
 
 
 class TestRouteCoverageDetector:
-    """Test route coverage detector."""
-
-    def test_detects_undocumented_routes(self, problematic_repo_path):
-        """Test that detector finds undocumented API routes."""
-        detector = RouteCoverageDetector(problematic_repo_path)
+    def test_detects_undocumented_routes(self, tmp_path: Path) -> None:
+        detector = RouteCoverageDetector(build_problematic_scorecard_repo(tmp_path))
         findings = detector.detect()
 
-        # Should find undocumented routes in routes.py
-        assert len(findings) > 0
+        assert findings
         assert any(f.severity == Severity.WARNING for f in findings)
         assert any("undocumented" in f.message.lower() for f in findings)
 
 
 class TestAbilityCoverageDetector:
-    """Test ability coverage detector."""
-
-    def test_detects_missing_permissions(self, problematic_repo_path):
-        """Test that detector finds missing permission checks."""
-        detector = AbilityCoverageDetector(problematic_repo_path)
+    def test_detects_missing_permissions(self, tmp_path: Path) -> None:
+        detector = AbilityCoverageDetector(build_problematic_scorecard_repo(tmp_path))
         findings = detector.detect()
 
-        # Should find routes without permission checks
-        # May be INFO level if no auth framework detected
-        assert len(findings) >= 0
+        assert findings
 
 
-# Precision/Recall Tests
-
-def test_detector_precision_problematic_repo(problematic_repo_path):
-    """Test precision: all findings should be valid issues."""
+def test_detector_precision_problematic_repo(tmp_path: Path) -> None:
     from src.scorecard.detectors import ALL_DETECTORS
 
-    all_findings = []
+    repo_path = build_problematic_scorecard_repo(tmp_path)
+    all_findings: list[Finding] = []
     for detector_class in ALL_DETECTORS:
-        detector = detector_class(problematic_repo_path)
-        findings = detector.detect()
-        all_findings.extend(findings)
+        all_findings.extend(detector_class(repo_path).detect())
 
-    # We expect findings in problematic repo
-    assert len(all_findings) > 0
-
-    # All findings should have required fields
+    assert all_findings
     for finding in all_findings:
         assert finding.detector
         assert finding.severity in [Severity.BLOCKER, Severity.WARNING, Severity.INFO]
@@ -207,19 +135,14 @@ def test_detector_precision_problematic_repo(problematic_repo_path):
         assert finding.file_path
 
 
-def test_detector_recall_good_repo(good_repo_path):
-    """Test recall: good repo should have minimal findings."""
+def test_detector_recall_good_repo(tmp_path: Path) -> None:
     from src.scorecard.detectors import ALL_DETECTORS
 
-    all_findings = []
+    repo_path = build_good_scorecard_repo(tmp_path)
+    all_findings: list[Finding] = []
     for detector_class in ALL_DETECTORS:
-        detector = detector_class(good_repo_path)
-        findings = detector.detect()
-        all_findings.extend(findings)
+        all_findings.extend(detector_class(repo_path).detect())
 
-    # Good repo should have few or no findings
-    assert len(all_findings) <= 5
-
-    # No blockers in good repo
+    assert len(all_findings) <= 2
     blockers = [f for f in all_findings if f.severity == Severity.BLOCKER]
-    assert len(blockers) == 0
+    assert blockers == []

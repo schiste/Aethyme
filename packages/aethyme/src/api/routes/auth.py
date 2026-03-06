@@ -1,19 +1,20 @@
-"""Authentication API routes."""
-
-from typing import Dict, Any
-from datetime import timedelta
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, EmailStr, Field
+import json
+import re
 import uuid
+from typing import Any
 
-from ...graph.connection_pool import db_pool
-from ..auth import (
+from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel, EmailStr, Field
+
+from ...auth import (
+    APIKeyManager,
+    CurrentUser,
+    OrgAdminUser,
     create_access_token,
     hash_password,
     verify_password,
-    User,
-    get_current_user,
 )
+from ...graph.connection_pool import db_pool
 
 router = APIRouter()
 
@@ -31,7 +32,7 @@ class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     expires_in: int
-    user: Dict[str, Any]
+    user: dict[str, Any]
 
 
 class RegisterRequest(BaseModel):
@@ -39,15 +40,17 @@ class RegisterRequest(BaseModel):
 
     email: EmailStr
     password: str = Field(..., min_length=8)
-    tenant_name: str = Field(..., min_length=1, max_length=255)
+    org_name: str = Field(..., min_length=1, max_length=255)
+    tenant_name: str = Field(default="default", min_length=1, max_length=255)
 
 
 class CreateAPIKeyRequest(BaseModel):
     """Request model for API key creation."""
 
     name: str = Field(..., min_length=1, max_length=255)
-    permissions: list = Field(default=["read"])
-    expires_in_days: int = Field(default=None, ge=1, le=365)
+    scopes: list[str] = Field(default=["repo:read"])
+    expires_in_days: int | None = Field(default=None, ge=1, le=365)
+    repo_id: str | None = Field(default=None)
 
 
 class APIKeyResponse(BaseModel):
@@ -56,7 +59,7 @@ class APIKeyResponse(BaseModel):
     api_key: str
     key_id: str
     name: str
-    expires_at: str = None
+    expires_at: str | None = None
 
 
 @router.post("/register", response_model=LoginResponse)
@@ -64,7 +67,7 @@ async def register(request: RegisterRequest) -> LoginResponse:
     """
     Register a new user and tenant.
 
-    Creates a new tenant and user account.
+    Creates a new org, tenant, and user account.
     """
     # Check if email already exists
     check_query = """
@@ -80,39 +83,57 @@ async def register(request: RegisterRequest) -> LoginResponse:
             detail="Email already registered",
         )
 
-    # Create tenant
+    org_slug = re.sub(r"[^a-z0-9]+", "-", request.org_name.lower()).strip("-") or "org"
+    tenant_slug = re.sub(r"[^a-z0-9]+", "-", request.tenant_name.lower()).strip("-") or "tenant"
+
+    org_id = str(uuid.uuid4())
     tenant_id = str(uuid.uuid4())
-    tenant_query = """
-        INSERT INTO aethyme.tenants (id, name, description)
-        VALUES (%s, %s, %s)
-        RETURNING id
+    create_org_query = """
+        INSERT INTO aethyme.orgs (id, name, slug, description)
+        VALUES (%s, %s, %s, %s)
     """
+    create_tenant_query = """
+        INSERT INTO aethyme.tenants (id, org_id, name, slug, description)
+        VALUES (%s, %s, %s, %s, %s)
+    """
+    create_user_query = """
+        INSERT INTO aethyme.users (id, org_id, tenant_id, email, password_hash, scopes)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    """
+    user_id = str(uuid.uuid4())
+    password_hash = hash_password(request.password)
+    scopes = ["org:admin", "repo:read", "repo:write"]
 
     try:
-        db_pool.execute(
-            tenant_query,
-            (tenant_id, request.tenant_name, f"Tenant for {request.email}"),
-            fetch=False,
-        )
-    except Exception as e:
-        # Handle unique constraint violation
-        if "unique" in str(e).lower():
+        with db_pool.transaction() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    create_org_query,
+                    (org_id, request.org_name, org_slug, f"Organization for {request.email}"),
+                )
+                cur.execute(
+                    create_tenant_query,
+                    (tenant_id, org_id, request.tenant_name, tenant_slug, f"Tenant for {request.email}"),
+                )
+                cur.execute(
+                    create_user_query,
+                    (user_id, org_id, tenant_id, request.email, password_hash, json.dumps(scopes)),
+                )
+    except Exception as err:
+        if "unique" in str(err).lower():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Tenant name already exists",
-            )
+                detail="Organization, tenant, or email already exists",
+            ) from err
         raise
 
-    # Create user (simplified - in production, use proper user table)
-    user_id = str(uuid.uuid4())
-
-    # Create access token
     access_token = create_access_token(
         data={
             "sub": user_id,
             "email": request.email,
+            "org": org_id,
             "tenant_id": tenant_id,
-            "permissions": ["read", "write"],
+            "scopes": scopes,
         }
     )
 
@@ -123,6 +144,8 @@ async def register(request: RegisterRequest) -> LoginResponse:
         user={
             "user_id": user_id,
             "email": request.email,
+            "org_id": org_id,
+            "org_name": request.org_name,
             "tenant_id": tenant_id,
             "tenant_name": request.tenant_name,
         },
@@ -136,33 +159,50 @@ async def login(request: LoginRequest) -> LoginResponse:
 
     Returns a JWT access token.
     """
-    # This is a simplified login - in production, check against user table
-    # For demo, we'll create a token for the default tenant
-
-    # Get default tenant
-    tenant_query = """
-        SELECT id, name FROM aethyme.tenants
-        WHERE name = 'aeptus'
+    user_query = """
+        SELECT
+            u.id,
+            u.email,
+            u.password_hash,
+            u.scopes,
+            u.org_id,
+            u.tenant_id,
+            o.name AS org_name,
+            t.name AS tenant_name
+        FROM aethyme.users u
+        JOIN aethyme.orgs o ON o.id = u.org_id
+        JOIN aethyme.tenants t ON t.id = u.tenant_id
+        WHERE u.email = %s
+          AND u.is_active = TRUE
         LIMIT 1
     """
-    result = db_pool.execute(tenant_query)
+    result = db_pool.execute(user_query, (request.email,))
 
     if not result:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Default tenant not found",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
         )
 
-    tenant = result[0]
-    user_id = str(uuid.uuid4())
+    user = result[0]
+    if not user["password_hash"] or not verify_password(request.password, user["password_hash"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+        )
 
-    # Create access token
+    scopes = user["scopes"]
+    if isinstance(scopes, str):
+        import json
+        scopes = json.loads(scopes)
+
     access_token = create_access_token(
         data={
-            "sub": user_id,
-            "email": request.email,
-            "tenant_id": str(tenant["id"]),
-            "permissions": ["read", "write"],
+            "sub": str(user["id"]),
+            "email": user["email"],
+            "org": str(user["org_id"]),
+            "tenant_id": str(user["tenant_id"]),
+            "scopes": scopes,
         }
     )
 
@@ -171,10 +211,12 @@ async def login(request: LoginRequest) -> LoginResponse:
         token_type="bearer",
         expires_in=86400,
         user={
-            "user_id": user_id,
-            "email": request.email,
-            "tenant_id": str(tenant["id"]),
-            "tenant_name": tenant["name"],
+            "user_id": str(user["id"]),
+            "email": user["email"],
+            "org_id": str(user["org_id"]),
+            "org_name": user["org_name"],
+            "tenant_id": str(user["tenant_id"]),
+            "tenant_name": user["tenant_name"],
         },
     )
 
@@ -182,57 +224,33 @@ async def login(request: LoginRequest) -> LoginResponse:
 @router.post("/api-key", response_model=APIKeyResponse)
 async def create_api_key(
     request: CreateAPIKeyRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: OrgAdminUser,
 ) -> APIKeyResponse:
     """
     Create a new API key.
 
     API keys provide an alternative authentication method to JWT tokens.
     """
-    # Generate API key
-    api_key = f"rgk_{uuid.uuid4().hex}_{uuid.uuid4().hex}"  # rgk = aethyme key
-    key_hash = hash_password(api_key)
-
-    # Calculate expiration
-    expires_at = None
-    if request.expires_in_days:
-        from datetime import datetime
-
-        expires_at = datetime.utcnow() + timedelta(days=request.expires_in_days)
-
-    # Store in database
-    key_id = str(uuid.uuid4())
-    query = """
-        INSERT INTO aethyme.api_keys (
-            id, tenant_id, name, key_hash, permissions, expires_at
-        ) VALUES (%s, %s, %s, %s, %s, %s)
-    """
-
-    db_pool.execute(
-        query,
-        (
-            key_id,
-            current_user.tenant_id,
-            request.name,
-            key_hash,
-            request.permissions,
-            expires_at,
-        ),
-        fetch=False,
+    created = APIKeyManager.create(
+        tenant_id=current_user.tenant_id,
+        name=request.name,
+        scopes=request.scopes,
+        expires_in_days=request.expires_in_days,
+        repo_id=request.repo_id,
     )
 
     return APIKeyResponse(
-        api_key=api_key,
-        key_id=key_id,
+        api_key=created["api_key"],
+        key_id=created["key_id"],
         name=request.name,
-        expires_at=expires_at.isoformat() if expires_at else None,
+        expires_at=created["expires_at"],
     )
 
 
 @router.get("/me")
 async def get_current_user_info(
-    current_user: User = Depends(get_current_user),
-) -> Dict[str, Any]:
+    current_user: CurrentUser,
+) -> dict[str, Any]:
     """
     Get current user information.
 

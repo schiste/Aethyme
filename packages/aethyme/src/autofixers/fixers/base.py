@@ -2,10 +2,11 @@
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import List, Dict, Optional
-import structlog
+from typing import Any
 
-logger = structlog.get_logger()
+from .._log import get_logger
+
+logger = get_logger()
 
 
 class BaseFixer(ABC):
@@ -15,7 +16,7 @@ class BaseFixer(ABC):
         self.repo_path = Path(repo_path)
         self.fixes_applied = 0
         self.files_processed = 0
-        self.errors = []
+        self.errors: list[str] = []
 
     @abstractmethod
     def get_fix_type(self) -> str:
@@ -28,17 +29,17 @@ class BaseFixer(ABC):
         pass
 
     @abstractmethod
-    def fix(self, file_path: Path, content: str) -> Optional[str]:
+    def fix(self, file_path: Path, content: str) -> str | None:
         """Apply fix to content and return new content, or None if no fix needed."""
         pass
 
-    def process_file(self, file_path: Path) -> Optional[Dict[str, any]]:
+    def process_file(self, file_path: Path) -> dict[str, Any] | None:
         """Process a single file."""
         if not self.can_fix(file_path):
             return None
 
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
+            with open(file_path, encoding='utf-8') as f:
                 original_content = f.read()
 
             new_content = self.fix(file_path, original_content)
@@ -62,12 +63,12 @@ class BaseFixer(ABC):
             logger.error("Fix failed", file=str(file_path), error=str(e))
             return None
 
-    def process_directory(self, directory: Optional[Path] = None) -> List[Dict[str, any]]:
+    def process_directory(self, directory: Path | None = None) -> list[dict[str, Any]]:
         """Process all applicable files in a directory."""
         if directory is None:
             directory = self.repo_path
 
-        fixes = []
+        fixes: list[dict[str, Any]] = []
         for file_path in directory.rglob("*"):
             if file_path.is_file():
                 fix_result = self.process_file(file_path)
@@ -84,7 +85,7 @@ class BaseFixer(ABC):
 
         return fixes
 
-    def get_stats(self) -> Dict[str, any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get statistics for this fixer."""
         return {
             "fix_type": self.get_fix_type(),

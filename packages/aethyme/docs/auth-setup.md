@@ -126,17 +126,13 @@ OIDC_REDIRECT_URI=https://aethyme.example.com/auth/callback
 ```python
 from src.auth.oidc import oidc_client
 
-# Check configuration
-assert oidc_client.is_configured
-
-# Discover provider configuration
-config = await oidc_client.discover_configuration()
-print(config['issuer'])
-print(config['authorization_endpoint'])
-
-# Generate authorization URL
-auth_url = oidc_client.generate_authorization_url()
-print(f"Login at: {auth_url}")
+async def main() -> None:
+    assert oidc_client.is_configured
+    config = await oidc_client.discover_configuration()
+    print(config["issuer"])
+    print(config["authorization_endpoint"])
+    auth_url = oidc_client.generate_authorization_url()
+    print(f"Login at: {auth_url}")
 ```
 
 ## JWT Token Format
@@ -421,18 +417,15 @@ Aethyme uses PostgreSQL Row-Level Security (RLS) to enforce tenant isolation:
 The middleware automatically sets the tenant context:
 
 ```python
-from src.auth.middleware import set_tenant_context, UserContext
+from src.graph.store import GraphStore
 
-user = UserContext(
-    user_id="user_123",
+store = GraphStore(
     org_id="org_abc",
-    scopes=["repo:read"]
+    tenant_id="tenant_123",
+    scopes=["repo:read"],
 )
 
-# This sets the PostgreSQL session variable
-await set_tenant_context(user)
-
-# Now all queries are automatically scoped to org_abc
+results = store.search("UserService")
 ```
 
 ### Verifying Isolation
@@ -643,11 +636,14 @@ def call_with_backoff(func, max_retries=3):
 
 **Solution:**
 ```python
-# Ensure middleware is setting context
-from src.auth.middleware import get_current_user, set_tenant_context
+# Ensure graph operations are created with request context
+from src.graph.store import GraphStore
 
-user = await get_current_user(credentials)
-await set_tenant_context(user)  # Must call before queries!
+store = GraphStore(
+    org_id=current_user.org_id,
+    tenant_id=current_user.tenant_id,
+    scopes=current_user.scopes,
+)
 ```
 
 ## Migration Guide

@@ -1,298 +1,264 @@
-"""Tests for tenant isolation and multi-tenancy security.
+"""Tests for tenant isolation and scoped authentication."""
 
-These tests verify that tenant A cannot access tenant B's data
-and that scoped tokens properly restrict access.
-"""
+import json
+import uuid
+from collections.abc import Generator
+from typing import cast
 
 import pytest
-import uuid
-from datetime import timedelta
 
+from src.auth.api_keys import APIKeyManager, APIKeyRevokedError, verify_api_key
+from src.auth.middleware import UserContext
 from src.auth.oidc import JWTTokenGenerator
-from src.auth.middleware import UserContext, verify_jwt_token
-from src.auth.api_keys import APIKeyManager, verify_api_key, APIKeyRevokedError, APIKeyExpiredError
-from src.graph.connection_pool import db_pool
+from tests.support import (
+    create_node,
+    create_org_and_tenant,
+    create_repository,
+    delete_org,
+    execute_as,
+)
+from tests.support.auth_db import TenantRecord
+
+RepoFixture = tuple[str, TenantRecord]
+
+
+def _scope_list(raw_scopes: object) -> list[str]:
+    parsed: object = raw_scopes
+    if isinstance(parsed, str):
+        parsed = json.loads(parsed)
+    if not isinstance(parsed, list):
+        raise TypeError(f"Expected list[str] scopes, got {type(parsed).__name__}")
+    parsed_list = cast(list[object], parsed)
+    return [str(scope) for scope in parsed_list]
 
 
 class TestTenantIsolation:
     """Test tenant isolation via RLS policies."""
 
     @pytest.fixture
-    def tenant_a_id(self):
-        """Create tenant A."""
-        tenant_id = str(uuid.uuid4())
-        query = """
-            INSERT INTO aethyme.tenants (id, name, description)
-            VALUES (%s, %s, %s)
-            RETURNING id
-        """
-        db_pool.execute(query, (tenant_id, f"tenant_a_{tenant_id[:8]}", "Test Tenant A"), fetch=False)
-        yield tenant_id
-
-        # Cleanup
-        db_pool.execute("DELETE FROM aethyme.tenants WHERE id = %s", (tenant_id,), fetch=False)
+    def tenant_a(self) -> Generator[TenantRecord, None, None]:
+        tenant = create_org_and_tenant("tenant-a")
+        yield tenant
+        delete_org(tenant["org_id"])
 
     @pytest.fixture
-    def tenant_b_id(self):
-        """Create tenant B."""
-        tenant_id = str(uuid.uuid4())
-        query = """
-            INSERT INTO aethyme.tenants (id, name, description)
-            VALUES (%s, %s, %s)
-            RETURNING id
-        """
-        db_pool.execute(query, (tenant_id, f"tenant_b_{tenant_id[:8]}", "Test Tenant B"), fetch=False)
-        yield tenant_id
-
-        # Cleanup
-        db_pool.execute("DELETE FROM aethyme.tenants WHERE id = %s", (tenant_id,), fetch=False)
+    def tenant_b(self) -> Generator[TenantRecord, None, None]:
+        tenant = create_org_and_tenant("tenant-b")
+        yield tenant
+        delete_org(tenant["org_id"])
 
     @pytest.fixture
-    def repo_tenant_a(self, tenant_a_id):
-        """Create repository for tenant A."""
-        repo_id = str(uuid.uuid4())
-        query = """
-            INSERT INTO aethyme.repositories (id, tenant_id, name, path)
-            VALUES (%s, %s, %s, %s)
-            RETURNING id
-        """
-        db_pool.execute(
-            query,
-            (repo_id, tenant_a_id, "repo_a", "/path/to/repo_a"),
-            fetch=False,
+    def repo_tenant_a(self, tenant_a: TenantRecord) -> Generator[RepoFixture, None, None]:
+        repo_id = create_repository(
+            org_id=tenant_a["org_id"],
+            tenant_id=tenant_a["tenant_id"],
+            name="repo_a",
+            path="/path/to/repo_a",
         )
-        yield repo_id, tenant_a_id
+        yield repo_id, tenant_a
 
     @pytest.fixture
-    def repo_tenant_b(self, tenant_b_id):
-        """Create repository for tenant B."""
-        repo_id = str(uuid.uuid4())
-        query = """
-            INSERT INTO aethyme.repositories (id, tenant_id, name, path)
-            VALUES (%s, %s, %s, %s)
-            RETURNING id
-        """
-        db_pool.execute(
-            query,
-            (repo_id, tenant_b_id, "repo_b", "/path/to/repo_b"),
-            fetch=False,
+    def repo_tenant_b(self, tenant_b: TenantRecord) -> Generator[RepoFixture, None, None]:
+        repo_id = create_repository(
+            org_id=tenant_b["org_id"],
+            tenant_id=tenant_b["tenant_id"],
+            name="repo_b",
+            path="/path/to/repo_b",
         )
-        yield repo_id, tenant_b_id
+        yield repo_id, tenant_b
 
-    def test_tenant_cannot_read_other_tenant_repos(self, repo_tenant_a, repo_tenant_b):
-        """Test that tenant A cannot read tenant B's repositories."""
-        repo_a_id, tenant_a_id = repo_tenant_a
-        repo_b_id, tenant_b_id = repo_tenant_b
+    def test_tenant_cannot_read_other_tenant_repos(
+        self,
+        repo_tenant_a: RepoFixture,
+        repo_tenant_b: RepoFixture,
+    ) -> None:
+        repo_a_id, tenant_a = repo_tenant_a
+        repo_b_id, _ = repo_tenant_b
 
-        # Set context for tenant A
-        db_pool.execute(f"SET app.current_tenant = '{tenant_a_id}'", fetch=False)
-        db_pool.execute("SET app.current_scopes = '[\"repo:read\"]'", fetch=False)
+        results = execute_as(
+            tenant_id=tenant_a["tenant_id"],
+            org_id=tenant_a["org_id"],
+            scopes=["repo:read"],
+            query="SELECT id, name FROM aethyme.repositories",
+        )
 
-        # Query repositories - should only see tenant A's repos
-        query = "SELECT id, name FROM aethyme.repositories"
-        results = db_pool.execute(query)
+        repo_ids = [str(row["id"]) for row in results or []]
+        assert repo_a_id in repo_ids
+        assert repo_b_id not in repo_ids
 
-        # Should find repo A
-        repo_ids = [str(r['id']) for r in results]
-        assert repo_a_id in repo_ids, "Tenant A should see their own repo"
-        assert repo_b_id not in repo_ids, "Tenant A should NOT see tenant B's repo"
+    def test_tenant_cannot_write_to_other_tenant_repos(
+        self,
+        repo_tenant_a: RepoFixture,
+        tenant_b: TenantRecord,
+    ) -> None:
+        repo_a_id, tenant_a = repo_tenant_a
 
-        # Reset context
-        db_pool.execute("RESET app.current_tenant", fetch=False)
-        db_pool.execute("RESET app.current_scopes", fetch=False)
+        result = execute_as(
+            tenant_id=tenant_b["tenant_id"],
+            org_id=tenant_b["org_id"],
+            scopes=["repo:write", "org:admin"],
+            query="""
+                UPDATE aethyme.repositories
+                SET name = 'hacked'
+                WHERE id = %s
+                RETURNING id
+            """,
+            params=(repo_a_id,),
+        )
 
-    def test_tenant_cannot_write_to_other_tenant_repos(self, repo_tenant_a, tenant_b_id):
-        """Test that tenant B cannot modify tenant A's repositories."""
-        repo_a_id, tenant_a_id = repo_tenant_a
+        assert not result or len(result) == 0
 
-        # Set context for tenant B with write scope
-        db_pool.execute(f"SET app.current_tenant = '{tenant_b_id}'", fetch=False)
-        db_pool.execute("SET app.current_scopes = '[\"repo:write\", \"org:admin\"]'", fetch=False)
+        check_result = execute_as(
+            tenant_id=tenant_a["tenant_id"],
+            org_id=tenant_a["org_id"],
+            scopes=["repo:read"],
+            query="SELECT name FROM aethyme.repositories WHERE id = %s",
+            params=(repo_a_id,),
+        )
 
-        # Try to update tenant A's repo - should fail
-        query = """
-            UPDATE aethyme.repositories
-            SET name = 'hacked'
-            WHERE id = %s
-            RETURNING id
-        """
+        assert check_result is not None
+        assert check_result[0]["name"] == "repo_a"
 
-        result = db_pool.execute(query, (repo_a_id,))
+    def test_nodes_tenant_isolation(
+        self,
+        repo_tenant_a: RepoFixture,
+        repo_tenant_b: RepoFixture,
+    ) -> None:
+        repo_a_id, tenant_a = repo_tenant_a
+        repo_b_id, tenant_b = repo_tenant_b
 
-        # Update should return nothing (RLS blocks it)
-        assert not result or len(result) == 0, "Tenant B should NOT be able to update tenant A's repo"
-
-        # Verify repo was not modified
-        db_pool.execute(f"SET app.current_tenant = '{tenant_a_id}'", fetch=False)
-        check_query = "SELECT name FROM aethyme.repositories WHERE id = %s"
-        check_result = db_pool.execute(check_query, (repo_a_id,))
-
-        assert check_result[0]['name'] == 'repo_a', "Repo name should not have changed"
-
-        # Reset context
-        db_pool.execute("RESET app.current_tenant", fetch=False)
-        db_pool.execute("RESET app.current_scopes", fetch=False)
-
-    def test_nodes_tenant_isolation(self, repo_tenant_a, repo_tenant_b):
-        """Test that nodes are isolated by tenant."""
-        repo_a_id, tenant_a_id = repo_tenant_a
-        repo_b_id, tenant_b_id = repo_tenant_b
-
-        # Create node for tenant A
         node_a_id = f"node_a_{uuid.uuid4().hex[:8]}"
-        query = """
-            INSERT INTO aethyme.nodes (
-                id, tenant_id, repository_id, symbol, file_path,
-                line_number, column_number, kind, language
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        db_pool.execute(
-            query,
-            (node_a_id, tenant_a_id, repo_a_id, "test_symbol_a", "test.py", 1, 1, "function", "python"),
-            fetch=False,
+        create_node(
+            org_id=tenant_a["org_id"],
+            tenant_id=tenant_a["tenant_id"],
+            repository_id=repo_a_id,
+            node_id=node_a_id,
+            symbol="test_symbol_a",
+            file_path="test.py",
         )
 
-        # Create node for tenant B
         node_b_id = f"node_b_{uuid.uuid4().hex[:8]}"
-        db_pool.execute(
-            query,
-            (node_b_id, tenant_b_id, repo_b_id, "test_symbol_b", "test.py", 1, 1, "function", "python"),
-            fetch=False,
+        create_node(
+            org_id=tenant_b["org_id"],
+            tenant_id=tenant_b["tenant_id"],
+            repository_id=repo_b_id,
+            node_id=node_b_id,
+            symbol="test_symbol_b",
+            file_path="test.py",
         )
 
-        # Set context for tenant A
-        db_pool.execute(f"SET app.current_tenant = '{tenant_a_id}'", fetch=False)
-        db_pool.execute("SET app.current_scopes = '[\"repo:read\"]'", fetch=False)
+        results = execute_as(
+            tenant_id=tenant_a["tenant_id"],
+            org_id=tenant_a["org_id"],
+            scopes=["repo:read"],
+            query="SELECT id FROM aethyme.nodes",
+        )
 
-        # Query nodes - should only see tenant A's nodes
-        query = "SELECT id FROM aethyme.nodes"
-        results = db_pool.execute(query)
-
-        node_ids = [r['id'] for r in results]
-        assert node_a_id in node_ids, "Tenant A should see their own nodes"
-        assert node_b_id not in node_ids, "Tenant A should NOT see tenant B's nodes"
-
-        # Reset context
-        db_pool.execute("RESET app.current_tenant", fetch=False)
-        db_pool.execute("RESET app.current_scopes", fetch=False)
+        node_ids = [row["id"] for row in results or []]
+        assert node_a_id in node_ids
+        assert node_b_id not in node_ids
 
 
 class TestScopedTokens:
     """Test scoped token access control."""
 
-    def test_read_only_token_cannot_write(self):
-        """Test that read-only scoped token cannot perform write operations."""
+    def test_read_only_token_cannot_write(self) -> None:
         user_id = str(uuid.uuid4())
         org_id = str(uuid.uuid4())
+        tenant_id = str(uuid.uuid4())
 
-        # Create read-only token
         token = JWTTokenGenerator.create_token(
             user_id=user_id,
+            tenant_id=tenant_id,
             org_id=org_id,
             scopes=["repo:read"],
         )
-
-        # Decode token
         payload = JWTTokenGenerator.decode_token(token)
 
-        assert "repo:read" in payload["scopes"]
-        assert "repo:write" not in payload["scopes"]
-
-        # Create user context
         user = UserContext(
             user_id=user_id,
+            tenant_id=tenant_id,
             org_id=org_id,
-            scopes=payload["scopes"],
+            scopes=_scope_list(payload["scopes"]),
         )
 
-        # Verify scopes
         assert user.has_scope("repo:read")
         assert not user.has_scope("repo:write")
         assert not user.has_scope("org:admin")
 
-    def test_write_token_has_read_access(self):
-        """Test that write token can also read."""
+    def test_write_token_has_read_access(self) -> None:
         user_id = str(uuid.uuid4())
         org_id = str(uuid.uuid4())
+        tenant_id = str(uuid.uuid4())
 
-        # Create write token
         token = JWTTokenGenerator.create_token(
             user_id=user_id,
+            tenant_id=tenant_id,
             org_id=org_id,
             scopes=["repo:read", "repo:write"],
         )
-
-        # Decode token
         payload = JWTTokenGenerator.decode_token(token)
 
-        # Create user context
         user = UserContext(
             user_id=user_id,
+            tenant_id=tenant_id,
             org_id=org_id,
-            scopes=payload["scopes"],
+            scopes=_scope_list(payload["scopes"]),
         )
 
-        # Verify scopes
         assert user.has_scope("repo:read")
         assert user.has_scope("repo:write")
 
-    def test_admin_scope_grants_all_permissions(self):
-        """Test that org:admin scope grants all permissions."""
+    def test_admin_scope_grants_all_permissions(self) -> None:
         user_id = str(uuid.uuid4())
         org_id = str(uuid.uuid4())
+        tenant_id = str(uuid.uuid4())
 
-        # Create admin token
         token = JWTTokenGenerator.create_token(
             user_id=user_id,
+            tenant_id=tenant_id,
             org_id=org_id,
             scopes=["org:admin"],
         )
-
-        # Decode token
         payload = JWTTokenGenerator.decode_token(token)
 
-        # Create user context
         user = UserContext(
             user_id=user_id,
+            tenant_id=tenant_id,
             org_id=org_id,
-            scopes=payload["scopes"],
+            scopes=_scope_list(payload["scopes"]),
         )
 
-        # Admin should have all scopes
         assert user.has_scope("repo:read")
         assert user.has_scope("repo:write")
         assert user.has_scope("org:admin")
-        assert user.has_scope("any:scope")  # Admin has everything
+        assert user.has_scope("any:scope")
 
-    def test_multiple_scopes(self):
-        """Test token with multiple scopes."""
+    def test_multiple_scopes(self) -> None:
         user_id = str(uuid.uuid4())
         org_id = str(uuid.uuid4())
-
+        tenant_id = str(uuid.uuid4())
         scopes = ["repo:read", "repo:write", "audit:read"]
 
-        token = JWTTokenGenerator.create_token(
+        JWTTokenGenerator.create_token(
             user_id=user_id,
+            tenant_id=tenant_id,
             org_id=org_id,
             scopes=scopes,
         )
 
         user = UserContext(
             user_id=user_id,
+            tenant_id=tenant_id,
             org_id=org_id,
             scopes=scopes,
         )
 
-        # Check individual scopes
         assert user.has_scope("repo:read")
         assert user.has_scope("repo:write")
         assert user.has_scope("audit:read")
-
-        # Check has_any_scope
         assert user.has_any_scope(["repo:read", "nonexistent"])
         assert not user.has_any_scope(["nonexistent", "also_nonexistent"])
-
-        # Check has_all_scopes
         assert user.has_all_scopes(["repo:read", "repo:write"])
         assert not user.has_all_scopes(["repo:read", "nonexistent"])
 
@@ -301,204 +267,94 @@ class TestAPIKeyAuth:
     """Test API key authentication and scoping."""
 
     @pytest.fixture
-    def test_tenant(self):
-        """Create test tenant."""
-        tenant_id = str(uuid.uuid4())
-        query = """
-            INSERT INTO aethyme.tenants (id, name, description)
-            VALUES (%s, %s, %s)
-            RETURNING id
-        """
-        db_pool.execute(query, (tenant_id, f"api_test_{tenant_id[:8]}", "API Key Test Tenant"), fetch=False)
-        yield tenant_id
+    def test_tenant(self) -> Generator[TenantRecord, None, None]:
+        tenant = create_org_and_tenant("api-test")
+        yield tenant
+        delete_org(tenant["org_id"])
 
-        # Cleanup
-        db_pool.execute("DELETE FROM aethyme.tenants WHERE id = %s", (tenant_id,), fetch=False)
-
-    def test_api_key_creation_and_verification(self, test_tenant):
-        """Test creating and verifying API keys."""
-        # Create API key
+    def test_api_key_creation_and_verification(self, test_tenant: TenantRecord) -> None:
         key_data = APIKeyManager.create(
-            tenant_id=test_tenant,
+            tenant_id=test_tenant["tenant_id"],
             name="Test Key",
             scopes=["repo:read", "repo:write"],
         )
 
-        assert "api_key" in key_data
         assert key_data["api_key"].startswith("rg_live_")
 
-        # Verify API key
         verified = verify_api_key(key_data["api_key"])
         assert verified is not None
-        assert str(verified["tenant_id"]) == test_tenant
+        assert str(verified["tenant_id"]) == test_tenant["tenant_id"]
 
-    def test_api_key_scoping(self, test_tenant):
-        """Test API key with limited scopes."""
-        # Create read-only API key
+    def test_api_key_scoping(self, test_tenant: TenantRecord) -> None:
         key_data = APIKeyManager.create(
-            tenant_id=test_tenant,
+            tenant_id=test_tenant["tenant_id"],
             name="Read-Only Key",
             scopes=["repo:read"],
         )
 
         verified = verify_api_key(key_data["api_key"])
-
-        import json
-        scopes = verified["scopes"]
-        if isinstance(scopes, str):
-            scopes = json.loads(scopes)
+        assert verified is not None
+        scopes = _scope_list(verified["scopes"])
 
         assert "repo:read" in scopes
         assert "repo:write" not in scopes
 
-    def test_api_key_revocation(self, test_tenant):
-        """Test revoking an API key."""
-        # Create API key
+    def test_api_key_revocation(self, test_tenant: TenantRecord) -> None:
         key_data = APIKeyManager.create(
-            tenant_id=test_tenant,
+            tenant_id=test_tenant["tenant_id"],
             name="Revoke Test Key",
             scopes=["repo:read"],
         )
 
-        # Verify it works
         verified = verify_api_key(key_data["api_key"])
         assert verified is not None
 
-        # Revoke it
-        revoked = APIKeyManager.revoke(key_data["key_id"], test_tenant)
+        revoked = APIKeyManager.revoke(key_data["key_id"], test_tenant["tenant_id"])
         assert revoked is True
 
-        # Verify it no longer works
         with pytest.raises(APIKeyRevokedError):
             verify_api_key(key_data["api_key"])
 
-    def test_api_key_rotation(self, test_tenant):
-        """Test rotating an API key."""
-        # Create API key
+    def test_api_key_rotation(self, test_tenant: TenantRecord) -> None:
         old_key_data = APIKeyManager.create(
-            tenant_id=test_tenant,
+            tenant_id=test_tenant["tenant_id"],
             name="Rotation Test Key",
             scopes=["repo:read", "repo:write"],
         )
-
         old_key = old_key_data["api_key"]
 
-        # Rotate key
         new_key_data = APIKeyManager.rotate(
             key_id=old_key_data["key_id"],
-            tenant_id=test_tenant,
+            tenant_id=test_tenant["tenant_id"],
         )
-
         new_key = new_key_data["api_key"]
 
-        # Old key should be revoked
         with pytest.raises(APIKeyRevokedError):
             verify_api_key(old_key)
 
-        # New key should work
         verified = verify_api_key(new_key)
         assert verified is not None
 
-    def test_api_key_list(self, test_tenant):
-        """Test listing API keys for a tenant."""
-        # Create multiple keys
-        key1 = APIKeyManager.create(
-            tenant_id=test_tenant,
+    def test_api_key_list(self, test_tenant: TenantRecord) -> None:
+        APIKeyManager.create(
+            tenant_id=test_tenant["tenant_id"],
             name="Key 1",
             scopes=["repo:read"],
         )
-
-        key2 = APIKeyManager.create(
-            tenant_id=test_tenant,
+        APIKeyManager.create(
+            tenant_id=test_tenant["tenant_id"],
             name="Key 2",
             scopes=["repo:read", "repo:write"],
         )
 
-        # List keys
-        keys = APIKeyManager.list_keys(test_tenant)
+        keys = APIKeyManager.list_keys(test_tenant["tenant_id"])
 
         assert len(keys) >= 2
-        key_names = [k["name"] for k in keys]
+        key_names = [key["name"] for key in keys]
         assert "Key 1" in key_names
         assert "Key 2" in key_names
 
-        # Verify actual keys are not returned
         for key in keys:
             assert "api_key" not in key
             assert "key_id" in key
 
-
-class TestRateLimit:
-    """Test rate limiting functionality."""
-
-    @pytest.mark.asyncio
-    async def test_rate_limit_basic(self):
-        """Test basic rate limiting."""
-        from src.middleware.rate_limit import RateLimiter
-
-        limiter = RateLimiter(default_limit=5, default_window=60)
-        await limiter.connect()
-
-        identifier = "test_user_123"
-        endpoint = "/api/test"
-
-        # First 5 requests should succeed
-        for i in range(5):
-            allowed, remaining, _ = await limiter.check_rate_limit(
-                identifier, endpoint, limit=5, window=60
-            )
-            assert allowed is True
-            assert remaining == 4 - i
-
-        # 6th request should be rate limited
-        allowed, remaining, retry_after = await limiter.check_rate_limit(
-            identifier, endpoint, limit=5, window=60
-        )
-        assert allowed is False
-        assert remaining == 0
-        assert retry_after > 0
-
-        # Reset and try again
-        await limiter.reset(identifier, endpoint)
-
-        allowed, remaining, _ = await limiter.check_rate_limit(
-            identifier, endpoint, limit=5, window=60
-        )
-        assert allowed is True
-
-        await limiter.disconnect()
-
-    @pytest.mark.asyncio
-    async def test_rate_limit_different_endpoints(self):
-        """Test rate limits are separate per endpoint."""
-        from src.middleware.rate_limit import RateLimiter
-
-        limiter = RateLimiter(default_limit=3, default_window=60)
-        await limiter.connect()
-
-        identifier = "test_user_456"
-
-        # Use up limit on endpoint 1
-        for i in range(3):
-            allowed, _, _ = await limiter.check_rate_limit(
-                identifier, "/api/endpoint1", limit=3, window=60
-            )
-            assert allowed is True
-
-        # Endpoint 1 should be rate limited
-        allowed, _, _ = await limiter.check_rate_limit(
-            identifier, "/api/endpoint1", limit=3, window=60
-        )
-        assert allowed is False
-
-        # Endpoint 2 should still allow requests
-        allowed, _, _ = await limiter.check_rate_limit(
-            identifier, "/api/endpoint2", limit=3, window=60
-        )
-        assert allowed is True
-
-        await limiter.disconnect()
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

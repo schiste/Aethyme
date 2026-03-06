@@ -1369,4 +1369,4 @@ Tool Usage Report:
 - [API Reference](../reference/api.md) - Full API documentation
 - [Testing Guide](testing.md) - How to test your Aethyme integration
 - [Quickstart](../getting-started/quickstart.md) - Get started with Aethyme
-- [Architecture Overview](../architecture/overview.md) - Understanding Aethyme internals
+- [Security Architecture](../architecture/security.md) - Understanding Aethyme internals

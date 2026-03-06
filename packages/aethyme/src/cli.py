@@ -1,36 +1,16 @@
-"""Command-line interface for Aethyme."""
+import sys
+from pathlib import Path
+from typing import Any, TypeAlias, TypedDict, cast
 
 import click
-import os
-import sys
-import json
-from pathlib import Path
-from typing import Optional, Dict, Any
 import structlog
-import uuid
-from datetime import datetime
 
 # Add src to path for module imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.config import settings
-from src.graph.store import GraphStore
 from src.graph.connection_pool import db_pool
-from src.indexer.scip_wrapper import SCIPIndexer
-from src.indexer.fallback_indexer import FallbackIndexer
-from src.indexer.graph_builder import GraphBuilder
-
-try:
-    from rich.console import Console
-    from rich.table import Table
-    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
-    from rich.panel import Panel
-    from rich.syntax import Syntax
-    from rich import print as rprint
-    RICH_AVAILABLE = True
-except ImportError:
-    RICH_AVAILABLE = False
-    Console = None
+from src.graph.store import GraphStore
+from src.indexing.service import RepositoryIndexRequest, run_indexing
 
 # Configure logging
 structlog.configure(
@@ -51,56 +31,68 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
-# Initialize console if rich is available
-console = Console() if RICH_AVAILABLE else None
+CLIState: TypeAlias = dict[str, str | bool | None]
 
 
-def output_json(data: Dict[str, Any]):
-    """Output data as JSON."""
-    click.echo(json.dumps(data, indent=2, default=str))
+class FixRecord(TypedDict):
+    """Autofix change proposal emitted by individual fixers."""
+
+    file_path: Path
+    original_content: str
+    new_content: str
+    fix_type: str
 
 
-def output_table(headers: list, rows: list, title: Optional[str] = None):
-    """Output data as a table using rich if available, otherwise plain text."""
-    if RICH_AVAILABLE and console:
-        table = Table(title=title, show_header=True, header_style="bold magenta")
-        for header in headers:
-            table.add_column(header)
-        for row in rows:
-            table.add_row(*[str(cell) for cell in row])
-        console.print(table)
-    else:
-        if title:
-            click.echo(f"\n{title}")
-            click.echo("=" * len(title))
-        click.echo("\t".join(headers))
-        click.echo("-" * 80)
-        for row in rows:
-            click.echo("\t".join(str(cell) for cell in row))
+def normalize_fixes(raw_fixes: list[dict[str, Any]]) -> list[FixRecord]:
+    """Validate fixer output before patch generation."""
+    normalized: list[FixRecord] = []
+    for raw_fix in raw_fixes:
+        file_path = raw_fix.get("file_path")
+        original_content = raw_fix.get("original_content")
+        new_content = raw_fix.get("new_content")
+        fix_type = raw_fix.get("fix_type")
+
+        if isinstance(file_path, str):
+            path_value = Path(file_path)
+        elif isinstance(file_path, Path):
+            path_value = file_path
+        else:
+            raise ValueError(f"Invalid fix file_path: {file_path!r}")
+
+        if not isinstance(original_content, str):
+            raise ValueError(f"Invalid fix original_content for {path_value}")
+        if not isinstance(new_content, str):
+            raise ValueError(f"Invalid fix new_content for {path_value}")
+        if not isinstance(fix_type, str):
+            raise ValueError(f"Invalid fix fix_type for {path_value}")
+
+        normalized.append(
+            FixRecord(
+                file_path=path_value,
+                original_content=original_content,
+                new_content=new_content,
+                fix_type=fix_type,
+            )
+        )
+
+    return normalized
 
 
-def success_message(message: str):
-    """Print success message."""
-    if RICH_AVAILABLE and console:
-        console.print(f"[green]✓[/green] {message}")
-    else:
-        click.echo(f"✓ {message}")
+def get_state(ctx: click.Context) -> CLIState:
+    """Return the mutable CLI state."""
+    if ctx.obj is None:
+        ctx.obj = {}
+    return cast(CLIState, ctx.obj)
 
 
-def error_message(message: str):
-    """Print error message."""
-    if RICH_AVAILABLE and console:
-        console.print(f"[red]✗[/red] {message}")
-    else:
-        click.echo(f"✗ {message}", err=True)
-
-
-def warning_message(message: str):
-    """Print warning message."""
-    if RICH_AVAILABLE and console:
-        console.print(f"[yellow]⚠[/yellow] {message}")
-    else:
-        click.echo(f"⚠ {message}")
+def default_tenant_id() -> str | None:
+    """Resolve the default tenant for local CLI workflows."""
+    result = db_pool.execute(
+        "SELECT id FROM aethyme.tenants WHERE slug = 'default' LIMIT 1"
+    )
+    if not result:
+        return None
+    return str(result[0]["id"])
 
 
 @click.group()
@@ -121,7 +113,12 @@ def warning_message(message: str):
     help="Verbose output",
 )
 @click.pass_context
-def cli(ctx, tenant_id, output_json_flag, verbose):
+def cli(
+    ctx: click.Context,
+    tenant_id: str | None,
+    output_json_flag: bool,
+    verbose: bool,
+) -> None:
     """Aethyme - Graph-based code intelligence system.
 
     A powerful CLI for code indexing, querying, and AI-readiness analysis.
@@ -132,10 +129,10 @@ def cli(ctx, tenant_id, output_json_flag, verbose):
         aethyme ai-ready --apply
         aethyme autofix --dry-run
     """
-    ctx.ensure_object(dict)
-    ctx.obj["tenant_id"] = tenant_id
-    ctx.obj["json"] = output_json_flag
-    ctx.obj["verbose"] = verbose
+    state = get_state(ctx)
+    state["tenant_id"] = tenant_id
+    state["json"] = output_json_flag
+    state["verbose"] = verbose
 
 
 @cli.command()
@@ -157,189 +154,55 @@ def cli(ctx, tenant_id, output_json_flag, verbose):
     help="Force use of fallback indexer",
 )
 @click.pass_context
-def index(ctx, repo_path, name, languages, use_fallback):
+def index(
+    ctx: click.Context,
+    repo_path: str,
+    name: str | None,
+    languages: str,
+    use_fallback: bool,
+) -> None:
     """Index a repository and build the code graph."""
-    repo_path = Path(repo_path).resolve()
-    repo_name = name or repo_path.name
-    languages_list = [lang.strip() for lang in languages.split(",")]
-
-    # Get or create tenant
-    tenant_id = ctx.obj.get("tenant_id")
-    if not tenant_id:
-        # Use default tenant
-        result = db_pool.execute(
-            "SELECT id FROM aethyme.tenants WHERE name = 'aeptus' LIMIT 1"
-        )
-        if result:
-            tenant_id = str(result[0]["id"])
-        else:
-            # Create default tenant
-            tenant_id = str(uuid.uuid4())
-            db_pool.execute(
-                """
-                INSERT INTO aethyme.tenants (id, name, description)
-                VALUES (%s, 'aeptus', 'Default tenant')
-                """,
-                (tenant_id,),
-                fetch=False,
-            )
-
-    logger.info(
-        "Starting repository indexing",
-        repo_path=str(repo_path),
-        repo_name=repo_name,
-        languages=languages_list,
-        tenant_id=tenant_id,
+    request = RepositoryIndexRequest(
+        repo_path=Path(repo_path),
+        repo_name=name,
+        languages=[lang.strip() for lang in languages.split(",")],
+        tenant_id=cast(str | None, get_state(ctx).get("tenant_id")),
+        use_fallback=use_fallback,
+        clear_existing=True,
     )
-
-    # Initialize store
-    store = GraphStore(tenant_id=tenant_id)
-
-    # Create or update repository
-    repo = store.create_repository(
-        name=repo_name,
-        path=str(repo_path),
-        languages=languages_list,
-    )
-    repository_id = str(repo["id"])
-
-    logger.info("Repository registered", repository_id=repository_id)
-
-    # Clear existing data for re-indexing
-    if click.confirm("Clear existing graph data for this repository?", default=True):
-        stats = store.clear_repository(repository_id)
-        logger.info(
-            "Cleared existing data",
-            nodes_deleted=stats["nodes_deleted"],
-            edges_deleted=stats["edges_deleted"],
-        )
-
     # Initialize graph builder
-    def progress_callback(current, total, message):
+    def progress_callback(current: int, total: int, message: str) -> None:
         click.echo(f"Progress: {current}/{total} - {message}")
-
-    builder = GraphBuilder(
-        store=store,
-        batch_size=1000,
-        progress_callback=progress_callback,
-    )
-
-    # Index each language
-    total_stats = {
-        "nodes": 0,
-        "edges": 0,
-        "files": 0,
-    }
-
-    for language in languages_list:
-        logger.info(f"Indexing {language} files...")
-
-        try:
-            # Try SCIP first unless fallback is forced
-            if not use_fallback:
-                indexer = SCIPIndexer(language)
-                if indexer.is_available():
-                    logger.info(f"Using SCIP indexer for {language}")
-                    scip_data = indexer.index(repo_path, repo_name)
-                    stats = builder.build_from_scip(scip_data, repository_id, language)
-
-                    total_stats["nodes"] += stats.nodes_processed
-                    total_stats["edges"] += stats.edges_created
-                    total_stats["files"] += stats.files_processed
-
-                    logger.info(
-                        f"Indexed {language} with SCIP",
-                        nodes=stats.nodes_processed,
-                        edges=stats.edges_created,
-                        files=stats.files_processed,
-                    )
-                    continue
-
-            # Fall back to regex-based indexer
-            logger.info(f"Using fallback indexer for {language}")
-            fallback = FallbackIndexer(language)
-            # Default exclusions for cleaner indexing
-            exclude_dirs = [
-                'node_modules', '__pycache__', '.git', 'venv', '.venv',
-                'dist', 'build', '.pytest_cache', '.mypy_cache',
-                'site-packages', 'proc', 'sys', 'dev', 'run', 'tmp'
-            ]
-            nodes, edges = fallback.index(repo_path, exclude_dirs=exclude_dirs)
-            stats = builder.build_from_fallback(nodes, edges, repository_id)
-
-            total_stats["nodes"] += stats.nodes_processed
-            total_stats["edges"] += stats.edges_created
-            total_stats["files"] += stats.files_processed
-
-            logger.info(
-                f"Indexed {language} with fallback",
-                nodes=stats.nodes_processed,
-                edges=stats.edges_created,
-            )
-
-        except Exception as e:
-            logger.error(f"Failed to index {language}", error=str(e))
-            if not click.confirm(f"Continue with other languages?", default=True):
-                sys.exit(1)
-
-    # Update repository status
-    db_pool.execute(
-        """
-        UPDATE aethyme.repositories
-        SET index_status = 'completed',
-            last_indexed_at = CURRENT_TIMESTAMP
-        WHERE id = %s AND tenant_id = %s
-        """,
-        (repository_id, tenant_id),
-        fetch=False,
-    )
-
-    # Get final statistics
-    graph_stats = store.get_statistics()
+    result = run_indexing(request, progress_callback=progress_callback)
 
     # Print summary
     click.echo("\n" + "=" * 60)
     click.echo("Indexing Complete!")
     click.echo("=" * 60)
-    click.echo(f"Repository: {repo_name}")
-    click.echo(f"Path: {repo_path}")
-    click.echo(f"Languages: {', '.join(languages_list)}")
+    click.echo(f"Repository: {result.repository_name}")
+    click.echo(f"Path: {result.repository_path}")
+    click.echo(f"Languages: {', '.join(result.languages)}")
     click.echo("-" * 60)
-    click.echo(f"Total Nodes: {graph_stats.get('total_nodes', 0):,}")
-    click.echo(f"Total Edges: {graph_stats.get('total_edges', 0):,}")
-    click.echo(f"Total Files: {graph_stats.get('total_files', 0):,}")
+    click.echo(f"Total Nodes: {result.graph_statistics.get('total_nodes', 0):,}")
+    click.echo(f"Total Edges: {result.graph_statistics.get('total_edges', 0):,}")
+    click.echo(f"Total Files: {result.graph_statistics.get('total_files', 0):,}")
     click.echo("-" * 60)
-
-    # Analyze graph
-    if click.confirm("Analyze graph structure?", default=True):
-        analysis = builder.analyze_graph()
-        click.echo("\nGraph Analysis:")
-        click.echo(f"  Orphan nodes: {analysis['orphan_nodes']}")
-        click.echo(f"  Node types: {dict(analysis['node_types'])}")
-        click.echo(f"  Edge types: {dict(analysis['edge_types'])}")
-
-        if analysis["top_symbols"]:
-            click.echo("\nTop 10 Most Referenced Symbols:")
-            for i, symbol_info in enumerate(analysis["top_symbols"], 1):
-                click.echo(
-                    f"  {i}. {symbol_info['symbol']} ({symbol_info['references']} references)"
-                )
+    for language_result in result.language_results:
+        click.echo(
+            f"{language_result.language}: {language_result.engine} "
+            f"({language_result.nodes} nodes, {language_result.edges} edges, {language_result.files} files)"
+        )
 
 
 @cli.command()
 @click.pass_context
-def stats(ctx):
+def stats(ctx: click.Context) -> None:
     """Show graph statistics."""
-    tenant_id = ctx.obj.get("tenant_id")
+    tenant_id = cast(str | None, get_state(ctx).get("tenant_id"))
 
     if not tenant_id:
-        # Get default tenant
-        result = db_pool.execute(
-            "SELECT id FROM aethyme.tenants WHERE name = 'aeptus' LIMIT 1"
-        )
-        if result:
-            tenant_id = str(result[0]["id"])
-        else:
+        tenant_id = default_tenant_id()
+        if tenant_id is None:
             click.echo("No tenant found. Please index a repository first.")
             return
 
@@ -360,17 +223,13 @@ def stats(ctx):
 @click.argument("symbol")
 @click.option("--depth", "-d", default=2, help="Depth for ego graph traversal")
 @click.pass_context
-def ego(ctx, symbol, depth):
+def ego(ctx: click.Context, symbol: str, depth: int) -> None:
     """Get ego graph for a symbol."""
-    tenant_id = ctx.obj.get("tenant_id")
+    tenant_id = cast(str | None, get_state(ctx).get("tenant_id"))
 
     if not tenant_id:
-        result = db_pool.execute(
-            "SELECT id FROM aethyme.tenants WHERE name = 'aeptus' LIMIT 1"
-        )
-        if result:
-            tenant_id = str(result[0]["id"])
-        else:
+        tenant_id = default_tenant_id()
+        if tenant_id is None:
             click.echo("No tenant found. Please index a repository first.")
             return
 
@@ -386,7 +245,7 @@ def ego(ctx, symbol, depth):
 
     if result.get("definition"):
         defn = result["definition"]
-        click.echo(f"\nDefinition:")
+        click.echo("\nDefinition:")
         click.echo(f"  File: {defn['file_path']}:{defn['line_number']}")
         click.echo(f"  Kind: {defn['kind']}")
         click.echo(f"  Language: {defn['language']}")
@@ -408,17 +267,13 @@ def ego(ctx, symbol, depth):
 @click.argument("symbol")
 @click.option("--max-depth", "-d", default=10, help="Maximum depth for impact analysis")
 @click.pass_context
-def impact(ctx, symbol, max_depth):
+def impact(ctx: click.Context, symbol: str, max_depth: int) -> None:
     """Analyze impact of changes to a symbol."""
-    tenant_id = ctx.obj.get("tenant_id")
+    tenant_id = cast(str | None, get_state(ctx).get("tenant_id"))
 
     if not tenant_id:
-        result = db_pool.execute(
-            "SELECT id FROM aethyme.tenants WHERE name = 'aeptus' LIMIT 1"
-        )
-        if result:
-            tenant_id = str(result[0]["id"])
-        else:
+        tenant_id = default_tenant_id()
+        if tenant_id is None:
             click.echo("No tenant found. Please index a repository first.")
             return
 
@@ -453,17 +308,13 @@ def impact(ctx, symbol, max_depth):
     help="Search type",
 )
 @click.pass_context
-def search(ctx, query, limit, type):
+def search(ctx: click.Context, query: str, limit: int, type: str) -> None:
     """Search for symbols in the graph."""
-    tenant_id = ctx.obj.get("tenant_id")
+    tenant_id = cast(str | None, get_state(ctx).get("tenant_id"))
 
     if not tenant_id:
-        result = db_pool.execute(
-            "SELECT id FROM aethyme.tenants WHERE name = 'aeptus' LIMIT 1"
-        )
-        if result:
-            tenant_id = str(result[0]["id"])
-        else:
+        tenant_id = default_tenant_id()
+        if tenant_id is None:
             click.echo("No tenant found. Please index a repository first.")
             return
 
@@ -520,9 +371,18 @@ def search(ctx, query, limit, type):
     help="Comma-separated list of detectors to run (runs all if not specified)",
 )
 @click.pass_context
-def ai_ready(ctx, repo, org, repo_id, format, output, detectors):
+def ai_ready(
+    ctx: click.Context,
+    repo: str | None,
+    org: str | None,
+    repo_id: str | None,
+    format: str,
+    output: str | None,
+    detectors: str | None,
+) -> None:
     """Run AI-readiness scorecard on a repository."""
     from pathlib import Path
+
     from src.scorecard.engine import ScorecardEngine
     from src.scorecard.metrics import record_scan_metrics
 
@@ -540,15 +400,15 @@ def ai_ready(ctx, repo, org, repo_id, format, output, detectors):
     click.echo()
 
     # Get tenant_id if using API mode
-    tenant_id = ctx.obj.get("tenant_id")
+    tenant_id = cast(str | None, get_state(ctx).get("tenant_id"))
     if org and not tenant_id:
         # Look up tenant by org name
-        result = db_pool.execute(
-            "SELECT id FROM aethyme.tenants WHERE name = %s LIMIT 1",
+        tenant_lookup = db_pool.execute(
+            "SELECT id FROM aethyme.tenants WHERE slug = %s LIMIT 1",
             (org,)
         )
-        if result:
-            tenant_id = str(result[0]["id"])
+        if tenant_lookup:
+            tenant_id = str(tenant_lookup[0]["id"])
 
     # Parse detectors list
     detector_list = None
@@ -574,9 +434,9 @@ def ai_ready(ctx, repo, org, repo_id, format, output, detectors):
         # Record metrics
         record_scan_metrics(result.report, tenant_id=tenant_id, repository_id=repo_id)
 
-    except Exception as e:
-        click.echo(f"Error during scan: {e}", err=True)
-        logger.error("Scorecard scan failed", error=str(e), exc_info=True)
+    except Exception as exc:
+        click.echo(f"Error during scan: {exc}", err=True)
+        logger.error("Scorecard scan failed", error=str(exc), exc_info=True)
         sys.exit(2)
 
     click.echo()
@@ -595,7 +455,8 @@ def ai_ready(ctx, repo, org, repo_id, format, output, detectors):
             output_path.write_text(json_output)
             click.echo(f"JSON report written to: {output_path}")
         elif format == "both":
-            json_path = Path(output or "scorecard-report.json")
+            output_base = Path(output) if output else Path("scorecard-report")
+            json_path = output_base if output_base.suffix == ".json" else output_base.with_suffix(".json")
             json_path.write_text(json_output)
             click.echo(f"JSON report written to: {json_path}")
         else:
@@ -608,7 +469,8 @@ def ai_ready(ctx, repo, org, repo_id, format, output, detectors):
             output_path.write_text(md_output)
             click.echo(f"Markdown report written to: {output_path}")
         elif format == "both":
-            md_path = Path(output or "scorecard-report.md")
+            output_base = Path(output) if output else Path("scorecard-report")
+            md_path = output_base if output_base.suffix == ".md" else output_base.with_suffix(".md")
             md_path.write_text(md_output)
             click.echo(f"Markdown report written to: {md_path}")
         else:
@@ -639,68 +501,77 @@ def ai_ready(ctx, repo, org, repo_id, format, output, detectors):
 )
 @click.option("--skip-approval", is_flag=True, help="Skip approval for risky changes")
 @click.pass_context
-def autofix(ctx, repo_path, dry_run, do_apply, pr, fix_type, skip_approval):
+def autofix(
+    ctx: click.Context,
+    repo_path: str,
+    dry_run: bool,
+    do_apply: bool,
+    pr: bool,
+    fix_type: str,
+    skip_approval: bool,
+) -> None:
     """Apply automated fixes to codebase issues."""
     from pathlib import Path
-    from src.autofixers.safety import SafetyEngine
-    from src.autofixers.patch import PatchGenerator
-    from src.autofixers.github import GitHubIntegration
+
     from src.autofixers.fixers import (
         DocsRegenerator,
+        FormatFixer,
+        I18nScaffolder,
         LinkFixer,
         SelectorInserter,
-        I18nScaffolder,
-        FormatFixer,
     )
+    from src.autofixers.github import GitHubIntegration
+    from src.autofixers.patch import PatchGenerator
+    from src.autofixers.safety import SafetyEngine
 
-    repo_path = Path(repo_path).resolve()
+    repository_path = Path(repo_path).resolve()
 
-    click.echo(f"\nAethyme Autofixer")
+    click.echo("\nAethyme Autofixer")
     click.echo("=" * 60)
-    click.echo(f"Repository: {repo_path}")
+    click.echo(f"Repository: {repository_path}")
     click.echo(f"Fix type: {fix_type}")
     click.echo(f"Mode: {'DRY RUN' if dry_run else 'APPLY' if do_apply else 'PR' if pr else 'DRY RUN'}")
     click.echo("")
 
     # Initialize components
     safety_engine = SafetyEngine()
-    patch_gen = PatchGenerator(repo_path, safety_engine)
+    patch_gen = PatchGenerator(repository_path, safety_engine)
 
     # Collect fixes based on type
-    all_fixes = []
+    all_fixes: list[FixRecord] = []
 
     if fix_type in ["all", "docs"]:
         click.echo("Scanning for documentation issues...")
-        docs_fixer = DocsRegenerator(repo_path)
-        docs_fixes = docs_fixer.create_folder_docs()
+        docs_fixer = DocsRegenerator(repository_path)
+        docs_fixes = normalize_fixes(docs_fixer.create_folder_docs())
         all_fixes.extend(docs_fixes)
         click.echo(f"  Found {len(docs_fixes)} documentation fixes")
 
     if fix_type in ["all", "links"]:
         click.echo("Scanning for link issues...")
-        link_fixer = LinkFixer(repo_path)
-        link_fixes = link_fixer.process_directory()
+        link_fixer = LinkFixer(repository_path)
+        link_fixes = normalize_fixes(link_fixer.process_directory())
         all_fixes.extend(link_fixes)
         click.echo(f"  Found {len(link_fixes)} link fixes")
 
     if fix_type in ["all", "selectors"]:
         click.echo("Scanning for missing test selectors...")
-        selector_fixer = SelectorInserter(repo_path)
-        selector_fixes = selector_fixer.process_directory()
+        selector_fixer = SelectorInserter(repository_path)
+        selector_fixes = normalize_fixes(selector_fixer.process_directory())
         all_fixes.extend(selector_fixes)
         click.echo(f"  Found {len(selector_fixes)} selector fixes")
 
     if fix_type in ["all", "i18n"]:
         click.echo("Scanning for hardcoded strings...")
-        i18n_fixer = I18nScaffolder(repo_path)
-        i18n_fixes = i18n_fixer.process_directory()
+        i18n_fixer = I18nScaffolder(repository_path)
+        i18n_fixes = normalize_fixes(i18n_fixer.process_directory())
         all_fixes.extend(i18n_fixes)
         click.echo(f"  Found {len(i18n_fixes)} i18n fixes")
 
     if fix_type in ["all", "format"]:
         click.echo("Scanning for formatting issues...")
-        format_fixer = FormatFixer(repo_path)
-        format_fixes = format_fixer.process_directory()
+        format_fixer = FormatFixer(repository_path)
+        format_fixes = normalize_fixes(format_fixer.process_directory())
         all_fixes.extend(format_fixes)
         click.echo(f"  Found {len(format_fixes)} formatting fixes")
 
@@ -782,7 +653,7 @@ def autofix(ctx, repo_path, dry_run, do_apply, pr, fix_type, skip_approval):
         # PR mode
         click.echo("\nCreating pull request...")
 
-        gh_integration = GitHubIntegration(repo_path)
+        gh_integration = GitHubIntegration(repository_path)
 
         # Check working tree
         if not gh_integration.is_clean_working_tree():
@@ -804,7 +675,7 @@ def autofix(ctx, repo_path, dry_run, do_apply, pr, fix_type, skip_approval):
             click.echo("\nFailed to create pull request")
 
 
-def main():
+def main() -> None:
     """Main entry point for CLI."""
     cli(obj={})
 

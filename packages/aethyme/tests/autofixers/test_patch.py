@@ -1,15 +1,15 @@
 """Tests for patch generator."""
 
-import pytest
 from pathlib import Path
-from src.autofixers.patch import PatchGenerator, FilePatch, PatchMode
-from src.autofixers.safety import SafetyEngine, RiskLevel
+
+from src.autofixers.patch import FilePatch, PatchGenerator
+from src.autofixers.safety import RiskLevel
 
 
 class TestFilePatch:
     """Tests for FilePatch class."""
 
-    def test_generates_diff(self, tmp_path):
+    def test_generates_diff(self, tmp_path: Path):
         """Should generate unified diff."""
         file_path = Path("test.py")
         original = "line1\nline2\nline3"
@@ -40,7 +40,7 @@ class TestFilePatch:
         assert summary["risk_level"] == "medium"
         assert summary["has_changes"] is True
 
-    def test_apply_patch(self, tmp_path):
+    def test_apply_patch(self, tmp_path: Path):
         """Should apply patch to disk."""
         file_path = tmp_path / "test.txt"
         file_path.write_text("original content")
@@ -60,7 +60,7 @@ class TestFilePatch:
 class TestPatchGenerator:
     """Tests for PatchGenerator class."""
 
-    def test_add_patch_with_changes(self, tmp_path):
+    def test_add_patch_with_changes(self, tmp_path: Path):
         """Should add patch when there are changes."""
         gen = PatchGenerator(tmp_path)
 
@@ -77,7 +77,7 @@ class TestPatchGenerator:
         assert patch is not None
         assert len(gen.patches) == 1
 
-    def test_skip_patch_without_changes(self, tmp_path):
+    def test_skip_patch_without_changes(self, tmp_path: Path):
         """Should skip patch when no changes."""
         gen = PatchGenerator(tmp_path)
 
@@ -94,7 +94,7 @@ class TestPatchGenerator:
         assert patch is None
         assert len(gen.patches) == 0
 
-    def test_skip_generated_files(self, tmp_path):
+    def test_skip_generated_files(self, tmp_path: Path):
         """Should skip generated files."""
         gen = PatchGenerator(tmp_path)
 
@@ -111,7 +111,7 @@ class TestPatchGenerator:
         assert patch is None
         assert len(gen.patches) == 0
 
-    def test_generate_unified_diff(self, tmp_path):
+    def test_generate_unified_diff(self, tmp_path: Path):
         """Should generate unified diff for all patches."""
         gen = PatchGenerator(tmp_path)
 
@@ -129,7 +129,7 @@ class TestPatchGenerator:
         assert "file1.py" in diff
         assert "file2.py" in diff
 
-    def test_get_summary(self, tmp_path):
+    def test_get_summary(self, tmp_path: Path):
         """Should return comprehensive summary."""
         gen = PatchGenerator(tmp_path)
 
@@ -151,7 +151,7 @@ class TestPatchGenerator:
         assert "docs_regen" in summary["by_fix_type"]
         assert summary["requires_approval"] == 1  # Medium risk
 
-    def test_dry_run(self, tmp_path):
+    def test_dry_run(self, tmp_path: Path):
         """Should show changes without applying."""
         gen = PatchGenerator(tmp_path)
 
@@ -170,7 +170,7 @@ class TestPatchGenerator:
         # File should not be modified
         assert file_path.read_text() == "original"
 
-    def test_apply_low_risk(self, tmp_path):
+    def test_apply_low_risk(self, tmp_path: Path):
         """Should apply low risk changes without approval."""
         gen = PatchGenerator(tmp_path)
 
@@ -185,7 +185,7 @@ class TestPatchGenerator:
         assert len(result["applied"]) == 1
         assert file_path.read_text() == "modified"
 
-    def test_requires_approval_for_medium_risk(self, tmp_path):
+    def test_requires_approval_for_medium_risk(self, tmp_path: Path):
         """Should require approval for medium risk."""
         gen = PatchGenerator(tmp_path)
 
@@ -202,7 +202,7 @@ class TestPatchGenerator:
         # File should not be modified
         assert file_path.read_text() == "original"
 
-    def test_skip_approval_applies_all(self, tmp_path):
+    def test_skip_approval_applies_all(self, tmp_path: Path):
         """Should apply all changes when skipping approval."""
         gen = PatchGenerator(tmp_path)
 
@@ -217,7 +217,7 @@ class TestPatchGenerator:
         assert len(result["applied"]) == 1
         assert file_path.read_text() == "modified"
 
-    def test_create_commit_message(self, tmp_path):
+    def test_create_commit_message(self, tmp_path: Path):
         """Should create descriptive commit message."""
         gen = PatchGenerator(tmp_path)
 
@@ -236,7 +236,7 @@ class TestPatchGenerator:
         assert "format_fix" in message
         assert "2" in message  # 2 files
 
-    def test_save_patch_file(self, tmp_path):
+    def test_save_patch_file(self, tmp_path: Path):
         """Should save patch to file."""
         gen = PatchGenerator(tmp_path)
 
@@ -251,7 +251,7 @@ class TestPatchGenerator:
         assert output.exists()
         assert output.read_text()  # Has content
 
-    def test_get_changed_files(self, tmp_path):
+    def test_get_changed_files(self, tmp_path: Path):
         """Should return list of changed files."""
         gen = PatchGenerator(tmp_path)
 
