@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::edge::Edge;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum GraphNodeKind {
     Repo,
     Area,
@@ -14,7 +14,7 @@ pub enum GraphNodeKind {
     Config,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct GraphNode {
     pub id: String,
     pub kind: GraphNodeKind,
@@ -26,7 +26,7 @@ pub struct GraphNode {
     pub metadata: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct GraphAnnotation {
     pub target_id: String,
     pub kind: String,
@@ -36,7 +36,7 @@ pub struct GraphAnnotation {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NormalizedGraph {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<Edge>,

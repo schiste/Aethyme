@@ -1,6 +1,10 @@
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use crate::area::AreaNode;
+use crate::cache::ParseCache;
 use crate::class::ClassNode;
 use crate::config::ConfigNode;
 use crate::directory::DirectoryNode;
@@ -9,12 +13,71 @@ use crate::edge::Edge;
 use crate::file::FileNode;
 use crate::function::FunctionNode;
 use crate::graph::{GraphNode, GraphNodeKind, NormalizedGraph};
+use crate::indexer::tree_sitter::{default_grammars_dir, GrammarRegistry};
+use crate::map_cache;
 use crate::passes;
 use crate::repo::{discover_repo, RepoSnapshot};
 use crate::risk::RiskFlag;
 use crate::symbol::Symbol;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Pre-computed HashMap indexes for O(1) lookups on entity id → area_id and display string.
+/// Built lazily via `OnceLock` on first access; not serialized (derived data).
+#[derive(Debug, Clone)]
+struct MapIndex {
+    area_id_by_id: HashMap<String, Option<String>>,
+    display_by_id: HashMap<String, String>,
+}
+
+impl MapIndex {
+    fn build(map: &RepositoryMap) -> Self {
+        let capacity = map.files.len()
+            + map.functions.len()
+            + map.classes.len()
+            + map.docs.len()
+            + map.configs.len()
+            + map.areas.len();
+        let mut area_id_by_id = HashMap::with_capacity(capacity);
+        let mut display_by_id = HashMap::with_capacity(capacity);
+
+        for file in &map.files {
+            area_id_by_id.insert(file.id.clone(), file.area_id.clone());
+            display_by_id.insert(file.id.clone(), file.path.clone());
+        }
+        for function in &map.functions {
+            area_id_by_id.insert(function.id.clone(), function.area_id.clone());
+            display_by_id.insert(
+                function.id.clone(),
+                format!("{}::{}", function.file_path, function.name),
+            );
+        }
+        for class in &map.classes {
+            area_id_by_id.insert(class.id.clone(), class.area_id.clone());
+            display_by_id.insert(
+                class.id.clone(),
+                format!("{}::{}", class.file_path, class.name),
+            );
+        }
+        for doc in &map.docs {
+            area_id_by_id.insert(doc.id.clone(), doc.area_id.clone());
+            display_by_id.insert(doc.id.clone(), doc.path.clone());
+        }
+        for config in &map.configs {
+            area_id_by_id.insert(config.id.clone(), config.area_id.clone());
+            display_by_id.insert(config.id.clone(), config.path.clone());
+        }
+        for area in &map.areas {
+            area_id_by_id.insert(area.id.clone(), Some(area.id.clone()));
+            display_by_id.insert(area.id.clone(), area.name.clone());
+        }
+
+        Self {
+            area_id_by_id,
+            display_by_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RepositoryMap {
     pub snapshot: RepoSnapshot,
     pub areas: Vec<AreaNode>,
@@ -28,16 +91,189 @@ pub struct RepositoryMap {
     pub edges: Vec<Edge>,
     pub risk_flags: Vec<RiskFlag>,
     pub graph: NormalizedGraph,
+    #[serde(skip)]
+    index: OnceLock<MapIndex>,
+}
+
+impl PartialEq for RepositoryMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.snapshot == other.snapshot
+            && self.areas == other.areas
+            && self.directories == other.directories
+            && self.files == other.files
+            && self.classes == other.classes
+            && self.functions == other.functions
+            && self.docs == other.docs
+            && self.configs == other.configs
+            && self.symbols == other.symbols
+            && self.edges == other.edges
+            && self.risk_flags == other.risk_flags
+            && self.graph == other.graph
+    }
+}
+
+impl Eq for RepositoryMap {}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BuildStageProfile {
+    pub name: String,
+    pub duration_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepositoryBuildProfile {
+    pub total_duration_ms: u128,
+    pub stages: Vec<BuildStageProfile>,
+    pub repo_files: usize,
+    pub source_files: usize,
+    pub doc_files: usize,
+    pub config_files: usize,
+    pub areas: usize,
+    pub directories: usize,
+    pub classes: usize,
+    pub functions: usize,
+    pub docs: usize,
+    pub configs: usize,
+    pub graph_nodes: usize,
+    pub graph_edges: usize,
+    pub graph_annotations: usize,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GraphBuildProfile {
+    node_materialization_ms: u128,
+    annotation_build_ms: u128,
+    sort_ms: u128,
 }
 
 impl RepositoryMap {
     pub fn build(root: &Path) -> Result<Self, String> {
-        let snapshot = discover_repo(root)?;
-        let structure = passes::structure::build(&snapshot);
-        let code = passes::code::build(root, &structure);
-        let docs = passes::docs::build(root, &structure, &code);
-        let configs = passes::configs::build(root, &structure, &code);
+        Self::build_with_profile(root).map(|(map, _profile)| map)
+    }
 
+    pub fn build_with_profile(root: &Path) -> Result<(Self, RepositoryBuildProfile), String> {
+        Self::build_with_profile_and_progress(root, |_| {})
+    }
+
+    pub fn build_no_cache(root: &Path) -> Result<(Self, RepositoryBuildProfile), String> {
+        Self::build_internal(root, |_| {}, true)
+    }
+
+    pub fn build_with_profile_and_progress<F>(
+        root: &Path,
+        progress: F,
+    ) -> Result<(Self, RepositoryBuildProfile), String>
+    where
+        F: FnMut(&BuildStageProfile),
+    {
+        Self::build_internal(root, progress, false)
+    }
+
+    fn build_internal<F>(
+        root: &Path,
+        mut progress: F,
+        no_cache: bool,
+    ) -> Result<(Self, RepositoryBuildProfile), String>
+    where
+        F: FnMut(&BuildStageProfile),
+    {
+        let total_started = Instant::now();
+        let mut stages = Vec::new();
+
+        // Try loading a cached map BEFORE discover_repo (avoids 20s+ file walk)
+        if !no_cache {
+            let cache_started = Instant::now();
+            if let Some(cached_map) = map_cache::try_load_cached_map(root) {
+                push_stage(&mut stages, "map_cache_hit", cache_started.elapsed().as_millis(), &mut progress);
+                let profile = RepositoryBuildProfile {
+                    total_duration_ms: total_started.elapsed().as_millis(),
+                    stages,
+                    repo_files: cached_map.snapshot.files.len(),
+                    source_files: cached_map.files.iter().filter(|f| matches!(f.role, crate::file::FileRole::Source)).count(),
+                    doc_files: cached_map.files.iter().filter(|f| matches!(f.role, crate::file::FileRole::Doc)).count(),
+                    config_files: cached_map.files.iter().filter(|f| matches!(f.role, crate::file::FileRole::Config)).count(),
+                    areas: cached_map.areas.len(),
+                    directories: cached_map.directories.len(),
+                    classes: cached_map.classes.len(),
+                    functions: cached_map.functions.len(),
+                    docs: cached_map.docs.len(),
+                    configs: cached_map.configs.len(),
+                    graph_nodes: cached_map.graph.nodes.len(),
+                    graph_edges: cached_map.graph.edges.len(),
+                    graph_annotations: cached_map.graph.annotations.len(),
+                    cache_hits: 0,
+                    cache_misses: 0,
+                };
+                return Ok((cached_map, profile));
+            }
+        }
+
+        let started = Instant::now();
+        let snapshot = discover_repo(root)?;
+        push_stage(&mut stages, "discover_repo", started.elapsed().as_millis(), &mut progress);
+
+        let started = Instant::now();
+        let structure = passes::structure::build(&snapshot);
+        push_stage(&mut stages, "structure", started.elapsed().as_millis(), &mut progress);
+
+        let grammar_registry = default_grammars_dir()
+            .map(|dir| GrammarRegistry::load(&dir));
+
+        let parse_cache = if no_cache { None } else { ParseCache::load(root) };
+        let (code, code_profile, new_cache, cache_stats) =
+            passes::code::build_with_profile(root, &structure, parse_cache.as_ref(), grammar_registry.as_ref());
+        if !no_cache {
+            new_cache.save(root);
+        }
+        push_stage(
+            &mut stages,
+            "code_parse_files",
+            code_profile.parse_files_ms,
+            &mut progress,
+        );
+        push_stage(
+            &mut stages,
+            "code_normalize_symbols",
+            code_profile.normalize_symbols_ms,
+            &mut progress,
+        );
+        push_stage(
+            &mut stages,
+            "code_resolve_imports",
+            code_profile.resolve_imports_ms,
+            &mut progress,
+        );
+        push_stage(
+            &mut stages,
+            "code_resolve_calls",
+            code_profile.resolve_calls_ms,
+            &mut progress,
+        );
+        push_stage(
+            &mut stages,
+            "code_resolve_references",
+            code_profile.resolve_references_ms,
+            &mut progress,
+        );
+
+        let (configs, _configs_profile) = passes::configs::build_with_profile_and_progress(
+            root,
+            &structure,
+            &code,
+            |name, duration_ms| push_stage(&mut stages, name, duration_ms, &mut progress),
+        );
+
+        let (docs, _docs_profile) = passes::docs::build_with_profile_and_progress(
+            root,
+            &structure,
+            &code,
+            Some(&configs),
+            |name, duration_ms| push_stage(&mut stages, name, duration_ms, &mut progress),
+        );
+
+        let started = Instant::now();
         let mut edges = Vec::new();
         edges.extend(structure.edges.clone());
         edges.extend(code.edges.clone());
@@ -45,6 +281,12 @@ impl RepositoryMap {
         edges.extend(configs.edges.clone());
         edges.sort();
         edges.dedup();
+        push_stage(
+            &mut stages,
+            "edge_normalization",
+            started.elapsed().as_millis(),
+            &mut progress,
+        );
 
         let mut map = Self {
             snapshot,
@@ -63,11 +305,72 @@ impl RepositoryMap {
                 edges: Vec::new(),
                 annotations: Vec::new(),
             },
+            index: OnceLock::new(),
         };
 
+        let started = Instant::now();
         map.risk_flags = passes::overlays::detect_risks(&map);
-        map.graph = build_graph(&map);
-        Ok(map)
+        push_stage(&mut stages, "overlays", started.elapsed().as_millis(), &mut progress);
+
+        let (graph, graph_profile) = build_graph_with_profile(&map);
+        map.graph = graph;
+        push_stage(
+            &mut stages,
+            "graph_nodes",
+            graph_profile.node_materialization_ms,
+            &mut progress,
+        );
+        push_stage(
+            &mut stages,
+            "graph_annotations",
+            graph_profile.annotation_build_ms,
+            &mut progress,
+        );
+        push_stage(
+            &mut stages,
+            "graph_sort",
+            graph_profile.sort_ms,
+            &mut progress,
+        );
+
+        let profile = RepositoryBuildProfile {
+            total_duration_ms: total_started.elapsed().as_millis(),
+            stages,
+            repo_files: map.snapshot.files.len(),
+            source_files: map
+                .files
+                .iter()
+                .filter(|file| matches!(file.role, crate::file::FileRole::Source))
+                .count(),
+            doc_files: map
+                .files
+                .iter()
+                .filter(|file| matches!(file.role, crate::file::FileRole::Doc))
+                .count(),
+            config_files: map
+                .files
+                .iter()
+                .filter(|file| matches!(file.role, crate::file::FileRole::Config))
+                .count(),
+            areas: map.areas.len(),
+            directories: map.directories.len(),
+            classes: map.classes.len(),
+            functions: map.functions.len(),
+            docs: map.docs.len(),
+            configs: map.configs.len(),
+            graph_nodes: map.graph.nodes.len(),
+            graph_edges: map.graph.edges.len(),
+            graph_annotations: map.graph.annotations.len(),
+            cache_hits: cache_stats.hits,
+            cache_misses: cache_stats.misses,
+        };
+
+        // Save the built map to cache for future runs
+        if !no_cache {
+            map_cache::save_cached_map(root, &map);
+        }
+
+        Ok((map, profile))
     }
 
     pub fn matching_target_ids(&self, target: &str) -> Vec<String> {
@@ -86,11 +389,6 @@ impl RepositoryMap {
         for directory in &self.directories {
             if directory.id == target || directory.path.eq_ignore_ascii_case(target) || directory.name.eq_ignore_ascii_case(target) {
                 push_unique(&mut matches, directory.id.clone());
-            }
-        }
-        for file in &self.files {
-            if file.id == target || file.path.eq_ignore_ascii_case(target) || file.name.eq_ignore_ascii_case(target) {
-                push_unique(&mut matches, file.id.clone());
             }
         }
         for class in &self.classes {
@@ -113,6 +411,11 @@ impl RepositoryMap {
                 push_unique(&mut matches, config.id.clone());
             }
         }
+        for file in &self.files {
+            if file.id == target || file.path.eq_ignore_ascii_case(target) || file.name.eq_ignore_ascii_case(target) {
+                push_unique(&mut matches, file.id.clone());
+            }
+        }
 
         if matches.is_empty() {
             matches.push(target.to_string());
@@ -120,27 +423,45 @@ impl RepositoryMap {
         matches
     }
 
-    pub fn display_for(&self, value: &str) -> String {
-        if let Some(file) = self.files.iter().find(|file| file.id == value) {
-            return file.path.clone();
-        }
-        if let Some(function) = self.functions.iter().find(|function| function.id == value) {
-            return format!("{}::{}", function.file_path, function.name);
-        }
-        if let Some(class) = self.classes.iter().find(|class| class.id == value) {
-            return format!("{}::{}", class.file_path, class.name);
-        }
-        if let Some(area) = self.areas.iter().find(|area| area.id == value) {
-            return area.name.clone();
-        }
-        if let Some(doc) = self.docs.iter().find(|doc| doc.id == value) {
-            return doc.path.clone();
-        }
-        if let Some(config) = self.configs.iter().find(|config| config.id == value) {
-            return config.path.clone();
-        }
-        value.to_string()
+    fn index(&self) -> &MapIndex {
+        self.index.get_or_init(|| MapIndex::build(self))
     }
+
+    pub fn display_for(&self, value: &str) -> String {
+        self.index()
+            .display_by_id
+            .get(value)
+            .cloned()
+            .unwrap_or_else(|| value.to_string())
+    }
+
+    pub fn area_id_for_target(&self, value: &str) -> Option<String> {
+        self.index()
+            .area_id_by_id
+            .get(value)
+            .cloned()
+            .flatten()
+    }
+}
+
+fn stage_profile(name: &str, duration_ms: u128) -> BuildStageProfile {
+    BuildStageProfile {
+        name: name.to_string(),
+        duration_ms,
+    }
+}
+
+fn push_stage<F>(
+    stages: &mut Vec<BuildStageProfile>,
+    name: &str,
+    duration_ms: u128,
+    progress: &mut F,
+) where
+    F: FnMut(&BuildStageProfile),
+{
+    let stage = stage_profile(name, duration_ms);
+    progress(&stage);
+    stages.push(stage);
 }
 
 fn push_unique(values: &mut Vec<String>, candidate: String) {
@@ -149,7 +470,8 @@ fn push_unique(values: &mut Vec<String>, candidate: String) {
     }
 }
 
-fn build_graph(map: &RepositoryMap) -> NormalizedGraph {
+fn build_graph_with_profile(map: &RepositoryMap) -> (NormalizedGraph, GraphBuildProfile) {
+    let nodes_started = Instant::now();
     let mut nodes = Vec::new();
     let repo_name = map.snapshot.repo_name();
     nodes.push(GraphNode {
@@ -164,6 +486,8 @@ fn build_graph(map: &RepositoryMap) -> NormalizedGraph {
     });
 
     for area in &map.areas {
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("inferred".to_string(), area.inferred.to_string());
         nodes.push(GraphNode {
             id: area.id.clone(),
             kind: GraphNodeKind::Area,
@@ -172,7 +496,7 @@ fn build_graph(map: &RepositoryMap) -> NormalizedGraph {
             language: None,
             confidence: 1000,
             source: "structure".to_string(),
-            metadata: std::collections::BTreeMap::new(),
+            metadata,
         });
     }
     for directory in &map.directories {
@@ -188,6 +512,9 @@ fn build_graph(map: &RepositoryMap) -> NormalizedGraph {
         });
     }
     for file in &map.files {
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("role".to_string(), format!("{:?}", file.role).to_ascii_lowercase());
+        metadata.insert("generated".to_string(), file.generated.to_string());
         nodes.push(GraphNode {
             id: file.id.clone(),
             kind: GraphNodeKind::File,
@@ -196,7 +523,7 @@ fn build_graph(map: &RepositoryMap) -> NormalizedGraph {
             language: file.language.clone(),
             confidence: 1000,
             source: "structure".to_string(),
-            metadata: std::collections::BTreeMap::new(),
+            metadata,
         });
     }
     for class in &map.classes {
@@ -224,6 +551,8 @@ fn build_graph(map: &RepositoryMap) -> NormalizedGraph {
         });
     }
     for doc in &map.docs {
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("doc_type".to_string(), doc.doc_type.clone());
         nodes.push(GraphNode {
             id: doc.id.clone(),
             kind: GraphNodeKind::Doc,
@@ -232,10 +561,12 @@ fn build_graph(map: &RepositoryMap) -> NormalizedGraph {
             language: None,
             confidence: 900,
             source: "docs".to_string(),
-            metadata: std::collections::BTreeMap::new(),
+            metadata,
         });
     }
     for config in &map.configs {
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("config_type".to_string(), config.config_type.clone());
         nodes.push(GraphNode {
             id: config.id.clone(),
             kind: GraphNodeKind::Config,
@@ -244,18 +575,30 @@ fn build_graph(map: &RepositoryMap) -> NormalizedGraph {
             language: None,
             confidence: 900,
             source: "config".to_string(),
-            metadata: std::collections::BTreeMap::new(),
+            metadata,
         });
     }
+    let node_materialization_ms = nodes_started.elapsed().as_millis();
 
+    let annotation_started = Instant::now();
     let annotations = passes::overlays::graph_annotations(map);
+    let annotation_build_ms = annotation_started.elapsed().as_millis();
     let mut graph = NormalizedGraph {
         nodes,
         edges: map.edges.clone(),
         annotations,
     };
+    let sort_started = Instant::now();
     graph.sort();
-    graph
+    let sort_ms = sort_started.elapsed().as_millis();
+    (
+        graph,
+        GraphBuildProfile {
+            node_materialization_ms,
+            annotation_build_ms,
+            sort_ms,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -288,6 +631,24 @@ mod tests {
         assert!(!map.configs.is_empty());
         assert!(!map.graph.nodes.is_empty());
         assert!(map.risk_flags.iter().any(|flag| flag.scope == "src/auth/service.py"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_with_profile_reports_stage_timings() {
+        let root = std::env::temp_dir().join("aethyme_engine_profile_test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("create temp repo");
+        fs::write(root.join("README.md"), "# Demo\n").expect("write readme");
+        fs::write(root.join("src/main.py"), "def run():\n    return True\n").expect("write source");
+
+        let (map, profile) = RepositoryMap::build_with_profile(&root).expect("build repository map with profile");
+
+        assert!(!profile.stages.is_empty());
+        assert!(profile.stages.iter().any(|stage| stage.name == "discover_repo"));
+        assert_eq!(profile.repo_files, map.snapshot.files.len());
+        assert_eq!(profile.graph_nodes, map.graph.nodes.len());
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::area::AreaNode;
 use crate::directory::DirectoryNode;
@@ -23,11 +23,31 @@ pub fn build(snapshot: &RepoSnapshot) -> StructurePass {
     let mut directories = Vec::new();
     let mut files = Vec::new();
     let mut edges = Vec::new();
+    let classified_files = snapshot
+        .files
+        .iter()
+        .map(|repo_file| {
+            let generated = is_generated(&repo_file.path);
+            let role = classify_file(repo_file, generated);
+            (repo_file, generated, role)
+        })
+        .collect::<Vec<_>>();
 
     for top_level in &snapshot.top_level_dirs {
         let area = AreaNode::new(&repo_name, top_level, false);
         edges.push(Edge::new(&repo_id, &area.id, EdgeKind::Contains, 1000, "structure"));
         areas.push(area);
+    }
+
+    for inferred in infer_subareas(&repo_name, &classified_files, &snapshot.top_level_dirs) {
+        if let Some(parent_path) = parent_path(&inferred.path_prefix) {
+            let parent_id = format!("area:{repo_name}:{parent_path}");
+            edges.push(Edge::new(&parent_id, &inferred.id, EdgeKind::Contains, 700, "structure"));
+            edges.push(Edge::new(&inferred.id, &parent_id, EdgeKind::BelongsTo, 700, "structure"));
+        } else {
+            edges.push(Edge::new(&repo_id, &inferred.id, EdgeKind::Contains, 700, "structure"));
+        }
+        areas.push(inferred);
     }
 
     let mut directory_paths = BTreeSet::new();
@@ -53,14 +73,15 @@ pub fn build(snapshot: &RepoSnapshot) -> StructurePass {
         if let Some(area_id_value) = &area_id {
             edges.push(Edge::new(&directory.id, area_id_value, EdgeKind::BelongsTo, 1000, "structure"));
         }
+        for inferred_area_id in inferred_area_ids_for_path(&directory.path, &areas) {
+            edges.push(Edge::new(&directory.id, &inferred_area_id, EdgeKind::BelongsTo, 700, "structure"));
+        }
 
         directories.push(directory);
     }
 
-    for repo_file in &snapshot.files {
+    for (repo_file, generated, role) in classified_files {
         let area_id = area_id_for_path(&repo_name, &repo_file.path, &snapshot.top_level_dirs);
-        let generated = is_generated(&repo_file.path);
-        let role = classify_file(repo_file, generated);
         let file = FileNode::new(
             &repo_name,
             &repo_file.path,
@@ -84,6 +105,9 @@ pub fn build(snapshot: &RepoSnapshot) -> StructurePass {
         if let Some(area_id_value) = &area_id {
             edges.push(Edge::new(&file.id, area_id_value, EdgeKind::BelongsTo, 1000, "structure"));
         }
+        for inferred_area_id in inferred_area_ids_for_path(&repo_file.path, &areas) {
+            edges.push(Edge::new(&file.id, &inferred_area_id, EdgeKind::BelongsTo, 700, "structure"));
+        }
 
         files.push(file);
     }
@@ -101,6 +125,60 @@ pub fn build(snapshot: &RepoSnapshot) -> StructurePass {
         files,
         edges,
     }
+}
+
+fn infer_subareas(
+    repo_name: &str,
+    files: &[(&RepoFile, bool, FileRole)],
+    top_level_dirs: &[String],
+) -> Vec<AreaNode> {
+    let mut candidates = BTreeMap::<String, (usize, usize, usize, usize)>::new();
+    for (file, _generated, role) in files {
+        let mut segments = file.path.split('/');
+        let Some(top) = segments.next() else {
+            continue;
+        };
+        let Some(second) = segments.next() else {
+            continue;
+        };
+        if !top_level_dirs.iter().any(|value| value == top) {
+            continue;
+        }
+        let candidate = format!("{top}/{second}");
+        if candidate == top {
+            continue;
+        }
+        let entry = candidates.entry(candidate).or_default();
+        match role {
+            FileRole::Generated | FileRole::Cache | FileRole::Binary | FileRole::Unknown => {}
+            _ => entry.0 += 1,
+        }
+        match role {
+            FileRole::Source => entry.1 += 1,
+            FileRole::Doc => entry.2 += 1,
+            FileRole::Config => entry.3 += 1,
+            FileRole::Generated | FileRole::Cache | FileRole::Binary | FileRole::Unknown | FileRole::Test | FileRole::Asset => {}
+        }
+    }
+
+    candidates
+        .into_iter()
+        .filter(|(_candidate, (relevant, source, docs, configs))| {
+            *relevant >= 2 && (*source > 0 || *docs > 0 || *configs > 0)
+        })
+        .map(|(candidate, _)| AreaNode::new(repo_name, &candidate, true))
+        .collect()
+}
+
+fn inferred_area_ids_for_path(path: &str, areas: &[AreaNode]) -> Vec<String> {
+    let mut matches = areas
+        .iter()
+        .filter(|area| area.inferred)
+        .filter(|area| path.starts_with(&format!("{}/", area.path_prefix)) || path == area.path_prefix)
+        .map(|area| area.id.clone())
+        .collect::<Vec<_>>();
+    matches.sort_by_key(String::len);
+    matches
 }
 
 pub fn area_id_for_path(repo_name: &str, path: &str, top_level_dirs: &[String]) -> Option<String> {
@@ -149,18 +227,7 @@ fn classify_file(repo_file: &RepoFile, generated: bool) -> FileRole {
     if lower.ends_with(".md") || lower.ends_with(".mdx") || lower.ends_with(".rst") || lower.ends_with("readme") {
         return FileRole::Doc;
     }
-    if lower.ends_with("cargo.toml")
-        || lower.ends_with("package.json")
-        || lower.ends_with("project.godot")
-        || lower.ends_with("pyproject.toml")
-        || lower.ends_with("dockerfile")
-        || lower.ends_with("docker-compose.yml")
-        || lower.ends_with("docker-compose.yaml")
-        || lower.ends_with(".yaml")
-        || lower.ends_with(".yml")
-        || lower.ends_with(".toml")
-        || lower.ends_with(".json")
-    {
+    if is_operational_config_path(&lower) {
         return FileRole::Config;
     }
     if lower.contains("test") || lower.contains("spec") {
@@ -181,4 +248,100 @@ fn classify_file(repo_file: &RepoFile, generated: bool) -> FileRole {
         return FileRole::Asset;
     }
     FileRole::Unknown
+}
+
+fn is_operational_config_path(lower_path: &str) -> bool {
+    let file_name = lower_path.rsplit('/').next().unwrap_or(lower_path);
+
+    if matches!(
+        file_name,
+        "cargo.toml"
+            | "package.json"
+            | "pyproject.toml"
+            | "project.godot"
+            | "dockerfile"
+            | "docker-compose.yml"
+            | "docker-compose.yaml"
+            | "tsconfig.json"
+            | "jsconfig.json"
+            | "turbo.json"
+            | "biome.json"
+            | "deno.json"
+            | "deno.jsonc"
+            | "pnpm-workspace.yaml"
+            | "pnpm-workspace.yml"
+    ) {
+        return true;
+    }
+
+    if file_name.starts_with(".env")
+        || file_name.starts_with(".gitignore")
+        || file_name.starts_with(".dockerignore")
+        || file_name.starts_with(".npmrc")
+        || file_name.starts_with(".yarnrc")
+        || file_name.starts_with(".prettierrc")
+        || file_name.starts_with(".eslintrc")
+        || file_name.starts_with(".stylelintrc")
+        || file_name.starts_with(".editorconfig")
+    {
+        return true;
+    }
+
+    if lower_path.starts_with(".github/workflows/")
+        || lower_path.contains("/.github/workflows/")
+        || lower_path.starts_with("config/")
+        || lower_path.contains("/config/")
+        || lower_path.starts_with("configs/")
+        || lower_path.contains("/configs/")
+        || lower_path.starts_with("deploy/")
+        || lower_path.contains("/deploy/")
+        || lower_path.starts_with("deployment/")
+        || lower_path.contains("/deployment/")
+        || lower_path.starts_with("infra/")
+        || lower_path.contains("/infra/")
+        || lower_path.starts_with("k8s/")
+        || lower_path.contains("/k8s/")
+        || lower_path.starts_with("helm/")
+        || lower_path.contains("/helm/")
+    {
+        return lower_path.ends_with(".yaml")
+            || lower_path.ends_with(".yml")
+            || lower_path.ends_with(".toml")
+            || lower_path.ends_with(".json");
+    }
+
+    lower_path.ends_with(".env")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::repo::RepoFile;
+
+    use super::{classify_file, FileRole};
+
+    #[test]
+    fn classify_file_limits_json_to_operational_config_paths() {
+        let package_json = RepoFile {
+            path: "frontend/package.json".to_string(),
+            language: None,
+            line_count: 0,
+            size_bytes: 0,
+        };
+        let content_json = RepoFile {
+            path: "content/object-templates.json".to_string(),
+            language: None,
+            line_count: 0,
+            size_bytes: 0,
+        };
+        let workflow_yaml = RepoFile {
+            path: ".github/workflows/ci.yml".to_string(),
+            language: None,
+            line_count: 0,
+            size_bytes: 0,
+        };
+
+        assert_eq!(classify_file(&package_json, false), FileRole::Config);
+        assert_eq!(classify_file(&workflow_yaml, false), FileRole::Config);
+        assert_ne!(classify_file(&content_json, false), FileRole::Config);
+    }
 }

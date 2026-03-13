@@ -1,10 +1,17 @@
+use std::collections::HashSet;
+use std::fs;
 use std::path::Path;
 
+use crate::activation::{hormone_profile, spread_activation};
 use crate::anchors::resolve_anchors;
-use crate::context_pack::{ContextPack, DependencyEdge, ImpactItem};
-use crate::guidance::{build_in_scope, build_out_of_scope, navigation_order};
+use crate::context_pack::{ActivationSummary, Anchor, AnchorKind, Budget, ContextPack, DependencyEdge, FileContent, ImpactItem, Snippet};
+use crate::edge::EdgeKind;
+use crate::guidance::{build_in_scope, build_out_of_scope_activated, navigation_order};
 use crate::map::RepositoryMap;
 use crate::neighborhood::{dependency_frontier, impact_frontier};
+use crate::overview::{build_repo_overview, overview_dependencies, overview_impact, repo_overview_seed};
+use crate::scope::ScopeBoundary;
+use crate::signals::evaluate_graph_signals;
 use crate::snippets::select_snippets;
 use crate::task::TaskInput;
 
@@ -13,35 +20,60 @@ pub fn build_context_pack(root: &Path, map: &RepositoryMap, task: TaskInput) -> 
     let scope_limit = if task.kind.is_explain_repo() { 8 } else { 5 };
     let anchors = resolve_anchors(map, &task, anchor_limit);
     let anchor_targets: Vec<String> = anchors.iter().map(|anchor| anchor.id.clone()).collect();
-    let mut dependencies = Vec::new();
-    let mut impact = Vec::new();
-
-    for target in &anchor_targets {
-        for dependency in dependency_frontier(map, target) {
-            dependencies.push(DependencyEdge {
-                from: map.display_for(target),
-                to: dependency,
-                kind: "related".to_string(),
-            });
-        }
-        for item in impact_frontier(map, target) {
-            impact.push(ImpactItem {
-                symbol: item.clone(),
-                file: item,
-                reason: "reverse dependency".to_string(),
-            });
-        }
-    }
+    let navigation = navigation_order(&anchors);
+    let overview = if task.kind.is_explain_repo() {
+        build_repo_overview(map, &repo_overview_seed(map))
+    } else {
+        Default::default()
+    };
+    let signals = evaluate_graph_signals(map);
+    let (mut dependencies, mut impact) = if task.kind.is_explain_repo() {
+        (overview_dependencies(map, &overview), overview_impact(map, &overview))
+    } else {
+        let primary_areas = primary_area_names(map, &anchors);
+        (
+            focused_dependencies(map, &anchor_targets, &primary_areas),
+            focused_impact(map, &anchor_targets, &primary_areas),
+        )
+    };
 
     dependencies.sort();
     dependencies.dedup();
     impact.sort();
     impact.dedup();
 
+    // Spreading activation: seed from anchors, propagate with task-specific hormone profile
+    let profile = hormone_profile(&task.kind);
+    let activation_map = spread_activation(map, &anchors, &profile);
+    let activated_set = activation_map.activated_set(0.1);
+
     let in_scope = build_in_scope(map, &anchors, scope_limit);
-    let out_of_scope = build_out_of_scope(map, &anchors, &task.kind);
-    let snippets = select_snippets(root, &anchors, 8);
-    let navigation = navigation_order(&anchors);
+    let out_of_scope = build_out_of_scope_activated(map, &anchors, &task.kind, &activated_set);
+
+    // Filter risk_flags to only those whose scope matches an activated node or anchor file
+    let anchor_files: std::collections::HashSet<String> = anchors
+        .iter()
+        .filter_map(|anchor| anchor.file.clone())
+        .collect();
+    let filtered_risk_flags: Vec<_> = map
+        .risk_flags
+        .iter()
+        .filter(|risk| activated_set.contains(&risk.scope) || anchor_files.contains(&risk.scope))
+        .cloned()
+        .collect();
+
+    let activation_summary = Some(ActivationSummary {
+        activated_node_count: activation_map.activations.len(),
+        max_depth_reached: activation_map.max_depth_reached,
+        top_activated: activation_map.top_activated(10),
+    });
+
+    let budget = Budget {
+        max_anchors: anchor_limit,
+        max_files: scope_limit,
+        ..Default::default()
+    };
+    let snippets = select_snippets(root, map, &anchors, &budget);
 
     let anchor_confidence = if anchors.is_empty() {
         0.0
@@ -60,24 +92,292 @@ pub fn build_context_pack(root: &Path, map: &RepositoryMap, task: TaskInput) -> 
 
     let mut pack = ContextPack {
         task,
+        summary: crate::context_pack::PackSummary {
+            snapshot: crate::context_pack::PackSnapshot {
+                languages: map.snapshot.languages.clone(),
+                top_level_dirs: map.snapshot.top_level_dirs.clone(),
+                readme_path: map.snapshot.readme_path.clone(),
+            },
+            files_count: map.snapshot.files.len(),
+            functions_count: map.functions.len(),
+            classes_count: map.classes.len(),
+            docs_count: map.docs.len(),
+            configs_count: map.configs.len(),
+        },
+        signals,
+        overview,
         anchors,
         in_scope,
         out_of_scope,
         dependencies,
         impact,
         snippets,
-        risk_flags: map.risk_flags.clone(),
+        file_contents: Vec::new(),
+        risk_flags: filtered_risk_flags,
         navigation_order: navigation,
-        budget: Default::default(),
+        budget,
         confidence: crate::context_pack::Confidence {
             anchor_confidence,
             scope_confidence,
         },
+        activation_summary,
     };
-    pack.budget.max_anchors = anchor_limit;
-    pack.budget.max_files = scope_limit;
     pack.sort();
     pack
+}
+
+pub fn build_context_pack_with_content(
+    root: &Path,
+    map: &RepositoryMap,
+    task: TaskInput,
+    content_budget: usize,
+) -> ContextPack {
+    let mut pack = build_context_pack(root, map, task);
+    pack.budget.content_budget = content_budget;
+    pack.file_contents = read_file_contents(root, &pack.anchors, &pack.in_scope, &pack.snippets, &pack.budget);
+    pack
+}
+
+fn is_likely_text(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    !matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "ico" | "svg"
+            | "woff" | "woff2" | "ttf" | "eot"
+            | "zip" | "tar" | "gz" | "bz2" | "xz"
+            | "exe" | "dll" | "so" | "dylib"
+            | "pdf" | "doc" | "docx"
+            | "mp3" | "mp4" | "wav" | "avi"
+            | "bin" | "dat" | "o" | "a" | "class"
+    )
+}
+
+fn read_file_contents(
+    root: &Path,
+    anchors: &[Anchor],
+    in_scope: &ScopeBoundary,
+    snippets: &[Snippet],
+    budget: &Budget,
+) -> Vec<FileContent> {
+    let mut seen = HashSet::new();
+    let mut candidates: Vec<(String, &str)> = Vec::new();
+
+    // Priority 1: anchor files
+    for anchor in anchors {
+        if let Some(file) = &anchor.file {
+            if seen.insert(file.clone()) {
+                candidates.push((file.clone(), "anchor_target"));
+            }
+        }
+        if anchor.kind == AnchorKind::File && seen.insert(anchor.id.clone()) {
+            candidates.push((anchor.id.clone(), "anchor_target"));
+        }
+    }
+
+    // Priority 2: in-scope files
+    for item in &in_scope.files {
+        if seen.insert(item.value.clone()) {
+            candidates.push((item.value.clone(), "in_scope"));
+        }
+    }
+
+    // Priority 3: snippet files not already included
+    for snippet in snippets {
+        if seen.insert(snippet.file.clone()) {
+            candidates.push((snippet.file.clone(), "snippet"));
+        }
+    }
+
+    let mut contents = Vec::new();
+    let mut cumulative_bytes: usize = 0;
+
+    for (path, reason) in &candidates {
+        if contents.len() >= budget.max_content_files {
+            break;
+        }
+        let absolute = root.join(path);
+        if !is_likely_text(&absolute) {
+            continue;
+        }
+        let text = match fs::read_to_string(&absolute) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let total_lines = text.lines().count();
+        if total_lines == 0 {
+            continue;
+        }
+
+        let (truncated, end_line) = if total_lines <= budget.max_lines_per_file {
+            (text, total_lines)
+        } else {
+            let cut: String = text.lines().take(budget.max_lines_per_file).collect::<Vec<_>>().join("\n");
+            (cut + "\n(truncated)", budget.max_lines_per_file)
+        };
+
+        if cumulative_bytes + truncated.len() > budget.content_budget {
+            break;
+        }
+        cumulative_bytes += truncated.len();
+
+        contents.push(FileContent {
+            path: path.clone(),
+            content: truncated,
+            start_line: 1,
+            end_line,
+            total_lines,
+            reason: reason.to_string(),
+        });
+    }
+
+    contents
+}
+
+fn focused_dependencies(map: &RepositoryMap, anchor_targets: &[String], primary_areas: &[String]) -> Vec<DependencyEdge> {
+    let mut dependencies = Vec::new();
+    for target in anchor_targets {
+        for edge in &map.edges {
+            if edge.from != *target {
+                continue;
+            }
+            if !matches!(
+                edge.kind,
+                EdgeKind::Configures | EdgeKind::EntrypointFor | EdgeKind::Imports | EdgeKind::Calls | EdgeKind::References
+            ) {
+                continue;
+            }
+            let display = map.display_for(&edge.to);
+            if !primary_areas.is_empty() && !display_in_primary_area(map, &display, primary_areas) {
+                continue;
+            }
+            dependencies.push(DependencyEdge {
+                from: map.display_for(target),
+                to: display,
+                kind: edge_kind_label(&edge.kind).to_string(),
+            });
+        }
+        if dependencies.is_empty() {
+            for dependency in dependency_frontier(map, target).into_iter().take(3) {
+                if !primary_areas.is_empty() && !display_in_primary_area(map, &dependency, primary_areas) {
+                    continue;
+                }
+                dependencies.push(DependencyEdge {
+                    from: map.display_for(target),
+                    to: dependency,
+                    kind: "related".to_string(),
+                });
+            }
+        }
+    }
+    dependencies.sort();
+    dependencies.dedup();
+    dependencies.truncate(6);
+    dependencies
+}
+
+fn focused_impact(map: &RepositoryMap, anchor_targets: &[String], primary_areas: &[String]) -> Vec<ImpactItem> {
+    let mut impact = Vec::new();
+    for target in anchor_targets {
+        for edge in &map.edges {
+            if edge.to != *target {
+                continue;
+            }
+            if !matches!(edge.kind, EdgeKind::Configures | EdgeKind::EntrypointFor | EdgeKind::Calls | EdgeKind::References) {
+                continue;
+            }
+            let display = map.display_for(&edge.from);
+            if !primary_areas.is_empty() && !display_in_primary_area(map, &display, primary_areas) {
+                continue;
+            }
+            impact.push(ImpactItem {
+                symbol: display.clone(),
+                file: display,
+                reason: format!("reverse {}", edge_kind_label(&edge.kind)),
+            });
+        }
+        if impact.is_empty() {
+            for item in impact_frontier(map, target).into_iter().take(3) {
+                if !primary_areas.is_empty() && !display_in_primary_area(map, &item, primary_areas) {
+                    continue;
+                }
+                impact.push(ImpactItem {
+                    symbol: item.clone(),
+                    file: item,
+                    reason: "reverse dependency".to_string(),
+                });
+            }
+        }
+    }
+    impact.sort();
+    impact.dedup();
+    impact.truncate(6);
+    impact
+}
+
+fn primary_area_names(map: &RepositoryMap, anchors: &[Anchor]) -> Vec<String> {
+    let mut areas = anchors
+        .iter()
+        .filter_map(|anchor| match anchor.kind {
+            AnchorKind::Folder => Some(anchor.id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if areas.is_empty() {
+        for anchor in anchors {
+            let file_path = match anchor.kind {
+                AnchorKind::File => anchor.file.as_deref().unwrap_or(&anchor.id),
+                AnchorKind::Symbol => anchor.file.as_deref().unwrap_or(""),
+                AnchorKind::Folder => "",
+            };
+            if file_path.is_empty() {
+                continue;
+            }
+            if let Some(area) = map
+                .files
+                .iter()
+                .find(|file| file.path == file_path)
+                .and_then(|file| file.area_id.as_deref())
+                .and_then(|area_id| map.areas.iter().find(|area| area.id == area_id))
+                .map(|area| area.name.clone())
+                && !areas.contains(&area)
+            {
+                areas.push(area);
+            }
+        }
+    }
+
+    areas
+}
+
+fn display_in_primary_area(map: &RepositoryMap, display: &str, primary_areas: &[String]) -> bool {
+    if primary_areas.is_empty() {
+        return true;
+    }
+    if primary_areas.iter().any(|area| area == display) {
+        return true;
+    }
+    map.files
+        .iter()
+        .find(|file| file.path == display)
+        .and_then(|file| file.area_id.as_deref())
+        .and_then(|area_id| map.areas.iter().find(|area| area.id == area_id))
+        .map(|area| primary_areas.contains(&area.name))
+        .unwrap_or(false)
+}
+
+fn edge_kind_label(kind: &EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::Contains => "contains",
+        EdgeKind::BelongsTo => "belongs_to",
+        EdgeKind::Defines => "defines",
+        EdgeKind::Imports => "imports",
+        EdgeKind::Calls => "calls",
+        EdgeKind::References => "references",
+        EdgeKind::Documents => "documents",
+        EdgeKind::Configures => "configures",
+        EdgeKind::EntrypointFor => "entrypoint_for",
+    }
 }
 
 #[cfg(test)]
@@ -123,6 +423,31 @@ mod tests {
 
         assert!(pack.anchors.iter().any(|anchor| anchor.id.contains("validate_token")));
         assert!(pack.in_scope.files.iter().any(|item| item.value == "src/auth.py"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn config_navigation_pack_stays_area_bounded() {
+        let root = std::env::temp_dir().join("aethyme_engine_config_nav_pack_test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("GameEngine/src")).expect("create engine dir");
+        fs::create_dir_all(root.join("Other")).expect("create other dir");
+        fs::write(root.join("GameEngine/src/lib.rs"), "pub fn main() {}\n").expect("write entrypoint");
+        fs::write(root.join("GameEngine/Cargo.toml"), "[package]\nname='demo'\n").expect("write manifest");
+        fs::write(root.join("Other/project.godot"), "[application]\n").expect("write unrelated config");
+
+        let map = RepositoryMap::build(&root).expect("build map");
+        let pack = build_context_pack(
+            &root,
+            &map,
+            TaskInput::from_task_text("Find the manifest that manages the main code entrypoint in the GameEngine area"),
+        );
+
+        assert!(pack.in_scope.areas.iter().any(|item| item.value == "GameEngine"));
+        assert!(pack.in_scope.files.iter().all(|item| item.value.starts_with("GameEngine/")));
+        assert!(pack.dependencies.iter().all(|edge| edge.to.starts_with("GameEngine") || edge.to == "GameEngine"));
+        assert!(pack.impact.iter().all(|item| item.file.starts_with("GameEngine") || item.file == "GameEngine"));
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -1,7 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
+use rayon::prelude::*;
+
+use crate::cache::{sha256_hex, CacheEntry, CacheStats, ParseCache};
 use crate::class::ClassNode;
 use crate::edge::{Edge, EdgeKind};
 use crate::file::{FileNode, FileRole};
@@ -19,6 +23,15 @@ pub struct CodePass {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeStageProfile {
+    pub parse_files_ms: u128,
+    pub normalize_symbols_ms: u128,
+    pub resolve_imports_ms: u128,
+    pub resolve_calls_ms: u128,
+    pub resolve_references_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedFile {
     file: FileNode,
     contents: String,
@@ -27,94 +40,172 @@ struct ParsedFile {
     import_edges: Vec<Edge>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct InternId(u32);
+
+#[derive(Debug, Default)]
+struct StringInterner {
+    ids: HashMap<String, InternId>,
+    values: Vec<String>,
+}
+
+impl StringInterner {
+    fn intern(&mut self, value: &str) -> InternId {
+        if let Some(id) = self.ids.get(value) {
+            return *id;
+        }
+
+        let id = InternId(self.values.len() as u32);
+        let owned = value.to_string();
+        self.values.push(owned.clone());
+        self.ids.insert(owned, id);
+        id
+    }
+}
+
+#[derive(Debug, Default)]
+struct GlobalIndexes {
+    file_ids: HashMap<String, InternId>,
+    functions_by_name: HashMap<InternId, Vec<usize>>,
+    classes_by_name: HashMap<InternId, Vec<usize>>,
+}
+
+#[derive(Debug, Clone)]
+struct FunctionBodyAnalysis {
+    function_index: usize,
+    tokens: BTreeSet<InternId>,
+    call_names: BTreeSet<InternId>,
+    qualified_call_names: BTreeSet<InternId>,
+    same_file_call_targets: Vec<usize>,
+}
+
 pub fn build(root: &Path, structure: &StructurePass) -> CodePass {
-    let mut parsed_files = Vec::new();
-    let mut classes = Vec::new();
-    let mut functions = Vec::new();
-    let mut compatibility_symbols = Vec::new();
-    let mut edges = Vec::new();
+    build_with_profile(root, structure, None, None).0
+}
 
-    for file in &structure.files {
-        if file.role != FileRole::Source {
-            continue;
+pub fn build_with_profile(
+    root: &Path,
+    structure: &StructurePass,
+    cache: Option<&ParseCache>,
+    grammar_registry: Option<&indexer::tree_sitter::GrammarRegistry>,
+) -> (CodePass, CodeStageProfile, ParseCache, CacheStats) {
+    let parse_started = Instant::now();
+    let source_files: Vec<&FileNode> = structure
+        .files
+        .iter()
+        .filter(|file| file.role == FileRole::Source)
+        .collect();
+
+    let parsed_results: Vec<(ParsedFile, bool)> = source_files
+        .par_iter()
+        .map(|file| parse_file_with_cache(root, file, cache, grammar_registry))
+        .collect();
+
+    let mut hits = 0usize;
+    let mut misses = 0usize;
+    let mut parsed_files = Vec::with_capacity(parsed_results.len());
+    let mut new_cache = ParseCache::new();
+    for (parsed, was_cached) in parsed_results {
+        if was_cached {
+            hits += 1;
+        } else {
+            misses += 1;
         }
-
-        let absolute_path = root.join(&file.path);
-        let contents = fs::read_to_string(&absolute_path).unwrap_or_default();
-        let language = file.language.clone().unwrap_or_default();
-        let extracted_symbols = extract_symbols(&language, &file.path, &contents)
-            .into_iter()
-            .map(|symbol| symbol.with_context(Some(language.clone()), file.area_id.clone()))
-            .collect::<Vec<_>>();
-        let import_edges = extract_import_edges(&language, &file.path, &contents);
-
-        for symbol in &extracted_symbols {
-            match symbol.kind {
-                SymbolKind::Class => {
-                    let class = ClassNode::new(
-                        &structure.repo_name,
-                        &file.id,
-                        &file.path,
-                        file.area_id.clone(),
-                        &language,
-                        &symbol.name,
-                        symbol.line,
-                        &symbol.signature,
-                    );
-                    edges.push(Edge::new(&file.id, &class.id, EdgeKind::Defines, 1000, &language));
-                    classes.push(class);
-                }
-                SymbolKind::Function => {
-                    let function = FunctionNode::new(
-                        &structure.repo_name,
-                        &file.id,
-                        &file.path,
-                        file.area_id.clone(),
-                        None,
-                        &language,
-                        &symbol.name,
-                        symbol.line,
-                        &symbol.signature,
-                    );
-                    edges.push(Edge::new(&file.id, &function.id, EdgeKind::Defines, 1000, &language));
-                    functions.push(function);
-                }
-                SymbolKind::Constant => {}
-            }
-            compatibility_symbols.push(symbol.clone());
-        }
-
-        parsed_files.push(ParsedFile {
-            file: file.clone(),
-            contents,
-            language,
-            symbols: extracted_symbols,
-            import_edges,
-        });
+        new_cache.insert(
+            parsed.file.path.clone(),
+            CacheEntry {
+                content_hash: sha256_hex(&parsed.contents),
+                symbols: parsed.symbols.clone(),
+                import_edges: parsed.import_edges.clone(),
+            },
+        );
+        parsed_files.push(parsed);
     }
+    parsed_files.sort_by(|left, right| left.file.path.cmp(&right.file.path));
+    let parse_files_ms = parse_started.elapsed().as_millis();
 
-    let file_functions = build_file_function_map(&functions);
-    let file_classes = build_file_class_map(&classes);
-    let all_function_names = build_global_function_name_map(&functions);
-    let all_class_names = build_global_class_name_map(&classes);
+    let normalize_started = Instant::now();
+    let (mut classes, mut functions, mut compatibility_symbols, mut edges) =
+        normalize_symbols(structure, &parsed_files);
+    let normalize_symbols_ms = normalize_started.elapsed().as_millis();
 
+    let mut interner = StringInterner::default();
+    let mut indexes = build_global_indexes(&functions, &classes, &mut interner);
+    let file_function_indexes = build_file_function_index_map(&functions);
+    let file_class_indexes = build_file_class_index_map(&classes);
+    let files_by_path = structure
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), file.id.clone()))
+        .collect::<HashMap<_, _>>();
+    let files_by_last_segment = build_last_segment_file_map(&structure.files);
+
+    let import_started = Instant::now();
+    let mut resolved_imports_by_file = HashMap::new();
     for parsed in &parsed_files {
-        let resolved_import_targets = resolve_import_edges(&structure.files, parsed);
-        edges.extend(resolved_import_targets.iter().cloned());
+        let resolved = resolve_import_edges(&files_by_path, &files_by_last_segment, parsed);
+        for edge in &resolved {
+            if !edge.to.starts_with("import:") {
+                let _ = intern_file_id(&mut indexes, &mut interner, &edge.to);
+            }
+        }
+        edges.extend(resolved.iter().cloned());
+        resolved_imports_by_file.insert(parsed.file.id.clone(), resolved);
+    }
+    let resolve_imports_ms = import_started.elapsed().as_millis();
+
+    let calls_started = Instant::now();
+    for parsed in &parsed_files {
+        let resolved_imports = resolved_imports_by_file
+            .get(&parsed.file.id)
+            .cloned()
+            .unwrap_or_default();
+        let current_function_indexes = file_function_indexes
+            .get(&parsed.file.id)
+            .cloned()
+            .unwrap_or_default();
+        let imported_symbol_names =
+            imported_symbol_names_for_language(&parsed.language, &parsed.contents, &mut interner);
+        let analyses = analyze_file_functions(parsed, &current_function_indexes, &functions, &mut interner);
         edges.extend(resolve_cross_file_calls(
-            parsed,
-            &file_functions,
-            &all_function_names,
-            &resolved_import_targets,
-        ));
-        edges.extend(resolve_references(
-            parsed,
-            &file_functions,
-            &file_classes,
-            &all_function_names,
-            &all_class_names,
+            &analyses,
+            &functions,
+            &indexes,
+            &resolved_imports,
+            &imported_symbol_names,
         ));
     }
+    let resolve_calls_ms = calls_started.elapsed().as_millis();
+
+    let refs_started = Instant::now();
+    for parsed in &parsed_files {
+        let resolved_imports = resolved_imports_by_file
+            .get(&parsed.file.id)
+            .cloned()
+            .unwrap_or_default();
+        let current_function_indexes = file_function_indexes
+            .get(&parsed.file.id)
+            .cloned()
+            .unwrap_or_default();
+        let current_class_indexes = file_class_indexes
+            .get(&parsed.file.id)
+            .cloned()
+            .unwrap_or_default();
+        let imported_symbol_names =
+            imported_symbol_names_for_language(&parsed.language, &parsed.contents, &mut interner);
+        let analyses = analyze_file_functions(parsed, &current_function_indexes, &functions, &mut interner);
+        edges.extend(resolve_references(
+            &analyses,
+            &current_class_indexes,
+            &functions,
+            &classes,
+            &indexes,
+            &resolved_imports,
+            &imported_symbol_names,
+            &interner,
+        ));
+    }
+    let resolve_references_ms = refs_started.elapsed().as_millis();
 
     classes.sort();
     functions.sort();
@@ -122,37 +213,221 @@ pub fn build(root: &Path, structure: &StructurePass) -> CodePass {
     edges.sort();
     edges.dedup();
 
-    CodePass {
-        classes,
-        functions,
-        compatibility_symbols,
-        edges,
-    }
+    (
+        CodePass {
+            classes,
+            functions,
+            compatibility_symbols,
+            edges,
+        },
+        CodeStageProfile {
+            parse_files_ms,
+            normalize_symbols_ms,
+            resolve_imports_ms,
+            resolve_calls_ms,
+            resolve_references_ms,
+        },
+        new_cache,
+        CacheStats { hits, misses },
+    )
 }
 
-fn extract_symbols(language: &str, path: &str, contents: &str) -> Vec<Symbol> {
-    match language {
-        "python" => indexer::python::extract_symbols(path, contents),
-        "typescript" | "javascript" => indexer::typescript::extract_symbols(path, contents),
-        "rust" => indexer::rust::extract_symbols(path, contents),
-        _ => Vec::new(),
+fn parse_file_with_cache(
+    root: &Path,
+    file: &FileNode,
+    cache: Option<&ParseCache>,
+    grammar_registry: Option<&indexer::tree_sitter::GrammarRegistry>,
+) -> (ParsedFile, bool) {
+    let absolute_path = root.join(&file.path);
+    let contents = fs::read_to_string(&absolute_path).unwrap_or_default();
+    let language = file.language.clone().unwrap_or_default();
+
+    if let Some(cache) = cache {
+        let hash = sha256_hex(&contents);
+        if let Some(entry) = cache.lookup(&file.path, &hash) {
+            let symbols = entry
+                .symbols
+                .iter()
+                .map(|s| s.clone().with_context(Some(language.clone()), file.area_id.clone()))
+                .collect();
+            return (
+                ParsedFile {
+                    file: file.clone(),
+                    contents,
+                    language,
+                    symbols,
+                    import_edges: entry.import_edges.clone(),
+                },
+                true,
+            );
+        }
     }
+
+    let symbols = indexer::extract_symbols(grammar_registry, &language, &file.path, &contents)
+        .into_iter()
+        .map(|symbol| symbol.with_context(Some(language.clone()), file.area_id.clone()))
+        .collect::<Vec<_>>();
+    let import_edges = indexer::extract_import_edges(grammar_registry, &language, &file.path, &contents);
+
+    (
+        ParsedFile {
+            file: file.clone(),
+            contents,
+            language,
+            symbols,
+            import_edges,
+        },
+        false,
+    )
 }
 
-fn extract_import_edges(language: &str, path: &str, contents: &str) -> Vec<Edge> {
-    match language {
-        "python" => indexer::python::extract_import_edges(path, contents),
-        "typescript" | "javascript" => indexer::typescript::extract_import_edges(path, contents),
-        "rust" => indexer::rust::extract_import_edges(path, contents),
-        _ => Vec::new(),
+fn normalize_symbols(
+    structure: &StructurePass,
+    parsed_files: &[ParsedFile],
+) -> (Vec<ClassNode>, Vec<FunctionNode>, Vec<Symbol>, Vec<Edge>) {
+    let mut classes = Vec::new();
+    let mut functions = Vec::new();
+    let mut compatibility_symbols = Vec::new();
+    let mut edges = Vec::new();
+
+    for parsed in parsed_files {
+        for symbol in &parsed.symbols {
+            match symbol.kind {
+                SymbolKind::Class => {
+                    let class = ClassNode::new(
+                        &structure.repo_name,
+                        &parsed.file.id,
+                        &parsed.file.path,
+                        parsed.file.area_id.clone(),
+                        &parsed.language,
+                        &symbol.name,
+                        symbol.line,
+                        &symbol.signature,
+                    );
+                    edges.push(Edge::new(
+                        &parsed.file.id,
+                        &class.id,
+                        EdgeKind::Defines,
+                        1000,
+                        &parsed.language,
+                    ));
+                    classes.push(class);
+                }
+                SymbolKind::Function => {
+                    let function = FunctionNode::new(
+                        &structure.repo_name,
+                        &parsed.file.id,
+                        &parsed.file.path,
+                        parsed.file.area_id.clone(),
+                        None,
+                        &parsed.language,
+                        &symbol.name,
+                        symbol.line,
+                        &symbol.signature,
+                    );
+                    edges.push(Edge::new(
+                        &parsed.file.id,
+                        &function.id,
+                        EdgeKind::Defines,
+                        1000,
+                        &parsed.language,
+                    ));
+                    functions.push(function);
+                }
+                SymbolKind::Constant => {}
+            }
+            compatibility_symbols.push(symbol.clone());
+        }
     }
+
+    (classes, functions, compatibility_symbols, edges)
 }
 
-fn resolve_import_edges(all_files: &[FileNode], parsed: &ParsedFile) -> Vec<Edge> {
+fn build_global_indexes(
+    functions: &[FunctionNode],
+    classes: &[ClassNode],
+    interner: &mut StringInterner,
+) -> GlobalIndexes {
+    let mut indexes = GlobalIndexes::default();
+
+    for (index, function) in functions.iter().enumerate() {
+        let name_id = interner.intern(&function.name);
+        indexes
+            .functions_by_name
+            .entry(name_id)
+            .or_default()
+            .push(index);
+        let _ = intern_file_id(&mut indexes, interner, &function.file_id);
+    }
+
+    for (index, class) in classes.iter().enumerate() {
+        let name_id = interner.intern(&class.name);
+        indexes.classes_by_name.entry(name_id).or_default().push(index);
+        let _ = intern_file_id(&mut indexes, interner, &class.file_id);
+    }
+
+    indexes
+}
+
+fn intern_file_id(indexes: &mut GlobalIndexes, interner: &mut StringInterner, file_id: &str) -> InternId {
+    if let Some(id) = indexes.file_ids.get(file_id) {
+        return *id;
+    }
+    let id = interner.intern(file_id);
+    indexes.file_ids.insert(file_id.to_string(), id);
+    id
+}
+
+fn build_file_function_index_map(functions: &[FunctionNode]) -> HashMap<String, Vec<usize>> {
+    let mut map = HashMap::new();
+    for (index, function) in functions.iter().enumerate() {
+        map.entry(function.file_id.clone())
+            .or_insert_with(Vec::new)
+            .push(index);
+    }
+    for indexes in map.values_mut() {
+        indexes.sort_by_key(|index| functions[*index].line);
+    }
+    map
+}
+
+fn build_file_class_index_map(classes: &[ClassNode]) -> HashMap<String, Vec<usize>> {
+    let mut map = HashMap::new();
+    for (index, class) in classes.iter().enumerate() {
+        map.entry(class.file_id.clone())
+            .or_insert_with(Vec::new)
+            .push(index);
+    }
+    for indexes in map.values_mut() {
+        indexes.sort_by_key(|index| classes[*index].line);
+    }
+    map
+}
+
+fn build_last_segment_file_map(all_files: &[FileNode]) -> HashMap<String, Vec<String>> {
+    let mut map = HashMap::new();
+    for file in all_files {
+        let last = last_target_segment(&file.path);
+        map.entry(last).or_insert_with(Vec::new).push(file.id.clone());
+    }
+    map
+}
+
+fn resolve_import_edges(
+    files_by_path: &HashMap<String, String>,
+    files_by_last_segment: &HashMap<String, Vec<String>>,
+    parsed: &ParsedFile,
+) -> Vec<Edge> {
     let mut resolved = Vec::new();
     for edge in &parsed.import_edges {
-        let resolved_target = resolve_import_target(all_files, &parsed.file.path, &edge.to, &parsed.language)
-            .unwrap_or_else(|| format!("import:{}", edge.to));
+        let resolved_target = resolve_import_target(
+            files_by_path,
+            files_by_last_segment,
+            &parsed.file.path,
+            &edge.to,
+            &parsed.language,
+        )
+        .unwrap_or_else(|| format!("import:{}", edge.to));
         resolved.push(Edge::new(
             &parsed.file.id,
             resolved_target,
@@ -165,106 +440,17 @@ fn resolve_import_edges(all_files: &[FileNode], parsed: &ParsedFile) -> Vec<Edge
 }
 
 fn resolve_import_target(
-    all_files: &[FileNode],
+    files_by_path: &HashMap<String, String>,
+    files_by_last_segment: &HashMap<String, Vec<String>>,
     source_file: &str,
     raw_target: &str,
     language: &str,
 ) -> Option<String> {
-    match language {
-        "python" => resolve_python_import_target(all_files, raw_target),
-        "typescript" | "javascript" => resolve_typescript_import_target(all_files, source_file, raw_target),
-        "rust" => resolve_rust_import_target(all_files, source_file, raw_target),
-        _ => None,
-    }
+    indexer::resolve::resolve(language, files_by_path, files_by_last_segment, source_file, raw_target)
 }
 
-fn resolve_python_import_target(all_files: &[FileNode], raw_target: &str) -> Option<String> {
-    let dotted_path = raw_target.replace('.', "/");
-    find_matching_file_id(all_files, &format!("{dotted_path}.py"))
-        .or_else(|| find_matching_file_id(all_files, &format!("{dotted_path}/__init__.py")))
-        .or_else(|| find_last_segment_file(all_files, raw_target, &[".py"]))
-}
-
-fn resolve_typescript_import_target(all_files: &[FileNode], source_file: &str, raw_target: &str) -> Option<String> {
-    if raw_target.starts_with('.') {
-        let source_dir = source_file.rsplit_once('/').map(|value| value.0).unwrap_or("");
-        let candidate = normalize_relative_path(source_dir, raw_target);
-        return find_matching_file_id(all_files, &candidate)
-            .or_else(|| find_matching_file_id(all_files, &format!("{candidate}.ts")))
-            .or_else(|| find_matching_file_id(all_files, &format!("{candidate}.tsx")))
-            .or_else(|| find_matching_file_id(all_files, &format!("{candidate}.js")))
-            .or_else(|| find_matching_file_id(all_files, &format!("{candidate}/index.ts")))
-            .or_else(|| find_matching_file_id(all_files, &format!("{candidate}/index.js")));
-    }
-
-    find_last_segment_file(all_files, raw_target, &[".ts", ".tsx", ".js", ".jsx"])
-}
-
-fn resolve_rust_import_target(all_files: &[FileNode], source_file: &str, raw_target: &str) -> Option<String> {
-    let source_dir = source_file.rsplit_once('/').map(|value| value.0).unwrap_or("");
-    let target = raw_target.trim_end_matches(';').trim();
-    let last_segment = target.split("::").last().unwrap_or(target);
-
-    if target.starts_with("super::") {
-        let parent_dir = source_dir.rsplit_once('/').map(|value| value.0).unwrap_or("");
-        let normalized = if parent_dir.is_empty() {
-            last_segment.to_string()
-        } else {
-            format!("{parent_dir}/{last_segment}")
-        };
-        return find_matching_file_id(all_files, &format!("{normalized}.rs"))
-            .or_else(|| find_matching_file_id(all_files, &format!("{normalized}/mod.rs")));
-    }
-
-    if target.starts_with("self::") {
-        let normalized = if source_dir.is_empty() {
-            last_segment.to_string()
-        } else {
-            format!("{source_dir}/{last_segment}")
-        };
-        return find_matching_file_id(all_files, &format!("{normalized}.rs"))
-            .or_else(|| find_matching_file_id(all_files, &format!("{normalized}/mod.rs")));
-    }
-
-    if target.starts_with("crate::") {
-        let relative = target.trim_start_matches("crate::").replace("::", "/");
-        return find_matching_file_id(all_files, &format!("src/{relative}.rs"))
-            .or_else(|| find_matching_file_id(all_files, &format!("src/{relative}/mod.rs")))
-            .or_else(|| find_last_segment_file(all_files, last_segment, &[".rs"]));
-    }
-
-    find_matching_file_id(all_files, &format!("{source_dir}/{target}.rs"))
-        .or_else(|| find_matching_file_id(all_files, &format!("{source_dir}/{target}/mod.rs")))
-        .or_else(|| find_last_segment_file(all_files, last_segment, &[".rs"]))
-}
-
-fn normalize_relative_path(source_dir: &str, raw_target: &str) -> String {
-    let mut parts: Vec<&str> = if source_dir.is_empty() {
-        Vec::new()
-    } else {
-        source_dir.split('/').collect()
-    };
-    for segment in raw_target.split('/') {
-        match segment {
-            "." | "" => {}
-            ".." => {
-                parts.pop();
-            }
-            value => parts.push(value),
-        }
-    }
-    parts.join("/")
-}
-
-fn find_matching_file_id(all_files: &[FileNode], candidate: &str) -> Option<String> {
-    all_files
-        .iter()
-        .find(|file| file.path == candidate)
-        .map(|file| file.id.clone())
-}
-
-fn find_last_segment_file(all_files: &[FileNode], raw_target: &str, extensions: &[&str]) -> Option<String> {
-    let last = raw_target
+fn last_target_segment(raw_target: &str) -> String {
+    raw_target
         .rsplit('/')
         .next()
         .unwrap_or(raw_target)
@@ -273,137 +459,154 @@ fn find_last_segment_file(all_files: &[FileNode], raw_target: &str, extensions: 
         .unwrap_or(raw_target)
         .rsplit("::")
         .next()
-        .unwrap_or(raw_target);
-
-    all_files
-        .iter()
-        .find(|file| extensions.iter().any(|ext| file.path.ends_with(&format!("/{last}{ext}"))))
-        .map(|file| file.id.clone())
-}
-
-fn build_file_function_map(functions: &[FunctionNode]) -> BTreeMap<String, Vec<FunctionNode>> {
-    let mut map = BTreeMap::new();
-    for function in functions {
-        map.entry(function.file_id.clone()).or_insert_with(Vec::new).push(function.clone());
-    }
-    for items in map.values_mut() {
-        items.sort_by(|left, right| left.line.cmp(&right.line).then_with(|| left.name.cmp(&right.name)));
-    }
-    map
-}
-
-fn build_file_class_map(classes: &[ClassNode]) -> BTreeMap<String, Vec<ClassNode>> {
-    let mut map = BTreeMap::new();
-    for class in classes {
-        map.entry(class.file_id.clone()).or_insert_with(Vec::new).push(class.clone());
-    }
-    for items in map.values_mut() {
-        items.sort_by(|left, right| left.line.cmp(&right.line).then_with(|| left.name.cmp(&right.name)));
-    }
-    map
-}
-
-fn build_global_function_name_map(functions: &[FunctionNode]) -> BTreeMap<String, Vec<FunctionNode>> {
-    let mut map = BTreeMap::new();
-    for function in functions {
-        map.entry(function.name.clone())
-            .or_insert_with(Vec::new)
-            .push(function.clone());
-    }
-    map
-}
-
-fn build_global_class_name_map(classes: &[ClassNode]) -> BTreeMap<String, Vec<ClassNode>> {
-    let mut map = BTreeMap::new();
-    for class in classes {
-        map.entry(class.name.clone())
-            .or_insert_with(Vec::new)
-            .push(class.clone());
-    }
-    map
+        .unwrap_or(raw_target)
+        .to_string()
 }
 
 fn resolve_cross_file_calls(
-    parsed: &ParsedFile,
-    file_functions: &BTreeMap<String, Vec<FunctionNode>>,
-    all_function_names: &BTreeMap<String, Vec<FunctionNode>>,
+    analyses: &[FunctionBodyAnalysis],
+    functions: &[FunctionNode],
+    indexes: &GlobalIndexes,
     resolved_import_edges: &[Edge],
+    imported_symbol_names: &BTreeSet<InternId>,
 ) -> Vec<Edge> {
-    let current_functions = file_functions.get(&parsed.file.id).cloned().unwrap_or_default();
-    let imported_targets: BTreeSet<String> = resolved_import_edges
+    let imported_targets: HashSet<InternId> = resolved_import_edges
         .iter()
-        .map(|edge| edge.to.clone())
-        .collect();
-    let imported_file_functions: Vec<FunctionNode> = file_functions
-        .iter()
-        .filter(|(file_id, _)| imported_targets.contains(*file_id))
-        .flat_map(|(_, functions)| functions.iter().cloned())
+        .filter_map(|edge| indexes.file_ids.get(&edge.to).copied())
         .collect();
 
     let mut edges = Vec::new();
-    for (index, function) in current_functions.iter().enumerate() {
-        let body = function_body(&parsed.contents, function.line, current_functions.get(index + 1).map(|item| item.line));
-        for target in &current_functions {
-            if target.id == function.id {
+    for analysis in analyses {
+        let function = &functions[analysis.function_index];
+
+        for target_index in &analysis.same_file_call_targets {
+            let target = &functions[*target_index];
+            edges.push(Edge::new(&function.id, &target.id, EdgeKind::Calls, 900, &function.language));
+        }
+
+        for (token, target_index) in body_call_candidates(&analysis.call_names, &indexes.functions_by_name) {
+            let target = &functions[target_index];
+            if target.file_id == function.file_id || target.id == function.id {
                 continue;
             }
-            if body.contains(&format!("{}(", target.name)) {
-                edges.push(Edge::new(&function.id, &target.id, EdgeKind::Calls, 800, &parsed.language));
-            }
-        }
-        for target in &imported_file_functions {
-            if body.contains(&format!("{}(", target.name)) || body.contains(&format!("::{}(", target.name)) {
-                edges.push(Edge::new(&function.id, &target.id, EdgeKind::Calls, 750, &parsed.language));
-            }
-        }
-        for target in body_call_candidates(&body, all_function_names) {
-            if target.file_id != function.file_id {
-                edges.push(Edge::new(&function.id, &target.id, EdgeKind::Calls, 600, &parsed.language));
+
+            let target_file_id = indexes.file_ids.get(&target.file_id).copied();
+            let directly_imported = imported_symbol_names.contains(&token);
+            let imported_file = target_file_id.is_some_and(|file_id| imported_targets.contains(&file_id));
+            if directly_imported || imported_file || analysis.qualified_call_names.contains(&token) {
+                let confidence = if directly_imported {
+                    920
+                } else if imported_file {
+                    860
+                } else {
+                    780
+                };
+                edges.push(Edge::new(
+                    &function.id,
+                    &target.id,
+                    EdgeKind::Calls,
+                    confidence,
+                    &function.language,
+                ));
             }
         }
     }
+
     edges.sort();
     edges.dedup();
     edges
 }
 
 fn resolve_references(
-    parsed: &ParsedFile,
-    file_functions: &BTreeMap<String, Vec<FunctionNode>>,
-    file_classes: &BTreeMap<String, Vec<ClassNode>>,
-    all_function_names: &BTreeMap<String, Vec<FunctionNode>>,
-    all_class_names: &BTreeMap<String, Vec<ClassNode>>,
+    analyses: &[FunctionBodyAnalysis],
+    current_class_indexes: &[usize],
+    functions: &[FunctionNode],
+    classes: &[ClassNode],
+    indexes: &GlobalIndexes,
+    resolved_import_edges: &[Edge],
+    imported_symbol_names: &BTreeSet<InternId>,
+    interner: &StringInterner,
 ) -> Vec<Edge> {
-    let current_functions = file_functions.get(&parsed.file.id).cloned().unwrap_or_default();
-    let current_classes = file_classes.get(&parsed.file.id).cloned().unwrap_or_default();
+    let imported_targets: HashSet<InternId> = resolved_import_edges
+        .iter()
+        .filter_map(|edge| indexes.file_ids.get(&edge.to).copied())
+        .collect();
     let mut edges = Vec::new();
-
-    for (index, function) in current_functions.iter().enumerate() {
-        let body = function_body(&parsed.contents, function.line, current_functions.get(index + 1).map(|item| item.line));
-
-        for class in &current_classes {
-            if body.contains(&class.name) {
-                edges.push(Edge::new(&function.id, &class.id, EdgeKind::References, 700, &parsed.language));
+    let local_class_name_indexes = current_class_indexes.iter().copied().fold(
+        HashMap::<InternId, Vec<usize>>::new(),
+        |mut acc, class_index| {
+            let class = &classes[class_index];
+            if let Some(class_name_id) = interner.ids.get(&class.name).copied() {
+                acc.entry(class_name_id).or_default().push(class_index);
             }
-        }
+            acc
+        },
+    );
 
-        for class_matches in all_class_names.values() {
-            for class in class_matches {
-                if class.file_id != function.file_id
-                    && (body.contains(&format!("{}::", class.name)) || body.contains(&format!("{}(", class.name)))
-                {
-                    edges.push(Edge::new(&function.id, &class.id, EdgeKind::References, 650, &parsed.language));
+    for analysis in analyses {
+        let function = &functions[analysis.function_index];
+
+        for token in &analysis.tokens {
+            if let Some(class_indexes) = local_class_name_indexes.get(token) {
+                for class_index in class_indexes {
+                    let class = &classes[*class_index];
+                    edges.push(Edge::new(
+                        &function.id,
+                        &class.id,
+                        EdgeKind::References,
+                        850,
+                        &function.language,
+                    ));
                 }
             }
         }
 
-        for function_matches in all_function_names.values() {
-            for target in function_matches {
-                if target.id != function.id
-                    && body.contains(&target.name)
-                    && !body.contains(&format!("{}(", target.name))
-                {
-                    edges.push(Edge::new(&function.id, &target.id, EdgeKind::References, 500, &parsed.language));
+        for token in &analysis.tokens {
+            if let Some(class_matches) = indexes.classes_by_name.get(token) {
+                for class_index in class_matches {
+                    let class = &classes[*class_index];
+                    if class.file_id == function.file_id {
+                        continue;
+                    }
+                    let target_file_id = indexes.file_ids.get(&class.file_id).copied();
+                    let imported_file = target_file_id.is_some_and(|file_id| imported_targets.contains(&file_id));
+                    let directly_imported = imported_symbol_names.contains(token);
+                    if imported_file || directly_imported {
+                        let confidence = if directly_imported { 900 } else { 800 };
+                        edges.push(Edge::new(
+                            &function.id,
+                            &class.id,
+                            EdgeKind::References,
+                            confidence,
+                            &function.language,
+                        ));
+                    }
+                }
+            }
+        }
+
+        for token in &analysis.tokens {
+            if let Some(function_matches) = indexes.functions_by_name.get(token) {
+                let is_call_name = analysis.call_names.contains(token);
+                for target_index in function_matches {
+                    let target = &functions[*target_index];
+                    if target.id == function.id || target.file_id == function.file_id {
+                        continue;
+                    }
+
+                    let target_file_id = indexes.file_ids.get(&target.file_id).copied();
+                    let imported_file = target_file_id.is_some_and(|file_id| imported_targets.contains(&file_id));
+                    let directly_imported = imported_symbol_names.contains(token);
+                    if !is_call_name && (imported_file || directly_imported) {
+                        let confidence = if directly_imported { 880 } else { 780 };
+                        edges.push(Edge::new(
+                            &function.id,
+                            &target.id,
+                            EdgeKind::References,
+                            confidence,
+                            &function.language,
+                        ));
+                    }
                 }
             }
         }
@@ -414,17 +617,284 @@ fn resolve_references(
     edges
 }
 
-fn body_call_candidates(
-    body: &str,
-    all_function_names: &BTreeMap<String, Vec<FunctionNode>>,
-) -> Vec<FunctionNode> {
-    let mut matches = Vec::new();
-    for (name, candidates) in all_function_names {
-        if body.contains(&format!("{name}(")) && candidates.len() == 1 {
-            matches.push(candidates[0].clone());
+fn imported_symbol_names_for_language(
+    language: &str,
+    contents: &str,
+    interner: &mut StringInterner,
+) -> BTreeSet<InternId> {
+    let names = match language {
+        "python" => python_imported_symbol_names(contents),
+        "rust" => rust_imported_symbol_names(contents),
+        "typescript" | "javascript" => typescript_imported_symbol_names(contents),
+        _ => BTreeSet::new(),
+    };
+    names.into_iter().map(|name| interner.intern(&name)).collect()
+}
+
+fn analyze_file_functions(
+    parsed: &ParsedFile,
+    current_function_indexes: &[usize],
+    functions: &[FunctionNode],
+    interner: &mut StringInterner,
+) -> Vec<FunctionBodyAnalysis> {
+    let mut local_function_name_indexes = HashMap::<InternId, Vec<usize>>::new();
+    for function_index in current_function_indexes.iter().copied() {
+        let function = &functions[function_index];
+        let name_id = interner.intern(&function.name);
+        local_function_name_indexes
+            .entry(name_id)
+            .or_default()
+            .push(function_index);
+    }
+
+    let mut analyses = Vec::with_capacity(current_function_indexes.len());
+    for (offset, function_index) in current_function_indexes.iter().enumerate() {
+        let function = &functions[*function_index];
+        let next_line = current_function_indexes
+            .get(offset + 1)
+            .map(|index| functions[*index].line);
+        let body = function_body(&parsed.contents, function.line, next_line);
+        let tokens = body_identifier_tokens(&body, interner);
+        let call_names = body_call_name_tokens(&body, interner);
+        let qualified_call_names = body_qualified_call_name_tokens(&body, interner);
+        let same_file_call_targets = call_names
+            .iter()
+            .filter_map(|name_id| local_function_name_indexes.get(name_id))
+            .flat_map(|target_indexes| target_indexes.iter().copied())
+            .filter(|target_index| functions[*target_index].id != function.id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        analyses.push(FunctionBodyAnalysis {
+            function_index: *function_index,
+            tokens,
+            call_names,
+            qualified_call_names,
+            same_file_call_targets,
+        });
+    }
+    analyses
+}
+
+fn python_imported_symbol_names(contents: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("from ")
+            && let Some((_module, imported)) = rest.split_once(" import ")
+        {
+            for part in imported.split(',') {
+                let token = part.trim();
+                let imported_name = token
+                    .split(" as ")
+                    .nth(1)
+                    .or_else(|| token.split_whitespace().next())
+                    .unwrap_or_default()
+                    .trim();
+                if !imported_name.is_empty() && imported_name != "*" {
+                    names.insert(imported_name.to_string());
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("import ") {
+            for part in rest.split(',') {
+                let token = part.trim();
+                let imported_name = token
+                    .split(" as ")
+                    .nth(1)
+                    .or_else(|| token.rsplit('.').next())
+                    .unwrap_or_default()
+                    .trim();
+                if !imported_name.is_empty() {
+                    names.insert(imported_name.to_string());
+                }
+            }
         }
     }
+    names
+}
+
+fn rust_imported_symbol_names(contents: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("use ") {
+            let use_target = rest.trim_end_matches(';').trim();
+            let tail = use_target.rsplit("::").next().unwrap_or(use_target).trim();
+            if tail.starts_with('{') && tail.ends_with('}') {
+                for item in tail.trim_matches(|c| c == '{' || c == '}').split(',') {
+                    let token = item.trim();
+                    let imported_name = token
+                        .split(" as ")
+                        .nth(1)
+                        .or_else(|| token.split_whitespace().next())
+                        .unwrap_or_default()
+                        .trim();
+                    if !imported_name.is_empty() && imported_name != "self" {
+                        names.insert(imported_name.to_string());
+                    }
+                }
+            } else {
+                let imported_name = tail
+                    .split(" as ")
+                    .nth(1)
+                    .or_else(|| tail.split_whitespace().next())
+                    .unwrap_or_default()
+                    .trim();
+                if !imported_name.is_empty() && imported_name != "self" {
+                    names.insert(imported_name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+fn typescript_imported_symbol_names(contents: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("import ") {
+            if let Some((imports, _source)) = rest.split_once(" from ") {
+                let imports = imports.trim();
+                if imports.starts_with('{') && imports.ends_with('}') {
+                    for item in imports.trim_matches(|c| c == '{' || c == '}').split(',') {
+                        let token = item.trim();
+                        let imported_name = token
+                            .split(" as ")
+                            .nth(1)
+                            .or_else(|| token.split_whitespace().next())
+                            .unwrap_or_default()
+                            .trim();
+                        if !imported_name.is_empty() {
+                            names.insert(imported_name.to_string());
+                        }
+                    }
+                } else if !imports.is_empty() {
+                    let imported_name = imports
+                        .split(" as ")
+                        .nth(1)
+                        .or_else(|| imports.split_whitespace().next())
+                        .unwrap_or_default()
+                        .trim();
+                    if !imported_name.is_empty() {
+                        names.insert(imported_name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+fn body_call_candidates(
+    call_names: &BTreeSet<InternId>,
+    functions_by_name: &HashMap<InternId, Vec<usize>>,
+) -> Vec<(InternId, usize)> {
+    let mut matches = Vec::new();
+    for token in call_names {
+        let Some(candidates) = functions_by_name.get(token) else {
+            continue;
+        };
+        matches.extend(candidates.iter().copied().map(|index| (*token, index)));
+    }
+    matches.sort_unstable();
+    matches.dedup();
     matches
+}
+
+fn body_identifier_tokens(body: &str, interner: &mut StringInterner) -> BTreeSet<InternId> {
+    body.split(|character: char| !character.is_alphanumeric() && character != '_')
+        .map(str::trim)
+        .filter(|token| token.len() >= 2)
+        .map(|token| interner.intern(token))
+        .collect()
+}
+
+fn body_call_name_tokens(body: &str, interner: &mut StringInterner) -> BTreeSet<InternId> {
+    let mut names = BTreeSet::new();
+    let mut chars = body.char_indices().peekable();
+
+    while let Some((start, ch)) = chars.next() {
+        if !(ch.is_ascii_alphabetic() || ch == '_') {
+            continue;
+        }
+
+        let mut end = start + ch.len_utf8();
+        while let Some((idx, next_ch)) = chars.peek().copied() {
+            if next_ch.is_ascii_alphanumeric() || next_ch == '_' {
+                end = idx + next_ch.len_utf8();
+                let _ = chars.next();
+            } else {
+                break;
+            }
+        }
+
+        let mut lookahead = chars.clone();
+        while let Some((_, next_ch)) = lookahead.peek().copied() {
+            if next_ch.is_whitespace() {
+                let _ = lookahead.next();
+            } else {
+                break;
+            }
+        }
+
+        if let Some((_, '(')) = lookahead.peek().copied() {
+            let token = &body[start..end];
+            if token.len() >= 2 {
+                names.insert(interner.intern(token));
+            }
+        }
+    }
+
+    names
+}
+
+fn body_qualified_call_name_tokens(body: &str, interner: &mut StringInterner) -> BTreeSet<InternId> {
+    let mut names = BTreeSet::new();
+    let bytes = body.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let ch = bytes[index] as char;
+        if !(ch.is_ascii_alphabetic() || ch == '_') {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        index += 1;
+        while index < bytes.len() {
+            let next = bytes[index] as char;
+            if next.is_ascii_alphanumeric() || next == '_' {
+                index += 1;
+            } else {
+                break;
+            }
+        }
+        let end = index;
+
+        let mut lookahead = index;
+        while lookahead < bytes.len() && (bytes[lookahead] as char).is_whitespace() {
+            lookahead += 1;
+        }
+        if lookahead >= bytes.len() || bytes[lookahead] != b'(' {
+            continue;
+        }
+
+        let is_qualified = if start >= 1 && bytes[start - 1] == b'.' {
+            true
+        } else {
+            start >= 2 && bytes[start - 2] == b':' && bytes[start - 1] == b':'
+        };
+        if is_qualified {
+            let token = &body[start..end];
+            if token.len() >= 2 {
+                names.insert(interner.intern(token));
+            }
+        }
+    }
+
+    names
 }
 
 fn function_body(contents: &str, start_line: usize, next_line: Option<usize>) -> String {
@@ -433,7 +903,12 @@ fn function_body(contents: &str, start_line: usize, next_line: Option<usize>) ->
         .map(|line| line.saturating_sub(start_line).max(1))
         .unwrap_or(40)
         .min(80);
-    contents.lines().skip(start).take(take).collect::<Vec<_>>().join("\n")
+    contents
+        .lines()
+        .skip(start)
+        .take(take)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -482,7 +957,36 @@ mod tests {
         let structure = structure::build(&snapshot);
         let code = build(&root, &structure);
 
-        assert!(code.edges.iter().any(|edge| matches!(edge.kind, EdgeKind::Calls) && edge.from.contains("run") && edge.to.contains("validate_token")));
+        assert!(code.edges.iter().any(|edge| {
+            matches!(edge.kind, EdgeKind::Calls) && edge.from.contains("run") && edge.to.contains("validate_token")
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cross_file_rust_call_resolution_links_imported_function() {
+        let root = std::env::temp_dir().join("aethyme_engine_cross_file_rust_call_test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("create temp repo");
+        fs::write(
+            root.join("src/lib.rs"),
+            "mod auth;\nuse crate::auth::validate_token;\n\npub fn run() -> bool {\n    validate_token()\n}\n",
+        )
+        .expect("write source");
+        fs::write(root.join("src/auth.rs"), "pub fn validate_token() -> bool {\n    true\n}\n")
+            .expect("write source");
+
+        let snapshot = discover_repo(&root).expect("discover repo");
+        let structure = structure::build(&snapshot);
+        let code = build(&root, &structure);
+
+        assert!(code.edges.iter().any(|edge| {
+            matches!(edge.kind, EdgeKind::Calls)
+                && edge.from.contains("run")
+                && edge.to.contains("validate_token")
+                && edge.confidence >= 900
+        }));
 
         let _ = fs::remove_dir_all(&root);
     }

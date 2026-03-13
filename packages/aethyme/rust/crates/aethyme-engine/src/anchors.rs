@@ -1,4 +1,6 @@
 use crate::context_pack::{Anchor, AnchorKind};
+use crate::edge::EdgeKind;
+use crate::file::FileRole;
 use crate::map::RepositoryMap;
 use crate::search::symbol_search;
 use crate::task::{TaskInput, TaskKind};
@@ -10,6 +12,8 @@ const STOP_WORDS: &[&str] = &[
     "updates",
     "modify",
     "modifies",
+    "fix",
+    "fixes",
     "the",
     "this",
     "that",
@@ -18,6 +22,28 @@ const STOP_WORDS: &[&str] = &[
     "component",
     "behavior",
     "flow",
+    "find",
+    "about",
+    "where",
+    "managed",
+    "manages",
+    "manage",
+    // Task-instruction verbs already captured as semantic flags in scoring
+    "controls",
+    "owns",
+    "identify",
+    "name",
+    // Common noise words from bug-fix task descriptions
+    "failing",
+    "failed",
+    "test",
+    "tests",
+    "pass",
+    "passing",
+    "does",
+    "not",
+    "bug",
+    "error",
 ];
 
 pub fn resolve_anchors(map: &RepositoryMap, task: &TaskInput, limit: usize) -> Vec<Anchor> {
@@ -33,8 +59,74 @@ pub fn resolve_anchors(map: &RepositoryMap, task: &TaskInput, limit: usize) -> V
             anchors.extend(explain_repo_entrypoint_anchors(map, 1));
             anchors.extend(explain_repo_config_anchors(map, 1));
         }
-        _ => {
+        TaskKind::NavigateConfigOwnership => {
+            let queries = candidate_queries(task);
+            anchors.extend(area_anchors(map, &queries, true, 1));
+            anchors.extend(navigation_config_anchors(map, task, &queries, 1));
+            if anchors.len() < limit {
+                for config in config_anchors(map, task, &queries, limit.saturating_sub(anchors.len())) {
+                    if !anchors.contains(&config) {
+                        anchors.push(config);
+                    }
+                    if anchors.len() == limit {
+                        break;
+                    }
+                }
+            }
+        }
+        TaskKind::ChangeSymbol | TaskKind::TraceImpact => {
+            // File references from task text get highest priority
+            anchors.extend(file_reference_anchors(map, task, limit));
+
             let mut queries = candidate_queries(task);
+            if queries.is_empty() {
+                queries.push(task.normalized.clone());
+            }
+            for query in &queries {
+                for hit in symbol_search(map, query, limit) {
+                    let reason = if task.kind == TaskKind::TraceImpact {
+                        format!("impact symbol via {}", hit.reason)
+                    } else {
+                        format!("change symbol via {}", hit.reason)
+                    };
+                    anchors.push(Anchor::new(AnchorKind::Symbol, hit.id, Some(hit.file), reason));
+                }
+            }
+            if anchors.len() < limit {
+                for query in &queries {
+                    for anchor in code_file_anchors(map, query, limit.saturating_sub(anchors.len())) {
+                        if !anchors.contains(&anchor) {
+                            anchors.push(anchor);
+                        }
+                        if anchors.len() == limit {
+                            break;
+                        }
+                    }
+                    if anchors.len() == limit {
+                        break;
+                    }
+                }
+            }
+            if anchors.len() < limit && wants_area_anchor(task) {
+                anchors.extend(area_anchors(
+                    map,
+                    &queries,
+                    true,
+                    limit.saturating_sub(anchors.len()),
+                ));
+            }
+        }
+        _ => {
+            // File references from task text get highest priority
+            anchors.extend(file_reference_anchors(map, task, limit));
+
+            let queries = candidate_queries(task);
+            let wants_area = wants_area_anchor(task);
+
+            anchors.extend(area_anchors(map, &queries, wants_area, limit));
+            anchors.extend(config_anchors(map, task, &queries, limit.saturating_sub(1).max(1)));
+
+            let mut queries = queries;
             if queries.is_empty() {
                 queries.push(task.normalized.clone());
             }
@@ -60,7 +152,135 @@ pub fn resolve_anchors(map: &RepositoryMap, task: &TaskInput, limit: usize) -> V
             break;
         }
     }
-    deduped
+    if matches!(task.kind, TaskKind::ExplainRepo) {
+        deduped
+    } else {
+        filter_primary_area_anchors(map, deduped, limit)
+    }
+}
+
+fn filter_primary_area_anchors(map: &RepositoryMap, anchors: Vec<Anchor>, limit: usize) -> Vec<Anchor> {
+    let primary_areas = anchors
+        .iter()
+        .filter_map(|anchor| match anchor.kind {
+            AnchorKind::Folder => Some(anchor.id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if primary_areas.is_empty() {
+        return anchors;
+    }
+
+    let mut filtered = Vec::new();
+    for anchor in anchors {
+        let keep = match anchor.kind {
+            AnchorKind::Folder => primary_areas.contains(&anchor.id),
+            AnchorKind::File | AnchorKind::Symbol => anchor
+                .file
+                .as_deref()
+                .or_else(|| file_for_symbol(map, &anchor.id))
+                .and_then(|file| file_area_name(map, file))
+                .is_some_and(|area| primary_areas.contains(&area)),
+        };
+        if keep && !filtered.contains(&anchor) {
+            filtered.push(anchor);
+        }
+        if filtered.len() == limit {
+            break;
+        }
+    }
+    filtered
+}
+
+/// Extract file-path-like references from task text and resolve them against the graph.
+///
+/// Scans for tokens containing a `.` followed by a known source extension (ts, js, py, rs, etc.).
+/// Matches against file basenames in the graph.  Returns file anchors plus their parent area anchors.
+fn file_reference_anchors(map: &RepositoryMap, task: &TaskInput, limit: usize) -> Vec<Anchor> {
+    const EXTENSIONS: &[&str] = &[
+        ".ts", ".tsx", ".js", ".jsx", ".py", ".rs", ".go", ".java", ".rb",
+        ".gd", ".cs", ".cpp", ".c", ".h", ".hpp", ".swift", ".kt",
+    ];
+
+    // Extract tokens that look like file references (contain a dot + known extension).
+    // Split on whitespace first to preserve path separators within tokens.
+    let mut file_refs: Vec<String> = Vec::new();
+    for token in task.raw.split_whitespace() {
+        let lowered = token.to_ascii_lowercase();
+        // Strip trailing punctuation (commas, colons, etc.)
+        let cleaned = lowered.trim_end_matches(|c: char| c.is_ascii_punctuation() && c != '.' && c != '/' && c != '-' && c != '_');
+        if EXTENSIONS.iter().any(|ext| cleaned.ends_with(ext)) {
+            if !file_refs.contains(&cleaned.to_string()) {
+                file_refs.push(cleaned.to_string());
+            }
+        }
+    }
+
+    if file_refs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut anchors = Vec::new();
+    let mut seen_areas: Vec<String> = Vec::new();
+
+    for file_ref in &file_refs {
+        let ref_basename = file_ref.rsplit('/').next().unwrap_or(file_ref);
+
+        for file in &map.files {
+            let file_lower = file.path.to_ascii_lowercase();
+            let file_basename = file_lower.rsplit('/').next().unwrap_or(&file_lower);
+
+            // Score: exact basename match > path-contains match
+            let score = if file_basename == ref_basename {
+                300 // highest priority — exact filename match
+            } else if file_lower.ends_with(file_ref.as_str()) {
+                280 // full relative path match
+            } else if file_lower.contains(ref_basename) {
+                200 // basename appears somewhere in path
+            } else {
+                continue;
+            };
+
+            anchors.push((
+                score,
+                Anchor::new(
+                    AnchorKind::File,
+                    &file.path,
+                    Some(&file.path),
+                    format!("file reference from task text ({})", file_ref),
+                ),
+            ));
+
+            // Also anchor on the file's parent area
+            if let Some(area_id) = &file.area_id {
+                if !seen_areas.contains(area_id) {
+                    if let Some(area) = map.areas.iter().find(|a| &a.id == area_id) {
+                        seen_areas.push(area_id.clone());
+                        anchors.push((
+                            score - 10, // slightly lower than the file itself
+                            Anchor::new(
+                                AnchorKind::Folder,
+                                &area.name,
+                                None::<String>,
+                                format!("area containing referenced file ({})", file_ref),
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    anchors.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.id.cmp(&right.1.id)));
+    anchors.truncate(limit);
+    anchors.into_iter().map(|(_, anchor)| anchor).collect()
+}
+
+fn wants_area_anchor(task: &TaskInput) -> bool {
+    ["area", "component", "module", "folder", "directory"]
+        .iter()
+        .any(|needle| task.normalized.contains(needle))
 }
 
 fn candidate_queries(task: &TaskInput) -> Vec<String> {
@@ -81,6 +301,224 @@ fn candidate_queries(task: &TaskInput) -> Vec<String> {
         }
     }
     queries
+}
+
+fn navigation_config_anchors(map: &RepositoryMap, task: &TaskInput, queries: &[String], limit: usize) -> Vec<Anchor> {
+    let mut anchors = config_anchors(map, task, queries, limit.max(3));
+    anchors.retain(|anchor| anchor.reason.contains("manifest"));
+    anchors.truncate(limit);
+    anchors
+}
+
+fn config_anchors(map: &RepositoryMap, task: &TaskInput, queries: &[String], limit: usize) -> Vec<Anchor> {
+    let mut anchors = Vec::new();
+    let wants_manifest = task.normalized.contains("manifest");
+    let wants_project = task.normalized.contains("project");
+    let wants_entrypoint = task.normalized.contains("entrypoint") || task.normalized.contains("main code");
+    let wants_ownership = task.normalized.contains("manage")
+        || task.normalized.contains("managed")
+        || task.normalized.contains("controls")
+        || task.normalized.contains("owner")
+        || task.normalized.contains("owns");
+    let matched_area_ids = map
+        .areas
+        .iter()
+        .filter(|area| {
+            let area_lower = area.name.to_ascii_lowercase();
+            queries.iter().any(|query| area_lower.contains(query))
+        })
+        .map(|area| area.id.clone())
+        .collect::<Vec<_>>();
+    for config in &map.configs {
+        let path_lower = config.path.to_ascii_lowercase();
+        let area_name = config
+            .area_id
+            .as_deref()
+            .and_then(|area_id| map.areas.iter().find(|area| area.id == area_id))
+            .map(|area| area.name.to_ascii_lowercase());
+        let area_matches = config
+            .area_id
+            .as_ref()
+            .is_some_and(|area_id| matched_area_ids.iter().any(|matched| matched == area_id));
+
+        let mut score = 0;
+        score += 8;
+        if queries.iter().any(|query| path_lower.contains(query)) {
+            score += 6;
+        }
+        if area_name
+            .as_deref()
+            .is_some_and(|name| queries.iter().any(|query| name.contains(query)))
+        {
+            score += 5;
+        }
+        if !matched_area_ids.is_empty() && !area_matches {
+            score = 0;
+        }
+        let config_area = config.area_id.as_deref();
+        let mut direct_entrypoint_edges = 0i32;
+        let mut transitive_entrypoint_edges = 0i32;
+        let mut cross_package_bonus = 0i32;
+        for edge in map
+            .edges
+            .iter()
+            .filter(|edge| edge.from == config.id && matches!(edge.kind, EdgeKind::EntrypointFor))
+            .filter(|edge| {
+                map.files
+                    .iter()
+                    .any(|file| file.id == edge.to && (matched_area_ids.is_empty() || file.area_id.as_ref().is_some_and(|area| matched_area_ids.contains(area))))
+                    || map.functions.iter().any(|function| {
+                        function.id == edge.to
+                            && (matched_area_ids.is_empty()
+                                || function.area_id.as_ref().is_some_and(|area| matched_area_ids.contains(area)))
+                    })
+            })
+        {
+            if edge.confidence >= 900 {
+                direct_entrypoint_edges += 1;
+                let target_area = map.files.iter()
+                    .find(|f| f.id == edge.to)
+                    .and_then(|f| f.area_id.as_deref());
+                if config_area.is_some() && target_area.is_some() && config_area != target_area {
+                    cross_package_bonus += 8;
+                }
+            } else {
+                transitive_entrypoint_edges += 1;
+            }
+        }
+        let area_configures = map
+            .edges
+            .iter()
+            .filter(|edge| edge.from == config.id && matches!(edge.kind, EdgeKind::Configures))
+            .filter(|edge| matched_area_ids.is_empty() || matched_area_ids.iter().any(|matched| matched == &edge.to))
+            .count() as i32;
+
+        if wants_manifest {
+            score += if config.config_type == "manifest" { 12 } else { -4 };
+        }
+        if wants_project {
+            score += if config.config_type == "project" { 8 } else { 0 };
+        }
+        if wants_entrypoint {
+            score += direct_entrypoint_edges * 20;
+            score += transitive_entrypoint_edges.min(3) * 2;
+            score += cross_package_bonus;
+        } else if direct_entrypoint_edges > 0 || transitive_entrypoint_edges > 0 {
+            score += 3;
+        }
+        if wants_ownership {
+            score += area_configures * 4;
+        } else if area_configures > 0 {
+            score += 2;
+        }
+        if matches!(config.config_type.as_str(), "manifest" | "project" | "runtime") {
+            score += 2;
+        }
+        if score == 0 {
+            continue;
+        }
+
+        anchors.push((
+            score,
+            Anchor::new(
+                AnchorKind::File,
+                &config.path,
+                Some(&config.path),
+                format!("{} config anchor (score {})", config.config_type, score),
+            ),
+        ));
+    }
+    anchors.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.id.cmp(&right.1.id)));
+    anchors.truncate(limit);
+    anchors.into_iter().map(|(_, anchor)| anchor).collect()
+}
+
+fn file_for_symbol<'a>(map: &'a RepositoryMap, symbol_id: &str) -> Option<&'a str> {
+    map.functions
+        .iter()
+        .find(|function| function.id == symbol_id)
+        .map(|function| function.file_path.as_str())
+        .or_else(|| map.classes.iter().find(|class| class.id == symbol_id).map(|class| class.file_path.as_str()))
+}
+
+fn file_area_name(map: &RepositoryMap, file_path: &str) -> Option<String> {
+    map.files
+        .iter()
+        .find(|file| file.path == file_path)
+        .and_then(|file| file.area_id.as_deref())
+        .and_then(|area_id| map.areas.iter().find(|area| area.id == area_id))
+        .map(|area| area.name.clone())
+}
+
+fn area_anchors(map: &RepositoryMap, queries: &[String], wants_area: bool, limit: usize) -> Vec<Anchor> {
+    let mut anchors = Vec::new();
+    for area in &map.areas {
+        let area_lower = area.name.to_ascii_lowercase();
+        let matching_queries = queries
+            .iter()
+            .filter(|query| area_lower.contains(query.as_str()))
+            .count() as i32;
+        let mut score = matching_queries * 8;
+        if wants_area && matching_queries > 0 {
+            score += 4;
+        }
+        // Prefer exact name matches over substring-in-path matches.
+        // e.g. area "packages" exactly matching query "packages" should beat
+        // area "backend/controls" matching query "controls" via substring.
+        let leaf_name = area_lower.rsplit('/').next().unwrap_or(&area_lower);
+        if queries.iter().any(|query| leaf_name == query.as_str()) {
+            score += 10;
+        }
+        if score == 0 {
+            continue;
+        }
+        anchors.push((score, Anchor::new(AnchorKind::Folder, &area.name, None::<String>, "area match")));
+    }
+    anchors.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.id.cmp(&right.1.id)));
+    anchors.truncate(limit);
+    anchors.into_iter().map(|(_, anchor)| anchor).collect()
+}
+
+fn code_file_anchors(map: &RepositoryMap, query: &str, limit: usize) -> Vec<Anchor> {
+    let lowered_query = query.to_ascii_lowercase();
+    let mut anchors = map
+        .files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Source | FileRole::Test))
+        .filter_map(|file| {
+            let lowered_path = file.path.to_ascii_lowercase();
+            let basename = lowered_path.rsplit('/').next().unwrap_or(lowered_path.as_str());
+            let score = if basename == format!("{lowered_query}.py")
+                || basename == format!("{lowered_query}.rs")
+                || basename == format!("{lowered_query}.ts")
+                || basename == format!("{lowered_query}.js")
+                || basename == format!("{lowered_query}.gd")
+            {
+                220
+            } else if basename.starts_with(&lowered_query) {
+                170
+            } else if basename.contains(&lowered_query) {
+                140
+            } else if lowered_path.contains(&lowered_query) {
+                100
+            } else {
+                return None;
+            };
+            Some((
+                score,
+                Anchor::new(
+                    AnchorKind::File,
+                    &file.path,
+                    Some(&file.path),
+                    format!("code file path match ({query})"),
+                ),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    anchors.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.id.cmp(&right.1.id)));
+    anchors.truncate(limit);
+    anchors.into_iter().map(|(_, anchor)| anchor).collect()
 }
 
 fn explain_repo_doc_anchors(map: &RepositoryMap, limit: usize) -> Vec<Anchor> {
@@ -172,9 +610,50 @@ fn explain_repo_config_anchors(map: &RepositoryMap, limit: usize) -> Vec<Anchor>
 mod tests {
     use std::fs;
 
+    use crate::context_pack::AnchorKind;
+
     use super::resolve_anchors;
     use crate::map::RepositoryMap;
     use crate::task::TaskInput;
+
+    #[test]
+    fn fix_task_extracts_file_reference_from_task_text() {
+        let root = std::env::temp_dir().join("aethyme_engine_anchor_fileref_test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("packages/auth/src/__tests__")).expect("create test dir");
+        fs::create_dir_all(root.join("packages/auth/src")).expect("create src dir");
+        fs::write(
+            root.join("packages/auth/src/__tests__/ability-implications.test.ts"),
+            "import { describe } from 'vitest'\ndescribe('test', () => {})\n",
+        )
+        .expect("write test file");
+        fs::write(
+            root.join("packages/auth/src/rbac-canonical.ts"),
+            "export const PERMISSION_IMPLICATIONS = {}\n",
+        )
+        .expect("write source file");
+
+        let map = RepositoryMap::build(&root).expect("build repository map");
+        let task = TaskInput::from_task_text(
+            "Fix failing test: manage permission does not imply share in ability-implications.test.ts",
+        );
+        let anchors = resolve_anchors(&map, &task, 5);
+
+        // Should find the referenced test file
+        assert!(
+            anchors.iter().any(|a| a.id.contains("ability-implications.test.ts")),
+            "expected anchor for ability-implications.test.ts, got: {:?}",
+            anchors.iter().map(|a| &a.id).collect::<Vec<_>>()
+        );
+        // Should anchor on the parent area (packages in this minimal repo)
+        assert!(
+            anchors.iter().any(|a| a.kind == AnchorKind::Folder),
+            "expected at least one area anchor, got: {:?}",
+            anchors.iter().map(|a| (&a.kind, &a.id)).collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn change_symbol_task_extracts_useful_symbol_token() {
@@ -211,6 +690,29 @@ mod tests {
         assert!(anchors.iter().any(|anchor| anchor.id == "documentation"));
         assert!(anchors.iter().any(|anchor| anchor.id == "GameEngine"));
         assert!(anchors.iter().any(|anchor| anchor.id.ends_with("technical-architecture.md")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn manifest_navigation_task_prefers_config_and_area_anchors() {
+        let root = std::env::temp_dir().join("aethyme_engine_anchor_manifest_test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("GameEngine/src")).expect("create engine dir");
+        fs::create_dir_all(root.join("Other")).expect("create other dir");
+        fs::write(root.join("GameEngine/src/main.rs"), "fn main() {}\n").expect("write entrypoint");
+        fs::write(root.join("GameEngine/Cargo.toml"), "[package]\nname='demo'\n").expect("write manifest");
+        fs::write(root.join("Other/project.godot"), "[application]\n").expect("write off-area config");
+
+        let map = RepositoryMap::build(&root).expect("build repository map");
+        let task = TaskInput::from_task_text("Find the manifest that manages the main code entrypoint in the GameEngine area");
+        let anchors = resolve_anchors(&map, &task, 5);
+
+        assert_eq!(task.kind, crate::task::TaskKind::NavigateConfigOwnership);
+        assert!(anchors.iter().any(|anchor| anchor.id.ends_with("Cargo.toml")));
+        assert!(anchors.iter().any(|anchor| anchor.id == "GameEngine"));
+        assert!(!anchors.iter().any(|anchor| anchor.id.contains("Other/project.godot")));
+        assert_eq!(anchors.iter().filter(|anchor| anchor.kind == AnchorKind::File).count(), 1);
 
         let _ = fs::remove_dir_all(&root);
     }
