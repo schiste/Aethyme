@@ -28,6 +28,25 @@ def render_pack_summary(pack: dict[str, Any]) -> str:
 
 def render_prompt_pack(pack: dict[str, Any]) -> str:
     """Render a compact prompt-oriented view of a task-context pack."""
+    task = pack.get("task", {})
+    if task.get("kind") == "explain_repo":
+        overview = pack.get("overview", {})
+        items: list[str] = []
+        items.extend(overview.get("overview_docs", [])[:2])
+        items.extend(overview.get("code_areas", [])[:2])
+        items.extend(overview.get("reference_areas", [])[:1])
+        items.extend(overview.get("subareas", [])[:1])
+        items.extend(overview.get("key_configs", [])[:1])
+        items.extend(overview.get("entrypoints", [])[:1])
+        items = [item for index, item in enumerate(items) if item and item not in items[:index]]
+        navigation = pack.get("navigation_order", [])
+        lines = []
+        if items:
+            lines.append("Overview: " + " | ".join(items[:5]))
+        if navigation:
+            lines.append("Order: " + " -> ".join(navigation[:4]))
+        return "\n".join(lines)
+
     lines: list[str] = []
 
     anchors = pack.get("anchors", [])
@@ -87,5 +106,90 @@ def render_prompt_pack(pack: dict[str, Any]) -> str:
     navigation = pack.get("navigation_order", [])
     if navigation:
         lines.append("Order: " + " -> ".join(navigation[:4]))
+
+    return "\n".join(lines)
+
+
+def render_explain_repo_text(inspect: dict[str, Any], pack: dict[str, Any]) -> str:
+    """Render a deterministic repo explanation from inspect + pack data."""
+    snapshot = inspect.get("snapshot", {})
+    overview = pack.get("overview", {})
+    languages = ", ".join(snapshot.get("languages", [])) or "unknown"
+    top_level_dirs = ", ".join(snapshot.get("top_level_dirs", []))
+    files_count = inspect.get("files_count", len(inspect.get("files", [])))
+    functions_count = inspect.get("functions_count", len(inspect.get("functions", [])))
+    classes_count = inspect.get("classes_count", len(inspect.get("classes", [])))
+    docs_count = inspect.get("docs_count", len(inspect.get("docs", [])))
+    configs_count = inspect.get("configs_count", len(inspect.get("configs", [])))
+    lines = [
+        f"Task: {pack.get('task', {}).get('raw', 'Explain this repo')}",
+        f"Languages: {languages}",
+        f"Top-level directories: {top_level_dirs}",
+        f"Files indexed: {files_count}",
+        f"Functions indexed: {functions_count}",
+        f"Classes indexed: {classes_count}",
+        f"Docs indexed: {docs_count}",
+        f"Configs indexed: {configs_count}",
+    ]
+
+    overview_docs = overview.get("overview_docs", [])
+    if overview_docs:
+        lines.append(f"README: {overview_docs[0]}")
+
+    code_areas = overview.get("code_areas", [])
+    if code_areas:
+        lines.append("")
+        lines.append("Code areas:")
+        for area in code_areas[:3]:
+            lines.append(f"- {area}")
+
+    reference_areas = overview.get("reference_areas", [])
+    if reference_areas:
+        lines.append("")
+        lines.append("Reference areas:")
+        for area in reference_areas[:3]:
+            lines.append(f"- {area}")
+
+    subareas = overview.get("subareas", [])
+    if subareas:
+        lines.append("")
+        lines.append("Key subareas:")
+        for area in subareas[:4]:
+            lines.append(f"- {area}")
+
+    key_configs = overview.get("key_configs", [])
+    if key_configs:
+        lines.append("")
+        lines.append("Key configs:")
+        for config in key_configs[:3]:
+            lines.append(f"- {config}")
+
+    entrypoints = overview.get("entrypoints", [])
+    if entrypoints:
+        lines.append("")
+        lines.append("Entrypoints:")
+        for entrypoint in entrypoints[:3]:
+            lines.append(f"- {entrypoint}")
+
+    representative_code_files = overview.get("representative_code_files", [])
+    if representative_code_files:
+        lines.append("")
+        lines.append("Representative code:")
+        for path in representative_code_files[:3]:
+            lines.append(f"- {path}")
+
+    representative_docs = overview.get("representative_docs", [])
+    if representative_docs:
+        lines.append("")
+        lines.append("Representative docs:")
+        for path in representative_docs[:3]:
+            lines.append(f"- {path}")
+
+    navigation = pack.get("navigation_order", [])
+    if navigation:
+        lines.append("")
+        lines.append("Navigation order:")
+        for item in navigation[:5]:
+            lines.append(f"- {item}")
 
     return "\n".join(lines)
