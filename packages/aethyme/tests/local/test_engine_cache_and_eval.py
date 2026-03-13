@@ -61,7 +61,7 @@ def test_engine_inspect_uses_snapshot_cache(monkeypatch, tmp_path: Path) -> None
     assert len(calls) == 1
 
 
-def test_explain_repo_evaluation_runs_command_runners(monkeypatch, tmp_path: Path) -> None:
+def test_explain_repo_generates_artifacts_and_invokes_backends(monkeypatch, tmp_path: Path) -> None:
     repo_path = tmp_path / "repo"
     build_demo_repo(repo_path)
     runner_script = tmp_path / "runner.py"

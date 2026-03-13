@@ -15,8 +15,27 @@ from .runner import EvaluationRunResult
 
 REPORTS_ROOT = Path(__file__).resolve().parents[2] / "docs" / "reports" / "evals"
 EVAL_RUNS_ROOT = Path(__file__).resolve().parents[2] / "eval-runs"
+RUNS_LEDGER = EVAL_RUNS_ROOT / "runs.jsonl"
 
-CONDITION_ORDER = ("control", "explore", "leverage")
+CONDITION_ORDER = ("control-cto-off", "control-cto-on", "explore", "leverage")
+# Legacy 3-condition order for backward compat with old result dicts.
+_LEGACY_CONDITION_ORDER = ("control", "explore", "leverage")
+
+
+# All known condition names in canonical display order.
+_ALL_KNOWN_CONDITIONS = (
+    "control-cto-off", "control-cto-on", "control", "explore", "leverage",
+)
+
+
+def _active_conditions(result: dict[str, Any]) -> tuple[str, ...]:
+    """Return condition names present in *result*, in canonical order.
+
+    Handles both the 4-condition design (control-cto-off, control-cto-on,
+    explore, leverage) and the legacy 3-condition design (control, explore,
+    leverage).
+    """
+    return tuple(c for c in _ALL_KNOWN_CONDITIONS if result.get(c))
 
 
 @dataclass(frozen=True)
@@ -119,23 +138,39 @@ def _get_aethyme_commit() -> str:
         return "unknown"
 
 
-def create_eval_run_dir(repo_path: Path, eval_type: str) -> Path:
-    """Create and return a timestamped eval run directory under eval-runs/."""
+def create_eval_run_dir(
+    repo_path: Path,
+    eval_type: str,
+    conditions: tuple[str, ...] | None = None,
+    *,
+    model: dict[str, str] | None = None,
+) -> Path:
+    """Create and return a timestamped eval run directory under eval-runs/.
+
+    *conditions* overrides which condition subdirectories to create.
+    Defaults to ``CONDITION_ORDER`` (4-condition design).
+
+    *model* is an optional dict with keys like ``name``, ``provider``,
+    ``reasoning``, ``backend`` — stored in metadata for reproducibility.
+    """
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     slug = _slugify(repo_path.name or "repo")
     run_dir = EVAL_RUNS_ROOT / f"{timestamp}-{slug}-{eval_type}"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "artifacts").mkdir(exist_ok=True)
-    for cond in CONDITION_ORDER:
+    for cond in (conditions or CONDITION_ORDER):
         (run_dir / "conditions" / cond).mkdir(parents=True, exist_ok=True)
         (run_dir / "chau7" / cond).mkdir(parents=True, exist_ok=True)
 
-    metadata = {
+    metadata: dict[str, Any] = {
         "timestamp": datetime.now(UTC).isoformat(),
         "aethyme_commit": _get_aethyme_commit(),
         "repo_path": str(repo_path),
         "eval_type": eval_type,
+        "conditions": list(conditions or CONDITION_ORDER),
     }
+    if model:
+        metadata["model"] = model
     (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return run_dir
 
@@ -143,9 +178,11 @@ def create_eval_run_dir(repo_path: Path, eval_type: str) -> Path:
 def write_eval_run_artifacts(run_dir: Path, result: dict[str, Any]) -> None:
     """Write all eval artifacts into the run directory structure."""
     artifacts = run_dir / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    active = _active_conditions(result)
 
     # Per-condition prompts
-    for cond in CONDITION_ORDER:
+    for cond in active:
         side = result.get(cond, {})
         if side and side.get("prompt"):
             (artifacts / f"{cond}-prompt.txt").write_text(side["prompt"], encoding="utf-8")
@@ -157,25 +194,277 @@ def write_eval_run_artifacts(run_dir: Path, result: dict[str, Any]) -> None:
         ("reference-output.json", "reference_output"),
         ("navigation-context.json", "navigation_context"),
         ("pack.json", "pack"),
+        ("task-spec.json", "task_spec"),
+        ("challenge.json", "challenge"),
+        ("signals.json", "signals"),
     ]:
         value = result.get(key)
         if value is not None:
             (artifacts / name).write_text(json.dumps(value, indent=2), encoding="utf-8")
 
-    # Per-condition results and assessments
-    for cond in CONDITION_ORDER:
+    # Per-condition results, assessments, and full run data
+    for cond in active:
         side = result.get(cond, {})
         if not side:
             continue
         cond_dir = run_dir / "conditions" / cond
+        cond_dir.mkdir(parents=True, exist_ok=True)
+
         run_data = side.get("run")
         if run_data and isinstance(run_data, dict):
+            # Structured output
             structured = run_data.get("structured_output")
             if structured is not None:
                 (cond_dir / "result.json").write_text(json.dumps(structured, indent=2), encoding="utf-8")
+            # Full run record (includes stdout, stderr, tokens, etc.)
+            (cond_dir / "run-record.json").write_text(json.dumps(run_data, indent=2, default=str), encoding="utf-8")
+            # Raw stdout/stderr as separate files for easy inspection
+            stdout = run_data.get("stdout", "")
+            if stdout:
+                (cond_dir / "raw-stdout.txt").write_text(stdout, encoding="utf-8")
+            stderr = run_data.get("stderr", "")
+            if stderr:
+                (cond_dir / "raw-stderr.txt").write_text(stderr, encoding="utf-8")
+
         assessment = side.get("assessment")
         if assessment is not None:
             (cond_dir / "assessment.json").write_text(json.dumps(assessment, indent=2), encoding="utf-8")
+
+
+def store_condition_raw(
+    run_dir: Path,
+    condition: str,
+    *,
+    stdout: str = "",
+    stderr: str = "",
+    structured_output: dict[str, Any] | None = None,
+    tokens: dict[str, int] | None = None,
+    duration_seconds: float | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
+    exit_code: int | None = None,
+    command: str | None = None,
+) -> Path:
+    """Store a condition's raw output immediately after it completes.
+
+    Call this as soon as you have the result — before scoring.  This ensures
+    raw data is preserved even if scoring or reporting fails later.
+    """
+    cond_dir = run_dir / "conditions" / condition
+    cond_dir.mkdir(parents=True, exist_ok=True)
+
+    if stdout:
+        (cond_dir / "raw-stdout.txt").write_text(stdout, encoding="utf-8")
+    if stderr:
+        (cond_dir / "raw-stderr.txt").write_text(stderr, encoding="utf-8")
+    if structured_output is not None:
+        (cond_dir / "result.json").write_text(
+            json.dumps(structured_output, indent=2), encoding="utf-8"
+        )
+    if tool_calls is not None:
+        (cond_dir / "tool-calls.json").write_text(
+            json.dumps(tool_calls, indent=2), encoding="utf-8"
+        )
+
+    meta: dict[str, Any] = {"stored_at": datetime.now(UTC).isoformat()}
+    if tokens:
+        meta["tokens"] = tokens
+    if duration_seconds is not None:
+        meta["duration_seconds"] = duration_seconds
+    if exit_code is not None:
+        meta["exit_code"] = exit_code
+    if command:
+        meta["command"] = command
+    (cond_dir / "run-metadata.json").write_text(
+        json.dumps(meta, indent=2), encoding="utf-8"
+    )
+    return cond_dir
+
+
+def store_condition_chau7(
+    run_dir: Path,
+    condition: str,
+    *,
+    run_id: str | None = None,
+    session_id: str | None = None,
+    transcript: list[dict[str, Any]] | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
+    tab_output: str | None = None,
+) -> Path:
+    """Store Chau7 telemetry for a condition.
+
+    Call this after pulling transcript and tool_calls from Chau7 MCP
+    (``run_transcript`` and ``run_tool_calls``).  This is mandatory for
+    every condition in every eval run — not an optional step.
+    """
+    chau7_dir = run_dir / "chau7" / condition
+    chau7_dir.mkdir(parents=True, exist_ok=True)
+
+    meta: dict[str, Any] = {"stored_at": datetime.now(UTC).isoformat()}
+    if run_id:
+        meta["run_id"] = run_id
+        (chau7_dir / "run-id.txt").write_text(run_id, encoding="utf-8")
+    if session_id:
+        meta["session_id"] = session_id
+        (chau7_dir / "session-id.txt").write_text(session_id, encoding="utf-8")
+    if transcript is not None:
+        meta["transcript_turns"] = len(transcript)
+        (chau7_dir / "transcript.json").write_text(
+            json.dumps(transcript, indent=2, default=str), encoding="utf-8"
+        )
+    if tool_calls is not None:
+        meta["tool_call_count"] = len(tool_calls)
+        (chau7_dir / "tool-calls.json").write_text(
+            json.dumps(tool_calls, indent=2, default=str), encoding="utf-8"
+        )
+    if tab_output:
+        (chau7_dir / "tab-output.txt").write_text(tab_output, encoding="utf-8")
+
+    (chau7_dir / "metadata.json").write_text(
+        json.dumps(meta, indent=2), encoding="utf-8"
+    )
+    return chau7_dir
+
+
+def _extract_ledger_record(
+    result: dict[str, Any],
+    *,
+    repo_path: Path | None = None,
+    run_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Extract a compact scorecard record from a full result dict.
+
+    One record per eval run — just the data you'd query across runs.
+    Everything else lives in the full ``complete-result.json``.
+    """
+    active = _active_conditions(result)
+    rp = repo_path or Path(result.get("report", {}).get("repo_path", "."))
+
+    record: dict[str, Any] = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "task": result.get("task", "unknown"),
+        "eval_type": result.get("eval_type", "unknown"),
+        "repo": rp.name,
+        "aethyme_commit": _get_aethyme_commit()[:8],
+    }
+
+    scenario = result.get("scenario")
+    if scenario:
+        record["scenario"] = scenario
+
+    model = result.get("model")
+    if model:
+        record["model"] = {
+            k: model[k]
+            for k in ("name", "provider", "backend", "reasoning")
+            if k in model
+        }
+
+    if run_dir:
+        record["run_dir"] = run_dir.name
+
+    conds: dict[str, dict[str, Any]] = {}
+    for cond in active:
+        side = result.get(cond, {})
+        if not isinstance(side, dict):
+            continue
+        assessment = side.get("assessment") or {}
+        run = side.get("run") or {}
+        if not isinstance(assessment, dict):
+            assessment = {}
+        if not isinstance(run, dict):
+            run = {}
+
+        entry: dict[str, Any] = {}
+        ws = assessment.get("weighted_score")
+        if ws is not None:
+            entry["score"] = ws
+        c = run.get("cost_usd")
+        if c is not None and c > 0:
+            entry["cost_usd"] = round(c, 4)
+        dur = run.get("duration_seconds")
+        if dur is not None and dur > 0:
+            entry["duration_s"] = round(dur, 1)
+        t = run.get("num_turns")
+        if t:
+            entry["turns"] = t
+        total = _total_tokens(run)
+        if total is not None:
+            entry["total_tokens"] = total
+        for tok_key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_create_tokens"):
+            v = run.get(tok_key)
+            if v:
+                entry[tok_key] = v
+
+        if entry:
+            conds[cond] = entry
+
+    record["conditions"] = conds
+    return record
+
+
+def append_to_ledger(
+    result: dict[str, Any],
+    *,
+    repo_path: Path | None = None,
+    run_dir: Path | None = None,
+) -> Path:
+    """Append a compact scorecard record to the JSONL ledger.
+
+    Returns the ledger path.  Safe to call multiple times — each call
+    appends exactly one line.
+    """
+    record = _extract_ledger_record(result, repo_path=repo_path, run_dir=run_dir)
+    RUNS_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    with open(RUNS_LEDGER, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, separators=(",", ":")) + "\n")
+    return RUNS_LEDGER
+
+
+def finalize_eval_run(
+    run_dir: Path,
+    result: dict[str, Any],
+    *,
+    repo_path: Path | None = None,
+    eval_type: str = "unknown",
+) -> Path:
+    """Write the complete result dump and final report for an eval run.
+
+    Call this after all conditions have been collected, scored, and
+    (optionally) enriched with Chau7 telemetry.  Writes:
+
+    1. ``complete-result.json`` — the entire result dict (the single
+       source of truth; every field that was available at eval time).
+    2. ``report.md`` — the final human-readable markdown report.
+    3. All per-condition artifacts via ``write_eval_run_artifacts()``.
+    4. One line to ``eval-runs/runs.jsonl`` ledger.
+    """
+    # 1. Complete dump
+    (run_dir / "complete-result.json").write_text(
+        json.dumps(result, indent=2, default=str), encoding="utf-8"
+    )
+
+    # 2. Structured artifacts
+    write_eval_run_artifacts(run_dir, result)
+
+    # 3. Markdown report
+    rp = repo_path or Path(result.get("report", {}).get("repo_path", "."))
+    content = _render_markdown(repo_path=rp, result=result)
+    (run_dir / "report.md").write_text(content, encoding="utf-8")
+
+    # 4. Also write to docs/reports/evals/ for discoverability
+    REPORTS_ROOT.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    slug = _slugify(rp.name or "repo")
+    report_path = REPORTS_ROOT / f"{timestamp}-{slug}-{eval_type}.md"
+    report_path.write_text(content, encoding="utf-8")
+
+    # 5. Append to JSONL ledger
+    append_to_ledger(result, repo_path=rp, run_dir=run_dir)
+
+    # 6. Print scorecard to stdout
+    print_scorecard(result)
+
+    return run_dir
 
 
 def write_explain_repo_markdown_report(
@@ -223,168 +512,344 @@ def write_navigation_ctf_markdown_report(
     return report_path
 
 
-def _render_markdown(*, repo_path: Path, result: dict[str, Any]) -> str:
-    report = result["report"]
-    condition_prompt_chars = report.get("condition_prompt_chars", {})
-    lines = [
-        f"# Eval Report: {result['task']}",
-        "",
-        f"Last Updated: {datetime.now(UTC).date().isoformat()}",
-        "",
-        f"- Repository: `{repo_path}`",
-        f"- Generated: `{datetime.now(UTC).isoformat()}`",
-        "",
-        "## Summary",
-        "",
-    ]
+def write_bug_fix_markdown_report(
+    *,
+    repo_path: Path,
+    result: dict[str, Any],
+    run_dir: Path | None = None,
+) -> Path:
+    content = _render_markdown(repo_path=repo_path, result=result)
 
-    # Prompt chars table
-    for cond in CONDITION_ORDER:
-        if cond in condition_prompt_chars:
-            lines.append(f"- {cond.title()} prompt chars: `{condition_prompt_chars[cond]}`")
-    lines.append(f"- Navigation items: `{report['navigation_items']}`")
-    lines.append(f"- Risk items: `{report['risk_items']}`")
-    lines.append("")
+    REPORTS_ROOT.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    slug = _slugify(repo_path.name or "repo")
+    report_path = REPORTS_ROOT / f"{timestamp}-{slug}-bug-fix.md"
+    report_path.write_text(content, encoding="utf-8")
 
-    if result.get("signals") is not None:
-        lines.extend(
-            [
-                "## Repo Signals",
-                "",
-                "```json",
-                json.dumps(result["signals"], indent=2),
-                "```",
-                "",
-            ]
-        )
+    if run_dir is not None:
+        write_eval_run_artifacts(run_dir, result)
+        (run_dir / "report.md").write_text(content, encoding="utf-8")
 
-    # Render each condition section
-    for cond in CONDITION_ORDER:
+    return report_path
+
+
+def print_scorecard(result: dict[str, Any], *, file: Any = None) -> None:
+    """Print the scorecard table to stdout (or *file*).
+
+    Call this after ``assemble_bug_fix_result()`` to display results in the
+    chat / terminal.  Output is a fixed-width table that renders well in
+    both terminal and markdown contexts.
+    """
+    import sys
+
+    out = file or sys.stdout
+    active = _active_conditions(result)
+
+    # Header
+    hdr = (
+        f"{'Condition':<22s} {'Score':>6s} {'Cost':>8s} "
+        f"{'Duration':>9s} {'Turns':>5s} "
+        f"{'Total Tok':>10s} "
+        f"{'In Tok':>8s} {'Out Tok':>8s} "
+        f"{'Cache Rd':>10s} {'Cache Wr':>10s}"
+    )
+    sep = "-" * len(hdr)
+    print(sep, file=out)
+    print(hdr, file=out)
+    print(sep, file=out)
+
+    for cond in active:
         side = result.get(cond, {})
-        if not side:
+        if not isinstance(side, dict):
             continue
-        prompt = side.get("prompt", result.get(f"{cond}_prompt", result.get("baseline_prompt" if cond == "control" else "", "")))
-        run = side.get("run", result.get(f"{cond}_run", result.get("baseline_run" if cond == "control" else None)))
-        assessment = side.get("assessment", result.get(f"{cond}_assessment"))
-        lines.extend(
-            [
-                f"## {cond.title()}",
-                "",
-            ]
-        )
-        lines.extend(_run_section(cond.title(), prompt, run, assessment))
-        lines.append("")
+        assessment = side.get("assessment") or {}
+        run = side.get("run") or {}
+        if not isinstance(assessment, dict):
+            assessment = {}
+        if not isinstance(run, dict):
+            run = {}
 
-    # Diagnostic sections
-    lines.extend(_tool_call_analysis_section(result))
-    lines.extend(_context_pack_audit_section(result))
+        ws = assessment.get("weighted_score")
+        score = f"{ws:.2f}" if ws is not None else "-"
 
-    # Comparison table
-    lines.extend(
-        [
-            "## Comparison",
-            "",
-            "| Metric | " + " | ".join(c.title() for c in CONDITION_ORDER if c in condition_prompt_chars) + " |",
-            "| --- | " + " | ".join("---" for c in CONDITION_ORDER if c in condition_prompt_chars) + " |",
-            "| Prompt chars | " + " | ".join(f"`{condition_prompt_chars.get(c, '-')}`" for c in CONDITION_ORDER if c in condition_prompt_chars) + " |",
-        ]
-    )
+        c = run.get("cost_usd")
+        cost = f"${c:.3f}" if c is not None and c > 0 else "-"
 
-    # Add run metrics row if any runs exist
-    condition_runs = report.get("condition_runs", {})
-    active_conditions = [c for c in CONDITION_ORDER if c in condition_prompt_chars]
-    durations = []
-    for c in active_conditions:
-        run = condition_runs.get(c)
-        if run and isinstance(run, dict):
-            durations.append(f"`{run['duration_seconds']:.3f}s`")
-        else:
-            durations.append("`-`")
-    if any(d != "`-`" for d in durations):
-        lines.append("| Wall time | " + " | ".join(durations) + " |")
+        dur = run.get("duration_seconds")
+        duration = f"{dur:.1f}s" if dur is not None and dur > 0 else "-"
 
-    lines.extend(
-        [
-            "",
-            f"- Navigation items surfaced: `{report['navigation_items']}`",
-            f"- Risk items surfaced: `{report['risk_items']}`",
-        ]
-    )
+        t = run.get("num_turns")
+        turns = str(t) if t is not None and t > 0 else "-"
 
-    lines.extend(
-        [
-            "",
-            "## Reference",
-            "",
-            "### Output Schema",
-            "",
-            "```json",
-            json.dumps(result.get("output_schema"), indent=2),
-            "```",
-            "",
-            "### Scoring Rubric",
-            "",
-            "```json",
-            json.dumps(result.get("scoring_rubric"), indent=2),
-            "```",
-            "",
-            "### Reference Output",
-            "",
-            "```json",
-            json.dumps(result.get("reference_output"), indent=2),
-            "```",
-        ]
-    )
+        total = _total_tokens(run)
+        total_tok = f"{total:,}" if total is not None else "-"
 
-    if result.get("challenge") is not None:
-        lines.extend(
-            [
-                "",
-                "### Challenge",
-                "",
-                "```json",
-                json.dumps(result.get("challenge"), indent=2),
-                "```",
-            ]
+        inp = run.get("input_tokens")
+        input_tok = f"{inp:,}" if inp is not None else "-"
+
+        outp = run.get("output_tokens")
+        output_tok = f"{outp:,}" if outp is not None else "-"
+
+        cr = run.get("cache_read_tokens")
+        cache_read = f"{cr:,}" if cr is not None else "-"
+
+        cc = run.get("cache_create_tokens")
+        cache_create = f"{cc:,}" if cc is not None else "-"
+
+        print(
+            f"{_cond_label(cond):<22s} {score:>6s} {cost:>8s} "
+            f"{duration:>9s} {turns:>5s} "
+            f"{total_tok:>10s} "
+            f"{input_tok:>8s} {output_tok:>8s} "
+            f"{cache_read:>10s} {cache_create:>10s}",
+            file=out,
         )
 
-    if result.get("pack") is not None:
-        lines.extend(
-            [
-                "",
-                "## Aethyme Pack",
-                "",
-                "```json",
-                json.dumps(result.get("pack"), indent=2),
-                "```",
-            ]
-        )
+    print(sep, file=out)
 
-    if result.get("explanation"):
-        lines.extend(
-            [
-                "",
-                "## Explanation",
-                "",
-                "```text",
-                result["explanation"],
-                "```",
-            ]
-        )
 
-    lines.extend(_manual_sections())
+def _total_tokens(run: dict[str, Any]) -> int | None:
+    """Sum all token types for a run (input + output + cache_read + cache_create).
 
+    Returns None if no token data is available at all.
+    """
+    keys = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_create_tokens")
+    vals = [run.get(k) for k in keys]
+    if all(v is None for v in vals):
+        return None
+    return sum(v or 0 for v in vals)
+
+
+def _cond_label(cond: str) -> str:
+    """Human-readable label for a condition name."""
+    labels = {
+        "control-cto-off": "Control (CTO off)",
+        "control-cto-on": "Control (CTO on)",
+        "control": "Control",
+        "explore": "Explore",
+        "leverage": "Leverage",
+    }
+    return labels.get(cond, cond.title())
+
+
+def _render_markdown(*, repo_path: Path, result: dict[str, Any]) -> str:
+    """Render the definitive eval report markdown.
+
+    Section order is fixed and non-negotiable:
+    Meta -> Model -> Scorecard -> Score Breakdown -> Prompts ->
+    Agent Output -> Tool Call Analysis -> Verdict -> Notes -> Raw Data
+    """
+    lines: list[str] = []
+    _section_meta(lines, repo_path, result)
+    _section_model(lines, result)
+    _section_scorecard(lines, result)
+    _section_score_breakdown(lines, result)
+    _section_prompts(lines, result)
+    _section_agent_output(lines, result)
+    _section_tool_calls(lines, result)
+    _section_verdict(lines, result)
+    _section_notes(lines, result)
+    _section_raw_data(lines, result)
     return "\n".join(lines) + "\n"
 
 
-def _tool_call_analysis_section(result: dict[str, Any]) -> list[str]:
-    """Per-condition tool call frequency tables. Skipped if no condition has tool data."""
+# ---------------------------------------------------------------------------
+# Section renderers — each appends to *lines* in place.
+# ---------------------------------------------------------------------------
+
+
+def _section_meta(
+    lines: list[str], repo_path: Path, result: dict[str, Any],
+) -> None:
+    active = _active_conditions(result)
+    lines.extend([
+        f"# Eval Report: {result.get('task', 'unknown')}",
+        "",
+        "## Meta",
+        "",
+        f"- Date: {datetime.now(UTC).date().isoformat()}",
+        f"- Repository: `{repo_path}`",
+        f"- Eval Type: {result.get('eval_type', 'unknown')}",
+    ])
+    scenario = result.get("scenario", "")
+    if scenario:
+        lines.append(f"- Scenario: {scenario}")
+    lines.extend([
+        f"- Conditions: {', '.join(active)}",
+        f"- Aethyme Commit: `{_get_aethyme_commit()}`",
+        "",
+    ])
+
+
+def _section_model(lines: list[str], result: dict[str, Any]) -> None:
+    model = result.get("model", {})
+    lines.extend(["## Model", ""])
+    if not model:
+        lines.extend(["N/A", ""])
+        return
+    lines.extend([
+        f"- Name: {model.get('name', 'N/A')}",
+        f"- Provider: {model.get('provider', 'N/A')}",
+        f"- Backend: {model.get('backend', 'N/A')}",
+        f"- Reasoning: {model.get('reasoning', 'N/A')}",
+        f"- Permission Mode: {model.get('permission_mode', 'N/A')}",
+        "",
+    ])
+
+
+def _section_scorecard(lines: list[str], result: dict[str, Any]) -> None:
+    """Scorecard with Score, Cost, Duration, Turns, and all token types."""
+    active = _active_conditions(result)
+    lines.extend([
+        "## Scorecard",
+        "",
+        "| Condition | Score | Cost | Duration | Turns "
+        "| Total Tokens | Input Tokens | Output Tokens | Cache Read | Cache Create |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ])
+    for cond in active:
+        side = result.get(cond, {})
+        if not isinstance(side, dict):
+            side = {}
+        assessment = side.get("assessment") or {}
+        run = side.get("run") or {}
+        if not isinstance(assessment, dict):
+            assessment = {}
+        if not isinstance(run, dict):
+            run = {}
+
+        ws = assessment.get("weighted_score")
+        score = f"{ws}" if ws is not None else "-"
+
+        c = run.get("cost_usd")
+        cost = f"${c:.3f}" if c is not None and c > 0 else "-"
+
+        dur = run.get("duration_seconds")
+        duration = f"{dur:.1f}s" if dur is not None and dur > 0 else "-"
+
+        t = run.get("num_turns")
+        turns = str(t) if t is not None and t > 0 else "-"
+
+        total = _total_tokens(run)
+        total_tok = f"{total:,}" if total is not None else "-"
+
+        inp = run.get("input_tokens")
+        input_tok = f"{inp:,}" if inp is not None else "-"
+
+        out = run.get("output_tokens")
+        output_tok = f"{out:,}" if out is not None else "-"
+
+        cr = run.get("cache_read_tokens")
+        cache_read = f"{cr:,}" if cr is not None else "-"
+
+        cc = run.get("cache_create_tokens")
+        cache_create = f"{cc:,}" if cc is not None else "-"
+
+        lines.append(
+            f"| {_cond_label(cond)} | {score} | {cost} | {duration} | {turns} "
+            f"| {total_tok} | {input_tok} | {output_tok} | {cache_read} | {cache_create} |"
+        )
+    lines.append("")
+
+
+def _section_score_breakdown(lines: list[str], result: dict[str, Any]) -> None:
+    """Per-component score breakdown (only rendered when scores exist)."""
+    active = _active_conditions(result)
+
+    # Find component names/weights from first condition that has them.
+    # The assessment uses "scores" (raw 0-1 values) and "weights" (integers
+    # like 60 meaning 60%).
+    components: list[tuple[str, float]] = []
+    for cond in active:
+        side = result.get(cond, {})
+        if not isinstance(side, dict):
+            continue
+        assessment = side.get("assessment") or {}
+        if not isinstance(assessment, dict):
+            continue
+        cs = assessment.get("scores", {})
+        weights = assessment.get("weights", {})
+        if cs:
+            components = [(name, weights.get(name, 0)) for name in cs]
+            break
+
+    if not components:
+        return
+
+    header = (
+        "| Component | Weight | "
+        + " | ".join(_cond_label(c) for c in active)
+        + " |"
+    )
+    sep = "|---|---| " + " | ".join("---" for _ in active) + " |"
+
+    lines.extend(["## Score Breakdown", "", header, sep])
+
+    for comp_name, weight in components:
+        # Weights are stored as integers (60 = 60%), not fractions.
+        weight_pct = f"{weight:.0f}%" if weight >= 1 else f"{weight * 100:.0f}%"
+        vals: list[str] = []
+        for cond in active:
+            side = result.get(cond, {})
+            if isinstance(side, dict):
+                a = side.get("assessment") or {}
+                cs = a.get("scores", {}) if isinstance(a, dict) else {}
+                v = cs.get(comp_name)
+                vals.append(f"{v:.3f}" if v is not None else "-")
+            else:
+                vals.append("-")
+        label = comp_name.replace("_", " ").title()
+        lines.append(f"| {label} | {weight_pct} | " + " | ".join(vals) + " |")
+    lines.append("")
+
+
+def _section_prompts(lines: list[str], result: dict[str, Any]) -> None:
+    """Verbatim prompt for each condition."""
+    active = _active_conditions(result)
+    lines.extend(["## Prompts", ""])
+    for cond in active:
+        side = result.get(cond, {})
+        prompt = side.get("prompt", "") if isinstance(side, dict) else ""
+        lines.extend([
+            f"### {_cond_label(cond)}",
+            "",
+            "```text",
+            prompt or "N/A",
+            "```",
+            "",
+        ])
+
+
+def _section_agent_output(lines: list[str], result: dict[str, Any]) -> None:
+    """Structured output JSON for each condition."""
+    active = _active_conditions(result)
+    lines.extend(["## Agent Output", ""])
+    for cond in active:
+        side = result.get(cond, {})
+        if isinstance(side, dict):
+            run = side.get("run") or {}
+            structured = run.get("structured_output") if isinstance(run, dict) else None
+        else:
+            structured = None
+        lines.extend([
+            f"### {_cond_label(cond)}",
+            "",
+            "```json",
+            json.dumps(structured, indent=2) if structured is not None else "null",
+            "```",
+            "",
+        ])
+
+
+def _section_tool_calls(lines: list[str], result: dict[str, Any]) -> None:
+    """Per-condition tool call frequency tables (skipped if no data)."""
+    active = _active_conditions(result)
     has_any = False
     section_lines: list[str] = []
 
-    for cond in CONDITION_ORDER:
+    for cond in active:
         side = result.get(cond, {})
-        if not side:
+        if not isinstance(side, dict):
             continue
         run = side.get("run")
         if not run or not isinstance(run, dict):
@@ -395,237 +860,197 @@ def _tool_call_analysis_section(result: dict[str, Any]) -> list[str]:
 
         has_any = True
         freq: Counter[str] = Counter()
-        cli_commands: list[str] = []
         for tc in tool_calls:
-            tool_name = tc.get("tool", "unknown")
-            freq[tool_name] += 1
-            if tool_name in ("shell", "bash", "terminal"):
-                summary = tc.get("input_summary", "")
-                if summary:
-                    cli_commands.append(summary)
+            freq[tc.get("tool", "unknown")] += 1
 
-        section_lines.extend(
-            [
-                f"### {cond.title()}",
-                "",
-                f"Total tool calls: `{len(tool_calls)}`",
-                "",
-                "| Tool | Count |",
-                "| --- | --- |",
-            ]
-        )
+        section_lines.extend([
+            f"### {_cond_label(cond)}",
+            "",
+            f"Total tool calls: {len(tool_calls)}",
+            "",
+            "| Tool | Count |",
+            "|---|---|",
+        ])
         for tool_name, count in freq.most_common():
             section_lines.append(f"| `{tool_name}` | {count} |")
         section_lines.append("")
 
-        if cli_commands:
-            section_lines.append("CLI commands executed:")
-            section_lines.append("")
-            for cmd in cli_commands:
-                section_lines.append(f"- `{cmd}`")
-            section_lines.append("")
-
     if not has_any:
-        return []
+        return
 
-    return ["", "## Tool Call Analysis", ""] + section_lines
+    lines.extend(["## Tool Call Analysis", ""] + section_lines)
 
 
-def _context_pack_audit_section(result: dict[str, Any]) -> list[str]:
-    """Context pack summary stats and navigation context dump."""
-    pack = result.get("pack")
-    nav_context = result.get("navigation_context")
-    if pack is None and nav_context is None:
-        return []
+def _section_verdict(lines: list[str], result: dict[str, Any]) -> None:
+    """Auto-generated one-paragraph summary comparing conditions."""
+    active = _active_conditions(result)
+    scores: dict[str, float] = {}
+    costs: dict[str, float] = {}
+    all_passed = True
 
-    lines = ["", "## Context Pack Audit", ""]
+    for cond in active:
+        side = result.get(cond, {})
+        if not isinstance(side, dict):
+            continue
+        assessment = side.get("assessment") or {}
+        run = side.get("run") or {}
+        if isinstance(assessment, dict):
+            ws = assessment.get("weighted_score")
+            if ws is not None:
+                scores[cond] = ws
+            cs = assessment.get("component_scores", {})
+            if cs.get("fix_test", 1.0) < 1.0:
+                all_passed = False
+        if isinstance(run, dict):
+            c = run.get("cost_usd")
+            if c is not None and c > 0:
+                costs[cond] = c
 
-    if pack is not None:
-        nav_order = pack.get("navigation_order", pack.get("scope", {}).get("navigation_order", []))
-        anchors = pack.get("anchors", [])
-        in_scope = pack.get("scope", {}).get("in_scope_files", [])
-        cli_commands = pack.get("commands", nav_context.get("commands", []) if nav_context else [])
-        lines.extend(
-            [
-                "### Pack Summary",
-                "",
-                f"- Anchors: `{len(anchors)}`",
-                f"- Navigation order items: `{len(nav_order)}`",
-                f"- In-scope files: `{len(in_scope)}`",
-                f"- CLI commands: `{len(cli_commands)}`",
-                "",
-            ]
-        )
+    lines.extend(["## Verdict", ""])
 
-    if nav_context is not None:
-        lines.extend(
-            [
-                "### Navigation Context",
-                "",
-                "```json",
-                json.dumps(nav_context, indent=2),
-                "```",
-                "",
-            ]
-        )
+    if not scores:
+        lines.extend(["N/A", ""])
+        return
 
-    lines.extend(
-        [
-            "<!-- Signal-to-Noise Assessment",
-            "Rate the relevance of the navigation context provided to the leverage condition:",
-            "- Anchors: were the starting points useful?",
-            "- Scope: did in-scope files cover what the agent needed?",
-            "- Navigation order: was the reading order helpful?",
-            "- Noise: what was included but not needed?",
-            "-->",
-        ]
+    best = max(scores, key=lambda k: scores[k])
+    worst = min(scores, key=lambda k: scores[k])
+
+    parts: list[str] = []
+    parts.append(
+        f"**{_cond_label(best)}** scored highest ({scores[best]:.2f}/100)"
+        + (f", **{_cond_label(worst)}** lowest ({scores[worst]:.2f}/100)" if best != worst else "")
+        + "."
     )
+    if costs:
+        cheapest = min(costs, key=lambda k: costs[k])
+        priciest = max(costs, key=lambda k: costs[k])
+        if cheapest != priciest:
+            parts.append(
+                f"Most efficient: {_cond_label(cheapest)} (${costs[cheapest]:.3f}), "
+                f"most expensive: {_cond_label(priciest)} (${costs[priciest]:.3f})."
+            )
+    if all_passed and scores:
+        parts.append("All conditions passed tests.")
 
-    return lines
-
-
-def _manual_sections() -> list[str]:
-    """Placeholder sections for manual post-run analysis."""
-    return [
-        "",
-        "## Graph Quality Notes",
-        "",
-        "<!-- Post-run analysis of graph quality:",
-        "- Did the graph capture the right structural relationships?",
-        "- Were important edges missing or spurious?",
-        "- How did graph coverage affect each condition's performance?",
-        "-->",
-        "",
-        "## Prompt Effectiveness",
-        "",
-        "<!-- Post-run analysis of prompt design:",
-        "- Did the control prompt give the agent enough to work with?",
-        "- Did the explore prompt's CLI commands get used effectively?",
-        "- Did the leverage prompt's context file provide the right framing?",
-        "- What prompt changes would improve the next run?",
-        "-->",
-        "",
-        "## Lessons & Action Items",
-        "",
-        "<!-- Post-run action items:",
-        "- [ ] ",
-        "- [ ] ",
-        "- [ ] ",
-        "-->",
-    ]
+    lines.extend([" ".join(parts), ""])
 
 
-def _run_section(
-    label: str,
-    prompt: str,
-    run: dict[str, Any] | None,
-    assessment: dict[str, Any] | None,
-) -> list[str]:
-    lines = [
-        "### Prompt",
+def _section_notes(lines: list[str], result: dict[str, Any]) -> None:
+    """Free-text notes or explanation."""
+    notes = result.get("notes", "")
+    explanation = result.get("explanation", "")
+    lines.extend(["## Notes", ""])
+    if notes:
+        lines.extend([notes, ""])
+    elif explanation:
+        lines.extend([explanation, ""])
+    else:
+        lines.extend(["N/A", ""])
+
+
+def _section_raw_data(lines: list[str], result: dict[str, Any]) -> None:
+    """All JSON dumps collapsed at the bottom."""
+    active = _active_conditions(result)
+    lines.extend(["---", "", "## Raw Data", ""])
+
+    # Reference Output
+    lines.extend([
+        "### Reference Output",
         "",
-        "```text",
-        prompt,
+        "```json",
+        json.dumps(result.get("reference_output"), indent=2),
         "```",
         "",
-    ]
-    if run is None:
-        lines.extend(
-            [
-                "### Run Metrics",
-                "",
-                "- input tokens: `null`",
-                "- output tokens: `null`",
-                "- retries: `null`",
-                "- wall time: `null`",
-                "",
-                "### Final Output Message",
-                "",
-                "```text",
-                f"{label} runner not executed.",
-                "```",
-                "",
-                "### Structured Output",
-                "",
-                "```json",
-                "null",
-                "```",
-            ]
-        )
-        if assessment is not None:
-            lines.extend(
-                [
-                    "",
-                    "### Assessment",
-                    "",
-                    "```json",
-                    json.dumps(assessment, indent=2),
-                    "```",
-                ]
-            )
-        return lines
+    ])
 
-    lines.extend(
-        [
-            "### Run Metrics",
-            "",
-            f"- command: `{run['command']}`",
-            f"- exit code: `{run['exit_code']}`",
-            f"- input tokens: `{run['input_tokens']}`",
-            f"- output tokens: `{run['output_tokens']}`",
-            f"- retries: `{run['retries']}`",
-            f"- review burden: `{run['review_burden']}`",
-            f"- wall time: `{run['duration_seconds']:.3f}s`",
-            "",
-            "### Final Output Message",
-            "",
-            "```text",
-            run.get("final_output_message") or "",
-            "```",
-            "",
-            "### Structured Output",
+    # Output Schema
+    lines.extend([
+        "### Output Schema",
+        "",
+        "```json",
+        json.dumps(result.get("output_schema"), indent=2),
+        "```",
+        "",
+    ])
+
+    # Scoring Rubric
+    lines.extend([
+        "### Scoring Rubric",
+        "",
+        "```json",
+        json.dumps(result.get("scoring_rubric"), indent=2),
+        "```",
+        "",
+    ])
+
+    # Per-Condition Run Records
+    lines.extend(["### Per-Condition Run Records", ""])
+    for cond in active:
+        side = result.get(cond, {})
+        run = side.get("run") if isinstance(side, dict) else None
+        lines.extend([
+            f"#### {_cond_label(cond)}",
             "",
             "```json",
-            json.dumps(run.get("structured_output"), indent=2),
+            json.dumps(run, indent=2, default=str) if run else "null",
             "```",
             "",
-            "### Raw Run Record",
+        ])
+
+    # Per-Condition Assessments
+    lines.extend(["### Per-Condition Assessments", ""])
+    for cond in active:
+        side = result.get(cond, {})
+        assessment = side.get("assessment") if isinstance(side, dict) else None
+        lines.extend([
+            f"#### {_cond_label(cond)}",
             "",
             "```json",
-            json.dumps(run, indent=2),
+            json.dumps(assessment, indent=2) if assessment else "null",
             "```",
-        ]
-    )
+            "",
+        ])
 
-    # Tool calls subsection
-    tool_calls = run.get("tool_calls")
-    if tool_calls and isinstance(tool_calls, list):
-        lines.extend(
-            [
-                "",
-                "### Tool Calls",
-                "",
-                f"Total: `{len(tool_calls)}`",
-                "",
-            ]
-        )
-        for tc in tool_calls:
-            tool_name = tc.get("tool", "unknown")
-            summary = tc.get("input_summary", "")
-            lines.append(f"- `{tool_name}({summary})`")
+    # Optional extras — only if present
+    if result.get("pack") is not None:
+        lines.extend([
+            "### Context Pack",
+            "",
+            "```json",
+            json.dumps(result["pack"], indent=2),
+            "```",
+            "",
+        ])
 
-    if assessment is not None:
-        lines.extend(
-            [
-                "",
-                "### Assessment",
-                "",
-                "```json",
-                json.dumps(assessment, indent=2),
-                "```",
-            ]
-        )
-    return lines
+    if result.get("navigation_context") is not None:
+        lines.extend([
+            "### Navigation Context",
+            "",
+            "```json",
+            json.dumps(result["navigation_context"], indent=2),
+            "```",
+            "",
+        ])
+
+    if result.get("challenge") is not None:
+        lines.extend([
+            "### Challenge",
+            "",
+            "```json",
+            json.dumps(result["challenge"], indent=2),
+            "```",
+            "",
+        ])
+
+    if result.get("signals") is not None:
+        lines.extend([
+            "### Repo Signals",
+            "",
+            "```json",
+            json.dumps(result["signals"], indent=2),
+            "```",
+            "",
+        ])
 
 
 def _slugify(value: str) -> str:
