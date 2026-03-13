@@ -3,6 +3,8 @@ const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
 const { setTimeout: delay } = require("timers/promises");
+const { runTerminalDeck, printDeck } = require("../lib/terminal-deck");
+const { aethymeInvestorDeck } = require("../lib/decks/aethyme-investor-deck");
 
 const args = process.argv.slice(2);
 
@@ -13,13 +15,17 @@ function usage() {
       "",
       "Usage:",
       "  aethyme graph --repo . --output .aethyme/graph.json",
+      "  aethyme deck [--print]",
       "",
-      "Options:",
+      "Graph options:",
       "  --repo <path>        Repository path (default: cwd)",
       "  --output <path>      Output JSON path (default: .aethyme/graph.json)",
       "  --languages <list>   Comma-separated languages (default: python,typescript)",
       "  --repo-name <name>   Repository name (default: folder name)",
       "  --tenant-id <uuid>   Tenant ID (optional)",
+      "",
+      "Deck options:",
+      "  --print              Print all slides without interactive controls",
       "  -h, --help           Show help",
     ].join("\n")
   );
@@ -139,6 +145,16 @@ async function main() {
   }
 
   const command = args[0];
+  if (command === "deck") {
+    if (hasFlag("--print")) {
+      process.stdout.write(printDeck(aethymeInvestorDeck));
+      return;
+    }
+
+    runTerminalDeck(aethymeInvestorDeck);
+    return;
+  }
+
   if (command !== "graph") {
     usage();
     fail(`Unknown command: ${command}`);
