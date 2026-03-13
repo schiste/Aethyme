@@ -12,6 +12,7 @@ It owns:
 4. scorecard analysis
 5. controlled autofix tooling from the CLI
 6. deterministic navigation primitives for AI agents
+7. navigation evaluation benchmarks — see [`docs/guides/eval-protocol.md`](docs/guides/eval-protocol.md)
 
 ## Canonical Model
 
@@ -82,26 +83,43 @@ Core commands:
 - `aethyme repo clear-cache /path/to/repo`
 - `aethyme query symbol /path/to/repo main`
 - `aethyme query deps /path/to/repo src/main.py`
+- `aethyme graph node /path/to/repo src/main.py --json-output`
+- `aethyme graph children /path/to/repo GameEngine --json-output`
+- `aethyme graph callers /path/to/repo fn:REPO:path:main --json-output`
+- `aethyme graph docs /path/to/repo src/main.py --json-output`
 - `aethyme task pack --repo /path/to/repo --task "Explain this repo" --json-output`
 - `aethyme task explain --repo /path/to/repo`
+- `aethyme task anchors --repo /path/to/repo --task "Update validate_token flow" --json-output`
+- `aethyme task scope --repo /path/to/repo --task "Update validate_token flow" --json-output`
+- `aethyme task next --repo /path/to/repo --task "Update validate_token flow" --json-output`
+- `aethyme task expand --repo /path/to/repo --node src/auth.py --json-output`
 - `aethyme eval explain-repo --repo /path/to/repo --json-output`
-- `aethyme eval explain-repo --repo /path/to/repo --baseline-cmd "<cmd>" --aethyme-cmd "<cmd>"`
+- `aethyme eval explain-repo --repo /path/to/repo --control-cmd "<cmd>" --explore-cmd "<cmd>" --leverage-cmd "<cmd>"`
+- `aethyme eval navigation-ctf --repo /path/to/repo --json-output`
+
+See [`docs/guides/eval-protocol.md`](docs/guides/eval-protocol.md) for the full 3-condition eval protocol, playground repositories, and execution method.
 
 This local path is the shortest route to proving:
 
 1. repository mapping
 2. discoverability
-3. deterministic task-context packs
-4. explain-repo evaluation artifacts
+3. graph-mediated navigation
+4. deterministic task-context packs
+5. explain-repo evaluation artifacts
 
 Runtime notes:
 
 - the Python layer now executes a built Rust binary rather than `cargo run` for every call
 - local repo artifacts are cached by snapshot key under `AETHYME_CACHE_DIR` or `/tmp/aethyme-cache`
 - Git repositories use commit plus dirty-state metadata for cache keys instead of a full recursive fingerprint on every call
-- `eval explain-repo` can execute real baseline and Aethyme runs when `--baseline-cmd` and `--aethyme-cmd` are provided
+- `eval explain-repo` can execute real runs when `--control-cmd`, `--explore-cmd`, and `--leverage-cmd` are provided
+- external runners receive `AETHYME_EVAL_OUTPUT_SCHEMA_FILE`, `AETHYME_EVAL_TOOL_REPO`, and `AETHYME_EVAL_TOOL_PYTHON` so agent wrappers can enforce structured output and call back into Aethyme
+- the preferred execution method is Chau7 MCP (spin up tabs, launch agents, collect results) — see [`docs/guides/eval-protocol.md`](docs/guides/eval-protocol.md)
 - without those commands, it still emits the comparison artifacts only
 - the Aethyme-assisted prompt now uses a compact rendered context-pack view instead of injecting the full raw pack
+- every `eval explain-repo` run writes a markdown report under `packages/aethyme/docs/reports/evals/`
+- the report includes the explanation, prompts, pack JSON, and verbose run results
+- eval outputs now include a structured output schema, scoring rubric, and reference answer
 
 ## Start Here
 
@@ -109,6 +127,8 @@ Runtime notes:
 - [`docs/vision.md`](docs/vision.md)
 - [`docs/agent-navigation-spec.md`](docs/agent-navigation-spec.md)
 - [`docs/architecture/research-informed-architecture-memo.md`](docs/architecture/research-informed-architecture-memo.md)
+- [`docs/architecture/research-lessons-revised-after-implementation.md`](docs/architecture/research-lessons-revised-after-implementation.md)
+- [`docs/architecture/graphability-and-navigability-signals.md`](docs/architecture/graphability-and-navigability-signals.md)
 - [`docs/architecture/rust-transition.md`](docs/architecture/rust-transition.md)
 - [`rust/README.md`](rust/README.md)
 - [`docs/getting-started/quickstart.md`](docs/getting-started/quickstart.md)

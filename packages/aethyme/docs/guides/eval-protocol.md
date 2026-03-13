@@ -1,22 +1,63 @@
 # Eval Protocol — Aethyme Navigation Benchmarks
 
-Last Updated: 2026-03-09
+Last Updated: 2026-03-10
 
-## Core Rule
+## Core Rules
 
-**Evaluations run only against Playground repositories.** Never run evals against the Aethyme repo itself — it conflates the tool with the subject.
+### 1. Playground Only
+
+**Evaluations target only Playground repositories.** Never execute eval agents against the Aethyme repo itself — it conflates the tool with the subject.
+
+### 2. No Eval-Driven Tool Changes
+
+**It is absolutely forbidden to modify Aethyme's tools, engine, pipeline, or skills to improve eval scores.** This is the single most important integrity rule for the project.
+
+Evals measure the generic system. The generic system must never be shaped to match eval expectations. The causal arrow is:
+
+```
+Generic tool improvement → eval scores change (observed)
+```
+
+Never:
+
+```
+Eval score is low → tweak tool to raise that score
+```
+
+Examples of **forbidden** changes:
+- Adding task-type-specific code paths in the engine to handle explain-repo differently from other tasks (e.g., injecting `overview_docs` into the file content reader only for explain-repo)
+- Adding special-case logic in anchor resolution, scope building, or file selection that targets known eval scenarios
+- Tuning budget defaults, priority orderings, or heuristics based on what a specific eval run scored poorly on
+- Modifying scoring rubrics to be more lenient toward Aethyme conditions
+- Changing skill prompts to hint at eval output formats
+- Adding post-processing in the pipeline that reformats output to match scorer expectations
+
+Examples of **allowed** changes:
+- Fixing a bug where the engine fails to read files it should be reading (generic correctness)
+- Improving anchor resolution quality across all task types based on structural analysis
+- Adding a new generic capability (like file content in context packs) that benefits any task
+- Fixing the scorer itself when it has genuine bugs (e.g., path normalization)
+- Improving graph construction (better edge detection, better area inference) — these are structural improvements to the map, not eval accommodations
+
+**The test:** Before making any change, ask: "Would I make this exact change if the eval didn't exist?" If the answer is no, or if the change only makes sense in the context of improving a specific eval metric, do not make it.
+
+**Why this matters:** Aethyme's value proposition is that a generic structural graph improves agent navigation on ANY repository and ANY task. If the tools are tuned to score well on specific evals, the product loses its generality claim. Eval scores that come from tool-tweaking are vanity metrics — they prove nothing about real-world value. A system that scores 70 honestly is worth more than one that scores 95 through overfitting.
+
+**When evals reveal genuine problems:** If an eval shows that Aethyme-equipped agents underperform vanilla agents, the correct response is to investigate whether there is a generic deficiency in the system (poor anchor quality, missing graph edges, excessive irrelevant context, skill instructions that waste turns). Fix the generic problem. Then re-run the eval to see if the generic fix helped. The eval is a diagnostic, not a target.
 
 ## Local Eval Storage
 
-Eval artifacts are stored locally under `packages/aethyme/eval-runs/` (gitignored). Each run creates a timestamped directory:
+Eval artifacts are stored locally under `packages/aethyme/eval-runs/` (gitignored). Each run creates a timestamped directory. **Every piece of data that exists at eval time must be stored.** Any run must be fully investigable retroactively.
 
 ```
 eval-runs/
   YYYYMMDD-HHMMSS-<slug>-<eval-type>/
-    metadata.json              # timestamp, aethyme commit, repo path, eval type
+    metadata.json              # timestamp, aethyme commit, repo path, eval type, conditions
+    complete-result.json       # FULL result dict — single source of truth
     report.md                  # rendered markdown report
     artifacts/                 # inputs and reference data
-      control-prompt.txt
+      control-cto-off-prompt.txt
+      control-cto-on-prompt.txt
       explore-prompt.txt
       leverage-prompt.txt
       output-schema.json
@@ -24,35 +65,62 @@ eval-runs/
       reference-output.json
       navigation-context.json
       pack.json
+      task-spec.json
+      challenge.json
+      signals.json
     conditions/                # per-condition outputs
-      control/
+      control-cto-off/
         result.json            # structured output from agent
         assessment.json        # scoring assessment
+        run-record.json        # full run data (tokens, timing, exit code, etc.)
+        run-metadata.json      # quick-access tokens/duration/exit_code
+        raw-stdout.txt         # complete agent stdout
+        raw-stderr.txt         # complete agent stderr
+        tool-calls.json        # tool calls from run data
+      control-cto-on/
+        ...
       explore/
-        result.json
-        assessment.json
+        ...
       leverage/
-        result.json
-        assessment.json
-    chau7/                     # manually populated telemetry
-      control/
-        run-metadata.json
-        transcript.json
-        tool-calls.json
+        ...
+    chau7/                     # Chau7 telemetry (MANDATORY for every condition)
+      control-cto-off/
+        metadata.json          # run_id, session_id, counts
+        run-id.txt
+        session-id.txt
+        transcript.json        # full per-turn conversation transcript
+        tool-calls.json        # detailed tool call data from Chau7
+        tab-output.txt         # raw terminal output
+      control-cto-on/
+        ...
       explore/
         ...
       leverage/
         ...
 ```
 
-| Artifact | Location | Created by |
-|----------|----------|------------|
-| Run directory | `eval-runs/<timestamp>-<slug>-<type>/` | `create_eval_run_dir()` |
-| Prompts, schemas, reference | `artifacts/` | `write_eval_run_artifacts()` |
-| Agent outputs | `conditions/<cond>/result.json` | `write_eval_run_artifacts()` |
-| Scoring assessments | `conditions/<cond>/assessment.json` | `write_eval_run_artifacts()` |
-| Rendered report | `report.md` | `write_*_markdown_report(run_dir=...)` |
-| Chau7 telemetry | `chau7/<cond>/` | Manual capture (Step 4.5) |
+### Storage Functions
+
+| Function | Purpose | When to call |
+|----------|---------|--------------|
+| `create_eval_run_dir()` | Create the timestamped directory with all subdirs | Step 1 (artifact generation) |
+| `store_condition_raw()` | Store a condition's raw output (stdout, stderr, structured output, tokens, duration) | Immediately after each condition completes (Step 4) |
+| `store_condition_chau7()` | Store Chau7 run_id, session_id, transcript, tool_calls, tab_output | After each condition completes (Step 4.5) |
+| `write_eval_run_artifacts()` | Write all shared and per-condition artifacts from a result dict | Step 5 (after scoring) |
+| `finalize_eval_run()` | Write complete-result.json, final report.md, and all artifacts | Step 6 (final step) |
+
+### Storage Contract
+
+Every eval run **must** have:
+1. `complete-result.json` — the entire result dict with all data that existed at eval time
+2. Per-condition `result.json` + `assessment.json` — structured output and scores
+3. Per-condition `raw-stdout.txt` — the complete agent output before parsing
+4. Per-condition Chau7 `transcript.json` + `tool-calls.json` — full turn-by-turn data
+5. All shared artifacts (prompts, schema, reference, pack, navigation context)
+
+If any of these are missing, the run is incomplete and must be re-captured or marked as partial in metadata.
+
+Condition slugs: `control-cto-off`, `control-cto-on`, `explore`, `leverage`.
 
 ## Playground Repositories
 
@@ -62,15 +130,51 @@ eval-runs/
 
 To add a new playground: clone a real repo, add it to this table, and reference it from the docs index.
 
-## 3-Condition Design
+### Isolated Benchmark Repos (Bug-Fix and Stateful Evals)
 
-Every eval compares three conditions to isolate the value of graph-derived navigation context:
+For evals where agents modify the repo (e.g. bug-fix), each condition must operate on its own pristine clone. Without isolation, the first condition to fix the bug leaves it fixed for subsequent conditions, invalidating the comparison.
 
-| Condition | What the agent receives | Nav context file | Graph CLI in prompt | What it tests |
-|-----------|------------------------|-----------------|---------------------|---------------|
-| **Control** | Task + repo path only | No | No | Raw LLM exploration ability |
-| **Explore** | Task + repo path + CLI commands | No | Yes | Whether graph tools alone help |
-| **Leverage** | Task + pre-computed navigation context file | Yes | Yes (in context) | Whether pre-computed graph analysis adds value |
+```
+/tmp/benchmark-run-001/
+  control-cto-off/     # git clone --local, no .codex/ skill
+  control-cto-on/      # git clone --local, no .codex/ skill
+  explore/             # git clone --local + .codex/skills/aethyme/SKILL.md
+  leverage/            # git clone --local + .codex/skills/aethyme/SKILL.md
+```
+
+**One-command setup:**
+
+```bash
+cd packages/aethyme
+python -m src.cli eval bug-fix prepare \
+  --source "/path/to/Playground" \
+  --dest "/tmp/benchmark-run-001"
+```
+
+This creates 4 clones (via `git clone --local` for speed), deploys the Aethyme skill to explore/leverage, plants the bug in each, and writes all prompt/schema/reference artifacts to `/tmp/`.
+
+**Repo-only setup** (no bug planting, useful for other eval types):
+
+```bash
+python -m src.cli eval setup-repos \
+  --source "/path/to/Playground" \
+  --dest "/tmp/benchmark-run-001"
+```
+
+Control conditions get no `.codex/` directory. Explore and leverage get `.codex/skills/aethyme/SKILL.md` with the Aethyme CLI path stamped in.
+
+## 4-Condition Design
+
+Every eval compares four conditions to isolate the value of graph-derived navigation context and terminal optimization:
+
+| Condition | What the agent receives | Nav context file | Graph CLI in prompt | Chau7 CTO | What it tests |
+|-----------|------------------------|-----------------|---------------------|-----------|---------------|
+| **Control (CTO off)** | Task + repo path only | No | No | forceOff | Raw LLM exploration, uncompressed terminal output |
+| **Control (CTO on)** | Task + repo path only | No | No | default | Raw LLM exploration with terminal compression |
+| **Explore** | Task + repo path + CLI commands | No | Yes | default | Whether graph tools alone help |
+| **Leverage** | Task + pre-computed navigation context file | Yes | Yes (in context) | default | Whether pre-computed graph analysis adds value |
+
+The two control conditions isolate the effect of Chau7's Command Token Optimization (CTO) on baseline agent behavior. CTO compresses terminal output to reduce token usage — disabling it gives a true uncompressed baseline.
 
 ## Eval Types
 
@@ -80,7 +184,7 @@ Task: "Explain this repo" — produces a structured overview with code areas, en
 
 #### Exact Prompts
 
-**Control prompt:**
+**Control prompt (CTO off and CTO on — same prompt, different CTO setting):**
 
 ```
 Task: Explain this repo
@@ -144,7 +248,7 @@ Task: Directed graph navigation challenge — find the config, entrypoint, and m
 
 The task text is generated per-repo. Example for the Aethyme Playground:
 
-**Control prompt:**
+**Control prompt (CTO off and CTO on — same prompt, different CTO setting):**
 
 ```
 Task: Find the manifest that manages the main code entrypoint in the <AREA> area, identify the entrypoint file it controls, and name the top-level area that owns both.
@@ -215,14 +319,14 @@ After scoring, produce a human-readable report per condition with:
 
 Then produce a qualitative comparison table:
 
-| Dimension | Control | Explore | Leverage |
-|-----------|---------|---------|----------|
-| Target accuracy | ... | ... | ... |
-| Reasoning quality | ... | ... | ... |
-| Path format | ... | ... | ... |
-| Relationship chain | ... | ... | ... |
-| Token Efficiency | ... | ... | ... |
-| Self-awareness | ... | ... | ... |
+| Dimension | Control (CTO off) | Control (CTO on) | Explore | Leverage |
+|-----------|-------------------|------------------|---------|----------|
+| Target accuracy | ... | ... | ... | ... |
+| Reasoning quality | ... | ... | ... | ... |
+| Path format | ... | ... | ... | ... |
+| Relationship chain | ... | ... | ... | ... |
+| Token Efficiency | ... | ... | ... | ... |
+| Self-awareness | ... | ... | ... | ... |
 
 ## Execution Method
 
@@ -274,10 +378,14 @@ PLAYGROUND = Path("/Users/christophehenner/Downloads/Repositories/Aethyme Playgr
 # Create persistent run directory
 run_dir = create_eval_run_dir(PLAYGROUND, "explain-repo")
 
+# Generates artifacts only (prompts, schemas, reference, context).
+# Does NOT execute agent sessions — those are launched via Chau7 MCP (step 2-3).
 result = run_explain_repo_evaluation(PLAYGROUND)
 
 # Write prompt files (also to /tmp/ for agent access)
-Path('/tmp/aethyme-eval-control-prompt.txt').write_text(result['control']['prompt'])
+# Both control conditions use the same prompt — CTO setting is configured on the Chau7 tab
+Path('/tmp/aethyme-eval-control-cto-off-prompt.txt').write_text(result['control']['prompt'])
+Path('/tmp/aethyme-eval-control-cto-on-prompt.txt').write_text(result['control']['prompt'])
 Path('/tmp/aethyme-eval-explore-prompt.txt').write_text(result['explore']['prompt'])
 Path('/tmp/aethyme-eval-leverage-prompt.txt').write_text(result['leverage']['prompt'])
 Path('/tmp/aethyme-eval-output-schema.json').write_text(json.dumps(result['output_schema'], indent=2))
@@ -286,7 +394,8 @@ Path('/tmp/aethyme-eval-reference.json').write_text(json.dumps(result['reference
 ```
 
 This produces:
-- `/tmp/aethyme-eval-control-prompt.txt`
+- `/tmp/aethyme-eval-control-cto-off-prompt.txt`
+- `/tmp/aethyme-eval-control-cto-on-prompt.txt`
 - `/tmp/aethyme-eval-explore-prompt.txt`
 - `/tmp/aethyme-eval-leverage-prompt.txt`
 - `/tmp/aethyme-eval-output-schema.json`
@@ -300,7 +409,13 @@ Open one terminal session per condition, each with the working directory set to 
 
 With Chau7 MCP:
 ```
-tab_create(directory="/Users/christophehenner/Downloads/Repositories/Aethyme Playground")  # x3
+tab_create(directory="/Users/christophehenner/Downloads/Repositories/Aethyme Playground")  # x4
+```
+
+Then configure CTO per condition:
+```
+tab_set_cto(tab_id=<control-cto-off-tab>, override="forceOff")
+# The other 3 tabs use default CTO (no override needed)
 ```
 
 #### 3. Launch Agents
@@ -316,9 +431,9 @@ codex exec \
   "$(cat /tmp/aethyme-eval-<CONDITION>-prompt.txt)"
 ```
 
-Where `<CONDITION>` is `control`, `explore`, or `leverage`.
+Where `<CONDITION>` is `control-cto-off`, `control-cto-on`, `explore`, or `leverage`.
 
-Any agent that can accept a system prompt and produce structured JSON output works. The output must conform to the schema at `/tmp/aethyme-eval-output-schema.json`.
+Both control conditions use the same prompt — only the CTO setting differs. Any agent that can accept a system prompt and produce structured JSON output works. The output must conform to the schema at `/tmp/aethyme-eval-output-schema.json`.
 
 #### 4. Monitor
 
@@ -332,46 +447,66 @@ tab_output(tab_id=<id>, lines=15)  # token counts at bottom
 
 Compute run time as `end - start` per condition. Report in the scores table as `Xm Ys`.
 
-#### 4.5. Capture Chau7 Telemetry
+#### 4.5. Capture Chau7 Telemetry (MANDATORY)
 
-After all agents finish, capture run telemetry for each condition. Get run IDs from `tab_status` or via `session_list` + `run_list`:
+After each agent finishes, **immediately** capture run telemetry. This is not optional — every eval run must have full transcript and tool call data for every condition. Without this data, the run cannot be investigated retroactively.
+
+Get run IDs from `tab_status` or via `session_list` + `run_list`:
 
 ```python
+from src.eval.report import store_condition_raw, store_condition_chau7
+
 # For each condition tab:
 status = tab_status(tab_id=<id>)
 run_id = status["active_run"]["id"]  # or find via run_list
 
-# Capture telemetry
-metadata = run_get(run_id=run_id)
+# Store raw result immediately
+result_json = json.loads(Path(f"/tmp/aethyme-eval-{cond}-result.json").read_text())
+tab_out = tab_output(tab_id=<id>, lines=5000)
+store_condition_raw(
+    run_dir, cond,
+    stdout=tab_out,
+    structured_output=result_json,
+)
+
+# Capture and store Chau7 telemetry
 transcript = run_transcript(run_id=run_id)
 tool_calls = run_tool_calls(run_id=run_id)
-
-# Save to run directory
-import json
-from pathlib import Path
-cond = "control"  # or "explore", "leverage"
-chau7_dir = run_dir / "chau7" / cond
-chau7_dir.mkdir(parents=True, exist_ok=True)
-(chau7_dir / "run-metadata.json").write_text(json.dumps(metadata, indent=2))
-(chau7_dir / "transcript.json").write_text(json.dumps(transcript, indent=2))
-(chau7_dir / "tool-calls.json").write_text(json.dumps(tool_calls, indent=2))
+store_condition_chau7(
+    run_dir, cond,
+    run_id=run_id,
+    transcript=transcript,
+    tool_calls=tool_calls,
+    tab_output=tab_out,
+)
 ```
 
-This step is optional but strongly recommended — telemetry enables the Tool Call Analysis section in the report.
+Repeat for every condition before proceeding to scoring.
 
-#### 5. Collect and Score
+#### 5. Collect, Score, and Finalize
 
 ```python
 import json
 from pathlib import Path
 from src.eval.scoring import score_explain_repo_output
+from src.eval.report import finalize_eval_run
 
 reference = json.loads(Path('/tmp/aethyme-eval-reference.json').read_text())
-for cond in ("control", "explore", "leverage"):
+repo_path_str = str(PLAYGROUND)
+
+for cond in ("control-cto-off", "control-cto-on", "explore", "leverage"):
     candidate = json.loads(Path(f"/tmp/aethyme-eval-{cond}-result.json").read_text())
-    assessment = score_explain_repo_output(candidate, reference)
+    assessment = score_explain_repo_output(candidate, reference, repo_path=repo_path_str)
+    result[cond]["run"] = result[cond].get("run") or {}
+    result[cond]["run"]["structured_output"] = candidate
+    result[cond]["assessment"] = assessment
     print(f"{cond}: {assessment['weighted_score']} / {assessment['max_score']}")
+
+# Finalize: writes complete-result.json, all artifacts, and final report.md
+finalize_eval_run(run_dir, result, repo_path=PLAYGROUND, eval_type="explain-repo")
 ```
+
+After `finalize_eval_run`, the run directory contains everything needed to investigate the run at any future point.
 
 #### 6. Qualitative Review
 
@@ -390,47 +525,47 @@ After scoring, read each result file and produce a human-readable report per con
 
 Then produce a qualitative comparison table:
 
-| Dimension | Control | Explore | Leverage |
-|-----------|---------|---------|----------|
-| Depth | ... | ... | ... |
-| Accuracy | ... | ... | ... |
-| Structure | ... | ... | ... |
-| Unique Finds | ... | ... | ... |
-| Token Efficiency | ... | ... | ... |
-| Why Score is Low | ... | ... | ... |
+| Dimension | Control (CTO off) | Control (CTO on) | Explore | Leverage |
+|-----------|-------------------|------------------|---------|----------|
+| Depth | ... | ... | ... | ... |
+| Accuracy | ... | ... | ... | ... |
+| Structure | ... | ... | ... | ... |
+| Unique Finds | ... | ... | ... | ... |
+| Token Efficiency | ... | ... | ... | ... |
+| Why Score is Low | ... | ... | ... | ... |
 
 ## Results Report Template
 
-Every eval results section **must** include the following, in order:
+Every eval report is generated by `_render_markdown()` in `src/eval/report.py`.
+The section order is fixed and non-negotiable. Never hand-write reports — always
+use `write_bug_fix_markdown_report()`, `finalize_eval_run()`, or equivalent.
 
-1. **Header** — `### <date> — <eval-type>: <agent> on <playground>` plus reference answer if applicable.
-2. **Starting Prompts** — The exact verbatim prompt text for each condition (Control, Explore, Leverage), in fenced code blocks.
-3. **Scores** — A table with one row per metric:
+Reports contain these sections **in this exact order**:
 
-| | Control | Explore | Leverage |
-|---|---------|---------|----------|
-| Score | ... / 100 | ... / 100 | ... / 100 |
-| Tokens | ... | ... | ... |
-| Run Time | ...m ...s | ...m ...s | ...m ...s |
+1. **Meta** — Date, repository path, eval type, scenario (if applicable), conditions list, Aethyme commit hash.
+2. **Model** — Name, provider, backend, reasoning level, permission mode. Without model details, results cannot be compared across runs. Pass model metadata via `model=` in `assemble_bug_fix_result()` or `create_eval_run_dir()`.
+3. **Scorecard** — One row per condition with: Score, Cost (USD), Duration, Turns, Input Tokens, Output Tokens, Cache Read Tokens, Cache Create Tokens.
 
-4. **Per-field breakdown** (if applicable) — A table showing each scored field with its weight and per-condition result.
-5. **Qualitative Assessment** — One paragraph per condition summarizing behavior, strengths, failures, and confidence.
-6. **Tool Call Analysis** (auto-generated) — Per-condition tool call frequency table and CLI commands list. Skipped if no condition has tool call data.
-7. **Context Pack Audit** (auto + manual) — Summary stats (anchor count, nav order items, in-scope files, CLI commands), navigation context JSON dump, and placeholder for manual signal-to-noise assessment.
-8. **Comparison** — A table comparing conditions across: Depth, Accuracy, Structure, Unique Finds, Token Efficiency, Why Score is Low.
-9. **Verdict** — One paragraph summarizing the gradient and key takeaway.
-10. **Graph Quality Notes** (manual) — Post-run analysis of graph structural quality and its impact on conditions.
-11. **Prompt Effectiveness** (manual) — Post-run analysis of how well each condition's prompt served the agent.
-12. **Lessons & Action Items** (manual) — Checklist of improvements for next run.
+| Condition | Score | Cost | Duration | Turns | Input Tokens | Output Tokens | Cache Read | Cache Create |
+|---|---|---|---|---|---|---|---|---|
+| Control (CTO off) | 93.83 | $0.161 | 74.8s | 10 | 146 | 2,718 | 542,126 | 74,517 |
 
-Omitting any of these sections makes the report non-compliant. When run time was not recorded, mark it as `not recorded`.
+4. **Score Breakdown** — Per-component weights and raw values (only rendered when scoring produces component scores, e.g. bug-fix).
+5. **Prompts** — Verbatim prompt text for each condition in fenced code blocks. All 4 conditions always shown.
+6. **Agent Output** — Structured output JSON for each condition.
+7. **Tool Call Analysis** (auto-generated) — Per-condition tool call frequency table. Skipped if no condition has tool call data.
+8. **Verdict** (auto-generated) — One paragraph: highest/lowest scorer, cheapest/most expensive, whether all tests passed.
+9. **Notes** — Free-text notes passed via `notes=` parameter, or "N/A".
+10. **Raw Data** (collapsed at bottom) — Reference Output, Output Schema, Scoring Rubric, Per-Condition Run Records (full JSON), Per-Condition Assessments (full JSON), plus optional Context Pack, Navigation Context, Challenge, and Repo Signals.
+
+All JSON dumps live exclusively in the Raw Data section — never inline in the body.
 
 ## Important Notes
 
 - **Aethyme tooling must be up to date**: Always run step 0 before generating artifacts. A stale engine binary or outdated eval/scoring code will produce results that aren't comparable across runs. Record the Aethyme commit hash alongside results.
 - **Leverage prompt references a file**: The navigation context file at `/tmp/aethyme-eval-navigation-context.json` must exist before the leverage agent starts. The artifact generation step (step 1) creates it.
 - **Leverage prompt env var**: The default prompt says `Use AETHYME_EVAL_NAVIGATION_CONTEXT_FILE` which is an env var contract for runner scripts. For Chau7 execution, the artifact generation rewrites it to `Read the navigation context file at /tmp/aethyme-eval-navigation-context.json`.
-- **Scoring is exact-match**: Outputs with markdown links (`src/cli.py#L159`) or prose descriptions score 0 against bare-path references (`src/cli.py`). Path normalization is a known improvement needed.
+- **Scoring applies path normalization** before comparison: markdown links, line anchors, absolute repo prefixes, and leading `./` are stripped. Pass `repo_path` to scoring functions for full normalization.
 - **CLI commands need cd prefix**: The graph CLI commands must include `cd <AETHYME_PATH> &&` before `python -m src.cli` because the agent runs from the playground directory, not the Aethyme directory.
 - **Token tracking**: Agent token usage is visible in the session output after execution completes. Record it alongside scores for cost analysis.
 - **Reports**: Every eval run writes a markdown report under `docs/reports/evals/`.
@@ -642,3 +777,29 @@ Per-field breakdown:
 | Self-awareness | "medium-high" — appropriately uncertain | "medium" — correctly uncertain | "high" — correctly confident |
 
 **Verdict**: The gradient is dramatic: Leverage (80) >> Explore (20) >> Control (0). Unlike explain-repo where all 3 were qualitatively strong, here Leverage found the exact right answer because the navigation context file contains the graph edges that define the reference. The CTF specifically tests whether the agent can follow graph relations, and only Leverage had those relations pre-computed. Note: the reference answer (`auth/package.json` → `ui/src/tokens/index.ts`) is a graph artifact — a human would likely agree with Control's answer (`app-shared/package.json` → `app-shared/src/index.ts`). This highlights the CTF measures graph navigation fidelity, not general understanding.
+
+#### Control Rerun — CTO Disabled (2026-03-09)
+
+Rerun of the control condition with Chau7 Command Token Optimization (CTO) forced off to measure whether CTO compression was affecting agent behavior.
+
+**Setup**: Same control prompt as above. Chau7 tab with `tab_set_cto(override="forceOff")`. Codex v0.112.0, gpt-5.4, `approval: never`, `sandbox: workspace-write`, `reasoning effort: high`.
+
+**Notable behavior**: The agent discovered a Codex `aethyme-navigation` skill and attempted to use the Aethyme CLI from the Playground directory (`python3 -m src.cli repo inspect ...`), which failed (`No module named src.cli`). It then fell back to direct file exploration — `find`, `sed`, `rg` across `packages/*/package.json`.
+
+| | Control (CTO on, original) | Control (CTO off, rerun) |
+|---|---|---|
+| Score | 0.0 / 100 | 20.0 / 100 |
+| Tokens | 48,026 | 96,366 |
+
+Per-field breakdown (rerun):
+
+| Field (weight) | Result |
+|---|---|
+| config_target (30) | 0% — `packages/ui/package.json` (absolute path) |
+| code_target (30) | 0% — `packages/ui/src/index.ts` (absolute path) |
+| management_area (20) | 100% — `packages` |
+| relationship_chain (20) | 0% — prose markdown relations with line anchors |
+
+**Result**: `ui/package.json` → `ui/src/index.ts` → area `packages`. Config and code targets differ from both the original control run (`app-shared`) and the reference (`auth`). Management area correct. Absolute paths and markdown link formatting in all fields. Confidence: "high". Rejected candidates: `app-shared/package.json` (wildcard exports, no root `.` binding).
+
+**Analysis**: CTO off doubled token usage (48K → 96K) but improved the score (0 → 20) by correctly identifying the top-level `packages` area. The agent chose `ui/package.json` — a different wrong answer than the original control's `app-shared/package.json`. Both are defensible human answers; neither matches the graph reference (`auth/package.json`). The Codex aethyme-navigation skill activation is a confound — the agent tried graph CLI commands that weren't part of the control prompt, suggesting skill contamination. CTO doesn't appear to be the primary factor in control's low scores; path format (absolute vs relative) and the fundamental mismatch between "reasonable human answer" and "graph-derived reference" remain the dominant issues.

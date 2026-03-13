@@ -24,17 +24,37 @@ Last Updated: 2026-03-06
 - `aethyme query deps /path/to/repo src/main.py`
 - `aethyme query impact /path/to/repo src/main.py`
 
+### Graph Navigation
+- `aethyme graph node /path/to/repo <target> --json-output`
+- `aethyme graph children /path/to/repo <target> --json-output`
+- `aethyme graph parents /path/to/repo <target> --json-output`
+- `aethyme graph callers /path/to/repo <target> --json-output`
+- `aethyme graph callees /path/to/repo <target> --json-output`
+- `aethyme graph docs /path/to/repo <target> --json-output`
+- `aethyme graph configs /path/to/repo <target> --json-output`
+
 ### Local Task Packs
 - `aethyme task pack --repo /path/to/repo --task "Explain this repo" --json-output`
 - `aethyme task explain --repo /path/to/repo`
+- `aethyme task anchors --repo /path/to/repo --task "..." --json-output`
+- `aethyme task scope --repo /path/to/repo --task "..." --json-output`
+- `aethyme task next --repo /path/to/repo --task "..." --json-output`
+- `aethyme task expand --repo /path/to/repo --node <target> --json-output`
 
 ### Local Evaluation
 - `aethyme eval explain-repo --repo /path/to/repo --json-output`
 - `aethyme eval explain-repo --repo /path/to/repo --baseline-cmd "<cmd>" --aethyme-cmd "<cmd>"`
+- `aethyme eval navigation-ctf --repo /path/to/repo --json-output`
+- Example Codex wrapper command: `packages/aethyme/.venv/bin/python packages/aethyme/scripts/eval/run_codex_eval.py`
 
 Current behavior:
 - with no commands, this builds the control artifacts and comparison report only
 - with `--baseline-cmd` and `--aethyme-cmd`, it executes real runs through the evaluation runner contract
+- external runners receive the prompt, navigation context, output schema, and Aethyme tool paths through `AETHYME_EVAL_*` env vars
+- the bundled Codex wrapper deletes its temporary prompt/event/schema files automatically; if you orchestrate runs through Chau7 MCP, close the tab after the report path is captured and the tab returns to idle
+- every run writes a markdown report under `packages/aethyme/docs/reports/evals/`
+- JSON output includes the generated `report_path`
+- evaluation JSON now includes `output_schema`, `scoring_rubric`, and `reference_output`
 
 ## Local Runtime Notes
 
