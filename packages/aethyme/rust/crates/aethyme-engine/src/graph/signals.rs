@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::edge::EdgeKind;
-use crate::file::FileRole;
+use crate::model::edge::EdgeKind;
+use crate::model::file::FileRole;
 use crate::map::RepositoryMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

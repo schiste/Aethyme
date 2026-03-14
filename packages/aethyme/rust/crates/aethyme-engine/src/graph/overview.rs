@@ -1,8 +1,8 @@
 use crate::context_pack::{DependencyEdge, ImpactItem, RepoOverview};
-use crate::edge::EdgeKind;
-use crate::file::FileRole;
+use crate::model::edge::EdgeKind;
+use crate::model::file::FileRole;
 use crate::map::RepositoryMap;
-use crate::signals::evaluate_graph_signals;
+use crate::graph::signals::evaluate_graph_signals;
 
 pub fn repo_overview_seed(map: &RepositoryMap) -> Vec<String> {
     let mut seed = Vec::new();

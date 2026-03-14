@@ -3,22 +3,22 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::area::AreaNode;
+use crate::model::area::AreaNode;
 use crate::cache::ParseCache;
-use crate::class::ClassNode;
-use crate::config::ConfigNode;
-use crate::directory::DirectoryNode;
-use crate::doc::DocNode;
-use crate::edge::Edge;
-use crate::file::FileNode;
-use crate::function::FunctionNode;
-use crate::graph::{GraphNode, GraphNodeKind, NormalizedGraph};
+use crate::model::class::ClassNode;
+use crate::model::config::ConfigNode;
+use crate::model::directory::DirectoryNode;
+use crate::model::doc::DocNode;
+use crate::model::edge::Edge;
+use crate::model::file::FileNode;
+use crate::model::function::FunctionNode;
+use crate::model::graph::{GraphNode, GraphNodeKind, NormalizedGraph};
 use crate::indexer::tree_sitter::{default_grammars_dir, GrammarRegistry};
 use crate::map_cache;
 use crate::passes;
 use crate::repo::{discover_repo, RepoSnapshot};
-use crate::risk::RiskFlag;
-use crate::symbol::Symbol;
+use crate::model::risk::RiskFlag;
+use crate::model::symbol::Symbol;
 
 /// Pre-computed HashMap indexes for O(1) lookups on entity id → area_id and display string.
 /// Built lazily via `OnceLock` on first access; not serialized (derived data).
@@ -191,9 +191,9 @@ impl RepositoryMap {
                     total_duration_ms: total_started.elapsed().as_millis(),
                     stages,
                     repo_files: cached_map.snapshot.files.len(),
-                    source_files: cached_map.files.iter().filter(|f| matches!(f.role, crate::file::FileRole::Source)).count(),
-                    doc_files: cached_map.files.iter().filter(|f| matches!(f.role, crate::file::FileRole::Doc)).count(),
-                    config_files: cached_map.files.iter().filter(|f| matches!(f.role, crate::file::FileRole::Config)).count(),
+                    source_files: cached_map.files.iter().filter(|f| matches!(f.role, crate::model::file::FileRole::Source)).count(),
+                    doc_files: cached_map.files.iter().filter(|f| matches!(f.role, crate::model::file::FileRole::Doc)).count(),
+                    config_files: cached_map.files.iter().filter(|f| matches!(f.role, crate::model::file::FileRole::Config)).count(),
                     areas: cached_map.areas.len(),
                     directories: cached_map.directories.len(),
                     classes: cached_map.classes.len(),
@@ -340,17 +340,17 @@ impl RepositoryMap {
             source_files: map
                 .files
                 .iter()
-                .filter(|file| matches!(file.role, crate::file::FileRole::Source))
+                .filter(|file| matches!(file.role, crate::model::file::FileRole::Source))
                 .count(),
             doc_files: map
                 .files
                 .iter()
-                .filter(|file| matches!(file.role, crate::file::FileRole::Doc))
+                .filter(|file| matches!(file.role, crate::model::file::FileRole::Doc))
                 .count(),
             config_files: map
                 .files
                 .iter()
-                .filter(|file| matches!(file.role, crate::file::FileRole::Config))
+                .filter(|file| matches!(file.role, crate::model::file::FileRole::Config))
                 .count(),
             areas: map.areas.len(),
             directories: map.directories.len(),

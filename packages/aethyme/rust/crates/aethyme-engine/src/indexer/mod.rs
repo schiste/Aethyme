@@ -2,8 +2,8 @@ pub mod heuristic;
 pub mod resolve;
 pub mod tree_sitter;
 
-use crate::edge::Edge;
-use crate::symbol::Symbol;
+use crate::model::edge::Edge;
+use crate::model::symbol::Symbol;
 
 use self::tree_sitter::GrammarRegistry;
 

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::edge::Edge;
+use super::edge::Edge;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum GraphNodeKind {

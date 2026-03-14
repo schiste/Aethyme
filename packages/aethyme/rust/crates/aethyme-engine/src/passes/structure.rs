@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::area::AreaNode;
-use crate::directory::DirectoryNode;
-use crate::edge::{Edge, EdgeKind};
-use crate::file::{FileNode, FileRole};
+use crate::model::area::AreaNode;
+use crate::model::directory::DirectoryNode;
+use crate::model::edge::{Edge, EdgeKind};
+use crate::model::file::{FileNode, FileRole};
 use crate::repo::{RepoFile, RepoSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

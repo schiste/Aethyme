@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::edge::EdgeKind;
-use crate::graph::GraphAnnotation;
+use crate::model::edge::EdgeKind;
+use crate::model::graph::GraphAnnotation;
 use crate::map::RepositoryMap;
-use crate::risk::{RiskArea, RiskFlag, RiskLevel};
+use crate::model::risk::{RiskArea, RiskFlag, RiskLevel};
 
 const SHARED_CORE_HIGH_THRESHOLD: usize = 5;
 const SHARED_CORE_LOW_THRESHOLD: usize = 3;

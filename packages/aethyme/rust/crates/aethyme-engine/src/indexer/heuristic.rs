@@ -1,5 +1,5 @@
-use crate::edge::{Edge, EdgeKind};
-use crate::symbol::{Symbol, SymbolKind};
+use crate::model::edge::{Edge, EdgeKind};
+use crate::model::symbol::{Symbol, SymbolKind};
 
 const FUNCTION_PREFIXES: &[&str] = &[
     "public static function ",

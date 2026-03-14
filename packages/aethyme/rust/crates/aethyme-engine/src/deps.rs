@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::config::ConfigNode;
+use crate::model::config::ConfigNode;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExternalDep {

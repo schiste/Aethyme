@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use crate::config::ConfigNode;
-use crate::edge::{Edge, EdgeKind};
+use crate::model::config::ConfigNode;
+use crate::model::edge::{Edge, EdgeKind};
 use crate::passes::code::CodePass;
 use crate::passes::structure::StructurePass;
 
@@ -57,7 +57,7 @@ where
     let mut parsed_configs = structure
         .files
         .par_iter()
-        .filter(|file| matches!(file.role, crate::file::FileRole::Config))
+        .filter(|file| matches!(file.role, crate::model::file::FileRole::Config))
         .map(|file| ParsedConfig {
             file_id: file.id.clone(),
             path: file.path.clone(),
@@ -385,7 +385,7 @@ mod tests {
     use std::fs;
 
     use super::build;
-    use crate::edge::EdgeKind;
+    use crate::model::edge::EdgeKind;
     use crate::passes::{code, structure};
     use crate::repo::discover_repo;
 

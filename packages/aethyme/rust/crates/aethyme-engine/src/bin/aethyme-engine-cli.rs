@@ -1,19 +1,19 @@
 use std::env;
 use std::path::PathBuf;
 
-use aethyme_engine::activation::{hormone_profile, spread_activation, spread_from_seed};
-use aethyme_engine::anchors::resolve_anchors;
+use aethyme_engine::graph::activation::{hormone_profile, spread_activation, spread_from_seed};
+use aethyme_engine::graph::anchors::resolve_anchors;
 use aethyme_engine::map::RepositoryMap;
-use aethyme_engine::neighborhood::{dependency_frontier, impact_frontier};
-use aethyme_engine::navigation::{
+use aethyme_engine::graph::neighborhood::{dependency_frontier, impact_frontier};
+use aethyme_engine::graph::navigation::{
     callers_view, callees_view, children_view, configs_view, docs_view, graph_expand_view,
     graph_overview_view, node_view, parents_view, task_anchors_view, task_expand_view, task_next_view,
     task_scope_view,
 };
-use aethyme_engine::overview::build_repo_overview;
+use aethyme_engine::graph::overview::build_repo_overview;
 use aethyme_engine::pipeline::{build_context_pack, build_context_pack_with_content};
-use aethyme_engine::search::symbol_search;
-use aethyme_engine::task::TaskInput;
+use aethyme_engine::graph::search::symbol_search;
+use aethyme_engine::model::task::TaskInput;
 use aethyme_engine::workspace::{build_workspace_graph, cross_repo_blast_radius};
 
 fn main() {

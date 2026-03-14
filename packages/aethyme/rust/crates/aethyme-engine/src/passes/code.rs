@@ -6,13 +6,13 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use crate::cache::{sha256_hex, CacheEntry, CacheStats, ParseCache};
-use crate::class::ClassNode;
-use crate::edge::{Edge, EdgeKind};
-use crate::file::{FileNode, FileRole};
-use crate::function::FunctionNode;
+use crate::model::class::ClassNode;
+use crate::model::edge::{Edge, EdgeKind};
+use crate::model::file::{FileNode, FileRole};
+use crate::model::function::FunctionNode;
 use crate::indexer;
 use crate::passes::structure::StructurePass;
-use crate::symbol::{Symbol, SymbolKind};
+use crate::model::symbol::{Symbol, SymbolKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodePass {
@@ -916,7 +916,7 @@ mod tests {
     use std::fs;
 
     use super::build;
-    use crate::edge::EdgeKind;
+    use crate::model::edge::EdgeKind;
     use crate::passes::structure;
     use crate::repo::discover_repo;
 

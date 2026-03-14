@@ -4,9 +4,9 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use crate::edge::{Edge, EdgeKind};
+use crate::model::edge::{Edge, EdgeKind};
 use crate::json::escape;
-use crate::symbol::{Symbol, SymbolKind};
+use crate::model::symbol::{Symbol, SymbolKind};
 
 const ENGINE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-cache-v2-treesitter");
 

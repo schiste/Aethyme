@@ -1,9 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::context_pack::Anchor;
-use crate::edge::EdgeKind;
+use crate::model::edge::EdgeKind;
 use crate::map::RepositoryMap;
-use crate::task::TaskKind;
+use crate::model::task::TaskKind;
 
 const EDGE_KIND_COUNT: usize = 9;
 
@@ -278,7 +278,7 @@ mod tests {
 
     use super::*;
     use crate::map::RepositoryMap;
-    use crate::task::TaskInput;
+    use crate::model::task::TaskInput;
 
     fn test_repo(suffix: &str) -> (std::path::PathBuf, RepositoryMap) {
         let root = std::env::temp_dir().join(format!("aethyme_activation_{suffix}"));
@@ -308,7 +308,7 @@ mod tests {
         let task = TaskInput::from_task_text(
             "Find the manifest that manages the main code entrypoint in the GameEngine area",
         );
-        let anchors = crate::anchors::resolve_anchors(&map, &task, 3);
+        let anchors = crate::graph::anchors::resolve_anchors(&map, &task, 3);
         let profile = hormone_profile(&task.kind);
         let activation = spread_activation(&map, &anchors, &profile);
 
@@ -338,7 +338,7 @@ mod tests {
         let task = TaskInput::from_task_text(
             "Find the manifest that manages the main code entrypoint in the GameEngine area",
         );
-        let anchors = crate::anchors::resolve_anchors(&map, &task, 3);
+        let anchors = crate::graph::anchors::resolve_anchors(&map, &task, 3);
         let profile = hormone_profile(&task.kind);
         let activation = spread_activation(&map, &anchors, &profile);
 
@@ -365,7 +365,7 @@ mod tests {
     fn threshold_cutoff_limits_propagation() {
         let (root, map) = test_repo("threshold");
         let task = TaskInput::from_task_text("Explain this repo");
-        let anchors = crate::anchors::resolve_anchors(&map, &task, 5);
+        let anchors = crate::graph::anchors::resolve_anchors(&map, &task, 5);
         let profile = hormone_profile(&task.kind);
         let activation = spread_activation(&map, &anchors, &profile);
 
@@ -410,7 +410,7 @@ mod tests {
     fn activated_set_filters_by_threshold() {
         let (root, map) = test_repo("activated_set");
         let task = TaskInput::from_task_text("Explain this repo");
-        let anchors = crate::anchors::resolve_anchors(&map, &task, 5);
+        let anchors = crate::graph::anchors::resolve_anchors(&map, &task, 5);
         let profile = hormone_profile(&task.kind);
         let activation = spread_activation(&map, &anchors, &profile);
 

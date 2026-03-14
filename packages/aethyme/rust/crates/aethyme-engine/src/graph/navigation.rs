@@ -1,12 +1,12 @@
-use crate::anchors::resolve_anchors;
+use crate::graph::anchors::resolve_anchors;
 use crate::context_pack::{Anchor, AnchorKind};
-use crate::edge::EdgeKind;
-use crate::guidance::{build_in_scope, build_out_of_scope, navigation_order};
+use crate::model::edge::EdgeKind;
+use crate::graph::guidance::{build_in_scope, build_out_of_scope, navigation_order};
 use crate::map::RepositoryMap;
-use crate::overview::build_repo_overview;
-use crate::risk::RiskFlag;
-use crate::signals::{evaluate_graph_signals, GraphSignals};
-use crate::task::TaskInput;
+use crate::graph::overview::build_repo_overview;
+use crate::model::risk::RiskFlag;
+use crate::graph::signals::{evaluate_graph_signals, GraphSignals};
+use crate::model::task::TaskInput;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphNodeView {
@@ -365,16 +365,16 @@ fn area_name(map: &RepositoryMap, area_id: Option<&str>) -> Option<String> {
         .map(|area| area.name.clone())
 }
 
-fn graph_kind(node: &crate::graph::GraphNode) -> String {
+fn graph_kind(node: &crate::model::graph::GraphNode) -> String {
     match node.kind {
-        crate::graph::GraphNodeKind::Repo => "repo",
-        crate::graph::GraphNodeKind::Area => "area",
-        crate::graph::GraphNodeKind::Directory => "directory",
-        crate::graph::GraphNodeKind::File => "file",
-        crate::graph::GraphNodeKind::Class => "class",
-        crate::graph::GraphNodeKind::Function => "function",
-        crate::graph::GraphNodeKind::Doc => "doc",
-        crate::graph::GraphNodeKind::Config => "config",
+        crate::model::graph::GraphNodeKind::Repo => "repo",
+        crate::model::graph::GraphNodeKind::Area => "area",
+        crate::model::graph::GraphNodeKind::Directory => "directory",
+        crate::model::graph::GraphNodeKind::File => "file",
+        crate::model::graph::GraphNodeKind::Class => "class",
+        crate::model::graph::GraphNodeKind::Function => "function",
+        crate::model::graph::GraphNodeKind::Doc => "doc",
+        crate::model::graph::GraphNodeKind::Config => "config",
     }
     .to_string()
 }
@@ -513,7 +513,7 @@ fn change_task_next_items(map: &RepositoryMap, anchors: &[Anchor]) -> Vec<GraphR
     items
 }
 
-fn extend_change_scope(map: &RepositoryMap, anchors: &[Anchor], in_scope: &mut crate::scope::ScopeBoundary) {
+fn extend_change_scope(map: &RepositoryMap, anchors: &[Anchor], in_scope: &mut crate::model::scope::ScopeBoundary) {
     let current_files = in_scope
         .files
         .iter()
@@ -533,9 +533,9 @@ fn extend_change_scope(map: &RepositoryMap, anchors: &[Anchor], in_scope: &mut c
         }
     }
     for file in additional.into_iter().take(3) {
-        in_scope.files.push(crate::scope::ScopeItem::new(
+        in_scope.files.push(crate::model::scope::ScopeItem::new(
             file,
-            crate::scope::ScopeKind::File,
+            crate::model::scope::ScopeKind::File,
             "caller/callee/config neighbor for change task",
         ));
     }
@@ -543,7 +543,7 @@ fn extend_change_scope(map: &RepositoryMap, anchors: &[Anchor], in_scope: &mut c
     in_scope.sort();
 }
 
-fn cap_change_scope(in_scope: &mut crate::scope::ScopeBoundary, max_files: usize) {
+fn cap_change_scope(in_scope: &mut crate::model::scope::ScopeBoundary, max_files: usize) {
     in_scope.files.truncate(max_files);
     let allowed_files = in_scope
         .files
@@ -613,8 +613,8 @@ fn change_display_for_relation_item(map: &RepositoryMap, item: GraphRelationItem
 
 fn scoped_change_symbols(
     map: &RepositoryMap,
-    files: &[crate::scope::ScopeItem],
-) -> Vec<crate::scope::ScopeItem> {
+    files: &[crate::model::scope::ScopeItem],
+) -> Vec<crate::model::scope::ScopeItem> {
     let mut symbols = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for file in files.iter().take(2) {
@@ -627,9 +627,9 @@ fn scoped_change_symbols(
         file_symbols.sort();
         for qualified_name in file_symbols.into_iter().take(8) {
             if seen.insert(qualified_name.clone()) {
-                symbols.push(crate::scope::ScopeItem::new(
+                symbols.push(crate::model::scope::ScopeItem::new(
                     qualified_name,
-                    crate::scope::ScopeKind::Symbol,
+                    crate::model::scope::ScopeKind::Symbol,
                     "symbol defined in in-scope change file",
                 ));
             }
@@ -673,7 +673,7 @@ mod tests {
         task_scope_view,
     };
     use crate::map::RepositoryMap;
-    use crate::task::TaskInput;
+    use crate::model::task::TaskInput;
 
     #[test]
     fn node_view_returns_function_metadata() {

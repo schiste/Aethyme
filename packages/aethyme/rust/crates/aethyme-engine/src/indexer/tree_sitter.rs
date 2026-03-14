@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use tree_sitter::{wasmtime::Engine, Language, Parser, Query, QueryCursor, StreamingIterator, WasmStore};
 
-use crate::edge::{Edge, EdgeKind};
-use crate::symbol::{Symbol, SymbolKind};
+use crate::model::edge::{Edge, EdgeKind};
+use crate::model::symbol::{Symbol, SymbolKind};
 
 pub struct LoadedGrammar {
     pub language: Language,

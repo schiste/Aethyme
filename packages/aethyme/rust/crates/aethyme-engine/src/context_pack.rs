@@ -1,7 +1,7 @@
-use crate::risk::RiskFlag;
-use crate::signals::GraphSignals;
-use crate::scope::ScopeBoundary;
-use crate::task::TaskInput;
+use crate::model::risk::RiskFlag;
+use crate::graph::signals::GraphSignals;
+use crate::model::scope::ScopeBoundary;
+use crate::model::task::TaskInput;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AnchorKind {

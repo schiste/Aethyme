@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use crate::doc::DocNode;
-use crate::edge::{Edge, EdgeKind};
+use crate::model::doc::DocNode;
+use crate::model::edge::{Edge, EdgeKind};
 use crate::passes::code::CodePass;
 use crate::passes::configs::ConfigsPass;
 use crate::passes::structure::StructurePass;
@@ -73,7 +73,7 @@ where
     let mut parsed_docs = structure
         .files
         .par_iter()
-        .filter(|file| matches!(file.role, crate::file::FileRole::Doc))
+        .filter(|file| matches!(file.role, crate::model::file::FileRole::Doc))
         .map(|file| parse_doc(root, file.path.as_str(), file.id.as_str(), file.name.as_str(), file.area_id.clone()))
         .collect::<Vec<_>>();
     parsed_docs.sort_by(|left, right| left.path.cmp(&right.path));
@@ -107,7 +107,7 @@ where
     let file_path_index = structure
         .files
         .iter()
-        .filter(|file| !matches!(file.role, crate::file::FileRole::Doc))
+        .filter(|file| !matches!(file.role, crate::model::file::FileRole::Doc))
         .map(|file| (file.path.to_ascii_lowercase(), file.id.clone()))
         .collect::<HashMap<_, _>>();
     let file_token_index = build_file_token_index(structure);
@@ -203,7 +203,7 @@ fn parse_doc(
 fn build_file_token_index(structure: &StructurePass) -> HashMap<AreaTokenKey, Vec<String>> {
     let mut index = HashMap::new();
     for file in &structure.files {
-        if matches!(file.role, crate::file::FileRole::Doc) {
+        if matches!(file.role, crate::model::file::FileRole::Doc) {
             continue;
         }
         let area_key = area_key(file.area_id.as_deref());
@@ -453,7 +453,7 @@ mod tests {
     use std::fs;
 
     use super::build;
-    use crate::edge::EdgeKind;
+    use crate::model::edge::EdgeKind;
     use crate::passes::{code, structure};
     use crate::repo::discover_repo;
 

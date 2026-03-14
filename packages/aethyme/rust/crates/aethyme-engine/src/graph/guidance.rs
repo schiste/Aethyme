@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 
 use crate::context_pack::{Anchor, AnchorKind};
 use crate::map::RepositoryMap;
-use crate::risk::RiskLevel;
-use crate::scope::{ScopeBoundary, ScopeItem, ScopeKind};
-use crate::task::TaskKind;
+use crate::model::risk::RiskLevel;
+use crate::model::scope::{ScopeBoundary, ScopeItem, ScopeKind};
+use crate::model::task::TaskKind;
 
 pub fn build_in_scope(map: &RepositoryMap, anchors: &[Anchor], max_files: usize) -> ScopeBoundary {
     let mut boundary = ScopeBoundary::default();

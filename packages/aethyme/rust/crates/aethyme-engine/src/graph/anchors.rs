@@ -1,9 +1,9 @@
 use crate::context_pack::{Anchor, AnchorKind};
-use crate::edge::EdgeKind;
-use crate::file::FileRole;
+use crate::model::edge::EdgeKind;
+use crate::model::file::FileRole;
 use crate::map::RepositoryMap;
-use crate::search::symbol_search;
-use crate::task::{TaskInput, TaskKind};
+use crate::graph::search::symbol_search;
+use crate::model::task::{TaskInput, TaskKind};
 
 const STOP_WORDS: &[&str] = &[
     "change",
@@ -614,7 +614,7 @@ mod tests {
 
     use super::resolve_anchors;
     use crate::map::RepositoryMap;
-    use crate::task::TaskInput;
+    use crate::model::task::TaskInput;
 
     #[test]
     fn fix_task_extracts_file_reference_from_task_text() {
@@ -708,7 +708,7 @@ mod tests {
         let task = TaskInput::from_task_text("Find the manifest that manages the main code entrypoint in the GameEngine area");
         let anchors = resolve_anchors(&map, &task, 5);
 
-        assert_eq!(task.kind, crate::task::TaskKind::NavigateConfigOwnership);
+        assert_eq!(task.kind, crate::model::task::TaskKind::NavigateConfigOwnership);
         assert!(anchors.iter().any(|anchor| anchor.id.ends_with("Cargo.toml")));
         assert!(anchors.iter().any(|anchor| anchor.id == "GameEngine"));
         assert!(!anchors.iter().any(|anchor| anchor.id.contains("Other/project.godot")));

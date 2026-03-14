@@ -1,27 +1,27 @@
-use crate::area::AreaNode;
-use crate::class::ClassNode;
-use crate::config::ConfigNode;
-use crate::activation::ActivationMap;
+use crate::model::area::AreaNode;
+use crate::model::class::ClassNode;
+use crate::model::config::ConfigNode;
+use crate::graph::activation::ActivationMap;
 use crate::context_pack::{ActivationSummary, Anchor, ContextPack, DependencyEdge, FileContent, ImpactItem, PackSnapshot, PackSummary, Snippet};
-use crate::overview::{build_repo_overview, repo_overview_seed};
-use crate::directory::DirectoryNode;
-use crate::doc::DocNode;
-use crate::edge::{Edge, EdgeKind};
-use crate::file::{FileNode, FileRole};
-use crate::function::FunctionNode;
-use crate::graph::{GraphAnnotation, GraphNode, GraphNodeKind};
+use crate::graph::overview::{build_repo_overview, repo_overview_seed};
+use crate::model::directory::DirectoryNode;
+use crate::model::doc::DocNode;
+use crate::model::edge::{Edge, EdgeKind};
+use crate::model::file::{FileNode, FileRole};
+use crate::model::function::FunctionNode;
+use crate::model::graph::{GraphAnnotation, GraphNode, GraphNodeKind};
 use crate::map::{RepositoryBuildProfile, RepositoryMap};
-use crate::navigation::{
+use crate::graph::navigation::{
     GraphExpandView, GraphNodeView, GraphRelationItem, GraphRelationView, TaskAnchorsView, TaskExpandView,
     TaskScopeView, RepoOverviewView,
 };
 use crate::repo::RepoSnapshot;
-use crate::risk::{RiskArea, RiskFlag, RiskLevel};
-use crate::scope::{ScopeBoundary, ScopeItem, ScopeKind};
-use crate::search::SearchHit;
-use crate::signals::{GraphSignals, SignalAssessment};
-use crate::symbol::{Symbol, SymbolKind};
-use crate::task::{TaskInput, TaskKind};
+use crate::model::risk::{RiskArea, RiskFlag, RiskLevel};
+use crate::model::scope::{ScopeBoundary, ScopeItem, ScopeKind};
+use crate::graph::search::SearchHit;
+use crate::graph::signals::{GraphSignals, SignalAssessment};
+use crate::model::symbol::{Symbol, SymbolKind};
+use crate::model::task::{TaskInput, TaskKind};
 use crate::workspace::{BlastRadiusItem, CrossEdgeKind, CrossRepoEdge, SharedDependency, WorkspaceGraph};
 
 pub fn escape(value: &str) -> String {
@@ -326,7 +326,7 @@ pub fn repository_map(map: &RepositoryMap) -> String {
     format!(
         "{{\"snapshot\":{},\"signals\":{},\"areas\":[{}],\"directories\":[{}],\"files\":[{}],\"classes\":[{}],\"functions\":[{}],\"docs\":[{}],\"configs\":[{}],\"symbols\":[{}],\"edges\":[{}],\"risk_flags\":[{}],\"graph\":{{\"nodes\":[{}],\"edges\":[{}],\"annotations\":[{}]}}}}",
         repo_snapshot(&map.snapshot),
-        graph_signals(&crate::signals::evaluate_graph_signals(map)),
+        graph_signals(&crate::graph::signals::evaluate_graph_signals(map)),
         map.areas.iter().map(area).collect::<Vec<_>>().join(","),
         map.directories.iter().map(directory).collect::<Vec<_>>().join(","),
         map.files.iter().map(file).collect::<Vec<_>>().join(","),
@@ -353,7 +353,7 @@ pub fn inspect_brief(map: &RepositoryMap) -> String {
     format!(
         "{{\"snapshot\":{},\"signals\":{},\"areas\":[{}],\"entrypoints\":{},\"key_configs\":{}}}",
         repo_snapshot_compact(&map.snapshot),
-        graph_signals(&crate::signals::evaluate_graph_signals(map)),
+        graph_signals(&crate::graph::signals::evaluate_graph_signals(map)),
         map.areas.iter().map(area).collect::<Vec<_>>().join(","),
         string_array(&overview.entrypoints),
         string_array(&overview.key_configs),
@@ -373,7 +373,7 @@ pub fn inspect_structure(map: &RepositoryMap) -> String {
     format!(
         "{{\"snapshot\":{},\"signals\":{},\"areas\":[{}],\"files\":[{}],\"configs\":[{}],\"docs\":[{}],\"entrypoints\":{},\"key_configs\":{}}}",
         repo_snapshot_compact(&map.snapshot),
-        graph_signals(&crate::signals::evaluate_graph_signals(map)),
+        graph_signals(&crate::graph::signals::evaluate_graph_signals(map)),
         map.areas.iter().map(area).collect::<Vec<_>>().join(","),
         compact_files,
         map.configs.iter().map(config).collect::<Vec<_>>().join(","),

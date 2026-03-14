@@ -2,18 +2,18 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use crate::activation::{hormone_profile, spread_activation};
-use crate::anchors::resolve_anchors;
+use crate::graph::activation::{hormone_profile, spread_activation};
+use crate::graph::anchors::resolve_anchors;
 use crate::context_pack::{ActivationSummary, Anchor, AnchorKind, Budget, ContextPack, DependencyEdge, FileContent, ImpactItem, Snippet};
-use crate::edge::EdgeKind;
-use crate::guidance::{build_in_scope, build_out_of_scope_activated, navigation_order};
+use crate::model::edge::EdgeKind;
+use crate::graph::guidance::{build_in_scope, build_out_of_scope_activated, navigation_order};
 use crate::map::RepositoryMap;
-use crate::neighborhood::{dependency_frontier, impact_frontier};
-use crate::overview::{build_repo_overview, overview_dependencies, overview_impact, repo_overview_seed};
-use crate::scope::ScopeBoundary;
-use crate::signals::evaluate_graph_signals;
+use crate::graph::neighborhood::{dependency_frontier, impact_frontier};
+use crate::graph::overview::{build_repo_overview, overview_dependencies, overview_impact, repo_overview_seed};
+use crate::model::scope::ScopeBoundary;
+use crate::graph::signals::evaluate_graph_signals;
 use crate::snippets::select_snippets;
-use crate::task::TaskInput;
+use crate::model::task::TaskInput;
 
 pub fn build_context_pack(root: &Path, map: &RepositoryMap, task: TaskInput) -> ContextPack {
     let anchor_limit = if task.kind.is_explain_repo() { 5 } else { 3 };
@@ -386,7 +386,7 @@ mod tests {
 
     use super::build_context_pack;
     use crate::map::RepositoryMap;
-    use crate::task::TaskInput;
+    use crate::model::task::TaskInput;
 
     #[test]
     fn explain_repo_pack_includes_readme_anchor() {
