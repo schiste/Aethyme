@@ -34,7 +34,7 @@ pub struct CodeStageProfile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedFile {
     file: FileNode,
-    contents: String,
+    content_hash: String,
     language: String,
     symbols: Vec<Symbol>,
     import_edges: Vec<Edge>,
@@ -104,7 +104,7 @@ pub fn build_with_profile(
     let mut hits = 0usize;
     let mut misses = 0usize;
     let mut parsed_files = Vec::with_capacity(parsed_results.len());
-    let mut new_cache = ParseCache::new();
+    let mut new_cache = ParseCache::for_repo(root);
     for (parsed, was_cached) in parsed_results {
         if was_cached {
             hits += 1;
@@ -114,7 +114,7 @@ pub fn build_with_profile(
         new_cache.insert(
             parsed.file.path.clone(),
             CacheEntry {
-                content_hash: sha256_hex(&parsed.contents),
+                content_hash: parsed.content_hash.clone(),
                 symbols: parsed.symbols.clone(),
                 import_edges: parsed.import_edges.clone(),
             },
@@ -164,9 +164,10 @@ pub fn build_with_profile(
             .get(&parsed.file.id)
             .cloned()
             .unwrap_or_default();
+        let contents = fs::read_to_string(root.join(&parsed.file.path)).unwrap_or_default();
         let imported_symbol_names =
-            imported_symbol_names_for_language(&parsed.language, &parsed.contents, &mut interner);
-        let analyses = analyze_file_functions(parsed, &current_function_indexes, &functions, &mut interner);
+            imported_symbol_names_for_language(&parsed.language, &contents, &mut interner);
+        let analyses = analyze_file_functions_with_contents(&contents, &current_function_indexes, &functions, &mut interner);
         edges.extend(resolve_cross_file_calls(
             &analyses,
             &functions,
@@ -191,9 +192,10 @@ pub fn build_with_profile(
             .get(&parsed.file.id)
             .cloned()
             .unwrap_or_default();
+        let contents = fs::read_to_string(root.join(&parsed.file.path)).unwrap_or_default();
         let imported_symbol_names =
-            imported_symbol_names_for_language(&parsed.language, &parsed.contents, &mut interner);
-        let analyses = analyze_file_functions(parsed, &current_function_indexes, &functions, &mut interner);
+            imported_symbol_names_for_language(&parsed.language, &contents, &mut interner);
+        let analyses = analyze_file_functions_with_contents(&contents, &current_function_indexes, &functions, &mut interner);
         edges.extend(resolve_references(
             &analyses,
             &current_class_indexes,
@@ -241,22 +243,22 @@ fn parse_file_with_cache(
     let absolute_path = root.join(&file.path);
     let contents = fs::read_to_string(&absolute_path).unwrap_or_default();
     let language = file.language.clone().unwrap_or_default();
+    let content_hash = sha256_hex(&contents);
 
     if let Some(cache) = cache {
-        let hash = sha256_hex(&contents);
-        if let Some(entry) = cache.lookup(&file.path, &hash) {
+        if let Some(entry) = cache.lookup(&file.path, &content_hash) {
             let symbols = entry
                 .symbols
-                .iter()
-                .map(|s| s.clone().with_context(Some(language.clone()), file.area_id.clone()))
+                .into_iter()
+                .map(|s| s.with_context(Some(language.clone()), file.area_id.clone()))
                 .collect();
             return (
                 ParsedFile {
                     file: file.clone(),
-                    contents,
+                    content_hash,
                     language,
                     symbols,
-                    import_edges: entry.import_edges.clone(),
+                    import_edges: entry.import_edges,
                 },
                 true,
             );
@@ -272,7 +274,7 @@ fn parse_file_with_cache(
     (
         ParsedFile {
             file: file.clone(),
-            contents,
+            content_hash,
             language,
             symbols,
             import_edges,
@@ -631,8 +633,8 @@ fn imported_symbol_names_for_language(
     names.into_iter().map(|name| interner.intern(&name)).collect()
 }
 
-fn analyze_file_functions(
-    parsed: &ParsedFile,
+fn analyze_file_functions_with_contents(
+    contents: &str,
     current_function_indexes: &[usize],
     functions: &[FunctionNode],
     interner: &mut StringInterner,
@@ -653,7 +655,7 @@ fn analyze_file_functions(
         let next_line = current_function_indexes
             .get(offset + 1)
             .map(|index| functions[*index].line);
-        let body = function_body(&parsed.contents, function.line, next_line);
+        let body = function_body(contents, function.line, next_line);
         let tokens = body_identifier_tokens(&body, interner);
         let call_names = body_call_name_tokens(&body, interner);
         let qualified_call_names = body_qualified_call_name_tokens(&body, interner);

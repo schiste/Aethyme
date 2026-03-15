@@ -126,7 +126,7 @@ def estimate_report(
     )
 
 
-def _get_aethyme_commit() -> str:
+def get_aethyme_commit() -> str:
     """Return the current Aethyme HEAD commit hash, or 'unknown' on failure."""
     try:
         return subprocess.check_output(
@@ -164,7 +164,7 @@ def create_eval_run_dir(
 
     metadata: dict[str, Any] = {
         "timestamp": datetime.now(UTC).isoformat(),
-        "aethyme_commit": _get_aethyme_commit(),
+        "aethyme_commit": get_aethyme_commit(),
         "repo_path": str(repo_path),
         "eval_type": eval_type,
         "conditions": list(conditions or CONDITION_ORDER),
@@ -344,7 +344,7 @@ def _extract_ledger_record(
         "task": result.get("task", "unknown"),
         "eval_type": result.get("eval_type", "unknown"),
         "repo": rp.name,
-        "aethyme_commit": _get_aethyme_commit()[:8],
+        "aethyme_commit": get_aethyme_commit()[:8],
     }
 
     scenario = result.get("scenario")
@@ -676,7 +676,7 @@ def _section_meta(
         lines.append(f"- Scenario: {scenario}")
     lines.extend([
         f"- Conditions: {', '.join(active)}",
-        f"- Aethyme Commit: `{_get_aethyme_commit()}`",
+        f"- Aethyme Commit: `{get_aethyme_commit()}`",
         "",
     ])
 

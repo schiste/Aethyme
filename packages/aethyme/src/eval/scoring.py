@@ -496,6 +496,101 @@ def score_bug_fix_output(
     return result
 
 
+def score_mediawiki_bug_fix_1(
+    candidate: dict[str, Any] | None,
+    reference: dict[str, Any],
+    *,
+    cost_usd: float = 0.0,
+    tokens_used: int = 0,
+    repo_path: str | None = None,
+) -> dict[str, Any]:
+    """Score the MediaWiki bug-fix-1 diagnostic evaluation (T419918).
+
+    The agent must identify files to edit and explain the fix approach.
+    No actual code modification is evaluated — this is purely diagnostic.
+    """
+    from .schemas import MEDIAWIKI_BUG_FIX_1_PATH_KEYS
+
+    weights = {
+        "files_identified": 40,
+        "root_cause_quality": 30,
+        "fix_plan_quality": 20,
+        "efficiency": 10,
+    }
+
+    if candidate is None:
+        return {
+            "scores": {k: 0.0 for k in weights},
+            "weights": weights,
+            "weighted_score": 0.0,
+            "max_score": 100,
+        }
+
+    # --- Files identified (40%) ---
+    # Set overlap on normalized file paths
+    ref_files = {
+        _normalize_path(f["path"], repo_path)
+        for f in reference.get("files_to_edit", [])
+    }
+    candidate_files_raw = candidate.get("files_to_edit", [])
+    if isinstance(candidate_files_raw, list):
+        cand_files = {
+            _normalize_path(
+                f["path"] if isinstance(f, dict) else f,
+                repo_path,
+            )
+            for f in candidate_files_raw
+        }
+    else:
+        cand_files = set()
+
+    if ref_files:
+        files_score = len(ref_files & cand_files) / len(ref_files)
+    else:
+        files_score = 0.0
+
+    # --- Root cause quality (30%) ---
+    root_cause_text = candidate.get("root_cause", "")
+    root_cause_kws = reference.get("root_cause_keywords", [])
+    root_cause_score = _keyword_score(root_cause_text, root_cause_kws)
+
+    # --- Fix plan quality (20%) ---
+    fix_plan_text = candidate.get("fix_plan", "")
+    fix_plan_kws = reference.get("fix_plan_keywords", [])
+    fix_plan_score = _keyword_score(fix_plan_text, fix_plan_kws)
+
+    # --- Efficiency (10%) ---
+    eff_score = _efficiency_score(cost_usd, reference_cost=0.20)
+
+    scores = {
+        "files_identified": files_score,
+        "root_cause_quality": root_cause_score,
+        "fix_plan_quality": fix_plan_score,
+        "efficiency": eff_score,
+    }
+
+    weighted = sum(scores[k] * weights[k] for k in weights)
+
+    guardrails = _compute_guardrails(
+        candidate,
+        repo_path=repo_path,
+        raw_score=weighted,
+        normalized_score=weighted,
+        path_keys=MEDIAWIKI_BUG_FIX_1_PATH_KEYS,
+    )
+
+    return {
+        "scores": scores,
+        "weights": weights,
+        "weighted_score": round(weighted, 2),
+        "max_score": 100,
+        "files_matched": sorted(ref_files & cand_files),
+        "files_missed": sorted(ref_files - cand_files),
+        "files_extra": sorted(cand_files - ref_files),
+        "guardrails": guardrails,
+    }
+
+
 def score_onboarding_auth_output(
     candidate: dict[str, Any] | None,
     reference: dict[str, Any],

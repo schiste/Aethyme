@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use crate::model::area::AreaNode;
 use crate::model::class::ClassNode;
 use crate::model::config::ConfigNode;
@@ -23,6 +25,127 @@ use crate::graph::signals::{GraphSignals, SignalAssessment};
 use crate::model::symbol::{Symbol, SymbolKind};
 use crate::model::task::{TaskInput, TaskKind};
 use crate::workspace::{BlastRadiusItem, CrossEdgeKind, CrossRepoEdge, SharedDependency, WorkspaceGraph};
+
+/// Write a JSON array to a writer, streaming one element at a time to avoid
+/// allocating a single giant string for the entire array.
+fn write_array<T, W: Write>(w: &mut W, items: &[T], to_json: impl Fn(&T) -> String) -> std::io::Result<()> {
+    write!(w, "[")?;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            write!(w, ",")?;
+        }
+        write!(w, "{}", to_json(item))?;
+    }
+    write!(w, "]")
+}
+
+/// Streaming version of `repository_map` — writes JSON directly to a writer
+/// instead of building a multi-hundred-MB String in memory.
+pub fn write_repository_map<W: Write>(w: &mut W, map: &RepositoryMap) -> std::io::Result<()> {
+    write!(w, "{{\"snapshot\":{},\"signals\":{},\"areas\":",
+        repo_snapshot(&map.snapshot),
+        graph_signals(&crate::graph::signals::evaluate_graph_signals(map)),
+    )?;
+    write_array(w, &map.areas, area)?;
+    write!(w, ",\"directories\":")?;
+    write_array(w, &map.directories, directory)?;
+    write!(w, ",\"files\":")?;
+    write_array(w, &map.files, file)?;
+    write!(w, ",\"classes\":")?;
+    write_array(w, &map.classes, class)?;
+    write!(w, ",\"functions\":")?;
+    write_array(w, &map.functions, function)?;
+    write!(w, ",\"docs\":")?;
+    write_array(w, &map.docs, doc)?;
+    write!(w, ",\"configs\":")?;
+    write_array(w, &map.configs, config)?;
+    write!(w, ",\"symbols\":")?;
+    write_array(w, &map.symbols, symbol)?;
+    write!(w, ",\"edges\":")?;
+    write_array(w, &map.edges, edge)?;
+    write!(w, ",\"risk_flags\":")?;
+    write_array(w, &map.risk_flags, risk_flag)?;
+    write!(w, ",\"graph\":{{\"nodes\":")?;
+    write_array(w, &map.graph.nodes, graph_node_record)?;
+    write!(w, ",\"edges\":")?;
+    write_array(w, &map.graph.edges, edge)?;
+    write!(w, ",\"annotations\":")?;
+    write_array(w, &map.graph.annotations, annotation)?;
+    write!(w, "}}}}")
+}
+
+/// Streaming version of `context_pack` — writes JSON directly to a writer.
+pub fn write_context_pack<W: Write>(w: &mut W, pack: &ContextPack) -> std::io::Result<()> {
+    let activation_json = pack
+        .activation_summary
+        .as_ref()
+        .map(activation_summary)
+        .unwrap_or_else(|| "null".to_string());
+    write!(w, "{{\"task\":{},\"summary\":{},\"signals\":{},\"overview\":{},\"anchors\":",
+        task_input(&pack.task),
+        pack_summary(&pack.summary),
+        graph_signals(&pack.signals),
+        repo_overview(pack),
+    )?;
+    write_array(w, &pack.anchors, anchor)?;
+    write!(w, ",\"in_scope\":{},\"out_of_scope\":{},\"dependencies\":",
+        scope_boundary(&pack.in_scope),
+        scope_boundary(&pack.out_of_scope),
+    )?;
+    write_array(w, &pack.dependencies, dependency)?;
+    write!(w, ",\"impact\":")?;
+    write_array(w, &pack.impact, impact)?;
+    write!(w, ",\"snippets\":")?;
+    write_array(w, &pack.snippets, snippet)?;
+    write!(w, ",\"file_contents\":")?;
+    write_array(w, &pack.file_contents, file_content)?;
+    write!(w, ",\"risk_flags\":")?;
+    write_array(w, &pack.risk_flags, risk_flag)?;
+    write!(w, ",\"navigation_order\":{},\"budget\":{{\"max_anchors\":{},\"max_files\":{},\"max_snippets\":{},\"dependency_depth\":{},\"impact_depth\":{},\"snippet_window\":{},\"content_budget\":{},\"max_content_files\":{},\"max_lines_per_file\":{}}},\"confidence\":{{\"anchor_confidence\":{},\"scope_confidence\":{}}},\"activation_summary\":{}}}",
+        string_array(&pack.navigation_order),
+        pack.budget.max_anchors,
+        pack.budget.max_files,
+        pack.budget.max_snippets,
+        pack.budget.dependency_depth,
+        pack.budget.impact_depth,
+        pack.budget.snippet_window,
+        pack.budget.content_budget,
+        pack.budget.max_content_files,
+        pack.budget.max_lines_per_file,
+        pack.confidence.anchor_confidence,
+        pack.confidence.scope_confidence,
+        activation_json,
+    )
+}
+
+/// Streaming version of `inspect_structure` — writes JSON directly to a writer.
+pub fn write_inspect_structure<W: Write>(w: &mut W, map: &RepositoryMap) -> std::io::Result<()> {
+    let overview = build_repo_overview(map, &repo_overview_seed(map));
+    write!(w, "{{\"snapshot\":{},\"signals\":{},\"areas\":",
+        repo_snapshot_compact(&map.snapshot),
+        graph_signals(&crate::graph::signals::evaluate_graph_signals(map)),
+    )?;
+    write_array(w, &map.areas, area)?;
+    write!(w, ",\"files\":[")?;
+    for (i, f) in map.files.iter().enumerate() {
+        if i > 0 {
+            write!(w, ",")?;
+        }
+        write!(w, "{{\"path\":{},\"role\":{},\"area_id\":{}}}",
+            string(&f.path),
+            string(file_role(&f.role)),
+            f.area_id.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        )?;
+    }
+    write!(w, "],\"configs\":")?;
+    write_array(w, &map.configs, config)?;
+    write!(w, ",\"docs\":")?;
+    write_array(w, &map.docs, doc)?;
+    write!(w, ",\"entrypoints\":{},\"key_configs\":{}}}",
+        string_array(&overview.entrypoints),
+        string_array(&overview.key_configs),
+    )
+}
 
 pub fn escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")

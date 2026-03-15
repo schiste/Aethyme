@@ -11,4 +11,5 @@ pub mod passes;
 pub mod pipeline;
 pub mod repo;
 pub mod snippets;
+pub mod store;
 pub mod workspace;

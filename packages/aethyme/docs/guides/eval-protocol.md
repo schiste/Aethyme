@@ -122,13 +122,69 @@ If any of these are missing, the run is incomplete and must be re-captured or ma
 
 Condition slugs: `control-cto-off`, `control-cto-on`, `explore`, `leverage`.
 
+### Data Collection Checklist
+
+Run this checklist **after every condition completes**, before moving to the next phase. Skipping any item produces invalid data.
+
+#### 1. Verify prompt was received
+```
+Check the first `type: "user"` message in the session JSONL.
+Confirm it contains the expected prompt text.
+If the condition is leverage, confirm the navigation context is present.
+```
+**Why:** `tab_send_input` silently fails with Claude Code TUI. The prompt may not have been received. An agent that got no prompt or the wrong prompt invalidates the condition.
+
+#### 2. Check for sub-agent sessions
+```
+Session JSONL path: ~/.claude/projects/<encoded-repo-path>/<session-id>.jsonl
+Sub-agent path:     ~/.claude/projects/<encoded-repo-path>/<session-id>/subagents/*.jsonl
+```
+**Why:** Claude Code (especially Haiku) frequently delegates to sub-agents via the `Agent` tool. The parent session may show 5 turns and $0.14, but the sub-agent did 56 turns and $0.55. Always sum parent + sub-agent tokens for the true cost.
+
+#### 3. Collect token counts from ALL session files
+```python
+# For each condition, sum across parent + all sub-agents:
+total_input    = parent.input + sum(sub.input for sub in subagents)
+total_output   = parent.output + sum(sub.output for sub in subagents)
+total_cache_r  = parent.cache_read + sum(sub.cache_read for sub in subagents)
+total_cache_c  = parent.cache_create + sum(sub.cache_create for sub in subagents)
+total_turns    = parent.turns + sum(sub.turns for sub in subagents)
+total_tools    = parent.tools + sum(sub.tools for sub in subagents)
+# Exclude the parent's "Agent" tool call from tool count (it's delegation, not work)
+```
+
+#### 4. Verify CTO state per tab
+```
+tab_status(tab_id) → check cto_active and cto_override fields.
+control-cto-off must show cto_override: "forceOff"
+all others must show cto_active: true (if CTO is globally enabled)
+```
+**Why:** CTO was found to be globally disabled during one eval run, making all conditions identical. Always verify CTO state before drawing CTO conclusions.
+
+#### 5. Map tab IDs to session files
+```
+Record which tab_id corresponds to which condition BEFORE launching.
+After completion, match tab_id → session JSONL via modification time or prompt content.
+```
+**Why:** Session JSONL filenames are UUIDs with no condition label. Without explicit mapping, you cannot tell which file is control-cto-off vs control-cto-on.
+
+### Known Limitations
+
+- **`tab_send_input` does not submit prompts in Claude Code TUI.** Text is pasted but Enter is not triggered. The user must press Enter manually on each tab. This is a Chau7 MCP limitation — Claude Code handles key events differently from raw terminal character input.
+- **`runtime_session_create` with `backend="claude"` fails** with `--print-session-id` error on current Claude Code versions. Use `tab_create` + `tab_exec` + manual prompt entry instead.
+- **Sub-agent JSONL files** are stored in `<session-id>/subagents/` subdirectory, not alongside the parent. Token extraction code must recurse into this directory.
+- **Haiku strategy variance is high.** The same prompt can produce 5-turn or 70-turn sessions depending on whether the model delegates to a sub-agent. Multiple runs per condition are needed for stable averages.
+
 ## Playground Repositories
 
-| Name | Path | Origin | Notes |
-|------|------|--------|-------|
-| Aethyme Playground | `/Users/christophehenner/Downloads/Repositories/Aethyme Playground` | `https://github.com/Aeptus/mockup.git` | Enterprise GRC platform (Django + React + infra) |
+Target repos are registered in `src/eval/targets.py` (canonical source). Run `python -m src.cli eval targets` to list and validate.
 
-To add a new playground: clone a real repo, add it to this table, and reference it from the docs index.
+| Target | Display | Control | Aethyme | Notes |
+|--------|---------|---------|---------|-------|
+| `grc` | GRC | `Playground/GRC/Playground Control` | `Playground/GRC/Playground Aethyme` | TypeScript monorepo |
+| `mediawiki` | MediaWiki | `Playground/Mediawiki/Mediawiki - Control` | `Playground/Mediawiki/Mediawiki - Aethyme` | PHP monolith (~12.5K files) |
+
+Each target is a pair: a vanilla **control** repo (no `.codex/skills/`) and an **aethyme** repo with the skill deployed. To add a new playground: clone a repo into both slots, deploy the Aethyme skill to the aethyme copy, and add an entry to `TARGETS` in `targets.py`.
 
 ### Isolated Benchmark Repos (Bug-Fix and Stateful Evals)
 
@@ -330,7 +386,43 @@ Then produce a qualitative comparison table:
 
 ## Execution Method
 
-Evals are orchestrated by spinning up AI agent sessions (via terminal multiplexer, Chau7 MCP, or equivalent) and feeding them the generated prompts. This is **not** done through runner scripts.
+### Orchestrator-Based Execution (Preferred)
+
+The orchestrator generates a complete, deterministic run plan that Claude executes mechanically via Chau7 MCP. No runtime decisions needed.
+
+**Generate a plan:**
+
+```bash
+cd packages/aethyme
+python -m src.cli eval run --eval-type bug-fix --target grc --model haiku
+python -m src.cli eval run --eval-type explain-repo --target mediawiki --model sonnet --json-output
+```
+
+The `--json-output` flag emits the full plan dict with 8 phases:
+
+0. **validate** — check repos, tooling, engine binary, no skill contamination
+1. **prepare** — generate artifacts (prompts, schema, reference, nav context), clone repos for bug-fix
+2. **launch** — create 4 Chau7 sessions with exact `runtime_session_create` or `tab_exec` params
+3. **monitor** — poll until all agents complete
+4. **collect** — gather structured output, telemetry, transcripts per condition
+5. **score** — call `assemble_bug_fix_result()` or equivalent scorer
+6. **report** — call `finalize_eval_run()` + `print_scorecard()` (never hand-write)
+7. **cleanup** — close all sessions and tabs
+
+Each phase contains all parameters pre-computed. Claude reads the plan and executes each step via Chau7 MCP tools (`runtime_session_create`, `tab_set_cto`, `runtime_turn_status`, `tab_output`, etc.).
+
+**Supported models:**
+
+| Model | Provider | Backend | Launch Method |
+|-------|----------|---------|---------------|
+| haiku | Anthropic | claude | `runtime_session_create` with `initial_prompt` |
+| sonnet | Anthropic | claude | `runtime_session_create` with `initial_prompt` |
+| opus | Anthropic | claude | `runtime_session_create` with `initial_prompt` |
+| gpt-5.4 | OpenAI | codex | `tab_create` + `tab_exec` with `codex exec` |
+
+### Manual Execution (Fallback)
+
+For cases where the orchestrator doesn't cover a specific need, the manual step-by-step process is below.
 
 ### Step-by-Step
 

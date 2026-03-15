@@ -765,6 +765,84 @@ def eval() -> None:
     """Local evaluation harnesses for Aethyme Core."""
 
 
+@eval.command("run")
+@click.option(
+    "--eval-type", required=True,
+    type=click.Choice(["bug-fix", "bug-fix-1", "explain-repo", "navigation-ctf"]),
+    help="Type of evaluation to run",
+)
+@click.option(
+    "--target", required=True,
+    type=click.Choice(["grc", "mediawiki"]),
+    help="Target playground repository",
+)
+@click.option(
+    "--model", required=True,
+    type=click.Choice(["haiku", "sonnet", "opus", "gpt-5.4"]),
+    help="Agent model to use",
+)
+@click.option("--scenario", type=click.Choice(["implication-share", "cross-package"]), default=None, help="Bug-fix scenario")
+@click.option("--reasoning", type=click.Choice(["default", "high", "low"]), default="default", help="Reasoning effort level")
+@click.option("--dest", "dest_dir", type=click.Path(path_type=Path), default=None, help="Override dest dir for bug-fix clones")
+@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON plan")
+def eval_run(
+    eval_type: str,
+    target: str,
+    model: str,
+    scenario: str | None,
+    reasoning: str,
+    dest_dir: Path | None,
+    json_output: bool,
+) -> None:
+    """Generate a complete eval run plan for Chau7 MCP execution."""
+    from src.eval.orchestrator import generate_run_plan
+
+    plan = generate_run_plan(
+        eval_type=eval_type,
+        target=target,
+        model=model,
+        scenario=scenario,
+        reasoning=reasoning,
+        dest_dir=str(dest_dir) if dest_dir else None,
+    )
+
+    if json_output:
+        click.echo(json.dumps(plan, indent=2))
+        return
+
+    meta = plan["meta"]
+    click.echo(f"Eval Type:  {meta['eval_type']}")
+    click.echo(f"Target:     {meta['target_display']}")
+    click.echo(f"Model:      {meta['model']['name']} ({meta['model']['provider']})")
+    click.echo(f"Backend:    {meta['model']['backend']}")
+    click.echo(f"Conditions: {', '.join(meta['conditions'])}")
+    if meta.get("scenario"):
+        click.echo(f"Scenario:   {meta['scenario']}")
+    click.echo(f"Commit:     {meta['aethyme_commit'][:8]}")
+    click.echo()
+    click.echo(f"Phases ({len(plan['phases'])}):")
+    for i, phase in enumerate(plan["phases"]):
+        click.echo(f"  {i}. {phase['name']}: {phase['description']}")
+    click.echo()
+    click.echo("Run with --json-output for the full plan dict.")
+
+
+@eval.command("targets")
+def eval_targets() -> None:
+    """List available eval targets and their validation status."""
+    from src.eval.targets import list_targets
+
+    for tgt in list_targets():
+        errors = tgt.validate()
+        status = "OK" if not errors else f"{len(errors)} ERRORS"
+        click.echo(f"{tgt.name}: {tgt.display_name} [{status}]")
+        click.echo(f"  Control: {tgt.control_path}")
+        click.echo(f"  Aethyme: {tgt.aethyme_path}")
+        if errors:
+            for err in errors:
+                click.echo(f"  ERROR: {err}")
+
+
 @eval.command("setup-repos")
 @click.option("--source", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path), help="Source repo to clone")
 @click.option("--dest", required=True, type=click.Path(path_type=Path), help="Destination directory for 4 condition clones")

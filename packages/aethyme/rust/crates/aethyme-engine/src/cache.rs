@@ -1,6 +1,5 @@
-use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -8,7 +7,7 @@ use crate::model::edge::{Edge, EdgeKind};
 use crate::json::escape;
 use crate::model::symbol::{Symbol, SymbolKind};
 
-const ENGINE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-cache-v2-treesitter");
+const ENGINE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-cache-v3-dir");
 
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
@@ -20,7 +19,7 @@ pub struct CacheEntry {
 #[derive(Debug, Clone)]
 pub struct ParseCache {
     pub engine_version: String,
-    pub entries: HashMap<String, CacheEntry>,
+    cache_dir: PathBuf,
 }
 
 pub struct CacheStats {
@@ -32,38 +31,69 @@ impl ParseCache {
     pub fn new() -> Self {
         Self {
             engine_version: ENGINE_VERSION.to_string(),
-            entries: HashMap::new(),
+            cache_dir: PathBuf::new(),
+        }
+    }
+
+    pub fn for_repo(repo_root: &Path) -> Self {
+        let cache_dir = cache_dir_path(repo_root);
+        Self {
+            engine_version: ENGINE_VERSION.to_string(),
+            cache_dir,
         }
     }
 
     pub fn load(repo_root: &Path) -> Option<Self> {
-        let cache_path = cache_file_path(repo_root);
-        let contents = fs::read_to_string(&cache_path).ok()?;
-        let cache = deserialize_cache(&contents)?;
-        if cache.engine_version != ENGINE_VERSION {
+        let cache_dir = cache_dir_path(repo_root);
+        let version_path = cache_dir.join("version");
+        let version = fs::read_to_string(&version_path).ok()?;
+        if version.trim() != ENGINE_VERSION {
+            // Version mismatch — clear old cache
+            let _ = fs::remove_dir_all(&cache_dir);
             return None;
         }
-        Some(cache)
+        Some(Self {
+            engine_version: ENGINE_VERSION.to_string(),
+            cache_dir,
+        })
     }
 
     pub fn save(&self, repo_root: &Path) {
-        let cache_path = cache_file_path(repo_root);
-        if let Some(parent) = cache_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
+        let cache_dir = cache_dir_path(repo_root);
+        let _ = fs::create_dir_all(&cache_dir);
         ensure_aethyme_gitignore(repo_root);
-        let serialized = serialize_cache(self);
-        let _ = fs::write(&cache_path, serialized);
+        let version_path = cache_dir.join("version");
+        let _ = fs::write(&version_path, ENGINE_VERSION);
     }
 
-    pub fn lookup(&self, file_path: &str, content_hash: &str) -> Option<&CacheEntry> {
-        self.entries
-            .get(file_path)
-            .filter(|entry| entry.content_hash == content_hash)
+    pub fn lookup(&self, file_path: &str, content_hash: &str) -> Option<CacheEntry> {
+        if self.cache_dir.as_os_str().is_empty() {
+            return None;
+        }
+        let entry_path = self.entry_path(file_path);
+        let contents = fs::read_to_string(&entry_path).ok()?;
+        let entry = deserialize_entry(&contents)?;
+        if entry.content_hash != content_hash {
+            return None;
+        }
+        Some(entry)
     }
 
     pub fn insert(&mut self, file_path: String, entry: CacheEntry) {
-        self.entries.insert(file_path, entry);
+        if self.cache_dir.as_os_str().is_empty() {
+            return;
+        }
+        let entry_path = self.entry_path(&file_path);
+        if let Some(parent) = entry_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let serialized = serialize_entry(&entry);
+        let _ = fs::write(&entry_path, serialized);
+    }
+
+    fn entry_path(&self, file_path: &str) -> PathBuf {
+        let hash = &sha256_hex(file_path)[..16];
+        self.cache_dir.join(format!("{}.json", hash))
     }
 }
 
@@ -73,8 +103,8 @@ pub fn sha256_hex(content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn cache_file_path(repo_root: &Path) -> std::path::PathBuf {
-    repo_root.join(".aethyme").join("cache").join("parse-cache.json")
+fn cache_dir_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(".aethyme").join("cache").join("v3")
 }
 
 /// Create a `.gitignore` inside `.aethyme/` so the cache is automatically
@@ -86,101 +116,57 @@ fn ensure_aethyme_gitignore(repo_root: &Path) {
     }
 }
 
-fn serialize_cache(cache: &ParseCache) -> String {
-    let mut entries_json = Vec::new();
-    for (path, entry) in &cache.entries {
-        let symbols_json: Vec<String> = entry
-            .symbols
-            .iter()
-            .map(|s| {
-                format!(
-                    "{{\"id\":\"{}\",\"name\":\"{}\",\"kind\":\"{}\",\"file\":\"{}\",\"line\":{},\"signature\":\"{}\"}}",
-                    escape(&s.id),
-                    escape(&s.name),
-                    symbol_kind_str(&s.kind),
-                    escape(&s.file),
-                    s.line,
-                    escape(&s.signature)
-                )
-            })
-            .collect();
-        let edges_json: Vec<String> = entry
-            .import_edges
-            .iter()
-            .map(|e| {
-                format!(
-                    "{{\"from\":\"{}\",\"to\":\"{}\",\"kind\":\"{}\",\"confidence\":{},\"source\":\"{}\"}}",
-                    escape(&e.from),
-                    escape(&e.to),
-                    edge_kind_str(&e.kind),
-                    e.confidence,
-                    escape(&e.source)
-                )
-            })
-            .collect();
-        entries_json.push(format!(
-            "\"{}\":{{\"content_hash\":\"{}\",\"symbols\":[{}],\"import_edges\":[{}]}}",
-            escape(path),
-            escape(&entry.content_hash),
-            symbols_json.join(","),
-            edges_json.join(",")
-        ));
-    }
+fn serialize_entry(entry: &CacheEntry) -> String {
+    let symbols_json: Vec<String> = entry
+        .symbols
+        .iter()
+        .map(|s| {
+            format!(
+                "{{\"id\":\"{}\",\"name\":\"{}\",\"kind\":\"{}\",\"file\":\"{}\",\"line\":{},\"signature\":\"{}\"}}",
+                escape(&s.id),
+                escape(&s.name),
+                symbol_kind_str(&s.kind),
+                escape(&s.file),
+                s.line,
+                escape(&s.signature)
+            )
+        })
+        .collect();
+    let edges_json: Vec<String> = entry
+        .import_edges
+        .iter()
+        .map(|e| {
+            format!(
+                "{{\"from\":\"{}\",\"to\":\"{}\",\"kind\":\"{}\",\"confidence\":{},\"source\":\"{}\"}}",
+                escape(&e.from),
+                escape(&e.to),
+                edge_kind_str(&e.kind),
+                e.confidence,
+                escape(&e.source)
+            )
+        })
+        .collect();
     format!(
-        "{{\"engine_version\":\"{}\",\"entries\":{{{}}}}}",
-        escape(&cache.engine_version),
-        entries_json.join(",")
+        "{{\"content_hash\":\"{}\",\"symbols\":[{}],\"import_edges\":[{}]}}",
+        escape(&entry.content_hash),
+        symbols_json.join(","),
+        edges_json.join(",")
     )
 }
 
-fn deserialize_cache(json: &str) -> Option<ParseCache> {
+fn deserialize_entry(json: &str) -> Option<CacheEntry> {
     let json = json.trim();
     if !json.starts_with('{') || !json.ends_with('}') {
         return None;
     }
     let inner = &json[1..json.len() - 1];
-
-    let engine_version = extract_string_field(inner, "engine_version")?;
-    let entries_start = inner.find("\"entries\"")?;
-    let colon_pos = inner[entries_start..].find(':')? + entries_start;
-    let entries_obj = extract_object(&inner[colon_pos + 1..])?;
-
-    let mut entries = HashMap::new();
-    let mut remaining = entries_obj.trim();
-    if remaining.starts_with('{') {
-        remaining = &remaining[1..remaining.len() - 1];
-    }
-
-    while !remaining.trim().is_empty() {
-        remaining = remaining.trim().trim_start_matches(',').trim();
-        if remaining.is_empty() {
-            break;
-        }
-        let (key, after_key) = extract_json_string(remaining)?;
-        let after_colon = after_key.trim().strip_prefix(':')?;
-        let entry_obj = extract_object(after_colon.trim())?;
-        let entry_inner = &entry_obj[1..entry_obj.len() - 1];
-
-        let content_hash = extract_string_field(entry_inner, "content_hash")?;
-        let symbols = parse_symbols_array(entry_inner)?;
-        let import_edges = parse_edges_array(entry_inner)?;
-
-        entries.insert(
-            key,
-            CacheEntry {
-                content_hash,
-                symbols,
-                import_edges,
-            },
-        );
-
-        let consumed = after_colon.trim().find(entry_obj.as_str())? + entry_obj.len();
-        remaining = &after_colon.trim()[consumed..];
-    }
-
-    Some(ParseCache {
-        engine_version,
-        entries,
+    let content_hash = extract_string_field(inner, "content_hash")?;
+    let symbols = parse_symbols_array(inner)?;
+    let import_edges = parse_edges_array(inner)?;
+    Some(CacheEntry {
+        content_hash,
+        symbols,
+        import_edges,
     })
 }
 
@@ -213,35 +199,6 @@ fn extract_json_string(json: &str) -> Option<(String, &str)> {
             return Some((unescaped, &json[end + 1..]));
         }
         end += 1;
-    }
-    None
-}
-
-fn extract_object(json: &str) -> Option<String> {
-    let json = json.trim();
-    if !json.starts_with('{') {
-        return None;
-    }
-    let mut depth = 0;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (i, ch) in json.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' if in_string => escaped = true,
-            '"' => in_string = !in_string,
-            '{' if !in_string => depth += 1,
-            '}' if !in_string => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(json[..=i].to_string());
-                }
-            }
-            _ => {}
-        }
     }
     None
 }
@@ -430,42 +387,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trip_empty_cache() {
-        let cache = ParseCache::new();
-        let serialized = serialize_cache(&cache);
-        let deserialized = deserialize_cache(&serialized).expect("should deserialize");
-        assert_eq!(deserialized.engine_version, cache.engine_version);
-        assert!(deserialized.entries.is_empty());
+    fn round_trip_entry() {
+        let entry = CacheEntry {
+            content_hash: "abc123".to_string(),
+            symbols: vec![Symbol {
+                id: "fn:test:src/main.py:run".to_string(),
+                name: "run".to_string(),
+                kind: SymbolKind::Function,
+                file: "src/main.py".to_string(),
+                line: 1,
+                signature: "def run()".to_string(),
+                language: None,
+                area: None,
+            }],
+            import_edges: vec![Edge::new("file:src/main.py", "file:src/auth.py", EdgeKind::Imports, 900, "python")],
+        };
+        let serialized = serialize_entry(&entry);
+        let deserialized = deserialize_entry(&serialized).expect("should deserialize");
+        assert_eq!(deserialized.content_hash, "abc123");
+        assert_eq!(deserialized.symbols.len(), 1);
+        assert_eq!(deserialized.symbols[0].name, "run");
+        assert_eq!(deserialized.import_edges.len(), 1);
     }
 
     #[test]
-    fn round_trip_with_entries() {
-        let mut cache = ParseCache::new();
-        cache.insert(
-            "src/main.py".to_string(),
-            CacheEntry {
-                content_hash: "abc123".to_string(),
-                symbols: vec![Symbol {
-                    id: "fn:test:src/main.py:run".to_string(),
-                    name: "run".to_string(),
-                    kind: SymbolKind::Function,
-                    file: "src/main.py".to_string(),
-                    line: 1,
-                    signature: "def run()".to_string(),
-                    language: None,
-                    area: None,
-                }],
-                import_edges: vec![Edge::new("file:src/main.py", "file:src/auth.py", EdgeKind::Imports, 900, "python")],
-            },
-        );
-        let serialized = serialize_cache(&cache);
-        let deserialized = deserialize_cache(&serialized).expect("should deserialize");
-        assert_eq!(deserialized.entries.len(), 1);
-        let entry = deserialized.entries.get("src/main.py").expect("entry exists");
-        assert_eq!(entry.content_hash, "abc123");
-        assert_eq!(entry.symbols.len(), 1);
-        assert_eq!(entry.symbols[0].name, "run");
-        assert_eq!(entry.import_edges.len(), 1);
+    fn round_trip_empty_entry() {
+        let entry = CacheEntry {
+            content_hash: "deadbeef".to_string(),
+            symbols: vec![],
+            import_edges: vec![],
+        };
+        let serialized = serialize_entry(&entry);
+        let deserialized = deserialize_entry(&serialized).expect("should deserialize");
+        assert_eq!(deserialized.content_hash, "deadbeef");
+        assert!(deserialized.symbols.is_empty());
+        assert!(deserialized.import_edges.is_empty());
+    }
+
+    #[test]
+    fn directory_cache_round_trip() {
+        let root = std::env::temp_dir().join("aethyme_dir_cache_test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp dir");
+
+        let mut cache = ParseCache::for_repo(&root);
+        cache.save(&root);
+
+        let entry = CacheEntry {
+            content_hash: "hash123".to_string(),
+            symbols: vec![Symbol {
+                id: "fn:test:src/lib.rs:foo".to_string(),
+                name: "foo".to_string(),
+                kind: SymbolKind::Function,
+                file: "src/lib.rs".to_string(),
+                line: 5,
+                signature: "fn foo()".to_string(),
+                language: None,
+                area: None,
+            }],
+            import_edges: vec![],
+        };
+        cache.insert("src/lib.rs".to_string(), entry);
+
+        // Reload from disk
+        let loaded = ParseCache::load(&root).expect("should load");
+        let found = loaded.lookup("src/lib.rs", "hash123").expect("should find entry");
+        assert_eq!(found.symbols.len(), 1);
+        assert_eq!(found.symbols[0].name, "foo");
+
+        // Wrong hash should miss
+        assert!(loaded.lookup("src/lib.rs", "wrong_hash").is_none());
+
+        // Unknown file should miss
+        assert!(loaded.lookup("src/unknown.rs", "hash123").is_none());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -247,6 +247,158 @@ def bug_fix_scoring_rubric() -> dict[str, object]:
     }
 
 
+# ---------------------------------------------------------------------------
+# MediaWiki bug-fix-1: T419918 — watchlist marks all revisions as seen
+# ---------------------------------------------------------------------------
+
+MEDIAWIKI_BUG_FIX_1_PATH_KEYS: frozenset[str] = frozenset({
+    "files_to_edit",
+})
+
+
+def mediawiki_bug_fix_1_output_schema() -> dict[str, object]:
+    """Schema for the MediaWiki bug-fix-1 diagnostic evaluation.
+
+    The agent must identify which files to edit and explain how to fix the bug.
+    It must NOT actually apply the fix.
+    """
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "files_to_edit",
+            "root_cause",
+            "fix_plan",
+        ],
+        "properties": {
+            "files_to_edit": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["path", "what_to_change"],
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path to the file that needs editing",
+                        },
+                        "what_to_change": {
+                            "type": "string",
+                            "description": "What specifically needs to change in this file",
+                        },
+                    },
+                },
+                "description": "Files that need editing to fix the bug",
+            },
+            "root_cause": {
+                "type": "string",
+                "description": (
+                    "Technical explanation of why the bug occurs — "
+                    "what code path leads to the wrong behavior"
+                ),
+            },
+            "fix_plan": {
+                "type": "string",
+                "description": (
+                    "Step-by-step explanation of how you would fix the bug. "
+                    "Do NOT apply the fix — describe what changes are needed."
+                ),
+            },
+        },
+    }
+
+
+def mediawiki_bug_fix_1_scoring_rubric() -> dict[str, object]:
+    return {
+        "weights": {
+            "files_identified": 40,
+            "root_cause_quality": 30,
+            "fix_plan_quality": 20,
+            "efficiency": 10,
+        },
+        "notes": [
+            "files_identified: set overlap of paths with reference. "
+            "Partial credit per file.",
+            "root_cause_quality: keyword match for key concepts "
+            "(RevisionRecord, integer vs object, doViewUpdates, showDiffPage).",
+            "fix_plan_quality: keyword match for fix approach "
+            "(pass RevisionRecord, deprecate $oldid, signature change).",
+            "efficiency: lower token usage scores higher.",
+        ],
+    }
+
+
+def mediawiki_bug_fix_1_reference() -> dict[str, object]:
+    """Ground truth derived from commit 425c358d279e0610365cda8fbe01d889f11238f0."""
+    return {
+        "bug_id": "T419918",
+        "title": "Viewing a diff/revision on a watchlisted page marks all revisions as seen",
+        "files_to_edit": [
+            {
+                "path": "includes/Page/WikiPage.php",
+                "what_to_change": (
+                    "Change doViewUpdates() signature: replace $oldid integer param "
+                    "with $oldRev RevisionRecord param. Add deprecation shim for "
+                    "callers still passing an integer."
+                ),
+            },
+            {
+                "path": "includes/Page/Article.php",
+                "what_to_change": (
+                    "Update 3 call sites of doViewUpdates(): stop passing $oldid "
+                    "integer, pass RevisionRecord object instead. In showDiffPage(), "
+                    "use $de->getNewRevision() instead of (int)$new."
+                ),
+            },
+            {
+                "path": "includes/Page/ImagePage.php",
+                "what_to_change": (
+                    "Update doViewUpdates() call: replace $this->getOldID() "
+                    "with $this->fetchRevisionRecord()."
+                ),
+            },
+            {
+                "path": "RELEASE-NOTES-1.46",
+                "what_to_change": (
+                    "Document that passing oldid to WikiPage::doViewUpdates "
+                    "is deprecated; pass RevisionRecord instead."
+                ),
+            },
+        ],
+        "root_cause": (
+            "Article::showDiffPage() passes a revision ID (integer) to "
+            "WikiPage::doViewUpdates(), but the downstream code in "
+            "WatchlistManager::clearTitleUserNotifications() needs a "
+            "RevisionRecord to correctly identify which specific revision "
+            "was viewed. When an integer is passed, the notification clearing "
+            "code marks ALL revisions as seen instead of just the one being "
+            "viewed."
+        ),
+        "root_cause_keywords": [
+            "integer", "RevisionRecord", "doViewUpdates", "showDiffPage",
+            "clearTitleUserNotifications", "WatchlistManager", "oldid",
+            "revision", "diff",
+        ],
+        "fix_plan": (
+            "1. Change WikiPage::doViewUpdates() signature to accept "
+            "RevisionRecord|null instead of int $oldid. "
+            "2. Add a deprecation shim using func_num_args() to detect "
+            "callers passing the old integer signature. "
+            "3. Update Article.php call sites: remove $oldid param, pass "
+            "RevisionRecord objects (fetchRevisionRecord() or "
+            "getNewRevision()). "
+            "4. Update ImagePage.php: replace getOldID() with "
+            "fetchRevisionRecord(). "
+            "5. Update RELEASE-NOTES-1.46 to document the deprecation."
+        ),
+        "fix_plan_keywords": [
+            "RevisionRecord", "deprecat", "signature", "func_num_args",
+            "fetchRevisionRecord", "getNewRevision", "getOldID",
+        ],
+        "commit": "425c358d279e0610365cda8fbe01d889f11238f0",
+    }
+
+
 def onboarding_auth_output_schema() -> dict[str, object]:
     """Schema for the onboarding auth explanation challenge."""
     return {
