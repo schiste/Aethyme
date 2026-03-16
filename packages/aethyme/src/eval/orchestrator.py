@@ -35,6 +35,8 @@ class ModelConfig:
     provider: str  # "anthropic" | "openai"
     backend: str  # "claude" | "codex"
     backend_args: tuple[str, ...]
+    input_cost_per_m: float = 0.0  # $/1M input tokens
+    output_cost_per_m: float = 0.0  # $/1M output tokens
     reasoning: str = "default"
 
     def to_dict(self) -> dict[str, Any]:
@@ -43,6 +45,8 @@ class ModelConfig:
             "provider": self.provider,
             "backend": self.backend,
             "reasoning": self.reasoning,
+            "input_cost_per_m": self.input_cost_per_m,
+            "output_cost_per_m": self.output_cost_per_m,
         }
 
 
@@ -50,18 +54,26 @@ MODELS: dict[str, ModelConfig] = {
     "haiku": ModelConfig(
         "haiku", "anthropic", "claude",
         ("--dangerously-skip-permissions",),
+        input_cost_per_m=0.80,
+        output_cost_per_m=4.00,
     ),
     "sonnet": ModelConfig(
         "sonnet", "anthropic", "claude",
         ("--dangerously-skip-permissions",),
+        input_cost_per_m=3.00,
+        output_cost_per_m=15.00,
     ),
     "opus": ModelConfig(
         "opus", "anthropic", "claude",
         ("--dangerously-skip-permissions",),
+        input_cost_per_m=15.00,
+        output_cost_per_m=75.00,
     ),
     "gpt-5.4": ModelConfig(
         "gpt-5.4", "openai", "codex",
         ("--sandbox", "workspace-write"),
+        input_cost_per_m=2.00,
+        output_cost_per_m=8.00,
     ),
 }
 
