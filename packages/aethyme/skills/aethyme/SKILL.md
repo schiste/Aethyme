@@ -1,8 +1,7 @@
 ---
 name: aethyme
-description: Use Aethyme's code graph for any repository task — understanding
-  code, finding files, tracing dependencies, or preparing changes. Returns
-  graph-informed file selection and actual source code in a single call.
+description: Use Aethyme's code graph for repository navigation — finding files,
+  tracing imports, locating callers, and understanding structure.
 ---
 
 # Aethyme Navigation
@@ -11,47 +10,52 @@ description: Use Aethyme's code graph for any repository task — understanding
 
 ```
 AETHYME_ROOT="{{AETHYME_ROOT}}"
-AETHYME_PYTHON="$AETHYME_ROOT/.venv/bin/python"
+ENGINE="$AETHYME_ROOT/rust/target/release/aethyme-engine-cli"
 ```
 
-Every command: `cd "$AETHYME_ROOT" && $AETHYME_PYTHON -m src.cli <subcommand> ...`
+## Commands
 
-## Start Here — Always
-
-For any task involving this repository, begin with ONE call:
-
+### Structure
 ```bash
-cd "$AETHYME_ROOT" && $AETHYME_PYTHON -m src.cli task context \
-  --repo "<repo-path>" --task "<your task description>" --json-output
+# List top-level code areas
+$ENGINE query-areas --repo . --depth 1
+
+# List all areas
+$ENGINE query-areas --repo .
 ```
 
-This returns in a single response:
-- **file_contents** — actual source code of graph-selected key files
-- **anchors** — the 3-5 most relevant entry points for your task
-- **in_scope / out_of_scope** — which files and areas matter
-- **navigation_order** — suggested exploration sequence
-- **dependencies / impact** — structural relationships
-- **risk_flags** — areas requiring careful attention
+### Imports
+```bash
+# What does this file import/depend on?
+$ENGINE deps --repo . --file <relative-path>
 
-## After the Context Call
+# What files import this file?
+$ENGINE importers --repo . --file <relative-path>
+```
 
-- If the file contents answer your question, **answer directly**.
-  Do not make additional Aethyme calls just because they exist.
-- If you need a file not included, read it with normal shell tools.
-- If you need to trace a specific call chain:
-  `graph callers <repo> <target> --json-output`
-  `graph callees <repo> <target> --json-output`
-- If you need to expand a node's neighborhood:
-  `graph expand <repo> <node-id> --json-output`
-- If you need dependency or impact frontier:
-  `query deps <repo> <target> --json-output`
-  `query impact <repo> <target> --json-output`
+### Callers (graph + grep combined)
+```bash
+# Find all call sites of a function/method/class across the codebase
+# Returns file:line:code for each match
+$ENGINE callers --repo . --symbol <name>
+```
 
-## What NOT to Do
+### Overview
+```bash
+# Structural overview with areas, entrypoints, risks
+$ENGINE query-overview --repo .
+```
 
-- Do not call `task anchors`, `task scope`, `task pack` separately —
-  `task context` includes all of them plus file content.
-- Do not call `repo inspect` — context already includes overview data.
-- Do not make multiple Aethyme calls when one `task context` suffices.
-- Do not prefer graph metadata over reading the actual file contents
-  returned in the context pack.
+## When to Use
+
+- **Starting a task:** `query-areas --depth 1` to see the codebase structure
+- **Finding dependencies:** `deps --file <path>` to see what a file depends on
+- **Impact analysis:** `importers --file <path>` to see what depends on a file
+- **Finding callers:** `callers --symbol <name>` to find all uses of a function
+- **General orientation:** `query-overview` for entrypoints and risk areas
+
+## When NOT to Use
+
+- Don't use Aethyme when a simple `grep` or `find` suffices
+- Don't call multiple commands when one answers your question
+- If `callers` returns what you need, don't also run `importers`

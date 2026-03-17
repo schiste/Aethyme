@@ -125,7 +125,7 @@ fn run() -> Result<(), String> {
             let map = build_map(&repo, no_cache)?;
             println!("{}", aethyme_engine::json::repo_overview_view(&graph_overview_view(&map)));
         }
-        "deps" => {
+        "graph-deps" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
             let map = build_map(&repo, no_cache)?;
@@ -291,45 +291,121 @@ fn run() -> Result<(), String> {
                 Ok::<(), String>(())
             })?;
         }
-        "query-file" => {
+        "importers" => {
             let repo = read_option(&args, "--repo")?;
             let file = read_option(&args, "--file")?;
             let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
             rt.block_on(async {
-                let store = aethyme_engine::store::GraphStore::open(&PathBuf::from(&repo).canonicalize().unwrap())
+                let canonical = PathBuf::from(&repo).canonicalize().map_err(|e| e.to_string())?;
+                let store = aethyme_engine::store::GraphStore::open(&canonical)
                     .await.map_err(|e| e.to_string())?;
-                let info = aethyme_engine::store::read::file_info(store.db(), &file)
+                let edges = aethyme_engine::store::read::edges_to(store.db(), &file)
                     .await.map_err(|e| e.to_string())?;
-                match info {
-                    Some(f) => println!("{}", serde_json::to_string_pretty(&f).unwrap()),
-                    None => println!("null"),
+                for edge in &edges {
+                    if let Some(ref paths) = edge.imported_by {
+                        for p in paths {
+                            println!("{}", p);
+                        }
+                    }
                 }
                 Ok::<(), String>(())
             })?;
         }
-        "query-edges" => {
+        "deps" => {
             let repo = read_option(&args, "--repo")?;
-            let from = read_option(&args, "--from")?;
+            let file = read_option(&args, "--file")?;
             let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
             rt.block_on(async {
-                let store = aethyme_engine::store::GraphStore::open(&PathBuf::from(&repo).canonicalize().unwrap())
+                let canonical = PathBuf::from(&repo).canonicalize().map_err(|e| e.to_string())?;
+                let store = aethyme_engine::store::GraphStore::open(&canonical)
                     .await.map_err(|e| e.to_string())?;
-                let edges = aethyme_engine::store::read::edges_from(store.db(), &from)
+                let edges = aethyme_engine::store::read::edges_from(store.db(), &file)
                     .await.map_err(|e| e.to_string())?;
-                println!("{}", serde_json::to_string_pretty(&edges).unwrap());
+                for edge in &edges {
+                    if let Some(ref paths) = edge.import_targets {
+                        for p in paths {
+                            println!("{}", p);
+                        }
+                    }
+                }
                 Ok::<(), String>(())
             })?;
         }
-        "query-callers" => {
+        "callers" => {
             let repo = read_option(&args, "--repo")?;
-            let target = read_option(&args, "--target")?;
+            let symbol_name = read_option(&args, "--symbol")?;
             let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
             rt.block_on(async {
-                let store = aethyme_engine::store::GraphStore::open(&PathBuf::from(&repo).canonicalize().unwrap())
+                let canonical = PathBuf::from(&repo).canonicalize().map_err(|e| e.to_string())?;
+                let store = aethyme_engine::store::GraphStore::open(&canonical)
                     .await.map_err(|e| e.to_string())?;
-                let edges = aethyme_engine::store::read::edges_to(store.db(), &target)
-                    .await.map_err(|e| e.to_string())?;
-                println!("{}", serde_json::to_string_pretty(&edges).unwrap());
+
+                // Step 1: grep -rl to find files containing the symbol name
+                let grep_output = std::process::Command::new("grep")
+                    .args([
+                        "-rl",
+                        "--include=*",
+                        "--exclude-dir=.git",
+                        "--exclude-dir=node_modules",
+                        "--exclude-dir=vendor",
+                        "--exclude-dir=.aethyme",
+                        &symbol_name,
+                    ])
+                    .arg(canonical.as_os_str())
+                    .output()
+                    .map_err(|e| format!("grep failed: {}", e))?;
+
+                let grep_stdout = String::from_utf8_lossy(&grep_output.stdout);
+                let repo_prefix = format!("{}/", canonical.display());
+                let found_files: Vec<String> = grep_stdout
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| l.strip_prefix(&repo_prefix).unwrap_or(l).to_string())
+                    .collect();
+
+                if found_files.is_empty() {
+                    return Ok::<(), String>(());
+                }
+
+                // Step 2: For each file, query the graph for files that import it
+                let mut search_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+                for f in &found_files {
+                    search_set.insert(f.clone());
+                    if let Ok(edges) = aethyme_engine::store::read::edges_to(store.db(), f).await {
+                        for edge in &edges {
+                            if let Some(ref paths) = edge.imported_by {
+                                for p in paths {
+                                    search_set.insert(p.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Step 3: grep -n the symbol name in all search set files
+                let abs_files: Vec<String> = search_set
+                    .iter()
+                    .map(|f| format!("{}{}", repo_prefix, f))
+                    .filter(|p| std::path::Path::new(p).exists())
+                    .collect();
+
+                if abs_files.is_empty() {
+                    return Ok::<(), String>(());
+                }
+
+                let mut grep_cmd = std::process::Command::new("grep");
+                grep_cmd.args(["-n", &symbol_name]);
+                for f in &abs_files {
+                    grep_cmd.arg(f);
+                }
+                let result = grep_cmd.output().map_err(|e| format!("grep failed: {}", e))?;
+                let result_stdout = String::from_utf8_lossy(&result.stdout);
+                for line in result_stdout.lines() {
+                    // Strip repo_prefix from output to make paths relative
+                    let relative = line.strip_prefix(&repo_prefix).unwrap_or(line);
+                    println!("{}", relative);
+                }
+
                 Ok::<(), String>(())
             })?;
         }
@@ -437,13 +513,6 @@ fn print_explanation(map: &RepositoryMap, pack: &aethyme_engine::context_pack::C
     }
 }
 
-/// Convert an engine symbol ID (fn:Repo:path:name) to a sanitized key
-/// that matches what resolve_record_parts produces for edges.
-fn sanitize_id_for_symbol(engine_id: &str) -> String {
-    let (_, key) = aethyme_engine::store::write::resolve_record_parts(engine_id);
-    key
-}
-
 async fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Result<(), String> {
     use aethyme_engine::store;
 
@@ -464,37 +533,17 @@ async fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Res
     }
     eprintln!("  files: {}", map.files.len());
 
-    // Symbols — store functions and classes with their engine IDs (matches edge from/to)
-    let mut symbol_count = 0usize;
-    let mut symbol_errors = 0usize;
-    for func in &map.functions {
-        let id = sanitize_id_for_symbol(&func.id);
-        if let Err(e) = store::write::insert_symbol_raw(
-            store.db(), &id, &func.name, "function", &func.file_path, func.line, &func.signature, Some(func.language.as_str()),
-        ).await {
-            if symbol_errors < 3 { eprintln!("  symbol error (fn): {}", e); }
-            symbol_errors += 1;
-        } else {
-            symbol_count += 1;
-        }
-    }
-    for class in &map.classes {
-        let id = sanitize_id_for_symbol(&class.id);
-        if let Err(e) = store::write::insert_symbol_raw(
-            store.db(), &id, &class.name, "class", &class.file_path, class.line, &class.signature, Some(class.language.as_str()),
-        ).await {
-            if symbol_errors < 3 { eprintln!("  symbol error (class): {}", e); }
-            symbol_errors += 1;
-        } else {
-            symbol_count += 1;
-        }
-    }
-    eprintln!("  symbols: {} ok, {} errors (from {} functions + {} classes)", symbol_count, symbol_errors, map.functions.len(), map.classes.len());
-
-    // Edges
+    // Edges — only write edges where both sides resolve to file or area tables (not symbol)
     let mut edge_errors = 0usize;
     let mut edge_ok = 0usize;
+    let mut edge_skipped = 0usize;
     for edge in &map.edges {
+        let (from_table, _) = store::write::resolve_record_parts(&edge.from);
+        let (to_table, _) = store::write::resolve_record_parts(&edge.to);
+        if from_table == "symbol" || to_table == "symbol" {
+            edge_skipped += 1;
+            continue;
+        }
         if let Err(e) = store::write::insert_edge(store.db(), edge).await {
             if edge_errors < 5 {
                 eprintln!("  edge error: {} -> {} ({:?}): {}", &edge.from[..edge.from.len().min(50)], &edge.to[..edge.to.len().min(50)], edge.kind, e);
@@ -504,7 +553,7 @@ async fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Res
             edge_ok += 1;
         }
     }
-    eprintln!("  edges: {} ok, {} errors (of {} total)", edge_ok, edge_errors, map.edges.len());
+    eprintln!("  edges: {} ok, {} errors, {} skipped (symbol-level) (of {} total)", edge_ok, edge_errors, edge_skipped, map.edges.len());
 
     // Risk flags
     for risk in &map.risk_flags {

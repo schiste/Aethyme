@@ -10,7 +10,6 @@ use crate::model::area::AreaNode;
 use crate::model::edge::{Edge, EdgeKind};
 use crate::model::file::{FileNode, FileRole};
 use crate::model::risk::{RiskFlag, RiskLevel};
-use crate::model::symbol::{Symbol, SymbolKind};
 
 /// Insert an area record.
 pub async fn insert_area(db: &Surreal<Db>, area: &AreaNode) -> Result<(), surrealdb::Error> {
@@ -54,57 +53,6 @@ pub async fn insert_file(db: &Surreal<Db>, file: &FileNode) -> Result<(), surrea
     Ok(())
 }
 
-/// Insert a symbol record.
-pub async fn insert_symbol(db: &Surreal<Db>, symbol: &Symbol) -> Result<(), surrealdb::Error> {
-    // symbol.id format: "includes/Page/Article.php::541::view"
-    // symbol.file format: "includes/Page/Article.php"
-    let id = sanitize_id(&symbol.id);
-    let file_ref = format!("file:`{}`", sanitize_id(&symbol.file));
-    let kind = symbol_kind_to_str(&symbol.kind);
-    db.query(
-        "CREATE type::record('symbol', $id) SET \
-         name = $name, kind = $kind, file = $file_ref, line = $line, \
-         signature = $sig, language = $lang"
-    )
-        .bind(("id", id))
-        .bind(("name", symbol.name.clone()))
-        .bind(("kind", kind.to_string()))
-        .bind(("file_ref", file_ref))
-        .bind(("line", symbol.line as i64))
-        .bind(("sig", Some(symbol.signature.clone())))
-        .bind(("lang", symbol.language.clone()))
-        .await?;
-    Ok(())
-}
-
-/// Insert a symbol from a FunctionNode or ClassNode (with engine-format ID).
-pub async fn insert_symbol_raw(
-    db: &Surreal<Db>,
-    id: &str,
-    name: &str,
-    kind: &str,
-    file_path: &str,
-    line: usize,
-    signature: &str,
-    language: Option<&str>,
-) -> Result<(), surrealdb::Error> {
-    let file_ref = format!("file:`{}`", sanitize_id(file_path));
-    db.query(
-        "CREATE type::record('symbol', $id) SET \
-         name = $name, kind = $kind, file = $file_ref, line = $line, \
-         signature = $sig, language = $lang"
-    )
-        .bind(("id", id.to_string()))
-        .bind(("name", name.to_string()))
-        .bind(("kind", kind.to_string()))
-        .bind(("file_ref", file_ref))
-        .bind(("line", line as i64))
-        .bind(("sig", Some(signature.to_string())))
-        .bind(("lang", language.map(|s| s.to_string())))
-        .await?;
-    Ok(())
-}
-
 /// Insert a typed edge relation.
 pub async fn insert_edge(db: &Surreal<Db>, edge: &Edge) -> Result<(), surrealdb::Error> {
     let table = edge_kind_to_table(&edge.kind);
@@ -135,15 +83,11 @@ pub async fn insert_risk(db: &Surreal<Db>, risk: &RiskFlag) -> Result<(), surrea
     Ok(())
 }
 
-/// Delete all data for a specific file and its symbols/edges.
+/// Delete all data for a specific file and its edges.
 /// Used for incremental re-indexing.
 pub async fn delete_file_data(db: &Surreal<Db>, file_path: &str) -> Result<(), surrealdb::Error> {
     let id = sanitize_id(file_path);
-    // Delete symbols belonging to this file
-    db.query("DELETE symbol WHERE file = type::record('file', $id)")
-        .bind(("id", id.clone()))
-        .await?;
-    // Delete edges from/to this file or its symbols
+    // Delete edges from/to this file
     db.query("DELETE imports WHERE in = type::record('file', $id) OR out = type::record('file', $id)")
         .bind(("id", id.clone()))
         .await?;
@@ -157,10 +101,11 @@ pub async fn delete_file_data(db: &Surreal<Db>, file_path: &str) -> Result<(), s
 // ── Helpers ──────────────────────────────────────────────────────────
 
 /// Map EdgeKind to SurrealDB relation table names.
+/// Symbol-level edges (Calls) are filtered out before reaching this function.
 fn edge_kind_to_table(kind: &EdgeKind) -> &'static str {
     match kind {
         EdgeKind::Imports => "imports",
-        EdgeKind::Calls => "calls",
+        EdgeKind::Calls => "imports", // symbol-level calls are skipped; fallback for safety
         EdgeKind::References => "imports", // fallback to imports
         EdgeKind::Configures => "configures",
         EdgeKind::Contains => "contains",
@@ -183,15 +128,6 @@ fn role_to_str(role: &FileRole) -> &'static str {
         FileRole::Binary => "binary",
         FileRole::Cache => "cache",
         FileRole::Unknown => "unknown",
-    }
-}
-
-/// Convert SymbolKind to string.
-fn symbol_kind_to_str(kind: &SymbolKind) -> &'static str {
-    match kind {
-        SymbolKind::Function => "function",
-        SymbolKind::Class => "class",
-        SymbolKind::Constant => "constant",
     }
 }
 

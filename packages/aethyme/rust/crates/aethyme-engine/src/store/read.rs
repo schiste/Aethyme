@@ -41,34 +41,16 @@ pub async fn files_in_area(
     Ok(files)
 }
 
-/// Get file info with its symbols.
-pub async fn file_info(
-    db: &Surreal<Db>,
-    file_path: &str,
-) -> Result<Option<FileWithSymbols>, surrealdb::Error> {
-    let id = super::write::sanitize_id(file_path);
-    let mut result = db
-        .query(
-            "SELECT *, (SELECT name, kind, line, signature FROM symbol WHERE file = $parent.id) AS symbols \
-             FROM type::record('file', $id)"
-        )
-        .bind(("id", id))
-        .await?;
-    let files: Vec<FileWithSymbols> = result.take(0)?;
-    Ok(files.into_iter().next())
-}
-
 // ── Edge / graph queries ────────────────────────────────────────────
 
-/// Get all outgoing edges from a file or symbol.
+/// Get all outgoing imports from a file (what does this file import?).
 pub async fn edges_from(
     db: &Surreal<Db>,
     entity_id: &str,
 ) -> Result<Vec<EdgeRecord>, surrealdb::Error> {
     let (table, key) = super::write::resolve_record_parts(entity_id);
     let query = format!(
-        "SELECT ->imports->file.path AS import_targets, \
-                ->calls->symbol.{{name, file, line}} AS call_targets \
+        "SELECT ->imports->file.path AS import_targets \
          FROM {table}:`{key}`"
     );
     let mut result = db.query(&query).await?;
@@ -76,15 +58,14 @@ pub async fn edges_from(
     Ok(edges)
 }
 
-/// Get all incoming edges TO a file or symbol (reverse lookup — "who calls me?").
+/// Get all incoming imports TO a file (who imports me?).
 pub async fn edges_to(
     db: &Surreal<Db>,
     entity_id: &str,
 ) -> Result<Vec<EdgeRecord>, surrealdb::Error> {
     let (table, key) = super::write::resolve_record_parts(entity_id);
     let query = format!(
-        "SELECT <-imports<-file.path AS imported_by, \
-                <-calls<-symbol.{{name, file, line}} AS called_by \
+        "SELECT <-imports<-file.path AS imported_by \
          FROM {table}:`{key}`"
     );
     let mut result = db.query(&query).await?;
@@ -117,10 +98,13 @@ pub async fn overview(db: &Surreal<Db>) -> Result<OverviewResult, surrealdb::Err
         .await?;
     let areas: Vec<AreaRecord> = areas_result.take(0)?;
 
+    // Entrypoints: get files marked as entry points via the entrypoint_for relation.
+    // The `in` side is the file record; query the file table for entries that have
+    // an outgoing entrypoint_for edge.
     let mut entrypoints_result = db
-        .query("SELECT out.path AS path FROM entrypoint_for ORDER BY confidence DESC LIMIT 10")
+        .query("SELECT path FROM file WHERE count(->entrypoint_for) > 0 LIMIT 10")
         .await?;
-    let entrypoints: Vec<PathRecord> = entrypoints_result.take(0)?;
+    let entrypoints: Vec<PathRecord> = entrypoints_result.take(0).unwrap_or_default();
 
     let mut risks_result = db
         .query("SELECT * FROM risk ORDER BY level DESC LIMIT 20")
@@ -158,28 +142,9 @@ pub struct FileRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
-pub struct SymbolRecord {
-    pub name: String,
-    pub kind: String,
-    pub line: Option<i64>,
-    pub signature: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
-pub struct FileWithSymbols {
-    pub path: String,
-    pub role: String,
-    pub language: Option<String>,
-    pub line_count: Option<i64>,
-    pub symbols: Vec<SymbolRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 pub struct EdgeRecord {
     pub import_targets: Option<Vec<String>>,
-    pub call_targets: Option<Vec<serde_json::Value>>,
     pub imported_by: Option<Vec<String>>,
-    pub called_by: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, SurrealValue)]
