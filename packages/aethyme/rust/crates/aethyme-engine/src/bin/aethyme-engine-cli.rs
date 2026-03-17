@@ -320,6 +320,19 @@ fn run() -> Result<(), String> {
                 Ok::<(), String>(())
             })?;
         }
+        "query-callers" => {
+            let repo = read_option(&args, "--repo")?;
+            let target = read_option(&args, "--target")?;
+            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+            rt.block_on(async {
+                let store = aethyme_engine::store::GraphStore::open(&PathBuf::from(&repo).canonicalize().unwrap())
+                    .await.map_err(|e| e.to_string())?;
+                let edges = aethyme_engine::store::read::edges_to(store.db(), &target)
+                    .await.map_err(|e| e.to_string())?;
+                println!("{}", serde_json::to_string_pretty(&edges).unwrap());
+                Ok::<(), String>(())
+            })?;
+        }
         "query-overview" => {
             let repo = read_option(&args, "--repo")?;
             let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
@@ -329,6 +342,19 @@ fn run() -> Result<(), String> {
                 let overview = aethyme_engine::store::read::overview(store.db())
                     .await.map_err(|e| e.to_string())?;
                 println!("{}", serde_json::to_string_pretty(&overview).unwrap());
+                Ok::<(), String>(())
+            })?;
+        }
+        "query-raw" => {
+            let repo = read_option(&args, "--repo")?;
+            let sql = read_option(&args, "--sql")?;
+            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+            rt.block_on(async {
+                let store = aethyme_engine::store::GraphStore::open(&PathBuf::from(&repo).canonicalize().unwrap())
+                    .await.map_err(|e| e.to_string())?;
+                let mut result = store.db().query(&sql).await.map_err(|e| e.to_string())?;
+                let rows: Vec<serde_json::Value> = result.take(0).map_err(|e| e.to_string())?;
+                println!("{}", serde_json::to_string_pretty(&rows).unwrap());
                 Ok::<(), String>(())
             })?;
         }
@@ -411,6 +437,13 @@ fn print_explanation(map: &RepositoryMap, pack: &aethyme_engine::context_pack::C
     }
 }
 
+/// Convert an engine symbol ID (fn:Repo:path:name) to a sanitized key
+/// that matches what resolve_record_parts produces for edges.
+fn sanitize_id_for_symbol(engine_id: &str) -> String {
+    let (_, key) = aethyme_engine::store::write::resolve_record_parts(engine_id);
+    key
+}
+
 async fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Result<(), String> {
     use aethyme_engine::store;
 
@@ -431,18 +464,47 @@ async fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Res
     }
     eprintln!("  files: {}", map.files.len());
 
-    // Symbols
-    for symbol in &map.symbols {
-        store::write::insert_symbol(store.db(), symbol).await.map_err(|e| e.to_string())?;
+    // Symbols — store functions and classes with their engine IDs (matches edge from/to)
+    let mut symbol_count = 0usize;
+    let mut symbol_errors = 0usize;
+    for func in &map.functions {
+        let id = sanitize_id_for_symbol(&func.id);
+        if let Err(e) = store::write::insert_symbol_raw(
+            store.db(), &id, &func.name, "function", &func.file_path, func.line, &func.signature, Some(func.language.as_str()),
+        ).await {
+            if symbol_errors < 3 { eprintln!("  symbol error (fn): {}", e); }
+            symbol_errors += 1;
+        } else {
+            symbol_count += 1;
+        }
     }
-    eprintln!("  symbols: {}", map.symbols.len());
+    for class in &map.classes {
+        let id = sanitize_id_for_symbol(&class.id);
+        if let Err(e) = store::write::insert_symbol_raw(
+            store.db(), &id, &class.name, "class", &class.file_path, class.line, &class.signature, Some(class.language.as_str()),
+        ).await {
+            if symbol_errors < 3 { eprintln!("  symbol error (class): {}", e); }
+            symbol_errors += 1;
+        } else {
+            symbol_count += 1;
+        }
+    }
+    eprintln!("  symbols: {} ok, {} errors (from {} functions + {} classes)", symbol_count, symbol_errors, map.functions.len(), map.classes.len());
 
     // Edges
+    let mut edge_errors = 0usize;
+    let mut edge_ok = 0usize;
     for edge in &map.edges {
-        let _ = store::write::insert_edge(store.db(), edge).await;
-        // Ignore individual edge insert failures (some edges may reference unknown nodes)
+        if let Err(e) = store::write::insert_edge(store.db(), edge).await {
+            if edge_errors < 5 {
+                eprintln!("  edge error: {} -> {} ({:?}): {}", &edge.from[..edge.from.len().min(50)], &edge.to[..edge.to.len().min(50)], edge.kind, e);
+            }
+            edge_errors += 1;
+        } else {
+            edge_ok += 1;
+        }
     }
-    eprintln!("  edges: {}", map.edges.len());
+    eprintln!("  edges: {} ok, {} errors (of {} total)", edge_ok, edge_errors, map.edges.len());
 
     // Risk flags
     for risk in &map.risk_flags {

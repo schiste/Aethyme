@@ -142,6 +142,48 @@ _EVAL_TYPE_DEFAULTS: dict[str, dict[str, str]] = {
         "report_function": "src.eval.report.finalize_eval_run",
         "target_restriction": "mediawiki",
     },
+    "impact-analysis": {
+        "task": (
+            "WikiPage::doViewUpdates() in includes/Page/WikiPage.php is being refactored "
+            "to accept different parameters. List every file that calls this method and "
+            "would need updating.\n\n"
+            "For each call site, provide: file path, line number, and the exact code at that line.\n\n"
+            "Return a structured analysis with all call sites found."
+        ),
+        "prepare_function": "src.eval.schemas.mediawiki_impact_analysis_reference",
+        "score_function": "src.eval.scoring.score_mediawiki_bug_fix_1",
+        "report_function": "src.eval.report.finalize_eval_run",
+        "target_restriction": "mediawiki",
+    },
+    "feature-localization": {
+        "task": (
+            "When a user clicks 'Watch' on a wiki page, what code runs? "
+            "Trace the full execution chain from the HTTP request handler to the "
+            "database write.\n\n"
+            "List each class and method in the chain, in execution order. "
+            "For each step, provide: file path, method name, and a one-line "
+            "description of what it does.\n\n"
+            "Return a structured analysis with the complete chain."
+        ),
+        "prepare_function": "src.eval.schemas.mediawiki_feature_localization_reference",
+        "score_function": "src.eval.scoring.score_mediawiki_bug_fix_1",
+        "report_function": "src.eval.report.finalize_eval_run",
+        "target_restriction": "mediawiki",
+    },
+    "config-audit": {
+        "task": (
+            "MediaWiki has rate limiting for API requests. Find:\n"
+            "(a) The configuration variable that controls rate limits\n"
+            "(b) Where the default value is defined (file and line)\n"
+            "(c) The class that enforces rate limiting at runtime\n"
+            "(d) How a site admin disables rate limiting for a specific action\n\n"
+            "Return a structured analysis with all four answers."
+        ),
+        "prepare_function": "src.eval.schemas.mediawiki_config_audit_reference",
+        "score_function": "src.eval.scoring.score_mediawiki_bug_fix_1",
+        "report_function": "src.eval.report.finalize_eval_run",
+        "target_restriction": "mediawiki",
+    },
     "explain-repo": {
         "task": "Explain this repo",
         "prepare_function": "src.eval.explain_repo.run_explain_repo_evaluation",
@@ -392,6 +434,11 @@ def _build_prepare_phase(
             f" --json-output"
         )
         description = f"Generate navigation-ctf artifacts for {target.display_name}"
+    elif eval_type in ("impact-analysis", "feature-localization", "config-audit"):
+        # Read-only diagnostic evals — no cloning, prompts written by the server
+        defaults = _EVAL_TYPE_DEFAULTS[eval_type]
+        cli_cmd = f"echo 'Prompts written by server for {eval_type}'"
+        description = f"Generate {eval_type} prompts for {target.display_name}"
     else:
         raise ValueError(f"Unknown eval_type: {eval_type}")
 

@@ -65,12 +65,27 @@ pub async fn edges_from(
     db: &Surreal<Db>,
     entity_id: &str,
 ) -> Result<Vec<EdgeRecord>, surrealdb::Error> {
-    let record_ref = super::write::resolve_record_id(entity_id);
+    let (table, key) = super::write::resolve_record_parts(entity_id);
     let query = format!(
         "SELECT ->imports->file.path AS import_targets, \
                 ->calls->symbol.{{name, file, line}} AS call_targets \
-         FROM {}",
-        record_ref
+         FROM {table}:`{key}`"
+    );
+    let mut result = db.query(&query).await?;
+    let edges: Vec<EdgeRecord> = result.take(0)?;
+    Ok(edges)
+}
+
+/// Get all incoming edges TO a file or symbol (reverse lookup — "who calls me?").
+pub async fn edges_to(
+    db: &Surreal<Db>,
+    entity_id: &str,
+) -> Result<Vec<EdgeRecord>, surrealdb::Error> {
+    let (table, key) = super::write::resolve_record_parts(entity_id);
+    let query = format!(
+        "SELECT <-imports<-file.path AS imported_by, \
+                <-calls<-symbol.{{name, file, line}} AS called_by \
+         FROM {table}:`{key}`"
     );
     let mut result = db.query(&query).await?;
     let edges: Vec<EdgeRecord> = result.take(0)?;
@@ -163,6 +178,8 @@ pub struct FileWithSymbols {
 pub struct EdgeRecord {
     pub import_targets: Option<Vec<String>>,
     pub call_targets: Option<Vec<serde_json::Value>>,
+    pub imported_by: Option<Vec<String>>,
+    pub called_by: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, SurrealValue)]

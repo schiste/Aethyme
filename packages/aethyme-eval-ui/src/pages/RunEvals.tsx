@@ -42,6 +42,27 @@ const EVAL_TYPES: { value: EvalType; label: string; description: string; target?
     target: "grc",
     conditions: "4 conditions with efficiency-focused scoring (30% weight on efficiency)",
   },
+  {
+    value: "impact-analysis",
+    label: "Impact Analysis (MediaWiki)",
+    description: "WikiPage::doViewUpdates() is being refactored. Agent must find all call sites across the codebase that would need updating. Tests graph edge traversal.",
+    target: "mediawiki",
+    conditions: "Scored by: set overlap of file:line pairs with reference (6 call sites in 3 files)",
+  },
+  {
+    value: "feature-localization",
+    label: "Feature Localization (MediaWiki)",
+    description: "Trace the 'Watch' button click from HTTP handler to database write. Agent must identify the full 4-step execution chain in order.",
+    target: "mediawiki",
+    conditions: "Scored by: ordered chain match — each step (file + method) scores 25%",
+  },
+  {
+    value: "config-audit",
+    label: "Config Audit (MediaWiki)",
+    description: "Find the rate limiting config variable, where it's defined, the enforcement class, and how to disable it. Tests config-to-code tracing.",
+    target: "mediawiki",
+    conditions: "Scored by: 25% per correct answer (config var, default location, enforcement class, disable method)",
+  },
 ];
 
 const MODELS: { value: ModelName; label: string; provider: string; backend: string }[] = [

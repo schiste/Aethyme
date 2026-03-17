@@ -1,4 +1,4 @@
-export type EvalType = "bug-fix" | "bug-fix-1" | "explain-repo" | "navigation-ctf" | "cross-package";
+export type EvalType = "bug-fix" | "bug-fix-1" | "explain-repo" | "navigation-ctf" | "cross-package" | "impact-analysis" | "feature-localization" | "config-audit";
 
 export type TargetName = "grc" | "mediawiki";
 

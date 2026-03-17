@@ -473,3 +473,125 @@ def onboarding_auth_scoring_rubric() -> dict[str, object]:
             "dependencies: set overlap with known deps (@aeptus/types, @casl/ability).",
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# MediaWiki: Impact Analysis — "What breaks if I change this?"
+# ---------------------------------------------------------------------------
+
+def mediawiki_impact_analysis_output_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["call_sites", "summary"],
+        "properties": {
+            "call_sites": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["file", "line", "code"],
+                    "properties": {
+                        "file": {"type": "string"},
+                        "line": {"type": "integer"},
+                        "code": {"type": "string"},
+                    },
+                },
+            },
+            "summary": {"type": "string"},
+        },
+    }
+
+
+def mediawiki_impact_analysis_reference() -> dict[str, object]:
+    return {
+        "call_sites": [
+            {"file": "includes/Page/Article.php", "line": 541},
+            {"file": "includes/Page/Article.php", "line": 586},
+            {"file": "includes/Page/Article.php", "line": 733},
+            {"file": "includes/Page/Article.php", "line": 1149},
+            {"file": "includes/Page/ImagePage.php", "line": 156},
+            {"file": "includes/Actions/ActionEntryPoint.php", "line": 134},
+        ],
+        "reference_files": [
+            "includes/Page/Article.php",
+            "includes/Page/ImagePage.php",
+            "includes/Actions/ActionEntryPoint.php",
+        ],
+        "target": "WikiPage::doViewUpdates()",
+    }
+
+
+# ---------------------------------------------------------------------------
+# MediaWiki: Feature Localization — "Where does this behavior live?"
+# ---------------------------------------------------------------------------
+
+def mediawiki_feature_localization_output_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["chain", "summary"],
+        "properties": {
+            "chain": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["file", "method", "description"],
+                    "properties": {
+                        "file": {"type": "string"},
+                        "method": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                },
+            },
+            "summary": {"type": "string"},
+        },
+    }
+
+
+def mediawiki_feature_localization_reference() -> dict[str, object]:
+    return {
+        "chain": [
+            {"file": "includes/Actions/WatchAction.php", "method": "onSubmit"},
+            {"file": "includes/Watchlist/WatchlistManager.php", "method": "setWatch"},
+            {"file": "includes/Watchlist/WatchlistManager.php", "method": "addWatchIgnoringRights"},
+            {"file": "includes/Watchlist/WatchedItemStore.php", "method": "addWatch"},
+        ],
+        "reference_files": [
+            "includes/Actions/WatchAction.php",
+            "includes/Watchlist/WatchlistManager.php",
+            "includes/Watchlist/WatchedItemStore.php",
+        ],
+        "entry_class": "WatchAction",
+        "terminal_class": "WatchedItemStore",
+    }
+
+
+# ---------------------------------------------------------------------------
+# MediaWiki: Configuration Audit — "What controls this behavior?"
+# ---------------------------------------------------------------------------
+
+def mediawiki_config_audit_output_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["config_variable", "default_location", "enforcement_class", "disable_method"],
+        "properties": {
+            "config_variable": {"type": "string"},
+            "default_location": {"type": "string"},
+            "enforcement_class": {"type": "string"},
+            "disable_method": {"type": "string"},
+        },
+    }
+
+
+def mediawiki_config_audit_reference() -> dict[str, object]:
+    return {
+        "config_variable": "RateLimits",
+        "config_variable_aliases": ["$wgRateLimits", "MainConfigNames::RateLimits", "RateLimits"],
+        "default_location": "includes/MainConfigSchema.php",
+        "enforcement_class": "RateLimiter",
+        "enforcement_file": "includes/Permissions/RateLimiter.php",
+        "disable_keywords": ["RateLimits", "empty", "RateLimitsExcludedIPs", "exclude"],
+    }

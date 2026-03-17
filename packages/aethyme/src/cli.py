@@ -768,7 +768,7 @@ def eval() -> None:
 @eval.command("run")
 @click.option(
     "--eval-type", required=True,
-    type=click.Choice(["bug-fix", "bug-fix-1", "explain-repo", "navigation-ctf"]),
+    type=click.Choice(["bug-fix", "bug-fix-1", "explain-repo", "navigation-ctf", "impact-analysis", "feature-localization", "config-audit"]),
     help="Type of evaluation to run",
 )
 @click.option(

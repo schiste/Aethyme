@@ -58,11 +58,25 @@ CTO_MAP = {
 }
 
 
+MIGRATIONS = [
+    "ALTER TABLE eval_results ADD COLUMN output TEXT",
+    "ALTER TABLE eval_results ADD COLUMN tool_breakdown TEXT",
+    "ALTER TABLE eval_results ADD COLUMN prompt TEXT",
+    "ALTER TABLE eval_results ADD COLUMN run_id TEXT",
+]
+
+
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    # Run migrations — each is idempotent (fails silently if column exists)
+    for migration in MIGRATIONS:
+        try:
+            conn.execute(migration)
+        except sqlite3.OperationalError:
+            pass  # Column already exists
     return conn
 
 

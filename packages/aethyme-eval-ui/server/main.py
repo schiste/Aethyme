@@ -510,6 +510,33 @@ Produce your analysis in exactly these sections:
 4. **Testing** — How to verify the fix works. What behavior to test before and after.
 
 Cite file paths and line numbers where relevant.""",
+        "impact-analysis": """\
+WikiPage::doViewUpdates() in includes/Page/WikiPage.php is being refactored to accept different parameters.
+
+List every file that calls this method and would need updating. For each call site, provide:
+- File path
+- Line number
+- The exact code at that line
+
+Be thorough — check all of includes/ for direct calls, indirect calls via subclasses, and references in comments/docs.""",
+        "feature-localization": """\
+When a user clicks "Watch" on a wiki page, what code runs?
+
+Trace the full execution chain from the HTTP request handler to the database write. List each class and method in the chain, in execution order. For each step, provide:
+- File path
+- Class::method name
+- One-line description of what it does and what it calls next
+
+Start from the Action handler and end at the database write.""",
+        "config-audit": """\
+MediaWiki has rate limiting for API requests. Find:
+
+(a) The configuration variable that controls rate limits — give the exact variable name
+(b) Where the default value is defined — give the exact file path and line number
+(c) The class that enforces rate limiting at runtime — give the file path and class name
+(d) How a site admin disables rate limiting for a specific action — explain the configuration change needed
+
+Cite file paths and line numbers for every answer.""",
         "bug-fix": """\
 A test is failing in this repository. Find the root cause and fix the bug so all tests pass.
 
@@ -586,7 +613,7 @@ Produce a structured analysis with config_target, code_target, management_area, 
     except Exception as e:
         log(f"WARNING: Could not clean stale tabs: {e}")
 
-    # Phase: Create tabs
+    # Phase: Create tabs — wait for each shell to be ready before moving on
     _run_state["currentPhase"] = "creating tabs"
     for cond in conditions:
         cond_name = cond["name"]
@@ -604,8 +631,22 @@ Produce a structured analysis with config_target, code_target, management_area, 
             tabs[cond_name] = tab_id
             log(f"[{cond_name}] Tab created: {tab_id[:12]}...")
 
+            # Wait for shell to be ready before anything else
+            shell_ready = False
+            for attempt in range(15):
+                time.sleep(2)
+                try:
+                    status = mcp_client.tab_status(tab_id)
+                    if status.get("is_at_prompt") and not status.get("shell_loading"):
+                        shell_ready = True
+                        log(f"[{cond_name}] Shell ready after {(attempt+1)*2}s")
+                        break
+                except Exception:
+                    pass
+            if not shell_ready:
+                log(f"[{cond_name}] WARNING: Shell not ready after 30s")
+
             if cond.get("cto_override"):
-                time.sleep(1)
                 try:
                     cto_result = mcp_client.tab_set_cto(tab_id, cond["cto_override"])
                     log(f"[{cond_name}] CTO set to {cond['cto_override']}: {cto_result}")
@@ -647,33 +688,26 @@ Produce a structured analysis with config_target, code_target, management_area, 
 
         try:
             if backend == "claude":
+                # Verify shell is actually ready before exec
+                for retry in range(3):
+                    try:
+                        pre_status = mcp_client.tab_status(tab_id)
+                        if pre_status.get("is_at_prompt") and pre_status.get("status") == "idle":
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(3)
+
                 cmd = f"claude --dangerously-skip-permissions --model {model_name}"
                 log(f"[{cond_name}] Executing: {cmd}")
                 exec_result = mcp_client.tab_exec(tab_id, cmd)
                 log(f"[{cond_name}] tab_exec result: {exec_result}")
 
-                # Poll until Claude is ready
-                log(f"[{cond_name}] Waiting for Claude to initialize...")
-                ready = False
-                for attempt in range(20):
-                    time.sleep(2)
-                    try:
-                        status = mcp_client.tab_status(tab_id)
-                        app = status.get("active_app", "?")
-                        st = status.get("status", "?")
-                        if attempt % 3 == 0:
-                            log(f"[{cond_name}] Poll #{attempt}: app={app} status={st}")
-                        if app == "Claude" and st == "waitingForInput":
-                            ready = True
-                            log(f"[{cond_name}] Claude ready after {(attempt+1)*2}s")
-                            break
-                    except Exception as e:
-                        log(f"[{cond_name}] Poll error: {e}")
+                # Wait for Claude to start
+                log(f"[{cond_name}] Waiting 12s for Claude to start...")
+                time.sleep(12)
 
-                if not ready:
-                    log(f"[{cond_name}] WARNING: Claude not ready after 40s, attempting prompt anyway")
-
-                # Identify the new session file (created after snapshot)
+                # Identify the new session file
                 if session_dir.exists():
                     current_files = set(session_dir.glob("*.jsonl"))
                     new_files = current_files - existing_files
@@ -686,39 +720,20 @@ Produce a structured analysis with config_target, code_target, management_area, 
 
                 # Send prompt
                 prompt_file = cond.get("prompt_file", "")
-                log(f"[{cond_name}] Prompt file: {prompt_file}")
                 if prompt_file:
-                    try:
-                        if not Path(prompt_file).exists():
-                            log(f"[{cond_name}] ERROR: Prompt file does not exist: {prompt_file}")
-                            continue
+                    if not Path(prompt_file).exists():
+                        log(f"[{cond_name}] ERROR: Prompt file missing: {prompt_file}")
+                        continue
 
-                        prompt_text = Path(prompt_file).read_text(encoding="utf-8")
-                        log(f"[{cond_name}] Sending {len(prompt_text)} chars to input...")
-                        send_result = mcp_client.tab_send_input(tab_id, prompt_text)
-                        log(f"[{cond_name}] tab_send_input result: {send_result}")
-
-                        time.sleep(2)
-
-                        log(f"[{cond_name}] Submitting prompt...")
-                        submit_result = mcp_client.tab_submit_prompt(tab_id)
-                        log(f"[{cond_name}] tab_submit_prompt result: {submit_result}")
-
-                        # Wait for Claude to start processing before moving to next tab
-                        time.sleep(3)
-                        try:
-                            post_status = mcp_client.tab_status(tab_id)
-                            post_app = post_status.get("active_app", "?")
-                            post_st = post_status.get("status", "?")
-                            post_prompt = post_status.get("is_at_prompt", "?")
-                            log(f"[{cond_name}] After submit: app={post_app} status={post_st} at_prompt={post_prompt}")
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        log(f"[{cond_name}] ERROR sending prompt: {e}")
-                        log(traceback.format_exc())
+                    prompt_text = Path(prompt_file).read_text(encoding="utf-8")
+                    log(f"[{cond_name}] Sending {len(prompt_text)} chars...")
+                    mcp_client.tab_send_input(tab_id, prompt_text)
+                    time.sleep(2)
+                    mcp_client.tab_submit_prompt(tab_id)
+                    log(f"[{cond_name}] Prompt submitted")
+                    time.sleep(3)
                 else:
-                    log(f"[{cond_name}] No prompt file specified")
+                    log(f"[{cond_name}] No prompt file")
             else:
                 prompt_file = cond.get("prompt_file", "")
                 result_file = cond.get("result_file", "")
@@ -754,12 +769,11 @@ Produce a structured analysis with config_target, code_target, management_area, 
                 app = status.get("active_app", "?")
                 st = status.get("status", "?")
                 at_prompt = status.get("is_at_prompt", False)
-                # Claude shows ❯ prompt when done (waitingForInput with is_at_prompt or idle)
-                if app == "Claude" and at_prompt:
+                # Done when Claude is at prompt (finished response) or shell is back (Claude exited)
+                if app == "Claude" and at_prompt and st == "waitingForInput":
                     completed.add(cond_name)
                     log(f"[{cond_name}] Completed (round {poll_round})")
-                elif st == "idle" and app != "Claude":
-                    # Claude exited
+                elif app != "Claude" and app != "?" and st == "idle":
                     completed.add(cond_name)
                     log(f"[{cond_name}] Claude exited (round {poll_round})")
                 else:

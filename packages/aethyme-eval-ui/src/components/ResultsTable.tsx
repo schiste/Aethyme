@@ -86,8 +86,9 @@ function parseToolBreakdown(raw: string | null): Record<string, number> | null {
 type ColumnKey = keyof EvalResult;
 
 const columns: { key: ColumnKey; label: string; align?: "right"; width: string }[] = [
-  { key: "runId", label: "Run", width: "8%" },
-  { key: "evalType", label: "Type", width: "9%" },
+  { key: "runId", label: "Run", width: "7%" },
+  { key: "date", label: "Date", width: "8%" },
+  { key: "evalType", label: "Type", width: "8%" },
   { key: "target", label: "Target", width: "7%" },
   { key: "model", label: "Model", width: "6%" },
   { key: "condition", label: "Condition", width: "13%" },
@@ -150,7 +151,7 @@ function Tooltip({ children, content }: { children: React.ReactNode; content: Re
 
 export default function ResultsTable({ results }: Props) {
   const [sort, setSort] = useState<SortConfig>({
-    key: "runId",
+    key: "date",
     direction: "desc",
   });
   const [selectedResult, setSelectedResult] = useState<EvalResult | null>(null);
@@ -270,6 +271,8 @@ export default function ResultsTable({ results }: Props) {
           </Tooltip>
         );
       }
+      case "date":
+        return <span className="text-xs font-mono whitespace-nowrap">{formatDate(row.date)}</span>;
       case "runId": {
         if (!row.runId) return <span className="text-[var(--color-text-muted)]">—</span>;
         const short = row.runId.replace("run-", "").slice(0, 10);
