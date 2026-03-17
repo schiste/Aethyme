@@ -528,16 +528,31 @@ async fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Res
     eprintln!("  areas: {}", map.areas.len());
 
     // Files
+    let mut file_ok = 0usize;
+    let mut file_errors = 0usize;
     for file in &map.files {
-        store::write::insert_file(store.db(), file).await.map_err(|e| e.to_string())?;
+        if let Err(e) = store::write::insert_file(store.db(), file).await {
+            if file_errors < 3 {
+                eprintln!("  file error: {} (area={:?}): {}", &file.path, &file.area_id, e);
+            }
+            file_errors += 1;
+        } else {
+            file_ok += 1;
+        }
     }
-    eprintln!("  files: {}", map.files.len());
+    eprintln!("  files: {} ok, {} errors (of {} total)", file_ok, file_errors, map.files.len());
 
-    // Edges — only write edges where both sides resolve to file or area tables (not symbol)
+    // Edges — only write edges where both sides resolve to file or area (not symbol)
+    // Also skip unresolved imports (import:Namespace\Class → no real file target)
     let mut edge_errors = 0usize;
     let mut edge_ok = 0usize;
     let mut edge_skipped = 0usize;
     for edge in &map.edges {
+        // Skip unresolved imports (target starts with "import:" but not "import:file:")
+        if edge.to.starts_with("import:") {
+            edge_skipped += 1;
+            continue;
+        }
         let (from_table, _) = store::write::resolve_record_parts(&edge.from);
         let (to_table, _) = store::write::resolve_record_parts(&edge.to);
         if from_table == "symbol" || to_table == "symbol" {

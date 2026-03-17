@@ -30,26 +30,41 @@ pub async fn insert_area(db: &Surreal<Db>, area: &AreaNode) -> Result<(), surrea
 /// Insert a file record.
 pub async fn insert_file(db: &Surreal<Db>, file: &FileNode) -> Result<(), surrealdb::Error> {
     let id = sanitize_id(&file.path);
-    // area_id is the engine's full ID like "area:Repo:path" — parse to get just the path
-    let area_ref = file.area_id.as_ref().map(|a| {
-        let (_, key) = resolve_record_parts(a);
-        format!("area:`{key}`")
-    });
     let role = role_to_str(&file.role);
-    db.query(
-        "CREATE type::record('file', $id) SET \
-         path = $path, area = $area, role = $role, language = $lang, \
-         line_count = $lines, size_bytes = $size, content_hash = $hash"
-    )
-        .bind(("id", id))
-        .bind(("path", file.path.clone()))
-        .bind(("area", area_ref))
-        .bind(("role", role.to_string()))
-        .bind(("lang", file.language.clone()))
-        .bind(("lines", file.line_count as i64))
-        .bind(("size", file.size_bytes as i64))
-        .bind(("hash", Option::<String>::None))
-        .await?;
+
+    // Build query dynamically based on whether area_id is present
+    // area field is typed option<record<area>> — must use type::record(), not a string
+    if let Some(ref area_id) = file.area_id {
+        let (_, area_key) = resolve_record_parts(area_id);
+        db.query(
+            "CREATE type::record('file', $id) SET \
+             path = $path, area = type::record('area', $area_key), role = $role, language = $lang, \
+             line_count = $lines, size_bytes = $size, content_hash = $hash"
+        )
+            .bind(("id", id))
+            .bind(("path", file.path.clone()))
+            .bind(("area_key", area_key))
+            .bind(("role", role.to_string()))
+            .bind(("lang", file.language.clone()))
+            .bind(("lines", file.line_count as i64))
+            .bind(("size", file.size_bytes as i64))
+            .bind(("hash", Option::<String>::None))
+            .await?;
+    } else {
+        db.query(
+            "CREATE type::record('file', $id) SET \
+             path = $path, role = $role, language = $lang, \
+             line_count = $lines, size_bytes = $size, content_hash = $hash"
+        )
+            .bind(("id", id))
+            .bind(("path", file.path.clone()))
+            .bind(("role", role.to_string()))
+            .bind(("lang", file.language.clone()))
+            .bind(("lines", file.line_count as i64))
+            .bind(("size", file.size_bytes as i64))
+            .bind(("hash", Option::<String>::None))
+            .await?;
+    }
     Ok(())
 }
 
@@ -167,11 +182,10 @@ pub fn resolve_record_parts(id: &str) -> (String, String) {
 
         match kind {
             "fn" | "class" | "const" => {
-                // Symbol: extract path and symbol name after repo prefix
                 let path_part = strip_repo_prefix(rest);
                 return ("symbol".to_string(), sanitize_id(path_part));
             }
-            "file" | "doc" => {
+            "file" | "doc" | "import" => {
                 let path_part = strip_repo_prefix(rest);
                 return ("file".to_string(), sanitize_id(path_part));
             }
