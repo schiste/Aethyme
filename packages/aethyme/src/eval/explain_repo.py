@@ -15,6 +15,7 @@ from typing import Any
 from ..indexing.engine import (
     build_task_pack,
 )
+from src.contracts.versions import contract_versions
 from ..rendering.context_pack import render_explain_repo_text
 from .control_prompt import build_baseline_prompt, build_leverage_prompt
 from .models import EvaluationSide
@@ -115,6 +116,8 @@ def run_explain_repo_evaluation(
 
     result: dict[str, Any] = {
         "task": task,
+        "eval_type": "explain-repo",
+        "contract_versions": contract_versions(),
         "signals": signals,
         "control": EvaluationSide(
             prompt=control_prompt,

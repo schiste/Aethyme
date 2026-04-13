@@ -13,10 +13,15 @@ import shlex
 import subprocess
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from shutil import which
 from typing import Any, Protocol
+
+from src.contracts.run_metadata import build_run_metadata
+from src.indexing.repository_snapshot import capture_snapshot
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EVAL_TOOL_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
@@ -37,6 +42,7 @@ class EvaluationRunResult:
     final_output_message: str | None
     structured_output: dict[str, Any] | None
     tool_calls: list[dict[str, str]] | None = None
+    run_metadata: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -53,6 +59,7 @@ class EvaluationRunResult:
             "final_output_message": self.final_output_message,
             "structured_output": self.structured_output,
             "tool_calls": self.tool_calls,
+            "run_metadata": self.run_metadata,
         }
 
 
@@ -89,6 +96,9 @@ class CommandEvaluationRunner:
         navigation_context: dict[str, Any] | None = None,
         output_schema: dict[str, Any] | None = None,
     ) -> EvaluationRunResult:
+        snapshot = capture_snapshot(repo_path)
+        run_id = uuid.uuid4().hex
+        started_at = datetime.now(UTC).isoformat()
         with tempfile.TemporaryDirectory(prefix="aethyme-eval-") as temp_dir:
             prompt_file = Path(temp_dir) / "prompt.txt"
             prompt_file.write_text(prompt, encoding="utf-8")
@@ -105,6 +115,7 @@ class CommandEvaluationRunner:
             env["AETHYME_EVAL_REPO"] = str(repo_path)
             env["AETHYME_EVAL_TASK"] = task
             env["AETHYME_EVAL_LABEL"] = label
+            env["AETHYME_EVAL_RUN_ID"] = run_id
             env["AETHYME_EVAL_TOOL_REPO"] = str(PROJECT_ROOT)
             env["AETHYME_EVAL_TOOL_PYTHON"] = str(EVAL_TOOL_PYTHON)
             if navigation_context is not None:
@@ -129,6 +140,24 @@ class CommandEvaluationRunner:
         stdout = result.stdout.strip()
         stderr = result.stderr.strip()
         metrics = _parse_metrics(stdout)
+        finished_at = datetime.now(UTC).isoformat()
+        run_metadata = build_run_metadata(
+            snapshot,
+            project_root=PROJECT_ROOT,
+            phase=f"eval:{label}",
+            status="success" if result.returncode == 0 else "failed",
+            run_id=run_id,
+            started_at=started_at,
+            finished_at=finished_at,
+            command=resolved_command,
+            config={
+                "task": task,
+                "label": label,
+                "working_directory": str((self.working_directory or repo_path).resolve()),
+                "has_navigation_context": navigation_context is not None,
+                "has_output_schema": output_schema is not None,
+            },
+        )
         return EvaluationRunResult(
             label=label,
             command=" ".join(resolved_command),
@@ -143,6 +172,7 @@ class CommandEvaluationRunner:
             final_output_message=_final_output_message(stdout, metrics.get("structured_output")),
             structured_output=metrics.get("structured_output"),
             tool_calls=metrics.get("tool_calls"),
+            run_metadata=run_metadata.to_dict(),
         )
 
 

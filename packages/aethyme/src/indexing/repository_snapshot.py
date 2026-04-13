@@ -7,6 +7,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.contracts.versions import REPOSITORY_SNAPSHOT_SCHEMA_VERSION
+
 EXCLUDED_DIRS = {
     ".git",
     ".venv",
@@ -35,6 +37,19 @@ class LocalRepositorySnapshot:
     def cache_key(self) -> str:
         """Return the stable cache key for the current repository snapshot."""
         return self.commit if self.commit and not self.dirty else self.fingerprint
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a versioned, serializable repository snapshot."""
+        return {
+            "schema_version": REPOSITORY_SNAPSHOT_SCHEMA_VERSION,
+            "repo_path": str(self.repo_path),
+            "repo_name": self.repo_name,
+            "commit": self.commit,
+            "fingerprint": self.fingerprint,
+            "file_count": self.file_count,
+            "dirty": self.dirty,
+            "snapshot_key": self.cache_key,
+        }
 
 
 def capture_snapshot(repo_path: Path) -> LocalRepositorySnapshot:

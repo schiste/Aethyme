@@ -19,6 +19,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from src.contracts.versions import contract_versions
+
 from ..indexing.engine import build_task_context, build_task_pack
 from .models import EvaluationSide
 from .bug_fix_setup import (
@@ -167,6 +169,7 @@ def run_bug_fix_evaluation(
     result: dict[str, Any] = {
         "task": task,
         "eval_type": "bug-fix",
+        "contract_versions": contract_versions(),
         "reference": reference,
         "control": EvaluationSide(
             prompt=control_prompt,

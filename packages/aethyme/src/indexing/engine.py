@@ -10,6 +10,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from src.contracts.run_metadata import RunMetadata, build_run_metadata
+
 from .repository_snapshot import LocalRepositorySnapshot, capture_snapshot
 
 ENGINE_MANIFEST_PATH = Path(__file__).resolve().parents[2] / "rust" / "Cargo.toml"
@@ -22,6 +24,30 @@ CACHE_ROOT = Path(os.getenv("AETHYME_CACHE_DIR", "/tmp/aethyme-cache"))
 
 class EngineError(RuntimeError):
     """Raised when the Rust engine command fails."""
+
+
+def build_engine_run_metadata(
+    snapshot: LocalRepositorySnapshot,
+    *,
+    phase: str,
+    status: str,
+    run_id: str | None = None,
+    command: list[str] | None = None,
+    config: dict[str, object] | None = None,
+    finished_at: str | None = None,
+) -> RunMetadata:
+    """Return versioned metadata for a normal engine invocation."""
+    return build_run_metadata(
+        snapshot,
+        project_root=ENGINE_MANIFEST_PATH.parents[1],
+        phase=phase,
+        status=status,
+        run_id=run_id,
+        engine_binary=ensure_engine_binary(),
+        command=command,
+        config=config,
+        finished_at=finished_at,
+    )
 
 
 def ensure_engine_binary() -> Path:

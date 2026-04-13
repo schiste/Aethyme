@@ -11,6 +11,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from src.contracts.eval_artifacts import make_eval_artifact_envelope
+from src.contracts.versions import (
+    RUN_METADATA_SCHEMA_VERSION,
+    contract_versions,
+)
+
 from .runner import EvaluationRunResult
 
 REPORTS_ROOT = Path(__file__).resolve().parents[2] / "docs" / "reports" / "evals"
@@ -144,6 +150,7 @@ def create_eval_run_dir(
     conditions: tuple[str, ...] | None = None,
     *,
     model: dict[str, str] | None = None,
+    run_name: str | None = None,
 ) -> Path:
     """Create and return a timestamped eval run directory under eval-runs/.
 
@@ -153,9 +160,12 @@ def create_eval_run_dir(
     *model* is an optional dict with keys like ``name``, ``provider``,
     ``reasoning``, ``backend`` — stored in metadata for reproducibility.
     """
-    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    slug = _slugify(repo_path.name or "repo")
-    run_dir = EVAL_RUNS_ROOT / f"{timestamp}-{slug}-{eval_type}"
+    if run_name:
+        run_dir = EVAL_RUNS_ROOT / run_name
+    else:
+        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        slug = _slugify(repo_path.name or "repo")
+        run_dir = EVAL_RUNS_ROOT / f"{timestamp}-{slug}-{eval_type}"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "artifacts").mkdir(exist_ok=True)
     for cond in (conditions or CONDITION_ORDER):
@@ -163,11 +173,13 @@ def create_eval_run_dir(
         (run_dir / "chau7" / cond).mkdir(parents=True, exist_ok=True)
 
     metadata: dict[str, Any] = {
+        "schema_version": RUN_METADATA_SCHEMA_VERSION,
         "timestamp": datetime.now(UTC).isoformat(),
         "aethyme_commit": get_aethyme_commit(),
         "repo_path": str(repo_path),
         "eval_type": eval_type,
         "conditions": list(conditions or CONDITION_ORDER),
+        "contract_versions": contract_versions(),
     }
     if model:
         metadata["model"] = model
@@ -200,7 +212,14 @@ def write_eval_run_artifacts(run_dir: Path, result: dict[str, Any]) -> None:
     ]:
         value = result.get(key)
         if value is not None:
-            (artifacts / name).write_text(json.dumps(value, indent=2), encoding="utf-8")
+            wrapped = make_eval_artifact_envelope(
+                name.removesuffix(".json"),
+                value,
+                run_id=result.get("run_id"),
+                eval_type=result.get("eval_type"),
+                target=result.get("target"),
+            )
+            (artifacts / name).write_text(json.dumps(wrapped, indent=2), encoding="utf-8")
 
     # Per-condition results, assessments, and full run data
     for cond in active:
@@ -266,6 +285,8 @@ def store_condition_raw(
         )
 
     meta: dict[str, Any] = {"stored_at": datetime.now(UTC).isoformat()}
+    meta["schema_version"] = RUN_METADATA_SCHEMA_VERSION
+    meta["contract_versions"] = contract_versions()
     if tokens:
         meta["tokens"] = tokens
     if duration_seconds is not None:
@@ -300,6 +321,8 @@ def store_condition_chau7(
     chau7_dir.mkdir(parents=True, exist_ok=True)
 
     meta: dict[str, Any] = {"stored_at": datetime.now(UTC).isoformat()}
+    meta["schema_version"] = RUN_METADATA_SCHEMA_VERSION
+    meta["contract_versions"] = contract_versions()
     if run_id:
         meta["run_id"] = run_id
         (chau7_dir / "run-id.txt").write_text(run_id, encoding="utf-8")
@@ -394,6 +417,14 @@ def _extract_ledger_record(
             v = run.get(tok_key)
             if v:
                 entry[tok_key] = v
+        run_metadata = run.get("run_metadata")
+        if isinstance(run_metadata, dict):
+            if run_metadata.get("run_id"):
+                entry["run_id"] = run_metadata["run_id"]
+            if run_metadata.get("repo_commit"):
+                entry["repo_commit"] = run_metadata["repo_commit"]
+            if run_metadata.get("config_hash"):
+                entry["config_hash"] = run_metadata["config_hash"]
 
         if entry:
             conds[cond] = entry

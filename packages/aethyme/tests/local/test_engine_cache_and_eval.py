@@ -141,13 +141,21 @@ def test_explain_repo_generates_artifacts_and_invokes_backends(monkeypatch, tmp_
 
     assert result["baseline_run"] is not None
     assert result["aethyme_run"] is not None
+    assert result["eval_type"] == "explain-repo"
+    assert result["contract_versions"]["run_metadata"] == "1"
     assert result["baseline_run"]["input_tokens"] is not None
     assert result["baseline_run"]["final_output_message"] == "control final output"
+    assert result["baseline_run"]["run_metadata"]["phase"] == "eval:control"
+    assert result["baseline_run"]["run_metadata"]["status"] == "success"
+    assert result["baseline_run"]["run_metadata"]["run_id"]
+    assert result["baseline_run"]["run_metadata"]["repo_path"] == str(repo_path)
+    assert result["baseline_run"]["run_metadata"]["command"][0] == sys.executable
     assert result["aethyme_run"]["structured_output"]["label"] == "leverage"
     assert result["aethyme_run"]["structured_output"]["ok"] is True
     assert result["aethyme_run"]["structured_output"]["schema_type"] == "object"
     assert result["aethyme_run"]["structured_output"]["tool_repo"].endswith("packages/aethyme")
     assert result["aethyme_run"]["structured_output"]["tool_python"].endswith(".venv/bin/python")
+    assert result["aethyme_run"]["run_metadata"]["phase"] == "eval:leverage"
     assert result["report"]["condition_runs"]["control"]["retries"] == 1
     assert result["report"]["condition_runs"]["leverage"]["retries"] == 0
     assert result["report_path"].endswith("report.md")

@@ -75,6 +75,8 @@ def test_local_eval_explain_repo(monkeypatch, tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["task"] == "Explain this repo"
+    assert payload["eval_type"] == "explain-repo"
+    assert payload["contract_versions"]["run_metadata"] == "1"
     assert "signals" in payload
     assert payload["signals"]["parser_visibility"]["score"] >= 0
     assert payload["report"]["baseline_prompt_chars"] > 0

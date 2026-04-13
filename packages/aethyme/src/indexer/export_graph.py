@@ -9,8 +9,11 @@ from pathlib import Path
 import click
 import structlog
 
+from src import __version__ as AETHYME_VERSION
+from src.contracts.graph_export import GraphExportEnvelope
 from ..graph.connection_pool import db_pool
 from ..graph.store import GraphStore
+from ..indexing.repository_snapshot import capture_snapshot
 
 logger = structlog.get_logger(__name__)
 
@@ -127,12 +130,22 @@ def main(tenant_id: str | None, repo_name: str, output: str) -> None:
             "nodes": len(nodes),
             "edges": len(edges),
         },
-        "generated_at": datetime.now(UTC).isoformat(),
         "nodes": nodes,
         "edges": edges,
     }
 
-    output_path.write_text(json.dumps(payload, indent=2, default=str))
+    snapshot = capture_snapshot(Path(repo["path"]))
+    envelope = GraphExportEnvelope(
+        repository=payload["repository"],
+        repository_snapshot=snapshot.to_dict(),
+        stats=payload["stats"],
+        nodes=payload["nodes"],
+        edges=payload["edges"],
+        generated_at=datetime.now(UTC).isoformat(),
+        engine_version=AETHYME_VERSION,
+    )
+
+    output_path.write_text(json.dumps(envelope.to_dict(), indent=2, default=str))
     click.echo(f"Exported {len(nodes)} nodes and {len(edges)} edges to {output_path}")
 
 

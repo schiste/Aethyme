@@ -12,6 +12,8 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from src.contracts.versions import contract_versions
+
 from ..indexing.engine import build_task_pack, graph_expand, inspect_repository
 from .control_prompt import build_baseline_prompt, build_leverage_prompt
 from .models import EvaluationSide
@@ -133,6 +135,8 @@ def run_navigation_ctf_evaluation(
 
     result: dict[str, Any] = {
         "task": task_spec["task"],
+        "eval_type": "navigation-ctf",
+        "contract_versions": contract_versions(),
         "signals": inspect.get("signals"),
         "task_spec": task_spec,
         "reference": reference,
