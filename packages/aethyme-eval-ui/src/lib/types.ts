@@ -134,6 +134,7 @@ export interface RepositorySetupStatus {
   source: string;
   commit: string;
   force: boolean;
+  skipped?: boolean;
   output?: string;
   error?: string;
   preparation?: RepositoryPreparation;

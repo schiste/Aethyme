@@ -274,7 +274,12 @@ export default function RunEvals() {
             setPreparation(latest);
           }
           await reloadRepositories();
-          setLog((prev) => [...prev, `Setup complete for ${target}.`]);
+          setLog((prev) => [
+            ...prev,
+            nextStatus.skipped
+              ? `Setup skipped for ${target}; playground already ready.`
+              : `Setup complete for ${target}.`,
+          ]);
           return;
         }
 
@@ -406,6 +411,9 @@ export default function RunEvals() {
                       : "border-[var(--color-accent)]/30 bg-[var(--color-accent)]/10"
                 }`}>
                   <div className="font-mono text-[var(--color-text)]">status: {setupStatus.status}</div>
+                  {setupStatus.skipped && (
+                    <div className="mt-1 text-[var(--color-text-muted)]">Playground already healthy, so setup was skipped.</div>
+                  )}
                   {setupStatus.output && (
                     <pre className="mt-2 max-h-28 overflow-y-auto whitespace-pre-wrap font-mono text-[11px] text-[var(--color-text-muted)]">
                       {setupStatus.output}

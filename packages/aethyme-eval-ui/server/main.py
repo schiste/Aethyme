@@ -438,6 +438,15 @@ def _run_setup_target(
 ) -> None:
     _setup_tasks[task_id]["status"] = "running"
     try:
+        current_snapshot = _build_repository_preparation(target)
+        if current_snapshot.get("ready") and not force:
+            snapshot = _write_preparation_snapshot(target, current_snapshot)
+            _setup_tasks[task_id]["status"] = "complete"
+            _setup_tasks[task_id]["skipped"] = True
+            _setup_tasks[task_id]["output"] = "Playground already ready; setup skipped."
+            _setup_tasks[task_id]["preparation"] = snapshot
+            return
+
         _ensure_aethyme_imports()
         from src.eval.targets import get_target
 
@@ -473,6 +482,7 @@ def _run_setup_target(
 
         snapshot = _write_preparation_snapshot(target, _build_repository_preparation(target))
         _setup_tasks[task_id]["status"] = "complete"
+        _setup_tasks[task_id]["skipped"] = False
         _setup_tasks[task_id]["preparation"] = snapshot
     except subprocess.TimeoutExpired:
         _setup_tasks[task_id]["status"] = "error"
