@@ -20,7 +20,7 @@ def _next_id() -> int:
 
 def _send(method: str, params: dict[str, Any] | None = None) -> Any:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(30)
+    sock.settimeout(60)
     try:
         sock.connect(str(MCP_SOCKET))
 
@@ -75,13 +75,18 @@ def _send(method: str, params: dict[str, Any] | None = None) -> Any:
 def _read_response(sock: socket.socket) -> dict:
     data = b""
     while True:
-        chunk = sock.recv(8192)
+        chunk = sock.recv(65536)
         if not chunk:
             break
         data += chunk
-        if b"\n" in data:
-            break
-    return json.loads(data.decode().strip())
+        # Try parsing — only succeed when we have complete, valid JSON.
+        # Use errors='replace' to handle partial multi-byte chars at chunk boundaries.
+        try:
+            text = data.decode("utf-8", errors="replace").strip()
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return json.loads(data.decode("utf-8", errors="replace").strip())
 
 
 # ── Public API ────────────────────────────────────────────────
@@ -94,8 +99,11 @@ def tab_list() -> list[dict[str, Any]]:
     return _send("tab_list")
 
 
-def tab_create(directory: str) -> dict[str, Any]:
-    return _send("tab_create", {"directory": directory})
+def tab_create(directory: str, window_id: int | None = None) -> dict[str, Any]:
+    params: dict[str, Any] = {"directory": directory}
+    if window_id is not None:
+        params["window_id"] = window_id
+    return _send("tab_create", params)
 
 
 def tab_close(tab_id: str, force: bool = True) -> dict[str, Any]:
@@ -106,8 +114,11 @@ def tab_status(tab_id: str) -> dict[str, Any]:
     return _send("tab_status", {"tab_id": tab_id})
 
 
-def tab_output(tab_id: str, lines: int = 50) -> dict[str, Any]:
-    return _send("tab_output", {"tab_id": tab_id, "lines": lines})
+def tab_output(tab_id: str, lines: int = 50, wait_for_stable_ms: int = 0, source: str = "buffer") -> dict[str, Any]:
+    params: dict[str, Any] = {"tab_id": tab_id, "lines": lines, "source": source}
+    if wait_for_stable_ms > 0:
+        params["wait_for_stable_ms"] = wait_for_stable_ms
+    return _send("tab_output", params)
 
 
 def tab_exec(tab_id: str, command: str) -> dict[str, Any]:
