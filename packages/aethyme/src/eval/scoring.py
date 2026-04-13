@@ -591,6 +591,79 @@ def score_mediawiki_bug_fix_1(
     }
 
 
+def score_mediawiki_dead_code(
+    candidate: dict[str, Any] | None,
+    reference: dict[str, Any],
+    *,
+    cost_usd: float = 0.0,
+    repo_path: str | None = None,
+) -> dict[str, Any]:
+    """Score dead code detection in the Watchlist subsystem."""
+    weights = {"functions_found": 60, "false_positives": 20, "efficiency": 20}
+
+    if candidate is None:
+        return {"scores": {k: 0.0 for k in weights}, "weights": weights, "weighted_score": 0.0, "max_score": 100}
+
+    ref_funcs = {f["function_name"] for f in reference.get("unused_functions", [])}
+    cand_funcs = set()
+    for item in candidate.get("unused_functions", []):
+        name = item["function_name"] if isinstance(item, dict) else str(item)
+        cand_funcs.add(name)
+
+    # Recall: how many of the 9 were found
+    recall = len(ref_funcs & cand_funcs) / len(ref_funcs) if ref_funcs else 0
+    # Precision: penalty for false positives
+    if cand_funcs:
+        precision = len(ref_funcs & cand_funcs) / len(cand_funcs)
+    else:
+        precision = 0
+    eff = _efficiency_score(cost_usd, reference_cost=1.0)
+
+    scores = {"functions_found": recall, "false_positives": precision, "efficiency": eff}
+    weighted = sum(scores[k] * weights[k] for k in weights)
+    return {
+        "scores": scores, "weights": weights,
+        "weighted_score": round(weighted, 2), "max_score": 100,
+        "functions_matched": sorted(ref_funcs & cand_funcs),
+        "functions_missed": sorted(ref_funcs - cand_funcs),
+        "false_positives": sorted(cand_funcs - ref_funcs),
+    }
+
+
+def score_mediawiki_migration(
+    candidate: dict[str, Any] | None,
+    reference: dict[str, Any],
+    *,
+    cost_usd: float = 0.0,
+    repo_path: str | None = None,
+) -> dict[str, Any]:
+    """Score migration planning — list of files referencing WatchedItemStore."""
+    weights = {"files_found": 60, "false_positives": 20, "efficiency": 20}
+
+    if candidate is None:
+        return {"scores": {k: 0.0 for k in weights}, "weights": weights, "weighted_score": 0.0, "max_score": 100}
+
+    ref_files = {_normalize_path(f, repo_path) for f in reference.get("affected_files", [])}
+    cand_files = set()
+    for item in candidate.get("affected_files", []):
+        path = item["path"] if isinstance(item, dict) else str(item)
+        cand_files.add(_normalize_path(path, repo_path))
+
+    recall = len(ref_files & cand_files) / len(ref_files) if ref_files else 0
+    precision = len(ref_files & cand_files) / len(cand_files) if cand_files else 0
+    eff = _efficiency_score(cost_usd, reference_cost=1.0)
+
+    scores = {"files_found": recall, "false_positives": precision, "efficiency": eff}
+    weighted = sum(scores[k] * weights[k] for k in weights)
+    return {
+        "scores": scores, "weights": weights,
+        "weighted_score": round(weighted, 2), "max_score": 100,
+        "files_matched": sorted(ref_files & cand_files),
+        "files_missed": sorted(ref_files - cand_files),
+        "false_positives": sorted(cand_files - ref_files),
+    }
+
+
 def score_onboarding_auth_output(
     candidate: dict[str, Any] | None,
     reference: dict[str, Any],

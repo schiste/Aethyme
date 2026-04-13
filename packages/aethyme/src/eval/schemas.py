@@ -595,3 +595,197 @@ def mediawiki_config_audit_reference() -> dict[str, object]:
         "enforcement_file": "includes/Permissions/RateLimiter.php",
         "disable_keywords": ["RateLimits", "empty", "RateLimitsExcludedIPs", "exclude"],
     }
+
+
+# ---------------------------------------------------------------------------
+# dead-code — find unused public methods in the Watchlist subsystem
+# ---------------------------------------------------------------------------
+
+MEDIAWIKI_DEAD_CODE_PATH_KEYS: frozenset[str] = frozenset({"unused_functions"})
+
+
+def mediawiki_dead_code_output_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["unused_functions"],
+        "properties": {
+            "unused_functions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["function_name", "defined_in", "reason"],
+                    "properties": {
+                        "function_name": {"type": "string"},
+                        "defined_in": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+        },
+    }
+
+
+def mediawiki_dead_code_scoring_rubric() -> dict[str, object]:
+    return {
+        "weights": {
+            "functions_found": 60,
+            "false_positives": 20,
+            "efficiency": 20,
+        },
+        "notes": [
+            "functions_found: recall — how many of the 9 truly unused functions were identified.",
+            "false_positives: precision — penalty for listing functions that ARE used externally.",
+            "efficiency: cost relative to $1.00 baseline.",
+        ],
+    }
+
+
+def mediawiki_dead_code_reference() -> dict[str, object]:
+    """Public functions in includes/Watchlist/ with no callers outside the subsystem.
+
+    Ground truth generated via:
+        grep -n 'public function' includes/Watchlist/*.php | grep -v __construct |
+        for each: grep -rl '<func>' --include='*.php' . | grep -v includes/Watchlist/ |
+                  grep -v /tests/ | grep -v vendor/ | wc -l
+        Functions with 0 external callers are listed here.
+    """
+    return {
+        "unused_functions": [
+            {"function_name": "buildTools", "defined_in": "includes/Watchlist/SpecialEditWatchlist.php"},
+            {"function_name": "countAllForUser", "defined_in": "includes/Watchlist/WatchedItemQueryService.php"},
+            {"function_name": "duplicateEntry", "defined_in": "includes/Watchlist/WatchedItemQueryService.php"},
+            {"function_name": "isTempWatchedIgnoringRights", "defined_in": "includes/Watchlist/WatchlistManager.php"},
+            {"function_name": "modifyWatchedItemsWithRCInfo", "defined_in": "includes/Watchlist/WatchedItemQueryService.php"},
+            {"function_name": "modifyWatchedItemsWithRCInfoQuery", "defined_in": "includes/Watchlist/WatchedItemQueryService.php"},
+            {"function_name": "overrideDeferredUpdatesAddCallableUpdateCallback", "defined_in": "includes/Watchlist/WatchedItemStore.php"},
+            {"function_name": "removeWatchIgnoringRights", "defined_in": "includes/Watchlist/WatchlistManager.php"},
+            {"function_name": "resetNotificationTimestamp", "defined_in": "includes/Watchlist/WatchedItemStore.php"},
+        ],
+        "scope": "includes/Watchlist/",
+        "exclusions": ["tests/", "vendor/", "__construct", "__destruct"],
+        "function_keywords": [
+            "buildTools", "countAllForUser", "duplicateEntry",
+            "isTempWatchedIgnoringRights", "modifyWatchedItemsWithRCInfo",
+            "overrideDeferredUpdatesAddCallableUpdateCallback",
+            "removeWatchIgnoringRights", "resetNotificationTimestamp",
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# migration-planning — list all files referencing WatchedItemStore
+# ---------------------------------------------------------------------------
+
+MEDIAWIKI_MIGRATION_PATH_KEYS: frozenset[str] = frozenset({"affected_files"})
+
+
+def mediawiki_migration_output_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["affected_files"],
+        "properties": {
+            "affected_files": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["path", "change_needed"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "change_needed": {"type": "string"},
+                    },
+                },
+            },
+        },
+    }
+
+
+def mediawiki_migration_scoring_rubric() -> dict[str, object]:
+    return {
+        "weights": {
+            "files_found": 60,
+            "false_positives": 20,
+            "efficiency": 20,
+        },
+        "notes": [
+            "files_found: recall — how many of the 53 reference files were listed.",
+            "false_positives: precision — penalty for listing files that don't reference WatchedItemStore.",
+            "efficiency: cost relative to $1.00 baseline.",
+        ],
+    }
+
+
+def mediawiki_migration_reference() -> dict[str, object]:
+    """All non-test, non-vendor files referencing WatchedItemStore.
+
+    Ground truth generated via:
+        grep -rl 'WatchedItemStore' --include='*.php' . |
+        grep -v /tests/ | grep -v vendor/ |
+        grep -v includes/Watchlist/WatchedItemStore.php | sort
+    """
+    return {
+        "class_to_rename": "WatchedItemStore",
+        "new_name": "WatchlistNotificationStore",
+        "affected_files": [
+            "autoload.php",
+            "docs/config-vars.php",
+            "includes/Actions/ActionFactory.php",
+            "includes/Actions/DeleteAction.php",
+            "includes/Actions/InfoAction.php",
+            "includes/Actions/UnwatchAction.php",
+            "includes/Actions/WatchAction.php",
+            "includes/Api/ApiBlock.php",
+            "includes/Api/ApiDelete.php",
+            "includes/Api/ApiEditPage.php",
+            "includes/Api/ApiMain.php",
+            "includes/Api/ApiMove.php",
+            "includes/Api/ApiProtect.php",
+            "includes/Api/ApiQuery.php",
+            "includes/Api/ApiQueryInfo.php",
+            "includes/Api/ApiQueryUserInfo.php",
+            "includes/Api/ApiQueryWatchlistRaw.php",
+            "includes/Api/ApiRollback.php",
+            "includes/Api/ApiSetNotificationTimestamp.php",
+            "includes/Api/ApiUnblock.php",
+            "includes/Api/ApiUndelete.php",
+            "includes/Api/ApiUpload.php",
+            "includes/Api/ApiUserrights.php",
+            "includes/Api/ApiWatch.php",
+            "includes/Api/ApiWatchlistTrait.php",
+            "includes/EditPage/EditPage.php",
+            "includes/MainConfigNames.php",
+            "includes/MainConfigSchema.php",
+            "includes/MediaWikiServices.php",
+            "includes/Page/MergeHistory.php",
+            "includes/Page/MovePage.php",
+            "includes/Page/PageCommandFactory.php",
+            "includes/RecentChanges/ChangesListQuery/ChangesListQuery.php",
+            "includes/RecentChanges/ChangesListQuery/ChangesListQueryFactory.php",
+            "includes/RecentChanges/ChangesListQuery/SeenCondition.php",
+            "includes/RecentChanges/RecentChangeNotifier.php",
+            "includes/ServiceWiring.php",
+            "includes/Skin/SkinTemplate.php",
+            "includes/SpecialPage/SpecialPageFactory.php",
+            "includes/Specials/Pager/EditWatchlistPager.php",
+            "includes/Specials/SpecialEditWatchlist.php",
+            "includes/Specials/SpecialMovePage.php",
+            "includes/Specials/SpecialRecentChanges.php",
+            "includes/Specials/SpecialRecentChangesLinked.php",
+            "includes/Specials/SpecialWatchlist.php",
+            "includes/Watchlist/NoWriteWatchedItemStore.php",
+            "includes/Watchlist/WatchedItemQueryService.php",
+            "includes/Watchlist/WatchedItemStoreInterface.php",
+            "includes/Watchlist/WatchlistExpiryJob.php",
+            "includes/Watchlist/WatchlistManager.php",
+            "includes/config-schema.php",
+            "maintenance/makeTestEdits.php",
+            "maintenance/purgeExpiredWatchlistItems.php",
+        ],
+        "file_keywords": [
+            "WatchedItemStore", "ServiceWiring", "autoload",
+            "ApiWatch", "WatchlistManager", "NoWriteWatchedItemStore",
+        ],
+    }

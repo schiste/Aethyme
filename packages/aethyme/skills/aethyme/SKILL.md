@@ -40,6 +40,13 @@ $ENGINE importers --repo . --file <relative-path>
 $ENGINE callers --repo . --symbol <name>
 ```
 
+### Unused Functions
+```bash
+# Find public functions in a directory with no callers outside it
+# Useful for dead code detection, API surface analysis, deprecation planning
+$ENGINE unused --repo . --scope <directory>
+```
+
 ### Overview
 ```bash
 # Structural overview with areas, entrypoints, risks
@@ -52,6 +59,7 @@ $ENGINE query-overview --repo .
 - **Finding dependencies:** `deps --file <path>` to see what a file depends on
 - **Impact analysis:** `importers --file <path>` to see what depends on a file
 - **Finding callers:** `callers --symbol <name>` to find all uses of a function
+- **Dead code / API surface:** `unused --scope <dir>` to find unused public functions
 - **General orientation:** `query-overview` for entrypoints and risk areas
 
 ## When NOT to Use
