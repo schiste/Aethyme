@@ -1,4 +1,14 @@
-export type EvalType = "bug-fix" | "bug-fix-1" | "explain-repo" | "navigation-ctf" | "cross-package" | "impact-analysis" | "feature-localization" | "config-audit";
+export type EvalType =
+  | "bug-fix"
+  | "bug-fix-1"
+  | "explain-repo"
+  | "navigation-ctf"
+  | "cross-package"
+  | "impact-analysis"
+  | "feature-localization"
+  | "config-audit"
+  | "dead-code"
+  | "migration";
 
 export type TargetName = "grc" | "mediawiki";
 
@@ -63,6 +73,11 @@ export interface Repository {
   target: string;
   controlPath: string;
   aethymePath: string;
+  setupSource: string | null;
+  setupCommit: string | null;
+  setupControlDirName?: string | null;
+  setupAethymeDirName?: string | null;
+  setupDest: string;
   validationStatus: ValidationStatus;
   controlClean: { clean: boolean; issues: string[] };
   aethymeIndex: IndexInfo;
@@ -76,6 +91,8 @@ export interface EvalRunConfig {
   target: string;
   model: ModelName;
   reasoning: Reasoning;
+  windowId?: number;
+  preparationId?: string;
 }
 
 export interface EvalRunState {
@@ -84,6 +101,42 @@ export interface EvalRunState {
   currentPhase: string | null;
   log: string[];
   error: string | null;
+}
+
+export interface RepositoryPreparation {
+  id: string;
+  target: string;
+  ready: boolean;
+  createdAt: string;
+  path: string;
+  errors: string[];
+  checks: {
+    validation: { valid: boolean; errors: string[] };
+    controlClean: { clean: boolean; issues: string[] };
+    engineBinary: { exists: boolean; path: string };
+    aethymeIndex: IndexInfo;
+    snippets: SnippetsInfo;
+    controlRepo: { path: string; commit: string | null; dirty: boolean | null };
+    aethymeRepo: { path: string; commit: string | null; dirty: boolean | null };
+  };
+}
+
+export interface RepositorySetupRequest {
+  target: string;
+  source?: string;
+  commit?: string;
+  force?: boolean;
+}
+
+export interface RepositorySetupStatus {
+  status: "queued" | "running" | "complete" | "error";
+  target: string;
+  source: string;
+  commit: string;
+  force: boolean;
+  output?: string;
+  error?: string;
+  preparation?: RepositoryPreparation;
 }
 
 export type SortDirection = "asc" | "desc";

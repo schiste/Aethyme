@@ -3,6 +3,9 @@ import type {
   Repository,
   EvalRunConfig,
   EvalRunState,
+  RepositoryPreparation,
+  RepositorySetupRequest,
+  RepositorySetupStatus,
 } from "./types";
 
 const API_BASE = "/api";
@@ -28,6 +31,59 @@ export async function validateRepository(
     body: JSON.stringify({ target }),
   });
   if (!res.ok) throw new Error(`Validation request failed: ${res.statusText}`);
+  return res.json();
+}
+
+export async function prepareRepository(
+  target: string,
+): Promise<RepositoryPreparation> {
+  const res = await fetch(`${API_BASE}/repositories/prepare`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target }),
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Preparation request failed: ${detail}`);
+  }
+  return res.json();
+}
+
+export async function fetchLatestPreparation(
+  target: string,
+): Promise<RepositoryPreparation | null> {
+  const res = await fetch(`${API_BASE}/repositories/prepare/${target}`);
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Preparation fetch failed: ${detail}`);
+  }
+  return res.json();
+}
+
+export async function setupRepository(
+  request: RepositorySetupRequest,
+): Promise<{ success: boolean; taskId?: string }> {
+  const res = await fetch(`${API_BASE}/repositories/setup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Setup request failed: ${detail}`);
+  }
+  return res.json();
+}
+
+export async function fetchSetupStatus(
+  taskId: string,
+): Promise<RepositorySetupStatus> {
+  const res = await fetch(`${API_BASE}/repositories/setup/status/${taskId}`);
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Setup status failed: ${detail}`);
+  }
   return res.json();
 }
 

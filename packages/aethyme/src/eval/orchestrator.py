@@ -196,6 +196,27 @@ _EVAL_TYPE_DEFAULTS: dict[str, dict[str, str]] = {
         "score_function": "src.eval.scoring.score_navigation_ctf_output",
         "report_function": "src.eval.report.finalize_eval_run",
     },
+    "dead-code": {
+        "task": (
+            "Find all public methods in includes/Watchlist/ that are never "
+            "called from outside that directory. Check every public function "
+            "and search the entire codebase for call sites."
+        ),
+        "prepare_function": "src.eval.schemas.mediawiki_dead_code_reference",
+        "score_function": "src.eval.scoring.score_mediawiki_dead_code",
+        "report_function": "src.eval.report.finalize_eval_run",
+        "target_restriction": "mediawiki",
+    },
+    "migration": {
+        "task": (
+            "List every file referencing WatchedItemStore that would need "
+            "updating if the class were renamed to WatchlistNotificationStore."
+        ),
+        "prepare_function": "src.eval.schemas.mediawiki_migration_reference",
+        "score_function": "src.eval.scoring.score_mediawiki_migration",
+        "report_function": "src.eval.report.finalize_eval_run",
+        "target_restriction": "mediawiki",
+    },
 }
 
 _AETHYME_PKG = str(PROJECT_ROOT)
@@ -365,8 +386,8 @@ def _build_validate_phase(target: EvalTarget) -> dict[str, Any]:
         },
     ]
     return {
-        "name": "validate",
-        "description": "Check repos, tooling, and engine binary",
+        "name": "prepare",
+        "description": "Check repository readiness and persist a preparation snapshot",
         "checks": checks,
     }
 
@@ -434,7 +455,7 @@ def _build_prepare_phase(
             f" --json-output"
         )
         description = f"Generate navigation-ctf artifacts for {target.display_name}"
-    elif eval_type in ("impact-analysis", "feature-localization", "config-audit"):
+    elif eval_type in ("impact-analysis", "feature-localization", "config-audit", "dead-code", "migration"):
         # Read-only diagnostic evals — no cloning, prompts written by the server
         defaults = _EVAL_TYPE_DEFAULTS[eval_type]
         cli_cmd = f"echo 'Prompts written by server for {eval_type}'"
@@ -443,7 +464,7 @@ def _build_prepare_phase(
         raise ValueError(f"Unknown eval_type: {eval_type}")
 
     return {
-        "name": "prepare",
+        "name": "build-inputs",
         "description": description,
         "cli_cmd": cli_cmd,
         "writes_to": list(paths["prompt_files"].values()) + [

@@ -1,11 +1,23 @@
 import { useState, useEffect } from "react";
-import { fetchRepositories, generatePlan, launchRun, fetchRunStatus } from "../lib/api";
+import {
+  fetchRepositories,
+  fetchChau7Tabs,
+  generatePlan,
+  launchRun,
+  fetchRunStatus,
+  prepareRepository,
+  fetchLatestPreparation,
+  setupRepository,
+  fetchSetupStatus,
+} from "../lib/api";
 import type {
   EvalType,
   ModelName,
   Reasoning,
   Repository,
   RunStatus,
+  RepositoryPreparation,
+  RepositorySetupStatus,
 } from "../lib/types";
 
 const EVAL_TYPES: { value: EvalType; label: string; description: string; target?: string; conditions: string }[] = [
@@ -63,6 +75,20 @@ const EVAL_TYPES: { value: EvalType; label: string; description: string; target?
     target: "mediawiki",
     conditions: "Scored by: 25% per correct answer (config var, default location, enforcement class, disable method)",
   },
+  {
+    value: "dead-code",
+    label: "Dead Code (MediaWiki)",
+    description: "Find public methods in includes/Watchlist/ that are never called from outside that directory.",
+    target: "mediawiki",
+    conditions: "4 conditions: control-cto-off, control-cto-on, explore (skill), leverage (enriched prompt)",
+  },
+  {
+    value: "migration",
+    label: "Migration (MediaWiki)",
+    description: "Find every non-test reference that must change when WatchedItemStore is renamed.",
+    target: "mediawiki",
+    conditions: "4 conditions: control-cto-off, control-cto-on, explore (skill), leverage (enriched prompt)",
+  },
 ];
 
 const MODELS: { value: ModelName; label: string; provider: string; backend: string }[] = [
@@ -92,22 +118,35 @@ export default function RunEvals() {
   const [target, setTarget] = useState<string>("grc");
   const [model, setModel] = useState<ModelName>("haiku");
   const [reasoning, setReasoning] = useState<Reasoning>("high");
+  const [windowId, setWindowId] = useState<string>("auto");
 
   const [repos, setRepos] = useState<Repository[]>([]);
   const [loadingRepos, setLoadingRepos] = useState(true);
+  const [availableWindows, setAvailableWindows] = useState<number[]>([]);
+  const [preparation, setPreparation] = useState<RepositoryPreparation | null>(null);
+  const [preparing, setPreparing] = useState(false);
+  const [setupStatus, setSetupStatus] = useState<RepositorySetupStatus | null>(null);
+  const [settingUp, setSettingUp] = useState(false);
+  const [setupForce, setSetupForce] = useState(false);
 
   const [status, setStatus] = useState<RunStatus>("idle");
   const [plan, setPlan] = useState<object | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [currentPhase, setCurrentPhase] = useState<string | null>(null);
 
+  const reloadRepositories = async () => {
+    const data = await fetchRepositories();
+    setRepos(data);
+    if (data.length > 0 && !data.find((r) => r.target === target)) {
+      setTarget(data[0].target);
+    }
+    return data;
+  };
+
   useEffect(() => {
-    fetchRepositories()
+    reloadRepositories()
       .then((data) => {
         setRepos(data);
-        if (data.length > 0 && !data.find((r) => r.target === target)) {
-          setTarget(data[0].target);
-        }
       })
       .catch((err) => {
         setLog((prev) => [...prev, `ERROR: Failed to load repositories: ${err.message}`]);
@@ -115,8 +154,33 @@ export default function RunEvals() {
       .finally(() => setLoadingRepos(false));
   }, []);
 
+  useEffect(() => {
+    fetchChau7Tabs()
+      .then((tabs) => {
+        const windows = Array.from(
+          new Set(
+            tabs
+              .map((tab) => tab?.window_id)
+              .filter((value): value is number => Number.isInteger(value)),
+          ),
+        ).sort((a, b) => a - b);
+        setAvailableWindows(windows);
+      })
+      .catch(() => {
+        setAvailableWindows([]);
+      });
+  }, []);
+
+  useEffect(() => {
+    fetchLatestPreparation(target)
+      .then((snapshot) => setPreparation(snapshot))
+      .catch(() => setPreparation(null));
+    setSetupStatus(null);
+  }, [target]);
+
   const selectedEvalType = EVAL_TYPES.find((t) => t.value === evalType);
   const selectedModel = MODELS.find((m) => m.value === model);
+  const selectedRepo = repos.find((repo) => repo.target === target) ?? null;
   // Auto-set target when eval type has a restriction
   useEffect(() => {
     if (selectedEvalType?.target) {
@@ -124,12 +188,22 @@ export default function RunEvals() {
     }
   }, [evalType]);
 
+  useEffect(() => {
+    setPlan(null);
+  }, [evalType, target, model, reasoning, windowId]);
+
+  const parsedWindowId =
+    windowId === "auto" || windowId === "" ? undefined : Number.parseInt(windowId, 10);
+
   async function handleGeneratePlan() {
     setStatus("planning");
     setPlan(null);
     setLog([]);
     try {
-      const result = await generatePlan({ evalType, target, model, reasoning });
+      const config = parsedWindowId === undefined
+        ? { evalType, target, model, reasoning }
+        : { evalType, target, model, reasoning, windowId: parsedWindowId };
+      const result = await generatePlan(config);
       setPlan(result);
       setLog((prev) => [...prev, "Plan generated successfully."]);
       setStatus("idle");
@@ -139,15 +213,108 @@ export default function RunEvals() {
     }
   }
 
+  async function handlePrepareTarget() {
+    setPreparing(true);
+    try {
+      const snapshot = await prepareRepository(target);
+      setPreparation(snapshot);
+      setLog((prev) => [
+        ...prev,
+        snapshot.ready
+          ? `Preparation ready: ${snapshot.id}`
+          : `Preparation failed: ${snapshot.errors.join(" | ")}`,
+      ]);
+    } catch (err: any) {
+      setLog((prev) => [...prev, `ERROR: ${err.message}`]);
+    } finally {
+      setPreparing(false);
+    }
+  }
+
+  async function handleSetupTarget() {
+    if (!selectedRepo) {
+      setLog((prev) => [...prev, "ERROR: No target repository selected."]);
+      return;
+    }
+    if (!selectedRepo.setupSource || !selectedRepo.setupCommit) {
+      setLog((prev) => [...prev, "ERROR: This target has no default setup source/commit configured yet."]);
+      return;
+    }
+
+    setSettingUp(true);
+    setSetupStatus(null);
+    setPreparation(null);
+    setPlan(null);
+    setLog((prev) => [
+      ...prev,
+      `Starting setup for ${target} from ${selectedRepo.setupSource} @ ${selectedRepo.setupCommit}${setupForce ? " (force)" : ""}`,
+    ]);
+
+    try {
+      const launch = await setupRepository({
+        target,
+        source: selectedRepo.setupSource,
+        commit: selectedRepo.setupCommit,
+        force: setupForce,
+      });
+      if (!launch.taskId) {
+        throw new Error("Setup did not return a task id.");
+      }
+
+      const poll = async () => {
+        const nextStatus = await fetchSetupStatus(launch.taskId as string);
+        setSetupStatus(nextStatus);
+
+        if (nextStatus.status === "complete") {
+          setSettingUp(false);
+          if (nextStatus.preparation) {
+            setPreparation(nextStatus.preparation);
+          } else {
+            const latest = await fetchLatestPreparation(target);
+            setPreparation(latest);
+          }
+          await reloadRepositories();
+          setLog((prev) => [...prev, `Setup complete for ${target}.`]);
+          return;
+        }
+
+        if (nextStatus.status === "error") {
+          setSettingUp(false);
+          setLog((prev) => [
+            ...prev,
+            `ERROR: Setup failed for ${target}: ${nextStatus.error ?? "unknown error"}`,
+          ]);
+          return;
+        }
+
+        window.setTimeout(() => {
+          void poll();
+        }, 3000);
+      };
+
+      await poll();
+    } catch (err: any) {
+      setSettingUp(false);
+      setLog((prev) => [...prev, `ERROR: ${err.message}`]);
+    }
+  }
+
   async function handleRun() {
     if (!plan) {
       setLog((prev) => [...prev, "Generate a plan first before running."]);
       return;
     }
+    if (!preparation?.ready) {
+      setLog((prev) => [...prev, "Prepare the target first before running."]);
+      return;
+    }
     setStatus("running");
     setLog([]);
     try {
-      const state = await launchRun({ evalType, target, model, reasoning });
+      const config = parsedWindowId === undefined
+        ? { evalType, target, model, reasoning, preparationId: preparation.id }
+        : { evalType, target, model, reasoning, windowId: parsedWindowId, preparationId: preparation.id };
+      const state = await launchRun(config);
       setCurrentPhase(state.currentPhase);
       setLog(state.log);
       if (state.status === "error") {
@@ -194,6 +361,63 @@ export default function RunEvals() {
           </h2>
 
           <div className="space-y-3">
+            <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-3 space-y-2">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-xs text-[var(--color-text-muted)] uppercase tracking-wide">Setup Playground</p>
+                  <p className="text-sm text-[var(--color-text)]">
+                    Recreate the control/aethyme playground pair, deploy the skill, and build the Aethyme index.
+                  </p>
+                </div>
+                <button
+                  onClick={handleSetupTarget}
+                  disabled={settingUp || status === "running" || loadingRepos || !selectedRepo?.setupSource || !selectedRepo?.setupCommit}
+                  className="px-4 py-2 text-sm font-medium rounded border border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)] hover:bg-[var(--color-surface-hover)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {settingUp ? "Setting Up..." : "Setup Target"}
+                </button>
+              </div>
+              {selectedRepo?.setupSource && selectedRepo?.setupCommit ? (
+                <div className="space-y-1 text-xs font-mono text-[var(--color-text-muted)]">
+                  <div>source: {selectedRepo.setupSource}</div>
+                  <div>commit: {selectedRepo.setupCommit}</div>
+                  <div>dest: {selectedRepo.setupDest}</div>
+                </div>
+              ) : (
+                <p className="text-xs text-[var(--color-score-yellow)]">
+                  No default setup source/commit is configured for this target yet.
+                </p>
+              )}
+              <label className="flex items-center gap-2 text-xs text-[var(--color-text-muted)]">
+                <input
+                  type="checkbox"
+                  checked={setupForce}
+                  onChange={(e) => setSetupForce(e.target.checked)}
+                  className="rounded border-[var(--color-border)] bg-[var(--color-surface)]"
+                />
+                Replace any existing playground repos for this target
+              </label>
+              {setupStatus && (
+                <div className={`rounded border px-3 py-2 text-xs ${
+                  setupStatus.status === "error"
+                    ? "border-[var(--color-score-red)]/40 bg-[var(--color-score-red)]/10"
+                    : setupStatus.status === "complete"
+                      ? "border-[var(--color-score-green)]/40 bg-[var(--color-score-green)]/10"
+                      : "border-[var(--color-accent)]/30 bg-[var(--color-accent)]/10"
+                }`}>
+                  <div className="font-mono text-[var(--color-text)]">status: {setupStatus.status}</div>
+                  {setupStatus.output && (
+                    <pre className="mt-2 max-h-28 overflow-y-auto whitespace-pre-wrap font-mono text-[11px] text-[var(--color-text-muted)]">
+                      {setupStatus.output}
+                    </pre>
+                  )}
+                  {setupStatus.error && (
+                    <div className="mt-2 text-[var(--color-score-red)]">{setupStatus.error}</div>
+                  )}
+                </div>
+              )}
+            </div>
+
             <div>
               <label className="block text-xs text-[var(--color-text-muted)] uppercase tracking-wide mb-1">
                 Eval Type
@@ -274,25 +498,56 @@ export default function RunEvals() {
                   ))}
                 </select>
               </div>
+
+              <div>
+                <label className="block text-xs text-[var(--color-text-muted)] uppercase tracking-wide mb-1">
+                  Chau7 Window
+                </label>
+                <select
+                  value={windowId}
+                  onChange={(e) => setWindowId(e.target.value)}
+                  className={selectClass}
+                >
+                  <option value="auto">Auto</option>
+                  {availableWindows.map((id) => (
+                    <option key={id} value={String(id)}>
+                      Window {id}
+                    </option>
+                  ))}
+                </select>
+              </div>
             </div>
+            <p className="text-xs text-[var(--color-text-muted)]">
+              Auto uses Chau7&apos;s active/preferred window. Pick a window ID to force eval tabs into that window.
+            </p>
           </div>
 
           <div className="flex gap-2 pt-2">
             <button
+              onClick={handlePrepareTarget}
+              disabled={preparing || status === "running" || loadingRepos || settingUp}
+              className="flex-1 px-4 py-2 text-sm font-medium rounded border border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)] hover:bg-[var(--color-surface-hover)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {preparing ? "Preparing..." : "Prepare Target"}
+            </button>
+            <button
               onClick={handleGeneratePlan}
-              disabled={status === "planning" || status === "running" || loadingRepos}
+              disabled={status === "planning" || status === "running" || loadingRepos || settingUp}
               className="flex-1 px-4 py-2 text-sm font-medium rounded border border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)] hover:bg-[var(--color-surface-hover)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {status === "planning" ? "Generating..." : "Generate Plan"}
             </button>
             <button
               onClick={handleRun}
-              disabled={!plan || status === "running"}
+              disabled={!plan || status === "running" || !preparation?.ready || settingUp}
               className="flex-1 px-4 py-2 text-sm font-medium rounded bg-[var(--color-accent)] text-white hover:bg-[var(--color-accent-hover)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {status === "running" ? "Running..." : "Run"}
             </button>
           </div>
+          <p className="text-xs text-[var(--color-text-muted)]">
+            Flow: setup playground if needed, prepare a readiness snapshot, generate the dry plan, then run the evaluation.
+          </p>
         </div>
 
         {/* Eval type details */}
@@ -345,6 +600,21 @@ export default function RunEvals() {
           <h2 className="text-sm font-medium text-[var(--color-text-muted)] uppercase tracking-wide">
             Target Repositories
           </h2>
+          {preparation && (
+            <div className={`rounded border px-3 py-2 text-xs ${
+              preparation.ready
+                ? "border-[var(--color-score-green)]/40 bg-[var(--color-score-green)]/10 text-[var(--color-text)]"
+                : "border-[var(--color-score-red)]/40 bg-[var(--color-score-red)]/10 text-[var(--color-text)]"
+            }`}>
+              <div className="font-mono">Preparation {preparation.id}</div>
+              <div>{preparation.ready ? "ready" : "not ready"}</div>
+              {!preparation.ready && preparation.errors.length > 0 && (
+                <div className="mt-1 text-[var(--color-score-red)]">
+                  {preparation.errors.join(" | ")}
+                </div>
+              )}
+            </div>
+          )}
           {loadingRepos ? (
             <p className="text-xs text-[var(--color-text-muted)]">Loading...</p>
           ) : (
@@ -369,14 +639,17 @@ export default function RunEvals() {
                       {repo.target === target && (
                         <span className="ml-2 text-xs text-[var(--color-accent)]">selected</span>
                       )}
+                      <p className="text-xs font-mono text-[var(--color-text-muted)]">
+                        {repo.controlPath}
+                      </p>
                     </div>
                   </div>
                   <div className="text-right">
-                    {repo.aethymeIndex?.indexed || repo.aethymeIndex?.indexed ? (
+                    {repo.aethymeIndex?.indexed ? (
                       <div>
                         <span className="text-xs font-mono text-[var(--color-score-green)]">indexed</span>
                         <p className="text-xs text-[var(--color-text-muted)] font-mono">
-                          {new Date(repo.aethymeIndex?.date || repo.aethymeIndex?.date || "").toLocaleDateString("en-US", {
+                          {new Date(repo.aethymeIndex.date || "").toLocaleDateString("en-US", {
                             month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
                           })}
                         </p>
@@ -421,7 +694,7 @@ export default function RunEvals() {
           <div className="bg-[var(--color-bg)] rounded p-3 min-h-32 max-h-96 overflow-y-auto">
             {log.length === 0 ? (
               <p className="text-xs text-[var(--color-text-muted)] font-mono">
-                No activity yet. Generate a plan to get started.
+                No activity yet. Setup or prepare the target, then generate a plan to get started.
               </p>
             ) : (
               <div className="space-y-1">

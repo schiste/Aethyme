@@ -23,6 +23,10 @@ class EvalTarget:
     control_path: Path
     aethyme_path: Path
     description: str = ""
+    setup_source: str | None = None
+    setup_commit: str | None = None
+    setup_control_dir_name: str | None = None
+    setup_aethyme_dir_name: str | None = None
 
     def validate(self) -> list[str]:
         """Return validation error strings.  Empty list means valid."""
@@ -63,6 +67,10 @@ class EvalTarget:
             "control_path": str(self.control_path),
             "aethyme_path": str(self.aethyme_path),
             "description": self.description,
+            "setup_source": self.setup_source,
+            "setup_commit": self.setup_commit,
+            "setup_control_dir_name": self.setup_control_dir_name,
+            "setup_aethyme_dir_name": self.setup_aethyme_dir_name,
         }
 
 
@@ -73,6 +81,8 @@ TARGETS: dict[str, EvalTarget] = {
         control_path=_PLAYGROUND_ROOT / "GRC" / "Playground Control",
         aethyme_path=_PLAYGROUND_ROOT / "GRC" / "Playground Aethyme",
         description="TypeScript monorepo (enterprise GRC platform)",
+        setup_control_dir_name="Playground Control",
+        setup_aethyme_dir_name="Playground Aethyme",
     ),
     "mediawiki": EvalTarget(
         name="mediawiki",
@@ -80,6 +90,10 @@ TARGETS: dict[str, EvalTarget] = {
         control_path=_PLAYGROUND_ROOT / "Mediawiki" / "Mediawiki - Control",
         aethyme_path=_PLAYGROUND_ROOT / "Mediawiki" / "Mediawiki - Aethyme",
         description="PHP monolith (~12.5K files)",
+        setup_source="https://github.com/wikimedia/mediawiki.git",
+        setup_commit="8b6613f3996",
+        setup_control_dir_name="Mediawiki - Control",
+        setup_aethyme_dir_name="Mediawiki - Aethyme",
     ),
 }
 

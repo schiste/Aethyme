@@ -1,6 +1,30 @@
 # Eval Protocol — Aethyme Navigation Benchmarks
 
-Last Updated: 2026-03-10
+Last Updated: 2026-04-13
+
+## Runtime Flow
+
+The runtime protocol is split into four distinct layers:
+
+1. **Setup Playground**
+   - Clone or refresh the Control and Aethyme repos for a target.
+   - Deploy the Aethyme skill into the Aethyme repo.
+   - Build the Aethyme graph index.
+2. **Prepare Target**
+   - Perform lightweight readiness checks only.
+   - Persist a preparation snapshot under `eval-runs/preparations/`.
+   - This step must not generate prompts or launch agents.
+3. **Generate Plan**
+   - Build the dry execution plan: conditions, paths, model/backend, prompts to materialize, run dir.
+   - This is orchestration metadata only.
+4. **Run Evaluation**
+   - Materialize eval inputs.
+   - Create tabs.
+   - Launch agents.
+   - Collect outputs.
+   - Score and finalize artifacts.
+
+`Prepare Target` is intentionally light. Heavy work like leverage prompt enrichment belongs to `Run Evaluation` under the explicit `build inputs` phase, not to repository preparation.
 
 ## Core Rules
 
@@ -132,7 +156,7 @@ Check the first `type: "user"` message in the session JSONL.
 Confirm it contains the expected prompt text.
 If the condition is leverage, confirm the navigation context is present.
 ```
-**Why:** `tab_send_input` silently fails with Claude Code TUI. The prompt may not have been received. An agent that got no prompt or the wrong prompt invalidates the condition.
+**Why:** prompt delivery is only valid after `tab_send_input(...)` is followed by `tab_submit_prompt()`. Do not assume the pasted text was actually accepted by Claude until the first user message in the session JSONL matches the expected prompt.
 
 #### 2. Check for sub-agent sessions
 ```
@@ -164,16 +188,20 @@ all others must show cto_active: true (if CTO is globally enabled)
 #### 5. Map tab IDs to session files
 ```
 Record which tab_id corresponds to which condition BEFORE launching.
-After completion, match tab_id → session JSONL via modification time or prompt content.
+Launch Claude with an explicit `--session-id <uuid>` per condition.
+Compute the exact JSONL path:
+~/.claude/projects/<encoded-repo-path>/<session-id>.jsonl
+Verify the first user message matches the condition prompt.
 ```
-**Why:** Session JSONL filenames are UUIDs with no condition label. Without explicit mapping, you cannot tell which file is control-cto-off vs control-cto-on.
+**Why:** `tab_status.ai_session_id` is not reliable enough for attribution, and same-repo conditions can otherwise be ambiguous. Explicit session IDs remove guesswork and make collection deterministic.
 
 ### Known Limitations
 
-- **`tab_send_input` does not submit prompts in Claude Code TUI.** Text is pasted but Enter is not triggered. The user must press Enter manually on each tab. This is a Chau7 MCP limitation — Claude Code handles key events differently from raw terminal character input.
-- **`runtime_session_create` with `backend="claude"` fails** with `--print-session-id` error on current Claude Code versions. Use `tab_create` + `tab_exec` + manual prompt entry instead.
+- **`tab_status.ai_session_id` is unreliable for condition attribution.** It can lag, point at an older session, or repeat across tabs in the same repo pair. Use the explicit `--session-id` passed at launch and the expected JSONL path instead.
+- **`runtime_session_create` with `backend="claude"` fails** with `--print-session-id` error on current Claude Code versions. Use `tab_create` + `tab_exec` + `tab_send_input` + `tab_submit_prompt` instead.
 - **Sub-agent JSONL files** are stored in `<session-id>/subagents/` subdirectory, not alongside the parent. Token extraction code must recurse into this directory.
 - **Haiku strategy variance is high.** The same prompt can produce 5-turn or 70-turn sessions depending on whether the model delegates to a sub-agent. Multiple runs per condition are needed for stable averages.
+- **The eval UI server uses file-first output capture.** If the prompt successfully makes the agent write `.aethyme-eval-output-<condition>.md`, prefer that file. Fall back to PTY log capture only when the file is missing.
 
 ## Playground Repositories
 
@@ -400,24 +428,24 @@ python -m src.cli eval run --eval-type explain-repo --target mediawiki --model s
 
 The `--json-output` flag emits the full plan dict with 8 phases:
 
-0. **validate** — check repos, tooling, engine binary, no skill contamination
-1. **prepare** — generate artifacts (prompts, schema, reference, nav context), clone repos for bug-fix
-2. **launch** — create 4 Chau7 sessions with exact `runtime_session_create` or `tab_exec` params
+0. **prepare** — repository readiness checks and readiness snapshot contract
+1. **build-inputs** — materialize prompts, schema, reference, nav context, bug-fix repo prep
+2. **launch** — create 4 Chau7 tabs, start the backend in each tab, then submit the prompt
 3. **monitor** — poll until all agents complete
 4. **collect** — gather structured output, telemetry, transcripts per condition
 5. **score** — call `assemble_bug_fix_result()` or equivalent scorer
 6. **report** — call `finalize_eval_run()` + `print_scorecard()` (never hand-write)
 7. **cleanup** — close all sessions and tabs
 
-Each phase contains all parameters pre-computed. Claude reads the plan and executes each step via Chau7 MCP tools (`runtime_session_create`, `tab_set_cto`, `runtime_turn_status`, `tab_output`, etc.).
+Each phase contains all parameters pre-computed. Claude reads the plan and executes each step via Chau7 MCP tools (`tab_create`, `tab_exec`, `tab_send_input`, `tab_submit_prompt`, `tab_set_cto`, `tab_status`, `tab_output`, etc.).
 
 **Supported models:**
 
 | Model | Provider | Backend | Launch Method |
 |-------|----------|---------|---------------|
-| haiku | Anthropic | claude | `runtime_session_create` with `initial_prompt` |
-| sonnet | Anthropic | claude | `runtime_session_create` with `initial_prompt` |
-| opus | Anthropic | claude | `runtime_session_create` with `initial_prompt` |
+| haiku | Anthropic | claude | `tab_create` + `tab_exec` + `tab_send_input` + `tab_submit_prompt` |
+| sonnet | Anthropic | claude | `tab_create` + `tab_exec` + `tab_send_input` + `tab_submit_prompt` |
+| opus | Anthropic | claude | `tab_create` + `tab_exec` + `tab_send_input` + `tab_submit_prompt` |
 | gpt-5.4 | OpenAI | codex | `tab_create` + `tab_exec` with `codex exec` |
 
 ### Manual Execution (Fallback)
@@ -895,3 +923,106 @@ Per-field breakdown (rerun):
 **Result**: `ui/package.json` → `ui/src/index.ts` → area `packages`. Config and code targets differ from both the original control run (`app-shared`) and the reference (`auth`). Management area correct. Absolute paths and markdown link formatting in all fields. Confidence: "high". Rejected candidates: `app-shared/package.json` (wildcard exports, no root `.` binding).
 
 **Analysis**: CTO off doubled token usage (48K → 96K) but improved the score (0 → 20) by correctly identifying the top-level `packages` area. The agent chose `ui/package.json` — a different wrong answer than the original control's `app-shared/package.json`. Both are defensible human answers; neither matches the graph reference (`auth/package.json`). The Codex aethyme-navigation skill activation is a confound — the agent tried graph CLI commands that weren't part of the control prompt, suggesting skill contamination. CTO doesn't appear to be the primary factor in control's low scores; path format (absolute vs relative) and the fundamental mismatch between "reasonable human answer" and "graph-derived reference" remain the dominant issues.
+
+---
+
+## Playground Setup
+
+See [playground-setup.md](playground-setup.md) for the full setup guide.
+
+**Scripts:**
+- `scripts/eval/setup-playground.sh` — clone, sanitize, deploy, verify
+- `scripts/eval/verify-playground.sh` — validate an existing playground
+- `scripts/eval/run-eval.sh` — end-to-end eval run (verify → server → launch → wait → results)
+
+---
+
+## Eval Type Registry
+
+| Type | Target | Task | Scoring |
+|---|---|---|---|
+| `bug-fix` | grc | Fix failing test (implication-share) | test pass + regression + code quality + efficiency |
+| `bug-fix-1` | mediawiki | Diagnose T419918 watchlist bug | files identified + root cause + fix plan + efficiency |
+| `explain-repo` | any | Explain repository architecture | structural accuracy vs engine reference |
+| `navigation-ctf` | any | Find manifest → entrypoint → area chain | exact path matching |
+| `impact-analysis` | mediawiki | List all callers of doViewUpdates() | call site recall + precision |
+| `feature-localization` | mediawiki | Trace Watch button execution chain | ordered method chain matching |
+| `config-audit` | mediawiki | Find rate limiting config + enforcement | exact variable/file/class matching |
+| `dead-code` | mediawiki | Find unused public functions in Watchlist/ | function recall + precision + efficiency |
+| `migration` | mediawiki | List files referencing WatchedItemStore | file recall + precision + efficiency |
+
+Schemas and references: `src/eval/schemas.py`
+Scoring functions: `src/eval/scoring.py`
+Orchestrator registration: `src/eval/orchestrator.py` (`_EVAL_TYPE_DEFAULTS`)
+Server task text: `packages/aethyme-eval-ui/server/main.py` (`EVAL_TASKS`)
+
+---
+
+## Known Pitfalls (Learned 2026-04-13)
+
+### Git History Leaks
+
+`git log --all` traverses ALL refs including remote tracking branches. If the source repo has a fix commit on `origin/master`, any agent that searches git history finds the answer for free — even if the checkout is at a pre-fix commit.
+
+**Fix:** Remove remotes, delete local branches, prune unreachable objects. The `setup-playground.sh` script does this automatically. Always verify with `git log --all --oneline | grep "<fix-description>"`.
+
+### Control Repo Contamination
+
+Chau7 creates `.chau7/snippets/` when opening a tab in a directory. Claude Code may create `.claude/` config dirs. These should not be present in the Control repo.
+
+**Fix:** Run `verify-playground.sh` before every eval. Delete `.chau7/` and `.claude/` from Control if found. Never run engine commands against Control.
+
+### Output Capture
+
+The agent's final text response is difficult to capture programmatically:
+
+| Source | Issue |
+|---|---|
+| Session JSONL | Final assistant response not written to file |
+| `tab_output` (buffer) | Scrollback buffer too small for agents with many tool calls |
+| `tab_output` (pty_log) | TUI spinner frames split keywords across lines |
+| File-based output | Best path when the agent obeys the prompt; missing file means fall back to PTY |
+
+**Current approach:** instruct each condition to write `.aethyme-eval-output-<condition>.md`, use that file if present, and fall back to PTY log with `_clean_pty_output()` + whitespace-collapsed keyword matching only when the file is missing.
+
+**Pending Chau7 fix:** `tab_last_response` API that returns the last agent text block at the application level, bypassing terminal rendering.
+
+### Score Inflation from Prompt Keywords
+
+The leverage prompt includes navigation context (function listings, file structure). If reference keywords appear in the prompt, the scorer matches them against the prompt text, not the agent's analysis.
+
+**Fix:** The `_score_output()` function strips prompt text before keyword matching. Always pass the condition's prompt to the scorer.
+
+### CTO Overhead on Large Repos
+
+On repos with 12K+ files, CTO (Context Tree Optimization) can increase token usage because the file tree is injected into every context window turn. On MediaWiki, control-cto-on sometimes costs MORE than cto-off.
+
+**Implication:** CTO's value is repo-size-dependent. For large repos, the navigation context from Aethyme tools is more cost-effective than the full file tree from CTO.
+
+---
+
+## Scoring Architecture
+
+### Server-Side Scoring (`_score_output`)
+
+Located in `packages/aethyme-eval-ui/server/main.py`. Runs after output collection, before DB insert.
+
+1. **Prompt stripping**: removes significant words (>5 chars) from the prompt to prevent inflation
+2. **Whitespace collapsing**: `re.sub(r'\s+', ' ', output)` to handle TUI noise splitting keywords
+3. **Keyword matching**: case-insensitive substring search against reference keywords
+4. **Efficiency scoring**: `reference_cost / (reference_cost + actual_cost)` — smooth curve rewarding lower cost
+
+### Formal Scoring (`src/eval/scoring.py`)
+
+Used for structured output comparison. Requires the agent's output as a parsed dict (not available from PTY log). Includes:
+
+- `_normalize_path()` — strips markdown links, line anchors, absolute prefixes
+- `_keyword_score()` — fraction of reference keywords present
+- `_efficiency_score()` — cost-relative scoring
+- `_compute_guardrails()` — detects formatting issues (absolute paths, markdown links)
+
+### Scoring Limitations
+
+- **PTY log scoring** is keyword-based and approximate. An agent could mention "doViewUpdates" in a wrong context and still get credit.
+- **Formal scoring** requires structured JSON output, which the current output capture doesn't provide.
+- **Cross-condition comparison** is only reliable for efficiency metrics (tokens, cost, tools, duration). Quality scores should be interpreted with caution until output capture is solved.
