@@ -1,8 +1,9 @@
 """Benchmark repo isolation: one clone per condition.
 
-Creates 4 independent ``git clone --local`` copies of a source repo so each
-benchmark condition operates on a pristine copy.  Control conditions get no
-``.codex/`` directory; explore/leverage get the Aethyme skill deployed.
+Creates 5 independent ``git clone --local`` copies of a source repo so each
+benchmark condition operates on a pristine copy. Control conditions get no
+``.codex/`` directory; explore/leverage/task-conditioned get the Aethyme skill
+deployed.
 """
 
 from __future__ import annotations
@@ -12,8 +13,8 @@ from pathlib import Path
 
 from ..indexing.skills import deploy_skills, AETHYME_PACKAGE_ROOT
 
-CONDITION_NAMES = ("control-cto-off", "control-cto-on", "explore", "leverage")
-AETHYME_CONDITIONS = frozenset({"explore", "leverage"})
+CONDITION_NAMES = ("control-cto-off", "control-cto-on", "explore", "leverage", "task-conditioned")
+AETHYME_CONDITIONS = frozenset({"explore", "leverage", "task-conditioned"})
 
 
 def create_condition_repos(
@@ -26,7 +27,7 @@ def create_condition_repos(
     """Clone *source* once per condition into *dest_dir*.
 
     Uses ``git clone --local`` for speed (hard links on same filesystem).
-    Deploys the Aethyme skill to explore/leverage clones.
+    Deploys the Aethyme skill to explore/leverage/task-conditioned clones.
     When *install_deps* is True (default), runs ``pnpm install --frozen-lockfile``
     in each clone so node_modules is available for vitest.
 
@@ -88,7 +89,7 @@ def deploy_aethyme_skill(repo_path: Path, aethyme_root: Path) -> None:
 def load_condition_repos(dest_dir: Path) -> dict[str, Path]:
     """Load existing condition repos from *dest_dir*.
 
-    Validates that all 4 condition directories exist and are git repos.
+    Validates that all 5 condition directories exist and are git repos.
     """
     dest_dir = Path(dest_dir).resolve()
     repos: dict[str, Path] = {}

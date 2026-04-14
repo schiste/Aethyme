@@ -105,7 +105,7 @@ class ConditionSpec:
     cto_override: str | None  # "forceOff" or None (default CTO)
     uses_aethyme: bool
     repo_selector: str  # "control" | "aethyme"
-    prompt_variant: str  # "baseline" | "leverage"
+    prompt_variant: str  # "baseline" | "leverage" | "task-conditioned"
 
 
 CONDITIONS: tuple[ConditionSpec, ...] = (
@@ -113,6 +113,7 @@ CONDITIONS: tuple[ConditionSpec, ...] = (
     ConditionSpec("control-cto-on", None, False, "control", "baseline"),
     ConditionSpec("explore", None, True, "aethyme", "baseline"),
     ConditionSpec("leverage", None, True, "aethyme", "leverage"),
+    ConditionSpec("task-conditioned", None, True, "aethyme", "task-conditioned"),
 )
 
 
@@ -434,6 +435,7 @@ def _build_prepare_phase(
             f"Path('{paths['prompt_files']['control-cto-on']}').write_text(ctrl); "
             f"Path('{paths['prompt_files']['explore']}').write_text(ctrl.replace(str('{target.control_path}'), str('{target.aethyme_path}'))); "
             f"Path('{paths['prompt_files']['leverage']}').write_text(lev); "
+            f"Path('{paths['prompt_files']['task-conditioned']}').write_text(lev); "
             f"Path('{paths['schema_file']}').write_text(json.dumps(schema, indent=2)); "
             f"Path('{paths['reference_file']}').write_text(json.dumps(ref, indent=2)); "
             f"Path('{paths['rubric_file']}').write_text(json.dumps(rubric, indent=2)); "
@@ -501,18 +503,23 @@ def _build_launch_phase(
 
         if model_config.backend == "claude":
             args = list(model_config.backend_args)
-            entry["launch_method"] = "runtime_session_create"
-            entry["session_create_params"] = {
-                "backend": "claude",
-                "model": model_config.name,
+            entry["launch_method"] = "tab_create_then_exec_submit"
+            entry["tab_create_params"] = {
                 "directory": directory,
-                "auto_approve": True,
-                "backend_args": args,
             }
+            entry["tab_exec_args"] = [
+                "claude",
+                "--dangerously-skip-permissions",
+                "--model",
+                model_config.name,
+                *args,
+            ]
             entry["prompt_source"] = "file"
             entry["note"] = (
-                "Read prompt from prompt_file, pass as initial_prompt "
-                "to runtime_session_create"
+                "Create a Chau7 tab, launch Claude via tab_exec, then send the "
+                "prompt with tab_send_input and tab_submit_prompt. "
+                "Launch with an explicit --session-id when deterministic "
+                "collection is required."
             )
         elif model_config.backend == "codex":
             codex_args = ["codex", "exec"] + list(model_config.backend_args) + [
@@ -536,7 +543,7 @@ def _build_launch_phase(
     return {
         "name": "launch",
         "description": (
-            f"Launch 4 agent sessions "
+            f"Launch {len(CONDITIONS)} agent sessions "
             f"({model_config.backend}/{model_config.name})"
         ),
         "backend": model_config.backend,
@@ -552,9 +559,10 @@ def _build_monitor_phase() -> dict[str, Any]:
         "poll_interval_seconds": 15,
         "timeout_seconds": 1800,
         "instructions": (
-            "For claude backend: poll runtime_turn_status(session_id) — "
-            "complete when status is 'ready' or session is stopped. "
-            "For codex backend: poll tab_status(tab_id) — "
+            "Poll tab_status(tab_id) for every condition. "
+            "For Claude-backed tabs, use the explicit session_id to map session "
+            "JSONL files and treat tab_status as shell and tab lifecycle state. "
+            "For Codex-backed tabs, poll tab_status(tab_id) — "
             "complete when is_at_prompt is true."
         ),
     }
@@ -576,7 +584,7 @@ def _build_collect_phase(
                 {"tool": "tab_output", "params": {"lines": 5000}},
                 {
                     "tool": (
-                        "runtime_session_get"
+                        "session_jsonl_and_tab_status"
                         if model_config.backend == "claude"
                         else "tab_status"
                     ),
@@ -591,8 +599,8 @@ def _build_collect_phase(
 
         if model_config.backend == "claude":
             collect_entry["result_extraction"] = (
-                "Extract structured output from the agent's final message "
-                "in the transcript or session JSONL"
+                "Extract output from the file-first capture path or from the "
+                "agent's final message in the transcript or session JSONL"
             )
         else:
             collect_entry["result_extraction"] = (
@@ -657,10 +665,9 @@ def _build_cleanup_phase() -> dict[str, Any]:
         "name": "cleanup",
         "description": "Close all agent sessions and tabs",
         "instructions": (
-            "For claude backend: "
-            "runtime_session_stop(session_id, close_tab=True) per condition. "
-            "For codex backend: "
-            "tab_close(tab_id, force=True) per condition. "
+            "Close each tab with tab_close(tab_id, force=True). "
+            "For Claude-backed runs, stop the app session first if the backend "
+            "exposes a direct stop call, but treat tab closure as mandatory. "
             "CRITICAL: Always close tabs — Chau7 has a limited tab pool."
         ),
     }

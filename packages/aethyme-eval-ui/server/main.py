@@ -1274,7 +1274,14 @@ Be exhaustive — missing a file means the rename breaks production. Search thor
         "engine_binary": str(ENGINE_BINARY),
     }
     try:
-        aethyme_dir = next((c["directory"] for c in conditions if c["name"] == "leverage"), "")
+        aethyme_dir = next(
+            (
+                c["directory"]
+                for c in conditions
+                if c["name"] in {"task-conditioned", "leverage"}
+            ),
+            "",
+        )
         import re as _re
         subsystem_match = _re.search(r'`([a-zA-Z0-9_/.-]+/)`', bare_task)
         subsystem = subsystem_match.group(1) if subsystem_match else None
@@ -1318,15 +1325,18 @@ Be exhaustive — missing a file means the rename breaks production. Search thor
                     "engine_binary": str(ENGINE_BINARY),
                 }
             else:
-                log(f"WARNING: Engine failed, using bare for leverage. stderr: {enriched_proc.stderr[:200]}")
+                log(
+                    "WARNING: Engine failed, using bare prompt for task-conditioned input. "
+                    f"stderr: {enriched_proc.stderr[:200]}"
+                )
         else:
-            log("No engine available, using bare prompt for leverage")
+            log("No engine available, using bare prompt for task-conditioned input")
             enrichment_observability = {
                 "status": "degraded",
                 "mode": "bare_prompt",
                 "engine_binary": str(ENGINE_BINARY),
                 "repo_path": aethyme_dir,
-                "reason": "engine_unavailable_or_missing_leverage_repo",
+                "reason": "engine_unavailable_or_missing_task_conditioned_repo",
             }
     except Exception as e:
         log(f"ERROR writing prompts: {e}")
@@ -1338,7 +1348,16 @@ Be exhaustive — missing a file means the rename breaks production. Search thor
         }
 
     for cond_name, prompt_path in prompt_files.items():
-        task_text = enriched_prompt if cond_name == "leverage" else bare_task
+        if cond_name == "task-conditioned":
+            task_text = enriched_prompt
+        elif cond_name == "leverage":
+            task_text = (
+                "Use Aethyme tools to navigate the repository graph. "
+                "Use them proactively, but do your own analysis.\n\n"
+                f"{bare_task}"
+            )
+        else:
+            task_text = bare_task
         out_path = str(output_files[cond_name])
         prompt_text = (
             f"IMPORTANT: You MUST save your complete analysis to `{out_path}` when done. "
@@ -1428,7 +1447,7 @@ def _score_output(eval_type: str, output: str, cost: float, prompt: str = "") ->
 
     The prompt text is stripped from the output before scoring to avoid
     inflating scores when the prompt itself contains reference keywords
-    (e.g., the leverage prompt with subsystem context).
+    (e.g., the task-conditioned prompt with subsystem context).
     """
     if not output or len(output) < 50:
         return 0.0
@@ -2193,8 +2212,10 @@ def _run_eval_background(
         },
         "baseline_prompt_chars": len(condition_payloads.get("control-cto-off", {}).get("prompt", "")),
         "aethyme_prompt_chars": len(condition_payloads.get("leverage", {}).get("prompt", "")),
+        "task_conditioned_prompt_chars": len(condition_payloads.get("task-conditioned", {}).get("prompt", "")),
         "baseline_run": condition_payloads.get("control-cto-off", {}).get("run"),
         "aethyme_run": condition_payloads.get("leverage", {}).get("run"),
+        "task_conditioned_run": condition_payloads.get("task-conditioned", {}).get("run"),
     }
 
     start_phase("finalizing", order=7, details={"conditions": sorted(condition_payloads.keys())})

@@ -47,13 +47,14 @@ CREATE INDEX IF NOT EXISTS idx_condition ON eval_results(condition);
 CREATE INDEX IF NOT EXISTS idx_date ON eval_results(date);
 """
 
-ALL_CONDITIONS = ("control-cto-off", "control-cto-on", "control", "explore", "leverage")
+ALL_CONDITIONS = ("control-cto-off", "control-cto-on", "control", "explore", "leverage", "task-conditioned")
 
 CTO_MAP = {
     "control-cto-off": "off",
     "control-cto-on": "on",
     "explore": "on",
     "leverage": "on",
+    "task-conditioned": "on",
     "control": "unknown",
 }
 

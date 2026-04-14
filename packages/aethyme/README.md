@@ -97,7 +97,7 @@ Core commands:
 - `aethyme eval explain-repo --repo /path/to/repo --control-cmd "<cmd>" --explore-cmd "<cmd>" --leverage-cmd "<cmd>"`
 - `aethyme eval navigation-ctf --repo /path/to/repo --json-output`
 
-See [`docs/guides/eval-protocol.md`](docs/guides/eval-protocol.md) for the full 3-condition eval protocol, playground repositories, and execution method.
+See [`docs/guides/eval-protocol.md`](docs/guides/eval-protocol.md) for the canonical 5-condition playground eval protocol, repository setup flow, and Chau7 execution method.
 
 This local path is the shortest route to proving:
 
@@ -112,9 +112,9 @@ Runtime notes:
 - the Python layer now executes a built Rust binary rather than `cargo run` for every call
 - local repo artifacts are cached by snapshot key under `AETHYME_CACHE_DIR` or `/tmp/aethyme-cache`
 - Git repositories use commit plus dirty-state metadata for cache keys instead of a full recursive fingerprint on every call
-- `eval explain-repo` can execute real runs when `--control-cmd`, `--explore-cmd`, and `--leverage-cmd` are provided
+- `eval explain-repo` can execute local comparison runs when `--control-cmd`, `--explore-cmd`, and `--leverage-cmd` are provided
 - external runners receive `AETHYME_EVAL_OUTPUT_SCHEMA_FILE`, `AETHYME_EVAL_TOOL_REPO`, and `AETHYME_EVAL_TOOL_PYTHON` so agent wrappers can enforce structured output and call back into Aethyme
-- the preferred execution method is Chau7 MCP (spin up tabs, launch agents, collect results) — see [`docs/guides/eval-protocol.md`](docs/guides/eval-protocol.md)
+- the canonical playground protocol is Chau7 MCP with 5 conditions: `control-cto-off`, `control-cto-on`, `explore`, `leverage`, `task-conditioned`
 - without those commands, it still emits the comparison artifacts only
 - the Aethyme-assisted prompt now uses a compact rendered context-pack view instead of injecting the full raw pack
 - every `eval explain-repo` run writes a markdown report under `packages/aethyme/docs/reports/evals/`

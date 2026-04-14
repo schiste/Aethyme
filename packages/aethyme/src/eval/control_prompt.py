@@ -5,8 +5,11 @@ The only difference is the runtime environment — Explore runs in a
 playground that has the Aethyme skill auto-loaded, Control does not.
 
 Leverage gets the same vanilla prompt **plus** a short "power user"
-instruction to actively use Aethyme tools.  No temp-file references,
-no injected CLI commands — the skill provides those.
+instruction to actively use Aethyme tools. Task-conditioned assistance
+is a separate prompt family that can inject a task pack or engine-
+generated context. No temp-file references, no injected CLI commands —
+the skill provides those unless the caller intentionally requests a
+task-conditioned artifact.
 """
 
 from __future__ import annotations
@@ -67,3 +70,4 @@ def build_aethyme_prompt(repo_path: Path, task: str, pack: dict[str, Any]) -> st
 
 # Legacy alias — kept for backward compat with callers that haven't migrated.
 build_iterative_aethyme_prompt = build_leverage_prompt
+build_task_conditioned_prompt = build_aethyme_prompt

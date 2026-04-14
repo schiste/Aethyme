@@ -23,23 +23,23 @@ REPORTS_ROOT = Path(__file__).resolve().parents[2] / "docs" / "reports" / "evals
 EVAL_RUNS_ROOT = Path(__file__).resolve().parents[2] / "eval-runs"
 RUNS_LEDGER = EVAL_RUNS_ROOT / "runs.jsonl"
 
-CONDITION_ORDER = ("control-cto-off", "control-cto-on", "explore", "leverage")
+CONDITION_ORDER = ("control-cto-off", "control-cto-on", "explore", "leverage", "task-conditioned")
 # Legacy 3-condition order for backward compat with old result dicts.
 _LEGACY_CONDITION_ORDER = ("control", "explore", "leverage")
 
 
 # All known condition names in canonical display order.
 _ALL_KNOWN_CONDITIONS = (
-    "control-cto-off", "control-cto-on", "control", "explore", "leverage",
+    "control-cto-off", "control-cto-on", "control", "explore", "leverage", "task-conditioned",
 )
 
 
 def _active_conditions(result: dict[str, Any]) -> tuple[str, ...]:
     """Return condition names present in *result*, in canonical order.
 
-    Handles both the 4-condition design (control-cto-off, control-cto-on,
-    explore, leverage) and the legacy 3-condition design (control, explore,
-    leverage).
+    Handles both the 5-condition design (control-cto-off, control-cto-on,
+    explore, leverage, task-conditioned) and the legacy 3-condition design
+    (control, explore, leverage).
     """
     return tuple(c for c in _ALL_KNOWN_CONDITIONS if result.get(c))
 
@@ -62,12 +62,20 @@ class EvaluationReport:
         return self.condition_prompt_chars.get("leverage", 0)
 
     @property
+    def task_conditioned_prompt_chars(self) -> int:
+        return self.condition_prompt_chars.get("task-conditioned", 0)
+
+    @property
     def baseline_run(self) -> dict[str, Any] | None:
         return self.condition_runs.get("control")
 
     @property
     def aethyme_run(self) -> dict[str, Any] | None:
         return self.condition_runs.get("leverage")
+
+    @property
+    def task_conditioned_run(self) -> dict[str, Any] | None:
+        return self.condition_runs.get("task-conditioned")
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -79,8 +87,10 @@ class EvaluationReport:
             # Legacy keys for backward compat
             "baseline_prompt_chars": self.baseline_prompt_chars,
             "aethyme_prompt_chars": self.aethyme_prompt_chars,
+            "task_conditioned_prompt_chars": self.task_conditioned_prompt_chars,
             "baseline_run": self.baseline_run,
             "aethyme_run": self.aethyme_run,
+            "task_conditioned_run": self.task_conditioned_run,
         }
         return d
 
@@ -155,7 +165,7 @@ def create_eval_run_dir(
     """Create and return a timestamped eval run directory under eval-runs/.
 
     *conditions* overrides which condition subdirectories to create.
-    Defaults to ``CONDITION_ORDER`` (4-condition design).
+    Defaults to ``CONDITION_ORDER`` (5-condition design).
 
     *model* is an optional dict with keys like ``name``, ``provider``,
     ``reasoning``, ``backend`` — stored in metadata for reproducibility.
@@ -660,6 +670,7 @@ def _cond_label(cond: str) -> str:
         "control": "Control",
         "explore": "Explore",
         "leverage": "Leverage",
+        "task-conditioned": "Task-Conditioned",
     }
     return labels.get(cond, cond.title())
 

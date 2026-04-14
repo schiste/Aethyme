@@ -19,7 +19,8 @@ export type Condition =
   | "control-cto-on"
   | "control"
   | "explore"
-  | "leverage";
+  | "leverage"
+  | "task-conditioned";
 
 export type Reasoning = "high" | "low";
 

@@ -74,21 +74,22 @@ This checks repo cleanliness, engine presence, index presence, and git state. It
 | `dead-code` | mediawiki | Find unused public functions in `includes/Watchlist/` |
 | `migration` | mediawiki | List all files referencing `WatchedItemStore` for rename |
 
-## 4-Condition Design
+## 5-Condition Design
 
-Every assessment runs the same task across 4 conditions to isolate what helps:
+Every assessment runs the same task across 5 conditions to isolate what helps:
 
-| Condition | Repo | CTO | Aethyme Skill | Nav Context | What it measures |
+| Condition | Repo | CTO | Aethyme Skill | Task-Specific Pack | What it measures |
 |---|---|---|---|---|---|
 | `control-cto-off` | Control | forceOff | No | No | Baseline: raw agent, no help |
 | `control-cto-on` | Control | default | No | No | Effect of CTO file tree context |
-| `explore` | Aethyme | default | Yes | No | Effect of having navigation tools available |
-| `leverage` | Aethyme | default | Yes | Yes (engine-generated) | Effect of pre-computed navigation context |
+| `explore` | Aethyme | default | Yes | No | Effect of having Aethyme available with no prompt help |
+| `leverage` | Aethyme | default | Yes | No | Effect of a generic prompt nudge to use Aethyme tools |
+| `task-conditioned` | Aethyme | default | Yes | Yes (engine-generated) | Effect of task-specific Aethyme guidance or context packs |
 
 **CTO** = Context Tree Optimization — Claude Code's file tree injection into context.
-**Nav Context** = Engine-generated prompt with repo structure, function listings, subsystem detail.
+**Task-Specific Pack** = Engine-generated prompt or artifact with repo structure, function listings, subsystem detail, or task navigation context.
 
-The leverage prompt is built by: `aethyme-engine-cli prompt --repo <path> --task <task> --focus overview [--subsystem <dir>]`
+The task-conditioned prompt is built by: `aethyme-engine-cli prompt --repo <path> --task <task> --focus overview [--subsystem <dir>]`
 
 ## Adding a New Assessment Scenario
 
@@ -134,7 +135,7 @@ Chau7 creates `.chau7/snippets/` when opening a tab in any directory. Delete fro
 The agent's final text response is hard to capture programmatically. The session JSONL doesn't include it. The terminal scrollback is too small. PTY log has TUI spinner noise. **Telemetry data** (tokens, cost, tools, duration) is reliable. **Quality scores** are approximate until Chau7 provides a `tab_last_response` API.
 
 ### Score inflation from prompt
-The leverage prompt contains navigation context with function/file names. If reference keywords appear in the prompt, the scorer matches them against prompt text, not analysis. The `_score_output()` function strips prompt words before matching — always pass the prompt.
+The task-conditioned prompt can contain navigation context with function/file names. If reference keywords appear in the prompt, the scorer matches them against prompt text, not analysis. The `_score_output()` function strips prompt words before matching — always pass the prompt.
 
 ### CTO overhead on large repos
 On 12K+ file repos like MediaWiki, CTO can increase cost by injecting the full file tree into every turn. Navigation context from Aethyme tools is more cost-effective than the CTO file tree for large repos.
@@ -146,7 +147,7 @@ CLI (src/cli.py)
   |__ orchestrator.py: generate_run_plan() -> 8-phase JSON plan
        |__ Phase 1: prepare (check repository readiness contract)
        |__ Phase 2: build-inputs (generate prompts, schemas, reference)
-       |__ Phase 3: launch (create Chau7 tabs, start Claude, send prompts)
+       |__ Phase 3: launch (create Chau7 tabs, start backend, send prompts)
        |__ Phase 4: monitor (poll tab_status until all complete)
        |__ Phase 5: collect (read session JSONL + tab output for tokens/cost/output)
        |__ Phase 6: score (keyword matching against reference)

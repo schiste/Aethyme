@@ -1,6 +1,6 @@
 # Eval Protocol — Aethyme Navigation Benchmarks
 
-Last Updated: 2026-04-13
+Last Updated: 2026-04-14
 
 ## Runtime Flow
 
@@ -24,7 +24,7 @@ The runtime protocol is split into four distinct layers:
    - Collect outputs.
    - Score and finalize artifacts.
 
-`Prepare Target` is intentionally light. Heavy work like leverage prompt enrichment belongs to `Run Evaluation` under the explicit `build inputs` phase, not to repository preparation.
+`Prepare Target` is intentionally light. Heavy work like task-conditioned prompt generation belongs to `Run Evaluation` under the explicit `build inputs` phase, not to repository preparation.
 
 ## Core Rules
 
@@ -84,6 +84,7 @@ eval-runs/
       control-cto-on-prompt.txt
       explore-prompt.txt
       leverage-prompt.txt
+      task-conditioned-prompt.txt
       output-schema.json
       scoring-rubric.json
       reference-output.json
@@ -107,6 +108,8 @@ eval-runs/
         ...
       leverage/
         ...
+      task-conditioned/
+        ...
     chau7/                     # Chau7 telemetry (MANDATORY for every condition)
       control-cto-off/
         metadata.json          # run_id, session_id, counts
@@ -120,6 +123,8 @@ eval-runs/
       explore/
         ...
       leverage/
+        ...
+      task-conditioned/
         ...
 ```
 
@@ -144,7 +149,7 @@ Every eval run **must** have:
 
 If any of these are missing, the run is incomplete and must be re-captured or marked as partial in metadata.
 
-Condition slugs: `control-cto-off`, `control-cto-on`, `explore`, `leverage`.
+Condition slugs: `control-cto-off`, `control-cto-on`, `explore`, `leverage`, `task-conditioned`.
 
 ### Data Collection Checklist
 
@@ -154,7 +159,7 @@ Run this checklist **after every condition completes**, before moving to the nex
 ```
 Check the first `type: "user"` message in the session JSONL.
 Confirm it contains the expected prompt text.
-If the condition is leverage, confirm the navigation context is present.
+If the condition is task-conditioned, confirm the task-specific context is present.
 ```
 **Why:** prompt delivery is only valid after `tab_send_input(...)` is followed by `tab_submit_prompt()`. Do not assume the pasted text was actually accepted by Claude until the first user message in the session JSONL matches the expected prompt.
 
@@ -224,6 +229,7 @@ For evals where agents modify the repo (e.g. bug-fix), each condition must opera
   control-cto-on/      # git clone --local, no .codex/ skill
   explore/             # git clone --local + .codex/skills/aethyme/SKILL.md
   leverage/            # git clone --local + .codex/skills/aethyme/SKILL.md
+  task-conditioned/    # git clone --local + .codex/skills/aethyme/SKILL.md
 ```
 
 **One-command setup:**
@@ -235,7 +241,7 @@ python -m src.cli eval bug-fix prepare \
   --dest "/tmp/benchmark-run-001"
 ```
 
-This creates 4 clones (via `git clone --local` for speed), deploys the Aethyme skill to explore/leverage, plants the bug in each, and writes all prompt/schema/reference artifacts to `/tmp/`.
+This creates 5 clones (via `git clone --local` for speed), deploys the Aethyme skill to `explore`, `leverage`, and `task-conditioned`, plants the bug in each, and writes all prompt/schema/reference artifacts to `/tmp/`.
 
 **Repo-only setup** (no bug planting, useful for other eval types):
 
@@ -245,18 +251,19 @@ python -m src.cli eval setup-repos \
   --dest "/tmp/benchmark-run-001"
 ```
 
-Control conditions get no `.codex/` directory. Explore and leverage get `.codex/skills/aethyme/SKILL.md` with the Aethyme CLI path stamped in.
+Control conditions get no `.codex/` directory. `explore`, `leverage`, and `task-conditioned` get `.codex/skills/aethyme/SKILL.md` with the Aethyme CLI path stamped in.
 
-## 4-Condition Design
+## 5-Condition Design
 
-Every eval compares four conditions to isolate the value of graph-derived navigation context and terminal optimization:
+Every eval compares five conditions to isolate environment help, prompt help, task-conditioned help, and terminal optimization:
 
-| Condition | What the agent receives | Nav context file | Graph CLI in prompt | Chau7 CTO | What it tests |
-|-----------|------------------------|-----------------|---------------------|-----------|---------------|
+| Condition | What the agent receives | Task-specific context | Graph CLI in prompt | Chau7 CTO | What it tests |
+|-----------|------------------------|----------------------|---------------------|-----------|---------------|
 | **Control (CTO off)** | Task + repo path only | No | No | forceOff | Raw LLM exploration, uncompressed terminal output |
 | **Control (CTO on)** | Task + repo path only | No | No | default | Raw LLM exploration with terminal compression |
-| **Explore** | Task + repo path + CLI commands | No | Yes | default | Whether graph tools alone help |
-| **Leverage** | Task + pre-computed navigation context file | Yes | Yes (in context) | default | Whether pre-computed graph analysis adds value |
+| **Explore** | Same baseline task in an Aethyme-enabled repo | No | No | default | Whether the skill/tool environment helps on its own |
+| **Leverage** | Baseline task + generic instruction to use Aethyme tools | No | No | default | Whether a generic prompt nudge improves tool use |
+| **Task-Conditioned** | Baseline task + engine-generated task guidance or context pack | Yes | Optional | default | Whether task-specific Aethyme guidance adds value |
 
 The two control conditions isolate the effect of Chau7's Command Token Optimization (CTO) on baseline agent behavior. CTO compresses terminal output to reduce token usage — disabling it gives a true uncompressed baseline.
 
@@ -282,18 +289,18 @@ Explore the repository directly and produce a structured explanation.
 Task: Explain this repo
 Repository path: <PLAYGROUND_PATH>
 Explore the repository and produce a structured explanation.
-
-You have access to the following graph navigation commands.
-Use them via Bash to explore the repository graph:
-
-  cd <AETHYME_PATH> && <AETHYME_VENV>/bin/python -m src.cli repo inspect '<PLAYGROUND_PATH>' --json-output
-  cd <AETHYME_PATH> && <AETHYME_VENV>/bin/python -m src.cli graph overview '<PLAYGROUND_PATH>' --json-output
-  cd <AETHYME_PATH> && <AETHYME_VENV>/bin/python -m src.cli graph expand '<PLAYGROUND_PATH>' <anchor-id> --json-output
-
-Return only the required structured output.
 ```
 
 **Leverage prompt:**
+
+```
+Task: Explain this repo
+Repository path: <PLAYGROUND_PATH>
+Use Aethyme tools to navigate the repository graph. Use them proactively, but do your own analysis.
+Explore the repository and produce a structured explanation.
+```
+
+**Task-Conditioned prompt:**
 
 ```
 Task: Explain this repo
@@ -301,7 +308,7 @@ Read the navigation context file at /tmp/aethyme-eval-navigation-context.json fo
 Use it as your primary navigation layer. Return only the required structured output.
 ```
 
-The navigation context file contains: anchors (key files/folders to start from), scope (in-scope files/symbols/areas, out-of-scope areas, risk flags), navigation order, and the same CLI commands available to Explore.
+The task-conditioned navigation context file contains: anchors (key files/folders to start from), scope (in-scope files/symbols/areas, out-of-scope areas, risk flags), navigation order, and any task-specific commands or guidance produced by the engine.
 
 #### Output Schema
 
@@ -346,19 +353,18 @@ Explore the repository directly and produce a structured explanation.
 Task: Find the manifest that manages the main code entrypoint in the <AREA> area, identify the entrypoint file it controls, and name the top-level area that owns both.
 Repository path: <PLAYGROUND_PATH>
 Explore the repository and produce a structured explanation.
-
-You have access to the following graph navigation commands.
-Use them via Bash to explore the repository graph:
-
-  cd <AETHYME_PATH> && <AETHYME_VENV>/bin/python -m src.cli task anchors --repo '<PLAYGROUND_PATH>' --task <task> --json-output
-  cd <AETHYME_PATH> && <AETHYME_VENV>/bin/python -m src.cli task scope --repo '<PLAYGROUND_PATH>' --task <task> --json-output
-  cd <AETHYME_PATH> && <AETHYME_VENV>/bin/python -m src.cli graph configs '<PLAYGROUND_PATH>' <area> --json-output
-  cd <AETHYME_PATH> && <AETHYME_VENV>/bin/python -m src.cli graph expand '<PLAYGROUND_PATH>' <anchor-id> --json-output
-
-Return only the required structured output.
 ```
 
 **Leverage prompt:**
+
+```
+Task: Find the manifest that manages the main code entrypoint in the <AREA> area, identify the entrypoint file it controls, and name the top-level area that owns both.
+Repository path: <PLAYGROUND_PATH>
+Use Aethyme tools to navigate the repository graph. Use them proactively, but do your own analysis.
+Explore the repository and produce a structured explanation.
+```
+
+**Task-Conditioned prompt:**
 
 ```
 Task: Find the manifest that manages the main code entrypoint in the <AREA> area, identify the entrypoint file it controls, and name the top-level area that owns both.
@@ -403,14 +409,14 @@ After scoring, produce a human-readable report per condition with:
 
 Then produce a qualitative comparison table:
 
-| Dimension | Control (CTO off) | Control (CTO on) | Explore | Leverage |
-|-----------|-------------------|------------------|---------|----------|
-| Target accuracy | ... | ... | ... | ... |
-| Reasoning quality | ... | ... | ... | ... |
-| Path format | ... | ... | ... | ... |
-| Relationship chain | ... | ... | ... | ... |
-| Token Efficiency | ... | ... | ... | ... |
-| Self-awareness | ... | ... | ... | ... |
+| Dimension | Control (CTO off) | Control (CTO on) | Explore | Leverage | Task-Conditioned |
+|-----------|-------------------|------------------|---------|----------|------------------|
+| Target accuracy | ... | ... | ... | ... | ... |
+| Reasoning quality | ... | ... | ... | ... | ... |
+| Path format | ... | ... | ... | ... | ... |
+| Relationship chain | ... | ... | ... | ... | ... |
+| Token Efficiency | ... | ... | ... | ... | ... |
+| Self-awareness | ... | ... | ... | ... | ... |
 
 ## Execution Method
 
@@ -430,14 +436,14 @@ The `--json-output` flag emits the full plan dict with 8 phases:
 
 0. **prepare** — repository readiness checks and readiness snapshot contract
 1. **build-inputs** — materialize prompts, schema, reference, nav context, bug-fix repo prep
-2. **launch** — create 4 Chau7 tabs, start the backend in each tab, then submit the prompt
+2. **launch** — create one Chau7 tab per condition, start the backend in each tab, then submit the prompt
 3. **monitor** — poll until all agents complete
 4. **collect** — gather structured output, telemetry, transcripts per condition
 5. **score** — call `assemble_bug_fix_result()` or equivalent scorer
 6. **report** — call `finalize_eval_run()` + `print_scorecard()` (never hand-write)
 7. **cleanup** — close all sessions and tabs
 
-Each phase contains all parameters pre-computed. Claude reads the plan and executes each step via Chau7 MCP tools (`tab_create`, `tab_exec`, `tab_send_input`, `tab_submit_prompt`, `tab_set_cto`, `tab_status`, `tab_output`, etc.).
+Each phase contains all parameters pre-computed. The runner executes each step via Chau7 MCP tools (`tab_create`, `tab_exec`, `tab_send_input`, `tab_submit_prompt`, `tab_set_cto`, `tab_status`, `tab_output`, etc.).
 
 **Supported models:**
 
@@ -508,6 +514,7 @@ Path('/tmp/aethyme-eval-control-cto-off-prompt.txt').write_text(result['control'
 Path('/tmp/aethyme-eval-control-cto-on-prompt.txt').write_text(result['control']['prompt'])
 Path('/tmp/aethyme-eval-explore-prompt.txt').write_text(result['explore']['prompt'])
 Path('/tmp/aethyme-eval-leverage-prompt.txt').write_text(result['leverage']['prompt'])
+Path('/tmp/aethyme-eval-task-conditioned-prompt.txt').write_text(result['task-conditioned']['prompt'])
 Path('/tmp/aethyme-eval-output-schema.json').write_text(json.dumps(result['output_schema'], indent=2))
 Path('/tmp/aethyme-eval-navigation-context.json').write_text(json.dumps(result['navigation_context'], indent=2))
 Path('/tmp/aethyme-eval-reference.json').write_text(json.dumps(result['reference_output']))
@@ -518,6 +525,7 @@ This produces:
 - `/tmp/aethyme-eval-control-cto-on-prompt.txt`
 - `/tmp/aethyme-eval-explore-prompt.txt`
 - `/tmp/aethyme-eval-leverage-prompt.txt`
+- `/tmp/aethyme-eval-task-conditioned-prompt.txt`
 - `/tmp/aethyme-eval-output-schema.json`
 - `/tmp/aethyme-eval-navigation-context.json`
 - `/tmp/aethyme-eval-reference.json`
@@ -529,13 +537,13 @@ Open one terminal session per condition, each with the working directory set to 
 
 With Chau7 MCP:
 ```
-tab_create(directory="/Users/christophehenner/Downloads/Repositories/Aethyme Playground")  # x4
+tab_create(directory="/Users/christophehenner/Downloads/Repositories/Aethyme Playground")  # x5
 ```
 
 Then configure CTO per condition:
 ```
 tab_set_cto(tab_id=<control-cto-off-tab>, override="forceOff")
-# The other 3 tabs use default CTO (no override needed)
+# The other 4 tabs use default CTO (no override needed)
 ```
 
 #### 3. Launch Agents
@@ -551,7 +559,7 @@ codex exec \
   "$(cat /tmp/aethyme-eval-<CONDITION>-prompt.txt)"
 ```
 
-Where `<CONDITION>` is `control-cto-off`, `control-cto-on`, `explore`, or `leverage`.
+Where `<CONDITION>` is `control-cto-off`, `control-cto-on`, `explore`, `leverage`, or `task-conditioned`.
 
 Both control conditions use the same prompt — only the CTO setting differs. Any agent that can accept a system prompt and produce structured JSON output works. The output must conform to the schema at `/tmp/aethyme-eval-output-schema.json`.
 
@@ -614,7 +622,7 @@ from src.eval.report import finalize_eval_run
 reference = json.loads(Path('/tmp/aethyme-eval-reference.json').read_text())
 repo_path_str = str(PLAYGROUND)
 
-for cond in ("control-cto-off", "control-cto-on", "explore", "leverage"):
+for cond in ("control-cto-off", "control-cto-on", "explore", "leverage", "task-conditioned"):
     candidate = json.loads(Path(f"/tmp/aethyme-eval-{cond}-result.json").read_text())
     assessment = score_explain_repo_output(candidate, reference, repo_path=repo_path_str)
     result[cond]["run"] = result[cond].get("run") or {}
@@ -645,14 +653,14 @@ After scoring, read each result file and produce a human-readable report per con
 
 Then produce a qualitative comparison table:
 
-| Dimension | Control (CTO off) | Control (CTO on) | Explore | Leverage |
-|-----------|-------------------|------------------|---------|----------|
-| Depth | ... | ... | ... | ... |
-| Accuracy | ... | ... | ... | ... |
-| Structure | ... | ... | ... | ... |
-| Unique Finds | ... | ... | ... | ... |
-| Token Efficiency | ... | ... | ... | ... |
-| Why Score is Low | ... | ... | ... | ... |
+| Dimension | Control (CTO off) | Control (CTO on) | Explore | Leverage | Task-Conditioned |
+|-----------|-------------------|------------------|---------|----------|------------------|
+| Depth | ... | ... | ... | ... | ... |
+| Accuracy | ... | ... | ... | ... | ... |
+| Structure | ... | ... | ... | ... | ... |
+| Unique Finds | ... | ... | ... | ... | ... |
+| Token Efficiency | ... | ... | ... | ... | ... |
+| Why Score is Low | ... | ... | ... | ... | ... |
 
 ## Results Report Template
 
@@ -671,7 +679,7 @@ Reports contain these sections **in this exact order**:
 | Control (CTO off) | 93.83 | $0.161 | 74.8s | 10 | 146 | 2,718 | 542,126 | 74,517 |
 
 4. **Score Breakdown** — Per-component weights and raw values (only rendered when scoring produces component scores, e.g. bug-fix).
-5. **Prompts** — Verbatim prompt text for each condition in fenced code blocks. All 4 conditions always shown.
+5. **Prompts** — Verbatim prompt text for each condition in fenced code blocks. All 5 conditions always shown.
 6. **Agent Output** — Structured output JSON for each condition.
 7. **Tool Call Analysis** (auto-generated) — Per-condition tool call frequency table. Skipped if no condition has tool call data.
 8. **Verdict** (auto-generated) — One paragraph: highest/lowest scorer, cheapest/most expensive, whether all tests passed.
@@ -683,14 +691,16 @@ All JSON dumps live exclusively in the Raw Data section — never inline in the 
 ## Important Notes
 
 - **Aethyme tooling must be up to date**: Always run step 0 before generating artifacts. A stale engine binary or outdated eval/scoring code will produce results that aren't comparable across runs. Record the Aethyme commit hash alongside results.
-- **Leverage prompt references a file**: The navigation context file at `/tmp/aethyme-eval-navigation-context.json` must exist before the leverage agent starts. The artifact generation step (step 1) creates it.
-- **Leverage prompt env var**: The default prompt says `Use AETHYME_EVAL_NAVIGATION_CONTEXT_FILE` which is an env var contract for runner scripts. For Chau7 execution, the artifact generation rewrites it to `Read the navigation context file at /tmp/aethyme-eval-navigation-context.json`.
+- **Task-conditioned prompt references a file**: The navigation context file at `/tmp/aethyme-eval-navigation-context.json` must exist before the task-conditioned agent starts. The artifact generation step (step 1) creates it.
+- **Task-conditioned prompt env var**: The default prompt says `Use AETHYME_EVAL_NAVIGATION_CONTEXT_FILE` which is an env var contract for runner scripts. For Chau7 execution, the artifact generation rewrites it to `Read the navigation context file at /tmp/aethyme-eval-navigation-context.json`.
 - **Scoring applies path normalization** before comparison: markdown links, line anchors, absolute repo prefixes, and leading `./` are stripped. Pass `repo_path` to scoring functions for full normalization.
 - **CLI commands need cd prefix**: The graph CLI commands must include `cd <AETHYME_PATH> &&` before `python -m src.cli` because the agent runs from the playground directory, not the Aethyme directory.
 - **Token tracking**: Agent token usage is visible in the session output after execution completes. Record it alongside scores for cost analysis.
 - **Reports**: Every eval run writes a markdown report under `docs/reports/evals/`.
 
 ## Results
+
+Historical results below predate the current canonical 5-condition protocol. They are kept for reference and may use earlier 3-condition or 4-condition layouts.
 
 ### 2026-03-09 — Codex on Aethyme repo (pre-playground, baseline run)
 
@@ -989,7 +999,7 @@ The agent's final text response is difficult to capture programmatically:
 
 ### Score Inflation from Prompt Keywords
 
-The leverage prompt includes navigation context (function listings, file structure). If reference keywords appear in the prompt, the scorer matches them against the prompt text, not the agent's analysis.
+The task-conditioned prompt can include navigation context (function listings, file structure). If reference keywords appear in the prompt, the scorer matches them against the prompt text, not the agent's analysis.
 
 **Fix:** The `_score_output()` function strips prompt text before keyword matching. Always pass the condition's prompt to the scorer.
 
