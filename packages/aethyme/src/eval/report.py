@@ -168,6 +168,7 @@ def create_eval_run_dir(
         run_dir = EVAL_RUNS_ROOT / f"{timestamp}-{slug}-{eval_type}"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "artifacts").mkdir(exist_ok=True)
+    (run_dir / "phases").mkdir(exist_ok=True)
     for cond in (conditions or CONDITION_ORDER):
         (run_dir / "conditions" / cond).mkdir(parents=True, exist_ok=True)
         (run_dir / "chau7" / cond).mkdir(parents=True, exist_ok=True)

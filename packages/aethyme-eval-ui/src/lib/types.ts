@@ -134,6 +134,10 @@ export interface RepositorySetupStatus {
   source: string;
   commit: string;
   force: boolean;
+  path?: string;
+  requestPath?: string;
+  startedAt?: string;
+  finishedAt?: string;
   skipped?: boolean;
   output?: string;
   error?: string;

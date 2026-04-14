@@ -63,7 +63,7 @@ export async function fetchLatestPreparation(
 
 export async function setupRepository(
   request: RepositorySetupRequest,
-): Promise<{ success: boolean; taskId?: string }> {
+): Promise<{ success: boolean; taskId?: string; path?: string }> {
   const res = await fetch(`${API_BASE}/repositories/setup`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

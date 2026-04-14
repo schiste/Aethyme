@@ -235,6 +235,153 @@ def _latest_preparation_snapshot(target: str) -> dict[str, Any] | None:
         return None
 
 
+def _setup_task_request_payload(*, target: str, source: str, commit: str, force: bool) -> dict[str, Any]:
+    return {
+        "target": target,
+        "source": source,
+        "commit": commit,
+        "force": force,
+    }
+
+
+def _persist_setup_task_state(
+    task_id: str,
+    *,
+    status: str,
+    request: dict[str, Any],
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    skipped: bool | None = None,
+    output: str | None = None,
+    error: str | None = None,
+    command: list[str] | None = None,
+    return_code: int | None = None,
+    preparation: dict[str, Any] | None = None,
+) -> None:
+    _ensure_aethyme_imports()
+    from src.eval.observability import write_setup_task_result
+
+    payload: dict[str, Any] = {
+        "status": status,
+        "request": request,
+    }
+    if started_at:
+        payload["started_at"] = started_at
+    if finished_at:
+        payload["finished_at"] = finished_at
+    if skipped is not None:
+        payload["skipped"] = skipped
+    if output is not None:
+        payload["output"] = output
+    if error is not None:
+        payload["error"] = error
+    if command is not None:
+        payload["command"] = command
+    if return_code is not None:
+        payload["return_code"] = return_code
+    if preparation is not None:
+        payload["preparation"] = preparation
+    write_setup_task_result(task_id, payload)
+
+
+def _append_setup_task_log(task_id: str, message: str) -> None:
+    _ensure_aethyme_imports()
+    from src.eval.observability import append_log, setup_task_dir
+
+    append_log(setup_task_dir(task_id) / "events.log", message)
+
+
+def _write_setup_task_stream(task_id: str, name: str, content: str) -> None:
+    _ensure_aethyme_imports()
+    from src.eval.observability import setup_task_dir
+
+    task_dir = setup_task_dir(task_id)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / name).write_text(content, encoding="utf-8")
+
+
+def _read_setup_task_state(task_id: str) -> dict[str, Any] | None:
+    _ensure_aethyme_imports()
+    from src.eval.observability import setup_task_dir
+
+    result_path = setup_task_dir(task_id) / "result.json"
+    request_path = setup_task_dir(task_id) / "request.json"
+    if not result_path.exists():
+        return None
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    status = {
+        "status": result.get("status", "unknown"),
+        "target": result.get("request", {}).get("target"),
+        "source": result.get("request", {}).get("source"),
+        "commit": result.get("request", {}).get("commit"),
+        "force": result.get("request", {}).get("force"),
+        "path": str(setup_task_dir(task_id)),
+        "skipped": result.get("skipped"),
+        "output": result.get("output"),
+        "error": result.get("error"),
+        "preparation": result.get("preparation"),
+        "startedAt": result.get("started_at"),
+        "finishedAt": result.get("finished_at"),
+    }
+    if request_path.exists():
+        status["requestPath"] = str(request_path)
+    return status
+
+
+def _plan_request_payload(req: Any) -> dict[str, Any]:
+    return {
+        "evalType": req.evalType,
+        "target": req.target,
+        "model": req.model,
+        "reasoning": req.reasoning,
+        "windowId": getattr(req, "windowId", None),
+        "preparationId": getattr(req, "preparationId", None),
+    }
+
+
+async def _generate_plan(req: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    _ensure_aethyme_imports()
+    from src.eval.observability import persist_plan_snapshot
+
+    reasoning_arg = "default" if req.reasoning == "high" else req.reasoning
+    cmd = [
+        str(AETHYME_PYTHON), "-m", "src.cli", "eval", "run",
+        "--eval-type", req.evalType,
+        "--target", req.target,
+        "--model", req.model,
+        "--reasoning", reasoning_arg,
+        "--json-output",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(AETHYME_PKG),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=f"Python venv not found at {AETHYME_PYTHON}") from exc
+
+    if proc.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"Plan generation failed: {stderr.decode()[:1000]}")
+
+    try:
+        plan = json.loads(stdout.decode())
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to parse plan output: {stdout.decode()[:500]}") from exc
+
+    plan_snapshot = persist_plan_snapshot(plan=plan, request=_plan_request_payload(req))
+    plan["observability"] = {
+        "planId": plan_snapshot["id"],
+        "planPath": plan_snapshot["path"],
+    }
+    return plan, plan_snapshot
+
+
 def _build_repository_preparation(target: str) -> dict[str, Any]:
     _ensure_aethyme_imports()
     from src.eval.targets import get_target
@@ -436,15 +583,43 @@ def _run_setup_target(
     force: bool,
     task_id: str,
 ) -> None:
+    request_payload = _setup_task_request_payload(
+        target=target,
+        source=source,
+        commit=commit,
+        force=force,
+    )
+    started_at = datetime.now(UTC).isoformat()
     _setup_tasks[task_id]["status"] = "running"
+    _setup_tasks[task_id]["startedAt"] = started_at
+    _append_setup_task_log(task_id, f"Starting setup for {target} at commit {commit}")
+    _persist_setup_task_state(
+        task_id,
+        status="running",
+        request=request_payload,
+        started_at=started_at,
+    )
     try:
         current_snapshot = _build_repository_preparation(target)
         if current_snapshot.get("ready") and not force:
             snapshot = _write_preparation_snapshot(target, current_snapshot)
+            finished_at = datetime.now(UTC).isoformat()
             _setup_tasks[task_id]["status"] = "complete"
             _setup_tasks[task_id]["skipped"] = True
             _setup_tasks[task_id]["output"] = "Playground already ready; setup skipped."
             _setup_tasks[task_id]["preparation"] = snapshot
+            _setup_tasks[task_id]["finishedAt"] = finished_at
+            _append_setup_task_log(task_id, "Playground already ready; setup skipped.")
+            _persist_setup_task_state(
+                task_id,
+                status="complete",
+                request=request_payload,
+                started_at=started_at,
+                finished_at=finished_at,
+                skipped=True,
+                output="Playground already ready; setup skipped.",
+                preparation=snapshot,
+            )
             return
 
         _ensure_aethyme_imports()
@@ -467,6 +642,7 @@ def _run_setup_target(
         if force:
             cmd.append("--force")
 
+        _append_setup_task_log(task_id, f"Executing setup-playground.sh for {target}")
         proc = subprocess.run(
             cmd,
             cwd=str(AETHYME_PKG),
@@ -474,22 +650,76 @@ def _run_setup_target(
             text=True,
             timeout=1800,
         )
-        _setup_tasks[task_id]["output"] = (proc.stdout + proc.stderr)[-8000:]
+        combined_output = proc.stdout + proc.stderr
+        _setup_tasks[task_id]["output"] = combined_output[-8000:]
+        _write_setup_task_stream(task_id, "stdout.log", proc.stdout)
+        _write_setup_task_stream(task_id, "stderr.log", proc.stderr)
         if proc.returncode != 0:
+            finished_at = datetime.now(UTC).isoformat()
             _setup_tasks[task_id]["status"] = "error"
             _setup_tasks[task_id]["error"] = f"setup-playground failed with exit code {proc.returncode}"
+            _setup_tasks[task_id]["finishedAt"] = finished_at
+            _append_setup_task_log(task_id, f"Setup failed with exit code {proc.returncode}")
+            _persist_setup_task_state(
+                task_id,
+                status="error",
+                request=request_payload,
+                started_at=started_at,
+                finished_at=finished_at,
+                output=combined_output,
+                error=f"setup-playground failed with exit code {proc.returncode}",
+                command=cmd,
+                return_code=proc.returncode,
+            )
             return
 
         snapshot = _write_preparation_snapshot(target, _build_repository_preparation(target))
+        finished_at = datetime.now(UTC).isoformat()
         _setup_tasks[task_id]["status"] = "complete"
         _setup_tasks[task_id]["skipped"] = False
         _setup_tasks[task_id]["preparation"] = snapshot
+        _setup_tasks[task_id]["finishedAt"] = finished_at
+        _append_setup_task_log(task_id, f"Setup complete; preparation snapshot: {snapshot['id']}")
+        _persist_setup_task_state(
+            task_id,
+            status="complete",
+            request=request_payload,
+            started_at=started_at,
+            finished_at=finished_at,
+            skipped=False,
+            output=combined_output,
+            command=cmd,
+            return_code=proc.returncode,
+            preparation=snapshot,
+        )
     except subprocess.TimeoutExpired:
+        finished_at = datetime.now(UTC).isoformat()
         _setup_tasks[task_id]["status"] = "error"
         _setup_tasks[task_id]["error"] = "Playground setup timed out after 1800s"
+        _setup_tasks[task_id]["finishedAt"] = finished_at
+        _append_setup_task_log(task_id, "Setup timed out after 1800s")
+        _persist_setup_task_state(
+            task_id,
+            status="error",
+            request=request_payload,
+            started_at=started_at,
+            finished_at=finished_at,
+            error="Playground setup timed out after 1800s",
+        )
     except Exception as e:
+        finished_at = datetime.now(UTC).isoformat()
         _setup_tasks[task_id]["status"] = "error"
         _setup_tasks[task_id]["error"] = str(e)
+        _setup_tasks[task_id]["finishedAt"] = finished_at
+        _append_setup_task_log(task_id, f"Setup raised exception: {e}")
+        _persist_setup_task_state(
+            task_id,
+            status="error",
+            request=request_payload,
+            started_at=started_at,
+            finished_at=finished_at,
+            error=str(e),
+        )
 
 @app.post("/api/repositories/index")
 async def index_repository(req: IndexRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
@@ -517,15 +747,32 @@ async def setup_repository(req: SetupRequest, background_tasks: BackgroundTasks)
         )
 
     task_id = f"setup-{req.target}-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}"
+    _ensure_aethyme_imports()
+    from src.eval.observability import initialize_setup_task_artifacts, setup_task_dir
+
+    request_payload = _setup_task_request_payload(
+        target=req.target,
+        source=source,
+        commit=commit,
+        force=req.force,
+    )
+    task_dir = initialize_setup_task_artifacts(task_id, request_payload)
     _setup_tasks[task_id] = {
         "status": "queued",
         "target": req.target,
         "source": source,
         "commit": commit,
         "force": req.force,
+        "path": str(task_dir),
     }
+    _append_setup_task_log(task_id, "Setup task queued")
+    _persist_setup_task_state(
+        task_id,
+        status="queued",
+        request=request_payload,
+    )
     background_tasks.add_task(_run_setup_target, req.target, source, commit, req.force, task_id)
-    return {"success": True, "taskId": task_id}
+    return {"success": True, "taskId": task_id, "path": str(setup_task_dir(task_id))}
 
 
 @app.get("/api/repositories/index/status/{task_id}")
@@ -538,7 +785,10 @@ async def index_status(task_id: str) -> dict[str, Any]:
 @app.get("/api/repositories/setup/status/{task_id}")
 async def setup_status(task_id: str) -> dict[str, Any]:
     if task_id not in _setup_tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
+        persisted = _read_setup_task_state(task_id)
+        if persisted is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return persisted
     return _setup_tasks[task_id]
 
 
@@ -555,33 +805,8 @@ class PlanRequest(BaseModel):
 
 @app.post("/api/plan")
 async def generate_plan(req: PlanRequest) -> dict[str, Any]:
-    reasoning_arg = "default" if req.reasoning == "high" else req.reasoning
-    cmd = [
-        str(AETHYME_PYTHON), "-m", "src.cli", "eval", "run",
-        "--eval-type", req.evalType,
-        "--target", req.target,
-        "--model", req.model,
-        "--reasoning", reasoning_arg,
-        "--json-output",
-    ]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(AETHYME_PKG),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-    except FileNotFoundError:
-        raise HTTPException(status_code=500, detail=f"Python venv not found at {AETHYME_PYTHON}")
-
-    if proc.returncode != 0:
-        raise HTTPException(status_code=500, detail=f"Plan generation failed: {stderr.decode()[:1000]}")
-
-    try:
-        return json.loads(stdout.decode())
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail=f"Failed to parse plan output: {stdout.decode()[:500]}")
+    plan, _ = await _generate_plan(req)
+    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +1126,23 @@ def _append_run_log(run_dir: Path | None, msg: str) -> None:
         pass
 
 
+def _file_observability(path: Path) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.exists(),
+    }
+    if not path.exists():
+        return payload
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        return payload
+    payload["size_bytes"] = len(content.encode("utf-8"))
+    payload["sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    payload["chars"] = len(content)
+    return payload
+
+
 def _materialize_eval_inputs(
     plan: dict[str, Any],
     req: Any,
@@ -908,6 +1150,7 @@ def _materialize_eval_inputs(
     *,
     log: Any,
 ) -> dict[str, Any]:
+    started_at = datetime.now(UTC).isoformat()
     prompt_files = plan["paths"]["prompt_files"]
     eval_type = req.evalType
 
@@ -1025,6 +1268,11 @@ Be exhaustive — missing a file means the rename breaks production. Search thor
 
     enriched_prompt = bare_task
     enrichment_meta: dict[str, Any] | None = None
+    enrichment_observability: dict[str, Any] = {
+        "status": "not_attempted",
+        "mode": "bare_prompt",
+        "engine_binary": str(ENGINE_BINARY),
+    }
     try:
         aethyme_dir = next((c["directory"] for c in conditions if c["name"] == "leverage"), "")
         import re as _re
@@ -1038,7 +1286,26 @@ Be exhaustive — missing a file means the rename breaks production. Search thor
                 log(f"Generating enriched prompt with subsystem context: {subsystem}")
             else:
                 log("Generating enriched prompt from engine...")
+            enrichment_started = datetime.now(UTC).isoformat()
             enriched_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            enrichment_finished = datetime.now(UTC).isoformat()
+            enrichment_observability = {
+                "status": "success" if enriched_proc.returncode == 0 and bool(enriched_proc.stdout.strip()) else "degraded",
+                "mode": "engine_prompt",
+                "command": cmd,
+                "engine_binary": str(ENGINE_BINARY),
+                "repo_path": aethyme_dir,
+                "task": bare_task,
+                "focus": "overview",
+                "subsystem": subsystem,
+                "started_at": enrichment_started,
+                "finished_at": enrichment_finished,
+                "return_code": enriched_proc.returncode,
+                "stdout_chars": len(enriched_proc.stdout or ""),
+                "stderr_chars": len(enriched_proc.stderr or ""),
+                "stdout": enriched_proc.stdout,
+                "stderr": enriched_proc.stderr,
+            }
             if enriched_proc.returncode == 0 and enriched_proc.stdout.strip():
                 enriched_prompt = enriched_proc.stdout
                 log(f"Enriched prompt generated: {len(enriched_prompt)} chars")
@@ -1054,8 +1321,21 @@ Be exhaustive — missing a file means the rename breaks production. Search thor
                 log(f"WARNING: Engine failed, using bare for leverage. stderr: {enriched_proc.stderr[:200]}")
         else:
             log("No engine available, using bare prompt for leverage")
+            enrichment_observability = {
+                "status": "degraded",
+                "mode": "bare_prompt",
+                "engine_binary": str(ENGINE_BINARY),
+                "repo_path": aethyme_dir,
+                "reason": "engine_unavailable_or_missing_leverage_repo",
+            }
     except Exception as e:
         log(f"ERROR writing prompts: {e}")
+        enrichment_observability = {
+            "status": "failed",
+            "mode": "bare_prompt",
+            "engine_binary": str(ENGINE_BINARY),
+            "error": str(e),
+        }
 
     for cond_name, prompt_path in prompt_files.items():
         task_text = enriched_prompt if cond_name == "leverage" else bare_task
@@ -1080,11 +1360,32 @@ Be exhaustive — missing a file means the rename breaks production. Search thor
         "task": bare_task,
         "status": "engine_enrichment_unavailable",
     }
+    finished_at = datetime.now(UTC).isoformat()
     return {
         "bare_task": bare_task,
         "shared_artifacts": shared_artifacts,
         "prompt_files": prompt_files,
         "output_files": output_files,
+        "observability": {
+            "status": "success" if not missing else "degraded",
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "eval_type": eval_type,
+            "target": req.target,
+            "bare_task_chars": len(bare_task),
+            "enrichment": enrichment_observability,
+            "prompt_files": {
+                cond_name: _file_observability(Path(prompt_path))
+                for cond_name, prompt_path in prompt_files.items()
+            },
+            "output_files": {
+                cond_name: {
+                    "path": str(output_files[cond_name]),
+                    "exists": output_files[cond_name].exists(),
+                }
+                for cond_name in output_files
+            },
+        },
     }
 
 def _clean_pty_output(raw: str) -> str:
@@ -1224,6 +1525,7 @@ def _run_eval_background(
     plan: dict[str, Any],
     req: RunRequest,
     *,
+    plan_snapshot: dict[str, Any] | None = None,
     preparation_snapshot: dict[str, Any] | None = None,
     run_dir_name: str | None = None,
 ) -> None:
@@ -1231,6 +1533,7 @@ def _run_eval_background(
     import time
     import traceback
     _ensure_aethyme_imports()
+    from src.eval.observability import write_phase_record, write_run_plan
     from src.eval.report import (
         create_eval_run_dir,
         finalize_eval_run,
@@ -1239,11 +1542,49 @@ def _run_eval_background(
     )
 
     run_dir: Path | None = None
+    phase_states: dict[str, dict[str, Any]] = {}
 
     def log(msg: str) -> None:
         _run_state["log"].append(msg)
         _append_run_log(run_dir, msg)
         print(f"[eval-run] {msg}")
+
+    def start_phase(name: str, *, order: int, details: dict[str, Any] | None = None) -> None:
+        started_at = datetime.now(UTC).isoformat()
+        phase_states[name] = {
+            "order": order,
+            "started_at": started_at,
+            "details": details or {},
+        }
+        _run_state["currentPhase"] = name
+        if run_dir is not None:
+            write_phase_record(
+                run_dir,
+                phase_name=name,
+                status="running",
+                started_at=started_at,
+                details=details or {},
+                order=order,
+            )
+        log(f"[phase:{name}] started")
+
+    def finish_phase(name: str, *, status: str, details: dict[str, Any] | None = None) -> None:
+        state = phase_states.get(name, {})
+        merged_details = dict(state.get("details", {}))
+        if details:
+            merged_details.update(details)
+        finished_at = datetime.now(UTC).isoformat()
+        if run_dir is not None:
+            write_phase_record(
+                run_dir,
+                phase_name=name,
+                status=status,
+                started_at=state.get("started_at"),
+                finished_at=finished_at,
+                details=merged_details,
+                order=state.get("order"),
+            )
+        log(f"[phase:{name}] {status}")
 
     _run_state["status"] = "running"
     _run_state["plan"] = plan
@@ -1286,6 +1627,11 @@ def _run_eval_background(
         metadata_path = run_dir / "metadata.json"
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         metadata["plan_run_dir"] = plan.get("paths", {}).get("run_dir")
+        if plan_snapshot is not None:
+            metadata["plan"] = {
+                "id": plan_snapshot.get("id"),
+                "path": plan_snapshot.get("path"),
+            }
         if preparation_snapshot is not None:
             metadata["preparation"] = {
                 "id": preparation_snapshot.get("id"),
@@ -1295,9 +1641,15 @@ def _run_eval_background(
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     except Exception:
         pass
+    write_run_plan(
+        run_dir,
+        plan=plan,
+        request=_plan_request_payload(req),
+        plan_snapshot=plan_snapshot,
+    )
 
     # Artifact build is separate from repository preparation and from tab execution.
-    _run_state["currentPhase"] = "build inputs"
+    start_phase("build inputs", order=1, details={"prompt_files": list(plan.get("paths", {}).get("prompt_files", {}).keys())})
     prepared_inputs = _materialize_eval_inputs(plan, req, conditions, log=log)
     prompt_files = prepared_inputs["prompt_files"]
     output_files = prepared_inputs["output_files"]
@@ -1306,14 +1658,17 @@ def _run_eval_background(
     shared_artifacts["preparation"] = preparation_snapshot
     bare_task = prepared_inputs["bare_task"]
     condition_payloads: dict[str, dict[str, Any]] = {}
+    finish_phase("build inputs", status=prepared_inputs["observability"]["status"], details=prepared_inputs["observability"])
 
     tabs: dict[str, str] = {}
 
     # Phase: Clean up stale MCP tabs
-    _run_state["currentPhase"] = "cleanup stale tabs"
+    start_phase("cleanup stale tabs", order=2)
+    stale_tab_count = 0
     try:
         existing_tabs = mcp_client.tab_list()
         mcp_tabs = [t for t in existing_tabs if t.get("is_mcp_controlled")]
+        stale_tab_count = len(mcp_tabs)
         if mcp_tabs:
             log(f"Closing {len(mcp_tabs)} stale MCP tabs...")
             for t in mcp_tabs:
@@ -1324,9 +1679,12 @@ def _run_eval_background(
             time.sleep(2)
     except Exception as e:
         log(f"WARNING: Could not clean stale tabs: {e}")
+        finish_phase("cleanup stale tabs", status="degraded", details={"closed_tabs": stale_tab_count, "error": str(e)})
+    else:
+        finish_phase("cleanup stale tabs", status="success", details={"closed_tabs": stale_tab_count})
 
     # Phase: Create tabs — wait for each shell to be ready before moving on
-    _run_state["currentPhase"] = "creating tabs"
+    start_phase("creating tabs", order=3, details={"requested_conditions": [c["name"] for c in conditions]})
     for cond in conditions:
         cond_name = cond["name"]
         directory = cond["directory"]
@@ -1369,9 +1727,23 @@ def _run_eval_background(
             log(traceback.format_exc())
 
     _run_state["tabs"] = tabs
+    tab_status = "success" if len(tabs) == len(conditions) else "degraded"
+    finish_phase(
+        "creating tabs",
+        status=tab_status,
+        details={
+            "created_tabs": {name: tab_id for name, tab_id in tabs.items()},
+            "created_count": len(tabs),
+            "expected_count": len(conditions),
+        },
+    )
 
     # Phase: Launch agents — with session file tracking
-    _run_state["currentPhase"] = "launching agents"
+    start_phase(
+        "launching agents",
+        order=4,
+        details={"backend": launch_phase.get("backend", "claude"), "model": launch_phase.get("model", "haiku")},
+    )
     backend = launch_phase.get("backend", "claude")
     model_name = launch_phase.get("model", "haiku")
 
@@ -1469,9 +1841,18 @@ def _run_eval_background(
 
     log("All agents launched.")
     log(f"Tab mapping: {json.dumps({k: v[:12] for k, v in tabs.items()}, indent=2)}")
+    finish_phase(
+        "launching agents",
+        status="success" if backend != "claude" or len(session_ids) == len(tabs) else "degraded",
+        details={
+            "session_ids": session_ids,
+            "session_files": {k: str(v) for k, v in session_files.items()},
+            "launched_tabs": list(tabs.keys()),
+        },
+    )
 
     # Phase: Monitor — poll until all agents complete
-    _run_state["currentPhase"] = "monitoring"
+    start_phase("monitoring", order=5, details={"poll_interval_seconds": 10, "max_rounds": 120})
     log("Monitoring agents...")
     completed: set[str] = set()
     for poll_round in range(120):  # Up to 20 minutes
@@ -1509,9 +1890,14 @@ def _run_eval_background(
             break
 
     log(f"All agents finished. Completed: {list(completed)}")
+    finish_phase(
+        "monitoring",
+        status="success" if len(completed) == len(tabs) else "degraded",
+        details={"completed": sorted(completed), "total_tabs": len(tabs), "poll_rounds": poll_round + 1},
+    )
 
     # Phase: Collect — try output file first, fall back to PTY log
-    _run_state["currentPhase"] = "collecting"
+    start_phase("collecting", order=6, details={"conditions": list(tabs.keys())})
     log("Collecting results...")
 
     tab_outputs: dict[str, str] = {}
@@ -1773,6 +2159,14 @@ def _run_eval_background(
             log(f"[{cond_name}] ERROR collecting: {e}")
             import traceback
             log(traceback.format_exc())
+    finish_phase(
+        "collecting",
+        status="success" if len(condition_payloads) == len(tabs) else "degraded",
+        details={
+            "collected_conditions": sorted(condition_payloads.keys()),
+            "tab_outputs": {cond: len(text) for cond, text in tab_outputs.items()},
+        },
+    )
 
     result: dict[str, Any] = {
         "task": bare_task,
@@ -1804,13 +2198,22 @@ def _run_eval_background(
         "aethyme_run": condition_payloads.get("leverage", {}).get("run"),
     }
 
+    start_phase("finalizing", order=7, details={"conditions": sorted(condition_payloads.keys())})
     finalize_eval_run(run_dir, result, repo_path=Path(req.target), eval_type=req.evalType)
     result["report_path"] = str(run_dir / "report.md")
     _run_state["result"] = result
     log(f"Finalized eval run: {run_dir / 'report.md'}")
+    finish_phase(
+        "finalizing",
+        status="success",
+        details={
+            "report_path": str(run_dir / "report.md"),
+            "complete_result_path": str(run_dir / "complete-result.json"),
+        },
+    )
 
     # Phase: Cleanup
-    _run_state["currentPhase"] = "cleanup"
+    start_phase("cleanup", order=8, details={"tabs": list(tabs.keys())})
     log("Closing tabs...")
     for cond_name, tab_id in tabs.items():
         try:
@@ -1821,6 +2224,7 @@ def _run_eval_background(
 
     _run_state["status"] = "complete"
     _run_state["currentPhase"] = "done"
+    finish_phase("cleanup", status="success", details={"closed_tabs": list(tabs.keys())})
     log("Eval run complete.")
 
 
@@ -1859,45 +2263,13 @@ async def launch_run(req: RunRequest, background_tasks: BackgroundTasks) -> dict
             "error": "Preparation not ready",
         }
 
-    # Generate plan first
-    reasoning_arg = "default" if req.reasoning == "high" else req.reasoning
-    cmd = [
-        str(AETHYME_PYTHON), "-m", "src.cli", "eval", "run",
-        "--eval-type", req.evalType,
-        "--target", req.target,
-        "--model", req.model,
-        "--reasoning", reasoning_arg,
-        "--json-output",
-    ]
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(AETHYME_PKG),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-    except FileNotFoundError:
+        plan, plan_snapshot = await _generate_plan(req)
+    except HTTPException as exc:
         return {
             "status": "error", "plan": None, "currentPhase": None,
-            "log": [f"Python venv not found at {AETHYME_PYTHON}"],
-            "error": "Missing venv",
-        }
-
-    if proc.returncode != 0:
-        return {
-            "status": "error", "plan": None, "currentPhase": None,
-            "log": [f"Plan generation failed: {stderr.decode()[:500]}"],
-            "error": stderr.decode()[:500],
-        }
-
-    try:
-        plan = json.loads(stdout.decode())
-    except json.JSONDecodeError:
-        return {
-            "status": "error", "plan": None, "currentPhase": None,
-            "log": ["Failed to parse plan output"],
-            "error": "Invalid JSON",
+            "log": [str(exc.detail)],
+            "error": str(exc.detail),
         }
 
     # Launch in background
@@ -1906,6 +2278,7 @@ async def launch_run(req: RunRequest, background_tasks: BackgroundTasks) -> dict
         _run_eval_background,
         plan,
         req,
+        plan_snapshot=plan_snapshot,
         preparation_snapshot=preparation_snapshot,
         run_dir_name=run_dir_name,
     )
