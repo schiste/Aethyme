@@ -2121,7 +2121,6 @@ def _run_eval_background(
             )
 
             from db import insert_result
-            from datetime import datetime, timezone
             cto = "off" if cond_name == "control-cto-off" else "on"
             tool_breakdown_json = json.dumps(
                 {k: v for k, v in sorted(data["tool_names"].items(), key=lambda x: -x[1]) if k != "Agent"}
@@ -2131,7 +2130,7 @@ def _run_eval_background(
                 "id": result_id,
                 "runId": run_id,
                 "runDir": run_dir.name,
-                "date": datetime.now(timezone.utc).isoformat()[:19],
+                "date": datetime.now(UTC).isoformat()[:19],
                 "evalType": req.evalType,
                 "target": req.target,
                 "model": req.model,
