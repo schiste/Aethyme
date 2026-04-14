@@ -190,6 +190,92 @@ fn build_overview_context(root: &Path, map: &RepositoryMap) -> String {
     sections.join("\n")
 }
 
+/// Generate detailed subsystem context: all public functions with their files.
+/// This is appended to the main prompt when --subsystem is specified.
+pub fn generate_subsystem_context(
+    _repo_root: &Path,
+    map: &RepositoryMap,
+    subsystem: &str,
+) -> String {
+    let mut sections = Vec::new();
+    let subsystem = subsystem.trim_end_matches('/');
+    let subsystem_prefix = format!("{subsystem}/");
+
+    let area_files: Vec<&str> = map
+        .files
+        .iter()
+        .filter(|f| f.path.starts_with(&subsystem_prefix))
+        .map(|f| f.path.as_str())
+        .collect();
+
+    sections.push(format!(
+        "## Subsystem Detail: `{subsystem}/`\n\n\
+         **Files:** {}\n",
+        area_files.len()
+    ));
+
+    // List all classes in the subsystem
+    let classes: Vec<String> = map
+        .classes
+        .iter()
+        .filter(|c| c.file_path.starts_with(&subsystem_prefix))
+        .map(|c| format!("- class `{}` in `{}`", c.name, c.file_path))
+        .collect();
+
+    if !classes.is_empty() {
+        let mut section = String::from("### Classes\n");
+        for c in &classes {
+            section.push_str(&format!("{c}\n"));
+        }
+        sections.push(section);
+    }
+
+    // List public-like methods plus top-level functions with their files.
+    let functions: Vec<String> = map
+        .functions
+        .iter()
+        .filter(|f| {
+            f.file_path.starts_with(&subsystem_prefix)
+                && (f.parent_class_id.is_none() || f.signature.trim_start().starts_with("public "))
+                && f.name != "__construct"
+                && f.name != "__destruct"
+                && f.name != "__init__"
+        })
+        .map(|f| format!("- `{}()` in `{}`", f.name, f.file_path))
+        .collect();
+
+    if !functions.is_empty() {
+        let mut section = format!("### Public Functions ({} total)\n", functions.len());
+        for f in &functions {
+            section.push_str(&format!("{f}\n"));
+        }
+        sections.push(section);
+    }
+
+    // Files outside subsystem that import files from it
+    let external_importers: Vec<String> = map
+        .edges
+        .iter()
+        .filter(|e| {
+            matches!(e.kind, EdgeKind::Imports)
+                && !e.from.starts_with(&subsystem_prefix)
+                && e.to.starts_with(&subsystem_prefix)
+        })
+        .map(|e| format!("- `{}` imports `{}`", e.from, e.to))
+        .take(20)
+        .collect();
+
+    if !external_importers.is_empty() {
+        let mut section = format!("### External Consumers ({} files import from this subsystem)\n", external_importers.len());
+        for imp in &external_importers {
+            section.push_str(&format!("{imp}\n"));
+        }
+        sections.push(section);
+    }
+
+    sections.join("\n")
+}
+
 // ── Area-specific context ───────────────────────────────────────────
 
 fn build_area_context(root: &Path, map: &RepositoryMap, area_name: &str) -> String {

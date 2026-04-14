@@ -268,6 +268,7 @@ fn run() -> Result<(), String> {
             let repo = read_option(&args, "--repo")?;
             let task = read_option(&args, "--task").unwrap_or_else(|_| "Explain this repository".to_string());
             let focus = read_option(&args, "--focus").ok();
+            let subsystem = read_option(&args, "--subsystem").ok();
             let map = build_map(&repo, no_cache)?;
             let canonical = PathBuf::from(&repo).canonicalize().map_err(|e| e.to_string())?;
             let prompt = aethyme_engine::store::prompt::generate_prompt(
@@ -277,6 +278,15 @@ fn run() -> Result<(), String> {
                 focus.as_deref(),
             );
             println!("{prompt}");
+            // If --subsystem is provided, append subsystem-specific context
+            if let Some(ref sub) = subsystem {
+                let sub_context = aethyme_engine::store::prompt::generate_subsystem_context(
+                    &canonical,
+                    &map,
+                    sub,
+                );
+                println!("\n{sub_context}");
+            }
         }
         "query-areas" => {
             let repo = read_option(&args, "--repo")?;
@@ -433,6 +443,100 @@ fn run() -> Result<(), String> {
                 println!("{}", serde_json::to_string_pretty(&rows).unwrap());
                 Ok::<(), String>(())
             })?;
+        }
+        "unused" => {
+            let repo = read_option(&args, "--repo")?;
+            let scope = read_option(&args, "--scope")?;
+            let canonical = PathBuf::from(&repo).canonicalize().map_err(|e| e.to_string())?;
+            let scope = scope.trim_end_matches('/').to_string();
+            let scope_abs = canonical.join(&scope);
+
+            // Step 1: Find all public function definitions in the scope
+            let grep_defs = std::process::Command::new("grep")
+                .args(["-rn", "public function ", "--include=*.php"])
+                .arg(&scope_abs)
+                .output()
+                .map_err(|e| format!("grep failed: {}", e))?;
+            if !grep_defs.status.success() && grep_defs.status.code() != Some(1) {
+                return Err(format!(
+                    "grep failed while reading definitions in {}",
+                    scope_abs.display()
+                ));
+            }
+
+            let defs_stdout = String::from_utf8_lossy(&grep_defs.stdout);
+            let repo_prefix = format!("{}/", canonical.display());
+
+            struct FuncDef {
+                name: String,
+                file: String,
+                line: u32,
+            }
+
+            let mut functions: Vec<FuncDef> = Vec::new();
+            for line in defs_stdout.lines() {
+                if line.is_empty() { continue; }
+                // Parse: /abs/path/to/file:line:    public function name(
+                // Convert to repo-relative path
+                let relative = line.strip_prefix(&repo_prefix).unwrap_or(line);
+                let parts: Vec<&str> = relative.splitn(3, ':').collect();
+                if parts.len() < 3 { continue; }
+                let file = parts[0].to_string();
+                let line_num: u32 = parts[1].parse().unwrap_or(0);
+                let code = parts[2].trim();
+                // Extract function name
+                if let Some(name_start) = code.find("function ") {
+                    let after = &code[name_start + 9..];
+                    let name: String = after.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    if name.is_empty() || name.starts_with("__") { continue; }
+                    functions.push(FuncDef { name, file, line: line_num });
+                }
+            }
+
+            eprintln!("Found {} public functions in {}", functions.len(), scope);
+
+            // Step 2: For each function, grep for callers outside the scope
+            let mut unused = Vec::new();
+            for func in &functions {
+                let call_pattern = format!(r"(->|::)\s*{}\s*\(", func.name);
+                let grep_callers = std::process::Command::new("grep")
+                    .args([
+                        "-REl",
+                        "--include=*.php",
+                        "--exclude-dir=.git",
+                        "--exclude-dir=tests",
+                        "--exclude-dir=vendor",
+                        "--exclude-dir=.aethyme",
+                        &call_pattern,
+                    ])
+                    .arg(&canonical)
+                    .output()
+                    .map_err(|e| format!("grep failed for {}: {}", func.name, e))?;
+                if !grep_callers.status.success() && grep_callers.status.code() != Some(1) {
+                    return Err(format!("grep failed while reading callers for {}", func.name));
+                }
+
+                let callers = String::from_utf8_lossy(&grep_callers.stdout);
+                let external_callers: Vec<&str> = callers
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| l.strip_prefix(&repo_prefix).unwrap_or(l))
+                    .filter(|l| !l.starts_with(&scope))
+                    .filter(|l| !l.contains("/tests/") && !l.contains("/vendor/"))
+                    .collect();
+
+                if external_callers.is_empty() {
+                    unused.push((&func.name, &func.file, func.line));
+                }
+            }
+
+            // Output results
+            eprintln!("{} unused (no external callers)", unused.len());
+            println!("# Unused public functions in {}", scope);
+            println!("# {} total public functions, {} unused\n", functions.len(), unused.len());
+            for (name, file, line) in &unused {
+                println!("{file}:{line}  {name}()");
+            }
         }
         other => return Err(format!("unsupported command: {other}")),
     }
