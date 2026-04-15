@@ -46,7 +46,7 @@ Creates `<Name> - Control` (vanilla) and `<Name> - Aethyme` (with skill + graph 
 ./scripts/eval/run-eval.sh --eval-type dead-code --target mediawiki --model haiku
 ```
 
-End-to-end: verifies playground, starts server, launches 4 agents via Chau7 MCP, polls until done, prints results table. Results stored in SQLite at `packages/aethyme-eval-ui/server/evals.db` and visible at http://localhost:5173.
+End-to-end: verifies playground, starts server, launches 5 conditions via Chau7 MCP, polls until done, prints the scorecard, and writes a full artifact bundle. Results are stored in SQLite at `packages/aethyme-eval-ui/server/evals.db`, visible at http://localhost:5173, and persisted under `packages/aethyme/eval-runs/<timestamp>-<target>-<type>/`.
 
 ### Prepare a target
 
@@ -90,6 +90,42 @@ Every assessment runs the same task across 5 conditions to isolate what helps:
 **Task-Specific Pack** = Engine-generated prompt or artifact with repo structure, function listings, subsystem detail, or task navigation context.
 
 The task-conditioned prompt is built by: `aethyme-engine-cli prompt --repo <path> --task <task> --focus overview [--subsystem <dir>]`
+
+## End-of-Run Metrics
+
+Every finalized eval must expose these per-condition metrics:
+
+- `quality_score` — the benchmark score from the task-specific scorer
+- `tool_call_count` and `top_tools` — what the agent actually used
+- `total_tokens`
+- `duration_seconds`
+- `cost_usd`
+- `score_per_1k_tokens`
+- `score_per_minute`
+- `global_score`
+
+`global_score` is the quality/resource tradeoff metric used for cross-condition comparison:
+
+```text
+100 * (
+  0.65 * normalized_quality +
+  0.20 * token_efficiency +
+  0.10 * duration_efficiency +
+  0.05 * cost_efficiency
+)
+```
+
+Normalization is run-relative:
+- `normalized_quality = quality_score / max_quality_in_run`
+- `token_efficiency = min_total_tokens_in_run / total_tokens`
+- `duration_efficiency = min_duration_in_run / duration_seconds`
+- `cost_efficiency = min_cost_in_run / cost_usd`
+
+Interpretation:
+- `quality_score` answers “who solved the task best?”
+- `global_score` answers “who delivered the best quality/resource tradeoff?”
+
+Do not replace quality with global score. Report both.
 
 ## Adding a New Assessment Scenario
 
@@ -150,8 +186,8 @@ CLI (src/cli.py)
        |__ Phase 3: launch (create Chau7 tabs, start backend, send prompts)
        |__ Phase 4: monitor (poll tab_status until all complete)
        |__ Phase 5: collect (read session JSONL + tab output for tokens/cost/output)
-       |__ Phase 6: score (keyword matching against reference)
-       |__ Phase 7: report (generate markdown)
+       |__ Phase 6: score (quality + usage metrics + global score)
+       |__ Phase 7: report (generate markdown + complete-result bundle)
        |__ Phase 8: cleanup (close tabs)
 
 Server (packages/aethyme-eval-ui/server/main.py)

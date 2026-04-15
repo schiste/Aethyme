@@ -672,21 +672,48 @@ Reports contain these sections **in this exact order**:
 
 1. **Meta** — Date, repository path, eval type, scenario (if applicable), conditions list, Aethyme commit hash.
 2. **Model** — Name, provider, backend, reasoning level, permission mode. Without model details, results cannot be compared across runs. Pass model metadata via `model=` in `assemble_bug_fix_result()` or `create_eval_run_dir()`.
-3. **Scorecard** — One row per condition with: Score, Cost (USD), Duration, Turns, Input Tokens, Output Tokens, Cache Read Tokens, Cache Create Tokens.
+3. **Scorecard** — One row per condition with: Quality, Global, Tools, Cost (USD), Duration, Total Tokens, Score / 1K Tokens, Score / Minute.
 
-| Condition | Score | Cost | Duration | Turns | Input Tokens | Output Tokens | Cache Read | Cache Create |
+| Condition | Quality | Global | Tools | Cost | Duration | Total Tokens | Score / 1K Tokens | Score / Minute |
 |---|---|---|---|---|---|---|---|---|
-| Control (CTO off) | 93.83 | $0.161 | 74.8s | 10 | 146 | 2,718 | 542,126 | 74,517 |
+| Control (CTO off) | 93.83 | 88.21 | 49 | $0.161 | 74.8s | 619,507 | 0.15 | 75.27 |
 
 4. **Score Breakdown** — Per-component weights and raw values (only rendered when scoring produces component scores, e.g. bug-fix).
 5. **Prompts** — Verbatim prompt text for each condition in fenced code blocks. All 5 conditions always shown.
 6. **Agent Output** — Structured output JSON for each condition.
 7. **Tool Call Analysis** (auto-generated) — Per-condition tool call frequency table. Skipped if no condition has tool call data.
-8. **Verdict** (auto-generated) — One paragraph: highest/lowest scorer, cheapest/most expensive, whether all tests passed.
+8. **Verdict** (auto-generated) — One paragraph: highest/lowest quality scorer, best global scorer, cheapest/most expensive, whether all tests passed.
 9. **Notes** — Free-text notes passed via `notes=` parameter, or "N/A".
 10. **Raw Data** (collapsed at bottom) — Reference Output, Output Schema, Scoring Rubric, Per-Condition Run Records (full JSON), Per-Condition Assessments (full JSON), plus optional Context Pack, Navigation Context, Challenge, and Repo Signals.
 
 All JSON dumps live exclusively in the Raw Data section — never inline in the body.
+
+### Metric Definitions
+
+- **Quality** — the task-specific benchmark score from the scorer for that eval type.
+- **Tools** — total tool call count observed for that condition.
+- **Total Tokens** — input + output + cache read + cache create.
+- **Score / 1K Tokens** — `quality_score * 1000 / total_tokens`.
+- **Score / Minute** — `quality_score * 60 / duration_seconds`.
+- **Global** — quality/resource tradeoff score:
+
+```text
+100 * (
+  0.65 * normalized_quality +
+  0.20 * token_efficiency +
+  0.10 * duration_efficiency +
+  0.05 * cost_efficiency
+)
+```
+
+with:
+
+- `normalized_quality = quality_score / max_quality_in_run`
+- `token_efficiency = min_total_tokens_in_run / total_tokens`
+- `duration_efficiency = min_duration_in_run / duration_seconds`
+- `cost_efficiency = min_cost_in_run / cost_usd`
+
+Use `quality_score` to judge task success. Use `global_score` to judge task success relative to resource use. Do not collapse the two into one number during analysis.
 
 ## Important Notes
 

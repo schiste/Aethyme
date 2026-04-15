@@ -25,3 +25,11 @@ Source of truth:
 Current practical interpretation:
 - score benchmark answers against `literal_external_only`
 - use `engineering_review` when assessing whether an answer shows sound software judgment
+
+Recommended reporting for this eval:
+- `quality_score` against `literal_external_only`
+- qualitative review against `engineering_review`
+- `tool_call_count`, `top_tools`, `total_tokens`, and `duration_seconds`
+- `global_score` for quality/resource tradeoff
+
+That keeps benchmark fit and engineering judgment separate while still exposing runtime efficiency.
