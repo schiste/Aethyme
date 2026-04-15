@@ -44,8 +44,9 @@ fi
 
 # ── Derive paths ─────────────────────────────────────────────────────
 
-# Capitalize first letter for display unless explicit directory names are supplied
-DISPLAY_NAME="$(echo "$NAME" | sed 's/./\U&/')"
+# Capitalize first letter for display unless explicit directory names are supplied.
+# zsh + BSD sed do not support the GNU-style \U escape used previously.
+DISPLAY_NAME="${(C)NAME}"
 CONTROL_DIR_NAME="${CONTROL_DIR_NAME:-$DISPLAY_NAME - Control}"
 AETHYME_DIR_NAME="${AETHYME_DIR_NAME:-$DISPLAY_NAME - Aethyme}"
 CONTROL_DIR="$DEST/$CONTROL_DIR_NAME"
@@ -81,7 +82,7 @@ fi
 if [[ -d "$CONTROL_DIR" || -d "$AETHYME_DIR" ]]; then
     if [[ "$FORCE" == true ]]; then
         echo "WARNING: --force specified, deleting existing repos..."
-        rm -rf "$CONTROL_DIR" "$AETHYME_DIR"
+        command rm -rf "$CONTROL_DIR" "$AETHYME_DIR"
     else
         echo "ERROR: Repos already exist. Use --force to delete and recreate."
         [[ -d "$CONTROL_DIR" ]] && echo "  $CONTROL_DIR"
