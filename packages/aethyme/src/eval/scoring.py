@@ -6,12 +6,48 @@ import json
 import re
 from typing import Any
 
-from src.eval.schemas import BUG_FIX_PATH_KEYS, EXPLAIN_REPO_PATH_KEYS, NAVIGATION_CTF_PATH_KEYS, ONBOARDING_AUTH_PATH_KEYS
+from src.eval.schemas import (
+    BUG_FIX_PATH_KEYS,
+    EXPLAIN_REPO_PATH_KEYS,
+    MEDIAWIKI_BUG_FIX_1_PATH_KEYS,
+    NAVIGATION_CTF_PATH_KEYS,
+    ONBOARDING_AUTH_PATH_KEYS,
+)
 
 
 def parse_structured_output(stdout: str) -> dict[str, Any] | None:
+    if not isinstance(stdout, str) or not stdout.strip():
+        return None
     try:
         payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        payload = _extract_json_payload(stdout)
+        if payload is None:
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+_FENCED_JSON_RE = re.compile(r"```json\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
+
+
+def _extract_json_payload(text: str) -> dict[str, Any] | None:
+    """Best-effort extraction of a JSON object from fenced or embedded text."""
+    match = _FENCED_JSON_RE.search(text)
+    if match:
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            return payload
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    snippet = text[start : end + 1]
+    try:
+        payload = json.loads(snippet)
     except json.JSONDecodeError:
         return None
     return payload if isinstance(payload, dict) else None
@@ -512,9 +548,10 @@ def score_mediawiki_bug_fix_1(
     from .schemas import MEDIAWIKI_BUG_FIX_1_PATH_KEYS
 
     weights = {
-        "files_identified": 40,
-        "root_cause_quality": 30,
-        "fix_plan_quality": 20,
+        "files_identified": 35,
+        "root_cause_quality": 25,
+        "fix_plan_quality": 15,
+        "testing_quality": 15,
         "efficiency": 10,
     }
 
@@ -559,6 +596,11 @@ def score_mediawiki_bug_fix_1(
     fix_plan_kws = reference.get("fix_plan_keywords", [])
     fix_plan_score = _keyword_score(fix_plan_text, fix_plan_kws)
 
+    # --- Testing quality (15%) ---
+    testing_text = candidate.get("testing", "")
+    testing_kws = reference.get("testing_keywords", [])
+    testing_score = _keyword_score(testing_text, testing_kws)
+
     # --- Efficiency (10%) ---
     eff_score = _efficiency_score(cost_usd, reference_cost=0.20)
 
@@ -566,6 +608,7 @@ def score_mediawiki_bug_fix_1(
         "files_identified": files_score,
         "root_cause_quality": root_cause_score,
         "fix_plan_quality": fix_plan_score,
+        "testing_quality": testing_score,
         "efficiency": eff_score,
     }
 
@@ -587,6 +630,7 @@ def score_mediawiki_bug_fix_1(
         "files_matched": sorted(ref_files & cand_files),
         "files_missed": sorted(ref_files - cand_files),
         "files_extra": sorted(cand_files - ref_files),
+        "candidate": candidate,
         "guardrails": guardrails,
     }
 

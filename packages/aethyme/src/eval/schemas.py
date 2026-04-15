@@ -273,6 +273,7 @@ def mediawiki_bug_fix_1_output_schema() -> dict[str, object]:
             "files_to_edit",
             "root_cause",
             "fix_plan",
+            "testing",
         ],
         "properties": {
             "files_to_edit": {
@@ -308,6 +309,12 @@ def mediawiki_bug_fix_1_output_schema() -> dict[str, object]:
                     "Do NOT apply the fix — describe what changes are needed."
                 ),
             },
+            "testing": {
+                "type": "string",
+                "description": (
+                    "How to verify the fix and what regressions should be checked."
+                ),
+            },
         },
     }
 
@@ -315,9 +322,10 @@ def mediawiki_bug_fix_1_output_schema() -> dict[str, object]:
 def mediawiki_bug_fix_1_scoring_rubric() -> dict[str, object]:
     return {
         "weights": {
-            "files_identified": 40,
-            "root_cause_quality": 30,
-            "fix_plan_quality": 20,
+            "files_identified": 35,
+            "root_cause_quality": 25,
+            "fix_plan_quality": 15,
+            "testing_quality": 15,
             "efficiency": 10,
         },
         "notes": [
@@ -327,6 +335,8 @@ def mediawiki_bug_fix_1_scoring_rubric() -> dict[str, object]:
             "(RevisionRecord, integer vs object, doViewUpdates, showDiffPage).",
             "fix_plan_quality: keyword match for fix approach "
             "(pass RevisionRecord, deprecate $oldid, signature change).",
+            "testing_quality: keyword match for validation plan and "
+            "regression coverage around diff/revision watchlist behavior.",
             "efficiency: lower token usage scores higher.",
         ],
     }
@@ -398,6 +408,15 @@ def mediawiki_bug_fix_1_reference() -> dict[str, object]:
         "fix_plan_keywords": [
             "RevisionRecord", "deprecat", "signature", "func_num_args",
             "fetchRevisionRecord", "getNewRevision", "getOldID",
+        ],
+        "testing": (
+            "Verify that viewing a diff or a specific revision only marks the "
+            "target revision as seen, not all revisions. Add or update regression "
+            "coverage around the diff/revision path and watchlist notification clearing."
+        ),
+        "testing_keywords": [
+            "diff", "revision", "watchlist", "notification", "seen",
+            "regression", "clearTitleUserNotifications", "doViewUpdates",
         ],
         "commit": "425c358d279e0610365cda8fbe01d889f11238f0",
     }

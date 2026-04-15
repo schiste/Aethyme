@@ -65,7 +65,7 @@ This checks repo cleanliness, engine presence, index presence, and git state. It
 | Type | Target | What it tests |
 |---|---|---|
 | `bug-fix` | grc | Fix a failing test (remove/restore permission implication) |
-| `bug-fix-1` | mediawiki | Diagnose T419918 — watchlist marks all revisions as seen |
+| `bug-fix-1` | mediawiki | Diagnose T419918 — watchlist marks all revisions as seen (strict JSON diagnostic output) |
 | `explain-repo` | any | Produce structured architecture overview |
 | `navigation-ctf` | any | Find manifest, entrypoint, area relationship chain |
 | `impact-analysis` | mediawiki | List all callers of `doViewUpdates()` |

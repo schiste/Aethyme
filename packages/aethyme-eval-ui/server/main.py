@@ -1126,6 +1126,54 @@ def _assessment_from_score(eval_type: str, score: float) -> dict[str, Any]:
     }
 
 
+def _parse_and_score_bug_fix_1_output(
+    output_text: str,
+    *,
+    cost: float,
+    repo_path: Path,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    import sys
+
+    sys.path.insert(0, str(AETHYME_PKG))
+    from src.eval.scoring import parse_structured_output, score_mediawiki_bug_fix_1
+    from src.eval.schemas import mediawiki_bug_fix_1_reference
+
+    candidate = parse_structured_output(output_text)
+    if candidate is None:
+        return None, {
+            "weighted_score": 0.0,
+            "max_score": 100,
+            "scores": {
+                "files_identified": 0.0,
+                "root_cause_quality": 0.0,
+                "fix_plan_quality": 0.0,
+                "testing_quality": 0.0,
+                "efficiency": 0.0,
+            },
+            "weights": {
+                "files_identified": 35,
+                "root_cause_quality": 25,
+                "fix_plan_quality": 15,
+                "testing_quality": 15,
+                "efficiency": 10,
+            },
+            "method": "structured_parse_failed",
+            "eval_type": "bug-fix-1",
+            "error": "output_not_valid_json_object",
+        }
+
+    reference = mediawiki_bug_fix_1_reference()
+    assessment = score_mediawiki_bug_fix_1(
+        candidate,
+        reference,
+        cost_usd=cost,
+        repo_path=str(repo_path.resolve()),
+    )
+    assessment["method"] = "score_mediawiki_bug_fix_1"
+    assessment["eval_type"] = "bug-fix-1"
+    return candidate, assessment
+
+
 def _missing_deliverable_assessment(
     eval_type: str,
     *,
@@ -1208,14 +1256,24 @@ Bug report (T419918): Viewing a diff/revision on a watchlisted page marks all re
 
 Identify which files need editing and explain how you would fix this bug. Do NOT apply the fix — only report your analysis.
 
-Produce your analysis in exactly these sections:
+Write exactly one JSON object with this shape:
+{
+  "files_to_edit": [
+    {
+      "path": "relative/path.php",
+      "what_to_change": "specific change needed in this file"
+    }
+  ],
+  "root_cause": "trace from viewing a diff/revision to the wrong watchlist behavior",
+  "fix_plan": "step-by-step fix plan including signature and deprecation strategy",
+  "testing": "how to verify the fix and what regressions to check"
+}
 
-1. **Root Cause** — What code path leads to the wrong behavior. Trace from the user action (viewing a diff) to the incorrect result (all revisions marked seen).
-2. **Files to Edit** — List each file that needs changes, with the specific function or method to modify and what the change should be.
-3. **Fix Plan** — Step-by-step description of the fix. Include method signature changes, parameter changes, and deprecation approach if applicable.
-4. **Testing** — How to verify the fix works. What behavior to test before and after.
-
-Cite file paths and line numbers where relevant.""",
+Rules:
+- Output JSON only, no markdown fences and no prose before or after the JSON.
+- Use repo-relative file paths.
+- Include the release notes file if the deprecation should be documented.
+- In `testing`, explicitly cover diff/revision behavior and watchlist notification regression checks.""",
         "impact-analysis": """\
 WikiPage::doViewUpdates() in includes/Page/WikiPage.php is being refactored to accept different parameters.
 
@@ -1292,7 +1350,8 @@ Be exhaustive — missing a file means the rename breaks production. Search thor
     for cond in conditions:
         cond_name = cond["name"]
         repo_dir = Path(cond["directory"])
-        output_path = repo_dir / f".aethyme-eval-output-{cond_name}.md"
+        output_suffix = "json" if eval_type == "bug-fix-1" else "md"
+        output_path = repo_dir / f".aethyme-eval-output-{cond_name}.{output_suffix}"
         output_files[cond_name] = output_path
         output_path.unlink(missing_ok=True)
 
@@ -1392,12 +1451,20 @@ Be exhaustive — missing a file means the rename breaks production. Search thor
         else:
             task_text = bare_task
         out_path = str(output_files[cond_name])
-        prompt_text = (
-            f"IMPORTANT: You MUST save your complete analysis to `{out_path}` when done. "
-            f"Use the Write tool to create this file with your full response.\n\n"
-            f"{task_text}\n\n"
-            f"Remember: save your complete analysis to `{out_path}`."
-        )
+        if eval_type == "bug-fix-1":
+            prompt_text = (
+                f"IMPORTANT: You MUST save exactly one JSON object to `{out_path}` when done. "
+                f"Use the Write tool to create this file. The file contents must be valid JSON and must match the required keys exactly.\n\n"
+                f"{task_text}\n\n"
+                f"Remember: save JSON only to `{out_path}`."
+            )
+        else:
+            prompt_text = (
+                f"IMPORTANT: You MUST save your complete analysis to `{out_path}` when done. "
+                f"Use the Write tool to create this file with your full response.\n\n"
+                f"{task_text}\n\n"
+                f"Remember: save your complete analysis to `{out_path}`."
+            )
         Path(prompt_path).write_text(prompt_text, encoding="utf-8")
         log(f"Wrote {cond_name}: {prompt_path} ({len(prompt_text)} chars)")
 
@@ -2142,6 +2209,11 @@ def _run_eval_background(
             output_snapshot = final_output_snapshots.get(cond_name, {"exists": False})
             deliverable_status = deliverable_statuses.get(cond_name, "failed")
             full_output = tab_outputs.get(cond_name, "")
+            repo_dir = next(
+                Path(c["directory"])
+                for c in conditions
+                if c["name"] == cond_name
+            )
 
             if deliverable_status == "success":
                 if len(full_output) > len(data.get("output", "")):
@@ -2150,11 +2222,25 @@ def _run_eval_background(
                         f"[{cond_name}] Using output file ({len(full_output)} chars) "
                         f"in place of JSONL ({len(data.get('output', ''))} chars)"
                     )
-                score = _score_output(req.evalType, data["output"], data["cost"], prompt=cond_prompt)
-                assessment = _assessment_from_score(req.evalType, score)
-                log(f"[{cond_name}] Score: {score:.1f}")
+                parsed_candidate = None
+                if req.evalType == "bug-fix-1":
+                    parsed_candidate, assessment = _parse_and_score_bug_fix_1_output(
+                        data["output"],
+                        cost=data["cost"],
+                        repo_path=repo_dir,
+                    )
+                    score = float(assessment.get("weighted_score", 0.0))
+                    log(
+                        f"[{cond_name}] Structured score: {score:.1f} "
+                        f"(parsed_candidate={'yes' if parsed_candidate else 'no'})"
+                    )
+                else:
+                    score = _score_output(req.evalType, data["output"], data["cost"], prompt=cond_prompt)
+                    assessment = _assessment_from_score(req.evalType, score)
+                    log(f"[{cond_name}] Score: {score:.1f}")
             else:
                 data["output"] = ""
+                parsed_candidate = None
                 score = 0.0
                 assessment = _missing_deliverable_assessment(
                     req.evalType,
@@ -2172,11 +2258,6 @@ def _run_eval_background(
 
             transcript = _read_session_events(session_file)
             tool_calls = _extract_tool_calls(transcript)
-            repo_dir = next(
-                Path(c["directory"])
-                for c in conditions
-                if c["name"] == cond_name
-            )
             run_metadata = _condition_run_metadata(
                 repo_path=repo_dir,
                 run_id=run_id,
@@ -2194,6 +2275,8 @@ def _run_eval_background(
                 "output_snapshot": output_snapshot,
                 "fallback_output_chars": len(full_output),
             }
+            if parsed_candidate is not None:
+                structured_output["parsed_candidate"] = parsed_candidate
             if deliverable_status != "success" and full_output:
                 structured_output["partial_output"] = full_output
             run_payload = {

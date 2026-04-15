@@ -979,7 +979,7 @@ See [playground-setup.md](playground-setup.md) for the full setup guide.
 | Type | Target | Task | Scoring |
 |---|---|---|---|
 | `bug-fix` | grc | Fix failing test (implication-share) | test pass + regression + code quality + efficiency |
-| `bug-fix-1` | mediawiki | Diagnose T419918 watchlist bug | files identified + root cause + fix plan + efficiency |
+| `bug-fix-1` | mediawiki | Diagnose T419918 watchlist bug | files identified + root cause + fix plan + testing + efficiency |
 | `explain-repo` | any | Explain repository architecture | structural accuracy vs engine reference |
 | `navigation-ctf` | any | Find manifest → entrypoint → area chain | exact path matching |
 | `impact-analysis` | mediawiki | List all callers of doViewUpdates() | call site recall + precision |
@@ -1051,7 +1051,7 @@ Located in `packages/aethyme-eval-ui/server/main.py`. Runs after output collecti
 
 ### Formal Scoring (`src/eval/scoring.py`)
 
-Used for structured output comparison. Requires the agent's output as a parsed dict (not available from PTY log). Includes:
+Used for structured output comparison. Requires the agent's output as a parsed dict. Includes:
 
 - `_normalize_path()` — strips markdown links, line anchors, absolute prefixes
 - `_keyword_score()` — fraction of reference keywords present
@@ -1061,5 +1061,6 @@ Used for structured output comparison. Requires the agent's output as a parsed d
 ### Scoring Limitations
 
 - **PTY log scoring** is keyword-based and approximate. An agent could mention "doViewUpdates" in a wrong context and still get credit.
-- **Formal scoring** requires structured JSON output, which the current output capture doesn't provide.
+- **Formal scoring** is now live for `bug-fix-1`, which writes a strict JSON deliverable and is parsed before scoring.
+- Other free-form MediaWiki evals still rely on server-side heuristics until they are migrated to structured output.
 - **Cross-condition comparison** is only reliable for efficiency metrics (tokens, cost, tools, duration). Quality scores should be interpreted with caution until output capture is solved.

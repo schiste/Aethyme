@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import pytest
 
-from src.eval.schemas import EXPLAIN_REPO_PATH_KEYS, NAVIGATION_CTF_PATH_KEYS
+from src.eval.schemas import (
+    EXPLAIN_REPO_PATH_KEYS,
+    NAVIGATION_CTF_PATH_KEYS,
+    mediawiki_bug_fix_1_reference,
+)
 from src.eval.scoring import (
     _compute_guardrails,
     _exact_path_score,
@@ -19,6 +23,8 @@ from src.eval.scoring import (
     _normalize_path,
     _ordered_list_score,
     _relationship_chain_score,
+    parse_structured_output,
+    score_mediawiki_bug_fix_1,
     score_explain_repo_output,
     score_navigation_ctf_output,
 )
@@ -80,6 +86,25 @@ class TestNormalizePath:
 
     def test_repo_path_with_trailing_slash(self):
         assert _normalize_path(f"{REPO}/src/x.py", REPO + "/") == "src/x.py"
+
+
+class TestParseStructuredOutput:
+    def test_plain_json_object(self):
+        payload = parse_structured_output('{"files_to_edit": [], "root_cause": "x", "fix_plan": "y", "testing": "z"}')
+        assert payload is not None
+        assert payload["root_cause"] == "x"
+
+    def test_fenced_json_object(self):
+        payload = parse_structured_output(
+            """Here is the result:
+
+```json
+{"files_to_edit": [], "root_cause": "x", "fix_plan": "y", "testing": "z"}
+```
+"""
+        )
+        assert payload is not None
+        assert payload["testing"] == "z"
 
 
 # ── _exact_path_score ────────────────────────────────────────────────────
@@ -397,6 +422,51 @@ class TestScoreNavigationCtfOutput:
         result = score_navigation_ctf_output(ref, ref)
         assert result is not None
         assert "guardrails" in result
+
+
+class TestScoreMediawikiBugFix1:
+    def test_scores_structured_candidate_with_testing_field(self):
+        reference = mediawiki_bug_fix_1_reference()
+        candidate = {
+            "files_to_edit": [
+                {
+                    "path": "includes/Page/WikiPage.php",
+                    "what_to_change": "Change doViewUpdates to accept a RevisionRecord and add a deprecation shim.",
+                },
+                {
+                    "path": "includes/Page/Article.php",
+                    "what_to_change": "Update the showDiffPage/doViewUpdates call sites to pass a RevisionRecord.",
+                },
+                {
+                    "path": "includes/Page/ImagePage.php",
+                    "what_to_change": "Use fetchRevisionRecord instead of getOldID.",
+                },
+                {
+                    "path": "RELEASE-NOTES-1.46",
+                    "what_to_change": "Document the deprecation of passing oldid to doViewUpdates.",
+                },
+            ],
+            "root_cause": (
+                "showDiffPage passes an integer oldid into doViewUpdates, but "
+                "WatchlistManager::clearTitleUserNotifications needs a RevisionRecord "
+                "for the viewed revision."
+            ),
+            "fix_plan": (
+                "Change the doViewUpdates signature, keep a func_num_args deprecation "
+                "shim, and update callers to pass fetchRevisionRecord/getNewRevision."
+            ),
+            "testing": (
+                "Verify diff and revision views only mark the correct revision as seen, "
+                "and add a regression around watchlist notification clearing."
+            ),
+        }
+
+        result = score_mediawiki_bug_fix_1(candidate, reference, cost_usd=0.2, repo_path=REPO)
+
+        assert result["scores"]["files_identified"] == 1.0
+        assert result["scores"]["testing_quality"] > 0.0
+        assert result["weighted_score"] > 70.0
+        assert result["candidate"]["testing"].startswith("Verify diff")
 
 
 # ── Regression: CTO-off rerun data ──────────────────────────────────────
