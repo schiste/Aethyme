@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+from functools import lru_cache
+from pathlib import Path
+
 
 # ---------------------------------------------------------------------------
 # Path key sets — which dict keys carry path-like strings for guardrails.
@@ -604,6 +608,12 @@ def mediawiki_config_audit_reference() -> dict[str, object]:
 MEDIAWIKI_DEAD_CODE_PATH_KEYS: frozenset[str] = frozenset({"unused_functions"})
 
 
+@lru_cache(maxsize=1)
+def _mediawiki_dead_code_watchlist_baseline() -> dict[str, object]:
+    baseline_path = Path(__file__).with_name("baselines") / "mediawiki_dead_code_watchlist.json"
+    return json.loads(baseline_path.read_text(encoding="utf-8"))
+
+
 def mediawiki_dead_code_output_schema() -> dict[str, object]:
     return {
         "type": "object",
@@ -635,42 +645,39 @@ def mediawiki_dead_code_scoring_rubric() -> dict[str, object]:
             "efficiency": 20,
         },
         "notes": [
-            "functions_found: recall — how many of the 9 truly unused functions were identified.",
-            "false_positives: precision — penalty for listing functions that ARE used externally.",
+            "functions_found: recall — how many of the reviewed literal external-only baseline functions were identified.",
+            "false_positives: precision — penalty for listing functions that are outside the reviewed literal baseline.",
             "efficiency: cost relative to $1.00 baseline.",
+            "Important: this benchmark uses the prompt semantics ('zero non-test callers outside includes/Watchlist/'), not a pure software-maintenance notion of dead code.",
         ],
     }
 
 
 def mediawiki_dead_code_reference() -> dict[str, object]:
-    """Public functions in includes/Watchlist/ with no callers outside the subsystem.
+    """Reviewed Watchlist benchmark baseline.
 
-    Ground truth generated via:
-        grep -n 'public function' includes/Watchlist/*.php | grep -v __construct |
-        for each: grep -rl '<func>' --include='*.php' . | grep -v includes/Watchlist/ |
-                  grep -v /tests/ | grep -v vendor/ | wc -l
-        Functions with 0 external callers are listed here.
+    The returned ``unused_functions`` list follows the literal prompt semantics:
+    public methods in ``includes/Watchlist/`` with zero non-test, non-vendor
+    call sites outside that directory. The reviewed baseline also preserves a
+    separate engineering judgment view so benchmark-fit and maintainability are
+    not conflated.
     """
+    baseline = _mediawiki_dead_code_watchlist_baseline()
+    literal = baseline["literal_external_only"]
+    likely_dead_code = baseline["engineering_review"]["likely_dead_code"]
     return {
-        "unused_functions": [
-            {"function_name": "buildTools", "defined_in": "includes/Watchlist/SpecialEditWatchlist.php"},
-            {"function_name": "countAllForUser", "defined_in": "includes/Watchlist/WatchedItemQueryService.php"},
-            {"function_name": "duplicateEntry", "defined_in": "includes/Watchlist/WatchedItemQueryService.php"},
-            {"function_name": "isTempWatchedIgnoringRights", "defined_in": "includes/Watchlist/WatchlistManager.php"},
-            {"function_name": "modifyWatchedItemsWithRCInfo", "defined_in": "includes/Watchlist/WatchedItemQueryService.php"},
-            {"function_name": "modifyWatchedItemsWithRCInfoQuery", "defined_in": "includes/Watchlist/WatchedItemQueryService.php"},
-            {"function_name": "overrideDeferredUpdatesAddCallableUpdateCallback", "defined_in": "includes/Watchlist/WatchedItemStore.php"},
-            {"function_name": "removeWatchIgnoringRights", "defined_in": "includes/Watchlist/WatchlistManager.php"},
-            {"function_name": "resetNotificationTimestamp", "defined_in": "includes/Watchlist/WatchedItemStore.php"},
-        ],
-        "scope": "includes/Watchlist/",
-        "exclusions": ["tests/", "vendor/", "__construct", "__destruct"],
+        "baseline_id": baseline["baseline_id"],
+        "reviewed_at": baseline["reviewed_at"],
+        "selection_rule": baseline["selection_rule"],
+        "unused_functions": literal,
+        "literal_external_only": literal,
+        "likely_dead_code": likely_dead_code,
+        "scope": baseline["scope"],
+        "exclusions": baseline["exclusions"],
         "function_keywords": [
-            "buildTools", "countAllForUser", "duplicateEntry",
-            "isTempWatchedIgnoringRights", "modifyWatchedItemsWithRCInfo",
-            "overrideDeferredUpdatesAddCallableUpdateCallback",
-            "removeWatchIgnoringRights", "resetNotificationTimestamp",
+            item["function_name"] for item in literal
         ],
+        "engineering_review": baseline["engineering_review"],
     }
 
 
