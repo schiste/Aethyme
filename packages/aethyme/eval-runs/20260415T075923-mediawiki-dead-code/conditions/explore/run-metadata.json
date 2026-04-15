@@ -1,0 +1,22 @@
+{
+  "stored_at": "2026-04-15T08:07:13.191047+00:00",
+  "schema_version": "1",
+  "contract_versions": {
+    "repository_snapshot": "1",
+    "run_metadata": "1",
+    "graph_export": "1",
+    "eval_artifact": "1",
+    "ranking": "1",
+    "output": "1"
+  },
+  "tokens": {
+    "input_tokens": 982,
+    "output_tokens": 53844,
+    "cache_read_tokens": 12946777,
+    "cache_create_tokens": 193220,
+    "total_tokens": 13194823
+  },
+  "duration_seconds": 314.304,
+  "exit_code": 0,
+  "command": "claude --dangerously-skip-permissions --model haiku --session-id 87e5c0e3-9222-4165-9672-ba05435bb78a -n aethyme-explore"
+}

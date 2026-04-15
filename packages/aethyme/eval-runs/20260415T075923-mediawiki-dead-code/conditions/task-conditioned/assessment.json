@@ -1,0 +1,12 @@
+{
+  "weighted_score": 60.5,
+  "max_score": 100,
+  "scores": {
+    "overall": 0.605
+  },
+  "weights": {
+    "overall": 100
+  },
+  "method": "server_keyword_heuristic",
+  "eval_type": "dead-code"
+}

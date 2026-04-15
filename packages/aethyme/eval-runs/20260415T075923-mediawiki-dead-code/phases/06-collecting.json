@@ -1,0 +1,98 @@
+{
+  "phase": "collecting",
+  "status": "success",
+  "contract_versions": {
+    "repository_snapshot": "1",
+    "run_metadata": "1",
+    "graph_export": "1",
+    "eval_artifact": "1",
+    "ranking": "1",
+    "output": "1"
+  },
+  "updated_at": "2026-04-15T08:07:13.344850+00:00",
+  "started_at": "2026-04-15T08:07:12.898700+00:00",
+  "finished_at": "2026-04-15T08:07:13.344804+00:00",
+  "duration_seconds": 0.446,
+  "details": {
+    "conditions": [
+      "control-cto-off",
+      "control-cto-on",
+      "explore",
+      "leverage",
+      "task-conditioned"
+    ],
+    "collected_conditions": [
+      "control-cto-off",
+      "control-cto-on",
+      "explore",
+      "leverage",
+      "task-conditioned"
+    ],
+    "tab_outputs": {
+      "control-cto-off": 6059,
+      "control-cto-on": 5107,
+      "explore": 9543,
+      "leverage": 5920,
+      "task-conditioned": 5326
+    },
+    "deliverable_statuses": {
+      "control-cto-off": "success",
+      "control-cto-on": "success",
+      "explore": "success",
+      "leverage": "success",
+      "task-conditioned": "success"
+    },
+    "output_snapshots": {
+      "control-cto-off": {
+        "path": "/Users/christophehenner/Downloads/Repositories/Playground/Mediawiki/Mediawiki - Control/.aethyme-eval-output-control-cto-off.md",
+        "exists": true,
+        "readable": true,
+        "chars": 6059,
+        "size_bytes": 6059,
+        "mtime_ns": 1776240428939411287,
+        "age_seconds": 3.96,
+        "sha256": "bb99f810b2a02dbfdca02d38d90ab7e8fb4a0f97129ab66e2dd7655f029bf873"
+      },
+      "control-cto-on": {
+        "path": "/Users/christophehenner/Downloads/Repositories/Playground/Mediawiki/Mediawiki - Control/.aethyme-eval-output-control-cto-on.md",
+        "exists": true,
+        "readable": true,
+        "chars": 5107,
+        "size_bytes": 5107,
+        "mtime_ns": 1776240236608965652,
+        "age_seconds": 196.29,
+        "sha256": "8c5d0e3f545d765633f36f3cd82bdbbafdbac442d78dfecc3bfa84fdb6ba79a0"
+      },
+      "explore": {
+        "path": "/Users/christophehenner/Downloads/Repositories/Playground/Mediawiki/Mediawiki - Aethyme/.aethyme-eval-output-explore.md",
+        "exists": true,
+        "readable": true,
+        "chars": 9543,
+        "size_bytes": 9551,
+        "mtime_ns": 1776240398646076582,
+        "age_seconds": 34.253,
+        "sha256": "a99ff36cfc2e2c201b4c93fdf60bd00ff5bd284bf4ac12233975d8abee43b352"
+      },
+      "leverage": {
+        "path": "/Users/christophehenner/Downloads/Repositories/Playground/Mediawiki/Mediawiki - Aethyme/.aethyme-eval-output-leverage.md",
+        "exists": true,
+        "readable": true,
+        "chars": 5920,
+        "size_bytes": 5920,
+        "mtime_ns": 1776240395535494375,
+        "age_seconds": 37.364,
+        "sha256": "e95d6d873ec3f716d1ec8baaac0cec3ba831842c9f811019656b4945cd523d64"
+      },
+      "task-conditioned": {
+        "path": "/Users/christophehenner/Downloads/Repositories/Playground/Mediawiki/Mediawiki - Aethyme/.aethyme-eval-output-task-conditioned.md",
+        "exists": true,
+        "readable": true,
+        "chars": 5326,
+        "size_bytes": 5326,
+        "mtime_ns": 1776240259440415929,
+        "age_seconds": 173.459,
+        "sha256": "6168528c8228e3e06be73389f121db0158a16ee2835273b5e09a3ed19f462731"
+      }
+    }
+  }
+}

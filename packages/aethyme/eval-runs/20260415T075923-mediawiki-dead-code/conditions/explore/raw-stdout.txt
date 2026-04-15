@@ -1,0 +1,243 @@
+# Analysis: Unused Public Methods in includes/Watchlist/
+
+## Summary
+Found **10 public methods** in `includes/Watchlist/` that are never called from outside that directory (excluding tests and vendor code).
+
+## Methodology
+- Extracted all public method definitions (excluding `__construct` and `__destruct`) from all PHP files in `includes/Watchlist/`
+- For each method, searched the entire codebase for calls using pattern matching for `->methodName` or `::methodName`
+- Excluded searches from `tests/` and `vendor/` directories per requirements
+- Excluded internal calls from within `includes/Watchlist/` to focus on external usage
+- Verified results by analyzing call stacks and method implementations
+
+---
+
+## Unused Public Methods
+
+### 1. buildTools (WatchlistSpecialPage)
+**File:** `includes/Watchlist/WatchlistSpecialPage.php:103`
+
+**Method signature:**
+```php
+public function buildTools( ?int $selectedMode = null ): string
+```
+
+**Why unused:**
+- Only called from `outputSubtitle()` method (line 91) within the same trait file
+- `outputSubtitle()` is a `protected` method, not public
+- While `outputSubtitle()` is called from `SpecialWatchlist`, `SpecialEditWatchlist`, and `SpecialWatchlistLabels`, these are in `includes/Specials/` (outside Watchlist directory), but they call the inherited protected method, not `buildTools` directly
+- No direct calls to `buildTools()` from outside the trait
+
+---
+
+### 2. countAllForUser (WatchlistLabelStore)
+**File:** `includes/Watchlist/WatchlistLabelStore.php:240`
+
+**Method signature:**
+```php
+public function countAllForUser( UserIdentity $user ): int
+```
+
+**Why unused:**
+- Only called from `save()` method (line 56) within the same class
+- Used internally to validate label count limits before creating new labels
+- No external callers found outside `includes/Watchlist/`
+
+**Search performed:**
+- Searched for `countAllForUser` across entire codebase excluding tests/vendor
+- Found only: `includes/Watchlist/WatchlistLabelStore.php:56` and `includes/Watchlist/WatchlistLabelStore.php:240`
+
+---
+
+### 3. duplicateEntry (WatchedItemStore)
+**File:** `includes/Watchlist/WatchedItemStore.php:1593`
+
+**Method signature:**
+```php
+public function duplicateEntry( PageReference $oldTarget, PageReference $newTarget )
+```
+
+**Why unused:**
+- Interface method defined in `WatchedItemStoreInterface`
+- Only called from `duplicateAllAssociatedEntries()` method (lines 1566, 1576) within the same `WatchedItemStore` class
+- No external calls from outside `includes/Watchlist/` directory
+- Different from `duplicateAllAssociatedEntries()` which IS called externally (in MovePage.php and MergeHistory.php)
+
+**Search performed:**
+- Searched for `->duplicateEntry` and `::duplicateEntry` outside Watchlist directory
+- No results found in non-test code
+
+---
+
+### 4. isTempWatchedIgnoringRights (WatchlistManager)
+**File:** `includes/Watchlist/WatchlistManager.php:320`
+
+**Method signature:**
+```php
+public function isTempWatchedIgnoringRights( UserIdentity $userIdentity, PageReference $target ): bool
+```
+
+**Why unused:**
+- Only called from `isTempWatched()` method (line 337) within the same class
+- `isTempWatched()` is the public wrapper that checks permissions before calling this method
+- No external calls found
+- Follows the pattern: public method with rights check → internal method without rights check
+
+**Search performed:**
+- Searched for `->isTempWatchedIgnoringRights` outside Watchlist directory
+- No results found
+
+---
+
+### 5. modifyWatchedItemsWithRCInfo (WatchedItemQueryServiceExtension)
+**File:** `includes/Watchlist/WatchedItemQueryServiceExtension.php:59`
+
+**Method signature:**
+```php
+public function modifyWatchedItemsWithRCInfo( UserIdentity $user, array $options, IReadableDatabase $db, array &$items, $res, &$startFrom )
+```
+
+**Why unused:**
+- Interface method defined in `WatchedItemQueryServiceExtension` interface
+- Marked as `@deprecated since 1.46` - no longer called
+- No implementations found in the codebase
+- Note: interface indicates it was deprecated in favor of `ApiQueryBaseBeforeQueryHook`
+
+**Search performed:**
+- Searched for `->modifyWatchedItemsWithRCInfo` and `::modifyWatchedItemsWithRCInfo`
+- No implementation calls or interface usage found
+
+---
+
+### 6. modifyWatchedItemsWithRCInfoQuery (WatchedItemQueryServiceExtension)
+**File:** `includes/Watchlist/WatchedItemQueryServiceExtension.php:39`
+
+**Method signature:**
+```php
+public function modifyWatchedItemsWithRCInfoQuery( UserIdentity $user, array $options, IReadableDatabase $db, array &$tables, array &$fields, array &$conds, array &$dbOptions, array &$joinConds )
+```
+
+**Why unused:**
+- Interface method defined in `WatchedItemQueryServiceExtension` interface  
+- Marked as `@deprecated since 1.46` - no longer called
+- No implementations found in the codebase
+- Note: interface indicates it was deprecated in favor of `ApiQueryBaseBeforeQueryHook`
+
+**Search performed:**
+- Searched for `->modifyWatchedItemsWithRCInfoQuery` and `::modifyWatchedItemsWithRCInfoQuery`
+- No implementation calls or interface usage found
+
+---
+
+### 7. newForUser (ClearUserWatchlistJob)
+**File:** `includes/Watchlist/ClearUserWatchlistJob.php:36`
+
+**Method signature:**
+```php
+public static function newForUser( UserIdentity $user, $maxWatchlistId )
+```
+
+**Why unused:**
+- Static factory method
+- Only called from `WatchedItemStore::clearUserWatchedItemsUsingJobQueue()` (line 376)
+- This call is within `includes/Watchlist/` directory
+- Class is registered in job queue config but instantiated only via factory method from within Watchlist directory
+
+**Search performed:**
+- Searched for `ClearUserWatchlistJob::newForUser` and `->newForUser`
+- Found only: `includes/Watchlist/WatchedItemStore.php:376`
+
+---
+
+### 8. overrideDeferredUpdatesAddCallableUpdateCallback (WatchedItemStore)
+**File:** `includes/Watchlist/WatchedItemStore.php:180`
+
+**Method signature:**
+```php
+public function overrideDeferredUpdatesAddCallableUpdateCallback( callable $callback ): ScopedCallback
+```
+
+**Why unused:**
+- Returns a `ScopedCallback` for testing purposes
+- Used only in unit tests (in `tests/phpunit/unit/includes/Watchlist/WatchedItemStoreUnitTest.php`)
+- Never called from any production code
+- Appears to be a testing utility method exposed publicly
+
+**Search performed:**
+- Searched for `->overrideDeferredUpdatesAddCallableUpdateCallback` excluding tests
+- No non-test results found
+
+---
+
+### 9. removeWatchIgnoringRights (WatchlistManager)
+**File:** `includes/Watchlist/WatchlistManager.php:411`
+
+**Method signature:**
+```php
+public function removeWatchIgnoringRights( UserIdentity $userIdentity, PageReference $target ): StatusValue
+```
+
+**Why unused:**
+- Only called from `removeWatch()` method (line 489) and `setWatch()` method (line 534) within the same class
+- `removeWatch()` is the public wrapper that checks permissions before calling this method
+- No external calls found
+- Follows the pattern: public method with rights check → internal method without rights check
+
+**Search performed:**
+- Searched for `->removeWatchIgnoringRights` outside Watchlist directory
+- No results found
+
+---
+
+### 10. resetNotificationTimestamp (WatchedItemStore)
+**File:** `includes/Watchlist/WatchedItemStore.php:1334`
+
+**Method signature:**
+```php
+public function resetNotificationTimestamp( UserIdentity $user, PageReference $title, $force = '', $oldid = 0 )
+```
+
+**Why unused:**
+- Interface method defined in `WatchedItemStoreInterface`
+- Only called from `WatchlistManager::clearTitleUserNotifications()` (line 232) within `includes/Watchlist/`
+- Also called in unit tests only
+- Despite being an interface method with multiple implementations (`WatchedItemStore`, `NoWriteWatchedItemStore`), it is never called from outside the Watchlist directory
+
+**Search performed:**
+- Searched for `->resetNotificationTimestamp` and `::resetNotificationTimestamp` outside Watchlist directory
+- Found calls in tests only, not in production code
+
+---
+
+## Summary by Category
+
+### Regular (Non-Interface) Methods (6)
+1. buildTools
+2. countAllForUser
+3. isTempWatchedIgnoringRights
+4. newForUser
+5. overrideDeferredUpdatesAddCallableUpdateCallback
+6. removeWatchIgnoringRights
+
+### Interface Methods (4)
+1. duplicateEntry (from `WatchedItemStoreInterface`)
+2. modifyWatchedItemsWithRCInfo (from `WatchedItemQueryServiceExtension`) - **DEPRECATED**
+3. modifyWatchedItemsWithRCInfoQuery (from `WatchedItemQueryServiceExtension`) - **DEPRECATED**
+4. resetNotificationTimestamp (from `WatchedItemStoreInterface`)
+
+---
+
+## Observations
+
+1. **Deprecated Methods**: Two methods (`modifyWatchedItemsWithRCInfo` and `modifyWatchedItemsWithRCInfoQuery`) are explicitly marked as deprecated since version 1.46 and replaced with `ApiQueryBaseBeforeQueryHook`.
+
+2. **Internal Utility Pattern**: Several methods follow an intentional pattern where a public method with rights checks calls an internal method without rights checks:
+   - `removeWatch()` → `removeWatchIgnoringRights()`
+   - `isTempWatched()` → `isTempWatchedIgnoringRights()`
+
+3. **Testing Utility**: `overrideDeferredUpdatesAddCallableUpdateCallback()` appears to be a testing utility exposed publicly but never used in production code.
+
+4. **Interface Implementations**: Despite being part of public interfaces (`WatchedItemStoreInterface`, `WatchedItemQueryServiceExtension`), several methods are never actually called from outside the directory, suggesting they may be:
+   - Part of deprecated interfaces
+   - Intended for future use
+   - Requirements of interface contracts but not actually used

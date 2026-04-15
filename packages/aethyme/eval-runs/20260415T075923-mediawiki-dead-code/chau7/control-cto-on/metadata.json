@@ -1,0 +1,16 @@
+{
+  "stored_at": "2026-04-15T08:07:13.055974+00:00",
+  "schema_version": "1",
+  "contract_versions": {
+    "repository_snapshot": "1",
+    "run_metadata": "1",
+    "graph_export": "1",
+    "eval_artifact": "1",
+    "ranking": "1",
+    "output": "1"
+  },
+  "run_id": "run-1776239963-mediawiki-dead-code",
+  "session_id": "4bb0f177-52dc-460d-b012-855fc9c1c6b6",
+  "transcript_turns": 188,
+  "tool_call_count": 51
+}

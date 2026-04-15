@@ -1,0 +1,92 @@
+IMPORTANT: You MUST save your complete analysis to `/Users/christophehenner/Downloads/Repositories/Playground/Mediawiki/Mediawiki - Aethyme/.aethyme-eval-output-task-conditioned.md` when done. Use the Write tool to create this file with your full response.
+
+Find all public methods in `includes/Watchlist/` that are never called from outside that directory.
+
+Scope:
+- Check every PHP file in `includes/Watchlist/` for public function definitions
+- For each public function, search the ENTIRE codebase (outside `includes/Watchlist/`) for call sites
+- Exclude test files (`tests/`) and vendor files (`vendor/`) from the caller search
+- Exclude constructors (`__construct`, `__destruct`)
+
+For each unused function, report:
+- The function name
+- The file it's defined in (relative path)
+- Why you believe it's unused (what you searched for and didn't find)
+
+Be thorough — check every public function, not just a sample. Missing a truly unused function or falsely flagging a used one both count against you.
+
+Repository path: /Users/christophehenner/Downloads/Repositories/Playground/Mediawiki/Mediawiki - Aethyme
+
+The navigation context below is a pre-computed map of the repository structure derived from graph analysis. Use it as your starting point — validate and deepen by reading the actual source files listed. Focus on architecture, not surface descriptions.
+
+## Navigation Context
+
+**Repository:** 12496 files, languages: javascript, php, python
+
+### README (`README.md`)
+```
+# MediaWiki
+
+MediaWiki is a free and open-source wiki software package written in PHP. It
+serves as the platform for Wikipedia and the other Wikimedia projects, used
+by hundreds of millions of people each month. MediaWiki is localised in over
+350 languages and its reliability and robust feature set have earned it a large
+and vibrant community of third-party users and developers.
+
+MediaWiki is:
+
+* feature-rich and extensible, both on-wiki and with hundreds of extensions;
+* scalable and suitable for both small and large sites;
+* simple to install, working on most hardware/software combinations; and
+* available in your language.
+
+For system requirements, installation, and upgrade details, see the files
+RELEASE-NOTES, INSTALL, and UPGRADE.
+
+* Ready to get started?
+  * https://www.mediawiki.org/wiki/Special:MyLanguage/Download
+* Setting up your local development environment?
+  * https://www.mediawiki.org/wiki/Special:MyLanguage/Local_development_quickstart
+* Looking for the technical manual?
+  * https://www.mediawiki.org/wiki/Special:MyLanguage/Manual:Contents
+* Seeking help from a person?
+```
+
+### Entry Points (root-level source files)
+- `.svgo.config.js` — SVGO Configuration Compatible to v3.0.0+
+- `Gruntfile.js` — module.exports = function ( grunt ) {
+- `api.php` — The web entry point for all %Action API queries, handled by ApiMain and ApiBase subclasses.
+- `autoload.php` — global $wgAutoloadLocalClasses;
+- `img_auth.php` — The web entry point for serving non-public images to logged-in users. To use this, see https://www.mediawiki.org/wiki/Special:MyLanguage/Manual:Image_authorization
+- `index.php` — The.php entry point for web browser navigations, usually routed to an Action or SpecialPage subclass.
+- `load.php` — use MediaWiki\Context\RequestContext;
+- `opensearch_desc.php` — The web entry point for generating an OpenSearch description document. See <http://www.opensearch.org/> for the specification of the OpenSearch
+
+### Bootstrap Chain
+`includes/BootstrapHelperFunctions.php` → `includes/MainConfigNames.php` → `includes/MainConfigSchema.php` → `includes/MediaWikiServices.php` → `includes/Setup.php`
+
+### Structure (top directories by file count)
+- `includes/` (3461 files) — key: libs (431), Api (291), Installer (268), Rest (173), Page (110)
+- `languages/` (3154 files) — key: messages (519)
+- `tests/` (2644 files) — key: phpunit (2371), qunit (76), selenium (61), api-testing (54), parser (29)
+- `resources/` (2639 files) — key: lib (1976), src (604), assets (43)
+- `maintenance/` (292 files) — key: language (35), benchmarks (18), includes (17), storage (14)
+- `sql/` (162 files)
+- `docs/` (62 files) — key: licenses (12)
+- `mw-config/` (13 files)
+- `extensions/` (3 files)
+- `skins/` (3 files)
+
+### Suggested Starting Files
+- `includes/ServiceWiring.php` — service/DI wiring
+- `docs/Events.md` — extensibility documentation
+- `docs/Hooks.md` — extensibility documentation
+
+
+## Subsystem Detail: `includes/Watchlist//`
+
+**Files:** 0
+
+
+
+Remember: save your complete analysis to `/Users/christophehenner/Downloads/Repositories/Playground/Mediawiki/Mediawiki - Aethyme/.aethyme-eval-output-task-conditioned.md`.

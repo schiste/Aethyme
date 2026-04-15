@@ -1,0 +1,40 @@
+{
+  "schema_version": "1",
+  "timestamp": "2026-04-15T07:59:23.857252+00:00",
+  "aethyme_commit": "093707b0136232bfc9f0c06b2add174ea4ba3b43",
+  "repo_path": "/Users/christophehenner/Downloads/Repositories/Playground/Mediawiki",
+  "eval_type": "dead-code",
+  "conditions": [
+    "control-cto-off",
+    "control-cto-on",
+    "explore",
+    "leverage",
+    "task-conditioned"
+  ],
+  "contract_versions": {
+    "repository_snapshot": "1",
+    "run_metadata": "1",
+    "graph_export": "1",
+    "eval_artifact": "1",
+    "ranking": "1",
+    "output": "1"
+  },
+  "model": {
+    "name": "haiku",
+    "provider": "anthropic",
+    "backend": "claude",
+    "reasoning": "default",
+    "input_cost_per_m": 0.8,
+    "output_cost_per_m": 4.0
+  },
+  "plan_run_dir": "eval-runs/20260415T075923-mediawiki-dead-code",
+  "plan": {
+    "id": "20260415T075923-mediawiki-dead-code",
+    "path": "/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/eval-runs/plans/20260415T075923-mediawiki-dead-code.json"
+  },
+  "preparation": {
+    "id": "20260415T075923-mediawiki",
+    "ready": true,
+    "path": "/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/eval-runs/preparations/20260415T075923-mediawiki.json"
+  }
+}

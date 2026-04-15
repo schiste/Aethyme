@@ -1,0 +1,40 @@
+{
+  "schema_version": "1",
+  "artifact_kind": "output-schema",
+  "generated_at": "2026-04-15T07:59:23.610578+00:00",
+  "run_id": "run-1776239963-mediawiki-dead-code",
+  "eval_type": "dead-code",
+  "target": "mediawiki",
+  "payload": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "unused_functions"
+    ],
+    "properties": {
+      "unused_functions": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "function_name",
+            "defined_in",
+            "reason"
+          ],
+          "properties": {
+            "function_name": {
+              "type": "string"
+            },
+            "defined_in": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}
