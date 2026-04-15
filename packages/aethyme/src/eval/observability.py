@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,8 @@ from .report import EVAL_RUNS_ROOT
 
 SETUP_RUNS_ROOT = EVAL_RUNS_ROOT / "setup-runs"
 PLANS_ROOT = EVAL_RUNS_ROOT / "plans"
+DEFAULT_OUTPUT_MIN_CHARS = 64
+DEFAULT_OUTPUT_STABLE_AGE_SECONDS = 3.0
 
 
 def utc_now_iso() -> str:
@@ -41,6 +45,53 @@ def append_log(path: Path, message: str) -> Path:
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(f"{utc_now_iso()} {message}\n")
     return path
+
+
+def snapshot_text_output(path: Path, *, now: float | None = None) -> dict[str, Any]:
+    """Return a lightweight snapshot of a text output file."""
+
+    snapshot: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.exists(),
+    }
+    if not path.exists():
+        return snapshot
+
+    try:
+        stat = path.stat()
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        snapshot["readable"] = False
+        return snapshot
+
+    observed_at = now if now is not None else time.time()
+    snapshot.update(
+        {
+            "readable": True,
+            "chars": len(content),
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "age_seconds": round(max(0.0, observed_at - stat.st_mtime), 3),
+            "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        }
+    )
+    return snapshot
+
+
+def text_output_is_ready(
+    snapshot: dict[str, Any],
+    *,
+    min_chars: int = DEFAULT_OUTPUT_MIN_CHARS,
+    stable_age_seconds: float = DEFAULT_OUTPUT_STABLE_AGE_SECONDS,
+) -> bool:
+    """Return True when an output file is present, non-trivial, and stable."""
+
+    if not snapshot.get("exists") or not snapshot.get("readable", True):
+        return False
+    return (
+        int(snapshot.get("chars", 0)) >= min_chars
+        and float(snapshot.get("age_seconds", 0.0)) >= stable_age_seconds
+    )
 
 
 def setup_task_dir(task_id: str) -> Path:

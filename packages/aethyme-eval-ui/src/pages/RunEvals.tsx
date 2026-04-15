@@ -119,6 +119,7 @@ export default function RunEvals() {
   const [model, setModel] = useState<ModelName>("haiku");
   const [reasoning, setReasoning] = useState<Reasoning>("high");
   const [windowId, setWindowId] = useState<string>("auto");
+  const [cleanupDelaySeconds, setCleanupDelaySeconds] = useState<string>("1");
 
   const [repos, setRepos] = useState<Repository[]>([]);
   const [loadingRepos, setLoadingRepos] = useState(true);
@@ -190,10 +191,15 @@ export default function RunEvals() {
 
   useEffect(() => {
     setPlan(null);
-  }, [evalType, target, model, reasoning, windowId]);
+  }, [evalType, target, model, reasoning, windowId, cleanupDelaySeconds]);
 
   const parsedWindowId =
     windowId === "auto" || windowId === "" ? undefined : Number.parseInt(windowId, 10);
+  const parsedCleanupDelaySeconds = Number.parseInt(cleanupDelaySeconds, 10);
+  const effectiveCleanupDelaySeconds =
+    Number.isFinite(parsedCleanupDelaySeconds) && parsedCleanupDelaySeconds >= 0
+      ? parsedCleanupDelaySeconds
+      : 1;
 
   async function handleGeneratePlan() {
     setStatus("planning");
@@ -201,8 +207,8 @@ export default function RunEvals() {
     setLog([]);
     try {
       const config = parsedWindowId === undefined
-        ? { evalType, target, model, reasoning }
-        : { evalType, target, model, reasoning, windowId: parsedWindowId };
+        ? { evalType, target, model, reasoning, cleanupDelaySeconds: effectiveCleanupDelaySeconds }
+        : { evalType, target, model, reasoning, windowId: parsedWindowId, cleanupDelaySeconds: effectiveCleanupDelaySeconds };
       const result = await generatePlan(config);
       setPlan(result);
       setLog((prev) => [...prev, "Plan generated successfully."]);
@@ -317,8 +323,8 @@ export default function RunEvals() {
     setLog([]);
     try {
       const config = parsedWindowId === undefined
-        ? { evalType, target, model, reasoning, preparationId: preparation.id }
-        : { evalType, target, model, reasoning, windowId: parsedWindowId, preparationId: preparation.id };
+        ? { evalType, target, model, reasoning, preparationId: preparation.id, cleanupDelaySeconds: effectiveCleanupDelaySeconds }
+        : { evalType, target, model, reasoning, windowId: parsedWindowId, preparationId: preparation.id, cleanupDelaySeconds: effectiveCleanupDelaySeconds };
       const state = await launchRun(config);
       setCurrentPhase(state.currentPhase);
       setLog(state.log);
@@ -524,10 +530,29 @@ export default function RunEvals() {
                   ))}
                 </select>
               </div>
+
+              <div>
+                <label className="block text-xs text-[var(--color-text-muted)] uppercase tracking-wide mb-1">
+                  Cleanup Delay
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={cleanupDelaySeconds}
+                  onChange={(e) => setCleanupDelaySeconds(e.target.value)}
+                  className={selectClass}
+                />
+              </div>
             </div>
-            <p className="text-xs text-[var(--color-text-muted)]">
-              Auto uses Chau7&apos;s active/preferred window. Pick a window ID to force eval tabs into that window.
-            </p>
+            <div className="space-y-1 text-xs text-[var(--color-text-muted)]">
+              <p>
+                Auto uses Chau7&apos;s active/preferred window. Pick a window ID to force eval tabs into that window.
+              </p>
+              <p>
+                Cleanup delay is the number of seconds to keep eval tabs open after finalization before closing them. Use a long delay for debugging and `1` for normal data collection.
+              </p>
+            </div>
           </div>
 
           <div className="flex gap-2 pt-2">

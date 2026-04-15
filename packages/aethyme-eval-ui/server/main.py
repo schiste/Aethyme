@@ -11,7 +11,7 @@ from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from db import import_eval_runs, query_results, insert_result
 
@@ -339,6 +339,7 @@ def _plan_request_payload(req: Any) -> dict[str, Any]:
         "reasoning": req.reasoning,
         "windowId": getattr(req, "windowId", None),
         "preparationId": getattr(req, "preparationId", None),
+        "cleanupDelaySeconds": getattr(req, "cleanupDelaySeconds", 1),
     }
 
 
@@ -375,6 +376,13 @@ async def _generate_plan(req: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         raise HTTPException(status_code=500, detail=f"Failed to parse plan output: {stdout.decode()[:500]}") from exc
 
     plan_snapshot = persist_plan_snapshot(plan=plan, request=_plan_request_payload(req))
+    cleanup_delay_seconds = getattr(req, "cleanupDelaySeconds", 1)
+    plan.setdefault("runtime", {})
+    plan["runtime"]["cleanupDelaySeconds"] = cleanup_delay_seconds
+    for phase in plan.get("phases", []):
+        if phase.get("name") == "cleanup":
+            phase["cleanup_delay_seconds"] = cleanup_delay_seconds
+            break
     plan["observability"] = {
         "planId": plan_snapshot["id"],
         "planPath": plan_snapshot["path"],
@@ -802,6 +810,7 @@ class PlanRequest(BaseModel):
     model: str
     reasoning: str = "high"
     windowId: int | None = None
+    cleanupDelaySeconds: int = Field(default=1, ge=0, le=3600)
 
 @app.post("/api/plan")
 async def generate_plan(req: PlanRequest) -> dict[str, Any]:
@@ -893,6 +902,7 @@ class RunRequest(BaseModel):
     reasoning: str = "high"
     windowId: int | None = None
     preparationId: str | None = None
+    cleanupDelaySeconds: int = Field(default=1, ge=0, le=3600)
 
 _run_state: dict[str, Any] = {
     "status": "idle",
@@ -1113,6 +1123,29 @@ def _assessment_from_score(eval_type: str, score: float) -> dict[str, Any]:
         "weights": {"overall": 100},
         "method": "server_keyword_heuristic",
         "eval_type": eval_type,
+    }
+
+
+def _missing_deliverable_assessment(
+    eval_type: str,
+    *,
+    expected_output_file: str | None,
+    output_snapshot: dict[str, Any],
+    fallback_chars: int,
+    last_tab_status: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "weighted_score": 0.0,
+        "max_score": 100,
+        "scores": {"overall": 0.0},
+        "weights": {"overall": 100},
+        "method": "missing_deliverable",
+        "eval_type": eval_type,
+        "error": "expected_output_file_missing_or_incomplete",
+        "expected_output_file": expected_output_file,
+        "output_snapshot": output_snapshot,
+        "fallback_output_chars": fallback_chars,
+        "last_tab_status": last_tab_status or {},
     }
 
 
@@ -1552,7 +1585,12 @@ def _run_eval_background(
     import time
     import traceback
     _ensure_aethyme_imports()
-    from src.eval.observability import write_phase_record, write_run_plan
+    from src.eval.observability import (
+        snapshot_text_output,
+        text_output_is_ready,
+        write_phase_record,
+        write_run_plan,
+    )
     from src.eval.report import (
         create_eval_run_dir,
         finalize_eval_run,
@@ -1614,6 +1652,7 @@ def _run_eval_background(
     log(f"Plan has {len(plan['phases'])} phases")
     if req.windowId is not None:
         log(f"Requested Chau7 window_id: {req.windowId}")
+    log(f"Cleanup delay: {req.cleanupDelaySeconds}s")
 
     launch_phase = next((p for p in plan["phases"] if p["name"] == "launch"), None)
     if not launch_phase:
@@ -1874,6 +1913,9 @@ def _run_eval_background(
     start_phase("monitoring", order=5, details={"poll_interval_seconds": 10, "max_rounds": 120})
     log("Monitoring agents...")
     completed: set[str] = set()
+    output_ready: dict[str, dict[str, Any]] = {}
+    output_snapshots: dict[str, dict[str, Any]] = {}
+    last_tab_statuses: dict[str, dict[str, Any]] = {}
     for poll_round in range(120):  # Up to 20 minutes
         time.sleep(10)
         all_done = True
@@ -1881,21 +1923,43 @@ def _run_eval_background(
             if cond_name in completed:
                 continue
             try:
+                output_file = output_files.get(cond_name)
+                snapshot = snapshot_text_output(output_file) if output_file else {"exists": False}
+                output_snapshots[cond_name] = snapshot
+                if text_output_is_ready(snapshot):
+                    completed.add(cond_name)
+                    output_ready[cond_name] = snapshot
+                    log(
+                        f"[{cond_name}] Completed via output file "
+                        f"({snapshot.get('chars', 0)} chars, age={snapshot.get('age_seconds', 0)}s)"
+                    )
+                    continue
+
                 status = mcp_client.tab_status(tab_id)
                 app = status.get("active_app", "?")
                 st = status.get("status", "?")
                 at_prompt = status.get("is_at_prompt", False)
-                # Done when agent is at prompt (finished response) or shell is back (agent exited)
-                # Chau7 may report active_app as "Claude" or "Cline" depending on version
-                # Some tabs report is_at_prompt=false but raw_status=waitingForInput when done
                 is_agent = app in ("Claude", "Cline")
                 raw_st = status.get("raw_status", "")
+                last_tab_statuses[cond_name] = {
+                    "active_app": app,
+                    "status": st,
+                    "raw_status": raw_st,
+                    "is_at_prompt": at_prompt,
+                }
+
+                if poll_round % 3 == 0 and (snapshot.get("exists") or st in ("waitingForInput", "idle")):
+                    log(
+                        f"[{cond_name}] Waiting for output file: "
+                        f"exists={snapshot.get('exists', False)} chars={snapshot.get('chars', 0)} "
+                        f"age={snapshot.get('age_seconds', 0)}s app={app} status={st} raw={raw_st}"
+                    )
+
+                # Completion is file-first. Idle tab states are diagnostic only.
                 if is_agent and (at_prompt or raw_st == "waitingForInput") and st in ("waitingForInput", "idle"):
-                    completed.add(cond_name)
-                    log(f"[{cond_name}] Completed (round {poll_round}, app={app}, at_prompt={at_prompt}, raw={raw_st})")
+                    all_done = False
                 elif not is_agent and app != "?" and st == "idle":
-                    completed.add(cond_name)
-                    log(f"[{cond_name}] Agent exited (round {poll_round})")
+                    all_done = False
                 else:
                     all_done = False
             except Exception as e:
@@ -1908,11 +1972,21 @@ def _run_eval_background(
         if all_done:
             break
 
+    incomplete_conditions = sorted(set(tabs) - completed)
+    if incomplete_conditions:
+        log(f"Monitoring ended with missing deliverables: {incomplete_conditions}")
     log(f"All agents finished. Completed: {list(completed)}")
     finish_phase(
         "monitoring",
         status="success" if len(completed) == len(tabs) else "degraded",
-        details={"completed": sorted(completed), "total_tabs": len(tabs), "poll_rounds": poll_round + 1},
+        details={
+            "completed": sorted(completed),
+            "incomplete": incomplete_conditions,
+            "total_tabs": len(tabs),
+            "poll_rounds": poll_round + 1,
+            "output_ready": output_ready,
+            "last_tab_statuses": last_tab_statuses,
+        },
     )
 
     # Phase: Collect — try output file first, fall back to PTY log
@@ -1920,12 +1994,18 @@ def _run_eval_background(
     log("Collecting results...")
 
     tab_outputs: dict[str, str] = {}
+    deliverable_statuses: dict[str, str] = {}
+    final_output_snapshots: dict[str, dict[str, Any]] = {}
     for cond_name, tab_id in tabs.items():
-        # Try output file first
         output_file = output_files.get(cond_name)
-        if output_file and output_file.exists():
+        output_snapshot = snapshot_text_output(output_file) if output_file else {"exists": False}
+        final_output_snapshots[cond_name] = output_snapshot
+
+        # Try output file first
+        if output_file and text_output_is_ready(output_snapshot):
             text = output_file.read_text(encoding="utf-8")
             tab_outputs[cond_name] = text
+            deliverable_statuses[cond_name] = "success"
             log(f"[{cond_name}] Output file read: {len(text)} chars")
         else:
             # Fall back to PTY log + cleaning
@@ -1934,9 +2014,14 @@ def _run_eval_background(
                 raw_text = raw.get("output", "")
                 cleaned = _clean_pty_output(raw_text)
                 tab_outputs[cond_name] = cleaned
-                log(f"[{cond_name}] PTY log fallback: {len(raw_text)} raw → {len(cleaned)} cleaned chars")
+                deliverable_statuses[cond_name] = "failed" if not output_snapshot.get("exists") else "degraded"
+                log(
+                    f"[{cond_name}] PTY log fallback: {len(raw_text)} raw → {len(cleaned)} cleaned chars "
+                    f"(deliverable status: {deliverable_statuses[cond_name]})"
+                )
             except Exception as e:
                 tab_outputs[cond_name] = ""
+                deliverable_statuses[cond_name] = "failed" if not output_snapshot.get("exists") else "degraded"
                 log(f"[{cond_name}] Failed to capture output: {e}")
 
     log(f"Session file mapping: {json.dumps({k: v.name for k, v in session_files.items()})}")
@@ -2053,16 +2138,37 @@ def _run_eval_background(
             tools_str = ", ".join(f"{n}:{c}" for n, c in sorted(data["tool_names"].items(), key=lambda x: -x[1])[:5])
             log(f"[{cond_name}] Turns: {data['turns']}, Tools: {data['tool_calls']} ({tools_str}), Tokens: {data['total_tokens']:,}, Cost: ${data['cost']}, Duration: {data['duration']}")
 
-            # Use tab output as the full analysis (JSONL misses final assistant response)
-            full_output = tab_outputs.get(cond_name, "")
-            if len(full_output) > len(data.get("output", "")):
-                data["output"] = full_output
-                log(f"[{cond_name}] Using tab output ({len(full_output)} chars) instead of JSONL ({len(data.get('output', ''))} chars)")
-
-            # Score the output — pass the prompt to exclude it from keyword matching
             cond_prompt = Path(prompt_files.get(cond_name, "")).read_text(encoding="utf-8") if prompt_files.get(cond_name) and Path(prompt_files.get(cond_name, "")).exists() else ""
-            score = _score_output(req.evalType, data["output"], data["cost"], prompt=cond_prompt)
-            log(f"[{cond_name}] Score: {score:.1f}")
+            output_snapshot = final_output_snapshots.get(cond_name, {"exists": False})
+            deliverable_status = deliverable_statuses.get(cond_name, "failed")
+            full_output = tab_outputs.get(cond_name, "")
+
+            if deliverable_status == "success":
+                if len(full_output) > len(data.get("output", "")):
+                    data["output"] = full_output
+                    log(
+                        f"[{cond_name}] Using output file ({len(full_output)} chars) "
+                        f"in place of JSONL ({len(data.get('output', ''))} chars)"
+                    )
+                score = _score_output(req.evalType, data["output"], data["cost"], prompt=cond_prompt)
+                assessment = _assessment_from_score(req.evalType, score)
+                log(f"[{cond_name}] Score: {score:.1f}")
+            else:
+                data["output"] = ""
+                score = 0.0
+                assessment = _missing_deliverable_assessment(
+                    req.evalType,
+                    expected_output_file=str(output_files.get(cond_name)) if output_files.get(cond_name) else None,
+                    output_snapshot=output_snapshot,
+                    fallback_chars=len(full_output),
+                    last_tab_status=last_tab_statuses.get(cond_name),
+                )
+                log(
+                    f"[{cond_name}] Missing deliverable: status={deliverable_status} "
+                    f"output_exists={output_snapshot.get('exists', False)} "
+                    f"chars={output_snapshot.get('chars', 0)} "
+                    f"fallback_chars={len(full_output)}"
+                )
 
             transcript = _read_session_events(session_file)
             tool_calls = _extract_tool_calls(transcript)
@@ -2079,11 +2185,17 @@ def _run_eval_background(
                 session_id=session_ids.get(cond_name),
                 started_at=data.get("started_at"),
                 finished_at=data.get("last_ts"),
-                status="success" if cond_name in completed else "degraded",
+                status=deliverable_status,
             )
             structured_output = {
                 "raw_output": data.get("output", ""),
+                "expected_output_file": str(output_files.get(cond_name)) if output_files.get(cond_name) else None,
+                "deliverable_status": deliverable_status,
+                "output_snapshot": output_snapshot,
+                "fallback_output_chars": len(full_output),
             }
+            if deliverable_status != "success" and full_output:
+                structured_output["partial_output"] = full_output
             run_payload = {
                 "command": (
                     f"claude --dangerously-skip-permissions --model {req.model} "
@@ -2104,7 +2216,6 @@ def _run_eval_background(
                 "structured_output": structured_output,
                 "run_metadata": run_metadata,
             }
-            assessment = _assessment_from_score(req.evalType, score)
             condition_payloads[cond_name] = {
                 "prompt": cond_prompt,
                 "run": run_payload,
@@ -2126,7 +2237,7 @@ def _run_eval_background(
                 },
                 duration_seconds=data.get("duration_seconds"),
                 tool_calls=tool_calls,
-                exit_code=0 if cond_name in completed else None,
+                exit_code=0 if deliverable_status == "success" else None,
                 command=run_payload["command"],
             )
             store_condition_chau7(
@@ -2179,10 +2290,16 @@ def _run_eval_background(
             log(traceback.format_exc())
     finish_phase(
         "collecting",
-        status="success" if len(condition_payloads) == len(tabs) else "degraded",
+        status=(
+            "success"
+            if len(condition_payloads) == len(tabs) and all(v == "success" for v in deliverable_statuses.values())
+            else "degraded"
+        ),
         details={
             "collected_conditions": sorted(condition_payloads.keys()),
             "tab_outputs": {cond: len(text) for cond, text in tab_outputs.items()},
+            "deliverable_statuses": deliverable_statuses,
+            "output_snapshots": final_output_snapshots,
         },
     )
 
@@ -2210,6 +2327,7 @@ def _run_eval_background(
             cond_name: side.get("run")
             for cond_name, side in condition_payloads.items()
         },
+        "deliverable_statuses": deliverable_statuses,
         "baseline_prompt_chars": len(condition_payloads.get("control-cto-off", {}).get("prompt", "")),
         "aethyme_prompt_chars": len(condition_payloads.get("leverage", {}).get("prompt", "")),
         "task_conditioned_prompt_chars": len(condition_payloads.get("task-conditioned", {}).get("prompt", "")),
@@ -2233,7 +2351,17 @@ def _run_eval_background(
     )
 
     # Phase: Cleanup
-    start_phase("cleanup", order=8, details={"tabs": list(tabs.keys())})
+    start_phase(
+        "cleanup",
+        order=8,
+        details={
+            "tabs": list(tabs.keys()),
+            "cleanup_delay_seconds": req.cleanupDelaySeconds,
+        },
+    )
+    if req.cleanupDelaySeconds > 0:
+        log(f"Waiting {req.cleanupDelaySeconds}s before closing tabs...")
+        time.sleep(req.cleanupDelaySeconds)
     log("Closing tabs...")
     for cond_name, tab_id in tabs.items():
         try:
@@ -2244,7 +2372,14 @@ def _run_eval_background(
 
     _run_state["status"] = "complete"
     _run_state["currentPhase"] = "done"
-    finish_phase("cleanup", status="success", details={"closed_tabs": list(tabs.keys())})
+    finish_phase(
+        "cleanup",
+        status="success",
+        details={
+            "closed_tabs": list(tabs.keys()),
+            "cleanup_delay_seconds": req.cleanupDelaySeconds,
+        },
+    )
     log("Eval run complete.")
 
 

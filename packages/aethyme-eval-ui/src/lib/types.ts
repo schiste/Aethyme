@@ -94,6 +94,7 @@ export interface EvalRunConfig {
   reasoning: Reasoning;
   windowId?: number;
   preparationId?: string;
+  cleanupDelaySeconds?: number;
 }
 
 export interface EvalRunState {

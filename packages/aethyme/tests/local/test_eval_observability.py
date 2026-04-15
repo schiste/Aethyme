@@ -87,3 +87,29 @@ def test_plan_and_phase_artifacts_are_self_contained(monkeypatch, tmp_path: Path
     run_plan_payload = json.loads(run_plan_path.read_text(encoding="utf-8"))
     assert run_plan_payload["plan_snapshot"]["id"] == snapshot["id"]
     assert run_plan_payload["request"]["model"] == "haiku"
+
+
+def test_text_output_snapshot_requires_non_trivial_stable_file(tmp_path: Path) -> None:
+    output_path = tmp_path / "analysis.md"
+    output_path.write_text("x" * 80, encoding="utf-8")
+
+    too_fresh = obs.snapshot_text_output(output_path, now=output_path.stat().st_mtime)
+    assert too_fresh["exists"] is True
+    assert too_fresh["chars"] == 80
+    assert obs.text_output_is_ready(too_fresh) is False
+
+    stable = obs.snapshot_text_output(output_path, now=output_path.stat().st_mtime + 5.0)
+    assert stable["age_seconds"] >= 5.0
+    assert obs.text_output_is_ready(stable) is True
+
+
+def test_text_output_snapshot_rejects_missing_or_tiny_file(tmp_path: Path) -> None:
+    missing = obs.snapshot_text_output(tmp_path / "missing.md")
+    assert missing["exists"] is False
+    assert obs.text_output_is_ready(missing) is False
+
+    tiny_path = tmp_path / "tiny.md"
+    tiny_path.write_text("short", encoding="utf-8")
+    tiny = obs.snapshot_text_output(tiny_path, now=tiny_path.stat().st_mtime + 10.0)
+    assert tiny["chars"] == 5
+    assert obs.text_output_is_ready(tiny) is False
