@@ -682,7 +682,7 @@ Reports contain these sections **in this exact order**:
 5. **Prompts** — Verbatim prompt text for each condition in fenced code blocks. All 5 conditions always shown.
 6. **Agent Output** — Structured output JSON for each condition.
 7. **Tool Call Analysis** (auto-generated) — Per-condition tool call frequency table. Skipped if no condition has tool call data.
-8. **Verdict** (auto-generated) — One paragraph: highest/lowest quality scorer, best global scorer, cheapest/most expensive, whether all tests passed.
+8. **Verdict** (auto-generated) — One paragraph: highest/lowest quality scorer, best recalculated scorer versus baseline, cheapest/most expensive, whether all tests passed.
 9. **Notes** — Free-text notes passed via `notes=` parameter, or "N/A".
 10. **Raw Data** (collapsed at bottom) — Reference Output, Output Schema, Scoring Rubric, Per-Condition Run Records (full JSON), Per-Condition Assessments (full JSON), plus optional Context Pack, Navigation Context, Challenge, and Repo Signals.
 
@@ -695,25 +695,37 @@ All JSON dumps live exclusively in the Raw Data section — never inline in the 
 - **Total Tokens** — input + output + cache read + cache create.
 - **Score / 1K Tokens** — `quality_score * 1000 / total_tokens`.
 - **Score / Minute** — `quality_score * 60 / duration_seconds`.
-- **Global** — quality/resource tradeoff score:
+- **Recalculated Eval** — control-relative quality/resource score. The control baseline is `control-cto-off` when present, otherwise `control`:
 
 ```text
-100 * (
-  0.65 * normalized_quality +
-  0.20 * token_efficiency +
-  0.10 * duration_efficiency +
-  0.05 * cost_efficiency
-)
+100
++ quality_delta_vs_control
++ 10 * ln(token_ratio_vs_control)
++ 10 * ln(time_ratio_vs_control)
++ 5 * ln(cost_ratio_vs_control)
 ```
 
 with:
 
-- `normalized_quality = quality_score / max_quality_in_run`
-- `token_efficiency = min_total_tokens_in_run / total_tokens`
-- `duration_efficiency = min_duration_in_run / duration_seconds`
-- `cost_efficiency = min_cost_in_run / cost_usd`
+- `quality_delta_vs_control = quality_score - control_quality_score`
+- `token_ratio_vs_control = control_total_tokens / total_tokens`
+- `time_ratio_vs_control = control_duration_seconds / duration_seconds`
+- `cost_ratio_vs_control = control_cost_usd / cost_usd`
 
-Use `quality_score` to judge task success. Use `global_score` to judge task success relative to resource use. Do not collapse the two into one number during analysis.
+Interpretation:
+
+- `100` means “equal overall value to the control baseline”
+- above `100` means “better than control overall”
+- below `100` means “worse than control overall”
+
+Design intent:
+
+- quality is anchored to the baseline, not to the best run in the batch
+- beating control on quality is rewarded directly
+- doing worse than control on quality is punished directly
+- faster and cheaper only help after the quality comparison is made
+
+Use `quality_score` to judge task success. Use `global_score` / `recalculated_eval_score` to judge whether a condition beat the control baseline with acceptable runtime cost. Do not collapse the two into one number during analysis.
 
 ## Important Notes
 

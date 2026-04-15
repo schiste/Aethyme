@@ -103,27 +103,29 @@ Every finalized eval must expose these per-condition metrics:
 - `score_per_1k_tokens`
 - `score_per_minute`
 - `global_score`
+- `recalculated_eval_score`
 
-`global_score` is the quality/resource tradeoff metric used for cross-condition comparison:
+`global_score` and `recalculated_eval_score` are the same stored number. It is the control-relative comparison metric used for cross-condition evaluation:
 
 ```text
-100 * (
-  0.65 * normalized_quality +
-  0.20 * token_efficiency +
-  0.10 * duration_efficiency +
-  0.05 * cost_efficiency
-)
+100
++ quality_delta_vs_control
++ 10 * ln(token_ratio_vs_control)
++ 10 * ln(time_ratio_vs_control)
++ 5 * ln(cost_ratio_vs_control)
 ```
 
-Normalization is run-relative:
-- `normalized_quality = quality_score / max_quality_in_run`
-- `token_efficiency = min_total_tokens_in_run / total_tokens`
-- `duration_efficiency = min_duration_in_run / duration_seconds`
-- `cost_efficiency = min_cost_in_run / cost_usd`
+The baseline is `control-cto-off` when present, otherwise `control`.
+
+Control-relative terms:
+- `quality_delta_vs_control = quality_score - control_quality_score`
+- `token_ratio_vs_control = control_total_tokens / total_tokens`
+- `time_ratio_vs_control = control_duration_seconds / duration_seconds`
+- `cost_ratio_vs_control = control_cost_usd / cost_usd`
 
 Interpretation:
 - `quality_score` answers “who solved the task best?”
-- `global_score` answers “who delivered the best quality/resource tradeoff?”
+- `global_score` answers “who beat the control baseline most convincingly once quality, time, tokens, and cost are all considered?”
 
 Do not replace quality with global score. Report both.
 
@@ -186,7 +188,7 @@ CLI (src/cli.py)
        |__ Phase 3: launch (create Chau7 tabs, start backend, send prompts)
        |__ Phase 4: monitor (poll tab_status until all complete)
        |__ Phase 5: collect (read session JSONL + tab output for tokens/cost/output)
-       |__ Phase 6: score (quality + usage metrics + global score)
+       |__ Phase 6: score (quality + usage metrics + recalculated eval score)
        |__ Phase 7: report (generate markdown + complete-result bundle)
        |__ Phase 8: cleanup (close tabs)
 

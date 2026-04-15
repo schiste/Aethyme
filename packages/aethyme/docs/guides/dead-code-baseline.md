@@ -30,6 +30,6 @@ Recommended reporting for this eval:
 - `quality_score` against `literal_external_only`
 - qualitative review against `engineering_review`
 - `tool_call_count`, `top_tools`, `total_tokens`, and `duration_seconds`
-- `global_score` for quality/resource tradeoff
+- `global_score` / `recalculated_eval_score` for value relative to the `control-cto-off` baseline
 
 That keeps benchmark fit and engineering judgment separate while still exposing runtime efficiency.

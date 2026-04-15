@@ -118,7 +118,7 @@ Runtime notes:
 - without those commands, it still emits the comparison artifacts only
 - the Aethyme-assisted prompt now uses a compact rendered context-pack view instead of injecting the full raw pack
 - every `eval explain-repo` run writes a markdown report under `packages/aethyme/docs/reports/evals/`
-- the report includes quality score, global score, tool usage, tokens, duration, prompts, pack JSON, and verbose run results
+- the report includes quality score, recalculated eval score vs control baseline, tool usage, tokens, duration, prompts, pack JSON, and verbose run results
 - eval outputs now include a structured output schema, scoring rubric, and reference answer
 
 ## Start Here

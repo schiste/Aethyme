@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import subprocess
 from collections import Counter
@@ -33,11 +34,11 @@ _ALL_KNOWN_CONDITIONS = (
     "control-cto-off", "control-cto-on", "control", "explore", "leverage", "task-conditioned",
 )
 
-_GLOBAL_SCORE_WEIGHTS = {
-    "quality": 0.65,
-    "tokens": 0.20,
-    "duration": 0.10,
-    "cost": 0.05,
+_RELATIVE_SCORE_WEIGHTS = {
+    "quality_delta_multiplier": 1.0,
+    "tokens_log_multiplier": 10.0,
+    "duration_log_multiplier": 10.0,
+    "cost_log_multiplier": 5.0,
 }
 
 
@@ -537,43 +538,43 @@ def finalize_eval_run(
 
 
 def augment_result_with_summary_metrics(result: dict[str, Any]) -> dict[str, Any]:
-    """Attach per-condition efficiency summaries and cross-condition comparison."""
+    """Attach per-condition summaries and control-relative comparison metrics."""
     active = _active_conditions(result)
     if not active:
         return result
 
-    qualities: list[float] = []
-    token_totals: list[int] = []
-    durations: list[float] = []
-    costs: list[float] = []
+    baseline_condition = (
+        "control-cto-off"
+        if "control-cto-off" in active
+        else ("control" if "control" in active else active[0])
+    )
+    baseline_side = result.get(baseline_condition, {})
+    if not isinstance(baseline_side, dict):
+        baseline_side = {}
+    baseline_assessment = baseline_side.get("assessment") or {}
+    baseline_run = baseline_side.get("run") or {}
+    if not isinstance(baseline_assessment, dict):
+        baseline_assessment = {}
+    if not isinstance(baseline_run, dict):
+        baseline_run = {}
 
-    for cond in active:
-        side = result.get(cond, {})
-        if not isinstance(side, dict):
-            continue
-        assessment = side.get("assessment") or {}
-        run = side.get("run") or {}
-        if not isinstance(assessment, dict):
-            assessment = {}
-        if not isinstance(run, dict):
-            run = {}
-        quality = assessment.get("weighted_score")
-        if isinstance(quality, (int, float)):
-            qualities.append(float(quality))
-        total_tokens = _total_tokens(run)
-        if isinstance(total_tokens, int) and total_tokens > 0:
-            token_totals.append(total_tokens)
-        duration = run.get("duration_seconds")
-        if isinstance(duration, (int, float)) and duration > 0:
-            durations.append(float(duration))
-        cost = run.get("cost_usd")
-        if isinstance(cost, (int, float)) and cost > 0:
-            costs.append(float(cost))
-
-    max_quality = max(qualities) if qualities else 0.0
-    min_tokens = min(token_totals) if token_totals else None
-    min_duration = min(durations) if durations else None
-    min_cost = min(costs) if costs else None
+    baseline_quality = baseline_assessment.get("weighted_score")
+    baseline_quality = (
+        float(baseline_quality) if isinstance(baseline_quality, (int, float)) else None
+    )
+    baseline_tokens = _total_tokens(baseline_run)
+    baseline_duration = baseline_run.get("duration_seconds")
+    baseline_duration = (
+        float(baseline_duration)
+        if isinstance(baseline_duration, (int, float)) and baseline_duration > 0
+        else None
+    )
+    baseline_cost = baseline_run.get("cost_usd")
+    baseline_cost = (
+        float(baseline_cost)
+        if isinstance(baseline_cost, (int, float)) and baseline_cost > 0
+        else None
+    )
 
     global_scores: dict[str, float] = {}
     quality_scores: dict[str, float] = {}
@@ -593,10 +594,11 @@ def augment_result_with_summary_metrics(result: dict[str, Any]) -> dict[str, Any
             cond=cond,
             assessment=assessment,
             run=run,
-            max_quality=max_quality,
-            min_tokens=min_tokens,
-            min_duration=min_duration,
-            min_cost=min_cost,
+            baseline_condition=baseline_condition,
+            baseline_quality=baseline_quality,
+            baseline_tokens=baseline_tokens,
+            baseline_duration=baseline_duration,
+            baseline_cost=baseline_cost,
         )
         side["summary_metrics"] = summary
 
@@ -608,19 +610,31 @@ def augment_result_with_summary_metrics(result: dict[str, Any]) -> dict[str, Any
             global_scores[cond] = float(global_score)
 
     result["comparison"] = {
-        "global_score_formula": (
-            "100 * (0.65 * normalized_quality + 0.20 * token_efficiency "
-            "+ 0.10 * duration_efficiency + 0.05 * cost_efficiency)"
+        "baseline_condition": baseline_condition,
+        "recalculated_eval_score_formula": (
+            "100 + quality_delta_vs_control "
+            "+ 10 * ln(token_ratio_vs_control) "
+            "+ 10 * ln(time_ratio_vs_control) "
+            "+ 5 * ln(cost_ratio_vs_control)"
         ),
-        "global_score_weights": _GLOBAL_SCORE_WEIGHTS,
-        "normalization": {
-            "normalized_quality": "quality_score / max_quality_in_run",
-            "token_efficiency": "min_total_tokens_in_run / total_tokens",
-            "duration_efficiency": "min_duration_in_run / duration_seconds",
-            "cost_efficiency": "min_cost_in_run / cost_usd",
+        "relative_score_weights": _RELATIVE_SCORE_WEIGHTS,
+        "baseline_interpretation": {
+            "100": "equal overall value to the control baseline",
+            ">100": "better overall value than the control baseline",
+            "<100": "worse overall value than the control baseline",
+        },
+        "relative_metrics": {
+            "quality_delta_vs_control": "quality_score - control_cto_off_quality_score",
+            "token_ratio_vs_control": "control_cto_off_total_tokens / total_tokens",
+            "time_ratio_vs_control": "control_cto_off_duration_seconds / duration_seconds",
+            "cost_ratio_vs_control": "control_cto_off_cost_usd / cost_usd",
         },
         "best_quality_condition": max(quality_scores, key=quality_scores.get) if quality_scores else None,
-        "best_global_condition": max(global_scores, key=global_scores.get) if global_scores else None,
+        "best_relative_condition": max(global_scores, key=global_scores.get) if global_scores else None,
+        "baseline_quality_score": baseline_quality,
+        "baseline_total_tokens": baseline_tokens,
+        "baseline_duration_seconds": round(baseline_duration, 3) if baseline_duration is not None else None,
+        "baseline_cost_usd": round(baseline_cost, 4) if baseline_cost is not None else None,
     }
     return result
 
@@ -705,7 +719,7 @@ def print_scorecard(result: dict[str, Any], *, file: Any = None) -> None:
 
     # Header
     hdr = (
-        f"{'Condition':<22s} {'Qual':>6s} {'Global':>7s} {'Tools':>6s} "
+        f"{'Condition':<22s} {'Qual':>6s} {'Recalc':>7s} {'Tools':>6s} "
         f"{'Cost':>8s} {'Duration':>9s} {'Total Tok':>10s} "
         f"{'Score/1K':>9s} {'Score/Min':>10s}"
     )
@@ -803,10 +817,11 @@ def _build_condition_summary(
     cond: str,
     assessment: dict[str, Any],
     run: dict[str, Any],
-    max_quality: float,
-    min_tokens: int | None,
-    min_duration: float | None,
-    min_cost: float | None,
+    baseline_condition: str,
+    baseline_quality: float | None,
+    baseline_tokens: int | None,
+    baseline_duration: float | None,
+    baseline_cost: float | None,
 ) -> dict[str, Any]:
     quality = assessment.get("weighted_score")
     quality_score = float(quality) if isinstance(quality, (int, float)) else None
@@ -823,29 +838,40 @@ def _build_condition_summary(
     tool_freq = _tool_frequency(run)
     tool_call_count = sum(tool_freq.values()) if tool_freq else 0
 
-    quality_norm = _ratio(quality_score, max_quality) if max_quality > 0 else 0.0
-    token_eff = _ratio(min_tokens, total_tokens) if min_tokens is not None else None
-    duration_eff = _ratio(min_duration, duration_seconds) if min_duration is not None else None
-    cost_eff = _ratio(min_cost, cost_usd) if min_cost is not None else None
+    quality_delta = (
+        quality_score - baseline_quality
+        if quality_score is not None and baseline_quality is not None
+        else None
+    )
+    token_ratio = _ratio(baseline_tokens, total_tokens) if baseline_tokens is not None else None
+    duration_ratio = _ratio(baseline_duration, duration_seconds) if baseline_duration is not None else None
+    cost_ratio = _ratio(baseline_cost, cost_usd) if baseline_cost is not None else None
 
     global_score = None
-    if quality_norm is not None:
-        global_score = 100.0 * (
-            _GLOBAL_SCORE_WEIGHTS["quality"] * quality_norm
-            + _GLOBAL_SCORE_WEIGHTS["tokens"] * (token_eff or 0.0)
-            + _GLOBAL_SCORE_WEIGHTS["duration"] * (duration_eff or 0.0)
-            + _GLOBAL_SCORE_WEIGHTS["cost"] * (cost_eff or 0.0)
-        )
+    if quality_delta is not None:
+        global_score = 100.0 + quality_delta
+        if token_ratio is not None and token_ratio > 0:
+            global_score += _RELATIVE_SCORE_WEIGHTS["tokens_log_multiplier"] * math.log(token_ratio)
+        if duration_ratio is not None and duration_ratio > 0:
+            global_score += _RELATIVE_SCORE_WEIGHTS["duration_log_multiplier"] * math.log(duration_ratio)
+        if cost_ratio is not None and cost_ratio > 0:
+            global_score += _RELATIVE_SCORE_WEIGHTS["cost_log_multiplier"] * math.log(cost_ratio)
 
     summary: dict[str, Any] = {
         "condition": cond,
+        "baseline_condition": baseline_condition,
         "quality_score": round(quality_score, 2) if quality_score is not None else None,
         "global_score": round(global_score, 2) if global_score is not None else None,
+        "recalculated_eval_score": round(global_score, 2) if global_score is not None else None,
+        "quality_delta_vs_control": round(quality_delta, 2) if quality_delta is not None else None,
         "tool_call_count": tool_call_count,
         "top_tools": _top_tools(tool_freq),
         "total_tokens": total_tokens,
         "duration_seconds": round(duration_seconds, 3) if duration_seconds is not None else None,
         "cost_usd": round(cost_usd, 4) if cost_usd is not None else None,
+        "token_ratio_vs_control": round(token_ratio, 4) if token_ratio is not None else None,
+        "time_ratio_vs_control": round(duration_ratio, 4) if duration_ratio is not None else None,
+        "cost_ratio_vs_control": round(cost_ratio, 4) if cost_ratio is not None else None,
         "score_per_1k_tokens": (
             round((quality_score * 1000.0) / total_tokens, 4)
             if quality_score is not None and total_tokens and total_tokens > 0
@@ -857,10 +883,10 @@ def _build_condition_summary(
             else None
         ),
         "efficiency_components": {
-            "quality_normalized": round(quality_norm, 4) if quality_norm is not None else None,
-            "token_efficiency": round(token_eff, 4) if token_eff is not None else None,
-            "duration_efficiency": round(duration_eff, 4) if duration_eff is not None else None,
-            "cost_efficiency": round(cost_eff, 4) if cost_eff is not None else None,
+            "quality_delta_vs_control": round(quality_delta, 4) if quality_delta is not None else None,
+            "token_ratio_vs_control": round(token_ratio, 4) if token_ratio is not None else None,
+            "time_ratio_vs_control": round(duration_ratio, 4) if duration_ratio is not None else None,
+            "cost_ratio_vs_control": round(cost_ratio, 4) if cost_ratio is not None else None,
         },
     }
 
@@ -959,7 +985,7 @@ def _section_scorecard(lines: list[str], result: dict[str, Any]) -> None:
     lines.extend([
         "## Scorecard",
         "",
-        "| Condition | Quality | Global | Tools | Cost | Duration | Total Tokens | Score / 1K Tokens | Score / Minute |",
+        "| Condition | Quality | Recalculated Eval | Tools | Cost | Duration | Total Tokens | Score / 1K Tokens | Score / Minute |",
         "|---|---|---|---|---|---|---|---|---|",
     ])
     for cond in active:
@@ -1191,8 +1217,8 @@ def _section_verdict(lines: list[str], result: dict[str, Any]) -> None:
     if global_scores:
         best_global = max(global_scores, key=lambda k: global_scores[k])
         parts.append(
-            f"Best overall quality/resource tradeoff: **{_cond_label(best_global)}** "
-            f"({global_scores[best_global]:.2f} global score)."
+            f"Best overall value versus the control baseline: **{_cond_label(best_global)}** "
+            f"({global_scores[best_global]:.2f} recalculated eval score)."
         )
     if costs:
         cheapest = min(costs, key=lambda k: costs[k])
