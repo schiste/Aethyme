@@ -33,6 +33,13 @@ _ALL_KNOWN_CONDITIONS = (
     "control-cto-off", "control-cto-on", "control", "explore", "leverage", "task-conditioned",
 )
 
+_GLOBAL_SCORE_WEIGHTS = {
+    "quality": 0.65,
+    "tokens": 0.20,
+    "duration": 0.10,
+    "cost": 0.05,
+}
+
 
 def _active_conditions(result: dict[str, Any]) -> tuple[str, ...]:
     """Return condition names present in *result*, in canonical order.
@@ -403,15 +410,21 @@ def _extract_ledger_record(
             continue
         assessment = side.get("assessment") or {}
         run = side.get("run") or {}
+        summary = side.get("summary_metrics") or {}
         if not isinstance(assessment, dict):
             assessment = {}
         if not isinstance(run, dict):
             run = {}
+        if not isinstance(summary, dict):
+            summary = {}
 
         entry: dict[str, Any] = {}
         ws = assessment.get("weighted_score")
         if ws is not None:
             entry["score"] = ws
+        gs = summary.get("global_score")
+        if gs is not None:
+            entry["global_score"] = gs
         c = run.get("cost_usd")
         if c is not None and c > 0:
             entry["cost_usd"] = round(c, 4)
@@ -421,9 +434,21 @@ def _extract_ledger_record(
         t = run.get("num_turns")
         if t:
             entry["turns"] = t
+        tc = summary.get("tool_call_count")
+        if tc is not None:
+            entry["tool_call_count"] = tc
         total = _total_tokens(run)
         if total is not None:
             entry["total_tokens"] = total
+        spt = summary.get("score_per_1k_tokens")
+        if spt is not None:
+            entry["score_per_1k_tokens"] = spt
+        spm = summary.get("score_per_minute")
+        if spm is not None:
+            entry["score_per_minute"] = spm
+        top_tools = summary.get("top_tools")
+        if top_tools:
+            entry["top_tools"] = top_tools
         for tok_key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_create_tokens"):
             v = run.get(tok_key)
             if v:
@@ -480,6 +505,8 @@ def finalize_eval_run(
     3. All per-condition artifacts via ``write_eval_run_artifacts()``.
     4. One line to ``eval-runs/runs.jsonl`` ledger.
     """
+    augment_result_with_summary_metrics(result)
+
     # 1. Complete dump
     (run_dir / "complete-result.json").write_text(
         json.dumps(result, indent=2, default=str), encoding="utf-8"
@@ -507,6 +534,95 @@ def finalize_eval_run(
     print_scorecard(result)
 
     return run_dir
+
+
+def augment_result_with_summary_metrics(result: dict[str, Any]) -> dict[str, Any]:
+    """Attach per-condition efficiency summaries and cross-condition comparison."""
+    active = _active_conditions(result)
+    if not active:
+        return result
+
+    qualities: list[float] = []
+    token_totals: list[int] = []
+    durations: list[float] = []
+    costs: list[float] = []
+
+    for cond in active:
+        side = result.get(cond, {})
+        if not isinstance(side, dict):
+            continue
+        assessment = side.get("assessment") or {}
+        run = side.get("run") or {}
+        if not isinstance(assessment, dict):
+            assessment = {}
+        if not isinstance(run, dict):
+            run = {}
+        quality = assessment.get("weighted_score")
+        if isinstance(quality, (int, float)):
+            qualities.append(float(quality))
+        total_tokens = _total_tokens(run)
+        if isinstance(total_tokens, int) and total_tokens > 0:
+            token_totals.append(total_tokens)
+        duration = run.get("duration_seconds")
+        if isinstance(duration, (int, float)) and duration > 0:
+            durations.append(float(duration))
+        cost = run.get("cost_usd")
+        if isinstance(cost, (int, float)) and cost > 0:
+            costs.append(float(cost))
+
+    max_quality = max(qualities) if qualities else 0.0
+    min_tokens = min(token_totals) if token_totals else None
+    min_duration = min(durations) if durations else None
+    min_cost = min(costs) if costs else None
+
+    global_scores: dict[str, float] = {}
+    quality_scores: dict[str, float] = {}
+
+    for cond in active:
+        side = result.get(cond, {})
+        if not isinstance(side, dict):
+            continue
+        assessment = side.get("assessment") or {}
+        run = side.get("run") or {}
+        if not isinstance(assessment, dict):
+            assessment = {}
+        if not isinstance(run, dict):
+            run = {}
+
+        summary = _build_condition_summary(
+            cond=cond,
+            assessment=assessment,
+            run=run,
+            max_quality=max_quality,
+            min_tokens=min_tokens,
+            min_duration=min_duration,
+            min_cost=min_cost,
+        )
+        side["summary_metrics"] = summary
+
+        quality = summary.get("quality_score")
+        if isinstance(quality, (int, float)):
+            quality_scores[cond] = float(quality)
+        global_score = summary.get("global_score")
+        if isinstance(global_score, (int, float)):
+            global_scores[cond] = float(global_score)
+
+    result["comparison"] = {
+        "global_score_formula": (
+            "100 * (0.65 * normalized_quality + 0.20 * token_efficiency "
+            "+ 0.10 * duration_efficiency + 0.05 * cost_efficiency)"
+        ),
+        "global_score_weights": _GLOBAL_SCORE_WEIGHTS,
+        "normalization": {
+            "normalized_quality": "quality_score / max_quality_in_run",
+            "token_efficiency": "min_total_tokens_in_run / total_tokens",
+            "duration_efficiency": "min_duration_in_run / duration_seconds",
+            "cost_efficiency": "min_cost_in_run / cost_usd",
+        },
+        "best_quality_condition": max(quality_scores, key=quality_scores.get) if quality_scores else None,
+        "best_global_condition": max(global_scores, key=global_scores.get) if global_scores else None,
+    }
+    return result
 
 
 def write_explain_repo_markdown_report(
@@ -589,11 +705,9 @@ def print_scorecard(result: dict[str, Any], *, file: Any = None) -> None:
 
     # Header
     hdr = (
-        f"{'Condition':<22s} {'Score':>6s} {'Cost':>8s} "
-        f"{'Duration':>9s} {'Turns':>5s} "
-        f"{'Total Tok':>10s} "
-        f"{'In Tok':>8s} {'Out Tok':>8s} "
-        f"{'Cache Rd':>10s} {'Cache Wr':>10s}"
+        f"{'Condition':<22s} {'Qual':>6s} {'Global':>7s} {'Tools':>6s} "
+        f"{'Cost':>8s} {'Duration':>9s} {'Total Tok':>10s} "
+        f"{'Score/1K':>9s} {'Score/Min':>10s}"
     )
     sep = "-" * len(hdr)
     print(sep, file=out)
@@ -606,13 +720,20 @@ def print_scorecard(result: dict[str, Any], *, file: Any = None) -> None:
             continue
         assessment = side.get("assessment") or {}
         run = side.get("run") or {}
+        summary = side.get("summary_metrics") or {}
         if not isinstance(assessment, dict):
             assessment = {}
         if not isinstance(run, dict):
             run = {}
+        if not isinstance(summary, dict):
+            summary = {}
 
         ws = assessment.get("weighted_score")
         score = f"{ws:.2f}" if ws is not None else "-"
+        gs = summary.get("global_score")
+        global_score = f"{gs:.2f}" if gs is not None else "-"
+        tc = summary.get("tool_call_count")
+        tool_count = str(tc) if tc is not None else "-"
 
         c = run.get("cost_usd")
         cost = f"${c:.3f}" if c is not None and c > 0 else "-"
@@ -620,30 +741,17 @@ def print_scorecard(result: dict[str, Any], *, file: Any = None) -> None:
         dur = run.get("duration_seconds")
         duration = f"{dur:.1f}s" if dur is not None and dur > 0 else "-"
 
-        t = run.get("num_turns")
-        turns = str(t) if t is not None and t > 0 else "-"
-
         total = _total_tokens(run)
         total_tok = f"{total:,}" if total is not None else "-"
-
-        inp = run.get("input_tokens")
-        input_tok = f"{inp:,}" if inp is not None else "-"
-
-        outp = run.get("output_tokens")
-        output_tok = f"{outp:,}" if outp is not None else "-"
-
-        cr = run.get("cache_read_tokens")
-        cache_read = f"{cr:,}" if cr is not None else "-"
-
-        cc = run.get("cache_create_tokens")
-        cache_create = f"{cc:,}" if cc is not None else "-"
+        spt = summary.get("score_per_1k_tokens")
+        score_per_tokens = f"{spt:.2f}" if spt is not None else "-"
+        spm = summary.get("score_per_minute")
+        score_per_minute = f"{spm:.2f}" if spm is not None else "-"
 
         print(
-            f"{_cond_label(cond):<22s} {score:>6s} {cost:>8s} "
-            f"{duration:>9s} {turns:>5s} "
-            f"{total_tok:>10s} "
-            f"{input_tok:>8s} {output_tok:>8s} "
-            f"{cache_read:>10s} {cache_create:>10s}",
+            f"{_cond_label(cond):<22s} {score:>6s} {global_score:>7s} {tool_count:>6s} "
+            f"{cost:>8s} {duration:>9s} {total_tok:>10s} "
+            f"{score_per_tokens:>9s} {score_per_minute:>10s}",
             file=out,
         )
 
@@ -660,6 +768,111 @@ def _total_tokens(run: dict[str, Any]) -> int | None:
     if all(v is None for v in vals):
         return None
     return sum(v or 0 for v in vals)
+
+
+def _tool_frequency(run: dict[str, Any]) -> Counter[str]:
+    freq: Counter[str] = Counter()
+    tool_calls = run.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return freq
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        name = tc.get("tool") or tc.get("name") or "unknown"
+        freq[str(name)] += 1
+    return freq
+
+
+def _top_tools(freq: Counter[str], *, limit: int = 3) -> list[dict[str, Any]]:
+    return [
+        {"name": tool_name, "count": count}
+        for tool_name, count in freq.most_common(limit)
+    ]
+
+
+def _ratio(numerator: float | int | None, denominator: float | int | None) -> float | None:
+    if numerator is None or denominator is None:
+        return None
+    if denominator <= 0:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def _build_condition_summary(
+    *,
+    cond: str,
+    assessment: dict[str, Any],
+    run: dict[str, Any],
+    max_quality: float,
+    min_tokens: int | None,
+    min_duration: float | None,
+    min_cost: float | None,
+) -> dict[str, Any]:
+    quality = assessment.get("weighted_score")
+    quality_score = float(quality) if isinstance(quality, (int, float)) else None
+    total_tokens = _total_tokens(run)
+    duration_seconds = run.get("duration_seconds")
+    duration_seconds = (
+        float(duration_seconds)
+        if isinstance(duration_seconds, (int, float)) and duration_seconds > 0
+        else None
+    )
+    cost_usd = run.get("cost_usd")
+    cost_usd = float(cost_usd) if isinstance(cost_usd, (int, float)) and cost_usd > 0 else None
+
+    tool_freq = _tool_frequency(run)
+    tool_call_count = sum(tool_freq.values()) if tool_freq else 0
+
+    quality_norm = _ratio(quality_score, max_quality) if max_quality > 0 else 0.0
+    token_eff = _ratio(min_tokens, total_tokens) if min_tokens is not None else None
+    duration_eff = _ratio(min_duration, duration_seconds) if min_duration is not None else None
+    cost_eff = _ratio(min_cost, cost_usd) if min_cost is not None else None
+
+    global_score = None
+    if quality_norm is not None:
+        global_score = 100.0 * (
+            _GLOBAL_SCORE_WEIGHTS["quality"] * quality_norm
+            + _GLOBAL_SCORE_WEIGHTS["tokens"] * (token_eff or 0.0)
+            + _GLOBAL_SCORE_WEIGHTS["duration"] * (duration_eff or 0.0)
+            + _GLOBAL_SCORE_WEIGHTS["cost"] * (cost_eff or 0.0)
+        )
+
+    summary: dict[str, Any] = {
+        "condition": cond,
+        "quality_score": round(quality_score, 2) if quality_score is not None else None,
+        "global_score": round(global_score, 2) if global_score is not None else None,
+        "tool_call_count": tool_call_count,
+        "top_tools": _top_tools(tool_freq),
+        "total_tokens": total_tokens,
+        "duration_seconds": round(duration_seconds, 3) if duration_seconds is not None else None,
+        "cost_usd": round(cost_usd, 4) if cost_usd is not None else None,
+        "score_per_1k_tokens": (
+            round((quality_score * 1000.0) / total_tokens, 4)
+            if quality_score is not None and total_tokens and total_tokens > 0
+            else None
+        ),
+        "score_per_minute": (
+            round((quality_score * 60.0) / duration_seconds, 4)
+            if quality_score is not None and duration_seconds and duration_seconds > 0
+            else None
+        ),
+        "efficiency_components": {
+            "quality_normalized": round(quality_norm, 4) if quality_norm is not None else None,
+            "token_efficiency": round(token_eff, 4) if token_eff is not None else None,
+            "duration_efficiency": round(duration_eff, 4) if duration_eff is not None else None,
+            "cost_efficiency": round(cost_eff, 4) if cost_eff is not None else None,
+        },
+    }
+
+    deliverable_status = (
+        run.get("structured_output", {}).get("deliverable_status")
+        if isinstance(run.get("structured_output"), dict)
+        else None
+    )
+    if deliverable_status:
+        summary["deliverable_status"] = deliverable_status
+
+    return summary
 
 
 def _cond_label(cond: str) -> str:
@@ -741,14 +954,13 @@ def _section_model(lines: list[str], result: dict[str, Any]) -> None:
 
 
 def _section_scorecard(lines: list[str], result: dict[str, Any]) -> None:
-    """Scorecard with Score, Cost, Duration, Turns, and all token types."""
+    """Scorecard with quality, efficiency, tools, and usage metrics."""
     active = _active_conditions(result)
     lines.extend([
         "## Scorecard",
         "",
-        "| Condition | Score | Cost | Duration | Turns "
-        "| Total Tokens | Input Tokens | Output Tokens | Cache Read | Cache Create |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| Condition | Quality | Global | Tools | Cost | Duration | Total Tokens | Score / 1K Tokens | Score / Minute |",
+        "|---|---|---|---|---|---|---|---|---|",
     ])
     for cond in active:
         side = result.get(cond, {})
@@ -756,13 +968,20 @@ def _section_scorecard(lines: list[str], result: dict[str, Any]) -> None:
             side = {}
         assessment = side.get("assessment") or {}
         run = side.get("run") or {}
+        summary = side.get("summary_metrics") or {}
         if not isinstance(assessment, dict):
             assessment = {}
         if not isinstance(run, dict):
             run = {}
+        if not isinstance(summary, dict):
+            summary = {}
 
         ws = assessment.get("weighted_score")
         score = f"{ws}" if ws is not None else "-"
+        gs = summary.get("global_score")
+        global_score = f"{gs}" if gs is not None else "-"
+        tc = summary.get("tool_call_count")
+        tool_count = f"{tc}" if tc is not None else "-"
 
         c = run.get("cost_usd")
         cost = f"${c:.3f}" if c is not None and c > 0 else "-"
@@ -770,27 +989,16 @@ def _section_scorecard(lines: list[str], result: dict[str, Any]) -> None:
         dur = run.get("duration_seconds")
         duration = f"{dur:.1f}s" if dur is not None and dur > 0 else "-"
 
-        t = run.get("num_turns")
-        turns = str(t) if t is not None and t > 0 else "-"
-
         total = _total_tokens(run)
         total_tok = f"{total:,}" if total is not None else "-"
-
-        inp = run.get("input_tokens")
-        input_tok = f"{inp:,}" if inp is not None else "-"
-
-        out = run.get("output_tokens")
-        output_tok = f"{out:,}" if out is not None else "-"
-
-        cr = run.get("cache_read_tokens")
-        cache_read = f"{cr:,}" if cr is not None else "-"
-
-        cc = run.get("cache_create_tokens")
-        cache_create = f"{cc:,}" if cc is not None else "-"
+        spt = summary.get("score_per_1k_tokens")
+        score_per_tokens = f"{spt:.2f}" if spt is not None else "-"
+        spm = summary.get("score_per_minute")
+        score_per_minute = f"{spm:.2f}" if spm is not None else "-"
 
         lines.append(
-            f"| {_cond_label(cond)} | {score} | {cost} | {duration} | {turns} "
-            f"| {total_tok} | {input_tok} | {output_tok} | {cache_read} | {cache_create} |"
+            f"| {_cond_label(cond)} | {score} | {global_score} | {tool_count} | {cost} | {duration} "
+            f"| {total_tok} | {score_per_tokens} | {score_per_minute} |"
         )
     lines.append("")
 
@@ -902,15 +1110,25 @@ def _section_tool_calls(lines: list[str], result: dict[str, Any]) -> None:
             continue
 
         has_any = True
-        freq: Counter[str] = Counter()
-        for tc in tool_calls:
-            freq[tc.get("tool", "unknown")] += 1
+        summary = side.get("summary_metrics") or {}
+        if not isinstance(summary, dict):
+            summary = {}
+        freq = _tool_frequency(run)
 
         section_lines.extend([
             f"### {_cond_label(cond)}",
             "",
             f"Total tool calls: {len(tool_calls)}",
             "",
+        ])
+        top_tools = summary.get("top_tools")
+        if top_tools:
+            section_lines.extend([
+                "Top tools: "
+                + ", ".join(f"`{item['name']}` x{item['count']}" for item in top_tools),
+                "",
+            ])
+        section_lines.extend([
             "| Tool | Count |",
             "|---|---|",
         ])
@@ -929,6 +1147,7 @@ def _section_verdict(lines: list[str], result: dict[str, Any]) -> None:
     active = _active_conditions(result)
     scores: dict[str, float] = {}
     costs: dict[str, float] = {}
+    global_scores: dict[str, float] = {}
     all_passed = True
 
     for cond in active:
@@ -937,6 +1156,7 @@ def _section_verdict(lines: list[str], result: dict[str, Any]) -> None:
             continue
         assessment = side.get("assessment") or {}
         run = side.get("run") or {}
+        summary = side.get("summary_metrics") or {}
         if isinstance(assessment, dict):
             ws = assessment.get("weighted_score")
             if ws is not None:
@@ -948,6 +1168,10 @@ def _section_verdict(lines: list[str], result: dict[str, Any]) -> None:
             c = run.get("cost_usd")
             if c is not None and c > 0:
                 costs[cond] = c
+        if isinstance(summary, dict):
+            gs = summary.get("global_score")
+            if gs is not None:
+                global_scores[cond] = gs
 
     lines.extend(["## Verdict", ""])
 
@@ -964,6 +1188,12 @@ def _section_verdict(lines: list[str], result: dict[str, Any]) -> None:
         + (f", **{_cond_label(worst)}** lowest ({scores[worst]:.2f}/100)" if best != worst else "")
         + "."
     )
+    if global_scores:
+        best_global = max(global_scores, key=lambda k: global_scores[k])
+        parts.append(
+            f"Best overall quality/resource tradeoff: **{_cond_label(best_global)}** "
+            f"({global_scores[best_global]:.2f} global score)."
+        )
     if costs:
         cheapest = min(costs, key=lambda k: costs[k])
         priciest = max(costs, key=lambda k: costs[k])
