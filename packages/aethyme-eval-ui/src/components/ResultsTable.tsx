@@ -83,22 +83,33 @@ function parseToolBreakdown(raw: string | null): Record<string, number> | null {
   }
 }
 
+function parseTopTools(raw: string | null): Array<{ name: string; count: number }> | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 type ColumnKey = keyof EvalResult;
 
 const columns: { key: ColumnKey; label: string; align?: "right"; width: string }[] = [
   { key: "runId", label: "Run", width: "7%" },
   { key: "date", label: "Date", width: "8%" },
   { key: "evalType", label: "Type", width: "8%" },
-  { key: "target", label: "Target", width: "7%" },
+  { key: "target", label: "Target", width: "6%" },
   { key: "model", label: "Model", width: "6%" },
-  { key: "condition", label: "Condition", width: "13%" },
+  { key: "condition", label: "Condition", width: "12%" },
   { key: "cto", label: "CTO", width: "4%" },
-  { key: "score", label: "Score", align: "right", width: "5%" },
-  { key: "turns", label: "Turns", align: "right", width: "5%" },
+  { key: "qualityScore", label: "Quality", align: "right", width: "6%" },
+  { key: "recalculatedEvalScore", label: "Recalc", align: "right", width: "6%" },
   { key: "toolCalls", label: "Tools", align: "right", width: "5%" },
   { key: "totalTokens", label: "Tokens", align: "right", width: "7%" },
-  { key: "cost", label: "Cost", align: "right", width: "7%" },
   { key: "duration", label: "Time", align: "right", width: "5%" },
+  { key: "scorePer1kTokens", label: "Score/1K", align: "right", width: "7%" },
+  { key: "scorePerMinute", label: "Score/Min", align: "right", width: "7%" },
 ];
 
 function sortResults(
@@ -179,6 +190,34 @@ export default function ResultsTable({ results }: Props) {
             {row.score}
           </span>
         );
+      case "qualityScore": {
+        const value = row.qualityScore ?? row.score;
+        return (
+          <span className={`font-mono font-semibold ${scoreColor(value ?? 0)}`}>
+            {typeof value === "number" ? value.toFixed(2) : "—"}
+          </span>
+        );
+      }
+      case "recalculatedEvalScore": {
+        const value = row.recalculatedEvalScore;
+        const delta = row.qualityDeltaVsControl;
+        const tokenRatio = row.tokenRatioVsControl;
+        const timeRatio = row.timeRatioVsControl;
+        const costRatio = row.costRatioVsControl;
+        const lines = [
+          `Quality Δ vs control: ${typeof delta === "number" ? delta.toFixed(2) : "—"}`,
+          `Token ratio vs control: ${typeof tokenRatio === "number" ? tokenRatio.toFixed(4) : "—"}`,
+          `Time ratio vs control:  ${typeof timeRatio === "number" ? timeRatio.toFixed(4) : "—"}`,
+          `Cost ratio vs control:  ${typeof costRatio === "number" ? costRatio.toFixed(4) : "—"}`,
+        ].join("\n");
+        return (
+          <Tooltip content={lines}>
+            <span className={`font-mono font-semibold cursor-help border-b border-dotted border-[var(--color-text-muted)] ${scoreColor(value ?? 0)}`}>
+              {typeof value === "number" ? value.toFixed(2) : "—"}
+            </span>
+          </Tooltip>
+        );
+      }
       case "totalTokens": {
         const tokenLines = [
           `Input:        ${formatTokens(row.inputTokens || 0)}`,
@@ -213,13 +252,17 @@ export default function ResultsTable({ results }: Props) {
         return <span className="font-mono">{row[key]}</span>;
       case "toolCalls": {
         const breakdown = parseToolBreakdown(row.toolBreakdown);
-        if (breakdown) {
-          const lines = Object.entries(breakdown)
-            .sort(([, a], [, b]) => b - a)
-            .map(([name, count]) => `${name}: ${count}`)
-            .join("\n");
+        const topTools = parseTopTools(row.topTools ?? null);
+        if (breakdown || topTools) {
+          const lines = breakdown
+            ? Object.entries(breakdown)
+                .sort(([, a], [, b]) => b - a)
+                .map(([name, count]) => `${name}: ${count}`)
+            : [];
+          const topLines = breakdown ? [] : (topTools || []).map((tool) => `${tool.name}: ${tool.count}`);
+          const content = [...lines, ...topLines].join("\n");
           return (
-            <Tooltip content={lines}>
+            <Tooltip content={content || "No tool breakdown available"}>
               <span className="font-mono cursor-help border-b border-dotted border-[var(--color-text-muted)]">
                 {row.toolCalls}
               </span>
@@ -228,6 +271,10 @@ export default function ResultsTable({ results }: Props) {
         }
         return <span className="font-mono">{row.toolCalls}</span>;
       }
+      case "scorePer1kTokens":
+        return <span className="font-mono">{typeof row.scorePer1kTokens === "number" ? row.scorePer1kTokens.toFixed(4) : "—"}</span>;
+      case "scorePerMinute":
+        return <span className="font-mono">{typeof row.scorePerMinute === "number" ? row.scorePerMinute.toFixed(4) : "—"}</span>;
       case "evalType":
         return (
           <span
@@ -271,8 +318,6 @@ export default function ResultsTable({ results }: Props) {
           </Tooltip>
         );
       }
-      case "date":
-        return <span className="text-xs font-mono whitespace-nowrap">{formatDate(row.date)}</span>;
       case "runId": {
         if (!row.runId) return <span className="text-[var(--color-text-muted)]">—</span>;
         const short = row.runId.replace("run-", "").slice(0, 10);

@@ -8,17 +8,23 @@ const ALL = "__all__";
 function toCSV(results: EvalResult[]): string {
   const headers = [
     "date",
+    "runId",
     "evalType",
     "target",
     "model",
     "condition",
     "reasoning",
     "score",
+    "qualityScore",
+    "recalculatedEvalScore",
+    "qualityDeltaVsControl",
     "turns",
     "toolCalls",
     "totalTokens",
     "cost",
     "duration",
+    "scorePer1kTokens",
+    "scorePerMinute",
     "fixed",
   ];
   const rows = results.map((r: EvalResult) =>
