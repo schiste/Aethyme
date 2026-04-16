@@ -5,6 +5,7 @@ import hashlib
 import json
 import subprocess
 import uuid
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -2422,6 +2423,73 @@ def _run_eval_background(
     start_phase("finalizing", order=7, details={"conditions": sorted(condition_payloads.keys())})
     finalize_eval_run(run_dir, result, repo_path=Path(req.target), eval_type=req.evalType)
     result["report_path"] = str(run_dir / "report.md")
+
+    # Upsert finalized per-condition rows so first-class DB columns include
+    # summary metrics computed during finalize_eval_run().
+    for cond_name, side in condition_payloads.items():
+        if not isinstance(side, dict):
+            continue
+        assessment = side.get("assessment") or {}
+        run = side.get("run") or {}
+        summary = side.get("summary_metrics") or {}
+        if not isinstance(assessment, dict):
+            assessment = {}
+        if not isinstance(run, dict):
+            run = {}
+        if not isinstance(summary, dict):
+            summary = {}
+
+        tool_calls = run.get("tool_calls")
+        if isinstance(tool_calls, list):
+            breakdown = Counter(
+                str(call.get("tool"))
+                for call in tool_calls
+                if isinstance(call, dict) and call.get("tool")
+            )
+            tool_breakdown_json = json.dumps(
+                {k: v for k, v in sorted(breakdown.items(), key=lambda item: (-item[1], item[0]))}
+            ) if breakdown else None
+        else:
+            tool_breakdown_json = None
+
+        insert_result({
+            "id": f"{run_dir.name}-{cond_name}",
+            "runId": ((run.get("run_metadata") or {}).get("run_id") if isinstance(run.get("run_metadata"), dict) else run_id),
+            "runDir": run_dir.name,
+            "date": datetime.now(UTC).isoformat()[:19],
+            "evalType": req.evalType,
+            "target": req.target,
+            "model": req.model,
+            "condition": cond_name,
+            "reasoning": req.reasoning,
+            "cto": ("off" if cond_name == "control-cto-off" else "on"),
+            "score": assessment.get("weighted_score", 0),
+            "turns": run.get("num_turns", 0),
+            "toolCalls": summary.get("tool_call_count", 0),
+            "totalTokens": summary.get("total_tokens", 0),
+            "inputTokens": run.get("input_tokens", 0),
+            "outputTokens": run.get("output_tokens", 0),
+            "cacheRead": run.get("cache_read_tokens", 0),
+            "cacheCreate": run.get("cache_create_tokens", 0),
+            "cost": run.get("cost_usd", 0),
+            "duration": (f"{run.get('duration_seconds', 0):.0f}s" if run.get("duration_seconds") else "-"),
+            "fixed": 0,
+            "scenario": result.get("scenario"),
+            "output": run.get("output"),
+            "prompt": side.get("prompt"),
+            "rawJson": json.dumps(side),
+            "toolBreakdown": tool_breakdown_json,
+            "qualityScore": summary.get("quality_score"),
+            "recalculatedEvalScore": summary.get("recalculated_eval_score", summary.get("global_score")),
+            "qualityDeltaVsControl": summary.get("quality_delta_vs_control"),
+            "tokenRatioVsControl": summary.get("token_ratio_vs_control"),
+            "timeRatioVsControl": summary.get("time_ratio_vs_control"),
+            "costRatioVsControl": summary.get("cost_ratio_vs_control"),
+            "scorePer1kTokens": summary.get("score_per_1k_tokens"),
+            "scorePerMinute": summary.get("score_per_minute"),
+            "topTools": (json.dumps(summary.get("top_tools")) if summary.get("top_tools") else None),
+        })
+
     _run_state["result"] = result
     log(f"Finalized eval run: {run_dir / 'report.md'}")
     finish_phase(

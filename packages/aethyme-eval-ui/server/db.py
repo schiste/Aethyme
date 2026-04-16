@@ -37,7 +37,16 @@ CREATE TABLE IF NOT EXISTS eval_results (
     output         TEXT,
     tool_breakdown TEXT,
     prompt         TEXT,
-    run_id         TEXT
+    run_id         TEXT,
+    quality_score REAL,
+    recalculated_eval_score REAL,
+    quality_delta_vs_control REAL,
+    token_ratio_vs_control REAL,
+    time_ratio_vs_control REAL,
+    cost_ratio_vs_control REAL,
+    score_per_1k_tokens REAL,
+    score_per_minute REAL,
+    top_tools TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_eval_type ON eval_results(eval_type);
@@ -64,6 +73,15 @@ MIGRATIONS = [
     "ALTER TABLE eval_results ADD COLUMN tool_breakdown TEXT",
     "ALTER TABLE eval_results ADD COLUMN prompt TEXT",
     "ALTER TABLE eval_results ADD COLUMN run_id TEXT",
+    "ALTER TABLE eval_results ADD COLUMN quality_score REAL",
+    "ALTER TABLE eval_results ADD COLUMN recalculated_eval_score REAL",
+    "ALTER TABLE eval_results ADD COLUMN quality_delta_vs_control REAL",
+    "ALTER TABLE eval_results ADD COLUMN token_ratio_vs_control REAL",
+    "ALTER TABLE eval_results ADD COLUMN time_ratio_vs_control REAL",
+    "ALTER TABLE eval_results ADD COLUMN cost_ratio_vs_control REAL",
+    "ALTER TABLE eval_results ADD COLUMN score_per_1k_tokens REAL",
+    "ALTER TABLE eval_results ADD COLUMN score_per_minute REAL",
+    "ALTER TABLE eval_results ADD COLUMN top_tools TEXT",
 ]
 
 
@@ -82,18 +100,17 @@ def get_db() -> sqlite3.Connection:
 
 
 def import_eval_runs(eval_runs_dir: Path) -> int:
-    """Scan eval-runs/ and import any runs not already in the DB."""
+    """Scan eval-runs/ and upsert all discovered runs into the DB."""
     if not eval_runs_dir.exists():
         return 0
 
     conn = get_db()
-    existing = {row[0] for row in conn.execute("SELECT id FROM eval_results").fetchall()}
     imported = 0
 
     for entry in sorted(eval_runs_dir.iterdir()):
         if not entry.is_dir():
             continue
-        if not re.match(r"\d{8}-\d{6}", entry.name):
+        if not re.match(r"\d{8}(?:T|-)\d{6}", entry.name):
             continue
 
         complete = entry / "complete-result.json"
@@ -131,17 +148,20 @@ def import_eval_runs(eval_runs_dir: Path) -> int:
                 continue
 
             result_id = f"{entry.name}-{cond}"
-            if result_id in existing:
-                continue
 
             assessment = side.get("assessment") or {}
             run = side.get("run") or {}
+            summary = side.get("summary_metrics") or {}
             if not isinstance(assessment, dict):
                 assessment = {}
             if not isinstance(run, dict):
                 run = {}
+            if not isinstance(summary, dict):
+                summary = {}
 
             ws = assessment.get("weighted_score", 0)
+            quality_score = summary.get("quality_score", ws)
+            recalculated_eval_score = summary.get("recalculated_eval_score", summary.get("global_score"))
             input_tokens = run.get("input_tokens") or 0
             output_tokens = run.get("output_tokens") or 0
             cache_read = run.get("cache_read_tokens", 0) or 0
@@ -156,14 +176,18 @@ def import_eval_runs(eval_runs_dir: Path) -> int:
             test_pass = assessment.get("test_pass")
             fixed = 1 if (test_pass if test_pass is not None else (ws > 0)) else 0
             cto = CTO_MAP.get(cond, "unknown")
+            tool_breakdown = _tool_breakdown_json(run.get("tool_calls"))
 
             conn.execute(
                 """INSERT OR REPLACE INTO eval_results
                    (id, run_dir, date, eval_type, target, model, condition, reasoning,
                     cto, score, turns, tool_calls, total_tokens, input_tokens,
                     output_tokens, cache_read, cache_create, cost, duration, fixed,
-                    scenario, raw_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    scenario, raw_json, output, tool_breakdown, prompt, run_id,
+                    quality_score, recalculated_eval_score, quality_delta_vs_control,
+                    token_ratio_vs_control, time_ratio_vs_control, cost_ratio_vs_control,
+                    score_per_1k_tokens, score_per_minute, top_tools)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     result_id, entry.name, date_str,
                     eval_type.split("-reasoning")[0] if "-reasoning" in eval_type else eval_type,
@@ -173,6 +197,19 @@ def import_eval_runs(eval_runs_dir: Path) -> int:
                     turns, tool_count, total, input_tokens, output_tokens,
                     cache_read, cache_create, round(cost, 4), dur_str, fixed,
                     scenario, json.dumps(side),
+                    run.get("output"),
+                    tool_breakdown,
+                    side.get("prompt"),
+                    ((run.get("run_metadata") or {}).get("run_id") if isinstance(run.get("run_metadata"), dict) else None),
+                    round(quality_score, 2) if quality_score is not None else None,
+                    round(recalculated_eval_score, 2) if recalculated_eval_score is not None else None,
+                    _maybe_round(summary.get("quality_delta_vs_control")),
+                    _maybe_round(summary.get("token_ratio_vs_control")),
+                    _maybe_round(summary.get("time_ratio_vs_control")),
+                    _maybe_round(summary.get("cost_ratio_vs_control")),
+                    _maybe_round(summary.get("score_per_1k_tokens")),
+                    _maybe_round(summary.get("score_per_minute")),
+                    json.dumps(summary.get("top_tools")) if summary.get("top_tools") else None,
                 ),
             )
             imported += 1
@@ -190,8 +227,11 @@ def insert_result(result: dict[str, Any]) -> None:
            (id, run_dir, date, eval_type, target, model, condition, reasoning,
             cto, score, turns, tool_calls, total_tokens, input_tokens,
             output_tokens, cache_read, cache_create, cost, duration, fixed,
-            scenario, raw_json, output, tool_breakdown, prompt, run_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            scenario, raw_json, output, tool_breakdown, prompt, run_id,
+            quality_score, recalculated_eval_score, quality_delta_vs_control,
+            token_ratio_vs_control, time_ratio_vs_control, cost_ratio_vs_control,
+            score_per_1k_tokens, score_per_minute, top_tools)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             result["id"], result.get("runDir"), result["date"],
             result["evalType"], result["target"], result["model"],
@@ -205,6 +245,15 @@ def insert_result(result: dict[str, Any]) -> None:
             result.get("scenario"), result.get("rawJson"),
             result.get("output"), result.get("toolBreakdown"),
             result.get("prompt"), result.get("runId"),
+            result.get("qualityScore"),
+            result.get("recalculatedEvalScore"),
+            result.get("qualityDeltaVsControl"),
+            result.get("tokenRatioVsControl"),
+            result.get("timeRatioVsControl"),
+            result.get("costRatioVsControl"),
+            result.get("scorePer1kTokens"),
+            result.get("scorePerMinute"),
+            result.get("topTools"),
         ),
     )
     conn.commit()
@@ -270,7 +319,41 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "toolBreakdown": row["tool_breakdown"],
         "prompt": row["prompt"],
         "runId": row["run_id"] if "run_id" in row.keys() else None,
+        "qualityScore": row["quality_score"] if "quality_score" in row.keys() else None,
+        "recalculatedEvalScore": row["recalculated_eval_score"] if "recalculated_eval_score" in row.keys() else None,
+        "qualityDeltaVsControl": row["quality_delta_vs_control"] if "quality_delta_vs_control" in row.keys() else None,
+        "tokenRatioVsControl": row["token_ratio_vs_control"] if "token_ratio_vs_control" in row.keys() else None,
+        "timeRatioVsControl": row["time_ratio_vs_control"] if "time_ratio_vs_control" in row.keys() else None,
+        "costRatioVsControl": row["cost_ratio_vs_control"] if "cost_ratio_vs_control" in row.keys() else None,
+        "scorePer1kTokens": row["score_per_1k_tokens"] if "score_per_1k_tokens" in row.keys() else None,
+        "scorePerMinute": row["score_per_minute"] if "score_per_minute" in row.keys() else None,
+        "topTools": row["top_tools"] if "top_tools" in row.keys() else None,
     }
+
+
+def _maybe_round(value: Any, digits: int = 4) -> float | None:
+    if value is None:
+        return None
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tool_breakdown_json(tool_calls: Any) -> str | None:
+    if not isinstance(tool_calls, list):
+        return None
+    breakdown: dict[str, int] = {}
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        name = call.get("tool")
+        if not name:
+            continue
+        breakdown[str(name)] = breakdown.get(str(name), 0) + 1
+    if not breakdown:
+        return None
+    return json.dumps({k: v for k, v in sorted(breakdown.items(), key=lambda item: (-item[1], item[0]))})
 
 
 def _extract_target(data: dict, metadata: dict) -> str:

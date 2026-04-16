@@ -49,6 +49,15 @@ export interface EvalResult {
   toolBreakdown: string | null;
   prompt: string | null;
   runId: string | null;
+  qualityScore?: number | null;
+  recalculatedEvalScore?: number | null;
+  qualityDeltaVsControl?: number | null;
+  tokenRatioVsControl?: number | null;
+  timeRatioVsControl?: number | null;
+  costRatioVsControl?: number | null;
+  scorePer1kTokens?: number | null;
+  scorePerMinute?: number | null;
+  topTools?: string | null;
 }
 
 export type ValidationStatus = "valid" | "invalid" | "unknown" | "checking";
