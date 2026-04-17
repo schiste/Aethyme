@@ -82,6 +82,18 @@ MIGRATIONS = [
     "ALTER TABLE eval_results ADD COLUMN score_per_1k_tokens REAL",
     "ALTER TABLE eval_results ADD COLUMN score_per_minute REAL",
     "ALTER TABLE eval_results ADD COLUMN top_tools TEXT",
+    # LLM-as-judge columns (P3: intra-rater reliability scoring)
+    "ALTER TABLE eval_results ADD COLUMN judge_score REAL",
+    "ALTER TABLE eval_results ADD COLUMN judge_stdev REAL",
+    "ALTER TABLE eval_results ADD COLUMN judge_model TEXT",
+    "ALTER TABLE eval_results ADD COLUMN judge_reliable INTEGER",
+    "ALTER TABLE eval_results ADD COLUMN judge_samples TEXT",
+    "ALTER TABLE eval_results ADD COLUMN judge_error TEXT",
+    "ALTER TABLE eval_results ADD COLUMN judge_cost_usd REAL",
+    # P1: multi-run support
+    "ALTER TABLE eval_results ADD COLUMN batch_id TEXT",
+    "ALTER TABLE eval_results ADD COLUMN run_index INTEGER",
+    "ALTER TABLE eval_results ADD COLUMN runs_in_batch INTEGER",
 ]
 
 
@@ -230,8 +242,15 @@ def insert_result(result: dict[str, Any]) -> None:
             scenario, raw_json, output, tool_breakdown, prompt, run_id,
             quality_score, recalculated_eval_score, quality_delta_vs_control,
             token_ratio_vs_control, time_ratio_vs_control, cost_ratio_vs_control,
-            score_per_1k_tokens, score_per_minute, top_tools)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            score_per_1k_tokens, score_per_minute, top_tools,
+            judge_score, judge_stdev, judge_model, judge_reliable,
+            judge_samples, judge_error, judge_cost_usd,
+            batch_id, run_index, runs_in_batch)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?)""",
         (
             result["id"], result.get("runDir"), result["date"],
             result["evalType"], result["target"], result["model"],
@@ -254,6 +273,18 @@ def insert_result(result: dict[str, Any]) -> None:
             result.get("scorePer1kTokens"),
             result.get("scorePerMinute"),
             result.get("topTools"),
+            # LLM judge fields
+            result.get("judgeScore"),
+            result.get("judgeStdev"),
+            result.get("judgeModel"),
+            1 if result.get("judgeReliable") else (0 if result.get("judgeReliable") is False else None),
+            result.get("judgeSamples"),
+            result.get("judgeError"),
+            result.get("judgeCostUsd"),
+            # Batch fields (P1 multi-run)
+            result.get("batchId"),
+            result.get("runIndex"),
+            result.get("runsInBatch"),
         ),
     )
     conn.commit()
@@ -328,6 +359,18 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "scorePer1kTokens": row["score_per_1k_tokens"] if "score_per_1k_tokens" in row.keys() else None,
         "scorePerMinute": row["score_per_minute"] if "score_per_minute" in row.keys() else None,
         "topTools": row["top_tools"] if "top_tools" in row.keys() else None,
+        # LLM judge fields (P3)
+        "judgeScore": row["judge_score"] if "judge_score" in row.keys() else None,
+        "judgeStdev": row["judge_stdev"] if "judge_stdev" in row.keys() else None,
+        "judgeModel": row["judge_model"] if "judge_model" in row.keys() else None,
+        "judgeReliable": bool(row["judge_reliable"]) if "judge_reliable" in row.keys() and row["judge_reliable"] is not None else None,
+        "judgeSamples": row["judge_samples"] if "judge_samples" in row.keys() else None,
+        "judgeError": row["judge_error"] if "judge_error" in row.keys() else None,
+        "judgeCostUsd": row["judge_cost_usd"] if "judge_cost_usd" in row.keys() else None,
+        # Multi-run fields (P1)
+        "batchId": row["batch_id"] if "batch_id" in row.keys() else None,
+        "runIndex": row["run_index"] if "run_index" in row.keys() else None,
+        "runsInBatch": row["runs_in_batch"] if "runs_in_batch" in row.keys() else None,
     }
 
 

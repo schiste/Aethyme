@@ -104,6 +104,13 @@ export interface EvalRunConfig {
   windowId?: number;
   preparationId?: string;
   cleanupDelaySeconds?: number;
+  /** P1: number of sequential eval repetitions. Default 1. */
+  runs?: number;
+  /** P3: enable LLM-as-judge scoring alongside keyword scoring.
+   * The judge runs Codex via a Chau7 tab (same path as eval agents — no direct API). */
+  useJudge?: boolean;
+  /** P3: how many times the judge scores each output (intra-rater reliability). */
+  judgeSamples?: number;
 }
 
 export interface EvalRunState {

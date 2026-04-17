@@ -197,6 +197,43 @@ def _preparation_file(preparation_id: str) -> Path:
     return PREPARATIONS_ROOT / f"{preparation_id}.json"
 
 
+def _fetch_judge_and_batch_fields(row_id: str) -> dict[str, Any]:
+    """Read judge + batch columns for an existing row, so a later INSERT OR REPLACE
+    doesn't wipe them. Returns camelCase keys ready to splat into insert_result()."""
+    import sqlite3
+    db_path = Path(__file__).resolve().parent / "evals.db"
+    if not db_path.exists():
+        return {}
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT judge_score, judge_stdev, judge_model, judge_reliable, "
+            "judge_samples, judge_error, judge_cost_usd, "
+            "batch_id, run_index, runs_in_batch "
+            "FROM eval_results WHERE id = ?",
+            (row_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+    finally:
+        conn.close()
+    if row is None:
+        return {}
+    return {
+        "judgeScore": row["judge_score"],
+        "judgeStdev": row["judge_stdev"],
+        "judgeModel": row["judge_model"],
+        "judgeReliable": (bool(row["judge_reliable"]) if row["judge_reliable"] is not None else None),
+        "judgeSamples": row["judge_samples"],
+        "judgeError": row["judge_error"],
+        "judgeCostUsd": row["judge_cost_usd"],
+        "batchId": row["batch_id"],
+        "runIndex": row["run_index"],
+        "runsInBatch": row["runs_in_batch"],
+    }
+
+
 def _write_preparation_snapshot(target: str, payload: dict[str, Any]) -> dict[str, Any]:
     PREPARATIONS_ROOT.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
@@ -904,6 +941,15 @@ class RunRequest(BaseModel):
     windowId: int | None = None
     preparationId: str | None = None
     cleanupDelaySeconds: int = Field(default=1, ge=0, le=3600)
+    # P1: number of sequential eval repetitions. Default 1 preserves existing behavior.
+    # Each repetition creates distinct rows sharing a batch_id so the UI can aggregate.
+    runs: int = Field(default=1, ge=1, le=20)
+    # P3: turn on LLM-as-judge scoring (in addition to keyword score).
+    # Judge runs codex via a Chau7 tab (same path as eval agents — no direct API).
+    # Intra-rater reliability: judge is called judgeSamples times on the same
+    # (task, reference, candidate) triple; we report mean + stdev.
+    useJudge: bool = True
+    judgeSamples: int = Field(default=3, ge=1, le=10)
 
 _run_state: dict[str, Any] = {
     "status": "idle",
@@ -1641,6 +1687,68 @@ def _score_output(eval_type: str, output: str, cost: float, prompt: str = "") ->
     return 0.0
 
 
+def _run_eval_batch(
+    first_plan: dict[str, Any],
+    req: RunRequest,
+    *,
+    plan_snapshot: dict[str, Any] | None,
+    preparation_snapshot: dict[str, Any] | None,
+    first_run_dir_name: str,
+    batch_id: str,
+) -> None:
+    """Run N sequential evals under a shared batch_id.
+
+    Iteration 1 uses the pre-generated first_plan (so the endpoint can
+    surface plan-generation failures synchronously). Iterations 2..N
+    regenerate the plan from scratch — each gets its own run_dir, tabs,
+    and session files.
+    """
+    import asyncio
+    total = req.runs
+
+    def _append_log(msg: str) -> None:
+        _run_state["log"].append(msg)
+        print(f"[eval-batch] {msg}")
+
+    _append_log(f"Starting batch of {total} runs (batch_id={batch_id})")
+
+    # Iteration 1: already have the plan
+    _run_eval_background(
+        first_plan,
+        req,
+        plan_snapshot=plan_snapshot,
+        preparation_snapshot=preparation_snapshot,
+        run_dir_name=first_run_dir_name,
+        batch_id=batch_id,
+        run_index=1,
+        runs_in_batch=total,
+    )
+
+    # Iterations 2..N: regenerate plan per iteration
+    for idx in range(2, total + 1):
+        _append_log(f"Batch iteration {idx}/{total}: regenerating plan...")
+        try:
+            loop = asyncio.new_event_loop()
+            plan_i, snapshot_i = loop.run_until_complete(_generate_plan(req))
+            loop.close()
+        except Exception as exc:
+            _append_log(f"Batch iteration {idx} failed during plan generation: {exc}")
+            break
+        dir_name_i = Path(plan_i["paths"]["run_dir"]).name
+        _run_eval_background(
+            plan_i,
+            req,
+            plan_snapshot=snapshot_i,
+            preparation_snapshot=preparation_snapshot,
+            run_dir_name=dir_name_i,
+            batch_id=batch_id,
+            run_index=idx,
+            runs_in_batch=total,
+        )
+
+    _append_log(f"Batch complete ({total} runs, batch_id={batch_id})")
+
+
 def _run_eval_background(
     plan: dict[str, Any],
     req: RunRequest,
@@ -1648,6 +1756,9 @@ def _run_eval_background(
     plan_snapshot: dict[str, Any] | None = None,
     preparation_snapshot: dict[str, Any] | None = None,
     run_dir_name: str | None = None,
+    batch_id: str | None = None,
+    run_index: int = 1,
+    runs_in_batch: int = 1,
 ) -> None:
     import mcp_client
     import time
@@ -2340,6 +2451,45 @@ def _run_eval_background(
                 {k: v for k, v in sorted(data["tool_names"].items(), key=lambda x: -x[1]) if k != "Agent"}
             )
             result_id = f"{run_dir.name}-{cond_name}"
+
+            # P3: LLM-as-judge scoring (runs alongside keyword score).
+            # Judge uses Codex via a Chau7 tab — same path as eval agents,
+            # no direct API calls. Runs in a neutral directory (Aethyme repo
+            # root) so it never touches the playground Control or Aethyme repos.
+            judge_result: dict[str, Any] | None = None
+            if req.useJudge and data.get("output"):
+                try:
+                    from llm_judge import score_eval_type_with_judge
+                    log(
+                        f"[{cond_name}] Running LLM judge via Codex "
+                        f"(samples={req.judgeSamples})..."
+                    )
+                    judge_result = score_eval_type_with_judge(
+                        eval_type=req.evalType,
+                        task=bare_task,
+                        candidate=data["output"],
+                        aethyme_pkg_path=str(AETHYME_PKG),
+                        tab_directory=str(AETHYME_PKG),
+                        samples=req.judgeSamples,
+                        log=lambda m: log(f"[{cond_name}] {m}"),
+                    )
+                    if judge_result.get("error"):
+                        log(f"[{cond_name}] Judge warning: {judge_result['error']}")
+                    else:
+                        log(
+                            f"[{cond_name}] Judge score: "
+                            f"{judge_result['mean_score']:.1f} "
+                            f"(stdev={judge_result['stdev']:.2f}, "
+                            f"reliable={judge_result['reliable']})"
+                        )
+                except Exception as e:
+                    log(f"[{cond_name}] Judge failed: {type(e).__name__}: {e}")
+                    judge_result = {
+                        "mean_score": None, "stdev": None, "samples": [],
+                        "backend": "codex", "reliable": False,
+                        "error": f"{type(e).__name__}: {e}",
+                    }
+
             insert_result({
                 "id": result_id,
                 "runId": run_id,
@@ -2366,6 +2516,21 @@ def _run_eval_background(
                 "prompt": data.get("prompt"),
                 "rawJson": json.dumps(condition_payloads[cond_name]),
                 "toolBreakdown": tool_breakdown_json,
+                # P3: judge fields. judgeModel stores the backend ("codex")
+                # for now — when multiple judge backends exist we can extend it
+                # to capture the specific model string from the Chau7 session.
+                "judgeScore": judge_result["mean_score"] if judge_result else None,
+                "judgeStdev": judge_result["stdev"] if judge_result else None,
+                "judgeModel": judge_result.get("backend") if judge_result else None,
+                "judgeReliable": judge_result["reliable"] if judge_result else None,
+                "judgeSamples": json.dumps(judge_result["samples"]) if judge_result else None,
+                "judgeError": judge_result.get("error") if judge_result else None,
+                # judgeCostUsd deprecated — cost tracked in Chau7 session telemetry.
+                "judgeCostUsd": None,
+                # P1: batch metadata
+                "batchId": batch_id,
+                "runIndex": run_index,
+                "runsInBatch": runs_in_batch,
             })
             log(f"[{cond_name}] Stored: {result_id} (output: {len(data.get('output',''))} chars)")
         except Exception as e:
@@ -2452,8 +2617,14 @@ def _run_eval_background(
         else:
             tool_breakdown_json = None
 
+        # Preserve judge + batch fields that were written during the collect phase.
+        # insert_result uses INSERT OR REPLACE, so any column not set here would
+        # be nulled out. We read the existing row first and forward those fields.
+        row_id = f"{run_dir.name}-{cond_name}"
+        judge_carry = _fetch_judge_and_batch_fields(row_id)
+
         insert_result({
-            "id": f"{run_dir.name}-{cond_name}",
+            "id": row_id,
             "runId": ((run.get("run_metadata") or {}).get("run_id") if isinstance(run.get("run_metadata"), dict) else run_id),
             "runDir": run_dir.name,
             "date": datetime.now(UTC).isoformat()[:19],
@@ -2488,6 +2659,7 @@ def _run_eval_background(
             "scorePer1kTokens": summary.get("score_per_1k_tokens"),
             "scorePerMinute": summary.get("score_per_minute"),
             "topTools": (json.dumps(summary.get("top_tools")) if summary.get("top_tools") else None),
+            **judge_carry,
         })
 
     _run_state["result"] = result
@@ -2578,16 +2750,42 @@ async def launch_run(req: RunRequest, background_tasks: BackgroundTasks) -> dict
             "error": str(exc.detail),
         }
 
-    # Launch in background
+    # Launch in background. For multi-run (req.runs > 1) a wrapper loops
+    # the background job N times, regenerating the plan per iteration so
+    # each run gets its own run_dir / tab set, all sharing one batch_id.
     run_dir_name = Path(plan["paths"]["run_dir"]).name
-    background_tasks.add_task(
-        _run_eval_background,
-        plan,
-        req,
-        plan_snapshot=plan_snapshot,
-        preparation_snapshot=preparation_snapshot,
-        run_dir_name=run_dir_name,
-    )
+
+    if req.runs > 1:
+        import time as _time
+        batch_id = f"batch-{int(_time.time())}-{req.target}-{req.evalType}"
+        background_tasks.add_task(
+            _run_eval_batch,
+            plan,
+            req,
+            plan_snapshot=plan_snapshot,
+            preparation_snapshot=preparation_snapshot,
+            first_run_dir_name=run_dir_name,
+            batch_id=batch_id,
+        )
+        launch_message = (
+            f"Plan generated. Running batch of {req.runs} sequential evals "
+            f"(batch_id={batch_id}). Each run gets its own run_dir; all share batch metadata."
+        )
+    else:
+        background_tasks.add_task(
+            _run_eval_background,
+            plan,
+            req,
+            plan_snapshot=plan_snapshot,
+            preparation_snapshot=preparation_snapshot,
+            run_dir_name=run_dir_name,
+            batch_id=None,
+            run_index=1,
+            runs_in_batch=1,
+        )
+        launch_message = (
+            "Plan generated. Building evaluation inputs, then launching agents via Chau7 MCP..."
+        )
 
     return {
         "status": "running",
@@ -2595,7 +2793,7 @@ async def launch_run(req: RunRequest, background_tasks: BackgroundTasks) -> dict
         "currentPhase": "build inputs",
         "log": [
             f"Using preparation {preparation_snapshot['id']}.",
-            "Plan generated. Building evaluation inputs, then launching agents via Chau7 MCP...",
+            launch_message,
         ],
         "error": None,
     }

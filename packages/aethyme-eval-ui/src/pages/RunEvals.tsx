@@ -11,6 +11,7 @@ import {
   fetchSetupStatus,
 } from "../lib/api";
 import type {
+  EvalRunConfig,
   EvalType,
   ModelName,
   Reasoning,
@@ -120,6 +121,11 @@ export default function RunEvals() {
   const [reasoning, setReasoning] = useState<Reasoning>("high");
   const [windowId, setWindowId] = useState<string>("auto");
   const [cleanupDelaySeconds, setCleanupDelaySeconds] = useState<string>("1");
+  // P1: sequential eval repetitions. Default 1; each run stored with a shared batch_id.
+  const [runs, setRuns] = useState<string>("1");
+  // P3: LLM-as-judge knobs.
+  const [useJudge, setUseJudge] = useState<boolean>(true);
+  const [judgeSamples, setJudgeSamples] = useState<string>("3");
 
   const [repos, setRepos] = useState<Repository[]>([]);
   const [loadingRepos, setLoadingRepos] = useState(true);
@@ -191,7 +197,7 @@ export default function RunEvals() {
 
   useEffect(() => {
     setPlan(null);
-  }, [evalType, target, model, reasoning, windowId, cleanupDelaySeconds]);
+  }, [evalType, target, model, reasoning, windowId, cleanupDelaySeconds, runs, useJudge, judgeSamples]);
 
   const parsedWindowId =
     windowId === "auto" || windowId === "" ? undefined : Number.parseInt(windowId, 10);
@@ -200,15 +206,39 @@ export default function RunEvals() {
     Number.isFinite(parsedCleanupDelaySeconds) && parsedCleanupDelaySeconds >= 0
       ? parsedCleanupDelaySeconds
       : 1;
+  const parsedRuns = Number.parseInt(runs, 10);
+  const effectiveRuns =
+    Number.isFinite(parsedRuns) && parsedRuns >= 1 && parsedRuns <= 20 ? parsedRuns : 1;
+  const parsedJudgeSamples = Number.parseInt(judgeSamples, 10);
+  const effectiveJudgeSamples =
+    Number.isFinite(parsedJudgeSamples) && parsedJudgeSamples >= 1 && parsedJudgeSamples <= 10
+      ? parsedJudgeSamples
+      : 3;
+
+  // Build the base config that every POST /run or /plan request uses.
+  // Centralized so new fields (runs, judge, etc.) only need to be added here.
+  function buildConfig(extra: Partial<EvalRunConfig> = {}): EvalRunConfig {
+    const base: EvalRunConfig = {
+      evalType,
+      target,
+      model,
+      reasoning,
+      cleanupDelaySeconds: effectiveCleanupDelaySeconds,
+      runs: effectiveRuns,
+      useJudge,
+      judgeSamples: effectiveJudgeSamples,
+      ...extra,
+    };
+    if (parsedWindowId !== undefined) base.windowId = parsedWindowId;
+    return base;
+  }
 
   async function handleGeneratePlan() {
     setStatus("planning");
     setPlan(null);
     setLog([]);
     try {
-      const config = parsedWindowId === undefined
-        ? { evalType, target, model, reasoning, cleanupDelaySeconds: effectiveCleanupDelaySeconds }
-        : { evalType, target, model, reasoning, windowId: parsedWindowId, cleanupDelaySeconds: effectiveCleanupDelaySeconds };
+      const config = buildConfig();
       const result = await generatePlan(config);
       setPlan(result);
       setLog((prev) => [...prev, "Plan generated successfully."]);
@@ -322,9 +352,7 @@ export default function RunEvals() {
     setStatus("running");
     setLog([]);
     try {
-      const config = parsedWindowId === undefined
-        ? { evalType, target, model, reasoning, preparationId: preparation.id, cleanupDelaySeconds: effectiveCleanupDelaySeconds }
-        : { evalType, target, model, reasoning, windowId: parsedWindowId, preparationId: preparation.id, cleanupDelaySeconds: effectiveCleanupDelaySeconds };
+      const config = buildConfig({ preparationId: preparation.id });
       const state = await launchRun(config);
       setCurrentPhase(state.currentPhase);
       setLog(state.log);
@@ -544,6 +572,51 @@ export default function RunEvals() {
                   className={selectClass}
                 />
               </div>
+
+              <div>
+                <label className="block text-xs text-[var(--color-text-muted)] uppercase tracking-wide mb-1">
+                  Runs
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  max={20}
+                  step={1}
+                  value={runs}
+                  onChange={(e) => setRuns(e.target.value)}
+                  className={selectClass}
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs text-[var(--color-text-muted)] uppercase tracking-wide mb-1">
+                  Judge
+                </label>
+                <select
+                  value={useJudge ? "on" : "off"}
+                  onChange={(e) => setUseJudge(e.target.value === "on")}
+                  className={selectClass}
+                >
+                  <option value="on">On (Codex)</option>
+                  <option value="off">Off</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs text-[var(--color-text-muted)] uppercase tracking-wide mb-1">
+                  Judge Samples
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  max={10}
+                  step={1}
+                  value={judgeSamples}
+                  onChange={(e) => setJudgeSamples(e.target.value)}
+                  disabled={!useJudge}
+                  className={selectClass}
+                />
+              </div>
             </div>
             <div className="space-y-1 text-xs text-[var(--color-text-muted)]">
               <p>
@@ -551,6 +624,12 @@ export default function RunEvals() {
               </p>
               <p>
                 Cleanup delay is the number of seconds to keep eval tabs open after finalization before closing them. Use a long delay for debugging and `1` for normal data collection.
+              </p>
+              <p>
+                <strong>Runs</strong>: sequential repetitions of the full eval (1–20). Each run gets its own run_dir; all share a <code>batch_id</code> so the UI can aggregate them. Use 3–5 runs to distinguish signal from single-run variance.
+              </p>
+              <p>
+                <strong>Judge</strong>: LLM-as-judge scoring via Codex in a Chau7 tab (same path as eval agents — no direct API). <strong>Samples</strong> are repeated judge calls on the same output to measure intra-rater reliability (stdev &lt; 10 = consistent). Each sample opens a brief judge tab.
               </p>
             </div>
           </div>
