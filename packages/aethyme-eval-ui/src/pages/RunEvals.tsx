@@ -78,9 +78,8 @@ const EVAL_TYPES: { value: EvalType; label: string; description: string; target?
   },
   {
     value: "dead-code",
-    label: "Dead Code (MediaWiki)",
-    description: "Find public methods in includes/Watchlist/ that are never called from outside that directory.",
-    target: "mediawiki",
+    label: "Dead Code",
+    description: "Target-specific dead-code scan. MediaWiki checks Watchlist methods; Aethyme checks indexing top-level functions.",
     conditions: "5 conditions: control-cto-off, control-cto-on, explore (skill only), leverage (generic Aethyme guidance), task-conditioned (engine-generated task guidance)",
   },
   {

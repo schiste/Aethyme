@@ -773,7 +773,7 @@ def eval() -> None:
 )
 @click.option(
     "--target", required=True,
-    type=click.Choice(["grc", "mediawiki"]),
+    type=click.Choice(["aethyme", "grc", "mediawiki"]),
     help="Target playground repository",
 )
 @click.option(

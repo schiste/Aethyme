@@ -1054,7 +1054,42 @@ def _extract_tool_calls(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return tool_calls
 
 
-def _shared_eval_artifacts(eval_type: str, task: str) -> dict[str, Any]:
+def _dead_code_task_for_target(target: str) -> str:
+    if target == "aethyme":
+        return """\
+Find all public top-level functions in `packages/aethyme/src/indexing/` that are never called from outside that directory.
+
+Scope:
+- Check every Python file in `packages/aethyme/src/indexing/` for public top-level function definitions
+- For each public function, search the entire repo outside `packages/aethyme/src/indexing/` for call sites
+- Search at least `packages/aethyme/src/`, `packages/aethyme/tests/`, and `packages/aethyme/scripts/`
+- Exclude private helpers whose names start with `_`
+
+For each unused function, report:
+- The function name
+- The file it's defined in (relative path)
+- Why you believe it's unused (what you searched for and didn't find)
+
+Be thorough — check every public top-level function, not just a sample. Missing a truly unused function or falsely flagging a used one both count against you."""
+
+    return """\
+Find all public methods in `includes/Watchlist/` that are never called from outside that directory.
+
+Scope:
+- Check every PHP file in `includes/Watchlist/` for public function definitions
+- For each public function, search the ENTIRE codebase (outside `includes/Watchlist/`) for call sites
+- Exclude test files (`tests/`) and vendor files (`vendor/`) from the caller search
+- Exclude constructors (`__construct`, `__destruct`)
+
+For each unused function, report:
+- The function name
+- The file it's defined in (relative path)
+- Why you believe it's unused (what you searched for and didn't find)
+
+Be thorough — check every public function, not just a sample. Missing a truly unused function or falsely flagging a used one both count against you."""
+
+
+def _shared_eval_artifacts(eval_type: str, task: str, *, target: str) -> dict[str, Any]:
     _ensure_aethyme_imports()
     from src.eval import schemas as eval_schemas
     from src.eval.report import contract_versions
@@ -1089,17 +1124,24 @@ def _shared_eval_artifacts(eval_type: str, task: str) -> dict[str, Any]:
         "impact-analysis": ("mediawiki_impact_analysis_output_schema", None, "mediawiki_impact_analysis_reference"),
         "feature-localization": ("mediawiki_feature_localization_output_schema", None, "mediawiki_feature_localization_reference"),
         "config-audit": ("mediawiki_config_audit_output_schema", None, "mediawiki_config_audit_reference"),
-        "dead-code": ("mediawiki_dead_code_output_schema", "mediawiki_dead_code_scoring_rubric", "mediawiki_dead_code_reference"),
         "migration": ("mediawiki_migration_output_schema", "mediawiki_migration_scoring_rubric", "mediawiki_migration_reference"),
     }
 
-    schema_name, rubric_name, reference_name = mapping.get(eval_type, (None, None, None))
+    if eval_type == "dead-code":
+        schema_name = "dead_code_output_schema_for_target"
+        rubric_name = "dead_code_scoring_rubric_for_target"
+        reference_name = "dead_code_reference_for_target"
+    else:
+        schema_name, rubric_name, reference_name = mapping.get(eval_type, (None, None, None))
     if schema_name and hasattr(eval_schemas, schema_name):
-        artifacts["output_schema"] = getattr(eval_schemas, schema_name)()
+        schema_fn = getattr(eval_schemas, schema_name)
+        artifacts["output_schema"] = schema_fn(target) if eval_type == "dead-code" else schema_fn()
     if rubric_name and hasattr(eval_schemas, rubric_name):
-        artifacts["scoring_rubric"] = getattr(eval_schemas, rubric_name)()
+        rubric_fn = getattr(eval_schemas, rubric_name)
+        artifacts["scoring_rubric"] = rubric_fn(target) if eval_type == "dead-code" else rubric_fn()
     if reference_name and hasattr(eval_schemas, reference_name):
-        reference = getattr(eval_schemas, reference_name)()
+        ref_fn = getattr(eval_schemas, reference_name)
+        reference = ref_fn(target) if eval_type == "dead-code" else ref_fn()
         artifacts["reference_output"] = reference
         if eval_type in {"navigation-ctf", "bug-fix"}:
             artifacts["reference"] = reference
@@ -1218,6 +1260,53 @@ def _parse_and_score_bug_fix_1_output(
     )
     assessment["method"] = "score_mediawiki_bug_fix_1"
     assessment["eval_type"] = "bug-fix-1"
+    return candidate, assessment
+
+
+def _parse_and_score_dead_code_output(
+    output_text: str,
+    *,
+    cost: float,
+    target: str,
+    repo_path: Path,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    import sys
+
+    sys.path.insert(0, str(AETHYME_PKG))
+    from src.eval.scoring import parse_structured_output, score_dead_code
+    from src.eval.schemas import dead_code_reference_for_target
+
+    candidate = parse_structured_output(output_text)
+    if candidate is None:
+        return None, {
+            "weighted_score": 0.0,
+            "max_score": 100,
+            "scores": {
+                "functions_found": 0.0,
+                "false_positives": 0.0,
+                "efficiency": 0.0,
+            },
+            "weights": {
+                "functions_found": 60,
+                "false_positives": 20,
+                "efficiency": 20,
+            },
+            "method": "structured_parse_failed",
+            "eval_type": "dead-code",
+            "target": target,
+            "error": "output_not_valid_json_object",
+        }
+
+    reference = dead_code_reference_for_target(target)
+    assessment = score_dead_code(
+        candidate,
+        reference,
+        cost_usd=cost,
+        repo_path=str(repo_path.resolve()),
+    )
+    assessment["method"] = "score_dead_code"
+    assessment["eval_type"] = "dead-code"
+    assessment["target"] = target
     return candidate, assessment
 
 
@@ -1356,21 +1445,6 @@ The test file is correct. The bug is in the source code.""",
 Find the manifest that manages the main code entrypoint, identify the entrypoint file it controls, and name the top-level area that owns both.
 
 Produce a structured analysis with config_target, code_target, management_area, and relationship_chain.""",
-        "dead-code": """\
-Find all public methods in `includes/Watchlist/` that are never called from outside that directory.
-
-Scope:
-- Check every PHP file in `includes/Watchlist/` for public function definitions
-- For each public function, search the ENTIRE codebase (outside `includes/Watchlist/`) for call sites
-- Exclude test files (`tests/`) and vendor files (`vendor/`) from the caller search
-- Exclude constructors (`__construct`, `__destruct`)
-
-For each unused function, report:
-- The function name
-- The file it's defined in (relative path)
-- Why you believe it's unused (what you searched for and didn't find)
-
-Be thorough — check every public function, not just a sample. Missing a truly unused function or falsely flagging a used one both count against you.""",
         "migration": """\
 We are renaming the class `WatchedItemStore` to `WatchlistNotificationStore`.
 
@@ -1383,11 +1457,14 @@ Exclude `includes/Watchlist/WatchedItemStore.php` itself — that's the file bei
 Be exhaustive — missing a file means the rename breaks production. Search thoroughly across all of `includes/`, `maintenance/`, `docs/`, and root-level files.""",
     }
 
-    bare_task = eval_tasks.get(eval_type, f"Analyze this repository for: {eval_type}")
+    if eval_type == "dead-code":
+        bare_task = _dead_code_task_for_target(req.target)
+    else:
+        bare_task = eval_tasks.get(eval_type, f"Analyze this repository for: {eval_type}")
     log(f"Eval type: {eval_type}")
     log(f"Bare task: {len(bare_task)} chars")
 
-    shared_artifacts = _shared_eval_artifacts(eval_type, bare_task)
+    shared_artifacts = _shared_eval_artifacts(eval_type, bare_task, target=req.target)
     shared_artifacts["target"] = req.target
     shared_artifacts["model"] = plan.get("meta", {}).get("model")
     shared_artifacts["scenario"] = plan.get("meta", {}).get("scenario")
@@ -1397,7 +1474,7 @@ Be exhaustive — missing a file means the rename breaks production. Search thor
     for cond in conditions:
         cond_name = cond["name"]
         repo_dir = Path(cond["directory"])
-        output_suffix = "json" if eval_type == "bug-fix-1" else "md"
+        output_suffix = "json" if eval_type in {"bug-fix-1", "dead-code"} else "md"
         output_path = repo_dir / f".aethyme-eval-output-{cond_name}.{output_suffix}"
         output_files[cond_name] = output_path
         output_path.unlink(missing_ok=True)
@@ -1502,6 +1579,22 @@ Be exhaustive — missing a file means the rename breaks production. Search thor
             prompt_text = (
                 f"IMPORTANT: You MUST save exactly one JSON object to `{out_path}` when done. "
                 f"Use the Write tool to create this file. The file contents must be valid JSON and must match the required keys exactly.\n\n"
+                f"{task_text}\n\n"
+                f"Remember: save JSON only to `{out_path}`."
+            )
+        elif eval_type == "dead-code":
+            prompt_text = (
+                f"IMPORTANT: You MUST save exactly one JSON object to `{out_path}` when done. "
+                f"Use the Write tool to create this file. The file contents must be valid JSON with exactly this shape:\n"
+                "{\n"
+                '  "unused_functions": [\n'
+                "    {\n"
+                '      "function_name": "name",\n'
+                '      "defined_in": "relative/path.py",\n'
+                '      "reason": "what you searched for and did not find"\n'
+                "    }\n"
+                "  ]\n"
+                "}\n\n"
                 f"{task_text}\n\n"
                 f"Remember: save JSON only to `{out_path}`."
             )
@@ -2339,6 +2432,18 @@ def _run_eval_background(
                     parsed_candidate, assessment = _parse_and_score_bug_fix_1_output(
                         data["output"],
                         cost=data["cost"],
+                        repo_path=repo_dir,
+                    )
+                    score = float(assessment.get("weighted_score", 0.0))
+                    log(
+                        f"[{cond_name}] Structured score: {score:.1f} "
+                        f"(parsed_candidate={'yes' if parsed_candidate else 'no'})"
+                    )
+                elif req.evalType == "dead-code":
+                    parsed_candidate, assessment = _parse_and_score_dead_code_output(
+                        data["output"],
+                        cost=data["cost"],
+                        target=req.target,
                         repo_path=repo_dir,
                     )
                     score = float(assessment.get("weighted_score", 0.0))

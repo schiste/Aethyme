@@ -1,7 +1,9 @@
 # Dead-Code Baseline
 
-The MediaWiki `dead-code` eval currently scores against a reviewed baseline for
-`includes/Watchlist/`.
+The `dead-code` eval currently supports reviewed target-specific baselines:
+
+- MediaWiki: `includes/Watchlist/`
+- Aethyme: `packages/aethyme/src/indexing/`
 
 The baseline is intentionally split into two views:
 
@@ -21,6 +23,7 @@ Why this split exists:
 
 Source of truth:
 - [mediawiki_dead_code_watchlist.json](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/src/eval/baselines/mediawiki_dead_code_watchlist.json:1)
+- [aethyme_dead_code_indexing.json](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/src/eval/baselines/aethyme_dead_code_indexing.json:1)
 
 Current practical interpretation:
 - score benchmark answers against `literal_external_only`

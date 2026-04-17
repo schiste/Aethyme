@@ -633,6 +633,12 @@ def _mediawiki_dead_code_watchlist_baseline() -> dict[str, object]:
     return json.loads(baseline_path.read_text(encoding="utf-8"))
 
 
+@lru_cache(maxsize=1)
+def _aethyme_dead_code_indexing_baseline() -> dict[str, object]:
+    baseline_path = Path(__file__).with_name("baselines") / "aethyme_dead_code_indexing.json"
+    return json.loads(baseline_path.read_text(encoding="utf-8"))
+
+
 def mediawiki_dead_code_output_schema() -> dict[str, object]:
     return {
         "type": "object",
@@ -656,6 +662,10 @@ def mediawiki_dead_code_output_schema() -> dict[str, object]:
     }
 
 
+def aethyme_dead_code_output_schema() -> dict[str, object]:
+    return mediawiki_dead_code_output_schema()
+
+
 def mediawiki_dead_code_scoring_rubric() -> dict[str, object]:
     return {
         "weights": {
@@ -670,6 +680,17 @@ def mediawiki_dead_code_scoring_rubric() -> dict[str, object]:
             "Important: this benchmark uses the prompt semantics ('zero non-test callers outside includes/Watchlist/'), not a pure software-maintenance notion of dead code.",
         ],
     }
+
+
+def aethyme_dead_code_scoring_rubric() -> dict[str, object]:
+    rubric = mediawiki_dead_code_scoring_rubric()
+    rubric["notes"] = [
+        "functions_found: recall — how many reviewed Aethyme indexing baseline functions were identified.",
+        "false_positives: precision — penalty for listing functions outside the reviewed indexing baseline.",
+        "efficiency: cost relative to $1.00 baseline.",
+        "Important: this benchmark uses the literal prompt semantics ('zero non-test callers outside packages/aethyme/src/indexing/'), not a broader maintainability definition of dead code.",
+    ]
+    return rubric
 
 
 def mediawiki_dead_code_reference() -> dict[str, object]:
@@ -698,6 +719,42 @@ def mediawiki_dead_code_reference() -> dict[str, object]:
         ],
         "engineering_review": baseline["engineering_review"],
     }
+
+
+def aethyme_dead_code_reference() -> dict[str, object]:
+    baseline = _aethyme_dead_code_indexing_baseline()
+    literal = baseline["literal_external_only"]
+    likely_dead_code = baseline["engineering_review"]["likely_dead_code"]
+    return {
+        "baseline_id": baseline["baseline_id"],
+        "reviewed_at": baseline["reviewed_at"],
+        "selection_rule": baseline["selection_rule"],
+        "unused_functions": literal,
+        "literal_external_only": literal,
+        "likely_dead_code": likely_dead_code,
+        "scope": baseline["scope"],
+        "exclusions": baseline["exclusions"],
+        "function_keywords": [item["function_name"] for item in literal],
+        "engineering_review": baseline["engineering_review"],
+    }
+
+
+def dead_code_reference_for_target(target: str) -> dict[str, object]:
+    if target == "aethyme":
+        return aethyme_dead_code_reference()
+    return mediawiki_dead_code_reference()
+
+
+def dead_code_output_schema_for_target(target: str) -> dict[str, object]:
+    if target == "aethyme":
+        return aethyme_dead_code_output_schema()
+    return mediawiki_dead_code_output_schema()
+
+
+def dead_code_scoring_rubric_for_target(target: str) -> dict[str, object]:
+    if target == "aethyme":
+        return aethyme_dead_code_scoring_rubric()
+    return mediawiki_dead_code_scoring_rubric()
 
 
 # ---------------------------------------------------------------------------

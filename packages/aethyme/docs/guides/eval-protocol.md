@@ -997,7 +997,7 @@ See [playground-setup.md](playground-setup.md) for the full setup guide.
 | `impact-analysis` | mediawiki | List all callers of doViewUpdates() | call site recall + precision |
 | `feature-localization` | mediawiki | Trace Watch button execution chain | ordered method chain matching |
 | `config-audit` | mediawiki | Find rate limiting config + enforcement | exact variable/file/class matching |
-| `dead-code` | mediawiki | Find unused public functions in Watchlist/ | function recall + precision + efficiency |
+| `dead-code` | mediawiki, aethyme | Target-specific dead-code scan (Watchlist methods or indexing functions) | function recall + precision + efficiency |
 | `migration` | mediawiki | List files referencing WatchedItemStore | file recall + precision + efficiency |
 
 Schemas and references: `src/eval/schemas.py`

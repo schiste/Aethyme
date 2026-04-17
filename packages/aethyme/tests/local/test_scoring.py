@@ -25,6 +25,7 @@ from src.eval.scoring import (
     _relationship_chain_score,
     parse_structured_output,
     score_mediawiki_bug_fix_1,
+    score_dead_code,
     score_explain_repo_output,
     score_navigation_ctf_output,
 )
@@ -105,6 +106,13 @@ class TestParseStructuredOutput:
         )
         assert payload is not None
         assert payload["testing"] == "z"
+
+    def test_dead_code_payload(self):
+        payload = parse_structured_output(
+            '{"unused_functions":[{"function_name":"activate","defined_in":"packages/aethyme/src/indexing/engine.py","reason":"no callers found"}]}'
+        )
+        assert payload is not None
+        assert payload["unused_functions"][0]["function_name"] == "activate"
 
 
 # ── _exact_path_score ────────────────────────────────────────────────────
@@ -229,6 +237,28 @@ class TestRelationshipChainScore:
     def test_none_candidate_with_reference(self):
         reference = [{"from": "a.json", "to": "b.py", "relation": "entrypoint_for"}]
         assert _relationship_chain_score(None, reference) == 0.0
+
+
+class TestScoreDeadCode:
+    def test_generic_dead_code_scoring(self):
+        reference = {
+            "unused_functions": [
+                {"function_name": "activate"},
+                {"function_name": "workspace_inspect"},
+            ]
+        }
+        candidate = {
+            "unused_functions": [
+                {"function_name": "activate"},
+                {"function_name": "false_positive"},
+            ]
+        }
+
+        result = score_dead_code(candidate, reference, cost_usd=0.5)
+
+        assert result["scores"]["functions_found"] == pytest.approx(0.5)
+        assert result["scores"]["false_positives"] == pytest.approx(0.5)
+        assert result["weighted_score"] > 0
 
 
 # ── _extract_path_strings ───────────────────────────────────────────────

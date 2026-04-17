@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.eval.schemas import mediawiki_dead_code_reference
+from src.eval.schemas import aethyme_dead_code_reference, mediawiki_dead_code_reference
 
 
 def test_mediawiki_dead_code_reference_uses_reviewed_watchlist_baseline() -> None:
@@ -24,3 +24,26 @@ def test_mediawiki_dead_code_reference_preserves_engineering_review_split() -> N
         for item in reference["engineering_review"]["likely_dead_code"]
     }
     assert likely == {"overrideDeferredUpdatesAddCallableUpdateCallback"}
+
+
+def test_aethyme_dead_code_reference_uses_reviewed_indexing_baseline() -> None:
+    reference = aethyme_dead_code_reference()
+
+    assert reference["baseline_id"] == "aethyme-dead-code-indexing-v1"
+    assert len(reference["unused_functions"]) == 13
+
+    by_name = {item["function_name"]: item for item in reference["unused_functions"]}
+    assert by_name["setup_indexing_logging"]["defined_in"] == "packages/aethyme/src/indexing/logging.py"
+    assert by_name["index_repository"]["defined_in"] == "packages/aethyme/src/indexing/service.py"
+    assert by_name["workspace_blast_radius"]["defined_in"] == "packages/aethyme/src/indexing/engine.py"
+
+
+def test_aethyme_dead_code_reference_preserves_engineering_review_split() -> None:
+    reference = aethyme_dead_code_reference()
+
+    likely = {
+        item["function_name"]
+        for item in reference["engineering_review"]["likely_dead_code"]
+    }
+    assert "activate" in likely
+    assert "workspace_inspect" in likely

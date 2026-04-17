@@ -43,7 +43,7 @@ Creates `<Name> - Control` (vanilla) and `<Name> - Aethyme` (with skill + graph 
 ### Run an assessment
 
 ```bash
-./scripts/eval/run-eval.sh --eval-type dead-code --target mediawiki --model haiku
+./scripts/eval/run-eval.sh --eval-type dead-code --target aethyme --model haiku
 ```
 
 End-to-end: verifies playground, starts server, launches 5 conditions via Chau7 MCP, polls until done, prints the scorecard, and writes a full artifact bundle. Results are stored in SQLite at `packages/aethyme-eval-ui/server/evals.db`, visible at http://localhost:5173, and persisted under `packages/aethyme/eval-runs/<timestamp>-<target>-<type>/`.
@@ -71,7 +71,7 @@ This checks repo cleanliness, engine presence, index presence, and git state. It
 | `impact-analysis` | mediawiki | List all callers of `doViewUpdates()` |
 | `feature-localization` | mediawiki | Trace Watch button execution from handler to DB write |
 | `config-audit` | mediawiki | Find rate limiting config, definition, enforcement, override |
-| `dead-code` | mediawiki | Find unused public functions in `includes/Watchlist/` |
+| `dead-code` | mediawiki, aethyme | Target-specific dead-code scan (MediaWiki Watchlist or Aethyme indexing) |
 | `migration` | mediawiki | List all files referencing `WatchedItemStore` for rename |
 
 ## 5-Condition Design

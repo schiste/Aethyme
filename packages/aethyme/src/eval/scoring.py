@@ -635,7 +635,7 @@ def score_mediawiki_bug_fix_1(
     }
 
 
-def score_mediawiki_dead_code(
+def score_dead_code(
     candidate: dict[str, Any] | None,
     reference: dict[str, Any],
     *,
@@ -672,6 +672,21 @@ def score_mediawiki_dead_code(
         "functions_missed": sorted(ref_funcs - cand_funcs),
         "false_positives": sorted(cand_funcs - ref_funcs),
     }
+
+
+def score_mediawiki_dead_code(
+    candidate: dict[str, Any] | None,
+    reference: dict[str, Any],
+    *,
+    cost_usd: float = 0.0,
+    repo_path: str | None = None,
+) -> dict[str, Any]:
+    return score_dead_code(
+        candidate,
+        reference,
+        cost_usd=cost_usd,
+        repo_path=repo_path,
+    )
 
 
 def score_mediawiki_migration(

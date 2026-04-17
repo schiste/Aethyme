@@ -198,15 +198,10 @@ _EVAL_TYPE_DEFAULTS: dict[str, dict[str, str]] = {
         "report_function": "src.eval.report.finalize_eval_run",
     },
     "dead-code": {
-        "task": (
-            "Find all public methods in includes/Watchlist/ that are never "
-            "called from outside that directory. Check every public function "
-            "and search the entire codebase for call sites."
-        ),
-        "prepare_function": "src.eval.schemas.mediawiki_dead_code_reference",
-        "score_function": "src.eval.scoring.score_mediawiki_dead_code",
+        "task": "Target-specific dead-code evaluation",
+        "prepare_function": "src.eval.schemas.dead_code_reference_for_target",
+        "score_function": "src.eval.scoring.score_dead_code",
         "report_function": "src.eval.report.finalize_eval_run",
-        "target_restriction": "mediawiki",
     },
     "migration": {
         "task": (
