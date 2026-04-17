@@ -10,7 +10,7 @@ export type EvalType =
   | "dead-code"
   | "migration";
 
-export type TargetName = "grc" | "mediawiki";
+export type TargetName = "aethyme" | "grc" | "mediawiki";
 
 export type ModelName = "haiku" | "sonnet" | "opus" | "gpt-5.4";
 

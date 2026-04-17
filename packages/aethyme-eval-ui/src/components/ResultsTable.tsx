@@ -287,6 +287,7 @@ export default function ResultsTable({ results }: Props) {
       case "target": {
         const isControl = row.condition.startsWith("control");
         const repoPaths: Record<string, [string, string]> = {
+          "aethyme": ["~/Playground/Aethyme/Aethyme - Control", "~/Playground/Aethyme/Aethyme - Aethyme"],
           "grc": ["~/Playground/GRC/Playground Control", "~/Playground/GRC/Playground Aethyme"],
           "mediawiki": ["~/Playground/Mediawiki/Mediawiki - Control", "~/Playground/Mediawiki/Mediawiki - Aethyme"],
         };

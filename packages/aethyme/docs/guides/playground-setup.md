@@ -147,6 +147,21 @@ TARGETS["myrepo"] = EvalTarget(
 )
 ```
 
+Example for this repo itself:
+```python
+TARGETS["aethyme"] = EvalTarget(
+    name="aethyme",
+    display_name="Aethyme",
+    control_path=_PLAYGROUND_ROOT / "Aethyme" / "Aethyme - Control",
+    aethyme_path=_PLAYGROUND_ROOT / "Aethyme" / "Aethyme - Aethyme",
+    description="Aethyme monorepo",
+    setup_source=str(Path(__file__).resolve().parents[4]),
+    setup_commit="<pinned-commit-sha>",
+    setup_control_dir_name="Aethyme - Control",
+    setup_aethyme_dir_name="Aethyme - Aethyme",
+)
+```
+
 3. Add eval scenarios in `src/eval/schemas.py` (reference data) and `src/eval/scoring.py` (scoring function)
 
 4. Register in `src/eval/orchestrator.py` (`_EVAL_TYPE_DEFAULTS` dict)

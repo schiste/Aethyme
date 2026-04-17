@@ -125,6 +125,20 @@ for REPO in "$CONTROL_DIR" "$AETHYME_DIR"; do
     echo "  Cleaned: $(basename "$REPO") — $(count_git_refs) refs, $(git remote | wc -l | tr -d ' ') remotes"
 done
 
+# Strip eval/tooling contamination from the Control repo. When the source repo is
+# Aethyme itself, tracked runtime folders like .chau7/ would otherwise leak into
+# the vanilla Control clone and invalidate the playground isolation contract.
+echo ">>> Removing Control-side tooling/runtime contamination..."
+cd "$CONTROL_DIR"
+for path in .codex .aethyme .chau7 .claude; do
+    tracked_files=("${(@f)$(git ls-files "$path" 2>/dev/null)}")
+    if (( ${#tracked_files[@]} > 0 )); then
+        git update-index --skip-worktree -- $tracked_files
+    fi
+done
+command rm -rf .codex .aethyme .chau7 .claude
+echo "  Removed: .codex .aethyme .chau7 .claude (if present)"
+
 # ── Step 3: Deploy Aethyme tooling ───────────────────────────────────
 
 echo ">>> Indexing Aethyme repo..."

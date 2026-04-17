@@ -75,6 +75,17 @@ class EvalTarget:
 
 
 TARGETS: dict[str, EvalTarget] = {
+    "aethyme": EvalTarget(
+        name="aethyme",
+        display_name="Aethyme",
+        control_path=_PLAYGROUND_ROOT / "Aethyme" / "Aethyme - Control",
+        aethyme_path=_PLAYGROUND_ROOT / "Aethyme" / "Aethyme - Aethyme",
+        description="Aethyme monorepo",
+        setup_source=str(Path(__file__).resolve().parents[4]),
+        setup_commit="b3676ceee430325cd5eaadb59625be910da9fed5",
+        setup_control_dir_name="Aethyme - Control",
+        setup_aethyme_dir_name="Aethyme - Aethyme",
+    ),
     "grc": EvalTarget(
         name="grc",
         display_name="GRC",
