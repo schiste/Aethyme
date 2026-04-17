@@ -14,6 +14,8 @@ You are working on the assessment system for Aethyme, a code navigation tool. As
 
 2. **No assessment-driven tool changes.** Never modify the engine, skills, or pipeline to improve assessment scores. Ask: "Would I make this change if the assessment didn't exist?" If no, don't make it. See `docs/guides/eval-protocol.md` for detailed examples.
 
+   The active repository-agnostic tooling roadmap is in `docs/guides/eval-tooling-roadmap.md`. Follow that ordering before touching `task-conditioned`.
+
 3. **Control repo is sacred.** The Control copy of each playground repo must never be modified after initial clone. No `.codex/`, no `.aethyme/`, no `.chau7/`. If contaminated, delete and re-clone.
 
 ## Scripts
@@ -90,6 +92,14 @@ Every assessment runs the same task across 5 conditions to isolate what helps:
 **Task-Specific Pack** = Engine-generated prompt or artifact with repo structure, function listings, subsystem detail, or task navigation context.
 
 The task-conditioned prompt is built by: `aethyme-engine-cli prompt --repo <path> --task <task> --focus overview [--subsystem <dir>]`
+
+Current product priority:
+
+1. strengthen `explore`
+2. make `leverage` a light generic uplift over `explore`
+3. revisit `task-conditioned` only after the generic tooling is stronger
+
+Do not use assessment results as a reason to grow the task-conditioned prompt first.
 
 ## End-of-Run Metrics
 
@@ -215,6 +225,7 @@ Storage
 | What | Where |
 |---|---|
 | Full protocol | `docs/guides/eval-protocol.md` |
+| Tooling roadmap | `docs/guides/eval-tooling-roadmap.md` |
 | Playground setup guide | `docs/guides/playground-setup.md` |
 | Target registry | `src/eval/targets.py` |
 | Orchestrator | `src/eval/orchestrator.py` |

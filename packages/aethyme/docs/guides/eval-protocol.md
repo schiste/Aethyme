@@ -1,6 +1,8 @@
 # Eval Protocol — Aethyme Navigation Benchmarks
 
-Last Updated: 2026-04-14
+Last Updated: 2026-04-17
+
+See also: [`eval-tooling-roadmap.md`](eval-tooling-roadmap.md) for the repository-agnostic tooling priorities that should improve `explore` and `leverage` before any further `task-conditioned` optimization.
 
 ## Runtime Flow
 
@@ -68,6 +70,23 @@ Examples of **allowed** changes:
 **Why this matters:** Aethyme's value proposition is that a generic structural graph improves agent navigation on ANY repository and ANY task. If the tools are tuned to score well on specific evals, the product loses its generality claim. Eval scores that come from tool-tweaking are vanity metrics — they prove nothing about real-world value. A system that scores 70 honestly is worth more than one that scores 95 through overfitting.
 
 **When evals reveal genuine problems:** If an eval shows that Aethyme-equipped agents underperform vanilla agents, the correct response is to investigate whether there is a generic deficiency in the system (poor anchor quality, missing graph edges, excessive irrelevant context, skill instructions that waste turns). Fix the generic problem. Then re-run the eval to see if the generic fix helped. The eval is a diagnostic, not a target.
+
+## Tooling Priority
+
+The current optimization order is:
+
+1. strengthen generic `explore` behavior
+2. make `leverage` a small, generic uplift over `explore`
+3. delay `task-conditioned` optimization until the generic tooling is stronger
+
+The default bias should be toward:
+
+- candidate enumeration
+- verification primitives
+- ambiguity surfacing
+- output-contract support
+
+Not toward larger prompt packs.
 
 ## Local Eval Storage
 

@@ -13,6 +13,7 @@ It owns:
 5. controlled autofix tooling from the CLI
 6. deterministic navigation primitives for AI agents
 7. navigation evaluation benchmarks — see [`docs/guides/eval-protocol.md`](docs/guides/eval-protocol.md)
+8. evaluation tooling roadmap — see [`docs/guides/eval-tooling-roadmap.md`](docs/guides/eval-tooling-roadmap.md)
 
 ## Canonical Model
 
@@ -98,6 +99,7 @@ Core commands:
 - `aethyme eval navigation-ctf --repo /path/to/repo --json-output`
 
 See [`docs/guides/eval-protocol.md`](docs/guides/eval-protocol.md) for the canonical 5-condition playground eval protocol, repository setup flow, and Chau7 execution method.
+See [`docs/guides/eval-tooling-roadmap.md`](docs/guides/eval-tooling-roadmap.md) for the current repository-agnostic priority order: strengthen `explore`, then `leverage`, then revisit `task-conditioned`.
 
 This local path is the shortest route to proving:
 
