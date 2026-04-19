@@ -4,6 +4,8 @@ build/
 coverage/
 test-results/
 playwright-report/
+.DS_Store
+.chau7/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
@@ -12,4 +14,5 @@ __pycache__/
 .env
 .env.*
 *.log
+packages/aethyme-eval-ui/server/evals.db
 packages/aethyme/rust/target/
