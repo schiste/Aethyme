@@ -18,7 +18,23 @@ ENGINE_MANIFEST_PATH = Path(__file__).resolve().parents[2] / "rust" / "Cargo.tom
 ENGINE_WORKSPACE_PATH = ENGINE_MANIFEST_PATH.parent
 ENGINE_BINARY_DEBUG = ENGINE_WORKSPACE_PATH / "target" / "debug" / "aethyme-engine-cli"
 ENGINE_BINARY_RELEASE = ENGINE_WORKSPACE_PATH / "target" / "release" / "aethyme-engine-cli"
+ENGINE_BINARY_PATH: Path | None = None
 CACHE_ROOT = Path(os.getenv("AETHYME_CACHE_DIR", "/tmp/aethyme-cache"))
+EngineRunner = Callable[[tuple[str, ...]], str]
+SUPPORTED_ENGINE_TRANSPORT_CONFIGS = ("auto", "subprocess", "pyo3")
+
+
+def _probe_pyo3_transport() -> tuple[bool, str]:
+    """Return readiness and detail message for PyO3 transport."""
+    try:
+        import aethyme_py  # type: ignore[import-not-found]
+    except ImportError:
+        return False, "module 'aethyme_py' not installed"
+
+    run_engine_command = getattr(aethyme_py, "run_engine_command", None)
+    if not callable(run_engine_command):
+        return False, "missing callable run_engine_command(args: list[str])"
+    return True, "ready"
 
 
 class EngineError(RuntimeError):
@@ -42,16 +58,89 @@ def build_engine_run_metadata(
         phase=phase,
         status=status,
         run_id=run_id,
-        engine_binary=ensure_engine_binary(),
+        engine_binary=_metadata_engine_binary(),
         command=command,
         config=config,
         finished_at=finished_at,
     )
 
 
+def _metadata_engine_binary() -> Path | None:
+    """Return binary metadata without forcing a subprocess binary for PyO3 runs."""
+    info = engine_runtime_info()
+    if info["resolved_transport"] != "subprocess":
+        return None
+    return ensure_engine_binary()
+
+
+def engine_runtime_info() -> dict[str, Any]:
+    """Return transport/runtime info without triggering a build."""
+    raw_transport = os.getenv("AETHYME_ENGINE_TRANSPORT")
+    configured_transport = (raw_transport or "auto").strip().lower() or "auto"
+    transport_source = "env" if raw_transport is not None and raw_transport.strip() else "default"
+    supported_transports = sorted(ENGINE_TRANSPORT_RUNNERS)
+    binary_path = _configured_engine_binary_path()
+    binary_exists = binary_path.exists()
+
+    if configured_transport == "auto":
+        pyo3_ready, pyo3_detail = _probe_pyo3_transport()
+        if pyo3_ready:
+            resolved_transport = "pyo3"
+            transport_ready = True
+            transport_detail = "auto->pyo3 (ready)"
+        else:
+            resolved_transport = "subprocess"
+            transport_ready = binary_exists
+            fallback_detail = "ready" if binary_exists else "binary not built"
+            transport_detail = f"auto->subprocess ({fallback_detail}; pyo3: {pyo3_detail})"
+    elif configured_transport == "subprocess":
+        resolved_transport = "subprocess"
+        transport_ready = binary_exists
+        transport_detail = "ready" if binary_exists else "binary not built"
+    elif configured_transport == "pyo3":
+        resolved_transport = "pyo3"
+        transport_ready, transport_detail = _probe_pyo3_transport()
+    elif configured_transport in ENGINE_TRANSPORT_RUNNERS:
+        resolved_transport = configured_transport
+        transport_ready = True
+        transport_detail = "ready (custom transport)"
+    else:
+        resolved_transport = None
+        transport_ready = False
+        transport_detail = "unsupported transport"
+
+    transport_supported = configured_transport in ENGINE_TRANSPORT_RUNNERS or configured_transport == "auto"
+
+    return {
+        "transport": configured_transport,
+        "transport_source": transport_source,
+        "resolved_transport": resolved_transport,
+        "transport_supported": transport_supported,
+        "supported_transports": sorted(set(SUPPORTED_ENGINE_TRANSPORT_CONFIGS) | set(ENGINE_TRANSPORT_RUNNERS)),
+        "runnable_transports": supported_transports,
+        "binary_path": str(binary_path),
+        "binary_exists": binary_exists,
+        "transport_ready": transport_ready,
+        "transport_detail": transport_detail,
+    }
+
+
+def register_engine_transport(name: str, runner: EngineRunner, *, override: bool = False) -> None:
+    """Register an engine transport runner."""
+    normalized = name.strip().lower()
+    if not normalized:
+        raise ValueError("Engine transport name must be non-empty.")
+    if normalized in ENGINE_TRANSPORT_RUNNERS and not override:
+        raise ValueError(
+            f"Engine transport {normalized!r} is already registered. "
+            "Use override=True to replace it."
+        )
+    ENGINE_TRANSPORT_RUNNERS[normalized] = runner
+
+
 def ensure_engine_binary() -> Path:
     """Build the Rust engine binary if it is missing or stale."""
-    binary_path = _preferred_engine_binary()
+    binary_path = _configured_engine_binary_path()
     needs_build = not binary_path.exists()
     if not needs_build:
         binary_mtime = binary_path.stat().st_mtime_ns
@@ -91,7 +180,15 @@ def _preferred_engine_binary() -> Path:
     return ENGINE_BINARY_DEBUG
 
 
-def _run_binary_command(*args: str) -> str:
+def _configured_engine_binary_path() -> Path:
+    """Return an explicit test/config override or the preferred built binary path."""
+    if ENGINE_BINARY_PATH is not None:
+        return ENGINE_BINARY_PATH
+    return _preferred_engine_binary()
+
+
+def _run_subprocess_transport(args: tuple[str, ...]) -> str:
+    """Execute engine command using subprocess transport."""
     binary_path = ensure_engine_binary()
     result = subprocess.run(
         [str(binary_path), *args],
@@ -104,14 +201,84 @@ def _run_binary_command(*args: str) -> str:
     return result.stdout.strip()
 
 
+def _run_pyo3_transport(args: tuple[str, ...]) -> str:
+    """Execute engine command through an in-process PyO3 binding."""
+    try:
+        import aethyme_py  # type: ignore[import-not-found]
+    except ImportError as exc:  # pragma: no cover - exercised in tests via message check
+        raise EngineError(
+            "PyO3 engine transport selected, but module 'aethyme_py' is not available."
+        ) from exc
+
+    run_engine_command = getattr(aethyme_py, "run_engine_command", None)
+    if not callable(run_engine_command):
+        raise EngineError(
+            "PyO3 engine transport requires callable 'aethyme_py.run_engine_command(args: list[str])'."
+        )
+
+    result = run_engine_command(list(args))
+    if not isinstance(result, str):
+        raise EngineError("PyO3 engine transport returned non-string output.")
+    return result.strip()
+
+
+ENGINE_TRANSPORT_RUNNERS: dict[str, EngineRunner] = {
+    "subprocess": _run_subprocess_transport,
+    "pyo3": _run_pyo3_transport,
+}
+
+
+def _run_binary_command(*args: str) -> str:
+    info = engine_runtime_info()
+    transport = info["resolved_transport"]
+    runner = ENGINE_TRANSPORT_RUNNERS.get(transport)
+    if runner is None:
+        supported = ", ".join(info["runnable_transports"])
+        raise EngineError(
+            "Unsupported engine transport: "
+            f"{info['transport']!r} (resolved={transport!r}). Supported runnable values: {supported!r}."
+        )
+    return runner(tuple(args))
+
+
 def _cache_directory(snapshot: LocalRepositorySnapshot) -> Path:
-    engine_key = str(ensure_engine_binary().stat().st_mtime_ns)
+    engine_key = _engine_cache_identity()
     cache_hash = hashlib.sha256(
         f"{snapshot.repo_path}:{snapshot.cache_key}:{engine_key}".encode()
     ).hexdigest()
     cache_dir = CACHE_ROOT / cache_hash
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
+
+
+def _engine_cache_identity() -> str:
+    """Return a transport-specific cache identity without forcing unused transports."""
+    info = engine_runtime_info()
+    transport = info["resolved_transport"]
+    if transport == "subprocess":
+        binary_path = ensure_engine_binary()
+        return f"transport=subprocess:path={binary_path}:mtime={binary_path.stat().st_mtime_ns}"
+    if transport == "pyo3":
+        return f"transport=pyo3:{_pyo3_cache_identity()}"
+    return f"transport={transport!r}:configured={info['transport']!r}:ready={info['transport_ready']!r}"
+
+
+def _pyo3_cache_identity() -> str:
+    """Return a stable-enough identity for the active PyO3 module."""
+    try:
+        import aethyme_py  # type: ignore[import-not-found]
+    except ImportError:
+        return "module=missing"
+
+    module_file = getattr(aethyme_py, "__file__", None)
+    version = getattr(aethyme_py, "__version__", None)
+    parts = [f"version={version!r}"]
+    if module_file:
+        module_path = Path(str(module_file))
+        parts.append(f"path={module_path}")
+        if module_path.exists():
+            parts.append(f"mtime={module_path.stat().st_mtime_ns}")
+    return ":".join(parts)
 
 
 def _load_cached_text(cache_path: Path) -> str | None:

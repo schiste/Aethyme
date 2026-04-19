@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, TypeAlias, TypedDict, cast
@@ -59,6 +60,7 @@ from src.indexing.engine import (
     inspect_repository,
     inspect_repository_brief,
     inspect_repository_structure,
+    engine_runtime_info,
     search_symbol,
     task_anchors,
     task_expand,
@@ -175,12 +177,22 @@ def default_tenant_id() -> str | None:
     is_flag=True,
     help="Verbose output",
 )
+@click.option(
+    "--engine-transport",
+    type=str,
+    envvar="AETHYME_ENGINE_TRANSPORT",
+    help=(
+        "Engine transport backend. Built-ins: auto, subprocess, pyo3. "
+        "Custom registered transport names are also accepted."
+    ),
+)
 @click.pass_context
 def cli(
     ctx: click.Context,
     tenant_id: str | None,
     output_json_flag: bool,
     verbose: bool,
+    engine_transport: str | None,
 ) -> None:
     """Aethyme - Graph-based code intelligence system.
 
@@ -196,6 +208,12 @@ def cli(
     state["tenant_id"] = tenant_id
     state["json"] = output_json_flag
     state["verbose"] = verbose
+    if engine_transport:
+        normalized_transport = engine_transport.strip().lower()
+        if not normalized_transport:
+            raise click.BadParameter("Engine transport cannot be empty.", param_hint="--engine-transport")
+        os.environ["AETHYME_ENGINE_TRANSPORT"] = normalized_transport
+        state["engine_transport"] = normalized_transport
 
 
 @cli.command()
@@ -378,6 +396,36 @@ def repo_deploy_skills(repo_path: Path, force: bool, do_remove: bool) -> None:
         click.echo("All skills already present (use --force to overwrite).")
 
 
+@repo.command("engine-info")
+@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
+@click.option("--check", "check_ready", is_flag=True, help="Exit non-zero if selected transport is not ready.")
+def repo_engine_info(json_output: bool, check_ready: bool) -> None:
+    """Show configured engine transport/runtime information."""
+    info = engine_runtime_info()
+    if json_output:
+        click.echo(json.dumps(info, indent=2))
+        if check_ready and (not info["transport_supported"] or not info["transport_ready"]):
+            raise click.ClickException("Engine transport is not ready.")
+        return
+
+    click.echo(f"Transport: {info['transport']}")
+    if info.get("transport_source"):
+        click.echo(f"Transport source: {info['transport_source']}")
+    if info.get("resolved_transport") is not None:
+        click.echo(f"Resolved transport: {info['resolved_transport']}")
+    click.echo(f"Supported: {'yes' if info['transport_supported'] else 'no'}")
+    click.echo(f"Ready: {'yes' if info['transport_ready'] else 'no'}")
+    click.echo(f"Transport detail: {info['transport_detail']}")
+    click.echo(f"Binary path: {info['binary_path']}")
+    click.echo(f"Binary exists: {'yes' if info['binary_exists'] else 'no'}")
+    click.echo(f"Supported transports: {', '.join(info['supported_transports'])}")
+    runnable = info.get("runnable_transports")
+    if isinstance(runnable, list) and runnable:
+        click.echo(f"Runnable transports: {', '.join(runnable)}")
+    if check_ready and (not info["transport_supported"] or not info["transport_ready"]):
+        raise click.ClickException("Engine transport is not ready.")
+
+
 @cli.group()
 def query() -> None:
     """Query the local Rust-backed navigation engine."""
@@ -454,6 +502,8 @@ def graph_node_command(repo_path: Path, target: str, json_output: bool) -> None:
     click.echo(f"ID: {result['id']}")
     click.echo(f"Kind: {result['kind']}")
     click.echo(f"Label: {result['label']}")
+    if result.get("confidence") is not None:
+        click.echo(f"Confidence: {result['confidence']}")
     if result.get("path"):
         click.echo(f"Path: {result['path']}")
     if result.get("area"):
@@ -464,6 +514,7 @@ def graph_node_command(repo_path: Path, target: str, json_output: bool) -> None:
         click.echo("Annotations:")
         for annotation in result["annotations"]:
             click.echo(f"- {annotation}")
+    _emit_completeness_signals(result)
 
 
 def _render_relation(result: dict[str, Any], json_output: bool) -> None:
@@ -474,6 +525,33 @@ def _render_relation(result: dict[str, Any], json_output: bool) -> None:
     click.echo(f"Relation: {result['relation']}")
     for item in result["items"]:
         click.echo(f"- {item['display']} ({item['kind']}, {item['relation']}, conf={item['confidence']})")
+    _emit_completeness_signals(result)
+
+
+def _emit_completeness_signals(payload: dict[str, Any]) -> None:
+    """Surface truncation/cap/confidence signals when available."""
+    if isinstance(payload.get("truncated"), bool):
+        truncated = payload["truncated"]
+        click.echo(f"Truncated: {'yes' if truncated else 'no'}")
+        if truncated and payload.get("reason"):
+            click.echo(f"Truncation reason: {payload['reason']}")
+
+    confidence = payload.get("confidence")
+    if isinstance(confidence, (int, float)):
+        click.echo(f"Confidence: {confidence}")
+    elif isinstance(confidence, dict):
+        anchor_conf = confidence.get("anchor_confidence")
+        scope_conf = confidence.get("scope_confidence")
+        if anchor_conf is not None or scope_conf is not None:
+            click.echo(
+                "Confidence:"
+                f" anchor={anchor_conf if anchor_conf is not None else 'n/a'}"
+                f", scope={scope_conf if scope_conf is not None else 'n/a'}"
+            )
+
+    caps = payload.get("caps")
+    if isinstance(caps, dict) and caps:
+        click.echo(f"Caps: {json.dumps(caps)}")
 
 
 @graph.command("children")
@@ -577,6 +655,7 @@ def graph_expand_command(repo_path: Path, target: str, json_output: bool) -> Non
         click.echo("Risks:")
         for risk in result["risks"]:
             click.echo(f"- {risk}")
+    _emit_completeness_signals(result)
 
 
 @graph.command("overview")
@@ -614,6 +693,7 @@ def graph_overview_command(repo_path: Path, json_output: bool) -> None:
         click.echo(f"{label.replace('_', ' ').title()}:")
         for item in items:
             click.echo(f"- {item}")
+    _emit_completeness_signals(result)
 
 
 @cli.group()
@@ -707,19 +787,35 @@ def task_scope_command(repo_path: Path, task_text: str, json_output: bool) -> No
     if result["in_scope_files"]:
         click.echo("In-scope files:")
         for item in result["in_scope_files"]:
-            click.echo(f"- {item}")
+            if isinstance(item, dict):
+                reason = item.get("reason")
+                suffix = f" ({reason})" if reason else ""
+                click.echo(f"- {item.get('value', item)}{suffix}")
+            else:
+                click.echo(f"- {item}")
     if result["in_scope_areas"]:
         click.echo("In-scope areas:")
         for item in result["in_scope_areas"]:
-            click.echo(f"- {item}")
+            if isinstance(item, dict):
+                reason = item.get("reason")
+                suffix = f" ({reason})" if reason else ""
+                click.echo(f"- {item.get('value', item)}{suffix}")
+            else:
+                click.echo(f"- {item}")
     if result["out_of_scope"]:
         click.echo("Out of scope:")
         for item in result["out_of_scope"]:
-            click.echo(f"- {item}")
+            if isinstance(item, dict):
+                reason = item.get("reason")
+                suffix = f" ({reason})" if reason else ""
+                click.echo(f"- {item.get('value', item)}{suffix}")
+            else:
+                click.echo(f"- {item}")
     if result["risks"]:
         click.echo("Risks:")
         for item in result["risks"]:
             click.echo(f"- {item}")
+    _emit_completeness_signals(result)
 
 
 @task.command("next")
@@ -757,6 +853,7 @@ def task_expand_command(repo_path: Path, node_target: str, json_output: bool) ->
         click.echo(f"{section.capitalize()}:")
         for item in items:
             click.echo(f"- {item}")
+    _emit_completeness_signals(result)
 
 
 @task.command("explain")

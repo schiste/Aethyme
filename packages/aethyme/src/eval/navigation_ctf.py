@@ -17,6 +17,7 @@ from src.contracts.versions import contract_versions
 from ..indexing.engine import build_task_pack, graph_expand, inspect_repository
 from .control_prompt import build_baseline_prompt, build_leverage_prompt
 from .models import EvaluationSide
+from .navigation_context import build_scope_view
 from .report import EvaluationReport, estimate_report, write_navigation_ctf_markdown_report
 from .runner import CommandEvaluationRunner, EVAL_TOOL_PYTHON, EvaluationRunner, PROJECT_ROOT
 from .schemas import navigation_ctf_output_schema, navigation_ctf_scoring_rubric
@@ -52,17 +53,7 @@ def run_navigation_ctf_evaluation(
         "task": task_spec["task"],
         "anchors": task_pack.get("anchors", []),
     }
-    in_scope = task_pack.get("in_scope", {})
-    out_of_scope = task_pack.get("out_of_scope", {})
-    scope_view = {
-        "task": task_spec["task"],
-        "navigation_order": task_pack.get("navigation_order", []),
-        "in_scope_files": [item["value"] for item in in_scope.get("files", [])],
-        "in_scope_symbols": [item["value"] for item in in_scope.get("symbols", [])],
-        "in_scope_areas": [item["value"] for item in in_scope.get("areas", [])],
-        "out_of_scope": [item["value"] for item in out_of_scope.get("areas", [])],
-        "risks": [risk["scope"] for risk in task_pack.get("risk_flags", [])],
-    }
+    scope_view = build_scope_view(task_spec["task"], task_pack)
     navigation_context = _build_navigation_context(repo_path, task_spec, anchors_view, scope_view)
 
     # --- Build prompts (agent-facing — no reference data) ---

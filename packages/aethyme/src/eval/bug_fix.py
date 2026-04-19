@@ -40,6 +40,7 @@ from .bug_fix_setup import (
     verify_setup,
 )
 from .control_prompt import build_baseline_prompt, build_leverage_prompt
+from .navigation_context import build_scope_view
 from .report import (
     CONDITION_ORDER,
     EvaluationReport,
@@ -404,16 +405,7 @@ def _build_navigation_context(
     except Exception:
         task_context = {}
 
-    in_scope = task_pack.get("in_scope", {})
-    out_of_scope = task_pack.get("out_of_scope", {})
-    scope_view = {
-        "task": task,
-        "navigation_order": task_pack.get("navigation_order", []),
-        "in_scope_files": [item["value"] for item in in_scope.get("files", [])],
-        "in_scope_symbols": [item["value"] for item in in_scope.get("symbols", [])],
-        "in_scope_areas": [item["value"] for item in in_scope.get("areas", [])],
-        "out_of_scope": [item["value"] for item in out_of_scope.get("areas", [])],
-    }
+    scope_view = build_scope_view(task, task_pack)
 
     return {
         "mode": "bug_fix_navigation",
@@ -423,7 +415,7 @@ def _build_navigation_context(
         "bug_area": "packages/auth/src/",
         "anchors": task_pack.get("anchors", []),
         "scope": scope_view,
-        "file_contents": task_context.get("files", {}),
+        "file_contents": task_context.get("file_contents", []),
     }
 
 

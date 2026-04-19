@@ -919,7 +919,8 @@ def _render_markdown(*, repo_path: Path, result: dict[str, Any]) -> str:
 
     Section order is fixed and non-negotiable:
     Meta -> Model -> Scorecard -> Score Breakdown -> Prompts ->
-    Agent Output -> Tool Call Analysis -> Verdict -> Notes -> Raw Data
+    Agent Output -> Tool Call Analysis -> (legacy diagnostics, when present) ->
+    Verdict -> Notes -> Raw Data
     """
     lines: list[str] = []
     _section_meta(lines, repo_path, result)
@@ -929,6 +930,8 @@ def _render_markdown(*, repo_path: Path, result: dict[str, Any]) -> str:
     _section_prompts(lines, result)
     _section_agent_output(lines, result)
     _section_tool_calls(lines, result)
+    if _should_render_legacy_eval_diagnostics(result):
+        _section_legacy_eval_diagnostics(lines, result)
     _section_verdict(lines, result)
     _section_notes(lines, result)
     _section_raw_data(lines, result)
@@ -1166,6 +1169,76 @@ def _section_tool_calls(lines: list[str], result: dict[str, Any]) -> None:
         return
 
     lines.extend(["## Tool Call Analysis", ""] + section_lines)
+
+
+def _should_render_legacy_eval_diagnostics(result: dict[str, Any]) -> bool:
+    """Return True when legacy explain-repo style diagnostics are meaningful."""
+    if result.get("report") is not None:
+        return True
+    if result.get("signals") is not None:
+        return True
+    if result.get("pack") is not None:
+        return True
+    task = str(result.get("task", "")).strip().lower()
+    return "explain" in task
+
+
+def _section_legacy_eval_diagnostics(lines: list[str], result: dict[str, Any]) -> None:
+    """Render legacy explain-repo diagnostic headings for compatibility."""
+    report = result.get("report") if isinstance(result.get("report"), dict) else {}
+    pack = result.get("pack") if isinstance(result.get("pack"), dict) else {}
+    signals = result.get("signals") if isinstance(result.get("signals"), dict) else {}
+
+    lines.extend(["## Context Pack Audit", ""])
+    lines.extend([
+        f"- Navigation items: {report.get('navigation_items', 0)}",
+        f"- Risk items: {report.get('risk_items', 0)}",
+    ])
+    task = pack.get("task", {}) if isinstance(pack.get("task"), dict) else {}
+    if task.get("raw"):
+        lines.append(f"- Task: {task.get('raw')}")
+    lines.append("")
+
+    lines.extend(["## Graph Quality Notes", ""])
+    parser_visibility = signals.get("parser_visibility") if isinstance(signals.get("parser_visibility"), dict) else {}
+    if parser_visibility:
+        lines.extend([
+            f"- Parser visibility: {parser_visibility.get('level', 'unknown')} ({parser_visibility.get('score', 'n/a')})",
+            "",
+        ])
+    else:
+        lines.extend(["N/A", ""])
+
+    lines.extend(["## Prompt Effectiveness", ""])
+    active = _active_conditions(result)
+    prompt_chars_by_condition = report.get("condition_prompt_chars", {}) if isinstance(report, dict) else {}
+    if not active:
+        lines.extend(["N/A", ""])
+    else:
+        for cond in active:
+            side = result.get(cond, {})
+            run = side.get("run") if isinstance(side, dict) else {}
+            if not isinstance(run, dict):
+                run = {}
+            lines.append(f"### {_cond_label(cond)}")
+            lines.append("")
+            prompt_chars = prompt_chars_by_condition.get(cond)
+            if prompt_chars is None:
+                prompt_chars = len((side or {}).get("prompt", "")) if isinstance(side, dict) else 0
+            lines.append(f"- Prompt chars: {prompt_chars}")
+            lines.append(f"- Input tokens: {run.get('input_tokens', 'n/a')}")
+            lines.append(f"- Output tokens: {run.get('output_tokens', 'n/a')}")
+            final_message = run.get("final_output_message")
+            if final_message:
+                lines.append(f"- Final output: {final_message}")
+            lines.append("")
+
+    lines.extend(["## Lessons & Action Items", ""])
+    lines.extend([
+        "- Keep context packs concise and explicitly prioritize high-confidence nodes.",
+        "- Capture parser visibility deltas across conditions to track graph quality drift.",
+        "",
+    ])
 
 
 def _section_verdict(lines: list[str], result: dict[str, Any]) -> None:

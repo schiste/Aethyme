@@ -82,6 +82,8 @@ Core commands:
 - `aethyme repo ingest /path/to/repo`
 - `aethyme repo inspect /path/to/repo --json-output`
 - `aethyme repo clear-cache /path/to/repo`
+- `aethyme --engine-transport auto repo engine-info`
+- `aethyme --engine-transport pyo3 repo engine-info --check`
 - `aethyme query symbol /path/to/repo main`
 - `aethyme query deps /path/to/repo src/main.py`
 - `aethyme graph node /path/to/repo src/main.py --json-output`
@@ -100,6 +102,14 @@ Core commands:
 
 See [`docs/guides/eval-protocol.md`](docs/guides/eval-protocol.md) for the canonical 5-condition playground eval protocol, repository setup flow, and Chau7 execution method.
 See [`docs/guides/eval-tooling-roadmap.md`](docs/guides/eval-tooling-roadmap.md) for the current repository-agnostic priority order: strengthen `explore`, then `leverage`, then revisit `task-conditioned`.
+
+### Local workflow test lanes
+
+- Default local test runs skip engine-backed integration tests if the Rust engine cannot be built in the current environment.
+- Set `AETHYME_REQUIRE_LOCAL_ENGINE=1` to enforce strict mode (tests fail instead of skip when engine build/runtime is unavailable).
+- Strict lane example:
+  - `AETHYME_REQUIRE_LOCAL_ENGINE=1 pytest packages/aethyme/tests/local/test_local_workflow.py -q`
+- CI runs both lanes in `.github/workflows/aethyme-local-tests.yml`.
 
 This local path is the shortest route to proving:
 
