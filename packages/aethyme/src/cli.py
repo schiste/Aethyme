@@ -40,10 +40,13 @@ from src.eval.navigation_ctf import (
 from src.graph.connection_pool import db_pool
 from src.graph.store import GraphStore
 from src.indexing.engine import (
+    analyze_dead_code as analyze_dead_code_answer,
     EngineError,
     build_task_context,
     build_task_pack,
     clear_repository_cache,
+    derived_function_usage,
+    derived_public_functions,
     graph_callees,
     graph_callers,
     graph_children,
@@ -618,6 +621,16 @@ def task() -> None:
     """Task-context workflows over the local repository engine."""
 
 
+@cli.group()
+def facts() -> None:
+    """Derived repository facts built on top of the graph."""
+
+
+@cli.group()
+def analyze() -> None:
+    """Deterministic analyzers that answer recurring repository questions."""
+
+
 @task.command("pack")
 @click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--task", "task_text", required=True, help="Task description")
@@ -758,6 +771,101 @@ def task_explain(repo_path: Path, task_text: str) -> None:
     except EngineError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(explanation)
+
+
+@facts.command("public-functions")
+@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--scope", "scope", required=True, help="Directory scope prefix")
+@click.option("--include-methods", "include_methods", is_flag=True, help="Include public methods as well as top-level functions")
+@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
+def facts_public_functions_command(repo_path: Path, scope: str, include_methods: bool, json_output: bool) -> None:
+    """List derived public/exported function facts for a scope."""
+    try:
+        result = derived_public_functions(repo_path, scope, include_methods=include_methods)
+    except EngineError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    for item in result:
+        click.echo(f"- {item['defined_in']}::{item['name']} [{item['exposure_kind']}]")
+
+
+@facts.command("function-usage")
+@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--target", "target", required=True, help="Function id, name, or qualified name")
+@click.option("--boundary", "boundary", required=True, help="Boundary prefix for internal vs external callers")
+@click.option("--roots", "roots", default="", help="Comma-separated search roots")
+@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
+def facts_function_usage_command(repo_path: Path, target: str, boundary: str, roots: str, json_output: bool) -> None:
+    """Show derived usage facts for one function relative to a boundary."""
+    roots_list = [item.strip() for item in roots.split(",") if item.strip()]
+    try:
+        result = derived_function_usage(repo_path, target, boundary=boundary, roots=roots_list)
+    except EngineError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    click.echo(f"Function: {result['function']['qualified_name']}")
+    click.echo(f"Boundary: {result['boundary']}")
+    if result["internal_callers"]:
+        click.echo("Internal callers:")
+        for item in result["internal_callers"]:
+            click.echo(f"- {item}")
+    if result["external_callers"]:
+        click.echo("External callers:")
+        for item in result["external_callers"]:
+            click.echo(f"- {item}")
+
+
+@analyze.command("dead-code")
+@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--scope", "scope", required=True, help="Directory scope prefix")
+@click.option("--roots", "roots", default="", help="Comma-separated search roots")
+@click.option("--include-methods", "include_methods", is_flag=True, help="Include public methods as well as top-level functions")
+@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
+def analyze_dead_code_command(
+    repo_path: Path,
+    scope: str,
+    roots: str,
+    include_methods: bool,
+    json_output: bool,
+) -> None:
+    """Analyze likely dead code with evidence and ambiguity markers."""
+    roots_list = [item.strip() for item in roots.split(",") if item.strip()]
+    try:
+        result = analyze_dead_code_answer(
+            repo_path,
+            scope,
+            roots=roots_list,
+            include_methods=include_methods,
+        )
+    except EngineError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    click.echo(f"Analyzer: {result['analyzer']} v{result['version']}")
+    click.echo(f"Scope: {result['query']['scope']}")
+    click.echo(
+        f"Candidates: {result['summary']['total_candidates']} total, "
+        f"{result['summary']['unused']} unused, "
+        f"{result['summary']['ambiguous']} ambiguous, "
+        f"{result['summary']['used']} used"
+    )
+    click.echo("Candidates:")
+    for candidate in result["candidates"]:
+        click.echo(
+            f"- {candidate['function']['defined_in']}::{candidate['function']['name']} "
+            f"[{candidate['status']}] conf={candidate['confidence']:.2f}"
+        )
 
 
 @cli.group()

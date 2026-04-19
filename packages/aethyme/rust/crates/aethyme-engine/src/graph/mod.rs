@@ -1,5 +1,7 @@
 pub mod activation;
+pub mod analyzers;
 pub mod anchors;
+pub mod facts;
 pub mod guidance;
 pub mod navigation;
 pub mod neighborhood;

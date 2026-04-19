@@ -18,7 +18,6 @@ ENGINE_MANIFEST_PATH = Path(__file__).resolve().parents[2] / "rust" / "Cargo.tom
 ENGINE_WORKSPACE_PATH = ENGINE_MANIFEST_PATH.parent
 ENGINE_BINARY_DEBUG = ENGINE_WORKSPACE_PATH / "target" / "debug" / "aethyme-engine-cli"
 ENGINE_BINARY_RELEASE = ENGINE_WORKSPACE_PATH / "target" / "release" / "aethyme-engine-cli"
-ENGINE_BINARY_PATH = ENGINE_BINARY_RELEASE if ENGINE_BINARY_RELEASE.exists() else ENGINE_BINARY_DEBUG
 CACHE_ROOT = Path(os.getenv("AETHYME_CACHE_DIR", "/tmp/aethyme-cache"))
 
 
@@ -52,9 +51,10 @@ def build_engine_run_metadata(
 
 def ensure_engine_binary() -> Path:
     """Build the Rust engine binary if it is missing or stale."""
-    needs_build = not ENGINE_BINARY_PATH.exists()
+    binary_path = _preferred_engine_binary()
+    needs_build = not binary_path.exists()
     if not needs_build:
-        binary_mtime = ENGINE_BINARY_PATH.stat().st_mtime_ns
+        binary_mtime = binary_path.stat().st_mtime_ns
         for source_path in [ENGINE_MANIFEST_PATH, *ENGINE_WORKSPACE_PATH.rglob("*.rs")]:
             if source_path.stat().st_mtime_ns > binary_mtime:
                 needs_build = True
@@ -70,11 +70,25 @@ def ensure_engine_binary() -> Path:
             "--bin",
             "aethyme-engine-cli",
         ]
+        if binary_path == ENGINE_BINARY_RELEASE:
+            command.insert(2, "--release")
         result = subprocess.run(command, check=False, capture_output=True, text=True)
         if result.returncode != 0:
             raise EngineError(result.stderr.strip() or result.stdout.strip() or "Rust engine build failed")
 
-    return ENGINE_BINARY_PATH
+    if not binary_path.exists():
+        raise EngineError(f"Rust engine binary missing after build: {binary_path}")
+    return binary_path
+
+
+def _preferred_engine_binary() -> Path:
+    if ENGINE_BINARY_RELEASE.exists() and ENGINE_BINARY_DEBUG.exists():
+        if ENGINE_BINARY_RELEASE.stat().st_mtime_ns >= ENGINE_BINARY_DEBUG.stat().st_mtime_ns:
+            return ENGINE_BINARY_RELEASE
+        return ENGINE_BINARY_DEBUG
+    if ENGINE_BINARY_RELEASE.exists():
+        return ENGINE_BINARY_RELEASE
+    return ENGINE_BINARY_DEBUG
 
 
 def _run_binary_command(*args: str) -> str:
@@ -297,6 +311,87 @@ def task_expand(repo_path: Path, target: str) -> dict[str, Any]:
         snapshot,
         cache_key,
         lambda: _run_binary_command("task-expand", "--repo", str(snapshot.repo_path), "--target", target),
+    )
+    return json.loads(output)
+
+
+def derived_public_functions(
+    repo_path: Path,
+    scope: str,
+    *,
+    include_methods: bool = False,
+) -> list[dict[str, Any]]:
+    """Return derived public or exported function facts within a scope."""
+    snapshot = capture_snapshot(repo_path)
+    cache_key = f"facts_public_functions_{_stable_hash(f'{scope}:{include_methods}')}"
+    output = _cached_text(
+        snapshot,
+        cache_key,
+        lambda: _run_binary_command(
+            "facts-public-functions",
+            "--repo",
+            str(snapshot.repo_path),
+            "--scope",
+            scope,
+            *(["--include-methods"] if include_methods else []),
+        ),
+    )
+    return json.loads(output)
+
+
+def derived_function_usage(
+    repo_path: Path,
+    target: str,
+    *,
+    boundary: str,
+    roots: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return deterministic usage facts for one function relative to a boundary."""
+    snapshot = capture_snapshot(repo_path)
+    roots = roots or []
+    roots_value = ",".join(roots)
+    cache_key = f"facts_function_usage_{_stable_hash(f'{target}:{boundary}:{roots_value}')}"
+    output = _cached_text(
+        snapshot,
+        cache_key,
+        lambda: _run_binary_command(
+            "facts-function-usage",
+            "--repo",
+            str(snapshot.repo_path),
+            "--target",
+            target,
+            "--boundary",
+            boundary,
+            *(["--roots", roots_value] if roots_value else []),
+        ),
+    )
+    return json.loads(output)
+
+
+def analyze_dead_code(
+    repo_path: Path,
+    scope: str,
+    *,
+    roots: list[str] | None = None,
+    include_methods: bool = False,
+) -> dict[str, Any]:
+    """Return a typed dead-code answer with evidence and ambiguity markers."""
+    snapshot = capture_snapshot(repo_path)
+    roots = roots or []
+    roots_value = ",".join(roots)
+    cache_key = f"analyze_dead_code_{_stable_hash(f'{scope}:{roots_value}:{include_methods}')}"
+    output = _cached_text(
+        snapshot,
+        cache_key,
+        lambda: _run_binary_command(
+            "analyze-dead-code",
+            "--repo",
+            str(snapshot.repo_path),
+            "--scope",
+            scope,
+            *(["--roots", roots_value] if roots_value else []),
+            *(["--include-methods"] if include_methods else []),
+        ),
     )
     return json.loads(output)
 

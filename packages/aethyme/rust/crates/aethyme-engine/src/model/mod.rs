@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod area;
 pub mod class;
 pub mod config;
