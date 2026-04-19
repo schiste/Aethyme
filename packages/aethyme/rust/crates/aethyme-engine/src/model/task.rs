@@ -54,7 +54,11 @@ fn classify_task(normalized: &str) -> TaskKind {
         TaskKind::ExplainComponent
     } else if normalized.contains("impact") || normalized.contains("blast radius") {
         TaskKind::TraceImpact
-    } else if normalized.contains("change") || normalized.contains("update") || normalized.contains("modify") || normalized.contains("fix") {
+    } else if normalized.contains("change")
+        || normalized.contains("update")
+        || normalized.contains("modify")
+        || normalized.contains("fix")
+    {
         TaskKind::ChangeSymbol
     } else {
         TaskKind::Unknown

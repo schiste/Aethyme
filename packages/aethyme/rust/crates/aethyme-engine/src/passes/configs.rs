@@ -94,13 +94,30 @@ where
             parsed.area_id.clone(),
         );
 
-        edges.push(Edge::new(&parsed.file_id, &config.id, EdgeKind::Defines, 1000, "config"));
+        edges.push(Edge::new(
+            &parsed.file_id,
+            &config.id,
+            EdgeKind::Defines,
+            1000,
+            "config",
+        ));
 
         if let Some(area_id) = &parsed.area_id {
-            edges.push(Edge::new(&config.id, area_id, EdgeKind::Configures, 800, "config"));
+            edges.push(Edge::new(
+                &config.id,
+                area_id,
+                EdgeKind::Configures,
+                800,
+                "config",
+            ));
         }
 
-        edges.extend(link_config_to_entrypoints(&config, &parsed.contents, structure, code));
+        edges.extend(link_config_to_entrypoints(
+            &config,
+            &parsed.contents,
+            structure,
+            code,
+        ));
         edges.extend(link_config_to_referenced_files(
             &config,
             &parsed.tokens,
@@ -129,7 +146,10 @@ where
 
 fn classify_config_type(path: &str) -> String {
     let lower = path.to_ascii_lowercase();
-    if lower.ends_with("cargo.toml") || lower.ends_with("package.json") || lower.ends_with("pyproject.toml") {
+    if lower.ends_with("cargo.toml")
+        || lower.ends_with("package.json")
+        || lower.ends_with("pyproject.toml")
+    {
         "manifest".to_string()
     } else if lower.ends_with("project.godot") {
         "project".to_string()
@@ -156,43 +176,95 @@ fn link_config_to_entrypoints(
     code: &CodePass,
 ) -> Vec<Edge> {
     let mut edges = Vec::new();
-    let area_id = config.area_id.clone().unwrap_or_else(|| structure.repo_id.clone());
-    let config_dir = config.path.rsplit_once('/').map(|value| value.0).unwrap_or("");
+    let area_id = config
+        .area_id
+        .clone()
+        .unwrap_or_else(|| structure.repo_id.clone());
+    let config_dir = config
+        .path
+        .rsplit_once('/')
+        .map(|value| value.0)
+        .unwrap_or("");
 
     match config.config_type.as_str() {
         "manifest" => {
-            edges.push(Edge::new(&config.id, &area_id, EdgeKind::EntrypointFor, 700, "config"));
+            edges.push(Edge::new(
+                &config.id,
+                &area_id,
+                EdgeKind::EntrypointFor,
+                700,
+                "config",
+            ));
             for entry_path in manifest_entrypoint_paths(contents) {
                 let normalized = normalize_config_relative_path(config_dir, &entry_path);
                 if let Some(file) = structure.files.iter().find(|file| file.path == normalized) {
-                    edges.push(Edge::new(&config.id, &file.id, EdgeKind::EntrypointFor, 900, "config"));
+                    edges.push(Edge::new(
+                        &config.id,
+                        &file.id,
+                        EdgeKind::EntrypointFor,
+                        900,
+                        "config",
+                    ));
                 }
             }
 
             for function in &code.functions {
-                if function.area_id.as_deref() == config.area_id.as_deref() && function.name == "main" {
-                    edges.push(Edge::new(&config.id, &function.id, EdgeKind::EntrypointFor, 800, "config"));
+                if function.area_id.as_deref() == config.area_id.as_deref()
+                    && function.name == "main"
+                {
+                    edges.push(Edge::new(
+                        &config.id,
+                        &function.id,
+                        EdgeKind::EntrypointFor,
+                        800,
+                        "config",
+                    ));
                 }
             }
         }
         "project" => {
-            edges.push(Edge::new(&config.id, &area_id, EdgeKind::EntrypointFor, 800, "config"));
+            edges.push(Edge::new(
+                &config.id,
+                &area_id,
+                EdgeKind::EntrypointFor,
+                800,
+                "config",
+            ));
             for entry_path in godot_entrypoint_paths(contents) {
                 let normalized = normalize_godot_path(&entry_path);
                 if let Some(file) = structure.files.iter().find(|file| file.path == normalized) {
-                    edges.push(Edge::new(&config.id, &file.id, EdgeKind::EntrypointFor, 900, "config"));
+                    edges.push(Edge::new(
+                        &config.id,
+                        &file.id,
+                        EdgeKind::EntrypointFor,
+                        900,
+                        "config",
+                    ));
                 }
             }
             for file in &structure.files {
                 if (file.path.ends_with(".tscn") || file.path.ends_with(".gd"))
-                    && (contents.contains(&file.path) || file.area_id.as_deref() == config.area_id.as_deref())
+                    && (contents.contains(&file.path)
+                        || file.area_id.as_deref() == config.area_id.as_deref())
                 {
-                    edges.push(Edge::new(&config.id, &file.id, EdgeKind::Configures, 700, "config"));
+                    edges.push(Edge::new(
+                        &config.id,
+                        &file.id,
+                        EdgeKind::Configures,
+                        700,
+                        "config",
+                    ));
                 }
             }
         }
         "runtime" => {
-            edges.push(Edge::new(&config.id, &area_id, EdgeKind::Configures, 700, "config"));
+            edges.push(Edge::new(
+                &config.id,
+                &area_id,
+                EdgeKind::Configures,
+                700,
+                "config",
+            ));
         }
         _ => {}
     }
@@ -211,11 +283,20 @@ fn link_config_to_referenced_files(
     let area_key = config.area_id.clone().unwrap_or_default();
 
     for token in tokens {
-        for key in [(area_key.clone(), token.clone()), (String::new(), token.clone())] {
+        for key in [
+            (area_key.clone(), token.clone()),
+            (String::new(), token.clone()),
+        ] {
             if let Some(file_ids) = file_token_index.get(&key) {
                 for file_id in file_ids {
                     if file_id != &config.file_id && seen.insert(file_id.clone()) {
-                        edges.push(Edge::new(&config.id, file_id, EdgeKind::Configures, 750, "config"));
+                        edges.push(Edge::new(
+                            &config.id,
+                            file_id,
+                            EdgeKind::Configures,
+                            750,
+                            "config",
+                        ));
                     }
                 }
             }
@@ -225,12 +306,28 @@ fn link_config_to_referenced_files(
     if config.path.ends_with("Cargo.toml") {
         for candidate in ["src/main.rs", "src/lib.rs"] {
             if let Some(file_id) = files_by_path.get(candidate) {
-                edges.push(Edge::new(&config.id, file_id, EdgeKind::EntrypointFor, 850, "config"));
+                edges.push(Edge::new(
+                    &config.id,
+                    file_id,
+                    EdgeKind::EntrypointFor,
+                    850,
+                    "config",
+                ));
             } else {
-                let candidate_token = candidate.rsplit('/').next().unwrap_or(candidate).to_ascii_lowercase();
+                let candidate_token = candidate
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(candidate)
+                    .to_ascii_lowercase();
                 if let Some(file_ids) = file_token_index.get(&(area_key.clone(), candidate_token)) {
                     for file_id in file_ids {
-                        edges.push(Edge::new(&config.id, file_id, EdgeKind::EntrypointFor, 850, "config"));
+                        edges.push(Edge::new(
+                            &config.id,
+                            file_id,
+                            EdgeKind::EntrypointFor,
+                            850,
+                            "config",
+                        ));
                     }
                 }
             }
@@ -246,7 +343,13 @@ fn link_config_to_referenced_files(
                 .to_ascii_lowercase();
             if let Some(file_ids) = file_token_index.get(&(area_key.clone(), candidate_token)) {
                 for file_id in file_ids {
-                    edges.push(Edge::new(&config.id, file_id, EdgeKind::EntrypointFor, 850, "config"));
+                    edges.push(Edge::new(
+                        &config.id,
+                        file_id,
+                        EdgeKind::EntrypointFor,
+                        850,
+                        "config",
+                    ));
                 }
             }
         }
@@ -274,7 +377,11 @@ fn manifest_entrypoint_paths(contents: &str) -> Vec<String> {
         if trimmed.starts_with("\".\"") {
             if let Some(value) = trimmed.split(':').nth(1) {
                 let cleaned = clean_value(value);
-                if !cleaned.is_empty() && (cleaned.ends_with(".ts") || cleaned.ends_with(".js") || cleaned.ends_with(".mjs")) {
+                if !cleaned.is_empty()
+                    && (cleaned.ends_with(".ts")
+                        || cleaned.ends_with(".js")
+                        || cleaned.ends_with(".mjs"))
+                {
                     paths.push(cleaned);
                 }
             }
@@ -286,7 +393,12 @@ fn manifest_entrypoint_paths(contents: &str) -> Vec<String> {
 fn package_entrypoint_paths_from_tokens(tokens: &BTreeSet<String>) -> Vec<String> {
     tokens
         .iter()
-        .filter(|token| token.ends_with(".js") || token.ends_with(".mjs") || token.ends_with(".cjs") || token.ends_with(".ts"))
+        .filter(|token| {
+            token.ends_with(".js")
+                || token.ends_with(".mjs")
+                || token.ends_with(".cjs")
+                || token.ends_with(".ts")
+        })
         .cloned()
         .collect()
 }
@@ -296,7 +408,9 @@ fn godot_entrypoint_paths(contents: &str) -> Vec<String> {
         .lines()
         .filter_map(|line| {
             let trimmed = line.trim();
-            if trimmed.starts_with("run/main_scene=") || trimmed.starts_with("application/run/main_scene=") {
+            if trimmed.starts_with("run/main_scene=")
+                || trimmed.starts_with("application/run/main_scene=")
+            {
                 return trimmed.split('=').nth(1).map(clean_value);
             }
             None
@@ -402,7 +516,13 @@ mod tests {
         let code = code::build(&root, &structure);
         let configs = build(&root, &structure, &code);
 
-        assert!(configs.edges.iter().any(|edge| matches!(edge.kind, EdgeKind::EntrypointFor) && edge.to.contains("src/main.rs")));
+        assert!(
+            configs
+                .edges
+                .iter()
+                .any(|edge| matches!(edge.kind, EdgeKind::EntrypointFor)
+                    && edge.to.contains("src/main.rs"))
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

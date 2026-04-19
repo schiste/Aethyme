@@ -1,5 +1,5 @@
-use crate::model::risk::RiskFlag;
 use crate::graph::signals::GraphSignals;
+use crate::model::risk::RiskFlag;
 use crate::model::scope::ScopeBoundary;
 use crate::model::task::TaskInput;
 

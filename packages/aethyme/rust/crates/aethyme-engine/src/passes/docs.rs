@@ -74,7 +74,15 @@ where
         .files
         .par_iter()
         .filter(|file| matches!(file.role, crate::model::file::FileRole::Doc))
-        .map(|file| parse_doc(root, file.path.as_str(), file.id.as_str(), file.name.as_str(), file.area_id.clone()))
+        .map(|file| {
+            parse_doc(
+                root,
+                file.path.as_str(),
+                file.id.as_str(),
+                file.name.as_str(),
+                file.area_id.clone(),
+            )
+        })
         .collect::<Vec<_>>();
     parsed_docs.sort_by(|left, right| left.path.cmp(&right.path));
     let read_docs_ms = read_started.elapsed().as_millis();
@@ -96,11 +104,29 @@ where
 
     let mut edges = Vec::new();
     for doc in &docs {
-        edges.push(Edge::new(&doc.file_id, &doc.id, EdgeKind::Defines, 1000, "docs"));
+        edges.push(Edge::new(
+            &doc.file_id,
+            &doc.id,
+            EdgeKind::Defines,
+            1000,
+            "docs",
+        ));
         if let Some(area_id) = &doc.area_id {
-            edges.push(Edge::new(&doc.id, area_id, EdgeKind::Documents, 800, "docs"));
+            edges.push(Edge::new(
+                &doc.id,
+                area_id,
+                EdgeKind::Documents,
+                800,
+                "docs",
+            ));
         } else {
-            edges.push(Edge::new(&doc.id, &structure.repo_id, EdgeKind::Documents, 800, "docs"));
+            edges.push(Edge::new(
+                &doc.id,
+                &structure.repo_id,
+                EdgeKind::Documents,
+                800,
+                "docs",
+            ));
         }
     }
 
@@ -113,16 +139,20 @@ where
     let file_token_index = build_file_token_index(structure);
     let config_token_index = build_config_token_index(configs);
     let area_token_index = build_area_token_index(structure);
-    let class_token_index = build_symbol_token_index(
-        code.classes
-            .iter()
-            .map(|class| (class.name.as_str(), class.id.as_str(), class.area_id.as_deref())),
-    );
-    let function_token_index = build_symbol_token_index(
-        code.functions
-            .iter()
-            .map(|function| (function.name.as_str(), function.id.as_str(), function.area_id.as_deref())),
-    );
+    let class_token_index = build_symbol_token_index(code.classes.iter().map(|class| {
+        (
+            class.name.as_str(),
+            class.id.as_str(),
+            class.area_id.as_deref(),
+        )
+    }));
+    let function_token_index = build_symbol_token_index(code.functions.iter().map(|function| {
+        (
+            function.name.as_str(),
+            function.id.as_str(),
+            function.area_id.as_deref(),
+        )
+    }));
 
     let areas_started = Instant::now();
     for (doc, parsed) in docs.iter().zip(parsed_docs.iter()) {
@@ -133,14 +163,23 @@ where
 
     let files_started = Instant::now();
     for (doc, parsed) in docs.iter().zip(parsed_docs.iter()) {
-        edges.extend(link_doc_to_files(doc, &parsed.tokens, &file_path_index, &file_token_index));
+        edges.extend(link_doc_to_files(
+            doc,
+            &parsed.tokens,
+            &file_path_index,
+            &file_token_index,
+        ));
     }
     let link_files_ms = files_started.elapsed().as_millis();
     progress("docs_link_files", link_files_ms);
 
     let configs_started = Instant::now();
     for (doc, parsed) in docs.iter().zip(parsed_docs.iter()) {
-        edges.extend(link_doc_to_configs(doc, &parsed.tokens, &config_token_index));
+        edges.extend(link_doc_to_configs(
+            doc,
+            &parsed.tokens,
+            &config_token_index,
+        ));
     }
     let link_configs_ms = configs_started.elapsed().as_millis();
     progress("docs_link_configs", link_configs_ms);
@@ -208,7 +247,10 @@ fn build_file_token_index(structure: &StructurePass) -> HashMap<AreaTokenKey, Ve
         }
         let area_key = area_key(file.area_id.as_deref());
         for token in [file.name.to_ascii_lowercase(), file_stem(&file.name)] {
-            index.entry((area_key.clone(), token)).or_insert_with(Vec::new).push(file.id.clone());
+            index
+                .entry((area_key.clone(), token))
+                .or_insert_with(Vec::new)
+                .push(file.id.clone());
         }
     }
     index
@@ -221,7 +263,10 @@ fn build_config_token_index(configs: Option<&ConfigsPass>) -> HashMap<String, Ve
     };
     for config in &configs.configs {
         for token in [config.path.to_ascii_lowercase(), file_stem(&config.path)] {
-            index.entry(token).or_insert_with(Vec::new).push(config.id.clone());
+            index
+                .entry(token)
+                .or_insert_with(Vec::new)
+                .push(config.id.clone());
         }
     }
     index
@@ -231,10 +276,16 @@ fn build_area_token_index(structure: &StructurePass) -> HashMap<String, Vec<Stri
     let mut index = HashMap::new();
     for area in &structure.areas {
         for token in identifier_tokens(&area.name) {
-            index.entry(token).or_insert_with(Vec::new).push(area.id.clone());
+            index
+                .entry(token)
+                .or_insert_with(Vec::new)
+                .push(area.id.clone());
         }
         for token in identifier_tokens(&area.path_prefix) {
-            index.entry(token).or_insert_with(Vec::new).push(area.id.clone());
+            index
+                .entry(token)
+                .or_insert_with(Vec::new)
+                .push(area.id.clone());
         }
     }
     index
@@ -302,7 +353,13 @@ fn link_doc_to_areas(
                 if doc_area_id == Some(area_id.as_str()) || !seen.insert(area_id.clone()) {
                     continue;
                 }
-                edges.push(Edge::new(&doc.id, area_id, EdgeKind::Documents, 700, "docs"));
+                edges.push(Edge::new(
+                    &doc.id,
+                    area_id,
+                    EdgeKind::Documents,
+                    700,
+                    "docs",
+                ));
             }
         }
     }
@@ -323,14 +380,29 @@ fn link_doc_to_files(
         if let Some(file_id) = file_path_index.get(token)
             && seen.insert(file_id.clone())
         {
-            edges.push(Edge::new(&doc.id, file_id, EdgeKind::Documents, 750, "docs"));
+            edges.push(Edge::new(
+                &doc.id,
+                file_id,
+                EdgeKind::Documents,
+                750,
+                "docs",
+            ));
         }
 
-        for key in [(area_key.clone(), token.clone()), (String::new(), token.clone())] {
+        for key in [
+            (area_key.clone(), token.clone()),
+            (String::new(), token.clone()),
+        ] {
             if let Some(file_ids) = file_token_index.get(&key) {
                 for file_id in file_ids {
                     if seen.insert(file_id.clone()) {
-                        edges.push(Edge::new(&doc.id, file_id, EdgeKind::References, 500, "docs"));
+                        edges.push(Edge::new(
+                            &doc.id,
+                            file_id,
+                            EdgeKind::References,
+                            500,
+                            "docs",
+                        ));
                     }
                 }
             }
@@ -351,7 +423,13 @@ fn link_doc_to_configs(
         if let Some(config_ids) = config_token_index.get(token) {
             for config_id in config_ids {
                 if seen.insert(config_id.clone()) {
-                    edges.push(Edge::new(&doc.id, config_id, EdgeKind::Documents, 650, "docs"));
+                    edges.push(Edge::new(
+                        &doc.id,
+                        config_id,
+                        EdgeKind::Documents,
+                        650,
+                        "docs",
+                    ));
                 }
             }
         }
@@ -375,32 +453,59 @@ fn link_doc_to_symbols(
         if let Some(class_ids) = class_token_index.get(&key) {
             for class_id in class_ids {
                 if seen.insert(class_id.clone()) {
-                    edges.push(Edge::new(&doc.id, class_id, EdgeKind::References, 550, "docs"));
+                    edges.push(Edge::new(
+                        &doc.id,
+                        class_id,
+                        EdgeKind::References,
+                        550,
+                        "docs",
+                    ));
                 }
             }
         }
         if let Some(function_ids) = function_token_index.get(&key) {
             for function_id in function_ids {
                 if seen.insert(function_id.clone()) {
-                    edges.push(Edge::new(&doc.id, function_id, EdgeKind::References, 550, "docs"));
+                    edges.push(Edge::new(
+                        &doc.id,
+                        function_id,
+                        EdgeKind::References,
+                        550,
+                        "docs",
+                    ));
                 }
             }
         }
     }
 
     for token in explicit_mentions {
-        for key in [(area_key.clone(), token.clone()), (String::new(), token.clone())] {
+        for key in [
+            (area_key.clone(), token.clone()),
+            (String::new(), token.clone()),
+        ] {
             if let Some(class_ids) = class_token_index.get(&key) {
                 for class_id in class_ids {
                     if seen.insert(class_id.clone()) {
-                        edges.push(Edge::new(&doc.id, class_id, EdgeKind::References, 550, "docs"));
+                        edges.push(Edge::new(
+                            &doc.id,
+                            class_id,
+                            EdgeKind::References,
+                            550,
+                            "docs",
+                        ));
                     }
                 }
             }
             if let Some(function_ids) = function_token_index.get(&key) {
                 for function_id in function_ids {
                     if seen.insert(function_id.clone()) {
-                        edges.push(Edge::new(&doc.id, function_id, EdgeKind::References, 550, "docs"));
+                        edges.push(Edge::new(
+                            &doc.id,
+                            function_id,
+                            EdgeKind::References,
+                            550,
+                            "docs",
+                        ));
                     }
                 }
             }
@@ -474,8 +579,14 @@ mod tests {
         let code = code::build(&root, &structure);
         let docs = build(&root, &structure, &code, None);
 
-        assert!(docs.edges.iter().any(|edge| matches!(edge.kind, EdgeKind::Documents) && edge.to.contains("src/main.py")));
-        assert!(docs.edges.iter().any(|edge| matches!(edge.kind, EdgeKind::References) && edge.to.contains("main")));
+        assert!(docs.edges.iter().any(
+            |edge| matches!(edge.kind, EdgeKind::Documents) && edge.to.contains("src/main.py")
+        ));
+        assert!(
+            docs.edges
+                .iter()
+                .any(|edge| matches!(edge.kind, EdgeKind::References) && edge.to.contains("main"))
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

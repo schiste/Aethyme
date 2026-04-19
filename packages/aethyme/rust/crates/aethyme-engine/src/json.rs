@@ -1,34 +1,43 @@
 use std::io::Write;
 
+use crate::context_pack::{
+    ActivationSummary, Anchor, ContextPack, DependencyEdge, FileContent, ImpactItem, PackSnapshot,
+    PackSummary, Snippet,
+};
+use crate::graph::activation::ActivationMap;
+use crate::graph::navigation::{
+    GraphExpandView, GraphNodeView, GraphRelationItem, GraphRelationView, RepoOverviewView,
+    TaskAnchorsView, TaskExpandView, TaskScopeView,
+};
+use crate::graph::overview::{build_repo_overview, repo_overview_seed};
+use crate::graph::search::SearchHit;
+use crate::graph::signals::{GraphSignals, SignalAssessment};
+use crate::map::{RepositoryBuildProfile, RepositoryMap};
 use crate::model::area::AreaNode;
 use crate::model::class::ClassNode;
 use crate::model::config::ConfigNode;
-use crate::graph::activation::ActivationMap;
-use crate::context_pack::{ActivationSummary, Anchor, ContextPack, DependencyEdge, FileContent, ImpactItem, PackSnapshot, PackSummary, Snippet};
-use crate::graph::overview::{build_repo_overview, repo_overview_seed};
 use crate::model::directory::DirectoryNode;
 use crate::model::doc::DocNode;
 use crate::model::edge::{Edge, EdgeKind};
 use crate::model::file::{FileNode, FileRole};
 use crate::model::function::FunctionNode;
 use crate::model::graph::{GraphAnnotation, GraphNode, GraphNodeKind};
-use crate::map::{RepositoryBuildProfile, RepositoryMap};
-use crate::graph::navigation::{
-    GraphExpandView, GraphNodeView, GraphRelationItem, GraphRelationView, TaskAnchorsView, TaskExpandView,
-    TaskScopeView, RepoOverviewView,
-};
-use crate::repo::RepoSnapshot;
 use crate::model::risk::{RiskArea, RiskFlag, RiskLevel};
 use crate::model::scope::{ScopeBoundary, ScopeItem, ScopeKind};
-use crate::graph::search::SearchHit;
-use crate::graph::signals::{GraphSignals, SignalAssessment};
 use crate::model::symbol::{Symbol, SymbolKind};
 use crate::model::task::{TaskInput, TaskKind};
-use crate::workspace::{BlastRadiusItem, CrossEdgeKind, CrossRepoEdge, SharedDependency, WorkspaceGraph};
+use crate::repo::RepoSnapshot;
+use crate::workspace::{
+    BlastRadiusItem, CrossEdgeKind, CrossRepoEdge, SharedDependency, WorkspaceGraph,
+};
 
 /// Write a JSON array to a writer, streaming one element at a time to avoid
 /// allocating a single giant string for the entire array.
-fn write_array<T, W: Write>(w: &mut W, items: &[T], to_json: impl Fn(&T) -> String) -> std::io::Result<()> {
+fn write_array<T, W: Write>(
+    w: &mut W,
+    items: &[T],
+    to_json: impl Fn(&T) -> String,
+) -> std::io::Result<()> {
     write!(w, "[")?;
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
@@ -42,7 +51,9 @@ fn write_array<T, W: Write>(w: &mut W, items: &[T], to_json: impl Fn(&T) -> Stri
 /// Streaming version of `repository_map` — writes JSON directly to a writer
 /// instead of building a multi-hundred-MB String in memory.
 pub fn write_repository_map<W: Write>(w: &mut W, map: &RepositoryMap) -> std::io::Result<()> {
-    write!(w, "{{\"snapshot\":{},\"signals\":{},\"areas\":",
+    write!(
+        w,
+        "{{\"snapshot\":{},\"signals\":{},\"areas\":",
         repo_snapshot(&map.snapshot),
         graph_signals(&crate::graph::signals::evaluate_graph_signals(map)),
     )?;
@@ -81,14 +92,18 @@ pub fn write_context_pack<W: Write>(w: &mut W, pack: &ContextPack) -> std::io::R
         .as_ref()
         .map(activation_summary)
         .unwrap_or_else(|| "null".to_string());
-    write!(w, "{{\"task\":{},\"summary\":{},\"signals\":{},\"overview\":{},\"anchors\":",
+    write!(
+        w,
+        "{{\"task\":{},\"summary\":{},\"signals\":{},\"overview\":{},\"anchors\":",
         task_input(&pack.task),
         pack_summary(&pack.summary),
         graph_signals(&pack.signals),
         repo_overview(pack),
     )?;
     write_array(w, &pack.anchors, anchor)?;
-    write!(w, ",\"in_scope\":{},\"out_of_scope\":{},\"dependencies\":",
+    write!(
+        w,
+        ",\"in_scope\":{},\"out_of_scope\":{},\"dependencies\":",
         scope_boundary(&pack.in_scope),
         scope_boundary(&pack.out_of_scope),
     )?;
@@ -101,7 +116,9 @@ pub fn write_context_pack<W: Write>(w: &mut W, pack: &ContextPack) -> std::io::R
     write_array(w, &pack.file_contents, file_content)?;
     write!(w, ",\"risk_flags\":")?;
     write_array(w, &pack.risk_flags, risk_flag)?;
-    write!(w, ",\"navigation_order\":{},\"budget\":{{\"max_anchors\":{},\"max_files\":{},\"max_snippets\":{},\"dependency_depth\":{},\"impact_depth\":{},\"snippet_window\":{},\"content_budget\":{},\"max_content_files\":{},\"max_lines_per_file\":{}}},\"confidence\":{{\"anchor_confidence\":{},\"scope_confidence\":{}}},\"activation_summary\":{}}}",
+    write!(
+        w,
+        ",\"navigation_order\":{},\"budget\":{{\"max_anchors\":{},\"max_files\":{},\"max_snippets\":{},\"dependency_depth\":{},\"impact_depth\":{},\"snippet_window\":{},\"content_budget\":{},\"max_content_files\":{},\"max_lines_per_file\":{}}},\"confidence\":{{\"anchor_confidence\":{},\"scope_confidence\":{}}},\"activation_summary\":{}}}",
         string_array(&pack.navigation_order),
         pack.budget.max_anchors,
         pack.budget.max_files,
@@ -121,7 +138,9 @@ pub fn write_context_pack<W: Write>(w: &mut W, pack: &ContextPack) -> std::io::R
 /// Streaming version of `inspect_structure` — writes JSON directly to a writer.
 pub fn write_inspect_structure<W: Write>(w: &mut W, map: &RepositoryMap) -> std::io::Result<()> {
     let overview = build_repo_overview(map, &repo_overview_seed(map));
-    write!(w, "{{\"snapshot\":{},\"signals\":{},\"areas\":",
+    write!(
+        w,
+        "{{\"snapshot\":{},\"signals\":{},\"areas\":",
         repo_snapshot_compact(&map.snapshot),
         graph_signals(&crate::graph::signals::evaluate_graph_signals(map)),
     )?;
@@ -131,24 +150,34 @@ pub fn write_inspect_structure<W: Write>(w: &mut W, map: &RepositoryMap) -> std:
         if i > 0 {
             write!(w, ",")?;
         }
-        write!(w, "{{\"path\":{},\"role\":{},\"area_id\":{}}}",
+        write!(
+            w,
+            "{{\"path\":{},\"role\":{},\"area_id\":{}}}",
             string(&f.path),
             string(file_role(&f.role)),
-            f.area_id.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+            f.area_id
+                .as_deref()
+                .map(string)
+                .unwrap_or_else(|| "null".to_string()),
         )?;
     }
     write!(w, "],\"configs\":")?;
     write_array(w, &map.configs, config)?;
     write!(w, ",\"docs\":")?;
     write_array(w, &map.docs, doc)?;
-    write!(w, ",\"entrypoints\":{},\"key_configs\":{}}}",
+    write!(
+        w,
+        ",\"entrypoints\":{},\"key_configs\":{}}}",
         string_array(&overview.entrypoints),
         string_array(&overview.key_configs),
     )
 }
 
 pub fn escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn string(value: &str) -> String {
@@ -156,7 +185,14 @@ fn string(value: &str) -> String {
 }
 
 fn string_array(values: &[String]) -> String {
-    format!("[{}]", values.iter().map(|value| string(value)).collect::<Vec<_>>().join(","))
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(|value| string(value))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 fn scope_kind(kind: &ScopeKind) -> &'static str {
@@ -262,9 +298,24 @@ fn scope_item(item: &ScopeItem) -> String {
 fn scope_boundary(boundary: &ScopeBoundary) -> String {
     format!(
         "{{\"files\":[{}],\"symbols\":[{}],\"areas\":[{}]}}",
-        boundary.files.iter().map(scope_item).collect::<Vec<_>>().join(","),
-        boundary.symbols.iter().map(scope_item).collect::<Vec<_>>().join(","),
-        boundary.areas.iter().map(scope_item).collect::<Vec<_>>().join(",")
+        boundary
+            .files
+            .iter()
+            .map(scope_item)
+            .collect::<Vec<_>>()
+            .join(","),
+        boundary
+            .symbols
+            .iter()
+            .map(scope_item)
+            .collect::<Vec<_>>()
+            .join(","),
+        boundary
+            .areas
+            .iter()
+            .map(scope_item)
+            .collect::<Vec<_>>()
+            .join(",")
     )
 }
 
@@ -283,7 +334,11 @@ fn anchor(anchor: &Anchor) -> String {
         crate::context_pack::AnchorKind::File => "file",
         crate::context_pack::AnchorKind::Folder => "folder",
     };
-    let file = anchor.file.as_deref().map(string).unwrap_or_else(|| "null".to_string());
+    let file = anchor
+        .file
+        .as_deref()
+        .map(string)
+        .unwrap_or_else(|| "null".to_string());
     format!(
         "{{\"kind\":{},\"id\":{},\"file\":{},\"reason\":{}}}",
         string(kind),
@@ -349,21 +404,42 @@ pub fn context_pack(pack: &ContextPack) -> String {
         .as_ref()
         .map(activation_summary)
         .unwrap_or_else(|| "null".to_string());
-    let file_contents_json = pack.file_contents.iter().map(file_content).collect::<Vec<_>>().join(",");
+    let file_contents_json = pack
+        .file_contents
+        .iter()
+        .map(file_content)
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         "{{\"task\":{},\"summary\":{},\"signals\":{},\"overview\":{},\"anchors\":[{}],\"in_scope\":{},\"out_of_scope\":{},\"dependencies\":[{}],\"impact\":[{}],\"snippets\":[{}],\"file_contents\":[{}],\"risk_flags\":[{}],\"navigation_order\":{},\"budget\":{{\"max_anchors\":{},\"max_files\":{},\"max_snippets\":{},\"dependency_depth\":{},\"impact_depth\":{},\"snippet_window\":{},\"content_budget\":{},\"max_content_files\":{},\"max_lines_per_file\":{}}},\"confidence\":{{\"anchor_confidence\":{},\"scope_confidence\":{}}},\"activation_summary\":{}}}",
         task_input(&pack.task),
         pack_summary(&pack.summary),
         graph_signals(&pack.signals),
         repo_overview(pack),
-        pack.anchors.iter().map(anchor).collect::<Vec<_>>().join(","),
+        pack.anchors
+            .iter()
+            .map(anchor)
+            .collect::<Vec<_>>()
+            .join(","),
         scope_boundary(&pack.in_scope),
         scope_boundary(&pack.out_of_scope),
-        pack.dependencies.iter().map(dependency).collect::<Vec<_>>().join(","),
+        pack.dependencies
+            .iter()
+            .map(dependency)
+            .collect::<Vec<_>>()
+            .join(","),
         pack.impact.iter().map(impact).collect::<Vec<_>>().join(","),
-        pack.snippets.iter().map(snippet).collect::<Vec<_>>().join(","),
+        pack.snippets
+            .iter()
+            .map(snippet)
+            .collect::<Vec<_>>()
+            .join(","),
         file_contents_json,
-        pack.risk_flags.iter().map(risk_flag).collect::<Vec<_>>().join(","),
+        pack.risk_flags
+            .iter()
+            .map(risk_flag)
+            .collect::<Vec<_>>()
+            .join(","),
         string_array(&pack.navigation_order),
         pack.budget.max_anchors,
         pack.budget.max_files,
@@ -451,23 +527,45 @@ pub fn repository_map(map: &RepositoryMap) -> String {
         repo_snapshot(&map.snapshot),
         graph_signals(&crate::graph::signals::evaluate_graph_signals(map)),
         map.areas.iter().map(area).collect::<Vec<_>>().join(","),
-        map.directories.iter().map(directory).collect::<Vec<_>>().join(","),
+        map.directories
+            .iter()
+            .map(directory)
+            .collect::<Vec<_>>()
+            .join(","),
         map.files.iter().map(file).collect::<Vec<_>>().join(","),
         map.classes.iter().map(class).collect::<Vec<_>>().join(","),
-        map.functions.iter().map(function).collect::<Vec<_>>().join(","),
+        map.functions
+            .iter()
+            .map(function)
+            .collect::<Vec<_>>()
+            .join(","),
         map.docs.iter().map(doc).collect::<Vec<_>>().join(","),
         map.configs.iter().map(config).collect::<Vec<_>>().join(","),
         map.symbols.iter().map(symbol).collect::<Vec<_>>().join(","),
         map.edges.iter().map(edge).collect::<Vec<_>>().join(","),
-        map.risk_flags.iter().map(risk_flag).collect::<Vec<_>>().join(","),
+        map.risk_flags
+            .iter()
+            .map(risk_flag)
+            .collect::<Vec<_>>()
+            .join(","),
         map.graph
             .nodes
             .iter()
             .map(graph_node_record)
             .collect::<Vec<_>>()
             .join(","),
-        map.graph.edges.iter().map(edge).collect::<Vec<_>>().join(","),
-        map.graph.annotations.iter().map(annotation).collect::<Vec<_>>().join(","),
+        map.graph
+            .edges
+            .iter()
+            .map(edge)
+            .collect::<Vec<_>>()
+            .join(","),
+        map.graph
+            .annotations
+            .iter()
+            .map(annotation)
+            .collect::<Vec<_>>()
+            .join(","),
     )
 }
 
@@ -485,14 +583,22 @@ pub fn inspect_brief(map: &RepositoryMap) -> String {
 
 pub fn inspect_structure(map: &RepositoryMap) -> String {
     let overview = build_repo_overview(map, &repo_overview_seed(map));
-    let compact_files = map.files.iter().map(|f| {
-        format!(
-            "{{\"path\":{},\"role\":{},\"area_id\":{}}}",
-            string(&f.path),
-            string(file_role(&f.role)),
-            f.area_id.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
-        )
-    }).collect::<Vec<_>>().join(",");
+    let compact_files = map
+        .files
+        .iter()
+        .map(|f| {
+            format!(
+                "{{\"path\":{},\"role\":{},\"area_id\":{}}}",
+                string(&f.path),
+                string(file_role(&f.role)),
+                f.area_id
+                    .as_deref()
+                    .map(string)
+                    .unwrap_or_else(|| "null".to_string()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         "{{\"snapshot\":{},\"signals\":{},\"areas\":[{}],\"files\":[{}],\"configs\":[{}],\"docs\":[{}],\"entrypoints\":{},\"key_configs\":{}}}",
         repo_snapshot_compact(&map.snapshot),
@@ -546,11 +652,20 @@ pub fn graph_node_view(view: &GraphNodeView) -> String {
         string(&view.id),
         string(&view.kind),
         string(&view.label),
-        view.path.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
-        view.language.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        view.path
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string()),
+        view.language
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string()),
         string(&view.source),
         view.confidence,
-        view.area.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        view.area
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string()),
         string_array(&view.annotations),
     )
 }
@@ -560,7 +675,11 @@ pub fn graph_relation(view: &GraphRelationView) -> String {
         "{{\"target\":{},\"relation\":{},\"items\":[{}]}}",
         string(&view.target),
         string(&view.relation),
-        view.items.iter().map(graph_relation_item).collect::<Vec<_>>().join(",")
+        view.items
+            .iter()
+            .map(graph_relation_item)
+            .collect::<Vec<_>>()
+            .join(",")
     )
 }
 
@@ -568,12 +687,36 @@ pub fn graph_expand_view(view: &GraphExpandView) -> String {
     format!(
         "{{\"target\":{},\"parents\":[{}],\"children\":[{}],\"callers\":[{}],\"callees\":[{}],\"docs\":[{}],\"configs\":[{}],\"risks\":{}}}",
         graph_node_view(&view.target),
-        view.parents.iter().map(graph_relation_item).collect::<Vec<_>>().join(","),
-        view.children.iter().map(graph_relation_item).collect::<Vec<_>>().join(","),
-        view.callers.iter().map(graph_relation_item).collect::<Vec<_>>().join(","),
-        view.callees.iter().map(graph_relation_item).collect::<Vec<_>>().join(","),
-        view.docs.iter().map(graph_relation_item).collect::<Vec<_>>().join(","),
-        view.configs.iter().map(graph_relation_item).collect::<Vec<_>>().join(","),
+        view.parents
+            .iter()
+            .map(graph_relation_item)
+            .collect::<Vec<_>>()
+            .join(","),
+        view.children
+            .iter()
+            .map(graph_relation_item)
+            .collect::<Vec<_>>()
+            .join(","),
+        view.callers
+            .iter()
+            .map(graph_relation_item)
+            .collect::<Vec<_>>()
+            .join(","),
+        view.callees
+            .iter()
+            .map(graph_relation_item)
+            .collect::<Vec<_>>()
+            .join(","),
+        view.docs
+            .iter()
+            .map(graph_relation_item)
+            .collect::<Vec<_>>()
+            .join(","),
+        view.configs
+            .iter()
+            .map(graph_relation_item)
+            .collect::<Vec<_>>()
+            .join(","),
         string_array(&view.risks),
     )
 }
@@ -598,7 +741,11 @@ pub fn task_anchors_view(view: &TaskAnchorsView) -> String {
     format!(
         "{{\"task\":{},\"anchors\":[{}]}}",
         string(&view.task),
-        view.anchors.iter().map(anchor).collect::<Vec<_>>().join(",")
+        view.anchors
+            .iter()
+            .map(anchor)
+            .collect::<Vec<_>>()
+            .join(",")
     )
 }
 
@@ -633,7 +780,11 @@ fn repo_snapshot_compact(snapshot: &RepoSnapshot) -> String {
         string(&snapshot.root),
         string_array(&snapshot.languages),
         string_array(&snapshot.top_level_dirs),
-        snapshot.readme_path.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        snapshot
+            .readme_path
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string()),
         snapshot.files.len(),
     )
 }
@@ -644,7 +795,11 @@ fn repo_snapshot(snapshot: &RepoSnapshot) -> String {
         string(&snapshot.root),
         string_array(&snapshot.languages),
         string_array(&snapshot.top_level_dirs),
-        snapshot.readme_path.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        snapshot
+            .readme_path
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string()),
         snapshot
             .files
             .iter()
@@ -652,7 +807,10 @@ fn repo_snapshot(snapshot: &RepoSnapshot) -> String {
                 format!(
                     "{{\"path\":{},\"language\":{},\"line_count\":{},\"size_bytes\":{}}}",
                     string(&file.path),
-                    file.language.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+                    file.language
+                        .as_deref()
+                        .map(string)
+                        .unwrap_or_else(|| "null".to_string()),
                     file.line_count,
                     file.size_bytes,
                 )
@@ -709,7 +867,11 @@ fn directory(directory: &DirectoryNode) -> String {
         string(&directory.id),
         string(&directory.path),
         string(&directory.name),
-        directory.area_id.as_deref().map(string).unwrap_or_else(|| "null".to_string())
+        directory
+            .area_id
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string())
     )
 }
 
@@ -719,12 +881,18 @@ fn file(file: &FileNode) -> String {
         string(&file.id),
         string(&file.path),
         string(&file.name),
-        file.language.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        file.language
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string()),
         string(file_role(&file.role)),
         file.line_count,
         file.size_bytes,
         if file.generated { "true" } else { "false" },
-        file.area_id.as_deref().map(string).unwrap_or_else(|| "null".to_string())
+        file.area_id
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string())
     )
 }
 
@@ -736,7 +904,11 @@ fn class(class: &ClassNode) -> String {
         string(&class.qualified_name),
         string(&class.file_id),
         string(&class.file_path),
-        class.area_id.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        class
+            .area_id
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string()),
         string(&class.language),
         class.line,
         string(&class.signature)
@@ -751,8 +923,16 @@ fn function(function: &FunctionNode) -> String {
         string(&function.qualified_name),
         string(&function.file_id),
         string(&function.file_path),
-        function.area_id.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
-        function.parent_class_id.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        function
+            .area_id
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string()),
+        function
+            .parent_class_id
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string()),
         string(&function.language),
         function.line,
         string(&function.signature)
@@ -767,7 +947,10 @@ fn doc(doc: &DocNode) -> String {
         string(&doc.path),
         string(&doc.title),
         string(&doc.doc_type),
-        doc.area_id.as_deref().map(string).unwrap_or_else(|| "null".to_string())
+        doc.area_id
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string())
     )
 }
 
@@ -778,7 +961,11 @@ fn config(config: &ConfigNode) -> String {
         string(&config.file_id),
         string(&config.path),
         string(&config.config_type),
-        config.area_id.as_deref().map(string).unwrap_or_else(|| "null".to_string())
+        config
+            .area_id
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string())
     )
 }
 
@@ -791,8 +978,16 @@ fn symbol(symbol: &Symbol) -> String {
         string(&symbol.file),
         symbol.line,
         string(&symbol.signature),
-        symbol.language.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
-        symbol.area.as_deref().map(string).unwrap_or_else(|| "null".to_string())
+        symbol
+            .language
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string()),
+        symbol
+            .area
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string())
     )
 }
 
@@ -813,8 +1008,14 @@ fn graph_node_record(node: &GraphNode) -> String {
         string(&node.id),
         string(graph_node_kind(&node.kind)),
         string(&node.label),
-        node.path.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
-        node.language.as_deref().map(string).unwrap_or_else(|| "null".to_string()),
+        node.path
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string()),
+        node.language
+            .as_deref()
+            .map(string)
+            .unwrap_or_else(|| "null".to_string()),
         node.confidence,
         string(&node.source)
     )
@@ -881,8 +1082,18 @@ pub fn workspace_graph(graph: &WorkspaceGraph) -> String {
     format!(
         "{{\"repos\":[{}],\"cross_edges\":[{}],\"shared_dependencies\":[{}]}}",
         repos_json.join(","),
-        graph.cross_edges.iter().map(cross_repo_edge).collect::<Vec<_>>().join(","),
-        graph.shared_dependencies.iter().map(shared_dependency).collect::<Vec<_>>().join(","),
+        graph
+            .cross_edges
+            .iter()
+            .map(cross_repo_edge)
+            .collect::<Vec<_>>()
+            .join(","),
+        graph
+            .shared_dependencies
+            .iter()
+            .map(shared_dependency)
+            .collect::<Vec<_>>()
+            .join(","),
     )
 }
 

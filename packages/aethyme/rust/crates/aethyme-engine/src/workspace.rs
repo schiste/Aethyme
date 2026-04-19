@@ -3,7 +3,7 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use crate::deps::{extract_external_deps, ExternalDep};
+use crate::deps::{ExternalDep, extract_external_deps};
 use crate::map::RepositoryMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,7 +287,10 @@ fn detect_direct_references(repos: &[WorkspaceRepo]) -> Vec<CrossRepoEdge> {
                             to_id: target_id.to_string(),
                             kind: CrossEdgeKind::DirectReference,
                             confidence: 500,
-                            evidence: format!("unresolved import '{}' matches module in {}", import_name, other_repo.name),
+                            evidence: format!(
+                                "unresolved import '{}' matches module in {}",
+                                import_name, other_repo.name
+                            ),
                         });
                     }
                 }

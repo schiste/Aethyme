@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tree_sitter::{wasmtime::Engine, Language, Parser, Query, QueryCursor, StreamingIterator, WasmStore};
+use tree_sitter::{
+    Language, Parser, Query, QueryCursor, StreamingIterator, WasmStore, wasmtime::Engine,
+};
 
 use crate::model::edge::{Edge, EdgeKind};
 use crate::model::symbol::{Symbol, SymbolKind};
@@ -121,9 +123,7 @@ where
         if slot.is_none() {
             let mut parser = Parser::new();
             let store = WasmStore::new(engine).expect("WasmStore creation failed");
-            parser
-                .set_wasm_store(store)
-                .expect("set_wasm_store failed");
+            parser.set_wasm_store(store).expect("set_wasm_store failed");
             *slot = Some(parser);
         }
         f(slot.as_mut().unwrap())
@@ -149,14 +149,7 @@ pub fn extract(
 
         let mut matches = cursor.matches(&grammar.query, tree.root_node(), contents.as_bytes());
         while let Some(m) = matches.next() {
-            process_match(
-                &grammar.query,
-                m,
-                path,
-                contents,
-                &mut symbols,
-                &mut edges,
-            );
+            process_match(&grammar.query, m, path, contents, &mut symbols, &mut edges);
         }
 
         Some((symbols, edges))
@@ -205,13 +198,7 @@ fn process_match(
                 line = capture.node.start_position().row + 1;
             }
         } else if capture_name == "import.source" {
-            edges.push(Edge::new(
-                path,
-                text,
-                EdgeKind::Imports,
-                900,
-                "tree-sitter",
-            ));
+            edges.push(Edge::new(path, text, EdgeKind::Imports, 900, "tree-sitter"));
         }
     }
 

@@ -1,12 +1,12 @@
-pub mod model;
-pub mod graph;
 pub mod cache;
 pub mod context_pack;
 pub mod deps;
+pub mod graph;
 pub mod indexer;
 pub mod json;
 pub mod map;
 pub mod map_cache;
+pub mod model;
 pub mod passes;
 pub mod pipeline;
 pub mod repo;

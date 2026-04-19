@@ -1,8 +1,8 @@
 use crate::context_pack::{DependencyEdge, ImpactItem, RepoOverview};
+use crate::graph::signals::evaluate_graph_signals;
+use crate::map::RepositoryMap;
 use crate::model::edge::EdgeKind;
 use crate::model::file::FileRole;
-use crate::map::RepositoryMap;
-use crate::graph::signals::evaluate_graph_signals;
 
 pub fn repo_overview_seed(map: &RepositoryMap) -> Vec<String> {
     let mut seed = Vec::new();
@@ -16,7 +16,11 @@ pub fn repo_overview_seed(map: &RepositoryMap) -> Vec<String> {
             seed.push(area.name.clone());
         }
     }
-    for function in map.functions.iter().filter(|function| function.name == "main") {
+    for function in map
+        .functions
+        .iter()
+        .filter(|function| function.name == "main")
+    {
         if !seed.contains(&function.file_path) {
             seed.push(function.file_path.clone());
         }
@@ -31,10 +35,26 @@ pub fn repo_overview_seed(map: &RepositoryMap) -> Vec<String> {
 
 pub fn build_repo_overview(map: &RepositoryMap, navigation_order: &[String]) -> RepoOverview {
     let signals = evaluate_graph_signals(map);
-    let code_area_limit = if signals.boundary_clarity.score < 55 { 2 } else { 3 };
-    let reference_area_limit = if signals.parser_visibility.score < 60 { 3 } else { 2 };
-    let entrypoint_limit = if signals.entrypoint_clarity.score >= 70 { 3 } else { 1 };
-    let key_config_limit = if signals.config_hygiene.score >= 70 { 3 } else { 2 };
+    let code_area_limit = if signals.boundary_clarity.score < 55 {
+        2
+    } else {
+        3
+    };
+    let reference_area_limit = if signals.parser_visibility.score < 60 {
+        3
+    } else {
+        2
+    };
+    let entrypoint_limit = if signals.entrypoint_clarity.score >= 70 {
+        3
+    } else {
+        1
+    };
+    let key_config_limit = if signals.config_hygiene.score >= 70 {
+        3
+    } else {
+        2
+    };
     let overview_docs = map
         .docs
         .iter()
@@ -54,7 +74,9 @@ pub fn build_repo_overview(map: &RepositoryMap, navigation_order: &[String]) -> 
         })
         .filter(|(_, _, name)| {
             navigation_order.iter().any(|item| item == name)
-                || overview_docs.iter().any(|path| path.starts_with(&format!("{name}/")))
+                || overview_docs
+                    .iter()
+                    .any(|path| path.starts_with(&format!("{name}/")))
         })
         .collect::<Vec<_>>();
     area_candidates.sort_by(|left, right| {
@@ -81,7 +103,8 @@ pub fn build_repo_overview(map: &RepositoryMap, navigation_order: &[String]) -> 
                 .any(|area| name.starts_with(&format!("{area}/")) || name == area)
         })
         .collect::<Vec<_>>();
-    subarea_candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    subarea_candidates
+        .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
     let subareas = subarea_candidates
         .into_iter()
         .take(4)
@@ -107,32 +130,41 @@ pub fn build_repo_overview(map: &RepositoryMap, navigation_order: &[String]) -> 
         })
         .collect::<Vec<_>>();
     entrypoints.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-    let entrypoints = entrypoints
-        .into_iter()
-        .map(|(_, display)| display)
-        .fold(Vec::new(), |mut acc, item| {
-            if !acc.contains(&item) && acc.len() < entrypoint_limit {
-                acc.push(item);
-            }
-            acc
-        });
+    let entrypoints =
+        entrypoints
+            .into_iter()
+            .map(|(_, display)| display)
+            .fold(Vec::new(), |mut acc, item| {
+                if !acc.contains(&item) && acc.len() < entrypoint_limit {
+                    acc.push(item);
+                }
+                acc
+            });
 
     let mut key_configs = map
         .configs
         .iter()
         .filter(|config| {
             if code_areas.is_empty() {
-                return config_is_overview_eligible(config.path.as_str(), config.config_type.as_str());
+                return config_is_overview_eligible(
+                    config.path.as_str(),
+                    config.config_type.as_str(),
+                );
             }
             config_is_overview_eligible(config.path.as_str(), config.config_type.as_str())
                 && config
-                .area_id
-                .as_deref()
-                .map(|area_id| code_areas.iter().any(|area| area_id.ends_with(area)))
-                .unwrap_or(false)
+                    .area_id
+                    .as_deref()
+                    .map(|area_id| code_areas.iter().any(|area| area_id.ends_with(area)))
+                    .unwrap_or(false)
         })
         .map(|config| {
-            let score = config_score(map, config.id.as_str(), config.path.as_str(), config.config_type.as_str());
+            let score = config_score(
+                map,
+                config.id.as_str(),
+                config.path.as_str(),
+                config.config_type.as_str(),
+            );
             (score, config.config_type.clone(), config.path.clone())
         })
         .collect::<Vec<_>>();
@@ -195,7 +227,13 @@ pub fn overview_dependencies(map: &RepositoryMap, overview: &RepoOverview) -> Ve
                 if edge.from != source_id {
                     continue;
                 }
-                if !matches!(edge.kind, EdgeKind::Contains | EdgeKind::Defines | EdgeKind::EntrypointFor | EdgeKind::Configures) {
+                if !matches!(
+                    edge.kind,
+                    EdgeKind::Contains
+                        | EdgeKind::Defines
+                        | EdgeKind::EntrypointFor
+                        | EdgeKind::Configures
+                ) {
                     continue;
                 }
                 let target = map.display_for(&edge.to);
@@ -250,14 +288,34 @@ fn area_score(map: &RepositoryMap, area_id: &str, area_name: &str) -> i32 {
         .iter()
         .filter(|file| file.area_id.as_deref() == Some(area_id))
         .collect::<Vec<_>>();
-    let source_count = files.iter().filter(|file| matches!(file.role, FileRole::Source)).count() as i32;
-    let config_count = files.iter().filter(|file| matches!(file.role, FileRole::Config)).count() as i32;
-    let doc_count = files.iter().filter(|file| matches!(file.role, FileRole::Doc)).count() as i32;
-    let asset_count = files.iter().filter(|file| matches!(file.role, FileRole::Asset)).count() as i32;
-    let test_count = files.iter().filter(|file| matches!(file.role, FileRole::Test)).count() as i32;
+    let source_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Source))
+        .count() as i32;
+    let config_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Config))
+        .count() as i32;
+    let doc_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Doc))
+        .count() as i32;
+    let asset_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Asset))
+        .count() as i32;
+    let test_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Test))
+        .count() as i32;
     let unknown_count = files
         .iter()
-        .filter(|file| matches!(file.role, FileRole::Unknown | FileRole::Generated | FileRole::Cache | FileRole::Binary))
+        .filter(|file| {
+            matches!(
+                file.role,
+                FileRole::Unknown | FileRole::Generated | FileRole::Cache | FileRole::Binary
+            )
+        })
         .count() as i32;
 
     let function_count = map
@@ -285,7 +343,12 @@ fn area_score(map: &RepositoryMap, area_id: &str, area_name: &str) -> i32 {
         .filter(|doc| doc.doc_type == "readme")
         .count() as i32;
 
-    let config_score = map.configs.iter().filter(|config| config.area_id.as_deref() == Some(area_id)).map(|config| config_weight(config.config_type.as_str())).sum::<i32>();
+    let config_score = map
+        .configs
+        .iter()
+        .filter(|config| config.area_id.as_deref() == Some(area_id))
+        .map(|config| config_weight(config.config_type.as_str()))
+        .sum::<i32>();
 
     let entrypoint_score = map
         .edges
@@ -298,11 +361,12 @@ fn area_score(map: &RepositoryMap, area_id: &str, area_name: &str) -> i32 {
         .count() as i32
         * 16;
 
-    let code_presence_bonus = if source_count > 0 || function_count > 0 || class_count > 0 || config_count > 0 {
-        40
-    } else {
-        0
-    };
+    let code_presence_bonus =
+        if source_count > 0 || function_count > 0 || class_count > 0 || config_count > 0 {
+            40
+        } else {
+            0
+        };
     let doc_score = std::cmp::min(doc_count, 4) * 2 + architecture_docs * 6 + readme_docs * 4;
     let unknown_penalty = if source_count == 0 && function_count == 0 && class_count == 0 {
         unknown_count * 2
@@ -330,12 +394,26 @@ fn subarea_score(map: &RepositoryMap, area_id: &str, area_name: &str) -> i32 {
         .iter()
         .filter(|file| file.path.starts_with(&format!("{area_name}/")))
         .collect::<Vec<_>>();
-    let source_count = files.iter().filter(|file| matches!(file.role, FileRole::Source)).count() as i32;
-    let config_count = files.iter().filter(|file| matches!(file.role, FileRole::Config)).count() as i32;
-    let doc_count = files.iter().filter(|file| matches!(file.role, FileRole::Doc)).count() as i32;
+    let source_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Source))
+        .count() as i32;
+    let config_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Config))
+        .count() as i32;
+    let doc_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Doc))
+        .count() as i32;
     let unknown_count = files
         .iter()
-        .filter(|file| matches!(file.role, FileRole::Unknown | FileRole::Generated | FileRole::Cache | FileRole::Binary))
+        .filter(|file| {
+            matches!(
+                file.role,
+                FileRole::Unknown | FileRole::Generated | FileRole::Cache | FileRole::Binary
+            )
+        })
         .count() as i32;
 
     let symbol_score = map
@@ -358,7 +436,12 @@ fn subarea_score(map: &RepositoryMap, area_id: &str, area_name: &str) -> i32 {
         .map(|config| config_weight(config.config_type.as_str()))
         .sum::<i32>();
 
-    source_count * 8 + config_count * 6 + symbol_score + config_score + std::cmp::min(doc_count, 3) * 2 - unknown_count
+    source_count * 8
+        + config_count * 6
+        + symbol_score
+        + config_score
+        + std::cmp::min(doc_count, 3) * 2
+        - unknown_count
 }
 
 fn config_score(map: &RepositoryMap, config_id: &str, config_path: &str, config_type: &str) -> i32 {
@@ -368,9 +451,11 @@ fn config_score(map: &RepositoryMap, config_id: &str, config_path: &str, config_
     let mut configures_area_targets = 0;
 
     for edge in map.edges.iter().filter(|edge| edge.from == config_id) {
-        let target_is_code_artifact = map.files.iter().any(|file| file.id == edge.to && matches!(file.role, FileRole::Source | FileRole::Test))
-            || map.functions.iter().any(|function| function.id == edge.to)
-            || map.classes.iter().any(|class| class.id == edge.to);
+        let target_is_code_artifact =
+            map.files.iter().any(|file| {
+                file.id == edge.to && matches!(file.role, FileRole::Source | FileRole::Test)
+            }) || map.functions.iter().any(|function| function.id == edge.to)
+                || map.classes.iter().any(|class| class.id == edge.to);
         let target_is_area = map.areas.iter().any(|area| area.id == edge.to);
 
         match edge.kind {
@@ -488,7 +573,11 @@ fn area_profile(map: &RepositoryMap, area_id: &str) -> AreaProfile {
     }
 }
 
-fn select_top_areas(candidates: Vec<(i32, AreaProfile, String)>, limit: usize, code_bearing: bool) -> Vec<String> {
+fn select_top_areas(
+    candidates: Vec<(i32, AreaProfile, String)>,
+    limit: usize,
+    code_bearing: bool,
+) -> Vec<String> {
     let matching_count = candidates
         .iter()
         .filter(|(_, profile, _)| profile.code_bearing == code_bearing)
@@ -555,15 +644,35 @@ mod tests {
         fs::create_dir_all(root.join("GameEngine/godot")).expect("create nested godot dir");
         fs::create_dir_all(root.join("GameEngine/rust/addgame/src")).expect("create rust dir");
         fs::write(root.join("README.md"), "# Demo\n").expect("write readme");
-        fs::write(root.join("godot/project.godot"), "[application]\nrun/main_scene=\"res://main.tscn\"\n").expect("write root godot project");
-        fs::write(root.join("GameEngine/godot/project.godot"), "[application]\nrun/main_scene=\"res://editor.tscn\"\n").expect("write nested godot project");
-        fs::write(root.join("GameEngine/rust/addgame/Cargo.toml"), "[package]\nname=\"demo\"\n").expect("write cargo manifest");
-        fs::write(root.join("GameEngine/rust/addgame/src/lib.rs"), "pub fn main() {}\n").expect("write rust source");
+        fs::write(
+            root.join("godot/project.godot"),
+            "[application]\nrun/main_scene=\"res://main.tscn\"\n",
+        )
+        .expect("write root godot project");
+        fs::write(
+            root.join("GameEngine/godot/project.godot"),
+            "[application]\nrun/main_scene=\"res://editor.tscn\"\n",
+        )
+        .expect("write nested godot project");
+        fs::write(
+            root.join("GameEngine/rust/addgame/Cargo.toml"),
+            "[package]\nname=\"demo\"\n",
+        )
+        .expect("write cargo manifest");
+        fs::write(
+            root.join("GameEngine/rust/addgame/src/lib.rs"),
+            "pub fn main() {}\n",
+        )
+        .expect("write rust source");
 
         let map = RepositoryMap::build(&root).expect("build repository map");
         let overview = build_repo_overview(&map, &repo_overview_seed(&map));
 
-        assert!(overview.key_configs.contains(&"GameEngine/rust/addgame/Cargo.toml".to_string()));
+        assert!(
+            overview
+                .key_configs
+                .contains(&"GameEngine/rust/addgame/Cargo.toml".to_string())
+        );
         assert_eq!(
             overview
                 .key_configs

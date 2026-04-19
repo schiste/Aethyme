@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::map::RepositoryMap;
 use crate::model::edge::EdgeKind;
 use crate::model::file::FileRole;
-use crate::map::RepositoryMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignalAssessment {
@@ -37,7 +37,11 @@ fn boundary_clarity(map: &RepositoryMap) -> SignalAssessment {
         .filter(|edge| {
             matches!(
                 edge.kind,
-                EdgeKind::Imports | EdgeKind::Calls | EdgeKind::References | EdgeKind::Configures | EdgeKind::Documents
+                EdgeKind::Imports
+                    | EdgeKind::Calls
+                    | EdgeKind::References
+                    | EdgeKind::Configures
+                    | EdgeKind::Documents
             )
         })
         .collect::<Vec<_>>();
@@ -54,7 +58,10 @@ fn boundary_clarity(map: &RepositoryMap) -> SignalAssessment {
         .iter()
         .filter(|file| matches!(file.role, FileRole::Source | FileRole::Test))
         .collect::<Vec<_>>();
-    let assigned_sources = source_files.iter().filter(|file| file.area_id.is_some()).count();
+    let assigned_sources = source_files
+        .iter()
+        .filter(|file| file.area_id.is_some())
+        .count();
     let generic_source_names = source_files
         .iter()
         .filter(|file| is_generic_name(file.name.as_str()))
@@ -71,7 +78,10 @@ fn boundary_clarity(map: &RepositoryMap) -> SignalAssessment {
         level: signal_level(score).to_string(),
         evidence: vec![
             format!("cross-area semantic edges: {cross_area}/{semantic_total}"),
-            format!("source files with area assignment: {assigned_sources}/{}", source_files.len()),
+            format!(
+                "source files with area assignment: {assigned_sources}/{}",
+                source_files.len()
+            ),
             format!("generic source file names: {generic_source_names}"),
         ],
     }
@@ -117,7 +127,10 @@ fn entrypoint_clarity(map: &RepositoryMap) -> SignalAssessment {
         level: signal_level(score).to_string(),
         evidence: vec![
             format!("direct code entrypoint edges: {}", entrypoint_edges.len()),
-            format!("configs with entrypoints: {}", configs_with_entrypoints.len()),
+            format!(
+                "configs with entrypoints: {}",
+                configs_with_entrypoints.len()
+            ),
             format!("areas with ambiguous entrypoints: {ambiguous_areas}"),
         ],
     }
@@ -133,10 +146,10 @@ fn config_hygiene(map: &RepositoryMap) -> SignalAssessment {
         .iter()
         .filter(|config| {
             config.area_id.is_some()
-                || map
-                    .edges
-                    .iter()
-                    .any(|edge| edge.from == config.id && matches!(edge.kind, EdgeKind::Configures | EdgeKind::EntrypointFor))
+                || map.edges.iter().any(|edge| {
+                    edge.from == config.id
+                        && matches!(edge.kind, EdgeKind::Configures | EdgeKind::EntrypointFor)
+                })
         })
         .count();
 
@@ -146,10 +159,17 @@ fn config_hygiene(map: &RepositoryMap) -> SignalAssessment {
         families_by_area
             .entry(area_key)
             .or_default()
-            .insert(config_family_key(config.config_type.as_str(), config.path.as_str()));
+            .insert(config_family_key(
+                config.config_type.as_str(),
+                config.path.as_str(),
+            ));
     }
-    let duplicate_families = operational_configs.len()
-        .saturating_sub(families_by_area.values().map(|families| families.len()).sum::<usize>());
+    let duplicate_families = operational_configs.len().saturating_sub(
+        families_by_area
+            .values()
+            .map(|families| families.len())
+            .sum::<usize>(),
+    );
     let noisy_configs = map.configs.len().saturating_sub(operational_configs.len());
 
     let linked_bonus = ratio_scaled(linked_configs, operational_configs.len(), 35);
@@ -162,7 +182,10 @@ fn config_hygiene(map: &RepositoryMap) -> SignalAssessment {
         level: signal_level(score).to_string(),
         evidence: vec![
             format!("operational configs: {}", operational_configs.len()),
-            format!("linked configs: {linked_configs}/{}", operational_configs.len()),
+            format!(
+                "linked configs: {linked_configs}/{}",
+                operational_configs.len()
+            ),
             format!("duplicate config families: {duplicate_families}"),
         ],
     }
@@ -175,12 +198,21 @@ fn hidden_coupling(map: &RepositoryMap) -> SignalAssessment {
         .filter(|edge| {
             matches!(
                 edge.kind,
-                EdgeKind::Calls | EdgeKind::References | EdgeKind::Configures | EdgeKind::EntrypointFor
+                EdgeKind::Calls
+                    | EdgeKind::References
+                    | EdgeKind::Configures
+                    | EdgeKind::EntrypointFor
             )
         })
         .collect::<Vec<_>>();
-    let low_confidence = semantic_edges.iter().filter(|edge| edge.confidence < 800).count();
-    let high_confidence = semantic_edges.iter().filter(|edge| edge.confidence >= 900).count();
+    let low_confidence = semantic_edges
+        .iter()
+        .filter(|edge| edge.confidence < 800)
+        .count();
+    let high_confidence = semantic_edges
+        .iter()
+        .filter(|edge| edge.confidence >= 900)
+        .count();
     let cross_area = semantic_edges
         .iter()
         .filter(|edge| {
@@ -199,9 +231,18 @@ fn hidden_coupling(map: &RepositoryMap) -> SignalAssessment {
         score,
         level: signal_level(score).to_string(),
         evidence: vec![
-            format!("low-confidence semantic edges: {low_confidence}/{}", semantic_edges.len()),
-            format!("high-confidence semantic edges: {high_confidence}/{}", semantic_edges.len()),
-            format!("cross-area semantic edges: {cross_area}/{}", semantic_edges.len()),
+            format!(
+                "low-confidence semantic edges: {low_confidence}/{}",
+                semantic_edges.len()
+            ),
+            format!(
+                "high-confidence semantic edges: {high_confidence}/{}",
+                semantic_edges.len()
+            ),
+            format!(
+                "cross-area semantic edges: {cross_area}/{}",
+                semantic_edges.len()
+            ),
         ],
     }
 }
@@ -224,12 +265,14 @@ fn parser_visibility(map: &RepositoryMap) -> SignalAssessment {
     let semantic_files = source_files
         .iter()
         .filter(|file| {
-            map.functions.iter().any(|function| function.file_id == file.id)
+            map.functions
+                .iter()
+                .any(|function| function.file_id == file.id)
                 || map.classes.iter().any(|class| class.file_id == file.id)
-                || map
-                    .edges
-                    .iter()
-                    .any(|edge| edge.from == file.id && matches!(edge.kind, EdgeKind::Imports | EdgeKind::Defines))
+                || map.edges.iter().any(|edge| {
+                    edge.from == file.id
+                        && matches!(edge.kind, EdgeKind::Imports | EdgeKind::Defines)
+                })
         })
         .count();
 
@@ -241,9 +284,18 @@ fn parser_visibility(map: &RepositoryMap) -> SignalAssessment {
         score,
         level: signal_level(score).to_string(),
         evidence: vec![
-            format!("supported source files: {supported_sources}/{}", source_files.len()),
-            format!("source files with semantic extraction: {semantic_files}/{}", source_files.len()),
-            format!("total extracted functions/classes: {}", map.functions.len() + map.classes.len()),
+            format!(
+                "supported source files: {supported_sources}/{}",
+                source_files.len()
+            ),
+            format!(
+                "source files with semantic extraction: {semantic_files}/{}",
+                source_files.len()
+            ),
+            format!(
+                "total extracted functions/classes: {}",
+                map.functions.len() + map.classes.len()
+            ),
         ],
     }
 }
@@ -256,12 +308,11 @@ fn config_path(map: &RepositoryMap, id: &str) -> Option<String> {
 }
 
 fn is_generic_name(name: &str) -> bool {
-    let stem = name
-        .split('.')
-        .next()
-        .unwrap_or(name)
-        .to_ascii_lowercase();
-    matches!(stem.as_str(), "utils" | "helpers" | "common" | "misc" | "temp")
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_lowercase();
+    matches!(
+        stem.as_str(),
+        "utils" | "helpers" | "common" | "misc" | "temp"
+    )
 }
 
 fn is_supported_language(language: &str) -> bool {

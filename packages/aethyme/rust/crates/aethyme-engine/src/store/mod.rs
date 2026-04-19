@@ -4,10 +4,10 @@
 //! with a persistent, queryable graph database.
 
 pub mod prompt;
+pub mod read;
 pub mod schema;
 pub mod snippets;
 pub mod write;
-pub mod read;
 
 use std::path::{Path, PathBuf};
 

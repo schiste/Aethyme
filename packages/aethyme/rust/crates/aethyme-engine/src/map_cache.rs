@@ -8,11 +8,31 @@ use crate::map::RepositoryMap;
 const MAP_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-map-v2-treesitter");
 
 const EXCLUDED_DIRS: &[&str] = &[
-    ".git", ".security-logs", ".venv", "venv", "node_modules", "dist",
-    "build", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
-    "target", "coverage", ".turbo", ".cache", ".claude", ".codex",
-    ".chau7", ".cursor", ".chunk-history", ".vscode", ".idea", ".zed",
-    ".windsurf", ".aethyme",
+    ".git",
+    ".security-logs",
+    ".venv",
+    "venv",
+    "node_modules",
+    "dist",
+    "build",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "target",
+    "coverage",
+    ".turbo",
+    ".cache",
+    ".claude",
+    ".codex",
+    ".chau7",
+    ".cursor",
+    ".chunk-history",
+    ".vscode",
+    ".idea",
+    ".zed",
+    ".windsurf",
+    ".aethyme",
 ];
 
 /// Lightweight filesystem scan — collects only paths and sizes (no file reads).
@@ -26,18 +46,28 @@ fn quick_scan(root: &Path) -> Vec<(String, u64)> {
 }
 
 fn quick_walk(root: &Path, current: &Path, entries: &mut Vec<(String, u64)>) {
-    let Ok(dir_entries) = fs::read_dir(current) else { return };
+    let Ok(dir_entries) = fs::read_dir(current) else {
+        return;
+    };
     for entry in dir_entries.flatten() {
         let path = entry.path();
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
 
-        let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
         if meta.file_type().is_symlink() && fs::metadata(&path).is_err() {
             continue;
         }
 
         if meta.is_dir() {
-            if EXCLUDED_DIRS.contains(&file_name) || file_name.starts_with(".venv") || file_name.starts_with("__pycache__") {
+            if EXCLUDED_DIRS.contains(&file_name)
+                || file_name.starts_with(".venv")
+                || file_name.starts_with("__pycache__")
+            {
                 continue;
             }
             quick_walk(root, &path, entries);
@@ -119,8 +149,7 @@ pub fn save_cached_map(root: &Path, map: &RepositoryMap) {
     if let Ok(entries) = fs::read_dir(cache_dir(&canonical)) {
         for entry in entries.flatten() {
             let entry_path = entry.path();
-            if entry_path.extension().and_then(|e| e.to_str()) == Some("bin")
-                && entry_path != path
+            if entry_path.extension().and_then(|e| e.to_str()) == Some("bin") && entry_path != path
             {
                 let _ = fs::remove_file(&entry_path);
             }

@@ -9,12 +9,25 @@ pub fn resolve(
 ) -> Option<String> {
     match language {
         "python" => resolve_python(files_by_path, files_by_last_segment, raw_target),
-        "typescript" | "javascript" => {
-            resolve_js(files_by_path, files_by_last_segment, source_file, raw_target)
-        }
-        "rust" => resolve_rust(files_by_path, files_by_last_segment, source_file, raw_target),
+        "typescript" | "javascript" => resolve_js(
+            files_by_path,
+            files_by_last_segment,
+            source_file,
+            raw_target,
+        ),
+        "rust" => resolve_rust(
+            files_by_path,
+            files_by_last_segment,
+            source_file,
+            raw_target,
+        ),
         "php" => resolve_php(files_by_path, files_by_last_segment, raw_target),
-        "go" => resolve_go(files_by_path, files_by_last_segment, source_file, raw_target),
+        "go" => resolve_go(
+            files_by_path,
+            files_by_last_segment,
+            source_file,
+            raw_target,
+        ),
         "java" | "kotlin" | "c_sharp" => {
             resolve_java_family(files_by_path, files_by_last_segment, raw_target)
         }
@@ -134,8 +147,11 @@ fn resolve_go(
     let source_dir = source_file.rsplit_once('/').map(|v| v.0).unwrap_or("");
 
     // Try relative to source
-    find_matching_file_id(files_by_path, &format!("{source_dir}/{pkg_name}/{pkg_name}.go"))
-        .or_else(|| find_last_segment_file(files_by_last_segment, pkg_name))
+    find_matching_file_id(
+        files_by_path,
+        &format!("{source_dir}/{pkg_name}/{pkg_name}.go"),
+    )
+    .or_else(|| find_last_segment_file(files_by_last_segment, pkg_name))
 }
 
 // --- Java/Kotlin/C#: dotted package → directory ---

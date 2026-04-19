@@ -1,8 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::context_pack::Anchor;
-use crate::model::edge::EdgeKind;
 use crate::map::RepositoryMap;
+use crate::model::edge::EdgeKind;
 use crate::model::task::TaskKind;
 
 const EDGE_KIND_COUNT: usize = 9;
@@ -233,11 +233,7 @@ pub fn spread_activation(
     }
 }
 
-pub fn spread_from_seed(
-    map: &RepositoryMap,
-    seed_id: &str,
-    max_hops: usize,
-) -> ActivationMap {
+pub fn spread_from_seed(map: &RepositoryMap, seed_id: &str, max_hops: usize) -> ActivationMap {
     // Try resolving the seed_id and also probe with a file-path anchor
     let anchor = Anchor::new(
         crate::context_pack::AnchorKind::File,
@@ -400,7 +396,10 @@ mod tests {
         let (root, map) = test_repo("from_seed");
         let activation = spread_from_seed(&map, "GameEngine/Cargo.toml", 3);
 
-        assert!(activation.seed_count >= 1, "should resolve at least one seed");
+        assert!(
+            activation.seed_count >= 1,
+            "should resolve at least one seed"
+        );
         assert!(!activation.activations.is_empty());
 
         let _ = fs::remove_dir_all(&root);

@@ -35,17 +35,41 @@ pub fn build(snapshot: &RepoSnapshot) -> StructurePass {
 
     for top_level in &snapshot.top_level_dirs {
         let area = AreaNode::new(&repo_name, top_level, false);
-        edges.push(Edge::new(&repo_id, &area.id, EdgeKind::Contains, 1000, "structure"));
+        edges.push(Edge::new(
+            &repo_id,
+            &area.id,
+            EdgeKind::Contains,
+            1000,
+            "structure",
+        ));
         areas.push(area);
     }
 
     for inferred in infer_subareas(&repo_name, &classified_files, &snapshot.top_level_dirs) {
         if let Some(parent_path) = parent_path(&inferred.path_prefix) {
             let parent_id = format!("area:{repo_name}:{parent_path}");
-            edges.push(Edge::new(&parent_id, &inferred.id, EdgeKind::Contains, 700, "structure"));
-            edges.push(Edge::new(&inferred.id, &parent_id, EdgeKind::BelongsTo, 700, "structure"));
+            edges.push(Edge::new(
+                &parent_id,
+                &inferred.id,
+                EdgeKind::Contains,
+                700,
+                "structure",
+            ));
+            edges.push(Edge::new(
+                &inferred.id,
+                &parent_id,
+                EdgeKind::BelongsTo,
+                700,
+                "structure",
+            ));
         } else {
-            edges.push(Edge::new(&repo_id, &inferred.id, EdgeKind::Contains, 700, "structure"));
+            edges.push(Edge::new(
+                &repo_id,
+                &inferred.id,
+                EdgeKind::Contains,
+                700,
+                "structure",
+            ));
         }
         areas.push(inferred);
     }
@@ -63,18 +87,48 @@ pub fn build(snapshot: &RepoSnapshot) -> StructurePass {
 
         if let Some(parent_path) = parent_path(&path) {
             let parent_id = format!("dir:{repo_name}:{parent_path}");
-            edges.push(Edge::new(&parent_id, &directory.id, EdgeKind::Contains, 1000, "structure"));
+            edges.push(Edge::new(
+                &parent_id,
+                &directory.id,
+                EdgeKind::Contains,
+                1000,
+                "structure",
+            ));
         } else if let Some(area_id_value) = &area_id {
-            edges.push(Edge::new(area_id_value, &directory.id, EdgeKind::Contains, 1000, "structure"));
+            edges.push(Edge::new(
+                area_id_value,
+                &directory.id,
+                EdgeKind::Contains,
+                1000,
+                "structure",
+            ));
         } else {
-            edges.push(Edge::new(&repo_id, &directory.id, EdgeKind::Contains, 1000, "structure"));
+            edges.push(Edge::new(
+                &repo_id,
+                &directory.id,
+                EdgeKind::Contains,
+                1000,
+                "structure",
+            ));
         }
 
         if let Some(area_id_value) = &area_id {
-            edges.push(Edge::new(&directory.id, area_id_value, EdgeKind::BelongsTo, 1000, "structure"));
+            edges.push(Edge::new(
+                &directory.id,
+                area_id_value,
+                EdgeKind::BelongsTo,
+                1000,
+                "structure",
+            ));
         }
         for inferred_area_id in inferred_area_ids_for_path(&directory.path, &areas) {
-            edges.push(Edge::new(&directory.id, &inferred_area_id, EdgeKind::BelongsTo, 700, "structure"));
+            edges.push(Edge::new(
+                &directory.id,
+                &inferred_area_id,
+                EdgeKind::BelongsTo,
+                700,
+                "structure",
+            ));
         }
 
         directories.push(directory);
@@ -95,18 +149,48 @@ pub fn build(snapshot: &RepoSnapshot) -> StructurePass {
 
         if let Some(parent_path_value) = parent_path(&repo_file.path) {
             let parent_id = format!("dir:{repo_name}:{parent_path_value}");
-            edges.push(Edge::new(&parent_id, &file.id, EdgeKind::Contains, 1000, "structure"));
+            edges.push(Edge::new(
+                &parent_id,
+                &file.id,
+                EdgeKind::Contains,
+                1000,
+                "structure",
+            ));
         } else if let Some(area_id_value) = &area_id {
-            edges.push(Edge::new(area_id_value, &file.id, EdgeKind::Contains, 1000, "structure"));
+            edges.push(Edge::new(
+                area_id_value,
+                &file.id,
+                EdgeKind::Contains,
+                1000,
+                "structure",
+            ));
         } else {
-            edges.push(Edge::new(&repo_id, &file.id, EdgeKind::Contains, 1000, "structure"));
+            edges.push(Edge::new(
+                &repo_id,
+                &file.id,
+                EdgeKind::Contains,
+                1000,
+                "structure",
+            ));
         }
 
         if let Some(area_id_value) = &area_id {
-            edges.push(Edge::new(&file.id, area_id_value, EdgeKind::BelongsTo, 1000, "structure"));
+            edges.push(Edge::new(
+                &file.id,
+                area_id_value,
+                EdgeKind::BelongsTo,
+                1000,
+                "structure",
+            ));
         }
         for inferred_area_id in inferred_area_ids_for_path(&repo_file.path, &areas) {
-            edges.push(Edge::new(&file.id, &inferred_area_id, EdgeKind::BelongsTo, 700, "structure"));
+            edges.push(Edge::new(
+                &file.id,
+                &inferred_area_id,
+                EdgeKind::BelongsTo,
+                700,
+                "structure",
+            ));
         }
 
         files.push(file);
@@ -157,7 +241,12 @@ fn infer_subareas(
             FileRole::Source => entry.1 += 1,
             FileRole::Doc => entry.2 += 1,
             FileRole::Config => entry.3 += 1,
-            FileRole::Generated | FileRole::Cache | FileRole::Binary | FileRole::Unknown | FileRole::Test | FileRole::Asset => {}
+            FileRole::Generated
+            | FileRole::Cache
+            | FileRole::Binary
+            | FileRole::Unknown
+            | FileRole::Test
+            | FileRole::Asset => {}
         }
     }
 
@@ -174,7 +263,9 @@ fn inferred_area_ids_for_path(path: &str, areas: &[AreaNode]) -> Vec<String> {
     let mut matches = areas
         .iter()
         .filter(|area| area.inferred)
-        .filter(|area| path.starts_with(&format!("{}/", area.path_prefix)) || path == area.path_prefix)
+        .filter(|area| {
+            path.starts_with(&format!("{}/", area.path_prefix)) || path == area.path_prefix
+        })
         .map(|area| area.id.clone())
         .collect::<Vec<_>>();
     matches.sort_by_key(String::len);
@@ -221,10 +312,17 @@ fn classify_file(repo_file: &RepoFile, generated: bool) -> FileRole {
         return FileRole::Generated;
     }
     let lower = repo_file.path.to_ascii_lowercase();
-    if lower.contains("__pycache__") || lower.contains(".pytest_cache") || lower.contains(".mypy_cache") {
+    if lower.contains("__pycache__")
+        || lower.contains(".pytest_cache")
+        || lower.contains(".mypy_cache")
+    {
         return FileRole::Cache;
     }
-    if lower.ends_with(".md") || lower.ends_with(".mdx") || lower.ends_with(".rst") || lower.ends_with("readme") {
+    if lower.ends_with(".md")
+        || lower.ends_with(".mdx")
+        || lower.ends_with(".rst")
+        || lower.ends_with("readme")
+    {
         return FileRole::Doc;
     }
     if is_operational_config_path(&lower) {
@@ -317,7 +415,7 @@ fn is_operational_config_path(lower_path: &str) -> bool {
 mod tests {
     use crate::repo::RepoFile;
 
-    use super::{classify_file, FileRole};
+    use super::{FileRole, classify_file};
 
     #[test]
     fn classify_file_limits_json_to_operational_config_paths() {

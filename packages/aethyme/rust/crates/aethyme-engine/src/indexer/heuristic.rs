@@ -72,7 +72,13 @@ pub fn extract_import_edges(path: &str, contents: &str) -> Vec<Edge> {
         let trimmed = line.trim();
         if let Some(target) = try_extract_import(trimmed) {
             if !target.is_empty() {
-                edges.push(Edge::new(path, &target, EdgeKind::Imports, 600, "heuristic"));
+                edges.push(Edge::new(
+                    path,
+                    &target,
+                    EdgeKind::Imports,
+                    600,
+                    "heuristic",
+                ));
             }
         }
     }

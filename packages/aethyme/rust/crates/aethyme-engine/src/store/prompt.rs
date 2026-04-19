@@ -34,19 +34,25 @@ pub fn generate_prompt(
     };
 
     let framing = match focus {
-        "overview" => "\
+        "overview" => {
+            "\
 The navigation context below is a pre-computed map of the repository structure \
 derived from graph analysis. Use it as your starting point — validate and deepen \
 by reading the actual source files listed. Focus on architecture, not surface \
-descriptions.",
-        "testing" => "\
+descriptions."
+        }
+        "testing" => {
+            "\
 The navigation context below maps the testing infrastructure derived from graph \
 analysis. Use it to locate test frameworks, configurations, and directories, then \
-read the actual test files to understand the testing strategy.",
-        _ => "\
+read the actual test files to understand the testing strategy."
+        }
+        _ => {
+            "\
 The navigation context below is a pre-computed map of this subsystem derived from \
 graph analysis. Use it as your starting point — validate by reading the source files \
-listed. Trace connections to understand how this area fits into the larger codebase.",
+listed. Trace connections to understand how this area fits into the larger codebase."
+        }
     };
 
     format!(
@@ -91,10 +97,7 @@ fn build_overview_context(root: &Path, map: &RepositoryMap) -> String {
     let root_sources: Vec<&str> = map
         .files
         .iter()
-        .filter(|f| {
-            matches!(f.role, FileRole::Source)
-                && !f.path.contains('/')
-        })
+        .filter(|f| matches!(f.role, FileRole::Source) && !f.path.contains('/'))
         .map(|f| f.path.as_str())
         .collect();
 
@@ -266,7 +269,10 @@ pub fn generate_subsystem_context(
         .collect();
 
     if !external_importers.is_empty() {
-        let mut section = format!("### External Consumers ({} files import from this subsystem)\n", external_importers.len());
+        let mut section = format!(
+            "### External Consumers ({} files import from this subsystem)\n",
+            external_importers.len()
+        );
         for imp in &external_importers {
             section.push_str(&format!("{imp}\n"));
         }
@@ -322,12 +328,21 @@ fn build_area_context(root: &Path, map: &RepositoryMap, area_name: &str) -> Stri
     }
 
     // Key files: look for index/main/init/mod files, README, configs
-    let key_file_patterns = ["index.", "main.", "__init__.", "mod.rs", "README", "package.json"];
+    let key_file_patterns = [
+        "index.",
+        "main.",
+        "__init__.",
+        "mod.rs",
+        "README",
+        "package.json",
+    ];
     let key_files: Vec<&str> = area_files
         .iter()
         .filter(|f| {
             let name = f.rsplit('/').next().unwrap_or(f);
-            key_file_patterns.iter().any(|p| name.starts_with(p) || name == *p)
+            key_file_patterns
+                .iter()
+                .any(|p| name.starts_with(p) || name == *p)
         })
         .copied()
         .take(8)
@@ -386,7 +401,8 @@ fn build_area_context(root: &Path, map: &RepositoryMap, area_name: &str) -> Stri
         .collect();
 
     if !imports_from.is_empty() {
-        let mut section = String::from("### External Dependencies (imports from outside this area)\n");
+        let mut section =
+            String::from("### External Dependencies (imports from outside this area)\n");
         let mut seen = std::collections::HashSet::new();
         for dep in &imports_from {
             if seen.insert(dep.clone()) {
@@ -477,9 +493,25 @@ fn build_docs_context(root: &Path, map: &RepositoryMap) -> String {
     sections.push(format!("**Documentation files:** {}\n", map.docs.len()));
 
     // Group by type
-    let readmes: Vec<&str> = map.docs.iter().filter(|d| d.doc_type == "readme").map(|d| d.path.as_str()).collect();
-    let architecture: Vec<&str> = map.docs.iter().filter(|d| d.doc_type == "architecture").map(|d| d.path.as_str()).collect();
-    let guides: Vec<&str> = map.docs.iter().filter(|d| d.doc_type != "readme" && d.doc_type != "architecture").map(|d| d.path.as_str()).take(10).collect();
+    let readmes: Vec<&str> = map
+        .docs
+        .iter()
+        .filter(|d| d.doc_type == "readme")
+        .map(|d| d.path.as_str())
+        .collect();
+    let architecture: Vec<&str> = map
+        .docs
+        .iter()
+        .filter(|d| d.doc_type == "architecture")
+        .map(|d| d.path.as_str())
+        .collect();
+    let guides: Vec<&str> = map
+        .docs
+        .iter()
+        .filter(|d| d.doc_type != "readme" && d.doc_type != "architecture")
+        .map(|d| d.path.as_str())
+        .take(10)
+        .collect();
 
     if !readmes.is_empty() {
         let mut section = String::from("### READMEs\n");
@@ -566,19 +598,27 @@ fn find_root_readme(map: &RepositoryMap) -> Option<String> {
 /// Language-agnostic boilerplate lines to skip when describing entry points.
 const BOILERPLATE: &[&str] = &[
     // PHP
-    "<?php", "<?", "declare(strict_types",
+    "<?php",
+    "<?",
+    "declare(strict_types",
     // JS/TS
-    "'use strict'", "\"use strict\"", "Object.defineProperty(exports",
+    "'use strict'",
+    "\"use strict\"",
+    "Object.defineProperty(exports",
     // Python
-    "#!/usr/bin/env python", "# -*- coding:",
+    "#!/usr/bin/env python",
+    "# -*- coding:",
     // Ruby
     "# frozen_string_literal:",
     // Rust
-    "#![allow(", "#![deny(", "#![cfg(",
+    "#![allow(",
+    "#![deny(",
+    "#![cfg(",
     // Go
     "//go:build",
     // Generic
-    "/*", "*/",
+    "/*",
+    "*/",
 ];
 
 /// Is this line boilerplate that should be skipped?
@@ -662,19 +702,27 @@ fn extract_doc_comment(content: &str) -> Option<String> {
             } else {
                 break;
             }
-            if desc_lines.len() >= 2 { break; }
+            if desc_lines.len() >= 2 {
+                break;
+            }
         }
     } else {
         // C-style /** ... */ or /* ... */
         for line in &lines[start..] {
             let t = line.trim();
-            if t == "/**" || t == "/*" { continue; }
-            if t.starts_with("*/") { break; }
+            if t == "/**" || t == "/*" {
+                continue;
+            }
+            if t.starts_with("*/") {
+                break;
+            }
             let text = t.trim_start_matches('*').trim();
             if !text.is_empty() && !text.starts_with('@') && !text.starts_with("\\") {
                 desc_lines.push(text);
             }
-            if desc_lines.len() >= 2 { break; }
+            if desc_lines.len() >= 2 {
+                break;
+            }
         }
     }
 
@@ -694,7 +742,11 @@ fn extract_module_docstring(content: &str) -> Option<String> {
         t.starts_with("\"\"\"") || t.starts_with("'''")
     })?;
 
-    let quote = if lines[start].trim().starts_with("\"\"\"") { "\"\"\"" } else { "'''" };
+    let quote = if lines[start].trim().starts_with("\"\"\"") {
+        "\"\"\""
+    } else {
+        "'''"
+    };
     let mut desc_lines = Vec::new();
 
     // Check for single-line docstring: """text"""
@@ -708,43 +760,71 @@ fn extract_module_docstring(content: &str) -> Option<String> {
 
     for line in &lines[start + 1..] {
         let t = line.trim();
-        if t.contains(quote) { break; }
+        if t.contains(quote) {
+            break;
+        }
         if !t.is_empty() {
             desc_lines.push(t);
         }
-        if desc_lines.len() >= 2 { break; }
+        if desc_lines.len() >= 2 {
+            break;
+        }
     }
 
-    if desc_lines.is_empty() { return None; }
+    if desc_lines.is_empty() {
+        return None;
+    }
     Some(desc_lines.join(" "))
 }
 
 /// Generic bootstrap file name patterns (language-agnostic).
 const BOOTSTRAP_NAMES: &[&str] = &[
     // Generic
-    "Bootstrap", "bootstrap", "Setup", "setup", "startup", "Startup",
-    "init", "Init", "Application", "application",
-    "Kernel", "kernel", "Server", "server",
+    "Bootstrap",
+    "bootstrap",
+    "Setup",
+    "setup",
+    "startup",
+    "Startup",
+    "init",
+    "Init",
+    "Application",
+    "application",
+    "Kernel",
+    "kernel",
+    "Server",
+    "server",
     // DI / service containers
-    "Services", "services", "Container", "container",
+    "Services",
+    "services",
+    "Container",
+    "container",
     // App entry orchestration
-    "App", "Main",
+    "App",
+    "Main",
 ];
 
 /// Import/require keywords across languages.
 const IMPORT_KEYWORDS: &[&str] = &[
     // PHP
-    "require", "include", "require_once", "include_once",
+    "require",
+    "include",
+    "require_once",
+    "include_once",
     // JS/TS
-    "import ", "require(",
+    "import ",
+    "require(",
     // Python
-    "from ", "import ",
+    "from ",
+    "import ",
     // Go
     "import ",
     // Rust
-    "use ", "mod ",
+    "use ",
+    "mod ",
     // Ruby
-    "require ", "require_relative ",
+    "require ",
+    "require_relative ",
     // Java/Kotlin
     "import ",
 ];
@@ -761,7 +841,9 @@ fn find_bootstrap_chain(root: &Path, map: &RepositoryMap, root_sources: &[&str])
                 let trimmed = line.trim();
                 // Does this line contain an import/require keyword?
                 let has_import = IMPORT_KEYWORDS.iter().any(|kw| trimmed.contains(kw));
-                if !has_import { continue; }
+                if !has_import {
+                    continue;
+                }
 
                 // Does it reference a bootstrap-named file?
                 for pattern in BOOTSTRAP_NAMES {
@@ -775,17 +857,23 @@ fn find_bootstrap_chain(root: &Path, map: &RepositoryMap, root_sources: &[&str])
                 }
             }
         }
-        if !chain.is_empty() { break; }
+        if !chain.is_empty() {
+            break;
+        }
     }
 
     // Also scan for well-known bootstrap files in the repo (depth <= 1)
     for file in &map.files {
         let name = file.path.rsplit('/').next().unwrap_or(&file.path);
         let stem = name.split('.').next().unwrap_or(name);
-        let is_bootstrap = BOOTSTRAP_NAMES.iter().any(|p| stem == *p || stem.contains(p));
+        let is_bootstrap = BOOTSTRAP_NAMES
+            .iter()
+            .any(|p| stem == *p || stem.contains(p));
         let shallow = file.path.matches('/').count() <= 1;
-        let not_test = !file.path.contains("test") && !file.path.contains("spec")
-            && !file.path.contains("mock") && !file.path.contains("fixture");
+        let not_test = !file.path.contains("test")
+            && !file.path.contains("spec")
+            && !file.path.contains("mock")
+            && !file.path.contains("fixture");
 
         if is_bootstrap && shallow && not_test {
             let entry = format!("`{}`", file.path);
@@ -948,7 +1036,8 @@ fn suggest_starting_files(_root: &Path, map: &RepositoryMap) -> Vec<(String, Str
         let stem = name.split('.').next().unwrap_or(name).to_lowercase();
 
         // Service wiring / container patterns
-        if (stem.contains("service") && (stem.contains("wir") || stem.contains("container") || stem.contains("provider")))
+        if (stem.contains("service")
+            && (stem.contains("wir") || stem.contains("container") || stem.contains("provider")))
             || stem == "services"
             || stem == "container"
             || stem == "injector"
@@ -976,8 +1065,10 @@ fn suggest_starting_files(_root: &Path, map: &RepositoryMap) -> Vec<(String, Str
     // Hooks / event / plugin system docs (any framework)
     for doc in &map.docs {
         let name_lower = doc.path.to_lowercase();
-        if name_lower.contains("hook") || name_lower.contains("event")
-            || name_lower.contains("plugin") || name_lower.contains("middleware")
+        if name_lower.contains("hook")
+            || name_lower.contains("event")
+            || name_lower.contains("plugin")
+            || name_lower.contains("middleware")
         {
             if !suggestions.iter().any(|(p, _)| p == &doc.path) {
                 suggestions.push((doc.path.clone(), "extensibility documentation".to_string()));

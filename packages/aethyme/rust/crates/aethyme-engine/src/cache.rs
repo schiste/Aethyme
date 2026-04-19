@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::model::edge::{Edge, EdgeKind};
 use crate::json::escape;
+use crate::model::edge::{Edge, EdgeKind};
 use crate::model::symbol::{Symbol, SymbolKind};
 
 const ENGINE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-cache-v3-dir");
@@ -112,7 +112,10 @@ fn cache_dir_path(repo_root: &Path) -> PathBuf {
 fn ensure_aethyme_gitignore(repo_root: &Path) {
     let gitignore = repo_root.join(".aethyme").join(".gitignore");
     if !gitignore.exists() {
-        let _ = fs::write(&gitignore, "# Auto-generated — Aethyme graph cache (recomputed locally)\n*\n");
+        let _ = fs::write(
+            &gitignore,
+            "# Auto-generated — Aethyme graph cache (recomputed locally)\n*\n",
+        );
     }
 }
 
@@ -195,7 +198,10 @@ fn extract_json_string(json: &str) -> Option<(String, &str)> {
             escaped = true;
         } else if bytes[end] == b'"' {
             let raw = &json[1..end];
-            let unescaped = raw.replace("\\\"", "\"").replace("\\\\", "\\").replace("\\n", "\n");
+            let unescaped = raw
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\")
+                .replace("\\n", "\n");
             return Some((unescaped, &json[end + 1..]));
         }
         end += 1;
@@ -400,7 +406,13 @@ mod tests {
                 language: None,
                 area: None,
             }],
-            import_edges: vec![Edge::new("file:src/main.py", "file:src/auth.py", EdgeKind::Imports, 900, "python")],
+            import_edges: vec![Edge::new(
+                "file:src/main.py",
+                "file:src/auth.py",
+                EdgeKind::Imports,
+                900,
+                "python",
+            )],
         };
         let serialized = serialize_entry(&entry);
         let deserialized = deserialize_entry(&serialized).expect("should deserialize");
@@ -451,7 +463,9 @@ mod tests {
 
         // Reload from disk
         let loaded = ParseCache::load(&root).expect("should load");
-        let found = loaded.lookup("src/lib.rs", "hash123").expect("should find entry");
+        let found = loaded
+            .lookup("src/lib.rs", "hash123")
+            .expect("should find entry");
         assert_eq!(found.symbols.len(), 1);
         assert_eq!(found.symbols[0].name, "foo");
 

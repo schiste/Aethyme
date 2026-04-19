@@ -5,14 +5,14 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use crate::cache::{sha256_hex, CacheEntry, CacheStats, ParseCache};
+use crate::cache::{CacheEntry, CacheStats, ParseCache, sha256_hex};
+use crate::indexer;
 use crate::model::class::ClassNode;
 use crate::model::edge::{Edge, EdgeKind};
 use crate::model::file::{FileNode, FileRole};
 use crate::model::function::FunctionNode;
-use crate::indexer;
-use crate::passes::structure::StructurePass;
 use crate::model::symbol::{Symbol, SymbolKind};
+use crate::passes::structure::StructurePass;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodePass {
@@ -167,7 +167,12 @@ pub fn build_with_profile(
         let contents = fs::read_to_string(root.join(&parsed.file.path)).unwrap_or_default();
         let imported_symbol_names =
             imported_symbol_names_for_language(&parsed.language, &contents, &mut interner);
-        let analyses = analyze_file_functions_with_contents(&contents, &current_function_indexes, &functions, &mut interner);
+        let analyses = analyze_file_functions_with_contents(
+            &contents,
+            &current_function_indexes,
+            &functions,
+            &mut interner,
+        );
         edges.extend(resolve_cross_file_calls(
             &analyses,
             &functions,
@@ -195,7 +200,12 @@ pub fn build_with_profile(
         let contents = fs::read_to_string(root.join(&parsed.file.path)).unwrap_or_default();
         let imported_symbol_names =
             imported_symbol_names_for_language(&parsed.language, &contents, &mut interner);
-        let analyses = analyze_file_functions_with_contents(&contents, &current_function_indexes, &functions, &mut interner);
+        let analyses = analyze_file_functions_with_contents(
+            &contents,
+            &current_function_indexes,
+            &functions,
+            &mut interner,
+        );
         edges.extend(resolve_references(
             &analyses,
             &current_class_indexes,
@@ -269,7 +279,8 @@ fn parse_file_with_cache(
         .into_iter()
         .map(|symbol| symbol.with_context(Some(language.clone()), file.area_id.clone()))
         .collect::<Vec<_>>();
-    let import_edges = indexer::extract_import_edges(grammar_registry, &language, &file.path, &contents);
+    let import_edges =
+        indexer::extract_import_edges(grammar_registry, &language, &file.path, &contents);
 
     (
         ParsedFile {
@@ -364,14 +375,22 @@ fn build_global_indexes(
 
     for (index, class) in classes.iter().enumerate() {
         let name_id = interner.intern(&class.name);
-        indexes.classes_by_name.entry(name_id).or_default().push(index);
+        indexes
+            .classes_by_name
+            .entry(name_id)
+            .or_default()
+            .push(index);
         let _ = intern_file_id(&mut indexes, interner, &class.file_id);
     }
 
     indexes
 }
 
-fn intern_file_id(indexes: &mut GlobalIndexes, interner: &mut StringInterner, file_id: &str) -> InternId {
+fn intern_file_id(
+    indexes: &mut GlobalIndexes,
+    interner: &mut StringInterner,
+    file_id: &str,
+) -> InternId {
     if let Some(id) = indexes.file_ids.get(file_id) {
         return *id;
     }
@@ -410,7 +429,9 @@ fn build_last_segment_file_map(all_files: &[FileNode]) -> HashMap<String, Vec<St
     let mut map = HashMap::new();
     for file in all_files {
         let last = last_target_segment(&file.path);
-        map.entry(last).or_insert_with(Vec::new).push(file.id.clone());
+        map.entry(last)
+            .or_insert_with(Vec::new)
+            .push(file.id.clone());
     }
     map
 }
@@ -448,7 +469,13 @@ fn resolve_import_target(
     raw_target: &str,
     language: &str,
 ) -> Option<String> {
-    indexer::resolve::resolve(language, files_by_path, files_by_last_segment, source_file, raw_target)
+    indexer::resolve::resolve(
+        language,
+        files_by_path,
+        files_by_last_segment,
+        source_file,
+        raw_target,
+    )
 }
 
 fn last_target_segment(raw_target: &str) -> String {
@@ -483,10 +510,18 @@ fn resolve_cross_file_calls(
 
         for target_index in &analysis.same_file_call_targets {
             let target = &functions[*target_index];
-            edges.push(Edge::new(&function.id, &target.id, EdgeKind::Calls, 900, &function.language));
+            edges.push(Edge::new(
+                &function.id,
+                &target.id,
+                EdgeKind::Calls,
+                900,
+                &function.language,
+            ));
         }
 
-        for (token, target_index) in body_call_candidates(&analysis.call_names, &indexes.functions_by_name) {
+        for (token, target_index) in
+            body_call_candidates(&analysis.call_names, &indexes.functions_by_name)
+        {
             let target = &functions[target_index];
             if target.file_id == function.file_id || target.id == function.id {
                 continue;
@@ -494,8 +529,10 @@ fn resolve_cross_file_calls(
 
             let target_file_id = indexes.file_ids.get(&target.file_id).copied();
             let directly_imported = imported_symbol_names.contains(&token);
-            let imported_file = target_file_id.is_some_and(|file_id| imported_targets.contains(&file_id));
-            if directly_imported || imported_file || analysis.qualified_call_names.contains(&token) {
+            let imported_file =
+                target_file_id.is_some_and(|file_id| imported_targets.contains(&file_id));
+            if directly_imported || imported_file || analysis.qualified_call_names.contains(&token)
+            {
                 let confidence = if directly_imported {
                     920
                 } else if imported_file {
@@ -571,7 +608,8 @@ fn resolve_references(
                         continue;
                     }
                     let target_file_id = indexes.file_ids.get(&class.file_id).copied();
-                    let imported_file = target_file_id.is_some_and(|file_id| imported_targets.contains(&file_id));
+                    let imported_file =
+                        target_file_id.is_some_and(|file_id| imported_targets.contains(&file_id));
                     let directly_imported = imported_symbol_names.contains(token);
                     if imported_file || directly_imported {
                         let confidence = if directly_imported { 900 } else { 800 };
@@ -597,7 +635,8 @@ fn resolve_references(
                     }
 
                     let target_file_id = indexes.file_ids.get(&target.file_id).copied();
-                    let imported_file = target_file_id.is_some_and(|file_id| imported_targets.contains(&file_id));
+                    let imported_file =
+                        target_file_id.is_some_and(|file_id| imported_targets.contains(&file_id));
                     let directly_imported = imported_symbol_names.contains(token);
                     if !is_call_name && (imported_file || directly_imported) {
                         let confidence = if directly_imported { 880 } else { 780 };
@@ -630,7 +669,10 @@ fn imported_symbol_names_for_language(
         "typescript" | "javascript" => typescript_imported_symbol_names(contents),
         _ => BTreeSet::new(),
     };
-    names.into_iter().map(|name| interner.intern(&name)).collect()
+    names
+        .into_iter()
+        .map(|name| interner.intern(&name))
+        .collect()
 }
 
 fn analyze_file_functions_with_contents(
@@ -851,7 +893,10 @@ fn body_call_name_tokens(body: &str, interner: &mut StringInterner) -> BTreeSet<
     names
 }
 
-fn body_qualified_call_name_tokens(body: &str, interner: &mut StringInterner) -> BTreeSet<InternId> {
+fn body_qualified_call_name_tokens(
+    body: &str,
+    interner: &mut StringInterner,
+) -> BTreeSet<InternId> {
     let mut names = BTreeSet::new();
     let bytes = body.as_bytes();
     let mut index = 0;
@@ -938,7 +983,11 @@ mod tests {
         let code = build(&root, &structure);
 
         assert!(code.classes.iter().any(|class| class.name == "Engine"));
-        assert!(code.functions.iter().any(|function| function.name == "make_engine"));
+        assert!(
+            code.functions
+                .iter()
+                .any(|function| function.name == "make_engine")
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -953,14 +1002,20 @@ mod tests {
             "from auth import validate_token\n\ndef run():\n    return validate_token()\n",
         )
         .expect("write source");
-        fs::write(root.join("src/auth.py"), "def validate_token():\n    return True\n").expect("write source");
+        fs::write(
+            root.join("src/auth.py"),
+            "def validate_token():\n    return True\n",
+        )
+        .expect("write source");
 
         let snapshot = discover_repo(&root).expect("discover repo");
         let structure = structure::build(&snapshot);
         let code = build(&root, &structure);
 
         assert!(code.edges.iter().any(|edge| {
-            matches!(edge.kind, EdgeKind::Calls) && edge.from.contains("run") && edge.to.contains("validate_token")
+            matches!(edge.kind, EdgeKind::Calls)
+                && edge.from.contains("run")
+                && edge.to.contains("validate_token")
         }));
 
         let _ = fs::remove_dir_all(&root);
@@ -976,8 +1031,11 @@ mod tests {
             "mod auth;\nuse crate::auth::validate_token;\n\npub fn run() -> bool {\n    validate_token()\n}\n",
         )
         .expect("write source");
-        fs::write(root.join("src/auth.rs"), "pub fn validate_token() -> bool {\n    true\n}\n")
-            .expect("write source");
+        fs::write(
+            root.join("src/auth.rs"),
+            "pub fn validate_token() -> bool {\n    true\n}\n",
+        )
+        .expect("write source");
 
         let snapshot = discover_repo(&root).expect("discover repo");
         let structure = structure::build(&snapshot);

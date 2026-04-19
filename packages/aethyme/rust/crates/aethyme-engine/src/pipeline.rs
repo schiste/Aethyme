@@ -2,18 +2,23 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
+use crate::context_pack::{
+    ActivationSummary, Anchor, AnchorKind, Budget, ContextPack, DependencyEdge, FileContent,
+    ImpactItem, Snippet,
+};
 use crate::graph::activation::{hormone_profile, spread_activation};
 use crate::graph::anchors::resolve_anchors;
-use crate::context_pack::{ActivationSummary, Anchor, AnchorKind, Budget, ContextPack, DependencyEdge, FileContent, ImpactItem, Snippet};
-use crate::model::edge::EdgeKind;
 use crate::graph::guidance::{build_in_scope, build_out_of_scope_activated, navigation_order};
-use crate::map::RepositoryMap;
 use crate::graph::neighborhood::{dependency_frontier, impact_frontier};
-use crate::graph::overview::{build_repo_overview, overview_dependencies, overview_impact, repo_overview_seed};
-use crate::model::scope::ScopeBoundary;
+use crate::graph::overview::{
+    build_repo_overview, overview_dependencies, overview_impact, repo_overview_seed,
+};
 use crate::graph::signals::evaluate_graph_signals;
-use crate::snippets::select_snippets;
+use crate::map::RepositoryMap;
+use crate::model::edge::EdgeKind;
+use crate::model::scope::ScopeBoundary;
 use crate::model::task::TaskInput;
+use crate::snippets::select_snippets;
 
 pub fn build_context_pack(root: &Path, map: &RepositoryMap, task: TaskInput) -> ContextPack {
     let anchor_limit = if task.kind.is_explain_repo() { 5 } else { 3 };
@@ -28,7 +33,10 @@ pub fn build_context_pack(root: &Path, map: &RepositoryMap, task: TaskInput) -> 
     };
     let signals = evaluate_graph_signals(map);
     let (mut dependencies, mut impact) = if task.kind.is_explain_repo() {
-        (overview_dependencies(map, &overview), overview_impact(map, &overview))
+        (
+            overview_dependencies(map, &overview),
+            overview_impact(map, &overview),
+        )
     } else {
         let primary_areas = primary_area_names(map, &anchors);
         (
@@ -134,7 +142,13 @@ pub fn build_context_pack_with_content(
 ) -> ContextPack {
     let mut pack = build_context_pack(root, map, task);
     pack.budget.content_budget = content_budget;
-    pack.file_contents = read_file_contents(root, &pack.anchors, &pack.in_scope, &pack.snippets, &pack.budget);
+    pack.file_contents = read_file_contents(
+        root,
+        &pack.anchors,
+        &pack.in_scope,
+        &pack.snippets,
+        &pack.budget,
+    );
     pack
 }
 
@@ -142,13 +156,38 @@ fn is_likely_text(path: &Path) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     !matches!(
         ext,
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "ico" | "svg"
-            | "woff" | "woff2" | "ttf" | "eot"
-            | "zip" | "tar" | "gz" | "bz2" | "xz"
-            | "exe" | "dll" | "so" | "dylib"
-            | "pdf" | "doc" | "docx"
-            | "mp3" | "mp4" | "wav" | "avi"
-            | "bin" | "dat" | "o" | "a" | "class"
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "bmp"
+            | "ico"
+            | "svg"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "eot"
+            | "zip"
+            | "tar"
+            | "gz"
+            | "bz2"
+            | "xz"
+            | "exe"
+            | "dll"
+            | "so"
+            | "dylib"
+            | "pdf"
+            | "doc"
+            | "docx"
+            | "mp3"
+            | "mp4"
+            | "wav"
+            | "avi"
+            | "bin"
+            | "dat"
+            | "o"
+            | "a"
+            | "class"
     )
 }
 
@@ -211,7 +250,11 @@ fn read_file_contents(
         let (truncated, end_line) = if total_lines <= budget.max_lines_per_file {
             (text, total_lines)
         } else {
-            let cut: String = text.lines().take(budget.max_lines_per_file).collect::<Vec<_>>().join("\n");
+            let cut: String = text
+                .lines()
+                .take(budget.max_lines_per_file)
+                .collect::<Vec<_>>()
+                .join("\n");
             (cut + "\n(truncated)", budget.max_lines_per_file)
         };
 
@@ -233,7 +276,11 @@ fn read_file_contents(
     contents
 }
 
-fn focused_dependencies(map: &RepositoryMap, anchor_targets: &[String], primary_areas: &[String]) -> Vec<DependencyEdge> {
+fn focused_dependencies(
+    map: &RepositoryMap,
+    anchor_targets: &[String],
+    primary_areas: &[String],
+) -> Vec<DependencyEdge> {
     let mut dependencies = Vec::new();
     for target in anchor_targets {
         for edge in &map.edges {
@@ -242,7 +289,11 @@ fn focused_dependencies(map: &RepositoryMap, anchor_targets: &[String], primary_
             }
             if !matches!(
                 edge.kind,
-                EdgeKind::Configures | EdgeKind::EntrypointFor | EdgeKind::Imports | EdgeKind::Calls | EdgeKind::References
+                EdgeKind::Configures
+                    | EdgeKind::EntrypointFor
+                    | EdgeKind::Imports
+                    | EdgeKind::Calls
+                    | EdgeKind::References
             ) {
                 continue;
             }
@@ -258,7 +309,9 @@ fn focused_dependencies(map: &RepositoryMap, anchor_targets: &[String], primary_
         }
         if dependencies.is_empty() {
             for dependency in dependency_frontier(map, target).into_iter().take(3) {
-                if !primary_areas.is_empty() && !display_in_primary_area(map, &dependency, primary_areas) {
+                if !primary_areas.is_empty()
+                    && !display_in_primary_area(map, &dependency, primary_areas)
+                {
                     continue;
                 }
                 dependencies.push(DependencyEdge {
@@ -275,14 +328,24 @@ fn focused_dependencies(map: &RepositoryMap, anchor_targets: &[String], primary_
     dependencies
 }
 
-fn focused_impact(map: &RepositoryMap, anchor_targets: &[String], primary_areas: &[String]) -> Vec<ImpactItem> {
+fn focused_impact(
+    map: &RepositoryMap,
+    anchor_targets: &[String],
+    primary_areas: &[String],
+) -> Vec<ImpactItem> {
     let mut impact = Vec::new();
     for target in anchor_targets {
         for edge in &map.edges {
             if edge.to != *target {
                 continue;
             }
-            if !matches!(edge.kind, EdgeKind::Configures | EdgeKind::EntrypointFor | EdgeKind::Calls | EdgeKind::References) {
+            if !matches!(
+                edge.kind,
+                EdgeKind::Configures
+                    | EdgeKind::EntrypointFor
+                    | EdgeKind::Calls
+                    | EdgeKind::References
+            ) {
                 continue;
             }
             let display = map.display_for(&edge.from);
@@ -297,7 +360,8 @@ fn focused_impact(map: &RepositoryMap, anchor_targets: &[String], primary_areas:
         }
         if impact.is_empty() {
             for item in impact_frontier(map, target).into_iter().take(3) {
-                if !primary_areas.is_empty() && !display_in_primary_area(map, &item, primary_areas) {
+                if !primary_areas.is_empty() && !display_in_primary_area(map, &item, primary_areas)
+                {
                     continue;
                 }
                 impact.push(ImpactItem {
@@ -394,13 +458,18 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("src")).expect("create temp repo");
         fs::write(root.join("README.md"), "# Demo\n").expect("write readme");
-        fs::write(root.join("src/main.py"), "def main():\n    return 1\n").expect("write entrypoint");
+        fs::write(root.join("src/main.py"), "def main():\n    return 1\n")
+            .expect("write entrypoint");
 
         let map = RepositoryMap::build(&root).expect("build map");
         let pack = build_context_pack(&root, &map, TaskInput::from_task_text("Explain this repo"));
 
         assert!(!pack.anchors.is_empty());
-        assert!(pack.navigation_order.iter().any(|value| value == "README.md"));
+        assert!(
+            pack.navigation_order
+                .iter()
+                .any(|value| value == "README.md")
+        );
         assert!(pack.navigation_order.iter().any(|value| value == "src"));
         assert!(pack.out_of_scope.areas.is_empty());
         let _ = fs::remove_dir_all(&root);
@@ -413,16 +482,34 @@ mod tests {
         fs::create_dir_all(root.join("src")).expect("create temp repo");
         fs::write(
             root.join("src/main.py"),
-            "from auth import validate_token\n\n".to_string() + "def main():\n    return validate_token()\n",
+            "from auth import validate_token\n\n".to_string()
+                + "def main():\n    return validate_token()\n",
         )
         .expect("write entrypoint");
-        fs::write(root.join("src/auth.py"), "def validate_token():\n    return True\n").expect("write source file");
+        fs::write(
+            root.join("src/auth.py"),
+            "def validate_token():\n    return True\n",
+        )
+        .expect("write source file");
 
         let map = RepositoryMap::build(&root).expect("build map");
-        let pack = build_context_pack(&root, &map, TaskInput::from_task_text("Update validate_token flow"));
+        let pack = build_context_pack(
+            &root,
+            &map,
+            TaskInput::from_task_text("Update validate_token flow"),
+        );
 
-        assert!(pack.anchors.iter().any(|anchor| anchor.id.contains("validate_token")));
-        assert!(pack.in_scope.files.iter().any(|item| item.value == "src/auth.py"));
+        assert!(
+            pack.anchors
+                .iter()
+                .any(|anchor| anchor.id.contains("validate_token"))
+        );
+        assert!(
+            pack.in_scope
+                .files
+                .iter()
+                .any(|item| item.value == "src/auth.py")
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -433,21 +520,47 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("GameEngine/src")).expect("create engine dir");
         fs::create_dir_all(root.join("Other")).expect("create other dir");
-        fs::write(root.join("GameEngine/src/lib.rs"), "pub fn main() {}\n").expect("write entrypoint");
-        fs::write(root.join("GameEngine/Cargo.toml"), "[package]\nname='demo'\n").expect("write manifest");
-        fs::write(root.join("Other/project.godot"), "[application]\n").expect("write unrelated config");
+        fs::write(root.join("GameEngine/src/lib.rs"), "pub fn main() {}\n")
+            .expect("write entrypoint");
+        fs::write(
+            root.join("GameEngine/Cargo.toml"),
+            "[package]\nname='demo'\n",
+        )
+        .expect("write manifest");
+        fs::write(root.join("Other/project.godot"), "[application]\n")
+            .expect("write unrelated config");
 
         let map = RepositoryMap::build(&root).expect("build map");
         let pack = build_context_pack(
             &root,
             &map,
-            TaskInput::from_task_text("Find the manifest that manages the main code entrypoint in the GameEngine area"),
+            TaskInput::from_task_text(
+                "Find the manifest that manages the main code entrypoint in the GameEngine area",
+            ),
         );
 
-        assert!(pack.in_scope.areas.iter().any(|item| item.value == "GameEngine"));
-        assert!(pack.in_scope.files.iter().all(|item| item.value.starts_with("GameEngine/")));
-        assert!(pack.dependencies.iter().all(|edge| edge.to.starts_with("GameEngine") || edge.to == "GameEngine"));
-        assert!(pack.impact.iter().all(|item| item.file.starts_with("GameEngine") || item.file == "GameEngine"));
+        assert!(
+            pack.in_scope
+                .areas
+                .iter()
+                .any(|item| item.value == "GameEngine")
+        );
+        assert!(
+            pack.in_scope
+                .files
+                .iter()
+                .all(|item| item.value.starts_with("GameEngine/"))
+        );
+        assert!(
+            pack.dependencies
+                .iter()
+                .all(|edge| edge.to.starts_with("GameEngine") || edge.to == "GameEngine")
+        );
+        assert!(
+            pack.impact
+                .iter()
+                .all(|item| item.file.starts_with("GameEngine") || item.file == "GameEngine")
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

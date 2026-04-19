@@ -16,7 +16,11 @@ pub async fn insert_area(db: &Surreal<Db>, area: &AreaNode) -> Result<(), surrea
     // Use path_prefix as the canonical ID — matches what edges reference after stripping kind+repo
     let id = sanitize_id(&area.path_prefix);
     let depth = area.path_prefix.matches('/').count() as i64 + 1;
-    let role: Option<String> = if area.inferred { Some("inferred".to_string()) } else { None };
+    let role: Option<String> = if area.inferred {
+        Some("inferred".to_string())
+    } else {
+        None
+    };
     db.query("CREATE type::record('area', $id) SET name = $name, depth = $depth, file_count = $fc, role = $role")
         .bind(("id", id))
         .bind(("name", area.name.clone()))
@@ -39,31 +43,31 @@ pub async fn insert_file(db: &Surreal<Db>, file: &FileNode) -> Result<(), surrea
         db.query(
             "CREATE type::record('file', $id) SET \
              path = $path, area = type::record('area', $area_key), role = $role, language = $lang, \
-             line_count = $lines, size_bytes = $size, content_hash = $hash"
+             line_count = $lines, size_bytes = $size, content_hash = $hash",
         )
-            .bind(("id", id))
-            .bind(("path", file.path.clone()))
-            .bind(("area_key", area_key))
-            .bind(("role", role.to_string()))
-            .bind(("lang", file.language.clone()))
-            .bind(("lines", file.line_count as i64))
-            .bind(("size", file.size_bytes as i64))
-            .bind(("hash", Option::<String>::None))
-            .await?;
+        .bind(("id", id))
+        .bind(("path", file.path.clone()))
+        .bind(("area_key", area_key))
+        .bind(("role", role.to_string()))
+        .bind(("lang", file.language.clone()))
+        .bind(("lines", file.line_count as i64))
+        .bind(("size", file.size_bytes as i64))
+        .bind(("hash", Option::<String>::None))
+        .await?;
     } else {
         db.query(
             "CREATE type::record('file', $id) SET \
              path = $path, role = $role, language = $lang, \
-             line_count = $lines, size_bytes = $size, content_hash = $hash"
+             line_count = $lines, size_bytes = $size, content_hash = $hash",
         )
-            .bind(("id", id))
-            .bind(("path", file.path.clone()))
-            .bind(("role", role.to_string()))
-            .bind(("lang", file.language.clone()))
-            .bind(("lines", file.line_count as i64))
-            .bind(("size", file.size_bytes as i64))
-            .bind(("hash", Option::<String>::None))
-            .await?;
+        .bind(("id", id))
+        .bind(("path", file.path.clone()))
+        .bind(("role", role.to_string()))
+        .bind(("lang", file.language.clone()))
+        .bind(("lines", file.line_count as i64))
+        .bind(("size", file.size_bytes as i64))
+        .bind(("hash", Option::<String>::None))
+        .await?;
     }
     Ok(())
 }
@@ -103,9 +107,11 @@ pub async fn insert_risk(db: &Surreal<Db>, risk: &RiskFlag) -> Result<(), surrea
 pub async fn delete_file_data(db: &Surreal<Db>, file_path: &str) -> Result<(), surrealdb::Error> {
     let id = sanitize_id(file_path);
     // Delete edges from/to this file
-    db.query("DELETE imports WHERE in = type::record('file', $id) OR out = type::record('file', $id)")
-        .bind(("id", id.clone()))
-        .await?;
+    db.query(
+        "DELETE imports WHERE in = type::record('file', $id) OR out = type::record('file', $id)",
+    )
+    .bind(("id", id.clone()))
+    .await?;
     // Delete the file record itself
     db.query("DELETE type::record('file', $id)")
         .bind(("id", id))

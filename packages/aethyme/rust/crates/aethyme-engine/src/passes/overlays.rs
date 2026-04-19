@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::map::RepositoryMap;
 use crate::model::edge::EdgeKind;
 use crate::model::graph::GraphAnnotation;
-use crate::map::RepositoryMap;
 use crate::model::risk::{RiskArea, RiskFlag, RiskLevel};
 
 const SHARED_CORE_HIGH_THRESHOLD: usize = 5;
@@ -44,10 +44,7 @@ fn shared_core_risks(map: &RepositoryMap) -> Vec<RiskFlag> {
         if in_degree < SHARED_CORE_LOW_THRESHOLD {
             continue;
         }
-        let path = file_id_to_path
-            .get(file_id)
-            .copied()
-            .unwrap_or(file_id);
+        let path = file_id_to_path.get(file_id).copied().unwrap_or(file_id);
         if in_degree >= SHARED_CORE_HIGH_THRESHOLD {
             risks.push(RiskFlag::new(
                 path,
@@ -71,7 +68,10 @@ fn destructive_risks(map: &RepositoryMap) -> Vec<RiskFlag> {
     let mut matches_by_file: HashMap<&str, Vec<&str>> = HashMap::new();
     for function in &map.functions {
         let lower = function.name.to_ascii_lowercase();
-        if DESTRUCTIVE_PATTERNS.iter().any(|pattern| lower.contains(pattern)) {
+        if DESTRUCTIVE_PATTERNS
+            .iter()
+            .any(|pattern| lower.contains(pattern))
+        {
             matches_by_file
                 .entry(&function.file_path)
                 .or_default()
@@ -157,16 +157,36 @@ fn path_risks(path: &str) -> Vec<RiskFlag> {
     let lower = path.to_ascii_lowercase();
     let mut risks = Vec::new();
     if lower.contains("auth") {
-        risks.push(RiskFlag::new(path, RiskArea::Auth, RiskLevel::High, "authentication boundary"));
+        risks.push(RiskFlag::new(
+            path,
+            RiskArea::Auth,
+            RiskLevel::High,
+            "authentication boundary",
+        ));
     }
     if lower.contains("permission") || lower.contains("rbac") {
-        risks.push(RiskFlag::new(path, RiskArea::Permissions, RiskLevel::High, "permission boundary"));
+        risks.push(RiskFlag::new(
+            path,
+            RiskArea::Permissions,
+            RiskLevel::High,
+            "permission boundary",
+        ));
     }
     if lower.contains("secret") || lower.contains("token") || lower.contains("credential") {
-        risks.push(RiskFlag::new(path, RiskArea::Secrets, RiskLevel::High, "sensitive credential surface"));
+        risks.push(RiskFlag::new(
+            path,
+            RiskArea::Secrets,
+            RiskLevel::High,
+            "sensitive credential surface",
+        ));
     }
     if lower.contains("migration") {
-        risks.push(RiskFlag::new(path, RiskArea::Migrations, RiskLevel::High, "schema change area"));
+        risks.push(RiskFlag::new(
+            path,
+            RiskArea::Migrations,
+            RiskLevel::High,
+            "schema change area",
+        ));
     }
     if lower.contains("deploy") || lower.contains("infra") || lower.contains("terraform") {
         let level = if lower.contains("helper") || lower.contains("util") {
@@ -174,10 +194,20 @@ fn path_risks(path: &str) -> Vec<RiskFlag> {
         } else {
             RiskLevel::Medium
         };
-        risks.push(RiskFlag::new(path, RiskArea::Infra, level, "infrastructure surface"));
+        risks.push(RiskFlag::new(
+            path,
+            RiskArea::Infra,
+            level,
+            "infrastructure surface",
+        ));
     }
     if lower.contains("billing") || lower.contains("invoice") {
-        risks.push(RiskFlag::new(path, RiskArea::Billing, RiskLevel::Medium, "billing logic"));
+        risks.push(RiskFlag::new(
+            path,
+            RiskArea::Billing,
+            RiskLevel::Medium,
+            "billing logic",
+        ));
     }
     risks
 }

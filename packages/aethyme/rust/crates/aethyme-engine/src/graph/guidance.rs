@@ -15,8 +15,14 @@ pub fn build_in_scope(map: &RepositoryMap, anchors: &[Anchor], max_files: usize)
     for anchor in anchors {
         match anchor.kind {
             AnchorKind::File | AnchorKind::Symbol => {
-                if let Some(file) = anchor.file.as_ref().or_else(|| file_for_symbol(map, &anchor.id)) {
-                    if !primary_area_set.is_empty() && !file_in_primary_areas(map, file, &primary_area_set) {
+                if let Some(file) = anchor
+                    .file
+                    .as_ref()
+                    .or_else(|| file_for_symbol(map, &anchor.id))
+                {
+                    if !primary_area_set.is_empty()
+                        && !file_in_primary_areas(map, file, &primary_area_set)
+                    {
                         continue;
                     }
                     if !files.contains(file) {
@@ -41,8 +47,16 @@ pub fn build_in_scope(map: &RepositoryMap, anchors: &[Anchor], max_files: usize)
     }
 
     for file in files.into_iter().take(max_files) {
-        boundary.files.push(ScopeItem::new(file.clone(), ScopeKind::File, "anchor-adjacent file"));
-        for function in map.functions.iter().filter(|function| function.file_path == file) {
+        boundary.files.push(ScopeItem::new(
+            file.clone(),
+            ScopeKind::File,
+            "anchor-adjacent file",
+        ));
+        for function in map
+            .functions
+            .iter()
+            .filter(|function| function.file_path == file)
+        {
             if !primary_area_set.is_empty()
                 && !function
                     .area_id
@@ -80,7 +94,11 @@ pub fn build_in_scope(map: &RepositoryMap, anchors: &[Anchor], max_files: usize)
     boundary
 }
 
-pub fn build_out_of_scope(map: &RepositoryMap, anchors: &[Anchor], task_kind: &TaskKind) -> ScopeBoundary {
+pub fn build_out_of_scope(
+    map: &RepositoryMap,
+    anchors: &[Anchor],
+    task_kind: &TaskKind,
+) -> ScopeBoundary {
     let mut boundary = ScopeBoundary::default();
     if matches!(task_kind, TaskKind::ExplainRepo) {
         return boundary;
@@ -99,7 +117,12 @@ pub fn build_out_of_scope(map: &RepositoryMap, anchors: &[Anchor], task_kind: &T
     }
     let anchor_files: BTreeSet<String> = anchors
         .iter()
-        .filter_map(|anchor| anchor.file.clone().or_else(|| file_for_symbol(map, &anchor.id).cloned()))
+        .filter_map(|anchor| {
+            anchor
+                .file
+                .clone()
+                .or_else(|| file_for_symbol(map, &anchor.id).cloned())
+        })
         .collect();
 
     for risk in &map.risk_flags {
@@ -165,7 +188,12 @@ pub fn build_out_of_scope_activated(
     // Only include risks on activated nodes
     let anchor_files: BTreeSet<String> = anchors
         .iter()
-        .filter_map(|anchor| anchor.file.clone().or_else(|| file_for_symbol(map, &anchor.id).cloned()))
+        .filter_map(|anchor| {
+            anchor
+                .file
+                .clone()
+                .or_else(|| file_for_symbol(map, &anchor.id).cloned())
+        })
         .collect();
 
     for risk in &map.risk_flags {
@@ -206,7 +234,12 @@ fn file_for_symbol<'a>(map: &'a RepositoryMap, symbol_id: &str) -> Option<&'a St
         .iter()
         .find(|function| function.id == symbol_id)
         .map(|function| &function.file_path)
-        .or_else(|| map.classes.iter().find(|class| class.id == symbol_id).map(|class| &class.file_path))
+        .or_else(|| {
+            map.classes
+                .iter()
+                .find(|class| class.id == symbol_id)
+                .map(|class| &class.file_path)
+        })
 }
 
 fn primary_area_names(map: &RepositoryMap, anchors: &[Anchor]) -> Vec<String> {
@@ -236,14 +269,18 @@ fn primary_area_names(map: &RepositoryMap, anchors: &[Anchor]) -> Vec<String> {
         match anchor.kind {
             AnchorKind::Folder => {}
             AnchorKind::File => {
-                if let Some(area) = file_area_name(map, anchor.file.as_deref().unwrap_or(&anchor.id))
+                if let Some(area) =
+                    file_area_name(map, anchor.file.as_deref().unwrap_or(&anchor.id))
                     && !areas.contains(&area)
                 {
                     areas.push(area);
                 }
             }
             AnchorKind::Symbol => {
-                if let Some(file) = anchor.file.as_ref().or_else(|| file_for_symbol(map, &anchor.id))
+                if let Some(file) = anchor
+                    .file
+                    .as_ref()
+                    .or_else(|| file_for_symbol(map, &anchor.id))
                     && let Some(area) = file_area_name(map, file)
                     && !areas.contains(&area)
                 {
@@ -255,9 +292,12 @@ fn primary_area_names(map: &RepositoryMap, anchors: &[Anchor]) -> Vec<String> {
     areas
 }
 
-fn file_in_primary_areas(map: &RepositoryMap, file_path: &str, primary_areas: &BTreeSet<String>) -> bool {
-    file_area_name(map, file_path)
-        .is_some_and(|area| primary_areas.contains(&area))
+fn file_in_primary_areas(
+    map: &RepositoryMap,
+    file_path: &str,
+    primary_areas: &BTreeSet<String>,
+) -> bool {
+    file_area_name(map, file_path).is_some_and(|area| primary_areas.contains(&area))
 }
 
 fn file_area_name(map: &RepositoryMap, file_path: &str) -> Option<String> {

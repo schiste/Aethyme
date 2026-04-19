@@ -34,7 +34,10 @@ fn generate(repo_root: &Path, map: &RepositoryMap) -> Vec<Snippet> {
 
     // 1. Overview prompt
     let overview_context = prompt::generate_prompt(
-        repo_root, map, "${input:task:Explain this repository}", Some("overview"),
+        repo_root,
+        map,
+        "${input:task:Explain this repository}",
+        Some("overview"),
     );
     snippets.push(Snippet {
         id: "aethyme-explore-overview".into(),
@@ -49,7 +52,8 @@ fn generate(repo_root: &Path, map: &RepositoryMap) -> Vec<Snippet> {
     // 2. One snippet per top-level area
     for area in areas.iter().take(8) {
         let context = prompt::generate_prompt(
-            repo_root, map,
+            repo_root,
+            map,
             &format!("${{input:task:Explain the {} subsystem}}", area),
             Some(area),
         );
@@ -68,7 +72,10 @@ fn generate(repo_root: &Path, map: &RepositoryMap) -> Vec<Snippet> {
     let has_tests = map.files.iter().any(|f| matches!(f.role, FileRole::Test));
     if has_tests {
         let context = prompt::generate_prompt(
-            repo_root, map, "${input:task:Explain the testing strategy}", Some("testing"),
+            repo_root,
+            map,
+            "${input:task:Explain the testing strategy}",
+            Some("testing"),
         );
         snippets.push(Snippet {
             id: "aethyme-explore-testing".into(),
@@ -109,10 +116,24 @@ fn generate(repo_root: &Path, map: &RepositoryMap) -> Vec<Snippet> {
 
 /// Directories to exclude from snippet options.
 pub(crate) const EXCLUDED_AREAS: &[&str] = &[
-    ".pnpm-store", "node_modules", "vendor", ".git", ".cache",
-    "dist", "build", "target", "coverage", "__pycache__",
-    ".next", ".nuxt", ".svelte-kit", "test-results", "logs",
-    ".aethyme", ".chau7", ".codex",
+    ".pnpm-store",
+    "node_modules",
+    "vendor",
+    ".git",
+    ".cache",
+    "dist",
+    "build",
+    "target",
+    "coverage",
+    "__pycache__",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    "test-results",
+    "logs",
+    ".aethyme",
+    ".chau7",
+    ".codex",
 ];
 
 /// Extract top-level area names, sorted by file count, excluding vendor/generated.
@@ -138,7 +159,10 @@ fn top_areas(map: &RepositoryMap) -> Vec<String> {
         .collect();
 
     areas.sort_by(|a, b| b.1.cmp(&a.1));
-    areas.into_iter().map(|(name, _)| name.to_string()).collect()
+    areas
+        .into_iter()
+        .map(|(name, _)| name.to_string())
+        .collect()
 }
 
 fn sanitize_snippet_id(name: &str) -> String {

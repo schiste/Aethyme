@@ -4,7 +4,12 @@ use std::path::Path;
 use crate::context_pack::{Anchor, AnchorKind, Budget, Snippet};
 use crate::map::RepositoryMap;
 
-pub fn select_snippets(root: &Path, map: &RepositoryMap, anchors: &[Anchor], budget: &Budget) -> Vec<Snippet> {
+pub fn select_snippets(
+    root: &Path,
+    map: &RepositoryMap,
+    anchors: &[Anchor],
+    budget: &Budget,
+) -> Vec<Snippet> {
     let mut snippets = Vec::new();
     let window = budget.snippet_window;
 
@@ -50,7 +55,12 @@ fn symbol_window(
         .iter()
         .find(|f| f.id == symbol_id)
         .map(|f| f.line)
-        .or_else(|| map.classes.iter().find(|c| c.id == symbol_id).map(|c| c.line));
+        .or_else(|| {
+            map.classes
+                .iter()
+                .find(|c| c.id == symbol_id)
+                .map(|c| c.line)
+        });
 
     let start = match def_line {
         Some(line) if line >= 1 => line,

@@ -1,11 +1,11 @@
-use crate::graph::anchors::resolve_anchors;
 use crate::context_pack::{Anchor, AnchorKind};
-use crate::model::edge::EdgeKind;
+use crate::graph::anchors::resolve_anchors;
 use crate::graph::guidance::{build_in_scope, build_out_of_scope, navigation_order};
-use crate::map::RepositoryMap;
 use crate::graph::overview::build_repo_overview;
+use crate::graph::signals::{GraphSignals, evaluate_graph_signals};
+use crate::map::RepositoryMap;
+use crate::model::edge::EdgeKind;
 use crate::model::risk::RiskFlag;
-use crate::graph::signals::{evaluate_graph_signals, GraphSignals};
 use crate::model::task::TaskInput;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +125,11 @@ pub fn children_view(map: &RepositoryMap, target: &str) -> GraphRelationView {
 
 pub fn parents_view(map: &RepositoryMap, target: &str) -> GraphRelationView {
     relation_view(map, target, "parents", |kind, from, to, seed| {
-        matches!(kind, EdgeKind::Contains | EdgeKind::Defines | EdgeKind::BelongsTo) && to == seed && from != to
+        matches!(
+            kind,
+            EdgeKind::Contains | EdgeKind::Defines | EdgeKind::BelongsTo
+        ) && to == seed
+            && from != to
     })
 }
 
@@ -149,7 +153,8 @@ pub fn docs_view(map: &RepositoryMap, target: &str) -> GraphRelationView {
 
 pub fn configs_view(map: &RepositoryMap, target: &str) -> GraphRelationView {
     relation_view(map, target, "configs", |kind, from, to, seed| {
-        matches!(kind, EdgeKind::Configures | EdgeKind::EntrypointFor) && (from == seed || to == seed)
+        matches!(kind, EdgeKind::Configures | EdgeKind::EntrypointFor)
+            && (from == seed || to == seed)
     })
 }
 
@@ -183,9 +188,17 @@ pub fn task_scope_view(map: &RepositoryMap, task: &TaskInput) -> TaskScopeView {
         task: task.raw.clone(),
         navigation_order: task_navigation_order(map, task, &anchors),
         in_scope_files: in_scope.files.into_iter().map(|item| item.value).collect(),
-        in_scope_symbols: in_scope.symbols.into_iter().map(|item| item.value).collect(),
+        in_scope_symbols: in_scope
+            .symbols
+            .into_iter()
+            .map(|item| item.value)
+            .collect(),
         in_scope_areas: in_scope.areas.into_iter().map(|item| item.value).collect(),
-        out_of_scope: out_of_scope.areas.into_iter().map(|item| item.value).collect(),
+        out_of_scope: out_of_scope
+            .areas
+            .into_iter()
+            .map(|item| item.value)
+            .collect(),
         risks,
     }
 }
@@ -264,7 +277,12 @@ pub fn graph_overview_view(map: &RepositoryMap) -> RepoOverviewView {
     }
 }
 
-fn relation_view<F>(map: &RepositoryMap, target: &str, relation: &str, predicate: F) -> GraphRelationView
+fn relation_view<F>(
+    map: &RepositoryMap,
+    target: &str,
+    relation: &str,
+    predicate: F,
+) -> GraphRelationView
 where
     F: Fn(&EdgeKind, &str, &str, &str) -> bool,
 {
@@ -274,7 +292,11 @@ where
         .iter()
         .filter(|edge| predicate(&edge.kind, &edge.from, &edge.to, &seed))
         .filter_map(|edge| {
-            let related = if edge.from == seed { &edge.to } else { &edge.from };
+            let related = if edge.from == seed {
+                &edge.to
+            } else {
+                &edge.from
+            };
             relation_item(map, related, edge_kind_label(&edge.kind), edge.confidence)
         })
         .collect::<Vec<_>>();
@@ -430,7 +452,11 @@ fn repo_navigation_seed(map: &RepositoryMap) -> Vec<String> {
             seed.push(area.name.clone());
         }
     }
-    for function in map.functions.iter().filter(|function| function.name == "main") {
+    for function in map
+        .functions
+        .iter()
+        .filter(|function| function.name == "main")
+    {
         if !seed.contains(&function.file_path) {
             seed.push(function.file_path.clone());
         }
@@ -496,7 +522,9 @@ fn change_task_next_items(map: &RepositoryMap, anchors: &[Anchor]) -> Vec<GraphR
         ] {
             for item in relation.items.into_iter().take(2) {
                 let adjusted_item = if item.kind == "function" {
-                    if let Some(function) = map.functions.iter().find(|function| function.id == item.id) {
+                    if let Some(function) =
+                        map.functions.iter().find(|function| function.id == item.id)
+                    {
                         relation_item_for_display(map, &function.file_path, "next").unwrap_or(item)
                     } else {
                         item
@@ -513,7 +541,11 @@ fn change_task_next_items(map: &RepositoryMap, anchors: &[Anchor]) -> Vec<GraphR
     items
 }
 
-fn extend_change_scope(map: &RepositoryMap, anchors: &[Anchor], in_scope: &mut crate::model::scope::ScopeBoundary) {
+fn extend_change_scope(
+    map: &RepositoryMap,
+    anchors: &[Anchor],
+    in_scope: &mut crate::model::scope::ScopeBoundary,
+) {
     let current_files = in_scope
         .files
         .iter()
@@ -580,7 +612,10 @@ fn change_neighbor_displays(map: &RepositoryMap, anchor: &Anchor) -> Vec<String>
             .map(|function| function.id.clone())
             .collect::<Vec<_>>();
         for function_id in file_function_ids {
-            for relation in [callers_view(map, &function_id), callees_view(map, &function_id)] {
+            for relation in [
+                callers_view(map, &function_id),
+                callees_view(map, &function_id),
+            ] {
                 for item in relation.items {
                     let display = change_display_for_relation_item(map, item);
                     if !displays.contains(&display) {
@@ -645,7 +680,11 @@ fn risk_matches_id(map: &RepositoryMap, scope: &str, target_id: &str) -> bool {
     if let Some(file) = map.files.iter().find(|file| file.id == target_id) {
         return file.path == scope;
     }
-    if let Some(function) = map.functions.iter().find(|function| function.id == target_id) {
+    if let Some(function) = map
+        .functions
+        .iter()
+        .find(|function| function.id == target_id)
+    {
         return function.file_path == scope;
     }
     if let Some(class) = map.classes.iter().find(|class| class.id == target_id) {
@@ -708,9 +747,21 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("GameEngine/src")).expect("create engine dir");
         fs::write(root.join("README.md"), "# Demo\n").expect("write readme");
-        fs::write(root.join("GameEngine/technical-architecture.md"), "# Architecture\n").expect("write docs");
-        fs::write(root.join("GameEngine/src/main.rs"), "fn helper() {}\nfn main() { helper(); }\n").expect("write entrypoint");
-        fs::write(root.join("GameEngine/Cargo.toml"), "[package]\nname='demo'\n").expect("write manifest");
+        fs::write(
+            root.join("GameEngine/technical-architecture.md"),
+            "# Architecture\n",
+        )
+        .expect("write docs");
+        fs::write(
+            root.join("GameEngine/src/main.rs"),
+            "fn helper() {}\nfn main() { helper(); }\n",
+        )
+        .expect("write entrypoint");
+        fs::write(
+            root.join("GameEngine/Cargo.toml"),
+            "[package]\nname='demo'\n",
+        )
+        .expect("write manifest");
 
         let map = RepositoryMap::build(&root).expect("build repository map");
         let children = children_view(&map, "GameEngine");
@@ -740,9 +791,21 @@ mod tests {
         let root = std::env::temp_dir().join("aethyme_engine_navigation_expand_test");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("GameEngine/src")).expect("create engine dir");
-        fs::write(root.join("GameEngine/technical-architecture.md"), "# Architecture\n").expect("write docs");
-        fs::write(root.join("GameEngine/src/main.rs"), "fn helper() {}\nfn main() { helper(); }\n").expect("write entrypoint");
-        fs::write(root.join("GameEngine/Cargo.toml"), "[package]\nname='demo'\n").expect("write manifest");
+        fs::write(
+            root.join("GameEngine/technical-architecture.md"),
+            "# Architecture\n",
+        )
+        .expect("write docs");
+        fs::write(
+            root.join("GameEngine/src/main.rs"),
+            "fn helper() {}\nfn main() { helper(); }\n",
+        )
+        .expect("write entrypoint");
+        fs::write(
+            root.join("GameEngine/Cargo.toml"),
+            "[package]\nname='demo'\n",
+        )
+        .expect("write manifest");
 
         let map = RepositoryMap::build(&root).expect("build repository map");
         let view = graph_expand_view(&map, "GameEngine/Cargo.toml").expect("expand view");

@@ -3,8 +3,10 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::model::area::AreaNode;
 use crate::cache::ParseCache;
+use crate::indexer::tree_sitter::{GrammarRegistry, default_grammars_dir};
+use crate::map_cache;
+use crate::model::area::AreaNode;
 use crate::model::class::ClassNode;
 use crate::model::config::ConfigNode;
 use crate::model::directory::DirectoryNode;
@@ -13,12 +15,10 @@ use crate::model::edge::Edge;
 use crate::model::file::FileNode;
 use crate::model::function::FunctionNode;
 use crate::model::graph::{GraphNode, GraphNodeKind, NormalizedGraph};
-use crate::indexer::tree_sitter::{default_grammars_dir, GrammarRegistry};
-use crate::map_cache;
-use crate::passes;
-use crate::repo::{discover_repo, RepoSnapshot};
 use crate::model::risk::RiskFlag;
 use crate::model::symbol::Symbol;
+use crate::passes;
+use crate::repo::{RepoSnapshot, discover_repo};
 
 /// Pre-computed HashMap indexes for O(1) lookups on entity id → area_id and display string.
 /// Built lazily via `OnceLock` on first access; not serialized (derived data).
@@ -186,14 +186,31 @@ impl RepositoryMap {
         if !no_cache {
             let cache_started = Instant::now();
             if let Some(cached_map) = map_cache::try_load_cached_map(root) {
-                push_stage(&mut stages, "map_cache_hit", cache_started.elapsed().as_millis(), &mut progress);
+                push_stage(
+                    &mut stages,
+                    "map_cache_hit",
+                    cache_started.elapsed().as_millis(),
+                    &mut progress,
+                );
                 let profile = RepositoryBuildProfile {
                     total_duration_ms: total_started.elapsed().as_millis(),
                     stages,
                     repo_files: cached_map.snapshot.files.len(),
-                    source_files: cached_map.files.iter().filter(|f| matches!(f.role, crate::model::file::FileRole::Source)).count(),
-                    doc_files: cached_map.files.iter().filter(|f| matches!(f.role, crate::model::file::FileRole::Doc)).count(),
-                    config_files: cached_map.files.iter().filter(|f| matches!(f.role, crate::model::file::FileRole::Config)).count(),
+                    source_files: cached_map
+                        .files
+                        .iter()
+                        .filter(|f| matches!(f.role, crate::model::file::FileRole::Source))
+                        .count(),
+                    doc_files: cached_map
+                        .files
+                        .iter()
+                        .filter(|f| matches!(f.role, crate::model::file::FileRole::Doc))
+                        .count(),
+                    config_files: cached_map
+                        .files
+                        .iter()
+                        .filter(|f| matches!(f.role, crate::model::file::FileRole::Config))
+                        .count(),
                     areas: cached_map.areas.len(),
                     directories: cached_map.directories.len(),
                     classes: cached_map.classes.len(),
@@ -212,18 +229,35 @@ impl RepositoryMap {
 
         let started = Instant::now();
         let snapshot = discover_repo(root)?;
-        push_stage(&mut stages, "discover_repo", started.elapsed().as_millis(), &mut progress);
+        push_stage(
+            &mut stages,
+            "discover_repo",
+            started.elapsed().as_millis(),
+            &mut progress,
+        );
 
         let started = Instant::now();
         let structure = passes::structure::build(&snapshot);
-        push_stage(&mut stages, "structure", started.elapsed().as_millis(), &mut progress);
+        push_stage(
+            &mut stages,
+            "structure",
+            started.elapsed().as_millis(),
+            &mut progress,
+        );
 
-        let grammar_registry = default_grammars_dir()
-            .map(|dir| GrammarRegistry::load(&dir));
+        let grammar_registry = default_grammars_dir().map(|dir| GrammarRegistry::load(&dir));
 
-        let parse_cache = if no_cache { None } else { ParseCache::load(root) };
-        let (code, code_profile, new_cache, cache_stats) =
-            passes::code::build_with_profile(root, &structure, parse_cache.as_ref(), grammar_registry.as_ref());
+        let parse_cache = if no_cache {
+            None
+        } else {
+            ParseCache::load(root)
+        };
+        let (code, code_profile, new_cache, cache_stats) = passes::code::build_with_profile(
+            root,
+            &structure,
+            parse_cache.as_ref(),
+            grammar_registry.as_ref(),
+        );
         if !no_cache {
             new_cache.save(root);
         }
@@ -310,7 +344,12 @@ impl RepositoryMap {
 
         let started = Instant::now();
         map.risk_flags = passes::overlays::detect_risks(&map);
-        push_stage(&mut stages, "overlays", started.elapsed().as_millis(), &mut progress);
+        push_stage(
+            &mut stages,
+            "overlays",
+            started.elapsed().as_millis(),
+            &mut progress,
+        );
 
         let (graph, graph_profile) = build_graph_with_profile(&map);
         map.graph = graph;
@@ -382,27 +421,43 @@ impl RepositoryMap {
         }
 
         for area in &self.areas {
-            if area.id == target || area.name.eq_ignore_ascii_case(&lowered) || area.path_prefix.eq_ignore_ascii_case(&lowered) || area.name.eq_ignore_ascii_case(target) {
+            if area.id == target
+                || area.name.eq_ignore_ascii_case(&lowered)
+                || area.path_prefix.eq_ignore_ascii_case(&lowered)
+                || area.name.eq_ignore_ascii_case(target)
+            {
                 push_unique(&mut matches, area.id.clone());
             }
         }
         for directory in &self.directories {
-            if directory.id == target || directory.path.eq_ignore_ascii_case(target) || directory.name.eq_ignore_ascii_case(target) {
+            if directory.id == target
+                || directory.path.eq_ignore_ascii_case(target)
+                || directory.name.eq_ignore_ascii_case(target)
+            {
                 push_unique(&mut matches, directory.id.clone());
             }
         }
         for class in &self.classes {
-            if class.id == target || class.name.eq_ignore_ascii_case(target) || class.qualified_name.eq_ignore_ascii_case(target) {
+            if class.id == target
+                || class.name.eq_ignore_ascii_case(target)
+                || class.qualified_name.eq_ignore_ascii_case(target)
+            {
                 push_unique(&mut matches, class.id.clone());
             }
         }
         for function in &self.functions {
-            if function.id == target || function.name.eq_ignore_ascii_case(target) || function.qualified_name.eq_ignore_ascii_case(target) {
+            if function.id == target
+                || function.name.eq_ignore_ascii_case(target)
+                || function.qualified_name.eq_ignore_ascii_case(target)
+            {
                 push_unique(&mut matches, function.id.clone());
             }
         }
         for doc in &self.docs {
-            if doc.id == target || doc.path.eq_ignore_ascii_case(target) || doc.title.eq_ignore_ascii_case(target) {
+            if doc.id == target
+                || doc.path.eq_ignore_ascii_case(target)
+                || doc.title.eq_ignore_ascii_case(target)
+            {
                 push_unique(&mut matches, doc.id.clone());
             }
         }
@@ -412,7 +467,10 @@ impl RepositoryMap {
             }
         }
         for file in &self.files {
-            if file.id == target || file.path.eq_ignore_ascii_case(target) || file.name.eq_ignore_ascii_case(target) {
+            if file.id == target
+                || file.path.eq_ignore_ascii_case(target)
+                || file.name.eq_ignore_ascii_case(target)
+            {
                 push_unique(&mut matches, file.id.clone());
             }
         }
@@ -436,11 +494,7 @@ impl RepositoryMap {
     }
 
     pub fn area_id_for_target(&self, value: &str) -> Option<String> {
-        self.index()
-            .area_id_by_id
-            .get(value)
-            .cloned()
-            .flatten()
+        self.index().area_id_by_id.get(value).cloned().flatten()
     }
 }
 
@@ -513,7 +567,10 @@ fn build_graph_with_profile(map: &RepositoryMap) -> (NormalizedGraph, GraphBuild
     }
     for file in &map.files {
         let mut metadata = std::collections::BTreeMap::new();
-        metadata.insert("role".to_string(), format!("{:?}", file.role).to_ascii_lowercase());
+        metadata.insert(
+            "role".to_string(),
+            format!("{:?}", file.role).to_ascii_lowercase(),
+        );
         metadata.insert("generated".to_string(), file.generated.to_string());
         nodes.push(GraphNode {
             id: file.id.clone(),
@@ -625,12 +682,20 @@ mod tests {
 
         assert!(!map.areas.is_empty());
         assert!(!map.directories.is_empty());
-        assert!(map.functions.iter().any(|function| function.name == "validate_token"));
+        assert!(
+            map.functions
+                .iter()
+                .any(|function| function.name == "validate_token")
+        );
         assert!(map.classes.iter().any(|class| class.name == "AuthService"));
         assert!(!map.docs.is_empty());
         assert!(!map.configs.is_empty());
         assert!(!map.graph.nodes.is_empty());
-        assert!(map.risk_flags.iter().any(|flag| flag.scope == "src/auth/service.py"));
+        assert!(
+            map.risk_flags
+                .iter()
+                .any(|flag| flag.scope == "src/auth/service.py")
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -643,10 +708,16 @@ mod tests {
         fs::write(root.join("README.md"), "# Demo\n").expect("write readme");
         fs::write(root.join("src/main.py"), "def run():\n    return True\n").expect("write source");
 
-        let (map, profile) = RepositoryMap::build_with_profile(&root).expect("build repository map with profile");
+        let (map, profile) =
+            RepositoryMap::build_with_profile(&root).expect("build repository map with profile");
 
         assert!(!profile.stages.is_empty());
-        assert!(profile.stages.iter().any(|stage| stage.name == "discover_repo"));
+        assert!(
+            profile
+                .stages
+                .iter()
+                .any(|stage| stage.name == "discover_repo")
+        );
         assert_eq!(profile.repo_files, map.snapshot.files.len());
         assert_eq!(profile.graph_nodes, map.graph.nodes.len());
 

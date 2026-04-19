@@ -64,10 +64,16 @@ impl RepoSnapshot {
 
 pub fn discover_repo(root: &Path) -> Result<RepoSnapshot, String> {
     if !root.exists() {
-        return Err(format!("Repository path does not exist: {}", root.display()));
+        return Err(format!(
+            "Repository path does not exist: {}",
+            root.display()
+        ));
     }
     if !root.is_dir() {
-        return Err(format!("Repository path is not a directory: {}", root.display()));
+        return Err(format!(
+            "Repository path is not a directory: {}",
+            root.display()
+        ));
     }
 
     let canonical_root = root
@@ -232,8 +238,7 @@ fn should_count_lines(path: &Path, file_name: &str, size_bytes: u64) -> bool {
     };
     matches!(
         extension.to_ascii_lowercase().as_str(),
-        "py"
-            | "ts"
+        "py" | "ts"
             | "tsx"
             | "js"
             | "jsx"
@@ -286,7 +291,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("src")).expect("create temp repo");
         fs::write(root.join("src/main.py"), "def run():\n    return True\n").expect("write source");
-        symlink(Path::new("missing-target"), root.join("broken-link")).expect("create broken symlink");
+        symlink(Path::new("missing-target"), root.join("broken-link"))
+            .expect("create broken symlink");
 
         let snapshot = discover_repo(&root).expect("discover repo with broken symlink");
 
@@ -330,9 +336,17 @@ mod tests {
     fn only_counts_lines_for_likely_text_files() {
         assert!(should_count_lines(Path::new("README.md"), "README.md", 64));
         assert!(should_count_lines(Path::new("src/main.py"), "main.py", 64));
-        assert!(should_count_lines(Path::new("config/app.toml"), "app.toml", 64));
+        assert!(should_count_lines(
+            Path::new("config/app.toml"),
+            "app.toml",
+            64
+        ));
         assert!(!should_count_lines(Path::new("image.png"), "image.png", 64));
         assert!(!should_count_lines(Path::new("video.mp4"), "video.mp4", 64));
-        assert!(!should_count_lines(Path::new("docs/big.md"), "big.md", 2_000_000));
+        assert!(!should_count_lines(
+            Path::new("docs/big.md"),
+            "big.md",
+            2_000_000
+        ));
     }
 }
