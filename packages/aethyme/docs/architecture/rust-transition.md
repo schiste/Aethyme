@@ -1,89 +1,174 @@
-# Rust Transition
+# Rust-Core Aethyme Transition
 
-Last Updated: 2026-03-06
+Last Updated: 2026-04-19
 
-## Decision
+## Mission
 
-Aethyme Core will move as much of the deterministic engine layer to Rust as is
-reasonable, while keeping API, CLI, auth enforcement, scorecard orchestration,
-and SDKs in Python for now.
+Aethyme is moving to a **Rust core** with one engine, one data model, and one
+binary.
 
-This is an explicit architectural decision.
+This change is driven by concrete pain today:
 
-## Why
+- duplicated data models across Rust and Python
+- subprocess hops on interactive paths
+- confidence and truncation signals produced by the engine but not consistently surfaced to users
+- distribution friction from split runtime surfaces
 
-The core vision requires:
+The goal is to keep Python only where it clearly wins: fast eval iteration and
+Python-native SDK ergonomics.
 
-- deterministic behavior
-- minimal context by default
-- explicit scope and risk handling
-- strong graph and retrieval primitives
-- later, permission-aware execution
+## The Bet
 
-Those engine properties fit Rust well.
+- **One engine**: the Rust engine runs in-process for CLI/API/MCP paths.
+- **One data model**: nodes, edges, context packs, confidence, truncation, and
+  cap signals are defined once in Rust and exposed everywhere.
+- **One binary**: `aethyme` ships as the primary installable runtime.
 
-## What Moves First
+Python remains for:
 
-Phase 1 Rust targets:
+- `src/eval/` workflows
+- `sdk/python/`
 
-1. repository mapping
-2. discoverability kernels
-3. context-pack types
-4. context-pack assembly pipeline
-5. scope and risk types
-6. indexing kernels
-7. graph expansion kernels
+Both consume the same Rust core via PyO3 (`aethyme_py`) instead of subprocess
+calls.
 
-## Current First Proof
+## Target Runtime Shape
 
-The first practical runtime shape is local and repo-first:
+`aethyme` (single static binary) contains:
 
-1. Python CLI accepts a local repository path and task
-2. Python invokes the Rust engine binary for mapping, search, neighborhood, and pack assembly
-3. Python renders the result and builds local evaluation artifacts
+- engine kernel (`aethyme-engine` lineage)
+- graph store via `sqlx` (compile-time-checked SQL)
+- HTTP API via `axum` + `tower`
+- CLI via `clap`
+- MCP server via `rmcp`, calling engine in-process
+- auth via `jsonwebtoken` + `argon2` + `oauth2`
+- scorecard and autofixer runtime in Rust with declarative rule authoring
+  (YAML/Rhai)
 
-That path currently covers:
+`aethyme_py` ships as a PyO3 wheel that exposes the same in-process engine to
+Python eval harnesses and Python SDK consumers.
 
-- `repo ingest`
-- `repo inspect`
-- `query symbol`
-- `query deps`
-- `query impact`
-- `task pack`
-- `task explain`
-- `eval explain-repo`
+## Non-Negotiables
 
-This is the correct first proof because it validates the deterministic engine boundary without waiting for any SaaS surface.
+1. **One data model**
+   - No parallel dataclass model drift.
+   - If a field exists in engine output, it must be available at every caller
+     boundary.
 
-## What Stays In Python
+2. **Single useful IPC boundary**
+   - PyO3 for Python eval + SDK.
+   - HTTP only for external network callers.
+   - No subprocess engine calls.
 
-For now, Python continues to own:
+3. **Always-visible completeness signals**
+   - Capped traversals must return `{ truncated, reason }`.
+   - Semantic edges must carry confidence.
+   - No silent partial responses.
 
-- API routes and FastAPI app
-- CLI commands
-- auth and tenant enforcement
-- scorecard orchestration
-- SDKs
-- migration tooling
+4. **Single-binary distribution must stay intact**
+   - `curl | sh`, `cargo install`, and `brew install` paths must continue to
+     work.
+
+5. **Determinism is tested, not assumed**
+   - Snapshot tests for engine outputs are maintained through migration.
 
 ## Migration Rule
 
-Do not do a full rewrite first.
+No big-bang rewrite.
 
-Move engine components only when they have:
+A component moves only when it has:
 
-- clear boundaries
-- stable inputs and outputs
-- measurable value for determinism or performance
+- stable interface boundaries
+- measurable determinism/performance win
+- sufficient test coverage to prove parity
 
-## Current Workspace
+Every migrated component lands behind a capability flag until Rust is at
+parity on the full Playground eval suite. Python removals happen only after
+parity is proven.
 
-The Rust workspace lives under:
+Per eval integrity rules, parity work must improve generic system behavior,
+never tune for specific eval metrics.
 
-- `packages/aethyme/rust`
+## Sequencing
 
-The first crate is:
+### Phase 0 — stop drift (weeks)
 
-- `crates/aethyme-engine`
+- Propagate confidence/truncation/cap signals through existing Python bridges.
+- Force Python-side shapes to converge with Rust model outputs.
 
-That crate is the starting point for deterministic engine structures.
+**Exit criteria:** signal parity achieved at API/CLI/user boundaries.
+
+### Phase 1 — collapse subprocess IPC
+
+- Replace `src/indexing/engine.py` subprocess bridge with PyO3 binding.
+- Keep Python CLI/API temporarily, but all engine calls run in-process.
+
+**Exit criteria:** no subprocess hop on engine calls from Python surfaces.
+
+### Phase 2 — MCP in Rust
+
+- Ship MCP server as Rust subcommand in main `aethyme` binary.
+- Remove Python from MCP serving path.
+
+**Exit criteria:** first production-ready single-binary assistant integration.
+
+### Phase 3 — CLI migration
+
+- Port `src/cli.py` behavior to `clap` in Rust.
+- Keep Python CLI only until full eval parity is demonstrated.
+
+**Exit criteria:** Rust CLI parity on Playground eval workflows.
+
+### Phase 4 — graph store migration
+
+- Move `src/graph/store.py` responsibilities to Rust + `sqlx`.
+- Consolidate schema/query ownership into Rust.
+
+**Exit criteria:** Python `GraphStore` removed.
+
+### Phase 5 — HTTP API migration
+
+- Port FastAPI routes to `axum` with contract-stable cutover.
+- Preserve OpenAPI behavior for external SDK compatibility.
+- Move auth primitives with API migration.
+
+**Exit criteria:** Python API path removed with zero contract regressions.
+
+### Phase 6 — scorecard + autofixer runtime migration
+
+- Port execution runtime to Rust.
+- Keep authoring velocity high via YAML/Rhai rule layer.
+- Do not migrate until rule DSL is stable.
+
+**Exit criteria:** Rust runtime parity with equal or better authoring velocity.
+
+### Phase 7 — final Python contraction
+
+- Remove `src/` except eval-specific and Python SDK surfaces.
+- Eval harness and SDK consume `aethyme_py` only.
+
+**Exit criteria:** no Python-owned core runtime components remain.
+
+## Explicit Non-Goals
+
+- Porting HTTP API first before model/signal parity is closed
+- Expanding breadth-first parser fallback at the cost of deterministic depth
+- Eliminating Python entirely
+- Freezing product progress for a rewrite-only window
+
+## 12-Month Success Criteria
+
+- One `aethyme` binary installable on macOS/Linux/Windows
+- `aethyme_py` wheel on PyPI consumed by eval harness + Python SDK
+- Zero subprocess calls into engine
+- One end-to-end data model with visible confidence and truncation signals
+- MCP surface constrained to a compact set of high-leverage tools
+- In-process eval execution with iteration speed maintained or improved
+
+## Operating Principle
+
+This is not a rewrite detour.
+
+The Rust engine already exists and already carries richer deterministic signals
+than current user-facing bridges preserve. The transition completes that path by
+removing boundary seams while keeping Python where it has enduring leverage.

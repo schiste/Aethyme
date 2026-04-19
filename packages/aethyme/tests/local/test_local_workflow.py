@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
+from functools import lru_cache
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from src.cli import cli
+from src.indexing.engine import EngineError, ensure_engine_binary
 
 
 def build_demo_repo(root: Path) -> None:
@@ -27,7 +32,31 @@ def build_demo_repo(root: Path) -> None:
     )
 
 
+def require_local_engine_or_skip() -> None:
+    """Skip integration tests when Rust engine build/runtime is unavailable."""
+    ready, detail = _probe_local_engine_once()
+    if not ready and _strict_engine_required():
+        raise AssertionError(f"local Rust engine required but unavailable: {detail}")
+    if not ready:
+        pytest.skip(f"local Rust engine unavailable in this environment: {detail}")
+
+
+def _strict_engine_required() -> bool:
+    return os.getenv("AETHYME_REQUIRE_LOCAL_ENGINE", "").strip().lower() in {"1", "true", "yes"}
+
+
+@lru_cache(maxsize=1)
+def _probe_local_engine_once() -> tuple[bool, str]:
+    """Build/probe local engine once per test session to avoid repeated cargo invocations."""
+    try:
+        ensure_engine_binary()
+    except EngineError as exc:
+        return False, str(exc)
+    return True, "ready"
+
+
 def test_local_repo_inspect_and_pack(tmp_path: Path) -> None:
+    require_local_engine_or_skip()
     repo_path = tmp_path / "demo-repo"
     build_demo_repo(repo_path)
     runner = CliRunner()
@@ -59,6 +88,7 @@ def test_local_repo_inspect_and_pack(tmp_path: Path) -> None:
 
 
 def test_local_eval_explain_repo(monkeypatch, tmp_path: Path) -> None:
+    require_local_engine_or_skip()
     repo_path = tmp_path / "demo-repo"
     build_demo_repo(repo_path)
     runner = CliRunner()
@@ -87,6 +117,7 @@ def test_local_eval_explain_repo(monkeypatch, tmp_path: Path) -> None:
 
 
 def test_local_graph_navigation_commands(tmp_path: Path) -> None:
+    require_local_engine_or_skip()
     repo_path = tmp_path / "demo-repo"
     build_demo_repo(repo_path)
     runner = CliRunner()
@@ -118,6 +149,7 @@ def test_local_graph_navigation_commands(tmp_path: Path) -> None:
 
 
 def test_local_task_navigation_commands(tmp_path: Path) -> None:
+    require_local_engine_or_skip()
     repo_path = tmp_path / "demo-repo"
     build_demo_repo(repo_path)
     runner = CliRunner()
@@ -159,3 +191,129 @@ def test_local_task_navigation_commands(tmp_path: Path) -> None:
     assert expand_result.exit_code == 0, expand_result.output
     expand_payload = json.loads(expand_result.output)
     assert "dependencies" in expand_payload
+
+
+def test_repo_engine_info_command(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.cli.engine_runtime_info",
+        lambda: {
+            "transport": "subprocess",
+            "transport_source": "env",
+            "resolved_transport": "subprocess",
+            "transport_supported": True,
+            "transport_ready": True,
+            "transport_detail": "ready",
+            "supported_transports": ["auto", "subprocess", "pyo3"],
+            "runnable_transports": ["subprocess", "pyo3"],
+            "binary_path": "/tmp/aethyme-engine-cli",
+            "binary_exists": False,
+        },
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["repo", "engine-info"])
+    assert result.exit_code == 0, result.output
+    assert "Transport: subprocess" in result.output
+    assert "Transport source: env" in result.output
+    assert "Resolved transport: subprocess" in result.output
+    assert "Supported: yes" in result.output
+    assert "Ready: yes" in result.output
+    assert "Binary path: /tmp/aethyme-engine-cli" in result.output
+    assert "Runnable transports: subprocess, pyo3" in result.output
+
+
+def test_engine_transport_global_option_sets_runtime_transport(monkeypatch) -> None:
+    def fake_runtime_info() -> dict[str, object]:
+        transport = os.getenv("AETHYME_ENGINE_TRANSPORT", "subprocess")
+        return {
+            "transport": transport,
+            "transport_source": "env",
+            "resolved_transport": transport,
+            "transport_supported": True,
+            "transport_ready": True,
+            "transport_detail": "ready",
+            "supported_transports": ["auto", "subprocess", "pyo3"],
+            "runnable_transports": ["subprocess", "pyo3"],
+            "binary_path": "/tmp/aethyme-engine-cli",
+            "binary_exists": False,
+        }
+
+    monkeypatch.setattr("src.cli.engine_runtime_info", fake_runtime_info)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--engine-transport", "pyo3", "repo", "engine-info"])
+    assert result.exit_code == 0, result.output
+    assert "Transport: pyo3" in result.output
+
+
+def test_engine_transport_global_option_accepts_custom_name(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.cli.engine_runtime_info",
+        lambda: {
+            "transport": os.getenv("AETHYME_ENGINE_TRANSPORT", "auto"),
+            "transport_source": "env",
+            "resolved_transport": "custom-runner",
+            "transport_supported": True,
+            "transport_ready": True,
+            "transport_detail": "ready (custom transport)",
+            "supported_transports": ["auto", "subprocess", "pyo3", "custom-runner"],
+            "runnable_transports": ["subprocess", "pyo3", "custom-runner"],
+            "binary_path": "/tmp/aethyme-engine-cli",
+            "binary_exists": False,
+        },
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--engine-transport", "CUSTOM-RUNNER", "repo", "engine-info"])
+    assert result.exit_code == 0, result.output
+    assert "Transport: custom-runner" in result.output
+
+
+def test_repo_engine_info_check_returns_nonzero_when_not_ready(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.cli.engine_runtime_info",
+        lambda: {
+            "transport": "pyo3",
+            "transport_source": "env",
+            "resolved_transport": "pyo3",
+            "transport_supported": True,
+            "transport_ready": False,
+            "transport_detail": "module 'aethyme_py' not installed",
+            "supported_transports": ["auto", "subprocess", "pyo3"],
+            "runnable_transports": ["subprocess", "pyo3"],
+            "binary_path": "/tmp/aethyme-engine-cli",
+            "binary_exists": False,
+        },
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["repo", "engine-info", "--check"])
+    assert result.exit_code != 0
+    assert "Engine transport is not ready" in result.output
+
+
+def test_engine_transport_global_option_rejects_blank(monkeypatch) -> None:
+    monkeypatch.setattr("src.cli.engine_runtime_info", lambda: {"transport": "auto"})
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--engine-transport", "   ", "repo", "engine-info"])
+    assert result.exit_code != 0
+    assert "Engine transport cannot be empty" in result.output
+
+
+def test_require_local_engine_or_skip_enforces_when_requested(monkeypatch) -> None:
+    monkeypatch.setenv("AETHYME_REQUIRE_LOCAL_ENGINE", "1")
+    _probe_local_engine_once.cache_clear()
+    monkeypatch.setattr(sys.modules[__name__], "_probe_local_engine_once", lambda: (False, "boom"))
+
+    with pytest.raises(AssertionError, match="required but unavailable"):
+        require_local_engine_or_skip()
+
+
+def test_require_local_engine_or_skip_skips_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("AETHYME_REQUIRE_LOCAL_ENGINE", raising=False)
+    _probe_local_engine_once.cache_clear()
+    monkeypatch.setattr(sys.modules[__name__], "_probe_local_engine_once", lambda: (False, "boom"))
+
+    with pytest.raises(pytest.skip.Exception, match="unavailable"):
+        require_local_engine_or_skip()

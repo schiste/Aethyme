@@ -22,6 +22,7 @@ from .report import EvaluationReport, estimate_report, write_explain_repo_markdo
 from .runner import CommandEvaluationRunner, EVAL_TOOL_PYTHON, EvaluationRunner, PROJECT_ROOT
 from .schemas import explain_repo_output_schema, explain_repo_scoring_rubric
 from .scoring import parse_structured_output, score_explain_repo_output
+from .navigation_context import build_scope_view
 
 DEFAULT_TASK = "Explain this repo"
 
@@ -229,17 +230,7 @@ def _build_explain_repo_navigation_context(
         "task": task,
         "anchors": pack.get("anchors", []),
     }
-    in_scope = pack.get("in_scope", {})
-    out_of_scope = pack.get("out_of_scope", {})
-    scope_view = {
-        "task": task,
-        "navigation_order": pack.get("navigation_order", []),
-        "in_scope_files": [item["value"] for item in in_scope.get("files", [])],
-        "in_scope_symbols": [item["value"] for item in in_scope.get("symbols", [])],
-        "in_scope_areas": [item["value"] for item in in_scope.get("areas", [])],
-        "out_of_scope": [item["value"] for item in out_of_scope.get("areas", [])],
-        "risks": [risk["scope"] for risk in pack.get("risk_flags", [])],
-    }
+    scope_view = build_scope_view(task, pack)
     return {
         "mode": "iterative_navigation",
         "repo_path": str(repo_path),

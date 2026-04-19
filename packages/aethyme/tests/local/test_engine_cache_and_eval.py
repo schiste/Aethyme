@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 from src.eval.control_prompt import build_aethyme_prompt
@@ -59,6 +60,159 @@ def test_engine_inspect_uses_snapshot_cache(monkeypatch, tmp_path: Path) -> None
 
     assert first == second
     assert len(calls) == 1
+
+
+def test_engine_command_rejects_unknown_transport(monkeypatch) -> None:
+    monkeypatch.setenv("AETHYME_ENGINE_TRANSPORT", "unknown")
+
+    try:
+        engine_module._run_binary_command("inspect", "--repo", "/tmp/repo")
+    except engine_module.EngineError as exc:
+        assert "Unsupported engine transport" in str(exc)
+    else:
+        raise AssertionError("Expected EngineError for unsupported engine transport")
+
+
+def test_engine_runtime_info_reflects_configured_transport(monkeypatch, tmp_path: Path) -> None:
+    fake_binary = tmp_path / "aethyme-engine-cli"
+    monkeypatch.setenv("AETHYME_ENGINE_TRANSPORT", "subprocess")
+    monkeypatch.setattr(engine_module, "ENGINE_BINARY_PATH", fake_binary)
+
+    info = engine_module.engine_runtime_info()
+
+    assert info["transport"] == "subprocess"
+    assert info["transport_source"] == "env"
+    assert info["transport_supported"] is True
+    assert info["binary_exists"] is False
+    assert info["transport_ready"] is False
+    assert info["transport_detail"] == "binary not built"
+    assert info["resolved_transport"] == "subprocess"
+    assert "auto" in info["supported_transports"]
+    assert "subprocess" in info["supported_transports"]
+    assert "pyo3" in info["supported_transports"]
+
+
+def test_register_engine_transport_runner(monkeypatch) -> None:
+    monkeypatch.setenv("AETHYME_ENGINE_TRANSPORT", "fake")
+
+    engine_module.register_engine_transport("fake", lambda args: json.dumps({"args": list(args)}))
+    try:
+        payload = json.loads(engine_module._run_binary_command("inspect", "--repo", "/tmp/repo"))
+    finally:
+        engine_module.ENGINE_TRANSPORT_RUNNERS.pop("fake", None)
+
+    assert payload["args"] == ["inspect", "--repo", "/tmp/repo"]
+
+
+def test_register_engine_transport_normalizes_name(monkeypatch) -> None:
+    monkeypatch.setenv("AETHYME_ENGINE_TRANSPORT", "custom")
+    engine_module.register_engine_transport("  CUSTOM  ", lambda _args: "{}")
+    try:
+        assert "custom" in engine_module.ENGINE_TRANSPORT_RUNNERS
+        output = engine_module._run_binary_command("inspect")
+    finally:
+        engine_module.ENGINE_TRANSPORT_RUNNERS.pop("custom", None)
+    assert output == "{}"
+
+
+def test_register_engine_transport_prevents_accidental_override() -> None:
+    try:
+        engine_module.register_engine_transport("subprocess", lambda _args: "{}")
+    except ValueError as exc:
+        assert "already registered" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for duplicate transport registration")
+
+
+def test_engine_command_dispatches_to_pyo3_transport(monkeypatch) -> None:
+    monkeypatch.setenv("AETHYME_ENGINE_TRANSPORT", "pyo3")
+    fake_module = types.SimpleNamespace(
+        run_engine_command=lambda args: json.dumps({"transport": "pyo3", "args": args})
+    )
+    monkeypatch.setitem(sys.modules, "aethyme_py", fake_module)
+
+    payload = json.loads(engine_module._run_binary_command("inspect", "--repo", "/tmp/repo"))
+    assert payload["transport"] == "pyo3"
+    assert payload["args"] == ["inspect", "--repo", "/tmp/repo"]
+
+
+def test_engine_runtime_info_reports_pyo3_readiness(monkeypatch) -> None:
+    monkeypatch.setenv("AETHYME_ENGINE_TRANSPORT", "pyo3")
+    fake_module = types.SimpleNamespace(run_engine_command=lambda _args: "{}")
+    monkeypatch.setitem(sys.modules, "aethyme_py", fake_module)
+
+    info = engine_module.engine_runtime_info()
+
+    assert info["transport"] == "pyo3"
+    assert info["resolved_transport"] == "pyo3"
+    assert info["transport_supported"] is True
+    assert info["transport_ready"] is True
+    assert info["transport_detail"] == "ready"
+
+
+def test_engine_runtime_info_auto_prefers_pyo3_when_available(monkeypatch) -> None:
+    monkeypatch.setenv("AETHYME_ENGINE_TRANSPORT", "auto")
+    fake_module = types.SimpleNamespace(run_engine_command=lambda _args: "{}")
+    monkeypatch.setitem(sys.modules, "aethyme_py", fake_module)
+
+    info = engine_module.engine_runtime_info()
+
+    assert info["transport"] == "auto"
+    assert info["resolved_transport"] == "pyo3"
+    assert info["transport_ready"] is True
+    assert "auto->pyo3" in info["transport_detail"]
+
+
+def test_engine_runtime_info_auto_falls_back_to_subprocess(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("AETHYME_ENGINE_TRANSPORT", "auto")
+    monkeypatch.delitem(sys.modules, "aethyme_py", raising=False)
+    monkeypatch.setattr(engine_module, "ENGINE_BINARY_PATH", tmp_path / "missing-engine")
+
+    info = engine_module.engine_runtime_info()
+
+    assert info["transport"] == "auto"
+    assert info["resolved_transport"] == "subprocess"
+    assert info["transport_ready"] is False
+    assert "auto->subprocess" in info["transport_detail"]
+
+
+def test_engine_runtime_info_defaults_to_auto(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("AETHYME_ENGINE_TRANSPORT", raising=False)
+    monkeypatch.delitem(sys.modules, "aethyme_py", raising=False)
+    monkeypatch.setattr(engine_module, "ENGINE_BINARY_PATH", tmp_path / "missing-engine")
+
+    info = engine_module.engine_runtime_info()
+
+    assert info["transport"] == "auto"
+    assert info["transport_source"] == "default"
+    assert info["resolved_transport"] == "subprocess"
+    assert info["transport_ready"] is False
+    assert info["transport_supported"] is True
+
+
+def test_engine_runtime_info_blank_env_defaults_to_auto(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("AETHYME_ENGINE_TRANSPORT", "   ")
+    monkeypatch.delitem(sys.modules, "aethyme_py", raising=False)
+    monkeypatch.setattr(engine_module, "ENGINE_BINARY_PATH", tmp_path / "missing-engine")
+
+    info = engine_module.engine_runtime_info()
+
+    assert info["transport"] == "auto"
+    assert info["transport_source"] == "default"
+    assert info["resolved_transport"] == "subprocess"
+    assert info["transport_supported"] is True
+
+
+def test_engine_command_pyo3_transport_requires_callable(monkeypatch) -> None:
+    monkeypatch.setenv("AETHYME_ENGINE_TRANSPORT", "pyo3")
+    monkeypatch.setitem(sys.modules, "aethyme_py", types.SimpleNamespace())
+
+    try:
+        engine_module._run_binary_command("inspect")
+    except engine_module.EngineError as exc:
+        assert "run_engine_command" in str(exc)
+    else:
+        raise AssertionError("Expected EngineError when PyO3 callable is missing")
 
 
 def test_explain_repo_generates_artifacts_and_invokes_backends(monkeypatch, tmp_path: Path) -> None:
@@ -234,6 +388,24 @@ def test_write_explain_repo_report_includes_verbose_results(tmp_path: Path) -> N
     assert "## Graph Quality Notes" in content
     assert "## Prompt Effectiveness" in content
     assert "## Lessons & Action Items" in content
+
+
+def test_render_markdown_skips_legacy_diagnostics_when_not_applicable() -> None:
+    from src.eval.report import _render_markdown
+
+    result = {
+        "task": "Bug fix task",
+        "eval_type": "bug-fix",
+        "control": {"prompt": "control", "run": {"structured_output": {"ok": True}}, "assessment": None},
+        "leverage": {"prompt": "leverage", "run": {"structured_output": {"ok": True}}, "assessment": None},
+    }
+
+    content = _render_markdown(repo_path=Path("/tmp/repo"), result=result)
+
+    assert "## Context Pack Audit" not in content
+    assert "## Graph Quality Notes" not in content
+    assert "## Prompt Effectiveness" not in content
+    assert "## Lessons & Action Items" not in content
 
 
 def test_capture_snapshot_uses_git_commit_when_clean(tmp_path: Path) -> None:

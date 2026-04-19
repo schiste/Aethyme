@@ -23,6 +23,51 @@ def render_pack_summary(pack: dict[str, Any]) -> str:
         lines.append("High-risk areas:")
         for risk in risks:
             lines.append(f"- {risk['scope']} ({risk['area']}): {risk['reason']}")
+
+    confidence = pack.get("confidence")
+    if isinstance(confidence, dict):
+        anchor_conf = confidence.get("anchor_confidence")
+        scope_conf = confidence.get("scope_confidence")
+        if anchor_conf is not None or scope_conf is not None:
+            lines.append(
+                "Confidence:"
+                f" anchor={anchor_conf if anchor_conf is not None else 'n/a'}"
+                f", scope={scope_conf if scope_conf is not None else 'n/a'}"
+            )
+
+    budget = pack.get("budget")
+    if isinstance(budget, dict):
+        budget_fields = [
+            "max_anchors",
+            "max_files",
+            "max_snippets",
+            "dependency_depth",
+            "impact_depth",
+            "content_budget",
+            "max_content_files",
+            "max_lines_per_file",
+        ]
+        rendered = [f"{field}={budget[field]}" for field in budget_fields if field in budget]
+        if rendered:
+            lines.append("Caps: " + ", ".join(rendered))
+
+    capped_files: list[str] = []
+    for file_content in pack.get("file_contents", []):
+        if not isinstance(file_content, dict):
+            continue
+        end_line = file_content.get("end_line")
+        total_lines = file_content.get("total_lines")
+        path = file_content.get("path", "<unknown>")
+        if (
+            isinstance(end_line, int)
+            and isinstance(total_lines, int)
+            and total_lines > end_line
+        ):
+            capped_files.append(f"{path} ({end_line}/{total_lines} lines)")
+    if capped_files:
+        lines.append("Truncated content:")
+        for item in capped_files[:5]:
+            lines.append(f"- {item}")
     return "\n".join(lines)
 
 
@@ -68,8 +113,14 @@ def render_prompt_pack(pack: dict[str, Any]) -> str:
     in_scope = pack.get("in_scope", {})
     in_scope_files = in_scope.get("files", [])
     in_scope_areas = in_scope.get("areas", [])
-    scope_items = [item["value"] for item in in_scope_files[:3]] + [
-        item["value"] for item in in_scope_areas[:3]
+    scope_items = [
+        item.get("value")
+        for item in in_scope_files[:3]
+        if isinstance(item, dict) and isinstance(item.get("value"), str)
+    ] + [
+        item.get("value")
+        for item in in_scope_areas[:3]
+        if isinstance(item, dict) and isinstance(item.get("value"), str)
     ]
     if scope_items:
         lines.append("Scope: " + " | ".join(scope_items))
@@ -97,7 +148,13 @@ def render_prompt_pack(pack: dict[str, Any]) -> str:
     out_of_scope = pack.get("out_of_scope", {})
     out_of_scope_areas = out_of_scope.get("areas", [])
     if out_of_scope_areas:
-        lines.append("Avoid: " + " | ".join([item["value"] for item in out_of_scope_areas[:3]]))
+        avoid_items = [
+            item.get("value")
+            for item in out_of_scope_areas[:3]
+            if isinstance(item, dict) and isinstance(item.get("value"), str)
+        ]
+        if avoid_items:
+            lines.append("Avoid: " + " | ".join(avoid_items))
 
     risks = pack.get("risk_flags", [])
     if risks:
