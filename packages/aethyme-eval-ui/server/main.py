@@ -942,9 +942,12 @@ class RunRequest(BaseModel):
     windowId: int | None = None
     preparationId: str | None = None
     cleanupDelaySeconds: int = Field(default=1, ge=0, le=3600)
-    # P1: number of sequential eval repetitions. Default 1 preserves existing behavior.
-    # Each repetition creates distinct rows sharing a batch_id so the UI can aggregate.
-    runs: int = Field(default=1, ge=1, le=20)
+    # P1: number of sequential eval repetitions. Default 3 — protocol requires
+    # N>=3 for any comparison across conditions so single-run variance can be
+    # distinguished from real effects. runs=1 is still allowed for debugging.
+    # All repetitions in a call share a batch_id so the UI can aggregate to
+    # median + IQR.
+    runs: int = Field(default=3, ge=1, le=20)
     # P3: turn on LLM-as-judge scoring (in addition to keyword score).
     # Judge runs codex via a Chau7 tab (same path as eval agents — no direct API).
     # Intra-rater reliability: judge is called judgeSamples times on the same
