@@ -75,6 +75,45 @@ async def get_batch(batch_id: str) -> dict[str, Any]:
     return aggregate_batch(batch_id)
 
 
+class CalibrationCheckRequest(BaseModel):
+    evalType: str
+    judgeSamples: int = Field(default=3, ge=1, le=10)
+
+
+@app.get("/api/judge/calibration/{eval_type}")
+async def list_calibration(eval_type: str) -> dict[str, Any]:
+    """List the calibration items on disk for an eval type (no scoring)."""
+    from calibration_check import list_calibration_items
+    items = list_calibration_items(eval_type)
+    return {
+        "eval_type": eval_type,
+        "items": [
+            {k: v for k, v in item.items() if k != "candidate"}
+            for item in items
+        ],
+        "count": len(items),
+    }
+
+
+@app.post("/api/judge/calibration-check")
+async def run_judge_calibration(req: CalibrationCheckRequest) -> dict[str, Any]:
+    """Run the judge against the calibration set and report drift vs human anchors.
+
+    If `passes` is false, recent batches' judge scores should be treated as
+    suspect until the judge/prompt/model is investigated. See
+    server/calibration/README.md for the item schema.
+    """
+    from calibration_check import run_calibration_check
+    # Run the judge in a neutral directory — the Aethyme package root — so
+    # calibration never touches a playground Control/Aethyme repo.
+    return run_calibration_check(
+        eval_type=req.evalType,
+        tab_directory=str(AETHYME_PKG),
+        aethyme_pkg_path=str(AETHYME_PKG),
+        samples=req.judgeSamples,
+    )
+
+
 @app.post("/api/results")
 async def add_result(result: dict[str, Any]) -> dict[str, str]:
     insert_result(result)
