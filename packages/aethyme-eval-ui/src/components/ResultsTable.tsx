@@ -192,6 +192,8 @@ function aggregateRuns(runs: EvalResult[]): EvalResult {
     scorePerMinute: meanOf(runs.map((r) => r.scorePerMinute)),
     judgeScore: meanOf(runs.map((r) => r.judgeScore)),
     judgeStdev: stdevOf(runs.map((r) => r.judgeScore)), // cross-run stdev, not intra-rater
+    scorerAgreementGap: meanOf(runs.map((r) => r.scorerAgreementGap)),
+    scorerAgreementDivergent: runs.some((r) => r.scorerAgreementDivergent === true) ? true : null,
     judgeModel: template.judgeModel,
     judgeReliable: runs.every((r) => r.judgeReliable === true)
       ? true
@@ -262,14 +264,15 @@ const columns: { key: ColumnKey; label: string; align?: "right"; width: string }
   { key: "model", label: "Model", width: "6%" },
   { key: "condition", label: "Condition", width: "11%" },
   { key: "cto", label: "CTO", width: "4%" },
-  { key: "qualityScore", label: "Quality", align: "right", width: "6%" },
-  { key: "recalculatedEvalScore", label: "Recalc", align: "right", width: "6%" },
-  { key: "judgeScore", label: "Judge", align: "right", width: "7%" },
+  { key: "qualityScore", label: "Quality", align: "right", width: "5%" },
+  { key: "recalculatedEvalScore", label: "Recalc", align: "right", width: "5%" },
+  { key: "judgeScore", label: "Judge", align: "right", width: "6%" },
+  { key: "scorerAgreementGap", label: "Δ K↔J", align: "right", width: "5%" },
   { key: "toolCalls", label: "Tools", align: "right", width: "4%" },
   { key: "totalTokens", label: "Tokens", align: "right", width: "6%" },
   { key: "duration", label: "Time", align: "right", width: "5%" },
-  { key: "scorePer1kTokens", label: "Score/1K", align: "right", width: "6%" },
-  { key: "scorePerMinute", label: "Score/Min", align: "right", width: "6%" },
+  { key: "scorePer1kTokens", label: "Score/1K", align: "right", width: "5%" },
+  { key: "scorePerMinute", label: "Score/Min", align: "right", width: "5%" },
 ];
 
 function sortGroups(groups: Group[], sort: SortConfig): Group[] {
@@ -467,6 +470,34 @@ export default function ResultsTable({ results }: Props) {
               }`}
             >
               {display}
+            </span>
+          </Tooltip>
+        );
+      }
+      case "scorerAgreementGap": {
+        const gap = row.scorerAgreementGap;
+        const divergent = row.scorerAgreementDivergent === true;
+        if (typeof gap !== "number") {
+          return <span className="text-[var(--color-text-muted)]">—</span>;
+        }
+        const tooltipLines = [
+          `|Judge − Quality| = ${gap.toFixed(2)}`,
+          divergent
+            ? "Flagged: gap exceeds divergence threshold (default 10)."
+            : "Within agreement threshold.",
+          "Diagnostic only — no automated downstream action.",
+        ].join("\n");
+        return (
+          <Tooltip content={tooltipLines}>
+            <span
+              className={`font-mono cursor-help border-b border-dotted ${
+                divergent
+                  ? "text-[var(--color-score-yellow)] border-[var(--color-score-yellow)]/50"
+                  : "text-[var(--color-text-muted)] border-[var(--color-text-muted)]"
+              }`}
+            >
+              {gap.toFixed(1)}
+              {divergent && <span className="ml-1">⚠</span>}
             </span>
           </Tooltip>
         );

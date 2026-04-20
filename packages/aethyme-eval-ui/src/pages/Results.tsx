@@ -66,6 +66,7 @@ export default function Results() {
   const [evalTypeFilter, setEvalTypeFilter] = useState<string>(ALL);
   const [targetFilter, setTargetFilter] = useState<string>(ALL);
   const [modelFilter, setModelFilter] = useState<string>(ALL);
+  const [divergentOnly, setDivergentOnly] = useState(false);
 
   useEffect(() => {
     fetchResults()
@@ -79,14 +80,20 @@ export default function Results() {
       });
   }, []);
 
+  const divergentCount = useMemo(
+    () => results.filter((r) => r.scorerAgreementDivergent === true).length,
+    [results],
+  );
+
   const filtered = useMemo(() => {
     return results.filter((r: EvalResult) => {
       if (evalTypeFilter !== ALL && r.evalType !== evalTypeFilter) return false;
       if (targetFilter !== ALL && r.target !== targetFilter) return false;
       if (modelFilter !== ALL && r.model !== modelFilter) return false;
+      if (divergentOnly && r.scorerAgreementDivergent !== true) return false;
       return true;
     });
-  }, [results, evalTypeFilter, targetFilter, modelFilter]);
+  }, [results, evalTypeFilter, targetFilter, modelFilter, divergentOnly]);
 
   const evalTypes: EvalType[] = ["bug-fix", "bug-fix-1", "explain-repo", "navigation-ctf", "cross-package", "impact-analysis", "feature-localization", "config-audit", "dead-code", "migration"];
   const targets: TargetName[] = ["aethyme", "grc", "mediawiki"];
@@ -162,6 +169,29 @@ export default function Results() {
           </select>
         </div>
 
+        <label
+          className={[
+            "flex items-center gap-1.5 text-xs select-none cursor-pointer px-2 py-1 rounded",
+            divergentOnly
+              ? "bg-[var(--color-score-yellow)]/15 text-[var(--color-score-yellow)]"
+              : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]",
+          ].join(" ")}
+          title="Show only rows where the LLM judge and keyword scorer disagree by more than the divergence threshold — useful for manually reviewing scoring quality."
+        >
+          <input
+            type="checkbox"
+            checked={divergentOnly}
+            onChange={(e) => setDivergentOnly(e.target.checked)}
+            className="accent-[var(--color-score-yellow)]"
+          />
+          <span>
+            Divergent only
+            {divergentCount > 0 && (
+              <span className="ml-1 font-mono">({divergentCount})</span>
+            )}
+          </span>
+        </label>
+
         <div className="flex-1" />
 
         <span className="text-xs text-[var(--color-text-muted)] font-mono">
@@ -183,6 +213,16 @@ export default function Results() {
           </button>
         </div>
       </div>
+
+      {divergentOnly && filtered.length > 0 && (
+        <div className="text-xs text-[var(--color-text-muted)] bg-[var(--color-score-yellow)]/8 border border-[var(--color-score-yellow)]/30 rounded px-3 py-2">
+          <span className="text-[var(--color-score-yellow)] font-medium">Review queue.</span>{" "}
+          These rows have a large gap between the keyword scorer and the LLM
+          judge. That's a data-quality signal, not a scoring axis — no
+          automated downstream action is taken. Open the run to see why they
+          disagree and decide whether the scorer or the judge needs attention.
+        </div>
+      )}
 
       {/* Table */}
       {loading ? (
