@@ -259,6 +259,7 @@ def score_with_judge(
     # are cheap (~3s each) and deterministic.
     sample_results: list[dict[str, Any]] = []
     errors: list[str] = []
+    judge_start = time.monotonic()  # P9: measure total judge overhead
 
     for i in range(samples):
         output_path = tmpdir / f"out-{i + 1}.json"
@@ -287,11 +288,14 @@ def score_with_judge(
                 except Exception as close_err:
                     errors.append(f"sample {i + 1} tab_close: {close_err}")
 
+    elapsed_seconds = round(time.monotonic() - judge_start, 2)
+
     if not sample_results:
         return {
             "mean_score": 0.0, "stdev": 0.0, "samples": [],
             "backend": "codex", "reliable": False,
             "error": "; ".join(errors) or "all judge calls failed",
+            "elapsed_seconds": elapsed_seconds,
         }
 
     scores = [s["score"] for s in sample_results]
@@ -305,6 +309,7 @@ def score_with_judge(
         "backend": "codex",
         "reliable": stdev < 10.0,
         "error": "; ".join(errors) if errors else None,
+        "elapsed_seconds": elapsed_seconds,
     }
 
 

@@ -229,7 +229,7 @@ def _fetch_judge_and_batch_fields(row_id: str) -> dict[str, Any]:
     try:
         row = conn.execute(
             "SELECT judge_score, judge_stdev, judge_model, judge_reliable, "
-            "judge_samples, judge_error, judge_cost_usd, "
+            "judge_samples, judge_error, judge_cost_usd, judge_elapsed_seconds, "
             "batch_id, run_index, runs_in_batch, deliverable_status, "
             "primary_metric, minimum_meaningful_delta "
             "FROM eval_results WHERE id = ?",
@@ -249,6 +249,7 @@ def _fetch_judge_and_batch_fields(row_id: str) -> dict[str, Any]:
         "judgeSamples": row["judge_samples"],
         "judgeError": row["judge_error"],
         "judgeCostUsd": row["judge_cost_usd"],
+        "judgeElapsedSeconds": row["judge_elapsed_seconds"],
         "batchId": row["batch_id"],
         "runIndex": row["run_index"],
         "runsInBatch": row["runs_in_batch"],
@@ -2673,6 +2674,8 @@ def _run_eval_background(
                 "judgeError": judge_result.get("error") if judge_result else None,
                 # judgeCostUsd deprecated — cost tracked in Chau7 session telemetry.
                 "judgeCostUsd": None,
+                # P9: wall-clock overhead the judge added for this row.
+                "judgeElapsedSeconds": judge_result.get("elapsed_seconds") if judge_result else None,
                 # P1: batch metadata
                 "batchId": batch_id,
                 "runIndex": run_index,

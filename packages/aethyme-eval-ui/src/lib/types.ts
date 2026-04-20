@@ -92,6 +92,9 @@ export interface EvalResult {
   /** P8 pre-registration. Minimum delta (in the primary metric's units)
    * that counts as meaningful. Acts as the margin in pairwise verdicts. */
   minimumMeaningfulDelta?: number | null;
+  /** P9: wall-clock seconds the LLM-judge added scoring this row
+   * (across its N samples). Visible as meta-overhead in batch reports. */
+  judgeElapsedSeconds?: number | null;
 }
 
 export type ValidationStatus = "valid" | "invalid" | "unknown" | "checking";

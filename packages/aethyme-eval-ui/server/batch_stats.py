@@ -281,11 +281,30 @@ def aggregate_batch(batch_id: str) -> dict[str, Any]:
 
     discrimination_info = _scenario_discrimination(conditions)
 
+    # P9: aggregate judge overhead across the batch so it's visible as
+    # meta-time separate from per-condition agent telemetry. A batch that
+    # spent 15 minutes of agent-wall-clock but 8 minutes of judge overhead
+    # on top is a meaningfully different workload than one with 0 judge
+    # overhead, and the efficiency story should reflect that.
+    judge_times = [
+        float(r["judge_elapsed_seconds"]) for r in rows
+        if r["judge_elapsed_seconds"] is not None
+    ]
+    judge_overhead = {
+        "rows_scored": len(judge_times),
+        "rows_total": len(rows),
+        "total_seconds": round(sum(judge_times), 2) if judge_times else 0.0,
+        "mean_seconds_per_row": (
+            round(statistics.mean(judge_times), 2) if judge_times else None
+        ),
+    }
+
     return {
         "batch": meta,
         "conditions": conditions,
         "comparisons_vs_baseline": comparisons,
         "scenario_discrimination": discrimination_info,
+        "judge_overhead": judge_overhead,
     }
 
 

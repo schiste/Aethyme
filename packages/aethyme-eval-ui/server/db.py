@@ -104,6 +104,10 @@ MIGRATIONS = [
     # (treated as defaults: "quality" / 5.0).
     "ALTER TABLE eval_results ADD COLUMN primary_metric TEXT",
     "ALTER TABLE eval_results ADD COLUMN minimum_meaningful_delta REAL",
+    # P9: judge overhead. Wall-clock seconds the LLM-judge call spent
+    # scoring this row (sum across its N samples). Makes judge time visible
+    # as meta-overhead separate from per-condition agent telemetry.
+    "ALTER TABLE eval_results ADD COLUMN judge_elapsed_seconds REAL",
 ]
 
 
@@ -274,13 +278,15 @@ def insert_result(result: dict[str, Any]) -> None:
             judge_score, judge_stdev, judge_model, judge_reliable,
             judge_samples, judge_error, judge_cost_usd,
             batch_id, run_index, runs_in_batch, deliverable_status,
-            primary_metric, minimum_meaningful_delta)
+            primary_metric, minimum_meaningful_delta,
+            judge_elapsed_seconds)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?,
-                   ?, ?)""",
+                   ?, ?,
+                   ?)""",
         (
             result["id"], result.get("runDir"), result["date"],
             result["evalType"], result["target"], result["model"],
@@ -319,6 +325,8 @@ def insert_result(result: dict[str, Any]) -> None:
             # Pre-registration (P8)
             result.get("primaryMetric"),
             result.get("minimumMeaningfulDelta"),
+            # Judge overhead (P9)
+            result.get("judgeElapsedSeconds"),
         ),
     )
     conn.commit()
@@ -433,6 +441,8 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         # (quality / 5.0) — the UI can render a dim hint rather than missing data.
         "primaryMetric": row["primary_metric"] if "primary_metric" in row.keys() else None,
         "minimumMeaningfulDelta": row["minimum_meaningful_delta"] if "minimum_meaningful_delta" in row.keys() else None,
+        # Judge overhead (P9) — wall-clock seconds the judge spent on this row.
+        "judgeElapsedSeconds": row["judge_elapsed_seconds"] if "judge_elapsed_seconds" in row.keys() else None,
     }
 
 
