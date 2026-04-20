@@ -27,7 +27,7 @@ if [[ -z "$EVAL_TYPE" || -z "$TARGET" ]]; then
     echo ""
     echo "Eval types: bug-fix, bug-fix-1, explain-repo, navigation-ctf, impact-analysis,"
     echo "            feature-localization, config-audit, dead-code, migration"
-    echo "Targets:    grc, mediawiki"
+    echo "Targets:    aethyme, grc, mediawiki"
     echo "Models:     haiku (default), sonnet, opus"
     exit 1
 fi
@@ -36,6 +36,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AETHYME_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SERVER_DIR="$(cd "$AETHYME_ROOT/../aethyme-eval-ui/server" && pwd)"
 SERVER_URL="http://localhost:8000"
+SERVER_HEALTH_URL="$SERVER_URL/api/chau7/status"
+SERVER_PYTHON="${SERVER_PYTHON:-$AETHYME_ROOT/.venv/bin/python}"
+CURL_BIN="${CURL_BIN:-/usr/bin/curl}"
 
 echo "=== Eval Run ==="
 echo "  Type:      $EVAL_TYPE"
@@ -60,15 +63,22 @@ fi
 # ── Step 2: Ensure server is running ─────────────────────────────────
 
 echo ">>> Checking eval server..."
-if curl -sS -o /dev/null -w "" "$SERVER_URL/api/run/status" 2>/dev/null; then
+if "$CURL_BIN" -sS -o /dev/null -w "" "$SERVER_HEALTH_URL" 2>/dev/null; then
     echo "  Server already running at $SERVER_URL"
 else
     echo "  Starting server..."
     cd "$SERVER_DIR"
-    .venv/bin/python -m uvicorn main:app --port 8000 > /dev/null 2>&1 &
+    "$SERVER_PYTHON" -m uvicorn main:app --port 8000 > /dev/null 2>&1 &
     SERVER_PID=$!
-    sleep 4
-    if ! curl -sS -o /dev/null "$SERVER_URL/api/run/status" 2>/dev/null; then
+    SERVER_READY=false
+    for _ in {1..20}; do
+        sleep 1
+        if "$CURL_BIN" -sS -o /dev/null "$SERVER_HEALTH_URL" 2>/dev/null; then
+            SERVER_READY=true
+            break
+        fi
+    done
+    if [[ "$SERVER_READY" != true ]]; then
         echo "ERROR: Server failed to start"
         exit 1
     fi
@@ -79,7 +89,7 @@ echo ""
 # ── Step 3: Prepare target snapshot ──────────────────────────────────
 
 echo ">>> Preparing target snapshot..."
-PREP_RESPONSE=$(curl -sS -X POST "$SERVER_URL/api/repositories/prepare" \
+PREP_RESPONSE=$("$CURL_BIN" -sS -X POST "$SERVER_URL/api/repositories/prepare" \
     -H "Content-Type: application/json" \
     -d "{\"target\":\"$TARGET\"}")
 
@@ -102,7 +112,7 @@ echo ""
 # ── Step 4: Launch eval ──────────────────────────────────────────────
 
 echo ">>> Launching eval..."
-RESPONSE=$(curl -sS -X POST "$SERVER_URL/api/run" \
+RESPONSE=$("$CURL_BIN" -sS -X POST "$SERVER_URL/api/run" \
     -H "Content-Type: application/json" \
     -d "{\"evalType\":\"$EVAL_TYPE\",\"target\":\"$TARGET\",\"model\":\"$MODEL\",\"reasoning\":\"$REASONING\",\"preparationId\":\"$PREP_ID\"}")
 
@@ -126,9 +136,20 @@ while [[ $POLL_COUNT -lt $MAX_POLLS ]]; do
     sleep 15
     ((POLL_COUNT++))
 
-    STATUS_JSON=$(curl -sS "$SERVER_URL/api/run/status")
-    PHASE=$(echo "$STATUS_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('currentPhase','?'))" 2>/dev/null)
-    RUN_STATUS=$(echo "$STATUS_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','?'))" 2>/dev/null)
+    STATUS_PAIR=$("$CURL_BIN" -sS "$SERVER_URL/api/run/status" | python3 -c "
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print('error\tstatus_parse_failed')
+    raise SystemExit(0)
+
+print(f\"{data.get('status', '?')}\t{data.get('currentPhase') or '?'}\")
+" 2>/dev/null)
+    RUN_STATUS="${STATUS_PAIR%%$'\t'*}"
+    PHASE="${STATUS_PAIR#*$'\t'}"
 
     if [[ "$RUN_STATUS" == "complete" ]]; then
         echo "  Completed after $((POLL_COUNT * 15))s"
@@ -162,7 +183,7 @@ echo ""
 echo ">>> Results:"
 echo ""
 
-curl -sS "$SERVER_URL/api/results?eval_type=$EVAL_TYPE&target=$TARGET" | python3 -c "
+"$CURL_BIN" -sS "$SERVER_URL/api/results?eval_type=$EVAL_TYPE&target=$TARGET" | python3 -c "
 import sys, json
 
 results = json.load(sys.stdin)

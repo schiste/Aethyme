@@ -24,7 +24,7 @@ done
 if [[ -n "$TARGET" && -z "$CONTROL_DIR" ]]; then
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
     AETHYME_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-    PATHS=$("$AETHYME_ROOT/.venv/bin/python" -c "
+    PATHS=$(cd "$AETHYME_ROOT" && "$AETHYME_ROOT/.venv/bin/python" -c "
 from src.eval.targets import get_target
 t = get_target('$TARGET')
 print(t.control_path)
@@ -125,10 +125,15 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
 
     # Skill deployed
     [[ -f .codex/skills/aethyme/SKILL.md ]] && check_pass "Skill deployed" || check_fail "Missing .codex/skills/aethyme/SKILL.md"
+    [[ -d .codex/skills/eval ]] && check_fail "Internal eval skill leaked into playground" || check_pass "No internal eval skill deployed"
 
     # Skill has no unresolved placeholders
     if [[ -f .codex/skills/aethyme/SKILL.md ]]; then
-        grep -q '{{AETHYME_ROOT}}' .codex/skills/aethyme/SKILL.md && check_fail "Skill has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "Skill placeholders resolved"
+        SKILL_FILE=".codex/skills/aethyme/SKILL.md"
+        grep -q '{{AETHYME_ROOT}}' "$SKILL_FILE" && check_fail "Skill has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "Skill placeholders resolved"
+        grep -q 'analyze dead-code' "$SKILL_FILE" && check_pass "Skill includes current dead-code analyzer" || check_fail "Skill missing analyze dead-code guidance"
+        grep -q 'facts function-usage' "$SKILL_FILE" && check_pass "Skill includes current usage facts command" || check_fail "Skill missing facts function-usage guidance"
+        grep -q '\$ENGINE unused' "$SKILL_FILE" && check_fail "Skill still advertises stale \$ENGINE unused command" || check_pass "Skill has no stale unused command"
     fi
 
     # Graph index

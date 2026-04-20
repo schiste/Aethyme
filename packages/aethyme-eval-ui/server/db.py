@@ -134,6 +134,8 @@ def import_eval_runs(eval_runs_dir: Path) -> int:
         except (json.JSONDecodeError, OSError):
             continue
 
+        judge_by_condition = _load_judge_results(entry)
+
         metadata = {}
         metadata_file = entry / "metadata.json"
         if metadata_file.exists():
@@ -189,6 +191,7 @@ def import_eval_runs(eval_runs_dir: Path) -> int:
             fixed = 1 if (test_pass if test_pass is not None else (ws > 0)) else 0
             cto = CTO_MAP.get(cond, "unknown")
             tool_breakdown = _tool_breakdown_json(run.get("tool_calls"))
+            judge = judge_by_condition.get(cond, {})
 
             conn.execute(
                 """INSERT OR REPLACE INTO eval_results
@@ -198,8 +201,13 @@ def import_eval_runs(eval_runs_dir: Path) -> int:
                     scenario, raw_json, output, tool_breakdown, prompt, run_id,
                     quality_score, recalculated_eval_score, quality_delta_vs_control,
                     token_ratio_vs_control, time_ratio_vs_control, cost_ratio_vs_control,
-                    score_per_1k_tokens, score_per_minute, top_tools)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    score_per_1k_tokens, score_per_minute, top_tools,
+                    judge_score, judge_stdev, judge_model, judge_reliable,
+                    judge_samples, judge_error, judge_cost_usd)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     result_id, entry.name, date_str,
                     eval_type.split("-reasoning")[0] if "-reasoning" in eval_type else eval_type,
@@ -222,6 +230,13 @@ def import_eval_runs(eval_runs_dir: Path) -> int:
                     _maybe_round(summary.get("score_per_1k_tokens")),
                     _maybe_round(summary.get("score_per_minute")),
                     json.dumps(summary.get("top_tools")) if summary.get("top_tools") else None,
+                    judge.get("judgeScore"),
+                    judge.get("judgeStdev"),
+                    judge.get("judgeModel"),
+                    judge.get("judgeReliable"),
+                    judge.get("judgeSamples"),
+                    judge.get("judgeError"),
+                    judge.get("judgeCostUsd"),
                 ),
             )
             imported += 1
@@ -390,7 +405,7 @@ def _tool_breakdown_json(tool_calls: Any) -> str | None:
     for call in tool_calls:
         if not isinstance(call, dict):
             continue
-        name = call.get("tool")
+        name = call.get("tool") or call.get("name")
         if not name:
             continue
         breakdown[str(name)] = breakdown.get(str(name), 0) + 1
@@ -400,11 +415,80 @@ def _tool_breakdown_json(tool_calls: Any) -> str | None:
 
 
 def _extract_target(data: dict, metadata: dict) -> str:
+    for candidate in (
+        data.get("target"),
+        metadata.get("target"),
+        data.get("target_slug"),
+        metadata.get("target_slug"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+
+    for cond in ALL_CONDITIONS:
+        side = data.get(cond)
+        if not isinstance(side, dict):
+            continue
+        run = side.get("run")
+        if not isinstance(run, dict):
+            continue
+        run_metadata = run.get("run_metadata")
+        if not isinstance(run_metadata, dict):
+            continue
+        candidate = run_metadata.get("target")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+
     repo_path = metadata.get("repo_path", "")
     dir_name = data.get("report", {}).get("repo_path", repo_path) if isinstance(data.get("report"), dict) else repo_path
     lower = str(dir_name).lower()
     if "mediawiki" in lower:
         return "mediawiki"
-    if "grc" in lower or "playground" in lower or "mockup" in lower:
+    if "aethyme" in lower:
+        return "aethyme"
+    if "grc" in lower or "mockup" in lower:
         return "grc"
     return Path(dir_name).name if dir_name else "unknown"
+
+
+def _load_judge_results(run_dir: Path) -> dict[str, dict[str, Any]]:
+    events_path = run_dir / "events.log"
+    if not events_path.exists():
+        return {}
+
+    try:
+        lines = events_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+
+    samples_by_condition: dict[str, list[float]] = {}
+    results: dict[str, dict[str, Any]] = {}
+    sample_re = re.compile(r"\[(?P<condition>[^\]]+)\]\s+sample\s+\d+/\d+:\s+score=(?P<score>-?\d+(?:\.\d+)?)")
+    final_re = re.compile(
+        r"\[(?P<condition>[^\]]+)\]\s+Judge score:\s+"
+        r"(?P<score>-?\d+(?:\.\d+)?)\s+"
+        r"\(stdev=(?P<stdev>-?\d+(?:\.\d+)?),\s+"
+        r"reliable=(?P<reliable>True|False)\)"
+    )
+
+    for line in lines:
+        sample_match = sample_re.search(line)
+        if sample_match:
+            condition = sample_match.group("condition")
+            samples_by_condition.setdefault(condition, []).append(float(sample_match.group("score")))
+            continue
+
+        final_match = final_re.search(line)
+        if final_match:
+            condition = final_match.group("condition")
+            samples = samples_by_condition.get(condition, [])
+            results[condition] = {
+                "judgeScore": float(final_match.group("score")),
+                "judgeStdev": float(final_match.group("stdev")),
+                "judgeModel": "codex",
+                "judgeReliable": 1 if final_match.group("reliable") == "True" else 0,
+                "judgeSamples": json.dumps([{"score": score} for score in samples]),
+                "judgeError": None,
+                "judgeCostUsd": None,
+            }
+
+    return results
