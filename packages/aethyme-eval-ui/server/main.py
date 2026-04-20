@@ -2694,7 +2694,36 @@ def _run_eval_background(
     }
 
     start_phase("finalizing", order=7, details={"conditions": sorted(condition_payloads.keys())})
-    finalize_eval_run(run_dir, result, repo_path=Path(req.target), eval_type=req.evalType)
+
+    # Compute rolling control baseline from history for this (model, eval_type,
+    # target, scenario) tuple — stabilizes global_score against single-run
+    # variance in the co-run control. Falls back to the co-run control when
+    # fewer than MIN_ROLLING_SAMPLES historical rows exist.
+    from baseline import compute_rolling_baseline
+    rolling_baseline = compute_rolling_baseline(
+        model=req.model,
+        eval_type=req.evalType,
+        target=req.target,
+        scenario=result.get("scenario"),
+    )
+    if rolling_baseline:
+        log(
+            f"Rolling baseline: quality={rolling_baseline['quality_score']:.1f} "
+            f"tokens={rolling_baseline['total_tokens']:,} "
+            f"duration={rolling_baseline['duration_seconds']:.1f}s "
+            f"cost=${rolling_baseline['cost_usd']:.2f} "
+            f"(n={rolling_baseline['window_size']})"
+        )
+    else:
+        log("Rolling baseline: insufficient history — falling back to co-run control")
+
+    finalize_eval_run(
+        run_dir,
+        result,
+        repo_path=Path(req.target),
+        eval_type=req.evalType,
+        baseline_override=rolling_baseline,
+    )
     result["report_path"] = str(run_dir / "report.md")
 
     # Upsert finalized per-condition rows so first-class DB columns include

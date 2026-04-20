@@ -494,6 +494,7 @@ def finalize_eval_run(
     *,
     repo_path: Path | None = None,
     eval_type: str = "unknown",
+    baseline_override: dict[str, Any] | None = None,
 ) -> Path:
     """Write the complete result dump and final report for an eval run.
 
@@ -505,8 +506,12 @@ def finalize_eval_run(
     2. ``report.md`` — the final human-readable markdown report.
     3. All per-condition artifacts via ``write_eval_run_artifacts()``.
     4. One line to ``eval-runs/runs.jsonl`` ledger.
+
+    ``baseline_override`` lets callers supply a rolling-history baseline
+    instead of the co-run control values, stabilizing comparison metrics
+    across runs.
     """
-    augment_result_with_summary_metrics(result)
+    augment_result_with_summary_metrics(result, baseline_override=baseline_override)
 
     # 1. Complete dump
     (run_dir / "complete-result.json").write_text(
@@ -537,8 +542,25 @@ def finalize_eval_run(
     return run_dir
 
 
-def augment_result_with_summary_metrics(result: dict[str, Any]) -> dict[str, Any]:
-    """Attach per-condition summaries and control-relative comparison metrics."""
+def augment_result_with_summary_metrics(
+    result: dict[str, Any],
+    *,
+    baseline_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Attach per-condition summaries and control-relative comparison metrics.
+
+    When `baseline_override` is provided it replaces the co-run control values
+    used as the denominator for ratio metrics. This is how callers apply a
+    *rolling baseline* computed from historical control-cto-off runs instead
+    of the current batch's own control row — single-run variance in the
+    co-run control otherwise propagates into every other condition's
+    derived score.
+
+    baseline_override shape:
+        {"source": "rolling", "window_size": N,
+         "quality_score": ..., "total_tokens": ...,
+         "duration_seconds": ..., "cost_usd": ...}
+    """
     active = _active_conditions(result)
     if not active:
         return result
@@ -558,23 +580,52 @@ def augment_result_with_summary_metrics(result: dict[str, Any]) -> dict[str, Any
     if not isinstance(baseline_run, dict):
         baseline_run = {}
 
-    baseline_quality = baseline_assessment.get("weighted_score")
-    baseline_quality = (
-        float(baseline_quality) if isinstance(baseline_quality, (int, float)) else None
-    )
-    baseline_tokens = _total_tokens(baseline_run)
-    baseline_duration = baseline_run.get("duration_seconds")
-    baseline_duration = (
-        float(baseline_duration)
-        if isinstance(baseline_duration, (int, float)) and baseline_duration > 0
-        else None
-    )
-    baseline_cost = baseline_run.get("cost_usd")
-    baseline_cost = (
-        float(baseline_cost)
-        if isinstance(baseline_cost, (int, float)) and baseline_cost > 0
-        else None
-    )
+    baseline_source = "co-run"
+    baseline_window_size: int | None = None
+
+    if baseline_override:
+        # Rolling (or otherwise externally-supplied) baseline wins over the
+        # co-run control values.
+        baseline_source = str(baseline_override.get("source", "override"))
+        raw_window = baseline_override.get("window_size")
+        baseline_window_size = int(raw_window) if isinstance(raw_window, int) else None
+
+        baseline_quality = baseline_override.get("quality_score")
+        baseline_quality = (
+            float(baseline_quality) if isinstance(baseline_quality, (int, float)) else None
+        )
+        baseline_tokens = baseline_override.get("total_tokens")
+        baseline_tokens = (
+            int(baseline_tokens) if isinstance(baseline_tokens, (int, float)) and baseline_tokens > 0 else None
+        )
+        baseline_duration = baseline_override.get("duration_seconds")
+        baseline_duration = (
+            float(baseline_duration)
+            if isinstance(baseline_duration, (int, float)) and baseline_duration > 0
+            else None
+        )
+        baseline_cost = baseline_override.get("cost_usd")
+        baseline_cost = (
+            float(baseline_cost) if isinstance(baseline_cost, (int, float)) and baseline_cost > 0 else None
+        )
+    else:
+        baseline_quality = baseline_assessment.get("weighted_score")
+        baseline_quality = (
+            float(baseline_quality) if isinstance(baseline_quality, (int, float)) else None
+        )
+        baseline_tokens = _total_tokens(baseline_run)
+        baseline_duration = baseline_run.get("duration_seconds")
+        baseline_duration = (
+            float(baseline_duration)
+            if isinstance(baseline_duration, (int, float)) and baseline_duration > 0
+            else None
+        )
+        baseline_cost = baseline_run.get("cost_usd")
+        baseline_cost = (
+            float(baseline_cost)
+            if isinstance(baseline_cost, (int, float)) and baseline_cost > 0
+            else None
+        )
 
     global_scores: dict[str, float] = {}
     quality_scores: dict[str, float] = {}
@@ -611,6 +662,8 @@ def augment_result_with_summary_metrics(result: dict[str, Any]) -> dict[str, Any
 
     result["comparison"] = {
         "baseline_condition": baseline_condition,
+        "baseline_source": baseline_source,
+        "baseline_window_size": baseline_window_size,
         "recalculated_eval_score_formula": (
             "100 + quality_delta_vs_control "
             "+ 10 * ln(token_ratio_vs_control) "
