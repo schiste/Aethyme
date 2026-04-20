@@ -55,6 +55,26 @@ async def get_results(
     return query_results(eval_type=eval_type, target=target, model=model, condition=condition)
 
 
+@app.get("/api/batches")
+async def get_batches(limit: int = 50) -> list[dict[str, Any]]:
+    """List recent multi-run batches with minimal summary."""
+    from batch_stats import list_batches
+    return list_batches(limit=limit)
+
+
+@app.get("/api/batches/{batch_id}")
+async def get_batch(batch_id: str) -> dict[str, Any]:
+    """Return aggregated per-condition statistics for a batch.
+
+    Response: {batch: <meta>, conditions: {<cond>: {<field>: {median, q1, q3,
+    iqr, min, max, n}, ..., deliverable_success_rate, judge_reliability_rate}}}.
+    Any condition with fewer than 4 runs reports median/min/max but omits
+    Q1/Q3/IQR (quantiles undefined at that sample size).
+    """
+    from batch_stats import aggregate_batch
+    return aggregate_batch(batch_id)
+
+
 @app.post("/api/results")
 async def add_result(result: dict[str, Any]) -> dict[str, str]:
     insert_result(result)
