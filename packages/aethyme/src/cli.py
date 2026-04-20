@@ -10,25 +10,23 @@ import structlog
 # Add src to path for module imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.eval.bug_fix import (
+    DEFAULT_CROSS_PACKAGE_TASK,
+    prepare_bug_fix_benchmark,
+    prepare_cross_package_benchmark,
+    reset_bug_fix,
+    run_bug_fix_evaluation,
+    setup_bug_fix,
+    verify_bug_fix_setup,
+)
+from src.eval.bug_fix import (
+    DEFAULT_TASK as DEFAULT_BUG_FIX_TASK,
+)
 from src.eval.explain_repo import (
     DEFAULT_TASK,
     command_runner,
     run_explain_repo_evaluation,
 )
-from src.eval.bug_fix import (
-    DEFAULT_CROSS_PACKAGE_TASK,
-    DEFAULT_TASK as DEFAULT_BUG_FIX_TASK,
-)
-from src.eval.bug_fix import (
-    command_runner as bug_fix_command_runner,
-    prepare_bug_fix_benchmark,
-    prepare_cross_package_benchmark,
-    run_bug_fix_evaluation,
-    setup_bug_fix,
-    verify_bug_fix_setup,
-    reset_bug_fix,
-)
-from src.eval.repos import create_condition_repos, load_condition_repos
 from src.eval.navigation_ctf import (
     DEFAULT_TASK as DEFAULT_NAVIGATION_TASK,
 )
@@ -38,16 +36,17 @@ from src.eval.navigation_ctf import (
 from src.eval.navigation_ctf import (
     run_navigation_ctf_evaluation,
 )
+from src.eval.repos import create_condition_repos
 from src.graph.connection_pool import db_pool
 from src.graph.store import GraphStore
 from src.indexing.engine import (
-    analyze_dead_code as analyze_dead_code_answer,
     EngineError,
     build_task_context,
     build_task_pack,
     clear_repository_cache,
     derived_function_usage,
     derived_public_functions,
+    engine_runtime_info,
     graph_callees,
     graph_callers,
     graph_children,
@@ -60,12 +59,14 @@ from src.indexing.engine import (
     inspect_repository,
     inspect_repository_brief,
     inspect_repository_structure,
-    engine_runtime_info,
     search_symbol,
     task_anchors,
     task_expand,
     task_next,
     task_scope,
+)
+from src.indexing.engine import (
+    analyze_dead_code as analyze_dead_code_answer,
 )
 from src.indexing.engine import (
     dependency_frontier as rust_dependency_frontier,
@@ -87,7 +88,7 @@ structlog.configure(
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
-        structlog.dev.ConsoleRenderer()
+        structlog.dev.ConsoleRenderer(),
     ],
     context_class=dict,
     logger_factory=structlog.stdlib.LoggerFactory(),
@@ -173,7 +174,8 @@ def default_tenant_id() -> str | None:
     help="Output in JSON format",
 )
 @click.option(
-    "--verbose", "-v",
+    "--verbose",
+    "-v",
     is_flag=True,
     help="Verbose output",
 )
@@ -211,7 +213,9 @@ def cli(
     if engine_transport:
         normalized_transport = engine_transport.strip().lower()
         if not normalized_transport:
-            raise click.BadParameter("Engine transport cannot be empty.", param_hint="--engine-transport")
+            raise click.BadParameter(
+                "Engine transport cannot be empty.", param_hint="--engine-transport"
+            )
         os.environ["AETHYME_ENGINE_TRANSPORT"] = normalized_transport
         state["engine_transport"] = normalized_transport
 
@@ -251,9 +255,11 @@ def index(
         use_fallback=use_fallback,
         clear_existing=True,
     )
+
     # Initialize graph builder
     def progress_callback(current: int, total: int, message: str) -> None:
         click.echo(f"Progress: {current}/{total} - {message}")
+
     result = run_indexing(request, progress_callback=progress_callback)
 
     # Print summary
@@ -306,7 +312,9 @@ def repo() -> None:
 
 
 @repo.command("ingest")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 def repo_ingest(repo_path: Path) -> None:
     """Capture local repository metadata for a local-first workflow."""
     snapshot = capture_snapshot(repo_path)
@@ -318,9 +326,17 @@ def repo_ingest(repo_path: Path) -> None:
 
 
 @repo.command("inspect")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-@click.option("--mode", "mode", type=click.Choice(["brief", "structure", "full"]), default="full", help="Inspect depth: brief (areas+signals), structure (adds files/configs/docs), full (everything)")
+@click.option(
+    "--mode",
+    "mode",
+    type=click.Choice(["brief", "structure", "full"]),
+    default="full",
+    help="Inspect depth: brief (areas+signals), structure (adds files/configs/docs), full (everything)",
+)
 def repo_inspect(repo_path: Path, json_output: bool, mode: str) -> None:
     """Inspect the local repository map produced by the Rust engine."""
     try:
@@ -353,11 +369,15 @@ def repo_inspect(repo_path: Path, json_output: bool, mode: str) -> None:
     if result.get("signals"):
         click.echo("Signals:")
         for name, signal in result["signals"].items():
-            click.echo(f"- {name.replace('_', ' ')}: {signal['score']} ({signal['level']})")
+            click.echo(
+                f"- {name.replace('_', ' ')}: {signal['score']} ({signal['level']})"
+            )
 
 
 @repo.command("clear-cache")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 def repo_clear_cache(repo_path: Path) -> None:
     """Clear cached local engine artifacts for the current repository snapshot."""
     clear_repository_cache(repo_path)
@@ -365,18 +385,25 @@ def repo_clear_cache(repo_path: Path) -> None:
 
 
 @repo.command("warm")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 def repo_warm(repo_path: Path) -> None:
     """Pre-build the repository map cache for fast subsequent commands."""
     from src.indexing.engine import warm_repository
+
     warm_repository(repo_path)
     click.echo(f"Map cache warmed for {repo_path}")
 
 
 @repo.command("deploy-skills")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 @click.option("--force", is_flag=True, help="Overwrite existing skills")
-@click.option("--remove", "do_remove", is_flag=True, help="Remove deployed skills instead")
+@click.option(
+    "--remove", "do_remove", is_flag=True, help="Remove deployed skills instead"
+)
 def repo_deploy_skills(repo_path: Path, force: bool, do_remove: bool) -> None:
     """Deploy Aethyme navigation skills to a target repository."""
     from src.indexing.skills import deploy_skills, remove_skills
@@ -398,13 +425,20 @@ def repo_deploy_skills(repo_path: Path, force: bool, do_remove: bool) -> None:
 
 @repo.command("engine-info")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-@click.option("--check", "check_ready", is_flag=True, help="Exit non-zero if selected transport is not ready.")
+@click.option(
+    "--check",
+    "check_ready",
+    is_flag=True,
+    help="Exit non-zero if selected transport is not ready.",
+)
 def repo_engine_info(json_output: bool, check_ready: bool) -> None:
     """Show configured engine transport/runtime information."""
     info = engine_runtime_info()
     if json_output:
         click.echo(json.dumps(info, indent=2))
-        if check_ready and (not info["transport_supported"] or not info["transport_ready"]):
+        if check_ready and (
+            not info["transport_supported"] or not info["transport_ready"]
+        ):
             raise click.ClickException("Engine transport is not ready.")
         return
 
@@ -437,7 +471,9 @@ def graph() -> None:
 
 
 @query.command("symbol")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 @click.argument("symbol_query")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def query_symbol(repo_path: Path, symbol_query: str, json_output: bool) -> None:
@@ -459,7 +495,9 @@ def query_symbol(repo_path: Path, symbol_query: str, json_output: bool) -> None:
 
 
 @query.command("deps")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 @click.argument("target")
 def query_deps(repo_path: Path, target: str) -> None:
     """Show dependency frontier for a target symbol or file."""
@@ -472,7 +510,9 @@ def query_deps(repo_path: Path, target: str) -> None:
 
 
 @query.command("impact")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 @click.argument("target")
 def query_impact(repo_path: Path, target: str) -> None:
     """Show reverse dependency frontier for a target symbol or file."""
@@ -485,7 +525,9 @@ def query_impact(repo_path: Path, target: str) -> None:
 
 
 @graph.command("node")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 @click.argument("target")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def graph_node_command(repo_path: Path, target: str, json_output: bool) -> None:
@@ -524,7 +566,9 @@ def _render_relation(result: dict[str, Any], json_output: bool) -> None:
     click.echo(f"Target: {result['target']}")
     click.echo(f"Relation: {result['relation']}")
     for item in result["items"]:
-        click.echo(f"- {item['display']} ({item['kind']}, {item['relation']}, conf={item['confidence']})")
+        click.echo(
+            f"- {item['display']} ({item['kind']}, {item['relation']}, conf={item['confidence']})"
+        )
     _emit_completeness_signals(result)
 
 
@@ -555,7 +599,9 @@ def _emit_completeness_signals(payload: dict[str, Any]) -> None:
 
 
 @graph.command("children")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 @click.argument("target")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def graph_children_command(repo_path: Path, target: str, json_output: bool) -> None:
@@ -567,7 +613,9 @@ def graph_children_command(repo_path: Path, target: str, json_output: bool) -> N
 
 
 @graph.command("parents")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 @click.argument("target")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def graph_parents_command(repo_path: Path, target: str, json_output: bool) -> None:
@@ -579,7 +627,9 @@ def graph_parents_command(repo_path: Path, target: str, json_output: bool) -> No
 
 
 @graph.command("callers")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 @click.argument("target")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def graph_callers_command(repo_path: Path, target: str, json_output: bool) -> None:
@@ -591,7 +641,9 @@ def graph_callers_command(repo_path: Path, target: str, json_output: bool) -> No
 
 
 @graph.command("callees")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 @click.argument("target")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def graph_callees_command(repo_path: Path, target: str, json_output: bool) -> None:
@@ -603,7 +655,9 @@ def graph_callees_command(repo_path: Path, target: str, json_output: bool) -> No
 
 
 @graph.command("docs")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 @click.argument("target")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def graph_docs_command(repo_path: Path, target: str, json_output: bool) -> None:
@@ -615,7 +669,9 @@ def graph_docs_command(repo_path: Path, target: str, json_output: bool) -> None:
 
 
 @graph.command("configs")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 @click.argument("target")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def graph_configs_command(repo_path: Path, target: str, json_output: bool) -> None:
@@ -627,7 +683,9 @@ def graph_configs_command(repo_path: Path, target: str, json_output: bool) -> No
 
 
 @graph.command("expand")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 @click.argument("target")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def graph_expand_command(repo_path: Path, target: str, json_output: bool) -> None:
@@ -650,7 +708,9 @@ def graph_expand_command(repo_path: Path, target: str, json_output: bool) -> Non
             continue
         click.echo(f"{label.capitalize()}:")
         for item in items:
-            click.echo(f"- {item['display']} ({item['kind']}, {item['relation']}, conf={item['confidence']})")
+            click.echo(
+                f"- {item['display']} ({item['kind']}, {item['relation']}, conf={item['confidence']})"
+            )
     if result.get("risks"):
         click.echo("Risks:")
         for risk in result["risks"]:
@@ -659,7 +719,9 @@ def graph_expand_command(repo_path: Path, target: str, json_output: bool) -> Non
 
 
 @graph.command("overview")
-@click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def graph_overview_command(repo_path: Path, json_output: bool) -> None:
     """Show a repo-level navigation overview derived from the graph."""
@@ -676,7 +738,9 @@ def graph_overview_command(repo_path: Path, json_output: bool) -> None:
     if result.get("signals"):
         click.echo("Signals:")
         for name, signal in result["signals"].items():
-            click.echo(f"- {name.replace('_', ' ')}: {signal['score']} ({signal['level']})")
+            click.echo(
+                f"- {name.replace('_', ' ')}: {signal['score']} ({signal['level']})"
+            )
     for label in (
         "code_areas",
         "reference_areas",
@@ -712,7 +776,12 @@ def analyze() -> None:
 
 
 @task.command("pack")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
 @click.option("--task", "task_text", required=True, help="Task description")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def task_pack(repo_path: Path, task_text: str, json_output: bool) -> None:
@@ -730,11 +799,24 @@ def task_pack(repo_path: Path, task_text: str, json_output: bool) -> None:
 
 
 @task.command("context")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
 @click.option("--task", "task_text", required=True, help="Task description")
-@click.option("--content-budget", "content_budget", default=80000, type=int, help="Max bytes of file content")
+@click.option(
+    "--content-budget",
+    "content_budget",
+    default=80000,
+    type=int,
+    help="Max bytes of file content",
+)
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-def task_context_command(repo_path: Path, task_text: str, content_budget: int, json_output: bool) -> None:
+def task_context_command(
+    repo_path: Path, task_text: str, content_budget: int, json_output: bool
+) -> None:
     """Build task context pack with file contents (single-call navigation)."""
     try:
         result = build_task_context(repo_path, task_text, content_budget)
@@ -749,7 +831,12 @@ def task_context_command(repo_path: Path, task_text: str, content_budget: int, j
 
 
 @task.command("anchors")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
 @click.option("--task", "task_text", required=True, help="Task description")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def task_anchors_command(repo_path: Path, task_text: str, json_output: bool) -> None:
@@ -769,7 +856,12 @@ def task_anchors_command(repo_path: Path, task_text: str, json_output: bool) -> 
 
 
 @task.command("scope")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
 @click.option("--task", "task_text", required=True, help="Task description")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def task_scope_command(repo_path: Path, task_text: str, json_output: bool) -> None:
@@ -819,7 +911,12 @@ def task_scope_command(repo_path: Path, task_text: str, json_output: bool) -> No
 
 
 @task.command("next")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
 @click.option("--task", "task_text", required=True, help="Task description")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def task_next_command(repo_path: Path, task_text: str, json_output: bool) -> None:
@@ -831,7 +928,12 @@ def task_next_command(repo_path: Path, task_text: str, json_output: bool) -> Non
 
 
 @task.command("expand")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
 @click.option("--node", "node_target", required=True, help="Node id or display target")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def task_expand_command(repo_path: Path, node_target: str, json_output: bool) -> None:
@@ -857,8 +959,19 @@ def task_expand_command(repo_path: Path, node_target: str, json_output: bool) ->
 
 
 @task.command("explain")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--task", "task_text", default=DEFAULT_TASK, show_default=True, help="Task description")
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.option(
+    "--task",
+    "task_text",
+    default=DEFAULT_TASK,
+    show_default=True,
+    help="Task description",
+)
 def task_explain(repo_path: Path, task_text: str) -> None:
     """Explain the repository using the deterministic Rust engine."""
     try:
@@ -871,14 +984,28 @@ def task_explain(repo_path: Path, task_text: str) -> None:
 
 
 @facts.command("public-functions")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
 @click.option("--scope", "scope", required=True, help="Directory scope prefix")
-@click.option("--include-methods", "include_methods", is_flag=True, help="Include public methods as well as top-level functions")
+@click.option(
+    "--include-methods",
+    "include_methods",
+    is_flag=True,
+    help="Include public methods as well as top-level functions",
+)
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-def facts_public_functions_command(repo_path: Path, scope: str, include_methods: bool, json_output: bool) -> None:
+def facts_public_functions_command(
+    repo_path: Path, scope: str, include_methods: bool, json_output: bool
+) -> None:
     """List derived public/exported function facts for a scope."""
     try:
-        result = derived_public_functions(repo_path, scope, include_methods=include_methods)
+        result = derived_public_functions(
+            repo_path, scope, include_methods=include_methods
+        )
     except EngineError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -891,16 +1018,32 @@ def facts_public_functions_command(repo_path: Path, scope: str, include_methods:
 
 
 @facts.command("function-usage")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--target", "target", required=True, help="Function id, name, or qualified name")
-@click.option("--boundary", "boundary", required=True, help="Boundary prefix for internal vs external callers")
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.option(
+    "--target", "target", required=True, help="Function id, name, or qualified name"
+)
+@click.option(
+    "--boundary",
+    "boundary",
+    required=True,
+    help="Boundary prefix for internal vs external callers",
+)
 @click.option("--roots", "roots", default="", help="Comma-separated search roots")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-def facts_function_usage_command(repo_path: Path, target: str, boundary: str, roots: str, json_output: bool) -> None:
+def facts_function_usage_command(
+    repo_path: Path, target: str, boundary: str, roots: str, json_output: bool
+) -> None:
     """Show derived usage facts for one function relative to a boundary."""
     roots_list = [item.strip() for item in roots.split(",") if item.strip()]
     try:
-        result = derived_function_usage(repo_path, target, boundary=boundary, roots=roots_list)
+        result = derived_function_usage(
+            repo_path, target, boundary=boundary, roots=roots_list
+        )
     except EngineError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -921,16 +1064,51 @@ def facts_function_usage_command(repo_path: Path, target: str, boundary: str, ro
 
 
 @analyze.command("dead-code")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
 @click.option("--scope", "scope", required=True, help="Directory scope prefix")
+@click.option(
+    "--boundary",
+    "boundary",
+    type=click.Choice(["outside-directory"]),
+    default="outside-directory",
+    show_default=True,
+    help="Caller boundary semantics. outside-directory means callers outside --scope count as external.",
+)
 @click.option("--roots", "roots", default="", help="Comma-separated search roots")
-@click.option("--include-methods", "include_methods", is_flag=True, help="Include public methods as well as top-level functions")
+@click.option(
+    "--include-methods",
+    "include_methods",
+    is_flag=True,
+    help="Include public methods as well as top-level functions",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["summary", "full-json", "eval-json"]),
+    default="summary",
+    show_default=True,
+    help="Output format. eval-json emits a task-ready unused_functions answer.",
+)
+@click.option(
+    "--show-observability",
+    "show_observability",
+    is_flag=True,
+    help="Include command observability in JSON formats.",
+)
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def analyze_dead_code_command(
     repo_path: Path,
     scope: str,
+    boundary: str,
     roots: str,
     include_methods: bool,
+    output_format: str,
+    show_observability: bool,
     json_output: bool,
 ) -> None:
     """Analyze likely dead code with evidence and ambiguity markers."""
@@ -945,8 +1123,36 @@ def analyze_dead_code_command(
     except EngineError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    if json_output:
-        click.echo(json.dumps(result, indent=2))
+    if json_output and output_format == "summary":
+        output_format = "full-json"
+
+    if output_format == "full-json":
+        result = {
+            **result,
+            "command_observability": _dead_code_command_observability(
+                repo_path=repo_path,
+                scope=scope,
+                roots=roots_list,
+                boundary=boundary,
+                include_methods=include_methods,
+                output_format=output_format,
+                result=result,
+            ),
+        }
+        _echo_json_with_output_size(result)
+        return
+
+    if output_format == "eval-json":
+        payload = _dead_code_eval_json(
+            result,
+            repo_path=repo_path,
+            scope=scope,
+            roots=roots_list,
+            boundary=boundary,
+            include_methods=include_methods,
+            show_observability=show_observability,
+        )
+        _echo_json_with_output_size(payload)
         return
 
     click.echo(f"Analyzer: {result['analyzer']} v{result['version']}")
@@ -965,6 +1171,114 @@ def analyze_dead_code_command(
         )
 
 
+def _dead_code_eval_json(
+    result: dict[str, Any],
+    *,
+    repo_path: Path,
+    scope: str,
+    roots: list[str],
+    boundary: str,
+    include_methods: bool,
+    show_observability: bool,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "unused_functions": [
+            _dead_code_eval_item(candidate)
+            for candidate in result.get("candidates", [])
+            if candidate.get("status") in {"Unused", "Ambiguous"}
+        ]
+    }
+    if show_observability:
+        payload["observability"] = _dead_code_command_observability(
+            repo_path=repo_path,
+            scope=scope,
+            roots=roots,
+            boundary=boundary,
+            include_methods=include_methods,
+            output_format="eval-json",
+            result=result,
+        )
+    return payload
+
+
+def _dead_code_eval_item(candidate: dict[str, Any]) -> dict[str, Any]:
+    function = candidate.get("function") or {}
+    evidence = candidate.get("evidence") or {}
+    return {
+        "function_name": function.get("name"),
+        "defined_in": function.get("defined_in"),
+        "status": candidate.get("status"),
+        "external_callers": evidence.get("external_callers", []),
+        "internal_callers": evidence.get("internal_callers", []),
+        "evidence": {
+            "searched_roots": evidence.get("searched_roots", []),
+            "external_callers": evidence.get("external_callers", []),
+            "internal_callers": evidence.get("internal_callers", []),
+            "docs_config_references": evidence.get("docs_config_references", []),
+            "ambiguity": candidate.get("ambiguity", []),
+        },
+        "confidence": candidate.get("confidence"),
+        "reason": candidate.get("rationale"),
+    }
+
+
+def _dead_code_command_observability(
+    *,
+    repo_path: Path,
+    scope: str,
+    roots: list[str],
+    boundary: str,
+    include_methods: bool,
+    output_format: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    snapshot = capture_snapshot(repo_path)
+    rust_observability = (
+        result.get("observability")
+        if isinstance(result.get("observability"), dict)
+        else {}
+    )
+    return {
+        "command": "analyze dead-code",
+        "repo_path": str(snapshot.repo_path),
+        "scope": scope,
+        "boundary": boundary,
+        "roots": roots,
+        "include_methods": include_methods,
+        "output_format": output_format,
+        "index_freshness": {
+            "status": "fresh_for_current_snapshot",
+            "repo_dirty": snapshot.dirty,
+            "commit": snapshot.commit,
+            "snapshot_key": snapshot.cache_key,
+            "file_count": snapshot.file_count,
+        },
+        "engine": engine_runtime_info(),
+        "graph_fact_count": {
+            "graph": rust_observability.get("graph_counts", {}),
+            "facts": rust_observability.get("fact_counts", {}),
+        },
+        "confidence_summary": rust_observability.get("confidence_summary", {}),
+        "degraded_reasons": rust_observability.get("degraded_reasons", []),
+        "failure_reason": None,
+        "output_size_bytes": None,
+    }
+
+
+def _echo_json_with_output_size(payload: dict[str, Any]) -> None:
+    if isinstance(payload.get("command_observability"), dict):
+        _set_output_size(payload, payload["command_observability"])
+    if isinstance(payload.get("observability"), dict):
+        _set_output_size(payload, payload["observability"])
+    click.echo(json.dumps(payload, indent=2))
+
+
+def _set_output_size(payload: dict[str, Any], observability: dict[str, Any]) -> None:
+    observability["output_size_bytes"] = len(
+        json.dumps(payload, indent=2).encode("utf-8")
+    )
+
+
 @cli.group()
 def eval() -> None:
     """Local evaluation harnesses for Aethyme Core."""
@@ -972,23 +1286,54 @@ def eval() -> None:
 
 @eval.command("run")
 @click.option(
-    "--eval-type", required=True,
-    type=click.Choice(["bug-fix", "bug-fix-1", "explain-repo", "navigation-ctf", "impact-analysis", "feature-localization", "config-audit", "dead-code", "migration"]),
+    "--eval-type",
+    required=True,
+    type=click.Choice(
+        [
+            "bug-fix",
+            "bug-fix-1",
+            "explain-repo",
+            "navigation-ctf",
+            "impact-analysis",
+            "feature-localization",
+            "config-audit",
+            "dead-code",
+            "migration",
+        ]
+    ),
     help="Type of evaluation to run",
 )
 @click.option(
-    "--target", required=True,
+    "--target",
+    required=True,
     type=click.Choice(["aethyme", "grc", "mediawiki"]),
     help="Target playground repository",
 )
 @click.option(
-    "--model", required=True,
+    "--model",
+    required=True,
     type=click.Choice(["haiku", "sonnet", "opus", "gpt-5.4"]),
     help="Agent model to use",
 )
-@click.option("--scenario", type=click.Choice(["implication-share", "cross-package"]), default=None, help="Bug-fix scenario")
-@click.option("--reasoning", type=click.Choice(["default", "high", "low"]), default="default", help="Reasoning effort level")
-@click.option("--dest", "dest_dir", type=click.Path(path_type=Path), default=None, help="Override dest dir for bug-fix clones")
+@click.option(
+    "--scenario",
+    type=click.Choice(["implication-share", "cross-package"]),
+    default=None,
+    help="Bug-fix scenario",
+)
+@click.option(
+    "--reasoning",
+    type=click.Choice(["default", "high", "low"]),
+    default="default",
+    help="Reasoning effort level",
+)
+@click.option(
+    "--dest",
+    "dest_dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Override dest dir for bug-fix clones",
+)
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON plan")
 def eval_run(
     eval_type: str,
@@ -1049,8 +1394,18 @@ def eval_targets() -> None:
 
 
 @eval.command("setup-repos")
-@click.option("--source", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path), help="Source repo to clone")
-@click.option("--dest", required=True, type=click.Path(path_type=Path), help="Destination directory for 4 condition clones")
+@click.option(
+    "--source",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Source repo to clone",
+)
+@click.option(
+    "--dest",
+    required=True,
+    type=click.Path(path_type=Path),
+    help="Destination directory for 4 condition clones",
+)
 def eval_setup_repos(source: Path, dest: Path) -> None:
     """Create 4 isolated repo clones for benchmark conditions."""
     repos = create_condition_repos(source, dest)
@@ -1059,14 +1414,35 @@ def eval_setup_repos(source: Path, dest: Path) -> None:
 
 
 @eval.command("explain-repo")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--task", "task_text", default=DEFAULT_TASK, show_default=True, help="Task description")
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.option(
+    "--task",
+    "task_text",
+    default=DEFAULT_TASK,
+    show_default=True,
+    help="Task description",
+)
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-@click.option("--control-cmd", help="Command for the control run (no context, no tools)")
-@click.option("--explore-cmd", help="Command for the explore run (tools in prompt, no context)")
-@click.option("--leverage-cmd", help="Command for the leverage run (pre-computed context + tools)")
-@click.option("--baseline-cmd", hidden=True, help="[Deprecated] Alias for --control-cmd")
-@click.option("--aethyme-cmd", hidden=True, help="[Deprecated] Alias for --leverage-cmd")
+@click.option(
+    "--control-cmd", help="Command for the control run (no context, no tools)"
+)
+@click.option(
+    "--explore-cmd", help="Command for the explore run (tools in prompt, no context)"
+)
+@click.option(
+    "--leverage-cmd", help="Command for the leverage run (pre-computed context + tools)"
+)
+@click.option(
+    "--baseline-cmd", hidden=True, help="[Deprecated] Alias for --control-cmd"
+)
+@click.option(
+    "--aethyme-cmd", hidden=True, help="[Deprecated] Alias for --leverage-cmd"
+)
 def eval_explain_repo(
     repo_path: Path,
     task_text: str,
@@ -1085,9 +1461,21 @@ def eval_explain_repo(
         leverage_cmd = aethyme_cmd
 
     try:
-        control_runner = command_runner(control_cmd, working_directory=repo_path) if control_cmd else None
-        explore_runner = command_runner(explore_cmd, working_directory=repo_path) if explore_cmd else None
-        leverage_runner = command_runner(leverage_cmd, working_directory=repo_path) if leverage_cmd else None
+        control_runner = (
+            command_runner(control_cmd, working_directory=repo_path)
+            if control_cmd
+            else None
+        )
+        explore_runner = (
+            command_runner(explore_cmd, working_directory=repo_path)
+            if explore_cmd
+            else None
+        )
+        leverage_runner = (
+            command_runner(leverage_cmd, working_directory=repo_path)
+            if leverage_cmd
+            else None
+        )
         result = run_explain_repo_evaluation(
             repo_path,
             task_text,
@@ -1122,14 +1510,35 @@ def eval_explain_repo(
 
 
 @eval.command("navigation-ctf")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--task", "task_text", default=DEFAULT_NAVIGATION_TASK, show_default=True, help="Task description")
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.option(
+    "--task",
+    "task_text",
+    default=DEFAULT_NAVIGATION_TASK,
+    show_default=True,
+    help="Task description",
+)
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-@click.option("--control-cmd", help="Command for the control run (no context, no tools)")
-@click.option("--explore-cmd", help="Command for the explore run (tools in prompt, no context)")
-@click.option("--leverage-cmd", help="Command for the leverage run (pre-computed context + tools)")
-@click.option("--baseline-cmd", hidden=True, help="[Deprecated] Alias for --control-cmd")
-@click.option("--aethyme-cmd", hidden=True, help="[Deprecated] Alias for --leverage-cmd")
+@click.option(
+    "--control-cmd", help="Command for the control run (no context, no tools)"
+)
+@click.option(
+    "--explore-cmd", help="Command for the explore run (tools in prompt, no context)"
+)
+@click.option(
+    "--leverage-cmd", help="Command for the leverage run (pre-computed context + tools)"
+)
+@click.option(
+    "--baseline-cmd", hidden=True, help="[Deprecated] Alias for --control-cmd"
+)
+@click.option(
+    "--aethyme-cmd", hidden=True, help="[Deprecated] Alias for --leverage-cmd"
+)
 def eval_navigation_ctf(
     repo_path: Path,
     task_text: str,
@@ -1200,7 +1609,12 @@ def eval_bug_fix_group() -> None:
 
 
 @eval_bug_fix_group.command("setup")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
 def eval_bug_fix_setup(repo_path: Path) -> None:
     """Plant the bug and create the test file in a Playground repo."""
     result = setup_bug_fix(repo_path)
@@ -1208,7 +1622,12 @@ def eval_bug_fix_setup(repo_path: Path) -> None:
 
 
 @eval_bug_fix_group.command("verify")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
 def eval_bug_fix_verify(repo_path: Path) -> None:
     """Verify the bug is planted: planted test should fail, existing tests should pass."""
     result = verify_bug_fix_setup(repo_path)
@@ -1216,7 +1635,12 @@ def eval_bug_fix_verify(repo_path: Path) -> None:
 
 
 @eval_bug_fix_group.command("reset")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
 def eval_bug_fix_reset(repo_path: Path) -> None:
     """Restore rbac-canonical.ts to its committed (buggy) state."""
     reset_bug_fix(repo_path)
@@ -1224,8 +1648,19 @@ def eval_bug_fix_reset(repo_path: Path) -> None:
 
 
 @eval_bug_fix_group.command("generate")
-@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--task", "task_text", default=DEFAULT_BUG_FIX_TASK, show_default=True, help="Task description")
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.option(
+    "--task",
+    "task_text",
+    default=DEFAULT_BUG_FIX_TASK,
+    show_default=True,
+    help="Task description",
+)
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def eval_bug_fix_generate(repo_path: Path, task_text: str, json_output: bool) -> None:
     """Generate all eval artifacts (prompts, schema, reference, nav context)."""
@@ -1240,20 +1675,40 @@ def eval_bug_fix_generate(repo_path: Path, task_text: str, json_output: bool) ->
 
     click.echo(f"Task: {result['task']}")
     click.echo(f"Report: {result['report_path']}")
-    click.echo(f"\nTest commands:")
+    click.echo("\nTest commands:")
     for name, cmd in result["test_commands"].items():
         click.echo(f"  {name}: {cmd}")
-    click.echo(f"\nReference:")
+    click.echo("\nReference:")
     click.echo(json.dumps(result["reference"], indent=2))
 
 
 @eval_bug_fix_group.command("prepare")
-@click.option("--source", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path), help="Source repo to clone")
-@click.option("--dest", required=True, type=click.Path(path_type=Path), help="Destination directory for 4 condition clones")
-@click.option("--task", "task_text", default=None, help="Task description (auto-set per scenario)")
-@click.option("--scenario", type=click.Choice(["implication-share", "cross-package"]), default="implication-share", show_default=True, help="Bug scenario to plant")
+@click.option(
+    "--source",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Source repo to clone",
+)
+@click.option(
+    "--dest",
+    required=True,
+    type=click.Path(path_type=Path),
+    help="Destination directory for 4 condition clones",
+)
+@click.option(
+    "--task", "task_text", default=None, help="Task description (auto-set per scenario)"
+)
+@click.option(
+    "--scenario",
+    type=click.Choice(["implication-share", "cross-package"]),
+    default="implication-share",
+    show_default=True,
+    help="Bug scenario to plant",
+)
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-def eval_bug_fix_prepare(source: Path, dest: Path, task_text: str | None, scenario: str, json_output: bool) -> None:
+def eval_bug_fix_prepare(
+    source: Path, dest: Path, task_text: str | None, scenario: str, json_output: bool
+) -> None:
     """One-step: clone 4 repos, plant bug, generate all artifacts."""
     try:
         if scenario == "cross-package":
@@ -1273,10 +1728,10 @@ def eval_bug_fix_prepare(source: Path, dest: Path, task_text: str | None, scenar
     click.echo("Repos created:")
     for cond, path in result["repos"].items():
         click.echo(f"  {cond}: {path}")
-    click.echo(f"\nArtifacts written:")
+    click.echo("\nArtifacts written:")
     for name, path in result["artifacts"].items():
         click.echo(f"  {name}: {path}")
-    click.echo(f"\nTest commands:")
+    click.echo("\nTest commands:")
     for name, cmd in result["test_commands"].items():
         click.echo(f"  {name}: {cmd}")
 
@@ -1391,9 +1846,7 @@ def search(ctx: click.Context, query: str, limit: int, type: str) -> None:
     for i, result in enumerate(results, 1):
         score = result.get("score", 0)
         click.echo(
-            f"{i:2}. {result['symbol']} "
-            f"({result['kind']}) "
-            f"[score: {score:.3f}]"
+            f"{i:2}. {result['symbol']} " f"({result['kind']}) " f"[score: {score:.3f}]"
         )
         click.echo(f"    {result['file_path']}:{result['line_number']}")
         if result.get("documentation"):
@@ -1466,8 +1919,7 @@ def ai_ready(
     if org and not tenant_id:
         # Look up tenant by org name
         tenant_lookup = db_pool.execute(
-            "SELECT id FROM aethyme.tenants WHERE slug = %s LIMIT 1",
-            (org,)
+            "SELECT id FROM aethyme.tenants WHERE slug = %s LIMIT 1", (org,)
         )
         if tenant_lookup:
             tenant_id = str(tenant_lookup[0]["id"])
@@ -1480,15 +1932,11 @@ def ai_ready(
     # Run scan
     try:
         engine = ScorecardEngine(
-            repo_path=repo_path,
-            repository_id=repo_id,
-            tenant_id=tenant_id
+            repo_path=repo_path, repository_id=repo_id, tenant_id=tenant_id
         )
 
         with click.progressbar(
-            length=100,
-            label="Scanning repository",
-            show_eta=True
+            length=100, label="Scanning repository", show_eta=True
         ) as bar:
             result = engine.scan(detectors=detector_list)
             bar.update(100)
@@ -1503,10 +1951,12 @@ def ai_ready(
 
     click.echo()
     click.echo(f"Scan completed: Score {result.score}/100")
-    click.echo(f"Findings: {result.report.total_findings} total "
-               f"({result.report.blocker_count} blockers, "
-               f"{result.report.warning_count} warnings, "
-               f"{result.report.info_count} info)")
+    click.echo(
+        f"Findings: {result.report.total_findings} total "
+        f"({result.report.blocker_count} blockers, "
+        f"{result.report.warning_count} warnings, "
+        f"{result.report.info_count} info)"
+    )
     click.echo()
 
     # Generate output
@@ -1518,7 +1968,11 @@ def ai_ready(
             click.echo(f"JSON report written to: {output_path}")
         elif format == "both":
             output_base = Path(output) if output else Path("scorecard-report")
-            json_path = output_base if output_base.suffix == ".json" else output_base.with_suffix(".json")
+            json_path = (
+                output_base
+                if output_base.suffix == ".json"
+                else output_base.with_suffix(".json")
+            )
             json_path.write_text(json_output)
             click.echo(f"JSON report written to: {json_path}")
         else:
@@ -1532,7 +1986,11 @@ def ai_ready(
             click.echo(f"Markdown report written to: {output_path}")
         elif format == "both":
             output_base = Path(output) if output else Path("scorecard-report")
-            md_path = output_base if output_base.suffix == ".md" else output_base.with_suffix(".md")
+            md_path = (
+                output_base
+                if output_base.suffix == ".md"
+                else output_base.with_suffix(".md")
+            )
             md_path.write_text(md_output)
             click.echo(f"Markdown report written to: {md_path}")
         else:
@@ -1592,7 +2050,9 @@ def autofix(
     click.echo("=" * 60)
     click.echo(f"Repository: {repository_path}")
     click.echo(f"Fix type: {fix_type}")
-    click.echo(f"Mode: {'DRY RUN' if dry_run else 'APPLY' if do_apply else 'PR' if pr else 'DRY RUN'}")
+    click.echo(
+        f"Mode: {'DRY RUN' if dry_run else 'APPLY' if do_apply else 'PR' if pr else 'DRY RUN'}"
+    )
     click.echo("")
 
     # Initialize components

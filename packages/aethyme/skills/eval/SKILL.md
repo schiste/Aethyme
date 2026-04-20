@@ -163,13 +163,20 @@ Add to `_EVAL_TYPE_DEFAULTS` dict and the `elif` chain in `_build_prepare_phase(
 ### 5. CLI — `src/cli.py`
 Add the type to the `click.Choice` list in the `--eval-type` option (~line 771).
 
-**Ground truth**: Generate by running commands against the actual repo. Example for dead-code:
+**Ground truth**: Generate by running commands against the actual repo. Prefer
+current Aethyme facts/analyzer commands for candidate collection, then manually
+review the resulting JSON against source when setting the benchmark reference.
+Example for dead-code:
 ```bash
-# Find all public function definitions in the scope
-grep -rn "public function" includes/Watchlist/*.php
-# For each function, check for callers outside the scope
-grep -rl "<func_name>" --include="*.php" . | grep -v includes/Watchlist/
+cd packages/aethyme
+.venv/bin/python -m src.cli facts public-functions --repo /path/to/repo --scope includes/Watchlist --include-methods --json-output
+.venv/bin/python -m src.cli analyze dead-code --repo /path/to/repo --scope includes/Watchlist --boundary outside-directory --include-methods --format eval-json --show-observability
+.venv/bin/python -m src.cli facts function-usage --repo /path/to/repo --target "<function>" --boundary includes/Watchlist --json-output
 ```
+
+For non-Python repositories or analyzer ambiguity, use language-specific grep or
+AST tools as a second pass. Do not expose eval baselines or prior reports to
+agent conditions.
 
 ## Known Pitfalls
 
@@ -184,6 +191,15 @@ The agent's final text response is hard to capture programmatically. The session
 
 ### Score inflation from prompt
 The task-conditioned prompt can contain navigation context with function/file names. If reference keywords appear in the prompt, the scorer matches them against prompt text, not analysis. The `_score_output()` function strips prompt words before matching — always pass the prompt.
+
+### Stale deployed skills
+The Aethyme condition is only meaningful if `.codex/skills/aethyme/SKILL.md`
+advertises current commands. `verify-playground.sh` must pass the skill freshness
+checks before a run. Treat old `$ENGINE unused --repo ...` guidance as stale;
+the current dead-code path starts with `python -m src.cli analyze dead-code
+--boundary outside-directory --format eval-json --show-observability`, with
+`facts public-functions` / `facts function-usage` reserved for follow-up
+verification.
 
 ### CTO overhead on large repos
 On 12K+ file repos like MediaWiki, CTO can increase cost by injecting the full file tree into every turn. Navigation context from Aethyme tools is more cost-effective than the CTO file tree for large repos.

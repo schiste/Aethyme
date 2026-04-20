@@ -25,6 +25,25 @@ Source of truth:
 - [mediawiki_dead_code_watchlist.json](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/src/eval/baselines/mediawiki_dead_code_watchlist.json:1)
 - [aethyme_dead_code_indexing.json](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/src/eval/baselines/aethyme_dead_code_indexing.json:1)
 
+Current analyzer path for collecting candidates:
+```bash
+cd packages/aethyme
+.venv/bin/python -m src.cli facts public-functions --repo /path/to/repo --scope <scope> --json-output
+.venv/bin/python -m src.cli analyze dead-code --repo /path/to/repo --scope <scope> --boundary outside-directory --format eval-json --show-observability
+.venv/bin/python -m src.cli facts function-usage --repo /path/to/repo --target <function> --boundary <scope> --json-output
+```
+
+Use `--include-methods` when the target language expresses the public API as
+methods. Use `--roots <dir1>,<dir2>` when the relevant search roots are known.
+Manual language-specific checks are still required before editing benchmark
+baselines.
+
+The direct analyzer answer is `unused_functions[]`. Each item contains
+`function_name`, `defined_in`, `status`, `external_callers`, `internal_callers`,
+`evidence`, `confidence`, and `reason`. With `--show-observability`, the payload
+also records command name, repository path, index freshness, graph/fact counts,
+confidence summary, output size, and degraded reasons.
+
 Current practical interpretation:
 - score benchmark answers against `literal_external_only`
 - use `engineering_review` when assessing whether an answer shows sound software judgment

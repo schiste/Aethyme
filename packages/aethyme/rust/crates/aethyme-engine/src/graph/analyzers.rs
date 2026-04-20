@@ -1,7 +1,8 @@
 use crate::graph::facts::{function_usage_fact, public_function_facts};
 use crate::map::RepositoryMap;
 use crate::model::analysis::{
-    AnswerStatus, DeadCodeAnswer, DeadCodeCandidate, DeadCodeQuery, DeadCodeSummary, EvidencePacket,
+    AnswerStatus, DeadCodeAnswer, DeadCodeCandidate, DeadCodeConfidenceSummary, DeadCodeFactCounts,
+    DeadCodeGraphCounts, DeadCodeObservability, DeadCodeQuery, DeadCodeSummary, EvidencePacket,
 };
 
 pub fn analyze_dead_code(
@@ -12,11 +13,18 @@ pub fn analyze_dead_code(
 ) -> DeadCodeAnswer {
     let roots = normalize_roots(searched_roots);
     let facts = public_function_facts(map, scope, include_methods);
+    let public_function_count = facts.len();
     let mut candidates = Vec::new();
     let mut excluded = Vec::new();
+    let mut internal_caller_count = 0;
+    let mut external_caller_count = 0;
+    let mut docs_config_reference_count = 0;
 
     for fact in facts {
         let usage = function_usage_fact(map, &fact, scope, &roots);
+        internal_caller_count += usage.internal_callers.len();
+        external_caller_count += usage.external_callers.len();
+        docs_config_reference_count += usage.docs_config_references.len();
         let ambiguity = ambiguity_for(&usage);
         let status = if !usage.external_callers.is_empty() {
             AnswerStatus::Used
@@ -35,6 +43,7 @@ pub fn analyze_dead_code(
                 searched_roots: usage.searched_roots.clone(),
                 internal_callers: usage.internal_callers.clone(),
                 external_callers: usage.external_callers.clone(),
+                docs_config_references: usage.docs_config_references.clone(),
             },
             ambiguity,
             rationale,
@@ -72,10 +81,27 @@ pub fn analyze_dead_code(
             .count(),
         used: excluded.len(),
     };
+    let observability = DeadCodeObservability {
+        graph_counts: DeadCodeGraphCounts {
+            functions: map.functions.len(),
+            docs: map.docs.len(),
+            configs: map.configs.len(),
+            edges: map.edges.len(),
+        },
+        fact_counts: DeadCodeFactCounts {
+            public_functions: public_function_count,
+            usage_facts: summary.total_candidates,
+            internal_callers: internal_caller_count,
+            external_callers: external_caller_count,
+            docs_config_references: docs_config_reference_count,
+        },
+        confidence_summary: confidence_summary(candidates.iter().chain(excluded.iter())),
+        degraded_reasons: degraded_reasons(public_function_count, &summary),
+    };
 
     DeadCodeAnswer {
         analyzer: "dead-code".to_string(),
-        version: "1".to_string(),
+        version: "2".to_string(),
         query: DeadCodeQuery {
             scope: scope.trim_end_matches('/').to_string(),
             searched_roots: roots,
@@ -84,6 +110,7 @@ pub fn analyze_dead_code(
         candidates,
         excluded,
         summary,
+        observability,
     }
 }
 
@@ -101,6 +128,9 @@ fn ambiguity_for(usage: &crate::model::analysis::FunctionUsageFact) -> Vec<Strin
     if usage.external_callers.is_empty() && !usage.internal_callers.is_empty() {
         ambiguity.push("exported_but_internal_only".to_string());
     }
+    if usage.external_callers.is_empty() && !usage.docs_config_references.is_empty() {
+        ambiguity.push("docs_config_only_references".to_string());
+    }
     if usage.function.name == "main" {
         ambiguity.push("entrypoint_like_name".to_string());
     }
@@ -111,7 +141,9 @@ fn confidence_for(status: &AnswerStatus, usage: &crate::model::analysis::Functio
     match status {
         AnswerStatus::Unused => 0.95,
         AnswerStatus::Ambiguous => {
-            if usage.external_callers.is_empty() {
+            if usage.external_callers.is_empty() && !usage.docs_config_references.is_empty() {
+                0.75
+            } else if usage.external_callers.is_empty() {
                 0.65
             } else {
                 0.4
@@ -119,6 +151,49 @@ fn confidence_for(status: &AnswerStatus, usage: &crate::model::analysis::Functio
         }
         AnswerStatus::Used => 0.98,
     }
+}
+
+fn confidence_summary<'a, I>(items: I) -> DeadCodeConfidenceSummary
+where
+    I: Iterator<Item = &'a DeadCodeCandidate>,
+{
+    let mut high = 0;
+    let mut medium = 0;
+    let mut low = 0;
+    let mut min = None::<f32>;
+    let mut max = None::<f32>;
+
+    for item in items {
+        let confidence = item.confidence;
+        if confidence >= 0.8 {
+            high += 1;
+        } else if confidence >= 0.5 {
+            medium += 1;
+        } else {
+            low += 1;
+        }
+        min = Some(min.map_or(confidence, |value| value.min(confidence)));
+        max = Some(max.map_or(confidence, |value| value.max(confidence)));
+    }
+
+    DeadCodeConfidenceSummary {
+        high,
+        medium,
+        low,
+        min,
+        max,
+    }
+}
+
+fn degraded_reasons(public_function_count: usize, summary: &DeadCodeSummary) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if public_function_count == 0 {
+        reasons.push("no_public_functions_found_in_scope".to_string());
+    }
+    if summary.ambiguous > 0 {
+        reasons.push("ambiguous_no_external_caller_candidates_present".to_string());
+    }
+    reasons
 }
 
 fn rationale_for(

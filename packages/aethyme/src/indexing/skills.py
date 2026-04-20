@@ -1,8 +1,9 @@
 """Deploy Aethyme skill templates to a target repository.
 
-Skills are generic Markdown templates stored at ``<aethyme-package>/skills/``.
-Deployment copies them into ``<target-repo>/.codex/skills/`` with the
-``{{AETHYME_ROOT}}`` placeholder replaced by the actual Aethyme package path.
+Runtime skills are generic Markdown templates stored at
+``<aethyme-package>/skills/``. Deployment copies target-safe skills into
+``<target-repo>/.codex/skills/`` with the ``{{AETHYME_ROOT}}`` placeholder
+replaced by the actual Aethyme package path.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from pathlib import Path
 # Aethyme package root — two levels up from this file (src/indexing/skills.py).
 AETHYME_PACKAGE_ROOT = Path(__file__).resolve().parent.parent.parent
 SKILLS_SOURCE_DIR = AETHYME_PACKAGE_ROOT / "skills"
+DEFAULT_RUNTIME_SKILLS = ("aethyme",)
 
 PLACEHOLDER = "{{AETHYME_ROOT}}"
 
@@ -23,7 +25,11 @@ def deploy_skills(
     aethyme_root: Path | None = None,
     force: bool = False,
 ) -> list[str]:
-    """Copy skill templates into *target_repo*/.codex/skills/.
+    """Copy target-safe skill templates into *target_repo*/.codex/skills/.
+
+    Only runtime navigation skills are deployed by default. Internal skills such
+    as the eval workflow must not be exposed to benchmark agent repositories
+    because they can leak protocol and scoring context.
 
     Parameters
     ----------
@@ -50,11 +56,11 @@ def deploy_skills(
     dest_base.mkdir(parents=True, exist_ok=True)
 
     deployed: list[str] = []
-    for skill_dir in sorted(SKILLS_SOURCE_DIR.iterdir()):
+    for skill_name in DEFAULT_RUNTIME_SKILLS:
+        skill_dir = SKILLS_SOURCE_DIR / skill_name
         if not skill_dir.is_dir():
             continue
 
-        skill_name = skill_dir.name
         dest_dir = dest_base / skill_name
 
         if dest_dir.exists():
@@ -79,7 +85,8 @@ def deploy_skills(
 def remove_skills(target_repo: Path) -> list[str]:
     """Remove Aethyme-deployed skills from *target_repo*.
 
-    Only removes skill directories whose names match source templates.
+    Removes skill directories whose names match source templates, including
+    internal skills that may have been deployed by older tooling.
     """
     removed: list[str] = []
     dest_base = Path(target_repo).resolve() / ".codex" / "skills"

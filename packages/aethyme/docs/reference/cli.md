@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-03-06
+Last Updated: 2026-04-20
 
 ## Global Options
 
@@ -18,6 +18,11 @@ Last Updated: 2026-03-06
 - `aethyme repo ingest /path/to/repo`
 - `aethyme repo inspect /path/to/repo --json-output`
 - `aethyme repo clear-cache /path/to/repo`
+- `aethyme repo deploy-skills /path/to/repo --force`
+
+`repo deploy-skills` deploys only target-safe runtime navigation skills by
+default. It must not deploy internal eval workflow skills into benchmark
+playground repositories.
 
 ### Local Discoverability
 - `aethyme query symbol /path/to/repo main`
@@ -32,6 +37,25 @@ Last Updated: 2026-03-06
 - `aethyme graph callees /path/to/repo <target> --json-output`
 - `aethyme graph docs /path/to/repo <target> --json-output`
 - `aethyme graph configs /path/to/repo <target> --json-output`
+- `aethyme graph overview /path/to/repo --json-output`
+
+### Derived Facts
+- `aethyme facts public-functions --repo /path/to/repo --scope src/pkg --json-output`
+- `aethyme facts function-usage --repo /path/to/repo --target my_function --boundary src/pkg --json-output`
+- Add `--roots src,tests` to `function-usage` when the repository is large and the relevant search roots are known.
+
+### Deterministic Analyzers
+- `aethyme analyze dead-code --repo /path/to/repo --scope src/pkg --boundary outside-directory --format eval-json --show-observability`
+- `aethyme analyze dead-code --repo /path/to/repo --scope src/pkg --format full-json`
+- Add `--include-methods` when class/object methods are in scope.
+- Add `--roots src,tests` to narrow caller evidence collection on large repositories.
+- `--format eval-json` emits `unused_functions[]` items with `function_name`,
+  `defined_in`, `status`, `external_callers`, `internal_callers`, `evidence`,
+  `confidence`, and `reason`.
+- `--show-observability` adds command name, repository path, index freshness,
+  graph/fact counts, output size, confidence summary, and degraded reasons.
+- `--json-output` remains supported as a compatibility alias for
+  `--format full-json`.
 
 ### Local Task Packs
 - `aethyme task pack --repo /path/to/repo --task "Explain this repo" --json-output`
@@ -40,6 +64,7 @@ Last Updated: 2026-03-06
 - `aethyme task scope --repo /path/to/repo --task "..." --json-output`
 - `aethyme task next --repo /path/to/repo --task "..." --json-output`
 - `aethyme task expand --repo /path/to/repo --node <target> --json-output`
+- `aethyme task context --repo /path/to/repo --task "..." --json-output`
 
 ### Local Evaluation
 - `aethyme eval explain-repo --repo /path/to/repo --json-output`

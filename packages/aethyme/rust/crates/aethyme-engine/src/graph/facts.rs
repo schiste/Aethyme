@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use crate::map::RepositoryMap;
 use crate::model::analysis::{ExposureKind, FunctionFact, FunctionUsageFact};
 use crate::model::edge::EdgeKind;
+use crate::model::file::FileRole;
 
 pub fn public_function_facts(
     map: &RepositoryMap,
@@ -53,15 +54,20 @@ pub fn function_usage_fact(
     let roots = normalize_roots(searched_roots);
     let mut internal = BTreeSet::new();
     let mut external = BTreeSet::new();
+    let mut docs_config = BTreeSet::new();
 
     for edge in &map.edges {
         if edge.to != fact.id {
             continue;
         }
+        if let Some(reference) = docs_config_display_for_id(map, &edge.from) {
+            docs_config.insert(reference);
+            continue;
+        }
         if !matches!(edge.kind, EdgeKind::Calls | EdgeKind::References) {
             continue;
         }
-        let Some(caller_path) = path_for_id(map, &edge.from) else {
+        let Some(caller_path) = source_code_path_for_id(map, &edge.from) else {
             continue;
         };
         if !roots.is_empty() && !roots.iter().any(|root| caller_path.starts_with(root)) {
@@ -81,6 +87,7 @@ pub fn function_usage_fact(
         searched_roots: roots,
         internal_callers: internal.into_iter().collect(),
         external_callers: external.into_iter().collect(),
+        docs_config_references: docs_config.into_iter().collect(),
     }
 }
 
@@ -174,7 +181,7 @@ fn looks_like_method(function: &crate::model::function::FunctionNode) -> bool {
     }
 }
 
-fn path_for_id(map: &RepositoryMap, value: &str) -> Option<String> {
+fn source_code_path_for_id(map: &RepositoryMap, value: &str) -> Option<String> {
     if let Some(function) = map.functions.iter().find(|function| function.id == value) {
         return Some(function.file_path.clone());
     }
@@ -182,13 +189,26 @@ fn path_for_id(map: &RepositoryMap, value: &str) -> Option<String> {
         return Some(class.file_path.clone());
     }
     if let Some(file) = map.files.iter().find(|file| file.id == value) {
-        return Some(file.path.clone());
+        if matches!(file.role, FileRole::Source | FileRole::Test) {
+            return Some(file.path.clone());
+        }
     }
+    None
+}
+
+fn docs_config_display_for_id(map: &RepositoryMap, value: &str) -> Option<String> {
     if let Some(doc) = map.docs.iter().find(|doc| doc.id == value) {
-        return Some(doc.path.clone());
+        return Some(format!("doc:{}", doc.path));
     }
     if let Some(config) = map.configs.iter().find(|config| config.id == value) {
-        return Some(config.path.clone());
+        return Some(format!("config:{}", config.path));
+    }
+    if let Some(file) = map.files.iter().find(|file| file.id == value) {
+        return match file.role {
+            FileRole::Doc => Some(format!("doc:{}", file.path)),
+            FileRole::Config => Some(format!("config:{}", file.path)),
+            _ => None,
+        };
     }
     None
 }
@@ -238,6 +258,7 @@ mod tests {
         let root = temp_repo("facts_usage");
         fs::create_dir_all(root.join("src/indexing")).expect("create indexing");
         fs::create_dir_all(root.join("src/api")).expect("create api");
+        fs::create_dir_all(root.join("docs")).expect("create docs");
         fs::write(
             root.join("src/indexing/service.py"),
             "def exported_helper():\n    return 1\n\n\
@@ -250,6 +271,11 @@ mod tests {
              def handler():\n    return exported_helper()\n",
         )
         .expect("write external caller");
+        fs::write(
+            root.join("docs/notes.md"),
+            "# Notes\n\n`exported_helper` is documented here but is not called.\n",
+        )
+        .expect("write docs");
 
         let map = RepositoryMap::build(&root).expect("build map");
         let fact = public_function_facts(&map, "src/indexing", false)
@@ -260,6 +286,13 @@ mod tests {
 
         assert_eq!(usage.internal_callers.len(), 1);
         assert_eq!(usage.external_callers.len(), 1);
+        assert!(
+            !usage
+                .external_callers
+                .iter()
+                .any(|caller| caller.contains("notes.md"))
+        );
+        assert_eq!(usage.docs_config_references, vec!["doc:docs/notes.md"]);
 
         let _ = fs::remove_dir_all(&root);
     }

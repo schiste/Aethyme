@@ -722,22 +722,31 @@ fn analyze_file_functions_with_contents(
 
 fn python_imported_symbol_names(contents: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
+    let mut pending_from_import = String::new();
+    let mut in_multiline_from_import = false;
+
     for line in contents.lines() {
         let trimmed = line.trim();
+        if in_multiline_from_import {
+            pending_from_import.push(' ');
+            pending_from_import.push_str(trimmed);
+            if trimmed.contains(')') {
+                add_python_imported_names(&pending_from_import, &mut names);
+                pending_from_import.clear();
+                in_multiline_from_import = false;
+            }
+            continue;
+        }
+
         if let Some(rest) = trimmed.strip_prefix("from ")
             && let Some((_module, imported)) = rest.split_once(" import ")
         {
-            for part in imported.split(',') {
-                let token = part.trim();
-                let imported_name = token
-                    .split(" as ")
-                    .nth(1)
-                    .or_else(|| token.split_whitespace().next())
-                    .unwrap_or_default()
-                    .trim();
-                if !imported_name.is_empty() && imported_name != "*" {
-                    names.insert(imported_name.to_string());
-                }
+            if imported.contains('(') && !imported.contains(')') {
+                pending_from_import.clear();
+                pending_from_import.push_str(imported);
+                in_multiline_from_import = true;
+            } else {
+                add_python_imported_names(imported, &mut names);
             }
         } else if let Some(rest) = trimmed.strip_prefix("import ") {
             for part in rest.split(',') {
@@ -754,7 +763,37 @@ fn python_imported_symbol_names(contents: &str) -> BTreeSet<String> {
             }
         }
     }
+    if in_multiline_from_import {
+        add_python_imported_names(&pending_from_import, &mut names);
+    }
     names
+}
+
+fn add_python_imported_names(imported: &str, names: &mut BTreeSet<String>) {
+    let imported = imported
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    for part in imported.split(',') {
+        let token = part
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim();
+        let imported_name = token
+            .split(" as ")
+            .nth(1)
+            .or_else(|| token.split_whitespace().next())
+            .unwrap_or_default()
+            .trim();
+        if !imported_name.is_empty() && imported_name != "*" {
+            names.insert(imported_name.to_string());
+        }
+    }
 }
 
 fn rust_imported_symbol_names(contents: &str) -> BTreeSet<String> {
@@ -1016,6 +1055,36 @@ mod tests {
             matches!(edge.kind, EdgeKind::Calls)
                 && edge.from.contains("run")
                 && edge.to.contains("validate_token")
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cross_file_python_call_resolution_links_multiline_imported_function() {
+        let root = std::env::temp_dir().join("aethyme_engine_multiline_python_import_test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("create temp repo");
+        fs::write(
+            root.join("src/cli.py"),
+            "from unresolved.engine import (\n    inspect_repository_brief,\n)\n\n\
+             def run():\n    return inspect_repository_brief()\n",
+        )
+        .expect("write source");
+        fs::write(
+            root.join("src/engine.py"),
+            "def inspect_repository_brief():\n    return {}\n",
+        )
+        .expect("write source");
+
+        let snapshot = discover_repo(&root).expect("discover repo");
+        let structure = structure::build(&snapshot);
+        let code = build(&root, &structure);
+
+        assert!(code.edges.iter().any(|edge| {
+            matches!(edge.kind, EdgeKind::Calls)
+                && edge.from.contains("run")
+                && edge.to.contains("inspect_repository_brief")
         }));
 
         let _ = fs::remove_dir_all(&root);
