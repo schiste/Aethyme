@@ -154,6 +154,19 @@ def compare_conditions(
     }
 
 
+# Map primary_metric string -> the stat key in the aggregated output.
+# RunRequest.primaryMetric values keyed here determine what comparisons
+# operate on when a batch is pre-registered (P8).
+_METRIC_KEY_MAP: dict[str, str] = {
+    "quality": "quality",
+    "judge": "judge",
+    "global_score": "global_score",
+    "cost": "cost",
+    "tokens": "tokens",
+    "time": "score_per_minute",  # higher is better
+}
+
+
 def aggregate_batch(batch_id: str) -> dict[str, Any]:
     """Return {batch: meta, conditions: {cond: {field: stats}}, comparisons: {...}}."""
     if not DB_PATH.exists():
@@ -222,25 +235,48 @@ def aggregate_batch(batch_id: str) -> dict[str, Any]:
         "first_date": min(r["date"] for r in rows if r["date"]),
         "last_date": max(r["date"] for r in rows if r["date"]),
         "total_rows": len(rows),
+        # Pre-registration (P8) — the declared primary metric and the
+        # minimum delta the user committed to before seeing results.
+        "primary_metric": first["primary_metric"] or "quality",
+        "minimum_meaningful_delta": (
+            float(first["minimum_meaningful_delta"])
+            if first["minimum_meaningful_delta"] is not None
+            else 5.0
+        ),
+        "pre_registered": first["primary_metric"] is not None,
     }
 
-    # Pairwise comparisons against the control baseline. "quality" is the
-    # primary metric; if/when pre-registration is added, that metric should
-    # determine what we compare on. For now we always compare quality.
+    # Pairwise comparisons against the control baseline. P8 pre-registration:
+    # the run can declare primary_metric and minimum_meaningful_delta on the
+    # RunRequest, which flow into every row. We honor them here so comparisons
+    # test the metric that was declared up front, with the threshold the user
+    # committed to — preventing post-hoc "the one metric where X wins" swaps.
+    pre_reg_metric = (first["primary_metric"] or "quality")
+    pre_reg_margin = (
+        float(first["minimum_meaningful_delta"])
+        if first["minimum_meaningful_delta"] is not None
+        else 5.0
+    )
+    metric_key = _METRIC_KEY_MAP.get(pre_reg_metric, "quality")
+
     baseline_cond = (
         "control-cto-off" if "control-cto-off" in conditions
         else ("control" if "control" in conditions else next(iter(conditions), None))
     )
     comparisons: dict[str, dict[str, Any]] = {}
     if baseline_cond and baseline_cond in conditions:
-        baseline_stats = conditions[baseline_cond].get("quality", {})
+        baseline_stats = conditions[baseline_cond].get(metric_key, {})
         for cond, stats in conditions.items():
             if cond == baseline_cond:
                 continue
             comparisons[cond] = {
                 "vs": baseline_cond,
-                "metric": "quality",
-                **compare_conditions(stats.get("quality", {}), baseline_stats),
+                "metric": metric_key,
+                **compare_conditions(
+                    stats.get(metric_key, {}),
+                    baseline_stats,
+                    margin=pre_reg_margin,
+                ),
             }
 
     discrimination_info = _scenario_discrimination(conditions)

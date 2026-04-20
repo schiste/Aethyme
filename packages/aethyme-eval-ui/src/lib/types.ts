@@ -86,6 +86,12 @@ export interface EvalResult {
   /** True when scorerAgreementGap exceeds the divergence threshold
    * (default 10). Diagnostic only — no automated downstream action. */
   scorerAgreementDivergent?: boolean | null;
+  /** P8 pre-registration. The primary metric declared when the run was
+   * launched — comparisons in the batch scorecard test this metric. */
+  primaryMetric?: string | null;
+  /** P8 pre-registration. Minimum delta (in the primary metric's units)
+   * that counts as meaningful. Acts as the margin in pairwise verdicts. */
+  minimumMeaningfulDelta?: number | null;
 }
 
 export type ValidationStatus = "valid" | "invalid" | "unknown" | "checking";
@@ -132,13 +138,21 @@ export interface EvalRunConfig {
   windowId?: number;
   preparationId?: string;
   cleanupDelaySeconds?: number;
-  /** P1: number of sequential eval repetitions. Default 1. */
+  /** P1: number of sequential eval repetitions. Default 3 (protocol).
+   * Comparisons across conditions need N>=3 so single-run variance can
+   * be separated from real effects. runs=1 is debug mode. */
   runs?: number;
   /** P3: enable LLM-as-judge scoring alongside keyword scoring.
    * The judge runs Codex via a Chau7 tab (same path as eval agents — no direct API). */
   useJudge?: boolean;
   /** P3: how many times the judge scores each output (intra-rater reliability). */
   judgeSamples?: number;
+  /** P8 pre-registration. The metric the batch will be judged on: "quality"
+   * (default) | "judge" | "global_score" | "cost" | "tokens" | "time". */
+  primaryMetric?: string;
+  /** P8 pre-registration. Minimum delta (in the primary metric's units)
+   * that counts as meaningful when comparing vs control. */
+  minimumMeaningfulDelta?: number;
 }
 
 export interface EvalRunState {

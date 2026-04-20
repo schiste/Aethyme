@@ -98,6 +98,12 @@ MIGRATIONS = [
     # Deliverable status — tracks whether the agent produced the required
     # structured output. One of "success", "degraded", "failed".
     "ALTER TABLE eval_results ADD COLUMN deliverable_status TEXT",
+    # P8: pre-registration. Captured from the RunRequest so downstream
+    # reporting knows which metric was declared as the primary outcome and
+    # how large a delta counts as meaningful. Null on rows from pre-P8 runs
+    # (treated as defaults: "quality" / 5.0).
+    "ALTER TABLE eval_results ADD COLUMN primary_metric TEXT",
+    "ALTER TABLE eval_results ADD COLUMN minimum_meaningful_delta REAL",
 ]
 
 
@@ -267,12 +273,14 @@ def insert_result(result: dict[str, Any]) -> None:
             score_per_1k_tokens, score_per_minute, top_tools,
             judge_score, judge_stdev, judge_model, judge_reliable,
             judge_samples, judge_error, judge_cost_usd,
-            batch_id, run_index, runs_in_batch, deliverable_status)
+            batch_id, run_index, runs_in_batch, deliverable_status,
+            primary_metric, minimum_meaningful_delta)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?)""",
+                   ?, ?, ?, ?,
+                   ?, ?)""",
         (
             result["id"], result.get("runDir"), result["date"],
             result["evalType"], result["target"], result["model"],
@@ -308,6 +316,9 @@ def insert_result(result: dict[str, Any]) -> None:
             result.get("runIndex"),
             result.get("runsInBatch"),
             result.get("deliverableStatus"),
+            # Pre-registration (P8)
+            result.get("primaryMetric"),
+            result.get("minimumMeaningfulDelta"),
         ),
     )
     conn.commit()
@@ -418,6 +429,10 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         # Flag only — diagnostic for reviewers, no automated action.
         "scorerAgreementGap": gap_rounded,
         "scorerAgreementDivergent": divergent,
+        # Pre-registration (P8). null on legacy rows means "defaults applied"
+        # (quality / 5.0) — the UI can render a dim hint rather than missing data.
+        "primaryMetric": row["primary_metric"] if "primary_metric" in row.keys() else None,
+        "minimumMeaningfulDelta": row["minimum_meaningful_delta"] if "minimum_meaningful_delta" in row.keys() else None,
     }
 
 

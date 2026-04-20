@@ -230,7 +230,8 @@ def _fetch_judge_and_batch_fields(row_id: str) -> dict[str, Any]:
         row = conn.execute(
             "SELECT judge_score, judge_stdev, judge_model, judge_reliable, "
             "judge_samples, judge_error, judge_cost_usd, "
-            "batch_id, run_index, runs_in_batch, deliverable_status "
+            "batch_id, run_index, runs_in_batch, deliverable_status, "
+            "primary_metric, minimum_meaningful_delta "
             "FROM eval_results WHERE id = ?",
             (row_id,),
         ).fetchone()
@@ -252,6 +253,8 @@ def _fetch_judge_and_batch_fields(row_id: str) -> dict[str, Any]:
         "runIndex": row["run_index"],
         "runsInBatch": row["runs_in_batch"],
         "deliverableStatus": row["deliverable_status"],
+        "primaryMetric": row["primary_metric"],
+        "minimumMeaningfulDelta": row["minimum_meaningful_delta"],
     }
 
 
@@ -974,6 +977,20 @@ class RunRequest(BaseModel):
     # (task, reference, candidate) triple; we report mean + stdev.
     useJudge: bool = True
     judgeSamples: int = Field(default=3, ge=1, le=10)
+    # P8: pre-registration. Declare up front which metric is the primary
+    # outcome and how large a delta counts as meaningful. Everything else is
+    # marked "exploratory" in the report. This blocks post-hoc cherry-picking
+    # ("the one metric where leverage wins").
+    # primaryMetric: "quality" | "global_score" | "judge" | "cost" | "time"
+    #   — quality (default) is the task-specific scorer output,
+    #   — global_score is the control-anchored composite,
+    #   — judge is the LLM-judge mean,
+    #   — cost/time compare efficiency only.
+    primaryMetric: str = "quality"
+    # minimumMeaningfulDelta: in the primary metric's units. For quality
+    # (0-100) a 5-point delta is a reasonable floor. Serves as the margin
+    # in pairwise comparison verdicts (see batch_stats.compare_conditions).
+    minimumMeaningfulDelta: float = Field(default=5.0, ge=0.0)
 
 _run_state: dict[str, Any] = {
     "status": "idle",
@@ -2662,6 +2679,11 @@ def _run_eval_background(
                 "runsInBatch": runs_in_batch,
                 # Whether the agent produced the required structured output.
                 "deliverableStatus": deliverable_statuses.get(cond_name),
+                # Pre-registration (P8) — the run request declared these up
+                # front; carrying them on every row keeps them queryable
+                # even if the plan snapshot is lost.
+                "primaryMetric": req.primaryMetric,
+                "minimumMeaningfulDelta": req.minimumMeaningfulDelta,
             })
             log(f"[{cond_name}] Stored: {result_id} (output: {len(data.get('output',''))} chars)")
         except Exception as e:
