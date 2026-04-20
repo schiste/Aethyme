@@ -105,15 +105,25 @@ Do not use assessment results as a reason to grow the task-conditioned prompt fi
 
 Every finalized eval must expose these per-condition metrics:
 
-- `quality_score` — the benchmark score from the task-specific scorer
+- `quality_score` — the benchmark score from the task-specific (keyword) scorer
+- `judge_score`, `judge_stdev`, `judge_reliable` — LLM-judge mean + intra-rater consistency
+- `scorer_agreement_gap`, `scorer_agreement_divergent` — `|judge - quality|`; divergent when gap > 10
 - `tool_call_count` and `top_tools` — what the agent actually used
 - `total_tokens`
 - `duration_seconds`
 - `cost_usd`
 - `score_per_1k_tokens`
 - `score_per_minute`
-- `global_score`
-- `recalculated_eval_score`
+- `global_score` / `recalculated_eval_score`
+- `deliverable_status` — "success" | "degraded" | "failed"
+- `primary_metric`, `minimum_meaningful_delta` — pre-registration declaration
+- `judge_elapsed_seconds` — wall-clock overhead added by the judge
+- `batch_id`, `run_index`, `runs_in_batch` — multi-run metadata
+
+Batch-level aggregates (`GET /api/batches/{batch_id}`) add:
+- `scenario_discrimination` — `between / within`, labelled strong/usable/low-discrimination
+- `comparisons_vs_baseline` — verdict per condition (`A>B` | `B>A` | `inconclusive`)
+- `judge_overhead` — total/mean seconds the judge added
 
 `global_score` and `recalculated_eval_score` are the same stored number. It is the control-relative comparison metric used for cross-condition evaluation:
 
@@ -125,19 +135,34 @@ Every finalized eval must expose these per-condition metrics:
 + 5 * ln(cost_ratio_vs_control)
 ```
 
-The baseline is `control-cto-off` when present, otherwise `control`.
+The baseline is a **rolling median** of the last K successful control-cto-off runs matching `(model, eval_type, target, scenario)` — K=10, minimum samples=3, else falls back to co-run. The `comparison` block records `baseline_source` and `baseline_window_size` so the source is always explicit.
 
 Control-relative terms:
-- `quality_delta_vs_control = quality_score - control_quality_score`
-- `token_ratio_vs_control = control_total_tokens / total_tokens`
-- `time_ratio_vs_control = control_duration_seconds / duration_seconds`
-- `cost_ratio_vs_control = control_cost_usd / cost_usd`
+- `quality_delta_vs_control = quality_score - baseline_quality_score`
+- `token_ratio_vs_control = baseline_total_tokens / total_tokens`
+- `time_ratio_vs_control = baseline_duration_seconds / duration_seconds`
+- `cost_ratio_vs_control = baseline_cost_usd / cost_usd`
 
 Interpretation:
-- `quality_score` answers “who solved the task best?”
-- `global_score` answers “who beat the control baseline most convincingly once quality, time, tokens, and cost are all considered?”
+- `quality_score` answers "who solved the task best?"
+- `global_score` answers "who beat the control baseline most convincingly once quality, time, tokens, and cost are all considered?"
 
 Do not replace quality with global score. Report both.
+
+## Multi-Run Protocol
+
+**N ≥ 3 is the default for any reported comparison.** `RunRequest.runs` defaults to 3; `runs=1` is debug mode. Each repetition gets its own run_dir and stores rows with a shared `batch_id` so the scorecard can aggregate to median + IQR.
+
+Key protocol rules:
+
+1. **No single-run comparisons.** Single-run quality differences routinely fall inside single-run variance. N=1 results cannot be published as evidence that one condition beats another.
+2. **Pre-register the outcome.** Set `primaryMetric` and `minimumMeaningfulDelta` at launch. Other metrics can be inspected but are marked exploratory.
+3. **Check the discrimination label.** `scenario_discrimination.label == "low-discrimination"` means the scenario didn't separate conditions — flag results as weak evidence regardless of who "wins".
+4. **Check judge reliability.** `judge_reliable == false` on any row invalidates its judge score. Use `quality_score` alone for that condition.
+5. **Check scorer agreement.** `scorer_agreement_divergent == true` (gap > 10) flags rows where keyword and judge disagree — worth manual review before drawing conclusions.
+6. **Calibrate the judge periodically.** `POST /api/judge/calibration-check` scores hand-anchored items and reports drift. If `passes == false`, recent judge scores are suspect until investigated.
+
+See [`docs/guides/eval-protocol.md`](../../docs/guides/eval-protocol.md) "Multi-Run Protocol" for the full specification, thresholds, and rationale.
 
 ## Adding a New Assessment Scenario
 

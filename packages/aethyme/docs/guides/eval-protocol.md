@@ -1,6 +1,6 @@
 # Eval Protocol — Aethyme Navigation Benchmarks
 
-Last Updated: 2026-04-17
+Last Updated: 2026-04-20
 
 See also: [`eval-tooling-roadmap.md`](eval-tooling-roadmap.md) for the repository-agnostic tooling priorities that should improve `explore` and `leverage` before any further `task-conditioned` optimization.
 
@@ -1095,3 +1095,115 @@ Used for structured output comparison. Requires the agent's output as a parsed d
 - **Formal scoring** is now live for `bug-fix-1`, which writes a strict JSON deliverable and is parsed before scoring.
 - Other free-form MediaWiki evals still rely on server-side heuristics until they are migrated to structured output.
 - **Cross-condition comparison** is only reliable for efficiency metrics (tokens, cost, tools, duration). Quality scores should be interpreted with caution until output capture is solved.
+
+---
+
+## Multi-Run Protocol (2026-04-20)
+
+Single-run eval results are debug artifacts, not evidence. This section codifies the requirements for any reported comparison.
+
+### N ≥ 3 Required for Comparisons
+
+`RunRequest.runs` defaults to 3. runs=1 is allowed and useful for iterating on the pipeline, but **no cross-condition comparison may be published from a single run.** Single-run variance on quality scores routinely exceeds the differences we care about (5-10 points on a 0-100 scale). Without N>=3 runs, we can't separate noise from signal.
+
+Each repetition creates its own `run_dir` and stores rows with a shared `batch_id`. Aggregation happens on read:
+
+```
+GET /api/batches                   # list recent batches
+GET /api/batches/{batch_id}        # aggregated scorecard
+```
+
+The batch endpoint returns per-condition `{median, q1, q3, iqr, min, max, n}` for quality, judge score, global_score, tokens, cost, turns, tool calls, score/1kTok, and score/min; plus deliverable success rate and judge reliability rate. IQR is omitted when N<4 (quartiles undefined); min/max fall back as a noise proxy.
+
+### Rolling Control Baseline
+
+`global_score` used to be computed against the co-run control-cto-off values. A lucky/unlucky control run shifted every derived metric by several points. The new protocol uses a **rolling median baseline** from the last K successful control-cto-off runs matching `(model, eval_type, target, scenario)`:
+
+- Window K = 10 (configurable via `DEFAULT_WINDOW` in `server/baseline.py`)
+- Minimum samples = 3 before a rolling baseline is used (falls back to co-run otherwise)
+- Only rows with `deliverable_status IN ('success', NULL)` count
+
+The `comparison` block in `complete-result.json` records `baseline_source` (`"rolling"` or `"co-run"`) and `baseline_window_size` so the source is always explicit.
+
+### Variance-Aware Pairwise Verdicts
+
+`aggregate_batch()` returns `comparisons_vs_baseline` with a simple verdict per condition:
+
+```
+delta     = median(condition) - median(baseline)
+noise     = (iqr(condition) + iqr(baseline)) / 2
+threshold = noise + margin   # margin = minimum_meaningful_delta
+verdict:
+  A>B             when delta >  threshold
+  B>A             when delta < -threshold
+  inconclusive    otherwise
+```
+
+`effect_size = delta / noise` is reported alongside the verdict for dimensionless comparison. This is a heuristic, not a formal t-test — the goal is to prevent "50.1 vs 50.0 is better" claims, not to replace proper statistical testing.
+
+### Scenario Discrimination
+
+Each batch reports `scenario_discrimination`:
+
+```
+between = stdev of condition median qualities
+within  = mean of per-condition IQRs
+ratio   = between / within
+label   = "strong" (>=2) | "usable" (>=1) | "low-discrimination" (<1)
+```
+
+Low-discrimination scenarios have conditions that converge into the noise floor — their results are weak evidence regardless of which condition "wins" on point estimates. Flag these scenarios for redesign (increase sensitivity) rather than drawing conclusions from them.
+
+### Pre-Registration
+
+`RunRequest` carries two declaration fields captured at launch time:
+
+- `primaryMetric`: `"quality"` (default) | `"judge"` | `"global_score"` | `"cost"` | `"tokens"` | `"time"`
+- `minimumMeaningfulDelta`: float (default 5.0), in the primary metric's units
+
+Both are stored on every row (`primary_metric`, `minimum_meaningful_delta` columns) and read back by `aggregate_batch()` so the pairwise comparisons test the pre-registered metric with the pre-registered margin. Other metrics are still reported but marked as exploratory. **Pre-registration prevents post-hoc cherry-picking** — you can't run the eval, notice your preferred condition wins on cost, and switch the primary metric to cost after the fact.
+
+### LLM-as-Judge
+
+The judge is a second, semantic scorer run alongside the keyword scorer. It uses Codex via a Chau7 tab (never a direct API SDK) with `--output-schema` enforcing structured JSON output. For each condition:
+
+- `judgeSamples` (default 3) independent scorings of the same `(task, reference, candidate)` triple
+- `judge_score` = mean of samples
+- `judge_stdev` = intra-rater consistency signal
+- `judge_reliable` = `stdev < 10` (configurable threshold)
+- `judge_elapsed_seconds` = wall-clock overhead this row added
+- `judge_samples` = serialized list of per-sample scores + rationale + key_matches/key_misses
+
+A failed or unavailable judge does not block the eval: the run completes with `judge_error` populated.
+
+The `scorerAgreementGap` derived field (`|judge - keyword|`) flags rows where the two scorers disagree by more than 10 points — review these to see which scorer is more accurate for that scenario.
+
+### Judge Calibration Drift Check
+
+Intra-rater consistency (judge stdev) measures stability, not accuracy. The judge can be stably wrong. `server/calibration/<eval-type>/*.json` holds hand-scored anchor items. Running:
+
+```
+POST /api/judge/calibration-check {"evalType": "bug-fix-1"}
+```
+
+re-scores all anchors with the current judge and reports per-item drift (`|judge_mean - human_score|`). Pass criteria: max drift <= 15 AND mean drift <= 10. A failing calibration check means recent batches' judge scores are suspect until the judge/prompt/model is investigated.
+
+Calibration files are not shipped with the repo; they must be seeded per eval type before the check is meaningful. See `packages/aethyme-eval-ui/server/calibration/README.md` for the item schema and scoring rubric.
+
+### End-of-Run Metrics — Current Canonical List
+
+Every finalized eval row exposes:
+
+- `quality_score` (keyword-based, task-specific)
+- `judge_score`, `judge_stdev`, `judge_reliable` (LLM-judge)
+- `scorerAgreementGap`, `scorerAgreementDivergent` (derived diagnostic)
+- `recalculated_eval_score` / `global_score` (control-anchored composite)
+- `quality_delta_vs_control`, `token_ratio_vs_control`, `time_ratio_vs_control`, `cost_ratio_vs_control`
+- `total_tokens`, `cost`, `duration`, `turns`, `tool_calls`, `top_tools`
+- `score_per_1k_tokens`, `score_per_minute`
+- `deliverable_status`
+- `primary_metric`, `minimum_meaningful_delta` (pre-registration)
+- `judge_elapsed_seconds` (overhead)
+- `batch_id`, `run_index`, `runs_in_batch` (multi-run)
+
+Batch-level aggregates add `scenario_discrimination`, `comparisons_vs_baseline`, and `judge_overhead`.
