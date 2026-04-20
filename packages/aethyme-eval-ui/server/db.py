@@ -347,7 +347,24 @@ def query_results(
     return [_row_to_dict(row) for row in rows]
 
 
+# Scorer-agreement flag threshold. When |judge_score - quality_score| exceeds
+# this, the row is flagged for review — the two scorers are telling different
+# stories about the same output. Not an automated action, just a signal.
+SCORER_AGREEMENT_DIVERGENCE_THRESHOLD = 10.0
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    # Derived protocol metrics: scorer agreement. |judge - keyword|.
+    q = row["quality_score"] if "quality_score" in row.keys() else None
+    j = row["judge_score"]   if "judge_score"   in row.keys() else None
+    if isinstance(q, (int, float)) and isinstance(j, (int, float)):
+        gap = abs(float(j) - float(q))
+        gap_rounded = round(gap, 2)
+        divergent = gap > SCORER_AGREEMENT_DIVERGENCE_THRESHOLD
+    else:
+        gap_rounded = None
+        divergent = None
+
     return {
         "id": row["id"],
         "date": row["date"],
@@ -396,6 +413,11 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "runsInBatch": row["runs_in_batch"] if "runs_in_batch" in row.keys() else None,
         # Deliverable status (success | degraded | failed)
         "deliverableStatus": row["deliverable_status"] if "deliverable_status" in row.keys() else None,
+        # Scorer agreement (derived — P7). `gap` is |judge - keyword|;
+        # `divergent` is true when gap > SCORER_AGREEMENT_DIVERGENCE_THRESHOLD.
+        # Flag only — diagnostic for reviewers, no automated action.
+        "scorerAgreementGap": gap_rounded,
+        "scorerAgreementDivergent": divergent,
     }
 
 

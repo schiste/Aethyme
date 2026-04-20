@@ -79,6 +79,13 @@ export interface EvalResult {
   runsInBatch?: number | null;
   // Whether the agent produced the required structured deliverable.
   deliverableStatus?: DeliverableStatus | null;
+  /** P7: |judge - keyword| quality-score gap. Derived server-side.
+   * Useful as a data-quality signal — large gaps mean one scorer
+   * disagrees with the other and the row is worth manual review. */
+  scorerAgreementGap?: number | null;
+  /** True when scorerAgreementGap exceeds the divergence threshold
+   * (default 10). Diagnostic only — no automated downstream action. */
+  scorerAgreementDivergent?: boolean | null;
 }
 
 export type ValidationStatus = "valid" | "invalid" | "unknown" | "checking";
