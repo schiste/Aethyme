@@ -210,7 +210,7 @@ def _fetch_judge_and_batch_fields(row_id: str) -> dict[str, Any]:
         row = conn.execute(
             "SELECT judge_score, judge_stdev, judge_model, judge_reliable, "
             "judge_samples, judge_error, judge_cost_usd, "
-            "batch_id, run_index, runs_in_batch "
+            "batch_id, run_index, runs_in_batch, deliverable_status "
             "FROM eval_results WHERE id = ?",
             (row_id,),
         ).fetchone()
@@ -231,6 +231,7 @@ def _fetch_judge_and_batch_fields(row_id: str) -> dict[str, Any]:
         "batchId": row["batch_id"],
         "runIndex": row["run_index"],
         "runsInBatch": row["runs_in_batch"],
+        "deliverableStatus": row["deliverable_status"],
     }
 
 
@@ -2636,6 +2637,8 @@ def _run_eval_background(
                 "batchId": batch_id,
                 "runIndex": run_index,
                 "runsInBatch": runs_in_batch,
+                # Whether the agent produced the required structured output.
+                "deliverableStatus": deliverable_statuses.get(cond_name),
             })
             log(f"[{cond_name}] Stored: {result_id} (output: {len(data.get('output',''))} chars)")
         except Exception as e:

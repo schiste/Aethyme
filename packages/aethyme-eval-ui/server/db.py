@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS eval_results (
     cost_ratio_vs_control REAL,
     score_per_1k_tokens REAL,
     score_per_minute REAL,
-    top_tools TEXT
+    top_tools TEXT,
+    deliverable_status TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_eval_type ON eval_results(eval_type);
@@ -94,6 +95,9 @@ MIGRATIONS = [
     "ALTER TABLE eval_results ADD COLUMN batch_id TEXT",
     "ALTER TABLE eval_results ADD COLUMN run_index INTEGER",
     "ALTER TABLE eval_results ADD COLUMN runs_in_batch INTEGER",
+    # Deliverable status — tracks whether the agent produced the required
+    # structured output. One of "success", "degraded", "failed".
+    "ALTER TABLE eval_results ADD COLUMN deliverable_status TEXT",
 ]
 
 
@@ -203,11 +207,13 @@ def import_eval_runs(eval_runs_dir: Path) -> int:
                     token_ratio_vs_control, time_ratio_vs_control, cost_ratio_vs_control,
                     score_per_1k_tokens, score_per_minute, top_tools,
                     judge_score, judge_stdev, judge_model, judge_reliable,
-                    judge_samples, judge_error, judge_cost_usd)
+                    judge_samples, judge_error, judge_cost_usd,
+                    deliverable_status)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                            ?, ?, ?, ?, ?, ?,
                            ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           ?, ?, ?, ?, ?, ?, ?)""",
+                           ?, ?, ?, ?, ?, ?, ?,
+                           ?)""",
                 (
                     result_id, entry.name, date_str,
                     eval_type.split("-reasoning")[0] if "-reasoning" in eval_type else eval_type,
@@ -237,6 +243,7 @@ def import_eval_runs(eval_runs_dir: Path) -> int:
                     judge.get("judgeSamples"),
                     judge.get("judgeError"),
                     judge.get("judgeCostUsd"),
+                    summary.get("deliverable_status"),
                 ),
             )
             imported += 1
@@ -260,12 +267,12 @@ def insert_result(result: dict[str, Any]) -> None:
             score_per_1k_tokens, score_per_minute, top_tools,
             judge_score, judge_stdev, judge_model, judge_reliable,
             judge_samples, judge_error, judge_cost_usd,
-            batch_id, run_index, runs_in_batch)
+            batch_id, run_index, runs_in_batch, deliverable_status)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?)""",
+                   ?, ?, ?, ?)""",
         (
             result["id"], result.get("runDir"), result["date"],
             result["evalType"], result["target"], result["model"],
@@ -300,6 +307,7 @@ def insert_result(result: dict[str, Any]) -> None:
             result.get("batchId"),
             result.get("runIndex"),
             result.get("runsInBatch"),
+            result.get("deliverableStatus"),
         ),
     )
     conn.commit()
@@ -386,6 +394,8 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "batchId": row["batch_id"] if "batch_id" in row.keys() else None,
         "runIndex": row["run_index"] if "run_index" in row.keys() else None,
         "runsInBatch": row["runs_in_batch"] if "runs_in_batch" in row.keys() else None,
+        # Deliverable status (success | degraded | failed)
+        "deliverableStatus": row["deliverable_status"] if "deliverable_status" in row.keys() else None,
     }
 
 

@@ -24,6 +24,13 @@ export type Condition =
 
 export type Reasoning = "high" | "low";
 
+/** Tracks whether the agent produced the required structured deliverable.
+ * "success" — deliverable present and well-formed.
+ * "degraded" — deliverable present but incomplete or malformed.
+ * "failed"  — deliverable missing entirely.
+ * null      — not tracked (legacy rows imported before deliverable_status existed). */
+export type DeliverableStatus = "success" | "degraded" | "failed";
+
 export interface EvalResult {
   id: string;
   date: string;
@@ -58,6 +65,20 @@ export interface EvalResult {
   scorePer1kTokens?: number | null;
   scorePerMinute?: number | null;
   topTools?: string | null;
+  // LLM-as-judge scoring (P3). Judge samples serialized as JSON array string.
+  judgeScore?: number | null;
+  judgeStdev?: number | null;
+  judgeModel?: string | null;
+  judgeReliable?: boolean | null;
+  judgeSamples?: string | null;
+  judgeError?: string | null;
+  judgeCostUsd?: number | null;
+  // Batch metadata (P1). Rows sharing batchId are repetitions of the same run.
+  batchId?: string | null;
+  runIndex?: number | null;
+  runsInBatch?: number | null;
+  // Whether the agent produced the required structured deliverable.
+  deliverableStatus?: DeliverableStatus | null;
 }
 
 export type ValidationStatus = "valid" | "invalid" | "unknown" | "checking";

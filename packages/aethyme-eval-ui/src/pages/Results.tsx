@@ -18,6 +18,11 @@ function toCSV(results: EvalResult[]): string {
     "qualityScore",
     "recalculatedEvalScore",
     "qualityDeltaVsControl",
+    "judgeScore",
+    "judgeStdev",
+    "judgeReliable",
+    "judgeModel",
+    "deliverableStatus",
     "turns",
     "toolCalls",
     "totalTokens",
@@ -26,9 +31,20 @@ function toCSV(results: EvalResult[]): string {
     "scorePer1kTokens",
     "scorePerMinute",
     "fixed",
+    "batchId",
+    "runIndex",
+    "runsInBatch",
   ];
   const rows = results.map((r: EvalResult) =>
-    headers.map((h) => String(r[h as keyof EvalResult])).join(","),
+    headers
+      .map((h) => {
+        const v = r[h as keyof EvalResult];
+        if (v == null) return "";
+        const s = String(v);
+        // Minimal CSV escaping — wrap any field containing comma/quote/newline in quotes.
+        return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      })
+      .join(","),
   );
   return [headers.join(","), ...rows].join("\n");
 }

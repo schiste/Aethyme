@@ -1,6 +1,11 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
-import type { EvalResult, SortConfig, SortDirection } from "../lib/types";
+import type {
+  DeliverableStatus,
+  EvalResult,
+  SortConfig,
+  SortDirection,
+} from "../lib/types";
 
 interface Props {
   results: EvalResult[];
@@ -93,32 +98,184 @@ function parseTopTools(raw: string | null): Array<{ name: string; count: number 
   }
 }
 
+function parseJudgeSamples(raw: string | null | undefined): number[] | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter((v): v is number => typeof v === "number");
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Batch grouping
+//
+// Rows sharing the same (batchId, condition) are repetitions of the same
+// configuration. We collapse them into a synthetic aggregate row showing
+// mean ± stdev across runs, and expose the individual runs via an expand
+// chevron. Singletons pass through unchanged.
+// ---------------------------------------------------------------------------
+
+interface BatchGroup {
+  kind: "batch";
+  key: string;          // stable id for expand state + React key
+  runs: EvalResult[];   // individual repetitions (sorted by runIndex ascending)
+  aggregate: EvalResult; // mean metrics, worst-case status
+}
+
+interface SingleGroup {
+  kind: "single";
+  key: string;
+  row: EvalResult;
+}
+
+type Group = BatchGroup | SingleGroup;
+
+function meanOf(nums: Array<number | null | undefined>): number | null {
+  const clean = nums.filter((n): n is number => typeof n === "number" && !Number.isNaN(n));
+  if (clean.length === 0) return null;
+  return clean.reduce((s, n) => s + n, 0) / clean.length;
+}
+
+function stdevOf(nums: Array<number | null | undefined>): number | null {
+  const clean = nums.filter((n): n is number => typeof n === "number" && !Number.isNaN(n));
+  if (clean.length < 2) return null;
+  const m = clean.reduce((s, n) => s + n, 0) / clean.length;
+  const variance = clean.reduce((s, n) => s + (n - m) ** 2, 0) / (clean.length - 1);
+  return Math.sqrt(variance);
+}
+
+/** Deliverable roll-up: worst wins. failed > degraded > success > null. */
+function rollupDeliverable(runs: EvalResult[]): DeliverableStatus | null {
+  const statuses = runs.map((r) => r.deliverableStatus ?? null);
+  if (statuses.some((s) => s === "failed")) return "failed";
+  if (statuses.some((s) => s === "degraded")) return "degraded";
+  if (statuses.some((s) => s === "success")) return "success";
+  return null;
+}
+
+function aggregateRuns(runs: EvalResult[]): EvalResult {
+  const template = runs[0];
+  // Take the most recent run's date so sort-by-date feels right on batches.
+  const latestDate = runs
+    .map((r) => r.date)
+    .sort()
+    .slice(-1)[0];
+
+  return {
+    ...template,
+    id: `batch:${template.batchId ?? template.id}:${template.condition}`,
+    date: latestDate ?? template.date,
+    runId: null,
+    output: null,
+    prompt: null,
+    scenario: template.scenario,
+    score: meanOf(runs.map((r) => r.score)) ?? 0,
+    turns: Math.round(meanOf(runs.map((r) => r.turns)) ?? 0),
+    toolCalls: Math.round(meanOf(runs.map((r) => r.toolCalls)) ?? 0),
+    totalTokens: Math.round(meanOf(runs.map((r) => r.totalTokens)) ?? 0),
+    inputTokens: Math.round(meanOf(runs.map((r) => r.inputTokens)) ?? 0),
+    outputTokens: Math.round(meanOf(runs.map((r) => r.outputTokens)) ?? 0),
+    cacheRead: Math.round(meanOf(runs.map((r) => r.cacheRead)) ?? 0),
+    cacheCreate: Math.round(meanOf(runs.map((r) => r.cacheCreate)) ?? 0),
+    cost: meanOf(runs.map((r) => r.cost)) ?? 0,
+    duration: template.duration,
+    qualityScore: meanOf(runs.map((r) => r.qualityScore)),
+    recalculatedEvalScore: meanOf(runs.map((r) => r.recalculatedEvalScore)),
+    qualityDeltaVsControl: meanOf(runs.map((r) => r.qualityDeltaVsControl)),
+    tokenRatioVsControl: meanOf(runs.map((r) => r.tokenRatioVsControl)),
+    timeRatioVsControl: meanOf(runs.map((r) => r.timeRatioVsControl)),
+    costRatioVsControl: meanOf(runs.map((r) => r.costRatioVsControl)),
+    scorePer1kTokens: meanOf(runs.map((r) => r.scorePer1kTokens)),
+    scorePerMinute: meanOf(runs.map((r) => r.scorePerMinute)),
+    judgeScore: meanOf(runs.map((r) => r.judgeScore)),
+    judgeStdev: stdevOf(runs.map((r) => r.judgeScore)), // cross-run stdev, not intra-rater
+    judgeModel: template.judgeModel,
+    judgeReliable: runs.every((r) => r.judgeReliable === true)
+      ? true
+      : runs.some((r) => r.judgeReliable === false)
+        ? false
+        : null,
+    judgeSamples: null,
+    judgeError: runs.find((r) => r.judgeError)?.judgeError ?? null,
+    judgeCostUsd: meanOf(runs.map((r) => r.judgeCostUsd)),
+    batchId: template.batchId,
+    runIndex: null,
+    runsInBatch: runs.length,
+    deliverableStatus: rollupDeliverable(runs),
+  };
+}
+
+function groupResults(results: EvalResult[]): Group[] {
+  const batchMap = new Map<string, EvalResult[]>();
+  const singles: EvalResult[] = [];
+
+  for (const r of results) {
+    const isBatchable =
+      r.batchId != null && (r.runsInBatch ?? 0) > 1 && r.condition != null;
+    if (isBatchable) {
+      const key = `${r.batchId}::${r.condition}`;
+      const bucket = batchMap.get(key);
+      if (bucket) bucket.push(r);
+      else batchMap.set(key, [r]);
+    } else {
+      singles.push(r);
+    }
+  }
+
+  const groups: Group[] = singles.map((row) => ({
+    kind: "single",
+    key: row.id,
+    row,
+  }));
+
+  for (const [key, runs] of batchMap) {
+    if (runs.length === 1) {
+      // Only one repetition has landed so far — show it as a single row.
+      groups.push({ kind: "single", key: runs[0].id, row: runs[0] });
+      continue;
+    }
+    runs.sort((a, b) => (a.runIndex ?? 0) - (b.runIndex ?? 0));
+    groups.push({ kind: "batch", key, runs, aggregate: aggregateRuns(runs) });
+  }
+
+  return groups;
+}
+
+function groupHead(group: Group): EvalResult {
+  return group.kind === "batch" ? group.aggregate : group.row;
+}
+
+// ---------------------------------------------------------------------------
+// Sort
+// ---------------------------------------------------------------------------
+
 type ColumnKey = keyof EvalResult;
 
 const columns: { key: ColumnKey; label: string; align?: "right"; width: string }[] = [
   { key: "runId", label: "Run", width: "7%" },
   { key: "date", label: "Date", width: "8%" },
   { key: "evalType", label: "Type", width: "8%" },
-  { key: "target", label: "Target", width: "6%" },
+  { key: "target", label: "Target", width: "5%" },
   { key: "model", label: "Model", width: "6%" },
-  { key: "condition", label: "Condition", width: "12%" },
+  { key: "condition", label: "Condition", width: "11%" },
   { key: "cto", label: "CTO", width: "4%" },
   { key: "qualityScore", label: "Quality", align: "right", width: "6%" },
   { key: "recalculatedEvalScore", label: "Recalc", align: "right", width: "6%" },
-  { key: "toolCalls", label: "Tools", align: "right", width: "5%" },
-  { key: "totalTokens", label: "Tokens", align: "right", width: "7%" },
+  { key: "judgeScore", label: "Judge", align: "right", width: "7%" },
+  { key: "toolCalls", label: "Tools", align: "right", width: "4%" },
+  { key: "totalTokens", label: "Tokens", align: "right", width: "6%" },
   { key: "duration", label: "Time", align: "right", width: "5%" },
-  { key: "scorePer1kTokens", label: "Score/1K", align: "right", width: "7%" },
-  { key: "scorePerMinute", label: "Score/Min", align: "right", width: "7%" },
+  { key: "scorePer1kTokens", label: "Score/1K", align: "right", width: "6%" },
+  { key: "scorePerMinute", label: "Score/Min", align: "right", width: "6%" },
 ];
 
-function sortResults(
-  results: EvalResult[],
-  sort: SortConfig,
-): EvalResult[] {
-  return [...results].sort((a, b) => {
-    const aVal = a[sort.key] ?? "";
-    const bVal = b[sort.key] ?? "";
+function sortGroups(groups: Group[], sort: SortConfig): Group[] {
+  return [...groups].sort((a, b) => {
+    const aVal = groupHead(a)[sort.key] ?? "";
+    const bVal = groupHead(b)[sort.key] ?? "";
     let cmp = 0;
     if (typeof aVal === "number" && typeof bVal === "number") {
       cmp = aVal - bVal;
@@ -128,6 +285,10 @@ function sortResults(
     return sort.direction === "asc" ? cmp : -cmp;
   });
 }
+
+// ---------------------------------------------------------------------------
+// Tooltip
+// ---------------------------------------------------------------------------
 
 function Tooltip({ children, content }: { children: React.ReactNode; content: React.ReactNode }) {
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
@@ -160,12 +321,45 @@ function Tooltip({ children, content }: { children: React.ReactNode; content: Re
   );
 }
 
+// ---------------------------------------------------------------------------
+// Deliverable badge
+// ---------------------------------------------------------------------------
+
+function DeliverableDot({ status }: { status: DeliverableStatus | null | undefined }) {
+  const cfg: Record<
+    "success" | "degraded" | "failed" | "unknown",
+    { color: string; label: string }
+  > = {
+    success: { color: "bg-[var(--color-score-green)]", label: "Deliverable: success" },
+    degraded: { color: "bg-[var(--color-score-yellow)]", label: "Deliverable: degraded (present but malformed)" },
+    failed: { color: "bg-[var(--color-score-red)]", label: "Deliverable: failed (not produced)" },
+    unknown: { color: "bg-[var(--color-border)]", label: "Deliverable status: unknown (legacy row)" },
+  };
+  const entry = cfg[status ?? "unknown"];
+  return (
+    <Tooltip content={entry.label}>
+      <span
+        className={`inline-block w-2 h-2 rounded-full ${entry.color} cursor-help`}
+        aria-label={entry.label}
+      />
+    </Tooltip>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main component
+// ---------------------------------------------------------------------------
+
 export default function ResultsTable({ results }: Props) {
   const [sort, setSort] = useState<SortConfig>({
     key: "date",
     direction: "desc",
   });
   const [selectedResult, setSelectedResult] = useState<EvalResult | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  const groups = useMemo(() => groupResults(results), [results]);
+  const sortedGroups = useMemo(() => sortGroups(groups, sort), [groups, sort]);
 
   function handleSort(key: ColumnKey) {
     setSort((prev) => {
@@ -178,9 +372,20 @@ export default function ResultsTable({ results }: Props) {
     });
   }
 
-  const sorted = sortResults(results, sort);
+  function toggleExpand(key: string) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
 
-  function renderCell(row: EvalResult, key: ColumnKey) {
+  function renderCell(
+    row: EvalResult,
+    key: ColumnKey,
+    ctx: { isBatch: boolean; isChild: boolean; runCount?: number },
+  ) {
     switch (key) {
       case "date":
         return <span className="text-xs font-mono whitespace-nowrap">{formatDate(row.date)}</span>;
@@ -214,6 +419,54 @@ export default function ResultsTable({ results }: Props) {
           <Tooltip content={lines}>
             <span className={`font-mono font-semibold cursor-help border-b border-dotted border-[var(--color-text-muted)] ${scoreColor(value ?? 0)}`}>
               {typeof value === "number" ? value.toFixed(2) : "—"}
+            </span>
+          </Tooltip>
+        );
+      }
+      case "judgeScore": {
+        const value = row.judgeScore;
+        if (typeof value !== "number") {
+          if (row.judgeError) {
+            return (
+              <Tooltip content={`Judge error:\n${row.judgeError}`}>
+                <span className="font-mono text-[var(--color-score-red)] cursor-help border-b border-dotted border-[var(--color-score-red)]/50">
+                  err
+                </span>
+              </Tooltip>
+            );
+          }
+          return <span className="text-[var(--color-text-muted)]">—</span>;
+        }
+        const stdev = row.judgeStdev;
+        const samples = parseJudgeSamples(row.judgeSamples);
+        const reliability =
+          row.judgeReliable === true
+            ? "reliable"
+            : row.judgeReliable === false
+              ? "unreliable"
+              : "n/a";
+        const display = typeof stdev === "number"
+          ? `${value.toFixed(2)} ± ${stdev.toFixed(2)}`
+          : value.toFixed(2);
+        const tooltipLines = [
+          `Judge score: ${value.toFixed(2)}`,
+          typeof stdev === "number" ? `Stdev: ${stdev.toFixed(2)}` : null,
+          `Model: ${row.judgeModel ?? "—"}`,
+          `Reliability: ${reliability}`,
+          samples ? `Samples: [${samples.map((s) => s.toFixed(2)).join(", ")}]` : null,
+          row.judgeError ? `Error: ${row.judgeError}` : null,
+        ].filter(Boolean).join("\n");
+        const unreliable = row.judgeReliable === false;
+        return (
+          <Tooltip content={tooltipLines}>
+            <span
+              className={`font-mono font-semibold cursor-help border-b border-dotted ${
+                unreliable
+                  ? "text-[var(--color-score-yellow)] border-[var(--color-score-yellow)]/50"
+                  : `${scoreColor(value)} border-[var(--color-text-muted)]`
+              }`}
+            >
+              {display}
             </span>
           </Tooltip>
         );
@@ -275,7 +528,17 @@ export default function ResultsTable({ results }: Props) {
         return <span className="font-mono">{typeof row.scorePer1kTokens === "number" ? row.scorePer1kTokens.toFixed(4) : "—"}</span>;
       case "scorePerMinute":
         return <span className="font-mono">{typeof row.scorePerMinute === "number" ? row.scorePerMinute.toFixed(4) : "—"}</span>;
-      case "evalType":
+      case "evalType": {
+        if (ctx.isBatch) {
+          return (
+            <span className="inline-flex items-center gap-1 text-[var(--color-text)]">
+              {row.evalType}
+              <span className="text-[10px] font-mono text-[var(--color-text-muted)] px-1 rounded bg-[var(--color-border)]/40">
+                ×{ctx.runCount}
+              </span>
+            </span>
+          );
+        }
         return (
           <span
             className="cursor-pointer text-[var(--color-accent)] hover:underline"
@@ -284,6 +547,7 @@ export default function ResultsTable({ results }: Props) {
             {row.evalType}
           </span>
         );
+      }
       case "target": {
         const isControl = row.condition.startsWith("control");
         const repoPaths: Record<string, [string, string]> = {
@@ -320,10 +584,21 @@ export default function ResultsTable({ results }: Props) {
         );
       }
       case "runId": {
+        if (ctx.isBatch) {
+          return (
+            <span className="font-mono text-[10px] text-[var(--color-text-muted)]">
+              batch ×{ctx.runCount}
+            </span>
+          );
+        }
         if (!row.runId) return <span className="text-[var(--color-text-muted)]">—</span>;
         const short = row.runId.replace("run-", "").slice(0, 10);
+        const indexSuffix =
+          typeof row.runIndex === "number" && typeof row.runsInBatch === "number" && row.runsInBatch > 1
+            ? ` (${row.runIndex}/${row.runsInBatch})`
+            : "";
         return (
-          <Tooltip content={row.runId}>
+          <Tooltip content={`${row.runId}${indexSuffix}`}>
             <span className="font-mono text-[var(--color-text-muted)] cursor-help border-b border-dotted border-[var(--color-border)]">
               {short}
             </span>
@@ -334,8 +609,11 @@ export default function ResultsTable({ results }: Props) {
         return <span className="font-mono">{row.duration}</span>;
       case "condition":
         return (
-          <span className="text-xs font-mono px-1 py-0.5 rounded bg-[var(--color-border)]/50">
-            {row.condition}
+          <span className="inline-flex items-center gap-1.5">
+            <DeliverableDot status={row.deliverableStatus ?? null} />
+            <span className="text-xs font-mono px-1 py-0.5 rounded bg-[var(--color-border)]/50">
+              {row.condition}
+            </span>
           </span>
         );
       case "cto":
@@ -350,6 +628,100 @@ export default function ResultsTable({ results }: Props) {
         );
       default:
         return <span className="text-xs">{String(row[key] ?? "")}</span>;
+    }
+  }
+
+  function renderRow(
+    row: EvalResult,
+    opts: {
+      rowKey: string;
+      isBatch: boolean;
+      isChild: boolean;
+      isExpanded?: boolean;
+      runCount?: number;
+      onToggle?: () => void;
+    },
+  ) {
+    const { rowKey, isBatch, isChild, isExpanded, runCount, onToggle } = opts;
+    return (
+      <tr
+        key={rowKey}
+        className={[
+          "border-t border-[var(--color-border)] transition-colors",
+          isChild
+            ? "bg-[var(--color-border)]/10 hover:bg-[var(--color-border)]/20"
+            : "hover:bg-[var(--color-surface-hover)]",
+          isBatch ? "font-medium" : "",
+        ].join(" ")}
+      >
+        {columns.map((col, idx) => (
+          <td
+            key={col.key}
+            className={[
+              "px-2 py-1.5 truncate",
+              col.align === "right" ? "text-right" : "text-left",
+            ].join(" ")}
+          >
+            {idx === 0 ? (
+              <span className="inline-flex items-center gap-1">
+                {isBatch && (
+                  <button
+                    onClick={onToggle}
+                    className="w-4 text-center text-[var(--color-text-muted)] hover:text-[var(--color-text)] font-mono text-[10px] leading-none"
+                    aria-label={isExpanded ? "Collapse batch" : "Expand batch"}
+                  >
+                    {isExpanded ? "▾" : "▸"}
+                  </button>
+                )}
+                {isChild && (
+                  <span className="w-4 text-center text-[var(--color-text-muted)] font-mono text-[10px]">
+                    └
+                  </span>
+                )}
+                {renderCell(row, col.key, { isBatch, isChild, runCount })}
+              </span>
+            ) : (
+              renderCell(row, col.key, { isBatch, isChild, runCount })
+            )}
+          </td>
+        ))}
+      </tr>
+    );
+  }
+
+  const rendered: React.ReactNode[] = [];
+  for (const group of sortedGroups) {
+    if (group.kind === "single") {
+      rendered.push(
+        renderRow(group.row, {
+          rowKey: group.key,
+          isBatch: false,
+          isChild: false,
+        }),
+      );
+    } else {
+      const isExpanded = expanded.has(group.key);
+      rendered.push(
+        renderRow(group.aggregate, {
+          rowKey: group.key,
+          isBatch: true,
+          isChild: false,
+          isExpanded,
+          runCount: group.runs.length,
+          onToggle: () => toggleExpand(group.key),
+        }),
+      );
+      if (isExpanded) {
+        for (const run of group.runs) {
+          rendered.push(
+            renderRow(run, {
+              rowKey: `${group.key}:${run.id}`,
+              isBatch: false,
+              isChild: true,
+            }),
+          );
+        }
+      }
     }
   }
 
@@ -383,25 +755,8 @@ export default function ResultsTable({ results }: Props) {
           </tr>
         </thead>
         <tbody>
-          {sorted.map((row) => (
-            <tr
-              key={row.id}
-              className="border-t border-[var(--color-border)] hover:bg-[var(--color-surface-hover)] transition-colors"
-            >
-              {columns.map((col) => (
-                <td
-                  key={col.key}
-                  className={[
-                    "px-2 py-1.5 truncate",
-                    col.align === "right" ? "text-right" : "text-left",
-                  ].join(" ")}
-                >
-                  {renderCell(row, col.key)}
-                </td>
-              ))}
-            </tr>
-          ))}
-          {sorted.length === 0 && (
+          {rendered}
+          {rendered.length === 0 && (
             <tr>
               <td
                 colSpan={columns.length}
