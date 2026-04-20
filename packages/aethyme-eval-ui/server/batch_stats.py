@@ -94,8 +94,68 @@ def list_batches(limit: int = 50) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def compare_conditions(
+    stats_a: dict[str, float | None],
+    stats_b: dict[str, float | None],
+    *,
+    margin: float = 1.0,
+) -> dict[str, Any]:
+    """Compare two condition stat blobs and render a verdict.
+
+    Inputs are _quantile_stats() dicts (median + IQR + min/max + n).
+
+    Heuristic, not a formal t-test:
+        delta = median_a - median_b
+        noise = (iqr_a + iqr_b) / 2   # combined spread proxy
+        verdict:
+          - "A>B" if delta > noise + margin
+          - "B>A" if delta < -(noise + margin)
+          - "inconclusive" otherwise
+
+    When IQR is unavailable (N<4 on either side), falls back to half-range
+    (max - min) / 2 as a noise proxy. Still heuristic, meant to prevent
+    "5 vs 5.1 is better" claims, not to replace statistical testing.
+    """
+    med_a, med_b = stats_a.get("median"), stats_b.get("median")
+    if med_a is None or med_b is None:
+        return {"verdict": "no-data", "delta": None, "noise": None,
+                "effect_size": None, "margin": margin}
+
+    iqr_a = stats_a.get("iqr")
+    iqr_b = stats_b.get("iqr")
+    if iqr_a is None:
+        rng_a = stats_a.get("max", med_a) - stats_a.get("min", med_a)
+        iqr_a = rng_a / 2.0
+    if iqr_b is None:
+        rng_b = stats_b.get("max", med_b) - stats_b.get("min", med_b)
+        iqr_b = rng_b / 2.0
+
+    delta = med_a - med_b
+    noise = (iqr_a + iqr_b) / 2.0
+    threshold = noise + margin
+
+    if delta > threshold:
+        verdict = "A>B"
+    elif delta < -threshold:
+        verdict = "B>A"
+    else:
+        verdict = "inconclusive"
+
+    # Effect size normalized by noise — negative = B wins, positive = A wins.
+    effect_size = round(delta / noise, 3) if noise > 0 else None
+
+    return {
+        "verdict": verdict,
+        "delta": round(delta, 3),
+        "noise": round(noise, 3),
+        "threshold": round(threshold, 3),
+        "effect_size": effect_size,
+        "margin": margin,
+    }
+
+
 def aggregate_batch(batch_id: str) -> dict[str, Any]:
-    """Return {batch: meta, conditions: {cond: {field: stats}}}."""
+    """Return {batch: meta, conditions: {cond: {field: stats}}, comparisons: {...}}."""
     if not DB_PATH.exists():
         return {"batch": None, "conditions": {}}
     conn = sqlite3.connect(str(DB_PATH))
@@ -163,4 +223,28 @@ def aggregate_batch(batch_id: str) -> dict[str, Any]:
         "last_date": max(r["date"] for r in rows if r["date"]),
         "total_rows": len(rows),
     }
-    return {"batch": meta, "conditions": conditions}
+
+    # Pairwise comparisons against the control baseline. "quality" is the
+    # primary metric; if/when pre-registration is added, that metric should
+    # determine what we compare on. For now we always compare quality.
+    baseline_cond = (
+        "control-cto-off" if "control-cto-off" in conditions
+        else ("control" if "control" in conditions else next(iter(conditions), None))
+    )
+    comparisons: dict[str, dict[str, Any]] = {}
+    if baseline_cond and baseline_cond in conditions:
+        baseline_stats = conditions[baseline_cond].get("quality", {})
+        for cond, stats in conditions.items():
+            if cond == baseline_cond:
+                continue
+            comparisons[cond] = {
+                "vs": baseline_cond,
+                "metric": "quality",
+                **compare_conditions(stats.get("quality", {}), baseline_stats),
+            }
+
+    return {
+        "batch": meta,
+        "conditions": conditions,
+        "comparisons_vs_baseline": comparisons,
+    }
