@@ -7,6 +7,11 @@ import {
   type MatrixCell,
   type MatrixRow,
 } from "../lib/pivot";
+import {
+  annotate,
+  verdictStyle,
+  type SignificanceResult,
+} from "../lib/significance";
 
 const ALL = "__all__";
 
@@ -43,7 +48,15 @@ function DeliverableDot({ status }: { status: MatrixCell["deliverableStatus"] })
   return <span className={`inline-block w-1.5 h-1.5 rounded-full ${color}`} title={`Deliverable: ${status}`} />;
 }
 
-function CellView({ cell, metric }: { cell: MatrixCell | undefined; metric: (typeof METRICS)[number] }) {
+function CellView({
+  cell,
+  metric,
+  significance,
+}: {
+  cell: MatrixCell | undefined;
+  metric: (typeof METRICS)[number];
+  significance?: SignificanceResult | null;
+}) {
   if (!cell) {
     return <span className="text-[var(--color-text-muted)] font-mono">—</span>;
   }
@@ -53,6 +66,17 @@ function CellView({ cell, metric }: { cell: MatrixCell | undefined; metric: (typ
   }
   const stdev = metric.key === "qualityScore" ? cell.qualityStdev : null;
   const n = cell.runs.length;
+  const vs = significance ? verdictStyle(significance.verdict, significance.delta) : null;
+  const verdictTitle = significance
+    ? [
+        `Δ vs control: ${significance.delta?.toFixed(2) ?? "—"}`,
+        `MMD: ${significance.mmdApplied}${significance.mmdPreRegistered ? " (pre-registered)" : " (default)"}`,
+        significance.verdict === "meaningful" ? "Verdict: meaningful" :
+        significance.verdict === "within-noise" ? "Verdict: within noise" :
+        significance.verdict === "insufficient" ? "Verdict: insufficient data (n<2 on one arm)" :
+        "",
+      ].filter(Boolean).join("\n")
+    : undefined;
   return (
     <span className={`inline-flex items-center gap-1 font-mono ${scoreColor(value, metric.higherIsBetter)}`}>
       <DeliverableDot status={cell.deliverableStatus} />
@@ -67,8 +91,33 @@ function CellView({ cell, metric }: { cell: MatrixCell | undefined; metric: (typ
           ×{n}
         </span>
       )}
+      {vs && (
+        <span
+          className={`text-[11px] ${vs.color}`}
+          title={verdictTitle}
+          aria-label={verdictTitle}
+        >
+          {vs.label}
+        </span>
+      )}
     </span>
   );
+}
+
+/** Pick the cell we'll treat as the baseline for pairwise comparisons in a row.
+ * Prefer `control-cto-off` (the canonical protocol baseline); fall back to
+ * `control-cto-on`, then any condition starting with `control`. Returns null
+ * when the row has no control arm at all. */
+function pickControlCell(row: MatrixRow): { condition: string; cell: MatrixCell } | null {
+  const preferred = ["control-cto-off", "control-cto-on", "control"];
+  for (const c of preferred) {
+    const cell = row.cells.get(c);
+    if (cell) return { condition: c, cell };
+  }
+  for (const [cond, cell] of row.cells) {
+    if (cond.startsWith("control")) return { condition: cond, cell };
+  }
+  return null;
 }
 
 export default function Matrix() {
@@ -80,6 +129,7 @@ export default function Matrix() {
   const [targetFilter, setTargetFilter] = useState<string>(ALL);
   const [modelFilter, setModelFilter] = useState<string>(ALL);
   const [metric, setMetric] = useState<MetricKey>("qualityScore");
+  const [showSignificance, setShowSignificance] = useState(true);
 
   useEffect(() => {
     fetchResults()
@@ -187,6 +237,16 @@ export default function Matrix() {
           </select>
         </div>
 
+        <label className="flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] select-none cursor-pointer">
+          <input
+            type="checkbox"
+            checked={showSignificance}
+            onChange={(e) => setShowSignificance(e.target.checked)}
+            className="accent-[var(--color-accent)]"
+          />
+          significance vs control
+        </label>
+
         <div className="flex-1" />
 
         <span className="text-xs text-[var(--color-text-muted)] font-mono">
@@ -199,7 +259,12 @@ export default function Matrix() {
           No runs match the current filters.
         </div>
       ) : (
-        <MatrixTable rows={matrix.rows} conditions={orderedConditions} metric={activeMetric} />
+        <MatrixTable
+          rows={matrix.rows}
+          conditions={orderedConditions}
+          metric={activeMetric}
+          showSignificance={showSignificance}
+        />
       )}
     </div>
   );
@@ -209,10 +274,12 @@ function MatrixTable({
   rows,
   conditions,
   metric,
+  showSignificance,
 }: {
   rows: MatrixRow[];
   conditions: string[];
   metric: (typeof METRICS)[number];
+  showSignificance: boolean;
 }) {
   // Group rows by (evalType, target, model) — a stable summary prefix —
   // so long matrices read as small blocks rather than one undifferentiated list.
@@ -252,28 +319,59 @@ function MatrixTable({
                 </tr>
               </thead>
               <tbody>
-                {groupRows.map((row) => (
-                  <tr key={row.id} className="border-t border-[var(--color-border)]">
-                    <td className="px-3 py-1.5 whitespace-nowrap text-[var(--color-text)]">
-                      <span className="font-mono text-[11px]">{row.key.reasoning}</span>
-                      {row.key.scenario && (
-                        <span className="ml-2 font-mono text-[11px] text-[var(--color-text-muted)]">
-                          / {row.key.scenario}
-                        </span>
-                      )}
-                      {row.key.batchId && (
-                        <span className="ml-2 font-mono text-[10px] text-[var(--color-text-muted)]">
-                          / {row.key.batchId.slice(0, 8)}
-                        </span>
-                      )}
-                    </td>
-                    {conditions.map((cond) => (
-                      <td key={cond} className="px-3 py-1.5 text-right">
-                        <CellView cell={row.cells.get(cond)} metric={metric} />
+                {groupRows.map((row) => {
+                  const control = pickControlCell(row);
+                  // MMD is a property of the batch, not the condition — pull from
+                  // any run in any cell; they're identical for a given launch.
+                  const anyRun =
+                    row.cells.values().next().value?.runs[0];
+                  const mmd = anyRun?.minimumMeaningfulDelta ?? null;
+                  return (
+                    <tr key={row.id} className="border-t border-[var(--color-border)]">
+                      <td className="px-3 py-1.5 whitespace-nowrap text-[var(--color-text)]">
+                        <span className="font-mono text-[11px]">{row.key.reasoning}</span>
+                        {row.key.scenario && (
+                          <span className="ml-2 font-mono text-[11px] text-[var(--color-text-muted)]">
+                            / {row.key.scenario}
+                          </span>
+                        )}
+                        {row.key.batchId && (
+                          <span className="ml-2 font-mono text-[10px] text-[var(--color-text-muted)]">
+                            / {row.key.batchId.slice(0, 8)}
+                          </span>
+                        )}
+                        {control && (
+                          <span
+                            className="ml-2 font-mono text-[10px] text-[var(--color-text-muted)]"
+                            title={`Baseline: ${control.condition}\nMMD: ${mmd ?? "default 5.0"}`}
+                          >
+                            / vs {control.condition.replace("control-", "")}
+                          </span>
+                        )}
                       </td>
-                    ))}
-                  </tr>
-                ))}
+                      {conditions.map((cond) => {
+                        const cell = row.cells.get(cond);
+                        const isControl = control?.condition === cond;
+                        const sig =
+                          showSignificance && cell && control && !isControl
+                            ? annotate({
+                                treatment: cell[metric.key],
+                                control: control.cell[metric.key],
+                                treatmentN: cell.runs.length,
+                                controlN: control.cell.runs.length,
+                                minimumMeaningfulDelta: mmd,
+                                higherIsBetter: metric.higherIsBetter,
+                              })
+                            : null;
+                        return (
+                          <td key={cond} className="px-3 py-1.5 text-right">
+                            <CellView cell={cell} metric={metric} significance={sig} />
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

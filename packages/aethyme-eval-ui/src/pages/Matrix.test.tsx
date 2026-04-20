@@ -95,4 +95,44 @@ describe("Matrix page", () => {
     // Both reasoning levels rendered (as separate row labels), under one group.
     expect(screen.getAllByText(/bug-fix · grc · haiku/)).toHaveLength(1);
   });
+
+  it("renders a meaningful-win verdict (▲) when treatment beats control by ≥ MMD", async () => {
+    // 3 runs each arm so n >= 2, 20-point gap, default MMD=5 → meaningful win
+    const common = {
+      batchId: "b1", runsInBatch: 3, runIndex: 1,
+      minimumMeaningfulDelta: 5, primaryMetric: "quality",
+    };
+    vi.mocked(api.fetchResults).mockResolvedValue([
+      row({ id: "c1", condition: "control-cto-off", qualityScore: 60, ...common }),
+      row({ id: "c2", condition: "control-cto-off", qualityScore: 62, ...common, runIndex: 2 }),
+      row({ id: "c3", condition: "control-cto-off", qualityScore: 58, ...common, runIndex: 3 }),
+      row({ id: "e1", condition: "explore",         qualityScore: 82, ...common }),
+      row({ id: "e2", condition: "explore",         qualityScore: 80, ...common, runIndex: 2 }),
+      row({ id: "e3", condition: "explore",         qualityScore: 78, ...common, runIndex: 3 }),
+    ]);
+    render(<MemoryRouter><Matrix /></MemoryRouter>);
+    await waitFor(() => {
+      expect(screen.getByText(/bug-fix · grc · haiku/)).toBeInTheDocument();
+    });
+    // ▲ = meaningful win per verdictStyle
+    expect(screen.getAllByText("▲").length).toBeGreaterThan(0);
+  });
+
+  it("renders a within-noise verdict (≈) when delta < MMD", async () => {
+    const common = {
+      batchId: "b1", runsInBatch: 3, runIndex: 1,
+      minimumMeaningfulDelta: 10, primaryMetric: "quality",
+    };
+    vi.mocked(api.fetchResults).mockResolvedValue([
+      row({ id: "c1", condition: "control-cto-off", qualityScore: 60, ...common }),
+      row({ id: "c2", condition: "control-cto-off", qualityScore: 62, ...common, runIndex: 2 }),
+      row({ id: "e1", condition: "explore",         qualityScore: 65, ...common }),
+      row({ id: "e2", condition: "explore",         qualityScore: 63, ...common, runIndex: 2 }),
+    ]);
+    render(<MemoryRouter><Matrix /></MemoryRouter>);
+    await waitFor(() => {
+      expect(screen.getByText(/bug-fix · grc · haiku/)).toBeInTheDocument();
+    });
+    expect(screen.getAllByText("≈").length).toBeGreaterThan(0);
+  });
 });
