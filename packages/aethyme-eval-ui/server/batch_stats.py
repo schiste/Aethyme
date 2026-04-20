@@ -243,8 +243,82 @@ def aggregate_batch(batch_id: str) -> dict[str, Any]:
                 **compare_conditions(stats.get("quality", {}), baseline_stats),
             }
 
+    discrimination_info = _scenario_discrimination(conditions)
+
     return {
         "batch": meta,
         "conditions": conditions,
         "comparisons_vs_baseline": comparisons,
+        "scenario_discrimination": discrimination_info,
+    }
+
+
+def _scenario_discrimination(
+    conditions: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """How well does this scenario separate conditions on quality?
+
+    Borrows the IRT "discrimination" concept:
+
+        between = stdev of condition median qualities
+        within  = mean of per-condition IQRs (noise across runs)
+        ratio   = between / within
+
+    Interpretation:
+      ratio >= 2.0 : scenario separates conditions strongly
+      1.0 <= ratio < 2.0 : usable, meaningful signal
+      ratio < 1.0  : low-discrimination — conditions converge into the
+                     noise floor, results should be flagged as weak
+                     evidence regardless of which condition "wins".
+
+    Requires N>=4 per condition (IQR defined) and at least 2 conditions
+    with quality medians. Returns None otherwise.
+    """
+    medians: list[float] = []
+    iqrs: list[float] = []
+    for cond, stats in conditions.items():
+        q = stats.get("quality", {})
+        if not isinstance(q, dict):
+            continue
+        med = q.get("median")
+        iqr = q.get("iqr")
+        if med is not None:
+            medians.append(float(med))
+        # Fall back to half-range when IQR undefined (tiny batches)
+        if iqr is None:
+            lo, hi = q.get("min"), q.get("max")
+            if lo is not None and hi is not None:
+                iqr = (float(hi) - float(lo)) / 2.0
+        if iqr is not None:
+            iqrs.append(float(iqr))
+
+    if len(medians) < 2 or not iqrs:
+        return {
+            "between_stdev": None, "within_spread": None,
+            "ratio": None, "label": "insufficient-data",
+            "notes": "Need >=2 conditions with quality medians",
+        }
+
+    between = statistics.stdev(medians) if len(medians) >= 2 else 0.0
+    within = statistics.mean(iqrs)
+    ratio = round(between / within, 3) if within > 0 else None
+
+    if ratio is None:
+        label = "insufficient-data"
+    elif ratio >= 2.0:
+        label = "strong"
+    elif ratio >= 1.0:
+        label = "usable"
+    else:
+        label = "low-discrimination"
+
+    return {
+        "between_stdev": round(between, 3),
+        "within_spread": round(within, 3),
+        "ratio": ratio,
+        "label": label,
+        "notes": (
+            "Between-condition spread relative to within-condition noise. "
+            "ratio>=2 strong, >=1 usable, <1 low-discrimination (treat results as weak evidence)."
+        ),
     }
