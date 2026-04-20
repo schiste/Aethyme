@@ -120,11 +120,13 @@ export default function RunEvals() {
   const [reasoning, setReasoning] = useState<Reasoning>("high");
   const [windowId, setWindowId] = useState<string>("auto");
   const [cleanupDelaySeconds, setCleanupDelaySeconds] = useState<string>("1");
-  // P1: sequential eval repetitions. Protocol default is 3 — comparisons
-  // across conditions need N>=3 to separate single-run variance from real
-  // effects. Each run is stored individually under a shared batch_id so the
-  // scorecard can aggregate to median + IQR. runs=1 is debug mode.
-  const [runs, setRuns] = useState<string>("3");
+  // P1: sequential eval repetitions. Protocol requires N>=3 for any
+  // *reported* comparison (eval-protocol.md), but the UI default is
+  // temporarily 1 while the pipeline is being debugged — bump to 3
+  // explicitly for comparisons you plan to publish. Each run is stored
+  // individually under a shared batch_id so the scorecard can aggregate
+  // to median + IQR.
+  const [runs, setRuns] = useState<string>("1");
   // P3: LLM-as-judge knobs.
   const [useJudge, setUseJudge] = useState<boolean>(true);
   const [judgeSamples, setJudgeSamples] = useState<string>("3");
@@ -628,7 +630,7 @@ export default function RunEvals() {
                 Cleanup delay is the number of seconds to keep eval tabs open after finalization before closing them. Use a long delay for debugging and `1` for normal data collection.
               </p>
               <p>
-                <strong>Runs</strong>: sequential repetitions of the full eval (1–20). Protocol default is <strong>3</strong> — comparisons across conditions need N≥3 so single-run variance can be separated from real effects. Each run gets its own run_dir; all share a <code>batch_id</code> for aggregation. <code>runs=1</code> is debug mode — use for fast iteration, not reported results.
+                <strong>Runs</strong>: sequential repetitions of the full eval (1–20). Default is currently <strong>1</strong> while the pipeline is being debugged. Protocol requires <strong>N≥3</strong> for any <em>reported</em> comparison — single-run results are debug artifacts. Each run gets its own run_dir; all share a <code>batch_id</code> for aggregation via <code>/api/batches/&#123;id&#125;</code>.
               </p>
               <p>
                 <strong>Judge</strong>: LLM-as-judge scoring via Codex in a Chau7 tab (same path as eval agents — no direct API). <strong>Samples</strong> are repeated judge calls on the same output to measure intra-rater reliability (stdev &lt; 10 = consistent). Each sample opens a brief judge tab.

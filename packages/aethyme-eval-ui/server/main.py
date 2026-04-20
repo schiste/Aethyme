@@ -1005,12 +1005,18 @@ class RunRequest(BaseModel):
     windowId: int | None = None
     preparationId: str | None = None
     cleanupDelaySeconds: int = Field(default=1, ge=0, le=3600)
-    # P1: number of sequential eval repetitions. Default 3 — protocol requires
-    # N>=3 for any comparison across conditions so single-run variance can be
-    # distinguished from real effects. runs=1 is still allowed for debugging.
+    # P1: number of sequential eval repetitions.
+    #
+    # Protocol requires N>=3 for any *reported* comparison so single-run
+    # variance can be distinguished from real effects — see eval-protocol.md.
+    # The default is temporarily 1 while the pipeline itself is being debugged
+    # (each run is expensive; we don't want every exploratory tweak to fire
+    # 3x more agent time). Bump the default back to 3 once the pipeline is
+    # stable. Pass `runs: 3` explicitly for comparisons you plan to publish.
+    #
     # All repetitions in a call share a batch_id so the UI can aggregate to
-    # median + IQR.
-    runs: int = Field(default=3, ge=1, le=20)
+    # median + IQR via GET /api/batches/{batch_id}.
+    runs: int = Field(default=1, ge=1, le=20)
     # P3: turn on LLM-as-judge scoring (in addition to keyword score).
     # Judge runs codex via a Chau7 tab (same path as eval agents — no direct API).
     # Intra-rater reliability: judge is called judgeSamples times on the same

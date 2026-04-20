@@ -1104,7 +1104,7 @@ Single-run eval results are debug artifacts, not evidence. This section codifies
 
 ### N ≥ 3 Required for Comparisons
 
-`RunRequest.runs` defaults to 3. runs=1 is allowed and useful for iterating on the pipeline, but **no cross-condition comparison may be published from a single run.** Single-run variance on quality scores routinely exceeds the differences we care about (5-10 points on a 0-100 scale). Without N>=3 runs, we can't separate noise from signal.
+`RunRequest.runs` currently defaults to `1` while the eval pipeline itself is being debugged — that default is a developer convenience, not the protocol. **No cross-condition comparison may be published from a single run.** Single-run variance on quality scores routinely exceeds the differences we care about (5-10 points on a 0-100 scale). For any comparison you plan to publish, explicitly pass `runs: 3` (or higher). The default will be bumped back to 3 once the pipeline stabilizes.
 
 Each repetition creates its own `run_dir` and stores rows with a shared `batch_id`. Aggregation happens on read:
 

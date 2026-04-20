@@ -151,7 +151,7 @@ Do not replace quality with global score. Report both.
 
 ## Multi-Run Protocol
 
-**N ≥ 3 is the default for any reported comparison.** `RunRequest.runs` defaults to 3; `runs=1` is debug mode. Each repetition gets its own run_dir and stores rows with a shared `batch_id` so the scorecard can aggregate to median + IQR.
+**N ≥ 3 is required for any reported comparison.** While the pipeline is being debugged, `RunRequest.runs` defaults to `1` to keep iteration cheap — that default is a developer convenience, not the protocol. **Explicitly pass `runs: 3` (or higher) for any comparison you plan to publish.** Each repetition gets its own run_dir and stores rows with a shared `batch_id` so the scorecard can aggregate to median + IQR.
 
 Key protocol rules:
 
