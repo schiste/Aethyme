@@ -2,10 +2,13 @@ import { useEffect, useState } from "react";
 import {
   fetchBatches,
   fetchBatchAggregate,
+  fetchBatchProbes,
   type BatchAggregate,
   type BatchSummary,
+  type ProbeRow,
 } from "../lib/api";
 import VarianceBreakdown from "../components/VarianceBreakdown";
+import ProbesPanel from "../components/ProbesPanel";
 
 /**
  * Batches page: list recent multi-run batches, surface each one's
@@ -24,6 +27,7 @@ export default function Batches() {
   const [aggregate, setAggregate] = useState<BatchAggregate | null>(null);
   const [aggLoading, setAggLoading] = useState(false);
   const [aggError, setAggError] = useState<string | null>(null);
+  const [probes, setProbes] = useState<ProbeRow[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -52,11 +56,16 @@ export default function Batches() {
     let cancelled = false;
     setAggLoading(true);
     setAggError(null);
+    // Fetch aggregate and probes in parallel — they're independent reads.
     (async () => {
       try {
-        const data = await fetchBatchAggregate(selected);
+        const [agg, probeData] = await Promise.all([
+          fetchBatchAggregate(selected),
+          fetchBatchProbes(selected).catch(() => [] as ProbeRow[]),
+        ]);
         if (!cancelled) {
-          setAggregate(data);
+          setAggregate(agg);
+          setProbes(probeData);
           setAggLoading(false);
         }
       } catch (e) {
@@ -149,6 +158,10 @@ export default function Batches() {
 
             <section className="p-3 border border-[var(--color-border)] rounded">
               <VarianceBreakdown variance={aggregate.variance_components} />
+            </section>
+
+            <section className="p-3 border border-[var(--color-border)] rounded">
+              <ProbesPanel probes={probes} />
             </section>
 
             <section className="p-3 border border-[var(--color-border)] rounded text-xs">

@@ -204,3 +204,39 @@ export async function fetchBatchAggregate(batchId: string): Promise<BatchAggrega
   if (!res.ok) throw new Error(`Failed to fetch batch: ${res.statusText}`);
   return res.json();
 }
+
+export interface ProbeRow {
+  result_id: string;
+  probe_name: string;
+  result: {
+    skipped?: boolean;
+    reason?: string;
+    // Navigation probe fields
+    first_hit_step?: number | null;
+    precision_at_k?: number;
+    recall_at_k?: number;
+    distractor_rate?: number;
+    hits?: string[];
+    distractors?: string[];
+    k_budget?: number;
+    k_examined?: number;
+    // Graph-usage probe fields
+    aethyme_called?: boolean;
+    aethyme_call_count?: number;
+    first_aethyme_step?: number | null;
+    first_mutating_step?: number | null;
+    aethyme_called_before_first_edit?: boolean | null;
+  };
+  condition: string;
+  run_index: number | null;
+  created_at: string;
+}
+
+export async function fetchBatchProbes(batchId: string): Promise<ProbeRow[]> {
+  const res = await fetch(
+    `${API_BASE}/batches/${encodeURIComponent(batchId)}/probes`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch probes: ${res.statusText}`);
+  const data = await res.json();
+  return (data.probes ?? []) as ProbeRow[];
+}
