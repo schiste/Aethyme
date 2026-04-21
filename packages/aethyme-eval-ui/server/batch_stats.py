@@ -14,6 +14,7 @@ No new tables. Everything is derived from `eval_results` at read time.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import statistics
 from pathlib import Path
@@ -281,6 +282,32 @@ def aggregate_batch(batch_id: str) -> dict[str, Any]:
 
     discrimination_info = _scenario_discrimination(conditions)
 
+    # G-theory variance decomposition (signal/noise breakdown).
+    # Feeds batch rows through MOM ANOVA to estimate sigma2_cond, sigma2_run,
+    # sigma2_judge + a generalizability coefficient (E-rho^2 analog of
+    # Cronbach's alpha). Tells the user *where* noise is coming from and
+    # how many runs they'd need for target reliability.
+    #
+    # judge_samples column holds a JSON-encoded array of per-sample dicts,
+    # not an integer count. We infer sample count from the array length.
+    n_judge_samples = 3  # default when no sample data available
+    first_samples_json = (
+        first["judge_samples"] if "judge_samples" in first.keys() else None
+    )
+    if first_samples_json:
+        try:
+            parsed = json.loads(first_samples_json)
+            if isinstance(parsed, list) and parsed:
+                n_judge_samples = len(parsed)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    from variance_decomp import decompose_batch
+    variance_components = decompose_batch(
+        [dict(r) for r in rows],
+        n_judge_samples_default=n_judge_samples,
+    )
+
     # P9: aggregate judge overhead across the batch so it's visible as
     # meta-time separate from per-condition agent telemetry. A batch that
     # spent 15 minutes of agent-wall-clock but 8 minutes of judge overhead
@@ -304,6 +331,7 @@ def aggregate_batch(batch_id: str) -> dict[str, Any]:
         "conditions": conditions,
         "comparisons_vs_baseline": comparisons,
         "scenario_discrimination": discrimination_info,
+        "variance_components": variance_components,
         "judge_overhead": judge_overhead,
     }
 
