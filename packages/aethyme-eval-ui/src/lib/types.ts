@@ -10,7 +10,7 @@ export type EvalType =
   | "dead-code"
   | "migration";
 
-export type TargetName = "aethyme" | "grc" | "mediawiki";
+export type TargetName = "grc" | "mediawiki";
 
 export type ModelName = "haiku" | "sonnet" | "opus" | "gpt-5.4";
 
@@ -146,10 +146,14 @@ export interface EvalRunConfig {
    * be separated from real effects. runs=1 is debug mode. */
   runs?: number;
   /** P3: enable LLM-as-judge scoring alongside keyword scoring.
-   * The judge runs Codex via a Chau7 tab (same path as eval agents — no direct API). */
+   * The judge runs via a Chau7 tab (same path as eval agents — no direct API). */
   useJudge?: boolean;
   /** P3: how many times the judge scores each output (intra-rater reliability). */
   judgeSamples?: number;
+  /** P3: which CLI the judge uses. "codex" is the legacy default.
+   * "claude-haiku" is the self-preference-bias mitigation: cross-family
+   * judging removes ~2-5pt bias seen in same-family judge/agent pairs. */
+  judgeBackend?: "codex" | "claude-haiku";
   /** P8 pre-registration. The metric the batch will be judged on: "quality"
    * (default) | "judge" | "global_score" | "cost" | "tokens" | "time". */
   primaryMetric?: string;

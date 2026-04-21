@@ -78,6 +78,11 @@ async def get_batch(batch_id: str) -> dict[str, Any]:
 class CalibrationCheckRequest(BaseModel):
     evalType: str
     judgeSamples: int = Field(default=3, ge=1, le=10)
+    # Pick which judge CLI to calibrate. The point of surfacing this is the
+    # back-test: run the same calibration set through "codex" and then
+    # "claude-haiku" and compare mean drift to decide which judge is more
+    # trustworthy for the current agent population.
+    judgeBackend: str = "codex"
 
 
 @app.get("/api/judge/calibration/{eval_type}")
@@ -111,6 +116,7 @@ async def run_judge_calibration(req: CalibrationCheckRequest) -> dict[str, Any]:
         tab_directory=str(AETHYME_PKG),
         aethyme_pkg_path=str(AETHYME_PKG),
         samples=req.judgeSamples,
+        backend=req.judgeBackend,
     )
 
 
@@ -1018,11 +1024,15 @@ class RunRequest(BaseModel):
     # median + IQR via GET /api/batches/{batch_id}.
     runs: int = Field(default=1, ge=1, le=20)
     # P3: turn on LLM-as-judge scoring (in addition to keyword score).
-    # Judge runs codex via a Chau7 tab (same path as eval agents — no direct API).
+    # Judge runs via a Chau7 tab — backend determines which CLI:
+    #   - "codex"        (legacy default) Codex CLI
+    #   - "claude-haiku" Claude Code CLI (cross-family judge; self-preference
+    #                    bias mitigation when agents include Codex)
     # Intra-rater reliability: judge is called judgeSamples times on the same
     # (task, reference, candidate) triple; we report mean + stdev.
     useJudge: bool = True
     judgeSamples: int = Field(default=3, ge=1, le=10)
+    judgeBackend: str = "codex"
     # P8: pre-registration. Declare up front which metric is the primary
     # outcome and how large a delta counts as meaningful. Everything else is
     # marked "exploratory" in the report. This blocks post-hoc cherry-picking
@@ -1142,23 +1152,6 @@ def _extract_tool_calls(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _dead_code_task_for_target(target: str) -> str:
-    if target == "aethyme":
-        return """\
-Find all public top-level functions in `packages/aethyme/src/indexing/` that are never called from outside that directory.
-
-Scope:
-- Check every Python file in `packages/aethyme/src/indexing/` for public top-level function definitions
-- For each public function, search the entire repo outside `packages/aethyme/src/indexing/` for call sites
-- Search at least `packages/aethyme/src/`, `packages/aethyme/tests/`, and `packages/aethyme/scripts/`
-- Exclude private helpers whose names start with `_`
-
-For each unused function, report:
-- The function name
-- The file it's defined in (relative path)
-- Why you believe it's unused (what you searched for and didn't find)
-
-Be thorough — check every public top-level function, not just a sample. Missing a truly unused function or falsely flagging a used one both count against you."""
-
     return """\
 Find all public methods in `includes/Watchlist/` that are never called from outside that directory.
 
@@ -2645,15 +2638,17 @@ def _run_eval_background(
             result_id = f"{run_dir.name}-{cond_name}"
 
             # P3: LLM-as-judge scoring (runs alongside keyword score).
-            # Judge uses Codex via a Chau7 tab — same path as eval agents,
-            # no direct API calls. Runs in a neutral directory (Aethyme repo
-            # root) so it never touches the playground Control or Aethyme repos.
+            # Judge uses a Chau7 tab (same path as eval agents — no direct API).
+            # Runs in a neutral directory (Aethyme repo root) so it never touches
+            # the playground Control or Aethyme repos. The backend (codex vs.
+            # claude-haiku) is chosen by req.judgeBackend — cross-family judges
+            # mitigate self-preference bias when agents and judge share a family.
             judge_result: dict[str, Any] | None = None
             if req.useJudge and data.get("output"):
                 try:
                     from llm_judge import score_eval_type_with_judge
                     log(
-                        f"[{cond_name}] Running LLM judge via Codex "
+                        f"[{cond_name}] Running LLM judge via {req.judgeBackend} "
                         f"(samples={req.judgeSamples})..."
                     )
                     judge_result = score_eval_type_with_judge(
@@ -2663,6 +2658,7 @@ def _run_eval_background(
                         aethyme_pkg_path=str(AETHYME_PKG),
                         tab_directory=str(AETHYME_PKG),
                         samples=req.judgeSamples,
+                        backend=req.judgeBackend,
                         log=lambda m: log(f"[{cond_name}] {m}"),
                     )
                     if judge_result.get("error"):
@@ -2678,7 +2674,7 @@ def _run_eval_background(
                     log(f"[{cond_name}] Judge failed: {type(e).__name__}: {e}")
                     judge_result = {
                         "mean_score": None, "stdev": None, "samples": [],
-                        "backend": "codex", "reliable": False,
+                        "backend": req.judgeBackend, "reliable": False,
                         "error": f"{type(e).__name__}: {e}",
                     }
 

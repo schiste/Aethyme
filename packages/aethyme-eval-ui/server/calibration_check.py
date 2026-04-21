@@ -72,16 +72,23 @@ def run_calibration_check(
     tab_directory: str,
     aethyme_pkg_path: str,
     samples: int = 3,
+    backend: str = "codex",
     log: Any = None,
 ) -> dict[str, Any]:
     """Score every calibration item with the current judge; report drift.
 
+    `backend` picks which judge CLI to calibrate. The full back-test runs
+    the same items through each backend independently and compares mean
+    drift — the backend with lower drift against human anchors is the
+    more accurate judge for the current agent population.
+
     Returns:
       {
         eval_type,
+        backend,                # echoed so back-test comparisons can key on it
         items_scored, items_found,
         max_drift, mean_drift,
-        passes,                # True when max<=15 AND mean<=10
+        passes,                 # True when max<=15 AND mean<=10
         threshold_max, threshold_mean,
         per_item: [
           {calibration_id, human_score, judge_mean, drift, stdev, reliable, error}
@@ -99,6 +106,7 @@ def run_calibration_check(
     if not items:
         return {
             "eval_type": eval_type,
+            "backend": backend,
             "items_scored": 0,
             "items_found": 0,
             "max_drift": None,
@@ -121,6 +129,7 @@ def run_calibration_check(
     except Exception as e:
         return {
             "eval_type": eval_type,
+            "backend": backend,
             "items_scored": 0,
             "items_found": len(items),
             "max_drift": None,
@@ -169,6 +178,7 @@ def run_calibration_check(
             rubric=default_rubric,
             samples=samples,
             tab_directory=tab_directory,
+            backend=backend,
             log=log,
         )
         judge_mean = result.get("mean_score")
@@ -206,6 +216,7 @@ def run_calibration_check(
 
     return {
         "eval_type": eval_type,
+        "backend": backend,
         "items_scored": len(drifts),
         "items_found": len(items),
         "max_drift": round(max_drift, 2) if max_drift is not None else None,

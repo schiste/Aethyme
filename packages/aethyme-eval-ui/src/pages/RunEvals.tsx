@@ -132,6 +132,12 @@ export default function RunEvals() {
   // P3: LLM-as-judge knobs.
   const [useJudge, setUseJudge] = useState<boolean>(true);
   const [judgeSamples, setJudgeSamples] = useState<string>("3");
+  // P3-B (self-preference mitigation): pick the judge CLI. "codex" is the
+  // legacy default; "claude-haiku" is the cross-family judge that removes
+  // the ~2-5pt self-preference bias when the agents under eval include
+  // Codex. Flip to claude-haiku by default once calibration back-test
+  // confirms lower mean drift against human anchors.
+  const [judgeBackend, setJudgeBackend] = useState<"codex" | "claude-haiku">("codex");
 
   const [repos, setRepos] = useState<Repository[]>([]);
   const [loadingRepos, setLoadingRepos] = useState(true);
@@ -203,7 +209,7 @@ export default function RunEvals() {
 
   useEffect(() => {
     setPlan(null);
-  }, [evalType, target, model, reasoning, windowId, cleanupDelaySeconds, runs, useJudge, judgeSamples]);
+  }, [evalType, target, model, reasoning, windowId, cleanupDelaySeconds, runs, useJudge, judgeSamples, judgeBackend]);
 
   const parsedWindowId =
     windowId === "auto" || windowId === "" ? undefined : Number.parseInt(windowId, 10);
@@ -233,6 +239,7 @@ export default function RunEvals() {
       runs: effectiveRuns,
       useJudge,
       judgeSamples: effectiveJudgeSamples,
+      judgeBackend,
       ...extra,
     };
     if (parsedWindowId !== undefined) base.windowId = parsedWindowId;
@@ -615,8 +622,23 @@ export default function RunEvals() {
                   onChange={(e) => setUseJudge(e.target.value === "on")}
                   className={selectClass}
                 >
-                  <option value="on">On (Codex)</option>
+                  <option value="on">On</option>
                   <option value="off">Off</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs text-[var(--color-text-muted)] uppercase tracking-wide mb-1">
+                  Judge Backend
+                </label>
+                <select
+                  value={judgeBackend}
+                  onChange={(e) => setJudgeBackend(e.target.value as "codex" | "claude-haiku")}
+                  disabled={!useJudge}
+                  className={selectClass}
+                >
+                  <option value="codex">Codex (legacy)</option>
+                  <option value="claude-haiku">Claude Haiku (cross-family)</option>
                 </select>
               </div>
 
@@ -647,7 +669,7 @@ export default function RunEvals() {
                 <strong>Runs</strong>: sequential repetitions of the full eval (1–20). Default is currently <strong>1</strong> while the pipeline is being debugged. Protocol requires <strong>N≥3</strong> for any <em>reported</em> comparison — single-run results are debug artifacts. Each run gets its own run_dir; all share a <code>batch_id</code> for aggregation via <code>/api/batches/&#123;id&#125;</code>.
               </p>
               <p>
-                <strong>Judge</strong>: LLM-as-judge scoring via Codex in a Chau7 tab (same path as eval agents — no direct API). <strong>Samples</strong> are repeated judge calls on the same output to measure intra-rater reliability (stdev &lt; 10 = consistent). Each sample opens a brief judge tab.
+                <strong>Judge</strong>: LLM-as-judge scoring in a Chau7 tab (same path as eval agents — no direct API). <strong>Backend</strong> picks the judge CLI — <strong>Codex</strong> (legacy) or <strong>Claude Haiku</strong> (cross-family; removes the ~2-5pt self-preference bias when agents include Codex). Prefer Claude Haiku once calibration back-test confirms lower drift against human anchors. <strong>Samples</strong> are repeated judge calls on the same output to measure intra-rater reliability (stdev &lt; 10 = consistent). Each sample opens a brief judge tab.
               </p>
             </div>
           </div>
