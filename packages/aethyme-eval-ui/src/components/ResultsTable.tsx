@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
+import DiffModal from "./DiffModal";
 import type {
   DeliverableStatus,
   EvalResult,
@@ -360,6 +361,20 @@ export default function ResultsTable({ results }: Props) {
   });
   const [selectedResult, setSelectedResult] = useState<EvalResult | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // Diff selection — rows chosen for side-by-side comparison. Cap at 2:
+  // any third click kicks out the oldest. Batch-aggregate rows are
+  // deliberately not selectable since they have no concrete `output`.
+  const [diffSelection, setDiffSelection] = useState<EvalResult[]>([]);
+  const [showDiff, setShowDiff] = useState(false);
+
+  function toggleDiffSelection(row: EvalResult) {
+    setDiffSelection((prev) => {
+      const exists = prev.find((r) => r.id === row.id);
+      if (exists) return prev.filter((r) => r.id !== row.id);
+      if (prev.length >= 2) return [prev[1], row];
+      return [...prev, row];
+    });
+  }
 
   const groups = useMemo(() => groupResults(results), [results]);
   const sortedGroups = useMemo(() => sortGroups(groups, sort), [groups, sort]);
@@ -695,7 +710,7 @@ export default function ResultsTable({ results }: Props) {
           >
             {idx === 0 ? (
               <span className="inline-flex items-center gap-1">
-                {isBatch && (
+                {isBatch ? (
                   <button
                     onClick={onToggle}
                     className="w-4 text-center text-[var(--color-text-muted)] hover:text-[var(--color-text)] font-mono text-[10px] leading-none"
@@ -703,9 +718,18 @@ export default function ResultsTable({ results }: Props) {
                   >
                     {isExpanded ? "▾" : "▸"}
                   </button>
+                ) : (
+                  <input
+                    type="checkbox"
+                    checked={diffSelection.some((r) => r.id === row.id)}
+                    onChange={() => toggleDiffSelection(row)}
+                    className="w-3 h-3 accent-[var(--color-accent)] cursor-pointer"
+                    aria-label="Select for diff"
+                    title="Select for side-by-side diff (max 2)"
+                  />
                 )}
                 {isChild && (
-                  <span className="w-4 text-center text-[var(--color-text-muted)] font-mono text-[10px]">
+                  <span className="w-3 text-center text-[var(--color-text-muted)] font-mono text-[10px]">
                     └
                   </span>
                 )}
@@ -759,6 +783,47 @@ export default function ResultsTable({ results }: Props) {
   return (
     <>
     {selectedResult && <OutputModal result={selectedResult} onClose={() => setSelectedResult(null)} />}
+    {showDiff && diffSelection.length === 2 && (
+      <DiffModal
+        a={diffSelection[0]}
+        b={diffSelection[1]}
+        onClose={() => setShowDiff(false)}
+      />
+    )}
+    {diffSelection.length > 0 && (
+      <div className="flex items-center justify-between px-3 py-2 mb-2 rounded border border-[var(--color-accent)]/40 bg-[var(--color-accent)]/8 text-xs">
+        <div className="flex items-center gap-3 text-[var(--color-text)]">
+          <span className="font-mono">{diffSelection.length}/2 selected</span>
+          {diffSelection.map((r) => (
+            <span key={r.id} className="font-mono px-1.5 py-0.5 rounded bg-[var(--color-border)]/40">
+              {r.condition}
+              <button
+                onClick={() => toggleDiffSelection(r)}
+                className="ml-1.5 text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+                aria-label={`Remove ${r.condition} from diff selection`}
+              >
+                ✕
+              </button>
+            </span>
+          ))}
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setDiffSelection([])}
+            className="px-2 py-1 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+          >
+            Clear
+          </button>
+          <button
+            onClick={() => setShowDiff(true)}
+            disabled={diffSelection.length !== 2}
+            className="px-3 py-1 rounded border border-[var(--color-accent)] text-[var(--color-accent)] hover:bg-[var(--color-accent)]/15 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Compare outputs →
+          </button>
+        </div>
+      </div>
+    )}
     <div className="rounded-lg border border-[var(--color-border)]">
       <table className="w-full text-xs table-fixed">
         <thead>
