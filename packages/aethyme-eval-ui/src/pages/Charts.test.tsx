@@ -109,6 +109,30 @@ describe("Charts page", () => {
     expect(screen.getByRole("img", { name: /Box plot/i })).toBeInTheDocument();
   });
 
+  it("switches to Heatmap tab and renders a grid of reasoning × condition cells", async () => {
+    vi.mocked(api.fetchResults).mockResolvedValue([
+      row({ id: "a", reasoning: "high", condition: "control-cto-off", qualityScore: 60 }),
+      row({ id: "b", reasoning: "high", condition: "explore",         qualityScore: 80 }),
+      row({ id: "c", reasoning: "low",  condition: "control-cto-off", qualityScore: 50 }),
+      row({ id: "d", reasoning: "low",  condition: "explore",         qualityScore: 90 }),
+    ]);
+    const user = (await import("@testing-library/user-event")).default.setup();
+    render(<MemoryRouter><Charts /></MemoryRouter>);
+    await waitFor(() => expect(screen.getByText(/4 points/)).toBeInTheDocument());
+    await user.click(screen.getByRole("button", { name: /^Heatmap/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/Reasoning × condition/)).toBeInTheDocument();
+    });
+    // 2 rows × 2 columns = 4 cells. Integer values render as "60", not "60.0".
+    // The cell value text lives inside SVG <text>.
+    const svg = screen.getByRole("img", { name: /Heatmap/i });
+    const text = svg.textContent ?? "";
+    expect(text).toContain("60");
+    expect(text).toContain("80");
+    expect(text).toContain("50");
+    expect(text).toContain("90");
+  });
+
   it("shows the 'need reps' empty state for singleton-only data", async () => {
     vi.mocked(api.fetchResults).mockResolvedValue([
       row({ id: "a", condition: "control-cto-off", qualityScore: 60 }),

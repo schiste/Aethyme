@@ -4,11 +4,14 @@ import type { EvalResult, EvalType, TargetName, ModelName } from "../lib/types";
 import { buildParetoPoints } from "../lib/chartData";
 import Scatter from "../components/charts/Scatter";
 import BoxPlot, { type BoxGroup } from "../components/charts/BoxPlot";
+import Heatmap, { type HeatmapCell } from "../components/charts/Heatmap";
 import { sortConditions } from "../lib/pivot";
 
 const ALL = "__all__";
 
-type Tab = "pareto" | "distributions";
+type Tab = "pareto" | "distributions" | "heatmap";
+type HeatmapAxis = "reasoning" | "model" | "target" | "evalType";
+type HeatmapMetric = "qualityScore" | "judgeScore" | "cost" | "totalTokens";
 type XAxis = "cost" | "totalTokens" | "durationSeconds";
 type YAxis = "qualityScore" | "judgeScore";
 
@@ -42,6 +45,8 @@ export default function Charts() {
   const [yAxis, setYAxis] = useState<YAxis>("qualityScore");
   const [distMetric, setDistMetric] = useState<"qualityScore" | "judgeScore" | "cost" | "totalTokens">("qualityScore");
   const [distBatchKey, setDistBatchKey] = useState<string | null>(null);
+  const [heatmapRowField, setHeatmapRowField] = useState<HeatmapAxis>("reasoning");
+  const [heatmapMetric, setHeatmapMetric] = useState<HeatmapMetric>("qualityScore");
 
   useEffect(() => {
     fetchResults()
@@ -110,6 +115,45 @@ export default function Charts() {
     }));
   }, [activeBatch, distMetric]);
 
+  // Heatmap data: pivot by (rowField) × condition, with mean of `heatmapMetric`.
+  // Empty cells (no runs for this row × condition) render as "—".
+  const heatmap = useMemo(() => {
+    const rowVals = new Set<string>();
+    const colVals = new Set<string>();
+    const bucket = new Map<string, number[]>();
+    const countBucket = new Map<string, number>();
+    for (const r of filtered) {
+      const rowKey = String(r[heatmapRowField] ?? "—");
+      const colKey = r.condition;
+      rowVals.add(rowKey);
+      colVals.add(colKey);
+      const v = r[heatmapMetric];
+      if (typeof v === "number" && Number.isFinite(v)) {
+        const key = `${rowKey}|${colKey}`;
+        const arr = bucket.get(key);
+        if (arr) arr.push(v);
+        else bucket.set(key, [v]);
+        countBucket.set(key, (countBucket.get(key) ?? 0) + 1);
+      }
+    }
+    const orderedRows = Array.from(rowVals).sort();
+    const orderedCols = sortConditions(Array.from(colVals));
+    const cells: HeatmapCell[] = [];
+    for (const row of orderedRows) {
+      for (const col of orderedCols) {
+        const key = `${row}|${col}`;
+        const arr = bucket.get(key);
+        if (arr && arr.length > 0) {
+          const mean = arr.reduce((s, n) => s + n, 0) / arr.length;
+          cells.push({ row, column: col, value: mean, n: arr.length });
+        } else {
+          cells.push({ row, column: col, value: null });
+        }
+      }
+    }
+    return { rows: orderedRows, columns: orderedCols, cells };
+  }, [filtered, heatmapRowField, heatmapMetric]);
+
   const xConfig = X_AXES.find((a) => a.value === xAxis)!;
   const yConfig = Y_AXES.find((a) => a.value === yAxis)!;
 
@@ -136,7 +180,7 @@ export default function Charts() {
     <div className="space-y-4">
       {/* Tab bar */}
       <div className="flex gap-1 border-b border-[var(--color-border)]">
-        {(["pareto", "distributions"] as Tab[]).map((t) => (
+        {(["pareto", "distributions", "heatmap"] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -147,7 +191,7 @@ export default function Charts() {
                 : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]",
             ].join(" ")}
           >
-            {t === "pareto" ? "Pareto scatter" : "Distributions"}
+            {t === "pareto" ? "Pareto scatter" : t === "distributions" ? "Distributions" : "Heatmap"}
           </button>
         ))}
       </div>
@@ -233,6 +277,37 @@ export default function Charts() {
             </select>
           </div>
         )}
+
+        {tab === "heatmap" && (
+          <>
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-[var(--color-text-muted)] uppercase tracking-wide">Rows</label>
+              <select
+                value={heatmapRowField}
+                onChange={(e) => setHeatmapRowField(e.target.value as HeatmapAxis)}
+                className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-2.5 py-1.5 text-sm text-[var(--color-text)]"
+              >
+                <option value="reasoning">Reasoning</option>
+                <option value="model">Model</option>
+                <option value="target">Target</option>
+                <option value="evalType">Eval type</option>
+              </select>
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-[var(--color-text-muted)] uppercase tracking-wide">Metric</label>
+              <select
+                value={heatmapMetric}
+                onChange={(e) => setHeatmapMetric(e.target.value as HeatmapMetric)}
+                className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-2.5 py-1.5 text-sm text-[var(--color-text)]"
+              >
+                <option value="qualityScore">Quality</option>
+                <option value="judgeScore">Judge</option>
+                <option value="cost">Cost</option>
+                <option value="totalTokens">Total tokens</option>
+              </select>
+            </div>
+          </>
+        )}
       </div>
 
       {tab === "pareto" && (
@@ -259,6 +334,38 @@ export default function Charts() {
             yField={yAxis}
             yLabel={yConfig.label}
           />
+        </div>
+      )}
+
+      {tab === "heatmap" && (
+        <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-4 space-y-3">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <h2 className="text-sm font-semibold text-[var(--color-text)]">
+              {heatmapRowLabel(heatmapRowField)} × condition — {distMetricLabel(heatmapMetric)}
+            </h2>
+            <span className="text-xs text-[var(--color-text-muted)] font-mono">
+              {heatmap.rows.length} × {heatmap.columns.length}
+            </span>
+          </div>
+          <p className="text-xs text-[var(--color-text-muted)]">
+            Cell value is the mean of {distMetricLabel(heatmapMetric)} across all
+            runs matching that row × column. Pick "Reasoning" as the row axis
+            to visualize the reasoning × navigation interaction — navigation
+            tools tend to help most when reasoning is constrained.
+          </p>
+          {heatmap.rows.length === 0 ? (
+            <div className="text-center py-12 text-[var(--color-text-muted)] text-sm">
+              No rows match the current filters.
+            </div>
+          ) : (
+            <Heatmap
+              rows={heatmap.rows}
+              columns={heatmap.columns}
+              cells={heatmap.cells}
+              higherIsBetter={heatmapMetric === "qualityScore" || heatmapMetric === "judgeScore"}
+              formatValue={distMetricFormatter(heatmapMetric)}
+            />
+          )}
         </div>
       )}
 
@@ -320,5 +427,15 @@ function distMetricFormatter(m: string): (v: number) => string {
     case "cost":        return (v) => `$${v.toFixed(2)}`;
     case "totalTokens": return formatTokens;
     default:            return (v) => (Number.isInteger(v) ? String(v) : v.toFixed(1));
+  }
+}
+
+function heatmapRowLabel(field: string): string {
+  switch (field) {
+    case "reasoning": return "Reasoning";
+    case "model":     return "Model";
+    case "target":    return "Target";
+    case "evalType":  return "Eval type";
+    default:          return field;
   }
 }
