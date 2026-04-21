@@ -189,18 +189,32 @@ def _build_claude_command(
     Key differences from codex:
       - Claude writes structured output to stdout (not a dedicated file flag),
         so we redirect stdout to output_path.
-      - `--bare` strips hooks, LSP, plugin sync, MCP, and CLAUDE.md autoload.
-        Without it, the judge would inherit ~70k cache tokens of project
-        context before seeing the first byte of the judging prompt.
       - `--disallowedTools` blocks every code/network tool. The judge must
         produce JSON from text — nothing else.
       - `--json-schema` inlines the schema (claude reads it from the flag
         value, not a path), so we pass the file content inlined with `$(cat)`.
+
+    We deliberately do NOT pass `--bare`. --bare skips *keychain reads*
+    along with its other strip flags — without keychain the CLI reports
+    "Not logged in" and refuses to run in OAuth installs. There's no
+    middle-ground flag that keeps keychain but strips hooks/MCP/CLAUDE.md.
+    Trade-off: ~70k extra input tokens per call for auto-loaded CLAUDE.md
+    + MCP + plugins (haiku = ~$0.056/call). Accepted because (a) the judge
+    prompt is explicit enough that the extra context doesn't change its
+    behavior, (b) --json-schema forces the model into the StructuredOutput
+    tool so MCP tools stay unused, (c) --disallowedTools blocks the ones
+    that would let the judge deviate.
+
+    Atomic write via `> OUT.partial && mv OUT.partial OUT`: shell redirect
+    creates the file immediately and streams into it, so a naive polling
+    reader would see the file exist while claude is still writing and
+    parse partial JSON. Writing to a .partial tempfile and moving on
+    success gives us the same atomic-appear semantics as codex's
+    --output-last-message, so _wait_for_output_file's polling is correct.
     """
     parts = [
         "claude",
         "-p",
-        "--bare",
         "--dangerously-skip-permissions",
         "--model", shlex.quote(model),
         "--output-format", "json",
@@ -210,12 +224,12 @@ def _build_claude_command(
         f'"$(cat {shlex.quote(str(schema_path))})"',
         "--disallowedTools", shlex.quote(_CLAUDE_DISALLOWED_TOOLS),
     ]
-    # stdin = prompt, stdout = output file. Claude's -p mode reads prompt
-    # from stdin when no positional prompt argument is given.
+    partial = shlex.quote(str(output_path) + ".partial")
+    final = shlex.quote(str(output_path))
     return (
         " ".join(parts)
         + f" < {shlex.quote(str(prompt_path))}"
-        + f" > {shlex.quote(str(output_path))}"
+        + f" > {partial} && mv {partial} {final}"
     )
 
 
