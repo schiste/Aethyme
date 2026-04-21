@@ -1,0 +1,124 @@
+{
+  "eval_type": "bug-fix-1",
+  "per_backend": {
+    "codex": {
+      "eval_type": "bug-fix-1",
+      "backend": "codex",
+      "items_scored": 5,
+      "items_found": 5,
+      "max_drift": 12.8,
+      "mean_drift": 7.12,
+      "passes": true,
+      "threshold_max": 15.0,
+      "threshold_mean": 10.0,
+      "per_item": [
+        {
+          "calibration_id": "mediawiki-bug-fix-1-001-control-cto-off",
+          "human_score": 45.9,
+          "judge_mean": 58.7,
+          "drift": 12.8,
+          "stdev": 4.04,
+          "reliable": true,
+          "error": null
+        },
+        {
+          "calibration_id": "mediawiki-bug-fix-1-002-control-cto-on",
+          "human_score": 39.7,
+          "judge_mean": 48.7,
+          "drift": 9.0,
+          "stdev": 6.35,
+          "reliable": true,
+          "error": null
+        },
+        {
+          "calibration_id": "mediawiki-bug-fix-1-003-explore",
+          "human_score": 49.3,
+          "judge_mean": 57.7,
+          "drift": 8.4,
+          "stdev": 2.08,
+          "reliable": true,
+          "error": null
+        },
+        {
+          "calibration_id": "mediawiki-bug-fix-1-004-leverage",
+          "human_score": 49.7,
+          "judge_mean": 48.3,
+          "drift": 1.4,
+          "stdev": 3.21,
+          "reliable": true,
+          "error": null
+        },
+        {
+          "calibration_id": "mediawiki-bug-fix-1-005-task-conditioned",
+          "human_score": 46.3,
+          "judge_mean": 50.3,
+          "drift": 4.0,
+          "stdev": 2.89,
+          "reliable": true,
+          "error": null
+        }
+      ]
+    },
+    "claude-haiku": {
+      "eval_type": "bug-fix-1",
+      "backend": "claude-haiku",
+      "items_scored": 5,
+      "items_found": 5,
+      "max_drift": 12.0,
+      "mean_drift": 6.62,
+      "passes": true,
+      "threshold_max": 15.0,
+      "threshold_mean": 10.0,
+      "per_item": [
+        {
+          "calibration_id": "mediawiki-bug-fix-1-001-control-cto-off",
+          "human_score": 45.9,
+          "judge_mean": 53.0,
+          "drift": 7.1,
+          "stdev": 3.61,
+          "reliable": true,
+          "error": null
+        },
+        {
+          "calibration_id": "mediawiki-bug-fix-1-002-control-cto-on",
+          "human_score": 39.7,
+          "judge_mean": 51.7,
+          "drift": 12.0,
+          "stdev": 7.09,
+          "reliable": true,
+          "error": null
+        },
+        {
+          "calibration_id": "mediawiki-bug-fix-1-003-explore",
+          "human_score": 49.3,
+          "judge_mean": 52.3,
+          "drift": 3.0,
+          "stdev": 4.51,
+          "reliable": true,
+          "error": null
+        },
+        {
+          "calibration_id": "mediawiki-bug-fix-1-004-leverage",
+          "human_score": 49.7,
+          "judge_mean": 59.3,
+          "drift": 9.6,
+          "stdev": 4.51,
+          "reliable": true,
+          "error": null
+        },
+        {
+          "calibration_id": "mediawiki-bug-fix-1-005-task-conditioned",
+          "human_score": 46.3,
+          "judge_mean": 47.7,
+          "drift": 1.4,
+          "stdev": 5.69,
+          "reliable": true,
+          "error": null
+        }
+      ]
+    }
+  },
+  "winner": "tie",
+  "winner_reason": "claude-haiku mean_drift=6.62 vs codex mean_drift=7.12 (delta=0.50 < tie threshold 2.0)",
+  "tie_threshold": 2.0
+}
