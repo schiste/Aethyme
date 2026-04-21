@@ -55,6 +55,19 @@ CREATE INDEX IF NOT EXISTS idx_target ON eval_results(target);
 CREATE INDEX IF NOT EXISTS idx_model ON eval_results(model);
 CREATE INDEX IF NOT EXISTS idx_condition ON eval_results(condition);
 CREATE INDEX IF NOT EXISTS idx_date ON eval_results(date);
+
+-- Capability probes (navigation, graph-usage). One row per (eval_result, probe).
+-- result_id FKs to eval_results.id. Kept as a child table rather than
+-- adding columns so probe definitions can evolve without migrations.
+CREATE TABLE IF NOT EXISTS eval_probes (
+    result_id   TEXT NOT NULL,
+    probe_name  TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (result_id, probe_name),
+    FOREIGN KEY (result_id) REFERENCES eval_results(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_eval_probes_result ON eval_probes(result_id);
 """
 
 ALL_CONDITIONS = ("control-cto-off", "control-cto-on", "control", "explore", "leverage", "task-conditioned")
@@ -123,6 +136,92 @@ def get_db() -> sqlite3.Connection:
         except sqlite3.OperationalError:
             pass  # Column already exists
     return conn
+
+
+def insert_probe_result(
+    *,
+    result_id: str,
+    probe_name: str,
+    result: dict[str, Any],
+    created_at: str | None = None,
+) -> None:
+    """Store one probe result for an eval row.
+
+    Upserts: re-inserting the same (result_id, probe_name) replaces the
+    row, matching the semantics of the parent eval_results table.
+    """
+    from datetime import datetime, timezone
+    ts = created_at or datetime.now(timezone.utc).isoformat()[:19]
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO eval_probes "
+            "(result_id, probe_name, result_json, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (result_id, probe_name, json.dumps(result), ts),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_probes_for_result(result_id: str) -> list[dict[str, Any]]:
+    """Return all probe results for a single eval row."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT probe_name, result_json, created_at "
+            "FROM eval_probes WHERE result_id = ?",
+            (result_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        try:
+            parsed = json.loads(r["result_json"])
+        except (json.JSONDecodeError, TypeError):
+            parsed = {"error": "unparseable result_json"}
+        out.append({
+            "probe_name": r["probe_name"],
+            "result": parsed,
+            "created_at": r["created_at"],
+        })
+    return out
+
+
+def list_probes_for_batch(batch_id: str) -> list[dict[str, Any]]:
+    """Return probe results for every row in a batch, joined with row metadata."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT p.result_id, p.probe_name, p.result_json, p.created_at,
+                   e.condition, e.run_index
+            FROM eval_probes p
+            JOIN eval_results e ON e.id = p.result_id
+            WHERE e.batch_id = ?
+            ORDER BY e.run_index, e.condition, p.probe_name
+            """,
+            (batch_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        try:
+            parsed = json.loads(r["result_json"])
+        except (json.JSONDecodeError, TypeError):
+            parsed = {"error": "unparseable result_json"}
+        out.append({
+            "result_id": r["result_id"],
+            "probe_name": r["probe_name"],
+            "result": parsed,
+            "condition": r["condition"],
+            "run_index": r["run_index"],
+            "created_at": r["created_at"],
+        })
+    return out
 
 
 def import_eval_runs(eval_runs_dir: Path) -> int:

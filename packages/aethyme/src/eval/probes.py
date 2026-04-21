@@ -93,12 +93,21 @@ def _bash_command(call: ToolCall) -> str:
 
 
 def _matches_target(path: str, target: str) -> bool:
-    """Suffix/substring match: agents use varied path prefixes."""
+    """Suffix/substring match for paths.
+
+    Agents use varied prefixes (absolute, repo-relative, package-relative)
+    and the match has to be robust to all of them. Case is folded because
+    real-world repos have mixed casing (MediaWiki has both `Watchlist/`
+    and `watchlist/` in places, and macOS filesystems case-fold anyway).
+    A strict case-sensitive match would miss genuine hits and give false
+    "agent never opened the right file" signal.
+    """
     if not path or not target:
         return False
-    # Normalize both sides a little — strip trailing slash, flip backslash.
-    p = path.replace("\\", "/").rstrip("/")
-    t = target.replace("\\", "/").rstrip("/")
+    # Normalize both sides a little — strip trailing slash, flip backslash,
+    # lowercase for cross-case robustness.
+    p = path.replace("\\", "/").rstrip("/").lower()
+    t = target.replace("\\", "/").rstrip("/").lower()
     return p.endswith(t) or t in p
 
 

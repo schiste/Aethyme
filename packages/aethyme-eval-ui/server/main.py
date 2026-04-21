@@ -172,6 +172,20 @@ async def reimport_results() -> dict[str, Any]:
     return {"imported": count}
 
 
+@app.get("/api/results/{result_id}/probes")
+async def get_result_probes(result_id: str) -> dict[str, Any]:
+    """Return probe results for a single eval row."""
+    from db import list_probes_for_result
+    return {"result_id": result_id, "probes": list_probes_for_result(result_id)}
+
+
+@app.get("/api/batches/{batch_id}/probes")
+async def get_batch_probes(batch_id: str) -> dict[str, Any]:
+    """Return probe results for every row in a batch."""
+    from db import list_probes_for_batch
+    return {"batch_id": batch_id, "probes": list_probes_for_batch(batch_id)}
+
+
 # ---------------------------------------------------------------------------
 # Repositories
 # ---------------------------------------------------------------------------
@@ -2757,6 +2771,43 @@ def _run_eval_background(
                 "minimumMeaningfulDelta": req.minimumMeaningfulDelta,
             })
             log(f"[{cond_name}] Stored: {result_id} (output: {len(data.get('output',''))} chars)")
+
+            # Capability probes — piggyback. Parse the session's tool-call
+            # stream, load probe_targets() from schemas, run navigation +
+            # graph-usage probes, store in eval_probes. Failures here must
+            # never break the main eval flow, so catch broadly.
+            try:
+                from probe_runner import run_probes_on_row
+                session_file = session_files.get(cond_name)
+                sub_agents_dir = (
+                    session_file.parent / session_file.stem / "subagents"
+                    if session_file else None
+                )
+                probe_run = run_probes_on_row(
+                    result_id=result_id,
+                    eval_type=req.evalType,
+                    session_file=session_file,
+                    sub_agents_dir=sub_agents_dir,
+                    aethyme_pkg=AETHYME_PKG,
+                )
+                nav = probe_run.probe_results.get("navigation", {})
+                gu = probe_run.probe_results.get("graph_usage", {})
+                nav_summary = (
+                    f"first_hit={nav.get('first_hit_step')} "
+                    f"recall@k={nav.get('recall_at_k')}"
+                    if not nav.get("skipped") else "skipped"
+                )
+                gu_summary = (
+                    f"aethyme_called={gu.get('aethyme_called')} "
+                    f"before_edit={gu.get('aethyme_called_before_first_edit')}"
+                    if not gu.get("skipped") else "skipped"
+                )
+                log(
+                    f"[{cond_name}] Probes ({probe_run.tool_call_count} tool calls): "
+                    f"navigation[{nav_summary}] graph_usage[{gu_summary}]"
+                )
+            except Exception as probe_err:
+                log(f"[{cond_name}] Probe run failed (non-fatal): {probe_err}")
         except Exception as e:
             log(f"[{cond_name}] ERROR collecting: {e}")
             import traceback
