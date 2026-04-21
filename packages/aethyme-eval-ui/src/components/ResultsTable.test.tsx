@@ -83,6 +83,46 @@ describe("ResultsTable — diff selection flow", () => {
     expect(labels.some((l) => l?.includes("control-cto-off"))).toBe(false);
   });
 
+  it("renders a JudgeDotStrip when a row has 2+ judge samples", () => {
+    const rows = [
+      row({
+        id: "a",
+        condition: "explore",
+        judgeScore: 50,
+        // Storage format used today: array of {score} objects
+        judgeSamples: JSON.stringify([{ score: 40 }, { score: 50 }, { score: 60 }]),
+      }),
+    ];
+    render(<ResultsTable results={rows} />);
+    const strips = document.querySelectorAll('svg[aria-label^="Judge samples"]');
+    expect(strips.length).toBe(1);
+    expect(strips[0].querySelectorAll("circle").length).toBe(3);
+  });
+
+  it("accepts the legacy plain-number samples format too", () => {
+    const rows = [
+      row({
+        id: "a",
+        judgeScore: 50,
+        judgeSamples: JSON.stringify([40, 50, 60]),
+      }),
+    ];
+    render(<ResultsTable results={rows} />);
+    const strips = document.querySelectorAll('svg[aria-label^="Judge samples"]');
+    expect(strips.length).toBe(1);
+    expect(strips[0].querySelectorAll("circle").length).toBe(3);
+  });
+
+  it("does not render a dot strip for single-sample or missing-samples rows", () => {
+    const rows = [
+      row({ id: "a", judgeScore: 50, judgeSamples: JSON.stringify([{ score: 50 }]) }),
+      row({ id: "b", judgeScore: 50, judgeSamples: null }),
+    ];
+    render(<ResultsTable results={rows} />);
+    const strips = document.querySelectorAll('svg[aria-label^="Judge samples"]');
+    expect(strips.length).toBe(0);
+  });
+
   it("clicking Compare opens the diff modal", async () => {
     const rows = [
       row({ id: "a", condition: "control-cto-off", output: "alpha\nbeta" }),

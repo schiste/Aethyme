@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
 import DiffModal from "./DiffModal";
+import JudgeDotStrip from "./charts/JudgeDotStrip";
 import type {
   DeliverableStatus,
   EvalResult,
@@ -104,7 +105,18 @@ function parseJudgeSamples(raw: string | null | undefined): number[] | null {
   try {
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return null;
-    return parsed.filter((v): v is number => typeof v === "number");
+    // Backend stores samples in two shapes depending on when the row was
+    // written: plain `[n, n, n]` or `[{score: n}, {score: n}, ...]`.
+    // Accept both. Non-numeric entries are dropped.
+    const out: number[] = [];
+    for (const entry of parsed) {
+      if (typeof entry === "number" && Number.isFinite(entry)) {
+        out.push(entry);
+      } else if (entry && typeof entry === "object" && typeof (entry as { score?: unknown }).score === "number") {
+        out.push((entry as { score: number }).score);
+      }
+    }
+    return out.length > 0 ? out : null;
   } catch {
     return null;
   }
@@ -475,16 +487,31 @@ export default function ResultsTable({ results }: Props) {
           row.judgeError ? `Error: ${row.judgeError}` : null,
         ].filter(Boolean).join("\n");
         const unreliable = row.judgeReliable === false;
+        const colorClass = unreliable
+          ? "text-[var(--color-score-yellow)]"
+          : scoreColor(value);
+        // Inline dot strip shows the N samples' spread relative to the mean —
+        // tight cluster = reliable, fan-out = ambiguous answer.
+        // Only render when we have 2+ samples; a single sample is
+        // uninformative about spread.
+        const showStrip = samples !== null && samples.length >= 2;
         return (
           <Tooltip content={tooltipLines}>
             <span
-              className={`font-mono font-semibold cursor-help border-b border-dotted ${
-                unreliable
-                  ? "text-[var(--color-score-yellow)] border-[var(--color-score-yellow)]/50"
-                  : `${scoreColor(value)} border-[var(--color-text-muted)]`
-              }`}
+              className={`inline-flex flex-col items-end gap-0.5 cursor-help ${colorClass}`}
             >
-              {display}
+              <span
+                className={`font-mono font-semibold border-b border-dotted ${
+                  unreliable
+                    ? "border-[var(--color-score-yellow)]/50"
+                    : "border-[var(--color-text-muted)]"
+                }`}
+              >
+                {display}
+              </span>
+              {showStrip && (
+                <JudgeDotStrip samples={samples} mean={value} width={60} height={10} />
+              )}
             </span>
           </Tooltip>
         );
