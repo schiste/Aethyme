@@ -3,6 +3,7 @@ import Layout from "./components/Layout";
 import Results from "./pages/Results";
 import Matrix from "./pages/Matrix";
 import Charts from "./pages/Charts";
+import Trends from "./pages/Trends";
 import Repositories from "./pages/Repositories";
 import RunEvals from "./pages/RunEvals";
 import Batches from "./pages/Batches";
@@ -15,6 +16,7 @@ export default function App() {
         <Route path="/results" element={<Results />} />
         <Route path="/matrix" element={<Matrix />} />
         <Route path="/charts" element={<Charts />} />
+        <Route path="/trends" element={<Trends />} />
         <Route path="/repositories" element={<Repositories />} />
         <Route path="/run" element={<RunEvals />} />
         <Route path="/batches" element={<Batches />} />

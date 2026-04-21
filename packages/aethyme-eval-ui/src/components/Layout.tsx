@@ -5,6 +5,7 @@ const tabs = [
   { to: "/matrix", label: "Matrix" },
   { to: "/batches", label: "Batches" },
   { to: "/charts", label: "Charts" },
+  { to: "/trends", label: "Trends" },
   { to: "/repositories", label: "Repositories" },
   { to: "/run", label: "Run Evals" },
 ] as const;
