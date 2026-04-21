@@ -113,6 +113,21 @@ describe("ResultsTable — diff selection flow", () => {
     expect(strips[0].querySelectorAll("circle").length).toBe(3);
   });
 
+  it("renders a ToolMixBar when a row has a tool breakdown", () => {
+    const rows = [
+      row({
+        id: "a",
+        toolCalls: 7,
+        toolBreakdown: JSON.stringify({ Read: 4, Grep: 2, Bash: 1 }),
+      }),
+    ];
+    render(<ResultsTable results={rows} />);
+    const bars = document.querySelectorAll('svg[aria-label^="Tool mix"]');
+    expect(bars).toHaveLength(1);
+    // 3 tools → 3 rects
+    expect(bars[0].querySelectorAll("rect")).toHaveLength(3);
+  });
+
   it("does not render a dot strip for single-sample or missing-samples rows", () => {
     const rows = [
       row({ id: "a", judgeScore: 50, judgeSamples: JSON.stringify([{ score: 50 }]) }),

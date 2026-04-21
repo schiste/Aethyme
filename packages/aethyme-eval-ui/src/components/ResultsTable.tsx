@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
 import DiffModal from "./DiffModal";
 import JudgeDotStrip from "./charts/JudgeDotStrip";
+import ToolMixBar, { type ToolCount } from "./charts/ToolMixBar";
 import type {
   DeliverableStatus,
   EvalResult,
@@ -579,23 +580,29 @@ export default function ResultsTable({ results }: Props) {
       case "toolCalls": {
         const breakdown = parseToolBreakdown(row.toolBreakdown);
         const topTools = parseTopTools(row.topTools ?? null);
-        if (breakdown || topTools) {
-          const lines = breakdown
-            ? Object.entries(breakdown)
-                .sort(([, a], [, b]) => b - a)
-                .map(([name, count]) => `${name}: ${count}`)
-            : [];
-          const topLines = breakdown ? [] : (topTools || []).map((tool) => `${tool.name}: ${tool.count}`);
-          const content = [...lines, ...topLines].join("\n");
-          return (
-            <Tooltip content={content || "No tool breakdown available"}>
-              <span className="font-mono cursor-help border-b border-dotted border-[var(--color-text-muted)]">
+        // Normalize to a ToolCount[] for the stacked bar, regardless of
+        // which shape the backend gave us.
+        const toolCounts: ToolCount[] = breakdown
+          ? Object.entries(breakdown).map(([name, count]) => ({ name, count }))
+          : (topTools ?? []);
+        if (toolCounts.length === 0) {
+          return <span className="font-mono">{row.toolCalls}</span>;
+        }
+        const content = toolCounts
+          .slice()
+          .sort((a, b) => b.count - a.count)
+          .map((t) => `${t.name}: ${t.count}`)
+          .join("\n");
+        return (
+          <Tooltip content={content}>
+            <span className="inline-flex flex-col items-end gap-0.5 cursor-help">
+              <span className="font-mono border-b border-dotted border-[var(--color-text-muted)]">
                 {row.toolCalls}
               </span>
-            </Tooltip>
-          );
-        }
-        return <span className="font-mono">{row.toolCalls}</span>;
+              <ToolMixBar tools={toolCounts} width={60} height={6} />
+            </span>
+          </Tooltip>
+        );
       }
       case "scorePer1kTokens":
         return <span className="font-mono">{typeof row.scorePer1kTokens === "number" ? row.scorePer1kTokens.toFixed(4) : "—"}</span>;
