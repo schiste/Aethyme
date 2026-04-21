@@ -3,9 +3,12 @@ import { fetchResults } from "../lib/api";
 import type { EvalResult, EvalType, TargetName, ModelName } from "../lib/types";
 import { buildParetoPoints } from "../lib/chartData";
 import Scatter from "../components/charts/Scatter";
+import BoxPlot, { type BoxGroup } from "../components/charts/BoxPlot";
+import { sortConditions } from "../lib/pivot";
 
 const ALL = "__all__";
 
+type Tab = "pareto" | "distributions";
 type XAxis = "cost" | "totalTokens" | "durationSeconds";
 type YAxis = "qualityScore" | "judgeScore";
 
@@ -31,11 +34,14 @@ export default function Charts() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  const [tab, setTab] = useState<Tab>("pareto");
   const [evalTypeFilter, setEvalTypeFilter] = useState<string>(ALL);
   const [targetFilter, setTargetFilter] = useState<string>(ALL);
   const [modelFilter, setModelFilter] = useState<string>(ALL);
   const [xAxis, setXAxis] = useState<XAxis>("cost");
   const [yAxis, setYAxis] = useState<YAxis>("qualityScore");
+  const [distMetric, setDistMetric] = useState<"qualityScore" | "judgeScore" | "cost" | "totalTokens">("qualityScore");
+  const [distBatchKey, setDistBatchKey] = useState<string | null>(null);
 
   useEffect(() => {
     fetchResults()
@@ -53,6 +59,56 @@ export default function Charts() {
   }, [results, evalTypeFilter, targetFilter, modelFilter]);
 
   const points = useMemo(() => buildParetoPoints(filtered), [filtered]);
+
+  // Distribution data: group the filtered rows by batch, then by condition.
+  // A box plot is only meaningful when you look at a single batch so the
+  // variation is "same config, different runs" — not mixing batches.
+  // Declared before any early-return so hook order stays stable.
+  const batchOptions = useMemo(() => {
+    const seen = new Map<string, { label: string; rows: EvalResult[] }>();
+    for (const r of filtered) {
+      const key = [
+        r.evalType, r.target, r.model, r.reasoning,
+        r.scenario ?? "—", r.batchId ?? `single:${r.id}`,
+      ].join("|");
+      const existing = seen.get(key);
+      if (existing) existing.rows.push(r);
+      else seen.set(key, {
+        label: [
+          r.evalType, r.target, r.model,
+          r.reasoning,
+          r.scenario ? `/${r.scenario}` : "",
+          r.batchId ? `· ${r.batchId.slice(0, 8)}` : "· single",
+        ].filter(Boolean).join(" "),
+        rows: [r],
+      });
+    }
+    return Array.from(seen.entries())
+      .map(([key, b]) => ({ key, ...b }))
+      .filter((b) => {
+        const perCond = new Map<string, number>();
+        for (const r of b.rows) perCond.set(r.condition, (perCond.get(r.condition) ?? 0) + 1);
+        return Array.from(perCond.values()).some((n) => n >= 2);
+      });
+  }, [filtered]);
+
+  const activeBatch =
+    batchOptions.find((b) => b.key === distBatchKey) ?? batchOptions[0];
+
+  const boxGroups = useMemo<BoxGroup[]>(() => {
+    if (!activeBatch) return [];
+    const byCond = new Map<string, EvalResult[]>();
+    for (const r of activeBatch.rows) {
+      const bucket = byCond.get(r.condition);
+      if (bucket) bucket.push(r);
+      else byCond.set(r.condition, [r]);
+    }
+    const ordered = sortConditions(Array.from(byCond.keys()));
+    return ordered.map((cond) => ({
+      label: cond,
+      values: (byCond.get(cond) ?? []).map((r) => r[distMetric] ?? null),
+    }));
+  }, [activeBatch, distMetric]);
 
   const xConfig = X_AXES.find((a) => a.value === xAxis)!;
   const yConfig = Y_AXES.find((a) => a.value === yAxis)!;
@@ -78,6 +134,24 @@ export default function Charts() {
 
   return (
     <div className="space-y-4">
+      {/* Tab bar */}
+      <div className="flex gap-1 border-b border-[var(--color-border)]">
+        {(["pareto", "distributions"] as Tab[]).map((t) => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={[
+              "px-3 py-1.5 text-sm rounded-t transition-colors",
+              tab === t
+                ? "text-[var(--color-text)] border-b-2 border-[var(--color-accent)] -mb-px"
+                : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]",
+            ].join(" ")}
+          >
+            {t === "pareto" ? "Pareto scatter" : "Distributions"}
+          </button>
+        ))}
+      </div>
+
       {/* Filter/axis bar */}
       <div className="flex flex-wrap items-center gap-3">
         <div className="flex items-center gap-2">
@@ -118,53 +192,133 @@ export default function Charts() {
 
         <div className="flex-1" />
 
-        <div className="flex items-center gap-2">
-          <label className="text-xs text-[var(--color-text-muted)] uppercase tracking-wide">Y</label>
-          <select
-            value={yAxis}
-            onChange={(e) => setYAxis(e.target.value as YAxis)}
-            className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-2.5 py-1.5 text-sm text-[var(--color-text)]"
-          >
-            {Y_AXES.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
-          </select>
-        </div>
+        {tab === "pareto" && (
+          <>
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-[var(--color-text-muted)] uppercase tracking-wide">Y</label>
+              <select
+                value={yAxis}
+                onChange={(e) => setYAxis(e.target.value as YAxis)}
+                className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-2.5 py-1.5 text-sm text-[var(--color-text)]"
+              >
+                {Y_AXES.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
+              </select>
+            </div>
 
-        <div className="flex items-center gap-2">
-          <label className="text-xs text-[var(--color-text-muted)] uppercase tracking-wide">X</label>
-          <select
-            value={xAxis}
-            onChange={(e) => setXAxis(e.target.value as XAxis)}
-            className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-2.5 py-1.5 text-sm text-[var(--color-text)]"
-          >
-            {X_AXES.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
-          </select>
-        </div>
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-[var(--color-text-muted)] uppercase tracking-wide">X</label>
+              <select
+                value={xAxis}
+                onChange={(e) => setXAxis(e.target.value as XAxis)}
+                className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-2.5 py-1.5 text-sm text-[var(--color-text)]"
+              >
+                {X_AXES.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
+              </select>
+            </div>
+          </>
+        )}
+
+        {tab === "distributions" && (
+          <div className="flex items-center gap-2">
+            <label className="text-xs text-[var(--color-text-muted)] uppercase tracking-wide">Metric</label>
+            <select
+              value={distMetric}
+              onChange={(e) => setDistMetric(e.target.value as typeof distMetric)}
+              className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-2.5 py-1.5 text-sm text-[var(--color-text)]"
+            >
+              <option value="qualityScore">Quality</option>
+              <option value="judgeScore">Judge</option>
+              <option value="cost">Cost</option>
+              <option value="totalTokens">Total tokens</option>
+            </select>
+          </div>
+        )}
       </div>
 
-      <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-4">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="text-sm font-semibold text-[var(--color-text)]">
-            {yConfig.label} vs {xConfig.label}
-          </h2>
-          <span className="text-xs text-[var(--color-text-muted)] font-mono">
-            {points.length} point{points.length !== 1 ? "s" : ""}
-          </span>
+      {tab === "pareto" && (
+        <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-4">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-semibold text-[var(--color-text)]">
+              {yConfig.label} vs {xConfig.label}
+            </h2>
+            <span className="text-xs text-[var(--color-text-muted)] font-mono">
+              {points.length} point{points.length !== 1 ? "s" : ""}
+            </span>
+          </div>
+          <p className="text-xs text-[var(--color-text-muted)] mb-3">
+            One dot per batch-condition. Point size grows with repetition count.
+            Vertical bar shows cross-run stdev where available. Dashed outline
+            means at least one run failed its deliverable — treat the score
+            with skepticism.
+          </p>
+          <Scatter
+            points={points}
+            xField={xAxis}
+            xLabel={xConfig.label}
+            formatX={xConfig.format}
+            yField={yAxis}
+            yLabel={yConfig.label}
+          />
         </div>
-        <p className="text-xs text-[var(--color-text-muted)] mb-3">
-          One dot per batch-condition. Point size grows with repetition count.
-          Vertical bar shows cross-run stdev where available. Dashed outline
-          means at least one run failed its deliverable — treat the score
-          with skepticism.
-        </p>
-        <Scatter
-          points={points}
-          xField={xAxis}
-          xLabel={xConfig.label}
-          formatX={xConfig.format}
-          yField={yAxis}
-          yLabel={yConfig.label}
-        />
-      </div>
+      )}
+
+      {tab === "distributions" && (
+        <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-4 space-y-3">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <h2 className="text-sm font-semibold text-[var(--color-text)]">
+              Distribution of {distMetricLabel(distMetric)} across conditions
+            </h2>
+            {batchOptions.length > 0 && (
+              <select
+                value={activeBatch?.key ?? ""}
+                onChange={(e) => setDistBatchKey(e.target.value)}
+                className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-2.5 py-1.5 text-xs text-[var(--color-text)] max-w-full"
+              >
+                {batchOptions.map((b) => (
+                  <option key={b.key} value={b.key}>{b.label}</option>
+                ))}
+              </select>
+            )}
+          </div>
+          {batchOptions.length === 0 ? (
+            <div className="text-center py-12 text-[var(--color-text-muted)] text-sm">
+              No batches with repetitions match the current filters. Box plots
+              need at least 2 runs per condition to be meaningful.
+            </div>
+          ) : (
+            <>
+              <p className="text-xs text-[var(--color-text-muted)]">
+                Box = interquartile range · line in box = median · whiskers =
+                1.5×IQR · dots = outliers. Conditions with n&lt;2 runs show
+                as a single highlighted dot.
+              </p>
+              <BoxPlot
+                groups={boxGroups}
+                yLabel={distMetricLabel(distMetric)}
+                formatY={distMetricFormatter(distMetric)}
+              />
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
+}
+
+function distMetricLabel(m: string): string {
+  switch (m) {
+    case "qualityScore": return "Quality";
+    case "judgeScore":   return "Judge";
+    case "cost":         return "Cost (USD)";
+    case "totalTokens":  return "Total tokens";
+    default: return m;
+  }
+}
+
+function distMetricFormatter(m: string): (v: number) => string {
+  switch (m) {
+    case "cost":        return (v) => `$${v.toFixed(2)}`;
+    case "totalTokens": return formatTokens;
+    default:            return (v) => (Number.isInteger(v) ? String(v) : v.toFixed(1));
+  }
 }

@@ -87,4 +87,39 @@ describe("Charts page", () => {
     expect(screen.getAllByText("explore").length).toBeGreaterThan(0);
     expect(screen.getAllByText("leverage").length).toBeGreaterThan(0);
   });
+
+  it("switches to Distributions tab and renders a BoxPlot for a batch with reps", async () => {
+    const batchCommon = { batchId: "b-dist", runsInBatch: 3, minimumMeaningfulDelta: 5 };
+    vi.mocked(api.fetchResults).mockResolvedValue([
+      row({ id: "c1", condition: "control-cto-off", qualityScore: 60, ...batchCommon, runIndex: 1 }),
+      row({ id: "c2", condition: "control-cto-off", qualityScore: 68, ...batchCommon, runIndex: 2 }),
+      row({ id: "c3", condition: "control-cto-off", qualityScore: 65, ...batchCommon, runIndex: 3 }),
+      row({ id: "e1", condition: "explore",         qualityScore: 80, ...batchCommon, runIndex: 1 }),
+      row({ id: "e2", condition: "explore",         qualityScore: 88, ...batchCommon, runIndex: 2 }),
+      row({ id: "e3", condition: "explore",         qualityScore: 85, ...batchCommon, runIndex: 3 }),
+    ]);
+    const user = (await import("@testing-library/user-event")).default.setup();
+    render(<MemoryRouter><Charts /></MemoryRouter>);
+    await waitFor(() => expect(screen.getByText(/2 points/)).toBeInTheDocument());
+    await user.click(screen.getByRole("button", { name: /Distributions/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/Distribution of Quality/)).toBeInTheDocument();
+    });
+    // BoxPlot rendered with proper aria-label
+    expect(screen.getByRole("img", { name: /Box plot/i })).toBeInTheDocument();
+  });
+
+  it("shows the 'need reps' empty state for singleton-only data", async () => {
+    vi.mocked(api.fetchResults).mockResolvedValue([
+      row({ id: "a", condition: "control-cto-off", qualityScore: 60 }),
+      row({ id: "b", condition: "explore",         qualityScore: 80 }),
+    ]);
+    const user = (await import("@testing-library/user-event")).default.setup();
+    render(<MemoryRouter><Charts /></MemoryRouter>);
+    await waitFor(() => expect(screen.getByText(/2 points/)).toBeInTheDocument());
+    await user.click(screen.getByRole("button", { name: /Distributions/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/No batches with repetitions/)).toBeInTheDocument();
+    });
+  });
 });
