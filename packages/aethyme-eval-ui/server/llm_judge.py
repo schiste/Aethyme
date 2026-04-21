@@ -35,6 +35,7 @@ from typing import Any
 
 # Must go through Chau7 MCP. No anthropic/openai SDK imports.
 import mcp_client
+from candidate_scrubber import scrub_candidate
 
 
 DEFAULT_SAMPLES = 3
@@ -86,6 +87,8 @@ def _build_judge_prompt(
     reference: dict[str, Any] | str,
     rubric: dict[str, Any] | None,
     candidate: str,
+    *,
+    scrub: bool = True,
 ) -> str:
     ref_text = (
         json.dumps(reference, indent=2) if isinstance(reference, dict) else str(reference)
@@ -94,17 +97,26 @@ def _build_judge_prompt(
         json.dumps(rubric, indent=2) if rubric else "(use the scoring guidance)"
     )
 
-    truncated_candidate = candidate
+    # Self-preference-bias mitigation: strip model-identifying envelope
+    # (chat prefixes, UI bullets, thinking blocks, provider boilerplate)
+    # before the judge sees the candidate. Scrubbing is line-anchored and
+    # only touches envelope — code blocks and analysis text are preserved.
+    # Applied BEFORE truncation so the envelope doesn't waste the budget.
+    scrubbed_candidate = candidate
+    if scrub:
+        scrubbed_candidate, _stats = scrub_candidate(candidate)
+
+    truncated_candidate = scrubbed_candidate
     truncation_note = ""
-    if len(candidate) > MAX_OUTPUT_CHARS:
+    if len(scrubbed_candidate) > MAX_OUTPUT_CHARS:
         half = MAX_OUTPUT_CHARS // 2
         truncated_candidate = (
-            f"{candidate[:half]}\n\n"
-            f"[...TRUNCATED {len(candidate) - MAX_OUTPUT_CHARS} CHARS...]\n\n"
-            f"{candidate[-half:]}"
+            f"{scrubbed_candidate[:half]}\n\n"
+            f"[...TRUNCATED {len(scrubbed_candidate) - MAX_OUTPUT_CHARS} CHARS...]\n\n"
+            f"{scrubbed_candidate[-half:]}"
         )
         truncation_note = (
-            f"\n\nNote: candidate truncated from {len(candidate)} to "
+            f"\n\nNote: candidate truncated from {len(scrubbed_candidate)} to "
             f"{MAX_OUTPUT_CHARS} chars (head + tail preserved)."
         )
 
@@ -365,12 +377,25 @@ def score_with_judge(
             "error": "candidate too short to judge",
         }
 
+    # Scrub envelope first so the stats can be reported, then pass the
+    # already-scrubbed candidate through the prompt builder (which would
+    # re-scrub idempotently but this keeps the stats reportable).
+    scrubbed_candidate, scrub_stats = scrub_candidate(candidate)
+    _log(
+        f"  scrubber: dropped {scrub_stats.lines_dropped} lines, "
+        f"stripped {scrub_stats.lines_prefix_stripped} prefixes, "
+        f"removed {scrub_stats.removed_chars} chars "
+        f"({scrub_stats.match_counts or 'no matches'})"
+    )
+
     tmpdir = Path(tempfile.mkdtemp(prefix="aethyme-judge-"))
     prompt_path = tmpdir / "prompt.txt"
     schema_path = tmpdir / "schema.json"
     try:
         prompt_path.write_text(
-            _build_judge_prompt(task, reference, rubric, candidate),
+            _build_judge_prompt(
+                task, reference, rubric, scrubbed_candidate, scrub=False
+            ),
             encoding="utf-8",
         )
         schema_path.write_text(
@@ -442,6 +467,13 @@ def score_with_judge(
         "reliable": stdev < 10.0,
         "error": "; ".join(errors) if errors else None,
         "elapsed_seconds": elapsed_seconds,
+        "scrub_stats": {
+            "original_chars": scrub_stats.original_chars,
+            "scrubbed_chars": scrub_stats.scrubbed_chars,
+            "lines_dropped": scrub_stats.lines_dropped,
+            "lines_prefix_stripped": scrub_stats.lines_prefix_stripped,
+            "match_counts": scrub_stats.match_counts,
+        },
     }
 
 
