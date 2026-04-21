@@ -226,3 +226,114 @@ def run_calibration_check(
         "threshold_mean": MEAN_DRIFT_THRESHOLD,
         "per_item": per_item,
     }
+
+
+# Minimum drift gap (in score points) for back-test to declare a winner.
+# Below this the two backends are considered tied — their accuracy is
+# indistinguishable on the current calibration set. Tuned conservatively:
+# 2 points is smaller than typical judge intra-rater stdev, so a "tie"
+# here really means "the two backends are within noise of each other".
+BACKTEST_TIE_THRESHOLD = 2.0
+
+
+def run_calibration_backtest(
+    *,
+    eval_type: str,
+    tab_directory: str,
+    aethyme_pkg_path: str,
+    backends: tuple[str, ...] = ("codex", "claude-haiku"),
+    samples: int = 3,
+    log: Any = None,
+) -> dict[str, Any]:
+    """Run calibration against each backend in sequence; declare a winner.
+
+    The point of a back-test is to answer a specific question: "given the
+    same human-anchored items, does backend A or backend B have lower
+    drift?" Lower mean_drift = better-calibrated judge for the current
+    agent population.
+
+    Returns:
+      {
+        eval_type,
+        per_backend: {<backend>: <run_calibration_check result>, ...},
+        winner: <backend_name> | "tie" | None,
+        winner_reason: "<backend> mean_drift=X vs <backend> mean_drift=Y (delta=Z)",
+        tie_threshold: BACKTEST_TIE_THRESHOLD,
+      }
+
+    A backend that errors or finds no items counts as "no data" and cannot
+    win. If both have no data, winner is None.
+
+    Never raises — inherits run_calibration_check's graceful degradation.
+    """
+    def _log(msg: str) -> None:
+        if callable(log):
+            log(msg)
+
+    per_backend: dict[str, dict[str, Any]] = {}
+    for backend in backends:
+        _log(f"[back-test] running calibration with backend={backend}")
+        per_backend[backend] = run_calibration_check(
+            eval_type=eval_type,
+            tab_directory=tab_directory,
+            aethyme_pkg_path=aethyme_pkg_path,
+            samples=samples,
+            backend=backend,
+            log=log,
+        )
+
+    # Pick the backend with the lowest mean_drift, ignoring backends that
+    # failed to score any items.
+    scored = {
+        b: r for b, r in per_backend.items()
+        if r.get("mean_drift") is not None
+    }
+    if not scored:
+        return {
+            "eval_type": eval_type,
+            "per_backend": per_backend,
+            "winner": None,
+            "winner_reason": "no backend produced any scored items",
+            "tie_threshold": BACKTEST_TIE_THRESHOLD,
+        }
+
+    ranked = sorted(scored.items(), key=lambda kv: kv[1]["mean_drift"])
+    best_backend, best_result = ranked[0]
+    if len(ranked) == 1:
+        return {
+            "eval_type": eval_type,
+            "per_backend": per_backend,
+            "winner": best_backend,
+            "winner_reason": (
+                f"{best_backend} mean_drift={best_result['mean_drift']:.2f} "
+                f"(only backend with scored items)"
+            ),
+            "tie_threshold": BACKTEST_TIE_THRESHOLD,
+        }
+
+    second_backend, second_result = ranked[1]
+    delta = second_result["mean_drift"] - best_result["mean_drift"]
+    if delta < BACKTEST_TIE_THRESHOLD:
+        return {
+            "eval_type": eval_type,
+            "per_backend": per_backend,
+            "winner": "tie",
+            "winner_reason": (
+                f"{best_backend} mean_drift={best_result['mean_drift']:.2f} vs "
+                f"{second_backend} mean_drift={second_result['mean_drift']:.2f} "
+                f"(delta={delta:.2f} < tie threshold {BACKTEST_TIE_THRESHOLD})"
+            ),
+            "tie_threshold": BACKTEST_TIE_THRESHOLD,
+        }
+
+    return {
+        "eval_type": eval_type,
+        "per_backend": per_backend,
+        "winner": best_backend,
+        "winner_reason": (
+            f"{best_backend} mean_drift={best_result['mean_drift']:.2f} vs "
+            f"{second_backend} mean_drift={second_result['mean_drift']:.2f} "
+            f"(delta={delta:.2f})"
+        ),
+        "tie_threshold": BACKTEST_TIE_THRESHOLD,
+    }

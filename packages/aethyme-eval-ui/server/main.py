@@ -120,6 +120,33 @@ async def run_judge_calibration(req: CalibrationCheckRequest) -> dict[str, Any]:
     )
 
 
+class CalibrationBacktestRequest(BaseModel):
+    evalType: str
+    # Which backends to run. Default is the two supported CLIs.
+    backends: list[str] = Field(default_factory=lambda: ["codex", "claude-haiku"])
+    judgeSamples: int = Field(default=3, ge=1, le=10)
+
+
+@app.post("/api/judge/calibration-backtest")
+async def run_judge_calibration_backtest(
+    req: CalibrationBacktestRequest,
+) -> dict[str, Any]:
+    """Back-test: run calibration against N backends and declare a winner.
+
+    Returns per-backend drift + a winner string. Used to decide whether
+    the default judge backend should flip (e.g., from "codex" to
+    "claude-haiku") based on empirical accuracy against human anchors.
+    """
+    from calibration_check import run_calibration_backtest
+    return run_calibration_backtest(
+        eval_type=req.evalType,
+        tab_directory=str(AETHYME_PKG),
+        aethyme_pkg_path=str(AETHYME_PKG),
+        backends=tuple(req.backends),
+        samples=req.judgeSamples,
+    )
+
+
 @app.post("/api/results")
 async def add_result(result: dict[str, Any]) -> dict[str, str]:
     insert_result(result)
