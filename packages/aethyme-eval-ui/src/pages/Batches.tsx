@@ -1,0 +1,204 @@
+import { useEffect, useState } from "react";
+import {
+  fetchBatches,
+  fetchBatchAggregate,
+  type BatchAggregate,
+  type BatchSummary,
+} from "../lib/api";
+import VarianceBreakdown from "../components/VarianceBreakdown";
+
+/**
+ * Batches page: list recent multi-run batches, surface each one's
+ * variance breakdown when selected.
+ *
+ * This is the P10 read side — the write side (setting batch_id when a
+ * run is launched) already exists in the /run flow. Anything with
+ * runs >= 2 shows up here; runs=1 rows have no batch_id and aren't
+ * listed.
+ */
+export default function Batches() {
+  const [batches, setBatches] = useState<BatchSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [aggregate, setAggregate] = useState<BatchAggregate | null>(null);
+  const [aggLoading, setAggLoading] = useState(false);
+  const [aggError, setAggError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await fetchBatches();
+        if (!cancelled) {
+          setBatches(data);
+          setLoading(false);
+          if (data.length > 0) setSelected(data[0].batch_id);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : String(e));
+          setLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!selected) return;
+    let cancelled = false;
+    setAggLoading(true);
+    setAggError(null);
+    (async () => {
+      try {
+        const data = await fetchBatchAggregate(selected);
+        if (!cancelled) {
+          setAggregate(data);
+          setAggLoading(false);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setAggError(e instanceof Error ? e.message : String(e));
+          setAggLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selected]);
+
+  if (loading) return <div className="p-4 text-sm">Loading batches…</div>;
+  if (error)
+    return (
+      <div className="p-4 text-sm text-[var(--color-score-red)]">
+        {error}
+      </div>
+    );
+  if (batches.length === 0)
+    return (
+      <div className="p-4 text-sm text-[var(--color-text-muted)]">
+        No multi-run batches yet. Set <code>runs ≥ 2</code> on the Run page
+        to aggregate across runs; <code>runs = 1</code> rows aren't batched.
+      </div>
+    );
+
+  return (
+    <div className="p-4 grid grid-cols-[320px_1fr] gap-4">
+      <aside>
+        <h2 className="text-sm font-semibold mb-2">Recent batches</h2>
+        <ul className="space-y-1">
+          {batches.map((b) => {
+            const isSelected = b.batch_id === selected;
+            return (
+              <li key={b.batch_id}>
+                <button
+                  onClick={() => setSelected(b.batch_id)}
+                  className={`w-full text-left p-2 rounded border text-xs transition-colors ${
+                    isSelected
+                      ? "border-[var(--color-accent)] bg-[var(--color-surface-hover)]"
+                      : "border-[var(--color-border)] hover:bg-[var(--color-surface-hover)]"
+                  }`}
+                >
+                  <div className="font-mono text-[11px] truncate">
+                    {b.batch_id}
+                  </div>
+                  <div className="flex items-center justify-between mt-0.5">
+                    <span className="text-[var(--color-text-muted)]">
+                      {b.eval_type} · {b.target} · {b.model}
+                    </span>
+                    <span className="font-mono">
+                      {b.distinct_runs}×{b.total_rows}
+                    </span>
+                  </div>
+                  <div className="text-[10px] text-[var(--color-text-muted)] mt-0.5">
+                    {b.last_date}
+                  </div>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </aside>
+
+      <section className="space-y-4">
+        {aggLoading && <div className="text-sm">Loading batch…</div>}
+        {aggError && (
+          <div className="text-sm text-[var(--color-score-red)]">
+            {aggError}
+          </div>
+        )}
+        {aggregate && (
+          <>
+            <header>
+              <h2 className="text-base font-semibold">
+                Batch {aggregate.batch?.batch_id as string}
+              </h2>
+              <div className="text-xs text-[var(--color-text-muted)]">
+                {String(aggregate.batch?.eval_type)} ·{" "}
+                {String(aggregate.batch?.target)} ·{" "}
+                {String(aggregate.batch?.model)} ·{" "}
+                pre-registered metric:{" "}
+                <code>{String(aggregate.batch?.primary_metric)}</code> · min
+                Δ = {String(aggregate.batch?.minimum_meaningful_delta)}
+              </div>
+            </header>
+
+            <section className="p-3 border border-[var(--color-border)] rounded">
+              <VarianceBreakdown variance={aggregate.variance_components} />
+            </section>
+
+            <section className="p-3 border border-[var(--color-border)] rounded text-xs">
+              <h3 className="text-sm font-semibold mb-2">Conditions</h3>
+              <table className="w-full font-mono text-[11px]">
+                <thead>
+                  <tr className="text-[var(--color-text-muted)] text-left">
+                    <th className="py-1">Condition</th>
+                    <th className="py-1">Quality median (IQR)</th>
+                    <th className="py-1">Judge median</th>
+                    <th className="py-1">Cost median</th>
+                    <th className="py-1">Deliverable rate</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(aggregate.conditions).map(([cond, stats]) => {
+                    const q = (stats as any).quality ?? {};
+                    const j = (stats as any).judge ?? {};
+                    const c = (stats as any).cost ?? {};
+                    const d = (stats as any).deliverable_success_rate ?? {};
+                    return (
+                      <tr
+                        key={cond}
+                        className="border-t border-[var(--color-border)]"
+                      >
+                        <td className="py-1">{cond}</td>
+                        <td className="py-1">
+                          {q.median ?? "—"}
+                          {q.iqr !== null && q.iqr !== undefined
+                            ? ` (±${q.iqr})`
+                            : ""}
+                        </td>
+                        <td className="py-1">{j.median ?? "—"}</td>
+                        <td className="py-1">
+                          {c.median ? `$${c.median.toFixed(3)}` : "—"}
+                        </td>
+                        <td className="py-1">
+                          {d.rate !== null && d.rate !== undefined
+                            ? `${(d.rate * 100).toFixed(0)}%`
+                            : "—"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </section>
+          </>
+        )}
+      </section>
+    </div>
+  );
+}

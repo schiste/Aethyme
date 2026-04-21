@@ -3,6 +3,7 @@ import { NavLink, Outlet } from "react-router-dom";
 const tabs = [
   { to: "/results", label: "Results" },
   { to: "/matrix", label: "Matrix" },
+  { to: "/batches", label: "Batches" },
   { to: "/charts", label: "Charts" },
   { to: "/repositories", label: "Repositories" },
   { to: "/run", label: "Run Evals" },

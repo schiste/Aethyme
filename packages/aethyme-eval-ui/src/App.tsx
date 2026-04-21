@@ -17,6 +17,7 @@ export default function App() {
         <Route path="/charts" element={<Charts />} />
         <Route path="/repositories" element={<Repositories />} />
         <Route path="/run" element={<RunEvals />} />
+        <Route path="/batches" element={<Batches />} />
       </Route>
     </Routes>
   );

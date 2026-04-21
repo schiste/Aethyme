@@ -154,3 +154,53 @@ export async function fetchChau7Tabs(): Promise<any[]> {
   if (!res.ok) throw new Error(`Failed to fetch tabs: ${res.statusText}`);
   return res.json();
 }
+
+// P1/P10: batch-level endpoints for multi-run aggregation.
+
+export interface BatchSummary {
+  batch_id: string;
+  last_date: string | null;
+  eval_type: string | null;
+  target: string | null;
+  model: string | null;
+  runs_in_batch: number | null;
+  distinct_runs: number;
+  total_rows: number;
+}
+
+export interface VarianceComponents {
+  sigma2_cond: number | null;
+  sigma2_run: number | null;
+  sigma2_judge: number | null;
+  sigma2_cond_clamped_to_zero: boolean;
+  generalizability_coeff: number | null;
+  dominant_noise_source: "run" | "judge" | null;
+  n_conditions: number;
+  n_rows: number;
+  mean_runs_per_condition: number;
+  n_judge_samples: number;
+  n_runs_needed_for_target: number | null;
+  target_reliability: number;
+  notes: string[];
+}
+
+export interface BatchAggregate {
+  batch: Record<string, unknown> | null;
+  conditions: Record<string, Record<string, unknown>>;
+  comparisons_vs_baseline?: Record<string, unknown>;
+  scenario_discrimination?: Record<string, unknown>;
+  variance_components?: VarianceComponents;
+  judge_overhead?: Record<string, unknown>;
+}
+
+export async function fetchBatches(limit = 50): Promise<BatchSummary[]> {
+  const res = await fetch(`${API_BASE}/batches?limit=${limit}`);
+  if (!res.ok) throw new Error(`Failed to fetch batches: ${res.statusText}`);
+  return res.json();
+}
+
+export async function fetchBatchAggregate(batchId: string): Promise<BatchAggregate> {
+  const res = await fetch(`${API_BASE}/batches/${encodeURIComponent(batchId)}`);
+  if (!res.ok) throw new Error(`Failed to fetch batch: ${res.statusText}`);
+  return res.json();
+}
