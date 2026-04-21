@@ -1,9 +1,17 @@
-"""LLM-as-judge scoring via Chau7 MCP + Codex CLI.
+"""LLM-as-judge scoring via Chau7 MCP + a pluggable CLI backend.
 
-All AI invocations go through Chau7 -> tab -> codex. No direct API calls.
-Uses `codex` CLI with `--output-schema` for schema-enforced JSON output and
-`--output-last-message` to write the final message to a file (no PTY scraping,
-no scrollback dependency).
+All AI invocations go through Chau7 -> tab -> (codex|claude) CLI. No direct
+API calls. Two backends are supported:
+
+  - "codex"        : Codex CLI with --output-schema + --output-last-message.
+                     Legacy default.
+  - "claude-haiku" : Claude Code CLI with --json-schema + --output-format json.
+                     Output parsed from stdout (captured via shell redirect
+                     to a file). Runs with --bare + --disallowedTools so the
+                     judge has no tools and no CLAUDE.md context — a minimal
+                     sandbox. This is the self-preference-bias mitigation:
+                     a judge in a different model family from the agents
+                     under evaluation (Stureborg 2024, Panickssery 2024).
 
 Intra-rater reliability: the same (task, reference, candidate) triple is
 judged N times; we return the mean + stdev across samples. A judge that
@@ -12,7 +20,7 @@ is not (stdev ~= 16) and gets flagged unreliable.
 
 Degrades gracefully: every failure path returns `{..., error: "..."}` with
 empty samples. An eval run never fails because the judge is misconfigured,
-timing out, or the Codex CLI is missing.
+timing out, or the CLI is missing.
 """
 
 from __future__ import annotations
@@ -31,12 +39,17 @@ import mcp_client
 
 DEFAULT_SAMPLES = 3
 MAX_OUTPUT_CHARS = 24_000
-# Poll cadence for the output file the codex CLI writes.
+# Poll cadence for the output file the CLI writes.
 # Codex tabs keep reporting status="running" / is_at_prompt=True for their entire
 # run, so tab_status is NOT a reliable completion signal. The output file's
 # appearance is atomic and trustworthy — that's our signal.
 OUTPUT_POLL_S = 2
-JUDGE_RUN_TIMEOUT_S = 300  # up to 5 min per sample (large candidates + codex latency)
+JUDGE_RUN_TIMEOUT_S = 300  # up to 5 min per sample (large candidates + CLI latency)
+
+# Supported judge backends. Kept as a module constant so callers (main.py,
+# calibration_check) can surface the list without import cycles.
+JUDGE_BACKENDS = ("codex", "claude-haiku")
+DEFAULT_BACKEND = "codex"  # Flipped to claude-haiku after calibration back-test.
 
 
 JUDGE_SCHEMA: dict[str, Any] = {
@@ -145,11 +158,116 @@ def _build_codex_command(
     return " ".join(parts) + f" < {shlex.quote(str(prompt_path))}"
 
 
+# Tools we disallow for the Claude judge: every code-touching tool, every
+# network tool. The judge should produce JSON from text, nothing else. Listed
+# explicitly rather than wildcarded because claude's CLI whitelist semantics
+# ignore unknown names silently — enumeration is the safer form.
+_CLAUDE_DISALLOWED_TOOLS = (
+    "Bash,Edit,Write,Read,Grep,Glob,WebFetch,WebSearch,"
+    "NotebookEdit,Task,TodoWrite,EnterPlanMode,ExitPlanMode"
+)
+
+
+def _build_claude_command(
+    prompt_path: Path, output_path: Path, schema_path: Path,
+    *, model: str = "haiku",
+) -> str:
+    """Build the shell command that runs Claude Code CLI on the judge prompt.
+
+    Key differences from codex:
+      - Claude writes structured output to stdout (not a dedicated file flag),
+        so we redirect stdout to output_path.
+      - `--bare` strips hooks, LSP, plugin sync, MCP, and CLAUDE.md autoload.
+        Without it, the judge would inherit ~70k cache tokens of project
+        context before seeing the first byte of the judging prompt.
+      - `--disallowedTools` blocks every code/network tool. The judge must
+        produce JSON from text — nothing else.
+      - `--json-schema` inlines the schema (claude reads it from the flag
+        value, not a path), so we pass the file content inlined with `$(cat)`.
+    """
+    parts = [
+        "claude",
+        "-p",
+        "--bare",
+        "--dangerously-skip-permissions",
+        "--model", shlex.quote(model),
+        "--output-format", "json",
+        "--json-schema",
+        # Inline the schema content via $(cat). The schema file is tempfile-
+        # generated so the shell substitution is safe.
+        f'"$(cat {shlex.quote(str(schema_path))})"',
+        "--disallowedTools", shlex.quote(_CLAUDE_DISALLOWED_TOOLS),
+    ]
+    # stdin = prompt, stdout = output file. Claude's -p mode reads prompt
+    # from stdin when no positional prompt argument is given.
+    return (
+        " ".join(parts)
+        + f" < {shlex.quote(str(prompt_path))}"
+        + f" > {shlex.quote(str(output_path))}"
+    )
+
+
+def _parse_codex_output(raw: str) -> dict[str, Any]:
+    """Parse codex --output-last-message: a single JSON object matching JUDGE_SCHEMA."""
+    return json.loads(raw)
+
+
+def _parse_claude_output(raw: str) -> dict[str, Any]:
+    """Parse claude --output-format json: a JSON array of events.
+
+    The schema-validated payload lives in the `result` event's
+    `structured_output` field. Failing that (schema validation off / skipped),
+    fall back to parsing the `result` field's text as JSON directly.
+    """
+    # Claude returns a JSON array of events; extract the terminal result event.
+    events = json.loads(raw)
+    if isinstance(events, list):
+        for ev in reversed(events):
+            if isinstance(ev, dict) and ev.get("type") == "result":
+                so = ev.get("structured_output")
+                if isinstance(so, dict):
+                    return so
+                # Fallback: parse the result text as JSON.
+                text = ev.get("result")
+                if isinstance(text, str) and text.strip():
+                    return json.loads(text)
+                break
+        raise ValueError("claude output had no result event with structured_output")
+    # If someone passed --output-format text (shouldn't happen), try direct parse.
+    if isinstance(events, dict):
+        return events
+    raise ValueError(f"unexpected claude output shape: {type(events).__name__}")
+
+
+def _build_command(
+    backend: str, prompt_path: Path, output_path: Path, schema_path: Path
+) -> str:
+    if backend == "codex":
+        return _build_codex_command(prompt_path, output_path, schema_path)
+    if backend == "claude-haiku":
+        return _build_claude_command(
+            prompt_path, output_path, schema_path, model="haiku"
+        )
+    raise ValueError(
+        f"unknown judge backend: {backend!r} (expected one of {JUDGE_BACKENDS})"
+    )
+
+
+def _parse_output(backend: str, raw: str) -> dict[str, Any]:
+    if backend == "codex":
+        return _parse_codex_output(raw)
+    if backend == "claude-haiku":
+        return _parse_claude_output(raw)
+    raise ValueError(f"unknown judge backend: {backend!r}")
+
+
 def _run_judge_once(
     tab_id: str,
     prompt_path: Path,
     output_path: Path,
     schema_path: Path,
+    *,
+    backend: str = DEFAULT_BACKEND,
 ) -> dict[str, Any]:
     """Run one judge call inside tab_id, parse the JSON output file.
 
@@ -157,7 +275,7 @@ def _run_judge_once(
     """
     output_path.unlink(missing_ok=True)
 
-    cmd = _build_codex_command(prompt_path, output_path, schema_path)
+    cmd = _build_command(backend, prompt_path, output_path, schema_path)
     exec_result = mcp_client.tab_exec(tab_id, cmd)
     if not exec_result.get("ok"):
         raise RuntimeError(
@@ -166,7 +284,7 @@ def _run_judge_once(
 
     if not _wait_for_output_file(output_path, JUDGE_RUN_TIMEOUT_S):
         raise TimeoutError(
-            f"codex did not write output within {JUDGE_RUN_TIMEOUT_S}s"
+            f"{backend} did not write output within {JUDGE_RUN_TIMEOUT_S}s"
         )
 
     raw = output_path.read_text(encoding="utf-8").strip()
@@ -174,8 +292,8 @@ def _run_judge_once(
         raise ValueError("output file was empty")
 
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
+        parsed = _parse_output(backend, raw)
+    except (json.JSONDecodeError, ValueError) as e:
         raise ValueError(f"output was not valid JSON: {e}; raw={raw[:300]}")
 
     score = parsed.get("score")
@@ -198,19 +316,24 @@ def score_with_judge(
     rubric: dict[str, Any] | None = None,
     samples: int = DEFAULT_SAMPLES,
     tab_directory: str,
+    backend: str = DEFAULT_BACKEND,
     log: Any = None,
 ) -> dict[str, Any]:
-    """Score a candidate via Codex in a Chau7 tab, N samples (intra-rater).
+    """Score a candidate via a CLI-based judge in a Chau7 tab, N samples (intra-rater).
 
     Returns:
       {
         "mean_score": float 0-100,
         "stdev": float,
         "samples": [ {score, rationale, key_matches, key_misses}, ... ],
-        "backend": "codex",
+        "backend": "codex" | "claude-haiku",
         "reliable": bool (stdev < 10 = consistent judge),
         "error": optional error string,
       }
+
+    `backend` picks the judge CLI (see JUDGE_BACKENDS). Swapping backends is
+    the primary self-preference-bias mitigation: Codex agents should not be
+    judged by Codex — use claude-haiku instead.
 
     `tab_directory` is the cwd for the Chau7 tab. Use a neutral directory
     (NOT a playground Control repo — those must stay untouched).
@@ -221,17 +344,24 @@ def score_with_judge(
         if callable(log):
             log(msg)
 
+    if backend not in JUDGE_BACKENDS:
+        return {
+            "mean_score": 0.0, "stdev": 0.0, "samples": [],
+            "backend": backend, "reliable": False,
+            "error": f"unknown backend {backend!r}; expected one of {JUDGE_BACKENDS}",
+        }
+
     if not mcp_client.is_available():
         return {
             "mean_score": 0.0, "stdev": 0.0, "samples": [],
-            "backend": "codex", "reliable": False,
+            "backend": backend, "reliable": False,
             "error": "Chau7 MCP not available",
         }
 
     if not candidate or len(candidate) < 50:
         return {
             "mean_score": 0.0, "stdev": 0.0, "samples": [],
-            "backend": "codex", "reliable": False,
+            "backend": backend, "reliable": False,
             "error": "candidate too short to judge",
         }
 
@@ -249,7 +379,7 @@ def score_with_judge(
     except Exception as e:
         return {
             "mean_score": 0.0, "stdev": 0.0, "samples": [],
-            "backend": "codex", "reliable": False,
+            "backend": backend, "reliable": False,
             "error": f"failed to write judge artifacts: {e}",
         }
 
@@ -269,12 +399,14 @@ def score_with_judge(
             tab_id = tab.get("tab_id")
             if not tab_id:
                 raise RuntimeError(f"tab_create returned no tab_id: {tab}")
-            _log(f"  sample {i + 1}/{samples}: judge tab {tab_id} opened")
+            _log(f"  sample {i + 1}/{samples} [{backend}]: judge tab {tab_id} opened")
 
             # Shell bootstrap pause
             time.sleep(3)
 
-            result = _run_judge_once(tab_id, prompt_path, output_path, schema_path)
+            result = _run_judge_once(
+                tab_id, prompt_path, output_path, schema_path, backend=backend
+            )
             sample_results.append(result)
             _log(f"  sample {i + 1}/{samples}: score={result['score']:.0f}")
         except Exception as e:
@@ -293,7 +425,7 @@ def score_with_judge(
     if not sample_results:
         return {
             "mean_score": 0.0, "stdev": 0.0, "samples": [],
-            "backend": "codex", "reliable": False,
+            "backend": backend, "reliable": False,
             "error": "; ".join(errors) or "all judge calls failed",
             "elapsed_seconds": elapsed_seconds,
         }
@@ -306,7 +438,7 @@ def score_with_judge(
         "mean_score": round(mean_score, 1),
         "stdev": round(stdev, 2),
         "samples": sample_results,
-        "backend": "codex",
+        "backend": backend,
         "reliable": stdev < 10.0,
         "error": "; ".join(errors) if errors else None,
         "elapsed_seconds": elapsed_seconds,
@@ -321,6 +453,7 @@ def score_eval_type_with_judge(
     aethyme_pkg_path: str,
     tab_directory: str,
     samples: int = DEFAULT_SAMPLES,
+    backend: str = DEFAULT_BACKEND,
     log: Any = None,
 ) -> dict[str, Any]:
     """Judge an output for a specific eval type, loading reference + rubric from schemas.py.
@@ -360,7 +493,7 @@ def score_eval_type_with_judge(
     except Exception as e:
         return {
             "mean_score": 0.0, "stdev": 0.0, "samples": [],
-            "backend": "codex", "reliable": False,
+            "backend": backend, "reliable": False,
             "error": f"could not load reference/rubric for {eval_type}: {e}",
             "eval_type": eval_type,
             "reference_loaded": False,
@@ -373,6 +506,7 @@ def score_eval_type_with_judge(
         rubric=rubric,
         samples=samples,
         tab_directory=tab_directory,
+        backend=backend,
         log=log,
     )
     result["eval_type"] = eval_type
