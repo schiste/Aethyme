@@ -250,6 +250,32 @@ def bug_fix_scoring_rubric() -> dict[str, object]:
     }
 
 
+def bug_fix_probe_targets() -> dict[str, object]:
+    """Ground truth for capability probes on the GRC bug-fix eval.
+
+    The test is in app-shared/src/tests/ and the bug is in
+    packages/auth/src/rbac-canonical.ts — a 4-hop import chain. A
+    well-navigated agent opens the canonical file in ≤5 Read calls;
+    shotgun exploration opens auth package files at random first.
+    """
+    return {
+        "must_open": [
+            "packages/auth/src/rbac-canonical.ts",
+            # The test file pins what "fixed" looks like — reading it
+            # is legitimate (orient on the contract), though not strictly
+            # required to diagnose.
+            "app-shared/src/tests/rbac.test.ts",
+        ],
+        "must_not_open": [
+            # Plausible-but-wrong: RBAC entrypoint, not canonical table.
+            "packages/auth/src/index.ts",
+            # Plausible-but-wrong: types, not behavior.
+            "packages/auth/src/types.ts",
+        ],
+        "k_budget": 6,
+    }
+
+
 # ---------------------------------------------------------------------------
 # MediaWiki bug-fix-1: T419918 — watchlist marks all revisions as seen
 # ---------------------------------------------------------------------------
@@ -338,6 +364,48 @@ def mediawiki_bug_fix_1_scoring_rubric() -> dict[str, object]:
             "regression coverage around diff/revision watchlist behavior.",
             "efficiency: lower token usage scores higher.",
         ],
+    }
+
+
+def mediawiki_bug_fix_1_probe_targets() -> dict[str, object]:
+    """Ground truth for capability probes on the MediaWiki bug-fix-1 eval.
+
+    The navigation probe asks: "given the symptom, did the agent open the
+    right source files in their first K Read/Grep calls?" The graph-usage
+    probe asks: "did the agent consult Aethyme's navigation tools before
+    making conclusions?"
+
+    must_open:
+      Files that contain the logic needed to diagnose the bug. The edit-
+      target files (WikiPage, Article, ImagePage) AND the downstream
+      consumer where the wrong behavior manifests (WatchlistManager).
+
+    must_not_open (distractors):
+      Low-value files that a hasty search could land on — revision
+      storage, diff rendering, test fixtures — that do not contain the
+      signature bug or the notification-clearing logic.
+
+    k_budget:
+      Read/Grep budget. 8 is generous; a focused agent should find a
+      must_open file in 3-5 tool calls. Anything above 8 indicates
+      shotgun-style exploration.
+    """
+    return {
+        "must_open": [
+            "includes/Page/WikiPage.php",
+            "includes/Page/Article.php",
+            "includes/Page/ImagePage.php",
+            "includes/watchlist/WatchlistManager.php",
+        ],
+        "must_not_open": [
+            # Plausible-but-wrong: storage layer, not behavior.
+            "includes/Revision/RevisionStore.php",
+            # Plausible-but-wrong: diff rendering, not notification.
+            "includes/diff/DifferenceEngine.php",
+            # Test fixtures — code, not runtime paths.
+            "tests/phpunit/includes/page/WikiPageTest.php",
+        ],
+        "k_budget": 8,
     }
 
 
@@ -632,12 +700,6 @@ def _mediawiki_dead_code_watchlist_baseline() -> dict[str, object]:
     return json.loads(baseline_path.read_text(encoding="utf-8"))
 
 
-@lru_cache(maxsize=1)
-def _aethyme_dead_code_indexing_baseline() -> dict[str, object]:
-    baseline_path = Path(__file__).with_name("baselines") / "aethyme_dead_code_indexing.json"
-    return json.loads(baseline_path.read_text(encoding="utf-8"))
-
-
 def mediawiki_dead_code_output_schema() -> dict[str, object]:
     return {
         "type": "object",
@@ -661,10 +723,6 @@ def mediawiki_dead_code_output_schema() -> dict[str, object]:
     }
 
 
-def aethyme_dead_code_output_schema() -> dict[str, object]:
-    return mediawiki_dead_code_output_schema()
-
-
 def mediawiki_dead_code_scoring_rubric() -> dict[str, object]:
     return {
         "weights": {
@@ -679,17 +737,6 @@ def mediawiki_dead_code_scoring_rubric() -> dict[str, object]:
             "Important: this benchmark uses the prompt semantics ('zero non-test callers outside includes/Watchlist/'), not a pure software-maintenance notion of dead code.",
         ],
     }
-
-
-def aethyme_dead_code_scoring_rubric() -> dict[str, object]:
-    rubric = mediawiki_dead_code_scoring_rubric()
-    rubric["notes"] = [
-        "functions_found: recall — how many reviewed Aethyme indexing baseline functions were identified.",
-        "false_positives: precision — penalty for listing functions outside the reviewed indexing baseline.",
-        "efficiency: cost relative to $1.00 baseline.",
-        "Important: this benchmark uses the literal prompt semantics ('zero non-test callers outside packages/aethyme/src/indexing/'), not a broader maintainability definition of dead code.",
-    ]
-    return rubric
 
 
 def mediawiki_dead_code_reference() -> dict[str, object]:
@@ -720,39 +767,15 @@ def mediawiki_dead_code_reference() -> dict[str, object]:
     }
 
 
-def aethyme_dead_code_reference() -> dict[str, object]:
-    baseline = _aethyme_dead_code_indexing_baseline()
-    literal = baseline["literal_external_only"]
-    likely_dead_code = baseline["engineering_review"]["likely_dead_code"]
-    return {
-        "baseline_id": baseline["baseline_id"],
-        "reviewed_at": baseline["reviewed_at"],
-        "selection_rule": baseline["selection_rule"],
-        "unused_functions": literal,
-        "literal_external_only": literal,
-        "likely_dead_code": likely_dead_code,
-        "scope": baseline["scope"],
-        "exclusions": baseline["exclusions"],
-        "function_keywords": [item["function_name"] for item in literal],
-        "engineering_review": baseline["engineering_review"],
-    }
-
-
 def dead_code_reference_for_target(target: str) -> dict[str, object]:
-    if target == "aethyme":
-        return aethyme_dead_code_reference()
     return mediawiki_dead_code_reference()
 
 
 def dead_code_output_schema_for_target(target: str) -> dict[str, object]:
-    if target == "aethyme":
-        return aethyme_dead_code_output_schema()
     return mediawiki_dead_code_output_schema()
 
 
 def dead_code_scoring_rubric_for_target(target: str) -> dict[str, object]:
-    if target == "aethyme":
-        return aethyme_dead_code_scoring_rubric()
     return mediawiki_dead_code_scoring_rubric()
 
 
