@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import ReadinessPanel from "../components/ReadinessPanel";
+import LiveTabsPanel from "../components/LiveTabsPanel";
 import {
   fetchRepositories,
   fetchChau7Tabs,
@@ -405,6 +406,8 @@ export default function RunEvals() {
         useJudge={useJudge}
         judgeSamples={parseInt(judgeSamples, 10) || 0}
       />
+
+      <LiveTabsPanel enabled={status === "running"} />
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       {/* Left: Configuration */}
