@@ -1,11 +1,12 @@
 'use client'
 
-import { Input, Select } from '@aeptus/ui'
 import { Calculator } from 'lucide-react'
 import { useState } from 'react'
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 
 interface CostEstimatorProps {
@@ -25,7 +26,7 @@ const PRICING = {
   },
 }
 
-export function CostEstimator({ _usage }: CostEstimatorProps) {
+export function CostEstimator({ usage: _usage }: CostEstimatorProps) {
   const [symbolCount, setSymbolCount] = useState(50000)
   const [queryCount, setQueryCount] = useState(1000)
   const [provider, setProvider] = useState('openai')

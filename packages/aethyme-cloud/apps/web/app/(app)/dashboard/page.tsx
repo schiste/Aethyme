@@ -10,7 +10,7 @@ export default function DashboardPage() {
       <div>
         <h1 className="text-3xl font-bold tracking-tight">Welcome back!</h1>
         <p className="text-muted-foreground mt-2">
-          Here's an overview of your Aethyme Cloud account
+          Here&apos;s an overview of your Aethyme Cloud account
         </p>
       </div>
 

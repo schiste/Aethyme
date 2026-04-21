@@ -53,7 +53,7 @@ export function SaveSearchDialog({ query, filters, onSave, onClose }: SaveSearch
               Search Query
             </div>
             <div className="px-3 py-2 bg-gray-900 border border-gray-700 rounded text-sm text-gray-400">
-              "{query}"
+              &quot;{query}&quot;
             </div>
           </div>
 

@@ -16,7 +16,7 @@ export function GitHubConnectButton({
   size = "default",
   className,
 }: GitHubConnectButtonProps) {
-  const { isConnected, isLoading, _error, connect } = useGitHubConnection()
+  const { isConnected, isLoading, error: _error, connect } = useGitHubConnection()
 
   if (isLoading) {
     return (

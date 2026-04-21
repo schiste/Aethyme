@@ -1,6 +1,5 @@
 """Tree-sitter parser service for code analysis and symbol extraction."""
 
-import os
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from tree_sitter import Language, Parser, Node

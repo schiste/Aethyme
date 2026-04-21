@@ -1,7 +1,6 @@
 """Advanced search query parser for Boolean operators and filters."""
 
-import re
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from enum import Enum
 

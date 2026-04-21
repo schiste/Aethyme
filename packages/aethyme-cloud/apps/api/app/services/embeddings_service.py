@@ -7,8 +7,6 @@ Generates and stores vector embeddings for semantic code search using customer A
 from typing import List, Optional, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, and_, text
-from datetime import datetime
-import asyncio
 
 from app.models.code_embeddings import CodeEmbedding
 from app.services.ai_credentials_service import AICredentialsService
@@ -16,8 +14,6 @@ from app.services.ai import (
     AIProviderType,
     EmbeddingModel,
     EmbeddingRequest,
-    InvalidAPIKeyError,
-    AIProviderError,
 )
 
 

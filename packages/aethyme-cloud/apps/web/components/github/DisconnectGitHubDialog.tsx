@@ -63,7 +63,7 @@ export function DisconnectGitHubDialog() {
                 <li>Revoke all GitHub-related permissions</li>
               </ul>
               <p className="text-sm text-muted-foreground mt-2">
-                Your imported repositories will remain but won't be updated.
+                Your imported repositories will remain but won&apos;t be updated.
               </p>
             </div>
           </div>

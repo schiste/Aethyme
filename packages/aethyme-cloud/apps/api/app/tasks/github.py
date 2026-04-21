@@ -1,16 +1,10 @@
 """GitHub integration background tasks."""
 
 import uuid
-from typing import Dict, Any, List
+from typing import Dict, Any
 from datetime import datetime
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.celery_app import celery_app
-from app.core.github import GitHubOAuthClient, GitHubAPIClient
-from app.core.encryption import decrypt_token
-from app.models.github_account import GitHubAccount
-from app.models.repository import Repository
 
 
 @celery_app.task(name="app.tasks.github.fetch_github_repositories")

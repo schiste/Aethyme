@@ -30,7 +30,7 @@ interface SemanticSearchResultsProps {
   query: string
 }
 
-export function SemanticSearchResults({ results, _query }: SemanticSearchResultsProps) {
+export function SemanticSearchResults({ results, query: _query }: SemanticSearchResultsProps) {
   const getLanguageColor = (language: string) => {
     const colors: Record<string, string> = {
       python: 'bg-blue-500/10 text-blue-700 dark:text-blue-400',

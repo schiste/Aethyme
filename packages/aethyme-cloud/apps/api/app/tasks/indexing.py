@@ -1,10 +1,8 @@
 """Repository indexing background tasks."""
 
-import asyncio
 import time
 from typing import Dict, Any
 from celery import Task
-from sqlalchemy import select
 from datetime import datetime
 
 from app.core.celery_app import celery_app

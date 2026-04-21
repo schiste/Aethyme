@@ -5,7 +5,6 @@ Tracks active collaboration servers and their health status using Redis.
 """
 
 import asyncio
-import json
 import logging
 import os
 import socket

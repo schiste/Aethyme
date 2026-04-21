@@ -7,10 +7,10 @@ Handles encryption, validation, and storage of API keys.
 
 from typing import List, Optional, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select
 from datetime import datetime
 
-from app.models.ai_credentials import AICredential, AIUsageLog, AIProviderQuota
+from app.models.ai_credentials import AICredential, AIUsageLog
 from app.services.ai import (
     AIProviderFactory,
     AIProviderType,
@@ -109,7 +109,7 @@ class AICredentialsService:
             query = query.where(AICredential.provider_type == provider_type.value)
 
         if active_only:
-            query = query.where(AICredential.is_active == True)
+            query = query.where(AICredential.is_active.is_(True))
 
         result = await self.db.execute(query)
         return result.scalars().all()

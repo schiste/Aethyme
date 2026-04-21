@@ -73,7 +73,7 @@ export default function SemanticSearchPage() {
             <CardHeader>
               <CardTitle>Search Query</CardTitle>
               <CardDescription>
-                Describe what you're looking for in plain English
+                Describe what you&apos;re looking for in plain English
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -115,7 +115,7 @@ export default function SemanticSearchPage() {
             <CardContent className="space-y-3 text-sm text-muted-foreground">
               <div>
                 <p className="font-semibold text-foreground mb-1">1. Natural Language</p>
-                <p>Describe what you're looking for in plain English</p>
+                <p>Describe what you&apos;re looking for in plain English</p>
               </div>
               <div>
                 <p className="font-semibold text-foreground mb-1">2. AI Understanding</p>

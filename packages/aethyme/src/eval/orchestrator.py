@@ -17,10 +17,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .report import CONDITION_ORDER, get_aethyme_commit
+from .report import get_aethyme_commit
 from .runner import PROJECT_ROOT
 from .targets import EvalTarget, get_target
-
 
 # ---------------------------------------------------------------------------
 # Model configuration

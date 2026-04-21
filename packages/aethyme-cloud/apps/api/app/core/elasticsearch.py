@@ -3,7 +3,6 @@
 import os
 from typing import List, Optional
 from elasticsearch import Elasticsearch, helpers
-from app.core.config import settings
 
 
 # Elasticsearch client (singleton)

@@ -1,12 +1,12 @@
 'use client'
 
-import { Input } from '@aeptus/ui'
 import { zodResolver } from '@hookform/resolvers/zod'
 import Link from 'next/link'
 import { useForm } from 'react-hook-form'
 
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useLogin } from '@/lib/hooks/use-auth'
 import { type LoginInput, loginSchema } from '@/lib/validators/auth'
@@ -74,7 +74,7 @@ export function LoginForm() {
           </Button>
 
           <p className="text-sm text-center text-slate-600 dark:text-slate-400">
-            Don't have an account?{' '}
+            Don&apos;t have an account?{' '}
             <Link href="/register" className="text-primary hover:underline">
               Sign up
             </Link>

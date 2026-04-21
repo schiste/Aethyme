@@ -7,13 +7,12 @@ Calculate and track code quality metrics:
 - Maintainability metrics (technical debt, code smells)
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
-from app.models.code_graph import CodeRelationship, SymbolMetadata, RelationshipType
-from app.services.scip import SCIPSymbol
+from app.models.code_graph import CodeRelationship, SymbolMetadata
 
 
 class CodeMetricsCalculator:

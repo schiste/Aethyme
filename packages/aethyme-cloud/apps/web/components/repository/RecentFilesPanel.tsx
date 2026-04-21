@@ -11,8 +11,8 @@ interface RecentFilesPanelProps {
   onFileClick: (path: string) => void
 }
 
-export function RecentFilesPanel({ repositoryId, _repositoryName, onFileClick }: RecentFilesPanelProps) {
-  const { recentFiles, removeRecentFile, _clearRecentFiles, getFileIcon } = useRecentFiles()
+export function RecentFilesPanel({ repositoryId, onFileClick }: RecentFilesPanelProps) {
+  const { recentFiles, removeRecentFile, getFileIcon } = useRecentFiles()
 
   // Filter files for this repository
   const filesForRepo = recentFiles.filter((file) => file.repository_id === repositoryId)

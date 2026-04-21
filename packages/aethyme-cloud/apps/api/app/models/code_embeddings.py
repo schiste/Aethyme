@@ -4,7 +4,7 @@ Code Embeddings Model
 Stores vector embeddings for semantic code search using pgvector.
 """
 
-from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Text, Index
+from sqlalchemy import Column, String, Integer, DateTime, Text, Index
 from sqlalchemy.sql import func
 from pgvector.sqlalchemy import Vector
 

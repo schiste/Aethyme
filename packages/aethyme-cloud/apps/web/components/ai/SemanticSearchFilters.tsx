@@ -1,8 +1,8 @@
 'use client'
 
-import { Select } from '@aeptus/ui'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useRepositories } from '@/lib/hooks/useRepositories'
 
 interface FiltersState {

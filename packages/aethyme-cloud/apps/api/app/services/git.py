@@ -4,9 +4,7 @@ import os
 import shutil
 from pathlib import Path
 from typing import List, Optional
-import git
 from git import Repo
-from app.core.config import settings
 
 
 class GitService:
@@ -68,7 +66,7 @@ class GitService:
                 clone_url = f"https://oauth2:{access_token}@{parts[0]}/{parts[1]}"
 
         # Clone repository
-        repo = Repo.clone_from(
+        Repo.clone_from(
             clone_url,
             repo_path,
             branch=branch,

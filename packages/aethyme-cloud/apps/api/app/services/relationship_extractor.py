@@ -10,13 +10,13 @@ These relationships are stored in the code_relationships table for graph analysi
 """
 
 import re
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Set
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 
 from app.models.code_graph import CodeRelationship, SymbolMetadata, RelationshipType
 from app.services.scip import SCIPSymbol, SCIPDocument
-from app.services.tree_sitter import TreeSitterService, Symbol
+from app.services.tree_sitter import TreeSitterService
 
 
 class RelationshipExtractor:

@@ -1,6 +1,6 @@
 'use client'
 
-import { Box, Braces, Code2, FileCode, Function, Package } from 'lucide-react'
+import { Box, Braces, Code2, FileCode, FunctionSquare, Package } from 'lucide-react'
 import React, { useState } from 'react'
 
 interface SymbolResult {
@@ -32,7 +32,7 @@ interface SymbolSearchResultsProps {
 }
 
 const SYMBOL_ICONS: Record<string, React.ElementType> = {
-  function: Function,
+  function: FunctionSquare,
   class: Box,
   method: Code2,
   variable: Braces,

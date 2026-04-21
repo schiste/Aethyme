@@ -6,9 +6,7 @@ Handles real-time annotation notifications.
 
 import logging
 from typing import Any, Dict
-from uuid import UUID
 
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import AsyncSessionLocal
 from app.services.annotations import AnnotationManager

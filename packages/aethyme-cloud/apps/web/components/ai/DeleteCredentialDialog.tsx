@@ -30,7 +30,7 @@ export function DeleteCredentialDialog({
         <AlertDialogHeader>
           <AlertDialogTitle>Delete AI Credential?</AlertDialogTitle>
           <AlertDialogDescription>
-            Are you sure you want to delete "{credentialName}"? This will prevent semantic search
+            Are you sure you want to delete &quot;{credentialName}&quot;? This will prevent semantic search
             from working until you add a new credential. This action cannot be undone.
           </AlertDialogDescription>
         </AlertDialogHeader>

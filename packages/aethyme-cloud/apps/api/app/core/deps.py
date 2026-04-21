@@ -52,7 +52,7 @@ async def get_current_user(
         result = await db.execute(
             select(APIKey).where(
                 APIKey.key_prefix == key_prefix,
-                APIKey.is_active == True,
+                APIKey.is_active.is_(True),
             )
         )
         api_key_records = result.scalars().all()
@@ -76,7 +76,7 @@ async def get_current_user(
                 result = await db.execute(
                     select(User).where(
                         User.organization_id == api_key_record.organization_id,
-                        User.is_active == True,
+                        User.is_active.is_(True),
                     ).limit(1)
                 )
                 user = result.scalar_one_or_none()

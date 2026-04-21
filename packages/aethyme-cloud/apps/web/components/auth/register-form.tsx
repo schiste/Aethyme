@@ -1,12 +1,12 @@
 'use client'
 
-import { Input } from '@aeptus/ui'
 import { zodResolver } from '@hookform/resolvers/zod'
 import Link from 'next/link'
 import { useForm } from 'react-hook-form'
 
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useRegister } from '@/lib/hooks/use-auth'
 import { type RegisterInput, registerSchema } from '@/lib/validators/auth'

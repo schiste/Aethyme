@@ -1,6 +1,5 @@
 "use client"
 
-import { Avatar, Input } from '@aeptus/ui'
 import {
   AlertCircle,
   Calendar,
@@ -14,8 +13,10 @@ import {
 } from "lucide-react"
 import { useMemo,useState } from "react"
 
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
 import { jobsApi } from "@/lib/api/jobs"
 import { repositoriesApi } from "@/lib/api/repositories"
 import { useGitHubConnection } from "@/lib/hooks/use-github-connection"

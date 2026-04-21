@@ -1,7 +1,7 @@
 """Repository management endpoints."""
 
 import uuid
-from typing import List, Optional
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -100,7 +100,7 @@ async def list_repositories(
         query = query.where(Repository.provider == provider)
     
     if indexed_only:
-        query = query.where(Repository.is_indexed == True)
+        query = query.where(Repository.is_indexed.is_(True))
     
     # Get total count
     count_query = select(func.count(Repository.id)).where(
@@ -109,7 +109,7 @@ async def list_repositories(
     if provider:
         count_query = count_query.where(Repository.provider == provider)
     if indexed_only:
-        count_query = count_query.where(Repository.is_indexed == True)
+        count_query = count_query.where(Repository.is_indexed.is_(True))
     
     total_result = await db.execute(count_query)
     total = total_result.scalar_one()
@@ -149,7 +149,7 @@ async def get_repository_stats(
     indexed_result = await db.execute(
         select(func.count(Repository.id)).where(
             Repository.organization_id == organization.id,
-            Repository.is_indexed == True,
+            Repository.is_indexed.is_(True),
         )
     )
     indexed = indexed_result.scalar_one()

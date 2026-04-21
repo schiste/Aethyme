@@ -1,12 +1,11 @@
 """Dashboard statistics and metrics endpoints."""
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from app.core.database import get_db
 from app.core.deps import get_current_organization
-from app.core.elasticsearch import CodeIndexer
 from app.models.organization import Organization
 from app.models.repository import Repository
 from app.schemas.dashboard import DashboardStatsResponse, LanguageStats
@@ -41,7 +40,7 @@ async def get_dashboard_stats(
     indexed_repos_result = await db.execute(
         select(func.count(Repository.id)).where(
             Repository.organization_id == organization.id,
-            Repository.is_indexed == True,
+            Repository.is_indexed.is_(True),
         )
     )
     indexed_repositories = indexed_repos_result.scalar_one()
@@ -68,7 +67,7 @@ async def get_dashboard_stats(
     total_files_result = await db.execute(
         select(func.sum(Repository.file_count)).where(
             Repository.organization_id == organization.id,
-            Repository.is_indexed == True,
+            Repository.is_indexed.is_(True),
         )
     )
     total_files = total_files_result.scalar_one() or 0
@@ -77,7 +76,7 @@ async def get_dashboard_stats(
     total_lines_result = await db.execute(
         select(func.sum(Repository.line_count)).where(
             Repository.organization_id == organization.id,
-            Repository.is_indexed == True,
+            Repository.is_indexed.is_(True),
         )
     )
     total_lines = total_lines_result.scalar_one() or 0
@@ -86,7 +85,7 @@ async def get_dashboard_stats(
     repos_result = await db.execute(
         select(Repository).where(
             Repository.organization_id == organization.id,
-            Repository.is_indexed == True,
+            Repository.is_indexed.is_(True),
         )
     )
     repositories = repos_result.scalars().all()
@@ -126,15 +125,6 @@ async def get_dashboard_stats(
                     percentage=round(percentage, 2)
                 )
             )
-
-    # Get Elasticsearch stats for additional metrics (if needed)
-    try:
-        indexer = CodeIndexer()
-        # Could get more detailed stats from ES if needed
-        # For now, we rely on database aggregations
-    except Exception:
-        # Continue without ES stats if unavailable
-        pass
 
     return DashboardStatsResponse(
         total_repositories=total_repositories,

@@ -1,12 +1,11 @@
 """WebSocket connection manager for handling multiple concurrent connections."""
 
 import asyncio
-import json
 import logging
 from typing import Dict, Set, Optional, List
 from uuid import UUID
-from datetime import datetime, timedelta
-from fastapi import WebSocket, WebSocketDisconnect
+from datetime import datetime
+from fastapi import WebSocket
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)

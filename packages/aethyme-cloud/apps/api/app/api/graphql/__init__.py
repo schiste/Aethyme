@@ -1,8 +1,7 @@
 """GraphQL API."""
 
-from fastapi import APIRouter
-from strawberry.fastapi import GraphQLRouter
 import strawberry
+from strawberry.fastapi import GraphQLRouter
 
 # Placeholder GraphQL schema
 @strawberry.type

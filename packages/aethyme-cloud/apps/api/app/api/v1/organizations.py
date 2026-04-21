@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from app.core.database import get_db
-from app.core.deps import get_current_user, get_current_organization, get_current_superuser
+from app.core.deps import get_current_organization, get_current_superuser
 from app.models.user import User
 from app.models.organization import Organization
 from app.models.repository import Repository

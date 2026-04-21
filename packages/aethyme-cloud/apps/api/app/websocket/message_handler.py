@@ -1,8 +1,7 @@
 """WebSocket message handler for routing and processing messages."""
 
 import logging
-from typing import Dict, Any, Callable, Awaitable, Optional
-from uuid import UUID
+from typing import Dict, Any, Callable, Awaitable
 from datetime import datetime
 
 logger = logging.getLogger(__name__)

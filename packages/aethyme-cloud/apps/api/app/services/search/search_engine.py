@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, and_, func
 from sqlalchemy.orm import selectinload
 
-from app.models.code_graph import SCIPSymbol, CodeRelationship, SymbolMetadata
+from app.models.code_graph import SCIPSymbol, SymbolMetadata
 
 
 class SearchScope(str, Enum):

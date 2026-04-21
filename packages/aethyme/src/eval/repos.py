@@ -11,7 +11,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from ..indexing.skills import deploy_skills, AETHYME_PACKAGE_ROOT
+from ..indexing.skills import AETHYME_PACKAGE_ROOT, deploy_skills
 
 CONDITION_NAMES = ("control-cto-off", "control-cto-on", "explore", "leverage", "task-conditioned")
 AETHYME_CONDITIONS = frozenset({"explore", "leverage", "task-conditioned"})
@@ -70,7 +70,7 @@ def create_condition_repos(
 
 def _install_node_deps(repos: dict[str, Path]) -> None:
     """Run ``pnpm install --frozen-lockfile`` in each clone that has a pnpm-lock.yaml."""
-    for cond, repo_path in repos.items():
+    for repo_path in repos.values():
         if not (repo_path / "pnpm-lock.yaml").exists():
             continue
         subprocess.run(

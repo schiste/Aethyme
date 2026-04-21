@@ -2,14 +2,12 @@
 
 import os
 import shutil
-import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 
 from git import Repo, GitCommandError
-from git.exc import InvalidGitRepositoryError
 
 
 @dataclass

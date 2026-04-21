@@ -19,7 +19,7 @@ from .control_prompt import build_baseline_prompt, build_leverage_prompt
 from .models import EvaluationSide
 from .navigation_context import build_scope_view
 from .report import EvaluationReport, estimate_report, write_navigation_ctf_markdown_report
-from .runner import CommandEvaluationRunner, EVAL_TOOL_PYTHON, EvaluationRunner, PROJECT_ROOT
+from .runner import EVAL_TOOL_PYTHON, PROJECT_ROOT, CommandEvaluationRunner, EvaluationRunner
 from .schemas import navigation_ctf_output_schema, navigation_ctf_scoring_rubric
 from .scoring import parse_structured_output, score_navigation_ctf_output
 

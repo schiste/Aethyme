@@ -13,7 +13,7 @@ from app.core.auth import get_current_user
 from app.core.database import get_db
 from app.models.user import User
 from app.services.ai_credentials_service import AICredentialsService
-from app.services.ai import AIProviderType, EmbeddingModel, ChatModel
+from app.services.ai import AIProviderType
 
 
 router = APIRouter()

@@ -6,7 +6,6 @@ Broadcasts connection events across all servers for distributed collaboration.
 """
 
 import asyncio
-import json
 import logging
 import os
 from typing import Optional

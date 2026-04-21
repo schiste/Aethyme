@@ -5,6 +5,7 @@ const RETRY_DELAY = 1000 // 1 second
 const TIMEOUT = 30000 // 30 seconds
 
 interface RetryConfig extends AxiosRequestConfig {
+  _authRetry?: boolean
   _retry?: number
   _retryDelay?: number
 }
@@ -47,8 +48,8 @@ class APIClient {
         const originalRequest = error.config as RetryConfig
 
         // Handle 401 Unauthorized - Try to refresh token
-        if (error.response?.status === 401 && originalRequest && !originalRequest._retry) {
-          originalRequest._retry = true
+        if (error.response?.status === 401 && originalRequest && !originalRequest._authRetry) {
+          originalRequest._authRetry = true
 
           try {
             const newToken = await this.refreshToken()

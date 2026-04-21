@@ -147,7 +147,7 @@ class CommentManager:
         )
 
         if not include_resolved:
-            query = query.where(Comment.resolved == False)
+            query = query.where(Comment.resolved.is_(False))
 
         if line_range:
             start_line, end_line = line_range
@@ -193,7 +193,7 @@ class CommentManager:
         query = select(Comment).where(Comment.user_id == user_id)
 
         if not include_resolved:
-            query = query.where(Comment.resolved == False)
+            query = query.where(Comment.resolved.is_(False))
 
         query = query.order_by(Comment.created_at.desc()).limit(limit)
 
@@ -224,7 +224,7 @@ class CommentManager:
         )
 
         if unread_only:
-            query = query.where(Mention.notified == False)
+            query = query.where(Mention.notified.is_(False))
 
         query = query.order_by(Comment.created_at.desc())
 

@@ -9,7 +9,6 @@ from typing import Any
 from src.eval.schemas import (
     BUG_FIX_PATH_KEYS,
     EXPLAIN_REPO_PATH_KEYS,
-    MEDIAWIKI_BUG_FIX_1_PATH_KEYS,
     NAVIGATION_CTF_PATH_KEYS,
     ONBOARDING_AUTH_PATH_KEYS,
 )
@@ -557,7 +556,7 @@ def score_mediawiki_bug_fix_1(
 
     if candidate is None:
         return {
-            "scores": {k: 0.0 for k in weights},
+            "scores": dict.fromkeys(weights, 0.0),
             "weights": weights,
             "weighted_score": 0.0,
             "max_score": 100,
@@ -646,7 +645,7 @@ def score_dead_code(
     weights = {"functions_found": 60, "false_positives": 20, "efficiency": 20}
 
     if candidate is None:
-        return {"scores": {k: 0.0 for k in weights}, "weights": weights, "weighted_score": 0.0, "max_score": 100}
+        return {"scores": dict.fromkeys(weights, 0.0), "weights": weights, "weighted_score": 0.0, "max_score": 100}
 
     ref_funcs = {f["function_name"] for f in reference.get("unused_functions", [])}
     cand_funcs = set()
@@ -700,7 +699,7 @@ def score_mediawiki_migration(
     weights = {"files_found": 60, "false_positives": 20, "efficiency": 20}
 
     if candidate is None:
-        return {"scores": {k: 0.0 for k in weights}, "weights": weights, "weighted_score": 0.0, "max_score": 100}
+        return {"scores": dict.fromkeys(weights, 0.0), "weights": weights, "weighted_score": 0.0, "max_score": 100}
 
     ref_files = {_normalize_path(f, repo_path) for f in reference.get("affected_files", [])}
     cand_files = set()

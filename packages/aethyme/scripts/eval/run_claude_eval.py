@@ -11,7 +11,6 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-
 MODEL = "sonnet"
 
 
@@ -74,7 +73,6 @@ def main() -> int:
         return result.returncode
 
     events = _parse_events(result.stdout)
-    result_event = _find_event(events, "result")
     structured_output, final_message = _extract_response(events)
     usage = _extract_usage(events)
     tool_calls = _extract_tool_calls(events)

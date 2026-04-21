@@ -1,7 +1,7 @@
 'use client'
 
 import { Search, X } from 'lucide-react'
-import React, { useMemo,useState } from 'react'
+import React, { useCallback, useMemo,useState } from 'react'
 
 import { type FileTreeNode } from '@/lib/api/repositories'
 
@@ -24,10 +24,12 @@ function FileTreeNodeComponent({ node, level, currentPath, onFileClick, searchQu
   const [isExpanded, setIsExpanded] = useState(level === 0) // Root level expanded by default
   const isFolder = node.type === 'folder'
   const isActive = currentPath === node.path
-  const hasChildren = node.children && node.children.length > 0
+  const children = node.children ?? []
+  const hasChildren = children.length > 0
 
   // Auto-expand if search query matches or forceExpanded
-  const shouldExpand = forceExpanded || (searchQuery && node.name.toLowerCase().includes(searchQuery.toLowerCase()))
+  const shouldExpand =
+    forceExpanded || (searchQuery.length > 0 && node.name.toLowerCase().includes(searchQuery.toLowerCase()))
   const expanded = isExpanded || shouldExpand
 
   // Check if node matches search
@@ -116,7 +118,7 @@ function FileTreeNodeComponent({ node, level, currentPath, onFileClick, searchQu
 
       {isFolder && expanded && hasChildren && (
         <div>
-          {node.children.map((child, index) => (
+          {children.map((child, index) => (
             <FileTreeNodeComponent
               key={`${child.path}-${index}`}
               node={child}

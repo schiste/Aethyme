@@ -1,6 +1,5 @@
 'use client'
 
-import { Input } from '@aeptus/ui'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { ChevronDown, Plus } from 'lucide-react'
 import { useState } from 'react'
@@ -23,6 +22,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useCreateRepository } from '@/lib/hooks/use-repositories'
 

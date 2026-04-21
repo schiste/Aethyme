@@ -3,11 +3,10 @@
 import logging
 import json
 from uuid import uuid4
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, Query, status
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, status
 from typing import Optional
 
 from app.core.auth import get_current_user_ws
-from app.models.users import User
 from .connection_manager import connection_manager
 from .message_handler import message_handler
 

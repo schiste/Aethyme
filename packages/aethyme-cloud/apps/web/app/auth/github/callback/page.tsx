@@ -1,6 +1,7 @@
 "use client"
 
 import { CheckCircle, Loader2, XCircle } from "lucide-react"
+import Image from "next/image"
 import { useRouter, useSearchParams } from "next/navigation"
 import { useEffect, useState } from "react"
 
@@ -90,9 +91,11 @@ export default function GitHubCallbackPage() {
               <div className="w-full rounded-lg border p-4">
                 <div className="flex items-center space-x-3">
                   {account.avatar_url && (
-                    <img
+                    <Image
                       src={account.avatar_url}
                       alt={account.github_username}
+                      width={40}
+                      height={40}
                       className="h-10 w-10 rounded-full"
                     />
                   )}

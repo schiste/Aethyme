@@ -9,7 +9,6 @@ Auto-generate comprehensive README files from repository analysis:
 """
 
 from typing import Dict, Any, List, Optional
-from datetime import datetime
 
 
 class READMEGenerator:

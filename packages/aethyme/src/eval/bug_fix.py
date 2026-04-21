@@ -13,7 +13,6 @@ workspace *after* the agent finishes — not on comparing structured output.
 from __future__ import annotations
 
 import json
-import shlex
 import shutil
 import threading
 from pathlib import Path
@@ -22,7 +21,6 @@ from typing import Any
 from src.contracts.versions import contract_versions
 
 from ..indexing.engine import build_task_context, build_task_pack
-from .models import EvaluationSide
 from .bug_fix_setup import (
     CROSS_PACKAGE_TEST_REL,
     RBAC_REL,
@@ -32,24 +30,18 @@ from .bug_fix_setup import (
     plant_bug,
     plant_cross_package_bug,
     reset_bug,
-    reset_cross_package_bug,
-    run_cross_package_fix_test,
-    run_cross_package_regression_tests,
-    run_fix_test,
-    run_regression_tests,
     verify_setup,
 )
-from .control_prompt import build_baseline_prompt, build_leverage_prompt
+from .models import EvaluationSide
 from .navigation_context import build_scope_view
 from .report import (
     CONDITION_ORDER,
     EvaluationReport,
-    create_eval_run_dir,
     estimate_report,
     finalize_eval_run,
     write_bug_fix_markdown_report,
 )
-from .runner import CommandEvaluationRunner, EVAL_TOOL_PYTHON, EvaluationRunner, PROJECT_ROOT
+from .runner import CommandEvaluationRunner, EvaluationRunner
 from .schemas import bug_fix_output_schema, bug_fix_scoring_rubric
 from .scoring import parse_structured_output, score_bug_fix_output
 
@@ -246,7 +238,7 @@ def prepare_bug_fix_benchmark(
 
     Returns dict with repos, prompts, artifacts paths, and shared eval data.
     """
-    from .repos import create_condition_repos, CONDITION_NAMES, AETHYME_CONDITIONS
+    from .repos import AETHYME_CONDITIONS, CONDITION_NAMES, create_condition_repos
 
     # 1. Create 4 independent clones
     repos = create_condition_repos(source, dest_dir)
@@ -446,7 +438,7 @@ def prepare_cross_package_benchmark(
     symptom-driven prompt (no file paths) and plants the execute bug
     with the test in app-shared instead of auth.
     """
-    from .repos import create_condition_repos, CONDITION_NAMES, AETHYME_CONDITIONS
+    from .repos import AETHYME_CONDITIONS, CONDITION_NAMES, create_condition_repos
 
     repos = create_condition_repos(source, dest_dir)
 

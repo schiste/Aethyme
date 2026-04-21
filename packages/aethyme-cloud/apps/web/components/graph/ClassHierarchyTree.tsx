@@ -1,7 +1,6 @@
 "use client"
 
-import { Select } from '@aeptus/ui'
-import "reactflow/dist.style.css"
+import "reactflow/dist/style.css"
 
 import { Loader2, Network } from "lucide-react"
 import { useCallback, useEffect, useState } from "react"
@@ -18,6 +17,7 @@ import ReactFlow, {
 
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 
 interface HierarchyData {
   nodes: Array<{

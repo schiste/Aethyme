@@ -183,7 +183,7 @@ class ClaudeProvider(AIProvider):
                 max_tokens=10,
             )
 
-            response = await self.chat_completion(test_request)
+            await self.chat_completion(test_request)
             return True
 
         except InvalidAPIKeyError:

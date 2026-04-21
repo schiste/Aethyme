@@ -3,7 +3,7 @@ OAuth endpoints for GitHub, GitLab, and Bitbucket integration.
 """
 
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 import secrets

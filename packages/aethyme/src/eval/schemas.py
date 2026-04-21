@@ -6,7 +6,6 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
-
 # ---------------------------------------------------------------------------
 # Path key sets — which dict keys carry path-like strings for guardrails.
 #

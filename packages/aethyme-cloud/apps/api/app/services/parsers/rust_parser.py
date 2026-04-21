@@ -343,8 +343,6 @@ class RustParser(BaseParser):
         # Look for closing brace
         brace_count = 0
         found_opening = False
-        semicolon_pos = -1
-
         for i in range(start_pos, len(content)):
             if content[i] == ';' and not found_opening:
                 # Struct with no body (tuple struct or unit struct)

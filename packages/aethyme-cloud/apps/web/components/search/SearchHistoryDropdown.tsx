@@ -88,7 +88,7 @@ export function SearchHistoryDropdown({ onSelectSearch, show, onClose }: SearchH
                 {/* Query */}
                 <div className="flex items-center space-x-2 mb-1">
                   <p className="text-sm font-medium text-gray-200 truncate">
-                    "{item.query}"
+                    &quot;{item.query}&quot;
                   </p>
                   {item.results_count !== undefined && (
                     <span className="text-xs text-gray-500">

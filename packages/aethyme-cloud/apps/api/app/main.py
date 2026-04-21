@@ -198,7 +198,7 @@ async def global_exception_handler(request, exc):
 
     # Log exception
     logger.error(
-        f"Unhandled exception",
+        "Unhandled exception",
         extra={
             "correlation_id": correlation_id,
             "path": request.url.path,

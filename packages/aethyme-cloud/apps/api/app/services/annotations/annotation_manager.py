@@ -128,12 +128,12 @@ class AnnotationManager:
 
         # Public/private filter
         if not include_private:
-            query = query.where(CodeAnnotation.is_public == True)
+            query = query.where(CodeAnnotation.is_public.is_(True))
         elif user_id:
             # Include public + user's private annotations
             query = query.where(
                 or_(
-                    CodeAnnotation.is_public == True,
+                    CodeAnnotation.is_public.is_(True),
                     CodeAnnotation.user_id == user_id,
                 )
             )

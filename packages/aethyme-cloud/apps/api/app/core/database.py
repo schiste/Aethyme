@@ -12,9 +12,9 @@ Features:
 """
 
 from typing import AsyncGenerator
-from sqlalchemy.ext.asyncio import AsyncSession, AsyncEngine, create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy.pool import NullPool, AsyncAdaptedQueuePool
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError, DisconnectionError
 import logging
@@ -164,7 +164,7 @@ async def init_db() -> None:
     try:
         async with engine.begin() as conn:
             # Test query
-            result = await conn.execute(text("SELECT 1"))
+            await conn.execute(text("SELECT 1"))
             logger.info("Database connection successful")
 
             # Create tables if they don't exist (development only)

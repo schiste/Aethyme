@@ -6,7 +6,6 @@ such as symbols, references, and relationships.
 Spec: https://github.com/sourcegraph/scip
 """
 
-import hashlib
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from app.services.tree_sitter import Symbol

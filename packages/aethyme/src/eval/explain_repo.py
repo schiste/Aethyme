@@ -12,18 +12,19 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from src.contracts.versions import contract_versions
+
 from ..indexing.engine import (
     build_task_pack,
 )
-from src.contracts.versions import contract_versions
 from ..rendering.context_pack import render_explain_repo_text
 from .control_prompt import build_baseline_prompt, build_leverage_prompt
 from .models import EvaluationSide
+from .navigation_context import build_scope_view
 from .report import EvaluationReport, estimate_report, write_explain_repo_markdown_report
-from .runner import CommandEvaluationRunner, EVAL_TOOL_PYTHON, EvaluationRunner, PROJECT_ROOT
+from .runner import EVAL_TOOL_PYTHON, PROJECT_ROOT, CommandEvaluationRunner, EvaluationRunner
 from .schemas import explain_repo_output_schema, explain_repo_scoring_rubric
 from .scoring import parse_structured_output, score_explain_repo_output
-from .navigation_context import build_scope_view
 
 DEFAULT_TASK = "Explain this repo"
 

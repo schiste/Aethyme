@@ -1,13 +1,13 @@
 'use client'
 
-import { Box, Braces, Code2,Filter, Function, Package, Search, X } from 'lucide-react'
+import { Box, Braces, Code2,Filter, FunctionSquare, Package, Search, X } from 'lucide-react'
 import React, { useState } from 'react'
 
 import { SymbolSearchResults } from '@/components/search/SymbolSearchResults'
 import { useSymbolSearch } from '@/lib/hooks/use-symbol-search'
 
 const SYMBOL_KINDS = [
-  { value: 'function', label: 'Functions', icon: Function, color: 'blue' },
+  { value: 'function', label: 'Functions', icon: FunctionSquare, color: 'blue' },
   { value: 'class', label: 'Classes', icon: Box, color: 'purple' },
   { value: 'method', label: 'Methods', icon: Code2, color: 'green' },
   { value: 'variable', label: 'Variables', icon: Braces, color: 'yellow' },
@@ -41,7 +41,6 @@ export default function SymbolSearchPage() {
     total,
     page,
     totalPages,
-    _limit,
     isLoading,
     error,
     kind,

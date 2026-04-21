@@ -1,6 +1,6 @@
 """User model for authentication and profile."""
 
-from sqlalchemy import Column, String, Boolean, Integer, ForeignKey
+from sqlalchemy import Column, String, Boolean, ForeignKey
 from sqlalchemy.orm import relationship
 from app.models.base import Base, TimestampMixin
 

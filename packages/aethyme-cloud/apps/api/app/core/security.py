@@ -208,7 +208,7 @@ async def get_current_user(
         raise credentials_exception
 
     # Get user from database
-    from app.core.database import AsyncSessionLocal, get_db
+    from app.core.database import AsyncSessionLocal
     from app.models.user import User
 
     # Use provided db session or create new one

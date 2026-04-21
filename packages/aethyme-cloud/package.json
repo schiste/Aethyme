@@ -28,5 +28,13 @@
     "node": ">=20.0.0",
     "pnpm": ">=8.0.0"
   },
-  "packageManager": "pnpm@8.15.0"
+  "packageManager": "pnpm@8.15.0",
+  "pnpm": {
+    "overrides": {
+      "glob@10.3.10": "10.5.0",
+      "glob@10.4.5": "10.5.0",
+      "js-yaml@4.1.0": "4.1.1",
+      "prismjs@1.27.0": "1.30.0"
+    }
+  }
 }

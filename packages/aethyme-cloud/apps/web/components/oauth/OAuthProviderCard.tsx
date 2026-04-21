@@ -1,9 +1,9 @@
 "use client"
 
-import { Alert } from '@aeptus/ui'
 import { AlertCircle, CheckCircle2, Github, GitlabIcon as GitLab } from "lucide-react"
 import { useState } from "react"
 
+import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"

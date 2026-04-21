@@ -8,9 +8,8 @@ Stores code relationships for graph analysis:
 - Type references
 """
 
-from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Index, Enum as SQLEnum
+from sqlalchemy import Column, String, Integer, DateTime, Index, Enum as SQLEnum
 from sqlalchemy.sql import func
-from sqlalchemy.orm import relationship
 import enum
 
 from app.core.database import Base

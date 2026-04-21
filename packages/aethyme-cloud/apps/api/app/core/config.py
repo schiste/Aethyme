@@ -5,7 +5,7 @@ Loads and validates environment variables using Pydantic Settings.
 """
 
 from typing import List, Optional
-from pydantic import Field, PostgresDsn, RedisDsn, validator
+from pydantic import Field, PostgresDsn, RedisDsn
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 

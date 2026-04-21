@@ -16,7 +16,6 @@ from src.eval.schemas import (
     mediawiki_bug_fix_1_reference,
 )
 from src.eval.scoring import (
-    _compute_guardrails,
     _exact_path_score,
     _extract_path_strings,
     _list_score,
@@ -24,9 +23,9 @@ from src.eval.scoring import (
     _ordered_list_score,
     _relationship_chain_score,
     parse_structured_output,
-    score_mediawiki_bug_fix_1,
     score_dead_code,
     score_explain_repo_output,
+    score_mediawiki_bug_fix_1,
     score_navigation_ctf_output,
 )
 

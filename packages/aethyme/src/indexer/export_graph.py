@@ -11,6 +11,7 @@ import structlog
 
 from src import __version__ as AETHYME_VERSION
 from src.contracts.graph_export import GraphExportEnvelope
+
 from ..graph.connection_pool import db_pool
 from ..graph.store import GraphStore
 from ..indexing.repository_snapshot import capture_snapshot

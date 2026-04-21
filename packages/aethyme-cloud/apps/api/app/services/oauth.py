@@ -4,14 +4,12 @@ OAuth Service for GitHub, GitLab, and Bitbucket integration.
 Handles OAuth flows, token exchange, and API client creation.
 """
 
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 from urllib.parse import urlencode
 import httpx
 from cryptography.fernet import Fernet
 
 from app.core.config import settings
-from app.models.user import User
-from app.models.repository import Repository
 
 
 class OAuthProvider:

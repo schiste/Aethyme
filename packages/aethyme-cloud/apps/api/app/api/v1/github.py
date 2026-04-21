@@ -1,22 +1,19 @@
 """GitHub OAuth and integration endpoints."""
 
 import uuid
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import datetime
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
-from app.core.github import GitHubOAuthClient, GitHubAPIClient
+from app.core.github import GitHubOAuthClient
 from app.core.encryption import encrypt_token, decrypt_token
 from app.models.user import User
 from app.models.github_account import GitHubAccount
 from app.schemas.github import (
     GitHubAuthorizationURL,
-    GitHubCallbackRequest,
-    GitHubAccountResponse,
     GitHubConnectionStatus,
     GitHubRepositoryListResponse,
     GitHubRepositoryInfo,

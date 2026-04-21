@@ -10,11 +10,8 @@ Automatically generate comprehensive documentation from code analysis:
 import re
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
 
-from app.models.code_graph import CodeRelationship, SymbolMetadata, RelationshipType
-from app.services.scip import SCIPSymbol, SCIPDocument
+from app.services.scip import SCIPSymbol
 
 
 class APIDocumentationGenerator:
@@ -396,7 +393,7 @@ class APIDocumentationGenerator:
         md_lines = []
 
         # Header
-        md_lines.append(f"# API Documentation")
+        md_lines.append("# API Documentation")
         md_lines.append(f"\n**Repository**: {docs['repository_id']}")
         md_lines.append(f"**Language**: {docs['language']}")
         md_lines.append(f"**Generated**: {docs['generated_at']}\n")

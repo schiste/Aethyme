@@ -1,8 +1,8 @@
 "use client"
 
-import { Alert } from '@aeptus/ui'
 import { AlertCircle, Loader2 } from "lucide-react"
 
+import { Alert, AlertDescription } from "@/components/ui/alert"
 import { OAuthProviderCard } from "@/components/oauth/OAuthProviderCard"
 import { useOAuth } from "@/lib/hooks/use-oauth"
 

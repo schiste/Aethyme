@@ -1,6 +1,5 @@
 'use client'
 
-import { Input, Select } from '@aeptus/ui'
 import { AlertCircle, CheckCircle2,Loader2 } from 'lucide-react'
 import { useState } from 'react'
 
@@ -13,7 +12,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useAICredentials } from '@/lib/hooks/useAICredentials'
 
 interface AddAICredentialDialogProps {
@@ -90,7 +91,7 @@ export function AddAICredentialDialog({ open, onOpenChange }: AddAICredentialDia
           <DialogHeader>
             <DialogTitle>Add AI Credential</DialogTitle>
             <DialogDescription>
-              Add your API key from an AI provider. We'll validate and encrypt it securely.
+              Add your API key from an AI provider. We&apos;ll validate and encrypt it securely.
             </DialogDescription>
           </DialogHeader>
 

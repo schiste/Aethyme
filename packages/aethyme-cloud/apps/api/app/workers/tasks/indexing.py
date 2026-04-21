@@ -76,6 +76,7 @@ async def index_repository_task(self, repository_id: str, full_reindex: bool = T
             access_token=_get_access_token(db, repository),
             branch=repository.default_branch or "main"
         )
+        print(f"[{self.request.id}] Cloned repository to {repo_path}")
 
         # Step 2: Get all files to index
         print(f"[{self.request.id}] Discovering files to index")

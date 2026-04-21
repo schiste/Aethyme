@@ -2,7 +2,6 @@
 
 import logging
 from typing import Dict, Any
-from uuid import UUID
 
 from app.websocket.connection_manager import connection_manager
 from app.websocket.message_handler import message_handler

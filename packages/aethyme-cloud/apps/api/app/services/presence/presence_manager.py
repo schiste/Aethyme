@@ -5,8 +5,7 @@ from typing import Dict, List, Optional, Set
 from uuid import UUID
 from datetime import datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, update
-from sqlalchemy.sql import func
+from sqlalchemy import select
 
 from app.models.collaboration.presence import UserPresence
 from app.models.collaboration.session import CollaborationSession

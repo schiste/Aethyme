@@ -135,7 +135,7 @@ export function SavedSearchesPanel({ onSelectSearch }: SavedSearchesPanelProps) 
                 </div>
 
                 <p className="text-xs text-gray-400 mb-1 truncate">
-                  "{search.query}"
+                  &quot;{search.query}&quot;
                 </p>
 
                 {/* Filters */}

@@ -1,6 +1,5 @@
 "use client"
 
-import { Select } from '@aeptus/ui'
 import "reactflow/dist/style.css"
 
 import { GitBranch, Loader2 } from "lucide-react"
@@ -18,6 +17,7 @@ import ReactFlow, {
 
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 
 interface GraphData {
   nodes: Array<{

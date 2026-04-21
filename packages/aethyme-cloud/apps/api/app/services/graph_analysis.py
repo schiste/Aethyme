@@ -11,7 +11,7 @@ Analyzes code relationships and generates graph data:
 from typing import List, Dict, Any, Optional, Set
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func
-from collections import defaultdict, deque
+from collections import deque
 
 from app.models.code_graph import CodeRelationship, SymbolMetadata, RelationshipType
 

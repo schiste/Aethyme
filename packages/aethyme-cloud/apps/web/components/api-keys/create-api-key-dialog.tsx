@@ -1,6 +1,5 @@
 'use client'
 
-import { Input } from '@aeptus/ui'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { AlertTriangle,Check, Copy, Plus } from 'lucide-react'
 import { useState } from 'react'
@@ -17,6 +16,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useCreateAPIKey } from '@/lib/hooks/use-api-keys'
 
@@ -94,7 +94,7 @@ export function CreateAPIKeyDialog() {
                 <div className="text-sm text-yellow-800 dark:text-yellow-200">
                   <p className="font-semibold">Important: Save this key now!</p>
                   <p className="mt-1">
-                    This is the only time you'll see the full key. Store it somewhere safe.
+                    This is the only time you&apos;ll see the full key. Store it somewhere safe.
                   </p>
                 </div>
               </div>
@@ -187,7 +187,7 @@ export function CreateAPIKeyDialog() {
         {createdKey && (
           <DialogFooter>
             <Button onClick={handleClose} className="w-full">
-              I've saved my key
+              I&apos;ve saved my key
             </Button>
           </DialogFooter>
         )}

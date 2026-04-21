@@ -76,6 +76,7 @@ class GenerateEmbeddingsResponse(BaseModel):
     """Response after generating embeddings."""
 
     repository_id: str
+    task_id: str
     embeddings_created: int
     model_used: str
     provider_used: str
@@ -175,6 +176,7 @@ async def generate_embeddings(
 
     return GenerateEmbeddingsResponse(
         repository_id=request.repository_id,
+        task_id=task.id,
         embeddings_created=0,
         model_used=request.model.value,
         provider_used=request.provider_type.value,

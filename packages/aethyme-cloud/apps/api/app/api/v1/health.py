@@ -1,7 +1,7 @@
 """Health check endpoints for monitoring."""
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from datetime import datetime
@@ -96,8 +96,6 @@ def check_celery_workers() -> Dict[str, Any]:
 
         # Get active workers (with timeout)
         active_workers = inspect.active()
-        stats = inspect.stats()
-
         if not active_workers:
             return {
                 "status": "unhealthy",

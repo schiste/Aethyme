@@ -1,9 +1,9 @@
 'use client'
 
-import { Avatar } from '@aeptus/ui'
 import { LogOut, Settings,User as UserIcon } from 'lucide-react'
 import { useRouter } from 'next/navigation'
 
+import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import {
   DropdownMenu,
   DropdownMenuContent,
