@@ -108,10 +108,10 @@ class TestParseStructuredOutput:
 
     def test_dead_code_payload(self):
         payload = parse_structured_output(
-            '{"unused_functions":[{"function_name":"activate","defined_in":"packages/aethyme/src/indexing/engine.py","reason":"no callers found"}]}'
+            '{"unused_functions":[{"function_name":"duplicateEntry","defined_in":"includes/Watchlist/WatchedItemStore.php","reason":"no callers found"}]}'
         )
         assert payload is not None
-        assert payload["unused_functions"][0]["function_name"] == "activate"
+        assert payload["unused_functions"][0]["function_name"] == "duplicateEntry"
 
 
 # ── _exact_path_score ────────────────────────────────────────────────────

@@ -164,7 +164,7 @@ export default function Matrix() {
     "bug-fix", "bug-fix-1", "explain-repo", "navigation-ctf", "cross-package",
     "impact-analysis", "feature-localization", "config-audit", "dead-code", "migration",
   ];
-  const targets: TargetName[] = ["aethyme", "grc", "mediawiki"];
+  const targets: TargetName[] = ["grc", "mediawiki"];
   const models: ModelName[] = ["haiku", "sonnet", "opus", "gpt-5.4"];
 
   if (loading) {

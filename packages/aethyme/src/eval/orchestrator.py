@@ -314,8 +314,6 @@ def _build_paths(
         "prompt_files": prompt_files,
         "result_files": result_files,
         "schema_file": f"{tmp}/aethyme-eval-output-schema.json",
-        "reference_file": f"{tmp}/aethyme-eval-reference.json",
-        "rubric_file": f"{tmp}/aethyme-eval-scoring-rubric.json",
         "nav_context_file": f"{tmp}/aethyme-eval-navigation-context.json",
     }
 
@@ -417,11 +415,8 @@ def _build_prepare_phase(
         cli_cmd = (
             f"cd {pkg} && {venv} -c \""
             f"from pathlib import Path; import json; "
-            f"from src.eval.schemas import mediawiki_bug_fix_1_output_schema, "
-            f"mediawiki_bug_fix_1_reference, mediawiki_bug_fix_1_scoring_rubric; "
-            f"ref = mediawiki_bug_fix_1_reference(); "
+            f"from src.eval.schemas import mediawiki_bug_fix_1_output_schema; "
             f"schema = mediawiki_bug_fix_1_output_schema(); "
-            f"rubric = mediawiki_bug_fix_1_scoring_rubric(); "
             f"task = {defaults['task']!r}; "
             f"json_tail = chr(10) + chr(10) + 'Output rules:' + chr(10) + '- Write exactly one JSON object.' + chr(10) + '- Keys: files_to_edit, root_cause, fix_plan, testing.' + chr(10) + '- Use repo-relative paths.'; "
             f"ctrl = task + chr(10) + chr(10) + 'Repository path: {target.control_path}' + chr(10) + 'Explore the repository and produce a structured JSON analysis.' + json_tail; "
@@ -433,8 +428,6 @@ def _build_prepare_phase(
             f"Path('{paths['prompt_files']['leverage']}').write_text(lev); "
             f"Path('{paths['prompt_files']['task-conditioned']}').write_text(tcond); "
             f"Path('{paths['schema_file']}').write_text(json.dumps(schema, indent=2)); "
-            f"Path('{paths['reference_file']}').write_text(json.dumps(ref, indent=2)); "
-            f"Path('{paths['rubric_file']}').write_text(json.dumps(rubric, indent=2)); "
             f"print('bug-fix-1 artifacts written')"
             f"\""
         )
@@ -467,7 +460,6 @@ def _build_prepare_phase(
         "cli_cmd": cli_cmd,
         "writes_to": list(paths["prompt_files"].values()) + [
             paths["schema_file"],
-            paths["reference_file"],
             paths["nav_context_file"],
         ],
     }

@@ -3,7 +3,9 @@
 The `dead-code` eval currently supports reviewed target-specific baselines:
 
 - MediaWiki: `includes/Watchlist/`
-- Aethyme: `packages/aethyme/src/indexing/`
+
+Aethyme itself is intentionally not a supported benchmark target. It contains
+evaluation references and historical reports that can contaminate self-runs.
 
 The baseline is intentionally split into two views:
 
@@ -23,11 +25,16 @@ Why this split exists:
 
 Source of truth:
 - [mediawiki_dead_code_watchlist.json](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/src/eval/baselines/mediawiki_dead_code_watchlist.json:1)
-- [aethyme_dead_code_indexing.json](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/src/eval/baselines/aethyme_dead_code_indexing.json:1)
 
-Current analyzer path for collecting candidates:
+Preferred analyzer path for collecting candidates:
 ```bash
 cd packages/aethyme
+.venv/bin/python -m src.cli intents --format compact-json
+.venv/bin/python -m src.cli explore --repo /path/to/repo --intent usage_boundary_query --request "Find public symbols in <scope> with no callers outside <scope>" --params '{"scope":"<scope>","symbol_kind":"public_top_level_function","boundary":{"type":"outside_directory","path":"<scope>"},"search_roots":[]}' --format answer-json --show-observability
+```
+
+Fallback low-level path:
+```bash
 .venv/bin/python -m src.cli facts public-functions --repo /path/to/repo --scope <scope> --json-output
 .venv/bin/python -m src.cli analyze dead-code --repo /path/to/repo --scope <scope> --boundary outside-directory --format eval-json --show-observability
 .venv/bin/python -m src.cli facts function-usage --repo /path/to/repo --target <function> --boundary <scope> --json-output
@@ -38,11 +45,15 @@ methods. Use `--roots <dir1>,<dir2>` when the relevant search roots are known.
 Manual language-specific checks are still required before editing benchmark
 baselines.
 
+The high-level `explore` answer is `answer[]`, with rejected candidates in
+`excluded[]` and the legacy eval shape at `output_adapters.dead_code_eval_json`.
+
 The direct analyzer answer is `unused_functions[]`. Each item contains
 `function_name`, `defined_in`, `status`, `external_callers`, `internal_callers`,
-`evidence`, `confidence`, and `reason`. With `--show-observability`, the payload
-also records command name, repository path, index freshness, graph/fact counts,
-confidence summary, output size, and degraded reasons.
+`evidence`, `confidence`, and `reason`. It also includes
+`excluded_functions[]`. With `--show-observability`, the payload also records
+command name, repository path, index freshness, graph/fact counts, confidence
+summary, output size, and degraded reasons.
 
 Current practical interpretation:
 - score benchmark answers against `literal_external_only`

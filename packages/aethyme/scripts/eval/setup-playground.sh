@@ -132,11 +132,12 @@ echo ">>> Removing Control-side tooling/runtime contamination..."
 cd "$CONTROL_DIR"
 for path in .codex .aethyme .chau7 .claude; do
     tracked_files=("${(@f)$(git ls-files "$path" 2>/dev/null)}")
+    tracked_files=("${(@)tracked_files:#}")
     if (( ${#tracked_files[@]} > 0 )); then
         git update-index --skip-worktree -- $tracked_files
     fi
 done
-command rm -rf .codex .aethyme .chau7 .claude
+/bin/rm -rf .codex .aethyme .chau7 .claude
 echo "  Removed: .codex .aethyme .chau7 .claude (if present)"
 
 # ── Step 3: Deploy Aethyme tooling ───────────────────────────────────

@@ -6,6 +6,7 @@
 #   ./scripts/eval/run-eval.sh --eval-type bug-fix-1 --target mediawiki --model haiku --reasoning high
 
 set -uo pipefail
+unsetopt BG_NICE 2>/dev/null || true
 
 # ── Parse arguments ──────────────────────────────────────────────────
 
@@ -27,7 +28,7 @@ if [[ -z "$EVAL_TYPE" || -z "$TARGET" ]]; then
     echo ""
     echo "Eval types: bug-fix, bug-fix-1, explain-repo, navigation-ctf, impact-analysis,"
     echo "            feature-localization, config-audit, dead-code, migration"
-    echo "Targets:    aethyme, grc, mediawiki"
+    echo "Targets:    grc, mediawiki"
     echo "Models:     haiku (default), sonnet, opus"
     exit 1
 fi
@@ -35,7 +36,9 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AETHYME_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SERVER_DIR="$(cd "$AETHYME_ROOT/../aethyme-eval-ui/server" && pwd)"
-SERVER_URL="http://localhost:8000"
+SERVER_URL="${AETHYME_EVAL_SERVER_URL:-http://localhost:8000}"
+SERVER_PORT="${AETHYME_EVAL_SERVER_PORT:-${SERVER_URL##*:}}"
+SERVER_PORT="${SERVER_PORT%%/*}"
 SERVER_HEALTH_URL="$SERVER_URL/api/chau7/status"
 SERVER_PYTHON="${SERVER_PYTHON:-$AETHYME_ROOT/.venv/bin/python}"
 CURL_BIN="${CURL_BIN:-/usr/bin/curl}"
@@ -45,6 +48,7 @@ echo "  Type:      $EVAL_TYPE"
 echo "  Target:    $TARGET"
 echo "  Model:     $MODEL"
 echo "  Reasoning: $REASONING"
+echo "  Server:    $SERVER_URL"
 echo ""
 
 # ── Step 1: Verify playground ────────────────────────────────────────
@@ -63,17 +67,17 @@ fi
 # ── Step 2: Ensure server is running ─────────────────────────────────
 
 echo ">>> Checking eval server..."
-if "$CURL_BIN" -sS -o /dev/null -w "" "$SERVER_HEALTH_URL" 2>/dev/null; then
+if "$CURL_BIN" -fsS -o /dev/null "$SERVER_HEALTH_URL" 2>/dev/null; then
     echo "  Server already running at $SERVER_URL"
 else
     echo "  Starting server..."
     cd "$SERVER_DIR"
-    "$SERVER_PYTHON" -m uvicorn main:app --port 8000 > /dev/null 2>&1 &
+    "$SERVER_PYTHON" -m uvicorn main:app --port "$SERVER_PORT" > /dev/null 2>&1 &
     SERVER_PID=$!
     SERVER_READY=false
     for _ in {1..20}; do
         sleep 1
-        if "$CURL_BIN" -sS -o /dev/null "$SERVER_HEALTH_URL" 2>/dev/null; then
+        if "$CURL_BIN" -fsS -o /dev/null "$SERVER_HEALTH_URL" 2>/dev/null; then
             SERVER_READY=true
             break
         fi

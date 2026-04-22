@@ -131,6 +131,8 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
     if [[ -f .codex/skills/aethyme/SKILL.md ]]; then
         SKILL_FILE=".codex/skills/aethyme/SKILL.md"
         grep -q '{{AETHYME_ROOT}}' "$SKILL_FILE" && check_fail "Skill has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "Skill placeholders resolved"
+        grep -q 'src.cli intents' "$SKILL_FILE" && check_pass "Skill includes current intent catalog guidance" || check_fail "Skill missing intents guidance"
+        grep -q 'src.cli explore' "$SKILL_FILE" && check_pass "Skill includes current explore guidance" || check_fail "Skill missing explore guidance"
         grep -q 'analyze dead-code' "$SKILL_FILE" && check_pass "Skill includes current dead-code analyzer" || check_fail "Skill missing analyze dead-code guidance"
         grep -q 'facts function-usage' "$SKILL_FILE" && check_pass "Skill includes current usage facts command" || check_fail "Skill missing facts function-usage guidance"
         grep -q '\$ENGINE unused' "$SKILL_FILE" && check_fail "Skill still advertises stale \$ENGINE unused command" || check_pass "Skill has no stale unused command"

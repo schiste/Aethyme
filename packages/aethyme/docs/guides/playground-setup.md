@@ -147,20 +147,10 @@ TARGETS["myrepo"] = EvalTarget(
 )
 ```
 
-Example for this repo itself:
-```python
-TARGETS["aethyme"] = EvalTarget(
-    name="aethyme",
-    display_name="Aethyme",
-    control_path=_PLAYGROUND_ROOT / "Aethyme" / "Aethyme - Control",
-    aethyme_path=_PLAYGROUND_ROOT / "Aethyme" / "Aethyme - Aethyme",
-    description="Aethyme monorepo",
-    setup_source=str(Path(__file__).resolve().parents[4]),
-    setup_commit="<pinned-commit-sha>",
-    setup_control_dir_name="Aethyme - Control",
-    setup_aethyme_dir_name="Aethyme - Aethyme",
-)
-```
+Aethyme itself must not be registered as a benchmark target. The repository
+contains eval references, historical reports, and tooling artifacts that can
+leak answer keys into the target under assessment. Use external repositories as
+benchmark targets and keep Aethyme self-runs as unscored diagnostics only.
 
 3. Add eval scenarios in `src/eval/schemas.py` (reference data) and `src/eval/scoring.py` (scoring function)
 
