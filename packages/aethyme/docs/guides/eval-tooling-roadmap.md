@@ -1,6 +1,6 @@
 # Eval Tooling Roadmap
 
-Last Updated: 2026-04-17
+Last Updated: 2026-04-22
 
 This roadmap defines the next repository-agnostic improvements for Aethyme's evaluation tooling.
 
@@ -71,6 +71,37 @@ Schema validation, output shaping, and final contract checks are part of the pro
 
 Build a generic capability that helps an agent construct a bounded, relevant search space before deep analysis.
 
+Current implementation status:
+
+- `explore --request ...` now defaults to the general-purpose
+  `task_localization_query` intent.
+- `task_localization_query` composes one bounded `task-localize` graph call,
+  bounded symbol search, source-text ranking, source call-site expansion,
+  filename fallback, and compact `task-expand` output into
+  graph/symbol/source-backed `answer[]`, low-confidence `navigation_hints[]`,
+  next actions, confidence, trust policy, and observability.
+- On large repos, `task_localization_query` returns degraded partial output
+  instead of blocking. If `task-localize` times out, the default path still
+  attempts bounded source-backed recovery unless explicitly disabled.
+- Source-backed recovery ranks localized symbol clusters before whole files,
+  prefers production call sites over tests, and performs a bounded second-hop
+  expansion so workflow bridges can be surfaced without an LLM inferring every
+  step manually.
+- `behavior_localization_query` is available for debugging and feature/workflow
+  localization. It uses the same answer schema with a larger source-text and
+  call-site budget.
+- Filename-only fallback is navigation-only. It must not appear as an
+  authoritative answer, and `safe_to_use_as_answer` must stay false when no
+  graph/symbol-backed candidates are available.
+- `explore --intent usage_boundary_query` remains the first specialized
+  high-level Explore intent.
+- For PHP scopes, it uses a scope-first `analyze-usage-boundary` engine path that enumerates scoped public functions/methods without building the full repository graph.
+- The output is already answer-shaped when trusted: `answer[]`, `excluded[]`,
+  `ambiguous[]`, confidence summaries, trust policy, and observability. When
+  degraded, `navigation_hints[]` should preserve normal agent exploration
+  rather than biasing the final answer.
+- Non-PHP usage-boundary scopes still need graph-backed fallback or future language-specific scope-first scanners.
+
 Expected capabilities:
 
 - enumerate public/exported symbols in a scope
@@ -98,6 +129,12 @@ Validation target:
 ### P2. Verification Primitives
 
 Once candidates exist, the agent needs generic ways to prove or disprove them.
+
+Current implementation status:
+
+- `usage_boundary_query` performs a first-pass outside-boundary caller check, internal-caller check, docs/config-only reference check, and name-collision ambiguity check.
+- The analyzer accepts `budget_ms` and `max_evidence_per_symbol` so evaluation runs can trade completeness for speed explicitly.
+- Follow-up verification still relies on graph-backed `facts function-usage` for ambiguous/non-PHP cases.
 
 Expected capabilities:
 
@@ -172,19 +209,31 @@ Only after P1-P4 are stronger, refine `leverage`.
 
 Preferred shape:
 
-- top relevant files
-- top relevant symbols
-- top likely investigation paths
-- short instructions on how to use generic tooling well
+- a short Aethyme usage card
+- the generic `explore --request ... --format answer-json --show-observability` command as the first call
+- instructions to choose a specialized intent only when the user request clearly matches one
+- instructions to read `answer[]`, `excluded[]`, `ambiguous[]`, and `observability`
 
 Avoid:
 
 - long engine-generated prompt packs
 - benchmark-shaped hints
+- prefilled candidate names from the reference answer
 
 Validation target:
 
 - `leverage` should outperform `explore` with only a small cost increase
+- reports should show whether `src.cli explore` / `src.cli intents` were actually called
+
+Current implementation status:
+
+- The leverage card can point to `.codex/skills/aethyme/aethyme-explore`, a
+  narrow wrapper installed in the Aethyme playground. This keeps prompts
+  generic and avoids disclosing the Aethyme source root.
+- Aethyme usage extraction recognizes the wrapper as an Explore call.
+- Single-run and batch eval paths share the same cold-probe leakage stamping
+  helper, so leakage fields are available for later analysis when the probe is
+  enabled.
 
 ## What Not To Optimize First
 

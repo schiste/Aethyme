@@ -164,11 +164,22 @@ Every eval run **must** have:
 2. Per-condition `result.json` + `assessment.json` — structured output and scores
 3. Per-condition `raw-stdout.txt` — the complete agent output before parsing
 4. Per-condition Chau7 `transcript.json` + `tool-calls.json` — full turn-by-turn data
-5. All shared artifacts (prompts, schema, reference, pack, navigation context)
+5. Per-condition `aethyme-usage.json` — whether Aethyme commands were actually invoked
+6. All shared artifacts (prompts, schema, reference, pack, navigation context)
 
 If any of these are missing, the run is incomplete and must be re-captured or marked as partial in metadata.
 
 Condition slugs: `control-cto-off`, `control-cto-on`, `explore`, `leverage`, `task-conditioned`.
+
+Condition intent:
+
+- `control-cto-off`: vanilla repository, basic prompt, CTO disabled.
+- `control-cto-on`: vanilla repository, basic prompt, CTO enabled.
+- `explore`: Aethyme-enabled repository, basic prompt only. This measures ambient discoverability.
+- `leverage`: Aethyme-enabled repository, basic prompt plus the generic Aethyme Explore usage card. This measures whether a light generic hint helps.
+- `task-conditioned`: Aethyme-enabled repository, basic prompt plus the full context pack. This measures context-pack value and cost.
+
+Do not collapse the three Aethyme-enabled conditions. They answer different questions.
 
 ### Data Collection Checklist
 
@@ -179,8 +190,28 @@ Run this checklist **after every condition completes**, before moving to the nex
 Check the first `type: "user"` message in the session JSONL.
 Confirm it contains the expected prompt text.
 If the condition is task-conditioned, confirm the task-specific context is present.
+If the condition is leverage, confirm the generic Aethyme usage card is present.
+If the condition is leverage, confirm the card calls `.codex/skills/aethyme/aethyme-explore`
+rather than exposing the Aethyme source root.
 ```
 **Why:** prompt delivery is only valid after `tab_send_input(...)` is followed by `tab_submit_prompt()`. Do not assume the pasted text was actually accepted by Claude until the first user message in the session JSONL matches the expected prompt.
+
+#### 1b. Verify Aethyme usage separately from Aethyme availability
+```
+Check the report's Aethyme Usage section and each condition's raw JSON.
+Record aethyme_used, aethyme_command_count, aethyme_commands,
+manual_shell_after_aethyme_count, and manual_search_after_aethyme_count.
+```
+**Why:** if `aethyme_used=false`, the condition measures availability or prompt design, not Aethyme product quality.
+
+#### 1c. Verify leakage probe fields
+```
+Check each stored row for leakage_score_cold, leakage_is_clean,
+leakage_raw_judge, leakage_probe_version, and leakage_error.
+```
+**Why:** missing leakage fields mean the run cannot distinguish real task
+performance from possible benchmark/reference leakage. Single-run and batch
+paths are expected to stamp these fields through the same helper.
 
 #### 2. Check for sub-agent sessions
 ```
@@ -1016,7 +1047,7 @@ See [playground-setup.md](playground-setup.md) for the full setup guide.
 | `impact-analysis` | mediawiki | List all callers of doViewUpdates() | call site recall + precision |
 | `feature-localization` | mediawiki | Trace Watch button execution chain | ordered method chain matching |
 | `config-audit` | mediawiki | Find rate limiting config + enforcement | exact variable/file/class matching |
-| `dead-code` | mediawiki, aethyme | Target-specific dead-code scan (Watchlist methods or indexing functions) | function recall + precision + efficiency |
+| `dead-code` | mediawiki | Target-specific dead-code scan (Watchlist methods) | function recall + precision + efficiency |
 | `migration` | mediawiki | List files referencing WatchedItemStore | file recall + precision + efficiency |
 
 Schemas and references: `src/eval/schemas.py`

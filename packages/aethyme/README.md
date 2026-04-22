@@ -128,7 +128,10 @@ Runtime notes:
 - external runners receive `AETHYME_EVAL_OUTPUT_SCHEMA_FILE`, `AETHYME_EVAL_TOOL_REPO`, and `AETHYME_EVAL_TOOL_PYTHON` so agent wrappers can enforce structured output and call back into Aethyme
 - the canonical playground protocol is Chau7 MCP with 5 conditions: `control-cto-off`, `control-cto-on`, `explore`, `leverage`, `task-conditioned`
 - without those commands, it still emits the comparison artifacts only
-- the Aethyme-assisted prompt now uses a compact rendered context-pack view instead of injecting the full raw pack
+- the `leverage` condition uses a compact generic Aethyme Explore usage card; `task-conditioned` remains the full context-pack mode
+- `explore --request ...` defaults to `task_localization_query`, a bounded general-purpose answer path that returns ranked candidate files/symbols/areas, evidence, confidence, next actions, and observability; on large repos it returns degraded partial output instead of blocking
+- `explore --intent usage_boundary_query` now uses a scope-first PHP analyzer path that returns answer/excluded/confidence/observability without building the full repository graph
+- reports include an Aethyme Usage section so availability is not confused with actual `src.cli` invocation
 - every `eval explain-repo` run writes a markdown report under `packages/aethyme/docs/reports/evals/`
 - the report includes quality score, recalculated eval score vs control baseline, tool usage, tokens, duration, prompts, pack JSON, and verbose run results
 - eval outputs now include a structured output schema, scoring rubric, and reference answer

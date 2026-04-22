@@ -1,8 +1,8 @@
 ---
 name: aethyme
-description: Use Aethyme's current repository analyzers and code graph for
-  navigation, caller tracing, derived facts, dead-code analysis, and task
-  context.
+description: Use Aethyme's high-level Explore intents, current repository
+  analyzers, and code graph for navigation, caller tracing, derived facts,
+  dead-code analysis, and task context.
 ---
 
 # Aethyme Navigation
@@ -27,6 +27,73 @@ Use this command shape:
 
 ## Fast Workflows
 
+### Start Here: Explore
+
+Prefer the high-level Explore surface before low-level graph navigation.
+Without an explicit intent, Aethyme runs the general-purpose
+`task_localization_query` intent and returns ranked candidate files, symbols,
+areas, evidence, confidence, next actions, trust policy, and observability for
+the user request. This default path uses one bounded `task-localize` graph call,
+bounded symbol search, source-text evidence, source call-site expansion,
+filename fallback, and compact expansions. Filename-only fallback is never
+authoritative: it appears in `navigation_hints[]`, not `answer[]`, and is
+marked `navigation_only` with low confidence. If graph localization exceeds the
+responsiveness budget on a large repo, Aethyme can still return degraded
+source-backed `answer[]` candidates when local text/call-site evidence is
+strong enough; otherwise it returns navigation guidance instead of waiting
+indefinitely or inventing an answer.
+
+```bash
+(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli explore --repo "$REPO" --request "<user request>" --format answer-json --show-observability)
+```
+
+Use a specialized intent only when the request clearly matches it. For
+behavior localization, debugging, or "which files implement this workflow"
+questions, use `behavior_localization_query`; it spends more budget on
+source-text ranking and call-site expansion.
+
+```bash
+(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli explore --repo "$REPO" --intent behavior_localization_query --request "<user request>" --format answer-json --show-observability)
+```
+
+For dead-code, boundary usage, or public API caller audits, call
+`usage_boundary_query` directly with structured params.
+
+```bash
+(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli explore --repo "$REPO" --intent usage_boundary_query --request "<user request>" --params '{"scope":"<directory>","symbol_kind":"public_top_level_function","boundary":{"type":"outside_directory","path":"<directory>"},"search_roots":[],"budget_ms":10000,"max_evidence_per_symbol":5}' --format answer-json --show-observability)
+```
+
+You can still list the intent catalog directly:
+
+```bash
+(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli intents --request "<user request>" --format compact-json)
+```
+
+Read `trust_policy` and `safe_to_use_as_answer` first. Use `answer[]` as the
+primary result only when `safe_to_use_as_answer` is true. If false, do not treat
+`navigation_hints[]` as an answer; use it only to guide manual repository
+search. Read `excluded[]` to understand why candidates or areas were rejected.
+Read `ambiguous[]` before trusting low-confidence candidates. Read
+`output_adapters.dead_code_eval_json` only when the task specifically asks for
+the dead-code evaluation schema.
+
+Always inspect `observability` before trusting the result: command, repo path,
+index freshness, graph/fact counts, output size, confidence summaries, and
+degraded reasons.
+
+If `degraded_reasons` says `task-localize` timed out, read
+`observability.degradation_guidance` before retrying. If
+`degradation_guidance.status` is `recovered`, inspect source-backed
+`answer[].evidence.line_refs` and `evidence.callsite_expansions` before broad
+manual search. If `safe_to_use_as_answer` is false, follow
+`navigation_hints[]` / `next_actions` as an investigation plan and verify with
+normal repo search before concluding. If a graph/symbol/source-backed
+`answer[]` is present, inspect candidates in order, then verify manually before
+finalizing.
+
+For very large repositories where first-response speed is more important than
+graph coverage, pass `--params '{"graph_query_timeout_ms":500}'`.
+
 ### Repository Orientation
 ```bash
 # Repo-level graph overview
@@ -50,8 +117,17 @@ Use this command shape:
 
 ### Dead Code and API Surface
 
-Use the analyzer first. `eval-json` is the lowest-friction path: it returns the
-task-ready answer list plus observability when requested.
+Use `explore --intent usage_boundary_query` first for boundary usage/dead-code
+questions. It is the lowest-friction path because it returns the final answer,
+excluded candidates, confidence, and observability in one JSON object.
+
+For PHP scopes, this Explore intent uses the scope-first `analyze-usage-boundary`
+engine path and avoids building the full repository graph. If the result has
+`degraded_reasons` for language support or no public symbols in a non-PHP scope,
+fall back to the graph-backed analyzer or facts commands below.
+
+Use the direct analyzer only as a fallback when a task explicitly asks for the
+legacy dead-code shape.
 
 ```bash
 (cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli analyze dead-code --repo "$REPO" --scope "<directory>" --boundary outside-directory --format eval-json --show-observability)
@@ -59,9 +135,9 @@ task-ready answer list plus observability when requested.
 
 Read `unused_functions` first. Each item includes `function_name`, `defined_in`,
 `status`, `external_callers`, `internal_callers`, `evidence`, `confidence`, and
-`reason`. Read `observability` to verify the command, repository path, index
-freshness, graph/fact counts, confidence summary, output size, and degraded
-reasons.
+`reason`. `excluded_functions` explains why candidates were rejected. Read
+`observability` to verify the command, repository path, index freshness,
+graph/fact counts, confidence summary, output size, and degraded reasons.
 
 Interpret status precisely:
 - `Unused`: no internal or external code callers found.
@@ -83,9 +159,10 @@ when the repository is large and the task gives likely search roots.
 
 ## When to Use
 
-- **Starting a task:** run `graph overview`, then `task scope` if the prompt has a concrete task.
+- **Starting a task:** run `explore --request` first; it composes anchors, scope, next steps, and compact expansions.
+- **Need a task-ready answer:** run `explore --request`; choose a specialized intent only when the request clearly matches one.
 - **Finding impact:** run `graph callers` or `graph parents` before broad text search.
-- **Dead code / API surface:** run `analyze dead-code`; use `facts function-usage` to verify ambiguous candidates.
+- **Dead code / API surface:** run `explore --intent usage_boundary_query`; use `facts function-usage` to verify ambiguous candidates.
 - **Need a compact task pack:** run `task context` or `task pack` before reading many files.
 
 ## When NOT to Use

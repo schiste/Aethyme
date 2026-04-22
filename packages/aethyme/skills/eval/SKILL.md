@@ -18,6 +18,12 @@ You are working on the assessment system for Aethyme, a code navigation tool. As
 
 3. **Control repo is sacred.** The Control copy of each playground repo must never be modified after initial clone. No `.codex/`, no `.aethyme/`, no `.chau7/`. If contaminated, delete and re-clone.
 
+4. **No answer leakage.** Eval prompts and launch plans must not expose
+   reference answers, scoring rubrics, prior eval reports, or benchmark
+   implementation files as evidence. The leverage condition uses a narrow
+   `.codex/skills/aethyme/aethyme-explore` wrapper in the Aethyme playground so
+   the prompt can call Explore without disclosing the Aethyme source root.
+
 ## Scripts
 
 All scripts are in `scripts/eval/` and auto-detect `AETHYME_ROOT` from their own location.
@@ -45,7 +51,7 @@ Creates `<Name> - Control` (vanilla) and `<Name> - Aethyme` (with skill + graph 
 ### Run an assessment
 
 ```bash
-./scripts/eval/run-eval.sh --eval-type dead-code --target aethyme --model haiku
+./scripts/eval/run-eval.sh --eval-type dead-code --target mediawiki --model haiku
 ```
 
 End-to-end: verifies playground, starts server, launches 5 conditions via Chau7 MCP, polls until done, prints the scorecard, and writes a full artifact bundle. Results are stored in SQLite at `packages/aethyme-eval-ui/server/evals.db`, visible at http://localhost:5173, and persisted under `packages/aethyme/eval-runs/<timestamp>-<target>-<type>/`.
@@ -73,7 +79,7 @@ This checks repo cleanliness, engine presence, index presence, and git state. It
 | `impact-analysis` | mediawiki | List all callers of `doViewUpdates()` |
 | `feature-localization` | mediawiki | Trace Watch button execution from handler to DB write |
 | `config-audit` | mediawiki | Find rate limiting config, definition, enforcement, override |
-| `dead-code` | mediawiki, aethyme | Target-specific dead-code scan (MediaWiki Watchlist or Aethyme indexing) |
+| `dead-code` | mediawiki | Target-specific dead-code scan (MediaWiki Watchlist) |
 | `migration` | mediawiki | List all files referencing `WatchedItemStore` for rename |
 
 ## 5-Condition Design
@@ -84,9 +90,9 @@ Every assessment runs the same task across 5 conditions to isolate what helps:
 |---|---|---|---|---|---|
 | `control-cto-off` | Control | forceOff | No | No | Baseline: raw agent, no help |
 | `control-cto-on` | Control | default | No | No | Effect of CTO file tree context |
-| `explore` | Aethyme | default | Yes | No | Effect of having Aethyme available with no prompt help |
-| `leverage` | Aethyme | default | Yes | No | Effect of a generic prompt nudge to use Aethyme tools |
-| `task-conditioned` | Aethyme | default | Yes | Yes (engine-generated) | Effect of task-specific Aethyme guidance or context packs |
+| `explore` | Aethyme | default | Yes | No | Effect of having Aethyme available with the basic prompt only |
+| `leverage` | Aethyme | default + generic Aethyme usage card | Yes | No | Effect of a generic hint that exposes the Explore contract |
+| `task-conditioned` | Aethyme | default + full context pack | Yes | Yes (engine-generated) | Effect of task-specific Aethyme context-pack mode |
 
 **CTO** = Context Tree Optimization — Claude Code's file tree injection into context.
 **Task-Specific Pack** = Engine-generated prompt or artifact with repo structure, function listings, subsystem detail, or task navigation context.
@@ -100,6 +106,29 @@ Current product priority:
 3. revisit `task-conditioned` only after the generic tooling is stronger
 
 Do not use assessment results as a reason to grow the task-conditioned prompt first.
+
+## Leakage and Observability
+
+Every run should record whether Aethyme was actually used:
+
+- `aethyme_used`
+- `aethyme_command_count`
+- `aethyme_commands`
+- `manual_shell_after_aethyme_count`
+- `manual_search_after_aethyme_count`
+
+Every run should also stamp the cold-probe leakage fields when the probe is
+available:
+
+- `leakage_score_cold`
+- `leakage_is_clean`
+- `leakage_raw_judge`
+- `leakage_probe_version`
+- `leakage_error`
+
+Single-run and batch launches both use the same leakage computation path. If
+these fields are absent, treat the run as incomplete for analysis rather than
+assuming it is clean.
 
 ## End-of-Run Metrics
 
@@ -194,10 +223,19 @@ review the resulting JSON against source when setting the benchmark reference.
 Example for dead-code:
 ```bash
 cd packages/aethyme
+.venv/bin/python -m src.cli explore --repo /path/to/repo --request "Find public methods in includes/Watchlist with no outside callers" --format answer-json
+.venv/bin/python -m src.cli explore --repo /path/to/repo --intent usage_boundary_query --request "Find public methods in includes/Watchlist with no outside callers" --params '{"scope":"includes/Watchlist","symbol_kind":"public_method","boundary":{"type":"outside_directory","path":"includes/Watchlist"},"search_roots":[],"budget_ms":10000,"max_evidence_per_symbol":5}' --format answer-json --show-observability
 .venv/bin/python -m src.cli facts public-functions --repo /path/to/repo --scope includes/Watchlist --include-methods --json-output
 .venv/bin/python -m src.cli analyze dead-code --repo /path/to/repo --scope includes/Watchlist --boundary outside-directory --include-methods --format eval-json --show-observability
 .venv/bin/python -m src.cli facts function-usage --repo /path/to/repo --target "<function>" --boundary includes/Watchlist --json-output
 ```
+
+For `explore --request`, inspect `degraded_reasons`. The default path is
+bounded for responsiveness: if graph localization times out, Aethyme may skip
+symbol search. Filename-only fallback must remain `navigation_hints[]`, not
+authoritative `answer[]`. Treat `safe_to_use_as_answer=false` as a safe
+degradation: the agent should continue normal repository investigation instead
+of trusting Aethyme candidates.
 
 For non-Python repositories or analyzer ambiguity, use language-specific grep or
 AST tools as a second pass. Do not expose eval baselines or prior reports to
@@ -222,9 +260,27 @@ The Aethyme condition is only meaningful if `.codex/skills/aethyme/SKILL.md`
 advertises current commands. `verify-playground.sh` must pass the skill freshness
 checks before a run. Treat old `$ENGINE unused --repo ...` guidance as stale;
 the current dead-code path starts with `python -m src.cli analyze dead-code
---boundary outside-directory --format eval-json --show-observability`, with
-`facts public-functions` / `facts function-usage` reserved for follow-up
-verification.
+--boundary outside-directory --format eval-json --show-observability`.
+The preferred high-level path for normal requests starts with `python -m src.cli
+explore --request ... --format answer-json --show-observability`; the default
+`task_localization_query` intent returns ranked candidates, evidence, confidence,
+trust policy, navigation hints, next actions, and observability. For degraded
+runs, verify that filename-only matches are not emitted as authoritative
+`answer[]` items. For dead-code or boundary usage requests, use
+`python -m src.cli explore --intent usage_boundary_query --format answer-json
+--show-observability`. For PHP scopes, that specialized Explore intent uses the
+scope-first `analyze-usage-boundary` engine path; `facts public-functions` /
+`facts function-usage` remain follow-up verification tools for ambiguous cases
+or non-PHP fallback.
+
+### Aethyme availability vs Aethyme usage
+An Aethyme-enabled repository does not prove that the agent used Aethyme. Every
+run report should inspect the `Aethyme Usage` section:
+- `explore` should usually show whether ambient availability alone was enough.
+- `leverage` should show whether the generic usage card caused real
+  `src.cli explore` / `src.cli intents` calls.
+- `task-conditioned` should be interpreted as context-pack value, not as proof
+  that high-level Explore commands were used.
 
 ### CTO overhead on large repos
 On 12K+ file repos like MediaWiki, CTO can increase cost by injecting the full file tree into every turn. Navigation context from Aethyme tools is more cost-effective than the CTO file tree for large repos.
