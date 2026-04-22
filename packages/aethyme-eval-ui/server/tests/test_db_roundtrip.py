@@ -22,6 +22,9 @@ REQUIRED_COLUMNS = {
     "batch_id", "run_index", "runs_in_batch",
     # Deliverable + pre-registration
     "deliverable_status", "primary_metric", "minimum_meaningful_delta",
+    # Pretraining-leakage cold-probe
+    "leakage_score_cold", "leakage_is_clean", "leakage_raw_judge",
+    "leakage_probe_version", "leakage_error",
 }
 
 
@@ -94,6 +97,47 @@ def test_filter_by_condition(isolated_db):
     explore = isolated_db.query_results(condition="explore")
     assert len(explore) == 1
     assert explore[0]["condition"] == "explore"
+
+
+def test_leakage_fields_roundtrip(isolated_db):
+    # True / False / None handling of leakage_is_clean matters — it's stored as
+    # INTEGER (0/1/NULL) and must come back as bool / bool / None.
+    isolated_db.insert_result({
+        "id": "leakage-clean", "date": "2026-04-21",
+        "evalType": "bug-fix-1", "target": "mediawiki", "model": "haiku",
+        "condition": "explore",
+        "leakageScoreCold": 0.40, "leakageIsClean": True,
+        "leakageRawJudge": 40.0, "leakageProbeVersion": "v0.1",
+        "leakageError": None,
+    })
+    isolated_db.insert_result({
+        "id": "leakage-dirty", "date": "2026-04-21",
+        "evalType": "bug-fix-1", "target": "mediawiki", "model": "haiku",
+        "condition": "leverage",
+        "leakageScoreCold": 0.85, "leakageIsClean": False,
+        "leakageRawJudge": 85.0, "leakageProbeVersion": "v0.1",
+        "leakageError": None,
+    })
+    rows = {r["id"]: r for r in isolated_db.query_results()}
+    assert rows["leakage-clean"]["leakageScoreCold"] == 0.40
+    assert rows["leakage-clean"]["leakageIsClean"] is True
+    assert rows["leakage-clean"]["leakageProbeVersion"] == "v0.1"
+    assert rows["leakage-dirty"]["leakageIsClean"] is False
+    assert rows["leakage-dirty"]["leakageRawJudge"] == 85.0
+
+
+def test_leakage_fields_default_to_none(isolated_db):
+    isolated_db.insert_result({
+        "id": "no-leakage", "date": "2026-04-21",
+        "evalType": "bug-fix", "target": "grc", "model": "haiku",
+        "condition": "control-cto-off",
+    })
+    row = isolated_db.query_results()[0]
+    assert row["leakageScoreCold"] is None
+    assert row["leakageIsClean"] is None
+    assert row["leakageRawJudge"] is None
+    assert row["leakageProbeVersion"] is None
+    assert row["leakageError"] is None
 
 
 def test_upsert_replaces_existing_row(isolated_db):

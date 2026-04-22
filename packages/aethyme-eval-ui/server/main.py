@@ -317,7 +317,9 @@ def _fetch_judge_and_batch_fields(row_id: str) -> dict[str, Any]:
             "SELECT judge_score, judge_stdev, judge_model, judge_reliable, "
             "judge_samples, judge_error, judge_cost_usd, judge_elapsed_seconds, "
             "batch_id, run_index, runs_in_batch, deliverable_status, "
-            "primary_metric, minimum_meaningful_delta "
+            "primary_metric, minimum_meaningful_delta, "
+            "leakage_score_cold, leakage_is_clean, leakage_raw_judge, "
+            "leakage_probe_version, leakage_error "
             "FROM eval_results WHERE id = ?",
             (row_id,),
         ).fetchone()
@@ -342,6 +344,15 @@ def _fetch_judge_and_batch_fields(row_id: str) -> dict[str, Any]:
         "deliverableStatus": row["deliverable_status"],
         "primaryMetric": row["primary_metric"],
         "minimumMeaningfulDelta": row["minimum_meaningful_delta"],
+        "leakageScoreCold": row["leakage_score_cold"],
+        "leakageIsClean": (
+            bool(row["leakage_is_clean"])
+            if row["leakage_is_clean"] is not None
+            else None
+        ),
+        "leakageRawJudge": row["leakage_raw_judge"],
+        "leakageProbeVersion": row["leakage_probe_version"],
+        "leakageError": row["leakage_error"],
     }
 
 
@@ -1088,6 +1099,14 @@ class RunRequest(BaseModel):
     # (0-100) a 5-point delta is a reasonable floor. Serves as the margin
     # in pairwise comparison verdicts (see batch_stats.compare_conditions).
     minimumMeaningfulDelta: float = Field(default=5.0, ge=0.0)
+    # Pretraining-leakage cold-probe. Runs once per batch before conditions
+    # launch, measures whether the model can produce the reference answer
+    # without repo access, and stamps the score on every row. Cached on
+    # disk keyed by (model, eval_type, scenario, task hash, reference hash,
+    # prompt version) so reruns are free. Disable to skip the probe (e.g.
+    # when MCP is unavailable or for a fast exploratory run).
+    leakageProbe: bool = True
+    leakageProbeForce: bool = False  # bypass the cache and re-probe
 
 _run_state: dict[str, Any] = {
     "status": "idle",
@@ -1190,6 +1209,177 @@ def _extract_tool_calls(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 }
             )
     return tool_calls
+
+
+def _command_from_tool_input(tool_input: Any) -> str:
+    if isinstance(tool_input, dict):
+        for key in ("command", "cmd"):
+            value = tool_input.get(key)
+            if isinstance(value, str):
+                return value
+    return ""
+
+
+def _classify_aethyme_command(command: str) -> str:
+    normalized = " ".join(command.split())
+    if "aethyme-explore" in normalized:
+        return "explore"
+    if "src.cli explore" in normalized or "-m src.cli explore" in normalized:
+        return "explore"
+    if "src.cli intents" in normalized or "-m src.cli intents" in normalized:
+        return "intents"
+    if "src.cli analyze dead-code" in normalized or "-m src.cli analyze dead-code" in normalized:
+        return "analyze dead-code"
+    if "src.cli facts public-functions" in normalized:
+        return "facts public-functions"
+    if "src.cli facts function-usage" in normalized:
+        return "facts function-usage"
+    if "aethyme-engine-cli prompt" in normalized:
+        return "engine prompt"
+    if "aethyme-engine-cli analyze-dead-code" in normalized:
+        return "engine analyze-dead-code"
+    return "aethyme command"
+
+
+def _is_aethyme_command(command: str) -> bool:
+    normalized = " ".join(command.split())
+    if not normalized:
+        return False
+    patterns = (
+        "aethyme-explore",
+        "-m src.cli",
+        "src.cli ",
+        "aethyme-engine-cli",
+    )
+    return any(pattern in normalized for pattern in patterns)
+
+
+def _is_manual_search_command(command: str) -> bool:
+    normalized = f" {' '.join(command.split())} "
+    return any(
+        pattern in normalized
+        for pattern in (" rg ", " grep ", " find ", " ack ", " ag ")
+    )
+
+
+def _extract_aethyme_usage(tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize whether the agent actually invoked Aethyme commands."""
+    commands: list[dict[str, Any]] = []
+    first_aethyme_index: int | None = None
+    manual_shell_after = 0
+    manual_search_after = 0
+
+    for index, call in enumerate(tool_calls):
+        tool_name = str(call.get("tool") or call.get("name") or "")
+        command = _command_from_tool_input(call.get("input"))
+        if _is_aethyme_command(command):
+            if first_aethyme_index is None:
+                first_aethyme_index = index
+            commands.append(
+                {
+                    "timestamp": call.get("timestamp"),
+                    "tool": tool_name,
+                    "kind": _classify_aethyme_command(command),
+                    "command": command,
+                }
+            )
+            continue
+
+        if first_aethyme_index is not None and tool_name in {"Bash", "Shell"}:
+            manual_shell_after += 1
+            if _is_manual_search_command(command):
+                manual_search_after += 1
+
+    return {
+        "aethyme_used": bool(commands),
+        "aethyme_command_count": len(commands),
+        "aethyme_commands": commands,
+        "first_aethyme_tool_call_index": first_aethyme_index,
+        "manual_shell_after_aethyme_count": manual_shell_after,
+        "manual_search_after_aethyme_count": manual_search_after,
+    }
+
+
+def _write_aethyme_eval_wrapper(repo_dir: Path) -> Path:
+    """Install a narrow eval wrapper so prompts need not expose Aethyme source."""
+    wrapper = repo_dir / ".codex" / "skills" / "aethyme" / "aethyme-explore"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    script = f"""#!/usr/bin/env bash
+set -euo pipefail
+export PYTHONPATH={json.dumps(str(AETHYME_PKG))}
+exec {json.dumps(str(AETHYME_PYTHON))} -m src.cli explore "$@"
+"""
+    wrapper.write_text(script, encoding="utf-8")
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def _aethyme_usage_card(*, task_text: str, tool_path: str | None = None) -> str:
+    """Generic Aethyme instructions for hinted eval arms.
+
+    The card intentionally does not include task-specific candidates, reference
+    answers, or benchmark-specific commands. The agent/LLM chooses the intent
+    and params; Aethyme only validates and executes deterministic analysis.
+    """
+    escaped_task = json.dumps(task_text)
+    if tool_path:
+        return f"""\
+Aethyme is available in this repository. Use it as a generic repository-analysis tool before broad manual shell exploration when it fits the task.
+
+Set up the command variables:
+```bash
+AETHYME_TOOL={json.dumps(tool_path)}
+REPO="$PWD"
+TASK={escaped_task}
+```
+
+First get the generic Explore intent contract:
+```bash
+"$AETHYME_TOOL" --repo "$REPO" --request "$TASK" --format answer-json
+```
+
+If the response is `intent_selection_required`, choose one intent from `available_intents`, fill its required params from the user request, then rerun:
+```bash
+"$AETHYME_TOOL" --repo "$REPO" --intent "<intent>" --request "$TASK" --params '<json>' --format answer-json --show-observability
+```
+
+Read `trust_policy` and `safe_to_use_as_answer` first.
+
+- If `safe_to_use_as_answer` is true, inspect `answer[]` in order, then verify before concluding.
+- If `safe_to_use_as_answer` is false, do NOT treat `navigation_hints[]` as candidate answers. Use them only as manual investigation/search guidance.
+- Read `excluded[]`, `ambiguous[]`, `next_actions`, `degraded_reasons`, and `observability` before trusting the result.
+- Do not inspect benchmark/evaluator files, eval run artifacts, or tool implementation files as evidence for the answer.
+"""
+    root = str(AETHYME_PKG)
+    py = str(AETHYME_PYTHON)
+    return f"""\
+Aethyme is available in this repository. Use it as a generic repository-analysis tool before broad manual shell exploration when it fits the task.
+
+Set up the command variables:
+```bash
+AETHYME_ROOT={json.dumps(root)}
+AETHYME_PY={json.dumps(py)}
+REPO="$PWD"
+TASK={escaped_task}
+```
+
+First get the generic Explore intent contract:
+```bash
+(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli explore --repo "$REPO" --request "$TASK" --format answer-json)
+```
+
+If the response is `intent_selection_required`, choose one intent from `available_intents`, fill its required params from the user request, then rerun:
+```bash
+(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli explore --repo "$REPO" --intent "<intent>" --request "$TASK" --params '<json>' --format answer-json --show-observability)
+```
+
+Read `trust_policy` and `safe_to_use_as_answer` first.
+
+- If `safe_to_use_as_answer` is true, inspect `answer[]` in order, then verify before concluding.
+- If `safe_to_use_as_answer` is false, do NOT treat `navigation_hints[]` as candidate answers. Use them only as manual investigation/search guidance.
+- Read `excluded[]`, `ambiguous[]`, `next_actions`, `degraded_reasons`, and `observability` before trusting the result.
+- Do not inspect benchmark/evaluator files, eval run artifacts, or tool implementation files as evidence for the answer.
+"""
 
 
 def _dead_code_task_for_target(target: str) -> str:
@@ -1603,6 +1793,18 @@ Be exhaustive — missing a file means the rename breaks production. Search thor
     for prompt_path in prompt_files.values():
         Path(prompt_path).unlink(missing_ok=True)
 
+    aethyme_tool_wrappers: dict[str, str] = {}
+    for cond in conditions:
+        cond_name = cond["name"]
+        if cond_name not in {"leverage"}:
+            continue
+        try:
+            wrapper = _write_aethyme_eval_wrapper(Path(cond["directory"]))
+            aethyme_tool_wrappers[cond_name] = str(wrapper.relative_to(Path(cond["directory"])))
+            log(f"Wrote {cond_name} Aethyme eval wrapper: {wrapper}")
+        except Exception as wrapper_error:
+            log(f"WARNING: Could not write Aethyme eval wrapper for {cond_name}: {wrapper_error}")
+
     enriched_prompt = bare_task
     enrichment_meta: dict[str, Any] | None = None
     enrichment_observability: dict[str, Any] = {
@@ -1689,8 +1891,11 @@ Be exhaustive — missing a file means the rename breaks production. Search thor
             task_text = enriched_prompt
         elif cond_name == "leverage":
             task_text = (
-                "Use Aethyme tools to navigate the repository graph. "
-                "Use them proactively, but do your own analysis.\n\n"
+                _aethyme_usage_card(
+                    task_text=bare_task,
+                    tool_path=aethyme_tool_wrappers.get(cond_name),
+                )
+                + "\n"
                 f"{bare_task}"
             )
         else:
@@ -1765,6 +1970,7 @@ Be exhaustive — missing a file means the rename breaks production. Search thor
                 }
                 for cond_name in output_files
             },
+            "aethyme_tool_wrappers": aethyme_tool_wrappers,
         },
     }
 
@@ -1926,6 +2132,8 @@ def _run_eval_batch(
 
     _append_log(f"Starting batch of {total} runs (batch_id={batch_id})")
 
+    leakage_row = _compute_leakage_row(req, first_plan, log=_append_log)
+
     # Iteration 1: already have the plan
     _run_eval_background(
         first_plan,
@@ -1936,6 +2144,7 @@ def _run_eval_batch(
         batch_id=batch_id,
         run_index=1,
         runs_in_batch=total,
+        leakage_row=leakage_row,
     )
 
     # Iterations 2..N: regenerate plan per iteration
@@ -1958,9 +2167,121 @@ def _run_eval_batch(
             batch_id=batch_id,
             run_index=idx,
             runs_in_batch=total,
+            leakage_row=leakage_row,
         )
 
     _append_log(f"Batch complete ({total} runs, batch_id={batch_id})")
+
+
+def _compute_leakage_row(
+    req: RunRequest,
+    plan: dict[str, Any],
+    *,
+    log: Any,
+) -> dict[str, Any] | None:
+    """Run or load the cold-probe for both single and batch eval runs."""
+    if not req.leakageProbe:
+        return None
+    try:
+        from leakage import cold_probe_for_eval_type
+        from src.eval.targets import get_target  # type: ignore
+
+        _ensure_aethyme_imports()
+        launch_phase = next(
+            (
+                phase
+                for phase in plan.get("phases", [])
+                if isinstance(phase, dict) and phase.get("name") == "launch"
+            ),
+            {},
+        )
+        probe_backend = launch_phase.get("backend", "claude")
+        probe_model = launch_phase.get("model", req.model)
+        bare_task = _bare_task_for_eval(req.evalType, req.target)
+        scenario = (
+            plan.get("scenario")
+            or plan.get("meta", {}).get("scenario")
+            or "default"
+        )
+        try:
+            target = get_target(req.target)
+            target_dict = target.to_dict()
+        except Exception:
+            target_dict = {"name": req.target, "display_name": req.target}
+
+        log(
+            f"Cold-probe: model={probe_model} backend={probe_backend} "
+            f"eval_type={req.evalType} scenario={scenario}"
+        )
+        probe_result = cold_probe_for_eval_type(
+            model=probe_model,
+            backend=probe_backend,
+            eval_type=req.evalType,
+            scenario=scenario,
+            task=bare_task,
+            target_dict=target_dict,
+            aethyme_pkg_path=str(AETHYME_PKG),
+            tab_directory=str(AETHYME_PKG),
+            judge_backend="claude-haiku",
+            judge_samples=1,
+            log=log,
+            force=req.leakageProbeForce,
+        )
+        row = {
+            "leakageScoreCold": probe_result.leakage_score_cold,
+            "leakageIsClean": probe_result.is_clean,
+            "leakageRawJudge": probe_result.raw_judge_score,
+            "leakageProbeVersion": probe_result.probe_prompt_version,
+            "leakageError": probe_result.error,
+        }
+        if probe_result.error:
+            log(f"Cold-probe warning: {probe_result.error}")
+        else:
+            log(
+                f"Cold-probe: leakage={probe_result.leakage_score_cold} "
+                f"is_clean={probe_result.is_clean} "
+                f"(cache_hit={probe_result.cache_hit})"
+            )
+        return row
+    except Exception as exc:
+        log(f"Cold-probe failed: {type(exc).__name__}: {exc}")
+        return {
+            "leakageScoreCold": None,
+            "leakageIsClean": None,
+            "leakageRawJudge": None,
+            "leakageProbeVersion": None,
+            "leakageError": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _bare_task_for_eval(eval_type: str, target: str) -> str:
+    if eval_type == "dead-code":
+        return _dead_code_task_for_target(target)
+    if eval_type == "bug-fix-1":
+        return """\
+Bug report (T419918): Viewing a diff/revision on a watchlisted page marks all revisions as 'seen' instead of only the one viewed.
+
+Identify which files need editing and explain how you would fix this bug. Do NOT apply the fix — only report your analysis.
+
+Write exactly one JSON object with this shape:
+{
+  "files_to_edit": [
+    {
+      "path": "relative/path.php",
+      "what_to_change": "specific change needed in this file"
+    }
+  ],
+  "root_cause": "trace from viewing a diff/revision to the wrong watchlist behavior",
+  "fix_plan": "step-by-step fix plan including signature and deprecation strategy",
+  "testing": "how to verify the fix and what regressions to check"
+}
+
+Rules:
+- Output JSON only, no markdown fences and no prose before or after the JSON.
+- Use repo-relative file paths.
+- Include the release notes file if the deprecation should be documented.
+- In `testing`, explicitly cover diff/revision behavior and watchlist notification regression checks."""
+    return f"Analyze this repository for: {eval_type}"
 
 
 def _run_eval_background(
@@ -1973,6 +2294,7 @@ def _run_eval_background(
     batch_id: str | None = None,
     run_index: int = 1,
     runs_in_batch: int = 1,
+    leakage_row: dict[str, Any] | None = None,
 ) -> None:
     import mcp_client
     import time
@@ -2057,6 +2379,8 @@ def _run_eval_background(
     conditions = launch_phase.get("conditions", [])
     log(f"Backend: {launch_phase.get('backend', '?')}, Model: {launch_phase.get('model', '?')}")
     log(f"Conditions: {[c['name'] for c in conditions]}")
+    if leakage_row is None:
+        leakage_row = _compute_leakage_row(req, plan, log=log)
 
     # Generate run_id for this eval run — groups all conditions together
     import time as _time
@@ -2596,6 +2920,7 @@ def _run_eval_background(
 
             transcript = _read_session_events(session_file)
             tool_calls = _extract_tool_calls(transcript)
+            aethyme_usage = _extract_aethyme_usage(tool_calls)
             run_metadata = _condition_run_metadata(
                 repo_path=repo_dir,
                 run_id=run_id,
@@ -2631,6 +2956,7 @@ def _run_eval_background(
                 "cache_create_tokens": data["cache_create"],
                 "num_turns": data["turns"],
                 "tool_calls": tool_calls,
+                "aethyme_usage": aethyme_usage,
                 "duration_seconds": data.get("duration_seconds"),
                 "cost_usd": data["cost"],
                 "final_output_message": data.get("output", ""),
@@ -2658,6 +2984,7 @@ def _run_eval_background(
                 },
                 duration_seconds=data.get("duration_seconds"),
                 tool_calls=tool_calls,
+                aethyme_usage=aethyme_usage,
                 exit_code=0 if deliverable_status == "success" else None,
                 command=run_payload["command"],
             )
@@ -2769,6 +3096,14 @@ def _run_eval_background(
                 # even if the plan snapshot is lost.
                 "primaryMetric": req.primaryMetric,
                 "minimumMeaningfulDelta": req.minimumMeaningfulDelta,
+                # Pretraining-leakage cold-probe — computed once per batch
+                # and stamped on every row so stratified aggregates can
+                # split clean vs contaminated items from SQL alone.
+                "leakageScoreCold": (leakage_row or {}).get("leakageScoreCold"),
+                "leakageIsClean": (leakage_row or {}).get("leakageIsClean"),
+                "leakageRawJudge": (leakage_row or {}).get("leakageRawJudge"),
+                "leakageProbeVersion": (leakage_row or {}).get("leakageProbeVersion"),
+                "leakageError": (leakage_row or {}).get("leakageError"),
             })
             log(f"[{cond_name}] Stored: {result_id} (output: {len(data.get('output',''))} chars)")
 
@@ -2911,9 +3246,9 @@ def _run_eval_background(
         tool_calls = run.get("tool_calls")
         if isinstance(tool_calls, list):
             breakdown = Counter(
-                str(call.get("tool"))
+                str(call.get("tool") or call.get("name"))
                 for call in tool_calls
-                if isinstance(call, dict) and call.get("tool")
+                if isinstance(call, dict) and (call.get("tool") or call.get("name"))
             )
             tool_breakdown_json = json.dumps(
                 {k: v for k, v in sorted(breakdown.items(), key=lambda item: (-item[1], item[0]))}

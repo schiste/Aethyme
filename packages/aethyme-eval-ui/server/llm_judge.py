@@ -89,6 +89,7 @@ def _build_judge_prompt(
     candidate: str,
     *,
     scrub: bool = True,
+    instructions: str | None = None,
 ) -> str:
     ref_text = (
         json.dumps(reference, indent=2) if isinstance(reference, dict) else str(reference)
@@ -96,6 +97,7 @@ def _build_judge_prompt(
     rubric_text = (
         json.dumps(rubric, indent=2) if rubric else "(use the scoring guidance)"
     )
+    header = instructions if instructions is not None else JUDGE_INSTRUCTIONS
 
     # Self-preference-bias mitigation: strip model-identifying envelope
     # (chat prefixes, UI bullets, thinking blocks, provider boilerplate)
@@ -121,7 +123,7 @@ def _build_judge_prompt(
         )
 
     return (
-        f"{JUDGE_INSTRUCTIONS}\n\n"
+        f"{header}\n\n"
         f"TASK:\n{task}\n\n"
         f"REFERENCE (ground truth):\n{ref_text}\n\n"
         f"RUBRIC:\n{rubric_text}\n\n"
@@ -344,6 +346,7 @@ def score_with_judge(
     tab_directory: str,
     backend: str = DEFAULT_BACKEND,
     log: Any = None,
+    instructions: str | None = None,
 ) -> dict[str, Any]:
     """Score a candidate via a CLI-based judge in a Chau7 tab, N samples (intra-rater).
 
@@ -408,7 +411,8 @@ def score_with_judge(
     try:
         prompt_path.write_text(
             _build_judge_prompt(
-                task, reference, rubric, scrubbed_candidate, scrub=False
+                task, reference, rubric, scrubbed_candidate,
+                scrub=False, instructions=instructions,
             ),
             encoding="utf-8",
         )

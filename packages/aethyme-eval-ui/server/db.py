@@ -121,6 +121,14 @@ MIGRATIONS = [
     # scoring this row (sum across its N samples). Makes judge time visible
     # as meta-overhead separate from per-condition agent telemetry.
     "ALTER TABLE eval_results ADD COLUMN judge_elapsed_seconds REAL",
+    # Pretraining-leakage cold-probe. One probe per (model, eval_type,
+    # scenario) stamped on every row in the batch, so stratified aggregates
+    # can split clean vs contaminated items from SQL alone.
+    "ALTER TABLE eval_results ADD COLUMN leakage_score_cold REAL",
+    "ALTER TABLE eval_results ADD COLUMN leakage_is_clean INTEGER",
+    "ALTER TABLE eval_results ADD COLUMN leakage_raw_judge REAL",
+    "ALTER TABLE eval_results ADD COLUMN leakage_probe_version TEXT",
+    "ALTER TABLE eval_results ADD COLUMN leakage_error TEXT",
 ]
 
 
@@ -378,14 +386,17 @@ def insert_result(result: dict[str, Any]) -> None:
             judge_samples, judge_error, judge_cost_usd,
             batch_id, run_index, runs_in_batch, deliverable_status,
             primary_metric, minimum_meaningful_delta,
-            judge_elapsed_seconds)
+            judge_elapsed_seconds,
+            leakage_score_cold, leakage_is_clean, leakage_raw_judge,
+            leakage_probe_version, leakage_error)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?,
                    ?, ?,
-                   ?)""",
+                   ?,
+                   ?, ?, ?, ?, ?)""",
         (
             result["id"], result.get("runDir"), result["date"],
             result["evalType"], result["target"], result["model"],
@@ -426,6 +437,17 @@ def insert_result(result: dict[str, Any]) -> None:
             result.get("minimumMeaningfulDelta"),
             # Judge overhead (P9)
             result.get("judgeElapsedSeconds"),
+            # Pretraining-leakage cold-probe fields. Null on rows that
+            # predate the probe or where the probe errored.
+            result.get("leakageScoreCold"),
+            (
+                1 if result.get("leakageIsClean") is True
+                else 0 if result.get("leakageIsClean") is False
+                else None
+            ),
+            result.get("leakageRawJudge"),
+            result.get("leakageProbeVersion"),
+            result.get("leakageError"),
         ),
     )
     conn.commit()
@@ -542,6 +564,17 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "minimumMeaningfulDelta": row["minimum_meaningful_delta"] if "minimum_meaningful_delta" in row.keys() else None,
         # Judge overhead (P9) — wall-clock seconds the judge spent on this row.
         "judgeElapsedSeconds": row["judge_elapsed_seconds"] if "judge_elapsed_seconds" in row.keys() else None,
+        # Pretraining-leakage cold-probe (one probe per (model, eval_type,
+        # scenario) stamped onto every row in the batch).
+        "leakageScoreCold": row["leakage_score_cold"] if "leakage_score_cold" in row.keys() else None,
+        "leakageIsClean": (
+            bool(row["leakage_is_clean"])
+            if "leakage_is_clean" in row.keys() and row["leakage_is_clean"] is not None
+            else None
+        ),
+        "leakageRawJudge": row["leakage_raw_judge"] if "leakage_raw_judge" in row.keys() else None,
+        "leakageProbeVersion": row["leakage_probe_version"] if "leakage_probe_version" in row.keys() else None,
+        "leakageError": row["leakage_error"] if "leakage_error" in row.keys() else None,
     }
 
 

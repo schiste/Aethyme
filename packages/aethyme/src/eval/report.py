@@ -279,6 +279,7 @@ def store_condition_raw(
     tokens: dict[str, int] | None = None,
     duration_seconds: float | None = None,
     tool_calls: list[dict[str, Any]] | None = None,
+    aethyme_usage: dict[str, Any] | None = None,
     exit_code: int | None = None,
     command: str | None = None,
 ) -> Path:
@@ -302,6 +303,10 @@ def store_condition_raw(
         (cond_dir / "tool-calls.json").write_text(
             json.dumps(tool_calls, indent=2), encoding="utf-8"
         )
+    if aethyme_usage is not None:
+        (cond_dir / "aethyme-usage.json").write_text(
+            json.dumps(aethyme_usage, indent=2), encoding="utf-8"
+        )
 
     meta: dict[str, Any] = {"stored_at": datetime.now(UTC).isoformat()}
     meta["schema_version"] = RUN_METADATA_SCHEMA_VERSION
@@ -314,6 +319,8 @@ def store_condition_raw(
         meta["exit_code"] = exit_code
     if command:
         meta["command"] = command
+    if aethyme_usage is not None:
+        meta["aethyme_usage"] = aethyme_usage
     (cond_dir / "run-metadata.json").write_text(
         json.dumps(meta, indent=2), encoding="utf-8"
     )
@@ -972,7 +979,8 @@ def _render_markdown(*, repo_path: Path, result: dict[str, Any]) -> str:
 
     Section order is fixed and non-negotiable:
     Meta -> Model -> Scorecard -> Score Breakdown -> Prompts ->
-    Agent Output -> Tool Call Analysis -> (legacy diagnostics, when present) ->
+    Agent Output -> Tool Call Analysis -> Aethyme Usage ->
+    (legacy diagnostics, when present) ->
     Verdict -> Notes -> Raw Data
     """
     lines: list[str] = []
@@ -983,6 +991,7 @@ def _render_markdown(*, repo_path: Path, result: dict[str, Any]) -> str:
     _section_prompts(lines, result)
     _section_agent_output(lines, result)
     _section_tool_calls(lines, result)
+    _section_aethyme_usage(lines, result)
     if _should_render_legacy_eval_diagnostics(result):
         _section_legacy_eval_diagnostics(lines, result)
     _section_verdict(lines, result)
@@ -1222,6 +1231,58 @@ def _section_tool_calls(lines: list[str], result: dict[str, Any]) -> None:
         return
 
     lines.extend(["## Tool Call Analysis", ""] + section_lines)
+
+
+def _section_aethyme_usage(lines: list[str], result: dict[str, Any]) -> None:
+    """Show whether Aethyme was actually invoked by each condition."""
+    active = _active_conditions(result)
+    rows: list[str] = []
+    has_any = False
+
+    for cond in active:
+        side = result.get(cond, {})
+        run = side.get("run") if isinstance(side, dict) else None
+        usage = run.get("aethyme_usage") if isinstance(run, dict) else None
+        if not isinstance(usage, dict):
+            continue
+        has_any = True
+        if usage.get("aethyme_used"):
+            used = "yes"
+        else:
+            used = "no"
+        kinds = ", ".join(
+            str(item.get("kind"))
+            for item in usage.get("aethyme_commands", [])
+            if isinstance(item, dict) and item.get("kind")
+        )
+        rows.append(
+            "| "
+            + " | ".join(
+                [
+                    _cond_label(cond),
+                    used,
+                    str(usage.get("aethyme_command_count", 0)),
+                    kinds or "-",
+                    str(usage.get("manual_shell_after_aethyme_count", 0)),
+                    str(usage.get("manual_search_after_aethyme_count", 0)),
+                ]
+            )
+            + " |"
+        )
+
+    if not has_any:
+        return
+
+    lines.extend(
+        [
+            "## Aethyme Usage",
+            "",
+            "| Condition | Aethyme Used | Aethyme Commands | Command Kinds | Shell After | Search After |",
+            "|---|---|---|---|---|---|",
+            *rows,
+            "",
+        ]
+    )
 
 
 def _should_render_legacy_eval_diagnostics(result: dict[str, Any]) -> bool:

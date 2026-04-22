@@ -105,12 +105,12 @@ def test_import_eval_runs_preserves_target_and_judge_metrics(tmp_path: Path) -> 
     db.DB_PATH = tmp_path / "evals.db"
 
     eval_runs_dir = tmp_path / "eval-runs"
-    run_dir = eval_runs_dir / "20260420T092820-aethyme-dead-code"
+    run_dir = eval_runs_dir / "20260420T092820-mediawiki-dead-code"
     run_dir.mkdir(parents=True)
 
     result = {
         "eval_type": "dead-code",
-        "target": "aethyme",
+        "target": "mediawiki",
         "model": {"name": "haiku", "reasoning": "high"},
         "leverage": {
             "prompt": "use aethyme tools",
@@ -126,8 +126,8 @@ def test_import_eval_runs_preserves_target_and_judge_metrics(tmp_path: Path) -> 
                 "tool_calls": [{"name": "Grep"}, {"name": "Read"}, {"name": "Grep"}],
                 "output": '{"unused_functions":[]}',
                 "run_metadata": {
-                    "run_id": "run-1776677300-aethyme-dead-code",
-                    "target": "aethyme",
+                    "run_id": "run-1776677300-mediawiki-dead-code",
+                    "target": "mediawiki",
                 },
             },
             "summary_metrics": {
@@ -152,7 +152,7 @@ def test_import_eval_runs_preserves_target_and_judge_metrics(tmp_path: Path) -> 
             {
                 "timestamp": "2026-04-20T09:40:20+00:00",
                 "eval_type": "dead-code",
-                "repo_path": "/Users/example/Downloads/Repositories/Playground/Aethyme",
+                "repo_path": "/Users/example/Downloads/Repositories/Playground/Mediawiki",
             }
         ),
         encoding="utf-8",
@@ -172,12 +172,12 @@ def test_import_eval_runs_preserves_target_and_judge_metrics(tmp_path: Path) -> 
     count = db.import_eval_runs(eval_runs_dir)
     assert count == 1
 
-    rows = db.query_results(eval_type="dead-code", target="aethyme")
+    rows = db.query_results(eval_type="dead-code", target="mediawiki")
     assert len(rows) == 1
     row = rows[0]
 
-    assert row["runId"] == "run-1776677300-aethyme-dead-code"
-    assert row["target"] == "aethyme"
+    assert row["runId"] == "run-1776677300-mediawiki-dead-code"
+    assert row["target"] == "mediawiki"
     assert row["qualityScore"] == 81.92
     assert row["recalculatedEvalScore"] == 118.22
     assert row["judgeScore"] == 5.0
