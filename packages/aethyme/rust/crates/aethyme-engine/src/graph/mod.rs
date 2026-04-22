@@ -8,3 +8,4 @@ pub mod neighborhood;
 pub mod overview;
 pub mod search;
 pub mod signals;
+pub mod usage_boundary;

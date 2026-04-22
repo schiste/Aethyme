@@ -346,6 +346,76 @@ def search_symbol(repo_path: Path, query: str) -> list[dict[str, Any]]:
     return json.loads(output)
 
 
+def search_symbols(
+    repo_path: Path,
+    queries: list[str],
+    *,
+    limit: int = 20,
+    timeout_seconds: float | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return symbol search results for multiple queries with one map load."""
+    normalized_queries = []
+    seen = set()
+    for query in queries:
+        stripped = query.strip()
+        if stripped and stripped not in seen:
+            seen.add(stripped)
+            normalized_queries.append(stripped)
+    if not normalized_queries:
+        return {}
+
+    snapshot = capture_snapshot(repo_path)
+    cache_key = f"symbol_batch_{_stable_hash(json.dumps([normalized_queries, limit]))}"
+    output = _cached_text(
+        snapshot,
+        cache_key,
+        lambda: _run_binary_command_with_timeout(
+            "symbol-batch",
+            "--repo",
+            str(snapshot.repo_path),
+            *[
+                arg
+                for query in normalized_queries
+                for arg in ("--query", query)
+            ],
+            "--limit",
+            str(limit),
+            timeout_seconds=timeout_seconds,
+        ),
+    )
+    return json.loads(output)
+
+
+def _run_binary_command_with_timeout(
+    *args: str,
+    timeout_seconds: float | None = None,
+) -> str:
+    """Run an engine command with an optional timeout for subprocess transport."""
+    if timeout_seconds is None:
+        return _run_binary_command(*args)
+
+    info = engine_runtime_info()
+    if info["resolved_transport"] != "subprocess":
+        return _run_binary_command(*args)
+
+    binary_path = ensure_engine_binary()
+    try:
+        result = subprocess.run(
+            [str(binary_path), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise EngineError(
+            f"Rust engine timed out after {timeout_seconds:.1f}s: {' '.join(args)}"
+        ) from exc
+    if result.returncode != 0:
+        raise EngineError(result.stderr.strip() or result.stdout.strip() or "Rust engine failed")
+    return result.stdout.strip()
+
+
 def graph_node(repo_path: Path, target: str) -> dict[str, Any]:
     """Return a graph node view for a resolved target."""
     snapshot = capture_snapshot(repo_path)
@@ -455,29 +525,66 @@ def build_task_context(repo_path: Path, task: str, content_budget: int = 80_000)
     return json.loads(output)
 
 
-def task_anchors(repo_path: Path, task: str) -> dict[str, Any]:
+def task_anchors(
+    repo_path: Path,
+    task: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
     """Return task anchors derived from the graph."""
-    return _task_view(repo_path, "task-anchors", task)
+    return _task_view(repo_path, "task-anchors", task, timeout_seconds=timeout_seconds)
 
 
-def task_scope(repo_path: Path, task: str) -> dict[str, Any]:
+def task_scope(
+    repo_path: Path,
+    task: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
     """Return task scope derived from the graph."""
-    return _task_view(repo_path, "task-scope", task)
+    return _task_view(repo_path, "task-scope", task, timeout_seconds=timeout_seconds)
 
 
-def task_next(repo_path: Path, task: str) -> dict[str, Any]:
+def task_next(
+    repo_path: Path,
+    task: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
     """Return the next navigation steps for a task."""
-    return _task_view(repo_path, "task-next", task)
+    return _task_view(repo_path, "task-next", task, timeout_seconds=timeout_seconds)
 
 
-def task_expand(repo_path: Path, target: str) -> dict[str, Any]:
+def task_localize(
+    repo_path: Path,
+    task: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Return task anchors, scope, and next steps with one engine map load."""
+    return _task_view(repo_path, "task-localize", task, timeout_seconds=timeout_seconds)
+
+
+def task_expand(
+    repo_path: Path,
+    target: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
     """Expand a graph node into related navigation context."""
     snapshot = capture_snapshot(repo_path)
     cache_key = f"task_expand_{_stable_hash(target)}"
     output = _cached_text(
         snapshot,
         cache_key,
-        lambda: _run_binary_command("task-expand", "--repo", str(snapshot.repo_path), "--target", target),
+        lambda: _run_binary_command_with_timeout(
+            "task-expand",
+            "--repo",
+            str(snapshot.repo_path),
+            "--target",
+            target,
+            timeout_seconds=timeout_seconds,
+        ),
     )
     return json.loads(output)
 
@@ -559,6 +666,35 @@ def analyze_dead_code(
             *(["--roots", roots_value] if roots_value else []),
             *(["--include-methods"] if include_methods else []),
         ),
+    )
+    return json.loads(output)
+
+
+def usage_boundary_query(
+    repo_path: Path,
+    scope: str,
+    *,
+    roots: list[str] | None = None,
+    include_methods: bool = False,
+    budget_ms: int = 10_000,
+    max_evidence_per_symbol: int = 5,
+) -> dict[str, Any]:
+    """Return a scope-first usage boundary answer without building the full graph."""
+    snapshot = capture_snapshot(repo_path)
+    roots = roots or []
+    roots_value = ",".join(roots)
+    output = _run_binary_command(
+        "analyze-usage-boundary",
+        "--repo",
+        str(snapshot.repo_path),
+        "--scope",
+        scope,
+        *(["--roots", roots_value] if roots_value else []),
+        *(["--include-methods"] if include_methods else []),
+        "--budget-ms",
+        str(max(0, int(budget_ms))),
+        "--max-evidence-per-symbol",
+        str(max(1, int(max_evidence_per_symbol))),
     )
     return json.loads(output)
 
@@ -650,12 +786,25 @@ def _graph_relation(repo_path: Path, command: str, target: str) -> dict[str, Any
     return json.loads(output)
 
 
-def _task_view(repo_path: Path, command: str, task: str) -> dict[str, Any]:
+def _task_view(
+    repo_path: Path,
+    command: str,
+    task: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
     snapshot = capture_snapshot(repo_path)
     cache_key = f"{command}_{_stable_hash(task)}"
     output = _cached_text(
         snapshot,
         cache_key,
-        lambda: _run_binary_command(command, "--repo", str(snapshot.repo_path), "--task", task),
+        lambda: _run_binary_command_with_timeout(
+            command,
+            "--repo",
+            str(snapshot.repo_path),
+            "--task",
+            task,
+            timeout_seconds=timeout_seconds,
+        ),
     )
     return json.loads(output)

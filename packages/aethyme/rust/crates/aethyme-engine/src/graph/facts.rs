@@ -60,9 +60,14 @@ pub fn function_usage_fact(
         if edge.to != fact.id {
             continue;
         }
-        if let Some(reference) = docs_config_display_for_id(map, &edge.from) {
-            docs_config.insert(reference);
-            continue;
+        if matches!(edge.kind, EdgeKind::References | EdgeKind::Documents) {
+            if let Some((reference, reference_path)) = docs_config_reference_for_id(map, &edge.from)
+            {
+                if roots.is_empty() || roots.iter().any(|root| reference_path.starts_with(root)) {
+                    docs_config.insert(reference);
+                }
+                continue;
+            }
         }
         if !matches!(edge.kind, EdgeKind::Calls | EdgeKind::References) {
             continue;
@@ -196,17 +201,17 @@ fn source_code_path_for_id(map: &RepositoryMap, value: &str) -> Option<String> {
     None
 }
 
-fn docs_config_display_for_id(map: &RepositoryMap, value: &str) -> Option<String> {
+fn docs_config_reference_for_id(map: &RepositoryMap, value: &str) -> Option<(String, String)> {
     if let Some(doc) = map.docs.iter().find(|doc| doc.id == value) {
-        return Some(format!("doc:{}", doc.path));
+        return Some((format!("doc:{}", doc.path), doc.path.clone()));
     }
     if let Some(config) = map.configs.iter().find(|config| config.id == value) {
-        return Some(format!("config:{}", config.path));
+        return Some((format!("config:{}", config.path), config.path.clone()));
     }
     if let Some(file) = map.files.iter().find(|file| file.id == value) {
         return match file.role {
-            FileRole::Doc => Some(format!("doc:{}", file.path)),
-            FileRole::Config => Some(format!("config:{}", file.path)),
+            FileRole::Doc => Some((format!("doc:{}", file.path), file.path.clone())),
+            FileRole::Config => Some((format!("config:{}", file.path), file.path.clone())),
             _ => None,
         };
     }
@@ -292,7 +297,13 @@ mod tests {
                 .iter()
                 .any(|caller| caller.contains("notes.md"))
         );
-        assert_eq!(usage.docs_config_references, vec!["doc:docs/notes.md"]);
+        assert_eq!(usage.docs_config_references, Vec::<String>::new());
+
+        let usage_with_docs = function_usage_fact(&map, &fact, "src/indexing", &[]);
+        assert_eq!(
+            usage_with_docs.docs_config_references,
+            vec!["doc:docs/notes.md"]
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

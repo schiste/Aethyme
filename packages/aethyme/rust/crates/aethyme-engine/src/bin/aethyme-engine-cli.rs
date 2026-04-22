@@ -14,6 +14,7 @@ use aethyme_engine::graph::navigation::{
 use aethyme_engine::graph::neighborhood::{dependency_frontier, impact_frontier};
 use aethyme_engine::graph::overview::build_repo_overview;
 use aethyme_engine::graph::search::symbol_search;
+use aethyme_engine::graph::usage_boundary::analyze_usage_boundary_scope_first;
 use aethyme_engine::map::RepositoryMap;
 use aethyme_engine::model::task::TaskInput;
 use aethyme_engine::pipeline::{build_context_pack, build_context_pack_with_content};
@@ -73,6 +74,23 @@ fn run() -> Result<(), String> {
             let map = build_map(&repo, no_cache)?;
             let hits = symbol_search(&map, &query, 20);
             println!("{}", aethyme_engine::json::search_hits(&hits));
+        }
+        "symbol-batch" => {
+            let repo = read_option(&args, "--repo")?;
+            let queries = read_options(&args, "--query");
+            if queries.is_empty() {
+                return Err("missing required option: --query".to_string());
+            }
+            let limit = read_option(&args, "--limit")
+                .ok()
+                .and_then(|raw| raw.parse::<usize>().ok())
+                .unwrap_or(20);
+            let map = build_map(&repo, no_cache)?;
+            let results = queries
+                .iter()
+                .map(|query| (query.clone(), symbol_search(&map, query, limit)))
+                .collect::<Vec<_>>();
+            println!("{}", aethyme_engine::json::search_hits_by_query(&results));
         }
         "graph-node" => {
             let repo = read_option(&args, "--repo")?;
@@ -224,6 +242,19 @@ fn run() -> Result<(), String> {
                 aethyme_engine::json::graph_relation(&task_next_view(&map, &task))
             );
         }
+        "task-localize" => {
+            let repo = read_option(&args, "--repo")?;
+            let map = build_map(&repo, no_cache)?;
+            let task_value = read_option(&args, "--task")?;
+            let task = TaskInput::from_task_text(&task_value);
+            let anchors = task_anchors_view(&map, &task);
+            let scope = task_scope_view(&map, &task);
+            let next = task_next_view(&map, &task);
+            println!(
+                "{}",
+                aethyme_engine::json::task_localization_view(&anchors, &scope, &next)
+            );
+        }
         "task-expand" => {
             let repo = read_option(&args, "--repo")?;
             let map = build_map(&repo, no_cache)?;
@@ -336,6 +367,41 @@ fn run() -> Result<(), String> {
                 .unwrap_or_default();
             let map = build_map(&repo, no_cache)?;
             let answer = analyze_dead_code(&map, &scope, &roots, include_methods);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&answer).map_err(|e| e.to_string())?
+            );
+        }
+        "analyze-usage-boundary" => {
+            let repo = read_option(&args, "--repo")?;
+            let scope = read_option(&args, "--scope")?;
+            let include_methods = has_flag(&args, "--include-methods");
+            let roots = read_option(&args, "--roots")
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(|item| item.trim().to_string())
+                        .filter(|item| !item.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let budget_ms = read_option(&args, "--budget-ms")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(10_000);
+            let max_evidence_per_symbol = read_option(&args, "--max-evidence-per-symbol")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(5);
+            let answer = analyze_usage_boundary_scope_first(
+                &PathBuf::from(&repo),
+                &scope,
+                &roots,
+                include_methods,
+                Some(budget_ms),
+                max_evidence_per_symbol,
+            )?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&answer).map_err(|e| e.to_string())?
@@ -705,6 +771,13 @@ fn read_option(args: &[String], flag: &str) -> Result<String, String> {
         .find(|pair| pair[0] == flag)
         .map(|pair| pair[1].clone())
         .ok_or_else(|| format!("missing required option: {flag}"))
+}
+
+fn read_options(args: &[String], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+        .collect()
 }
 
 fn has_flag(args: &[String], flag: &str) -> bool {

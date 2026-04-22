@@ -167,6 +167,8 @@ pub fn build_with_profile(
         let contents = fs::read_to_string(root.join(&parsed.file.path)).unwrap_or_default();
         let imported_symbol_names =
             imported_symbol_names_for_language(&parsed.language, &contents, &mut interner);
+        let imported_symbol_aliases =
+            imported_symbol_aliases_for_language(&parsed.language, &contents, &mut interner);
         let analyses = analyze_file_functions_with_contents(
             &contents,
             &current_function_indexes,
@@ -179,6 +181,7 @@ pub fn build_with_profile(
             &indexes,
             &resolved_imports,
             &imported_symbol_names,
+            &imported_symbol_aliases,
         ));
     }
     let resolve_calls_ms = calls_started.elapsed().as_millis();
@@ -200,6 +203,8 @@ pub fn build_with_profile(
         let contents = fs::read_to_string(root.join(&parsed.file.path)).unwrap_or_default();
         let imported_symbol_names =
             imported_symbol_names_for_language(&parsed.language, &contents, &mut interner);
+        let imported_symbol_aliases =
+            imported_symbol_aliases_for_language(&parsed.language, &contents, &mut interner);
         let analyses = analyze_file_functions_with_contents(
             &contents,
             &current_function_indexes,
@@ -214,6 +219,7 @@ pub fn build_with_profile(
             &indexes,
             &resolved_imports,
             &imported_symbol_names,
+            &imported_symbol_aliases,
             &interner,
         ));
     }
@@ -498,6 +504,7 @@ fn resolve_cross_file_calls(
     indexes: &GlobalIndexes,
     resolved_import_edges: &[Edge],
     imported_symbol_names: &BTreeSet<InternId>,
+    imported_symbol_aliases: &HashMap<InternId, InternId>,
 ) -> Vec<Edge> {
     let imported_targets: HashSet<InternId> = resolved_import_edges
         .iter()
@@ -519,16 +526,19 @@ fn resolve_cross_file_calls(
             ));
         }
 
-        for (token, target_index) in
-            body_call_candidates(&analysis.call_names, &indexes.functions_by_name)
-        {
+        for (token, target_index) in body_call_candidates(
+            &analysis.call_names,
+            &indexes.functions_by_name,
+            imported_symbol_aliases,
+        ) {
             let target = &functions[target_index];
             if target.file_id == function.file_id || target.id == function.id {
                 continue;
             }
 
             let target_file_id = indexes.file_ids.get(&target.file_id).copied();
-            let directly_imported = imported_symbol_names.contains(&token);
+            let directly_imported = imported_symbol_names.contains(&token)
+                || imported_symbol_aliases.contains_key(&token);
             let imported_file =
                 target_file_id.is_some_and(|file_id| imported_targets.contains(&file_id));
             if directly_imported || imported_file || analysis.qualified_call_names.contains(&token)
@@ -564,6 +574,7 @@ fn resolve_references(
     indexes: &GlobalIndexes,
     resolved_import_edges: &[Edge],
     imported_symbol_names: &BTreeSet<InternId>,
+    imported_symbol_aliases: &HashMap<InternId, InternId>,
     interner: &StringInterner,
 ) -> Vec<Edge> {
     let imported_targets: HashSet<InternId> = resolved_import_edges
@@ -601,7 +612,10 @@ fn resolve_references(
         }
 
         for token in &analysis.tokens {
-            if let Some(class_matches) = indexes.classes_by_name.get(token) {
+            for lookup_token in candidate_lookup_tokens(*token, imported_symbol_aliases) {
+                let Some(class_matches) = indexes.classes_by_name.get(&lookup_token) else {
+                    continue;
+                };
                 for class_index in class_matches {
                     let class = &classes[*class_index];
                     if class.file_id == function.file_id {
@@ -610,7 +624,8 @@ fn resolve_references(
                     let target_file_id = indexes.file_ids.get(&class.file_id).copied();
                     let imported_file =
                         target_file_id.is_some_and(|file_id| imported_targets.contains(&file_id));
-                    let directly_imported = imported_symbol_names.contains(token);
+                    let directly_imported = imported_symbol_names.contains(token)
+                        || imported_symbol_aliases.contains_key(token);
                     if imported_file || directly_imported {
                         let confidence = if directly_imported { 900 } else { 800 };
                         edges.push(Edge::new(
@@ -626,7 +641,10 @@ fn resolve_references(
         }
 
         for token in &analysis.tokens {
-            if let Some(function_matches) = indexes.functions_by_name.get(token) {
+            for lookup_token in candidate_lookup_tokens(*token, imported_symbol_aliases) {
+                let Some(function_matches) = indexes.functions_by_name.get(&lookup_token) else {
+                    continue;
+                };
                 let is_call_name = analysis.call_names.contains(token);
                 for target_index in function_matches {
                     let target = &functions[*target_index];
@@ -637,7 +655,8 @@ fn resolve_references(
                     let target_file_id = indexes.file_ids.get(&target.file_id).copied();
                     let imported_file =
                         target_file_id.is_some_and(|file_id| imported_targets.contains(&file_id));
-                    let directly_imported = imported_symbol_names.contains(token);
+                    let directly_imported = imported_symbol_names.contains(token)
+                        || imported_symbol_aliases.contains_key(token);
                     if !is_call_name && (imported_file || directly_imported) {
                         let confidence = if directly_imported { 880 } else { 780 };
                         edges.push(Edge::new(
@@ -672,6 +691,21 @@ fn imported_symbol_names_for_language(
     names
         .into_iter()
         .map(|name| interner.intern(&name))
+        .collect()
+}
+
+fn imported_symbol_aliases_for_language(
+    language: &str,
+    contents: &str,
+    interner: &mut StringInterner,
+) -> HashMap<InternId, InternId> {
+    let aliases = match language {
+        "python" => python_imported_symbol_aliases(contents),
+        _ => HashMap::new(),
+    };
+    aliases
+        .into_iter()
+        .map(|(alias, original)| (interner.intern(&alias), interner.intern(&original)))
         .collect()
 }
 
@@ -769,6 +803,42 @@ fn python_imported_symbol_names(contents: &str) -> BTreeSet<String> {
     names
 }
 
+fn python_imported_symbol_aliases(contents: &str) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    let mut pending_from_import = String::new();
+    let mut in_multiline_from_import = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if in_multiline_from_import {
+            pending_from_import.push(' ');
+            pending_from_import.push_str(trimmed);
+            if trimmed.contains(')') {
+                add_python_imported_aliases(&pending_from_import, &mut aliases);
+                pending_from_import.clear();
+                in_multiline_from_import = false;
+            }
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("from ")
+            && let Some((_module, imported)) = rest.split_once(" import ")
+        {
+            if imported.contains('(') && !imported.contains(')') {
+                pending_from_import.clear();
+                pending_from_import.push_str(imported);
+                in_multiline_from_import = true;
+            } else {
+                add_python_imported_aliases(imported, &mut aliases);
+            }
+        }
+    }
+    if in_multiline_from_import {
+        add_python_imported_aliases(&pending_from_import, &mut aliases);
+    }
+    aliases
+}
+
 fn add_python_imported_names(imported: &str, names: &mut BTreeSet<String>) {
     let imported = imported
         .trim()
@@ -792,6 +862,36 @@ fn add_python_imported_names(imported: &str, names: &mut BTreeSet<String>) {
             .trim();
         if !imported_name.is_empty() && imported_name != "*" {
             names.insert(imported_name.to_string());
+        }
+    }
+}
+
+fn add_python_imported_aliases(imported: &str, aliases: &mut HashMap<String, String>) {
+    let imported = imported
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    for part in imported.split(',') {
+        let token = part
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim();
+        let Some((original, alias)) = token.split_once(" as ") else {
+            continue;
+        };
+        let original = original
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim();
+        let alias = alias.split_whitespace().next().unwrap_or_default().trim();
+        if !original.is_empty() && !alias.is_empty() && original != alias {
+            aliases.insert(alias.to_string(), original.to_string());
         }
     }
 }
@@ -872,17 +972,31 @@ fn typescript_imported_symbol_names(contents: &str) -> BTreeSet<String> {
 fn body_call_candidates(
     call_names: &BTreeSet<InternId>,
     functions_by_name: &HashMap<InternId, Vec<usize>>,
+    imported_symbol_aliases: &HashMap<InternId, InternId>,
 ) -> Vec<(InternId, usize)> {
     let mut matches = Vec::new();
     for token in call_names {
-        let Some(candidates) = functions_by_name.get(token) else {
-            continue;
-        };
-        matches.extend(candidates.iter().copied().map(|index| (*token, index)));
+        for lookup_token in candidate_lookup_tokens(*token, imported_symbol_aliases) {
+            let Some(candidates) = functions_by_name.get(&lookup_token) else {
+                continue;
+            };
+            matches.extend(candidates.iter().copied().map(|index| (*token, index)));
+        }
     }
     matches.sort_unstable();
     matches.dedup();
     matches
+}
+
+fn candidate_lookup_tokens(
+    token: InternId,
+    imported_symbol_aliases: &HashMap<InternId, InternId>,
+) -> Vec<InternId> {
+    let mut tokens = vec![token];
+    if let Some(original) = imported_symbol_aliases.get(&token) {
+        tokens.push(*original);
+    }
+    tokens
 }
 
 fn body_identifier_tokens(body: &str, interner: &mut StringInterner) -> BTreeSet<InternId> {
@@ -1055,6 +1169,37 @@ mod tests {
             matches!(edge.kind, EdgeKind::Calls)
                 && edge.from.contains("run")
                 && edge.to.contains("validate_token")
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cross_file_python_call_resolution_links_aliased_imported_function() {
+        let root = std::env::temp_dir().join("aethyme_engine_alias_python_import_test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("create temp repo");
+        fs::write(
+            root.join("src/cli.py"),
+            "from engine import analyze_dead_code as analyze_dead_code_answer\n\n\
+             def run():\n    return analyze_dead_code_answer()\n",
+        )
+        .expect("write source");
+        fs::write(
+            root.join("src/engine.py"),
+            "def analyze_dead_code():\n    return {}\n",
+        )
+        .expect("write source");
+
+        let snapshot = discover_repo(&root).expect("discover repo");
+        let structure = structure::build(&snapshot);
+        let code = build(&root, &structure);
+
+        assert!(code.edges.iter().any(|edge| {
+            matches!(edge.kind, EdgeKind::Calls)
+                && edge.from.contains("run")
+                && edge.to.contains("analyze_dead_code")
+                && edge.confidence >= 900
         }));
 
         let _ = fs::remove_dir_all(&root);

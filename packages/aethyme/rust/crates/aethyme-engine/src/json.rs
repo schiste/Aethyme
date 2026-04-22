@@ -517,6 +517,17 @@ pub fn search_hits(hits: &[SearchHit]) -> String {
     )
 }
 
+pub fn search_hits_by_query(results: &[(String, Vec<SearchHit>)]) -> String {
+    format!(
+        "{{{}}}",
+        results
+            .iter()
+            .map(|(query, hits)| format!("{}:{}", string(query), search_hits(hits)))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 pub fn string_list(items: &[String]) -> String {
     string_array(items)
 }
@@ -759,6 +770,20 @@ pub fn task_scope_view(view: &TaskScopeView) -> String {
         string_array(&view.in_scope_areas),
         string_array(&view.out_of_scope),
         string_array(&view.risks),
+    )
+}
+
+pub fn task_localization_view(
+    anchors: &TaskAnchorsView,
+    scope: &TaskScopeView,
+    next: &GraphRelationView,
+) -> String {
+    format!(
+        "{{\"task\":{},\"anchors\":{},\"scope\":{},\"next\":{}}}",
+        string(&anchors.task),
+        task_anchors_view(anchors),
+        task_scope_view(scope),
+        graph_relation(next),
     )
 }
 
