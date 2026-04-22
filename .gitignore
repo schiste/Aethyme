@@ -4,6 +4,7 @@ build/
 coverage/
 test-results/
 playwright-report/
+.playwright-mcp/
 .DS_Store
 .chau7/
 __pycache__/
