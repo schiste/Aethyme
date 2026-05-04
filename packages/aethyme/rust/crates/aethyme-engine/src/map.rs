@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::cache::ParseCache;
+use crate::store::redb::parse_store::ParseStore;
 use crate::indexer::tree_sitter::{GrammarRegistry, default_grammars_dir};
 use crate::map_cache;
 use crate::model::area::AreaNode;
@@ -247,20 +247,25 @@ impl RepositoryMap {
 
         let grammar_registry = default_grammars_dir().map(|dir| GrammarRegistry::load(&dir));
 
-        let parse_cache = if no_cache {
+        // Option X: when --no-cache is set, do not open the parse store at all.
+        // No reads, no writes, no transactions opened. The flag now matches its name.
+        let parse_store = if no_cache {
             None
         } else {
-            ParseCache::load(root)
+            match ParseStore::open(root) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    eprintln!("aethyme: parse store unavailable, falling back to no-cache: {err}");
+                    None
+                }
+            }
         };
-        let (code, code_profile, new_cache, cache_stats) = passes::code::build_with_profile(
+        let (code, code_profile, cache_stats) = passes::code::build_with_profile(
             root,
             &structure,
-            parse_cache.as_ref(),
+            parse_store.as_ref(),
             grammar_registry.as_ref(),
         );
-        if !no_cache {
-            new_cache.save(root);
-        }
         push_stage(
             &mut stages,
             "code_parse_files",

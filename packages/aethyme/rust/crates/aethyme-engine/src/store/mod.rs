@@ -5,6 +5,7 @@
 
 pub mod prompt;
 pub mod read;
+pub mod redb;
 pub mod schema;
 pub mod snippets;
 pub mod write;

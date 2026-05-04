@@ -2,6 +2,10 @@ use std::env;
 use std::io::Write;
 use std::path::PathBuf;
 
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 use aethyme_engine::graph::activation::{hormone_profile, spread_activation, spread_from_seed};
 use aethyme_engine::graph::analyzers::analyze_dead_code;
 use aethyme_engine::graph::anchors::resolve_anchors;
@@ -21,6 +25,9 @@ use aethyme_engine::pipeline::{build_context_pack, build_context_pack_with_conte
 use aethyme_engine::workspace::{build_workspace_graph, cross_repo_blast_radius};
 
 fn main() {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     if let Err(message) = run() {
         eprintln!("{message}");
         std::process::exit(1);

@@ -5,8 +5,9 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use crate::cache::{CacheEntry, CacheStats, ParseCache, sha256_hex};
+use crate::cache::{CacheStats, sha256_hex};
 use crate::indexer;
+use crate::store::redb::parse_store::ParseStore;
 use crate::model::class::ClassNode;
 use crate::model::edge::{Edge, EdgeKind};
 use crate::model::file::{FileNode, FileRole};
@@ -86,9 +87,9 @@ pub fn build(root: &Path, structure: &StructurePass) -> CodePass {
 pub fn build_with_profile(
     root: &Path,
     structure: &StructurePass,
-    cache: Option<&ParseCache>,
+    store: Option<&ParseStore>,
     grammar_registry: Option<&indexer::tree_sitter::GrammarRegistry>,
-) -> (CodePass, CodeStageProfile, ParseCache, CacheStats) {
+) -> (CodePass, CodeStageProfile, CacheStats) {
     let parse_started = Instant::now();
     let source_files: Vec<&FileNode> = structure
         .files
@@ -98,28 +99,47 @@ pub fn build_with_profile(
 
     let parsed_results: Vec<(ParsedFile, bool)> = source_files
         .par_iter()
-        .map(|file| parse_file_with_cache(root, file, cache, grammar_registry))
+        .map(|file| parse_file_with_cache(root, file, store, grammar_registry))
         .collect();
 
     let mut hits = 0usize;
     let mut misses = 0usize;
     let mut parsed_files = Vec::with_capacity(parsed_results.len());
-    let mut new_cache = ParseCache::for_repo(root);
+    // Open one BuildSession; insert each parsed entry through it without
+    // cloning. Cache failures are logged but do not fail the build (the cache
+    // is regenerable by definition).
+    let mut session = match store {
+        Some(s) => match s.begin_build() {
+            Ok(session) => Some(session),
+            Err(err) => {
+                eprintln!("aethyme: parse store begin_build failed: {err}");
+                None
+            }
+        },
+        None => None,
+    };
     for (parsed, was_cached) in parsed_results {
         if was_cached {
             hits += 1;
         } else {
             misses += 1;
         }
-        new_cache.insert(
-            parsed.file.path.clone(),
-            CacheEntry {
-                content_hash: parsed.content_hash.clone(),
-                symbols: parsed.symbols.clone(),
-                import_edges: parsed.import_edges.clone(),
-            },
-        );
+        if let Some(s) = session.as_mut() {
+            if let Err(err) = s.insert_borrowed(
+                &parsed.file.path,
+                &parsed.content_hash,
+                &parsed.symbols,
+                &parsed.import_edges,
+            ) {
+                eprintln!("aethyme: parse store insert failed for {}: {err}", parsed.file.path);
+            }
+        }
         parsed_files.push(parsed);
+    }
+    if let Some(s) = session {
+        if let Err(err) = s.commit() {
+            eprintln!("aethyme: parse store commit failed: {err}");
+        }
     }
     parsed_files.sort_by(|left, right| left.file.path.cmp(&right.file.path));
     let parse_files_ms = parse_started.elapsed().as_millis();
@@ -245,7 +265,6 @@ pub fn build_with_profile(
             resolve_calls_ms,
             resolve_references_ms,
         },
-        new_cache,
         CacheStats { hits, misses },
     )
 }
@@ -253,7 +272,7 @@ pub fn build_with_profile(
 fn parse_file_with_cache(
     root: &Path,
     file: &FileNode,
-    cache: Option<&ParseCache>,
+    store: Option<&ParseStore>,
     grammar_registry: Option<&indexer::tree_sitter::GrammarRegistry>,
 ) -> (ParsedFile, bool) {
     let absolute_path = root.join(&file.path);
@@ -261,8 +280,11 @@ fn parse_file_with_cache(
     let language = file.language.clone().unwrap_or_default();
     let content_hash = sha256_hex(&contents);
 
-    if let Some(cache) = cache {
-        if let Some(entry) = cache.lookup(&file.path, &content_hash) {
+    // Cache lookup failures (corrupt entry, redb error) are treated as misses;
+    // we re-parse and overwrite. The cache is regenerable, so silently degrading
+    // is the right behavior.
+    if let Some(store) = store {
+        if let Ok(Some(entry)) = store.lookup(&file.path, &content_hash) {
             let symbols = entry
                 .symbols
                 .into_iter()
