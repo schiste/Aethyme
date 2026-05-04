@@ -67,7 +67,7 @@ fi
 # ── Step 2: Ensure server is running ─────────────────────────────────
 
 echo ">>> Checking eval server..."
-if "$CURL_BIN" -fsS -o /dev/null "$SERVER_HEALTH_URL" 2>/dev/null; then
+if "$CURL_BIN" -sS "$SERVER_HEALTH_URL" >/dev/null 2>&1; then
     echo "  Server already running at $SERVER_URL"
 else
     echo "  Starting server..."
@@ -77,7 +77,7 @@ else
     SERVER_READY=false
     for _ in {1..20}; do
         sleep 1
-        if "$CURL_BIN" -fsS -o /dev/null "$SERVER_HEALTH_URL" 2>/dev/null; then
+        if "$CURL_BIN" -sS "$SERVER_HEALTH_URL" >/dev/null 2>&1; then
             SERVER_READY=true
             break
         fi
