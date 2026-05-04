@@ -8,7 +8,11 @@
 
 use std::path::{Path, PathBuf};
 
-use redb::{Database, MultimapTableDefinition, ReadableTable, TableDefinition};
+use redb::{Database, MultimapTableDefinition, ReadableTable, TableDefinition, WriteTransaction};
+use serde::Serialize;
+
+use crate::model::edge::EdgeKind;
+use crate::model::intern::InternedStr;
 
 /// Bumped when the on-disk format changes incompatibly. We re-create the file
 /// rather than try to migrate.
@@ -60,6 +64,28 @@ const SYMBOL_BY_NAME: MultimapTableDefinition<&str, &str> =
 
 const RISK_FLAGS: MultimapTableDefinition<&str, &[u8]> =
     MultimapTableDefinition::new("risk_flags");
+
+/// Rotate the in-flight write transaction after this many ops.
+/// Bounds fsync rate and the size of any single committed batch.
+const ROTATE_EVERY_OPS: usize = 4096;
+
+/// Rotate the in-flight write transaction after this many bytes.
+/// Bounds the in-memory dirty-page footprint of a single transaction.
+const ROTATE_EVERY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Adjacency-table value layout (Variant B from the schema decision).
+///
+/// Stored under EDGES_OUT keyed by `src`, and under EDGES_IN keyed by `dst`.
+/// The `other` field carries `dst` in EDGES_OUT and `src` in EDGES_IN, so a
+/// caller iterating either direction sees the opposite endpoint without a
+/// cross-table lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct AdjacencyRecord {
+    pub kind: EdgeKind,
+    pub other: InternedStr,
+    pub confidence: u16,
+    pub source: InternedStr,
+}
 
 #[derive(Debug)]
 pub enum GraphStoreError {
@@ -146,6 +172,201 @@ impl GraphStore {
     pub(crate) fn db(&self) -> &Database {
         &self.db
     }
+
+    /// Open a Variant-B index session. The session holds one open
+    /// `WriteTransaction` and rotates it periodically based on
+    /// `IndexSession::should_rotate`. Drop without `commit()` aborts.
+    pub fn begin_index(&self) -> Result<IndexSession<'_>, GraphStoreError> {
+        let txn = self.db.begin_write()?;
+        Ok(IndexSession {
+            db: &self.db,
+            txn: Some(txn),
+            ops_since_rotate: 0,
+            bytes_since_rotate: 0,
+        })
+    }
+}
+
+/// One open redb write transaction that accepts many node/edge inserts and
+/// commits/rotates based on a policy. Mirrors `parse_store::BuildSession`.
+///
+/// "Op" counts every primary-table or adjacency insert; secondary-index
+/// updates are folded into the parent op (one logical edge insert =
+/// 2 adjacency rows, counted as 1 op). Bytes count actual bincode payload.
+pub struct IndexSession<'db> {
+    db: &'db Database,
+    txn: Option<WriteTransaction>,
+    ops_since_rotate: usize,
+    bytes_since_rotate: usize,
+}
+
+impl<'db> IndexSession<'db> {
+    /// Insert (or overwrite) a node row in the given primary table.
+    /// Caller picks the table; 3.3 will provide typed wrappers
+    /// (`insert_file`, `insert_function`, …) on top of this primitive.
+    pub fn insert_node(
+        &mut self,
+        table: TableDefinition<&str, &[u8]>,
+        key: &str,
+        value: &impl Serialize,
+    ) -> Result<(), GraphStoreError> {
+        let bytes = bincode::serialize(value)?;
+        let written = bytes.len();
+        {
+            let txn = self.txn.as_ref().expect("IndexSession invariant: txn present");
+            let mut t = txn.open_table(table)?;
+            t.insert(key, bytes.as_slice())?;
+        }
+        self.ops_since_rotate += 1;
+        self.bytes_since_rotate += written;
+        if self.should_rotate() {
+            self.rotate()?;
+        }
+        Ok(())
+    }
+
+    /// Insert one logical edge as two adjacency rows: `(src → kind/dst)` in
+    /// EDGES_OUT and `(dst → kind/src)` in EDGES_IN. Counted as one op.
+    pub fn insert_edge(
+        &mut self,
+        src: &str,
+        dst: &str,
+        kind: EdgeKind,
+        confidence: u16,
+        source: InternedStr,
+    ) -> Result<(), GraphStoreError> {
+        let out_record = AdjacencyRecord {
+            kind: kind.clone(),
+            other: InternedStr::from(dst),
+            confidence,
+            source: source.clone(),
+        };
+        let in_record = AdjacencyRecord {
+            kind,
+            other: InternedStr::from(src),
+            confidence,
+            source,
+        };
+        let out_bytes = bincode::serialize(&out_record)?;
+        let in_bytes = bincode::serialize(&in_record)?;
+        let written = out_bytes.len() + in_bytes.len();
+        {
+            let txn = self.txn.as_ref().expect("IndexSession invariant: txn present");
+            let mut out = txn.open_multimap_table(EDGES_OUT)?;
+            out.insert(src, out_bytes.as_slice())?;
+            let mut inv = txn.open_multimap_table(EDGES_IN)?;
+            inv.insert(dst, in_bytes.as_slice())?;
+        }
+        self.ops_since_rotate += 1;
+        self.bytes_since_rotate += written;
+        if self.should_rotate() {
+            self.rotate()?;
+        }
+        Ok(())
+    }
+
+    /// Append `node_id` under `path` in a multimap path index
+    /// (FUNCTIONS_BY_PATH or NODES_BY_PATH). No counter increment — these
+    /// are tiny side effects of a parent insert.
+    pub fn add_path_index(
+        &mut self,
+        table: MultimapTableDefinition<&str, &str>,
+        path: &str,
+        node_id: &str,
+    ) -> Result<(), GraphStoreError> {
+        let txn = self.txn.as_ref().expect("IndexSession invariant: txn present");
+        let mut t = txn.open_multimap_table(table)?;
+        t.insert(path, node_id)?;
+        Ok(())
+    }
+
+    /// Append `node_id` under lowercased `name` in SYMBOL_BY_NAME.
+    /// No counter increment — folded into a parent symbol insert.
+    pub fn add_symbol_index(
+        &mut self,
+        name_lower: &str,
+        node_id: &str,
+    ) -> Result<(), GraphStoreError> {
+        let txn = self.txn.as_ref().expect("IndexSession invariant: txn present");
+        let mut t = txn.open_multimap_table(SYMBOL_BY_NAME)?;
+        t.insert(name_lower, node_id)?;
+        Ok(())
+    }
+
+    /// Append a bincoded risk record under `scope` in RISK_FLAGS.
+    pub fn add_risk(
+        &mut self,
+        scope: &str,
+        value: &impl Serialize,
+    ) -> Result<(), GraphStoreError> {
+        let bytes = bincode::serialize(value)?;
+        let written = bytes.len();
+        {
+            let txn = self.txn.as_ref().expect("IndexSession invariant: txn present");
+            let mut t = txn.open_multimap_table(RISK_FLAGS)?;
+            t.insert(scope, bytes.as_slice())?;
+        }
+        self.ops_since_rotate += 1;
+        self.bytes_since_rotate += written;
+        if self.should_rotate() {
+            self.rotate()?;
+        }
+        Ok(())
+    }
+
+    /// Commit all pending writes. Consumes the session.
+    pub fn commit(mut self) -> Result<(), GraphStoreError> {
+        let txn = self.txn.take().expect("IndexSession invariant: txn present");
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Force a rotation now (commit current txn, open a fresh one). Useful at
+    /// natural pipeline boundaries (e.g. between indexing passes).
+    pub fn rotate(&mut self) -> Result<(), GraphStoreError> {
+        let txn = self.txn.take().expect("IndexSession invariant: txn present");
+        txn.commit()?;
+        self.txn = Some(self.db.begin_write()?);
+        self.ops_since_rotate = 0;
+        self.bytes_since_rotate = 0;
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ⚠ TODO(daisy): YOUR DECISION — rotate policy thresholds
+    // ─────────────────────────────────────────────────────────────────────────
+    //
+    // Returning `true` after an insert triggers commit + fresh transaction.
+    // Returning `false` keeps batching.
+    //
+    // Workload differs from parse_store: graph_store sees many small writes
+    // (one node = one row, one edge = two adjacency rows). On MediaWiki the
+    // ballpark is ~25k files + ~80k functions + ~10k classes + ~1M edges =
+    // O(1M) ops. Per-op payload is small (tens to a few hundred bytes).
+    //
+    // Three counter shapes to consider:
+    //
+    //   • OPS-only: `ops_since_rotate >= N`. Predictable rotate cadence,
+    //     ignores payload heterogeneity. Good when you trust ops to be
+    //     uniformly small.
+    //   • BYTES-only: `bytes_since_rotate >= N`. Bounds dirty-page memory
+    //     directly, which is the actual scarce resource. But on tiny-row
+    //     workloads, a 16 MiB threshold could mean 200k+ ops in one txn —
+    //     long fsync stall when it finally rotates.
+    //   • HYBRID (parse_store style): rotate on either threshold. Caps both.
+    //
+    // Constants today: ROTATE_EVERY_OPS = 4096, ROTATE_EVERY_BYTES = 8 MiB.
+    // For ~1M ops on MediaWiki that's ~244 commits, ~244 ms of fsync
+    // overhead — tolerable but tunable. Adjust the consts at module top.
+    //
+    // Constraints to respect:
+    //   - `ops_since_rotate` and `bytes_since_rotate` reset on rotate.
+    //   - returning `true` is ALWAYS safe (just slower); returning `false`
+    //     too aggressively risks unbounded memory growth on big repos.
+    fn should_rotate(&self) -> bool {
+        self.ops_since_rotate >= ROTATE_EVERY_OPS
+            || self.bytes_since_rotate >= ROTATE_EVERY_BYTES
+    }
 }
 
 fn ensure_schema(db: &Database) -> Result<(), GraphStoreError> {
@@ -205,7 +426,8 @@ fn ensure_schema(db: &Database) -> Result<(), GraphStoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use redb::ReadableTableMetadata;
+    use redb::{ReadableMultimapTable, ReadableTableMetadata};
+    use serde::Deserialize;
 
     macro_rules! function_name {
         () => {{
@@ -286,6 +508,166 @@ mod tests {
             .expect("present");
         let bytes: [u8; 4] = value.value().try_into().expect("4 bytes");
         assert_eq!(u32::from_le_bytes(bytes), SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Test-only sample node — small Serialize/Deserialize struct so we can
+    /// exercise insert_node without depending on FileNode/FunctionNode shape.
+    #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+    struct SampleNode {
+        id: String,
+        path: String,
+    }
+
+    fn read_node_bytes(
+        db: &Database,
+        table: TableDefinition<&str, &[u8]>,
+        key: &str,
+    ) -> Option<Vec<u8>> {
+        let txn = db.begin_read().expect("read txn");
+        let t = txn.open_table(table).expect("open");
+        t.get(key).expect("get").map(|v| v.value().to_vec())
+    }
+
+    fn collect_multimap(
+        db: &Database,
+        table: MultimapTableDefinition<&str, &[u8]>,
+        key: &str,
+    ) -> Vec<Vec<u8>> {
+        let txn = db.begin_read().expect("read txn");
+        let t = txn.open_multimap_table(table).expect("open");
+        let iter = t.get(key).expect("get");
+        iter.map(|r| r.expect("row").value().to_vec()).collect()
+    }
+
+    #[test]
+    fn insert_node_and_read_back() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let mut session = store.begin_index().expect("session");
+        let node = SampleNode {
+            id: "file:Repo:src/lib.rs".into(),
+            path: "src/lib.rs".into(),
+        };
+        session.insert_node(FILES, &node.id, &node).expect("insert");
+        session.commit().expect("commit");
+
+        let bytes = read_node_bytes(store.db(), FILES, "file:Repo:src/lib.rs")
+            .expect("present");
+        let got: SampleNode = bincode::deserialize(&bytes).expect("decode");
+        assert_eq!(got, node);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn insert_edge_writes_both_directions() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let mut session = store.begin_index().expect("session");
+        session
+            .insert_edge(
+                "file:Repo:a.rs",
+                "file:Repo:b.rs",
+                EdgeKind::Imports,
+                100,
+                InternedStr::from("import"),
+            )
+            .expect("insert_edge");
+        session.commit().expect("commit");
+
+        let out = collect_multimap(store.db(), EDGES_OUT, "file:Repo:a.rs");
+        assert_eq!(out.len(), 1, "EDGES_OUT has one row keyed by src");
+        let out_rec: AdjacencyRecord = bincode::deserialize(&out[0]).expect("decode");
+        assert_eq!(out_rec.kind, EdgeKind::Imports);
+        assert_eq!(out_rec.other.as_str(), "file:Repo:b.rs");
+        assert_eq!(out_rec.confidence, 100);
+
+        let inv = collect_multimap(store.db(), EDGES_IN, "file:Repo:b.rs");
+        assert_eq!(inv.len(), 1, "EDGES_IN has one row keyed by dst");
+        let in_rec: AdjacencyRecord = bincode::deserialize(&inv[0]).expect("decode");
+        assert_eq!(in_rec.kind, EdgeKind::Imports);
+        assert_eq!(in_rec.other.as_str(), "file:Repo:a.rs");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drop_without_commit_loses_writes() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        {
+            let mut session = store.begin_index().expect("session");
+            let node = SampleNode {
+                id: "x".into(),
+                path: "x.rs".into(),
+            };
+            session.insert_node(FILES, &node.id, &node).expect("insert");
+            // session dropped without commit — txn aborts
+        }
+        assert!(
+            read_node_bytes(store.db(), FILES, "x").is_none(),
+            "uncommitted writes must not be visible"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn manual_rotate_persists_then_continues() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let mut session = store.begin_index().expect("session");
+
+        let a = SampleNode { id: "a".into(), path: "a.rs".into() };
+        session.insert_node(FILES, &a.id, &a).expect("insert a");
+        session.rotate().expect("rotate");
+
+        // After rotate, `a` is durable; subsequent inserts continue in a fresh txn.
+        assert!(read_node_bytes(store.db(), FILES, "a").is_some(), "a is durable");
+
+        let b = SampleNode { id: "b".into(), path: "b.rs".into() };
+        session.insert_node(FILES, &b.id, &b).expect("insert b");
+        session.commit().expect("commit");
+
+        assert!(read_node_bytes(store.db(), FILES, "b").is_some(), "b after second commit");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn secondary_indexes_record_node_ids() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let mut session = store.begin_index().expect("session");
+
+        session
+            .add_path_index(FUNCTIONS_BY_PATH, "src/lib.rs", "fn:Repo:src/lib.rs:foo")
+            .expect("path");
+        session
+            .add_symbol_index("foo", "fn:Repo:src/lib.rs:foo")
+            .expect("name");
+        session.commit().expect("commit");
+
+        let txn = store.db().begin_read().expect("read");
+        let by_path = txn
+            .open_multimap_table(FUNCTIONS_BY_PATH)
+            .expect("FUNCTIONS_BY_PATH");
+        let path_hits: Vec<String> = by_path
+            .get("src/lib.rs")
+            .expect("get")
+            .map(|r| r.expect("row").value().to_string())
+            .collect();
+        assert_eq!(path_hits, vec!["fn:Repo:src/lib.rs:foo"]);
+
+        let by_name = txn
+            .open_multimap_table(SYMBOL_BY_NAME)
+            .expect("SYMBOL_BY_NAME");
+        let name_hits: Vec<String> = by_name
+            .get("foo")
+            .expect("get")
+            .map(|r| r.expect("row").value().to_string())
+            .collect();
+        assert_eq!(name_hits, vec!["fn:Repo:src/lib.rs:foo"]);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
