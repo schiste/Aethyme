@@ -59,7 +59,7 @@ pub fn extract_symbols(path: &str, contents: &str) -> Vec<Symbol> {
         let trimmed = line.trim_start();
         if let Some((name, kind)) = try_extract_symbol(trimmed) {
             if !name.is_empty() {
-                symbols.push(Symbol::new(&name, kind, path, index + 1, trimmed));
+                symbols.push(Symbol::new(name.as_str(), kind, path, index + 1, trimmed));
             }
         }
     }

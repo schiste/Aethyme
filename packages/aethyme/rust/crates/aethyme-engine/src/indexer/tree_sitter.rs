@@ -212,7 +212,7 @@ fn process_match(
                     .trim_start()
                     .to_string();
             }
-            symbols.push(Symbol::new(name, symbol_kind, path, line, &signature));
+            symbols.push(Symbol::new(name, symbol_kind, path, line, signature.as_str()));
         }
     }
 }
