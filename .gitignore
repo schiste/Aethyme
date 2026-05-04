@@ -16,4 +16,11 @@ __pycache__/
 .env.*
 *.log
 packages/aethyme-eval-ui/server/evals.db
+packages/aethyme-eval-ui/server/evals.db-shm
+packages/aethyme-eval-ui/server/evals.db-wal
 packages/aethyme/rust/target/
+
+# Profiling artifacts (dhat / mediawiki build dumps)
+packages/aethyme/.profiling/
+packages/aethyme/dhat-heap.json
+
