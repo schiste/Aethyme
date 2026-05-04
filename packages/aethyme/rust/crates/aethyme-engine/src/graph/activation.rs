@@ -55,13 +55,13 @@ impl AdjacencyIndex {
         let mut incoming: HashMap<String, Vec<(String, EdgeKind)>> = HashMap::new();
         for edge in &map.edges {
             outgoing
-                .entry(edge.from.clone())
+                .entry(edge.from.to_string())
                 .or_default()
-                .push((edge.to.clone(), edge.kind.clone()));
+                .push((edge.to.to_string(), edge.kind.clone()));
             incoming
-                .entry(edge.to.clone())
+                .entry(edge.to.to_string())
                 .or_default()
-                .push((edge.from.clone(), edge.kind.clone()));
+                .push((edge.from.to_string(), edge.kind.clone()));
         }
         Self { outgoing, incoming }
     }

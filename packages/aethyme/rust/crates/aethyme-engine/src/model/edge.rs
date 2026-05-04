@@ -1,3 +1,5 @@
+use crate::model::intern::InternedStr;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum EdgeKind {
     Contains,
@@ -13,20 +15,20 @@ pub enum EdgeKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Edge {
-    pub from: String,
-    pub to: String,
+    pub from: InternedStr,
+    pub to: InternedStr,
     pub kind: EdgeKind,
     pub confidence: u16,
-    pub source: String,
+    pub source: InternedStr,
 }
 
 impl Edge {
     pub fn new(
-        from: impl Into<String>,
-        to: impl Into<String>,
+        from: impl Into<InternedStr>,
+        to: impl Into<InternedStr>,
         kind: EdgeKind,
         confidence: u16,
-        source: impl Into<String>,
+        source: impl Into<InternedStr>,
     ) -> Self {
         Self {
             from: from.into(),

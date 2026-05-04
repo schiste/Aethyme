@@ -139,11 +139,11 @@ pub fn graph_annotations(map: &RepositoryMap) -> Vec<GraphAnnotation> {
     for edge in &map.edges {
         if matches!(edge.kind, EdgeKind::EntrypointFor) {
             annotations.push(GraphAnnotation {
-                target_id: edge.from.clone(),
+                target_id: edge.from.to_string(),
                 kind: "navigation".to_string(),
                 value: "entrypoint".to_string(),
                 confidence: edge.confidence,
-                source: edge.source.clone(),
+                source: edge.source.to_string(),
                 reason: "edge inferred as navigation entrypoint".to_string(),
             });
         }

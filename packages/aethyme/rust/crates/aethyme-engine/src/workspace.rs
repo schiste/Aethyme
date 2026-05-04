@@ -282,7 +282,7 @@ fn detect_direct_references(repos: &[WorkspaceRepo]) -> Vec<CrossRepoEdge> {
                     if let Some(target_id) = paths.get(last_segment) {
                         edges.push(CrossRepoEdge {
                             from_repo: repo.name.clone(),
-                            from_id: edge.from.clone(),
+                            from_id: edge.from.to_string(),
                             to_repo: other_repo.name.clone(),
                             to_id: target_id.to_string(),
                             kind: CrossEdgeKind::DirectReference,

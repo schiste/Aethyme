@@ -75,8 +75,8 @@ pub async fn insert_file(db: &Surreal<Db>, file: &FileNode) -> Result<(), surrea
 /// Insert a typed edge relation.
 pub async fn insert_edge(db: &Surreal<Db>, edge: &Edge) -> Result<(), surrealdb::Error> {
     let table = edge_kind_to_table(&edge.kind);
-    let (from_table, from_id) = resolve_record_parts(&edge.from);
-    let (to_table, to_id) = resolve_record_parts(&edge.to);
+    let (from_table, from_id) = resolve_record_parts(edge.from.as_str());
+    let (to_table, to_id) = resolve_record_parts(edge.to.as_str());
 
     // RELATE requires raw record refs: table:`id`
     let query = format!(
@@ -84,7 +84,7 @@ pub async fn insert_edge(db: &Surreal<Db>, edge: &Edge) -> Result<(), surrealdb:
     );
     db.query(&query)
         .bind(("conf", edge.confidence as f64))
-        .bind(("src", Some(edge.source.clone())))
+        .bind(("src", Some(edge.source.to_string())))
         .await?;
     Ok(())
 }

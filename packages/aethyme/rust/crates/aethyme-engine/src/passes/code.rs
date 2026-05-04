@@ -555,7 +555,7 @@ fn resolve_cross_file_calls(
 ) -> Vec<Edge> {
     let imported_targets: HashSet<InternId> = resolved_import_edges
         .iter()
-        .filter_map(|edge| indexes.file_ids.get(&edge.to).copied())
+        .filter_map(|edge| indexes.file_ids.get(edge.to.as_str()).copied())
         .collect();
 
     let mut edges = Vec::new();
@@ -626,7 +626,7 @@ fn resolve_references(
 ) -> Vec<Edge> {
     let imported_targets: HashSet<InternId> = resolved_import_edges
         .iter()
-        .filter_map(|edge| indexes.file_ids.get(&edge.to).copied())
+        .filter_map(|edge| indexes.file_ids.get(edge.to.as_str()).copied())
         .collect();
     let mut edges = Vec::new();
     let local_class_name_indexes = current_class_indexes.iter().copied().fold(
