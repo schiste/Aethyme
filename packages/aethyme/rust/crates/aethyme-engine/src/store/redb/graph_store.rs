@@ -377,6 +377,171 @@ pub fn insert_risk(
     session.add_risk(&risk.scope, risk)
 }
 
+// ── Read primitives ─────────────────────────────────────────────────────────
+// Mirror the surface of `super::super::read` (live functions only —
+// `subgraph` and `files_in_area` were dead code in the SurrealDB version
+// and are not ported).
+
+/// Top-level overview returned from `GraphStore::overview`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Overview {
+    pub repo: Option<RepoMetadata>,
+    pub areas: Vec<AreaNode>,
+    pub entrypoint_paths: Vec<String>,
+    pub risks: Vec<RiskFlag>,
+}
+
+fn area_depth(area: &AreaNode) -> u32 {
+    (area.path_prefix.matches('/').count() + 1) as u32
+}
+
+fn collect_adjacency(
+    db: &Database,
+    table: MultimapTableDefinition<&str, &[u8]>,
+    key: &str,
+) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
+    let txn = db.begin_read()?;
+    let t = match txn.open_multimap_table(table) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    for r in t.get(key)? {
+        let row = r?;
+        let rec: AdjacencyRecord = bincode::deserialize(row.value())?;
+        out.push(rec);
+    }
+    Ok(out)
+}
+
+impl GraphStore {
+    /// List all areas, optionally filtered by depth (1 = top-level, 2 =
+    /// nested under top-level, etc). Depth is computed from `path_prefix`.
+    pub fn list_areas(
+        &self,
+        depth: Option<u32>,
+    ) -> Result<Vec<AreaNode>, GraphStoreError> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(AREAS)?;
+        let mut out = Vec::new();
+        for entry in t.iter()? {
+            let (_, value) = entry?;
+            let area: AreaNode = bincode::deserialize(value.value())?;
+            if let Some(d) = depth {
+                if area_depth(&area) != d {
+                    continue;
+                }
+            }
+            out.push(area);
+        }
+        // Stable sort by depth then path_prefix so callers don't see
+        // redb's iteration order (which is sorted-by-key but the keys are
+        // structured IDs, not path_prefixes).
+        out.sort_by(|a, b| {
+            area_depth(a)
+                .cmp(&area_depth(b))
+                .then_with(|| a.path_prefix.cmp(&b.path_prefix))
+        });
+        Ok(out)
+    }
+
+    /// Outgoing adjacency rows for `entity_id`. Each row carries the partner
+    /// (`other`) so callers don't need a second lookup.
+    pub fn edges_from(
+        &self,
+        entity_id: &str,
+    ) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
+        collect_adjacency(&self.db, EDGES_OUT, entity_id)
+    }
+
+    /// Incoming adjacency rows for `entity_id`. The `O(in_degree)` shape
+    /// from the dead-code algorithm fix — the whole reason EDGES_IN exists
+    /// from day one in this schema.
+    pub fn edges_to(
+        &self,
+        entity_id: &str,
+    ) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
+        collect_adjacency(&self.db, EDGES_IN, entity_id)
+    }
+
+    /// One-shot summary used by the `query-overview` CLI command:
+    /// repo metadata + top-N areas at depth 1 + first-N entrypoint files +
+    /// top-N risks (by RiskLevel descending).
+    pub fn overview(
+        &self,
+        area_limit: usize,
+        entrypoint_limit: usize,
+        risk_limit: usize,
+    ) -> Result<Overview, GraphStoreError> {
+        let repo = self.repo_metadata()?;
+
+        // Top areas at depth 1, in path_prefix order.
+        let mut areas = self.list_areas(Some(1))?;
+        areas.truncate(area_limit);
+
+        // Entrypoints: scan EDGES_OUT once, collect distinct sources whose
+        // adjacency carries kind = EntrypointFor. O(E) but no per-file
+        // lookups. Resolve src node_id → file path via FILES so the output
+        // matches what surreal returned.
+        let entrypoint_paths = {
+            let txn = self.db.begin_read()?;
+            let edges = txn.open_multimap_table(EDGES_OUT)?;
+            let files = txn.open_table(FILES)?;
+            let mut seen = std::collections::BTreeSet::new();
+            let mut paths = Vec::new();
+            'outer: for kv in edges.iter()? {
+                let (key, mut values) = kv?;
+                let src = key.value().to_string();
+                let mut has_entrypoint = false;
+                while let Some(v) = values.next() {
+                    let row = v?;
+                    let rec: AdjacencyRecord = bincode::deserialize(row.value())?;
+                    if matches!(rec.kind, EdgeKind::EntrypointFor) {
+                        has_entrypoint = true;
+                        break;
+                    }
+                }
+                if !has_entrypoint || !seen.insert(src.clone()) {
+                    continue;
+                }
+                let Some(blob) = files.get(src.as_str())? else { continue };
+                let file: FileNode = bincode::deserialize(blob.value())?;
+                paths.push(file.path);
+                if paths.len() >= entrypoint_limit {
+                    break 'outer;
+                }
+            }
+            paths
+        };
+
+        // Risks: collect from RISK_FLAGS multimap, sort by level desc, truncate.
+        let risks = {
+            let txn = self.db.begin_read()?;
+            let t = txn.open_multimap_table(RISK_FLAGS)?;
+            let mut all = Vec::new();
+            for kv in t.iter()? {
+                let (_, mut values) = kv?;
+                while let Some(v) = values.next() {
+                    let row = v?;
+                    let risk: RiskFlag = bincode::deserialize(row.value())?;
+                    all.push(risk);
+                }
+            }
+            all.sort_by(|a, b| b.level.cmp(&a.level));
+            all.truncate(risk_limit);
+            all
+        };
+
+        Ok(Overview {
+            repo,
+            areas,
+            entrypoint_paths,
+            risks,
+        })
+    }
+}
+
 /// One open redb write transaction that accepts many node/edge inserts and
 /// commits/rotates based on a policy. Mirrors `parse_store::BuildSession`.
 ///
@@ -1065,6 +1230,155 @@ mod tests {
         // b and c rows themselves remain.
         assert!(read_node_bytes(store.db(), FILES, &b.id).is_some());
         assert!(read_node_bytes(store.db(), FILES, &c.id).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_areas_filters_by_depth_and_sorts_stable() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let mut session = store.begin_index().expect("session");
+        // Insert areas in non-sorted order to verify the sort.
+        for prefix in ["src/lib", "tests", "src", "src/bin", "docs"] {
+            insert_area(&mut session, &AreaNode::new("Repo", prefix, false))
+                .expect("insert");
+        }
+        session.commit().expect("commit");
+
+        let all = store.list_areas(None).expect("list all");
+        let prefixes: Vec<&str> = all.iter().map(|a| a.path_prefix.as_str()).collect();
+        // depth 1 areas first (alphabetical), then depth 2.
+        assert_eq!(prefixes, vec!["docs", "src", "tests", "src/bin", "src/lib"]);
+
+        let depth1 = store.list_areas(Some(1)).expect("depth 1");
+        let prefixes1: Vec<&str> = depth1.iter().map(|a| a.path_prefix.as_str()).collect();
+        assert_eq!(prefixes1, vec!["docs", "src", "tests"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn edges_from_and_edges_to() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let mut session = store.begin_index().expect("session");
+        insert_edge(
+            &mut session,
+            &Edge::new("file:R:a.rs", "file:R:b.rs", EdgeKind::Imports, 100, "imp"),
+        )
+        .expect("a→b");
+        insert_edge(
+            &mut session,
+            &Edge::new("file:R:a.rs", "file:R:c.rs", EdgeKind::Imports, 100, "imp"),
+        )
+        .expect("a→c");
+        insert_edge(
+            &mut session,
+            &Edge::new("file:R:c.rs", "file:R:b.rs", EdgeKind::Imports, 100, "imp"),
+        )
+        .expect("c→b");
+        session.commit().expect("commit");
+
+        let from_a = store.edges_from("file:R:a.rs").expect("from a");
+        let mut targets: Vec<&str> = from_a.iter().map(|r| r.other.as_str()).collect();
+        targets.sort();
+        assert_eq!(targets, vec!["file:R:b.rs", "file:R:c.rs"]);
+
+        let to_b = store.edges_to("file:R:b.rs").expect("to b");
+        let mut srcs: Vec<&str> = to_b.iter().map(|r| r.other.as_str()).collect();
+        srcs.sort();
+        assert_eq!(srcs, vec!["file:R:a.rs", "file:R:c.rs"]);
+
+        // Unknown id: empty, not error.
+        assert!(store.edges_from("file:R:nope.rs").expect("ok").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn overview_assembles_repo_areas_entrypoints_risks() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+
+        let mut session = store.begin_index().expect("session");
+        // 2 top-level areas + 1 nested.
+        insert_area(&mut session, &AreaNode::new("R", "src", false)).expect("src");
+        insert_area(&mut session, &AreaNode::new("R", "docs", false)).expect("docs");
+        insert_area(&mut session, &AreaNode::new("R", "src/bin", false)).expect("nest");
+
+        // Two files. main.rs is an entrypoint via an EntrypointFor edge.
+        let main = sample_file("R", "src/main.rs", Some("area:R:src"));
+        let lib = sample_file("R", "src/lib.rs", Some("area:R:src"));
+        insert_file(&mut session, &main).expect("main");
+        insert_file(&mut session, &lib).expect("lib");
+        insert_edge(
+            &mut session,
+            &Edge::new(&main.id, "area:R:src", EdgeKind::EntrypointFor, 100, "ep"),
+        )
+        .expect("entrypoint");
+
+        // Risks: one Low and one High. High should sort first.
+        insert_risk(
+            &mut session,
+            &RiskFlag::new("low/", RiskArea::Auth, RiskLevel::Low, "minor"),
+        )
+        .expect("low");
+        insert_risk(
+            &mut session,
+            &RiskFlag::new("high/", RiskArea::Secrets, RiskLevel::High, "secret"),
+        )
+        .expect("high");
+        session.commit().expect("commit");
+
+        store
+            .set_repo_metadata(&RepoMetadata {
+                root_path: "/tmp/r".into(),
+                commit_hash: None,
+                indexed_at_unix: 0,
+                file_count: 2,
+                languages: vec!["rust".into()],
+            })
+            .expect("meta");
+
+        let ov = store.overview(20, 10, 20).expect("overview");
+        assert_eq!(ov.repo.as_ref().unwrap().file_count, 2);
+
+        // Only depth-1 areas in the overview.
+        let area_prefixes: Vec<&str> = ov.areas.iter().map(|a| a.path_prefix.as_str()).collect();
+        assert_eq!(area_prefixes, vec!["docs", "src"]);
+
+        // Entrypoint resolves the file_id back to its path.
+        assert_eq!(ov.entrypoint_paths, vec!["src/main.rs".to_string()]);
+
+        // Risks sorted High-first.
+        assert_eq!(ov.risks.len(), 2);
+        assert_eq!(ov.risks[0].level, RiskLevel::High);
+        assert_eq!(ov.risks[1].level, RiskLevel::Low);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn overview_respects_limits() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let mut session = store.begin_index().expect("session");
+        for i in 0..5 {
+            insert_area(
+                &mut session,
+                &AreaNode::new("R", &format!("a{i}"), false),
+            )
+            .expect("area");
+            insert_risk(
+                &mut session,
+                &RiskFlag::new(format!("r{i}"), RiskArea::Auth, RiskLevel::Low, "x"),
+            )
+            .expect("risk");
+        }
+        session.commit().expect("commit");
+
+        let ov = store.overview(2, 10, 3).expect("overview");
+        assert_eq!(ov.areas.len(), 2);
+        assert_eq!(ov.risks.len(), 3);
         let _ = std::fs::remove_dir_all(&root);
     }
 
