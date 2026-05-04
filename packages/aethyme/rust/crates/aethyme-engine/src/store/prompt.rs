@@ -7,13 +7,9 @@
 use std::fs;
 use std::path::Path;
 
-use crate::graph::overview::build_repo_overview;
 use crate::map::RepositoryMap;
 use crate::model::edge::EdgeKind;
 use crate::model::file::FileRole;
-
-/// Maximum lines to read from each file header.
-const HEADER_LINES: usize = 40;
 
 /// Generate a complete agent-ready prompt with navigation context.
 pub fn generate_prompt(
@@ -487,7 +483,7 @@ fn build_testing_context(root: &Path, map: &RepositoryMap) -> String {
 
 // ── Docs context ────────────────────────────────────────────────────
 
-fn build_docs_context(root: &Path, map: &RepositoryMap) -> String {
+fn build_docs_context(_root: &Path, map: &RepositoryMap) -> String {
     let mut sections = Vec::new();
 
     sections.push(format!("**Documentation files:** {}\n", map.docs.len()));
