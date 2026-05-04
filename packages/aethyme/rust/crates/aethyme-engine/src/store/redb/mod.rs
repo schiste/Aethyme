@@ -1,11 +1,9 @@
 //! redb-backed storage layers.
 //!
-//! This module is intentionally separate from the surrealdb-backed code in
-//! `super::{read, write, schema, ...}`. The plan is to migrate one layer at a
-//! time; surrealdb code stays in place until each redb layer replaces it.
-//!
-//! Phase 1: `parse_store` — replaces `crate::cache::ParseCache`.
-//! Phase 3: `graph_store` — replaces `super::GraphStore` (SurrealDB).
+//! - `parse_store` — per-file parse cache (replaced `crate::cache::ParseCache`
+//!   in Phase 1+2).
+//! - `graph_store` — repo-wide graph (replaced the SurrealDB GraphStore in
+//!   Phase 3, when the BSL license forced a migration).
 
 pub mod graph_store;
 pub mod parse_store;

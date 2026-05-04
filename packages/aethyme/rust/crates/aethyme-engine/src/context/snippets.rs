@@ -7,9 +7,9 @@
 
 use std::path::Path;
 
+use crate::context::prompt;
 use crate::map::RepositoryMap;
 use crate::model::file::FileRole;
-use crate::store::prompt;
 
 /// Generate and write Chau7 snippets for a repository.
 pub fn generate_and_write(repo_root: &Path, map: &RepositoryMap) -> Result<(), String> {

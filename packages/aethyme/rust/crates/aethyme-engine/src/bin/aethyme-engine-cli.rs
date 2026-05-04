@@ -437,7 +437,7 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            aethyme_engine::store::snippets::generate_and_write(&canonical, &map)?;
+            aethyme_engine::context::snippets::generate_and_write(&canonical, &map)?;
             eprintln!(
                 "Snippets written to {}/.chau7/snippets.json",
                 canonical.display()
@@ -453,7 +453,7 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let prompt = aethyme_engine::store::prompt::generate_prompt(
+            let prompt = aethyme_engine::context::prompt::generate_prompt(
                 &canonical,
                 &map,
                 &task,
@@ -462,7 +462,7 @@ fn run() -> Result<(), String> {
             println!("{prompt}");
             // If --subsystem is provided, append subsystem-specific context
             if let Some(ref sub) = subsystem {
-                let sub_context = aethyme_engine::store::prompt::generate_subsystem_context(
+                let sub_context = aethyme_engine::context::prompt::generate_subsystem_context(
                     &canonical, &map, sub,
                 );
                 println!("\n{sub_context}");
