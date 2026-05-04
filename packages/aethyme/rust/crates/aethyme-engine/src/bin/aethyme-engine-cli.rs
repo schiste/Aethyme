@@ -431,9 +431,8 @@ fn run() -> Result<(), String> {
                 map.classes.len(),
                 map.edges.len(),
             );
-            eprintln!("Writing to SurrealDB store...");
-            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-            rt.block_on(async { index_to_store(&PathBuf::from(&repo), &map).await })?;
+            eprintln!("Writing to redb graph store...");
+            index_to_store(&PathBuf::from(&repo), &map)?;
             eprintln!("Generating Chau7 snippets...");
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
@@ -474,118 +473,90 @@ fn run() -> Result<(), String> {
             let depth = read_option(&args, "--depth")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok());
-            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-            rt.block_on(async {
-                let store = aethyme_engine::store::GraphStore::open(
-                    &PathBuf::from(&repo).canonicalize().unwrap(),
-                )
-                .await
+            let canonical = PathBuf::from(&repo)
+                .canonicalize()
                 .map_err(|e| e.to_string())?;
-                let areas = aethyme_engine::store::read::list_areas(store.db(), depth)
-                    .await
+            let store =
+                aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
                     .map_err(|e| e.to_string())?;
-                println!("{}", serde_json::to_string_pretty(&areas).unwrap());
-                Ok::<(), String>(())
-            })?;
+            let areas = store.list_areas(depth).map_err(|e| e.to_string())?;
+            println!("{}", serde_json::to_string_pretty(&areas).unwrap());
         }
         "importers" => {
             let repo = read_option(&args, "--repo")?;
             let file = read_option(&args, "--file")?;
-            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-            rt.block_on(async {
-                let canonical = PathBuf::from(&repo)
-                    .canonicalize()
+            let canonical = PathBuf::from(&repo)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let store =
+                aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
                     .map_err(|e| e.to_string())?;
-                let store = aethyme_engine::store::GraphStore::open(&canonical)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let edges = aethyme_engine::store::read::edges_to(store.db(), &file)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                for edge in &edges {
-                    if let Some(ref paths) = edge.imported_by {
-                        for p in paths {
-                            println!("{}", p);
-                        }
-                    }
+            let edges = store.edges_to(&file).map_err(|e| e.to_string())?;
+            for edge in &edges {
+                if let Some(path) = file_path_from_id(edge.other.as_str()) {
+                    println!("{path}");
                 }
-                Ok::<(), String>(())
-            })?;
+            }
         }
         "deps" => {
             let repo = read_option(&args, "--repo")?;
             let file = read_option(&args, "--file")?;
-            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-            rt.block_on(async {
-                let canonical = PathBuf::from(&repo)
-                    .canonicalize()
+            let canonical = PathBuf::from(&repo)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let store =
+                aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
                     .map_err(|e| e.to_string())?;
-                let store = aethyme_engine::store::GraphStore::open(&canonical)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let edges = aethyme_engine::store::read::edges_from(store.db(), &file)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                for edge in &edges {
-                    if let Some(ref paths) = edge.import_targets {
-                        for p in paths {
-                            println!("{}", p);
-                        }
-                    }
+            let edges = store.edges_from(&file).map_err(|e| e.to_string())?;
+            for edge in &edges {
+                if let Some(path) = file_path_from_id(edge.other.as_str()) {
+                    println!("{path}");
                 }
-                Ok::<(), String>(())
-            })?;
+            }
         }
         "callers" => {
             let repo = read_option(&args, "--repo")?;
             let symbol_name = read_option(&args, "--symbol")?;
-            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-            rt.block_on(async {
-                let canonical = PathBuf::from(&repo)
-                    .canonicalize()
-                    .map_err(|e| e.to_string())?;
-                let store = aethyme_engine::store::GraphStore::open(&canonical)
-                    .await
+            let canonical = PathBuf::from(&repo)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let store =
+                aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
                     .map_err(|e| e.to_string())?;
 
-                // Step 1: grep -rl to find files containing the symbol name
-                let grep_output = std::process::Command::new("grep")
-                    .args([
-                        "-rl",
-                        "--include=*",
-                        "--exclude-dir=.git",
-                        "--exclude-dir=node_modules",
-                        "--exclude-dir=vendor",
-                        "--exclude-dir=.aethyme",
-                        &symbol_name,
-                    ])
-                    .arg(canonical.as_os_str())
-                    .output()
-                    .map_err(|e| format!("grep failed: {}", e))?;
+            // Step 1: grep -rl to find files containing the symbol name
+            let grep_output = std::process::Command::new("grep")
+                .args([
+                    "-rl",
+                    "--include=*",
+                    "--exclude-dir=.git",
+                    "--exclude-dir=node_modules",
+                    "--exclude-dir=vendor",
+                    "--exclude-dir=.aethyme",
+                    &symbol_name,
+                ])
+                .arg(canonical.as_os_str())
+                .output()
+                .map_err(|e| format!("grep failed: {}", e))?;
 
-                let grep_stdout = String::from_utf8_lossy(&grep_output.stdout);
-                let repo_prefix = format!("{}/", canonical.display());
-                let found_files: Vec<String> = grep_stdout
-                    .lines()
-                    .filter(|l| !l.is_empty())
-                    .map(|l| l.strip_prefix(&repo_prefix).unwrap_or(l).to_string())
-                    .collect();
+            let grep_stdout = String::from_utf8_lossy(&grep_output.stdout);
+            let repo_prefix = format!("{}/", canonical.display());
+            let found_files: Vec<String> = grep_stdout
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| l.strip_prefix(&repo_prefix).unwrap_or(l).to_string())
+                .collect();
 
-                if found_files.is_empty() {
-                    return Ok::<(), String>(());
-                }
-
+            if !found_files.is_empty() {
                 // Step 2: For each file, query the graph for files that import it
                 let mut search_set: std::collections::BTreeSet<String> =
                     std::collections::BTreeSet::new();
                 for f in &found_files {
                     search_set.insert(f.clone());
-                    if let Ok(edges) = aethyme_engine::store::read::edges_to(store.db(), f).await {
+                    if let Ok(edges) = store.edges_to(f) {
                         for edge in &edges {
-                            if let Some(ref paths) = edge.imported_by {
-                                for p in paths {
-                                    search_set.insert(p.clone());
-                                }
+                            if let Some(p) = file_path_from_id(edge.other.as_str()) {
+                                search_set.insert(p);
                             }
                         }
                     }
@@ -598,59 +569,42 @@ fn run() -> Result<(), String> {
                     .filter(|p| std::path::Path::new(p).exists())
                     .collect();
 
-                if abs_files.is_empty() {
-                    return Ok::<(), String>(());
+                if !abs_files.is_empty() {
+                    let mut grep_cmd = std::process::Command::new("grep");
+                    grep_cmd.args(["-n", &symbol_name]);
+                    for f in &abs_files {
+                        grep_cmd.arg(f);
+                    }
+                    let result = grep_cmd
+                        .output()
+                        .map_err(|e| format!("grep failed: {}", e))?;
+                    let result_stdout = String::from_utf8_lossy(&result.stdout);
+                    for line in result_stdout.lines() {
+                        let relative = line.strip_prefix(&repo_prefix).unwrap_or(line);
+                        println!("{}", relative);
+                    }
                 }
-
-                let mut grep_cmd = std::process::Command::new("grep");
-                grep_cmd.args(["-n", &symbol_name]);
-                for f in &abs_files {
-                    grep_cmd.arg(f);
-                }
-                let result = grep_cmd
-                    .output()
-                    .map_err(|e| format!("grep failed: {}", e))?;
-                let result_stdout = String::from_utf8_lossy(&result.stdout);
-                for line in result_stdout.lines() {
-                    // Strip repo_prefix from output to make paths relative
-                    let relative = line.strip_prefix(&repo_prefix).unwrap_or(line);
-                    println!("{}", relative);
-                }
-
-                Ok::<(), String>(())
-            })?;
+            }
         }
         "query-overview" => {
             let repo = read_option(&args, "--repo")?;
-            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-            rt.block_on(async {
-                let store = aethyme_engine::store::GraphStore::open(
-                    &PathBuf::from(&repo).canonicalize().unwrap(),
-                )
-                .await
+            let canonical = PathBuf::from(&repo)
+                .canonicalize()
                 .map_err(|e| e.to_string())?;
-                let overview = aethyme_engine::store::read::overview(store.db())
-                    .await
+            let store =
+                aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
                     .map_err(|e| e.to_string())?;
-                println!("{}", serde_json::to_string_pretty(&overview).unwrap());
-                Ok::<(), String>(())
-            })?;
-        }
-        "query-raw" => {
-            let repo = read_option(&args, "--repo")?;
-            let sql = read_option(&args, "--sql")?;
-            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-            rt.block_on(async {
-                let store = aethyme_engine::store::GraphStore::open(
-                    &PathBuf::from(&repo).canonicalize().unwrap(),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                let mut result = store.db().query(&sql).await.map_err(|e| e.to_string())?;
-                let rows: Vec<serde_json::Value> = result.take(0).map_err(|e| e.to_string())?;
-                println!("{}", serde_json::to_string_pretty(&rows).unwrap());
-                Ok::<(), String>(())
-            })?;
+            let overview = store.overview(20, 10, 20).map_err(|e| e.to_string())?;
+            // Hand-roll JSON to keep the output stable: native Overview isn't
+            // serde::Serialize on the AreaNode/RiskFlag side either, so we
+            // build a serde_json::Value here.
+            let json = serde_json::json!({
+                "repo": overview.repo,
+                "areas": overview.areas,
+                "entrypoints": overview.entrypoint_paths,
+                "risks": overview.risks,
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
         }
         "unused" => {
             let repo = read_option(&args, "--repo")?;
@@ -860,21 +814,29 @@ fn print_explanation(map: &RepositoryMap, pack: &aethyme_engine::context_pack::C
     }
 }
 
-async fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Result<(), String> {
-    use aethyme_engine::store;
+/// Resolve a structured node id like `file:Repo:src/lib.rs` to its repo-relative
+/// path. Returns `None` for non-file kinds (areas, symbols, unresolved imports).
+fn file_path_from_id(id: &str) -> Option<String> {
+    let rest = id.strip_prefix("file:")?;
+    let after_repo = rest.split_once(':')?.1;
+    Some(after_repo.to_string())
+}
+
+fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Result<(), String> {
+    use aethyme_engine::store::redb::graph_store::{
+        self as gs, GraphStore, RepoMetadata,
+    };
 
     let canonical = repo_root.canonicalize().map_err(|e| e.to_string())?;
-    let store = store::GraphStore::open(&canonical)
-        .await
-        .map_err(|e| e.to_string())?;
-    store.ensure_schema().await.map_err(|e| e.to_string())?;
-    store.reset().await.map_err(|e| e.to_string())?;
+    // reset() = delete file + recreate. Mirrors what surreal's REMOVE DATABASE
+    // gave us: every index pass starts from a clean slate.
+    let store = GraphStore::reset(&canonical).map_err(|e| e.to_string())?;
+
+    let mut session = store.begin_index().map_err(|e| e.to_string())?;
 
     // Areas
     for area in &map.areas {
-        store::write::insert_area(store.db(), area)
-            .await
-            .map_err(|e| e.to_string())?;
+        gs::insert_area(&mut session, area).map_err(|e| e.to_string())?;
     }
     eprintln!("  areas: {}", map.areas.len());
 
@@ -882,7 +844,7 @@ async fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Res
     let mut file_ok = 0usize;
     let mut file_errors = 0usize;
     for file in &map.files {
-        if let Err(e) = store::write::insert_file(store.db(), file).await {
+        if let Err(e) = gs::insert_file(&mut session, file) {
             if file_errors < 3 {
                 eprintln!(
                     "  file error: {} (area={:?}): {}",
@@ -901,29 +863,30 @@ async fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Res
         map.files.len()
     );
 
-    // Edges — only write edges where both sides resolve to file or area (not symbol)
-    // Also skip unresolved imports (import:Namespace\Class → no real file target)
+    // Edges — skip unresolved imports and any symbol-level endpoints. With
+    // raw structured IDs we just inspect the prefix; redb keys are not
+    // sanitized so what the engine produced is what we filter on.
     let mut edge_errors = 0usize;
     let mut edge_ok = 0usize;
     let mut edge_skipped = 0usize;
     for edge in &map.edges {
-        // Skip unresolved imports (target starts with "import:" but not "import:file:")
-        if edge.to.starts_with("import:") {
+        let from = edge.from.as_str();
+        let to = edge.to.as_str();
+        if to.starts_with("import:")
+            || from.starts_with("fn:")
+            || from.starts_with("class:")
+            || to.starts_with("fn:")
+            || to.starts_with("class:")
+        {
             edge_skipped += 1;
             continue;
         }
-        let (from_table, _) = store::write::resolve_record_parts(&edge.from);
-        let (to_table, _) = store::write::resolve_record_parts(&edge.to);
-        if from_table == "symbol" || to_table == "symbol" {
-            edge_skipped += 1;
-            continue;
-        }
-        if let Err(e) = store::write::insert_edge(store.db(), edge).await {
+        if let Err(e) = gs::insert_edge(&mut session, edge) {
             if edge_errors < 5 {
                 eprintln!(
                     "  edge error: {} -> {} ({:?}): {}",
-                    &edge.from[..edge.from.len().min(50)],
-                    &edge.to[..edge.to.len().min(50)],
+                    &from[..from.len().min(50)],
+                    &to[..to.len().min(50)],
                     edge.kind,
                     e
                 );
@@ -943,13 +906,14 @@ async fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Res
 
     // Risk flags
     for risk in &map.risk_flags {
-        store::write::insert_risk(store.db(), risk)
-            .await
-            .map_err(|e| e.to_string())?;
+        gs::insert_risk(&mut session, risk).map_err(|e| e.to_string())?;
     }
     eprintln!("  risks: {}", map.risk_flags.len());
 
-    // Repo metadata
+    session.commit().map_err(|e| e.to_string())?;
+
+    // Repo metadata — outside the IndexSession because it's a one-shot
+    // META write and we want it persisted only after the bulk load succeeded.
     let commit = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(&canonical)
@@ -957,21 +921,21 @@ async fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Res
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string());
-
+    let indexed_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     store
-        .db()
-        .query(
-            "CREATE repo SET root_path = $root, commit_hash = $commit, \
-         indexed_at = time::now(), file_count = $fc, languages = $langs",
-        )
-        .bind(("root", canonical.to_string_lossy().to_string()))
-        .bind(("commit", commit))
-        .bind(("fc", map.files.len() as i64))
-        .bind(("langs", Some(map.snapshot.languages.clone())))
-        .await
+        .set_repo_metadata(&RepoMetadata {
+            root_path: canonical.to_string_lossy().to_string(),
+            commit_hash: commit,
+            indexed_at_unix,
+            file_count: map.files.len() as u64,
+            languages: map.snapshot.languages.clone(),
+        })
         .map_err(|e| e.to_string())?;
 
-    let db_path = canonical.join(".aethyme").join("graph.db");
+    let db_path = canonical.join(".aethyme").join("graph_store.redb");
     eprintln!("Store written to: {}", db_path.display());
     Ok(())
 }
