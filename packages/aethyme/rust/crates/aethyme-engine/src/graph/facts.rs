@@ -56,10 +56,11 @@ pub fn function_usage_fact(
     let mut external = BTreeSet::new();
     let mut docs_config = BTreeSet::new();
 
-    for edge in &map.edges {
-        if edge.to != fact.id {
-            continue;
-        }
+    // Use the inverted edge index instead of scanning every edge in the map.
+    // For 30K functions × 3.8M edges on MediaWiki, the old scan was O(F × E);
+    // this is O(F × in_degree).
+    for &edge_idx in map.edges_to(&fact.id) {
+        let edge = &map.edges[edge_idx];
         if matches!(edge.kind, EdgeKind::References | EdgeKind::Documents) {
             if let Some((reference, reference_path)) = docs_config_reference_for_id(map, &edge.from)
             {

@@ -22,10 +22,17 @@ use crate::repo::{RepoSnapshot, discover_repo};
 
 /// Pre-computed HashMap indexes for O(1) lookups on entity id → area_id and display string.
 /// Built lazily via `OnceLock` on first access; not serialized (derived data).
+///
+/// `edges_in_by_target_id` is the inverted edge index that fixes the O(F × E)
+/// scan in `function_usage_fact`: for each node id, store the indices into
+/// `map.edges` of every incoming edge. Lookup becomes O(in_degree) instead of
+/// O(|edges|). On MediaWiki this collapses `analyze-dead-code` from ~3 minutes
+/// to ~seconds for the per-function caller scan.
 #[derive(Debug, Clone)]
 struct MapIndex {
     area_id_by_id: HashMap<String, Option<String>>,
     display_by_id: HashMap<String, String>,
+    edges_in_by_target_id: HashMap<String, Vec<usize>>,
 }
 
 impl MapIndex {
@@ -76,9 +83,19 @@ impl MapIndex {
             display_by_id.insert(area.id.clone(), area.name.clone());
         }
 
+        // Build the inverted edge index: edge.to → indices into map.edges
+        let mut edges_in_by_target_id: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, edge) in map.edges.iter().enumerate() {
+            edges_in_by_target_id
+                .entry(edge.to.to_string())
+                .or_default()
+                .push(idx);
+        }
+
         Self {
             area_id_by_id,
             display_by_id,
+            edges_in_by_target_id,
         }
     }
 }
@@ -506,6 +523,19 @@ impl RepositoryMap {
 
     pub fn area_id_for_target(&self, value: &str) -> Option<String> {
         self.index().area_id_by_id.get(value).cloned().flatten()
+    }
+
+    /// Indices into `self.edges` of every edge whose `to` matches `target_id`.
+    /// Returns an empty slice when the target has no incoming edges.
+    ///
+    /// Replaces the O(|edges|) full scan that `function_usage_fact` and
+    /// other "who points at this node" callers used to do.
+    pub fn edges_to(&self, target_id: &str) -> &[usize] {
+        self.index()
+            .edges_in_by_target_id
+            .get(target_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
