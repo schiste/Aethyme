@@ -8,6 +8,7 @@ pub mod edge;
 pub mod file;
 pub mod function;
 pub mod graph;
+pub mod intern;
 pub mod risk;
 pub mod scope;
 pub mod symbol;
