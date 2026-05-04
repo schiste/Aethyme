@@ -1,13 +1,13 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Instant;
 
 use rayon::prelude::*;
 
 use crate::cache::{CacheStats, sha256_hex};
 use crate::indexer;
+use crate::model::intern::InternedStr;
 use crate::store::redb::parse_store::ParseStore;
 use crate::model::class::ClassNode;
 use crate::model::edge::{Edge, EdgeKind};
@@ -289,19 +289,19 @@ fn parse_file_with_cache(
     // Cache lookup failures (corrupt entry, redb error) are treated as misses;
     // we re-parse and overwrite. The cache is regenerable, so silently degrading
     // is the right behavior.
-    // Convert per-file context strings to Arc<str> ONCE, then share via Arc::clone
+    // Convert per-file context strings to InternedStr ONCE, then clone via Arc::clone
     // when applying to each symbol. Without a global interner this still gives us
-    // per-file dedup (one Arc<"php"> shared across all symbols in this file
+    // per-file dedup (one InternedStr<"php"> shared across all symbols in this file
     // instead of one Arc per symbol).
-    let language_arc: Arc<str> = Arc::from(language.as_str());
-    let area_arc: Option<Arc<str>> = file.area_id.as_deref().map(Arc::from);
+    let language_str: InternedStr = InternedStr::from(language.as_str());
+    let area_str: Option<InternedStr> = file.area_id.as_deref().map(InternedStr::from);
 
     if let Some(store) = store {
         if let Ok(Some(entry)) = store.lookup(&file.path, &content_hash) {
             let symbols = entry
                 .symbols
                 .into_iter()
-                .map(|s| s.with_context(Some(Arc::clone(&language_arc)), area_arc.clone()))
+                .map(|s| s.with_context(Some(language_str.clone()), area_str.clone()))
                 .collect();
             return (
                 ParsedFile {
@@ -318,7 +318,7 @@ fn parse_file_with_cache(
 
     let symbols = indexer::extract_symbols(grammar_registry, &language, &file.path, &contents)
         .into_iter()
-        .map(|symbol| symbol.with_context(Some(Arc::clone(&language_arc)), area_arc.clone()))
+        .map(|symbol| symbol.with_context(Some(language_str.clone()), area_str.clone()))
         .collect::<Vec<_>>();
     let import_edges =
         indexer::extract_import_edges(grammar_registry, &language, &file.path, &contents);

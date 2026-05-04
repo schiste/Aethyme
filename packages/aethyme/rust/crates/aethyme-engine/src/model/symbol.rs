@@ -1,6 +1,4 @@
-use std::sync::Arc;
-
-use crate::model::intern::{arc_str, arc_str_opt};
+use crate::model::intern::InternedStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum SymbolKind {
@@ -11,34 +9,27 @@ pub enum SymbolKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Symbol {
-    #[serde(with = "arc_str")]
-    pub id: Arc<str>,
-    #[serde(with = "arc_str")]
-    pub name: Arc<str>,
+    pub id: InternedStr,
+    pub name: InternedStr,
     pub kind: SymbolKind,
-    #[serde(with = "arc_str")]
-    pub file: Arc<str>,
+    pub file: InternedStr,
     pub line: usize,
-    #[serde(with = "arc_str")]
-    pub signature: Arc<str>,
-    #[serde(with = "arc_str_opt")]
-    pub language: Option<Arc<str>>,
-    #[serde(with = "arc_str_opt")]
-    pub area: Option<Arc<str>>,
+    pub signature: InternedStr,
+    pub language: Option<InternedStr>,
+    pub area: Option<InternedStr>,
 }
 
 impl Symbol {
     pub fn new(
-        name: impl Into<Arc<str>>,
+        name: impl Into<InternedStr>,
         kind: SymbolKind,
-        file: impl Into<Arc<str>>,
+        file: impl Into<InternedStr>,
         line: usize,
-        signature: impl Into<Arc<str>>,
+        signature: impl Into<InternedStr>,
     ) -> Self {
-        let resolved_name: Arc<str> = name.into();
-        let resolved_file: Arc<str> = file.into();
-        let id: Arc<str> =
-            Arc::from(format!("{}::{}::{}", resolved_file, line, resolved_name));
+        let resolved_name: InternedStr = name.into();
+        let resolved_file: InternedStr = file.into();
+        let id = InternedStr::from(format!("{}::{}::{}", resolved_file, line, resolved_name));
         Self {
             id,
             name: resolved_name,
@@ -51,7 +42,11 @@ impl Symbol {
         }
     }
 
-    pub fn with_context(mut self, language: Option<Arc<str>>, area: Option<Arc<str>>) -> Self {
+    pub fn with_context(
+        mut self,
+        language: Option<InternedStr>,
+        area: Option<InternedStr>,
+    ) -> Self {
         self.language = language;
         self.area = area;
         self
