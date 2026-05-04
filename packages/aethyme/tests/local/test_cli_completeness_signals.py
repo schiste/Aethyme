@@ -531,8 +531,10 @@ def test_explore_filters_noisy_symbol_queries_and_degrades_without_blocking(
     payload = json.loads(result.output)
     assert payload["status"] == "degraded"
     assert payload["answer"][0]["target"] == "includes/Watchlist"
-    assert payload["safe_to_use_as_answer"] is True
-    assert payload["trust_policy"]["safe_to_use_as_answer"] is True
+    assert payload["safe_to_use_as_answer"] is False
+    assert payload["trust_policy"]["safe_to_use_as_answer"] is False
+    assert payload["trust_policy"]["trust_policy"] == "needs_verification"
+    assert payload["trust_policy"]["verification_required"] is True
     assert payload["trust_policy"]["degraded"] is True
     assert "T419918" not in captured_symbol_queries
     assert "report" not in captured_symbol_queries
@@ -669,8 +671,10 @@ class Article {
     payload = json.loads(result.output)
     paths = [item.get("path") for item in payload["answer"]]
     assert payload["status"] == "degraded"
-    assert payload["safe_to_use_as_answer"] is True
+    assert payload["safe_to_use_as_answer"] is False
+    assert payload["trust_policy"]["trust_policy"] == "needs_verification"
     assert payload["trust_policy"]["evidence_level"] == "text"
+    assert payload["verification_steps"]
     assert "includes/Watchlist/WatchlistManager.php" in paths
     assert "includes/Page/WikiPage.php" in paths
     assert "includes/Page/Article.php" in paths

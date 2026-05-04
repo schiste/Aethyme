@@ -233,9 +233,11 @@ cd packages/aethyme
 For `explore --request`, inspect `degraded_reasons`. The default path is
 bounded for responsiveness: if graph localization times out, Aethyme may skip
 symbol search. Filename-only fallback must remain `navigation_hints[]`, not
-authoritative `answer[]`. Treat `safe_to_use_as_answer=false` as a safe
-degradation: the agent should continue normal repository investigation instead
-of trusting Aethyme candidates.
+authoritative `answer[]`. The default detail is compact and should include
+`verification_steps[]`; use `--detail standard` or `--detail full` only when the
+analysis needs more evidence payload. Treat `safe_to_use_as_answer=false` and
+`trust_policy.trust_policy=needs_verification` as safe degradation: the agent
+should verify the ranked candidates before trusting them.
 
 For non-Python repositories or analyzer ambiguity, use language-specific grep or
 AST tools as a second pass. Do not expose eval baselines or prior reports to

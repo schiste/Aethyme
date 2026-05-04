@@ -32,16 +32,19 @@ Use this command shape:
 Prefer the high-level Explore surface before low-level graph navigation.
 Without an explicit intent, Aethyme runs the general-purpose
 `task_localization_query` intent and returns ranked candidate files, symbols,
-areas, evidence, confidence, next actions, trust policy, and observability for
-the user request. This default path uses one bounded `task-localize` graph call,
+areas, compact evidence, confidence, verification steps, trust policy, and
+observability for the user request. This default path uses one bounded
+`task-localize` graph call,
 bounded symbol search, source-text evidence, source call-site expansion,
 filename fallback, and compact expansions. Filename-only fallback is never
 authoritative: it appears in `navigation_hints[]`, not `answer[]`, and is
-marked `navigation_only` with low confidence. If graph localization exceeds the
-responsiveness budget on a large repo, Aethyme can still return degraded
+marked `navigation_only` with low confidence. The default output detail is
+`compact`; use `--detail standard` or `--detail full` only when additional
+evidence/debug payload is worth the extra tokens. If graph localization exceeds
+the responsiveness budget on a large repo, Aethyme can still return degraded
 source-backed `answer[]` candidates when local text/call-site evidence is
-strong enough; otherwise it returns navigation guidance instead of waiting
-indefinitely or inventing an answer.
+strong enough, but the trust policy becomes `needs_verification` and
+`safe_to_use_as_answer=false`.
 
 ```bash
 (cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli explore --repo "$REPO" --request "<user request>" --format answer-json --show-observability)
@@ -70,10 +73,11 @@ You can still list the intent catalog directly:
 ```
 
 Read `trust_policy` and `safe_to_use_as_answer` first. Use `answer[]` as the
-primary result only when `safe_to_use_as_answer` is true. If false, do not treat
-`navigation_hints[]` as an answer; use it only to guide manual repository
-search. Read `excluded[]` to understand why candidates or areas were rejected.
-Read `ambiguous[]` before trusting low-confidence candidates. Read
+primary result only when `safe_to_use_as_answer` is true. If false, treat
+`answer[]` and `navigation_hints[]` as a ranked investigation plan, not a final
+answer; follow `verification_steps[]` before concluding. Read `excluded[]` to
+understand why candidates or areas were rejected. Read `ambiguous[]` before
+trusting low-confidence candidates. Read
 `output_adapters.dead_code_eval_json` only when the task specifically asks for
 the dead-code evaluation schema.
 
@@ -84,10 +88,10 @@ degraded reasons.
 If `degraded_reasons` says `task-localize` timed out, read
 `observability.degradation_guidance` before retrying. If
 `degradation_guidance.status` is `recovered`, inspect source-backed
-`answer[].evidence.line_refs` and `evidence.callsite_expansions` before broad
-manual search. If `safe_to_use_as_answer` is false, follow
-`navigation_hints[]` / `next_actions` as an investigation plan and verify with
-normal repo search before concluding. If a graph/symbol/source-backed
+`answer[].evidence.line_refs` and `verification_steps[]` before broad manual
+search. If `safe_to_use_as_answer` is false, follow `verification_steps[]`,
+`navigation_hints[]`, and `next_actions` as an investigation plan and verify
+with normal repo search before concluding. If a graph/symbol/source-backed
 `answer[]` is present, inspect candidates in order, then verify manually before
 finalizing.
 
@@ -159,7 +163,7 @@ when the repository is large and the task gives likely search roots.
 
 ## When to Use
 
-- **Starting a task:** run `explore --request` first; it composes anchors, scope, next steps, and compact expansions.
+- **Starting a task:** run `explore --request` first; it composes anchors, scope, compact evidence, and verification steps.
 - **Need a task-ready answer:** run `explore --request`; choose a specialized intent only when the request clearly matches one.
 - **Finding impact:** run `graph callers` or `graph parents` before broad text search.
 - **Dead code / API surface:** run `explore --intent usage_boundary_query`; use `facts function-usage` to verify ambiguous candidates.

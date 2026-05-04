@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import sys
 from pathlib import Path
 from typing import Any, TypeAlias, TypedDict, cast
@@ -71,13 +72,13 @@ from src.indexing.engine import (
     analyze_dead_code as analyze_dead_code_answer,
 )
 from src.indexing.engine import (
-    usage_boundary_query as usage_boundary_query_answer,
-)
-from src.indexing.engine import (
     dependency_frontier as rust_dependency_frontier,
 )
 from src.indexing.engine import (
     impact_frontier as rust_impact_frontier,
+)
+from src.indexing.engine import (
+    usage_boundary_query as usage_boundary_query_answer,
 )
 from src.indexing.repository_snapshot import capture_snapshot
 from src.indexing.service import RepositoryIndexRequest, run_indexing
@@ -381,6 +382,18 @@ def intents_command(request_text: str, output_format: str) -> None:
     help="Task-ready answer contract.",
 )
 @click.option(
+    "--detail",
+    "output_detail",
+    type=click.Choice(["compact", "standard", "full"]),
+    default="compact",
+    show_default=True,
+    help=(
+        "Explore output budget. compact is answer-first with short evidence; "
+        "standard includes broader evidence summaries; full preserves verbose "
+        "debug evidence."
+    ),
+)
+@click.option(
     "--show-observability",
     "show_observability",
     is_flag=True,
@@ -392,6 +405,7 @@ def explore_command(
     request_text: str,
     params_json: str,
     output_format: str,
+    output_detail: str,
     show_observability: bool,
 ) -> None:
     """Run a high-level Explore intent and return a task-ready answer."""
@@ -407,6 +421,7 @@ def explore_command(
             request_text=request_text,
             params=params,
             show_observability=show_observability,
+            output_detail=output_detail,
             intent_source="explicit" if intent else "default",
             intent_name="task_localization_query",
         )
@@ -424,6 +439,7 @@ def explore_command(
             request_text=request_text,
             params=behavior_params,
             show_observability=show_observability,
+            output_detail=output_detail,
             intent_source="explicit",
             intent_name="behavior_localization_query",
         )
@@ -1442,11 +1458,12 @@ def _intent_catalog() -> dict[str, Any]:
             "no_hidden_task_specific_routing": True,
         },
         "canonical_flow": [
-            "Run `aethyme explore --repo <repo> --request <task> --format answer-json --show-observability` first.",
+            "Run `aethyme explore --repo <repo> --request <task> --format answer-json` first; default detail is compact.",
             "Read `trust_policy` and use `answer[]` only when `safe_to_use_as_answer` is true.",
+            "If trust_policy is `needs_verification`, follow `verification_steps[]` before using answer[] as final evidence.",
             "If only `navigation_hints[]` are available, treat them as manual investigation steps, not candidate answers.",
             "For a specialized intent, rerun `aethyme explore --repo <repo> --intent <intent> --request <task> --params '<json>' --format answer-json --show-observability`.",
-            "Read answer[] first only after the trust policy, excluded[] second, ambiguous[]/navigation_hints[]/next_actions third, observability last.",
+            "Read answer[] first only after the trust policy, verification_steps[] second, excluded[] third, ambiguous[]/navigation_hints[]/next_actions fourth, observability last.",
         ],
         "modes": [
             {
@@ -1476,7 +1493,9 @@ def _intent_catalog() -> dict[str, Any]:
                             "max_symbols",
                             "max_areas",
                             "max_next_items",
+                            "max_answer_items",
                             "max_expansions",
+                            "detail",
                             "include_expansions",
                             "max_symbol_queries",
                             "max_symbol_results",
@@ -1489,19 +1508,21 @@ def _intent_catalog() -> dict[str, Any]:
                             "skip_symbols_after_graph_timeout",
                         ],
                         "param_defaults": {
-                            "max_anchors": 5,
-                            "max_files": 8,
-                            "max_symbols": 8,
-                            "max_areas": 5,
-                            "max_next_items": 10,
-                            "max_expansions": 3,
+                            "detail": "compact",
+                            "max_anchors": 3,
+                            "max_files": 5,
+                            "max_symbols": 5,
+                            "max_areas": 3,
+                            "max_next_items": 5,
+                            "max_answer_items": 12,
+                            "max_expansions": 1,
                             "include_expansions": True,
-                            "max_symbol_queries": 6,
-                            "max_symbol_results": 5,
-                            "max_text_files": 8,
-                            "max_text_line_refs": 4,
-                            "max_callsite_symbols": 5,
-                            "max_callsite_results": 6,
+                            "max_symbol_queries": 5,
+                            "max_symbol_results": 4,
+                            "max_text_files": 5,
+                            "max_text_line_refs": 2,
+                            "max_callsite_symbols": 4,
+                            "max_callsite_results": 4,
                             "symbol_query_timeout_ms": 1000,
                             "graph_query_timeout_ms": 1000,
                             "skip_symbols_after_graph_timeout": False,
@@ -1516,6 +1537,13 @@ def _intent_catalog() -> dict[str, Any]:
                             "confidence": "number",
                             "reason": "string",
                         },
+                        "verification_step_schema": {
+                            "action": "read_source_window | search_symbol_in_candidate | read_candidate_file",
+                            "target": "symbol or path",
+                            "path": "repo-relative path when known",
+                            "command": "shell command for cheap manual verification",
+                            "reason": "why this verification step matters",
+                        },
                         "navigation_hint_schema": {
                             "kind": "filesystem_file | graph_next_action | investigation_plan",
                             "status": "navigation_hint",
@@ -1526,7 +1554,8 @@ def _intent_catalog() -> dict[str, Any]:
                             "safe_to_use_as_answer": "boolean",
                             "safe_to_use_as_navigation": "boolean",
                             "evidence_level": "graph | symbol | text | filename | none",
-                            "trust_policy": "answer_candidate | navigation_only | failed",
+                            "verification_required": "boolean",
+                            "trust_policy": "answer_candidate | needs_verification | navigation_only | failed",
                         },
                         "observability": [
                             "command name",
@@ -1665,12 +1694,78 @@ def _parse_json_object(raw_value: str, *, option_name: str) -> dict[str, Any]:
     return parsed
 
 
+def _task_localization_output_detail(
+    params: dict[str, Any], output_detail: str
+) -> str:
+    raw = params.get("detail", output_detail)
+    detail = str(raw or "compact").strip().lower()
+    if detail not in {"compact", "standard", "full"}:
+        raise click.BadParameter(
+            "Expected one of: compact, standard, full.", param_hint="--detail"
+        )
+    return detail
+
+
+def _task_localization_detail_defaults(detail: str) -> dict[str, Any]:
+    if detail == "full":
+        return {
+            "max_anchors": 5,
+            "max_files": 8,
+            "max_symbols": 8,
+            "max_areas": 5,
+            "max_next_items": 10,
+            "max_answer_items": 0,
+            "max_expansions": 3,
+            "max_symbol_queries": 6,
+            "max_symbol_results": 5,
+            "max_text_files": 8,
+            "max_text_line_refs": 4,
+            "max_callsite_symbols": 5,
+            "max_callsite_results": 6,
+            "include_expansions": True,
+        }
+    if detail == "standard":
+        return {
+            "max_anchors": 4,
+            "max_files": 6,
+            "max_symbols": 6,
+            "max_areas": 4,
+            "max_next_items": 6,
+            "max_answer_items": 24,
+            "max_expansions": 2,
+            "max_symbol_queries": 6,
+            "max_symbol_results": 4,
+            "max_text_files": 6,
+            "max_text_line_refs": 3,
+            "max_callsite_symbols": 5,
+            "max_callsite_results": 5,
+            "include_expansions": True,
+        }
+    return {
+        "max_anchors": 3,
+        "max_files": 5,
+        "max_symbols": 5,
+        "max_areas": 3,
+        "max_next_items": 5,
+        "max_answer_items": 12,
+        "max_expansions": 1,
+        "max_symbol_queries": 5,
+        "max_symbol_results": 4,
+        "max_text_files": 5,
+        "max_text_line_refs": 2,
+        "max_callsite_symbols": 4,
+        "max_callsite_results": 4,
+        "include_expansions": True,
+    }
+
+
 def _explore_task_localization_query(
     *,
     repo_path: Path,
     request_text: str,
     params: dict[str, Any],
     show_observability: bool,
+    output_detail: str,
     intent_source: str,
     intent_name: str = "task_localization_query",
 ) -> dict[str, Any]:
@@ -1684,31 +1779,52 @@ def _explore_task_localization_query(
             errors=["Missing request text. Provide --request for task localization."],
         )
 
-    max_anchors = _positive_int_param(params, "max_anchors", default=5, minimum=1)
-    max_files = _positive_int_param(params, "max_files", default=8, minimum=1)
-    max_symbols = _positive_int_param(params, "max_symbols", default=8, minimum=1)
-    max_areas = _positive_int_param(params, "max_areas", default=5, minimum=0)
+    detail = _task_localization_output_detail(params, output_detail)
+    defaults = _task_localization_detail_defaults(detail)
+    max_anchors = _positive_int_param(
+        params, "max_anchors", default=defaults["max_anchors"], minimum=1
+    )
+    max_files = _positive_int_param(
+        params, "max_files", default=defaults["max_files"], minimum=1
+    )
+    max_symbols = _positive_int_param(
+        params, "max_symbols", default=defaults["max_symbols"], minimum=1
+    )
+    max_areas = _positive_int_param(
+        params, "max_areas", default=defaults["max_areas"], minimum=0
+    )
     max_next_items = _positive_int_param(
-        params, "max_next_items", default=10, minimum=0
+        params, "max_next_items", default=defaults["max_next_items"], minimum=0
+    )
+    max_answer_items = _positive_int_param(
+        params, "max_answer_items", default=defaults["max_answer_items"], minimum=0
     )
     max_expansions = _positive_int_param(
-        params, "max_expansions", default=3, minimum=0
+        params, "max_expansions", default=defaults["max_expansions"], minimum=0
     )
     max_symbol_queries = _positive_int_param(
-        params, "max_symbol_queries", default=6, minimum=0
+        params, "max_symbol_queries", default=defaults["max_symbol_queries"], minimum=0
     )
     max_symbol_results = _positive_int_param(
-        params, "max_symbol_results", default=5, minimum=0
+        params, "max_symbol_results", default=defaults["max_symbol_results"], minimum=0
     )
-    max_text_files = _positive_int_param(params, "max_text_files", default=8, minimum=0)
+    max_text_files = _positive_int_param(
+        params, "max_text_files", default=defaults["max_text_files"], minimum=0
+    )
     max_text_line_refs = _positive_int_param(
-        params, "max_text_line_refs", default=4, minimum=1
+        params, "max_text_line_refs", default=defaults["max_text_line_refs"], minimum=1
     )
     max_callsite_symbols = _positive_int_param(
-        params, "max_callsite_symbols", default=5, minimum=0
+        params,
+        "max_callsite_symbols",
+        default=defaults["max_callsite_symbols"],
+        minimum=0,
     )
     max_callsite_results = _positive_int_param(
-        params, "max_callsite_results", default=6, minimum=0
+        params,
+        "max_callsite_results",
+        default=defaults["max_callsite_results"],
+        minimum=0,
     )
     symbol_query_timeout_ms = _positive_int_param(
         params, "symbol_query_timeout_ms", default=1_000, minimum=100
@@ -1719,7 +1835,9 @@ def _explore_task_localization_query(
     skip_symbols_after_graph_timeout = bool(
         params.get("skip_symbols_after_graph_timeout", False)
     )
-    include_expansions = bool(params.get("include_expansions", True))
+    include_expansions = bool(
+        params.get("include_expansions", defaults["include_expansions"])
+    )
     degraded_reasons: list[str] = []
 
     graph_timeout_seconds = graph_query_timeout_ms / 1000
@@ -1833,6 +1951,35 @@ def _explore_task_localization_query(
         show_observability=show_observability,
     )
     status = "degraded" if degraded_reasons else "complete"
+    public_answer_items = _task_localization_public_answer_items(
+        answer_items, detail=detail, max_items=max_answer_items
+    )
+    public_evidence = _task_localization_evidence_payload(
+        detail=detail,
+        answer_items=answer_items,
+        navigation_hints=navigation_hints,
+        excluded_items=excluded_items,
+        symbol_matches=symbol_matches,
+        text_items=text_items,
+        callsite_expansions=callsite_expansions,
+        filesystem_items=filesystem_items,
+        anchors=anchors_result.get("anchors", []),
+        scope_result=scope_result,
+        next_result=next_result,
+        max_symbols=max_symbols,
+        max_files=max_files,
+        max_anchors=max_anchors,
+        max_areas=max_areas,
+        max_next_items=max_next_items,
+        max_answer_items=max_answer_items,
+        expansions=expansions,
+    )
+    verification_steps = _task_localization_verification_steps(
+        answer_items=answer_items,
+        navigation_hints=navigation_hints,
+        repo_path=repo_path,
+        max_items=max_next_items,
+    )
 
     return {
         "schema_version": "aethyme-explore-v1",
@@ -1845,11 +1992,13 @@ def _explore_task_localization_query(
             "parameters": params,
         },
         "resolved_parameters": {
+            "detail": detail,
             "max_anchors": max_anchors,
             "max_files": max_files,
             "max_symbols": max_symbols,
             "max_areas": max_areas,
             "max_next_items": max_next_items,
+            "max_answer_items": max_answer_items,
             "max_expansions": max_expansions,
             "include_expansions": include_expansions,
             "max_symbol_queries": max_symbol_queries,
@@ -1862,39 +2011,11 @@ def _explore_task_localization_query(
             "graph_query_timeout_ms": graph_query_timeout_ms,
             "skip_symbols_after_graph_timeout": skip_symbols_after_graph_timeout,
         },
-        "answer": answer_items,
+        "answer": public_answer_items,
         "navigation_hints": navigation_hints,
         "excluded": excluded_items,
         "ambiguous": ambiguous_items,
-        "evidence": {
-            "answer_count": len(answer_items),
-            "navigation_hint_count": len(navigation_hints),
-            "excluded_count": len(excluded_items),
-            "symbol_matches": _ranked_symbol_matches(symbol_matches)[:max_symbols],
-            "source_text_candidates": [
-                _compact_candidate_item(item) for item in text_items
-            ],
-            "callsite_expansions": callsite_expansions,
-            "filesystem_candidates": filesystem_items,
-            "anchors": anchors_result.get("anchors", [])[:max_anchors],
-            "scope": {
-                "navigation_order": _string_items(
-                    scope_result.get("navigation_order", [])
-                ),
-                "in_scope_files": _scope_values(
-                    scope_result.get("in_scope_files", [])
-                )[:max_files],
-                "in_scope_symbols": _scope_values(
-                    scope_result.get("in_scope_symbols", [])
-                )[:max_symbols],
-                "in_scope_areas": _scope_values(
-                    scope_result.get("in_scope_areas", [])
-                )[:max_areas],
-                "risks": _string_items(scope_result.get("risks", [])),
-            },
-            "next_items": _dict_items(next_result.get("items", []))[:max_next_items],
-            "expansions": expansions,
-        },
+        "evidence": public_evidence,
         "confidence": {
             "overall": _overall_confidence(answer_items),
             "answer_summary": _confidence_summary_for_items(answer_items),
@@ -1904,8 +2025,8 @@ def _explore_task_localization_query(
         "output_adapters": {
             "task_localization_json": {
                 "candidate_files": [
-                    _compact_candidate_item(item)
-                    for item in answer_items
+                    _adapter_candidate_item(item, detail=detail)
+                    for item in public_answer_items
                     if item.get("kind")
                     in {
                         "symbol_search_file",
@@ -1918,8 +2039,8 @@ def _explore_task_localization_query(
                     and item.get("path")
                 ],
                 "candidate_symbols": [
-                    _compact_candidate_item(item)
-                    for item in answer_items
+                    _adapter_candidate_item(item, detail=detail)
+                    for item in public_answer_items
                     if item.get("kind") in {"symbol_search", "in_scope_symbol"}
                     or item.get("evidence", {}).get("anchor_kind") == "symbol"
                 ],
@@ -1928,7 +2049,8 @@ def _explore_task_localization_query(
                     repo_path=repo_path,
                     max_items=max_next_items,
                 ),
-                "navigation_hints": navigation_hints,
+                "verification_steps": verification_steps,
+                "navigation_hints": [] if detail == "compact" else navigation_hints,
             }
         },
         "safe_to_use_as_answer": trust_policy["safe_to_use_as_answer"],
@@ -1936,6 +2058,7 @@ def _explore_task_localization_query(
         "trust_policy": trust_policy,
         "observability": command_observability,
         "degraded_reasons": degraded_reasons,
+        "verification_steps": verification_steps,
         "next_actions": _task_localization_next_actions(
             answer_items=answer_items,
             navigation_hints=navigation_hints,
@@ -2796,14 +2919,21 @@ def _task_localization_answer_items(
     for item in _task_localization_symbol_file_items(symbol_matches):
         add_item(item)
 
+    primary_text_items = [
+        item for item in text_items if not _candidate_looks_reference_only(item)
+    ]
+    reference_text_items = [
+        item for item in text_items if _candidate_looks_reference_only(item)
+    ]
+
     source_first_count = min(max_files, 4)
-    for item in text_items[:source_first_count]:
+    for item in primary_text_items[:source_first_count]:
         add_item(item)
 
     for item in callsite_items[:max_files]:
         add_item(item)
 
-    for item in text_items[source_first_count:max_files]:
+    for item in primary_text_items[source_first_count:max_files]:
         add_item(item)
 
     for match in _ranked_symbol_matches(symbol_matches)[:max_symbols]:
@@ -2920,6 +3050,9 @@ def _task_localization_answer_items(
             }
         )
 
+    for item in reference_text_items[:max_files]:
+        add_item(item)
+
     return items
 
 
@@ -3000,6 +3133,16 @@ def _task_localization_navigation_hints(
     return hints
 
 
+def _candidate_looks_reference_only(item: dict[str, Any]) -> bool:
+    path = item.get("path")
+    role = item.get("role")
+    return (
+        isinstance(path, str)
+        and _path_looks_like_reference_only(path)
+        or role == "docs"
+    )
+
+
 def _task_localization_excluded_items(
     scope: dict[str, Any], *, max_items: int
 ) -> list[dict[str, Any]]:
@@ -3069,9 +3212,12 @@ def _task_localization_trust_policy(
     degraded_reasons: list[str],
 ) -> dict[str, Any]:
     evidence_level = _highest_evidence_level(answer_items, navigation_hints)
-    overall_confidence = _overall_confidence(answer_items)
+    best_answer_confidence = _best_confidence(answer_items)
+    degraded = bool(degraded_reasons)
     safe_to_use_as_answer = bool(answer_items) and (
-        overall_confidence is None or overall_confidence >= 0.5
+        not degraded
+        and (best_answer_confidence is None or best_answer_confidence >= 0.72)
+        and evidence_level in {"text", "symbol", "graph", "reference"}
     )
     if not answer_items:
         reason = (
@@ -3080,19 +3226,24 @@ def _task_localization_trust_policy(
         )
     elif degraded_reasons:
         reason = (
-            "Answer candidates have graph, symbol, or source evidence, but the "
-            "command was degraded. Verify before relying on them."
+            "Answer candidates were found, but at least one analyzer degraded. "
+            "Use them as ranked navigation and verify before forming a final answer."
         )
     else:
-        reason = "Answer candidates have graph, symbol, or source evidence."
+        reason = "Answer candidates have graph, symbol, or source evidence and no analyzer degraded."
+    policy_name = "answer_candidate" if safe_to_use_as_answer else (
+        "needs_verification" if answer_items else "navigation_only"
+    )
     return {
         "safe_to_use_as_answer": safe_to_use_as_answer,
         "safe_to_use_as_navigation": bool(answer_items or navigation_hints),
         "evidence_level": evidence_level,
         "authoritative_answer_count": len(answer_items),
         "navigation_hint_count": len(navigation_hints),
-        "degraded": bool(degraded_reasons),
-        "trust_policy": "answer_candidate" if safe_to_use_as_answer else "navigation_only",
+        "best_answer_confidence": best_answer_confidence,
+        "degraded": degraded,
+        "verification_required": not safe_to_use_as_answer,
+        "trust_policy": policy_name,
         "reason": reason,
     }
 
@@ -3125,7 +3276,7 @@ def _task_localization_next_actions(
         "If the top candidate is a symbol, inspect its defining file and callers/callees before editing or concluding.",
     ]
     if not trust_policy.get("safe_to_use_as_answer"):
-        actions.append("Treat answer[] as navigation only until manually verified.")
+        actions.append("Follow verification_steps before using answer[] as final evidence.")
     if ambiguous_items:
         actions.append("Review ambiguous[] before relying on low-confidence candidates.")
     if degraded_reasons:
@@ -3256,7 +3407,205 @@ def _compact_task_expansion(expansion: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _compact_candidate_item(item: dict[str, Any]) -> dict[str, Any]:
+def _task_localization_public_answer_items(
+    items: list[dict[str, Any]], *, detail: str, max_items: int
+) -> list[dict[str, Any]]:
+    if detail == "full":
+        return items
+    visible_items = items[:max_items] if max_items > 0 else items
+    max_line_refs = 3 if detail == "standard" else 2
+    max_top_symbols = 3 if detail == "standard" else 2
+    return [
+        _compact_candidate_item(
+            item,
+            max_line_refs=max_line_refs,
+            max_top_symbols=max_top_symbols,
+            include_chains=True,
+        )
+        for item in visible_items
+    ]
+
+
+def _task_localization_evidence_payload(
+    *,
+    detail: str,
+    answer_items: list[dict[str, Any]],
+    navigation_hints: list[dict[str, Any]],
+    excluded_items: list[dict[str, Any]],
+    symbol_matches: list[dict[str, Any]],
+    text_items: list[dict[str, Any]],
+    callsite_expansions: dict[str, Any],
+    filesystem_items: list[dict[str, Any]],
+    anchors: Any,
+    scope_result: dict[str, Any],
+    next_result: dict[str, Any],
+    max_symbols: int,
+    max_files: int,
+    max_anchors: int,
+    max_areas: int,
+    max_next_items: int,
+    max_answer_items: int,
+    expansions: dict[str, Any],
+) -> dict[str, Any]:
+    visible_answer_items = answer_items[:max_answer_items] if max_answer_items > 0 else answer_items
+    base: dict[str, Any] = {
+        "detail": detail,
+        "answer_count": len(answer_items),
+        "visible_answer_count": len(visible_answer_items),
+        "navigation_hint_count": len(navigation_hints),
+        "excluded_count": len(excluded_items),
+        "top_answer_targets": [
+            {
+                "kind": item.get("kind"),
+                "target": item.get("target"),
+                "path": item.get("path"),
+                "confidence": item.get("confidence"),
+                "evidence_source": (
+                    item.get("evidence", {}).get("source")
+                    if isinstance(item.get("evidence"), dict)
+                    else None
+                ),
+            }
+            for item in visible_answer_items[:max_files]
+        ],
+        "candidate_source_counts": {
+            "symbol_matches": len(symbol_matches),
+            "source_text_candidates": len(text_items),
+            "callsite_expansions": len(callsite_expansions),
+            "filesystem_candidates": len(filesystem_items),
+            "anchors": len(_dict_items(anchors)),
+        },
+    }
+    if detail == "compact":
+        return base
+
+    base.update(
+        {
+            "symbol_matches": _ranked_symbol_matches(symbol_matches)[:max_symbols],
+            "source_text_candidates": [
+                _compact_candidate_item(item, max_line_refs=2, max_top_symbols=2)
+                for item in text_items[:max_files]
+            ],
+            "filesystem_candidates": filesystem_items[:max_files],
+            "anchors": _dict_items(anchors)[:max_anchors],
+            "scope": {
+                "navigation_order": _string_items(
+                    scope_result.get("navigation_order", [])
+                ),
+                "in_scope_files": _scope_values(
+                    scope_result.get("in_scope_files", [])
+                )[:max_files],
+                "in_scope_symbols": _scope_values(
+                    scope_result.get("in_scope_symbols", [])
+                )[:max_symbols],
+                "in_scope_areas": _scope_values(
+                    scope_result.get("in_scope_areas", [])
+                )[:max_areas],
+                "risks": _string_items(scope_result.get("risks", [])),
+            },
+            "next_items": _dict_items(next_result.get("items", []))[:max_next_items],
+            "expansions": expansions,
+        }
+    )
+    if detail == "full":
+        base["callsite_expansions"] = callsite_expansions
+    else:
+        base["callsite_expansion_summary"] = {
+            key: {
+                "caller_count": value.get("caller_count"),
+                "symbol": value.get("symbol"),
+            }
+            for key, value in list(callsite_expansions.items())[:max_symbols]
+            if isinstance(value, dict)
+        }
+    return base
+
+
+def _task_localization_verification_steps(
+    *,
+    answer_items: list[dict[str, Any]],
+    navigation_hints: list[dict[str, Any]],
+    repo_path: Path,
+    max_items: int,
+) -> list[dict[str, Any]]:
+    steps: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int | None]] = set()
+
+    def add_step(step: dict[str, Any]) -> None:
+        target = str(step.get("target") or step.get("path") or "").strip()
+        line = step.get("line") if isinstance(step.get("line"), int) else None
+        key = (str(step.get("action") or ""), target, line)
+        if not target or key in seen or len(steps) >= max_items:
+            return
+        seen.add(key)
+        steps.append(step)
+
+    for item in [*answer_items, *navigation_hints]:
+        if len(steps) >= max_items:
+            break
+        path = item.get("path")
+        if not isinstance(path, str) or not path.strip():
+            continue
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
+        line_refs = _dict_items(evidence.get("line_refs"))
+        if line_refs:
+            line = line_refs[0].get("line")
+            if isinstance(line, int):
+                start = max(1, line - 30)
+                end = line + 30
+                add_step(
+                    {
+                        "action": "read_source_window",
+                        "target": path,
+                        "path": path,
+                        "line": line,
+                        "command": (
+                            f"cd {shlex.quote(str(repo_path))} && "
+                            f"sed -n '{start},{end}p' {shlex.quote(path)}"
+                        ),
+                        "reason": "Verify the strongest source line before trusting this candidate.",
+                    }
+                )
+                continue
+        symbols = evidence.get("symbols")
+        if isinstance(symbols, list) and symbols:
+            symbol = str(symbols[0]).strip()
+            if symbol:
+                add_step(
+                    {
+                        "action": "search_symbol_in_candidate",
+                        "target": symbol,
+                        "path": path,
+                        "command": (
+                            f"cd {shlex.quote(str(repo_path))} && "
+                            f"rg -n {shlex.quote(symbol)} {shlex.quote(path)}"
+                        ),
+                        "reason": "Verify that the candidate participates in the suspected call chain.",
+                    }
+                )
+                continue
+        add_step(
+            {
+                "action": "read_candidate_file",
+                "target": path,
+                "path": path,
+                "command": (
+                    f"cd {shlex.quote(str(repo_path))} && "
+                    f"sed -n '1,220p' {shlex.quote(path)}"
+                ),
+                "reason": "Inspect this ranked candidate before broad repository search.",
+            }
+        )
+    return steps
+
+
+def _compact_candidate_item(
+    item: dict[str, Any],
+    *,
+    max_line_refs: int = 2,
+    max_top_symbols: int = 2,
+    include_chains: bool = False,
+) -> dict[str, Any]:
     evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
     compact: dict[str, Any] = {
         "kind": item.get("kind"),
@@ -3269,20 +3618,79 @@ def _compact_candidate_item(item: dict[str, Any]) -> dict[str, Any]:
     if item.get("role"):
         compact["role"] = item.get("role")
     if evidence:
-        compact["evidence"] = {
-            key: evidence.get(key)
-            for key in (
-                "source",
-                "matched_terms",
-                "hit_count",
-                "line_refs",
-                "symbols",
-                "top_symbols",
-                "score",
+        compact_evidence: dict[str, Any] = {}
+        passthrough_keys = (
+            "source",
+            "matched_terms",
+            "hit_count",
+            "symbols",
+            "score",
+            "query",
+            "symbol_name",
+            "symbol_kind",
+            "anchor_kind",
+            "expansion",
+            "display",
+            "relation",
+            "graph_kind",
+        )
+        for key in passthrough_keys:
+            if key in evidence:
+                compact_evidence[key] = evidence.get(key)
+        if "line_refs" in evidence:
+            compact_evidence["line_refs"] = _compact_line_refs(
+                evidence.get("line_refs"), max_items=max_line_refs
             )
-            if key in evidence
+        if "top_symbols" in evidence:
+            compact_evidence["top_symbols"] = _dict_items(
+                evidence.get("top_symbols")
+            )[:max_top_symbols]
+        if include_chains and "chains" in evidence:
+            compact_evidence["chains"] = _dict_items(evidence.get("chains"))[:2]
+        compact["evidence"] = {
+            key: value
+            for key, value in compact_evidence.items()
+            if value not in (None, [], {})
         }
     return compact
+
+
+def _adapter_candidate_item(item: dict[str, Any], *, detail: str) -> dict[str, Any]:
+    if detail != "compact":
+        return _compact_candidate_item(item)
+    compact = {
+        "kind": item.get("kind"),
+        "target": item.get("target"),
+        "path": item.get("path"),
+        "status": item.get("status"),
+        "confidence": item.get("confidence"),
+        "reason": item.get("reason"),
+    }
+    return {
+        key: value
+        for key, value in compact.items()
+        if value not in (None, [], {})
+    }
+
+
+def _compact_line_refs(raw_refs: Any, *, max_items: int) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for item in _dict_items(raw_refs)[:max_items]:
+        compact = {
+            "line": item.get("line"),
+            "text": item.get("text"),
+            "matched_terms": item.get("matched_terms"),
+            "enclosing_symbol": item.get("enclosing_symbol"),
+            "score": item.get("score"),
+        }
+        refs.append(
+            {
+                key: value
+                for key, value in compact.items()
+                if value not in (None, [], {})
+            }
+        )
+    return refs
 
 
 def _anchor_target(anchor: dict[str, Any]) -> str:
@@ -3608,20 +4016,6 @@ def _text_candidate_score(
     line_refs: list[dict[str, Any]],
     top_symbol_score: int,
 ) -> int:
-    weighted_terms = {
-        "watchlist": 24,
-        "watchlisted": 24,
-        "watched": 20,
-        "notification": 20,
-        "notify": 18,
-        "diff": 18,
-        "difference": 18,
-        "revision": 16,
-        "revisions": 16,
-        "oldid": 18,
-        "deprecated": 16,
-        "deprecation": 16,
-    }
     top_line_score = sum(int(item.get("score") or 0) for item in line_refs[:3])
     top_line_terms = {
         term
@@ -3638,6 +4032,12 @@ def _text_candidate_score(
         score += 8
     if _path_looks_like_test(rel_path):
         score -= 120
+    if _path_looks_like_reference_only(rel_path):
+        score -= 180
+        if {"doc", "docs", "documentation", "readme", "release", "deprecation"} & {
+            term.lower() for term in matched_terms
+        }:
+            score += 80
     if hit_count > 200:
         score -= min(80, (hit_count - 200) // 8)
     if rel_path in {"autoload.php", "includes/MainConfigSchema.php"}:
@@ -3680,7 +4080,11 @@ def _text_candidate_confidence(
 def _source_candidate_role(rel_path: str, matched_terms: set[str]) -> str:
     lowered_path = rel_path.lower()
     lowered_terms = {term.lower() for term in matched_terms}
-    if "release" in lowered_path or "deprecat" in lowered_terms:
+    if (
+        "release" in lowered_path
+        or "deprecat" in lowered_terms
+        or _path_looks_like_reference_only(rel_path)
+    ):
         return "docs"
     if {"diff", "difference", "view", "viewing"} & lowered_terms:
         return "entrypoint"
@@ -3793,6 +4197,18 @@ def _path_looks_like_test(rel_path: str) -> bool:
         or "/test/" in lowered
         or "/tests/" in lowered
         or "test" in Path(lowered).name
+    )
+
+
+def _path_looks_like_reference_only(rel_path: str) -> bool:
+    lowered = rel_path.lower()
+    suffix = Path(lowered).suffix
+    return (
+        suffix in {".md", ".rst", ".txt"}
+        or lowered.startswith(("doc/", "docs/", "documentation/"))
+        or "/doc/" in lowered
+        or "/docs/" in lowered
+        or "/documentation/" in lowered
     )
 
 
@@ -4468,6 +4884,17 @@ def _overall_confidence(items: list[dict[str, Any]]) -> float | None:
     if not values:
         return None
     return round(min(values), 4)
+
+
+def _best_confidence(items: list[dict[str, Any]]) -> float | None:
+    values = [
+        confidence
+        for item in items
+        if (confidence := _confidence_value(item.get("confidence"))) is not None
+    ]
+    if not values:
+        return None
+    return round(max(values), 4)
 
 
 def _confidence_summary_for_items(items: list[dict[str, Any]]) -> dict[str, Any]:
