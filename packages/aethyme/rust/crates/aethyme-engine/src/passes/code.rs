@@ -176,14 +176,18 @@ pub fn build_with_profile(
 
     let calls_started = Instant::now();
     for parsed in &parsed_files {
-        let resolved_imports = resolved_imports_by_file
+        // Borrow Vec contents as slices instead of `.cloned().unwrap_or_default()`
+        // — the helpers below all take `&[T]` so the clone was pure waste.
+        // dhat baseline showed PPs 6/7 (~700 MB combined) came from cloning
+        // `Vec<Edge>` here per-file across 4093 MediaWiki files.
+        let resolved_imports: &[Edge] = resolved_imports_by_file
             .get(&parsed.file.id)
-            .cloned()
-            .unwrap_or_default();
-        let current_function_indexes = file_function_indexes
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let current_function_indexes: &[usize] = file_function_indexes
             .get(&parsed.file.id)
-            .cloned()
-            .unwrap_or_default();
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let contents = fs::read_to_string(root.join(&parsed.file.path)).unwrap_or_default();
         let imported_symbol_names =
             imported_symbol_names_for_language(&parsed.language, &contents, &mut interner);
@@ -191,7 +195,7 @@ pub fn build_with_profile(
             imported_symbol_aliases_for_language(&parsed.language, &contents, &mut interner);
         let analyses = analyze_file_functions_with_contents(
             &contents,
-            &current_function_indexes,
+            current_function_indexes,
             &functions,
             &mut interner,
         );
@@ -199,7 +203,7 @@ pub fn build_with_profile(
             &analyses,
             &functions,
             &indexes,
-            &resolved_imports,
+            resolved_imports,
             &imported_symbol_names,
             &imported_symbol_aliases,
         ));
@@ -208,18 +212,19 @@ pub fn build_with_profile(
 
     let refs_started = Instant::now();
     for parsed in &parsed_files {
-        let resolved_imports = resolved_imports_by_file
+        // Same fix as the resolve_calls loop above — borrow as slices, do not clone.
+        let resolved_imports: &[Edge] = resolved_imports_by_file
             .get(&parsed.file.id)
-            .cloned()
-            .unwrap_or_default();
-        let current_function_indexes = file_function_indexes
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let current_function_indexes: &[usize] = file_function_indexes
             .get(&parsed.file.id)
-            .cloned()
-            .unwrap_or_default();
-        let current_class_indexes = file_class_indexes
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let current_class_indexes: &[usize] = file_class_indexes
             .get(&parsed.file.id)
-            .cloned()
-            .unwrap_or_default();
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let contents = fs::read_to_string(root.join(&parsed.file.path)).unwrap_or_default();
         let imported_symbol_names =
             imported_symbol_names_for_language(&parsed.language, &contents, &mut interner);
@@ -227,17 +232,17 @@ pub fn build_with_profile(
             imported_symbol_aliases_for_language(&parsed.language, &contents, &mut interner);
         let analyses = analyze_file_functions_with_contents(
             &contents,
-            &current_function_indexes,
+            current_function_indexes,
             &functions,
             &mut interner,
         );
         edges.extend(resolve_references(
             &analyses,
-            &current_class_indexes,
+            current_class_indexes,
             &functions,
             &classes,
             &indexes,
-            &resolved_imports,
+            resolved_imports,
             &imported_symbol_names,
             &imported_symbol_aliases,
             &interner,
