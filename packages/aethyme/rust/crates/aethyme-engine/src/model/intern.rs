@@ -1,7 +1,7 @@
-//! Deduplicating `Arc<str>` factory.
+//! Deduplicating `Arc<str>` factory plus an `InternedStr` newtype wrapper.
 //!
 //! Used by Phase 2 of the build-memory work: entity types (Symbol,
-//! FunctionNode, Edge, …) hold `Arc<str>` for their string fields so that
+//! FunctionNode, Edge, …) hold `InternedStr` for their string fields so that
 //! cloning becomes a refcount increment instead of a heap allocation.
 //! `ArcInterner::intern` ensures that the same logical string lives in
 //! exactly one heap allocation, no matter how many times it appears.
@@ -10,7 +10,9 @@
 //! context. Wrap with a Mutex/sharded structure if you need concurrent
 //! interning across rayon threads.
 
+use std::borrow::Borrow;
 use std::collections::HashSet;
+use std::ops::Deref;
 use std::sync::Arc;
 
 /// Deduplicates `&str` inputs into shared `Arc<str>` outputs. Within one
@@ -72,6 +74,145 @@ pub mod arc_str {
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Arc<str>, D::Error> {
         let s = String::deserialize(de)?;
         Ok(Arc::from(s.as_str()))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// InternedStr — newtype wrapper over Arc<str> with the PartialEq impls,
+// Display, Hash, Borrow<str>, and From conversions that make it a true
+// drop-in replacement for `String` in entity types. Cloning is an atomic
+// refcount increment.
+//
+// Defined here (not a separate module) because every consumer that uses
+// `ArcInterner` will also want `InternedStr`.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InternedStr(Arc<str>);
+
+impl InternedStr {
+    pub fn new(s: impl Into<Arc<str>>) -> Self {
+        Self(s.into())
+    }
+
+    /// Borrow the underlying `Arc<str>` (e.g. to share with another
+    /// `InternedStr` or to push into a HashMap keyed on `Arc<str>`).
+    pub fn as_arc(&self) -> &Arc<str> {
+        &self.0
+    }
+
+    pub fn into_arc(self) -> Arc<str> {
+        self.0
+    }
+}
+
+impl Deref for InternedStr {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for InternedStr {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Borrow<str> for InternedStr {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for InternedStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&*self.0, f)
+    }
+}
+
+// ── PartialEq with str-shaped types in BOTH directions ──────────────────
+impl PartialEq<str> for InternedStr {
+    fn eq(&self, other: &str) -> bool {
+        &**self == other
+    }
+}
+impl PartialEq<&str> for InternedStr {
+    fn eq(&self, other: &&str) -> bool {
+        &**self == *other
+    }
+}
+impl PartialEq<String> for InternedStr {
+    fn eq(&self, other: &String) -> bool {
+        &**self == other.as_str()
+    }
+}
+impl PartialEq<InternedStr> for str {
+    fn eq(&self, other: &InternedStr) -> bool {
+        self == &**other
+    }
+}
+impl PartialEq<InternedStr> for &str {
+    fn eq(&self, other: &InternedStr) -> bool {
+        *self == &**other
+    }
+}
+impl PartialEq<InternedStr> for String {
+    fn eq(&self, other: &InternedStr) -> bool {
+        self.as_str() == &**other
+    }
+}
+
+// ── From conversions (covers all common construction sites) ─────────────
+impl From<&str> for InternedStr {
+    fn from(s: &str) -> Self {
+        Self(Arc::from(s))
+    }
+}
+impl From<String> for InternedStr {
+    fn from(s: String) -> Self {
+        Self(Arc::from(s.as_str()))
+    }
+}
+impl From<&String> for InternedStr {
+    fn from(s: &String) -> Self {
+        Self(Arc::from(s.as_str()))
+    }
+}
+impl From<Arc<str>> for InternedStr {
+    fn from(s: Arc<str>) -> Self {
+        Self(s)
+    }
+}
+impl From<&Arc<str>> for InternedStr {
+    fn from(s: &Arc<str>) -> Self {
+        Self(Arc::clone(s))
+    }
+}
+impl From<&InternedStr> for InternedStr {
+    fn from(s: &InternedStr) -> Self {
+        s.clone()
+    }
+}
+
+// ── Serde — transparent string serialization ────────────────────────────
+impl serde::Serialize for InternedStr {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for InternedStr {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        Ok(Self(Arc::from(s.as_str())))
+    }
+}
+
+// `ArcInterner` can return `InternedStr` directly when desired.
+impl ArcInterner {
+    pub fn intern_to(&mut self, value: &str) -> InternedStr {
+        InternedStr::from(self.intern(value))
     }
 }
 
@@ -155,6 +296,62 @@ mod tests {
         assert_eq!(json, "\"payload\"");
         let back: Wrap = serde_json::from_str(&json).unwrap();
         assert_eq!(back, original);
+    }
+
+    #[test]
+    fn interned_str_partial_eq_against_all_str_shapes() {
+        let s = InternedStr::from("hello");
+        // &str
+        assert_eq!(s, "hello");
+        // String
+        assert_eq!(s, String::from("hello"));
+        // Reverse direction (matters for `find(|x| "literal" == x.id)`)
+        assert_eq!("hello", s);
+        assert_eq!(String::from("hello"), s);
+        // Inequality
+        assert_ne!(s, "world");
+    }
+
+    #[test]
+    fn interned_str_clone_shares_heap_buffer() {
+        let a = InternedStr::from("share me");
+        let b = a.clone();
+        assert!(Arc::ptr_eq(a.as_arc(), b.as_arc()));
+    }
+
+    #[test]
+    fn interned_str_display_and_deref() {
+        let s = InternedStr::from("payload");
+        assert_eq!(format!("{}", s), "payload");
+        assert_eq!(&*s, "payload");
+        assert_eq!(s.len(), 7); // via Deref<Target=str>
+    }
+
+    #[test]
+    fn interned_str_serde_roundtrip() {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Wrap {
+            name: InternedStr,
+        }
+
+        let original = Wrap {
+            name: InternedStr::from("payload"),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert_eq!(json, r#"{"name":"payload"}"#);
+        let back: Wrap = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn arc_interner_intern_to_returns_interned_str() {
+        let mut interner = ArcInterner::new();
+        let a = interner.intern_to("dup");
+        let b = interner.intern_to("dup");
+        // Same heap buffer, even though they're separate InternedStr values.
+        assert!(Arc::ptr_eq(a.as_arc(), b.as_arc()));
     }
 
     #[test]
