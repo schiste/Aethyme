@@ -186,7 +186,7 @@ pub fn build_with_profile(
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let current_function_indexes: &[usize] = file_function_indexes
-            .get(&parsed.file.id)
+            .get(parsed.file.id.as_str())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let contents = fs::read_to_string(root.join(&parsed.file.path)).unwrap_or_default();
@@ -219,11 +219,11 @@ pub fn build_with_profile(
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let current_function_indexes: &[usize] = file_function_indexes
-            .get(&parsed.file.id)
+            .get(parsed.file.id.as_str())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let current_class_indexes: &[usize] = file_class_indexes
-            .get(&parsed.file.id)
+            .get(parsed.file.id.as_str())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let contents = fs::read_to_string(root.join(&parsed.file.path)).unwrap_or_default();
@@ -345,46 +345,56 @@ fn normalize_symbols(
     let mut edges = Vec::new();
 
     for parsed in parsed_files {
+        // Per-file Arc dedup: convert each context string ONCE per file, then
+        // share via cheap Arc::clone for every symbol. Without this, every
+        // FunctionNode/ClassNode allocates fresh heap buffers for the same
+        // file_id/file_path/language strings.
+        let file_id_str = InternedStr::from(parsed.file.id.as_str());
+        let file_path_str = InternedStr::from(parsed.file.path.as_str());
+        let language_str = InternedStr::from(parsed.language.as_str());
+        let area_id_str: Option<InternedStr> =
+            parsed.file.area_id.as_deref().map(InternedStr::from);
+
         for symbol in &parsed.symbols {
             match symbol.kind {
                 SymbolKind::Class => {
                     let class = ClassNode::new(
                         &structure.repo_name,
-                        &parsed.file.id,
-                        &parsed.file.path,
-                        parsed.file.area_id.clone(),
-                        &parsed.language,
-                        &symbol.name,
+                        file_id_str.clone(),
+                        file_path_str.clone(),
+                        area_id_str.clone(),
+                        language_str.clone(),
+                        symbol.name.clone(),
                         symbol.line,
-                        &symbol.signature,
+                        symbol.signature.clone(),
                     );
                     edges.push(Edge::new(
-                        &parsed.file.id,
-                        &class.id,
+                        file_id_str.as_str(),
+                        class.id.as_str(),
                         EdgeKind::Defines,
                         1000,
-                        &parsed.language,
+                        language_str.as_str(),
                     ));
                     classes.push(class);
                 }
                 SymbolKind::Function => {
                     let function = FunctionNode::new(
                         &structure.repo_name,
-                        &parsed.file.id,
-                        &parsed.file.path,
-                        parsed.file.area_id.clone(),
+                        file_id_str.clone(),
+                        file_path_str.clone(),
+                        area_id_str.clone(),
                         None,
-                        &parsed.language,
-                        &symbol.name,
+                        language_str.clone(),
+                        symbol.name.clone(),
                         symbol.line,
-                        &symbol.signature,
+                        symbol.signature.clone(),
                     );
                     edges.push(Edge::new(
-                        &parsed.file.id,
-                        &function.id,
+                        file_id_str.as_str(),
+                        function.id.as_str(),
                         EdgeKind::Defines,
                         1000,
-                        &parsed.language,
+                        language_str.as_str(),
                     ));
                     functions.push(function);
                 }
@@ -440,7 +450,9 @@ fn intern_file_id(
     id
 }
 
-fn build_file_function_index_map(functions: &[FunctionNode]) -> HashMap<String, Vec<usize>> {
+fn build_file_function_index_map(
+    functions: &[FunctionNode],
+) -> HashMap<InternedStr, Vec<usize>> {
     let mut map = HashMap::new();
     for (index, function) in functions.iter().enumerate() {
         map.entry(function.file_id.clone())
@@ -453,7 +465,7 @@ fn build_file_function_index_map(functions: &[FunctionNode]) -> HashMap<String, 
     map
 }
 
-fn build_file_class_index_map(classes: &[ClassNode]) -> HashMap<String, Vec<usize>> {
+fn build_file_class_index_map(classes: &[ClassNode]) -> HashMap<InternedStr, Vec<usize>> {
     let mut map = HashMap::new();
     for (index, class) in classes.iter().enumerate() {
         map.entry(class.file_id.clone())
@@ -571,7 +583,7 @@ fn resolve_cross_file_calls(
                 continue;
             }
 
-            let target_file_id = indexes.file_ids.get(&target.file_id).copied();
+            let target_file_id = indexes.file_ids.get(target.file_id.as_str()).copied();
             let directly_imported = imported_symbol_names.contains(&token)
                 || imported_symbol_aliases.contains_key(&token);
             let imported_file =
@@ -621,7 +633,7 @@ fn resolve_references(
         HashMap::<InternId, Vec<usize>>::new(),
         |mut acc, class_index| {
             let class = &classes[class_index];
-            if let Some(class_name_id) = interner.ids.get(&class.name).copied() {
+            if let Some(class_name_id) = interner.ids.get(class.name.as_str()).copied() {
                 acc.entry(class_name_id).or_default().push(class_index);
             }
             acc
@@ -656,7 +668,7 @@ fn resolve_references(
                     if class.file_id == function.file_id {
                         continue;
                     }
-                    let target_file_id = indexes.file_ids.get(&class.file_id).copied();
+                    let target_file_id = indexes.file_ids.get(class.file_id.as_str()).copied();
                     let imported_file =
                         target_file_id.is_some_and(|file_id| imported_targets.contains(&file_id));
                     let directly_imported = imported_symbol_names.contains(token)
@@ -687,7 +699,7 @@ fn resolve_references(
                         continue;
                     }
 
-                    let target_file_id = indexes.file_ids.get(&target.file_id).copied();
+                    let target_file_id = indexes.file_ids.get(target.file_id.as_str()).copied();
                     let imported_file =
                         target_file_id.is_some_and(|file_id| imported_targets.contains(&file_id));
                     let directly_imported = imported_symbol_names.contains(token)

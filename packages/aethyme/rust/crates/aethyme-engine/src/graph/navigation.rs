@@ -457,8 +457,9 @@ fn repo_navigation_seed(map: &RepositoryMap) -> Vec<String> {
         .iter()
         .filter(|function| function.name == "main")
     {
-        if !seed.contains(&function.file_path) {
-            seed.push(function.file_path.clone());
+        let file_path_str = function.file_path.as_str();
+        if !seed.iter().any(|s| s == file_path_str) {
+            seed.push(function.file_path.to_string());
         }
     }
     for config in &map.configs {
@@ -640,7 +641,7 @@ fn direct_change_relations(map: &RepositoryMap, target: &str) -> [GraphRelationV
 fn change_display_for_relation_item(map: &RepositoryMap, item: GraphRelationItem) -> String {
     if item.kind == "function" {
         if let Some(function) = map.functions.iter().find(|function| function.id == item.id) {
-            return function.file_path.clone();
+            return function.file_path.to_string();
         }
     }
     item.display
@@ -657,7 +658,7 @@ fn scoped_change_symbols(
             .functions
             .iter()
             .filter(|function| function.file_path == file.value)
-            .map(|function| function.qualified_name.clone())
+            .map(|function| function.qualified_name.to_string())
             .collect::<Vec<_>>();
         file_symbols.sort();
         for qualified_name in file_symbols.into_iter().take(8) {

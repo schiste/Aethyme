@@ -44,16 +44,22 @@ impl MapIndex {
             display_by_id.insert(file.id.clone(), file.path.clone());
         }
         for function in &map.functions {
-            area_id_by_id.insert(function.id.clone(), function.area_id.clone());
+            area_id_by_id.insert(
+                function.id.to_string(),
+                function.area_id.as_deref().map(String::from),
+            );
             display_by_id.insert(
-                function.id.clone(),
+                function.id.to_string(),
                 format!("{}::{}", function.file_path, function.name),
             );
         }
         for class in &map.classes {
-            area_id_by_id.insert(class.id.clone(), class.area_id.clone());
+            area_id_by_id.insert(
+                class.id.to_string(),
+                class.area_id.as_deref().map(String::from),
+            );
             display_by_id.insert(
-                class.id.clone(),
+                class.id.to_string(),
                 format!("{}::{}", class.file_path, class.name),
             );
         }
@@ -447,7 +453,7 @@ impl RepositoryMap {
                 || class.name.eq_ignore_ascii_case(target)
                 || class.qualified_name.eq_ignore_ascii_case(target)
             {
-                push_unique(&mut matches, class.id.clone());
+                push_unique(&mut matches, class.id.to_string());
             }
         }
         for function in &self.functions {
@@ -455,7 +461,7 @@ impl RepositoryMap {
                 || function.name.eq_ignore_ascii_case(target)
                 || function.qualified_name.eq_ignore_ascii_case(target)
             {
-                push_unique(&mut matches, function.id.clone());
+                push_unique(&mut matches, function.id.to_string());
             }
         }
         for doc in &self.docs {
@@ -590,11 +596,11 @@ fn build_graph_with_profile(map: &RepositoryMap) -> (NormalizedGraph, GraphBuild
     }
     for class in &map.classes {
         nodes.push(GraphNode {
-            id: class.id.clone(),
+            id: class.id.to_string(),
             kind: GraphNodeKind::Class,
-            label: class.name.clone(),
-            path: Some(class.file_path.clone()),
-            language: Some(class.language.clone()),
+            label: class.name.to_string(),
+            path: Some(class.file_path.to_string()),
+            language: Some(class.language.to_string()),
             confidence: 1000,
             source: "code".to_string(),
             metadata: std::collections::BTreeMap::new(),
@@ -602,11 +608,11 @@ fn build_graph_with_profile(map: &RepositoryMap) -> (NormalizedGraph, GraphBuild
     }
     for function in &map.functions {
         nodes.push(GraphNode {
-            id: function.id.clone(),
+            id: function.id.to_string(),
             kind: GraphNodeKind::Function,
-            label: function.name.clone(),
-            path: Some(function.file_path.clone()),
-            language: Some(function.language.clone()),
+            label: function.name.to_string(),
+            path: Some(function.file_path.to_string()),
+            language: Some(function.language.to_string()),
             confidence: 1000,
             source: "code".to_string(),
             metadata: std::collections::BTreeMap::new(),

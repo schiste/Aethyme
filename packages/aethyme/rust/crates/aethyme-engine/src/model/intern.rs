@@ -104,6 +104,13 @@ impl InternedStr {
     pub fn into_arc(self) -> Arc<str> {
         self.0
     }
+
+    /// Borrow as `&str`. Provided so consumers don't need to write `&*x` or
+    /// `x.as_ref()` — and so they don't accidentally hit the unstable
+    /// `str::as_str` method via Deref.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl Deref for InternedStr {
@@ -192,6 +199,20 @@ impl From<&Arc<str>> for InternedStr {
 impl From<&InternedStr> for InternedStr {
     fn from(s: &InternedStr) -> Self {
         s.clone()
+    }
+}
+
+// Boundary conversions for code that holds owned `String` (e.g. Anchor,
+// ScopeItem, FunctionFact). These allocate; prefer keeping data as
+// `InternedStr` end-to-end where possible.
+impl From<InternedStr> for String {
+    fn from(s: InternedStr) -> Self {
+        s.0.to_string()
+    }
+}
+impl From<&InternedStr> for String {
+    fn from(s: &InternedStr) -> Self {
+        s.0.to_string()
     }
 }
 

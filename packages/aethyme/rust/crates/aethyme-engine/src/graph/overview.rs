@@ -21,8 +21,9 @@ pub fn repo_overview_seed(map: &RepositoryMap) -> Vec<String> {
         .iter()
         .filter(|function| function.name == "main")
     {
-        if !seed.contains(&function.file_path) {
-            seed.push(function.file_path.clone());
+        let file_path_str = function.file_path.as_str();
+        if !seed.iter().any(|s| s == file_path_str) {
+            seed.push(function.file_path.to_string());
         }
     }
     for config in &map.configs {

@@ -1,38 +1,41 @@
+use crate::model::intern::InternedStr;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ClassNode {
-    pub id: String,
-    pub name: String,
-    pub qualified_name: String,
-    pub file_id: String,
-    pub file_path: String,
-    pub area_id: Option<String>,
-    pub language: String,
+    pub id: InternedStr,
+    pub name: InternedStr,
+    pub qualified_name: InternedStr,
+    pub file_id: InternedStr,
+    pub file_path: InternedStr,
+    pub area_id: Option<InternedStr>,
+    pub language: InternedStr,
     pub line: usize,
-    pub signature: String,
+    pub signature: InternedStr,
 }
 
 impl ClassNode {
     pub fn new(
         repo_name: &str,
-        file_id: &str,
-        file_path: &str,
-        area_id: Option<String>,
-        language: &str,
-        name: &str,
+        file_id: InternedStr,
+        file_path: InternedStr,
+        area_id: Option<InternedStr>,
+        language: InternedStr,
+        name: InternedStr,
         line: usize,
-        signature: &str,
+        signature: InternedStr,
     ) -> Self {
-        let qualified_name = format!("{file_path}::{name}");
+        let qualified_name = InternedStr::from(format!("{file_path}::{name}"));
+        let id = InternedStr::from(format!("class:{repo_name}:{file_path}:{name}"));
         Self {
-            id: format!("class:{repo_name}:{file_path}:{name}"),
-            name: name.to_string(),
+            id,
+            name,
             qualified_name,
-            file_id: file_id.to_string(),
-            file_path: file_path.to_string(),
+            file_id,
+            file_path,
             area_id,
-            language: language.to_string(),
+            language,
             line,
-            signature: signature.to_string(),
+            signature,
         }
     }
 }

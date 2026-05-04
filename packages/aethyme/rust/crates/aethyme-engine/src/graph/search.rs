@@ -18,10 +18,10 @@ pub fn symbol_search(map: &RepositoryMap, query: &str, limit: usize) -> Vec<Sear
     for class in &map.classes {
         if let Some(score) = score_name(&class.name, &lowered_query) {
             hits.push(SearchHit {
-                id: class.id.clone(),
-                name: class.name.clone(),
+                id: class.id.to_string(),
+                name: class.name.to_string(),
                 kind: "class".to_string(),
-                file: class.file_path.clone(),
+                file: class.file_path.to_string(),
                 line: class.line,
                 score,
                 reason: "class-name-match".to_string(),
@@ -32,10 +32,10 @@ pub fn symbol_search(map: &RepositoryMap, query: &str, limit: usize) -> Vec<Sear
     for function in &map.functions {
         if let Some(score) = score_name(&function.name, &lowered_query) {
             hits.push(SearchHit {
-                id: function.id.clone(),
-                name: function.name.clone(),
+                id: function.id.to_string(),
+                name: function.name.to_string(),
                 kind: "function".to_string(),
-                file: function.file_path.clone(),
+                file: function.file_path.to_string(),
                 line: function.line,
                 score,
                 reason: "function-name-match".to_string(),

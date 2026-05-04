@@ -21,15 +21,15 @@ pub fn public_function_facts(
                 map.classes
                     .iter()
                     .find(|class| &class.id == class_id)
-                    .map(|class| class.name.clone())
+                    .map(|class| class.name.to_string())
             });
             Some(FunctionFact {
-                id: function.id.clone(),
-                name: function.name.clone(),
-                qualified_name: function.qualified_name.clone(),
-                defined_in: function.file_path.clone(),
+                id: function.id.to_string(),
+                name: function.name.to_string(),
+                qualified_name: function.qualified_name.to_string(),
+                defined_in: function.file_path.to_string(),
                 line: function.line,
-                language: function.language.clone(),
+                language: function.language.to_string(),
                 parent_class,
                 exposure_kind,
             })
@@ -188,10 +188,10 @@ fn looks_like_method(function: &crate::model::function::FunctionNode) -> bool {
 
 fn source_code_path_for_id(map: &RepositoryMap, value: &str) -> Option<String> {
     if let Some(function) = map.functions.iter().find(|function| function.id == value) {
-        return Some(function.file_path.clone());
+        return Some(function.file_path.to_string());
     }
     if let Some(class) = map.classes.iter().find(|class| class.id == value) {
-        return Some(class.file_path.clone());
+        return Some(class.file_path.to_string());
     }
     if let Some(file) = map.files.iter().find(|file| file.id == value) {
         if matches!(file.role, FileRole::Source | FileRole::Test) {

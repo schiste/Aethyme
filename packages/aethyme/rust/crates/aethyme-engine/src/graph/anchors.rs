@@ -410,14 +410,14 @@ fn config_anchors(
                             || file
                                 .area_id
                                 .as_ref()
-                                .is_some_and(|area| matched_area_ids.contains(area)))
+                                .is_some_and(|area| matched_area_ids.iter().any(|a| a == area.as_str())))
                 }) || map.functions.iter().any(|function| {
                     function.id == edge.to
                         && (matched_area_ids.is_empty()
                             || function
                                 .area_id
                                 .as_ref()
-                                .is_some_and(|area| matched_area_ids.contains(area)))
+                                .is_some_and(|area| matched_area_ids.iter().any(|a| a == area.as_str())))
                 })
             })
         {

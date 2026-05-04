@@ -8,7 +8,7 @@ use crate::model::task::TaskKind;
 
 pub fn build_in_scope(map: &RepositoryMap, anchors: &[Anchor], max_files: usize) -> ScopeBoundary {
     let mut boundary = ScopeBoundary::default();
-    let mut files = Vec::new();
+    let mut files: Vec<String> = Vec::new();
     let primary_areas = primary_area_names(map, anchors);
     let primary_area_set: BTreeSet<String> = primary_areas.iter().cloned().collect();
 
@@ -17,7 +17,7 @@ pub fn build_in_scope(map: &RepositoryMap, anchors: &[Anchor], max_files: usize)
             AnchorKind::File | AnchorKind::Symbol => {
                 if let Some(file) = anchor
                     .file
-                    .as_ref()
+                    .as_deref()
                     .or_else(|| file_for_symbol(map, &anchor.id))
                 {
                     if !primary_area_set.is_empty()
@@ -25,8 +25,8 @@ pub fn build_in_scope(map: &RepositoryMap, anchors: &[Anchor], max_files: usize)
                     {
                         continue;
                     }
-                    if !files.contains(file) {
-                        files.push(file.clone());
+                    if !files.iter().any(|f| f == file) {
+                        files.push(file.to_string());
                     }
                 }
             }
@@ -121,7 +121,7 @@ pub fn build_out_of_scope(
             anchor
                 .file
                 .clone()
-                .or_else(|| file_for_symbol(map, &anchor.id).cloned())
+                .or_else(|| file_for_symbol(map, &anchor.id).map(String::from))
         })
         .collect();
 
@@ -192,7 +192,7 @@ pub fn build_out_of_scope_activated(
             anchor
                 .file
                 .clone()
-                .or_else(|| file_for_symbol(map, &anchor.id).cloned())
+                .or_else(|| file_for_symbol(map, &anchor.id).map(String::from))
         })
         .collect();
 
@@ -229,16 +229,16 @@ pub fn navigation_order(anchors: &[Anchor]) -> Vec<String> {
     order
 }
 
-fn file_for_symbol<'a>(map: &'a RepositoryMap, symbol_id: &str) -> Option<&'a String> {
+fn file_for_symbol<'a>(map: &'a RepositoryMap, symbol_id: &str) -> Option<&'a str> {
     map.functions
         .iter()
         .find(|function| function.id == symbol_id)
-        .map(|function| &function.file_path)
+        .map(|function| function.file_path.as_str())
         .or_else(|| {
             map.classes
                 .iter()
                 .find(|class| class.id == symbol_id)
-                .map(|class| &class.file_path)
+                .map(|class| class.file_path.as_str())
         })
 }
 
@@ -279,7 +279,7 @@ fn primary_area_names(map: &RepositoryMap, anchors: &[Anchor]) -> Vec<String> {
             AnchorKind::Symbol => {
                 if let Some(file) = anchor
                     .file
-                    .as_ref()
+                    .as_deref()
                     .or_else(|| file_for_symbol(map, &anchor.id))
                     && let Some(area) = file_area_name(map, file)
                     && !areas.contains(&area)
