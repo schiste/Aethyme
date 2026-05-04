@@ -2872,10 +2872,33 @@ def _run_eval_background(
                         f"[{cond_name}] Using output file ({len(full_output)} chars) "
                         f"in place of JSONL ({len(data.get('output', ''))} chars)"
                     )
+
+                # For structured eval types, the agent's deliverable is a JSON
+                # file it saved per the prompt instructions — `data["output"]`
+                # is the chat narrative from JSONL/tab terminal which the
+                # structured parser would (correctly) reject as not-valid-JSON.
+                # Read the file contents directly when present.
+                structured_input = data["output"]
+                if req.evalType in ("dead-code", "bug-fix-1"):
+                    snapshot_path = output_snapshot.get("path")
+                    if snapshot_path:
+                        try:
+                            structured_input = Path(snapshot_path).read_text(encoding="utf-8")
+                            log(
+                                f"[{cond_name}] Using structured-output file "
+                                f"({len(structured_input)} chars) for scoring"
+                            )
+                        except OSError as exc:
+                            log(
+                                f"[{cond_name}] Failed to read structured output "
+                                f"file {snapshot_path}: {exc}; falling back to "
+                                f"chat output"
+                            )
+
                 parsed_candidate = None
                 if req.evalType == "bug-fix-1":
                     parsed_candidate, assessment = _parse_and_score_bug_fix_1_output(
-                        data["output"],
+                        structured_input,
                         cost=data["cost"],
                         repo_path=repo_dir,
                     )
@@ -2886,7 +2909,7 @@ def _run_eval_background(
                     )
                 elif req.evalType == "dead-code":
                     parsed_candidate, assessment = _parse_and_score_dead_code_output(
-                        data["output"],
+                        structured_input,
                         cost=data["cost"],
                         target=req.target,
                         repo_path=repo_dir,
