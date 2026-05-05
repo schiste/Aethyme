@@ -5968,6 +5968,13 @@ def enhance_verify_command(repo_path: Path) -> None:
 
 def main() -> None:
     """Main entry point for CLI."""
+    # Lazy import + registration of the daemon group: defining it inline
+    # here would force the daemon module's signal/socket imports onto every
+    # one-shot CLI invocation, defeating the daemon's startup-cost story.
+    from src.daemon import daemon as _daemon_group
+
+    if "daemon" not in cli.commands:
+        cli.add_command(_daemon_group)
     cli(obj={})
 
 

@@ -9,6 +9,14 @@ license = "UNLICENSED"
 name = "aethyme_engine"
 path = "src/lib.rs"
 
+[[bin]]
+name = "aethyme-engine-cli"
+path = "src/bin/aethyme-engine-cli.rs"
+
+[[bin]]
+name = "aethyme"
+path = "src/bin/aethyme.rs"
+
 [dependencies]
 rayon = "1.10"
 sha2 = "0.10"
