@@ -255,7 +255,20 @@ fn run() -> Result<(), String> {
             let profile = has_flag(&args, "--profile");
             let mut profiler = StageProfiler::new("task-localize", profile);
 
-            let map = profiler.stage("map_build", || build_map(&repo, no_cache))?;
+            // Use build_with_profile so we can fold the internal per-stage
+            // timings (discover_repo, structure, code_parse_files, etc.) into
+            // our profiler output. `RepositoryMap::build` only returned the
+            // map, so previously we could only see total map_build time.
+            let (map, build_profile) = profiler.stage("map_build", || {
+                if no_cache {
+                    RepositoryMap::build_no_cache(&PathBuf::from(&repo))
+                } else {
+                    RepositoryMap::build_with_profile(&PathBuf::from(&repo))
+                }
+            })?;
+            if profile {
+                profiler.attach_substages("map_build", &build_profile);
+            }
             let task = profiler
                 .stage_pure("task_parse", || TaskInput::from_task_text(&task_value));
             let anchors =
@@ -771,10 +784,15 @@ fn build_map(repo: &str, no_cache: bool) -> Result<RepositoryMap, String> {
 /// Output line example (only when `--profile` is set):
 ///   [profile] task-localize: map_build=12480ms task_parse=0ms anchors=210ms \
 ///             scope=830ms next=305ms json_render=12ms total=13837ms
+enum StageEntry {
+    Top { name: String, ms: u128 },
+    Sub { parent: String, name: String, ms: u128 },
+}
+
 struct StageProfiler {
     command: &'static str,
     enabled: bool,
-    stages: Vec<(&'static str, std::time::Duration)>,
+    stages: Vec<StageEntry>,
     started_at: std::time::Instant,
 }
 
@@ -797,7 +815,10 @@ impl StageProfiler {
         }
         let start = std::time::Instant::now();
         let out = f();
-        self.stages.push((name, start.elapsed()));
+        self.stages.push(StageEntry::Top {
+            name: name.to_string(),
+            ms: start.elapsed().as_millis(),
+        });
         out
     }
 
@@ -810,8 +831,32 @@ impl StageProfiler {
         }
         let start = std::time::Instant::now();
         let out = f();
-        self.stages.push((name, start.elapsed()));
+        self.stages.push(StageEntry::Top {
+            name: name.to_string(),
+            ms: start.elapsed().as_millis(),
+        });
         out
+    }
+
+    /// Fold an existing `RepositoryBuildProfile`'s per-stage timings into the
+    /// profiler output as substages of `parent`. Lets us see what's inside
+    /// the otherwise-opaque map_build phase without re-instrumenting the
+    /// build path.
+    fn attach_substages(
+        &mut self,
+        parent: &'static str,
+        build_profile: &aethyme_engine::map::RepositoryBuildProfile,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        for stage in &build_profile.stages {
+            self.stages.push(StageEntry::Sub {
+                parent: parent.to_string(),
+                name: stage.name.clone(),
+                ms: stage.duration_ms,
+            });
+        }
     }
 
     fn report(&self) {
@@ -819,17 +864,43 @@ impl StageProfiler {
             return;
         }
         let total = self.started_at.elapsed();
-        let mut line = format!("[profile] {}: ", self.command);
-        for (i, (name, dur)) in self.stages.iter().enumerate() {
-            if i > 0 {
-                line.push(' ');
+        let mut top_line = format!("[profile] {}: ", self.command);
+        let mut first_top = true;
+        let mut subs_by_parent: std::collections::BTreeMap<String, Vec<(String, u128)>> =
+            std::collections::BTreeMap::new();
+
+        for entry in &self.stages {
+            match entry {
+                StageEntry::Top { name, ms } => {
+                    if !first_top {
+                        top_line.push(' ');
+                    }
+                    first_top = false;
+                    top_line.push_str(name);
+                    top_line.push('=');
+                    top_line.push_str(&format!("{ms}ms"));
+                }
+                StageEntry::Sub { parent, name, ms } => {
+                    subs_by_parent
+                        .entry(parent.clone())
+                        .or_default()
+                        .push((name.clone(), *ms));
+                }
             }
-            line.push_str(name);
-            line.push('=');
-            line.push_str(&format!("{}ms", dur.as_millis()));
         }
-        line.push_str(&format!(" total={}ms", total.as_millis()));
-        eprintln!("{line}");
+        top_line.push_str(&format!(" total={}ms", total.as_millis()));
+        eprintln!("{top_line}");
+
+        for (parent, subs) in subs_by_parent {
+            let mut sub_line = format!("[profile]   {parent}.* :");
+            for (name, ms) in subs {
+                sub_line.push(' ');
+                sub_line.push_str(&name);
+                sub_line.push('=');
+                sub_line.push_str(&format!("{ms}ms"));
+            }
+            eprintln!("{sub_line}");
+        }
     }
 }
 
