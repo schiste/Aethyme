@@ -40,6 +40,18 @@ const ROTATE_EVERY_FILES: usize = 256;
 /// — important on adversarial inputs where one CacheEntry can be several MB.
 const ROTATE_EVERY_BYTES: usize = 16 * 1024 * 1024;
 
+/// Refuse to write a parse-cache entry larger than this. redb has a hard
+/// 3 GiB-per-value cap, but well before that limit a single entry is almost
+/// certainly noise — minified vendor bundles (swagger-ui, jquery, lodash)
+/// extracted as tens of thousands of pseudo-symbols by tree-sitter on
+/// machine-generated code. Skipping these keeps the cache useful for the
+/// rest of the repo and avoids a per-call retry storm where the insert
+/// fails, redb reports the error, and we re-attempt next call.
+///
+/// MediaWiki's `resources/lib/swagger-ui/swagger-ui-bundle.js` was producing
+/// a 3.8 GB serialized entry (3.6 GiB) before this guard was added.
+const SKIP_ENTRY_OVER_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+
 #[derive(Debug)]
 pub enum ParseStoreError {
     Io(std::io::Error),
@@ -236,6 +248,24 @@ impl<'db> BuildSession<'db> {
         let view = View { content_hash, symbols, import_edges };
         let bytes = bincode::serialize(&view)?;
         let written = bytes.len();
+
+        // Skip pathologically large entries instead of trying to insert and
+        // letting redb fail (redb's 3 GiB cap turns the failure into per-call
+        // retry overhead that compounded into ~40s of wasted work on
+        // MediaWiki). Returning Ok keeps the build path going; the file will
+        // simply re-parse next time, the same way an unrelated cache miss
+        // would.
+        if written > SKIP_ENTRY_OVER_BYTES {
+            eprintln!(
+                "aethyme: parse store skipping {} ({:.1} MB > {:.1} MB cap; \
+                 likely a generated bundle)",
+                file_path,
+                written as f64 / (1024.0 * 1024.0),
+                SKIP_ENTRY_OVER_BYTES as f64 / (1024.0 * 1024.0),
+            );
+            return Ok(());
+        }
+
         {
             let txn = self.txn.as_ref().expect("BuildSession invariant: txn present");
             let mut table = txn.open_table(PARSE_ENTRIES)?;
