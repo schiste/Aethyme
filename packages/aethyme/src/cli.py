@@ -1792,17 +1792,29 @@ def _task_localization_detail_defaults(detail: str) -> dict[str, Any]:
             "max_callsite_results": 5,
             "include_expansions": True,
         }
+    # Compact defaults — agent-first.
+    #
+    # max_answer_items used to be 12 here, larger than the union of
+    # max_files (5) + max_symbols (5) = 10. Lowering to 5 brings the cap
+    # into alignment with the sources that fill it and cuts the largest
+    # response field (`answer`, ~2.4k tokens at 12 items) roughly in half.
+    # Agents typically act on the top 1-3 candidates; readers asking for
+    # more should use `--detail standard` or `--detail full`.
+    #
+    # max_text_files lowered to 3 because filesystem-filename matches are
+    # the weakest evidence kind — only useful as `navigation_hints[]`,
+    # never authoritative `answer[]` items.
     return {
         "max_anchors": 3,
         "max_files": 5,
         "max_symbols": 5,
         "max_areas": 3,
         "max_next_items": 5,
-        "max_answer_items": 12,
+        "max_answer_items": 5,
         "max_expansions": 1,
         "max_symbol_queries": 5,
         "max_symbol_results": 4,
-        "max_text_files": 5,
+        "max_text_files": 3,
         "max_text_line_refs": 2,
         "max_callsite_symbols": 4,
         "max_callsite_results": 4,
