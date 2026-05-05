@@ -1,6 +1,6 @@
 use std::env;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -43,6 +43,7 @@ fn run() -> Result<(), String> {
     let no_cache = has_flag(&args, "--no-cache");
     let command = args.remove(0);
     match command.as_str() {
+        "daemon" => return run_daemon_subcommand(&args, no_cache),
         "inspect" => {
             let repo = read_option(&args, "--repo")?;
             let mode = read_option(&args, "--mode").unwrap_or_else(|_| "full".to_string());
@@ -762,6 +763,171 @@ fn read_options(args: &[String], flag: &str) -> Vec<String> {
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
+}
+
+// daemon subcommand — start/stop/status/serve. Dispatches to the library
+// in crate::daemon. Lifecycle helpers (fork via Command + setsid pre_exec,
+// pidfile management, kill via libc) live here because they're shell-tied
+// concerns rather than core engine concerns.
+
+fn run_daemon_subcommand(args: &[String], no_cache: bool) -> Result<(), String> {
+    if args.is_empty() {
+        return Err(
+            "usage: aethyme-engine-cli daemon <serve|start|stop|status> --repo <path>"
+                .to_string(),
+        );
+    }
+    let action = &args[0];
+    let repo_str = read_option(args, "--repo")?;
+    let repo = PathBuf::from(&repo_str);
+    if !repo.is_dir() {
+        return Err(format!("--repo path is not a directory: {repo_str}"));
+    }
+
+    match action.as_str() {
+        "serve" => daemon_serve_action(&repo, no_cache, args),
+        "start" => daemon_start_action(&repo, no_cache, args),
+        "stop" => daemon_stop_action(&repo),
+        "status" => daemon_status_action(&repo),
+        other => Err(format!("daemon: unknown action {other:?}")),
+    }
+}
+
+fn parse_daemon_idle_timeout(args: &[String]) -> Result<std::time::Duration, String> {
+    if let Ok(value) = read_option(args, "--idle-timeout") {
+        let secs: u64 = value
+            .trim()
+            .parse()
+            .map_err(|e| format!("--idle-timeout: {e}"))?;
+        return Ok(std::time::Duration::from_secs(secs));
+    }
+    Ok(std::time::Duration::from_secs(
+        aethyme_engine::daemon::DEFAULT_IDLE_TIMEOUT_SECONDS,
+    ))
+}
+
+fn daemon_serve_action(repo: &Path, no_cache: bool, args: &[String]) -> Result<(), String> {
+    let idle_timeout = parse_daemon_idle_timeout(args)?;
+    let config = aethyme_engine::daemon::DaemonConfig::new(repo.to_path_buf())
+        .with_idle_timeout(idle_timeout)
+        .with_no_cache(no_cache);
+    aethyme_engine::daemon::serve_forever(config)
+}
+
+fn daemon_start_action(repo: &Path, no_cache: bool, args: &[String]) -> Result<(), String> {
+    let pidfile = aethyme_engine::daemon::pidfile_path_for(repo);
+    if pidfile.exists() {
+        if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                let alive = unsafe { libc::kill(pid, 0) };
+                if alive == 0 {
+                    eprintln!("engine daemon already running (pid {pid})");
+                    return Ok(());
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&pidfile);
+    }
+
+    let aethyme_dir = repo.join(".aethyme");
+    std::fs::create_dir_all(&aethyme_dir).map_err(|e| format!("create .aethyme: {e}"))?;
+
+    let log_path = aethyme_engine::daemon::logfile_path_for(repo);
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("open logfile {}: {}", log_path.display(), e))?;
+    let log_stdout = log_file
+        .try_clone()
+        .map_err(|e| format!("clone log fd: {e}"))?;
+    let log_stderr = log_file
+        .try_clone()
+        .map_err(|e| format!("clone log fd: {e}"))?;
+
+    let self_path = std::env::current_exe()
+        .map_err(|e| format!("current_exe: {e}"))?;
+
+    let mut cmd = std::process::Command::new(&self_path);
+    if no_cache {
+        cmd.arg("--no-cache");
+    }
+    cmd.arg("daemon").arg("serve").arg("--repo").arg(repo);
+    if let Ok(idle) = read_option(args, "--idle-timeout") {
+        cmd.arg("--idle-timeout").arg(idle);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_stdout))
+        .stderr(std::process::Stdio::from(log_stderr));
+
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    let pid = child.id();
+    std::fs::write(&pidfile, pid.to_string()).map_err(|e| format!("write pidfile: {e}"))?;
+
+    eprintln!(
+        "engine daemon spawned (pid {pid}, log {})\n  building map will take ~70s on a 12K-file repo",
+        log_path.display()
+    );
+    Ok(())
+}
+
+fn daemon_stop_action(repo: &Path) -> Result<(), String> {
+    let pidfile = aethyme_engine::daemon::pidfile_path_for(repo);
+    let Ok(pid_str) = std::fs::read_to_string(&pidfile) else {
+        eprintln!("engine daemon: not running");
+        return Ok(());
+    };
+    let Ok(pid) = pid_str.trim().parse::<i32>() else {
+        let _ = std::fs::remove_file(&pidfile);
+        eprintln!("engine daemon: stale pidfile cleaned");
+        return Ok(());
+    };
+    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if result == 0 {
+        let _ = std::fs::remove_file(&pidfile);
+        eprintln!("engine daemon: SIGTERM sent to pid {pid}");
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            let _ = std::fs::remove_file(&pidfile);
+            eprintln!("engine daemon: pid {pid} already gone, pidfile cleaned");
+        } else {
+            return Err(format!("kill pid {pid}: {err}"));
+        }
+    }
+    Ok(())
+}
+
+fn daemon_status_action(repo: &Path) -> Result<(), String> {
+    let socket = aethyme_engine::daemon::socket_path_for(repo);
+    if !socket.exists() {
+        eprintln!("engine daemon: not running ({} does not exist)", socket.display());
+        std::process::exit(1);
+    }
+    match aethyme_engine::daemon::send_request(
+        &socket,
+        &serde_json::json!({"command":"ping"}),
+    ) {
+        Ok(response) => {
+            let trimmed = response.trim();
+            println!("engine daemon: {trimmed}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("engine daemon: socket exists but ping failed: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn build_map(repo: &str, no_cache: bool) -> Result<RepositoryMap, String> {
