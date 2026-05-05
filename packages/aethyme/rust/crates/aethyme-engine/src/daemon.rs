@@ -173,6 +173,17 @@ pub fn serve_forever(config: DaemonConfig) -> Result<(), String> {
         build_started.elapsed()
     );
 
+    // Pre-warm GraphSignals so the first task-localize call doesn't pay
+    // the ~17s parser_visibility O(F·E) sweep. Without this, call 1 is
+    // slow even though calls 2+ are fast — bad UX for any agent that
+    // makes only one or two queries before moving on.
+    let signals_started = Instant::now();
+    let _ = map.signals();
+    eprintln!(
+        "aethyme-engine-daemon: signals warm (took {:?})",
+        signals_started.elapsed()
+    );
+
     let state = Arc::new(Mutex::new(DaemonState {
         repo: config.repo.clone(),
         map,
