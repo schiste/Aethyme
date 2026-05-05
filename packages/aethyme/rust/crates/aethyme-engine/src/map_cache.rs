@@ -7,6 +7,27 @@ use crate::map::RepositoryMap;
 
 const MAP_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-map-v2-treesitter");
 
+/// Skip the map cache (both load and save) when its serialized size would
+/// exceed this threshold. bincode deserialization is O(size) and dominated by
+/// allocating + populating the nested struct tree; on MediaWiki the cache
+/// reached 8.2 GB and took 118-130 seconds to load — slower than rebuilding
+/// from scratch (~71s with parse_store.redb warm). For repos under the
+/// threshold the cache stays a real win (sub-second loads vs multi-second
+/// rebuilds on small repos).
+///
+/// Override with `AETHYME_MAP_CACHE_MAX_MB`; set to 0 to disable the cache
+/// entirely.
+const DEFAULT_MAP_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+
+fn map_cache_max_bytes() -> u64 {
+    if let Ok(v) = std::env::var("AETHYME_MAP_CACHE_MAX_MB") {
+        if let Ok(mb) = v.trim().parse::<u64>() {
+            return mb.saturating_mul(1024 * 1024);
+        }
+    }
+    DEFAULT_MAP_CACHE_MAX_BYTES
+}
+
 const EXCLUDED_DIRS: &[&str] = &[
     ".git",
     ".security-logs",
@@ -114,13 +135,35 @@ fn cache_path(root: &Path, fingerprint: &str) -> std::path::PathBuf {
 /// Try to load a cached `RepositoryMap` without running `discover_repo()`.
 ///
 /// Performs a lightweight filesystem scan (paths + sizes only, no file reads)
-/// to compute a fingerprint. If a valid cache exists, deserializes and returns
-/// the full map including its snapshot.
+/// to compute a fingerprint. If a valid cache exists AND is below the
+/// `AETHYME_MAP_CACHE_MAX_MB` threshold, deserializes and returns the full
+/// map. Oversized caches are skipped (and removed) — the rebuild path is
+/// faster than deserializing them at MediaWiki scale.
 pub fn try_load_cached_map(root: &Path) -> Option<RepositoryMap> {
+    let max_bytes = map_cache_max_bytes();
+    if max_bytes == 0 {
+        return None;
+    }
     let canonical = root.canonicalize().ok()?;
     let scan = quick_scan(&canonical);
     let fp = scan_fingerprint(&scan);
     let path = cache_path(&canonical, &fp);
+
+    // Stat first so we can refuse oversized caches without paying the read.
+    let metadata = fs::metadata(&path).ok()?;
+    let size = metadata.len();
+    if size > max_bytes {
+        eprintln!(
+            "aethyme: map cache at {} is {:.1} GB (over {:.1} GB limit) — \
+             skipping load and removing; rebuild will be faster",
+            path.display(),
+            size as f64 / (1024.0 * 1024.0 * 1024.0),
+            max_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+        let _ = fs::remove_file(&path);
+        return None;
+    }
+
     let data = fs::read(&path).ok()?;
     let map: RepositoryMap = bincode::deserialize(&data).ok()?;
     // Sanity check: file count should match
@@ -131,7 +174,15 @@ pub fn try_load_cached_map(root: &Path) -> Option<RepositoryMap> {
 }
 
 /// Save a built `RepositoryMap` to the cache.
+///
+/// Refuses to write caches that exceed `AETHYME_MAP_CACHE_MAX_MB` — at the
+/// scale where loading would be slower than rebuilding, writing is also
+/// wasted I/O.
 pub fn save_cached_map(root: &Path, map: &RepositoryMap) {
+    let max_bytes = map_cache_max_bytes();
+    if max_bytes == 0 {
+        return;
+    }
     let canonical = match root.canonicalize() {
         Ok(p) => p,
         Err(_) => return,
@@ -143,13 +194,29 @@ pub fn save_cached_map(root: &Path, map: &RepositoryMap) {
         let _ = fs::create_dir_all(parent);
     }
     if let Ok(data) = bincode::serialize(map) {
+        if data.len() as u64 > max_bytes {
+            eprintln!(
+                "aethyme: serialized map is {:.1} GB (over {:.1} GB cache \
+                 limit) — not writing cache; subsequent calls will rebuild",
+                data.len() as f64 / (1024.0 * 1024.0 * 1024.0),
+                max_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+            // Still clean up any stale cache files so we don't leave a stale
+            // smaller cache that would be loaded next time.
+            cleanup_stale_caches(&canonical, &path);
+            return;
+        }
         let _ = fs::write(&path, data);
     }
-    // Clean up stale map caches (keep only the current one)
-    if let Ok(entries) = fs::read_dir(cache_dir(&canonical)) {
+    cleanup_stale_caches(&canonical, &path);
+}
+
+fn cleanup_stale_caches(canonical: &Path, keep_path: &Path) {
+    if let Ok(entries) = fs::read_dir(cache_dir(canonical)) {
         for entry in entries.flatten() {
             let entry_path = entry.path();
-            if entry_path.extension().and_then(|e| e.to_str()) == Some("bin") && entry_path != path
+            if entry_path.extension().and_then(|e| e.to_str()) == Some("bin")
+                && entry_path != keep_path
             {
                 let _ = fs::remove_file(&entry_path);
             }
