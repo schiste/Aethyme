@@ -251,16 +251,22 @@ fn run() -> Result<(), String> {
         }
         "task-localize" => {
             let repo = read_option(&args, "--repo")?;
-            let map = build_map(&repo, no_cache)?;
             let task_value = read_option(&args, "--task")?;
-            let task = TaskInput::from_task_text(&task_value);
-            let anchors = task_anchors_view(&map, &task);
-            let scope = task_scope_view(&map, &task);
-            let next = task_next_view(&map, &task);
-            println!(
-                "{}",
+            let profile = has_flag(&args, "--profile");
+            let mut profiler = StageProfiler::new("task-localize", profile);
+
+            let map = profiler.stage("map_build", || build_map(&repo, no_cache))?;
+            let task = profiler
+                .stage_pure("task_parse", || TaskInput::from_task_text(&task_value));
+            let anchors =
+                profiler.stage_pure("anchors", || task_anchors_view(&map, &task));
+            let scope = profiler.stage_pure("scope", || task_scope_view(&map, &task));
+            let next = profiler.stage_pure("next", || task_next_view(&map, &task));
+            let rendered = profiler.stage_pure("json_render", || {
                 aethyme_engine::json::task_localization_view(&anchors, &scope, &next)
-            );
+            });
+            println!("{rendered}");
+            profiler.report();
         }
         "task-expand" => {
             let repo = read_option(&args, "--repo")?;
@@ -750,6 +756,80 @@ fn build_map(repo: &str, no_cache: bool) -> Result<RepositoryMap, String> {
         RepositoryMap::build_no_cache(&PathBuf::from(repo)).map(|(map, _)| map)
     } else {
         RepositoryMap::build(&PathBuf::from(repo))
+    }
+}
+
+/// Per-stage wall-time profiler for one engine command.
+///
+/// Diagnostic for "where does the 14s actually go?" — the daemon mode
+/// shipped in `aethyme` (Rust binary) eliminates the ~1.5-3s of Python
+/// startup but the engine subprocess still dominates per-call cost. The
+/// profiler reports stage timings to stderr so we can decide whether
+/// (a) `RepositoryMap::build` rebuild is the bottleneck (→ engine daemon)
+/// or (b) the localization views themselves are heavy (→ answer cache).
+///
+/// Output line example (only when `--profile` is set):
+///   [profile] task-localize: map_build=12480ms task_parse=0ms anchors=210ms \
+///             scope=830ms next=305ms json_render=12ms total=13837ms
+struct StageProfiler {
+    command: &'static str,
+    enabled: bool,
+    stages: Vec<(&'static str, std::time::Duration)>,
+    started_at: std::time::Instant,
+}
+
+impl StageProfiler {
+    fn new(command: &'static str, enabled: bool) -> Self {
+        Self {
+            command,
+            enabled,
+            stages: Vec::new(),
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    fn stage<T, E, F>(&mut self, name: &'static str, f: F) -> Result<T, E>
+    where
+        F: FnOnce() -> Result<T, E>,
+    {
+        if !self.enabled {
+            return f();
+        }
+        let start = std::time::Instant::now();
+        let out = f();
+        self.stages.push((name, start.elapsed()));
+        out
+    }
+
+    fn stage_pure<T, F>(&mut self, name: &'static str, f: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        if !self.enabled {
+            return f();
+        }
+        let start = std::time::Instant::now();
+        let out = f();
+        self.stages.push((name, start.elapsed()));
+        out
+    }
+
+    fn report(&self) {
+        if !self.enabled {
+            return;
+        }
+        let total = self.started_at.elapsed();
+        let mut line = format!("[profile] {}: ", self.command);
+        for (i, (name, dur)) in self.stages.iter().enumerate() {
+            if i > 0 {
+                line.push(' ');
+            }
+            line.push_str(name);
+            line.push('=');
+            line.push_str(&format!("{}ms", dur.as_millis()));
+        }
+        line.push_str(&format!(" total={}ms", total.as_millis()));
+        eprintln!("{line}");
     }
 }
 
