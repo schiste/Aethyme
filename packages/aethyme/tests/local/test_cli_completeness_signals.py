@@ -419,6 +419,7 @@ def test_explore_without_intent_runs_default_task_localization_query(
             "Find the files impacted by this change.",
             "--format",
             "answer-json",
+            "--show-observability",
         ],
     )
 
@@ -524,6 +525,7 @@ def test_explore_filters_noisy_symbol_queries_and_degrades_without_blocking(
             '{"symbol_query_timeout_ms":100}',
             "--format",
             "answer-json",
+            "--show-observability",
         ],
     )
 
@@ -576,6 +578,7 @@ def test_explore_skips_symbol_search_after_graph_timeout(
             '{"skip_symbols_after_graph_timeout":true}',
             "--format",
             "answer-json",
+            "--show-observability",
         ],
     )
 
@@ -664,6 +667,7 @@ class Article {
             ),
             "--format",
             "answer-json",
+            "--show-observability",
         ],
     )
 
