@@ -168,7 +168,10 @@ pub fn task_anchors_view(map: &RepositoryMap, task: &TaskInput) -> TaskAnchorsVi
 
 pub fn task_scope_view(map: &RepositoryMap, task: &TaskInput) -> TaskScopeView {
     let anchors = resolve_anchors(map, task, 5);
-    let signals = evaluate_graph_signals(map);
+    // Memoized on RepositoryMap — first read computes, subsequent reads
+    // are pointer-cheap. Saves repeating ~25 seconds of signals
+    // evaluation across anchors + scope + next on a 12K-file repo.
+    let signals = map.signals();
     let max_files = if task.kind.is_change_task() && signals.hidden_coupling.score < 35 {
         4
     } else if task.kind.is_change_task() {
@@ -205,7 +208,7 @@ pub fn task_scope_view(map: &RepositoryMap, task: &TaskInput) -> TaskScopeView {
 
 pub fn task_next_view(map: &RepositoryMap, task: &TaskInput) -> GraphRelationView {
     let anchors = resolve_anchors(map, task, 5);
-    let signals = evaluate_graph_signals(map);
+    let signals = map.signals();
     let items = if task.kind.is_explain_repo() {
         let overview = graph_overview_view(map);
         overview_navigation_order(&overview)

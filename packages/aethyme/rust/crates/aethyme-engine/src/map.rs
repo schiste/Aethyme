@@ -116,6 +116,16 @@ pub struct RepositoryMap {
     pub graph: NormalizedGraph,
     #[serde(skip)]
     index: OnceLock<MapIndex>,
+    /// Lazily-computed graph signals (boundary clarity, hidden coupling,
+    /// parser visibility, etc). The computation walks 12k files × 3.8M
+    /// edges in some assessments — `parser_visibility` alone is
+    /// O(F · (F_func + F_class + E)) — so memoizing here turns repeated
+    /// callers (anchors + scope + next during one task-localize call)
+    /// into a single compute. The daemon benefits even more: one compute
+    /// per daemon lifetime, free for every subsequent request.
+    /// Not serialized (derived from the rest of the map).
+    #[serde(skip)]
+    signals: OnceLock<crate::graph::signals::GraphSignals>,
 }
 
 impl PartialEq for RepositoryMap {
@@ -368,6 +378,7 @@ impl RepositoryMap {
                 annotations: Vec::new(),
             },
             index: OnceLock::new(),
+            signals: OnceLock::new(),
         };
 
         let started = Instant::now();
@@ -511,6 +522,13 @@ impl RepositoryMap {
 
     fn index(&self) -> &MapIndex {
         self.index.get_or_init(|| MapIndex::build(self))
+    }
+
+    /// Memoized `GraphSignals` for this map. Computed on first call,
+    /// reused across every subsequent call against the same map.
+    pub fn signals(&self) -> &crate::graph::signals::GraphSignals {
+        self.signals
+            .get_or_init(|| crate::graph::signals::evaluate_graph_signals(self))
     }
 
     pub fn display_for(&self, value: &str) -> String {
