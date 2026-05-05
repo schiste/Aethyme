@@ -5840,6 +5840,72 @@ def autofix(
             click.echo("\nFailed to create pull request")
 
 
+@cli.group()
+def enhance() -> None:
+    """Deploy or verify Aethyme discoverability files in a target repository.
+
+    A repo is "Aethyme-enhanced" when an agent landing in its working
+    directory finds AGENTS.md/CLAUDE.md (root-level announcement) plus
+    .claude/skills/aethyme/SKILL.md and .codex/skills/aethyme/SKILL.md
+    (per-product detailed runbooks). All four are derived from the canonical
+    templates in packages/aethyme/skills/aethyme/.
+    """
+
+
+@enhance.command("deploy")
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Target repository to enhance",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Rewrite files whose content already matches",
+)
+def enhance_deploy_command(repo_path: Path, force: bool) -> None:
+    """Write all four discoverability files into the target repo."""
+    from src.enhance import deploy
+
+    actions = deploy(repo_path, force=force)
+    for a in actions:
+        click.echo(f"  {a.action:9}  {a.target.relative_path}")
+    click.echo(f"Enhanced: {repo_path}")
+
+
+@enhance.command("verify")
+@click.option(
+    "--repo",
+    "repo_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Target repository to verify",
+)
+def enhance_verify_command(repo_path: Path) -> None:
+    """Check that the four discoverability files are present and substituted."""
+    from src.enhance import is_ok, verify
+
+    results = verify(repo_path)
+    for r in results:
+        ok = r.exists and not r.placeholder_present
+        marker = "OK" if ok else "FAIL"
+        notes: list[str] = []
+        if not r.exists:
+            notes.append("missing")
+        elif r.placeholder_present:
+            notes.append("placeholder not substituted")
+        if r.exists and not r.matches_canonical:
+            notes.append("content drift (allowed)")
+        suffix = f"  ({', '.join(notes)})" if notes else ""
+        click.echo(f"  [{marker:4}] {r.target.relative_path}{suffix}")
+    if not is_ok(results):
+        click.echo("Verification failed.", err=True)
+        sys.exit(1)
+    click.echo("All discoverability files present and substituted.")
+
+
 def main() -> None:
     """Main entry point for CLI."""
     cli(obj={})

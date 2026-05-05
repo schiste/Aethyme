@@ -126,11 +126,11 @@ for REPO in "$CONTROL_DIR" "$AETHYME_DIR"; do
 done
 
 # Strip eval/tooling contamination from the Control repo. When the source repo is
-# Aethyme itself, tracked runtime folders like .chau7/ would otherwise leak into
-# the vanilla Control clone and invalidate the playground isolation contract.
+# Aethyme itself (or already enhanced), discoverability files would otherwise leak
+# into the vanilla Control clone and invalidate the playground isolation contract.
 echo ">>> Removing Control-side tooling/runtime contamination..."
 cd "$CONTROL_DIR"
-for path in .codex .aethyme .chau7 .claude; do
+for path in .codex .aethyme .chau7 .claude AGENTS.md CLAUDE.md; do
     tracked_files=("${(@f)$(git ls-files "$path" 2>/dev/null)}")
     tracked_files=("${(@)tracked_files:#}")
     if (( ${#tracked_files[@]} > 0 )); then
@@ -138,7 +138,8 @@ for path in .codex .aethyme .chau7 .claude; do
     fi
 done
 /bin/rm -rf .codex .aethyme .chau7 .claude
-echo "  Removed: .codex .aethyme .chau7 .claude (if present)"
+/bin/rm -f AGENTS.md CLAUDE.md
+echo "  Removed: .codex .aethyme .chau7 .claude AGENTS.md CLAUDE.md (if present)"
 
 # ── Step 3: Deploy Aethyme tooling ───────────────────────────────────
 
@@ -146,11 +147,8 @@ echo ">>> Indexing Aethyme repo..."
 cd "$AETHYME_DIR"
 "$ENGINE" index --repo . 2>&1 | tail -5
 
-echo ">>> Deploying skill..."
-mkdir -p .codex/skills/aethyme
-cp "$AETHYME_ROOT/skills/aethyme/SKILL.md" .codex/skills/aethyme/SKILL.md
-sed -i '' "s|{{AETHYME_ROOT}}|$AETHYME_ROOT|g" .codex/skills/aethyme/SKILL.md
-echo "  Skill deployed to .codex/skills/aethyme/"
+echo ">>> Deploying enhancement files..."
+"$AETHYME_ROOT/.venv/bin/python" -m src.cli enhance deploy --repo "$AETHYME_DIR" --force
 
 # ── Step 4: Verify ───────────────────────────────────────────────────
 
@@ -159,17 +157,25 @@ echo ">>> Verifying..."
 
 ERRORS=0
 
-# Control checks
+# Control checks: must NOT have any enhancement files
 cd "$CONTROL_DIR"
-[[ -d .codex ]]   && echo "  FAIL: Control has .codex/"   && ((ERRORS++)) || true
-[[ -d .aethyme ]] && echo "  FAIL: Control has .aethyme/" && ((ERRORS++)) || true
-[[ -d .chau7 ]]   && echo "  FAIL: Control has .chau7/"   && ((ERRORS++)) || true
-echo "  Control: clean (no .codex, .aethyme, .chau7)"
+[[ -d .codex ]]    && { echo "  FAIL: Control has .codex/";    ((ERRORS++)); } || true
+[[ -d .aethyme ]]  && { echo "  FAIL: Control has .aethyme/";  ((ERRORS++)); } || true
+[[ -d .chau7 ]]    && { echo "  FAIL: Control has .chau7/";    ((ERRORS++)); } || true
+[[ -d .claude ]]   && { echo "  FAIL: Control has .claude/";   ((ERRORS++)); } || true
+[[ -f AGENTS.md ]] && { echo "  FAIL: Control has AGENTS.md";  ((ERRORS++)); } || true
+[[ -f CLAUDE.md ]] && { echo "  FAIL: Control has CLAUDE.md";  ((ERRORS++)); } || true
+[[ $ERRORS -eq 0 ]] && echo "  Control: clean (no enhancement files)"
 
-# Aethyme checks
+# Aethyme checks: enhancement files via the canonical verifier, plus the redb store
 cd "$AETHYME_DIR"
-[[ -f .codex/skills/aethyme/SKILL.md ]] && echo "  Aethyme: skill present" || { echo "  FAIL: Aethyme missing skill"; ((ERRORS++)); }
-[[ -d .aethyme/graph.db ]]              && echo "  Aethyme: graph.db present" || { echo "  FAIL: Aethyme missing graph.db"; ((ERRORS++)); }
+if "$AETHYME_ROOT/.venv/bin/python" -m src.cli enhance verify --repo "$AETHYME_DIR"; then
+    echo "  Aethyme: enhancement files OK"
+else
+    echo "  FAIL: Aethyme enhancement verification failed"
+    ((ERRORS++))
+fi
+[[ -f .aethyme/graph_store.redb ]] && echo "  Aethyme: graph_store.redb present" || { echo "  FAIL: Aethyme missing graph_store.redb"; ((ERRORS++)); }
 
 # Same commit
 CONTROL_HEAD=$(cd "$CONTROL_DIR" && git rev-parse HEAD)
