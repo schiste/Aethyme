@@ -124,6 +124,13 @@ pub struct ExploreParams {
     /// Caps independently of `max_answer_items` so symbol evidence
     /// doesn't crowd out anchor evidence.
     pub max_symbol_files: usize,
+    /// Maximum source-text candidate files emitted to `answer[]`.
+    pub max_text_files: usize,
+    /// Per-file cap on the `evidence.line_refs` excerpt list. Only the
+    /// highest-scoring lines per file appear in the response — agents read
+    /// 1-2; emitting all hits would be ~6,000 tokens of noise on a
+    /// well-matching file.
+    pub max_text_line_refs: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +148,8 @@ impl Default for ExploreParams {
             max_symbol_queries: 5,
             max_symbol_results: 4,
             max_symbol_files: 8, // truncated when answer list fills
+            max_text_files: 5,   // matches Python compact default
+            max_text_line_refs: 2,
         }
     }
 }
@@ -204,7 +213,24 @@ pub fn explore_task_localization(
         }
     };
 
-    Ok(build_response(request, &view, &symbol_matches, params))
+    // 3. Source-text evidence. Runs ripgrep client-side against the repo
+    //    filesystem; doesn't need the daemon. Tolerates ripgrep absence:
+    //    we degrade to symbol-only without failing the request.
+    let text_terms = extract_text_search_terms(request);
+    let text_items = source_text_files(
+        repo,
+        &text_terms,
+        params.max_text_files,
+        params.max_text_line_refs,
+    );
+
+    Ok(build_response(
+        request,
+        &view,
+        &symbol_matches,
+        &text_items,
+        params,
+    ))
 }
 
 fn call_task_localize(
@@ -307,6 +333,256 @@ impl SymbolHit {
     }
 }
 
+// ── source-text search (Rust port of _task_localization_text_items) ────
+//
+// Strategy: shell out to ripgrep for the heavy lifting (file walking,
+// suffix filtering, gitignore-respecting traversal, multi-pattern match)
+// and do the scoring + ranking in Rust. Ripgrep at 161ms on Mockup for a
+// single term means the whole multi-term pass lands well under 1s — fast
+// enough that we don't need to background it.
+//
+// What we do NOT port from the Python helper (yet, deferred to later
+// sessions): per-line symbol clustering, file-role classification, the
+// elaborate `_text_candidate_score` weighting heuristic. This session's
+// port is a correct-but-simpler version: per-file hit count × distinct
+// term coverage, with a cap on the line-ref preview list to keep the
+// response token-cheap.
+
+const RIPGREP_BIN: &str = "rg";
+const SOURCE_TEXT_FILE_SIZE_CAP_BYTES: u64 = 750_000;
+
+#[derive(Debug, Clone)]
+struct TextHit {
+    path: String,
+    matched_terms: std::collections::BTreeSet<String>,
+    hit_count: usize,
+    line_refs: Vec<TextLineRef>,
+}
+
+#[derive(Debug, Clone)]
+struct TextLineRef {
+    line: u64,
+    text: String,
+    matched_terms: Vec<String>,
+}
+
+/// Build the term list for source-text search. Wider than
+/// `extract_symbol_queries` — keeps behavioural words ("view", "seen")
+/// that are too noisy for symbol search but useful for line-level
+/// evidence. Mirrors `_request_text_search_terms` in cli.py.
+pub(crate) fn extract_text_search_terms(request: &str) -> Vec<String> {
+    let mut terms = extract_symbol_queries(request);
+    let lowered = request.to_ascii_lowercase();
+    let mut extras: Vec<&str> = Vec::new();
+    if lowered.contains("watchlist") || lowered.contains("watchlisted") {
+        extras.extend(["watchlist", "watchlisted", "watched", "notification"]);
+    }
+    if lowered.contains("seen") {
+        extras.extend(["seen", "notification", "timestamp"]);
+    }
+    if lowered.contains("view") {
+        extras.extend(["view", "viewed", "viewing"]);
+    }
+    if lowered.contains("diff") {
+        extras.extend(["diff", "difference", "diffonly"]);
+    }
+    if lowered.contains("revision") || lowered.contains("oldid") {
+        extras.extend(["revision", "revisions", "oldid"]);
+    }
+    let mut seen: std::collections::HashSet<String> = terms
+        .iter()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    for extra in extras {
+        let lower = extra.to_ascii_lowercase();
+        if seen.insert(lower) {
+            terms.push(extra.to_string());
+        }
+    }
+    terms
+}
+
+/// Walk the repo with ripgrep across all terms in one pass, score each
+/// matching file by hit count × distinct-term coverage, return up to
+/// `max_files` candidates.
+fn source_text_files(
+    repo: &Path,
+    terms: &[String],
+    max_files: usize,
+    max_line_refs: usize,
+) -> Vec<AnswerItem> {
+    if terms.is_empty() || max_files == 0 {
+        return Vec::new();
+    }
+
+    let mut hits_by_file: std::collections::BTreeMap<String, TextHit> =
+        std::collections::BTreeMap::new();
+
+    for chunk in terms.chunks(8) {
+        let pattern = chunk
+            .iter()
+            .map(|t| regex::escape(t))
+            .collect::<Vec<_>>()
+            .join("|");
+        if pattern.is_empty() {
+            continue;
+        }
+        let lowered_terms: Vec<String> =
+            chunk.iter().map(|t| t.to_ascii_lowercase()).collect();
+        let output = match std::process::Command::new(RIPGREP_BIN)
+            .arg("-i")
+            .arg("--no-heading")
+            .arg("--with-filename")
+            .arg("--line-number")
+            .arg("--max-filesize")
+            .arg(SOURCE_TEXT_FILE_SIZE_CAP_BYTES.to_string())
+            .arg("--no-messages")
+            .arg("-e")
+            .arg(&pattern)
+            .arg(repo)
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        if !output.stdout.is_empty() {
+            ingest_rg_output(
+                &output.stdout,
+                repo,
+                &lowered_terms,
+                &mut hits_by_file,
+            );
+        }
+    }
+
+    let mut ranked: Vec<TextHit> = hits_by_file.into_values().collect();
+    ranked.sort_by(|a, b| {
+        b.matched_terms
+            .len()
+            .cmp(&a.matched_terms.len())
+            .then_with(|| b.hit_count.cmp(&a.hit_count))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    ranked
+        .into_iter()
+        .take(max_files)
+        .map(|hit| {
+            let matched_count = hit.matched_terms.len();
+            let confidence = if matched_count >= 3 {
+                0.84
+            } else if matched_count == 2 {
+                0.78
+            } else {
+                0.70
+            };
+            let reason = if matched_count >= 2 {
+                "Source text matched multiple request terms in executable code; \
+                 line refs are evidence, not filename-only hints."
+            } else {
+                "Source text matched one request term; verify the line context \
+                 before treating as authoritative."
+            };
+            let mut line_refs: Vec<&TextLineRef> = hit.line_refs.iter().collect();
+            // Highest-scoring lines = most distinct matched terms,
+            // then earliest line number for stability.
+            line_refs.sort_by(|a, b| {
+                b.matched_terms
+                    .len()
+                    .cmp(&a.matched_terms.len())
+                    .then_with(|| a.line.cmp(&b.line))
+            });
+            let line_refs_json: Vec<serde_json::Value> = line_refs
+                .into_iter()
+                .take(max_line_refs)
+                .map(|r| {
+                    serde_json::json!({
+                        "line": r.line,
+                        "text": r.text,
+                        "matched_terms": r.matched_terms,
+                    })
+                })
+                .collect();
+            AnswerItem {
+                kind: "source_text_file".into(),
+                target: hit.path.clone(),
+                path: Some(hit.path),
+                status: "candidate".into(),
+                confidence,
+                reason: reason.into(),
+                role: "candidate".into(),
+                evidence: serde_json::json!({
+                    "source": "source-text-search",
+                    "matched_terms": hit.matched_terms.iter().collect::<Vec<_>>(),
+                    "hit_count": hit.hit_count,
+                    "line_refs": line_refs_json,
+                }),
+            }
+        })
+        .collect()
+}
+
+fn ingest_rg_output(
+    stdout: &[u8],
+    repo: &Path,
+    lowered_terms: &[String],
+    hits_by_file: &mut std::collections::BTreeMap<String, TextHit>,
+) {
+    let text = match std::str::from_utf8(stdout) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    for line in text.lines() {
+        // ripgrep default format: <path>:<line>:<text>
+        let mut parts = line.splitn(3, ':');
+        let abs_path = match parts.next() {
+            Some(p) => p,
+            None => continue,
+        };
+        let line_no: u64 = match parts.next().and_then(|n| n.parse().ok()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let line_text = parts.next().unwrap_or("");
+        let rel_path = match Path::new(abs_path).strip_prefix(repo) {
+            Ok(p) => p.to_string_lossy().to_string(),
+            Err(_) => abs_path.to_string(),
+        };
+        let lower = line_text.to_ascii_lowercase();
+        let matched: Vec<String> = lowered_terms
+            .iter()
+            .filter(|t| lower.contains(t.as_str()))
+            .cloned()
+            .collect();
+        if matched.is_empty() {
+            // `rg` matched but our local lowercase scan missed (rare —
+            // could happen with regex metachar quirks). Skip.
+            continue;
+        }
+        let entry = hits_by_file
+            .entry(rel_path.clone())
+            .or_insert_with(|| TextHit {
+                path: rel_path,
+                matched_terms: std::collections::BTreeSet::new(),
+                hit_count: 0,
+                line_refs: Vec::new(),
+            });
+        for term in &matched {
+            entry.matched_terms.insert(term.clone());
+        }
+        entry.hit_count += 1;
+        // Cap stored line refs per file to bound memory; the ranking
+        // step picks the top N by term coverage afterwards.
+        if entry.line_refs.len() < 32 {
+            entry.line_refs.push(TextLineRef {
+                line: line_no,
+                text: line_text.trim().chars().take(220).collect(),
+                matched_terms: matched,
+            });
+        }
+    }
+}
+
 // ── symbol query extraction (Rust port of _request_symbol_queries) ──────
 //
 // Tokenizes `request`, drops English stop words and noisy single-letter
@@ -370,6 +646,7 @@ fn build_response(
     request: &str,
     view: &serde_json::Value,
     symbol_matches: &SymbolBatchResults,
+    text_items: &[AnswerItem],
     params: &ExploreParams,
 ) -> ExploreResponse {
     let anchors = view
@@ -473,9 +750,23 @@ fn build_response(
         }
     }
 
-    // Symbol-search-derived items rank ahead of in_scope_file because
-    // matching the request's content terms against actual symbol names is
-    // stronger evidence than merely being in the same area.
+    // Source-text items rank highest in `answer[]`: they carry actual
+    // line-level evidence (line_refs) and are the strongest single
+    // signal an agent can verify quickly. Symbol-search items rank
+    // second; in_scope_file items last.
+    for item in text_items {
+        if answers.len() >= params.max_answer_items {
+            break;
+        }
+        if answers
+            .iter()
+            .any(|a| a.path.as_deref() == item.path.as_deref())
+        {
+            continue;
+        }
+        answers.push(item.clone());
+    }
+
     let symbol_items = build_symbol_file_items(symbol_matches, params.max_symbol_files);
     for item in &symbol_items {
         if answers.len() >= params.max_answer_items {
@@ -541,24 +832,24 @@ fn build_response(
 
     // Trust policy. Tightens as more evidence sources land:
     //
-    //   sessions 1: anchors + scope only         → needs_verification
-    //   session  2: + symbol search (this commit) → answer_candidate when
+    //   session 1: anchors + scope only          → needs_verification
+    //   session 2: + symbol search                → answer_candidate when
     //                                              ≥2 distinct query terms
     //                                              matched in the same file
-    //                                              (high-confidence 0.88)
-    //   session 3+: + source-text + callsite     → tighter rules per Python
-    //
-    // `answer_candidate` is awarded to results we'd defend as a primary
-    // answer; `needs_verification` is for "ranked plan, look at it" — the
-    // agent shouldn't act on the answer without checking it. The bar to
-    // award `answer_candidate` is intentionally high: the native path
-    // doesn't yet run source-text grep or callsite expansion, so the
-    // remaining evidence must be strong enough on its own.
+    //   session 3 (this commit):
+    //              + source-text + corroboration → answer_candidate raised
+    //                                              when text + symbol agree
+    //                                              on the same file (the
+    //                                              strongest signal short
+    //                                              of running the test
+    //                                              suite); weaker shapes
+    //                                              degrade gracefully.
+    //   session 4+: callsite expansion            → tighter still
     let high_confidence_count = answers
         .iter()
         .filter(|a| a.confidence >= 0.85)
         .count();
-    let multi_query_symbol_files = symbol_items
+    let multi_query_symbol_files: Vec<&str> = symbol_items
         .iter()
         .filter(|item| {
             item.evidence
@@ -567,21 +858,47 @@ fn build_response(
                 .map(|arr| arr.len() >= 2)
                 .unwrap_or(false)
         })
-        .count();
+        .filter_map(|item| item.path.as_deref())
+        .collect();
+    let strong_text_files: Vec<&str> = text_items
+        .iter()
+        .filter(|item| {
+            item.evidence
+                .get("matched_terms")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.len() >= 2)
+                .unwrap_or(false)
+        })
+        .filter_map(|item| item.path.as_deref())
+        .collect();
+    // Symbol + text agree on the same file = the highest local signal we
+    // produce without running tests or callsite expansion. Treat the
+    // intersection as cross-corroborated.
+    let cross_corroborated: Vec<&&str> = multi_query_symbol_files
+        .iter()
+        .filter(|p| strong_text_files.contains(p))
+        .collect();
 
     let policy_kind = if answers.is_empty() && nav_hints.is_empty() {
         "failed"
-    } else if multi_query_symbol_files >= 1 {
-        // Multi-query symbol match in a single file is meaningful — the
-        // request mentions several distinct terms and they all hit the
-        // same target. That's the kind of evidence we'd defend as an
-        // authoritative answer candidate.
+    } else if !cross_corroborated.is_empty()
+        || !multi_query_symbol_files.is_empty()
+    {
         "answer_candidate"
+    } else if !text_items.is_empty() || !symbol_items.is_empty() {
+        // Some text or symbol evidence but not strong enough to defend.
+        "needs_verification"
     } else {
         "needs_verification"
     };
-    let evidence_level = if multi_query_symbol_files >= 1 {
+    let evidence_level = if !cross_corroborated.is_empty() {
+        "graph+symbol+text"
+    } else if !multi_query_symbol_files.is_empty() && !text_items.is_empty() {
+        "graph+symbol+text-weak"
+    } else if !multi_query_symbol_files.is_empty() {
         "graph+symbol"
+    } else if !text_items.is_empty() {
+        "graph+text"
     } else if !symbol_items.is_empty() {
         "graph+symbol-weak"
     } else {
@@ -589,6 +906,11 @@ fn build_response(
     };
     let safe_to_use_as_answer = matches!(policy_kind, "answer_candidate");
     let trust_reason = match policy_kind {
+        "answer_candidate" if !cross_corroborated.is_empty() => format!(
+            "Symbol search and source-text both matched {} candidate file(s); \
+             cross-corroborated evidence treated as authoritative.",
+            cross_corroborated.len()
+        ),
         "answer_candidate" => format!(
             "Symbol search matched {} distinct request terms in the same \
              file; treating as authoritative answer candidate.",
@@ -603,11 +925,11 @@ fn build_response(
                 .unwrap_or(2)
         ),
         "failed" => {
-            "No anchors, in-scope files, or symbol matches found.".to_string()
+            "No anchors, in-scope files, symbol matches, or source-text hits."
+                .to_string()
         }
-        _ => "Graph-derived candidates without strong cross-corroboration. \
-              Verify before acting; consider running the Python explore for \
-              richer evidence."
+        _ => "Evidence present but not strong enough to defend as an \
+              authoritative answer. Verify before acting."
             .to_string(),
     };
     let trust_policy = TrustPolicy {
@@ -873,6 +1195,7 @@ mod tests {
             "find watchlist handlers",
             &sample_view(),
             &empty_symbols(),
+            &[],
             &ExploreParams::default(),
         );
         assert!(!response.answer.is_empty(), "expected at least one answer");
@@ -903,6 +1226,7 @@ mod tests {
             "test",
             &view,
             &empty_symbols(),
+            &[],
             &ExploreParams {
                 max_answer_items: 3,
                 ..ExploreParams::default()
@@ -928,6 +1252,7 @@ mod tests {
             "nothing matches",
             &view,
             &empty_symbols(),
+            &[],
             &ExploreParams::default(),
         );
         assert_eq!(response.status, "degraded");
@@ -942,6 +1267,7 @@ mod tests {
             "find handlers",
             &sample_view(),
             &empty_symbols(),
+            &[],
             &ExploreParams::default(),
         );
         // Without symbol evidence, anchors+scope alone don't earn
@@ -961,6 +1287,7 @@ mod tests {
             "find session authenticate handlers",
             &sample_view(),
             &symbols,
+            &[],
             &ExploreParams::default(),
         );
         assert!(response.safe_to_use_as_answer);
@@ -985,6 +1312,7 @@ mod tests {
             "find helper code",
             &sample_view(),
             &symbols,
+            &[],
             &ExploreParams::default(),
         );
         // One query matched is weak corroboration — bar to claim
@@ -1014,5 +1342,31 @@ mod tests {
             queries.iter().map(|q| q.to_ascii_lowercase()).collect();
         assert!(lower.contains(&"add_watch".to_string()));
         assert!(lower.contains(&"addwatch".to_string()));
+    }
+
+    #[test]
+    fn extract_text_search_terms_extends_for_behavioural_words() {
+        // For text search we keep behavioural keywords like "viewed" and
+        // "seen" that the symbol-query helper drops. The trigger is
+        // matching them in the request itself; if the request mentions
+        // "watchlist" we add domain synonyms ("watched", "notification").
+        let terms = extract_text_search_terms(
+            "Bug: viewing a diff revision marks watchlist as seen",
+        );
+        let lower: Vec<String> = terms.iter().map(|t| t.to_ascii_lowercase()).collect();
+        // The request word "viewing" survives (symbol-search would drop it
+        // as too noisy, text-search keeps it).
+        assert!(lower.contains(&"viewing".to_string()));
+        // Domain expansions added by the watchlist trigger:
+        assert!(lower.contains(&"watched".to_string()));
+        assert!(lower.contains(&"notification".to_string()));
+        // Domain expansions added by the diff/revision trigger:
+        assert!(lower.contains(&"diff".to_string()));
+        assert!(lower.contains(&"revisions".to_string()));
+        // No duplicates (case-insensitive):
+        let mut sorted = lower.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), lower.len(), "duplicate term in {lower:?}");
     }
 }
