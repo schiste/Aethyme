@@ -44,6 +44,7 @@ fn run() -> Result<(), String> {
     let command = args.remove(0);
     match command.as_str() {
         "daemon" => return run_daemon_subcommand(&args, no_cache),
+        "explore" => return run_explore_subcommand(&args),
         "inspect" => {
             let repo = read_option(&args, "--repo")?;
             let mode = read_option(&args, "--mode").unwrap_or_else(|_| "full".to_string());
@@ -763,6 +764,67 @@ fn read_options(args: &[String], flag: &str) -> Vec<String> {
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
+}
+
+// explore subcommand — native Rust path through the engine daemon.
+//
+// Compatible with the answer-json shape Python emits at `--detail compact`
+// for the task_localization_query intent. Exits with status 2 and a
+// recognizable error when the daemon isn't running, so callers can detect
+// the fallback condition and route to Python.
+
+fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
+    let repo_str = read_option(args, "--repo")?;
+    let request = read_option(args, "--request")?;
+    let format = read_option(args, "--format").unwrap_or_else(|_| "answer-json".to_string());
+    if format != "answer-json" {
+        return Err(format!(
+            "explore: only --format answer-json is supported in the native \
+             path; got {format:?}"
+        ));
+    }
+    let detail = read_option(args, "--detail").unwrap_or_else(|_| "compact".to_string());
+    let detail_enum = match detail.as_str() {
+        "compact" => aethyme_engine::explore::Detail::Compact,
+        "standard" => aethyme_engine::explore::Detail::Standard,
+        "full" => aethyme_engine::explore::Detail::Full,
+        other => return Err(format!("explore: unknown --detail {other:?}")),
+    };
+
+    let max_answer_items: usize = read_option(args, "--max-answer-items")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+
+    let params = aethyme_engine::explore::ExploreParams {
+        max_answer_items,
+        detail: detail_enum,
+    };
+
+    let repo = PathBuf::from(&repo_str);
+    if !repo.is_dir() {
+        return Err(format!("--repo path is not a directory: {repo_str}"));
+    }
+
+    match aethyme_engine::explore::explore_task_localization(&repo, &request, &params) {
+        Ok(response) => {
+            let json = serde_json::to_string_pretty(&response)
+                .map_err(|e| format!("serialize response: {e}"))?;
+            println!("{json}");
+            Ok(())
+        }
+        Err(aethyme_engine::explore::ExploreError::DaemonNotRunning) => {
+            // Distinct exit code so callers (e.g. the top-level `aethyme`
+            // binary) can fall back to the Python orchestrator.
+            eprintln!(
+                "explore: engine daemon not running; \
+                 start one with `aethyme-engine-cli daemon start --repo {}`",
+                repo.display()
+            );
+            std::process::exit(2);
+        }
+        Err(other) => Err(format!("explore: {other}")),
+    }
 }
 
 // daemon subcommand — start/stop/status/serve. Dispatches to the library

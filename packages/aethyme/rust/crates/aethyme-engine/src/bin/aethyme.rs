@@ -82,18 +82,91 @@ fn print_top_level_help() {
 }
 
 // ── explore ─────────────────────────────────────────────────────────────────
+//
+// Routing precedence (best to worst):
+//   1. Native Rust path via the engine daemon (in-process, no subprocess
+//      spawn). Returns answer-json directly. Session-1 scope: anchors +
+//      in-scope files only; trust capped at needs_verification.
+//   2. Python daemon socket (the Python explore orchestrator running as a
+//      long-lived process). Richer evidence — symbol search, source-text,
+//      callsite expansion. Pays Python startup once at daemon start.
+//   3. Python subprocess fallback. Pays Python startup every call.
+//
+// Each step falls through on failure so the caller always gets an answer
+// (or a clean "daemon not running" + subprocess output).
 
 fn run_explore(args: &[String]) -> ExitCode {
     let repo = resolve_repo(args);
 
     if let Some(repo_path) = repo.as_ref() {
+        // Native Rust path is the preferred route when the engine daemon
+        // is up. In-process call into the engine library; no subprocess
+        // overhead, no inter-binary roundtrip.
+        if let Some(exit) = try_native_explore(repo_path, args) {
+            return exit;
+        }
+
+        // Python daemon (warm Python state). One subprocess hop instead
+        // of two (skips the per-call interpreter startup).
         if let Some(response) = try_daemon(repo_path, "explore", args) {
             print!("{response}");
             return ExitCode::SUCCESS;
         }
     }
 
+    // Cold Python subprocess.
     delegate_to_python("explore", args)
+}
+
+/// Attempt the native Rust explore path. Returns Some(exit) when the engine
+/// daemon was reachable (success or error); None when the daemon isn't
+/// running and the caller should fall through to the next route.
+fn try_native_explore(repo: &Path, args: &[String]) -> Option<ExitCode> {
+    use aethyme_engine::explore::{
+        Detail, ExploreError, ExploreParams, explore_task_localization,
+    };
+
+    // Only the simplest invocation shape is supported in session 1. Any
+    // unsupported flag means "fall through to Python so we don't lose
+    // capability while the native path is incomplete".
+    let request = match find_arg(args, "--request") {
+        Some(r) => r,
+        None => return None,
+    };
+    let format = find_arg(args, "--format").unwrap_or_else(|| "answer-json".into());
+    if format != "answer-json" {
+        return None;
+    }
+    // The native path only implements compact today; standard/full need the
+    // richer evidence pipeline that's still in Python.
+    let detail_str = find_arg(args, "--detail").unwrap_or_else(|| "compact".into());
+    if detail_str != "compact" {
+        return None;
+    }
+    // --intent or --params imply a non-default flow; let Python handle it.
+    if find_arg(args, "--intent").is_some() || find_arg(args, "--params").is_some() {
+        return None;
+    }
+
+    let params = ExploreParams {
+        max_answer_items: 5,
+        detail: Detail::Compact,
+    };
+
+    match explore_task_localization(repo, &request, &params) {
+        Ok(response) => match serde_json::to_string_pretty(&response) {
+            Ok(json) => {
+                println!("{json}");
+                Some(ExitCode::SUCCESS)
+            }
+            Err(_) => None,
+        },
+        Err(ExploreError::DaemonNotRunning) => None,
+        Err(other) => {
+            eprintln!("aethyme: native explore failed, falling back to Python: {other}");
+            None
+        }
+    }
 }
 
 fn try_daemon(repo: &Path, command: &str, args: &[String]) -> Option<String> {
