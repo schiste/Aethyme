@@ -60,7 +60,7 @@ pub struct ExploreRequest {
     pub parameters: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AnswerItem {
     pub kind: String,
     pub target: String,
@@ -115,6 +115,15 @@ pub struct ExploreParams {
     /// `--detail` flag. Today only `compact` is fully implemented in the
     /// native path; standard/full fall back to Python at the call site.
     pub detail: Detail,
+    /// Number of distinct symbol queries to derive from the request. The
+    /// Python compact default is 5; matched here.
+    pub max_symbol_queries: usize,
+    /// Per-query result cap for symbol search.
+    pub max_symbol_results: usize,
+    /// Number of symbol-search-derived files to include in `answer[]`.
+    /// Caps independently of `max_answer_items` so symbol evidence
+    /// doesn't crowd out anchor evidence.
+    pub max_symbol_files: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +138,9 @@ impl Default for ExploreParams {
         Self {
             max_answer_items: 5, // matches Python compact default after f1e3da5
             detail: Detail::Compact,
+            max_symbol_queries: 5,
+            max_symbol_results: 4,
+            max_symbol_files: 8, // truncated when answer list fills
         }
     }
 }
@@ -171,16 +183,42 @@ pub fn explore_task_localization(
         return Err(ExploreError::DaemonNotRunning);
     }
 
+    // 1. Graph-derived view (anchors + scope + next).
+    let view = call_task_localize(&socket, request)?;
+
+    // 2. Symbol-search evidence. On failure (degraded daemon, network
+    //    blip), keep going with the anchors-only path rather than block
+    //    the whole request.
+    let symbol_queries = extract_symbol_queries(request);
+    let symbol_queries = if symbol_queries.len() > params.max_symbol_queries {
+        symbol_queries[..params.max_symbol_queries].to_vec()
+    } else {
+        symbol_queries
+    };
+    let symbol_matches = if symbol_queries.is_empty() {
+        SymbolBatchResults::default()
+    } else {
+        match call_symbol_batch(&socket, &symbol_queries, params.max_symbol_results) {
+            Ok(r) => r,
+            Err(_) => SymbolBatchResults::default(),
+        }
+    };
+
+    Ok(build_response(request, &view, &symbol_matches, params))
+}
+
+fn call_task_localize(
+    socket: &Path,
+    request: &str,
+) -> Result<serde_json::Value, ExploreError> {
     let rpc_request = serde_json::json!({
         "command": "task-localize",
         "task": request,
     });
-
-    let response_text = daemon::send_request(&socket, &rpc_request)
+    let response_text = daemon::send_request(socket, &rpc_request)
         .map_err(ExploreError::DaemonRpc)?;
     let envelope: serde_json::Value = serde_json::from_str(response_text.trim())
         .map_err(|e| ExploreError::InvalidResponse(format!("not JSON: {e}")))?;
-
     if envelope.get("ok") != Some(&serde_json::Value::Bool(true)) {
         let msg = envelope
             .get("error")
@@ -188,11 +226,140 @@ pub fn explore_task_localization(
             .unwrap_or("unknown daemon error");
         return Err(ExploreError::DaemonRpc(msg.to_string()));
     }
-    let view = envelope
+    envelope
         .get("result")
-        .ok_or_else(|| ExploreError::InvalidResponse("missing `result`".into()))?;
+        .cloned()
+        .ok_or_else(|| ExploreError::InvalidResponse("missing `result`".into()))
+}
 
-    Ok(build_response(request, view, params))
+fn call_symbol_batch(
+    socket: &Path,
+    queries: &[String],
+    limit: usize,
+) -> Result<SymbolBatchResults, ExploreError> {
+    let rpc_request = serde_json::json!({
+        "command": "symbol-batch",
+        "queries": queries,
+        "limit": limit,
+    });
+    let response_text = daemon::send_request(socket, &rpc_request)
+        .map_err(ExploreError::DaemonRpc)?;
+    let envelope: serde_json::Value = serde_json::from_str(response_text.trim())
+        .map_err(|e| ExploreError::InvalidResponse(format!("not JSON: {e}")))?;
+    if envelope.get("ok") != Some(&serde_json::Value::Bool(true)) {
+        let msg = envelope
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown daemon error");
+        return Err(ExploreError::DaemonRpc(msg.to_string()));
+    }
+    let result_obj = envelope
+        .get("result")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| ExploreError::InvalidResponse("missing/object `result`".into()))?;
+
+    let mut by_query: std::collections::BTreeMap<String, Vec<SymbolHit>> =
+        std::collections::BTreeMap::new();
+    for (query, hits) in result_obj {
+        let arr = match hits.as_array() {
+            Some(a) => a,
+            None => continue,
+        };
+        let parsed: Vec<SymbolHit> = arr
+            .iter()
+            .filter_map(SymbolHit::from_value)
+            .collect();
+        by_query.insert(query.clone(), parsed);
+    }
+    Ok(SymbolBatchResults {
+        query_order: queries.to_vec(),
+        by_query,
+    })
+}
+
+#[derive(Debug, Default)]
+struct SymbolBatchResults {
+    /// Original query order — preserves user-intent order across the
+    /// alphabetical BTreeMap iteration.
+    query_order: Vec<String>,
+    by_query: std::collections::BTreeMap<String, Vec<SymbolHit>>,
+}
+
+#[derive(Debug, Clone)]
+struct SymbolHit {
+    name: String,
+    kind: String,
+    file: String,
+    line: u64,
+    score: i64,
+}
+
+impl SymbolHit {
+    fn from_value(v: &serde_json::Value) -> Option<Self> {
+        let obj = v.as_object()?;
+        Some(SymbolHit {
+            name: obj.get("name")?.as_str()?.to_string(),
+            kind: obj.get("kind")?.as_str()?.to_string(),
+            file: obj.get("file")?.as_str()?.to_string(),
+            line: obj.get("line")?.as_u64().unwrap_or(0),
+            score: obj.get("score")?.as_i64().unwrap_or(0),
+        })
+    }
+}
+
+// ── symbol query extraction (Rust port of _request_symbol_queries) ──────
+//
+// Tokenizes `request`, drops English stop words and noisy single-letter
+// tokens, builds the canonical query list. When a token contains an
+// underscore we add the dropped-underscore variant too (so `add_watch`
+// also queries `addwatch`). Order-preserving + de-duplicated lowercase.
+
+const STOP_WORDS: &[&str] = &[
+    "about", "after", "against", "also", "and", "before", "being", "between",
+    "bug", "code", "command", "could", "defined", "does", "done", "file",
+    "files", "find", "fix", "for", "from", "have", "here", "how", "implement",
+    "implemented", "implementation", "into", "issue", "json", "located",
+    "make", "marked", "marks", "need", "object", "not", "only", "output",
+    "path", "prose", "question", "relative", "report", "repo", "repository",
+    "request", "rules", "shape", "the", "should", "specific", "that", "their",
+    "there", "this", "ticket", "seen", "viewed", "viewing", "what", "when",
+    "where", "which", "who", "why", "with", "would", "you",
+];
+
+pub(crate) fn extract_symbol_queries(request: &str) -> Vec<String> {
+    let normalized = request.replace('`', " ");
+    let mut raw_terms: Vec<String> = Vec::new();
+    for token in normalized.replace('/', " ").replace('-', " ").split_whitespace() {
+        let term: String = token
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if term.len() < 3 {
+            continue;
+        }
+        let lowered = term.to_ascii_lowercase();
+        if STOP_WORDS.contains(&lowered.as_str()) {
+            continue;
+        }
+        raw_terms.push(term);
+    }
+
+    let mut queries: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for term in &raw_terms {
+        let mut variants: Vec<String> = vec![term.clone()];
+        if term.contains('_') {
+            variants.push(term.replace('_', ""));
+        }
+        for variant in variants {
+            let lowered = variant.to_ascii_lowercase();
+            if seen.insert(lowered) {
+                queries.push(variant);
+            }
+        }
+    }
+    queries
 }
 
 // ── response synthesis ──────────────────────────────────────────────────
@@ -202,6 +369,7 @@ pub fn explore_task_localization(
 fn build_response(
     request: &str,
     view: &serde_json::Value,
+    symbol_matches: &SymbolBatchResults,
     params: &ExploreParams,
 ) -> ExploreResponse {
     let anchors = view
@@ -305,6 +473,23 @@ fn build_response(
         }
     }
 
+    // Symbol-search-derived items rank ahead of in_scope_file because
+    // matching the request's content terms against actual symbol names is
+    // stronger evidence than merely being in the same area.
+    let symbol_items = build_symbol_file_items(symbol_matches, params.max_symbol_files);
+    for item in &symbol_items {
+        if answers.len() >= params.max_answer_items {
+            break;
+        }
+        if answers
+            .iter()
+            .any(|a| a.path.as_deref() == item.path.as_deref())
+        {
+            continue;
+        }
+        answers.push(item.clone());
+    }
+
     for file in &in_scope_files {
         if answers.len() >= params.max_answer_items {
             break;
@@ -354,33 +539,90 @@ fn build_response(
     // Confidence summary: trivial bucketing on the answer items.
     let answer_summary = bucket_confidence(&answers);
 
-    // Trust policy.
+    // Trust policy. Tightens as more evidence sources land:
     //
-    // The native path doesn't (yet) run symbol search, source-text grep,
-    // or callsite expansion — those are the evidence sources Python uses
-    // to justify `answer_candidate` trust. So at session 1 we deliberately
-    // hold trust at `needs_verification` regardless of how strong the
-    // anchors look. Subsequent sessions raise trust as the native pipeline
-    // earns it back.
-    let trust_reason = if answers.is_empty() && nav_hints.is_empty() {
-        "No anchors or in-scope files found by graph navigation."
+    //   sessions 1: anchors + scope only         → needs_verification
+    //   session  2: + symbol search (this commit) → answer_candidate when
+    //                                              ≥2 distinct query terms
+    //                                              matched in the same file
+    //                                              (high-confidence 0.88)
+    //   session 3+: + source-text + callsite     → tighter rules per Python
+    //
+    // `answer_candidate` is awarded to results we'd defend as a primary
+    // answer; `needs_verification` is for "ranked plan, look at it" — the
+    // agent shouldn't act on the answer without checking it. The bar to
+    // award `answer_candidate` is intentionally high: the native path
+    // doesn't yet run source-text grep or callsite expansion, so the
+    // remaining evidence must be strong enough on its own.
+    let high_confidence_count = answers
+        .iter()
+        .filter(|a| a.confidence >= 0.85)
+        .count();
+    let multi_query_symbol_files = symbol_items
+        .iter()
+        .filter(|item| {
+            item.evidence
+                .get("matched_queries")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.len() >= 2)
+                .unwrap_or(false)
+        })
+        .count();
+
+    let policy_kind = if answers.is_empty() && nav_hints.is_empty() {
+        "failed"
+    } else if multi_query_symbol_files >= 1 {
+        // Multi-query symbol match in a single file is meaningful — the
+        // request mentions several distinct terms and they all hit the
+        // same target. That's the kind of evidence we'd defend as an
+        // authoritative answer candidate.
+        "answer_candidate"
     } else {
-        "Native session-1 path: anchors and scope only. Run symbol/text \
-         analyzers (Python explore) before treating as authoritative."
+        "needs_verification"
+    };
+    let evidence_level = if multi_query_symbol_files >= 1 {
+        "graph+symbol"
+    } else if !symbol_items.is_empty() {
+        "graph+symbol-weak"
+    } else {
+        "graph"
+    };
+    let safe_to_use_as_answer = matches!(policy_kind, "answer_candidate");
+    let trust_reason = match policy_kind {
+        "answer_candidate" => format!(
+            "Symbol search matched {} distinct request terms in the same \
+             file; treating as authoritative answer candidate.",
+            symbol_items
+                .iter()
+                .filter_map(|item| item
+                    .evidence
+                    .get("matched_queries")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.len()))
+                .max()
+                .unwrap_or(2)
+        ),
+        "failed" => {
+            "No anchors, in-scope files, or symbol matches found.".to_string()
+        }
+        _ => "Graph-derived candidates without strong cross-corroboration. \
+              Verify before acting; consider running the Python explore for \
+              richer evidence."
+            .to_string(),
     };
     let trust_policy = TrustPolicy {
-        safe_to_use_as_answer: false,
+        safe_to_use_as_answer,
         safe_to_use_as_navigation: !answers.is_empty() || !nav_hints.is_empty(),
-        evidence_level: "graph",
-        authoritative_answer_count: 0,
+        evidence_level: match evidence_level {
+            "graph+symbol" => "graph+symbol",
+            "graph+symbol-weak" => "graph+symbol-weak",
+            _ => "graph",
+        },
+        authoritative_answer_count: high_confidence_count,
         navigation_hint_count,
         degraded: false,
-        trust_policy: if answers.is_empty() && nav_hints.is_empty() {
-            "failed"
-        } else {
-            "needs_verification"
-        },
-        reason: trust_reason.to_string(),
+        trust_policy: policy_kind,
+        reason: trust_reason,
     };
 
     let status = if answers.is_empty() && nav_hints.is_empty() {
@@ -428,7 +670,7 @@ fn build_response(
             excluded_summary: ConfidenceSummary::default(),
             analyzed_summary: serde_json::json!({}),
         },
-        safe_to_use_as_answer: false,
+        safe_to_use_as_answer: trust_policy.safe_to_use_as_answer,
         safe_to_use_as_navigation: trust_policy.safe_to_use_as_navigation,
         trust_policy,
         degraded_reasons: Vec::new(),
@@ -444,6 +686,96 @@ fn build_response(
             "usage_boundary_query",
         ],
     }
+}
+
+/// Group symbol-search hits by file, rank by query coverage + cumulative
+/// score, emit AnswerItems with `kind = "symbol_search_file"`. Mirrors
+/// `_task_localization_symbol_file_items` in the Python orchestrator so
+/// downstream consumers see the same shape.
+///
+/// Confidence scoring:
+///   - 2+ distinct queries matched in this file → 0.88 (multi-term match)
+///   - 1 query matched                          → 0.76
+///
+/// These are the same numbers Python uses; preserving them keeps the
+/// trust-policy heuristics consistent across implementations.
+fn build_symbol_file_items(
+    symbol_matches: &SymbolBatchResults,
+    cap: usize,
+) -> Vec<AnswerItem> {
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
+
+    #[derive(Default)]
+    struct PerFile {
+        queries: BTreeSet<String>,
+        symbols: Vec<serde_json::Value>,
+        score: i64,
+    }
+
+    let mut by_file: BTreeMap<String, PerFile> = BTreeMap::new();
+    // Iterate queries in original order so the most relevant query
+    // dominates `symbols[0]` for a given file.
+    for query in &symbol_matches.query_order {
+        let Some(hits) = symbol_matches.by_query.get(query) else {
+            continue;
+        };
+        for hit in hits {
+            if hit.file.trim().is_empty() {
+                continue;
+            }
+            let entry = by_file.entry(hit.file.clone()).or_default();
+            entry.queries.insert(query.clone());
+            entry.symbols.push(serde_json::json!({
+                "name": hit.name,
+                "kind": hit.kind,
+                "line": hit.line,
+                "score": hit.score,
+            }));
+            entry.score += hit.score;
+        }
+    }
+
+    let mut ranked: Vec<(String, PerFile)> = by_file.into_iter().collect();
+    ranked.sort_by(|(la, a), (lb, b)| {
+        // Primary: more distinct queries. Secondary: total score.
+        // Tertiary: filename alphabetical for stability.
+        b.queries
+            .len()
+            .cmp(&a.queries.len())
+            .then_with(|| b.score.cmp(&a.score))
+            .then_with(|| la.cmp(lb))
+    });
+
+    let mut items: Vec<AnswerItem> = Vec::new();
+    for (file_path, summary) in ranked.into_iter().take(cap) {
+        let matched_queries: Vec<String> = summary.queries.iter().cloned().collect();
+        let multi = matched_queries.len() > 1;
+        let confidence = if multi { 0.88 } else { 0.76 };
+        let reason = if multi {
+            "Multiple request terms matched symbols in this file."
+        } else {
+            "A request term matched a symbol in this file."
+        };
+        let symbols_preview: Vec<serde_json::Value> =
+            summary.symbols.into_iter().take(5).collect();
+        items.push(AnswerItem {
+            kind: "symbol_search_file".into(),
+            target: file_path.clone(),
+            path: Some(file_path),
+            status: "candidate".into(),
+            confidence,
+            reason: reason.into(),
+            role: "candidate".into(),
+            evidence: serde_json::json!({
+                "source": "query-symbol",
+                "matched_queries": matched_queries,
+                "symbols": symbols_preview,
+                "combined_score": summary.score,
+            }),
+        });
+    }
+    items
 }
 
 fn bucket_confidence(items: &[AnswerItem]) -> ConfidenceSummary {
@@ -509,11 +841,38 @@ mod tests {
         })
     }
 
+    fn empty_symbols() -> SymbolBatchResults {
+        SymbolBatchResults::default()
+    }
+
+    fn symbols_for(file: &str, queries: &[(&str, i64)]) -> SymbolBatchResults {
+        let mut by_query = std::collections::BTreeMap::new();
+        let mut order = Vec::new();
+        for (q, score) in queries {
+            order.push((*q).to_string());
+            by_query.insert(
+                (*q).to_string(),
+                vec![SymbolHit {
+                    name: format!("hit_for_{q}"),
+                    kind: "function".into(),
+                    file: file.to_string(),
+                    line: 42,
+                    score: *score,
+                }],
+            );
+        }
+        SymbolBatchResults {
+            query_order: order,
+            by_query,
+        }
+    }
+
     #[test]
     fn build_response_synthesizes_answers_and_nav_hints() {
         let response = build_response(
             "find watchlist handlers",
             &sample_view(),
+            &empty_symbols(),
             &ExploreParams::default(),
         );
         assert!(!response.answer.is_empty(), "expected at least one answer");
@@ -543,9 +902,10 @@ mod tests {
         let response = build_response(
             "test",
             &view,
+            &empty_symbols(),
             &ExploreParams {
                 max_answer_items: 3,
-                detail: Detail::Compact,
+                ..ExploreParams::default()
             },
         );
         assert_eq!(response.answer.len(), 3);
@@ -564,8 +924,12 @@ mod tests {
             },
             "next": {"items": []}
         });
-        let response =
-            build_response("nothing matches", &view, &ExploreParams::default());
+        let response = build_response(
+            "nothing matches",
+            &view,
+            &empty_symbols(),
+            &ExploreParams::default(),
+        );
         assert_eq!(response.status, "degraded");
         assert!(response.answer.is_empty());
         assert!(response.navigation_hints.is_empty());
@@ -573,16 +937,82 @@ mod tests {
     }
 
     #[test]
-    fn trust_policy_session_one_caps_at_needs_verification() {
+    fn trust_policy_without_symbol_evidence_is_needs_verification() {
         let response = build_response(
             "find handlers",
             &sample_view(),
+            &empty_symbols(),
             &ExploreParams::default(),
         );
-        // Session 1 contract: even with strong anchors, never claim
-        // `answer_candidate` because we haven't run symbol/text/callsite
-        // analyzers yet.
+        // Without symbol evidence, anchors+scope alone don't earn
+        // `answer_candidate` — the cross-corroboration is missing.
         assert!(!response.safe_to_use_as_answer);
         assert_eq!(response.trust_policy.trust_policy, "needs_verification");
+        assert_eq!(response.trust_policy.evidence_level, "graph");
+    }
+
+    #[test]
+    fn multi_query_symbol_match_elevates_to_answer_candidate() {
+        let symbols = symbols_for(
+            "src/auth/SessionStore.php",
+            &[("session", 200), ("authenticate", 300)],
+        );
+        let response = build_response(
+            "find session authenticate handlers",
+            &sample_view(),
+            &symbols,
+            &ExploreParams::default(),
+        );
+        assert!(response.safe_to_use_as_answer);
+        assert_eq!(response.trust_policy.trust_policy, "answer_candidate");
+        assert_eq!(response.trust_policy.evidence_level, "graph+symbol");
+        // The matched file should appear in answer[] as a symbol_search_file
+        // ahead of in_scope_file items because symbol evidence is stronger.
+        let symbol_match_position = response
+            .answer
+            .iter()
+            .position(|a| a.kind == "symbol_search_file");
+        assert!(
+            symbol_match_position.is_some(),
+            "symbol_search_file should be present in answer[]"
+        );
+    }
+
+    #[test]
+    fn single_query_symbol_match_stays_at_needs_verification() {
+        let symbols = symbols_for("src/util/helpers.php", &[("helper", 100)]);
+        let response = build_response(
+            "find helper code",
+            &sample_view(),
+            &symbols,
+            &ExploreParams::default(),
+        );
+        // One query matched is weak corroboration — bar to claim
+        // `answer_candidate` is multi-term match in the SAME file.
+        assert!(!response.safe_to_use_as_answer);
+        assert_eq!(response.trust_policy.trust_policy, "needs_verification");
+        assert_eq!(response.trust_policy.evidence_level, "graph+symbol-weak");
+    }
+
+    #[test]
+    fn extract_symbol_queries_drops_stop_words_and_short_terms() {
+        let queries = extract_symbol_queries(
+            "Find the file that handles WatchedItem revisions",
+        );
+        // "find", "the", "that" are stop words. "Watcheditem" stays.
+        assert!(queries.iter().any(|q| q.eq_ignore_ascii_case("WatchedItem")));
+        assert!(queries.iter().any(|q| q.eq_ignore_ascii_case("revisions")));
+        assert!(!queries.iter().any(|q| q.eq_ignore_ascii_case("the")));
+        assert!(!queries.iter().any(|q| q.eq_ignore_ascii_case("find")));
+    }
+
+    #[test]
+    fn extract_symbol_queries_adds_underscore_collapsed_variant() {
+        let queries = extract_symbol_queries("trace add_watch behavior");
+        // Both `add_watch` and `addwatch` should be present.
+        let lower: Vec<String> =
+            queries.iter().map(|q| q.to_ascii_lowercase()).collect();
+        assert!(lower.contains(&"add_watch".to_string()));
+        assert!(lower.contains(&"addwatch".to_string()));
     }
 }

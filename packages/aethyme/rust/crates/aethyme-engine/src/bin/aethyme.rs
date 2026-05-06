@@ -151,6 +151,7 @@ fn try_native_explore(repo: &Path, args: &[String]) -> Option<ExitCode> {
     let params = ExploreParams {
         max_answer_items: 5,
         detail: Detail::Compact,
+        ..ExploreParams::default()
     };
 
     match explore_task_localization(repo, &request, &params) {

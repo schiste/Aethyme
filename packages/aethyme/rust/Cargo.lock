@@ -23,6 +23,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "dhat",
+ "libc",
  "once_cell",
  "rayon",
  "redb",

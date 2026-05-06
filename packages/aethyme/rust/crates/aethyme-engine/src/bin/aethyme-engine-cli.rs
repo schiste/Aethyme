@@ -799,6 +799,7 @@ fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
     let params = aethyme_engine::explore::ExploreParams {
         max_answer_items,
         detail: detail_enum,
+        ..aethyme_engine::explore::ExploreParams::default()
     };
 
     let repo = PathBuf::from(&repo_str);

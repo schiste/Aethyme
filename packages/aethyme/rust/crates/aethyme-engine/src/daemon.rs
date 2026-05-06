@@ -57,6 +57,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::graph::navigation::{task_anchors_view, task_next_view, task_scope_view};
+use crate::graph::search::symbol_search;
 use crate::map::RepositoryMap;
 use crate::model::task::TaskInput;
 
@@ -332,6 +333,60 @@ fn handle_request(mut stream: UnixStream, state: &Arc<Mutex<DaemonState>>) -> bo
             let view =
                 crate::json::task_localization_view(&anchors, &scope, &next);
             send_ok_raw(&mut stream, &view);
+            false
+        }
+        "symbol-batch" => {
+            // Run symbol_search against the resident map for each query.
+            // Returns a JSON object keyed by query: {query → [SearchHit, ...]}.
+            // Mirrors the `aethyme-engine-cli symbol-batch` shape so the
+            // Python wrapper can route through the daemon transparently.
+            let queries: Vec<String> = request
+                .get("queries")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let limit = request
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20) as usize;
+
+            if queries.is_empty() {
+                send_error(&mut stream, "missing or empty `queries` array");
+                return false;
+            }
+
+            let s = state.lock().expect("daemon state lock poisoned");
+            let mut results: serde_json::Map<String, serde_json::Value> =
+                serde_json::Map::new();
+            for query in &queries {
+                let hits = symbol_search(&s.map, query, limit);
+                let arr: Vec<serde_json::Value> = hits
+                    .into_iter()
+                    .map(|h| {
+                        serde_json::json!({
+                            "id": h.id,
+                            "name": h.name,
+                            "kind": h.kind,
+                            "file": h.file,
+                            "line": h.line,
+                            "score": h.score,
+                            "reason": h.reason,
+                        })
+                    })
+                    .collect();
+                results.insert(query.clone(), serde_json::Value::Array(arr));
+            }
+            send_ok_value(
+                &mut stream,
+                serde_json::json!({
+                    "ok": true,
+                    "result": serde_json::Value::Object(results),
+                }),
+            );
             false
         }
         other => {
