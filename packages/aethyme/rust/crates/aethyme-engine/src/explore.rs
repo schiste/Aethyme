@@ -260,6 +260,36 @@ pub enum Detail {
     Full,
 }
 
+impl Detail {
+    /// Apply detail-level overrides to params. Standard widens caps
+    /// roughly 2x; Full widens 4x. Compact uses the user-provided
+    /// (or default) values unchanged.
+    ///
+    /// We widen the *existing* evidence caps rather than emitting
+    /// new fields (the way Python's `--detail standard` does with
+    /// `output_adapters` etc.) because the agent flow rarely needs
+    /// the verbose envelope — what helps is more candidates to
+    /// triage. Output_adapters and observability stay compact-shaped.
+    pub fn apply_param_widening(&self, params: &mut ExploreParams) {
+        let factor: usize = match self {
+            Detail::Compact => return,
+            Detail::Standard => 2,
+            Detail::Full => 4,
+        };
+        params.max_answer_items = params.max_answer_items.saturating_mul(factor);
+        params.max_symbol_queries =
+            params.max_symbol_queries.saturating_mul(factor);
+        params.max_symbol_results =
+            params.max_symbol_results.saturating_mul(factor);
+        params.max_symbol_files = params.max_symbol_files.saturating_mul(factor);
+        params.max_text_files = params.max_text_files.saturating_mul(factor);
+        params.max_text_line_refs =
+            params.max_text_line_refs.saturating_mul(factor);
+        params.max_filename_hints =
+            params.max_filename_hints.saturating_mul(factor);
+    }
+}
+
 impl Default for ExploreParams {
     fn default() -> Self {
         Self {
@@ -332,6 +362,15 @@ pub struct UsageBoundaryParams {
     /// Maximum evidence items per candidate symbol (internal_callers,
     /// external_callers samples). Capped to keep responses bounded.
     pub max_evidence_per_symbol: usize,
+    /// Maximum number of candidates to emit in `answer[]`. The
+    /// MediaWiki measurement showed the analyzer can produce 49
+    /// candidates on a moderate scope, blowing the response to 20K
+    /// tokens. This cap keeps responses agent-readable; consumers
+    /// that need the full list can iterate via narrower scopes.
+    /// Candidates are pre-sorted by status (Unused first) and
+    /// confidence (highest first), so truncation keeps the strongest
+    /// evidence.
+    pub max_answer_items: usize,
 }
 
 impl Default for UsageBoundaryParams {
@@ -342,6 +381,10 @@ impl Default for UsageBoundaryParams {
             include_methods: true,
             budget_ms: 10_000,
             max_evidence_per_symbol: 5,
+            // Mirrors task_localization compact default. 25 is enough
+            // for the agent to triage; full lists are available via
+            // narrower --scope or the Python orchestrator.
+            max_answer_items: 25,
         }
     }
 }
@@ -388,13 +431,40 @@ fn build_usage_boundary_response(
 ) -> ExploreResponse {
     // Split candidates by status: Unused/Ambiguous → answer[],
     // Used → excluded[]. The agent acts on `answer[]` items only.
+    //
+    // Pre-sort candidates so truncation later keeps the strongest:
+    // Unused > Ambiguous, then by confidence descending.
+    let mut sorted: Vec<&DeadCodeCandidate> = answer.candidates.iter().collect();
+    sorted.sort_by(|a, b| {
+        // Unused (0) ranks ahead of Ambiguous (1) ahead of Used (2).
+        // Reverse-compare confidence inside same status.
+        let status_rank = |s: &AnswerStatus| match s {
+            AnswerStatus::Unused => 0u8,
+            AnswerStatus::Ambiguous => 1,
+            AnswerStatus::Used => 2,
+        };
+        status_rank(&a.status)
+            .cmp(&status_rank(&b.status))
+            .then_with(|| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
     let mut answers: Vec<AnswerItem> = Vec::new();
     let mut excluded: Vec<serde_json::Value> = Vec::new();
     let mut ambiguous: Vec<serde_json::Value> = Vec::new();
 
-    for candidate in &answer.candidates {
+    for candidate in sorted {
         match candidate.status {
             AnswerStatus::Unused | AnswerStatus::Ambiguous => {
+                if answers.len() >= params.max_answer_items {
+                    // Cap reached; remaining candidates are trimmed.
+                    // Pre-sort guarantees what we kept is the strongest
+                    // evidence by status × confidence.
+                    continue;
+                }
                 let item = candidate_to_answer_item(candidate);
                 if matches!(candidate.status, AnswerStatus::Ambiguous) {
                     ambiguous.push(serde_json::to_value(&item).unwrap_or_default());
@@ -654,6 +724,14 @@ pub fn explore_with_intent(
     }
 
     let mut effective_params = params.clone();
+    // Order: detail widening first (compact → standard/full caps),
+    // then intent overrides (behavior_localization wider than
+    // task_localization). Intent overrides apply MIN-bound semantics
+    // — they widen but never shrink — so order is fine either way,
+    // but doing detail first feels like the user-visible flag should
+    // dominate.
+    let detail = effective_params.detail;
+    detail.apply_param_widening(&mut effective_params);
     intent.apply_param_defaults(&mut effective_params);
     let params = &effective_params;
 

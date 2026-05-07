@@ -894,6 +894,10 @@ fn run_explore_usage_boundary(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
+    let max_answer_items: usize = read_option(args, "--max-answer-items")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(25);
 
     let params = aethyme_engine::explore::UsageBoundaryParams {
         scope,
@@ -901,6 +905,7 @@ fn run_explore_usage_boundary(
         include_methods,
         budget_ms,
         max_evidence_per_symbol: max_evidence,
+        max_answer_items,
     };
 
     let repo = PathBuf::from(repo_str);
