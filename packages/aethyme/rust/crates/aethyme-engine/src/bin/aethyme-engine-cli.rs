@@ -809,6 +809,12 @@ fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
         "behavior_localization_query" | "behavior" => {
             aethyme_engine::explore::Intent::BehaviorLocalization
         }
+        "auto" => {
+            // Heuristic-based intent selection: scans the first ~10
+            // tokens of the request for change-task verbs. Defaults
+            // to `task_localization_query` when no signal is found.
+            aethyme_engine::explore::Intent::auto_select(&request)
+        }
         "usage_boundary_query" => {
             return Err(
                 "explore: usage_boundary_query is not yet ported to the \

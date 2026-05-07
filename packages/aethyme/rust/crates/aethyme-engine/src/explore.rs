@@ -154,6 +154,70 @@ impl Intent {
             }
         }
     }
+
+    /// Heuristic intent selection from request text.
+    ///
+    /// Returns `BehaviorLocalization` when the request opens with a
+    /// change-task verb ("add", "implement", "fix", etc.) within the
+    /// first 10 tokens — that's where intent verbs front-load.
+    /// Otherwise returns `TaskLocalization`.
+    ///
+    /// Cost asymmetry: this heuristic intentionally leans toward
+    /// `BehaviorLocalization` when uncertain. Picking behavior when
+    /// the user wanted task only costs a slightly wider search;
+    /// picking task when the user wanted behavior costs missed
+    /// candidate sites — a real quality regression. The signal-set
+    /// is conservative (only confident change-verbs) but the bias
+    /// is to surface change-shape evidence when it's plausible.
+    ///
+    /// Currently opt-in via `--intent auto` from the CLI; the
+    /// default stays at `TaskLocalization` for back-compat. Once
+    /// evals validate the heuristic's hit rate on real requests,
+    /// this can become the default.
+    pub fn auto_select(request: &str) -> Self {
+        const CHANGE_VERBS: &[&str] = &[
+            // Additive
+            "add", "adds", "adding", "implement", "implements",
+            "implementing", "introduce", "introduces", "introducing",
+            "create", "creates", "creating", "build", "builds",
+            "building", "wire", "wires", "wiring",
+            // Modifying
+            "modify", "modifies", "modifying", "edit", "edits", "editing",
+            "change", "changes", "changing", "update", "updates",
+            "updating", "tweak", "tweaks",
+            // Restructuring
+            "refactor", "refactors", "refactoring", "restructure",
+            "restructures", "restructuring", "rewrite", "rewrites",
+            "rewriting", "rename", "renames", "renaming", "extract",
+            "extracts", "extracting",
+            // Fixing
+            "fix", "fixes", "fixing", "repair", "repairs", "repairing",
+            "resolve", "resolves", "resolving", "patch", "patches",
+            "patching",
+            // Removing
+            "remove", "removes", "removing", "delete", "deletes",
+            "deleting", "drop", "drops", "dropping", "deprecate",
+            "deprecates", "deprecating", "retire", "retires", "retiring",
+            // Migrating
+            "migrate", "migrates", "migrating", "port", "ports",
+            "porting", "convert", "converts", "converting",
+        ];
+        let lower = request.to_ascii_lowercase();
+        // Look only at the first ~10 tokens — verbs front-load.
+        let token_iter = lower
+            .split(|c: char| {
+                c.is_whitespace()
+                    || matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'')
+            })
+            .filter(|s| !s.is_empty())
+            .take(10);
+        for token in token_iter {
+            if CHANGE_VERBS.contains(&token) {
+                return Intent::BehaviorLocalization;
+            }
+        }
+        Intent::TaskLocalization
+    }
 }
 
 // ── parameters ──────────────────────────────────────────────────────────
@@ -1873,5 +1937,100 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), lower.len(), "duplicate term in {lower:?}");
+    }
+
+    // ── Intent::auto_select heuristic ──────────────────────────────────
+
+    #[test]
+    fn auto_select_picks_behavior_for_change_verbs() {
+        // Standard change-task openings.
+        assert_eq!(
+            Intent::auto_select("Add a new authentication provider"),
+            Intent::BehaviorLocalization,
+        );
+        assert_eq!(
+            Intent::auto_select("Implement caching for the snapshot builder"),
+            Intent::BehaviorLocalization,
+        );
+        assert_eq!(
+            Intent::auto_select("Fix the bug where viewing a diff marks all revisions as seen"),
+            Intent::BehaviorLocalization,
+        );
+        assert_eq!(
+            Intent::auto_select("Refactor the suppliers grader scoring logic"),
+            Intent::BehaviorLocalization,
+        );
+        assert_eq!(
+            Intent::auto_select("Remove the deprecated v1 API surface"),
+            Intent::BehaviorLocalization,
+        );
+        assert_eq!(
+            Intent::auto_select("Migrate from SurrealDB to redb"),
+            Intent::BehaviorLocalization,
+        );
+    }
+
+    #[test]
+    fn auto_select_picks_task_for_read_only_verbs() {
+        // "where/find/show/explain" — the user wants to LOCATE, not change.
+        assert_eq!(
+            Intent::auto_select("Where does suppliers grader live?"),
+            Intent::TaskLocalization,
+        );
+        assert_eq!(
+            Intent::auto_select("Find files that handle watchlist notifications"),
+            Intent::TaskLocalization,
+        );
+        assert_eq!(
+            Intent::auto_select("Show me the auth flow"),
+            Intent::TaskLocalization,
+        );
+        assert_eq!(
+            Intent::auto_select("Explain how the snapshot builder works"),
+            Intent::TaskLocalization,
+        );
+        // No verb at all — default to task.
+        assert_eq!(
+            Intent::auto_select("authentication provider"),
+            Intent::TaskLocalization,
+        );
+    }
+
+    #[test]
+    fn auto_select_only_scans_first_10_tokens() {
+        // Long preamble whose CHANGE verb sits past the 10-token window
+        // should NOT trigger BehaviorLocalization. Verbs front-load in
+        // requests; mid-sentence verbs are usually descriptive.
+        let request = "Where does the file that the recent CI failure last \
+                       Tuesday refers to add a new feature live?";
+        // "add" appears at token ~13. Should still be TaskLocalization.
+        assert_eq!(
+            Intent::auto_select(request),
+            Intent::TaskLocalization,
+        );
+    }
+
+    #[test]
+    fn auto_select_ignores_verb_inside_word() {
+        // "padding" contains "add" as substring — must NOT trigger.
+        // Tokenization is the safety net: we match whole tokens, not
+        // substrings.
+        assert_eq!(
+            Intent::auto_select("Where is the padding logic for the form?"),
+            Intent::TaskLocalization,
+        );
+    }
+
+    #[test]
+    fn auto_select_handles_punctuation_around_verbs() {
+        // Common patterns where the verb has punctuation neighbors.
+        assert_eq!(
+            Intent::auto_select("Bug: \"add\" feature broken"),
+            Intent::BehaviorLocalization,
+        );
+        assert_eq!(
+            Intent::auto_select("TODO -- implement the missing handler"),
+            Intent::BehaviorLocalization,
+        );
     }
 }
