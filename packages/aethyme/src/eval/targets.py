@@ -78,11 +78,14 @@ TARGETS: dict[str, EvalTarget] = {
     "grc": EvalTarget(
         name="grc",
         display_name="GRC",
-        control_path=_PLAYGROUND_ROOT / "GRC" / "Playground Control",
-        aethyme_path=_PLAYGROUND_ROOT / "GRC" / "Playground Aethyme",
+        # The TypeScript monorepo previously lived at GRC/Playground{Control,Aethyme}.
+        # It was reorganized under Playground/Mockup/Mockup\ -\ {Control,Aethyme}.
+        # Slug stays "grc" for tooling stability; paths sync to current filesystem.
+        control_path=_PLAYGROUND_ROOT / "Mockup" / "Mockup - Control",
+        aethyme_path=_PLAYGROUND_ROOT / "Mockup" / "Mockup - Aethyme",
         description="TypeScript monorepo (enterprise GRC platform)",
-        setup_control_dir_name="Playground Control",
-        setup_aethyme_dir_name="Playground Aethyme",
+        setup_control_dir_name="Mockup - Control",
+        setup_aethyme_dir_name="Mockup - Aethyme",
     ),
     "mediawiki": EvalTarget(
         name="mediawiki",

@@ -5449,7 +5449,11 @@ def eval_bug_fix_prepare(
         raise click.ClickException(str(exc)) from exc
 
     if json_output:
-        click.echo(json.dumps(result, indent=2))
+        # `cleanup_timer` is a threading.Timer the orchestrator uses to
+        # auto-delete the benchmark dir after 5 min. It's not part of
+        # the JSON contract — strip it before serializing.
+        printable = {k: v for k, v in result.items() if k != "cleanup_timer"}
+        click.echo(json.dumps(printable, indent=2))
         return
 
     click.echo(f"Scenario: {scenario}")
