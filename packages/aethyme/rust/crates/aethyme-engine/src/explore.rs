@@ -98,7 +98,7 @@ pub struct ConfidenceSummary {
 pub struct TrustPolicy {
     pub safe_to_use_as_answer: bool,
     pub safe_to_use_as_navigation: bool,
-    pub evidence_level: &'static str,
+    pub evidence_level: String,
     pub authoritative_answer_count: usize,
     pub navigation_hint_count: usize,
     pub degraded: bool,
@@ -456,10 +456,16 @@ fn source_text_files(
     }
 
     let mut ranked: Vec<TextHit> = hits_by_file.into_values().collect();
+    // Sort by composite score: (suffix_class_rank desc, distinct_terms desc,
+    // hit_count desc, path asc). suffix_class_rank pushes executable source
+    // ahead of locale data / changelogs so the agent doesn't see a wall of
+    // i18n JSON files when their query terms happen to be common words.
+    // Mirrors the Python helper's role-aware penalty without porting the
+    // full heuristic (deferred to session 4+).
     ranked.sort_by(|a, b| {
-        b.matched_terms
-            .len()
-            .cmp(&a.matched_terms.len())
+        suffix_class_rank(&b.path)
+            .cmp(&suffix_class_rank(&a.path))
+            .then_with(|| b.matched_terms.len().cmp(&a.matched_terms.len()))
             .then_with(|| b.hit_count.cmp(&a.hit_count))
             .then_with(|| a.path.cmp(&b.path))
     });
@@ -520,6 +526,61 @@ fn source_text_files(
             }
         })
         .collect()
+}
+
+/// Coarse file-class ranking for source-text matches. Higher is better.
+///
+/// The query "find logic" matches lots of locale JSON files because every
+/// translated string contains "logic". Without a class signal, those
+/// files swamp `answer[]`. We rank executable source highest, then docs,
+/// then changelogs/data lowest. Inside a class, finer ranking falls back
+/// to term coverage and hit count.
+///
+/// This is intentionally simpler than the Python helper's weighting (which
+/// combines file role, path patterns, enclosing-symbol presence, etc).
+/// Captures the 80% case at 20% of the code.
+fn suffix_class_rank(path: &str) -> i32 {
+    let lower = path.to_ascii_lowercase();
+    // Strong demote: locale/translation files. The `/locales/` segment is
+    // the canonical pattern across most monorepos.
+    if lower.contains("/locales/")
+        || lower.contains("/locale/")
+        || lower.contains("/i18n/")
+        || lower.contains("/translations/")
+    {
+        return 0;
+    }
+    // Top-level data / metadata files. Match common request terms but
+    // rarely the actual answer.
+    let basename = lower.rsplit('/').next().unwrap_or(&lower);
+    if basename == "changelog.md"
+        || basename == "history.md"
+        || basename == "package-lock.json"
+        || basename == "yarn.lock"
+        || basename == "pnpm-lock.yaml"
+    {
+        return 1;
+    }
+    // Source code by suffix.
+    let suffix = lower.rsplit('.').next().unwrap_or("");
+    match suffix {
+        "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "go" | "java" | "kt"
+        | "swift" | "rb" | "php" | "c" | "h" | "cpp" | "hpp" | "cs"
+        | "mjs" | "cjs" | "vue" | "svelte" => 5,
+        // Test files — slightly lower than code but still useful.
+        s if (lower.contains("/tests/")
+            || lower.contains("/test/")
+            || lower.contains(".test.")
+            || lower.contains(".spec."))
+            && !s.is_empty() =>
+        {
+            4
+        }
+        "md" | "rst" | "adoc" | "txt" => 3,
+        "yml" | "yaml" | "toml" | "ini" | "conf" | "config" => 2,
+        // Generic JSON / data — common text matches but weak signal.
+        _ => 1,
+    }
 }
 
 fn ingest_rg_output(
@@ -677,18 +738,26 @@ fn build_response(
 
     // Synthesize answer items.
     //
-    // For session 1 we trust two signals:
-    //   1. anchors with `kind = "file"` are confident enough to be
-    //      `answer[]` items at confidence 0.85.
-    //   2. in_scope_files become `answer[]` items at confidence 0.7,
-    //      bounded by max_answer_items.
+    // Insertion order = priority order (each loop respects the
+    // `max_answer_items` cap and skips paths already added):
     //
-    // Anchors with `kind = "folder"` and in_scope_areas become
-    //   `navigation_hints[]` instead of `answer[]` because the agent
-    //   is asking for FILES to act on, and a folder is one click of
-    //   navigation away from being actionable.
+    //   1. source_text_file  — line-level evidence, strongest signal
+    //   2. symbol_search_file — name-match evidence
+    //   3. anchor             — graph-derived seed (heuristic, weaker)
+    //   4. in_scope_file      — area-membership-only (weakest)
+    //
+    // This matters: anchors are heuristic seeds (e.g. "package.json"
+    // matched a generic config-anchor weight). They're weaker
+    // evidence than a line that literally contains the request's
+    // terms in executable code. Putting them last among
+    // answer-track items reflects that.
+    //
+    // anchors with `kind = "folder" | "area"` and in_scope_areas
+    // are routed to `navigation_hints[]` because the agent is asking
+    // for FILES to act on, not directories.
     let mut answers: Vec<AnswerItem> = Vec::new();
     let mut nav_hints: Vec<AnswerItem> = Vec::new();
+    let mut anchor_file_items: Vec<AnswerItem> = Vec::new();
 
     for anchor in &anchors {
         let kind = anchor.get("kind").and_then(|v| v.as_str()).unwrap_or("");
@@ -702,7 +771,7 @@ fn build_response(
         match kind {
             "file" => {
                 let path = file.map(String::from).or_else(|| Some(id.to_string()));
-                answers.push(AnswerItem {
+                anchor_file_items.push(AnswerItem {
                     kind: "anchor".into(),
                     target: id.to_string(),
                     path,
@@ -750,10 +819,60 @@ fn build_response(
         }
     }
 
-    // Source-text items rank highest in `answer[]`: they carry actual
-    // line-level evidence (line_refs) and are the strongest single
-    // signal an agent can verify quickly. Symbol-search items rank
-    // second; in_scope_file items last.
+    // Slot budgeting: if symbol search has multi-query hits, reserve up
+    // to 2 slots so they always land in `answer[]` even when text
+    // matches are plentiful. Without this, a query like "find suppliers
+    // grader scoring logic" gets 5 weak text matches and zero symbol
+    // matches in the response — even when the most relevant file
+    // (suppliers_grader.py) was found by symbol search.
+    //
+    // The reservation is conservative: only ≥2 slots, only when symbol
+    // has multi-query hits. Single-query symbol matches stay weakly
+    // ranked.
+    let symbol_items = build_symbol_file_items(symbol_matches, params.max_symbol_files);
+    let multi_query_symbol_count = symbol_items
+        .iter()
+        .filter(|item| {
+            item.evidence
+                .get("matched_queries")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.len() >= 2)
+                .unwrap_or(false)
+        })
+        .count();
+    let symbol_reserved = multi_query_symbol_count.min(2);
+    let text_budget = params.max_answer_items.saturating_sub(symbol_reserved);
+
+    for item in text_items.iter().take(text_budget.max(1)) {
+        if answers.len() >= text_budget {
+            break;
+        }
+        if answers
+            .iter()
+            .any(|a| a.path.as_deref() == item.path.as_deref())
+        {
+            continue;
+        }
+        answers.push(item.clone());
+    }
+
+    for item in &symbol_items {
+        if answers.len() >= params.max_answer_items {
+            break;
+        }
+        if answers
+            .iter()
+            .any(|a| a.path.as_deref() == item.path.as_deref())
+        {
+            continue;
+        }
+        answers.push(item.clone());
+    }
+
+    // Backfill text again now that symbol items have landed — the
+    // budget cap above held remaining text out; if there's room left
+    // (no symbol items, or symbol items dedup'd against text), let
+    // text fill the rest.
     for item in text_items {
         if answers.len() >= params.max_answer_items {
             break;
@@ -767,8 +886,7 @@ fn build_response(
         answers.push(item.clone());
     }
 
-    let symbol_items = build_symbol_file_items(symbol_matches, params.max_symbol_files);
-    for item in &symbol_items {
+    for item in &anchor_file_items {
         if answers.len() >= params.max_answer_items {
             break;
         }
@@ -935,11 +1053,7 @@ fn build_response(
     let trust_policy = TrustPolicy {
         safe_to_use_as_answer,
         safe_to_use_as_navigation: !answers.is_empty() || !nav_hints.is_empty(),
-        evidence_level: match evidence_level {
-            "graph+symbol" => "graph+symbol",
-            "graph+symbol-weak" => "graph+symbol-weak",
-            _ => "graph",
-        },
+        evidence_level: evidence_level.to_string(),
         authoritative_answer_count: high_confidence_count,
         navigation_hint_count,
         degraded: false,
