@@ -106,6 +106,56 @@ pub struct TrustPolicy {
     pub reason: String,
 }
 
+// ── intents ────────────────────────────────────────────────────────────
+
+/// The two task_localization-shaped intents we support natively.
+///
+/// `task_localization_query` is the default: bounded answer, compact
+/// detail, conservative defaults. `behavior_localization_query` is for
+/// change-tasks ("what would I edit to make X happen?") — same engine
+/// call, wider params.
+///
+/// `usage_boundary_query` is a different engine path
+/// (`analyze usage-boundary`, returns a candidates list keyed by
+/// status=Unused/Ambiguous). Not yet ported; the caller falls back to
+/// Python for that intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    TaskLocalization,
+    BehaviorLocalization,
+}
+
+impl Intent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Intent::TaskLocalization => "task_localization_query",
+            Intent::BehaviorLocalization => "behavior_localization_query",
+        }
+    }
+
+    /// Apply intent-specific overrides to params. behavior_localization
+    /// widens the search: more text candidates, more callsite breadth.
+    /// Mirrors Python's behavior_params dict in cli.py:432-436.
+    pub fn apply_param_defaults(&self, params: &mut ExploreParams) {
+        match self {
+            Intent::TaskLocalization => {}
+            Intent::BehaviorLocalization => {
+                if params.max_text_files < 10 {
+                    params.max_text_files = 10;
+                }
+                if params.max_filename_hints < 5 {
+                    params.max_filename_hints = 5;
+                }
+                // Also expand symbol coverage — change tasks need to
+                // see more candidate sites.
+                if params.max_symbol_files < 12 {
+                    params.max_symbol_files = 12;
+                }
+            }
+        }
+    }
+}
+
 // ── parameters ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -192,10 +242,28 @@ pub fn explore_task_localization(
     request: &str,
     params: &ExploreParams,
 ) -> Result<ExploreResponse, ExploreError> {
+    explore_with_intent(repo, request, Intent::TaskLocalization, params)
+}
+
+/// Run an explore intent with explicit intent selection.
+///
+/// `task_localization` is the read-only default ("where is X?").
+/// `behavior_localization` is for change-tasks ("what do I edit to
+/// make X happen?") — wider param defaults, otherwise same path.
+pub fn explore_with_intent(
+    repo: &Path,
+    request: &str,
+    intent: Intent,
+    params: &ExploreParams,
+) -> Result<ExploreResponse, ExploreError> {
     let socket = daemon::socket_path_for(repo);
     if !socket.exists() {
         return Err(ExploreError::DaemonNotRunning);
     }
+
+    let mut effective_params = params.clone();
+    intent.apply_param_defaults(&mut effective_params);
+    let params = &effective_params;
 
     // 1. Graph-derived view (anchors + scope + next).
     let view = call_task_localize(&socket, request)?;
@@ -244,6 +312,7 @@ pub fn explore_task_localization(
 
     Ok(build_response(
         request,
+        intent,
         &view,
         &symbol_matches,
         &text_items,
@@ -873,6 +942,7 @@ pub(crate) fn extract_symbol_queries(request: &str) -> Vec<String> {
 /// envelope the agent contract expects.
 fn build_response(
     request: &str,
+    intent: Intent,
     view: &serde_json::Value,
     symbol_matches: &SymbolBatchResults,
     text_items: &[AnswerItem],
@@ -1284,7 +1354,7 @@ fn build_response(
     ExploreResponse {
         schema_version: "aethyme-explore-v1",
         mode: "explore",
-        intent: "task_localization_query",
+        intent: intent.as_str(),
         intent_source: "default",
         status,
         request: ExploreRequest {
@@ -1616,6 +1686,7 @@ mod tests {
     fn build_response_synthesizes_answers_and_nav_hints() {
         let response = build_response(
             "find watchlist handlers",
+            Intent::TaskLocalization,
             &sample_view(),
             &empty_symbols(),
             &[],
@@ -1648,6 +1719,7 @@ mod tests {
         );
         let response = build_response(
             "test",
+            Intent::TaskLocalization,
             &view,
             &empty_symbols(),
             &[],
@@ -1675,6 +1747,7 @@ mod tests {
         });
         let response = build_response(
             "nothing matches",
+            Intent::TaskLocalization,
             &view,
             &empty_symbols(),
             &[],
@@ -1691,6 +1764,7 @@ mod tests {
     fn trust_policy_without_symbol_evidence_is_needs_verification() {
         let response = build_response(
             "find handlers",
+            Intent::TaskLocalization,
             &sample_view(),
             &empty_symbols(),
             &[],
@@ -1712,6 +1786,7 @@ mod tests {
         );
         let response = build_response(
             "find session authenticate handlers",
+            Intent::TaskLocalization,
             &sample_view(),
             &symbols,
             &[],
@@ -1738,6 +1813,7 @@ mod tests {
         let symbols = symbols_for("src/util/helpers.php", &[("helper", 100)]);
         let response = build_response(
             "find helper code",
+            Intent::TaskLocalization,
             &sample_view(),
             &symbols,
             &[],

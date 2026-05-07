@@ -796,6 +796,30 @@ fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
 
+    // --intent picks the orchestration shape. task_localization_query
+    // (default) for read-only "where is X?". behavior_localization_query
+    // for change-tasks ("what do I edit to make X happen?") — same
+    // engine path, wider param defaults.
+    let intent_str = read_option(args, "--intent")
+        .unwrap_or_else(|_| "task_localization_query".to_string());
+    let intent = match intent_str.as_str() {
+        "task_localization_query" | "default" | "" => {
+            aethyme_engine::explore::Intent::TaskLocalization
+        }
+        "behavior_localization_query" | "behavior" => {
+            aethyme_engine::explore::Intent::BehaviorLocalization
+        }
+        "usage_boundary_query" => {
+            return Err(
+                "explore: usage_boundary_query is not yet ported to the \
+                 native path; fall back to `aethyme explore --intent \
+                 usage_boundary_query` via the Python orchestrator"
+                    .into(),
+            );
+        }
+        other => return Err(format!("explore: unknown --intent {other:?}")),
+    };
+
     let params = aethyme_engine::explore::ExploreParams {
         max_answer_items,
         detail: detail_enum,
@@ -807,7 +831,7 @@ fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
         return Err(format!("--repo path is not a directory: {repo_str}"));
     }
 
-    match aethyme_engine::explore::explore_task_localization(&repo, &request, &params) {
+    match aethyme_engine::explore::explore_with_intent(&repo, &request, intent, &params) {
         Ok(response) => {
             let json = serde_json::to_string_pretty(&response)
                 .map_err(|e| format!("serialize response: {e}"))?;
