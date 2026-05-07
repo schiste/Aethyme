@@ -56,7 +56,9 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::graph::navigation::{task_anchors_view, task_next_view, task_scope_view};
+use crate::graph::navigation::{
+    callers_view, task_anchors_view, task_next_view, task_scope_view,
+};
 use crate::graph::search::symbol_search;
 use crate::map::RepositoryMap;
 use crate::model::task::TaskInput;
@@ -379,6 +381,55 @@ fn handle_request(mut stream: UnixStream, state: &Arc<Mutex<DaemonState>>) -> bo
                     })
                     .collect();
                 results.insert(query.clone(), serde_json::Value::Array(arr));
+            }
+            send_ok_value(
+                &mut stream,
+                serde_json::json!({
+                    "ok": true,
+                    "result": serde_json::Value::Object(results),
+                }),
+            );
+            false
+        }
+        "callers-of" => {
+            // Look up the callers of one or more symbols against the
+            // resident graph. Returns map keyed by symbol id:
+            // `{symbol_id → [{ "id": ..., "label": ..., "path": ... },
+            // ...]}`. Symbols not found in the graph map to empty
+            // arrays (not errors — common when a symbol-search hit
+            // came from a file with no callgraph edges yet).
+            let targets: Vec<String> = request
+                .get("targets")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if targets.is_empty() {
+                send_error(&mut stream, "missing or empty `targets` array");
+                return false;
+            }
+            let s = state.lock().expect("daemon state lock poisoned");
+            let mut results: serde_json::Map<String, serde_json::Value> =
+                serde_json::Map::new();
+            for target in &targets {
+                let view = callers_view(&s.map, target);
+                let arr: Vec<serde_json::Value> = view
+                    .items
+                    .into_iter()
+                    .map(|item| {
+                        serde_json::json!({
+                            "id": item.id,
+                            "kind": item.kind,
+                            "display": item.display,
+                            "relation": item.relation,
+                            "confidence": item.confidence,
+                        })
+                    })
+                    .collect();
+                results.insert(target.clone(), serde_json::Value::Array(arr));
             }
             send_ok_value(
                 &mut stream,

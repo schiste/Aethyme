@@ -251,6 +251,17 @@ pub struct ExploreParams {
     /// `navigation_hints[]`. Filename-only matches aren't
     /// authoritative; this caps how many we suggest as "look here".
     pub max_filename_hints: usize,
+    /// Number of strongest symbol-search hits to feed into the
+    /// callsite expansion pass. Each hit costs one `callers-of`
+    /// daemon RPC; setting this too high inflates response time on
+    /// queries that match many symbols. 4 is the Python compact
+    /// default and a reasonable cap.
+    pub max_callsite_symbols: usize,
+    /// Per-symbol cap on the caller files surfaced as
+    /// `call_site_file` answer items. Most agents read the top 3-4;
+    /// emitting all callers (which can be hundreds for popular
+    /// functions) inflates the response unnecessarily.
+    pub max_callsite_results: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +312,8 @@ impl Default for ExploreParams {
             max_text_files: 5,   // matches Python compact default
             max_text_line_refs: 2,
             max_filename_hints: 3,
+            max_callsite_symbols: 4,  // Python compact default
+            max_callsite_results: 4,  // Python compact default
         }
     }
 }
@@ -780,6 +793,25 @@ pub fn explore_with_intent(
         params.max_filename_hints,
     );
 
+    // 5. Callsite expansion. For each strong symbol hit, look up
+    //    its callers (via the daemon's callers-of RPC) and emit
+    //    `call_site_file` AnswerItems for the caller files. This is
+    //    the deepest evidence layer: not "this file defines X" but
+    //    "these files actually call X." A file appearing in BOTH
+    //    symbol matches AND someone-else's-callsite is the strongest
+    //    cross-corroboration we produce without running tests.
+    //
+    //    Tolerates daemon failure on this RPC the same way we do for
+    //    symbol-batch — degrade silently, keep the rest of the
+    //    answer.
+    let callsite_items = compute_callsite_files(
+        &socket,
+        &symbol_matches,
+        params.max_callsite_symbols,
+        params.max_callsite_results,
+    )
+    .unwrap_or_default();
+
     Ok(build_response(
         request,
         intent,
@@ -788,8 +820,207 @@ pub fn explore_with_intent(
         &symbol_matches,
         &text_items,
         &filename_items,
+        &callsite_items,
         params,
     ))
+}
+
+/// Pick the strongest symbol hits, look up callers via the daemon,
+/// and emit one `call_site_file` AnswerItem per distinct caller file.
+///
+/// Strategy:
+///   1. Walk symbol_matches in query-order, collect distinct symbol
+///      ids up to `max_symbols`. Prefer high-score hits.
+///   2. Issue one `callers-of` RPC with the batch (single roundtrip).
+///   3. Group caller paths by file, dedup, score by how many distinct
+///      symbols routed to that file (signal multiplier — a file
+///      calling 2+ of our candidate symbols is stronger evidence).
+///   4. Take top `max_results`.
+fn compute_callsite_files(
+    socket: &Path,
+    symbol_matches: &SymbolBatchResults,
+    max_symbols: usize,
+    max_results: usize,
+) -> Result<Vec<AnswerItem>, ExploreError> {
+    if max_symbols == 0 || max_results == 0 {
+        return Ok(Vec::new());
+    }
+    // Collect distinct symbol ids round-robin across queries: take the
+    // highest-scoring hit from each query first, then the second, etc.
+    // This is critical when one query (e.g. "suppliers") returns 20
+    // hits while another ("grader") returns 2 — depth-first iteration
+    // would burn the entire `max_symbols` budget on the first query and
+    // never reach the second. The whole point of callsite expansion is
+    // to find files that bridge the user's distinct concepts, so each
+    // concept must contribute.
+    let mut symbol_ids: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut pass = 0usize;
+    loop {
+        if symbol_ids.len() >= max_symbols {
+            break;
+        }
+        let mut added_this_pass = false;
+        for query in &symbol_matches.query_order {
+            if symbol_ids.len() >= max_symbols {
+                break;
+            }
+            let Some(hits) = symbol_matches.by_query.get(query) else {
+                continue;
+            };
+            let Some(hit) = hits.get(pass) else { continue };
+            // SymbolHit name is what the engine accepts via callers-of
+            // (matched against the symbol-name index). For canonical
+            // tightness we could parse and pass full ids, but names
+            // route correctly today.
+            if seen.insert(hit.name.clone()) {
+                symbol_ids.push(hit.name.clone());
+                added_this_pass = true;
+            }
+        }
+        if !added_this_pass {
+            // No query had a hit at this depth — nothing left to drain.
+            break;
+        }
+        pass += 1;
+    }
+    if symbol_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rpc = serde_json::json!({
+        "command": "callers-of",
+        "targets": symbol_ids,
+    });
+    let response_text = daemon::send_request(socket, &rpc)
+        .map_err(ExploreError::DaemonRpc)?;
+    let envelope: serde_json::Value =
+        serde_json::from_str(response_text.trim())
+            .map_err(|e| ExploreError::InvalidResponse(format!("not JSON: {e}")))?;
+    if envelope.get("ok") != Some(&serde_json::Value::Bool(true)) {
+        return Ok(Vec::new());
+    }
+    let result_obj = match envelope.get("result").and_then(|v| v.as_object()) {
+        Some(o) => o,
+        None => return Ok(Vec::new()),
+    };
+
+    // file_path -> (Set<symbol_name>, hit_count, sample_callers)
+    let mut by_file: std::collections::BTreeMap<
+        String,
+        (
+            std::collections::BTreeSet<String>,
+            usize,
+            Vec<serde_json::Value>,
+        ),
+    > = std::collections::BTreeMap::new();
+    for (symbol, callers) in result_obj {
+        let arr = match callers.as_array() {
+            Some(a) => a,
+            None => continue,
+        };
+        for caller in arr {
+            // The id format is `<kind>:<repo>:<path>:<symbol>` —
+            // splitting on ':' once, the file path lives between the
+            // 2nd and last segment. Easier: use the `path` we asked
+            // for if the daemon provided it directly... actually we
+            // didn't include path in the response. Fall back to
+            // parsing `id`.
+            let id = match caller.get("id").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let Some(file_path) = file_path_from_caller_id(id) else {
+                continue;
+            };
+            let entry = by_file.entry(file_path.clone()).or_insert_with(|| {
+                (
+                    std::collections::BTreeSet::new(),
+                    0,
+                    Vec::new(),
+                )
+            });
+            entry.0.insert(symbol.clone());
+            entry.1 += 1;
+            if entry.2.len() < 5 {
+                entry.2.push(serde_json::json!({
+                    "symbol": symbol,
+                    "caller_id": id,
+                    "display": caller.get("display"),
+                }));
+            }
+        }
+    }
+
+    // Rank: more distinct symbols routing through this file = stronger
+    // evidence. Tiebreak on hit_count then path (alphabetical).
+    let mut ranked: Vec<(String, std::collections::BTreeSet<String>, usize, Vec<serde_json::Value>)> =
+        by_file
+            .into_iter()
+            .map(|(path, (syms, hits, samples))| (path, syms, hits, samples))
+            .collect();
+    ranked.sort_by(|a, b| {
+        b.1.len()
+            .cmp(&a.1.len())
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked.truncate(max_results);
+
+    Ok(ranked
+        .into_iter()
+        .map(|(path, symbols, hit_count, samples)| {
+            let symbol_count = symbols.len();
+            let multi = symbol_count >= 2;
+            let confidence = if multi { 0.86 } else { 0.74 };
+            let reason = if multi {
+                "Multiple candidate symbols are called from this file; \
+                 likely a usage entry point or dispatch hub."
+            } else {
+                "This file calls one of the candidate symbols; verify \
+                 whether it's the primary caller or one of many."
+            };
+            let symbols_list: Vec<&String> = symbols.iter().collect();
+            AnswerItem {
+                kind: "call_site_file".into(),
+                target: path.clone(),
+                path: Some(path),
+                status: "candidate".into(),
+                confidence,
+                reason: reason.into(),
+                role: "callsite".into(),
+                evidence: serde_json::json!({
+                    "source": "callers-of",
+                    "symbols": symbols_list,
+                    "hit_count": hit_count,
+                    "samples": samples,
+                }),
+            }
+        })
+        .collect())
+}
+
+/// Parse a caller's structured id of the form
+/// `<kind>:<repo>:<path>:<symbol>` and return the path segment.
+/// Returns `None` if the id doesn't match the expected shape, which
+/// happens when the engine emits a node id with no file (e.g.
+/// area-level nodes).
+fn file_path_from_caller_id(id: &str) -> Option<String> {
+    // The engine canonicalizes path-bearing ids as
+    //   `kind:repo_name:relative/path:symbol`
+    // For our purposes we want the third colon-separated segment.
+    // Split with limit so a colon inside the symbol name doesn't
+    // break the parse.
+    let parts: Vec<&str> = id.splitn(4, ':').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let path = parts[2];
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.to_string())
 }
 
 fn call_task_localize(
@@ -1449,6 +1680,7 @@ fn build_response(
     symbol_matches: &SymbolBatchResults,
     text_items: &[AnswerItem],
     filename_items: &[AnswerItem],
+    callsite_items: &[AnswerItem],
     params: &ExploreParams,
 ) -> ExploreResponse {
     let anchors = view
@@ -1610,6 +1842,44 @@ fn build_response(
         answers.push(item.clone());
     }
 
+    // Callsite evidence: files that CALL one of our candidate symbols.
+    // Ranks just after symbol_search_file because "this file calls X"
+    // is behavioural evidence (similar strength to "this file's
+    // source-text contains X's name"). Multi-symbol callsites
+    // (rank ≥0.86 confidence) often surface dispatch hubs the agent
+    // cares about more than the symbol's home file.
+    for item in callsite_items {
+        // Always allow merging into an existing answer (no new slot
+        // consumed); only the push-new branch checks the cap.
+        if let Some(existing) = answers
+            .iter_mut()
+            .find(|a| a.path.as_deref() == item.path.as_deref())
+        {
+            // Pull symbols list from the callsite item's evidence and
+            // attach it to the existing item under `also_callsite_for`.
+            // Bump confidence by a small amount (capped at 0.9) since
+            // multiple corroborating sources increase trust.
+            if let Some(syms) = item.evidence.get("symbols").cloned() {
+                if let Some(obj) = existing.evidence.as_object_mut() {
+                    obj.insert("also_callsite_for".to_string(), syms);
+                    obj.insert(
+                        "callsite_hit_count".to_string(),
+                        item.evidence
+                            .get("hit_count")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    );
+                }
+            }
+            existing.confidence = ((existing.confidence + 0.05).min(0.9) * 100.0).round() / 100.0;
+            continue;
+        }
+        if answers.len() >= params.max_answer_items {
+            continue;
+        }
+        answers.push(item.clone());
+    }
+
     // Backfill text again now that symbol items have landed — the
     // budget cap above held remaining text out; if there's room left
     // (no symbol items, or symbol items dedup'd against text), let
@@ -1750,13 +2020,30 @@ fn build_response(
         })
         .filter_map(|item| item.path.as_deref())
         .collect();
-    // Symbol + text agree on the same file = the highest local signal we
-    // produce without running tests or callsite expansion. Treat the
-    // intersection as cross-corroborated.
+    // Symbol + text agree on the same file = a strong local signal.
     let cross_corroborated: Vec<&&str> = multi_query_symbol_files
         .iter()
         .filter(|p| strong_text_files.contains(p))
         .collect();
+
+    // Callsite evidence raises trust further: a file with multi-query
+    // symbol matches AND callers-of evidence is approaching test-suite
+    // territory. We track multi-symbol callsite files separately
+    // because that's the strongest dispatch signal we produce.
+    let strong_callsite_files: Vec<&str> = callsite_items
+        .iter()
+        .filter(|item| {
+            item.evidence
+                .get("symbols")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.len() >= 2)
+                .unwrap_or(false)
+        })
+        .filter_map(|item| item.path.as_deref())
+        .collect();
+    let triple_corroborated: bool = !strong_callsite_files.is_empty()
+        && (!cross_corroborated.is_empty()
+            || !multi_query_symbol_files.is_empty());
 
     let policy_kind = if answers.is_empty() && nav_hints.is_empty() {
         "failed"
@@ -1770,12 +2057,18 @@ fn build_response(
     } else {
         "needs_verification"
     };
-    let evidence_level = if !cross_corroborated.is_empty() {
+    let evidence_level = if triple_corroborated {
+        "graph+symbol+text+callsite"
+    } else if !cross_corroborated.is_empty() {
         "graph+symbol+text"
+    } else if !strong_callsite_files.is_empty() {
+        "graph+symbol+callsite"
     } else if !multi_query_symbol_files.is_empty() && !text_items.is_empty() {
         "graph+symbol+text-weak"
     } else if !multi_query_symbol_files.is_empty() {
         "graph+symbol"
+    } else if !callsite_items.is_empty() {
+        "graph+callsite-weak"
     } else if !text_items.is_empty() {
         "graph+text"
     } else if !symbol_items.is_empty() {
@@ -2189,6 +2482,7 @@ mod tests {
             &empty_symbols(),
             &[],
             &[],
+            &[],
             &ExploreParams::default(),
         );
         assert!(!response.answer.is_empty(), "expected at least one answer");
@@ -2223,6 +2517,7 @@ mod tests {
             &empty_symbols(),
             &[],
             &[],
+            &[],
             &ExploreParams {
                 max_answer_items: 3,
                 ..ExploreParams::default()
@@ -2252,6 +2547,7 @@ mod tests {
             &empty_symbols(),
             &[],
             &[],
+            &[],
             &ExploreParams::default(),
         );
         assert_eq!(response.status, "degraded");
@@ -2268,6 +2564,7 @@ mod tests {
             IntentSource::Default,
             &sample_view(),
             &empty_symbols(),
+            &[],
             &[],
             &[],
             &ExploreParams::default(),
@@ -2291,6 +2588,7 @@ mod tests {
             IntentSource::Default,
             &sample_view(),
             &symbols,
+            &[],
             &[],
             &[],
             &ExploreParams::default(),
@@ -2319,6 +2617,7 @@ mod tests {
             IntentSource::Default,
             &sample_view(),
             &symbols,
+            &[],
             &[],
             &[],
             &ExploreParams::default(),
