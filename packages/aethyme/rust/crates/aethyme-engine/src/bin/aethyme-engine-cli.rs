@@ -816,12 +816,9 @@ fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
             aethyme_engine::explore::Intent::auto_select(&request)
         }
         "usage_boundary_query" => {
-            return Err(
-                "explore: usage_boundary_query is not yet ported to the \
-                 native path; fall back to `aethyme explore --intent \
-                 usage_boundary_query` via the Python orchestrator"
-                    .into(),
-            );
+            // Different orchestrator: doesn't go through the daemon,
+            // calls `analyze_usage_boundary_scope_first` directly.
+            return run_explore_usage_boundary(args, &repo_str, &request);
         }
         other => return Err(format!("explore: unknown --intent {other:?}")),
     };
@@ -855,6 +852,57 @@ fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
             std::process::exit(2);
         }
         Err(other) => Err(format!("explore: {other}")),
+    }
+}
+
+/// Run the `usage_boundary_query` intent path. Doesn't go through the
+/// engine daemon — calls `analyze_usage_boundary_scope_first` directly.
+/// All flags pre-validated in `run_explore_subcommand`; this path
+/// reads its own usage-boundary-specific flags.
+fn run_explore_usage_boundary(
+    args: &[String],
+    repo_str: &str,
+    request: &str,
+) -> Result<(), String> {
+    let scope = read_option(args, "--scope").map_err(|_| {
+        "usage_boundary_query requires --scope <repo-relative-path>".to_string()
+    })?;
+    let search_roots: Vec<String> = read_options(args, "--search-root");
+    let include_methods = !has_flag(args, "--no-methods");
+    let budget_ms: u64 = read_option(args, "--budget-ms")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+    let max_evidence: usize = read_option(args, "--max-evidence-per-symbol")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+
+    let params = aethyme_engine::explore::UsageBoundaryParams {
+        scope,
+        search_roots,
+        include_methods,
+        budget_ms,
+        max_evidence_per_symbol: max_evidence,
+    };
+
+    let repo = PathBuf::from(repo_str);
+    if !repo.is_dir() {
+        return Err(format!("--repo path is not a directory: {repo_str}"));
+    }
+
+    match aethyme_engine::explore::explore_usage_boundary(&repo, request, &params) {
+        Ok(response) => {
+            let json = serde_json::to_string_pretty(&response)
+                .map_err(|e| format!("serialize response: {e}"))?;
+            println!("{json}");
+            Ok(())
+        }
+        Err(aethyme_engine::explore::ExploreError::BadParams(msg)) => {
+            eprintln!("explore (usage_boundary_query): {msg}");
+            std::process::exit(2);
+        }
+        Err(err) => Err(format!("explore (usage_boundary_query): {err}")),
     }
 }
 
