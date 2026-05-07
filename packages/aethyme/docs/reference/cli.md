@@ -30,6 +30,9 @@ playground repositories.
 - `aethyme query impact /path/to/repo src/main.py`
 
 ### High-Level Intent Surface
+
+> **Note (2026-05-07):** `aethyme explore` is now served by the native Rust binary (`aethyme-engine-cli explore`). The Python implementation at `python -m src.cli explore` is deprecated as a fallback only and prints a stderr warning when invoked directly. All examples below route through native; no behavior change for callers.
+
 - `aethyme explore --repo /path/to/repo --request "Find public functions with no outside callers" --format answer-json`
 - `aethyme intents --request "Find public functions with no outside callers" --format compact-json`
 - `aethyme explore --repo /path/to/repo --intent behavior_localization_query --request "Find the files responsible for this behavior" --format answer-json --show-observability`

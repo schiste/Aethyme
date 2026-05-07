@@ -118,56 +118,66 @@ fn run_explore(args: &[String]) -> ExitCode {
     delegate_to_python("explore", args)
 }
 
-/// Attempt the native Rust explore path. Returns Some(exit) when the engine
-/// daemon was reachable (success or error); None when the daemon isn't
-/// running and the caller should fall through to the next route.
+/// Attempt the native Rust explore path by shelling out to the
+/// `aethyme-engine-cli` binary, which lives next to this one in the
+/// release directory and implements the full explore pipeline (all 3
+/// intents, all detail levels, --intent auto, --max-answer-items,
+/// --show-observability, callsite expansion, etc.).
+///
+/// We forward ALL args verbatim — no parsing or filtering — so any
+/// flag the engine CLI supports is supported through this thin
+/// client too. Returns Some(exit) when the spawn was successful (we
+/// always honor whatever exit code the engine CLI returned, including
+/// failures); only returns None on infrastructure errors (binary
+/// missing, fork failure) so the caller can fall through to the
+/// Python daemon / Python subprocess path.
+///
+/// Pre-widening this used to gate on session-1 limitations (compact
+/// detail only, no --intent, no --params) and bail to Python for
+/// anything richer. Since sessions 2-5 + the four deployment items
+/// closed those gaps, the native binary handles everything; the gate
+/// is now removed.
 fn try_native_explore(repo: &Path, args: &[String]) -> Option<ExitCode> {
-    use aethyme_engine::explore::{
-        Detail, ExploreError, ExploreParams, explore_task_localization,
-    };
-
-    // Only the simplest invocation shape is supported in session 1. Any
-    // unsupported flag means "fall through to Python so we don't lose
-    // capability while the native path is incomplete".
-    let request = match find_arg(args, "--request") {
-        Some(r) => r,
-        None => return None,
-    };
-    let format = find_arg(args, "--format").unwrap_or_else(|| "answer-json".into());
-    if format != "answer-json" {
-        return None;
-    }
-    // The native path only implements compact today; standard/full need the
-    // richer evidence pipeline that's still in Python.
-    let detail_str = find_arg(args, "--detail").unwrap_or_else(|| "compact".into());
-    if detail_str != "compact" {
-        return None;
-    }
-    // --intent or --params imply a non-default flow; let Python handle it.
-    if find_arg(args, "--intent").is_some() || find_arg(args, "--params").is_some() {
-        return None;
-    }
-
-    let params = ExploreParams {
-        max_answer_items: 5,
-        detail: Detail::Compact,
-        ..ExploreParams::default()
-    };
-
-    match explore_task_localization(repo, &request, &params) {
-        Ok(response) => match serde_json::to_string_pretty(&response) {
-            Ok(json) => {
-                println!("{json}");
-                Some(ExitCode::SUCCESS)
+    let _ = repo; // No longer needed for capability gating.
+    let cli_path = engine_cli_binary_path()?;
+    let mut cmd = Command::new(&cli_path);
+    cmd.arg("explore");
+    cmd.args(args);
+    cmd.stdin(Stdio::inherit());
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+    match cmd.status() {
+        Ok(status) => {
+            // exit code 2 from aethyme-engine-cli is the documented
+            // "daemon not running" signal; falling back to the Python
+            // daemon / subprocess path is the right move.
+            if status.code() == Some(2) {
+                return None;
             }
-            Err(_) => None,
-        },
-        Err(ExploreError::DaemonNotRunning) => None,
-        Err(other) => {
-            eprintln!("aethyme: native explore failed, falling back to Python: {other}");
-            None
+            Some(match status.code() {
+                Some(code) if (0..=255).contains(&code) => ExitCode::from(code as u8),
+                _ => ExitCode::from(1),
+            })
+        }
+        Err(_) => None,
+    }
+}
+
+/// Locate the `aethyme-engine-cli` binary. It's built into the same
+/// release directory as this thin client, so resolving the current
+/// exe's parent and looking for a sibling is the right strategy. Falls
+/// back to PATH search if the sibling isn't present.
+fn engine_cli_binary_path() -> Option<PathBuf> {
+    if let Ok(mut exe) = env::current_exe() {
+        exe.pop();
+        let candidate = exe.join("aethyme-engine-cli");
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
+    // PATH fallback — useful when the binaries aren't co-located
+    // (e.g. installed separately into different bin dirs).
+    Some(PathBuf::from("aethyme-engine-cli"))
 }
 
 fn try_daemon(repo: &Path, command: &str, args: &[String]) -> Option<String> {

@@ -795,6 +795,10 @@ fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
+    // --show-observability toggles richer observability shaping in the
+    // response. Default is compact; setting the flag mirrors Python's
+    // `--show-observability` at cli.py:396-401.
+    let show_observability = has_flag(args, "--show-observability");
 
     // --intent picks the orchestration shape. The default when no
     // --intent is passed is `auto`: scan the first ~10 tokens of the
@@ -837,6 +841,7 @@ fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
     let params = aethyme_engine::explore::ExploreParams {
         max_answer_items,
         detail: detail_enum,
+        show_observability,
         ..aethyme_engine::explore::ExploreParams::default()
     };
 

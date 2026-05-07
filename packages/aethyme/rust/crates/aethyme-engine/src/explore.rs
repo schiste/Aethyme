@@ -54,6 +54,22 @@ pub struct ExploreResponse {
     pub verification_steps: Vec<serde_json::Value>,
     pub next_actions: Vec<String>,
     pub available_specialized_intents: Vec<&'static str>,
+    /// Downstream-friendly repackaging of the response. Mirrors Python's
+    /// `output_adapters.task_localization_json` / `dead_code_eval_json`
+    /// at `cli.py:2088-2118` and `cli.py:4700`.
+    ///
+    /// Gated by `detail==Full` OR `show_observability` to mirror
+    /// `_trim_explore_response` at `cli.py:1735-1739` — at compact and
+    /// standard the canonical `answer[]` is what consumers read; the
+    /// adapter is redundant repackaging that costs tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_adapters: Option<serde_json::Value>,
+    /// Echo of the effective `ExploreParams` after intent + detail
+    /// widening. Mirrors Python's `resolved_parameters`. Same gate as
+    /// `output_adapters` (full or show-observability) — internal tuning
+    /// knobs aren't actionable by the agent at compact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_parameters: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,6 +278,12 @@ pub struct ExploreParams {
     /// emitting all callers (which can be hundreds for popular
     /// functions) inflates the response unnecessarily.
     pub max_callsite_results: usize,
+    /// When true, emit a richer observability envelope. Mirrors Python's
+    /// `--show-observability` flag at `cli.py:396-401`. Compact form
+    /// (default) keeps the response small; full form includes graph
+    /// counts, fact counts, confidence summary, and degraded reasons
+    /// for downstream introspection.
+    pub show_observability: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,7 +336,36 @@ impl Default for ExploreParams {
             max_filename_hints: 3,
             max_callsite_symbols: 4,  // Python compact default
             max_callsite_results: 4,  // Python compact default
+            show_observability: false, // Python default; --show-observability flips it
         }
+    }
+}
+
+impl ExploreParams {
+    /// Serialize the resolved params as a JSON object for
+    /// `resolved_parameters` echo. We don't auto-derive Serialize on
+    /// the struct because some downstream consumers expect specific
+    /// field naming and Detail's enum form needs a string (not a
+    /// debug-formatted variant).
+    pub fn to_json(&self) -> serde_json::Value {
+        let detail = match self.detail {
+            Detail::Compact => "compact",
+            Detail::Standard => "standard",
+            Detail::Full => "full",
+        };
+        serde_json::json!({
+            "max_answer_items": self.max_answer_items,
+            "detail": detail,
+            "max_symbol_queries": self.max_symbol_queries,
+            "max_symbol_results": self.max_symbol_results,
+            "max_symbol_files": self.max_symbol_files,
+            "max_text_files": self.max_text_files,
+            "max_text_line_refs": self.max_text_line_refs,
+            "max_filename_hints": self.max_filename_hints,
+            "max_callsite_symbols": self.max_callsite_symbols,
+            "max_callsite_results": self.max_callsite_results,
+            "show_observability": self.show_observability,
+        })
     }
 }
 
@@ -623,6 +674,34 @@ fn build_usage_boundary_response(
             "task_localization_query",
             "behavior_localization_query",
         ],
+        // Dead-code eval scoring reads `output_adapters.dead_code_eval_json.unused_functions`
+        // directly — this adapter is the SCORER input, not just verbose
+        // diagnostics. Always emit (no detail gate) for usage_boundary;
+        // omitting it would silently break the eval pipeline. Mirrors
+        // Python at cli.py:4700, which also emits unconditionally for
+        // this intent.
+        output_adapters: Some(serde_json::json!({
+            "dead_code_eval_json": {
+                "unused_functions": answer
+                    .candidates
+                    .iter()
+                    .filter(|c| matches!(c.status, AnswerStatus::Unused))
+                    .map(|c| serde_json::json!({
+                        "name": c.function.name,
+                        "defined_in": c.function.defined_in,
+                        "confidence": c.confidence,
+                    }))
+                    .collect::<Vec<_>>(),
+            }
+        })),
+        resolved_parameters: Some(serde_json::json!({
+            "scope": params.scope,
+            "search_roots": params.search_roots,
+            "include_methods": params.include_methods,
+            "budget_ms": params.budget_ms,
+            "max_evidence_per_symbol": params.max_evidence_per_symbol,
+            "max_answer_items": params.max_answer_items,
+        })),
     }
 }
 
@@ -2146,6 +2225,39 @@ fn build_response(
         text_items,
     );
 
+    // Build output_adapters and resolved_parameters only when the
+    // caller has asked for verbose shaping. Mirrors Python's
+    // _trim_explore_response gate at cli.py:1732-1743. At compact the
+    // canonical answer[] is sufficient; the repackaging is redundant.
+    let verbose = matches!(params.detail, Detail::Full) || params.show_observability;
+    let output_adapters = if verbose {
+        Some(build_output_adapters(
+            &answers,
+            &nav_hints,
+            &next_actions,
+            &verification_steps,
+            params.detail,
+        ))
+    } else {
+        None
+    };
+    let resolved_parameters = if verbose {
+        Some(params.to_json())
+    } else {
+        None
+    };
+
+    // At compact, truncate verification_steps to 2 (mirrors Python's
+    // _trim_explore_response at cli.py:1752-1755). Agents follow 1-2
+    // before deciding; emitting all 5+ inflates response by ~30%.
+    let verification_steps = if matches!(params.detail, Detail::Compact)
+        && !params.show_observability
+    {
+        verification_steps.into_iter().take(2).collect()
+    } else {
+        verification_steps
+    };
+
     ExploreResponse {
         schema_version: "aethyme-explore-v1",
         mode: "explore",
@@ -2187,7 +2299,68 @@ fn build_response(
             "behavior_localization_query",
             "usage_boundary_query",
         ],
+        output_adapters,
+        resolved_parameters,
     }
+}
+
+/// Build the `output_adapters.task_localization_json` structure that
+/// downstream consumers (skills, eval scoring, agent post-processing)
+/// read instead of poking through the heterogeneous `answer[]` list.
+///
+/// Filtering rules mirror Python at `cli.py:2088-2118`:
+///   - candidate_files  → kinds {symbol_search_file, source_text_file,
+///                        call_site_file, filesystem_file, anchor,
+///                        in_scope_file} that have a `path`.
+///   - candidate_symbols → kinds {symbol_search, in_scope_symbol} OR
+///                        items whose evidence carries `anchor_kind ==
+///                        "symbol"`.
+///   - navigation_hints → empty when `detail == compact`; otherwise
+///                        echoes the response's nav_hints.
+fn build_output_adapters(
+    answers: &[AnswerItem],
+    nav_hints: &[AnswerItem],
+    next_actions: &[String],
+    verification_steps: &[serde_json::Value],
+    detail: Detail,
+) -> serde_json::Value {
+    let candidate_files: Vec<&AnswerItem> = answers
+        .iter()
+        .filter(|item| item.path.is_some())
+        .filter(|item| matches!(
+            item.kind.as_str(),
+            "symbol_search_file"
+                | "source_text_file"
+                | "call_site_file"
+                | "filesystem_file"
+                | "anchor"
+                | "in_scope_file"
+        ))
+        .collect();
+    let candidate_symbols: Vec<&AnswerItem> = answers
+        .iter()
+        .filter(|item| {
+            matches!(item.kind.as_str(), "symbol_search" | "in_scope_symbol")
+                || item
+                    .evidence
+                    .get("anchor_kind")
+                    .and_then(|v| v.as_str())
+                    == Some("symbol")
+        })
+        .collect();
+    let navigation_hints_field: Vec<&AnswerItem> = match detail {
+        Detail::Compact => Vec::new(),
+        _ => nav_hints.iter().collect(),
+    };
+    serde_json::json!({
+        "task_localization_json": {
+            "candidate_files": candidate_files,
+            "candidate_symbols": candidate_symbols,
+            "next_actions": next_actions,
+            "verification_steps": verification_steps,
+            "navigation_hints": navigation_hints_field,
+        }
+    })
 }
 
 /// Tailor the verification steps to the evidence we actually produced.

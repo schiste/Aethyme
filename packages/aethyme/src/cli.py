@@ -409,6 +409,19 @@ def explore_command(
     show_observability: bool,
 ) -> None:
     """Run a high-level Explore intent and return a task-ready answer."""
+    # Soft retirement (task #48, 2026-05-07): the canonical entry point for
+    # explore is now the native Rust binary `aethyme explore` (which routes to
+    # `aethyme-engine-cli explore`). The Python implementation here is kept as
+    # a fallback for the next eval cycle so we have a baseline if the Rust
+    # path regresses on a real repo. After validation it will be deleted.
+    # Set AETHYME_EXPLORE_KEEP_PYTHON=1 to silence the warning.
+    if not os.environ.get("AETHYME_EXPLORE_KEEP_PYTHON"):
+        click.echo(
+            "DEPRECATED: 'python -m src.cli explore' is retiring. Use "
+            "'aethyme explore' (native Rust). Set "
+            "AETHYME_EXPLORE_KEEP_PYTHON=1 to silence this warning.",
+            err=True,
+        )
     if output_format != "answer-json":
         raise click.ClickException(f"Unsupported explore format: {output_format}")
     params = _parse_json_object(params_json, option_name="--params")

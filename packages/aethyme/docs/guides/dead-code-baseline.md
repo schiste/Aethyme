@@ -28,9 +28,11 @@ Source of truth:
 
 Preferred analyzer path for collecting candidates:
 ```bash
+# `aethyme explore` is the canonical entry point; routes natively via Rust.
+# `python -m src.cli intents` is still Python (intent catalog discovery).
 cd packages/aethyme
 .venv/bin/python -m src.cli intents --format compact-json
-.venv/bin/python -m src.cli explore --repo /path/to/repo --intent usage_boundary_query --request "Find public symbols in <scope> with no callers outside <scope>" --params '{"scope":"<scope>","symbol_kind":"public_top_level_function","boundary":{"type":"outside_directory","path":"<scope>"},"search_roots":[]}' --format answer-json --show-observability
+aethyme explore --repo /path/to/repo --intent usage_boundary_query --request "Find public symbols in <scope> with no callers outside <scope>" --scope "<scope>" --search-root src --search-root tests --format answer-json --show-observability
 ```
 
 Fallback low-level path:
