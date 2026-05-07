@@ -796,24 +796,35 @@ fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
 
-    // --intent picks the orchestration shape. task_localization_query
-    // (default) for read-only "where is X?". behavior_localization_query
-    // for change-tasks ("what do I edit to make X happen?") — same
-    // engine path, wider param defaults.
+    // --intent picks the orchestration shape. The default when no
+    // --intent is passed is `auto`: scan the first ~10 tokens of the
+    // request for change-verbs and pick behavior_localization when
+    // we see one, else task_localization. Pre-fix the default was
+    // hard-coded to task_localization, but real agent flows mix
+    // change-tasks ("Add X") with read-tasks ("Where is Y?") freely
+    // and forcing the agent to specify --intent every time is
+    // friction. `--intent default` (or task_localization_query
+    // explicitly) restores the conservative pre-auto behavior for
+    // callers that prefer to opt out of the heuristic.
     let intent_str = read_option(args, "--intent")
-        .unwrap_or_else(|_| "task_localization_query".to_string());
-    let intent = match intent_str.as_str() {
-        "task_localization_query" | "default" | "" => {
-            aethyme_engine::explore::Intent::TaskLocalization
-        }
-        "behavior_localization_query" | "behavior" => {
-            aethyme_engine::explore::Intent::BehaviorLocalization
-        }
-        "auto" => {
+        .unwrap_or_else(|_| "auto".to_string());
+    let (intent, intent_source) = match intent_str.as_str() {
+        "task_localization_query" | "default" => (
+            aethyme_engine::explore::Intent::TaskLocalization,
+            aethyme_engine::explore::IntentSource::Explicit,
+        ),
+        "behavior_localization_query" | "behavior" => (
+            aethyme_engine::explore::Intent::BehaviorLocalization,
+            aethyme_engine::explore::IntentSource::Explicit,
+        ),
+        "auto" | "" => {
             // Heuristic-based intent selection: scans the first ~10
             // tokens of the request for change-task verbs. Defaults
             // to `task_localization_query` when no signal is found.
-            aethyme_engine::explore::Intent::auto_select(&request)
+            (
+                aethyme_engine::explore::Intent::auto_select(&request),
+                aethyme_engine::explore::IntentSource::Auto,
+            )
         }
         "usage_boundary_query" => {
             // Different orchestrator: doesn't go through the daemon,
@@ -834,7 +845,13 @@ fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
         return Err(format!("--repo path is not a directory: {repo_str}"));
     }
 
-    match aethyme_engine::explore::explore_with_intent(&repo, &request, intent, &params) {
+    match aethyme_engine::explore::explore_with_intent(
+        &repo,
+        &request,
+        intent,
+        intent_source,
+        &params,
+    ) {
         Ok(response) => {
             let json = serde_json::to_string_pretty(&response)
                 .map_err(|e| format!("serialize response: {e}"))?;

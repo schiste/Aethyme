@@ -110,17 +110,17 @@ pub struct TrustPolicy {
 
 // ── intents ────────────────────────────────────────────────────────────
 
-/// The two task_localization-shaped intents we support natively.
+/// The two task_localization-shaped intents handled by the daemon path.
 ///
 /// `task_localization_query` is the default: bounded answer, compact
 /// detail, conservative defaults. `behavior_localization_query` is for
 /// change-tasks ("what would I edit to make X happen?") — same engine
 /// call, wider params.
 ///
-/// `usage_boundary_query` is a different engine path
-/// (`analyze usage-boundary`, returns a candidates list keyed by
-/// status=Unused/Ambiguous). Not yet ported; the caller falls back to
-/// Python for that intent.
+/// `usage_boundary_query` is dispatched separately because it doesn't
+/// use the daemon — it calls `analyze_usage_boundary_scope_first`
+/// directly via `explore_usage_boundary`. This enum only covers the
+/// daemon-routed intents; the third intent has its own entry point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
     TaskLocalization,
@@ -603,7 +603,37 @@ pub fn explore_task_localization(
     request: &str,
     params: &ExploreParams,
 ) -> Result<ExploreResponse, ExploreError> {
-    explore_with_intent(repo, request, Intent::TaskLocalization, params)
+    explore_with_intent(
+        repo,
+        request,
+        Intent::TaskLocalization,
+        IntentSource::Default,
+        params,
+    )
+}
+
+/// How the intent was selected. Reported back in the response so
+/// consumers can attribute the choice (an agent that explicitly
+/// requested behavior_localization should know its choice was honored,
+/// vs the heuristic having picked it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntentSource {
+    /// No --intent flag — the default (TaskLocalization) was used.
+    Default,
+    /// Caller passed --intent <X> explicitly.
+    Explicit,
+    /// Caller passed --intent auto and the heuristic picked X.
+    Auto,
+}
+
+impl IntentSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IntentSource::Default => "default",
+            IntentSource::Explicit => "explicit",
+            IntentSource::Auto => "auto",
+        }
+    }
 }
 
 /// Run an explore intent with explicit intent selection.
@@ -615,6 +645,7 @@ pub fn explore_with_intent(
     repo: &Path,
     request: &str,
     intent: Intent,
+    intent_source: IntentSource,
     params: &ExploreParams,
 ) -> Result<ExploreResponse, ExploreError> {
     let socket = daemon::socket_path_for(repo);
@@ -674,6 +705,7 @@ pub fn explore_with_intent(
     Ok(build_response(
         request,
         intent,
+        intent_source,
         &view,
         &symbol_matches,
         &text_items,
@@ -1159,21 +1191,51 @@ fn suffix_class_rank(path: &str) -> i32 {
     {
         return 1;
     }
-    // Source code by suffix.
+    // Test-file demote MUST be checked BEFORE the source-code arm —
+    // a test file in a source language (test_foo.py, auth.spec.ts)
+    // would otherwise hit the rank-5 source arm and ignore the
+    // "tests rank slightly lower" intent.
+    let is_test = lower.contains("/tests/")
+        || lower.contains("/test/")
+        || lower.contains(".test.")
+        || lower.contains(".spec.")
+        || lower.contains("_test.");
     let suffix = lower.rsplit('.').next().unwrap_or("");
+    let is_source = matches!(
+        suffix,
+        "rs" | "py"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "go"
+            | "java"
+            | "kt"
+            | "swift"
+            | "rb"
+            | "php"
+            | "c"
+            | "h"
+            | "cpp"
+            | "hpp"
+            | "cs"
+            | "mjs"
+            | "cjs"
+            | "vue"
+            | "svelte"
+    );
+    if is_source && is_test {
+        return 4;
+    }
+    if is_source {
+        return 5;
+    }
+    if is_test {
+        // Non-source test fixture (.json, .yaml, etc) — weaker than
+        // tests in source languages but still has signal.
+        return 3;
+    }
     match suffix {
-        "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "go" | "java" | "kt"
-        | "swift" | "rb" | "php" | "c" | "h" | "cpp" | "hpp" | "cs"
-        | "mjs" | "cjs" | "vue" | "svelte" => 5,
-        // Test files — slightly lower than code but still useful.
-        s if (lower.contains("/tests/")
-            || lower.contains("/test/")
-            || lower.contains(".test.")
-            || lower.contains(".spec."))
-            && !s.is_empty() =>
-        {
-            4
-        }
         "md" | "rst" | "adoc" | "txt" => 3,
         "yml" | "yaml" | "toml" | "ini" | "conf" | "config" => 2,
         // Generic JSON / data — common text matches but weak signal.
@@ -1304,6 +1366,7 @@ pub(crate) fn extract_symbol_queries(request: &str) -> Vec<String> {
 fn build_response(
     request: &str,
     intent: Intent,
+    intent_source: IntentSource,
     view: &serde_json::Value,
     symbol_matches: &SymbolBatchResults,
     text_items: &[AnswerItem],
@@ -1716,7 +1779,7 @@ fn build_response(
         schema_version: "aethyme-explore-v1",
         mode: "explore",
         intent: intent.as_str(),
-        intent_source: "default",
+        intent_source: intent_source.as_str(),
         status,
         request: ExploreRequest {
             raw: request.to_string(),
@@ -1732,7 +1795,13 @@ fn build_response(
             excluded_count: 0,
         },
         confidence: Confidence {
-            overall: overall_confidence(&_dummy_strings_for_summary()),
+            // Aggregate "overall" confidence is intentionally None for the
+            // task/behavior path: each AnswerItem carries its own
+            // confidence, and a single weighted aggregate would obscure
+            // the distinction between "one strong + four weak" and "five
+            // medium." Consumers should read per-item confidence + the
+            // trust_policy verdict.
+            overall: None,
             answer_summary,
             excluded_summary: ConfidenceSummary::default(),
             analyzed_summary: serde_json::json!({}),
@@ -1968,17 +2037,6 @@ fn bucket_confidence(items: &[AnswerItem]) -> ConfidenceSummary {
     summary
 }
 
-fn overall_confidence(_items: &[String]) -> Option<f64> {
-    // Stub — real implementation will use weighted aggregate over evidence
-    // sources in a later session. Returning None keeps the contract honest:
-    // "no overall confidence is computed yet."
-    None
-}
-
-fn _dummy_strings_for_summary() -> Vec<String> {
-    Vec::new()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2048,6 +2106,7 @@ mod tests {
         let response = build_response(
             "find watchlist handlers",
             Intent::TaskLocalization,
+            IntentSource::Default,
             &sample_view(),
             &empty_symbols(),
             &[],
@@ -2081,6 +2140,7 @@ mod tests {
         let response = build_response(
             "test",
             Intent::TaskLocalization,
+            IntentSource::Default,
             &view,
             &empty_symbols(),
             &[],
@@ -2109,6 +2169,7 @@ mod tests {
         let response = build_response(
             "nothing matches",
             Intent::TaskLocalization,
+            IntentSource::Default,
             &view,
             &empty_symbols(),
             &[],
@@ -2126,6 +2187,7 @@ mod tests {
         let response = build_response(
             "find handlers",
             Intent::TaskLocalization,
+            IntentSource::Default,
             &sample_view(),
             &empty_symbols(),
             &[],
@@ -2148,6 +2210,7 @@ mod tests {
         let response = build_response(
             "find session authenticate handlers",
             Intent::TaskLocalization,
+            IntentSource::Default,
             &sample_view(),
             &symbols,
             &[],
@@ -2175,6 +2238,7 @@ mod tests {
         let response = build_response(
             "find helper code",
             Intent::TaskLocalization,
+            IntentSource::Default,
             &sample_view(),
             &symbols,
             &[],
@@ -2316,6 +2380,34 @@ mod tests {
             Intent::auto_select("Where is the padding logic for the form?"),
             Intent::TaskLocalization,
         );
+    }
+
+    // ── suffix_class_rank: regression tests for the test-demote bugfix ─
+
+    #[test]
+    fn suffix_class_rank_demotes_source_language_tests() {
+        // Source-language test files should rank BELOW non-test source
+        // (4 vs 5). Pre-bugfix, the test arm was unreachable for these.
+        assert!(suffix_class_rank("src/auth.rs") > suffix_class_rank("tests/auth_test.rs"));
+        assert!(suffix_class_rank("backend/grader.py") > suffix_class_rank("backend/tests/test_grader.py"));
+        assert!(suffix_class_rank("packages/auth/src/login.ts") > suffix_class_rank("packages/auth/src/login.test.ts"));
+    }
+
+    #[test]
+    fn suffix_class_rank_orders_categories_correctly() {
+        let source = suffix_class_rank("src/foo.rs");
+        let test = suffix_class_rank("tests/foo_test.rs");
+        let docs = suffix_class_rank("README.md");
+        let config = suffix_class_rank("config.yml");
+        let data = suffix_class_rank("data/users.json");
+        let locale = suffix_class_rank("packages/app/locales/en.json");
+        let lockfile = suffix_class_rank("package-lock.json");
+        assert!(source > test);
+        assert!(test > docs);
+        assert!(docs > config);
+        assert!(config > data);
+        assert!(data >= lockfile);
+        assert!(lockfile > locale);
     }
 
     #[test]
