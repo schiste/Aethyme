@@ -131,6 +131,10 @@ pub struct ExploreParams {
     /// 1-2; emitting all hits would be ~6,000 tokens of noise on a
     /// well-matching file.
     pub max_text_line_refs: usize,
+    /// Number of filename-token matches to surface in
+    /// `navigation_hints[]`. Filename-only matches aren't
+    /// authoritative; this caps how many we suggest as "look here".
+    pub max_filename_hints: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +154,7 @@ impl Default for ExploreParams {
             max_symbol_files: 8, // truncated when answer list fills
             max_text_files: 5,   // matches Python compact default
             max_text_line_refs: 2,
+            max_filename_hints: 3,
         }
     }
 }
@@ -224,11 +229,25 @@ pub fn explore_task_localization(
         params.max_text_line_refs,
     );
 
+    // 4. Filename-token matches. These are navigation_hints, not
+    //    answers — a filename match alone is a "look here next"
+    //    signal, not authoritative. Catches the case where the
+    //    canonical file's NAME contains the request terms but its
+    //    symbols don't (e.g. `suppliers_grader.py` for "find
+    //    suppliers grader" — its functions are named
+    //    `_default_graders` etc).
+    let filename_items = filename_token_matches(
+        repo,
+        &symbol_queries,
+        params.max_filename_hints,
+    );
+
     Ok(build_response(
         request,
         &view,
         &symbol_matches,
         &text_items,
+        &filename_items,
         params,
     ))
 }
@@ -331,6 +350,155 @@ impl SymbolHit {
             score: obj.get("score")?.as_i64().unwrap_or(0),
         })
     }
+}
+
+// ── filename-token matching (Rust port of _task_localization_filesystem_items) ──
+//
+// Catches the case where the relevant file's NAME contains the request
+// terms but its symbols don't. Example from the Mockup measurement:
+// query "find suppliers grader" — `suppliers_grader.py` is the obvious
+// answer, but its functions are named `_default_graders` etc. Symbol
+// search misses the file; filename matching catches it.
+//
+// Output goes to `navigation_hints[]`, NOT `answer[]`: a filename-only
+// match is a hint to look at, not authoritative evidence. Confidence
+// stays low (0.28-0.38). Mirrors Python's
+// `_task_localization_filesystem_items` contract.
+
+const FILENAME_ALLOWED_SUFFIXES: &[&str] = &[
+    "c", "cc", "cpp", "cs", "go", "h", "hpp", "java", "js", "jsx",
+    "kt", "mjs", "php", "py", "rb", "rs", "swift", "ts", "tsx", "vue",
+];
+
+fn filename_token_matches(
+    repo: &Path,
+    terms: &[String],
+    max_items: usize,
+) -> Vec<AnswerItem> {
+    if terms.is_empty() || max_items == 0 {
+        return Vec::new();
+    }
+    // `rg --files` walks the repo respecting gitignore, returns one
+    // path per line. Way faster than std::fs traversal on 7K-file repos
+    // and skips junk (.venv, node_modules, etc) by default.
+    let output = match std::process::Command::new(RIPGREP_BIN)
+        .arg("--files")
+        .arg("--no-messages")
+        .arg(repo)
+        .output()
+    {
+        Ok(o) if o.status.success() || !o.stdout.is_empty() => o,
+        _ => return Vec::new(),
+    };
+    let stdout = match std::str::from_utf8(&output.stdout) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let lowered_terms: Vec<String> =
+        terms.iter().map(|t| t.to_ascii_lowercase()).collect();
+    let mut scored: Vec<(i32, Vec<String>, String)> = Vec::new();
+    for abs_line in stdout.lines() {
+        if abs_line.is_empty() {
+            continue;
+        }
+        let abs = Path::new(abs_line);
+        // Suffix gate: only consider source-code files.
+        let suffix = abs
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        match suffix.as_deref() {
+            Some(s) if FILENAME_ALLOWED_SUFFIXES.contains(&s) => {}
+            _ => continue,
+        }
+        let rel_path = match abs.strip_prefix(repo) {
+            Ok(p) => p.to_string_lossy().to_string(),
+            Err(_) => continue,
+        };
+        let (score, matched) = filename_match_score(&rel_path, &lowered_terms);
+        if score <= 0 {
+            continue;
+        }
+        scored.push((score, matched, rel_path));
+    }
+
+    // Sort by score descending, prefer SHORTER paths within same score
+    // (less-nested = more likely to be the canonical home of the
+    // concept), then alphabetical for stability.
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.2.len().cmp(&b.2.len()))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    scored.truncate(max_items);
+
+    scored
+        .into_iter()
+        .map(|(score, matched_terms, rel_path)| {
+            let multi = matched_terms.len() > 1;
+            let confidence = if multi { 0.38 } else { 0.28 };
+            AnswerItem {
+                kind: "filesystem_file".into(),
+                target: rel_path.clone(),
+                path: Some(rel_path),
+                status: "navigation_hint".into(),
+                confidence,
+                reason: "Filename-only match. Use as a search/navigation hint, \
+                         not as primary answer evidence."
+                    .into(),
+                role: "navigation_filename".into(),
+                evidence: serde_json::json!({
+                    "source": "filesystem-filename",
+                    "matched_terms": matched_terms,
+                    "score": score,
+                }),
+            }
+        })
+        .collect()
+}
+
+/// Score a path against query terms, mirroring Python's
+/// `_filesystem_match_score`. Higher = stronger filename signal.
+///   - exact stem match:    +20
+///   - stem prefix:         +12
+///   - substring in stem:    +8
+///   - substring in basename:+5
+///   - substring in path:    +2
+fn filename_match_score(path: &str, lowered_terms: &[String]) -> (i32, Vec<String>) {
+    let lowered_path = path.to_ascii_lowercase();
+    let filename = Path::new(&lowered_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&lowered_path)
+        .to_string();
+    let stem = Path::new(&lowered_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&filename)
+        .to_string();
+
+    let mut score = 0;
+    let mut matched: Vec<String> = Vec::new();
+    for term in lowered_terms {
+        if term == &stem {
+            score += 20;
+            matched.push(term.clone());
+        } else if stem.starts_with(term) {
+            score += 12;
+            matched.push(term.clone());
+        } else if stem.contains(term) {
+            score += 8;
+            matched.push(term.clone());
+        } else if filename.contains(term) {
+            score += 5;
+            matched.push(term.clone());
+        } else if lowered_path.contains(term) {
+            score += 2;
+            matched.push(term.clone());
+        }
+    }
+    (score, matched)
 }
 
 // ── source-text search (Rust port of _task_localization_text_items) ────
@@ -708,6 +876,7 @@ fn build_response(
     view: &serde_json::Value,
     symbol_matches: &SymbolBatchResults,
     text_items: &[AnswerItem],
+    filename_items: &[AnswerItem],
     params: &ExploreParams,
 ) -> ExploreResponse {
     let anchors = view
@@ -938,6 +1107,26 @@ fn build_response(
         });
     }
 
+    // Filename-token matches: navigation hints, NOT answers. The
+    // contract is "look here next" rather than "this IS the answer".
+    // Skip files that already appear in answer[] (those have stronger
+    // evidence and the agent has them in context already).
+    for item in filename_items {
+        if nav_hints
+            .iter()
+            .any(|h| h.path.as_deref() == item.path.as_deref())
+        {
+            continue;
+        }
+        if answers
+            .iter()
+            .any(|a| a.path.as_deref() == item.path.as_deref())
+        {
+            continue;
+        }
+        nav_hints.push(item.clone());
+    }
+
     // Cap answer count after dedup so we hit the user's intent for
     // `max_answer_items` exactly.
     answers.truncate(params.max_answer_items);
@@ -1081,6 +1270,17 @@ fn build_response(
         ]
     };
 
+    // Compute fields that need by-ref reads BEFORE moving the values
+    // into the response struct.
+    let safe_to_use_as_answer = trust_policy.safe_to_use_as_answer;
+    let safe_to_use_as_navigation = trust_policy.safe_to_use_as_navigation;
+    let verification_steps = build_verification_steps(
+        &answers,
+        &nav_hints,
+        &trust_policy,
+        text_items,
+    );
+
     ExploreResponse {
         schema_version: "aethyme-explore-v1",
         mode: "explore",
@@ -1106,22 +1306,131 @@ fn build_response(
             excluded_summary: ConfidenceSummary::default(),
             analyzed_summary: serde_json::json!({}),
         },
-        safe_to_use_as_answer: trust_policy.safe_to_use_as_answer,
-        safe_to_use_as_navigation: trust_policy.safe_to_use_as_navigation,
+        safe_to_use_as_answer,
+        safe_to_use_as_navigation,
         trust_policy,
         degraded_reasons: Vec::new(),
-        verification_steps: vec![
-            serde_json::json!({
-                "step": "Open the top answer[] item and confirm it matches the task before relying on it.",
-                "rationale": "Graph navigation found this candidate; verifying that the file genuinely handles the task is fast.",
-            }),
-        ],
+        verification_steps,
         next_actions,
         available_specialized_intents: vec![
             "behavior_localization_query",
             "usage_boundary_query",
         ],
     }
+}
+
+/// Tailor the verification steps to the evidence we actually produced.
+///
+/// Mirrors the philosophy of Python's
+/// `_task_localization_verification_steps`: the steps an agent should
+/// take depend on what we found and how confident we are. Generic
+/// "verify before acting" is honest but unhelpful; pointing at a
+/// specific line ref or symbol gives the agent a concrete thing to do.
+///
+/// Step priority (we emit at most 4):
+///   1. If text evidence with line_refs → read the cited line(s)
+///   2. If symbol evidence → grep callers/dispatch sites of the symbol
+///   3. If failed/no answers → suggest broadening the request or running
+///      Python explore for richer evidence
+///   4. Generic "open top answer and confirm" as a final fallback
+fn build_verification_steps(
+    answers: &[AnswerItem],
+    nav_hints: &[AnswerItem],
+    trust_policy: &TrustPolicy,
+    text_items: &[AnswerItem],
+) -> Vec<serde_json::Value> {
+    let mut steps: Vec<serde_json::Value> = Vec::new();
+
+    // Step 1: cite a specific line ref the agent can read.
+    if let Some(top_text) = text_items.first() {
+        if let Some(line_refs) =
+            top_text.evidence.get("line_refs").and_then(|v| v.as_array())
+        {
+            if let Some(first_ref) = line_refs.first() {
+                let line = first_ref.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+                let path = top_text.path.as_deref().unwrap_or("(unknown)");
+                steps.push(serde_json::json!({
+                    "step": format!(
+                        "Read {}:{} and confirm the matched terms appear in \
+                         executable code (not a comment or stringified \
+                         translation).",
+                        path, line
+                    ),
+                    "rationale": "Source-text evidence is line-level; verifying \
+                                  the line context takes one Read tool call.",
+                }));
+            }
+        }
+    }
+
+    // Step 2: when symbol-search anchored a file (different from text
+    // top), suggest checking the symbol's call sites.
+    let symbol_file = answers
+        .iter()
+        .find(|a| a.kind == "symbol_search_file")
+        .or_else(|| nav_hints.iter().find(|h| h.kind == "anchor_symbol"));
+    if let Some(item) = symbol_file {
+        let path = item.path.as_deref().unwrap_or(item.target.as_str());
+        let matched: Option<Vec<String>> = item
+            .evidence
+            .get("matched_queries")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|t| t.as_str().map(String::from)).collect());
+        let term_hint = match matched {
+            Some(t) if !t.is_empty() => format!(" (matched {})", t.join(", ")),
+            _ => String::new(),
+        };
+        steps.push(serde_json::json!({
+            "step": format!(
+                "Search the codebase for callers of the symbol(s) Aethyme \
+                 found in {}{}; the call sites confirm whether this file is \
+                 the entry point or just one of many implementations.",
+                path, term_hint
+            ),
+            "rationale": "Symbol-name matches show definition; callers show \
+                          actual usage and surface dispatch.",
+        }));
+    }
+
+    // Step 3: degraded/failed → suggest rerun.
+    if trust_policy.trust_policy == "failed"
+        || trust_policy.trust_policy == "needs_verification"
+    {
+        if answers.is_empty() && nav_hints.is_empty() {
+            steps.push(serde_json::json!({
+                "step": "Broaden the request: include domain terms (entity \
+                         names, file types) or rerun with `--detail standard` \
+                         for wider symbol/text coverage.",
+                "rationale": "No candidates surfaced — the request may not \
+                              tokenize into useful query terms.",
+            }));
+        } else if trust_policy.trust_policy == "needs_verification" {
+            steps.push(serde_json::json!({
+                "step": "If the task requires high confidence, rerun with \
+                         `--detail standard` or via the Python explore for \
+                         additional source-callsite expansion and evidence \
+                         aggregation.",
+                "rationale": "Native session-3 path covers the common cases; \
+                              richer evidence sources are deferred to the \
+                              Python orchestrator.",
+            }));
+        }
+    }
+
+    // Final fallback if we somehow produced nothing actionable above.
+    if steps.is_empty() {
+        steps.push(serde_json::json!({
+            "step": "Open the top answer[] item and confirm it matches the \
+                     task before relying on it.",
+            "rationale": "Graph navigation found this candidate; verifying \
+                          that the file genuinely handles the task is fast.",
+        }));
+    }
+
+    // Cap at 4: longer lists are noise; the first 1-2 are typically the
+    // strongest moves an agent can take.
+    steps.truncate(4);
+    steps
 }
 
 /// Group symbol-search hits by file, rank by query coverage + cumulative
@@ -1310,6 +1619,7 @@ mod tests {
             &sample_view(),
             &empty_symbols(),
             &[],
+            &[],
             &ExploreParams::default(),
         );
         assert!(!response.answer.is_empty(), "expected at least one answer");
@@ -1341,6 +1651,7 @@ mod tests {
             &view,
             &empty_symbols(),
             &[],
+            &[],
             &ExploreParams {
                 max_answer_items: 3,
                 ..ExploreParams::default()
@@ -1367,6 +1678,7 @@ mod tests {
             &view,
             &empty_symbols(),
             &[],
+            &[],
             &ExploreParams::default(),
         );
         assert_eq!(response.status, "degraded");
@@ -1381,6 +1693,7 @@ mod tests {
             "find handlers",
             &sample_view(),
             &empty_symbols(),
+            &[],
             &[],
             &ExploreParams::default(),
         );
@@ -1401,6 +1714,7 @@ mod tests {
             "find session authenticate handlers",
             &sample_view(),
             &symbols,
+            &[],
             &[],
             &ExploreParams::default(),
         );
@@ -1426,6 +1740,7 @@ mod tests {
             "find helper code",
             &sample_view(),
             &symbols,
+            &[],
             &[],
             &ExploreParams::default(),
         );
