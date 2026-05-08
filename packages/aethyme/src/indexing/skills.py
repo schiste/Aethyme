@@ -71,11 +71,16 @@ def deploy_skills(
 
         shutil.copytree(skill_dir, dest_dir)
 
-        # Replace placeholders in all .md files.
-        for md_file in dest_dir.rglob("*.md"):
-            text = md_file.read_text()
-            if PLACEHOLDER in text:
-                md_file.write_text(text.replace(PLACEHOLDER, str(aethyme_root)))
+        # Replace placeholders in markdown docs and shell wrappers.
+        # The `.sh` extension is enforced for pure shells; the `aethyme-explore`
+        # convenience wrapper has no extension by convention but is shell.
+        for path in dest_dir.rglob("*"):
+            if path.is_dir():
+                continue
+            if path.suffix in (".md", ".sh") or path.name == "aethyme-explore":
+                text = path.read_text()
+                if PLACEHOLDER in text:
+                    path.write_text(text.replace(PLACEHOLDER, str(aethyme_root)))
 
         deployed.append(skill_name)
 

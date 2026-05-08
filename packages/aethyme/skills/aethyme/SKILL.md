@@ -9,19 +9,24 @@ description: Use Aethyme's high-level Explore intents, current repository
 
 ## Setup
 
-Run Aethyme from the tool package root, but keep the target repository as
-`$REPO`. The deployed skill replaces `{{AETHYME_ROOT}}` with the local Aethyme
-package path.
+`aethyme explore` is the canonical entry point — a native Rust binary that
+routes to the engine daemon for sub-second warm latency. Other commands
+(`graph`, `facts`, `task`, `analyze`) still go through the Python CLI.
 
 ```
 AETHYME_ROOT="{{AETHYME_ROOT}}"
 AETHYME_PY="$AETHYME_ROOT/.venv/bin/python"
+AETHYME_BIN="$AETHYME_ROOT/rust/target/release/aethyme"
 REPO="$PWD"
 ```
 
-Use this command shape:
+Command shapes:
 
 ```bash
+# Explore (native Rust, daemon-routed):
+"$AETHYME_BIN" explore --repo "$REPO" ...
+
+# Everything else (Python CLI):
 (cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli <command> ...)
 ```
 
@@ -47,7 +52,7 @@ strong enough, but the trust policy becomes `needs_verification` and
 `safe_to_use_as_answer=false`.
 
 ```bash
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli explore --repo "$REPO" --request "<user request>" --format answer-json --show-observability)
+"$AETHYME_BIN" explore --repo "$REPO" --request "<user request>" --format answer-json --show-observability
 ```
 
 Use a specialized intent only when the request clearly matches it. For
@@ -56,14 +61,14 @@ questions, use `behavior_localization_query`; it spends more budget on
 source-text ranking and call-site expansion.
 
 ```bash
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli explore --repo "$REPO" --intent behavior_localization_query --request "<user request>" --format answer-json --show-observability)
+"$AETHYME_BIN" explore --repo "$REPO" --intent behavior_localization_query --request "<user request>" --format answer-json --show-observability
 ```
 
-For dead-code, boundary usage, or public API caller audits, call
-`usage_boundary_query` directly with structured params.
+For dead-code, boundary usage, or public API caller audits, use
+`usage_boundary_query` with `--scope` (and optionally `--search-root`):
 
 ```bash
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli explore --repo "$REPO" --intent usage_boundary_query --request "<user request>" --params '{"scope":"<directory>","symbol_kind":"public_top_level_function","boundary":{"type":"outside_directory","path":"<directory>"},"search_roots":[],"budget_ms":10000,"max_evidence_per_symbol":5}' --format answer-json --show-observability)
+"$AETHYME_BIN" explore --repo "$REPO" --intent usage_boundary_query --request "<user request>" --scope "<directory>" --search-root src --search-root tests --format answer-json --show-observability
 ```
 
 You can still list the intent catalog directly:

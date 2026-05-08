@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Native Rust thin client for `aethyme explore` — the canonical hot path.
+#
+# This wrapper is the convenience entry point for in-repo skill consumers.
+# The `aethyme` binary detects an engine daemon and routes to the native
+# Rust `aethyme-engine-cli explore` for sub-second warm latency. If no
+# daemon is running, it falls back to the Python daemon / subprocess
+# transparently.
+#
+# Replaced the soft-retired Python `python -m src.cli explore` wrapper
+# on 2026-05-08 (task #59 — Python explore hard-deleted).
+#
+# `{{AETHYME_ROOT}}` is replaced by `deploy_skills` in
+# packages/aethyme/src/indexing/skills.py with the local package path.
+set -euo pipefail
+exec "{{AETHYME_ROOT}}/rust/target/release/aethyme" explore "$@"
