@@ -24,3 +24,6 @@ packages/aethyme/rust/target/
 packages/aethyme/.profiling/
 packages/aethyme/dhat-heap.json
 
+# Claude Code per-project runtime files (settings.local.json, scheduled_tasks.lock, etc.)
+.claude/
+

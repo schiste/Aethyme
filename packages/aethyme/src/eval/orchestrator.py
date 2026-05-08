@@ -135,7 +135,9 @@ _EVAL_TYPE_DEFAULTS: dict[str, dict[str, str]] = {
             "Bug report (T419918): Viewing a diff/revision on a watchlisted "
             "page marks all revisions as 'seen' instead of only the one viewed. "
             "Identify which files need editing and explain how you would fix "
-            "this bug. Do NOT apply the fix — only report your analysis."
+            "this bug. Do NOT apply the fix and do NOT write any files in the "
+            "repository — produce your analysis as JSON in your final response "
+            "only."
         ),
         "prepare_function": "src.eval.schemas.mediawiki_bug_fix_1_reference",
         "score_function": "src.eval.scoring.score_mediawiki_bug_fix_1",
@@ -418,7 +420,7 @@ def _build_prepare_phase(
             f"from src.eval.schemas import mediawiki_bug_fix_1_output_schema; "
             f"schema = mediawiki_bug_fix_1_output_schema(); "
             f"task = {defaults['task']!r}; "
-            f"json_tail = chr(10) + chr(10) + 'Output rules:' + chr(10) + '- Write exactly one JSON object.' + chr(10) + '- Keys: files_to_edit, root_cause, fix_plan, testing.' + chr(10) + '- Use repo-relative paths.'; "
+            f"json_tail = chr(10) + chr(10) + 'Output rules:' + chr(10) + '- Emit exactly one JSON object as your final chat response (do NOT write it to a file).' + chr(10) + '- Keys: files_to_edit, root_cause, fix_plan, testing.' + chr(10) + '- Use repo-relative paths.'; "
             f"ctrl = task + chr(10) + chr(10) + 'Repository path: {target.control_path}' + chr(10) + 'Explore the repository and produce a structured JSON analysis.' + json_tail; "
             f"lev = 'Use Aethyme tools to navigate the repository graph.' + chr(10) + task + chr(10) + chr(10) + 'Repository path: {target.aethyme_path}' + chr(10) + 'Explore the repository and produce a structured JSON analysis.' + json_tail; "
             f"tcond = 'Use Aethyme tools and any task-conditioned context artifacts to navigate the repository graph, but do your own analysis.' + chr(10) + task + chr(10) + chr(10) + 'Repository path: {target.aethyme_path}' + chr(10) + 'Produce a structured JSON analysis.' + json_tail; "
