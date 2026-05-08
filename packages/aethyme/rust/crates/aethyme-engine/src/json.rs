@@ -174,10 +174,33 @@ pub fn write_inspect_structure<W: Write>(w: &mut W, map: &RepositoryMap) -> std:
 }
 
 pub fn escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+    // Per RFC 8259 §7, JSON strings must escape: `"`, `\`, and U+0000
+    // through U+001F. The previous version only handled `"`, `\`, and
+    // `\n`, which produced invalid JSON whenever input contained `\r`
+    // (Windows line endings), `\t` (literal tabs in code), or any other
+    // control character. The fixed version uses the named short escapes
+    // for the common controls and a `\u00XX` fallback for the rest.
+    //
+    // Order matters: `\` must be replaced first so subsequent escapes
+    // we INSERT (which contain `\`) aren't double-escaped.
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                // Other C0 controls — emit \uXXXX. Required for valid JSON.
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn string(value: &str) -> String {
@@ -1174,4 +1197,366 @@ fn activation_summary(summary: &ActivationSummary) -> String {
         "{{\"activated_node_count\":{},\"max_depth_reached\":{},\"top_activated\":[{}]}}",
         summary.activated_node_count, summary.max_depth_reached, top,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    //! Foundational tests for the hand-written JSON serializer.
+    //!
+    //! Strategy: focus on the primitives (`escape`, `string`,
+    //! `string_array`, `write_array`) and the enum-to-str converters,
+    //! since those have small surfaces and shape every consumer's
+    //! output. Round-trip tests use `serde_json` as an oracle: any
+    //! string we escape must parse back to the original. Larger
+    //! aggregate functions (context_pack, repository_map) are exercised
+    //! via integration tests in explore.rs and the engine binary.
+    //!
+    //! Bug found while writing these tests (now fixed): the original
+    //! `escape()` only handled `\`, `"`, and `\n`. Per RFC 8259 §7,
+    //! all C0 controls (U+0000–U+001F) must be escaped — so input
+    //! with `\r`, `\t`, `\b`, `\f`, etc. produced invalid JSON.
+    //! Cargo tests now guard against regression.
+    use super::*;
+    use serde_json::Value;
+
+    fn parse(s: &str) -> Value {
+        serde_json::from_str(s)
+            .unwrap_or_else(|e| panic!("expected valid JSON, got {s:?}: {e}"))
+    }
+
+    // ── escape() ─────────────────────────────────────────────────
+
+    #[test]
+    fn escape_passes_through_plain_ascii() {
+        assert_eq!(escape("hello world"), "hello world");
+        assert_eq!(escape(""), "");
+        assert_eq!(escape("foo/bar.rs"), "foo/bar.rs");
+    }
+
+    #[test]
+    fn escape_handles_backslash() {
+        assert_eq!(escape("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn escape_handles_double_quote() {
+        assert_eq!(escape("a\"b"), "a\\\"b");
+    }
+
+    #[test]
+    fn escape_handles_newline() {
+        assert_eq!(escape("a\nb"), "a\\nb");
+    }
+
+    #[test]
+    fn escape_handles_carriage_return() {
+        // Regression: pre-fix this returned a literal CR in JSON,
+        // which is an invalid string per RFC 8259.
+        assert_eq!(escape("a\rb"), "a\\rb");
+    }
+
+    #[test]
+    fn escape_handles_tab() {
+        // Regression: pre-fix this returned a literal tab — some
+        // permissive parsers accepted it, but strict ones (jq, serde
+        // with default settings) rejected.
+        assert_eq!(escape("a\tb"), "a\\tb");
+    }
+
+    #[test]
+    fn escape_handles_backspace_and_formfeed() {
+        assert_eq!(escape("a\u{0008}b"), "a\\bb");
+        assert_eq!(escape("a\u{000C}b"), "a\\fb");
+    }
+
+    #[test]
+    fn escape_handles_other_c0_controls_via_unicode_escape() {
+        // U+0001 (start of heading) — uncommon but JSON-spec-required.
+        assert_eq!(escape("\u{0001}"), "\\u0001");
+        // U+001F (unit separator) is the highest C0 control.
+        assert_eq!(escape("\u{001F}"), "\\u001f");
+    }
+
+    #[test]
+    fn escape_passes_through_unicode_above_0x20() {
+        assert_eq!(escape("café"), "café");
+        assert_eq!(escape("日本語"), "日本語");
+        assert_eq!(escape("emoji 🦀"), "emoji 🦀");
+    }
+
+    #[test]
+    fn escape_combination_of_specials() {
+        let raw = "line1\nline2\ttab\rcr\"quote\\back";
+        let escaped = escape(raw);
+        assert_eq!(escaped, "line1\\nline2\\ttab\\rcr\\\"quote\\\\back");
+        // Round-trip via serde_json: the wrapped form must parse and
+        // recover the original.
+        let wrapped = format!("\"{escaped}\"");
+        let parsed: String = serde_json::from_str(&wrapped).unwrap();
+        assert_eq!(parsed, raw);
+    }
+
+    /// Property-style test: for every input, wrapping `escape()` in
+    /// quotes must produce JSON that round-trips to the original.
+    /// This is the strongest guarantee — any escape bug breaks it.
+    #[test]
+    fn escape_round_trips_for_representative_inputs() {
+        let inputs = [
+            "",
+            "simple",
+            "with\"quote",
+            "with\\backslash",
+            "with\nnewline",
+            "with\rcr",
+            "with\ttab",
+            "with\u{0008}backspace",
+            "with\u{000C}formfeed",
+            "with\u{0001}control",
+            "with\u{001F}unit-sep",
+            "café 🦀",
+            "all\nthe\rthings\tat\u{0008}once\u{000C}plus\u{0001}controls\"and\\escapes",
+        ];
+        for raw in inputs {
+            let wrapped = format!("\"{}\"", escape(raw));
+            let parsed: String = serde_json::from_str(&wrapped).unwrap_or_else(|e| {
+                panic!("escape({raw:?}) → {wrapped:?} failed to parse: {e}")
+            });
+            assert_eq!(parsed, raw, "round-trip failed for {raw:?}");
+        }
+    }
+
+    // ── string() / string_array() ────────────────────────────────
+
+    #[test]
+    fn string_wraps_in_double_quotes_and_escapes() {
+        assert_eq!(string("hello"), "\"hello\"");
+        assert_eq!(string("a\"b"), "\"a\\\"b\"");
+        assert_eq!(string(""), "\"\"");
+    }
+
+    #[test]
+    fn string_array_empty() {
+        let empty: [String; 0] = [];
+        assert_eq!(string_array(&empty), "[]");
+    }
+
+    #[test]
+    fn string_array_single() {
+        assert_eq!(string_array(&["a".to_string()]), "[\"a\"]");
+    }
+
+    #[test]
+    fn string_array_multi_with_specials() {
+        let items = vec!["hello".to_string(), "wo\"rld".to_string()];
+        let result = string_array(&items);
+        assert_eq!(result, "[\"hello\",\"wo\\\"rld\"]");
+        // Must parse as a real JSON array.
+        let parsed: Vec<String> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed, items);
+    }
+
+    // ── write_array() ────────────────────────────────────────────
+
+    #[test]
+    fn write_array_empty() {
+        let mut buf = Vec::new();
+        let items: [&str; 0] = [];
+        write_array(&mut buf, &items, |s| string(s)).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "[]");
+    }
+
+    #[test]
+    fn write_array_single() {
+        let mut buf = Vec::new();
+        let items = ["one"];
+        write_array(&mut buf, &items, |s| string(s)).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "[\"one\"]");
+    }
+
+    #[test]
+    fn write_array_multi_separates_with_commas() {
+        let mut buf = Vec::new();
+        let items = ["a", "b", "c"];
+        write_array(&mut buf, &items, |s| string(s)).unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        assert_eq!(rendered, "[\"a\",\"b\",\"c\"]");
+        let parsed: Vec<String> = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed, vec!["a", "b", "c"]);
+    }
+
+    // ── enum converters ──────────────────────────────────────────
+    //
+    // For each enum, exhaustive variant coverage. If a variant is
+    // added without updating the converter, the match becomes
+    // non-exhaustive and the file won't compile — but it's worth
+    // documenting the public string contract here so consumers can
+    // see it.
+
+    #[test]
+    fn scope_kind_strings() {
+        assert_eq!(scope_kind(&ScopeKind::File), "file");
+        assert_eq!(scope_kind(&ScopeKind::Folder), "folder");
+        assert_eq!(scope_kind(&ScopeKind::Symbol), "symbol");
+        assert_eq!(scope_kind(&ScopeKind::Area), "area");
+    }
+
+    #[test]
+    fn symbol_kind_strings() {
+        assert_eq!(symbol_kind(&SymbolKind::Function), "function");
+        assert_eq!(symbol_kind(&SymbolKind::Class), "class");
+        assert_eq!(symbol_kind(&SymbolKind::Constant), "constant");
+    }
+
+    #[test]
+    fn task_kind_strings() {
+        assert_eq!(task_kind(&TaskKind::ExplainRepo), "explain_repo");
+        assert_eq!(task_kind(&TaskKind::ExplainComponent), "explain_component");
+        assert_eq!(task_kind(&TaskKind::ChangeSymbol), "change_symbol");
+        assert_eq!(task_kind(&TaskKind::TraceImpact), "trace_impact");
+        assert_eq!(
+            task_kind(&TaskKind::NavigateConfigOwnership),
+            "navigate_config_ownership"
+        );
+        assert_eq!(task_kind(&TaskKind::Unknown), "unknown");
+    }
+
+    #[test]
+    fn edge_kind_strings() {
+        assert_eq!(edge_kind(&EdgeKind::Contains), "contains");
+        assert_eq!(edge_kind(&EdgeKind::BelongsTo), "belongs_to");
+        assert_eq!(edge_kind(&EdgeKind::Defines), "defines");
+        assert_eq!(edge_kind(&EdgeKind::Imports), "imports");
+        assert_eq!(edge_kind(&EdgeKind::Calls), "calls");
+        assert_eq!(edge_kind(&EdgeKind::References), "references");
+        assert_eq!(edge_kind(&EdgeKind::Documents), "documents");
+        assert_eq!(edge_kind(&EdgeKind::Configures), "configures");
+        assert_eq!(edge_kind(&EdgeKind::EntrypointFor), "entrypoint_for");
+    }
+
+    #[test]
+    fn risk_area_strings() {
+        assert_eq!(risk_area(&RiskArea::Auth), "auth");
+        assert_eq!(risk_area(&RiskArea::Permissions), "permissions");
+        assert_eq!(risk_area(&RiskArea::Secrets), "secrets");
+        assert_eq!(risk_area(&RiskArea::Migrations), "migrations");
+        assert_eq!(risk_area(&RiskArea::Infra), "infra");
+        assert_eq!(risk_area(&RiskArea::Billing), "billing");
+        assert_eq!(risk_area(&RiskArea::SharedCore), "shared-core");
+        assert_eq!(risk_area(&RiskArea::Destructive), "destructive");
+        assert_eq!(
+            risk_area(&RiskArea::UserDefined("custom".into())),
+            "custom"
+        );
+    }
+
+    #[test]
+    fn risk_level_strings() {
+        assert_eq!(risk_level(&RiskLevel::Low), "low");
+        assert_eq!(risk_level(&RiskLevel::Medium), "medium");
+        assert_eq!(risk_level(&RiskLevel::High), "high");
+    }
+
+    #[test]
+    fn file_role_strings() {
+        assert_eq!(file_role(&FileRole::Source), "source");
+        assert_eq!(file_role(&FileRole::Test), "test");
+        assert_eq!(file_role(&FileRole::Doc), "doc");
+        assert_eq!(file_role(&FileRole::Config), "config");
+        assert_eq!(file_role(&FileRole::Asset), "asset");
+        assert_eq!(file_role(&FileRole::Generated), "generated");
+        assert_eq!(file_role(&FileRole::Binary), "binary");
+        assert_eq!(file_role(&FileRole::Cache), "cache");
+        assert_eq!(file_role(&FileRole::Unknown), "unknown");
+    }
+
+    #[test]
+    fn graph_node_kind_strings() {
+        assert_eq!(graph_node_kind(&GraphNodeKind::Repo), "repo");
+        assert_eq!(graph_node_kind(&GraphNodeKind::Area), "area");
+        assert_eq!(graph_node_kind(&GraphNodeKind::Directory), "directory");
+        assert_eq!(graph_node_kind(&GraphNodeKind::File), "file");
+        assert_eq!(graph_node_kind(&GraphNodeKind::Class), "class");
+        assert_eq!(graph_node_kind(&GraphNodeKind::Function), "function");
+        assert_eq!(graph_node_kind(&GraphNodeKind::Doc), "doc");
+        assert_eq!(graph_node_kind(&GraphNodeKind::Config), "config");
+    }
+
+    // ── search_hits ──────────────────────────────────────────────
+    //
+    // SearchHit is a public struct with simple field types, so we can
+    // construct one inline and verify the rendered JSON parses + has
+    // the expected shape.
+
+    #[test]
+    fn search_hits_empty() {
+        assert_eq!(search_hits(&[]), "[]");
+    }
+
+    #[test]
+    fn search_hits_single_round_trip() {
+        let hit = SearchHit {
+            id: "fn:example.rs:foo".into(),
+            name: "foo".into(),
+            kind: "function".into(),
+            file: "src/example.rs".into(),
+            line: 42,
+            score: 850,
+            reason: "exact-name".into(),
+        };
+        let rendered = search_hits(std::slice::from_ref(&hit));
+        let parsed = parse(&rendered);
+        let arr = parsed.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        let obj = arr[0].as_object().unwrap();
+        assert_eq!(obj["id"], "fn:example.rs:foo");
+        assert_eq!(obj["name"], "foo");
+        assert_eq!(obj["kind"], "function");
+        assert_eq!(obj["file"], "src/example.rs");
+        assert_eq!(obj["line"], 42);
+        assert_eq!(obj["score"], 850);
+        assert_eq!(obj["reason"], "exact-name");
+    }
+
+    #[test]
+    fn search_hits_with_specials_in_strings_round_trips() {
+        let hit = SearchHit {
+            id: "tab\there".into(),
+            name: "newline\nname".into(),
+            kind: "k".into(),
+            file: "with\\back\"slash".into(),
+            line: 1,
+            score: 0,
+            reason: "rationale".into(),
+        };
+        let rendered = search_hits(std::slice::from_ref(&hit));
+        // Must parse — this would have failed pre-escape-fix because
+        // of the literal tab and newline.
+        let parsed = parse(&rendered);
+        let obj = &parsed[0];
+        assert_eq!(obj["id"], "tab\there");
+        assert_eq!(obj["name"], "newline\nname");
+        assert_eq!(obj["file"], "with\\back\"slash");
+    }
+
+    #[test]
+    fn search_hits_by_query_groups_correctly() {
+        let hit = SearchHit {
+            id: "id1".into(),
+            name: "n1".into(),
+            kind: "k".into(),
+            file: "f".into(),
+            line: 1,
+            score: 500,
+            reason: "r".into(),
+        };
+        let results = vec![
+            ("query-a".to_string(), vec![hit.clone()]),
+            ("query-b".to_string(), vec![]),
+        ];
+        let rendered = search_hits_by_query(&results);
+        let parsed = parse(&rendered);
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj["query-a"].as_array().unwrap().len(), 1);
+        assert_eq!(obj["query-b"].as_array().unwrap().len(), 0);
+    }
 }
