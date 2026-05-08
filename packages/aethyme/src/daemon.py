@@ -47,7 +47,6 @@ import sys
 import tempfile
 import threading
 import time
-from io import StringIO
 from pathlib import Path
 from typing import Any
 
@@ -213,8 +212,11 @@ class _DaemonServer:
         return buf.decode("utf-8", errors="replace").strip()
 
     def _dispatch(self, command: str, args: list[str]) -> str:
-        if command == "explore":
-            return _capture_click_command("explore", args)
+        # `explore` was historically routed here — it's now served natively by
+        # `aethyme-engine-cli explore` (the Rust thin client in
+        # rust/crates/aethyme-engine/src/bin/aethyme.rs detects an engine
+        # daemon socket and invokes the Rust binary directly). After task #59
+        # deleted the Python explore_command this dispatch became dead code.
         if command == "ping":
             return json.dumps({"pong": True, "repo": str(self.repo)})
         return json.dumps({"error": f"unknown daemon command: {command!r}"})
@@ -241,51 +243,6 @@ class _DaemonServer:
         except Exception:
             logger.exception("import warmup failed; first call will pay the cost")
 
-
-def _capture_click_command(subcommand: str, args: list[str]) -> str:
-    """Run a click command in-process and capture its stdout."""
-
-    from src.cli import cli  # imported here so the warmup actually warms
-
-    # Click wants a fresh argv-like list. We mirror ``sys.argv[1:]`` semantics.
-    invoke_args = [subcommand, *args]
-
-    buf = StringIO()
-    err_buf = StringIO()
-
-    # Save stdout/stderr in case the click command writes via sys.stdout /
-    # print() rather than only through click.echo.
-    saved_stdout = sys.stdout
-    saved_stderr = sys.stderr
-    try:
-        sys.stdout = buf
-        sys.stderr = err_buf
-        try:
-            cli.main(args=invoke_args, standalone_mode=False, prog_name="aethyme-daemon")
-        except SystemExit as exc:
-            # Click raises SystemExit on errors; capture the code in the body.
-            if exc.code not in (None, 0):
-                return json.dumps(
-                    {
-                        "error": "click_exit",
-                        "code": int(exc.code) if isinstance(exc.code, int) else 1,
-                        "stderr": err_buf.getvalue(),
-                    }
-                )
-        except Exception as exc:  # pragma: no cover — defensive
-            return json.dumps(
-                {
-                    "error": "exception",
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                    "stderr": err_buf.getvalue(),
-                }
-            )
-    finally:
-        sys.stdout = saved_stdout
-        sys.stderr = saved_stderr
-
-    return buf.getvalue()
 
 
 # ── click subcommands ──────────────────────────────────────────────────────
