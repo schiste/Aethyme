@@ -303,6 +303,17 @@ impl Detail {
     /// `output_adapters` etc.) because the agent flow rarely needs
     /// the verbose envelope — what helps is more candidates to
     /// triage. Output_adapters and observability stay compact-shaped.
+    ///
+    /// Why 2x (not Python's ~5x) at standard: the predecessor Python
+    /// `_task_localization_detail_defaults` jumped `max_answer_items`
+    /// from 5 (compact) to 24 (standard) — a 4.8x widening. We picked
+    /// 2x because the 2026-05-07 evals (GRC + MediaWiki bug-fix-1)
+    /// showed agents triage well with 10 candidates at standard;
+    /// pushing to ~22 inflates response tokens without observable
+    /// quality gain. Callers needing the wider pool can ask for
+    /// `--detail full` (4x) or set `--max-answer-items` explicitly.
+    /// This is a deliberate divergence from the Python predecessor,
+    /// not an oversight (cleanup ladder #5 / project_native_explore_parity_2026_05_07.md).
     pub fn apply_param_widening(&self, params: &mut ExploreParams) {
         let factor: usize = match self {
             Detail::Compact => return,

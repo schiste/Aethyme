@@ -1566,7 +1566,15 @@ def _intent_catalog() -> dict[str, Any]:
                         "trust_contract": {
                             "safe_to_use_as_answer": "boolean",
                             "safe_to_use_as_navigation": "boolean",
-                            "evidence_level": "graph | symbol | text | filename | none",
+                            # Native (Rust) explore emits compound levels that
+                            # describe WHICH evidence sources corroborated, e.g.
+                            # `graph+symbol+text+callsite` (triple corroborated),
+                            # `graph+symbol+callsite` (strong callsite),
+                            # `graph+callsite-weak`, `graph+text`, `graph+symbol`,
+                            # `graph+symbol-weak`, `graph` (anchors only). Single-
+                            # word legacy forms (`graph`/`symbol`/`text`) still
+                            # appear at the lowest tiers and on degraded paths.
+                            "evidence_level": "compound: graph[+symbol[-weak]][+text[-weak]][+callsite[-weak]] | none",
                             "verification_required": "boolean",
                             "trust_policy": "answer_candidate | needs_verification | navigation_only | failed",
                         },
