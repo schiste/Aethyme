@@ -5141,6 +5141,49 @@ def eval_setup_repos(source: Path, dest: Path) -> None:
         click.echo(f"{cond}: {path}")
 
 
+def _condition_cmd_options(func):
+    """Add the five condition-command click options shared by `eval explain-repo`
+    and `eval navigation-ctf`. Includes the deprecated `--baseline-cmd` /
+    `--aethyme-cmd` aliases so old scripts keep working — pair with
+    :func:`_resolve_legacy_cmd_aliases` inside the command body to map them.
+    """
+    func = click.option(
+        "--aethyme-cmd", hidden=True, help="[Deprecated] Alias for --leverage-cmd"
+    )(func)
+    func = click.option(
+        "--baseline-cmd", hidden=True, help="[Deprecated] Alias for --control-cmd"
+    )(func)
+    func = click.option(
+        "--leverage-cmd",
+        help="Command for the leverage run (pre-computed context + tools)",
+    )(func)
+    func = click.option(
+        "--explore-cmd",
+        help="Command for the explore run (tools in prompt, no context)",
+    )(func)
+    func = click.option(
+        "--control-cmd", help="Command for the control run (no context, no tools)"
+    )(func)
+    return func
+
+
+def _resolve_legacy_cmd_aliases(
+    control_cmd: str | None,
+    leverage_cmd: str | None,
+    baseline_cmd: str | None,
+    aethyme_cmd: str | None,
+) -> tuple[str | None, str | None]:
+    """Map the deprecated `--baseline-cmd` → `--control-cmd` and
+    `--aethyme-cmd` → `--leverage-cmd`. Returns the resolved (control, leverage)
+    pair. Modern flags win when both are passed.
+    """
+    if control_cmd is None and baseline_cmd is not None:
+        control_cmd = baseline_cmd
+    if leverage_cmd is None and aethyme_cmd is not None:
+        leverage_cmd = aethyme_cmd
+    return control_cmd, leverage_cmd
+
+
 @eval.command("explain-repo")
 @click.option(
     "--repo",
@@ -5156,21 +5199,7 @@ def eval_setup_repos(source: Path, dest: Path) -> None:
     help="Task description",
 )
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-@click.option(
-    "--control-cmd", help="Command for the control run (no context, no tools)"
-)
-@click.option(
-    "--explore-cmd", help="Command for the explore run (tools in prompt, no context)"
-)
-@click.option(
-    "--leverage-cmd", help="Command for the leverage run (pre-computed context + tools)"
-)
-@click.option(
-    "--baseline-cmd", hidden=True, help="[Deprecated] Alias for --control-cmd"
-)
-@click.option(
-    "--aethyme-cmd", hidden=True, help="[Deprecated] Alias for --leverage-cmd"
-)
+@_condition_cmd_options
 def eval_explain_repo(
     repo_path: Path,
     task_text: str,
@@ -5182,11 +5211,9 @@ def eval_explain_repo(
     aethyme_cmd: str | None,
 ) -> None:
     """Build the control artifacts for a local explain-repo benchmark."""
-    # Map legacy flags
-    if control_cmd is None and baseline_cmd is not None:
-        control_cmd = baseline_cmd
-    if leverage_cmd is None and aethyme_cmd is not None:
-        leverage_cmd = aethyme_cmd
+    control_cmd, leverage_cmd = _resolve_legacy_cmd_aliases(
+        control_cmd, leverage_cmd, baseline_cmd, aethyme_cmd
+    )
 
     try:
         control_runner = (
@@ -5252,21 +5279,7 @@ def eval_explain_repo(
     help="Task description",
 )
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-@click.option(
-    "--control-cmd", help="Command for the control run (no context, no tools)"
-)
-@click.option(
-    "--explore-cmd", help="Command for the explore run (tools in prompt, no context)"
-)
-@click.option(
-    "--leverage-cmd", help="Command for the leverage run (pre-computed context + tools)"
-)
-@click.option(
-    "--baseline-cmd", hidden=True, help="[Deprecated] Alias for --control-cmd"
-)
-@click.option(
-    "--aethyme-cmd", hidden=True, help="[Deprecated] Alias for --leverage-cmd"
-)
+@_condition_cmd_options
 def eval_navigation_ctf(
     repo_path: Path,
     task_text: str,
@@ -5278,11 +5291,9 @@ def eval_navigation_ctf(
     aethyme_cmd: str | None,
 ) -> None:
     """Build a directed repository navigation benchmark from real graph relations."""
-    # Map legacy flags
-    if control_cmd is None and baseline_cmd is not None:
-        control_cmd = baseline_cmd
-    if leverage_cmd is None and aethyme_cmd is not None:
-        leverage_cmd = aethyme_cmd
+    control_cmd, leverage_cmd = _resolve_legacy_cmd_aliases(
+        control_cmd, leverage_cmd, baseline_cmd, aethyme_cmd
+    )
 
     try:
         control_runner = (
