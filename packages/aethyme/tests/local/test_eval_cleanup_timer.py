@@ -120,3 +120,44 @@ def test_cleanup_benchmark_is_idempotent(tmp_path: Path):
     target = tmp_path / "missing"  # Never created.
     cleanup_benchmark(target)  # First call: no-op (doesn't exist)
     cleanup_benchmark(target)  # Second call: still no-op
+
+
+def test_schedule_cleanup_notice_goes_to_stderr_not_stdout(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+):
+    """Regression: pre-2026-05-09 the "Benchmark clones at ... will be
+    deleted in N min" line printed to stdout, breaking
+    `python -m src.cli ... --json-output | jq` for every consumer.
+
+    The fix routes the notice to stderr. This test reaches into
+    `prepare_bug_fix_benchmark` to exercise the print path.
+    """
+    from src.eval.bug_fix import prepare_bug_fix_benchmark
+
+    # Use the actual control playground if it exists; otherwise skip.
+    # We can't synthesize a TS monorepo for the test cheaply.
+    src = Path("/Users/christophehenner/Downloads/Repositories/Playground/Mockup/Mockup - Control")
+    if not src.exists():
+        pytest.skip(f"Mockup control playground not present at {src}")
+
+    dest = tmp_path / "stderr-test"
+    try:
+        result = prepare_bug_fix_benchmark(src, dest)
+    finally:
+        # Cancel the timer so we don't leave a 15-min daemon timer running.
+        timer = result.get("cleanup_timer") if "result" in dir() else None
+        if timer is not None:
+            timer.cancel()
+
+    captured = capsys.readouterr()
+    # The notice must NOT appear on stdout
+    assert "Benchmark clones at" not in captured.out, (
+        f"stdout should be clean for json-output consumers, but got: "
+        f"{captured.out!r}"
+    )
+    # The notice MUST appear on stderr (otherwise the operator never sees it)
+    assert "Benchmark clones at" in captured.err, (
+        f"the operator-facing notice should be on stderr, got: "
+        f"{captured.err!r}"
+    )

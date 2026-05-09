@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -312,7 +313,15 @@ def prepare_bug_fix_benchmark(
         timer = schedule_cleanup(dest_dir, delay=cleanup_delay)
         result["cleanup_timer"] = timer
         mins = cleanup_delay / 60
-        print(f"Benchmark clones at {dest_dir} will be deleted in {mins:.0f} min.")
+        # Route the heads-up to stderr, NOT stdout. Callers using
+        # `--json-output | jq` need stdout to be valid JSON only;
+        # the cleanup notice is operator-facing status, so stderr is
+        # the natural channel. Pre-2026-05-09 this went to stdout and
+        # broke every pipe consumer.
+        print(
+            f"Benchmark clones at {dest_dir} will be deleted in {mins:.0f} min.",
+            file=sys.stderr,
+        )
 
     return result
 
