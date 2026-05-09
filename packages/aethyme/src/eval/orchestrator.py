@@ -278,6 +278,7 @@ def generate_run_plan(
     phases = [
         _build_validate_phase(eval_target),
         _build_prepare_phase(eval_type, eval_target, scenario, dest_dir, paths),
+        _build_warm_phase(eval_target),
         _build_launch_phase(eval_type, eval_target, model_config, dest_dir, paths),
         _build_monitor_phase(),
         _build_collect_phase(model_config, paths),
@@ -384,6 +385,60 @@ def _build_validate_phase(target: EvalTarget) -> dict[str, Any]:
         "name": "prepare",
         "description": "Check repository readiness and persist a preparation snapshot",
         "checks": checks,
+    }
+
+
+def _build_warm_phase(target: EvalTarget) -> dict[str, Any]:
+    """Pre-warm the engine daemon for the target's Aethyme repo.
+
+    Cold start on MediaWiki is ~108s map_build + ~16s signals (measured
+    2026-05-07). If the daemon isn't pre-warmed, the leverage condition's
+    first `aethyme explore` call eats that cost serially. Warming before
+    `launch` makes per-condition timing comparable.
+
+    For small repos (e.g. Mockup, ~7K files) cold start is ~6s, but the
+    phase is cheap to run and keeps the contract uniform across targets.
+
+    Phase shape mirrors `prepare` and `monitor`: structured fields the
+    runner executes. The `cli_cmd` is the canonical shell sequence; the
+    `wait_for` field tells the runner what to grep for in the log.
+    """
+    engine_bin = str(
+        PROJECT_ROOT / "rust" / "target" / "release" / "aethyme-engine-cli"
+    )
+    aethyme_repo = str(target.aethyme_path)
+    log_path = str(target.aethyme_path / ".aethyme" / "engine-daemon.log")
+
+    return {
+        "name": "warm",
+        "description": (
+            f"Pre-warm engine daemon for {target.display_name} so leverage "
+            f"condition doesn't eat cold-start cost (≤108s on MediaWiki, "
+            f"≤6s on Mockup)"
+        ),
+        "engine_bin": engine_bin,
+        "aethyme_repo": aethyme_repo,
+        "log_path": log_path,
+        "cli_cmd": (
+            f"\"{engine_bin}\" daemon status --repo \"{aethyme_repo}\" "
+            f"|| (\"{engine_bin}\" daemon start --repo \"{aethyme_repo}\" "
+            f"&& while ! tail -1 \"{log_path}\" 2>/dev/null | grep -q "
+            f"'listening on'; do sleep 5; done)"
+        ),
+        "wait_for": "listening on",
+        "max_wait_seconds": 240,
+        "instructions": (
+            "If the daemon is already running for the target Aethyme repo, "
+            "skip. Otherwise: spawn it with `aethyme-engine-cli daemon start "
+            "--repo <path>` and poll the log file at log_path until the line "
+            "matching wait_for appears. Bail with a warning after "
+            "max_wait_seconds — the eval can still run, but leverage will pay "
+            "the cold-start cost."
+        ),
+        "skippable_when": (
+            "Caller passes --no-warm OR the daemon socket already exists. "
+            "Always emit the phase; runners decide whether to execute it."
+        ),
     }
 
 
