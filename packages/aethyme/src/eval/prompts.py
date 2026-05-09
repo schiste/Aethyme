@@ -246,13 +246,14 @@ _IMPACT_ANALYSIS_SCHEMA_SHAPE = (
 def build_impact_analysis_prompts(target: EvalTarget) -> dict[str, str]:
     leverage_hint = (
         "Aethyme is available. For impact analysis, the most direct "
-        "approach is `aethyme graph callers` against `WikiPage::doViewUpdates`:\n"
+        "approach is `aethyme graph callers` against the target method. "
+        "The deployed skill at `.codex/skills/aethyme/SKILL.md` describes "
+        "the full command set; the relevant invocation here is:\n"
         "```bash\n"
-        'AETHYME_BIN="{{AETHYME_ROOT}}/rust/target/release/aethyme"\n'
-        'aethyme graph callers "$REPO" "doViewUpdates" --json-output\n'
+        'aethyme graph callers "$PWD" "doViewUpdates" --json-output\n'
         "```\n\n"
         "Each result includes file, line, and signature; cross-reference "
-        "by reading those line numbers to extract exact code.\n\n"
+        "by reading those line numbers to extract the exact code.\n\n"
     )
     return _build_per_condition(
         target=target,
