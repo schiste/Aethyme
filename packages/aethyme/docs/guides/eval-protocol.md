@@ -67,6 +67,8 @@ Examples of **allowed** changes:
 
 **The test:** Before making any change, ask: "Would I make this exact change if the eval didn't exist?" If the answer is no, or if the change only makes sense in the context of improving a specific eval metric, do not make it.
 
+**Audit trail.** Rejected proposals are recorded in [`docs/architecture/eval-tuning-rejected.md`](../architecture/eval-tuning-rejected.md). When you find yourself proposing a change that fails the cardinal-rule test, add an entry there before moving on — the same idea will surface again in six months, and the next contributor needs the "why not" without having to re-derive it.
+
 **Why this matters:** Aethyme's value proposition is that a generic structural graph improves agent navigation on ANY repository and ANY task. If the tools are tuned to score well on specific evals, the product loses its generality claim. Eval scores that come from tool-tweaking are vanity metrics — they prove nothing about real-world value. A system that scores 70 honestly is worth more than one that scores 95 through overfitting.
 
 **When evals reveal genuine problems:** If an eval shows that Aethyme-equipped agents underperform vanilla agents, the correct response is to investigate whether there is a generic deficiency in the system (poor anchor quality, missing graph edges, excessive irrelevant context, skill instructions that waste turns). Fix the generic problem. Then re-run the eval to see if the generic fix helped. The eval is a diagnostic, not a target.
