@@ -1,0 +1,54 @@
+name: Cross-Process Contract Check
+
+# Auto-detects PRs that remove or rename symbols listed in
+# `packages/aethyme/docs/architecture/cross-process-consumers.md`
+# without declaring a contract decision in the PR body. This is the
+# friction layer for the cardinal rule: deleting a cross-process
+# entry point must be deliberate, not an accidental side effect of
+# refactoring. The 2026-05-08 hard-delete of `python -m src.cli
+# explore` broke the deployed `aethyme-explore` wrapper because
+# this check didn't exist; now it does.
+
+on:
+  pull_request:
+    branches: ["main", "master"]
+
+jobs:
+  contract-check:
+    name: Cross-process contract check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR (full history for diff)
+        uses: actions/checkout@v4
+        with:
+          # Need both branches to compute the diff. Default
+          # actions/checkout fetches only the head — we need the
+          # base ref present locally to `git diff base..HEAD`.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Capture PR body
+        # Write the PR body to a file so the script can parse the
+        # `Contract:` checkbox. We avoid interpolating the body
+        # into a shell command (injection-safe) by reading it from
+        # the GitHub event payload via jq.
+        run: |
+          jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH" > /tmp/pr-body.md
+          echo "PR body captured ($(wc -c < /tmp/pr-body.md) bytes)"
+
+      - name: Run cross-process contract check
+        # `BASE_REF` is read from env, not interpolated into the run
+        # script — this is the safe pattern for untrusted-ish
+        # context fields. github.base_ref is set by GitHub from the
+        # branch protection target and isn't directly user-supplied,
+        # but the same hygiene applies.
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          python scripts/check-cross-process-contract.py \
+            --base "origin/${BASE_REF}" \
+            --pr-body /tmp/pr-body.md
