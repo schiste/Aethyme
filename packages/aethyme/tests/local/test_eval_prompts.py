@@ -98,31 +98,50 @@ def test_control_prompts_omit_aethyme_guidance(eval_type: str, mediawiki_target)
 
 
 @pytest.mark.parametrize("eval_type", sorted(BUILDERS))
-def test_leverage_prompt_contains_aethyme_guidance(eval_type: str, mediawiki_target):
-    """The leverage condition gets explicit Aethyme guidance — that's its
-    whole purpose vs explore (skill available but not pointed at)."""
+def test_leverage_prompt_points_at_skill(eval_type: str, mediawiki_target):
+    """The leverage condition's *only* extra signal vs explore is a
+    minimal pointer at the deployed skill. We assert SKILL.md is named
+    so the agent knows where to read for usage; no per-eval-type
+    intent guidance, no bash blocks (those would constitute
+    eval-tuning by handing the agent the answer)."""
     prompts = build_prompts(eval_type, mediawiki_target)
-    text = prompts["leverage"].lower()
-    assert "aethyme" in text, (
-        f"{eval_type}/leverage missing Aethyme guidance — should be explicit"
+    text = prompts["leverage"]
+    assert ".codex/skills/aethyme/SKILL.md" in text, (
+        f"{eval_type}/leverage should point at the skill's SKILL.md"
     )
 
 
-def test_dead_code_leverage_uses_usage_boundary_intent(mediawiki_target):
-    """Regression: the dead-code leverage prompt must mention the
-    `usage_boundary_query` intent (the canonical entry point for
-    boundary-based dead-code questions). Catches accidental drift to a
-    less-targeted intent."""
-    prompts = build_prompts("dead-code", mediawiki_target)
-    assert "usage_boundary_query" in prompts["leverage"]
-
-
-def test_bug_fix_1_leverage_uses_behavior_localization_intent(mediawiki_target):
-    """Regression: bug-fix-1's leverage prompt should reach for
-    `behavior_localization_query` (the canonical intent for "which
-    files implement this behavior")."""
-    prompts = build_prompts("bug-fix-1", mediawiki_target)
-    assert "behavior_localization_query" in prompts["leverage"]
+@pytest.mark.parametrize("eval_type", sorted(BUILDERS))
+def test_leverage_prompt_has_no_intent_specific_bash_block(
+    eval_type: str, mediawiki_target,
+):
+    """Regression-guard against re-introducing per-eval-type bash blocks
+    in the leverage prompt. The whole point of the leverage-vs-explore
+    comparison is to measure the cost of "agent told the tool exists"
+    vs "agent has skill loaded but no instruction" — a fenced bash
+    block with the canonical intent invocation collapses that gap and
+    biases the eval. See feedback memory `feedback_no_eval_overfitting`."""
+    prompts = build_prompts(eval_type, mediawiki_target)
+    text = prompts["leverage"]
+    # The shared task body may contain code fences for the schema
+    # example, so we look for bash/shell-tagged fences specifically.
+    assert "```bash" not in text, (
+        f"{eval_type}/leverage contains a bash code block — leverage "
+        "should be a minimal tool pointer, not a step-by-step recipe"
+    )
+    # Per-eval-type intent names should not leak into the leverage
+    # hint — they belong inside the skill itself, not in the prompt.
+    for intent in (
+        "usage_boundary_query",
+        "behavior_localization_query",
+        "task_localization_query",
+    ):
+        # The shared task text never names intents; if one appears it
+        # came from a hand-rolled leverage hint.
+        assert intent not in text, (
+            f"{eval_type}/leverage names intent {intent!r} — that's "
+            "eval-tuning, not leverage measurement"
+        )
 
 
 def test_unknown_eval_type_raises_keyerror(mediawiki_target):

@@ -38,6 +38,27 @@ CONDITION_NAMES: tuple[str, ...] = (
 )
 
 
+# The leverage condition's prompt addition: a *minimal* pointer at the
+# tool, not a step-by-step guide. The whole point of the leverage-vs-
+# explore comparison is to measure the cost of "agent told the tool
+# exists" vs "agent has skill loaded but no instruction."
+#
+# An earlier version of this hint named the canonical intent
+# (`usage_boundary_query`, `behavior_localization_query`) and listed
+# the response fields to read. That biased the discoverability gap
+# upward — we were measuring "great prompt engineering" rather than
+# "tool was pointed at." The current shape just names the entry point;
+# the agent must read SKILL.md (or experiment) to learn how to invoke
+# it. That's the honest measurement.
+_LEVERAGE_HINT = (
+    "Aethyme is available in this repository. See "
+    "`.codex/skills/aethyme/SKILL.md` for usage; the wrapper at "
+    "`.codex/skills/aethyme/aethyme-explore` is the convenience "
+    "entry point. Use it where it helps; verify its output before "
+    "acting on it.\n\n"
+)
+
+
 # ---------------------------------------------------------------------------
 # Shared shape: every diagnostic prompt has a preamble (output-file rule),
 # the task itself, an optional condition-specific prefix (Aethyme guidance
@@ -132,23 +153,11 @@ _BUG_FIX_1_SCHEMA_SHAPE = (
 
 def build_bug_fix_1_prompts(target: EvalTarget) -> dict[str, str]:
     """T419918 watchlist diagnostic. MediaWiki-only."""
-    leverage_hint = (
-        "Aethyme is available in this repository. The shell wrapper at "
-        "`.codex/skills/aethyme/aethyme-explore` routes to the native Rust "
-        "binary. For T-419918 the relevant intent is "
-        "`behavior_localization_query` (which files implement this "
-        "behavior?):\n"
-        "```bash\n"
-        '"$AETHYME_TOOL" --repo "$REPO" --intent behavior_localization_query '
-        '--request "$TASK" --format answer-json --show-observability\n'
-        "```\n\n"
-        "Read `trust_policy` first; verify candidates before concluding.\n\n"
-    )
     return _build_per_condition(
         target=target,
         task=_BUG_FIX_1_TASK,
         schema_shape=_BUG_FIX_1_SCHEMA_SHAPE,
-        leverage_hint=leverage_hint,
+        leverage_hint=_LEVERAGE_HINT,
     )
 
 
@@ -189,33 +198,11 @@ _DEAD_CODE_SCHEMA_SHAPE = (
 
 
 def build_dead_code_prompts(target: EvalTarget) -> dict[str, str]:
-    leverage_hint = (
-        "Aethyme is available in this repository. The shell wrapper at "
-        "`.codex/skills/aethyme/aethyme-explore` routes to the native Rust "
-        "binary.\n\n"
-        "Use the usage_boundary_query intent for this task:\n"
-        "```bash\n"
-        'AETHYME_TOOL=".codex/skills/aethyme/aethyme-explore"\n'
-        'REPO="$PWD"\n'
-        '"$AETHYME_TOOL" --repo "$REPO" --intent usage_boundary_query '
-        '--request "<task>" --scope "includes/Watchlist" --search-root . '
-        '--format answer-json --show-observability\n'
-        "```\n\n"
-        "Read `trust_policy` and `safe_to_use_as_answer` first.\n\n"
-        "- If `safe_to_use_as_answer` is true, use "
-        "`output_adapters.dead_code_eval_json.unused_functions` as your "
-        "candidate list, then verify each before concluding.\n"
-        "- If `safe_to_use_as_answer` is false, treat the answer as "
-        "ranked navigation; verify candidates with `grep`/`rg` before "
-        "listing them.\n"
-        "- Read `excluded[]`, `degraded_reasons`, and `observability` "
-        "before trusting.\n\n"
-    )
     return _build_per_condition(
         target=target,
         task=_DEAD_CODE_TASK,
         schema_shape=_DEAD_CODE_SCHEMA_SHAPE,
-        leverage_hint=leverage_hint,
+        leverage_hint=_LEVERAGE_HINT,
     )
 
 
@@ -244,22 +231,11 @@ _IMPACT_ANALYSIS_SCHEMA_SHAPE = (
 
 
 def build_impact_analysis_prompts(target: EvalTarget) -> dict[str, str]:
-    leverage_hint = (
-        "Aethyme is available. For impact analysis, the most direct "
-        "approach is `aethyme graph callers` against the target method. "
-        "The deployed skill at `.codex/skills/aethyme/SKILL.md` describes "
-        "the full command set; the relevant invocation here is:\n"
-        "```bash\n"
-        'aethyme graph callers "$PWD" "doViewUpdates" --json-output\n'
-        "```\n\n"
-        "Each result includes file, line, and signature; cross-reference "
-        "by reading those line numbers to extract the exact code.\n\n"
-    )
     return _build_per_condition(
         target=target,
         task=_IMPACT_ANALYSIS_TASK,
         schema_shape=_IMPACT_ANALYSIS_SCHEMA_SHAPE,
-        leverage_hint=leverage_hint,
+        leverage_hint=_LEVERAGE_HINT,
     )
 
 
@@ -294,23 +270,11 @@ _FEATURE_LOCALIZATION_SCHEMA_SHAPE = (
 
 
 def build_feature_localization_prompts(target: EvalTarget) -> dict[str, str]:
-    leverage_hint = (
-        "Aethyme is available. For feature-localization, the "
-        "`behavior_localization_query` intent surfaces the relevant "
-        "files, and `aethyme graph callees` traces from each entry "
-        "point downward:\n"
-        "```bash\n"
-        '"$AETHYME_TOOL" --repo "$REPO" --intent behavior_localization_query '
-        '--request "$TASK" --format answer-json\n'
-        "# Then for each candidate entry point:\n"
-        'aethyme graph callees "$REPO" "<class::method>" --json-output\n'
-        "```\n\n"
-    )
     return _build_per_condition(
         target=target,
         task=_FEATURE_LOCALIZATION_TASK,
         schema_shape=_FEATURE_LOCALIZATION_SCHEMA_SHAPE,
-        leverage_hint=leverage_hint,
+        leverage_hint=_LEVERAGE_HINT,
     )
 
 
@@ -340,22 +304,11 @@ _CONFIG_AUDIT_SCHEMA_SHAPE = (
 
 
 def build_config_audit_prompts(target: EvalTarget) -> dict[str, str]:
-    leverage_hint = (
-        "Aethyme is available. The `task_localization_query` intent "
-        "ranks candidate files for textual + symbol-search + filename "
-        "matches against your request keywords:\n"
-        "```bash\n"
-        '"$AETHYME_TOOL" --repo "$REPO" --intent task_localization_query '
-        '--request "$TASK" --format answer-json --show-observability\n'
-        "```\n\n"
-        "Use `aethyme graph callers` to find enforcement-class call "
-        "sites once you've identified candidates.\n\n"
-    )
     return _build_per_condition(
         target=target,
         task=_CONFIG_AUDIT_TASK,
         schema_shape=_CONFIG_AUDIT_SCHEMA_SHAPE,
-        leverage_hint=leverage_hint,
+        leverage_hint=_LEVERAGE_HINT,
     )
 
 
@@ -390,21 +343,11 @@ _MIGRATION_SCHEMA_SHAPE = (
 
 
 def build_migration_prompts(target: EvalTarget) -> dict[str, str]:
-    leverage_hint = (
-        "Aethyme is available. For migration impact, `aethyme query "
-        "impact` surfaces the cross-file dependency graph rooted at "
-        "the renamed symbol:\n"
-        "```bash\n"
-        'aethyme query impact "$REPO" "WatchedItemStore" --json-output\n'
-        "```\n\n"
-        "Cross-reference with `rg WatchedItemStore` to catch references "
-        "that don't go through the graph (e.g. docblock mentions).\n\n"
-    )
     return _build_per_condition(
         target=target,
         task=_MIGRATION_TASK,
         schema_shape=_MIGRATION_SCHEMA_SHAPE,
-        leverage_hint=leverage_hint,
+        leverage_hint=_LEVERAGE_HINT,
     )
 
 
