@@ -1239,6 +1239,53 @@ fn build_response(
         verification_steps
     };
 
+    // Post-conditions for `answers[]`. These are debug-only; they
+    // document the response contract that a downstream agent or scoring
+    // pipeline can rely on.
+    //
+    //   - cap: `answers.len() <= max_answer_items`. The dedup loop
+    //     enforces this on every push; this assert guards against a
+    //     future contributor adding an unguarded `answers.push(...)`
+    //     without a cap check.
+    //   - distinct paths: no two items share the same `Some(path)`.
+    //     The merge-into-existing branch in the callsite dedup loop
+    //     depends on this — if the same path appeared twice, only
+    //     the first match would receive merged evidence.
+    //   - kinds belong to the answer-track set (no nav_hint kinds
+    //     leaking into `answer[]`).
+    debug_assert!(
+        answers.len() <= params.max_answer_items,
+        "answer cap violated: {} > {}",
+        answers.len(),
+        params.max_answer_items
+    );
+    {
+        let mut paths: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for item in &answers {
+            if let Some(p) = item.path.as_deref() {
+                debug_assert!(
+                    paths.insert(p),
+                    "duplicate path in answers[]: {p:?}; dedup contract violated"
+                );
+            }
+        }
+    }
+    debug_assert!(
+        answers.iter().all(|item| matches!(
+            item.kind.as_str(),
+            "anchor"
+                | "in_scope_file"
+                | "in_scope_symbol"
+                | "symbol_search"
+                | "symbol_search_file"
+                | "source_text_file"
+                | "call_site_file"
+                | "filesystem_file"
+        )),
+        "answer item with unexpected kind: {:?}",
+        answers.iter().map(|i| i.kind.as_str()).collect::<Vec<_>>()
+    );
+
     ExploreResponse {
         schema_version: "aethyme-explore-v1",
         mode: "explore",

@@ -155,7 +155,7 @@ pub(super) fn compute_callsite_files(
     });
     ranked.truncate(max_results);
 
-    Ok(ranked
+    let result: Vec<AnswerItem> = ranked
         .into_iter()
         .map(|(path, symbols, hit_count, samples)| {
             let symbol_count = symbols.len();
@@ -185,7 +185,32 @@ pub(super) fn compute_callsite_files(
                 }),
             }
         })
-        .collect())
+        .collect();
+
+    // Post-conditions documenting the contract for downstream callers in
+    // `build_response`:
+    //   - cap respected: never emit more than `max_results` items
+    //   - kind invariant: every item is a `call_site_file` (build_response
+    //     uses .kind to route into the answer/nav-hint partitioning)
+    //   - distinct paths: no two items share the same `path` (the by_file
+    //     BTreeMap collapses duplicates by construction; this check would
+    //     have caught a regression if the dedup were ever weakened)
+    debug_assert!(
+        result.len() <= max_results,
+        "callsite cap violated: {} > {}",
+        result.len(),
+        max_results
+    );
+    debug_assert!(
+        result.iter().all(|item| item.kind == "call_site_file"),
+        "callsite item with unexpected kind"
+    );
+    debug_assert_eq!(
+        result.len(),
+        result.iter().filter_map(|i| i.path.as_deref()).collect::<std::collections::HashSet<_>>().len(),
+        "callsite items have duplicate paths"
+    );
+    Ok(result)
 }
 
 /// Parse a caller's structured id of the form
