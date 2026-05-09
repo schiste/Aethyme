@@ -268,6 +268,15 @@ def write_eval_run_artifacts(run_dir: Path, result: dict[str, Any]) -> None:
         if assessment is not None:
             (cond_dir / "assessment.json").write_text(json.dumps(assessment, indent=2), encoding="utf-8")
 
+        # Free-text orchestrator-supplied annotation for this condition.
+        # Stored as plain text (not JSON) because that's what it is —
+        # a human note, not structured data.
+        policy_note = side.get("agent_policy_notes")
+        if isinstance(policy_note, str) and policy_note.strip():
+            (cond_dir / "agent-policy-notes.txt").write_text(
+                policy_note.strip() + "\n", encoding="utf-8"
+            )
+
 
 def store_condition_raw(
     run_dir: Path,
@@ -1055,6 +1064,7 @@ def _render_markdown(*, repo_path: Path, result: dict[str, Any]) -> str:
     _section_agent_output(lines, result)
     _section_tool_calls(lines, result)
     _section_aethyme_usage(lines, result)
+    _section_agent_policy_notes(lines, result)
     if _should_render_legacy_eval_diagnostics(result):
         _section_legacy_eval_diagnostics(lines, result)
     _section_verdict(lines, result)
@@ -1570,6 +1580,53 @@ def _section_verdict(lines: list[str], result: dict[str, Any]) -> None:
         parts.append("All conditions passed tests.")
 
     lines.extend([" ".join(parts), ""])
+
+
+def _section_agent_policy_notes(
+    lines: list[str], result: dict[str, Any],
+) -> None:
+    """Render per-condition free-text observations from the orchestrator.
+
+    `agent_policy_notes` is a string field on each per-condition side
+    that the human running the eval can fill in to record what the
+    agent actually *did* — distinct from the quantitative metrics.
+    Examples:
+      - "agent ran `aethyme explore` 3 times before reading SKILL.md"
+      - "leverage agent didn't trust answer, re-verified everything via grep"
+      - "explore agent never invoked aethyme, used pure ripgrep"
+
+    These notes are essential for interpreting the table: a leverage
+    condition that costs more than explore reads very differently if
+    the leverage agent never used the tool the pointer pointed at.
+
+    Skipped entirely when no condition has a note set, so unannotated
+    runs don't carry an empty section. The data is also persisted as
+    a per-condition file in `write_eval_run_artifacts` so it survives
+    independent of the markdown.
+    """
+    active = _active_conditions(result)
+    notes_by_condition: list[tuple[str, str]] = []
+    for cond in active:
+        side = result.get(cond, {}) or {}
+        if not isinstance(side, dict):
+            continue
+        note = side.get("agent_policy_notes")
+        if isinstance(note, str) and note.strip():
+            notes_by_condition.append((cond, note.strip()))
+    if not notes_by_condition:
+        return
+    lines.extend(["## Agent Policy Notes", ""])
+    lines.extend([
+        "Per-condition observations on what the agent actually did "
+        "(distinct from the quantitative metrics above). Read these "
+        "before drawing conclusions from the table — a cheap row "
+        "doesn't mean what you think if the agent didn't use the "
+        "expected tool.",
+        "",
+    ])
+    for cond, note in notes_by_condition:
+        lines.append(f"- **{_cond_label(cond)}:** {note}")
+    lines.append("")
 
 
 def _section_notes(lines: list[str], result: dict[str, Any]) -> None:
