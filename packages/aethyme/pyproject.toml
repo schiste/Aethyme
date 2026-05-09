@@ -33,6 +33,15 @@ dev = [
     "pyright>=1.1.0",
     "black>=23.0.0",
     "ipython>=8.0.0",
+    # Whole-program reachability analysis. Ruff F401 is strictly local
+    # ("is this import referenced in the same file?"). Vulture is
+    # whole-program ("is this function reachable from any entry point?").
+    # The 2,500-line Python explore stack hard-deleted on 2026-05-08
+    # had every import live (referenced by helpers) and every helper
+    # live (called by the deprecated entry point), but the entire
+    # subgraph was unreachable in practice. Ruff said clean; vulture
+    # would have flagged it.
+    "vulture>=2.10",
 ]
 
 [project.scripts]
@@ -41,6 +50,45 @@ aethyme = "src.cli:main"
 [build-system]
 requires = ["setuptools>=68.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.vulture]
+# Whole-program reachability check. Run via:
+#   .venv/bin/vulture src/  (or `pip install -e ".[dev]"` first)
+#
+# Threshold rationale: at 80%+ confidence the suite is clean; at 70%+
+# also clean. At 60% there are ~240 findings, most of which are false
+# positives from decorator-registered handlers (FastAPI `@app.get`,
+# Click commands) that vulture can't trace through. We pin the CI
+# floor at 80% to keep signal high; lower thresholds are useful
+# locally during a refactor pass to find borderline cases.
+min_confidence = 80
+paths = ["src"]
+exclude = [
+    # Vendored / generated / migrations don't carry the project's
+    # reachability discipline; vulture's complaints there are noise.
+    "src/migrations/",
+]
+# Patterns vulture would otherwise flag as unused, but which are
+# legitimately reached via decorator registration, dynamic import,
+# or framework-internal lookup. Adding a name here is a deliberate
+# act — the assertion is "I checked, this name IS reached via X."
+ignore_names = [
+    # Click command callbacks registered via `@cli.command(...)`
+    # decorators. Vulture sees the function defs; can't see the
+    # decorator-driven registration into Click's command tree.
+    "*_command",
+    # FastAPI route handlers registered via `@router.get/.post(...)`.
+    # Same shape as Click; not visibly called from Python code.
+    "get_*",
+    "post_*",
+    "put_*",
+    "delete_*",
+    "patch_*",
+    # pytest fixtures decorated with `@pytest.fixture` are looked up
+    # by name from test functions; vulture doesn't trace fixture deps.
+    # (Tests are excluded by default by `paths`, but defensive.)
+    "*_fixture",
+]
 
 [tool.ruff]
 line-length = 100
