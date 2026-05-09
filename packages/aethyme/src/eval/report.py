@@ -777,6 +777,7 @@ def write_explain_repo_markdown_report(
     run_dir: Path | None = None,
 ) -> Path:
     """Persist a standard markdown report for an explain-repo evaluation."""
+    augment_result_with_summary_metrics(result)
     content = _render_markdown(repo_path=repo_path, result=result)
 
     # Always write to docs/reports/evals/
@@ -800,6 +801,7 @@ def write_navigation_ctf_markdown_report(
     result: dict[str, Any],
     run_dir: Path | None = None,
 ) -> Path:
+    augment_result_with_summary_metrics(result)
     content = _render_markdown(repo_path=repo_path, result=result)
 
     REPORTS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -821,6 +823,7 @@ def write_bug_fix_markdown_report(
     result: dict[str, Any],
     run_dir: Path | None = None,
 ) -> Path:
+    augment_result_with_summary_metrics(result)
     content = _render_markdown(repo_path=repo_path, result=result)
 
     REPORTS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -1049,10 +1052,19 @@ def _render_markdown(*, repo_path: Path, result: dict[str, Any]) -> str:
     """Render the definitive eval report markdown.
 
     Section order is fixed and non-negotiable:
-    Meta -> Model -> Scorecard -> Score Breakdown -> Prompts ->
-    Agent Output -> Tool Call Analysis -> Aethyme Usage ->
+    Meta -> Objective -> Constraints -> Model -> Discoverability Gap ->
+    Scorecard -> Score Breakdown -> Prompts -> Agent Output ->
+    Tool Call Analysis -> Aethyme Usage -> Agent Policy Notes ->
     (legacy diagnostics, when present) ->
     Verdict -> Notes -> Raw Data
+
+    Callers MUST run `augment_result_with_summary_metrics(result)`
+    before calling this function. The augment populates the
+    `comparison` block (including `discoverability_gap`) and the
+    per-condition `summary_metrics` that several sections render.
+    `finalize_eval_run` does this explicitly so it can pass a
+    `baseline_override`; the bespoke `write_*_markdown_report`
+    entry points do it via the helper below.
     """
     lines: list[str] = []
     _section_meta(lines, repo_path, result)
