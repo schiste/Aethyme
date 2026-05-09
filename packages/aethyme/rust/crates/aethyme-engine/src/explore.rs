@@ -1972,4 +1972,255 @@ mod tests {
             Intent::BehaviorLocalization,
         );
     }
+
+    // ── response-shape snapshot tests ───────────────────────────────
+    //
+    // Goal: catch silent drift in the JSON response schema. Today's
+    // hard-delete of Python explore removed the side-by-side comparison
+    // that would have caught divergences naturally; these tests are
+    // the standing replacement.
+    //
+    // What we assert:
+    //   (a) Required top-level keys are always present (any agent can
+    //       rely on `answer[]`, `trust_policy`, etc. existing).
+    //   (b) Optional keys (`output_adapters`, `resolved_parameters`)
+    //       gate correctly on `Detail::Full` / `show_observability`.
+    //   (c) Nested types — e.g. `evidence.answer_count` is a number,
+    //       `trust_policy.trust_policy` is one of the documented
+    //       enum values.
+    //
+    // What we DON'T assert:
+    //   - Exact bytes (too brittle — float precision, key order,
+    //     etc. would break tests on benign refactors).
+    //   - Exact answer-list contents (those are integration-test
+    //     concerns; this is a schema test).
+
+    fn empty_view() -> serde_json::Value {
+        serde_json::json!({
+            "task": "stub",
+            "anchors": {"task": "stub", "anchors": []},
+            "scope": {
+                "task": "stub",
+                "navigation_order": [],
+                "in_scope_files": [],
+                "in_scope_symbols": [],
+                "in_scope_areas": [],
+                "out_of_scope": [],
+                "risks": []
+            },
+            "next": {"target": "stub", "relation": "next", "items": []}
+        })
+    }
+
+    fn empty_symbol_matches() -> SymbolBatchResults {
+        SymbolBatchResults::default()
+    }
+
+    fn build_minimal_response(detail: Detail, show_observability: bool) -> ExploreResponse {
+        let view = empty_view();
+        let symbols = empty_symbol_matches();
+        let params = ExploreParams {
+            detail,
+            show_observability,
+            ..ExploreParams::default()
+        };
+        build_response(
+            "stub request",
+            Intent::TaskLocalization,
+            IntentSource::Default,
+            &view,
+            &symbols,
+            &[],
+            &[],
+            &[],
+            &params,
+        )
+    }
+
+    /// Required top-level keys that EVERY response must carry. Adding
+    /// or removing a key here is a schema-breaking change for downstream
+    /// consumers; do it deliberately, not as a side-effect.
+    const REQUIRED_TOP_LEVEL_KEYS: &[&str] = &[
+        "schema_version",
+        "mode",
+        "intent",
+        "intent_source",
+        "status",
+        "request",
+        "answer",
+        "navigation_hints",
+        "excluded",
+        "ambiguous",
+        "evidence",
+        "confidence",
+        "safe_to_use_as_answer",
+        "safe_to_use_as_navigation",
+        "trust_policy",
+        "degraded_reasons",
+        "verification_steps",
+        "next_actions",
+        "available_specialized_intents",
+    ];
+
+    #[test]
+    fn response_compact_has_all_required_keys() {
+        let response = build_minimal_response(Detail::Compact, false);
+        let json = serde_json::to_value(&response).unwrap();
+        let obj = json.as_object().expect("response is a JSON object");
+        for key in REQUIRED_TOP_LEVEL_KEYS {
+            assert!(
+                obj.contains_key(*key),
+                "compact response missing required key: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_compact_omits_verbose_fields() {
+        // At compact + no show_observability, the Python predecessor
+        // trimmed `output_adapters` and `resolved_parameters` (cli.py
+        // `_trim_explore_response`). Native preserves that contract.
+        let response = build_minimal_response(Detail::Compact, false);
+        let json = serde_json::to_value(&response).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(
+            !obj.contains_key("output_adapters"),
+            "compact must omit output_adapters; got {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !obj.contains_key("resolved_parameters"),
+            "compact must omit resolved_parameters"
+        );
+    }
+
+    #[test]
+    fn response_full_emits_verbose_fields() {
+        // At Detail::Full, the verbose envelope (output_adapters +
+        // resolved_parameters) lights up.
+        let response = build_minimal_response(Detail::Full, false);
+        let json = serde_json::to_value(&response).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(
+            obj.contains_key("output_adapters"),
+            "Detail::Full must emit output_adapters"
+        );
+        assert!(
+            obj.contains_key("resolved_parameters"),
+            "Detail::Full must emit resolved_parameters"
+        );
+    }
+
+    #[test]
+    fn response_show_observability_overrides_detail() {
+        // `--show-observability` forces verbose shaping even at compact.
+        let response = build_minimal_response(Detail::Compact, true);
+        let json = serde_json::to_value(&response).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(
+            obj.contains_key("output_adapters"),
+            "show_observability=true must emit output_adapters"
+        );
+        assert!(
+            obj.contains_key("resolved_parameters"),
+            "show_observability=true must emit resolved_parameters"
+        );
+    }
+
+    #[test]
+    fn response_top_level_types_are_stable() {
+        // Pin the type of each top-level field. A future refactor that
+        // accidentally changed `answer` from array to object (for
+        // example) would fail loudly here, before any consumer broke.
+        let response = build_minimal_response(Detail::Compact, false);
+        let json = serde_json::to_value(&response).unwrap();
+        let obj = json.as_object().unwrap();
+
+        let expectations: &[(&str, &str)] = &[
+            ("schema_version", "string"),
+            ("mode", "string"),
+            ("intent", "string"),
+            ("intent_source", "string"),
+            ("status", "string"),
+            ("request", "object"),
+            ("answer", "array"),
+            ("navigation_hints", "array"),
+            ("excluded", "array"),
+            ("ambiguous", "array"),
+            ("evidence", "object"),
+            ("confidence", "object"),
+            ("safe_to_use_as_answer", "boolean"),
+            ("safe_to_use_as_navigation", "boolean"),
+            ("trust_policy", "object"),
+            ("degraded_reasons", "array"),
+            ("verification_steps", "array"),
+            ("next_actions", "array"),
+            ("available_specialized_intents", "array"),
+        ];
+
+        for (key, expected_type) in expectations {
+            let value = obj.get(*key).unwrap_or_else(|| {
+                panic!("missing required key {key} in response")
+            });
+            let actual_type = match value {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "boolean",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => "object",
+            };
+            assert_eq!(
+                actual_type, *expected_type,
+                "field {key:?} expected type {expected_type:?}, got {actual_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trust_policy_inner_shape_is_stable() {
+        let response = build_minimal_response(Detail::Compact, false);
+        let json = serde_json::to_value(&response).unwrap();
+        let trust = json.get("trust_policy").and_then(|v| v.as_object()).unwrap();
+
+        // The trust_policy object's keys are read by every downstream
+        // consumer that branches on whether to act on `answer[]`.
+        for key in &[
+            "safe_to_use_as_answer",
+            "safe_to_use_as_navigation",
+            "evidence_level",
+            "authoritative_answer_count",
+            "navigation_hint_count",
+            "degraded",
+            "trust_policy",
+            "reason",
+        ] {
+            assert!(trust.contains_key(*key), "trust_policy missing key: {key}");
+        }
+
+        // The `trust_policy` enum value is one of the documented values
+        // (mirrors Python's `_intent_catalog` declaration in cli.py:1571).
+        let policy = trust.get("trust_policy").and_then(|v| v.as_str()).unwrap();
+        let allowed = ["answer_candidate", "needs_verification", "navigation_only", "failed"];
+        assert!(
+            allowed.contains(&policy),
+            "trust_policy enum value {policy:?} not in documented set {allowed:?}"
+        );
+    }
+
+    #[test]
+    fn evidence_inner_shape_is_stable() {
+        let response = build_minimal_response(Detail::Compact, false);
+        let json = serde_json::to_value(&response).unwrap();
+        let evidence = json.get("evidence").and_then(|v| v.as_object()).unwrap();
+
+        for key in &["answer_count", "navigation_hint_count", "excluded_count"] {
+            let v = evidence
+                .get(*key)
+                .and_then(|x| x.as_u64())
+                .unwrap_or_else(|| panic!("evidence.{key} should be a non-negative integer"));
+            // Sanity: counts are bounded and non-negative.
+            assert!(v < 10_000, "evidence.{key} unrealistic: {v}");
+        }
+    }
 }
