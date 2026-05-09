@@ -32,7 +32,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-
 # Tool names we treat as "file-reading" for navigation probes. Grep
 # counts — an agent that greps for the right keyword has navigated
 # correctly even without opening the file first.

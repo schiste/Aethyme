@@ -150,7 +150,7 @@ class _DaemonServer:
             while not self.shutdown.is_set():
                 try:
                     conn, _ = sock.accept()
-                except socket.timeout:
+                except TimeoutError:
                     continue
                 except OSError as exc:
                     if self.shutdown.is_set():

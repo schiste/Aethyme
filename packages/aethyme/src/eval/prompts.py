@@ -25,7 +25,7 @@ add a `("<type>", build_<type>_prompts)` row to `BUILDERS` below.
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 from .targets import EvalTarget
 
