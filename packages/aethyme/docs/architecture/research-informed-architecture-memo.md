@@ -344,15 +344,15 @@ This section translates the research conclusions into a direct upgrade plan for 
 ### Current design
 The current Rust engine is still structurally thin.
 
-Main active pieces today:
+Main active pieces today (paths post-2026-05-08 module split):
 - [`../../rust/crates/aethyme-engine/src/repo.rs`](../../rust/crates/aethyme-engine/src/repo.rs)
 - [`../../rust/crates/aethyme-engine/src/map.rs`](../../rust/crates/aethyme-engine/src/map.rs)
-- [`../../rust/crates/aethyme-engine/src/search.rs`](../../rust/crates/aethyme-engine/src/search.rs)
-- [`../../rust/crates/aethyme-engine/src/neighborhood.rs`](../../rust/crates/aethyme-engine/src/neighborhood.rs)
-- [`../../rust/crates/aethyme-engine/src/anchors.rs`](../../rust/crates/aethyme-engine/src/anchors.rs)
+- [`../../rust/crates/aethyme-engine/src/graph/search.rs`](../../rust/crates/aethyme-engine/src/graph/search.rs)
+- [`../../rust/crates/aethyme-engine/src/graph/neighborhood.rs`](../../rust/crates/aethyme-engine/src/graph/neighborhood.rs)
+- [`../../rust/crates/aethyme-engine/src/graph/anchors.rs`](../../rust/crates/aethyme-engine/src/graph/anchors.rs)
 - [`../../rust/crates/aethyme-engine/src/pipeline.rs`](../../rust/crates/aethyme-engine/src/pipeline.rs)
-- [`../../rust/crates/aethyme-engine/src/symbol.rs`](../../rust/crates/aethyme-engine/src/symbol.rs)
-- [`../../rust/crates/aethyme-engine/src/edge.rs`](../../rust/crates/aethyme-engine/src/edge.rs)
+- [`../../rust/crates/aethyme-engine/src/model/symbol.rs`](../../rust/crates/aethyme-engine/src/model/symbol.rs)
+- [`../../rust/crates/aethyme-engine/src/model/edge.rs`](../../rust/crates/aethyme-engine/src/model/edge.rs)
 
 Current properties:
 - broad filesystem scan
@@ -455,21 +455,21 @@ These should become the real repograph core:
   - split into explicit pass outputs
   - stop treating the repository map as one flattened artifact
 
-- [`symbol.rs`](../../rust/crates/aethyme-engine/src/symbol.rs)
+- [`model/symbol.rs`](../../rust/crates/aethyme-engine/src/model/symbol.rs)
   - replace the generic symbol bucket with class/function-focused node types
   - keep generic symbol support only if needed for unresolved references later
 
-- [`edge.rs`](../../rust/crates/aethyme-engine/src/edge.rs)
+- [`model/edge.rs`](../../rust/crates/aethyme-engine/src/model/edge.rs)
   - expand edge taxonomy
   - store edge source and numeric confidence, not just a coarse enum
 
-- [`search.rs`](../../rust/crates/aethyme-engine/src/search.rs)
+- [`graph/search.rs`](../../rust/crates/aethyme-engine/src/graph/search.rs)
   - switch from symbol/file lookup over a flat map to lookup over the normalized graph
 
-- [`neighborhood.rs`](../../rust/crates/aethyme-engine/src/neighborhood.rs)
+- [`graph/neighborhood.rs`](../../rust/crates/aethyme-engine/src/graph/neighborhood.rs)
   - expand from shallow dependency neighbors to typed graph neighborhoods
 
-- [`anchors.rs`](../../rust/crates/aethyme-engine/src/anchors.rs)
+- [`graph/anchors.rs`](../../rust/crates/aethyme-engine/src/graph/anchors.rs)
   - derive anchors from graph views rather than file-name heuristics only
 
 - [`pipeline.rs`](../../rust/crates/aethyme-engine/src/pipeline.rs)

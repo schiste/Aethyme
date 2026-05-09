@@ -1,6 +1,6 @@
 # Engine latency: where 14s actually goes
 
-Date: 2026-05-05
+Last Updated: 2026-05-05
 Trigger: After shipping the response trim (`671cb75`) and `aethyme` Rust
 binary + Python daemon (`ff1ac47`), per-call cost was 4,200 tokens / ~14s
 warm. Token side is now in good shape; latency demanded measurement

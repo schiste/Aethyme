@@ -1,5 +1,7 @@
 # Cross-process consumers of Aethyme entry points
 
+Last Updated: 2026-05-09
+
 When code outside the `packages/aethyme/` Python or Rust source tree
 invokes an Aethyme command, it crosses a process boundary. Static
 analysis (ruff, cargo check, type checkers) does not see those

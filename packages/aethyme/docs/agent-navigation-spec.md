@@ -1143,7 +1143,7 @@ repositories, not a tweak that raises a specific metric.
 The test: "Would I make this change if the eval didn't exist?" If no, the
 change is overfitting and must not ship.
 
-See [`guides/eval-protocol.md`](../guides/eval-protocol.md) for the full rule
+See [`guides/eval-protocol.md`](guides/eval-protocol.md) for the full rule
 with detailed examples.
 
 ### Nightly Evaluation

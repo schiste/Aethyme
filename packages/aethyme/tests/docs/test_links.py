@@ -66,9 +66,20 @@ def test_markdown_files_exist(docs_dir: Path) -> None:
 
 
 def test_internal_links_valid(docs_dir: Path) -> None:
+    """Internal links in human-curated docs must resolve.
+
+    Auto-generated eval reports (`docs/reports/`) are excluded: they
+    embed paths to transient runtime artifacts (e.g. `/private/tmp/
+    aethyme-eval-demo-xxx/`) that don't exist outside the run, by
+    design. Subjecting them to the same contract as hand-written
+    documentation conflates human authoring discipline with runtime
+    capture.
+    """
     broken_links: list[BrokenLink] = []
 
     for md_file in find_markdown_files(docs_dir):
+        if "reports" in md_file.relative_to(docs_dir).parts:
+            continue
         for link, line_num in extract_links(md_file):
             if is_external_link(link) or is_anchor_link(link):
                 continue
@@ -160,10 +171,19 @@ def test_runbooks_have_standard_sections(docs_dir: Path) -> None:
 
 
 def test_documentation_has_last_updated(docs_dir: Path) -> None:
+    """Hand-curated docs must carry "Last Updated:" or "Last Reviewed:".
+
+    Auto-generated eval reports (`docs/reports/`) are excluded: they're
+    timestamped by filename (e.g. `20260507-191139-...md`), and
+    forcing every auto-generated report through a "must have a stamp"
+    contract is a category mistake. The filename is the stamp.
+    """
     missing_dates: list[str] = []
 
     for md_file in find_markdown_files(docs_dir):
         if md_file.name in {"README.md", "INDEX.md"}:
+            continue
+        if "reports" in md_file.relative_to(docs_dir).parts:
             continue
 
         content = md_file.read_text(encoding="utf-8")

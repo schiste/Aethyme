@@ -1,5 +1,7 @@
 # Dead-Code Baseline
 
+Last Updated: 2026-05-08
+
 The `dead-code` eval currently supports reviewed target-specific baselines:
 
 - MediaWiki: `includes/Watchlist/`
@@ -24,7 +26,7 @@ Why this split exists:
 - that is not the same thing as “safe to remove dead code”
 
 Source of truth:
-- [mediawiki_dead_code_watchlist.json](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/src/eval/baselines/mediawiki_dead_code_watchlist.json:1)
+- [mediawiki_dead_code_watchlist.json](../../src/eval/baselines/mediawiki_dead_code_watchlist.json)
 
 Preferred analyzer path for collecting candidates:
 ```bash

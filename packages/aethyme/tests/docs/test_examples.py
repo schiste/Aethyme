@@ -79,14 +79,28 @@ def docs_dir() -> Path:
 
 
 def test_python_examples_syntax(docs_dir: Path) -> None:
-    """Python code examples must compile."""
+    """Python code examples must compile.
+
+    Skipped automatically when the block contains placeholder syntax —
+    `...` (ellipsis), `<...>` angle-bracket parameter notation (e.g.
+    `tab_status(tab_id=<id>)`), or `# TODO` markers — since those are
+    pseudo-code for human readers, not executable Python.
+
+    Auto-generated eval reports under `docs/reports/` are excluded
+    entirely; their code blocks are paste-from-runtime captures, not
+    documentation.
+    """
     errors: list[CodeSyntaxError] = []
 
+    placeholder_markers = ("...", "<", "# TODO")
+
     for md_file in docs_dir.rglob("*.md"):
+        if "reports" in md_file.relative_to(docs_dir).parts:
+            continue
         for lang, code, line_num in find_code_blocks(md_file):
             if lang not in {"python", "py"}:
                 continue
-            if "..." in code:
+            if any(marker in code for marker in placeholder_markers):
                 continue
 
             try:

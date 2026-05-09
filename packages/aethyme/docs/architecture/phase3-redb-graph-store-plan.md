@@ -1,6 +1,6 @@
 # Phase 3 — SurrealDB Graph Store → redb Migration Plan
 
-Last updated: 2026-05-04
+Last Updated: 2026-05-04
 
 ## Forcing function
 
