@@ -45,7 +45,13 @@ from .runner import CommandEvaluationRunner, EvaluationRunner
 from .schemas import bug_fix_output_schema, bug_fix_scoring_rubric
 from .scoring import parse_structured_output, score_bug_fix_output
 
-_CLEANUP_DELAY_SECONDS = 5 * 60  # 5 minutes
+# Default auto-cleanup delay for benchmark clones. Bumped 2026-05-09 from
+# 5 → 15 min after a 2026-05-07 GRC run lost its first clone dir mid-debug.
+# 15 min covers the agent runtime (typically 1-3 min on Mockup, up to ~16
+# min on MediaWiki) plus a generous buffer; eval runners that take longer
+# should call `cancel_cleanup_timer()` on the result dict explicitly (which
+# the launch phase orchestration does automatically).
+_CLEANUP_DELAY_SECONDS = 15 * 60
 
 DEFAULT_TASK = "Fix failing test: manage permission does not imply share in ability-implications.test.ts"
 DEFAULT_CROSS_PACKAGE_TASK = "Fix regression: execute permission does not grant read access"
@@ -319,7 +325,7 @@ def cleanup_benchmark(dest_dir: Path) -> None:
 
 
 def schedule_cleanup(dest_dir: Path, *, delay: float = _CLEANUP_DELAY_SECONDS) -> threading.Timer:
-    """Schedule removal of benchmark clones after *delay* seconds (default 5 min).
+    """Schedule removal of benchmark clones after *delay* seconds (default 15 min).
 
     Returns the timer so callers can ``.cancel()`` it if they need the clones
     longer (e.g. for manual inspection).
@@ -329,6 +335,25 @@ def schedule_cleanup(dest_dir: Path, *, delay: float = _CLEANUP_DELAY_SECONDS) -
     timer.daemon = True  # don't prevent process exit
     timer.start()
     return timer
+
+
+def cancel_cleanup_timer(prepare_result: dict[str, Any]) -> bool:
+    """Cancel the auto-cleanup timer if `prepare_bug_fix_benchmark` armed one.
+
+    Returns True if a timer was cancelled, False otherwise (no timer set, or
+    already fired). Idempotent — safe to call multiple times.
+
+    Intended for the launch-phase orchestration: once agents have been
+    dispatched to the clones, the run is committed and we no longer want
+    them deleted out from under us.
+    """
+    timer = prepare_result.get("cleanup_timer")
+    if timer is None:
+        return False
+    if not isinstance(timer, threading.Timer):
+        return False
+    timer.cancel()
+    return True
 
 
 def command_runner(command: str, working_directory: Path | None = None) -> CommandEvaluationRunner:
