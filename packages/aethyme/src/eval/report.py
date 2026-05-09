@@ -696,7 +696,69 @@ def augment_result_with_summary_metrics(
         "baseline_duration_seconds": round(baseline_duration, 3) if baseline_duration is not None else None,
         "baseline_cost_usd": round(baseline_cost, 4) if baseline_cost is not None else None,
     }
+    gap = _compute_discoverability_gap(result)
+    if gap is not None:
+        result["comparison"]["discoverability_gap"] = gap
     return result
+
+
+def _compute_discoverability_gap(result: dict[str, Any]) -> dict[str, Any] | None:
+    """Compute the discoverability gap between explore and leverage.
+
+    `discoverability_gap_pct = (explore - leverage) / explore * 100`
+
+    Positive means leverage was cheaper than explore — pointing the
+    agent at the skill helped. Negative means leverage cost MORE —
+    the pointer hurt (e.g. the agent over-trusted the tool and ran
+    extra verification it would have skipped without the hint).
+
+    The gap is the headline finding for any explore-vs-leverage pair.
+    Computed on both cost (preferred when available) and total tokens
+    (fallback for runs without per-call pricing). Both scales matter
+    — cost is what the user pays; tokens are the model-agnostic axis.
+
+    Returns None when neither condition is present in the result, or
+    when explore values are zero/missing (avoids division by zero and
+    nonsense gaps).
+    """
+    explore = result.get("explore") or {}
+    leverage = result.get("leverage") or {}
+    if not isinstance(explore, dict) or not isinstance(leverage, dict):
+        return None
+    explore_run = explore.get("run") or {}
+    leverage_run = leverage.get("run") or {}
+    if not isinstance(explore_run, dict) or not isinstance(leverage_run, dict):
+        return None
+
+    out: dict[str, Any] = {}
+
+    explore_cost = explore_run.get("cost_usd")
+    leverage_cost = leverage_run.get("cost_usd")
+    if (
+        isinstance(explore_cost, (int, float)) and float(explore_cost) > 0
+        and isinstance(leverage_cost, (int, float))
+    ):
+        out["cost_explore_usd"] = round(float(explore_cost), 4)
+        out["cost_leverage_usd"] = round(float(leverage_cost), 4)
+        out["cost_gap_pct"] = round(
+            (float(explore_cost) - float(leverage_cost))
+            / float(explore_cost) * 100.0,
+            2,
+        )
+
+    explore_tokens = _total_tokens(explore_run)
+    leverage_tokens = _total_tokens(leverage_run)
+    if (
+        explore_tokens is not None and explore_tokens > 0
+        and leverage_tokens is not None
+    ):
+        out["tokens_explore"] = explore_tokens
+        out["tokens_leverage"] = leverage_tokens
+        out["tokens_gap_pct"] = round(
+            (explore_tokens - leverage_tokens) / explore_tokens * 100.0, 2
+        )
+
+    return out or None
 
 
 def write_explain_repo_markdown_report(
@@ -986,6 +1048,7 @@ def _render_markdown(*, repo_path: Path, result: dict[str, Any]) -> str:
     lines: list[str] = []
     _section_meta(lines, repo_path, result)
     _section_model(lines, result)
+    _section_discoverability_gap(lines, result)
     _section_scorecard(lines, result)
     _section_score_breakdown(lines, result)
     _section_prompts(lines, result)
@@ -1063,6 +1126,57 @@ def _render_objective_and_constraints(
         lines.extend(["## Constraints", ""])
         lines.extend(f"- {c}" for c in constraints)
         lines.append("")
+
+
+def _section_discoverability_gap(
+    lines: list[str], result: dict[str, Any],
+) -> None:
+    """Render the explore-vs-leverage discoverability gap.
+
+    The gap is the headline finding of any eval that compares both
+    conditions: how much does pointing the agent at the deployed
+    skill change cost? Positive = leverage cheaper (pointer helped);
+    negative = leverage more expensive (pointer hurt).
+
+    Skipped entirely when both conditions aren't present (e.g. an
+    explain-repo-only run, or a repro that only ran one side).
+    """
+    comparison = result.get("comparison") or {}
+    if not isinstance(comparison, dict):
+        return
+    gap = comparison.get("discoverability_gap")
+    if not isinstance(gap, dict) or not gap:
+        return
+
+    lines.extend(["## Discoverability Gap", ""])
+    lines.extend([
+        "Difference in cost between `explore` (skill present, no "
+        "instruction) and `leverage` (skill present, agent told it "
+        "exists). Positive = pointing helped; negative = pointing hurt.",
+        "",
+    ])
+
+    cost_pct = gap.get("cost_gap_pct")
+    if cost_pct is not None:
+        ce = gap.get("cost_explore_usd")
+        cl = gap.get("cost_leverage_usd")
+        sign = "+" if cost_pct >= 0 else ""
+        lines.append(
+            f"- **Cost:** `{sign}{cost_pct:.2f}%` "
+            f"(explore ${ce:.4f} → leverage ${cl:.4f})"
+        )
+
+    tok_pct = gap.get("tokens_gap_pct")
+    if tok_pct is not None:
+        te = gap.get("tokens_explore")
+        tl = gap.get("tokens_leverage")
+        sign = "+" if tok_pct >= 0 else ""
+        lines.append(
+            f"- **Tokens:** `{sign}{tok_pct:.2f}%` "
+            f"(explore {te:,} → leverage {tl:,})"
+        )
+
+    lines.append("")
 
 
 def _section_model(lines: list[str], result: dict[str, Any]) -> None:
