@@ -120,11 +120,42 @@ CONDITIONS: tuple[ConditionSpec, ...] = (
 # Eval-type defaults
 # ---------------------------------------------------------------------------
 
-_EVAL_TYPE_DEFAULTS: dict[str, dict[str, str]] = {
+# Per-eval-type defaults.
+#
+# Each entry declares:
+# - `task`: prompt fed to the agent (the *what*).
+# - `objective`: human-facing comparison statement — what we're using
+#   the eval to compare across conditions, and which dimensions are
+#   gates vs comparison axes. Rendered into the report header so the
+#   reader doesn't have to reverse-engineer it from the table.
+# - `constraints`: gates the answer must satisfy to count. Distinct
+#   from rubric weights (those live in scoring); these are pre-rubric
+#   admissibility checks like "valid JSON" or "didn't modify the
+#   control repo." Rendered into the report header alongside the
+#   objective.
+# - `prepare_function`, `score_function`, `report_function`,
+#   `target_restriction`: orchestration plumbing (unchanged).
+#
+# `objective` and `constraints` are NEVER inserted into agent
+# prompts — they're for the human reader. Adding them to prompts
+# would constitute eval-tuning by handing the agent the rubric.
+_EVAL_TYPE_DEFAULTS: dict[str, dict[str, Any]] = {
     "bug-fix": {
         "task": (
             "Fix failing test: manage permission does not imply share "
             "in ability-implications.test.ts"
+        ),
+        "objective": (
+            "Compare cost across conditions to fix the failing "
+            "ability-implications test (manage → share). Quality is a "
+            "gate (test must pass post-fix); efficiency is the "
+            "comparison axis."
+        ),
+        "constraints": (
+            "The failing test must transition from FAIL to PASS, with "
+            "previously-passing tests staying green.",
+            "Output JSON must be saved to the agent-specified path.",
+            "Fix may modify repository code (this eval applies a fix).",
         ),
         "prepare_function": "src.eval.bug_fix.prepare_bug_fix_benchmark",
         "score_function": "src.eval.bug_fix.assemble_bug_fix_result",
@@ -139,6 +170,18 @@ _EVAL_TYPE_DEFAULTS: dict[str, dict[str, str]] = {
             "repository — produce your analysis as JSON in your final response "
             "only."
         ),
+        "objective": (
+            "Compare cost across conditions to localize T419918 "
+            "(watchlist seen-marking) without applying a fix. "
+            "Quality is a gate (the implementation file must be "
+            "named); efficiency is the comparison axis."
+        ),
+        "constraints": (
+            "Output must be valid JSON matching the documented schema.",
+            "Output must be saved to the agent-specified path; "
+            "missing or empty output scores 0.",
+            "Repository files must not be modified.",
+        ),
         "prepare_function": "src.eval.schemas.mediawiki_bug_fix_1_reference",
         "score_function": "src.eval.scoring.score_mediawiki_bug_fix_1",
         "report_function": "src.eval.report.finalize_eval_run",
@@ -151,6 +194,16 @@ _EVAL_TYPE_DEFAULTS: dict[str, dict[str, str]] = {
             "would need updating.\n\n"
             "For each call site, provide: file path, line number, and the exact code at that line.\n\n"
             "Return a structured analysis with all call sites found."
+        ),
+        "objective": (
+            "Compare cost across conditions to enumerate all callers "
+            "of `WikiPage::doViewUpdates`. Recall is the gate (missed "
+            "call sites = wrong answer); efficiency is the comparison."
+        ),
+        "constraints": (
+            "Output must be valid JSON matching the documented schema.",
+            "Output must be saved to the agent-specified path.",
+            "Repository files must not be modified.",
         ),
         "prepare_function": "src.eval.schemas.mediawiki_impact_analysis_reference",
         "score_function": "src.eval.scoring.score_mediawiki_bug_fix_1",
@@ -167,6 +220,17 @@ _EVAL_TYPE_DEFAULTS: dict[str, dict[str, str]] = {
             "description of what it does.\n\n"
             "Return a structured analysis with the complete chain."
         ),
+        "objective": (
+            "Compare cost across conditions to reconstruct the "
+            "execution chain for the 'Watch' click path. Chain "
+            "ordering and per-step file resolution are gates; "
+            "efficiency is the comparison."
+        ),
+        "constraints": (
+            "Output must be valid JSON matching the documented schema.",
+            "Output must be saved to the agent-specified path.",
+            "Repository files must not be modified.",
+        ),
         "prepare_function": "src.eval.schemas.mediawiki_feature_localization_reference",
         "score_function": "src.eval.scoring.score_mediawiki_bug_fix_1",
         "report_function": "src.eval.report.finalize_eval_run",
@@ -181,6 +245,19 @@ _EVAL_TYPE_DEFAULTS: dict[str, dict[str, str]] = {
             "(d) How a site admin disables rate limiting for a specific action\n\n"
             "Return a structured analysis with all four answers."
         ),
+        "objective": (
+            "Compare cost across conditions to locate the four parts "
+            "of MediaWiki's rate-limit configuration: variable name, "
+            "default site, enforcement class, override mechanism. All "
+            "four are gates; efficiency is the comparison."
+        ),
+        "constraints": (
+            "Output must include all four fields "
+            "(config_variable, default_definition, enforcement_class, "
+            "disable_mechanism).",
+            "Output must be saved to the agent-specified path.",
+            "Repository files must not be modified.",
+        ),
         "prepare_function": "src.eval.schemas.mediawiki_config_audit_reference",
         "score_function": "src.eval.scoring.score_mediawiki_bug_fix_1",
         "report_function": "src.eval.report.finalize_eval_run",
@@ -188,18 +265,47 @@ _EVAL_TYPE_DEFAULTS: dict[str, dict[str, str]] = {
     },
     "explain-repo": {
         "task": "Explain this repo",
+        "objective": (
+            "Compare cost across conditions to produce a high-level "
+            "repo summary. Primary-language identification is a gate; "
+            "coverage of top entry points contributes to quality."
+        ),
+        "constraints": (
+            "Output must be saved to the agent-specified path.",
+            "Repository files must not be modified.",
+        ),
         "prepare_function": "src.eval.explain_repo.run_explain_repo_evaluation",
         "score_function": "src.eval.scoring.score_explain_repo_output",
         "report_function": "src.eval.report.finalize_eval_run",
     },
     "navigation-ctf": {
         "task": "Find the manifest that manages the main code entrypoint",
+        "objective": (
+            "Compare cost across conditions to locate the named "
+            "manifest file. The path must be returned exactly; "
+            "partial matches do not count."
+        ),
+        "constraints": (
+            "Output must be saved to the agent-specified path.",
+            "Repository files must not be modified.",
+        ),
         "prepare_function": "src.eval.navigation_ctf.run_navigation_ctf_evaluation",
         "score_function": "src.eval.scoring.score_navigation_ctf_output",
         "report_function": "src.eval.report.finalize_eval_run",
     },
     "dead-code": {
         "task": "Target-specific dead-code evaluation",
+        "objective": (
+            "Compare cost across conditions to enumerate unreachable "
+            "functions in the target scope. Precision is the gate "
+            "(false positives — live code listed as dead — are worse "
+            "than false negatives); efficiency is the comparison."
+        ),
+        "constraints": (
+            "Output must be valid JSON matching the documented schema.",
+            "Output must be saved to the agent-specified path.",
+            "Repository files must not be modified.",
+        ),
         "prepare_function": "src.eval.schemas.dead_code_reference_for_target",
         "score_function": "src.eval.scoring.score_dead_code",
         "report_function": "src.eval.report.finalize_eval_run",
@@ -208,6 +314,19 @@ _EVAL_TYPE_DEFAULTS: dict[str, dict[str, str]] = {
         "task": (
             "List every file referencing WatchedItemStore that would need "
             "updating if the class were renamed to WatchlistNotificationStore."
+        ),
+        "objective": (
+            "Compare cost across conditions to enumerate all "
+            "references to `WatchedItemStore` that need updating on "
+            "rename. Recall is the gate (missed references = broken "
+            "rename); efficiency is the comparison."
+        ),
+        "constraints": (
+            "Output must be valid JSON matching the documented schema.",
+            "Vendor files must be excluded.",
+            "Each reference must be labeled with kind (instantiation, "
+            "type-hint, use-import, service-locator, docblock).",
+            "Repository files must not be modified.",
         ),
         "prepare_function": "src.eval.schemas.mediawiki_migration_reference",
         "score_function": "src.eval.scoring.score_mediawiki_migration",
@@ -218,6 +337,25 @@ _EVAL_TYPE_DEFAULTS: dict[str, dict[str, str]] = {
 
 _AETHYME_PKG = str(PROJECT_ROOT)
 _AETHYME_VENV_PYTHON = str(PROJECT_ROOT / ".venv" / "bin" / "python")
+
+
+def get_eval_type_contract(eval_type: str) -> tuple[str, list[str]]:
+    """Return (objective, constraints) for an eval type.
+
+    Single source of truth for the comparison contract — what we are
+    using the eval to compare across conditions, and which gates the
+    answer must pass to count. The report layer reads this at render
+    time so the table is annotated with the same statement that the
+    eval was designed against.
+
+    Returns ``("", [])`` for unknown eval types so the render layer
+    can no-op gracefully on legacy results that predate the contract.
+    """
+    defaults = _EVAL_TYPE_DEFAULTS.get(eval_type, {})
+    return (
+        defaults.get("objective", ""),
+        list(defaults.get("constraints", ())),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +401,7 @@ def generate_run_plan(
     run_dir_name = f"{timestamp}-{slug}"
     paths = _build_paths(eval_type, dest_dir, run_dir_name)
 
+    eval_defaults = _EVAL_TYPE_DEFAULTS[eval_type]
     meta = {
         "eval_type": eval_type,
         "target": eval_target.name,
@@ -273,6 +412,11 @@ def generate_run_plan(
         "aethyme_root": _AETHYME_PKG,
         "timestamp": datetime.now(UTC).isoformat(),
         "conditions": [c.name for c in CONDITIONS],
+        # Comparison contract — propagated into the report header so a
+        # reader looking at the table knows what is being compared and
+        # what counts as admissible. NOT inserted into agent prompts.
+        "objective": eval_defaults.get("objective", ""),
+        "constraints": list(eval_defaults.get("constraints", ())),
     }
 
     phases = [

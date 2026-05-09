@@ -1026,6 +1026,43 @@ def _section_meta(
         f"- Aethyme Commit: `{get_aethyme_commit()}`",
         "",
     ])
+    _render_objective_and_constraints(lines, result)
+
+
+def _render_objective_and_constraints(
+    lines: list[str], result: dict[str, Any],
+) -> None:
+    """Render the comparison contract (objective + constraints) below Meta.
+
+    Resolution order:
+    1. ``result["objective"]`` / ``result["constraints"]`` (legacy
+       results that already carry the contract — preferred so the
+       report reflects what the eval was actually measured against,
+       even if defaults change later).
+    2. Lookup by ``result["eval_type"]`` from the orchestrator's
+       canonical defaults.
+    3. No-op for unknown eval types — the rest of the report still
+       renders.
+
+    Lazy-import of `orchestrator` because `orchestrator` already
+    imports from `report` (`get_aethyme_commit`); a top-level import
+    would create a cycle.
+    """
+    objective = result.get("objective", "") or ""
+    constraints = result.get("constraints", []) or []
+    if not objective and not constraints:
+        eval_type = result.get("eval_type", "")
+        if eval_type:
+            from .orchestrator import get_eval_type_contract
+            objective, constraints = get_eval_type_contract(eval_type)
+    if not objective and not constraints:
+        return
+    if objective:
+        lines.extend(["## Objective", "", objective, ""])
+    if constraints:
+        lines.extend(["## Constraints", ""])
+        lines.extend(f"- {c}" for c in constraints)
+        lines.append("")
 
 
 def _section_model(lines: list[str], result: dict[str, Any]) -> None:
