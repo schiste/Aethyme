@@ -85,8 +85,20 @@ def get_model(name: str, reasoning: str = "default") -> ModelConfig:
         raise KeyError(f"Unknown model {name!r}. Available: {available}")
     cfg = MODELS[key]
     if reasoning != "default" and reasoning != cfg.reasoning:
+        # Copy with the reasoning override. Earlier versions of this
+        # branch passed positional args ending in `reasoning`, which
+        # silently landed in `input_cost_per_m` (positional slot 4 in
+        # the dataclass) and zeroed every cost-based metric for any
+        # eval that overrode reasoning. Use keyword args here so a
+        # future field addition can't reintroduce the same bug.
         return ModelConfig(
-            cfg.name, cfg.provider, cfg.backend, cfg.backend_args, reasoning,
+            name=cfg.name,
+            provider=cfg.provider,
+            backend=cfg.backend,
+            backend_args=cfg.backend_args,
+            input_cost_per_m=cfg.input_cost_per_m,
+            output_cost_per_m=cfg.output_cost_per_m,
+            reasoning=reasoning,
         )
     return cfg
 
