@@ -131,8 +131,19 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
     if [[ -f .codex/skills/aethyme/SKILL.md ]]; then
         SKILL_FILE=".codex/skills/aethyme/SKILL.md"
         grep -q '{{AETHYME_ROOT}}' "$SKILL_FILE" && check_fail "Skill has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "Skill placeholders resolved"
+        # 2026-05-08: Python explore_command was hard-deleted. The skill's
+        # explore guidance now references the native Rust binary
+        # (`$AETHYME_BIN explore`); the `intents` command stays in Python.
         grep -q 'src.cli intents' "$SKILL_FILE" && check_pass "Skill includes current intent catalog guidance" || check_fail "Skill missing intents guidance"
-        grep -q 'src.cli explore' "$SKILL_FILE" && check_pass "Skill includes current explore guidance" || check_fail "Skill missing explore guidance"
+        (grep -q '"$AETHYME_BIN" explore' "$SKILL_FILE" || grep -q 'aethyme explore' "$SKILL_FILE") \
+            && check_pass "Skill includes current native-explore guidance" \
+            || check_fail "Skill missing native explore guidance"
+        # The post-2026-05-08 SKILL.md should NOT mention `src.cli explore` —
+        # that's the deleted Python entry point. Flip the check: if it's
+        # there, the skill is stale.
+        grep -q 'src.cli explore' "$SKILL_FILE" \
+            && check_fail "Skill still references deleted 'src.cli explore' (Python explore_command was hard-deleted 2026-05-08; redeploy with current template)" \
+            || check_pass "Skill has no stale 'src.cli explore' references"
         grep -q 'analyze dead-code' "$SKILL_FILE" && check_pass "Skill includes current dead-code analyzer" || check_fail "Skill missing analyze dead-code guidance"
         grep -q 'facts function-usage' "$SKILL_FILE" && check_pass "Skill includes current usage facts command" || check_fail "Skill missing facts function-usage guidance"
         grep -q '\$ENGINE unused' "$SKILL_FILE" && check_fail "Skill still advertises stale \$ENGINE unused command" || check_pass "Skill has no stale unused command"
