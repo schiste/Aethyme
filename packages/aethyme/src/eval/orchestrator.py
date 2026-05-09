@@ -466,29 +466,26 @@ def _build_prepare_phase(
             f"Clone 4 repos from {target.display_name} control, "
             f"plant bug, generate all artifacts"
         )
-    elif eval_type == "bug-fix-1":
-        # Read-only diagnostic eval — no cloning, just write prompts + schema
-        defaults = _EVAL_TYPE_DEFAULTS["bug-fix-1"]
-        cli_cmd = (
-            f"cd {pkg} && {venv} -c \""
-            f"from pathlib import Path; import json; "
-            f"from src.eval.schemas import mediawiki_bug_fix_1_output_schema; "
-            f"schema = mediawiki_bug_fix_1_output_schema(); "
-            f"task = {defaults['task']!r}; "
-            f"json_tail = chr(10) + chr(10) + 'Output rules:' + chr(10) + '- Emit exactly one JSON object as your final chat response (do NOT write it to a file).' + chr(10) + '- Keys: files_to_edit, root_cause, fix_plan, testing.' + chr(10) + '- Use repo-relative paths.'; "
-            f"ctrl = task + chr(10) + chr(10) + 'Repository path: {target.control_path}' + chr(10) + 'Explore the repository and produce a structured JSON analysis.' + json_tail; "
-            f"lev = 'Use Aethyme tools to navigate the repository graph.' + chr(10) + task + chr(10) + chr(10) + 'Repository path: {target.aethyme_path}' + chr(10) + 'Explore the repository and produce a structured JSON analysis.' + json_tail; "
-            f"tcond = 'Use Aethyme tools and any task-conditioned context artifacts to navigate the repository graph, but do your own analysis.' + chr(10) + task + chr(10) + chr(10) + 'Repository path: {target.aethyme_path}' + chr(10) + 'Produce a structured JSON analysis.' + json_tail; "
-            f"Path('{paths['prompt_files']['control-cto-off']}').write_text(ctrl); "
-            f"Path('{paths['prompt_files']['control-cto-on']}').write_text(ctrl); "
-            f"Path('{paths['prompt_files']['explore']}').write_text(ctrl.replace(str('{target.control_path}'), str('{target.aethyme_path}'))); "
-            f"Path('{paths['prompt_files']['leverage']}').write_text(lev); "
-            f"Path('{paths['prompt_files']['task-conditioned']}').write_text(tcond); "
-            f"Path('{paths['schema_file']}').write_text(json.dumps(schema, indent=2)); "
-            f"print('bug-fix-1 artifacts written')"
-            f"\""
+    elif eval_type in ("bug-fix-1", "dead-code", "impact-analysis",
+                       "feature-localization", "config-audit", "migration"):
+        # Read-only diagnostic eval — no cloning. The orchestrator writes
+        # all 5 condition prompts via `src.eval.prompts_writer`, which
+        # delegates to the unit-tested `src.eval.prompts.build_prompts`.
+        # Replaces the old inline `python -c "..."` template (fragile —
+        # em-dashes and quoted JSON inside `task` strings repeatedly
+        # broke shell quoting on bug-fix-1).
+        prompt_args = " ".join(
+            f"--prompt-out {cond.name}={paths['prompt_files'][cond.name]}"
+            for cond in CONDITIONS
         )
-        description = f"Generate bug-fix-1 (T419918) artifacts for {target.display_name}"
+        cli_cmd = (
+            f"cd {pkg} && {venv} -m src.eval.prompts_writer"
+            f" --eval-type {eval_type}"
+            f" --target {target.name}"
+            f" --schema-out {paths['schema_file']}"
+            f" {prompt_args}"
+        )
+        description = f"Generate {eval_type} prompts + schema for {target.display_name}"
     elif eval_type == "explain-repo":
         cli_cmd = (
             f"cd {pkg} && {venv} -m src.cli eval explain-repo"
@@ -503,11 +500,6 @@ def _build_prepare_phase(
             f" --json-output"
         )
         description = f"Generate navigation-ctf artifacts for {target.display_name}"
-    elif eval_type in ("impact-analysis", "feature-localization", "config-audit", "dead-code", "migration"):
-        # Read-only diagnostic evals — no cloning, prompts written by the server
-        defaults = _EVAL_TYPE_DEFAULTS[eval_type]
-        cli_cmd = f"echo 'Prompts written by server for {eval_type}'"
-        description = f"Generate {eval_type} prompts for {target.display_name}"
     else:
         raise ValueError(f"Unknown eval_type: {eval_type}")
 
