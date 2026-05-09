@@ -40,6 +40,33 @@ NAVIGATION_CTF_PATH_KEYS: frozenset[str] = frozenset({
 })
 
 
+# Reader-facing legend for the per-component `tunability` annotation
+# attached to every scoring rubric below. Tunability captures how
+# susceptible a rubric component is to *deliberate gaming* — not how
+# important it is, not how heavily it's weighted. A high-tunability
+# component scores higher when the system is engineered to game it
+# (e.g., return more candidates to boost recall, sprinkle keywords
+# to boost prose-quality), independent of genuine capability.
+#
+# IMPORTANT: tunability is an annotation to inform reviewers, NOT a
+# scoring input. Do not "rebalance weights based on tunability" —
+# that's eval-tuning dressed up as principle. Recording the values
+# is allowed; acting on them by changing weights without separate
+# evidence of bias is not.
+_TUNABILITY_LEGEND = (
+    "tunability: per-component susceptibility to gaming. "
+    "low = hard to inflate without genuine capability "
+    "(e.g., binary external test pass, exact-path match). "
+    "medium = inflatable with effort "
+    "(e.g., set-overlap recall — return more candidates). "
+    "high = trivially inflatable "
+    "(e.g., keyword presence — sprinkle the keyword list; "
+    "efficiency — caching/prompt-min that doesn't reflect skill). "
+    "ANNOTATION ONLY: do not change weights based on these values "
+    "without independent evidence of measurement bias."
+)
+
+
 def explain_repo_output_schema() -> dict[str, object]:
     return {
         "type": "object",
@@ -89,11 +116,29 @@ def explain_repo_scoring_rubric() -> dict[str, object]:
             "representative_code_files": 3,
             "representative_docs": 2,
         },
+        # Per-component susceptibility to deliberate tuning. NOT used
+        # for scoring — purely a reader-facing annotation. See the
+        # `_TUNABILITY_LEGEND` note below for what each level means.
+        # Adding annotations here is allowed; CHANGING WEIGHTS based
+        # on tunability is not — that's eval-tuning by another name.
+        "tunability": {
+            "code_areas": "medium",
+            "reference_areas": "medium",
+            "entrypoints": "low",
+            "important_docs": "medium",
+            "key_configs": "low",
+            "key_languages": "low",
+            "high_risk_areas": "medium",
+            "navigation_order": "medium",
+            "representative_code_files": "medium",
+            "representative_docs": "medium",
+        },
         "notes": [
             "Prefer exact path and area matches.",
             "Navigation order is partial-credit and ordered.",
             "Repo summary is informative but not currently machine-scored.",
             "Path normalization strips markdown links, line anchors, absolute prefixes, and leading ./ before comparison.",
+            _TUNABILITY_LEGEND,
         ],
     }
 
@@ -176,10 +221,17 @@ def navigation_ctf_scoring_rubric() -> dict[str, object]:
             "management_area": 20,
             "relationship_chain": 20,
         },
+        "tunability": {
+            "config_target": "low",
+            "code_target": "low",
+            "management_area": "medium",
+            "relationship_chain": "medium",
+        },
         "notes": [
             "Exact config/code path matches carry most of the score.",
             "Relationship chain must express both ownership and management links.",
             "Path normalization strips markdown links, line anchors, absolute prefixes, and leading ./ before comparison.",
+            _TUNABILITY_LEGEND,
         ],
     }
 
@@ -241,11 +293,18 @@ def bug_fix_scoring_rubric() -> dict[str, object]:
             "correct_file": 10,
             "efficiency": 10,
         },
+        "tunability": {
+            "fix_test": "low",
+            "regression": "low",
+            "correct_file": "medium",
+            "efficiency": "high",
+        },
         "notes": [
             "fix_test: vitest run on the planted test — binary pass/fail.",
             "regression: vitest run on all auth tests — no regressions introduced.",
             "correct_file: agent identifies the correct file in structured output.",
             "efficiency: lower token usage scores higher.",
+            _TUNABILITY_LEGEND,
         ],
     }
 
@@ -353,6 +412,13 @@ def mediawiki_bug_fix_1_scoring_rubric() -> dict[str, object]:
             "testing_quality": 15,
             "efficiency": 10,
         },
+        "tunability": {
+            "files_identified": "medium",
+            "root_cause_quality": "high",
+            "fix_plan_quality": "high",
+            "testing_quality": "high",
+            "efficiency": "high",
+        },
         "notes": [
             "files_identified: set overlap of paths with reference. "
             "Partial credit per file.",
@@ -363,6 +429,7 @@ def mediawiki_bug_fix_1_scoring_rubric() -> dict[str, object]:
             "testing_quality: keyword match for validation plan and "
             "regression coverage around diff/revision watchlist behavior.",
             "efficiency: lower token usage scores higher.",
+            _TUNABILITY_LEGEND,
         ],
     }
 
@@ -555,12 +622,22 @@ def onboarding_auth_scoring_rubric() -> dict[str, object]:
             "consumers": 10,
             "dependencies": 15,
         },
+        "tunability": {
+            "auth_package": "low",
+            "key_files": "medium",
+            "session_keywords": "high",
+            "rbac_keywords": "high",
+            "logout_keywords": "high",
+            "consumers": "medium",
+            "dependencies": "medium",
+        },
         "notes": [
             "auth_package: exact path match to packages/auth.",
             "key_files: set overlap with reference file list.",
             "session/rbac/logout: keyword presence in prose fields.",
             "consumers: set overlap with known importers.",
             "dependencies: set overlap with known deps (@aeptus/types, @casl/ability).",
+            _TUNABILITY_LEGEND,
         ],
     }
 
@@ -730,11 +807,23 @@ def mediawiki_dead_code_scoring_rubric() -> dict[str, object]:
             "false_positives": 20,
             "efficiency": 20,
         },
+        "tunability": {
+            # Recall is genuinely hard to game — finding functions
+            # the reference lists requires actually finding them.
+            "functions_found": "low",
+            # Precision (anti-false-positives) is trivially gameable
+            # — list fewer functions = fewer wrong picks. The score
+            # rewards conservative under-reporting in a way that's
+            # not always aligned with "the agent is good."
+            "false_positives": "high",
+            "efficiency": "high",
+        },
         "notes": [
             "functions_found: recall — how many of the reviewed literal external-only baseline functions were identified.",
             "false_positives: precision — penalty for listing functions that are outside the reviewed literal baseline.",
             "efficiency: cost relative to $1.00 baseline.",
             "Important: this benchmark uses the prompt semantics ('zero non-test callers outside includes/Watchlist/'), not a pure software-maintenance notion of dead code.",
+            _TUNABILITY_LEGEND,
         ],
     }
 
@@ -815,10 +904,16 @@ def mediawiki_migration_scoring_rubric() -> dict[str, object]:
             "false_positives": 20,
             "efficiency": 20,
         },
+        "tunability": {
+            "files_found": "low",
+            "false_positives": "high",
+            "efficiency": "high",
+        },
         "notes": [
             "files_found: recall — how many of the 53 reference files were listed.",
             "false_positives: precision — penalty for listing files that don't reference WatchedItemStore.",
             "efficiency: cost relative to $1.00 baseline.",
+            _TUNABILITY_LEGEND,
         ],
     }
 
