@@ -130,8 +130,41 @@ CONDITIONS: tuple[ConditionSpec, ...] = (
     # generated against a sibling task in the same module. Isolates loading
     # cost (what leverage pays for blob ingestion) from misdirection cost
     # (what an agent loses by trusting the wrong content).
+    #
+    # Opt-in per eval type: only runs when the eval declares an
+    # `alternative_task` in `_EVAL_TYPE_DEFAULTS`. See
+    # `active_conditions_for()` below for the gating logic.
     ConditionSpec("negative-context", None, True, "aethyme", "negative-context"),
 )
+
+
+def active_conditions_for(eval_type: str) -> tuple[ConditionSpec, ...]:
+    """Return the conditions that should run for this eval type.
+
+    The 6th condition (`negative-context`) is opt-in — only runs when
+    the eval declares an `alternative_task` in `_EVAL_TYPE_DEFAULTS`.
+    Eval types without it (bug-fix-1, dead-code, impact-analysis,
+    etc.) get the original 5 conditions.
+
+    Why opt-in rather than always-on: the negative-context condition
+    needs a *plausibly-wrong* nav-context blob to load, which the
+    `bug_fix.py` flow generates via `generate_plausible_error_context`.
+    The diagnostic eval types (driven by `prompts.py`) don't have a
+    nav-context file in their flow — they're text-only prompts. Until
+    the diagnostic flow grows nav-context support, those evals run
+    with 5 conditions.
+
+    Adding negative-context to a new eval type: declare
+    `alternative_task` in its `_EVAL_TYPE_DEFAULTS` entry AND ensure
+    its prepare/build-inputs phase generates the wrong nav-context
+    artifact. The first condition is checked here; the second is on
+    the contributor.
+    """
+    defaults = _EVAL_TYPE_DEFAULTS.get(eval_type, {})
+    has_alternative = bool(defaults.get("alternative_task"))
+    if has_alternative:
+        return CONDITIONS
+    return tuple(c for c in CONDITIONS if c.name != "negative-context")
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +474,7 @@ def generate_run_plan(
         "aethyme_commit": get_aethyme_commit(),
         "aethyme_root": _AETHYME_PKG,
         "timestamp": datetime.now(UTC).isoformat(),
-        "conditions": [c.name for c in CONDITIONS],
+        "conditions": [c.name for c in active_conditions_for(eval_type)],
         # Comparison contract — propagated into the report header so a
         # reader looking at the table knows what is being compared and
         # what counts as admissible. NOT inserted into agent prompts.
@@ -455,7 +488,7 @@ def generate_run_plan(
         _build_warm_phase(eval_target),
         _build_launch_phase(eval_type, eval_target, model_config, dest_dir, paths),
         _build_monitor_phase(),
-        _build_collect_phase(model_config, paths),
+        _build_collect_phase(eval_type, model_config, paths),
         _build_score_phase(eval_type, scenario, model_config),
         _build_report_phase(eval_type, paths),
         _build_cleanup_phase(),
@@ -476,12 +509,13 @@ def _build_paths(
 ) -> dict[str, Any]:
     """Compute all artifact paths up front."""
     tmp = str(Path("/tmp").resolve())
+    active = active_conditions_for(eval_type)
 
     prompt_files = {
-        c.name: f"{tmp}/aethyme-eval-{c.name}-prompt.txt" for c in CONDITIONS
+        c.name: f"{tmp}/aethyme-eval-{c.name}-prompt.txt" for c in active
     }
     result_files = {
-        c.name: f"{tmp}/aethyme-eval-{c.name}-result.json" for c in CONDITIONS
+        c.name: f"{tmp}/aethyme-eval-{c.name}-result.json" for c in active
     }
 
     paths: dict[str, Any] = {
@@ -497,7 +531,7 @@ def _build_paths(
     if eval_type == "bug-fix" and dest_dir:
         paths["dest_dir"] = dest_dir
         paths["condition_repos"] = {
-            c.name: f"{dest_dir}/{c.name}" for c in CONDITIONS
+            c.name: f"{dest_dir}/{c.name}" for c in active
         }
 
     return paths
@@ -660,7 +694,7 @@ def _build_prepare_phase(
         # broke shell quoting on bug-fix-1).
         prompt_args = " ".join(
             f"--prompt-out {cond.name}={paths['prompt_files'][cond.name]}"
-            for cond in CONDITIONS
+            for cond in active_conditions_for(eval_type)
         )
         cli_cmd = (
             f"cd {pkg} && {venv} -m src.eval.prompts_writer"
@@ -708,7 +742,7 @@ def _build_launch_phase(
     """Build per-condition launch instructions."""
     conditions_launch: list[dict[str, Any]] = []
 
-    for cond in CONDITIONS:
+    for cond in active_conditions_for(eval_type):
         directory = _resolve_condition_dir(eval_type, cond, target, dest_dir)
         prompt_file = paths["prompt_files"][cond.name]
         result_file = paths["result_files"][cond.name]
@@ -790,12 +824,13 @@ def _build_monitor_phase() -> dict[str, Any]:
 
 
 def _build_collect_phase(
+    eval_type: str,
     model_config: ModelConfig,
     paths: dict[str, Any],
 ) -> dict[str, Any]:
     per_condition: list[dict[str, Any]] = []
 
-    for cond in CONDITIONS:
+    for cond in active_conditions_for(eval_type):
         result_file = paths["result_files"][cond.name]
 
         collect_entry: dict[str, Any] = {

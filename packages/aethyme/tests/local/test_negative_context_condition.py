@@ -222,12 +222,15 @@ def test_run_plan_paths_include_negative_context_artifacts():
         "navigation-ctf",
     ],
 )
-def test_other_eval_types_still_have_negative_context_in_launch(eval_type: str):
-    """The 6th condition is global to the orchestrator, not bug-fix-
-    specific. Other eval types that don't yet declare an alternative
-    task should still list the condition in the launch phase — they'd
-    fall back to a leverage replay if launched, which is acceptable
-    until we add per-eval alternative tasks."""
+def test_eval_types_without_alternative_task_skip_negative_context(eval_type: str):
+    """Per-eval-type opt-in: only eval types that declare
+    `alternative_task` in `_EVAL_TYPE_DEFAULTS` get the 6th condition.
+    The diagnostic eval types (driven by `prompts.py`) don't have a
+    nav-context blob in their flow, so until we add nav-context
+    plumbing there, they run with the original 5 conditions. This test
+    pins the gating contract so a future change that adds
+    `alternative_task` to one of these (without also adding the
+    nav-context generator) trips a deterministic failure."""
     target = (
         "mediawiki" if eval_type in {
             "bug-fix-1", "dead-code", "impact-analysis",
@@ -239,6 +242,27 @@ def test_other_eval_types_still_have_negative_context_in_launch(eval_type: str):
     )
     launch = next(p for p in plan["phases"] if p["name"] == "launch")
     cond_names = [c["name"] for c in launch["conditions"]]
-    assert "negative-context" in cond_names, (
-        f"{eval_type} launch phase should list negative-context"
+    # None of these declare alternative_task today.
+    assert "negative-context" not in cond_names, (
+        f"{eval_type} launch phase has negative-context, but the eval "
+        "type doesn't declare `alternative_task` — orchestrator "
+        "filtering is broken or the eval type silently grew negative-"
+        "context support without nav-context plumbing."
     )
+    # And it should still have the original 5 conditions.
+    for required in ("control-cto-off", "control-cto-on", "explore",
+                     "leverage", "task-conditioned"):
+        assert required in cond_names, (
+            f"{eval_type} missing required condition {required!r}"
+        )
+
+
+def test_bug_fix_with_alternative_task_keeps_negative_context():
+    """Inverse of the above: bug-fix DOES declare alternative_task,
+    so its 6th condition runs."""
+    plan = generate_run_plan(
+        eval_type="bug-fix", target="grc", model="haiku",
+    )
+    launch = next(p for p in plan["phases"] if p["name"] == "launch")
+    cond_names = [c["name"] for c in launch["conditions"]]
+    assert "negative-context" in cond_names
