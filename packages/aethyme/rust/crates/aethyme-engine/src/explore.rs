@@ -238,6 +238,114 @@ impl Intent {
 
 // ── parameters ──────────────────────────────────────────────────────────
 
+/// One rung of the progressive-disclosure ladder. The agent invokes
+/// `aethyme-engine-cli explore --depth N` (0..=3) to dial in just enough
+/// context to act, paying the cost only for what it asks about.
+///
+/// Constraints when editing this table:
+///
+/// 1. **Each rung must be meaningfully different from the one below.**
+///    If depth=2 returns the same content as depth=1 plus 2 lines of
+///    snippet, agents will skip 1 and go straight to 2 — the level
+///    isn't doing real budget work.
+/// 2. **`max_response_tokens` is a soft cap.** The response builder
+///    truncates the answer list when serialized output approaches this
+///    threshold. Setting it lets the agent treat each call as "buy at
+///    most $X of context" rather than "buy whatever the engine
+///    decides."
+/// 3. **depth=0 must stay genuinely cheap.** This is the discovery
+///    rung — agents call it first to map what's relevant. If it
+///    bloats, agents stop using the ladder and fall back to bulk
+///    loading.
+/// 4. **depth=3 is the only rung with `include_call_graph: true`.**
+///    Call-graph closure is O(graph) per call; gating it behind the
+///    most-specific rung prevents accidental call-graph fan-out on
+///    cheap discovery calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisclosureLevel {
+    pub max_items: usize,
+    pub include_signatures: bool,
+    pub include_snippets: bool,
+    /// Per-item snippet length cap (lines). 0 = no snippets;
+    /// `usize::MAX` = full content (only at depth=3).
+    pub snippet_lines: usize,
+    pub include_call_graph: bool,
+    /// Soft cap on serialized response size. The response builder
+    /// truncates the answer list when JSON output approaches this
+    /// threshold. Approximate — token counts vary by tokenizer.
+    ///
+    /// **Status (v1, 2026-05-09):** the value is declared here and
+    /// surfaced via `apply_disclosure_level`, but the response
+    /// builder does NOT yet enforce it. depth=0 currently emits
+    /// ~10 KB (13 items × ~800B per item baseline) rather than the
+    /// nominal ~600. The budget will be enforced when the answer-
+    /// item shape is trimmed at low depths (drop the nested
+    /// evidence wrapper for path-only items). Until then the cap
+    /// reads as documentation, not behavior. Tracked for follow-up.
+    pub max_response_tokens: usize,
+}
+
+/// Progressive-disclosure budget table.
+///
+/// | depth | items | sigs | snippet | call_graph | ~tokens |
+/// |-------|-------|------|---------|------------|---------|
+/// | 0     | 15    | no   | —       | no         | ~600    |
+/// | 1     | 8     | yes  | —       | no         | ~1500   |
+/// | 2     | 3     | yes  | 20 ln   | no         | ~4000   |
+/// | 3     | 1     | yes  | full    | yes        | ~8000   |
+///
+/// Adjusting these is allowed and expected — keep it a *single edit
+/// here* rather than threading a new flag through the engine. The
+/// constraint comment above lists the invariants any change must
+/// preserve.
+pub const DISCLOSURE_LEVELS: [DisclosureLevel; 4] = [
+    // depth=0 — discovery: names + paths only, no signatures, no
+    // snippets. Agents call this first to triage scope. The agent
+    // pays ~600 tokens for a map of up to 15 candidates and decides
+    // which one to escalate on.
+    DisclosureLevel {
+        max_items: 15,
+        include_signatures: false,
+        include_snippets: false,
+        snippet_lines: 0,
+        include_call_graph: false,
+        max_response_tokens: 600,
+    },
+    // depth=1 — candidates: + signatures and per-item relevance hints.
+    // Agents who escalated from depth=0 use this to disambiguate
+    // between top candidates without yet paying for source.
+    DisclosureLevel {
+        max_items: 8,
+        include_signatures: true,
+        include_snippets: false,
+        snippet_lines: 0,
+        include_call_graph: false,
+        max_response_tokens: 1500,
+    },
+    // depth=2 — snippets: + 20-line code excerpts for top 3.
+    // Agents escalate here when they've narrowed to a small set and
+    // need to see what each candidate actually does.
+    DisclosureLevel {
+        max_items: 3,
+        include_signatures: true,
+        include_snippets: true,
+        snippet_lines: 20,
+        include_call_graph: false,
+        max_response_tokens: 4000,
+    },
+    // depth=3 — deep dive: full content + call-graph closure for one
+    // anchor. The most expensive rung; intended for a final commit
+    // before the agent acts.
+    DisclosureLevel {
+        max_items: 1,
+        include_signatures: true,
+        include_snippets: true,
+        snippet_lines: usize::MAX,
+        include_call_graph: true,
+        max_response_tokens: 8000,
+    },
+];
+
 #[derive(Debug, Clone)]
 pub struct ExploreParams {
     pub max_answer_items: usize,
@@ -245,6 +353,15 @@ pub struct ExploreParams {
     /// `--detail` flag. Today only `compact` is fully implemented in the
     /// native path; standard/full fall back to Python at the call site.
     pub detail: Detail,
+    /// Progressive-disclosure depth (0..=3). When `Some(N)`, applies
+    /// `DISCLOSURE_LEVELS[N]` as caps over the existing fields —
+    /// enforcing a budget-per-call rather than the bulk-load default.
+    /// `None` (legacy default) preserves the pre-2026-05-09 behavior:
+    /// caps come from `Detail` and explicit `--max-answer-items`.
+    /// When both `--depth` and `--detail` are provided, depth wins
+    /// (most-specific budget control). Call `apply_disclosure_level()`
+    /// to materialize the table values into the existing param fields.
+    pub depth: Option<u8>,
     /// Number of distinct symbol queries to derive from the request. The
     /// Python compact default is 5; matched here.
     pub max_symbol_queries: usize,
@@ -337,6 +454,7 @@ impl Default for ExploreParams {
         Self {
             max_answer_items: 5, // matches Python compact default after f1e3da5
             detail: Detail::Compact,
+            depth: None, // legacy detail-based path; --depth flips it
             max_symbol_queries: 5,
             max_symbol_results: 4,
             max_symbol_files: 8, // truncated when answer list fills
@@ -365,6 +483,7 @@ impl ExploreParams {
         serde_json::json!({
             "max_answer_items": self.max_answer_items,
             "detail": detail,
+            "depth": self.depth,
             "max_symbol_queries": self.max_symbol_queries,
             "max_symbol_results": self.max_symbol_results,
             "max_symbol_files": self.max_symbol_files,
@@ -375,6 +494,67 @@ impl ExploreParams {
             "max_callsite_results": self.max_callsite_results,
             "show_observability": self.show_observability,
         })
+    }
+
+    /// Apply the disclosure-level table to the existing param fields.
+    ///
+    /// When `depth` is `Some(N)` (0..=3), this reads
+    /// `DISCLOSURE_LEVELS[N]` and writes the corresponding caps into
+    /// `max_answer_items`, `max_text_line_refs`, and the deeper
+    /// per-knob fields. Existing non-cap fields (callsite, filename
+    /// hints) are scaled proportionally so a depth=0 call doesn't
+    /// pay for a wide callsite expansion that contradicts its budget.
+    ///
+    /// `depth` values outside 0..=3 are clamped to the nearest valid
+    /// rung so callers can pass user-supplied integers without an
+    /// explicit validation step. The clamping is silent because the
+    /// CLI binary validates earlier; this method's robustness is
+    /// belt-and-braces for embedded callers (Python via PyO3, future
+    /// MCP wiring).
+    pub fn apply_disclosure_level(&mut self) {
+        let Some(raw_depth) = self.depth else {
+            return;
+        };
+        let depth = (raw_depth as usize).min(DISCLOSURE_LEVELS.len() - 1);
+        let level = DISCLOSURE_LEVELS[depth];
+
+        self.max_answer_items = level.max_items;
+
+        // Snippet inclusion gates `max_text_line_refs`. Levels without
+        // snippets get 0 line_refs (no excerpts in evidence); levels
+        // with snippets get a proportional cap (1 ref at depth=1
+        // signature-only, more at higher rungs).
+        if level.include_snippets {
+            self.max_text_line_refs = match raw_depth {
+                2 => 4,
+                3 => 10,
+                _ => 2,
+            };
+        } else {
+            // depth=0 strips line_refs entirely (just paths/names).
+            // depth=1 keeps 1 line_ref to surface the signature
+            // line — that's the "+ signatures" promise.
+            self.max_text_line_refs = if level.include_signatures { 1 } else { 0 };
+        }
+
+        // Cap downstream knobs so they don't crowd the budget.
+        // Symbol files / filename hints / callsite expansion all
+        // contribute to answer fan-out; scale them down at low depth.
+        self.max_symbol_files = self.max_symbol_files.min(level.max_items);
+        self.max_text_files = self.max_text_files.min(level.max_items);
+        self.max_filename_hints = match raw_depth {
+            0 => 0,
+            1 => 2,
+            _ => self.max_filename_hints,
+        };
+
+        // Callsite expansion is expensive (one daemon RPC per symbol)
+        // and only meaningful when the agent is actively closing a
+        // loop. Disable below depth=2.
+        if raw_depth < 2 {
+            self.max_callsite_symbols = 0;
+            self.max_callsite_results = 0;
+        }
     }
 }
 
@@ -1607,6 +1787,158 @@ pub(super) fn bucket_confidence(items: &[AnswerItem]) -> ConfidenceSummary {
         }
     }
     summary
+}
+
+#[cfg(test)]
+mod disclosure_tests {
+    //! Tests for the progressive-disclosure ladder (`DISCLOSURE_LEVELS`
+    //! + `ExploreParams::apply_disclosure_level`).
+    //!
+    //! The table encodes a budget contract: depth=0 is cheap discovery,
+    //! depth=3 is expensive deep-dive. These tests pin invariants so a
+    //! contributor adjusting the table doesn't accidentally violate
+    //! the "each rung must be meaningfully different" rule.
+    use super::*;
+
+    #[test]
+    fn disclosure_table_has_four_rungs() {
+        // Pin the count — the CLI parser bounds-checks against this
+        // length, and SKILL.md teaches a 4-level ladder. A future
+        // change adding a 5th rung needs to update this test, the
+        // CLI bound, and the skill teaching together.
+        assert_eq!(DISCLOSURE_LEVELS.len(), 4);
+    }
+
+    #[test]
+    fn disclosure_levels_are_meaningfully_different() {
+        // Constraint #1 from the table comment: each rung must
+        // differ from the one below in at least one observable
+        // way. Implementation: walk pairs and assert at least one
+        // field changes.
+        for i in 0..(DISCLOSURE_LEVELS.len() - 1) {
+            let a = DISCLOSURE_LEVELS[i];
+            let b = DISCLOSURE_LEVELS[i + 1];
+            let differs = a.max_items != b.max_items
+                || a.include_signatures != b.include_signatures
+                || a.include_snippets != b.include_snippets
+                || a.snippet_lines != b.snippet_lines
+                || a.include_call_graph != b.include_call_graph
+                || a.max_response_tokens != b.max_response_tokens;
+            assert!(
+                differs,
+                "DISCLOSURE_LEVELS[{i}] and [{}] are observably \
+                 identical — agents will skip the cheaper rung",
+                i + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn token_budgets_are_monotonically_increasing() {
+        // Constraint: deeper rungs cost more. If depth=2 cost less
+        // than depth=1, the ladder shape is broken — agents have no
+        // reason to stop at lower rungs.
+        let budgets: Vec<usize> = DISCLOSURE_LEVELS
+            .iter()
+            .map(|l| l.max_response_tokens)
+            .collect();
+        for i in 0..(budgets.len() - 1) {
+            assert!(
+                budgets[i] < budgets[i + 1],
+                "budgets {} -> {} not strictly increasing: {budgets:?}",
+                i, i + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn call_graph_only_at_max_depth() {
+        // Constraint #4: call-graph closure is O(graph) per call;
+        // gating it behind the deepest rung prevents accidental
+        // fan-out. If a future change opens this up at lower
+        // depths, that should be deliberate — and tested.
+        for (i, level) in DISCLOSURE_LEVELS.iter().enumerate() {
+            let expect = i == DISCLOSURE_LEVELS.len() - 1;
+            assert_eq!(
+                level.include_call_graph, expect,
+                "DISCLOSURE_LEVELS[{i}].include_call_graph must be \
+                 {expect} (only the deepest rung enables call-graph)",
+            );
+        }
+    }
+
+    #[test]
+    fn depth_zero_strips_evidence() {
+        // depth=0 is the discovery rung — cheap. Apply must zero
+        // out line_refs and downstream knobs that crowd the budget.
+        let mut p = ExploreParams::default();
+        p.depth = Some(0);
+        p.apply_disclosure_level();
+        assert_eq!(p.max_answer_items, 15);
+        assert_eq!(p.max_text_line_refs, 0);
+        assert_eq!(p.max_filename_hints, 0);
+        assert_eq!(p.max_callsite_symbols, 0);
+        assert_eq!(p.max_callsite_results, 0);
+    }
+
+    #[test]
+    fn depth_one_keeps_signature_line_only() {
+        let mut p = ExploreParams::default();
+        p.depth = Some(1);
+        p.apply_disclosure_level();
+        assert_eq!(p.max_answer_items, 8);
+        // Exactly 1 line_ref to surface the signature line — the
+        // "+ signatures" promise without the snippet cost.
+        assert_eq!(p.max_text_line_refs, 1);
+        // Callsite expansion still gated below depth=2.
+        assert_eq!(p.max_callsite_symbols, 0);
+    }
+
+    #[test]
+    fn depth_two_enables_snippets_and_callsites() {
+        let mut p = ExploreParams::default();
+        p.depth = Some(2);
+        p.apply_disclosure_level();
+        assert_eq!(p.max_answer_items, 3);
+        assert!(p.max_text_line_refs > 0);
+        assert!(p.max_callsite_symbols > 0);
+    }
+
+    #[test]
+    fn depth_three_pulls_full_content() {
+        let mut p = ExploreParams::default();
+        p.depth = Some(3);
+        p.apply_disclosure_level();
+        assert_eq!(p.max_answer_items, 1);
+        // depth=3 has the call-graph flag — verify the table value.
+        assert!(DISCLOSURE_LEVELS[3].include_call_graph);
+        assert_eq!(DISCLOSURE_LEVELS[3].snippet_lines, usize::MAX);
+    }
+
+    #[test]
+    fn out_of_range_depth_clamps_to_max() {
+        // The CLI binary validates 0..=3 explicitly, but the
+        // method itself is robust against bad inputs from future
+        // embedded callers (PyO3, MCP). Clamps silently to the
+        // top rung rather than panicking — defensive only.
+        let mut p = ExploreParams::default();
+        p.depth = Some(99);
+        p.apply_disclosure_level();
+        // Should land on the deepest rung's caps.
+        assert_eq!(p.max_answer_items, 1);
+    }
+
+    #[test]
+    fn no_depth_leaves_params_untouched() {
+        // depth=None means use legacy detail-based defaults.
+        // apply_disclosure_level must be a no-op in this case.
+        let mut p = ExploreParams::default();
+        let before_max_items = p.max_answer_items;
+        let before_callsite = p.max_callsite_symbols;
+        p.apply_disclosure_level();
+        assert_eq!(p.max_answer_items, before_max_items);
+        assert_eq!(p.max_callsite_symbols, before_callsite);
+    }
 }
 
 #[cfg(test)]

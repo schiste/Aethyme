@@ -795,6 +795,24 @@ fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
+    // --depth N (0..=3) selects a rung on the progressive-disclosure
+    // ladder defined in `DISCLOSURE_LEVELS`. Overrides --detail and
+    // --max-answer-items when set: the depth table is the budget,
+    // not the per-knob defaults. When --depth is omitted, behavior is
+    // pre-2026-05-09 (legacy detail-based path).
+    let depth: Option<u8> = match read_option(args, "--depth") {
+        Ok(s) => match s.parse::<u8>() {
+            Ok(n) if (n as usize) < aethyme_engine::explore::DISCLOSURE_LEVELS.len() => Some(n),
+            Ok(n) => {
+                return Err(format!(
+                    "explore: --depth {n} out of range (0..={})",
+                    aethyme_engine::explore::DISCLOSURE_LEVELS.len() - 1,
+                ));
+            }
+            Err(e) => return Err(format!("explore: --depth must be 0..=3: {e}")),
+        },
+        Err(_) => None,
+    };
     // --show-observability toggles richer observability shaping in the
     // response. Default is compact; setting the flag mirrors Python's
     // `--show-observability` at cli.py:396-401.
@@ -838,12 +856,18 @@ fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
         other => return Err(format!("explore: unknown --intent {other:?}")),
     };
 
-    let params = aethyme_engine::explore::ExploreParams {
+    let mut params = aethyme_engine::explore::ExploreParams {
         max_answer_items,
         detail: detail_enum,
+        depth,
         show_observability,
         ..aethyme_engine::explore::ExploreParams::default()
     };
+    // When --depth is set, the disclosure-level table overrides the
+    // per-knob defaults. Apply AFTER struct construction so the
+    // table values land on the right fields without callers having
+    // to remember the order.
+    params.apply_disclosure_level();
 
     let repo = PathBuf::from(&repo_str);
     if !repo.is_dir() {
