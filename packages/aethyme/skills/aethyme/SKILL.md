@@ -103,6 +103,68 @@ finalizing.
 For very large repositories where first-response speed is more important than
 graph coverage, pass `--params '{"graph_query_timeout_ms":500}'`.
 
+### Progressive Disclosure: `--depth`
+
+`explore` accepts a `--depth N` flag (0..=3) that puts you on a four-rung
+ladder of context cost. Lower rungs are cheap and broad; higher rungs are
+expensive and specific. Use this when you want to spend tokens deliberately
+rather than absorb a large bulk response.
+
+Inventory (one line each — call once and you'll see the shape):
+
+- `--depth 0`: paths + names for many candidates. **Discovery.**
+- `--depth 1`: paths + names + signatures for a shorter list. **Triage.**
+- `--depth 2`: + 20-line snippets for the top few. **Read the code.**
+- `--depth 3`: + full content + call-graph closure for one anchor. **Commit.**
+
+**When to use which.** This is the part that matters; the level inventory
+above is just so you recognize the shapes. Two heuristics:
+
+1. **Start at 0 unless you already know the symbol.** If the user said "fix
+   the bug in `WatchedItemStore::handleDelete`", you don't need discovery —
+   skip to `--depth 2` or `--depth 3` on that anchor. If the user said "fix
+   the bug where deleted users still appear in shared resources", you don't
+   yet know which file to read; start at `--depth 0` to triage.
+
+2. **Escalate one rung at a time. Stop when you have enough to act.** Each
+   escalation roughly 2-3× the previous rung's cost. If you're at `--depth 1`
+   with 8 candidates and one of them is clearly right, jump to `--depth 3`
+   on that one anchor — don't pay `--depth 2` first as a formality. Conversely,
+   if `--depth 0` returns 15 candidates and several look plausible, escalate
+   to `--depth 1` on the same query (now you see signatures) before picking
+   a single anchor for `--depth 2`.
+
+**What "escalate" means in practice.** Two shapes:
+
+- **Same query, deeper level.** Same `--request` string, bump `--depth`. Use
+  this when you want to keep the same triage but pay for richer evidence.
+
+  ```bash
+  "$AETHYME_BIN" explore --repo "$REPO" --request "permission share grants" --depth 0
+  # Reads ~15 candidate paths/names. Pick one to escalate.
+  "$AETHYME_BIN" explore --repo "$REPO" --request "permission share grants" --depth 1
+  # Same triage with signatures attached.
+  ```
+
+- **Narrower query, deeper level.** Reformulate the request around a single
+  candidate from the previous rung. Use this when one rung's output already
+  identified the anchor.
+
+  ```bash
+  "$AETHYME_BIN" explore --repo "$REPO" --request "permission share grants" --depth 0
+  # depth 0 surfaces rbac-canonical.ts as the top hit.
+  "$AETHYME_BIN" explore --repo "$REPO" --request "PERMISSION_IMPLICATIONS Action.MANAGE share" --depth 3
+  # Pulled full content + call graph for the specific anchor.
+  ```
+
+**When NOT to escalate.** If `--depth 0` already gives you a single
+unambiguous candidate AND you can verify it with `Read` or `grep` directly,
+do that — don't pay for a second engine call. The depth ladder is for cases
+where the first rung's information genuinely doesn't answer your question.
+
+The legacy `--detail compact|standard|full` flag still works for callers who
+prefer the older budget vocabulary; when both are passed, `--depth` wins.
+
 ### Repository Orientation
 ```bash
 # Repo-level graph overview

@@ -441,6 +441,22 @@ def _build_bug_fix_reference() -> dict[str, Any]:
 _LEVERAGE_NAV_CONTEXT_PATH = "/tmp/aethyme-eval-navigation-context.json"
 _NEGATIVE_NAV_CONTEXT_PATH = "/tmp/aethyme-eval-negative-navigation-context.json"
 
+# Leverage's preamble is a *minimal pointer* at the deployed skill —
+# no nav-context blob path, no per-task command examples, no intent
+# names. The 2026-05-09 trim revealed that the prior blob-reference
+# preamble inflated leverage cost via cache-create overhead without
+# changing tool usage; the minimal pointer aligns leverage with the
+# `_LEVERAGE_HINT` pattern in `prompts.py` and turns leverage into
+# a pure discoverability+pointer test (vs explore's pure
+# discoverability test).
+_LEVERAGE_MINIMAL_POINTER = (
+    "Aethyme is available in this repository. See "
+    "`.codex/skills/aethyme/SKILL.md` for usage; the wrapper at "
+    "`.codex/skills/aethyme/aethyme-explore` is the convenience "
+    "entry point. Use `--depth 0` first to triage scope, escalate "
+    "one rung at a time. Verify its output before acting on it.\n\n"
+)
+
 
 def _build_bug_fix_prompt(
     repo_path: Path,
@@ -455,16 +471,16 @@ def _build_bug_fix_prompt(
     - ``"baseline"`` (control + explore + task-conditioned): no preamble.
       Agents either don't have the skill (control) or have it without
       explicit instruction (explore).
-    - ``"leverage"``: minimal pointer at the *real* nav-context file.
-    - ``"negative-context"``: minimal pointer at the *plausibly-wrong*
-      nav-context file. Same shape as leverage on purpose — the agent
-      can't tell from the prompt alone that the file is wrong.
+    - ``"leverage"``: minimal pointer at the deployed SKILL.md. No
+      nav-context blob path — the agent invokes the live tool on
+      demand via the depth ladder.
+    - ``"negative-context"``: pointer at the *plausibly-wrong*
+      nav-context blob file (asymmetric with leverage by design —
+      this condition tests trust calibration when the agent is
+      handed wrong context upfront).
     """
     if condition == "leverage":
-        preamble = (
-            "Use Aethyme tools to navigate the repository graph.\n"
-            f"Navigation context is available at {_LEVERAGE_NAV_CONTEXT_PATH}\n\n"
-        )
+        preamble = _LEVERAGE_MINIMAL_POINTER
     elif condition == "negative-context":
         preamble = (
             "Use Aethyme tools to navigate the repository graph.\n"

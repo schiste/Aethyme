@@ -69,50 +69,68 @@ def test_negative_context_is_aethyme_condition():
 
 def test_negative_context_prompt_points_at_negative_file():
     """The negative-context condition's prompt must reference the
-    *plausibly-wrong* nav-context path, not the real one. If the
-    paths get crossed the condition silently degenerates to leverage."""
+    *plausibly-wrong* nav-context path. Asymmetric with leverage by
+    design — leverage uses a minimal pointer (no blob path); only
+    negative-context has the blob reference, because that's the
+    whole point of the condition."""
     prompt = _build_bug_fix_prompt(
         Path("/tmp/repo"), "task", condition="negative-context",
     )
     assert _NEGATIVE_NAV_CONTEXT_PATH in prompt
+    # The leverage blob path must NOT leak — agents shouldn't see it
+    # via the negative-context prompt.
     assert _LEVERAGE_NAV_CONTEXT_PATH not in prompt
 
 
-def test_leverage_prompt_points_at_real_file():
+def test_leverage_prompt_uses_minimal_pointer_not_blob_path():
+    """As of 2026-05-09, the leverage condition tests the depth
+    ladder rather than a pre-loaded blob. The prompt must point at
+    SKILL.md (and the wrapper) without naming a blob file path —
+    this is the trim that revealed the negative discoverability gap
+    on the prior eval. Reverting this would re-inflate leverage cost
+    via cache-create overhead and is eval-tuning by another name."""
     prompt = _build_bug_fix_prompt(
         Path("/tmp/repo"), "task", condition="leverage",
     )
-    assert _LEVERAGE_NAV_CONTEXT_PATH in prompt
+    assert "SKILL.md" in prompt, (
+        "leverage preamble must point at SKILL.md (minimal pointer)"
+    )
+    assert _LEVERAGE_NAV_CONTEXT_PATH not in prompt, (
+        "leverage prompt must NOT reference the nav-context blob path. "
+        "If you're trying to add the blob back, see the cardinal-rule "
+        "section in eval-protocol.md and `eval-tuning-rejected.md`."
+    )
     assert _NEGATIVE_NAV_CONTEXT_PATH not in prompt
 
 
-def test_baseline_prompt_has_no_nav_context_pointer():
-    """Control / explore / task-conditioned must not name either
-    nav-context file — they're either skill-less (control) or
+def test_baseline_prompt_has_no_aethyme_pointer():
+    """Control / explore / task-conditioned must not name SKILL.md
+    or any blob path — they're either skill-less (control) or
     discoverability-only (explore/task-conditioned)."""
     prompt = _build_bug_fix_prompt(
         Path("/tmp/repo"), "task", condition="baseline",
     )
+    assert "SKILL.md" not in prompt
     assert _LEVERAGE_NAV_CONTEXT_PATH not in prompt
     assert _NEGATIVE_NAV_CONTEXT_PATH not in prompt
 
 
-def test_leverage_and_negative_prompts_share_body():
-    """Beyond the preamble, the two prompts must be byte-identical.
-    Otherwise we're measuring something other than "did the wrong
-    context mislead the agent"."""
+def test_leverage_and_negative_share_task_body():
+    """Beyond their (asymmetric) preambles, the two prompts must
+    share the same task body. Different bodies would mean we're
+    measuring something other than 'did the wrong context mislead
+    the agent'."""
     leverage = _build_bug_fix_prompt(
         Path("/tmp/repo"), "task", condition="leverage",
     )
     negative = _build_bug_fix_prompt(
         Path("/tmp/repo"), "task", condition="negative-context",
     )
-    # Strip the preamble line that names the nav-context path; the
-    # rest must match.
+
     def _body_after_preamble(text: str) -> str:
-        # Both prompts have a 2-line preamble + blank line, then body.
+        # Both prompts have preamble + blank line + body. Find the
+        # first "A test is failing" line and return from there.
         lines = text.splitlines()
-        # Find the first "A test is failing" line, return from there.
         for i, line in enumerate(lines):
             if line.startswith("A test is failing"):
                 return "\n".join(lines[i:])
