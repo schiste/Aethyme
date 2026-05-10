@@ -125,6 +125,12 @@ CONDITIONS: tuple[ConditionSpec, ...] = (
     ConditionSpec("explore", None, True, "aethyme", "baseline"),
     ConditionSpec("leverage", None, True, "aethyme", "leverage"),
     ConditionSpec("task-conditioned", None, True, "aethyme", "task-conditioned"),
+    # Trust-calibration condition (added 2026-05-09). Same skill + nav-context
+    # *file* as leverage, but the file is a plausibly-wrong nav-context
+    # generated against a sibling task in the same module. Isolates loading
+    # cost (what leverage pays for blob ingestion) from misdirection cost
+    # (what an agent loses by trusting the wrong content).
+    ConditionSpec("negative-context", None, True, "aethyme", "negative-context"),
 )
 
 
@@ -156,6 +162,18 @@ _EVAL_TYPE_DEFAULTS: dict[str, dict[str, Any]] = {
         "task": (
             "Fix failing test: manage permission does not imply share "
             "in ability-implications.test.ts"
+        ),
+        # Sibling task used by the negative-context condition's
+        # plausibly-wrong nav-context generator. Same package family
+        # (auth) and conceptually adjacent (user-lifecycle vs permission
+        # implications) — should land in the 30%-50% identifier-overlap
+        # band that yields a "moderate mismatch difficulty" test.
+        # The candidate must satisfy the 5-property plausibility rule
+        # in `bug_fix.generate_plausible_error_context` at runtime; if
+        # it doesn't, either widen the alternative or pick a closer one.
+        "alternative_task": (
+            "Fix bug: deleted users still appear in shared resource "
+            "lists in the auth package"
         ),
         "objective": (
             "Compare cost across conditions to fix the failing "
@@ -611,16 +629,26 @@ def _build_prepare_phase(
 
     if eval_type == "bug-fix":
         scenario_flag = f" --scenario {scenario}" if scenario else ""
+        # Propagate the alternative task for the negative-context condition.
+        # Single-quoted in shell to survive embedded apostrophes / commas;
+        # task strings shouldn't contain single quotes (we control them in
+        # `_EVAL_TYPE_DEFAULTS`), but if a future contributor adds one,
+        # the CLI will surface a clear shell error rather than silently
+        # truncate.
+        alt_task = _EVAL_TYPE_DEFAULTS[eval_type].get("alternative_task")
+        alt_flag = f" --alternative-task '{alt_task}'" if alt_task else ""
         cli_cmd = (
             f"cd {pkg} && {venv} -m src.cli eval bug-fix prepare"
             f" --source '{target.control_path}'"
             f" --dest '{dest_dir}'"
             f"{scenario_flag}"
+            f"{alt_flag}"
             f" --json-output"
         )
         description = (
-            f"Clone 4 repos from {target.display_name} control, "
-            f"plant bug, generate all artifacts"
+            f"Clone {len(CONDITIONS)} repos from {target.display_name} "
+            f"control, plant bug, generate all artifacts (incl. negative "
+            f"nav-context)"
         )
     elif eval_type in ("bug-fix-1", "dead-code", "impact-analysis",
                        "feature-localization", "config-audit", "migration"):

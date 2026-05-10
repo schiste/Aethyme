@@ -2013,6 +2013,17 @@ def eval_bug_fix_generate(repo_path: Path, task_text: str, json_output: bool) ->
     "--task", "task_text", default=None, help="Task description (auto-set per scenario)"
 )
 @click.option(
+    "--alternative-task",
+    "alternative_task",
+    default=None,
+    help=(
+        "Sibling task used to generate the negative-context condition's "
+        "plausibly-wrong nav-context. Omit to skip — the negative-context "
+        "condition then falls back to the real nav-context (orchestrator "
+        "marks status=fallback_no_alternative)."
+    ),
+)
+@click.option(
     "--scenario",
     type=click.Choice(["implication-share", "cross-package"]),
     default="implication-share",
@@ -2021,16 +2032,23 @@ def eval_bug_fix_generate(repo_path: Path, task_text: str, json_output: bool) ->
 )
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def eval_bug_fix_prepare(
-    source: Path, dest: Path, task_text: str | None, scenario: str, json_output: bool
+    source: Path, dest: Path, task_text: str | None,
+    alternative_task: str | None, scenario: str, json_output: bool,
 ) -> None:
-    """One-step: clone 4 repos, plant bug, generate all artifacts."""
+    """One-step: clone repos, plant bug, generate all artifacts."""
     try:
         if scenario == "cross-package":
             task = task_text or DEFAULT_CROSS_PACKAGE_TASK
+            # cross-package doesn't yet support negative-context; the
+            # alternative_task flag is ignored here. Future: add the same
+            # plumbing once we have a sibling task in app-shared/.
             result = prepare_cross_package_benchmark(source, dest, task=task)
         else:
             task = task_text or DEFAULT_BUG_FIX_TASK
-            result = prepare_bug_fix_benchmark(source, dest, task=task)
+            result = prepare_bug_fix_benchmark(
+                source, dest, task=task,
+                alternative_task=alternative_task,
+            )
     except EngineError as exc:
         raise click.ClickException(str(exc)) from exc
 

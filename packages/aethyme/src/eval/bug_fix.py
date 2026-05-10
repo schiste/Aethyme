@@ -231,23 +231,33 @@ def prepare_bug_fix_benchmark(
     dest_dir: Path,
     task: str = DEFAULT_TASK,
     *,
+    alternative_task: str | None = None,
     auto_cleanup: bool = True,
     cleanup_delay: float = _CLEANUP_DELAY_SECONDS,
 ) -> dict[str, Any]:
-    """Create 4 isolated clones, plant the bug in each, and generate all artifacts.
+    """Create one clone per condition, plant the bug, generate all artifacts.
 
     Each condition gets its own repo clone so agents can't contaminate each
     other (e.g. one fixing the bug before the next runs).
 
+    When *alternative_task* is provided, also generates a plausibly-wrong
+    nav-context for the negative-context condition (built by running the
+    same generator on the same repo against the alternative task; the 5-
+    property plausibility rule is enforced via
+    ``generate_plausible_error_context``). When omitted, the negative-
+    context condition still gets a clone but its nav-context file falls
+    back to the real one — making the condition equivalent to leverage,
+    which the orchestrator can detect via the artifacts dict.
+
     When *auto_cleanup* is True (default), schedules deletion of *dest_dir*
-    after *cleanup_delay* seconds (default 5 min).  The timer handle is
-    returned under ``cleanup_timer`` — call ``.cancel()`` to keep the clones.
+    after *cleanup_delay* seconds. The timer handle is returned under
+    ``cleanup_timer`` — call ``.cancel()`` to keep the clones.
 
     Returns dict with repos, prompts, artifacts paths, and shared eval data.
     """
-    from .repos import AETHYME_CONDITIONS, CONDITION_NAMES, create_condition_repos
+    from .repos import CONDITION_NAMES, create_condition_repos
 
-    # 1. Create 4 independent clones
+    # 1. Create one independent clone per condition
     repos = create_condition_repos(source, dest_dir)
 
     # 2. Plant bug + create test in every clone
@@ -255,15 +265,51 @@ def prepare_bug_fix_benchmark(
     for cond, repo_path in repos.items():
         setup_results[cond] = setup_bug_fix(repo_path)
 
-    # 3. Build per-condition prompts (each embeds its own repo path)
+    # 3. Build per-condition prompts (each embeds its own repo path).
+    # Three distinct prompt shapes:
+    #   - leverage / negative-context: pointer at a nav-context file
+    #   - everything else: bare task body
     prompts: dict[str, str] = {}
     for cond, repo_path in repos.items():
-        leverage = cond in AETHYME_CONDITIONS and cond == "leverage"
-        prompts[cond] = _build_bug_fix_prompt(repo_path, task, leverage=leverage)
+        if cond == "leverage":
+            prompt_condition = "leverage"
+        elif cond == "negative-context":
+            prompt_condition = "negative-context"
+        else:
+            prompt_condition = "baseline"
+        prompts[cond] = _build_bug_fix_prompt(
+            repo_path, task, condition=prompt_condition
+        )
 
-    # 4. Build navigation context from the leverage clone
+    # 4. Build navigation contexts.
+    # Real nav-context (leverage) — generated against the actual task.
     leverage_repo = repos["leverage"]
     navigation_context = _build_navigation_context(leverage_repo, task)
+
+    # Negative nav-context (plausibly-wrong) — generated against an
+    # alternative task in the same repo, validated by the 5-property
+    # plausibility rule. If the candidate fails plausibility (e.g. the
+    # alternative task produces too narrow an anchor set), we fall back
+    # to the real nav-context — measured behavior degenerates to a
+    # leverage replay and the orchestrator can detect this via
+    # `negative_context_status` in the result.
+    negative_navigation_context: dict[str, Any] = navigation_context
+    negative_status = "fallback_no_alternative"
+    if alternative_task:
+        negative_repo = repos.get("negative-context")
+        if negative_repo is not None:
+            try:
+                negative_navigation_context = generate_plausible_error_context(
+                    navigation_context,
+                    repo_path=negative_repo,
+                    alternative_task=alternative_task,
+                )
+                negative_status = "ok"
+            except PlausibilityError as exc:
+                # Fall back to the real context but record why. The
+                # orchestrator surfaces this in the report so a reader
+                # knows the condition didn't run as intended.
+                negative_status = f"fallback_plausibility_failed: {exc}"
 
     # 5. Shared artifacts
     reference = _build_bug_fix_reference()
@@ -289,9 +335,13 @@ def prepare_bug_fix_benchmark(
     Path(rubric_path).write_text(json.dumps(scoring_rubric, indent=2))
     artifact_paths["scoring_rubric"] = rubric_path
 
-    nav_path = "/tmp/aethyme-eval-navigation-context.json"
+    nav_path = _LEVERAGE_NAV_CONTEXT_PATH
     Path(nav_path).write_text(json.dumps(navigation_context, indent=2))
     artifact_paths["navigation_context"] = nav_path
+
+    neg_nav_path = _NEGATIVE_NAV_CONTEXT_PATH
+    Path(neg_nav_path).write_text(json.dumps(negative_navigation_context, indent=2))
+    artifact_paths["negative_navigation_context"] = neg_nav_path
 
     result = {
         "repos": {cond: str(path) for cond, path in repos.items()},
@@ -302,6 +352,8 @@ def prepare_bug_fix_benchmark(
         "output_schema": output_schema,
         "scoring_rubric": scoring_rubric,
         "navigation_context": navigation_context,
+        "negative_navigation_context": negative_navigation_context,
+        "negative_context_status": negative_status,
         "test_commands": {
             "fix_test": f"npx vitest run {TEST_REL}",
             "regression_test": "npx vitest run packages/auth/src/__tests__/",
@@ -386,16 +438,40 @@ def _build_bug_fix_reference() -> dict[str, Any]:
     }
 
 
-def _build_bug_fix_prompt(repo_path: Path, task: str, *, leverage: bool = False) -> str:
-    """Build the bug-fix prompt for control/explore or leverage conditions.
+_LEVERAGE_NAV_CONTEXT_PATH = "/tmp/aethyme-eval-navigation-context.json"
+_NEGATIVE_NAV_CONTEXT_PATH = "/tmp/aethyme-eval-negative-navigation-context.json"
 
-    All conditions get the same core prompt with test failure information.
-    Leverage additionally gets a nudge to use Aethyme tools.
+
+def _build_bug_fix_prompt(
+    repo_path: Path,
+    task: str,
+    *,
+    condition: str = "baseline",
+) -> str:
+    """Build the bug-fix prompt for one of three condition shapes.
+
+    Body is identical across conditions — only the preamble varies:
+
+    - ``"baseline"`` (control + explore + task-conditioned): no preamble.
+      Agents either don't have the skill (control) or have it without
+      explicit instruction (explore).
+    - ``"leverage"``: minimal pointer at the *real* nav-context file.
+    - ``"negative-context"``: minimal pointer at the *plausibly-wrong*
+      nav-context file. Same shape as leverage on purpose — the agent
+      can't tell from the prompt alone that the file is wrong.
     """
-    preamble = (
-        "Use Aethyme tools to navigate the repository graph.\n"
-        "Navigation context is available at /tmp/aethyme-eval-navigation-context.json\n\n"
-    ) if leverage else ""
+    if condition == "leverage":
+        preamble = (
+            "Use Aethyme tools to navigate the repository graph.\n"
+            f"Navigation context is available at {_LEVERAGE_NAV_CONTEXT_PATH}\n\n"
+        )
+    elif condition == "negative-context":
+        preamble = (
+            "Use Aethyme tools to navigate the repository graph.\n"
+            f"Navigation context is available at {_NEGATIVE_NAV_CONTEXT_PATH}\n\n"
+        )
+    else:
+        preamble = ""
 
     return (
         f"{preamble}"

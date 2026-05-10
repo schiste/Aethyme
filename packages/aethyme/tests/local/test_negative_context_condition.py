@@ -1,0 +1,226 @@
+"""Tests for the negative-context condition wiring.
+
+The 6th condition is plumbed across `repos.py` (CONDITION_NAMES,
+AETHYME_CONDITIONS), `orchestrator.py` (CONDITIONS,
+_EVAL_TYPE_DEFAULTS), `bug_fix.py` (prompt builder, prepare), and
+the CLI (`--alternative-task` flag).
+
+These tests pin the alignment so a future refactor that updates one
+list without the other trips a deterministic failure.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+
+from src.eval.bug_fix import (
+    _LEVERAGE_NAV_CONTEXT_PATH,
+    _NEGATIVE_NAV_CONTEXT_PATH,
+    _build_bug_fix_prompt,
+)
+from src.eval.orchestrator import (
+    CONDITIONS,
+    _EVAL_TYPE_DEFAULTS,
+    generate_run_plan,
+)
+from src.eval.repos import AETHYME_CONDITIONS, CONDITION_NAMES
+
+
+# ---------------------------------------------------------------------------
+# Alignment between CONDITION_NAMES (repos.py) and CONDITIONS (orchestrator)
+# ---------------------------------------------------------------------------
+
+
+def test_condition_names_match_orchestrator_conditions():
+    """The two parallel arrays must list the same condition names in
+    the same order. Repos clones one dir per CONDITION_NAMES entry;
+    the orchestrator launches one tab per CONDITIONS entry. A
+    mismatch silently breaks the launch phase."""
+    repos_names = CONDITION_NAMES
+    orch_names = tuple(c.name for c in CONDITIONS)
+    assert repos_names == orch_names, (
+        f"CONDITION_NAMES vs orchestrator.CONDITIONS drifted:\n"
+        f"  repos.py:        {repos_names}\n"
+        f"  orchestrator.py: {orch_names}"
+    )
+
+
+def test_negative_context_present_in_both_arrays():
+    """Sanity: the new condition is wired through, not orphaned."""
+    assert "negative-context" in CONDITION_NAMES
+    assert "negative-context" in {c.name for c in CONDITIONS}
+
+
+def test_negative_context_is_aethyme_condition():
+    """The condition gets the deployed skill — agent has live tools to
+    detect/correct misdirection. This is what makes the test mirror a
+    stale-graph production scenario rather than a pure deception trick."""
+    assert "negative-context" in AETHYME_CONDITIONS
+
+
+# ---------------------------------------------------------------------------
+# Prompt builder
+# ---------------------------------------------------------------------------
+
+
+def test_negative_context_prompt_points_at_negative_file():
+    """The negative-context condition's prompt must reference the
+    *plausibly-wrong* nav-context path, not the real one. If the
+    paths get crossed the condition silently degenerates to leverage."""
+    prompt = _build_bug_fix_prompt(
+        Path("/tmp/repo"), "task", condition="negative-context",
+    )
+    assert _NEGATIVE_NAV_CONTEXT_PATH in prompt
+    assert _LEVERAGE_NAV_CONTEXT_PATH not in prompt
+
+
+def test_leverage_prompt_points_at_real_file():
+    prompt = _build_bug_fix_prompt(
+        Path("/tmp/repo"), "task", condition="leverage",
+    )
+    assert _LEVERAGE_NAV_CONTEXT_PATH in prompt
+    assert _NEGATIVE_NAV_CONTEXT_PATH not in prompt
+
+
+def test_baseline_prompt_has_no_nav_context_pointer():
+    """Control / explore / task-conditioned must not name either
+    nav-context file — they're either skill-less (control) or
+    discoverability-only (explore/task-conditioned)."""
+    prompt = _build_bug_fix_prompt(
+        Path("/tmp/repo"), "task", condition="baseline",
+    )
+    assert _LEVERAGE_NAV_CONTEXT_PATH not in prompt
+    assert _NEGATIVE_NAV_CONTEXT_PATH not in prompt
+
+
+def test_leverage_and_negative_prompts_share_body():
+    """Beyond the preamble, the two prompts must be byte-identical.
+    Otherwise we're measuring something other than "did the wrong
+    context mislead the agent"."""
+    leverage = _build_bug_fix_prompt(
+        Path("/tmp/repo"), "task", condition="leverage",
+    )
+    negative = _build_bug_fix_prompt(
+        Path("/tmp/repo"), "task", condition="negative-context",
+    )
+    # Strip the preamble line that names the nav-context path; the
+    # rest must match.
+    def _body_after_preamble(text: str) -> str:
+        # Both prompts have a 2-line preamble + blank line, then body.
+        lines = text.splitlines()
+        # Find the first "A test is failing" line, return from there.
+        for i, line in enumerate(lines):
+            if line.startswith("A test is failing"):
+                return "\n".join(lines[i:])
+        return text
+
+    assert _body_after_preamble(leverage) == _body_after_preamble(negative)
+
+
+# ---------------------------------------------------------------------------
+# _EVAL_TYPE_DEFAULTS — alternative_task is declared
+# ---------------------------------------------------------------------------
+
+
+def test_bug_fix_declares_alternative_task():
+    """The bug-fix scenario must declare an alternative task; without
+    it the negative-context condition can't generate plausibly-wrong
+    context and degenerates to a leverage replay."""
+    bf = _EVAL_TYPE_DEFAULTS["bug-fix"]
+    alt = bf.get("alternative_task")
+    assert isinstance(alt, str) and alt.strip(), (
+        "_EVAL_TYPE_DEFAULTS['bug-fix']['alternative_task'] must be "
+        "set to a non-empty string. See orchestrator.py."
+    )
+    # Must differ from the real task — otherwise it's the same context,
+    # not a wrong one.
+    assert alt != bf["task"]
+
+
+# ---------------------------------------------------------------------------
+# Run plan — negative-context surfaces in launch phase
+# ---------------------------------------------------------------------------
+
+
+def test_run_plan_includes_negative_context_in_launch_phase():
+    """The launch phase must list the negative-context condition in
+    its `conditions` array, with the same launch_method as the other
+    Aethyme conditions."""
+    plan = generate_run_plan(
+        eval_type="bug-fix", target="grc", model="haiku",
+    )
+    launch = next(p for p in plan["phases"] if p["name"] == "launch")
+    cond_names = [c["name"] for c in launch["conditions"]]
+    assert "negative-context" in cond_names
+
+
+def test_run_plan_prepare_phase_passes_alternative_task():
+    """The prepare phase's cli_cmd must include `--alternative-task`
+    so the negative nav-context generator runs during build-inputs."""
+    plan = generate_run_plan(
+        eval_type="bug-fix", target="grc", model="haiku",
+    )
+    prepare = next(p for p in plan["phases"] if p["name"] == "build-inputs")
+    cmd = prepare.get("cli_cmd", "")
+    assert "--alternative-task" in cmd, (
+        "prepare phase cli_cmd is missing --alternative-task. The "
+        "negative-context condition will degenerate to a leverage "
+        "replay without it."
+    )
+
+
+def test_run_plan_paths_include_negative_context_artifacts():
+    """The plan's `paths` block reserves slots for every condition's
+    prompt and result file. Adding negative-context to CONDITIONS
+    must not orphan its artifact paths."""
+    plan = generate_run_plan(
+        eval_type="bug-fix", target="grc", model="haiku",
+    )
+    paths = plan["paths"]
+    assert "negative-context" in paths["prompt_files"]
+    assert "negative-context" in paths["result_files"]
+    assert "negative-context" in paths["condition_repos"]
+
+
+# ---------------------------------------------------------------------------
+# Scenario alignment with non-bug-fix evals (regression guard)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "eval_type",
+    [
+        "bug-fix-1",
+        "dead-code",
+        "impact-analysis",
+        "feature-localization",
+        "config-audit",
+        "migration",
+        "explain-repo",
+        "navigation-ctf",
+    ],
+)
+def test_other_eval_types_still_have_negative_context_in_launch(eval_type: str):
+    """The 6th condition is global to the orchestrator, not bug-fix-
+    specific. Other eval types that don't yet declare an alternative
+    task should still list the condition in the launch phase — they'd
+    fall back to a leverage replay if launched, which is acceptable
+    until we add per-eval alternative tasks."""
+    target = (
+        "mediawiki" if eval_type in {
+            "bug-fix-1", "dead-code", "impact-analysis",
+            "feature-localization", "config-audit", "migration",
+        } else "grc"
+    )
+    plan = generate_run_plan(
+        eval_type=eval_type, target=target, model="haiku",
+    )
+    launch = next(p for p in plan["phases"] if p["name"] == "launch")
+    cond_names = [c["name"] for c in launch["conditions"]]
+    assert "negative-context" in cond_names, (
+        f"{eval_type} launch phase should list negative-context"
+    )

@@ -13,8 +13,23 @@ from pathlib import Path
 
 from ..indexing.skills import AETHYME_PACKAGE_ROOT, deploy_skills
 
-CONDITION_NAMES = ("control-cto-off", "control-cto-on", "explore", "leverage", "task-conditioned")
-AETHYME_CONDITIONS = frozenset({"explore", "leverage", "task-conditioned"})
+CONDITION_NAMES = (
+    "control-cto-off",
+    "control-cto-on",
+    "explore",
+    "leverage",
+    "task-conditioned",
+    # `negative-context` is the trust-calibration condition (added 2026-05-09).
+    # Same setup as leverage but loads a *plausibly-wrong* nav-context (real
+    # Aethyme artifact for a different task in the same module). Belongs to
+    # AETHYME_CONDITIONS — agent has the live skill, so what we measure is
+    # behavior when the initial context is stale/wrong but verification tools
+    # are available, mirroring real production failure modes.
+    "negative-context",
+)
+AETHYME_CONDITIONS = frozenset({
+    "explore", "leverage", "task-conditioned", "negative-context",
+})
 
 
 def create_condition_repos(
