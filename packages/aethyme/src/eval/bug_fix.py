@@ -445,6 +445,208 @@ def _build_navigation_context(
     }
 
 
+# ===========================================================================
+# Plausible-error generator (negative-context eval condition)
+# ===========================================================================
+#
+# The negative-context condition tests *trust calibration* — what does the
+# agent do when given context that LOOKS right but answers the wrong
+# question? It isolates two effects the leverage measurement entangles:
+#
+# 1. Loading cost (tokens spent ingesting any context, right or wrong).
+# 2. Misdirection cost (extra turns spent following bad anchors before
+#    discovering the mismatch).
+#
+# A candidate negative context is "plausible" when it would survive the
+# agent's surface-level skepticism — meaning the agent has to do real
+# verification work to discover the mismatch. We generate it by running
+# the SAME nav-context generator on the SAME repo with a DIFFERENT task,
+# then enforce 5 properties so accidental easy-mismatches don't sneak in.
+#
+# This is generic across any repo / language / framework — the rule
+# operates on the nav-context JSON shape, never on file contents or
+# language-specific conventions.
+
+DEFAULT_PLAUSIBILITY_OVERLAP_THRESHOLD = 0.30
+"""How much of the real context's anchor set must also appear in the
+candidate. Set per-direction (real ∩ cand / real), not Jaccard, so
+small candidate sets aren't disproportionately punished. 0.30 is a
+deliberate guess — too low and we admit topical-mismatch contexts as
+'plausible', too high and we can't generate plausible candidates for
+narrow modules. Tunable per-call via `overlap_threshold` argument."""
+
+# Maximum allowed size ratio between candidate and real (in either
+# direction). 2.0 = candidate may be at most 2× larger or 2× smaller
+# than the real. Catches the "candidate is a tiny stub or a giant blob"
+# failure modes that would let the agent dismiss it on size alone.
+_MAX_SIZE_RATIO = 2.0
+
+
+class PlausibilityError(ValueError):
+    """Raised when a candidate negative context fails the plausibility rule.
+
+    Distinct from generic ValueError so orchestrators can choose to
+    downgrade (skip the negative-context condition this run) rather than
+    fail the entire eval. The error message names the violated property
+    and the offending values so the caller can adjust the alternative
+    task without re-deriving from scratch.
+    """
+
+
+def _anchor_identifier_set(ctx: dict[str, Any]) -> set[str]:
+    """Extract the stable identifier set from a nav-context.
+
+    Repo-agnostic by design: pulls anchor `id` fields rather than file
+    paths or content tokens. Anchor IDs are symbol-level identifiers
+    produced by the engine, so the same comparison shape works for
+    TypeScript, PHP, Rust, etc. Anchors without an `id` are skipped
+    rather than substituted — they don't contribute signal.
+    """
+    out: set[str] = set()
+    for anchor in ctx.get("anchors", []) or []:
+        if isinstance(anchor, dict):
+            anchor_id = anchor.get("id")
+            if isinstance(anchor_id, str) and anchor_id:
+                out.add(anchor_id)
+    return out
+
+
+def _assert_plausibly_wrong(
+    real: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    overlap_threshold: float,
+) -> None:
+    """Enforce the 5-property plausibility rule. Raise PlausibilityError
+    on the first violation, naming the property and offending values.
+
+    Properties (in order checked):
+
+      1. Shape-identical    — same top-level keys.
+      2. Approximate-size   — within `_MAX_SIZE_RATIO` (currently 2×).
+      3. Domain-adjacent    — same `repo_path`. Cross-repo candidates
+                              fail trivially as topical mismatch.
+      4. Identifier-overlap — fraction of real anchor IDs that also
+                              appear in candidate ≥ overlap_threshold.
+      5. Distinct           — anchor sets must NOT be identical, else
+                              the candidate is the same context, not
+                              a *wrong* one.
+
+    Property 6 from the design doc ("real, not synthetic") is satisfied
+    by construction when the candidate is built via the production
+    nav-context generator — we don't runtime-check it, we just require
+    callers to use `generate_plausible_error_context()`.
+    """
+    # 1. Shape
+    if set(real.keys()) != set(candidate.keys()):
+        only_real = set(real.keys()) - set(candidate.keys())
+        only_cand = set(candidate.keys()) - set(real.keys())
+        raise PlausibilityError(
+            "shape mismatch: real has unique keys "
+            f"{sorted(only_real)}, candidate has unique keys "
+            f"{sorted(only_cand)}"
+        )
+
+    # 2. Approximate size
+    real_size = len(json.dumps(real))
+    cand_size = len(json.dumps(candidate))
+    if real_size == 0 or cand_size == 0:
+        raise PlausibilityError(
+            f"degenerate sizes: real={real_size}, cand={cand_size}"
+        )
+    ratio = cand_size / real_size
+    if ratio < (1 / _MAX_SIZE_RATIO) or ratio > _MAX_SIZE_RATIO:
+        raise PlausibilityError(
+            f"size ratio {ratio:.2f}× outside [1/{_MAX_SIZE_RATIO}, "
+            f"{_MAX_SIZE_RATIO}]: real={real_size}B, cand={cand_size}B"
+        )
+
+    # 3. Domain (same repo)
+    if real.get("repo_path") != candidate.get("repo_path"):
+        raise PlausibilityError(
+            f"different repos: real={real.get('repo_path')!r}, "
+            f"cand={candidate.get('repo_path')!r}"
+        )
+
+    # 4. Identifier overlap
+    real_ids = _anchor_identifier_set(real)
+    cand_ids = _anchor_identifier_set(candidate)
+    if not real_ids or not cand_ids:
+        raise PlausibilityError(
+            f"empty anchor id set: real={len(real_ids)}, cand={len(cand_ids)}"
+        )
+    overlap_fraction = len(real_ids & cand_ids) / len(real_ids)
+    if overlap_fraction < overlap_threshold:
+        raise PlausibilityError(
+            f"identifier overlap {overlap_fraction:.2f} below threshold "
+            f"{overlap_threshold:.2f}: only "
+            f"{len(real_ids & cand_ids)} of {len(real_ids)} real anchors "
+            "appear in candidate"
+        )
+
+    # 5. Distinct
+    if real_ids == cand_ids:
+        raise PlausibilityError(
+            "candidate anchor set identical to real — not a *wrong* "
+            "context, just the same context. Use a more divergent "
+            "alternative task."
+        )
+
+
+def generate_plausible_error_context(
+    real_context: dict[str, Any],
+    *,
+    repo_path: Path,
+    alternative_task: str,
+    overlap_threshold: float = DEFAULT_PLAUSIBILITY_OVERLAP_THRESHOLD,
+) -> dict[str, Any]:
+    """Generate a plausibly-wrong nav-context for the negative-context
+    eval condition.
+
+    The candidate is produced by running the production nav-context
+    generator on the same repo with a different task. Because the
+    generator is the same, the candidate is a *real* Aethyme artifact
+    — not synthetic — that just answers the wrong question.
+
+    Parameters
+    ----------
+    real_context:
+        The production nav-context that the leverage condition uses.
+        Used as the reference for shape/size/identifier comparisons.
+    repo_path:
+        Same repo as the real context. Required because the candidate
+        must satisfy domain-adjacency.
+    alternative_task:
+        A different task description for the same repo. Caller's
+        responsibility to choose an alternative whose anchors plausibly
+        overlap the real context (typically: a sibling task in the
+        same module). The function is repo-agnostic — it doesn't
+        synthesize the alternative, only consumes it.
+    overlap_threshold:
+        Minimum fraction of real anchor IDs that must also appear in
+        the candidate (default 0.30). Lower threshold = looser
+        plausibility; higher threshold = stricter.
+
+    Returns
+    -------
+    dict:
+        The candidate nav-context. Same shape as the real one,
+        guaranteed to satisfy the 5-property plausibility rule.
+
+    Raises
+    ------
+    PlausibilityError:
+        If the candidate fails any of the 5 properties. Caller can
+        catch this and either pick a different `alternative_task` or
+        skip the negative-context condition for this run.
+    """
+    candidate = _build_navigation_context(repo_path, alternative_task)
+    _assert_plausibly_wrong(
+        real_context, candidate, overlap_threshold=overlap_threshold
+    )
+    return candidate
+
+
 # =========================================================================
 # Cross-package scenario
 # =========================================================================
