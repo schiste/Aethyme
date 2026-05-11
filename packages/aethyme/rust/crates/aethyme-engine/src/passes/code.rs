@@ -1093,6 +1093,47 @@ fn body_call_name_tokens(body: &str, interner: &mut StringInterner) -> BTreeSet<
     names
 }
 
+/// Lexer state for the qualified-call extractor. The extractor walks
+/// body bytes once and tracks whether the current position is inside
+/// a comment or string literal; identifiers only count as qualified
+/// calls when seen in `Normal` state.
+///
+/// Why a tokenizer rather than a regex pre-strip: regexes can be fooled
+/// by `//` inside a string literal or `"` inside a `/* */` block. A
+/// stateful walker handles these cases without backtracking. Cost is
+/// ~30 lines; the throughput is identical (one byte-walk pass).
+///
+/// Languages covered: PHP (`//`, `#`, `/* */`, `"..."`, `'...'`),
+/// JavaScript / TypeScript / Rust / C++ (subset). PHP heredoc/nowdoc
+/// (`<<<EOT ... EOT`) is NOT handled — rare in modern PHP and a
+/// follow-up if we hit false positives from them. Rust raw strings
+/// (`r"..."`, `r#"..."#`) are NOT handled either; same rationale.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LexState {
+    Normal,
+    LineComment,
+    HashComment,    // PHP `#`-prefix line comment
+    BlockComment,
+    StringDouble,
+    StringSingle,
+}
+
+/// Extract the set of qualified call names that appear in `body`.
+///
+/// "Qualified" means the identifier is preceded by a member-access
+/// operator: `.` (JS/Rust/etc.), `::` (Rust/PHP static, C++ scope), or
+/// `->` (PHP arrow, C++ pointer-member, Rust). Plain bare-function
+/// calls (`foo()`) are NOT collected — those are handled by
+/// `body_call_name_tokens` separately.
+///
+/// Identifiers inside comments or string literals are skipped — a
+/// mention of `WikiPage::doViewUpdates` in a `// comment` does NOT
+/// register as a real call. Pre-fix, the extractor used raw text and
+/// the resulting `WatchlistManager` false-positive caller for
+/// `doViewUpdates` was the only "caller" the MediaWiki graph captured
+/// for that method (the 7+ real arrow-method callsites in Article.php
+/// and ImagePage.php were missed because the extractor recognized
+/// only `.` and `::`).
 fn body_qualified_call_name_tokens(
     body: &str,
     interner: &mut StringInterner,
@@ -1100,9 +1141,83 @@ fn body_qualified_call_name_tokens(
     let mut names = BTreeSet::new();
     let bytes = body.as_bytes();
     let mut index = 0;
+    let mut state = LexState::Normal;
 
     while index < bytes.len() {
-        let ch = bytes[index] as char;
+        let b = bytes[index];
+
+        // State transitions: handle entering/exiting comments and strings
+        // *before* looking at the byte as a content character.
+        match state {
+            LexState::Normal => {
+                // Enter a state from Normal on opener bytes.
+                if b == b'/' && index + 1 < bytes.len() {
+                    match bytes[index + 1] {
+                        b'/' => { state = LexState::LineComment; index += 2; continue; }
+                        b'*' => { state = LexState::BlockComment; index += 2; continue; }
+                        _ => {}
+                    }
+                }
+                if b == b'#' {
+                    state = LexState::HashComment;
+                    index += 1;
+                    continue;
+                }
+                if b == b'"' {
+                    state = LexState::StringDouble;
+                    index += 1;
+                    continue;
+                }
+                if b == b'\'' {
+                    state = LexState::StringSingle;
+                    index += 1;
+                    continue;
+                }
+                // Fall through to identifier detection below.
+            }
+            LexState::LineComment | LexState::HashComment => {
+                if b == b'\n' {
+                    state = LexState::Normal;
+                }
+                index += 1;
+                continue;
+            }
+            LexState::BlockComment => {
+                if b == b'*' && index + 1 < bytes.len() && bytes[index + 1] == b'/' {
+                    state = LexState::Normal;
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+                continue;
+            }
+            LexState::StringDouble => {
+                if b == b'\\' && index + 1 < bytes.len() {
+                    // Skip the escaped char so `"\""` doesn't close on the inner `"`.
+                    index += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    state = LexState::Normal;
+                }
+                index += 1;
+                continue;
+            }
+            LexState::StringSingle => {
+                if b == b'\\' && index + 1 < bytes.len() {
+                    index += 2;
+                    continue;
+                }
+                if b == b'\'' {
+                    state = LexState::Normal;
+                }
+                index += 1;
+                continue;
+            }
+        }
+
+        // Only in Normal state: collect qualified calls.
+        let ch = b as char;
         if !(ch.is_ascii_alphabetic() || ch == '_') {
             index += 1;
             continue;
@@ -1128,10 +1243,18 @@ fn body_qualified_call_name_tokens(
             continue;
         }
 
+        // Qualified iff preceded by one of: `.`, `::`, or `->`.
+        // The `->` clause is the 2026-05-09 addition that closes the
+        // PHP arrow-method-call recall gap (was capturing 1 of ~10
+        // callers of `WikiPage::doViewUpdates` in MediaWiki).
         let is_qualified = if start >= 1 && bytes[start - 1] == b'.' {
             true
+        } else if start >= 2 && bytes[start - 2] == b':' && bytes[start - 1] == b':' {
+            true
+        } else if start >= 2 && bytes[start - 2] == b'-' && bytes[start - 1] == b'>' {
+            true
         } else {
-            start >= 2 && bytes[start - 2] == b':' && bytes[start - 1] == b':'
+            false
         };
         if is_qualified {
             let token = &body[start..end];
@@ -1156,6 +1279,180 @@ fn function_body(contents: &str, start_line: usize, next_line: Option<usize>) ->
         .take(take)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod qualified_call_extractor_tests {
+    //! Unit tests for `body_qualified_call_name_tokens`.
+    //!
+    //! The function powers caller-edge attribution for any
+    //! identifier preceded by `.`, `::`, or `->`. Pre-2026-05-09 it
+    //! recognized only `.` and `::` and operated on raw text without
+    //! comment/string awareness; the MediaWiki bug-fix-1 eval surfaced
+    //! both gaps (1 caller captured for `doViewUpdates` instead of
+    //! ~10+; the one captured was a comment mention).
+    //!
+    //! Test coverage:
+    //!   - All 3 qualified-call prefixes (`.`, `::`, `->`).
+    //!   - Bare-function calls are NOT counted (`foo()` alone).
+    //!   - Mentions inside `//`, `#`, and `/* */` comments are ignored.
+    //!   - Mentions inside `"..."` and `'...'` strings are ignored.
+    //!   - Escaped quotes inside strings don't terminate the string early.
+    //!   - The original two-char-minimum (`token.len() >= 2`) holds.
+    use super::{body_qualified_call_name_tokens, StringInterner};
+
+    fn extract(body: &str) -> Vec<String> {
+        let mut interner = StringInterner::default();
+        let ids = body_qualified_call_name_tokens(body, &mut interner);
+        // Resolve InternId back to its original string via the
+        // interner's `values` vec — accessing a private field is
+        // fine here because this test module is a child of the same
+        // module that defines `StringInterner`.
+        let mut out: Vec<String> = ids
+            .into_iter()
+            .map(|id| interner.values[id.0 as usize].clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn arrow_call_is_qualified() {
+        // PHP / Rust / C++: $obj->method(...) — the case that was missing.
+        assert_eq!(extract("$this->doViewUpdates($a, $b);"), vec!["doViewUpdates"]);
+    }
+
+    #[test]
+    fn dot_call_is_qualified() {
+        // JavaScript / Rust: obj.method(...) — pre-existing case.
+        assert_eq!(extract("obj.handleClick();"), vec!["handleClick"]);
+    }
+
+    #[test]
+    fn double_colon_call_is_qualified() {
+        // PHP static / C++ scope / Rust path: Class::method(...).
+        assert_eq!(
+            extract("WikiPage::doViewUpdates($x);"),
+            vec!["doViewUpdates"]
+        );
+    }
+
+    #[test]
+    fn bare_call_is_not_qualified() {
+        // `foo()` alone is NOT a qualified call. Caller-edge logic
+        // for bare calls runs through `body_function_name_tokens`,
+        // not this function.
+        assert_eq!(extract("foo();"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn single_char_qualified_call_is_filtered() {
+        // The 2-char minimum existed pre-2026-05-09 and is
+        // intentional — 1-char names are too noisy.
+        assert_eq!(extract("$this->a();"), Vec::<String>::new());
+        assert_eq!(extract("$this->ab();"), vec!["ab"]);
+    }
+
+    #[test]
+    fn line_comment_is_skipped() {
+        // The MediaWiki false-positive: WatchlistManager's only
+        // mention of WikiPage::doViewUpdates was in a `//` comment.
+        // After the fix, comment mentions are ignored.
+        assert_eq!(
+            extract("// WikiPage::doViewUpdates() is called later\nfoo();"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn hash_comment_is_skipped() {
+        // PHP supports `#` line comments alongside `//`.
+        assert_eq!(
+            extract("# WikiPage::doViewUpdates() is called later\nfoo();"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn block_comment_is_skipped() {
+        assert_eq!(
+            extract("/* WikiPage::doViewUpdates(\nstill in comment\n*/ foo();"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn double_quoted_string_is_skipped() {
+        assert_eq!(
+            extract("$msg = \"WikiPage::doViewUpdates() called\"; $x->go();"),
+            vec!["go"]
+        );
+    }
+
+    #[test]
+    fn single_quoted_string_is_skipped() {
+        assert_eq!(
+            extract("$msg = 'WikiPage::doViewUpdates()'; $x->go();"),
+            vec!["go"]
+        );
+    }
+
+    #[test]
+    fn escaped_quote_inside_double_string_does_not_terminate_early() {
+        // `"\""` is a one-char string containing a quote. If the lexer
+        // mishandled the backslash, it would treat the inner `"` as
+        // closing and then see `WikiPage::doViewUpdates` in Normal
+        // state. The test asserts the escape is honored.
+        assert_eq!(
+            extract("$msg = \"\\\"WikiPage::doViewUpdates()\"; foo();"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn comment_then_real_call_works() {
+        // After a comment ends, the next line's qualified call should
+        // be picked up (state correctly returns to Normal).
+        assert_eq!(
+            extract("// $this->ignored();\n$this->handleClick();"),
+            vec!["handleClick"]
+        );
+    }
+
+    #[test]
+    fn mixed_real_world_mediawiki_pattern() {
+        // Approximation of the Article.php pattern that motivated the
+        // fix: arrow calls + an inline comment + a string mention.
+        let body = r#"
+            // $oldid handling for diff view (see WikiPage::doViewUpdates docs)
+            if ($oldid && !$this->isDiffOnlyView()) {
+                $this->mPage->doViewUpdates($context->getAuthority(), (int)$new);
+                $logger->info("dispatched to WikiPage::doViewUpdates");
+            }
+            $de->showDiffPage($this->isDiffOnlyView());
+        "#;
+        let names = extract(body);
+        // Every real arrow-method call is captured:
+        //   $this->isDiffOnlyView()   ->  isDiffOnlyView
+        //   $this->mPage->doViewUpdates()  ->  doViewUpdates
+        //   $context->getAuthority()  ->  getAuthority
+        //   $logger->info("...")      ->  info
+        //   $de->showDiffPage(...)    ->  showDiffPage
+        // The two `WikiPage::doViewUpdates` mentions — one in a doc
+        // comment, one in a log-string literal — are correctly
+        // ignored, so `doViewUpdates` appears in the set ONCE
+        // (deduped by the BTreeSet) from its real call site.
+        assert_eq!(
+            names,
+            vec![
+                "doViewUpdates",
+                "getAuthority",
+                "info",
+                "isDiffOnlyView",
+                "showDiffPage",
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
