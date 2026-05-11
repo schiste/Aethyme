@@ -6,6 +6,11 @@ Explore surface before brute-force grep. It is bounded for responsiveness,
 returns answer-json with confidence and verification steps, and degrades
 gracefully on large repos.
 
+If `.codex/skills/repo-onboarding/SKILL.md` or
+`.claude/skills/repo-onboarding/SKILL.md` exists, load that first when the
+repository is unfamiliar or the request asks for repo overview, setup,
+entrypoints, or where to begin.
+
 ## Quick start (any agent)
 
 ```bash
@@ -29,6 +34,8 @@ Same content lives at both of these per-product skill paths:
 
 - `.claude/skills/aethyme/SKILL.md` — Claude Skills convention
 - `.codex/skills/aethyme/SKILL.md` — Codex skills convention
+- `.claude/skills/repo-onboarding/SKILL.md` — generated repo-specific orientation
+- `.codex/skills/repo-onboarding/SKILL.md` — generated repo-specific orientation
 
 Read whichever your agent surface auto-loads. The files are identical and
 contain: full intent catalog, output schema, dead-code workflow, scope-first
@@ -43,4 +50,5 @@ To confirm the enhancement is intact in this repository:
 ```
 
 Returns nonzero if any of `AGENTS.md`, `CLAUDE.md`, `.claude/skills/aethyme/SKILL.md`,
-or `.codex/skills/aethyme/SKILL.md` is missing or has unsubstituted placeholders.
+`.codex/skills/aethyme/SKILL.md`, `.claude/skills/repo-onboarding/SKILL.md`, or
+`.codex/skills/repo-onboarding/SKILL.md` is missing or has unsubstituted placeholders.

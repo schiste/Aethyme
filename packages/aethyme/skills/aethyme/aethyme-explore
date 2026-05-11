@@ -13,4 +13,16 @@
 # `{{AETHYME_ROOT}}` is replaced by `deploy_skills` in
 # packages/aethyme/src/indexing/skills.py with the local package path.
 set -euo pipefail
-exec "{{AETHYME_ROOT}}/rust/target/release/aethyme" explore "$@"
+
+AETHYME_ROOT="{{AETHYME_ROOT}}"
+REPO="${PWD}"
+
+if [[ -x "$AETHYME_ROOT/.venv/bin/python" && -d "$REPO" ]]; then
+    "$AETHYME_ROOT/.venv/bin/python" -m src.cli repo record-wrapper-invocation \
+        "$REPO" \
+        --wrapper aethyme-explore \
+        --detail source=wrapper \
+        >/dev/null 2>&1 || true
+fi
+
+exec "$AETHYME_ROOT/rust/target/release/aethyme" explore "$@"

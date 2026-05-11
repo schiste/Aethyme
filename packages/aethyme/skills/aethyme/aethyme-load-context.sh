@@ -17,6 +17,7 @@
 
 set -uo pipefail
 
+AETHYME_ROOT="{{AETHYME_ROOT}}"
 cwd="${CLAUDE_PROJECT_DIR:-${PWD}}"
 
 agents="$cwd/AGENTS.md"
@@ -41,6 +42,14 @@ fi
 
 if [[ -z "$context" ]]; then
     exit 0
+fi
+
+if [[ -x "$AETHYME_ROOT/.venv/bin/python" && -d "$cwd" ]]; then
+    "$AETHYME_ROOT/.venv/bin/python" -m src.cli repo record-wrapper-invocation \
+        "$cwd" \
+        --wrapper aethyme-sessionstart-hook \
+        --detail source=claude-hook \
+        >/dev/null 2>&1 || true
 fi
 
 # Emit the JSON envelope. Use python for safe JSON escaping rather than

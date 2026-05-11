@@ -32,6 +32,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from src.indexing.experience_telemetry import (
+    append_event,
+    event_payload_from_generated_artifacts,
+    summarize_events,
+)
+from src.indexing.onboarding import (
+    ACT_CLAUDE_PATH,
+    ACT_CODEX_PATH,
+    ACT_STARTER_JSON_PATH,
+    ONBOARDING_CLAUDE_PATH,
+    ONBOARDING_CODEX_PATH,
+    ONBOARDING_JSON_PATH,
+    expected_onboarding_files,
+    recommendation_summary,
+)
+
 PLACEHOLDER = "{{AETHYME_ROOT}}"
 
 # packages/aethyme/, the canonical AETHYME_ROOT during install.
@@ -77,6 +93,15 @@ TARGETS: tuple[EnhancementTarget, ...] = (
         "as additionalContext (works around headless-launch limitation)",
     ),
 )
+
+GENERATED_TARGET_DESCRIPTIONS: dict[str, str] = {
+    ONBOARDING_JSON_PATH: "Deterministic repo-onboarding facts",
+    ACT_STARTER_JSON_PATH: "Deterministic repo Act starter facts",
+    ONBOARDING_CLAUDE_PATH: "Claude Skills repo-specific onboarding runbook",
+    ONBOARDING_CODEX_PATH: "Codex skills repo-specific onboarding runbook",
+    ACT_CLAUDE_PATH: "Claude Skills repo-specific Act starter runbook",
+    ACT_CODEX_PATH: "Codex skills repo-specific Act starter runbook",
+}
 
 # Settings.local.json gets MERGED rather than written from a template, so
 # user customisations survive re-deployment. The hook entry below is what
@@ -141,9 +166,37 @@ def deploy(repo: Path, *, force: bool = False) -> list[DeployAction]:
             _ensure_executable(dest)
         actions.append(DeployAction(t, "updated" if existed else "created"))
 
+    for relative_path, content in expected_onboarding_files(repo).items():
+        target = EnhancementTarget(
+            relative_path,
+            _TEMPLATE_DIR / "AGENTS.md",
+            GENERATED_TARGET_DESCRIPTIONS.get(relative_path, "Generated onboarding artifact"),
+        )
+        dest = repo / relative_path
+        if dest.exists() and not force and dest.read_text(encoding="utf-8") == content:
+            actions.append(DeployAction(target, "unchanged"))
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        existed = dest.exists()
+        dest.write_text(content, encoding="utf-8")
+        actions.append(DeployAction(target, "updated" if existed else "created"))
+
     # Merge-aware settings.local.json deployment.
     settings_action = _ensure_settings_hook(repo)
     actions.append(settings_action)
+
+    append_event(
+        repo,
+        "enhance.deploy",
+        {
+            "force": force,
+            "actions": [
+                {"path": action.target.relative_path, "action": action.action}
+                for action in actions
+            ],
+            **event_payload_from_generated_artifacts(repo),
+        },
+    )
 
     return actions
 
@@ -249,6 +302,26 @@ def verify(repo: Path) -> list[VerifyResult]:
             )
         )
 
+    for relative_path, content in expected_onboarding_files(repo).items():
+        target = EnhancementTarget(
+            relative_path,
+            _TEMPLATE_DIR / "AGENTS.md",
+            GENERATED_TARGET_DESCRIPTIONS.get(relative_path, "Generated onboarding artifact"),
+        )
+        dest = repo / relative_path
+        if not dest.exists():
+            out.append(VerifyResult(target, False, False, False))
+            continue
+        actual = dest.read_text(encoding="utf-8")
+        out.append(
+            VerifyResult(
+                target=target,
+                exists=True,
+                placeholder_present=PLACEHOLDER in actual,
+                matches_canonical=(actual == content),
+            )
+        )
+
     # Settings hook check.
     settings_target = EnhancementTarget(
         f"{SETTINGS_FILE} (SessionStart hook)",
@@ -294,3 +367,30 @@ def is_ok(results: Iterable[VerifyResult]) -> bool:
     leftover {{AETHYME_ROOT}} placeholders are real failures.
     """
     return all(r.exists and not r.placeholder_present for r in results)
+
+
+def summarize(repo: Path) -> dict[str, Any]:
+    """Return a small enhancement summary with recommendations."""
+    files = expected_onboarding_files(repo)
+    onboarding = json.loads(files[ONBOARDING_JSON_PATH])
+    act = json.loads(files[ACT_STARTER_JSON_PATH])
+    recommendation = recommendation_summary(repo)
+    return {
+        "recommended_skill": recommendation["recommended_skill"],
+        "recommended_mode": recommendation["recommended_mode"],
+        "reason": recommendation["reason"],
+        "onboarding": {
+            "commands": onboarding["telemetry"]["counts"]["commands"],
+            "areas": onboarding["telemetry"]["counts"]["areas"],
+            "entrypoints": onboarding["telemetry"]["counts"]["entrypoints"],
+            "notes": onboarding["telemetry"]["counts"]["notes"],
+            "overrides_applied": onboarding["telemetry"]["overrides_applied"],
+            "override_invalid": onboarding["telemetry"]["override_invalid"],
+        },
+        "act": {
+            "has_fast_test": bool(act["commands"].get("fast_test")),
+            "entrypoints": act["telemetry"]["entrypoint_count"],
+            "caution_zones": act["telemetry"]["caution_zone_count"],
+        },
+        "experience_telemetry": summarize_events(repo),
+    }

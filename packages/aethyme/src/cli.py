@@ -436,7 +436,11 @@ def repo_warm(repo_path: Path) -> None:
     "--remove", "do_remove", is_flag=True, help="Remove deployed skills instead"
 )
 def repo_deploy_skills(repo_path: Path, force: bool, do_remove: bool) -> None:
-    """Deploy Aethyme navigation skills to a target repository."""
+    """Compatibility path for static runtime skill deployment.
+
+    Prefer `aethyme enhance deploy --repo <path>` for the full discoverability
+    and generated onboarding path.
+    """
     from src.indexing.skills import deploy_skills, remove_skills
 
     if do_remove:
@@ -452,6 +456,175 @@ def repo_deploy_skills(repo_path: Path, force: bool, do_remove: bool) -> None:
         click.echo(f"Deployed skills: {', '.join(deployed)}")
     else:
         click.echo("All skills already present (use --force to overwrite).")
+    click.echo("Note: `repo deploy-skills` is a compatibility path. Prefer `aethyme enhance deploy --repo <path>`.")
+
+
+@repo.command("compile-skills")
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
+@click.option(
+    "--skill",
+    "skill_names",
+    multiple=True,
+    type=click.Choice(["repo-onboarding"]),
+    help="Generated skill to compile. Defaults to repo-onboarding.",
+)
+def repo_compile_skills(repo_path: Path, skill_names: tuple[str, ...]) -> None:
+    """Compile deterministic repo-specific skills without the full enhancement wrapper."""
+    from src.indexing.experience_telemetry import (
+        append_event,
+        event_payload_from_generated_artifacts,
+    )
+    from src.indexing.onboarding import expected_onboarding_files
+
+    selected = skill_names or ("repo-onboarding",)
+    written: list[str] = []
+    if "repo-onboarding" in selected:
+        for relative_path, content in expected_onboarding_files(repo_path).items():
+            dest = repo_path / relative_path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+            written.append(relative_path)
+
+    for relative_path in written:
+        click.echo(f"  compiled   {relative_path}")
+    append_event(
+        repo_path,
+        "repo.compile-skills",
+        {
+            "selected_skills": list(selected),
+            "written_paths": written,
+            **event_payload_from_generated_artifacts(repo_path),
+        },
+    )
+    click.echo(f"Compiled repo skills for: {repo_path}")
+
+
+@repo.command("init-onboarding-overrides")
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
+@click.option("--force", is_flag=True, help="Overwrite an existing override file")
+def repo_init_onboarding_overrides(repo_path: Path, force: bool) -> None:
+    """Write a starter onboarding override file for maintainers."""
+    from src.indexing.experience_telemetry import append_event
+    from src.indexing.onboarding import ONBOARDING_OVERRIDE_PATH, override_template
+
+    dest = repo_path / ONBOARDING_OVERRIDE_PATH
+    if dest.exists() and not force:
+        raise click.ClickException(
+            f"{ONBOARDING_OVERRIDE_PATH} already exists. Use --force to overwrite."
+        )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(override_template(), indent=2) + "\n", encoding="utf-8")
+    append_event(
+        repo_path,
+        "repo.init-onboarding-overrides",
+        {"force": force, "path": ONBOARDING_OVERRIDE_PATH},
+    )
+    click.echo(f"Wrote {ONBOARDING_OVERRIDE_PATH}")
+
+
+@repo.command("validate-onboarding-overrides")
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
+def repo_validate_onboarding_overrides(repo_path: Path) -> None:
+    """Validate the onboarding override file if present."""
+    from src.indexing.experience_telemetry import append_event
+    from src.indexing.onboarding import validate_overrides
+
+    result = validate_overrides(repo_path)
+    append_event(
+        repo_path,
+        "repo.validate-onboarding-overrides",
+        {"ok": result["ok"], "exists": result["exists"], "errors": result["errors"]},
+    )
+    if result["ok"]:
+        if result["exists"]:
+            click.echo(f"Valid override file: {result['path']}")
+        else:
+            click.echo(f"No override file present: {result['path']}")
+        return
+    click.echo(f"Invalid override file: {result['path']}", err=True)
+    for error in result["errors"]:
+        click.echo(f"  - {error}", err=True)
+    raise SystemExit(1)
+
+
+@repo.command("record-wrapper-invocation", hidden=True)
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
+@click.option("--wrapper", "wrapper_name", required=True, help="Wrapper or hook name")
+@click.option("--detail", "details", multiple=True, help="Optional key=value detail")
+def repo_record_wrapper_invocation(
+    repo_path: Path,
+    wrapper_name: str,
+    details: tuple[str, ...],
+) -> None:
+    """Internal: record that an Aethyme-provided wrapper or hook was invoked."""
+    from src.indexing.experience_telemetry import record_wrapper_invocation
+
+    parsed_details: dict[str, str] = {}
+    for item in details:
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        parsed_details[key] = value
+    record_wrapper_invocation(
+        repo_path,
+        wrapper_name=wrapper_name,
+        details=parsed_details or None,
+    )
+
+
+@repo.command("experience-telemetry")
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
+@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
+def repo_experience_telemetry(repo_path: Path, json_output: bool) -> None:
+    """Show a stable report over repo-local experience telemetry."""
+    from src.indexing.experience_telemetry import detailed_report
+
+    report = detailed_report(repo_path)
+    if json_output:
+        click.echo(json.dumps(report, indent=2))
+        return
+
+    click.echo(f"Path: {report['path']}")
+    click.echo(f"Exists: {'yes' if report['exists'] else 'no'}")
+    click.echo(f"Events: {report['event_count']}")
+    click.echo(f"Last event: {report['last_event_type'] or 'none'}")
+    if report["by_type"]:
+        click.echo("By type:")
+        for event_type, count in sorted(report["by_type"].items()):
+            click.echo(f"- {event_type}: {count}")
+    if report["wrapper_invocations"]:
+        click.echo("Wrapper invocations:")
+        for wrapper_name, count in sorted(report["wrapper_invocations"].items()):
+            click.echo(f"- {wrapper_name}: {count}")
+    if report.get("kpis"):
+        kpis = report["kpis"]
+        click.echo("KPIs:")
+        click.echo(f"- wrapper_total: {kpis['wrapper_total']}")
+        click.echo(f"- onboarding_commands: {kpis['onboarding_commands']}")
+        click.echo(f"- onboarding_notes: {kpis['onboarding_notes']}")
+        click.echo(f"- act_has_fast_test: {kpis['act_has_fast_test']}")
+        if kpis["signals"]:
+            click.echo("Signals:")
+            for signal in kpis["signals"]:
+                click.echo(f"- {signal['status']} {signal['code']}: {signal['message']}")
+        if kpis["suggestions"]:
+            click.echo("Suggestions:")
+            for suggestion in kpis["suggestions"]:
+                click.echo(f"- {suggestion['code']}: {suggestion['message']}")
+    if report["recent_events"]:
+        click.echo("Recent events:")
+        for event in report["recent_events"][-5:]:
+            click.echo(f"- {event['timestamp']} {event['event_type']}")
 
 
 @repo.command("engine-info")
@@ -2540,8 +2713,10 @@ def enhance() -> None:
     A repo is "Aethyme-enhanced" when an agent landing in its working
     directory finds AGENTS.md/CLAUDE.md (root-level announcement) plus
     .claude/skills/aethyme/SKILL.md and .codex/skills/aethyme/SKILL.md
-    (per-product detailed runbooks). All four are derived from the canonical
-    templates in packages/aethyme/skills/aethyme/.
+    (per-product detailed runbooks), plus generated repo-onboarding artifacts
+    under `.aethyme/generated/` and per-product `repo-onboarding` skills.
+    Static tool runbooks are derived from canonical templates; onboarding is
+    generated deterministically from repository facts.
     """
 
 
@@ -2559,7 +2734,7 @@ def enhance() -> None:
     help="Rewrite files whose content already matches",
 )
 def enhance_deploy_command(repo_path: Path, force: bool) -> None:
-    """Write all four discoverability files into the target repo."""
+    """Write discoverability files plus generated onboarding into the target repo."""
     from src.enhance import deploy
 
     actions = deploy(repo_path, force=force)
@@ -2577,8 +2752,9 @@ def enhance_deploy_command(repo_path: Path, force: bool) -> None:
     help="Target repository to verify",
 )
 def enhance_verify_command(repo_path: Path) -> None:
-    """Check that the four discoverability files are present and substituted."""
-    from src.enhance import is_ok, verify
+    """Check that discoverability and onboarding files are present and usable."""
+    from src.enhance import is_ok, summarize, verify
+    from src.indexing.experience_telemetry import append_event
 
     results = verify(repo_path)
     for r in results:
@@ -2596,6 +2772,42 @@ def enhance_verify_command(repo_path: Path) -> None:
     if not is_ok(results):
         click.echo("Verification failed.", err=True)
         sys.exit(1)
+    summary = summarize(repo_path)
+    append_event(
+        repo_path,
+        "enhance.verify",
+        {
+            "ok": True,
+            "recommended_skill": summary["recommended_skill"],
+            "recommended_mode": summary["recommended_mode"],
+            "experience_telemetry_before_write": summary["experience_telemetry"],
+        },
+    )
+    click.echo("Enhancement summary:")
+    click.echo(
+        "  Recommendation: "
+        f"load `{summary['recommended_skill']}` then run `{summary['recommended_mode']}`"
+    )
+    click.echo(f"  Reason: {summary['reason']}")
+    click.echo(
+        "  Onboarding: "
+        f"commands={summary['onboarding']['commands']}, "
+        f"areas={summary['onboarding']['areas']}, "
+        f"entrypoints={summary['onboarding']['entrypoints']}, "
+        f"notes={summary['onboarding']['notes']}, "
+        f"overrides={summary['onboarding']['overrides_applied']}"
+    )
+    click.echo(
+        "  Act starter: "
+        f"fast_test={summary['act']['has_fast_test']}, "
+        f"entrypoints={summary['act']['entrypoints']}, "
+        f"caution_zones={summary['act']['caution_zones']}"
+    )
+    click.echo(
+        "  Experience telemetry: "
+        f"events={summary['experience_telemetry']['event_count']}, "
+        f"last={summary['experience_telemetry']['last_event_type']}"
+    )
     click.echo("All discoverability files present and substituted.")
 
 
