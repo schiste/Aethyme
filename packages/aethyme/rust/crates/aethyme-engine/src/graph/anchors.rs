@@ -130,26 +130,57 @@ pub fn resolve_anchors(map: &RepositoryMap, task: &TaskInput, limit: usize) -> V
             }
         }
         _ => {
-            // File references from task text get highest priority
+            // Unknown (residual) tasks: mirror the ChangeSymbol arm's
+            // priority order — specific signals (file refs, symbols,
+            // code-file matches, configs) first; broad area anchors as
+            // a filler.
+            //
+            // Pre-2026-05-10, this arm ran `area_anchors` BEFORE
+            // `symbol_search`. On narrative queries with many candidate
+            // tokens (e.g., a bug description like "Viewing a diff/
+            // revision on a watchlisted page marks all revisions as
+            // 'seen'..."), the 5 area-name matches saturated `limit`
+            // before symbol hits got a chance — even when matching
+            // symbols clearly existed (`showDiffPage`, `doViewUpdates`,
+            // `mapDiffPrevNext`, etc.). The MediaWiki bug-fix-1
+            // recall gap traced directly to this ordering.
+            //
+            // Areas still appear when no specific anchor fills the
+            // slot, preserving the "broad orientation" value of the
+            // Unknown arm for genuinely-exploratory queries (e.g.
+            // "what's in includes/?" — area-heavy is the right answer).
+
+            // File references from task text get highest priority.
             anchors.extend(file_reference_anchors(map, task, limit));
 
-            let queries = candidate_queries(task);
-            let wants_area = wants_area_anchor(task);
-
-            anchors.extend(area_anchors(map, &queries, wants_area, limit));
-            anchors.extend(config_anchors(
-                map,
-                task,
-                &queries,
-                limit.saturating_sub(1).max(1),
-            ));
-
-            let mut queries = queries;
+            let mut queries = candidate_queries(task);
             if queries.is_empty() {
                 queries.push(task.normalized.clone());
             }
-            for query in queries {
-                for hit in symbol_search(map, &query, limit) {
+
+            // Symbol search: specific identifiers matching task tokens.
+            // These are the highest-signal anchors for any query whose
+            // terms map to real code names.
+            //
+            // Per-token cap: take ONE top-scoring symbol per query
+            // token. With many candidate tokens (narrative queries
+            // can produce 10+), a single high-density token would
+            // otherwise saturate the slot — e.g. "diff" alone returns
+            // 5+ DiffEngine-style matches and crowds out matches for
+            // "page", "view", "revision", etc. Capping at 1 surfaces
+            // ONE match per concept; the dedup-truncate step that
+            // follows keeps the first `limit` distinct anchors,
+            // giving the answer cross-token variety.
+            //
+            // Why 1 (not 2 or 3): with `limit=5` and 11 candidate
+            // tokens, 1-per-token still produces 5+ candidates after
+            // dedup; the bottleneck is the dedup step, not symbol
+            // density. If a future change reduces query-token count
+            // (more aggressive stopword filtering), raising this
+            // cap may be the right move.
+            const SYMBOLS_PER_TOKEN: usize = 1;
+            for query in &queries {
+                for hit in symbol_search(map, query, SYMBOLS_PER_TOKEN) {
                     anchors.push(Anchor::new(
                         AnchorKind::Symbol,
                         hit.id,
@@ -157,6 +188,64 @@ pub fn resolve_anchors(map: &RepositoryMap, task: &TaskInput, limit: usize) -> V
                         format!("{} via {}", hit.reason, query),
                     ));
                 }
+            }
+
+            // Code-file matches: source files whose basename matches a
+            // query token. Lower priority than symbols but higher than
+            // broad areas — e.g. `watchlist.rs` for a query mentioning
+            // "watchlist".
+            if anchors.len() < limit {
+                for query in &queries {
+                    for anchor in code_file_anchors(
+                        map, query, limit.saturating_sub(anchors.len()),
+                    ) {
+                        if !anchors.contains(&anchor) {
+                            anchors.push(anchor);
+                        }
+                        if anchors.len() == limit {
+                            break;
+                        }
+                    }
+                    if anchors.len() == limit {
+                        break;
+                    }
+                }
+            }
+
+            // Config anchors (manifests, runtime configs) — kept in
+            // the Unknown arm because queries like "where is X
+            // configured" genuinely benefit. Lower priority than
+            // symbols / code files.
+            if anchors.len() < limit {
+                for config in config_anchors(
+                    map,
+                    task,
+                    &queries,
+                    limit.saturating_sub(anchors.len()),
+                ) {
+                    if !anchors.contains(&config) {
+                        anchors.push(config);
+                    }
+                    if anchors.len() == limit {
+                        break;
+                    }
+                }
+            }
+
+            // Areas LAST as fillers. Pre-fix this was the first call,
+            // saturating the limit; now it only adds folder anchors
+            // when budget remains. For a query like "Explain
+            // includes/Page" with no symbol terms, areas will still
+            // fully populate; for narrative queries, areas appear
+            // alongside the specific anchors that should lead.
+            if anchors.len() < limit {
+                let wants_area = wants_area_anchor(task);
+                anchors.extend(area_anchors(
+                    map,
+                    &queries,
+                    wants_area,
+                    limit.saturating_sub(anchors.len()),
+                ));
             }
         }
     }
@@ -867,6 +956,149 @@ mod tests {
             anchors
                 .iter()
                 .any(|anchor| anchor.id.ends_with("technical-architecture.md"))
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unknown_arm_narrative_query_surfaces_symbols_not_only_folders() {
+        // Regression test for the MediaWiki bug-fix-1 anchor gap.
+        //
+        // Pre-2026-05-10: a narrative query with many tokens that
+        // happen to match top-level folder names would fill the
+        // anchor limit (default 5) with folder anchors, leaving no
+        // budget for symbol matches. Symbols were appended AFTER
+        // areas in the Unknown arm — too late.
+        //
+        // Post-2026-05-10: the Unknown arm runs `symbol_search`
+        // before `area_anchors`, with areas as fillers. A query
+        // that mentions a symbol present in the graph MUST surface
+        // at least one Symbol anchor.
+        let root = std::env::temp_dir().join("aethyme_engine_anchor_narrative_test");
+        let _ = fs::remove_dir_all(&root);
+        // Set up a minimal repo with one symbol whose name matches a
+        // query token, plus several folder names that match other
+        // query tokens (to simulate the "areas saturate limit" case).
+        fs::create_dir_all(root.join("Page/sub")).expect("create dir");
+        fs::create_dir_all(root.join("Diff/sub")).expect("create dir");
+        fs::create_dir_all(root.join("Revision/sub")).expect("create dir");
+        fs::create_dir_all(root.join("Watchlist/sub")).expect("create dir");
+        // Stub file in each folder so they're registered as areas.
+        for name in &["Page", "Diff", "Revision", "Watchlist"] {
+            fs::write(
+                root.join(name).join("sub").join("Stub.py"),
+                "def stub():\n    pass\n",
+            )
+            .expect("write stub");
+        }
+        // The producer symbol — name matches a query token.
+        // Use `showDiffPage` because:
+        //   - it doesn't contain change/update/modify/fix substrings,
+        //     so the task stays classified as Unknown;
+        //   - `Page` in its name also matches an area, exposing the
+        //     symbols-vs-folders competition.
+        fs::write(
+            root.join("Page/sub/handler.py"),
+            "def showDiffPage(self):\n    return 42\n",
+        )
+        .expect("write handler.py");
+
+        let map = RepositoryMap::build(&root).expect("build repository map");
+
+        // Descriptive query mimicking T419918: no fix/change/update/
+        // modify verb, so classifies as Unknown. The tokens "page",
+        // "diff", "revision", "watchlist" all match area names; the
+        // token "showDiffPage" matches our planted symbol.
+        let task = TaskInput::from_task_text(
+            "Viewing a diff on a watchlisted page calls showDiffPage \
+             and marks revisions as seen instead of only the one viewed",
+        );
+        assert_eq!(
+            task.kind,
+            crate::model::task::TaskKind::Unknown,
+            "test setup precondition: query must classify as Unknown; \
+             got {:?}",
+            task.kind,
+        );
+
+        let anchors = resolve_anchors(&map, &task, 5);
+
+        // Post-fix: at least one Symbol anchor must surface even
+        // though four folder names (Page, Diff, Revision, Watchlist)
+        // match query tokens and would have saturated the limit
+        // pre-fix.
+        let symbol_count = anchors
+            .iter()
+            .filter(|a| a.kind == AnchorKind::Symbol)
+            .count();
+        assert!(
+            symbol_count >= 1,
+            "expected at least 1 Symbol anchor; got {}: {:?}",
+            symbol_count,
+            anchors
+                .iter()
+                .map(|a| (&a.kind, &a.id))
+                .collect::<Vec<_>>()
+        );
+        // And the showDiffPage symbol specifically should be among
+        // the anchors — that's the canonical recall test.
+        assert!(
+            anchors.iter().any(|a| a.id.contains("showDiffPage")),
+            "expected an anchor naming `showDiffPage`; got: {:?}",
+            anchors.iter().map(|a| &a.id).collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unknown_arm_orientation_query_still_gets_folder_anchors() {
+        // Companion to the test above: a query that has NO matching
+        // symbols (purely a "what's in here?" exploration) must
+        // still get folder anchors as fillers. This pins the
+        // "areas-as-filler" semantics — they appear when nothing
+        // more specific does, preserving the orientation value of
+        // the Unknown arm.
+        let root = std::env::temp_dir().join("aethyme_engine_anchor_orientation_test");
+        let _ = fs::remove_dir_all(&root);
+        // Mimic the structure of `explain_repo_prefers_structural_folder_anchors`
+        // (which we know produces area anchors): top-level dirs with
+        // content. This guarantees the test environment HAS areas to
+        // surface.
+        fs::create_dir_all(root.join("Inventory/src")).expect("create dir");
+        fs::create_dir_all(root.join("Auth/src")).expect("create dir");
+        fs::write(
+            root.join("Inventory/src/lib.py"),
+            "def stub():\n    pass\n",
+        )
+        .expect("write inventory file");
+        fs::write(
+            root.join("Auth/src/lib.py"),
+            "def stub():\n    pass\n",
+        )
+        .expect("write auth file");
+
+        let map = RepositoryMap::build(&root).expect("build repository map");
+        // Query with no token matching any planted symbol name.
+        // "look around in the Inventory area" → token "inventory"
+        // matches the Inventory folder; no symbol named "inventory"
+        // exists. We expect a Folder anchor for Inventory.
+        let task = TaskInput::from_task_text("Look around in the Inventory area");
+        assert_eq!(
+            task.kind,
+            crate::model::task::TaskKind::Unknown,
+            "test setup precondition: query must classify as Unknown; \
+             got {:?}",
+            task.kind,
+        );
+        let anchors = resolve_anchors(&map, &task, 5);
+
+        assert!(
+            anchors.iter().any(|a| a.kind == AnchorKind::Folder),
+            "orientation queries must still receive folder anchors; \
+             got: {:?}",
+            anchors.iter().map(|a| (&a.kind, &a.id)).collect::<Vec<_>>()
         );
 
         let _ = fs::remove_dir_all(&root);
