@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-04-22
+Last Updated: 2026-05-11
 
 ## Global Options
 
@@ -18,16 +18,115 @@ Last Updated: 2026-04-22
 - `aethyme repo ingest /path/to/repo`
 - `aethyme repo inspect /path/to/repo --json-output`
 - `aethyme repo clear-cache /path/to/repo`
+- `aethyme repo compile-skills /path/to/repo`
+- `aethyme repo init-onboarding-overrides /path/to/repo`
+- `aethyme repo validate-onboarding-overrides /path/to/repo`
+- `aethyme repo experience-telemetry /path/to/repo`
 - `aethyme repo deploy-skills /path/to/repo --force`
 
-`repo deploy-skills` deploys only target-safe runtime navigation skills by
-default. It must not deploy internal eval workflow skills into benchmark
-playground repositories.
+`repo compile-skills` generates repo-specific skills, currently
+`repo-onboarding`, into `.aethyme/generated/` plus per-product skill paths.
+It also records summon policy and generation telemetry inside the generated
+artifact. Maintainers can override selected sections with
+`.aethyme/overrides/onboarding.json`.
+It also generates a deterministic `repo-act` starter artifact and skill for
+debugging and validation planning.
+
+Example override:
+
+```json
+{
+  "commands": [
+    {
+      "kind": "test",
+      "command": "./scripts/test-fast.sh",
+      "source": "manual-override",
+      "confidence": "high"
+    }
+  ],
+  "notes": [
+    "Use sandbox credentials from 1Password.",
+    "Do not edit src/gen directly; run pnpm codegen."
+  ]
+}
+```
+
+`notes[]` are rendered into the visible `repo-onboarding` skill under
+`Maintainer Notes`; humans contribute by editing the override file and
+regenerating onboarding, not by editing generated skill files directly.
+
+`repo init-onboarding-overrides` writes a starter override file.
+`repo validate-onboarding-overrides` checks that the override file is valid JSON
+and that key fields use the expected shapes.
+
+`repo deploy-skills` is now a compatibility path that deploys only the static
+runtime navigation skill. For real repositories, prefer
+`aethyme enhance deploy --repo /path/to/repo`.
 
 ### Local Discoverability
+- `aethyme enhance deploy --repo /path/to/repo`
+- `aethyme enhance verify --repo /path/to/repo`
 - `aethyme query symbol /path/to/repo main`
 - `aethyme query deps /path/to/repo src/main.py`
 - `aethyme query impact /path/to/repo src/main.py`
+
+`enhance deploy` is the primary repo-facing discoverability path. It writes:
+- `AGENTS.md` and `CLAUDE.md`
+- `.claude/skills/aethyme/SKILL.md`
+- `.codex/skills/aethyme/SKILL.md`
+- `.claude/hooks/aethyme-load-context.sh`
+- `.aethyme/generated/onboarding.json`
+- `.aethyme/generated/act-starter.json`
+- `.claude/skills/repo-onboarding/SKILL.md`
+- `.codex/skills/repo-onboarding/SKILL.md`
+- `.claude/skills/repo-act/SKILL.md`
+- `.codex/skills/repo-act/SKILL.md`
+
+`onboarding.json` is the canonical artifact. It includes:
+- repo identity
+- inferred commands, areas, entrypoints, caution zones
+- summon rules for when the onboarding skill should be loaded
+- freshness metadata
+- generation telemetry and override status
+
+`act-starter.json` is the deterministic execution companion artifact. It includes:
+- debugging and validation starter checklists
+- likely fast test/lint/build commands
+- likely entrypoints and caution zones
+
+`enhance verify` also prints a compact summary: recommended skill/mode,
+onboarding counts, override presence, and Act starter readiness.
+
+Stable experience-layer telemetry is written to:
+- `.aethyme/generated/experience-telemetry.jsonl`
+
+Inspect it with:
+- `aethyme repo experience-telemetry /path/to/repo`
+- `aethyme repo experience-telemetry /path/to/repo --json-output`
+
+The report now derives simple experience-layer KPIs, for example:
+- enhancement installed but no wrapper usage recorded yet
+- invalid onboarding override present
+- onboarding exists but no fast test command detected
+
+It also emits concrete suggestions tied to those signals, for example:
+- load onboarding and use the Aethyme wrapper on the next broad task
+- fix or reinitialize an invalid override
+- add a fast test command through onboarding overrides
+
+This ledger records deterministic lifecycle events only, such as:
+- `enhance.deploy`
+- `enhance.verify`
+- `repo.compile-skills`
+- `repo.init-onboarding-overrides`
+- `repo.validate-onboarding-overrides`
+
+Wrapper-level signals are also recorded when Aethyme-provided entry points are
+actually invoked:
+- `wrapper.invocation` with `wrapper_name=aethyme-explore`
+- `wrapper.invocation` with `wrapper_name=aethyme-sessionstart-hook`
+
+It does not yet claim actual agent adoption or downstream answer quality.
 
 ### High-Level Intent Surface
 
@@ -38,10 +137,11 @@ playground repositories.
 - `aethyme explore --repo /path/to/repo --intent behavior_localization_query --request "Find the files responsible for this behavior" --format answer-json --show-observability`
 - `aethyme explore --repo /path/to/repo --intent usage_boundary_query --request "Find public functions with no outside callers" --params '{"scope":"src/pkg","symbol_kind":"public_top_level_function","boundary":{"type":"outside_directory","path":"src/pkg"},"search_roots":["src","tests"],"budget_ms":10000,"max_evidence_per_symbol":5}' --format answer-json --show-observability`
 
-`intents` returns the finite mode/intent catalog. Current modes are `explore`,
-`act`, and `learn`; `explore` implements the default
-`task_localization_query` intent plus specialized intents such as
-`behavior_localization_query` and `usage_boundary_query`.
+`intents` returns the finite mode/intent catalog. The public product model is
+`explore / act / learn`; `explore` is the implemented primary mode today and
+ships the default `task_localization_query` intent plus specialized intents
+such as `behavior_localization_query` and `usage_boundary_query`. `act` and
+`learn` are product-direction modes, not equivalent top-level CLI groups yet.
 
 `explore --request ...` without `--intent` runs the default
 `task_localization_query` intent. It composes one bounded `task-localize` graph

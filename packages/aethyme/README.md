@@ -1,8 +1,8 @@
 # Aethyme Core
 
-Last Updated: 2026-03-06
+Last Updated: 2026-05-11
 
-Aethyme Core is the backend product in this repository.
+Aethyme Core is the deterministic repository tooling product in this repository.
 
 It owns:
 
@@ -14,6 +14,18 @@ It owns:
 6. deterministic navigation primitives for AI agents
 7. navigation evaluation benchmarks — see [`docs/guides/eval-protocol.md`](docs/guides/eval-protocol.md)
 8. evaluation tooling roadmap — see [`docs/guides/eval-tooling-roadmap.md`](docs/guides/eval-tooling-roadmap.md)
+
+## Public Product Model
+
+Aethyme's public model is:
+
+- `Explore`: deterministic repository orientation, candidate answers, evidence, verification steps
+- `Act`: planned layer for task-shaped execution guidance built on Explore outputs
+- `Learn`: planned layer for post-task telemetry, ranking feedback, and future improvement
+
+Today, `Explore` is the implemented primary entry point. Lower-level graph,
+query, facts, and task commands remain available as supporting primitives, not
+the default operator path.
 
 ## Canonical Model
 
@@ -77,7 +89,16 @@ API and CLI indexing both run through [`src/indexing/service.py`](src/indexing/s
 
 For the first product proof, Aethyme can run against one local repository without any SaaS layer.
 
-Core commands:
+Primary commands:
+
+- `aethyme explore --repo /path/to/repo --request "<task>" --format answer-json`
+- `aethyme enhance deploy --repo /path/to/repo`
+- `aethyme enhance verify --repo /path/to/repo`
+- `aethyme repo compile-skills /path/to/repo`
+- `aethyme repo init-onboarding-overrides /path/to/repo`
+- `aethyme repo validate-onboarding-overrides /path/to/repo`
+
+Supporting commands:
 
 - `aethyme repo ingest /path/to/repo`
 - `aethyme repo inspect /path/to/repo --json-output`
@@ -129,6 +150,12 @@ Runtime notes:
 - the canonical playground protocol is Chau7 MCP with 5 conditions: `control-cto-off`, `control-cto-on`, `explore`, `leverage`, `task-conditioned`
 - without those commands, it still emits the comparison artifacts only
 - the `leverage` condition uses a compact generic Aethyme Explore usage card; `task-conditioned` remains the full context-pack mode
+- `aethyme enhance deploy --repo <path>` is the primary real-repository enhancement path; it writes cross-product discoverability files plus generated repo-onboarding artifacts
+- `aethyme repo deploy-skills` remains a compatibility path for the static runtime skill and benchmark-oriented consumers
+- generated onboarding lives at `.aethyme/generated/onboarding.json` and renders to `.codex/skills/repo-onboarding/SKILL.md` and `.claude/skills/repo-onboarding/SKILL.md`
+- generated Act starter lives at `.aethyme/generated/act-starter.json` and renders to `.codex/skills/repo-act/SKILL.md` and `.claude/skills/repo-act/SKILL.md`
+- repo-local onboarding overrides live at `.aethyme/overrides/onboarding.json`; this side owns summon policy, overrides, compact rendering, and generation telemetry, while graph quality stays below the contract boundary
+- stable experience-layer lifecycle telemetry is written to `.aethyme/generated/experience-telemetry.jsonl`
 - `explore --request ...` defaults to `task_localization_query`, a bounded general-purpose answer path that returns ranked candidate files/symbols/areas, compact evidence, verification steps, confidence, next actions, and observability; on large repos it returns degraded `needs_verification` output instead of blocking or claiming answer safety
 - `explore --intent usage_boundary_query` now uses a scope-first PHP analyzer path that returns answer/excluded/confidence/observability without building the full repository graph
 - reports include an Aethyme Usage section so availability is not confused with actual `src.cli` invocation

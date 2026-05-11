@@ -79,10 +79,10 @@ consumer. This file exists so that doesn't happen again.
 ### Externally deployed runtime files (under `~/Downloads/Repositories/Playground/`)
 
 These are files in *separate repos* (the playground clones), put there
-by `deploy_skills` / `enhance.deploy`. They're snapshots of the
-templates above; whenever the canonical template changes, redeploy
-with `aethyme repo deploy-skills --repo <playground> --force` to keep
-them current.
+by `deploy_skills` / `enhance.deploy`. For benchmark clones, static skill
+deployment remains the compatibility path; for normal repositories,
+`enhance.deploy` is the primary path because it also writes generated
+onboarding artifacts.
 
 | Path (under each `<Playground>/<repo> - Aethyme/`) | Source template | Last verified |
 |---|---|---|
@@ -101,7 +101,9 @@ When deleting or renaming a CLI entry point:
 - [ ] For `verify-playground.sh`: update the grep patterns.
 - [ ] For `setup-playground.sh`: update if it calls the entry point.
 - [ ] Run `aethyme repo deploy-skills --force` against any active
-      playground to flush the stale deployed copy.
+      benchmark playground clone to flush the stale static copy.
+- [ ] Run `aethyme enhance deploy --repo <path>` against any normal
+      repository enhancement target to refresh generated onboarding.
 - [ ] Add a row to the relevant section above documenting the change.
 - [ ] If a consumer was missed (i.e. you discovered it during a
       validation eval rather than this audit): **add it to this file
