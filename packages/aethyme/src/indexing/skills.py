@@ -1,9 +1,12 @@
-"""Deploy Aethyme skill templates to a target repository.
+"""Deploy static Aethyme skill templates to a target repository.
 
 Runtime skills are generic Markdown templates stored at
 ``<aethyme-package>/skills/``. Deployment copies target-safe skills into
 ``<target-repo>/.codex/skills/`` with the ``{{AETHYME_ROOT}}`` placeholder
 replaced by the actual Aethyme package path.
+
+This module intentionally handles only the static runtime skill. Repo-specific
+generated skills such as onboarding are emitted by the enhancement flow.
 """
 
 from __future__ import annotations
