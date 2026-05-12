@@ -114,6 +114,7 @@ def build_onboarding_artifact(
     primary_commands = _primary_commands(commands)
     areas = _collect_areas(repo_path)
     entrypoints = _collect_entrypoints(repo_path, manifests)
+    primary_entrypoints = _primary_entrypoints(entrypoints)
     caution_zones = _collect_caution_zones(repo_path)
     repo_kind = _infer_repo_kind(repo_path, manifests, areas)
     languages = _infer_languages(repo_path, manifests)
@@ -133,6 +134,7 @@ def build_onboarding_artifact(
         "primary_commands": primary_commands,
         "areas": areas,
         "entrypoints": entrypoints,
+        "primary_entrypoints": primary_entrypoints,
         "caution_zones": caution_zones,
         "navigation_recipes": _navigation_recipes(aethyme_root),
         "summon": _summon_policy(),
@@ -156,6 +158,7 @@ def build_act_starter_artifact(onboarding_artifact: dict[str, Any]) -> dict[str,
     commands = onboarding_artifact.get("commands", [])
     primary_commands = onboarding_artifact.get("primary_commands", {})
     entrypoints = onboarding_artifact.get("entrypoints", [])
+    primary_entrypoints = onboarding_artifact.get("primary_entrypoints", {})
     caution_zones = onboarding_artifact.get("caution_zones", [])
     return {
         "schema_version": "aethyme-act-starter-v1",
@@ -187,10 +190,12 @@ def build_act_starter_artifact(onboarding_artifact: dict[str, Any]) -> dict[str,
             "dev": primary_commands.get("dev") or _first_command_of_kind(commands, "dev"),
         },
         "entrypoints": entrypoints[:3],
+        "primary_entrypoints": primary_entrypoints,
         "caution_zones": caution_zones[:5],
         "telemetry": {
             "derived_from": ONBOARDING_JSON_PATH,
             "entrypoint_count": len(entrypoints),
+            "primary_entrypoint_count": len(primary_entrypoints),
             "caution_zone_count": len(caution_zones),
         },
     }
@@ -203,6 +208,7 @@ def render_onboarding_skill(artifact: dict[str, Any]) -> str:
     primary_commands = artifact.get("primary_commands") or {}
     areas = artifact["areas"]
     entrypoints = artifact["entrypoints"]
+    primary_entrypoints = artifact.get("primary_entrypoints") or {}
     caution_zones = artifact["caution_zones"]
     recipes = artifact["navigation_recipes"]
     notes = artifact.get("notes") or []
@@ -256,12 +262,21 @@ def render_onboarding_skill(artifact: dict[str, Any]) -> str:
             f" ({command['kind']}; {command['confidence']} confidence from `{command['source']}`)"
         )
 
-    if entrypoints:
+    if primary_entrypoints:
         lines.extend(["", "## Entrypoints", ""])
+        for label in ("app", "cli", "worker", "test"):
+            entrypoint = primary_entrypoints.get(label)
+            if entrypoint:
+                lines.append(
+                    f"- `{label}`: `{entrypoint['path']}`"
+                    f" ({entrypoint['reason']}; {entrypoint.get('confidence', 'medium')} confidence)"
+                )
+        lines.extend(["", "## Additional Entrypoints", ""])
+    if entrypoints:
         for entrypoint in entrypoints[:5]:
             lines.append(
                 f"- `{entrypoint['path']}`"
-                f" ({entrypoint['kind']}; {entrypoint['reason']}; {entrypoint.get('confidence', 'medium')} confidence)"
+                f" ({entrypoint['kind']}; role={entrypoint.get('role', 'unknown')}; {entrypoint['reason']}; {entrypoint.get('confidence', 'medium')} confidence)"
             )
 
     if areas:
@@ -308,6 +323,7 @@ def render_act_skill(artifact: dict[str, Any]) -> str:
     repo = artifact["repo"]
     commands = artifact["commands"]
     entrypoints = artifact["entrypoints"]
+    primary_entrypoints = artifact.get("primary_entrypoints") or {}
     caution_zones = artifact["caution_zones"]
     checklists = artifact["starter_checklists"]
 
@@ -336,6 +352,10 @@ def render_act_skill(artifact: dict[str, Any]) -> str:
     for label, command in commands.items():
         if command:
             lines.append(f"- `{label}`: `{command}`")
+    if primary_entrypoints:
+        lines.extend(["", "## Primary Entrypoints", ""])
+        for label, entrypoint in primary_entrypoints.items():
+            lines.append(f"- `{label}`: `{entrypoint['path']}` ({entrypoint['reason']})")
     if entrypoints:
         lines.extend(["", "## Likely Entrypoints", ""])
         for entrypoint in entrypoints:
@@ -510,7 +530,7 @@ def _collect_commands(
             inferred["confidence"],
         )
 
-    return sorted(
+    ranked_commands = sorted(
         commands,
         key=lambda command: (
             _kind_priority(command["kind"]),
@@ -518,7 +538,8 @@ def _collect_commands(
             command["source"],
             command["command"],
         ),
-    )[:12]
+    )
+    return ranked_commands[:16]
 
 
 def _make_targets(makefile_path: Path) -> set[str]:
@@ -562,42 +583,80 @@ def _collect_areas(repo_path: Path) -> list[dict[str, str]]:
 
 def _collect_entrypoints(repo_path: Path, manifests: list[str]) -> list[dict[str, str]]:
     candidates: list[dict[str, str]] = []
-    roots = [
-        "main.py",
-        "app.py",
-        "manage.py",
-        "main.go",
-        "cmd",
-        "src/main.py",
-        "src/index.ts",
-        "src/index.js",
-        "src/main.ts",
-        "src/main.rs",
-        "public/index.php",
-        "index.php",
-    ]
-    for relative in roots:
-        path = repo_path / relative
-        if path.exists():
-            kind = "directory" if path.is_dir() else "file"
-            candidates.append(
-                {
-                    "path": relative,
-                    "kind": kind,
-                    "reason": "conventional application entrypoint",
-                    "confidence": "medium",
-                }
-            )
-    if "Cargo.toml" in manifests and (repo_path / "src/lib.rs").exists():
+    seen: set[tuple[str, str]] = set()
+
+    def add(path: str, kind: str, role: str, reason: str, confidence: str) -> None:
+        key = (path, role)
+        if key in seen:
+            return
+        seen.add(key)
         candidates.append(
             {
-                "path": "src/lib.rs",
-                "kind": "file",
-                "reason": "library root for Rust crate",
-                "confidence": "medium",
+                "path": path,
+                "kind": kind,
+                "role": role,
+                "reason": reason,
+                "confidence": confidence,
             }
         )
-    return candidates[:6]
+
+    conventional_roots = [
+        ("main.py", "file", "app", "conventional Python application entrypoint", "medium"),
+        ("app.py", "file", "app", "common Python application entrypoint", "medium"),
+        ("manage.py", "file", "cli", "common framework management entrypoint", "high"),
+        ("main.go", "file", "app", "conventional Go application entrypoint", "medium"),
+        ("cmd", "directory", "cli", "conventional Go or CLI command root", "medium"),
+        ("src/main.py", "file", "app", "conventional source application entrypoint", "medium"),
+        ("src/index.ts", "file", "app", "conventional TypeScript application entrypoint", "medium"),
+        ("src/index.js", "file", "app", "conventional JavaScript application entrypoint", "medium"),
+        ("src/main.ts", "file", "app", "conventional TypeScript application entrypoint", "medium"),
+        ("src/main.rs", "file", "app", "conventional Rust binary entrypoint", "high"),
+        ("public/index.php", "file", "app", "common PHP public entrypoint", "high"),
+        ("index.php", "file", "app", "common PHP entrypoint", "medium"),
+        ("tests", "directory", "test", "conventional test root", "medium"),
+        ("test", "directory", "test", "conventional test root", "medium"),
+    ]
+    for relative, kind, role, reason, confidence in conventional_roots:
+        path = repo_path / relative
+        if path.exists():
+            add(relative, kind, role, reason, confidence)
+
+    for candidate in _entrypoints_from_package_json(repo_path):
+        add(
+            candidate["path"],
+            candidate["kind"],
+            candidate["role"],
+            candidate["reason"],
+            candidate["confidence"],
+        )
+    for candidate in _entrypoints_from_procfile(repo_path):
+        add(
+            candidate["path"],
+            candidate["kind"],
+            candidate["role"],
+            candidate["reason"],
+            candidate["confidence"],
+        )
+    for candidate in _entrypoints_from_compose(repo_path):
+        add(
+            candidate["path"],
+            candidate["kind"],
+            candidate["role"],
+            candidate["reason"],
+            candidate["confidence"],
+        )
+
+    if "Cargo.toml" in manifests and (repo_path / "src/lib.rs").exists():
+        add("src/lib.rs", "file", "cli", "library root for Rust crate", "medium")
+
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            _entrypoint_role_priority(candidate["role"]),
+            -_confidence_rank(candidate["confidence"]),
+            candidate["path"],
+        ),
+    )[:8]
 
 
 def _collect_caution_zones(repo_path: Path) -> list[dict[str, str]]:
@@ -770,6 +829,151 @@ def _commands_from_compose(repo_path: Path) -> list[dict[str, str]]:
     return commands
 
 
+def _entrypoints_from_package_json(repo_path: Path) -> list[dict[str, str]]:
+    package_json_path = repo_path / "package.json"
+    if not package_json_path.exists():
+        return []
+    package_json = json.loads(package_json_path.read_text(encoding="utf-8"))
+    candidates: list[dict[str, str]] = []
+    for field, role, reason in (
+        ("main", "app", "package main entrypoint",),
+        ("bin", "cli", "package CLI entrypoint",),
+    ):
+        value = package_json.get(field)
+        if isinstance(value, str):
+            path = value.lstrip("./")
+            if (repo_path / path).exists():
+                candidates.append(
+                    {
+                        "path": path,
+                        "kind": "file",
+                        "role": role,
+                        "reason": reason,
+                        "confidence": "high",
+                    }
+                )
+        elif isinstance(value, dict) and field == "bin":
+            for bin_path in value.values():
+                if not isinstance(bin_path, str):
+                    continue
+                path = bin_path.lstrip("./")
+                if (repo_path / path).exists():
+                    candidates.append(
+                        {
+                            "path": path,
+                            "kind": "file",
+                            "role": "cli",
+                            "reason": "package bin entrypoint",
+                            "confidence": "high",
+                        }
+                    )
+    scripts = package_json.get("scripts") or {}
+    script_candidates = {
+        "dev": ("app", "package dev script"),
+        "start": ("app", "package start script"),
+        "worker": ("worker", "package worker script"),
+        "test": ("test", "package test script"),
+    }
+    for script_name, (role, reason) in script_candidates.items():
+        if script_name in scripts:
+            candidates.append(
+                {
+                    "path": f"package.json:scripts.{script_name}",
+                    "kind": "script",
+                    "role": role,
+                    "reason": reason,
+                    "confidence": "medium",
+                }
+            )
+    return candidates
+
+
+def _entrypoints_from_procfile(repo_path: Path) -> list[dict[str, str]]:
+    procfile_path = repo_path / "Procfile"
+    if not procfile_path.exists():
+        return []
+    candidates: list[dict[str, str]] = []
+    for line in procfile_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or ":" not in stripped:
+            continue
+        name, command = stripped.split(":", 1)
+        process_name = name.strip().lower()
+        role = "app"
+        reason = "Procfile process entrypoint"
+        if process_name in {"worker", "job", "consumer"}:
+            role = "worker"
+            reason = "Procfile worker process entrypoint"
+        elif process_name in {"test", "tests"}:
+            role = "test"
+            reason = "Procfile test process entrypoint"
+        elif process_name in {"cli", "console"}:
+            role = "cli"
+            reason = "Procfile CLI process entrypoint"
+        candidates.append(
+            {
+                "path": f"Procfile:{process_name}",
+                "kind": "process",
+                "role": role,
+                "reason": reason,
+                "confidence": "high",
+            }
+        )
+        inferred_path = _extract_path_like_token(command.strip(), repo_path)
+        if inferred_path:
+            candidates.append(
+                {
+                    "path": inferred_path,
+                    "kind": "file" if (repo_path / inferred_path).is_file() else "directory",
+                    "role": role,
+                    "reason": f"{reason} target",
+                    "confidence": "medium",
+                }
+            )
+    return candidates
+
+
+def _entrypoints_from_compose(repo_path: Path) -> list[dict[str, str]]:
+    filenames = ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
+    compose_name = next((name for name in filenames if (repo_path / name).exists()), None)
+    if not compose_name:
+        return []
+    contents = (repo_path / compose_name).read_text(encoding="utf-8")
+    candidates: list[dict[str, str]] = []
+    for service_name in ("app", "web", "server", "worker", "test", "tests"):
+        if f"{service_name}:" not in contents:
+            continue
+        role = "app"
+        reason = "compose service entrypoint"
+        if service_name == "worker":
+            role = "worker"
+            reason = "compose worker entrypoint"
+        elif service_name in {"test", "tests"}:
+            role = "test"
+            reason = "compose test service entrypoint"
+        candidates.append(
+            {
+                "path": f"{compose_name}:{service_name}",
+                "kind": "service",
+                "role": role,
+                "reason": reason,
+                "confidence": "medium",
+            }
+        )
+    return candidates
+
+
+def _extract_path_like_token(command: str, repo_path: Path) -> str | None:
+    for token in command.split():
+        normalized = token.strip("\"'").lstrip("./")
+        if not normalized or normalized.startswith("-"):
+            continue
+        candidate = repo_path / normalized
+        if candidate.exists():
+            return normalized
+    return None
+
+
 def _kind_priority(kind: str) -> int:
     priority = {
         "install": 0,
@@ -781,6 +985,10 @@ def _kind_priority(kind: str) -> int:
         "primary-script": 6,
     }
     return priority.get(kind, 99)
+
+
+def _entrypoint_role_priority(role: str) -> int:
+    return {"app": 0, "cli": 1, "worker": 2, "test": 3}.get(role, 99)
 
 
 def _confidence_rank(confidence: str) -> int:
@@ -801,6 +1009,26 @@ def _primary_commands(commands: list[dict[str, str]]) -> dict[str, str]:
         if ranked:
             primary[kind] = str(ranked[0]["command"])
     return primary
+
+
+def _primary_entrypoints(entrypoints: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    primary: dict[str, dict[str, str]] = {}
+    for role in ("app", "cli", "worker", "test"):
+        ranked = sorted(
+            [entrypoint for entrypoint in entrypoints if entrypoint.get("role") == role],
+            key=lambda entrypoint: (
+                -_confidence_rank(str(entrypoint.get("confidence"))),
+                _entrypoint_kind_priority(str(entrypoint.get("kind"))),
+                str(entrypoint.get("path")),
+            ),
+        )
+        if ranked:
+            primary[role] = ranked[0]
+    return primary
+
+
+def _entrypoint_kind_priority(kind: str) -> int:
+    return {"file": 0, "directory": 1, "process": 2, "service": 3, "script": 4}.get(kind, 99)
 
 
 def _source_priority(kind: str, source: str) -> int:
