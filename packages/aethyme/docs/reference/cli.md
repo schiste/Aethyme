@@ -23,6 +23,7 @@ Last Updated: 2026-05-11
 - `aethyme repo validate-onboarding-overrides /path/to/repo`
 - `aethyme repo experience-telemetry /path/to/repo`
 - `aethyme repo experience-telemetry /path/to/repo --check`
+- `aethyme repo experience-status /path/to/repo`
 - `aethyme repo deploy-skills /path/to/repo --force`
 
 `repo compile-skills` generates repo-specific skills, currently
@@ -101,10 +102,16 @@ onboarding counts, override presence, override freshness, and Act starter readin
 Stable experience-layer telemetry is written to:
 - `.aethyme/generated/experience-telemetry.jsonl`
 
+Generated experience status artifacts are written to:
+- `.aethyme/generated/experience-status.json`
+- `.aethyme/generated/experience-status.md`
+
 Inspect it with:
 - `aethyme repo experience-telemetry /path/to/repo`
 - `aethyme repo experience-telemetry /path/to/repo --json-output`
 - `aethyme repo experience-telemetry /path/to/repo --check`
+- `aethyme repo experience-status /path/to/repo`
+- `aethyme repo experience-status /path/to/repo --json-output`
 
 The report now derives simple experience-layer KPIs, for example:
 - enhancement installed but no wrapper usage recorded yet
@@ -114,6 +121,13 @@ The report now derives simple experience-layer KPIs, for example:
 
 `--check` exits nonzero when attention signals are present, so it can be used in
 CI or local verification gates without parsing the full report.
+
+`repo experience-status` writes a compact operator artifact with:
+- enhancement installed/verified state
+- onboarding/Act presence
+- override freshness
+- KPI signals and suggestions
+- recommended next command
 
 It also emits concrete suggestions tied to those signals, for example:
 - load onboarding and use the Aethyme wrapper on the next broad task
