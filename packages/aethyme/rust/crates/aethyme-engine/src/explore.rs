@@ -970,7 +970,13 @@ fn build_response(
     // for FILES to act on, not directories.
     let mut answers: Vec<AnswerItem> = Vec::new();
     let mut nav_hints: Vec<AnswerItem> = Vec::new();
-    let mut anchor_file_items: Vec<AnswerItem> = Vec::new();
+    // Anchors that should land in `answer[]` rather than
+    // `navigation_hints[]`. Renamed from `anchor_file_items` on
+    // 2026-05-12 when `"symbol"` anchors started being promoted
+    // alongside `"file"` anchors. Same merge pass; same downstream
+    // handling (kind="anchor"); the `evidence.anchor_kind` field
+    // distinguishes which sub-kind produced the item.
+    let mut anchor_items: Vec<AnswerItem> = Vec::new();
 
     for anchor in &anchors {
         let kind = anchor.get("kind").and_then(|v| v.as_str()).unwrap_or("");
@@ -984,7 +990,7 @@ fn build_response(
         match kind {
             "file" => {
                 let path = file.map(String::from).or_else(|| Some(id.to_string()));
-                anchor_file_items.push(AnswerItem {
+                anchor_items.push(AnswerItem {
                     kind: "anchor".into(),
                     target: id.to_string(),
                     path,
@@ -995,6 +1001,45 @@ fn build_response(
                     evidence: serde_json::json!({
                         "source": "task-localize.anchors",
                         "anchor_kind": "file",
+                    }),
+                });
+            }
+            "symbol" => {
+                // Promote symbol-kind anchors into `answer[]` as
+                // first-class candidates (2026-05-12). Pre-fix these
+                // landed in `navigation_hints[]` via the `other` arm
+                // — agents reading only `answer[]` never saw them,
+                // even though symbol-name match is at least as
+                // specific as filename match.
+                //
+                // Confidence 0.80: slightly below file anchors
+                // (0.85) to acknowledge that today's `symbol_search`
+                // is token-substring-based and can produce noisy
+                // matches (e.g. "marks → GrammarKsh"). When the
+                // symbol-search ranking gets stricter (a separate
+                // follow-up), this can move to 0.85 — one-line
+                // change. The intermediate value also lets the
+                // trust_policy machinery flag symbol anchors as
+                // "candidate but verify" without special-casing.
+                //
+                // Dedup at merge step (path-based) means symbol
+                // anchors for files ALREADY in `answer[]` via
+                // text-match are dropped silently. The real impact
+                // is on files NOT yet in answer[] — the long tail
+                // of graph-derived candidates that text-match
+                // missed.
+                let path = file.map(String::from);
+                anchor_items.push(AnswerItem {
+                    kind: "anchor".into(),
+                    target: id.to_string(),
+                    path,
+                    status: "candidate".into(),
+                    confidence: 0.80,
+                    reason,
+                    role: "anchor".into(),
+                    evidence: serde_json::json!({
+                        "source": "task-localize.anchors",
+                        "anchor_kind": "symbol",
                     }),
                 });
             }
@@ -1137,7 +1182,7 @@ fn build_response(
         answers.push(item.clone());
     }
 
-    for item in &anchor_file_items {
+    for item in &anchor_items {
         if answers.len() >= params.max_answer_items {
             break;
         }
@@ -2033,6 +2078,178 @@ mod tests {
             response.navigation_hints.iter().any(|h| h.target == "includes/Watchlist"),
             "folder anchor should land in navigation_hints[]"
         );
+    }
+
+    #[test]
+    fn build_response_promotes_symbol_anchors_into_answer() {
+        // Regression test for the 2026-05-12 symbol-anchor promotion.
+        //
+        // Pre-fix: anchors with `kind: "symbol"` (produced by the
+        // Unknown arm of `resolve_anchors` after 7a01c32) landed in
+        // `navigation_hints[]` via the generic `other` arm. Agents
+        // reading only `answer[]` never saw them, even though
+        // symbol-name match is at least as specific as filename match.
+        //
+        // Post-fix: symbol anchors push into `answer[]` as
+        // `kind: "anchor"` items with `evidence.anchor_kind: "symbol"`
+        // and `confidence: 0.80`. Path-based dedup against text
+        // matches still applies — see the merge step at the
+        // "anchor_items" loop.
+        let view = serde_json::json!({
+            "task": "find watchlist handlers",
+            "anchors": {
+                "task": "find watchlist handlers",
+                "anchors": [
+                    {
+                        "kind": "symbol",
+                        // Qualified id mirrors the real shape:
+                        // `fn:<repo>:<file>:<symbol>`.
+                        "id": "fn:Mediawiki - Aethyme:includes/Page/WikiPage.php:doViewUpdates",
+                        "file": "includes/Page/WikiPage.php",
+                        "reason": "function-name-match via viewupdates"
+                    }
+                ]
+            },
+            "scope": {
+                "in_scope_files": [],
+                "in_scope_symbols": [],
+                "in_scope_areas": [],
+                "out_of_scope": [],
+                "risks": []
+            },
+            "next": {"items": []}
+        });
+        let response = build_response(
+            "find watchlist handlers",
+            Intent::TaskLocalization,
+            IntentSource::Default,
+            &view,
+            &empty_symbols(),
+            &[],
+            &[],
+            &[],
+            &ExploreParams::default(),
+        );
+
+        let promoted = response
+            .answer
+            .iter()
+            .find(|a| a.path.as_deref() == Some("includes/Page/WikiPage.php"))
+            .expect(
+                "symbol anchor for `doViewUpdates` should be promoted into \
+                 answer[] (was previously routed to navigation_hints)",
+            );
+
+        // Pinned downstream contract: kind="anchor" with sub-kind in
+        // evidence. This keeps the answer-kind list in the
+        // `debug_assert!` at line ~1454 unchanged.
+        assert_eq!(promoted.kind, "anchor");
+        assert_eq!(
+            promoted.evidence.get("anchor_kind").and_then(|v| v.as_str()),
+            Some("symbol")
+        );
+
+        // Confidence: 0.80 (chosen 2026-05-12). Slightly below file
+        // anchors (0.85) to acknowledge symbol_search's current
+        // token-substring naivete. If a future ranking improvement
+        // makes symbol matches as reliable as filename matches, raise
+        // this to 0.85 — single-line change.
+        let confidence_diff = (promoted.confidence - 0.80_f64).abs();
+        assert!(
+            confidence_diff < 1e-9,
+            "expected confidence 0.80; got {}",
+            promoted.confidence
+        );
+
+        // The qualified symbol id flows into `target` so agents can
+        // navigate to the specific symbol, not just the file.
+        assert!(
+            promoted.target.contains("doViewUpdates"),
+            "target should preserve the qualified symbol id; got {}",
+            promoted.target
+        );
+
+        // Sanity: the same anchor should NOT also appear in
+        // navigation_hints (we promoted it, didn't duplicate it).
+        assert!(
+            response
+                .navigation_hints
+                .iter()
+                .all(|h| h.path.as_deref() != Some("includes/Page/WikiPage.php")
+                    || h.kind != "anchor_symbol"),
+            "symbol anchor should be in answer[], not duplicated to \
+             navigation_hints[]"
+        );
+    }
+
+    #[test]
+    fn build_response_symbol_anchor_dedup_against_text_match() {
+        // When a file is ALREADY in answer[] via text-match, a symbol
+        // anchor for the same file should be dropped (path-based
+        // dedup at the merge step). The text-match item carries
+        // line-level evidence which is stronger than "this file
+        // contains a matching symbol name."
+        let view = serde_json::json!({
+            "task": "find watchlist handlers",
+            "anchors": {
+                "task": "find watchlist handlers",
+                "anchors": [
+                    {
+                        "kind": "symbol",
+                        "id": "fn:repo:WatchedItemStore.php:resetNotificationTimestamp",
+                        "file": "includes/Watchlist/WatchedItemStore.php",
+                        "reason": "function-name-match via notification"
+                    }
+                ]
+            },
+            "scope": {
+                "in_scope_files": [],
+                "in_scope_symbols": [],
+                "in_scope_areas": [],
+                "out_of_scope": [],
+                "risks": []
+            },
+            "next": {"items": []}
+        });
+        let text_match = AnswerItem {
+            kind: "source_text_file".into(),
+            target: "includes/Watchlist/WatchedItemStore.php".into(),
+            path: Some("includes/Watchlist/WatchedItemStore.php".into()),
+            status: "candidate".into(),
+            confidence: 0.75,
+            reason: "text-match line evidence".into(),
+            role: "candidate".into(),
+            evidence: serde_json::json!({"source": "text-search"}),
+        };
+        let response = build_response(
+            "find watchlist handlers",
+            Intent::TaskLocalization,
+            IntentSource::Default,
+            &view,
+            &empty_symbols(),
+            &[text_match],  // text-match for same file as symbol anchor
+            &[],
+            &[],
+            &ExploreParams::default(),
+        );
+
+        // Exactly ONE answer for this file — the text-match one.
+        let matches: Vec<_> = response
+            .answer
+            .iter()
+            .filter(|a| a.path.as_deref()
+                == Some("includes/Watchlist/WatchedItemStore.php"))
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly 1 answer for the file; got {}: {:?}",
+            matches.len(),
+            matches.iter().map(|m| &m.kind).collect::<Vec<_>>(),
+        );
+        // The survivor is the text-match (added first, stronger
+        // evidence), not the symbol anchor.
+        assert_eq!(matches[0].kind, "source_text_file");
     }
 
     #[test]
