@@ -89,7 +89,9 @@ For `AGENTS.md`, Aethyme owns only the block between
 `<!-- AETHYME:BEGIN generated -->` and `<!-- AETHYME:END generated -->`.
 Maintainer-authored instructions outside that block are preserved across
 redeploys. Existing full-file Aethyme templates are migrated into the managed
-block on the next deploy.
+block on the next deploy. The block includes a compact repo-routing summary:
+repo-onboarding skill path, repo-act skill path, experience status path, primary
+fast test when detected, and primary app entrypoint when detected.
 
 `onboarding.json` is the canonical artifact. It includes:
 - repo identity

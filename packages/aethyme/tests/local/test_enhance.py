@@ -63,6 +63,10 @@ def test_enhance_deploy_writes_generated_onboarding(tmp_path: Path) -> None:
     assert AETHYME_BLOCK_END in agents_text
     assert "python -m src.cli explore" in agents_text
     assert "Do not run `python -m src.cli explore`" in agents_text
+    assert "## Aethyme Repo Routing" in agents_text
+    assert "Primary fast test: `pnpm test`" in agents_text
+    assert "Primary app entrypoint: `src/main.ts`" in agents_text
+    assert ".aethyme/generated/experience-status.md" in agents_text
 
 
 def test_enhance_deploy_preserves_human_agents_content(tmp_path: Path) -> None:
@@ -84,6 +88,7 @@ def test_enhance_deploy_preserves_human_agents_content(tmp_path: Path) -> None:
     assert second_text.count(AETHYME_BLOCK_BEGIN) == 1
     assert second_text.count(AETHYME_BLOCK_END) == 1
     assert "# Maintainer Rules" in second_text
+    assert "## Aethyme Repo Routing" in second_text
 
 
 def test_enhance_deploy_migrates_old_full_file_agents_template(tmp_path: Path) -> None:

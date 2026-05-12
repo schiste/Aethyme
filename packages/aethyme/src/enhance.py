@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from src.indexing.experience_telemetry import (
+    STATUS_MARKDOWN_PATH,
     append_event,
     event_payload_from_generated_artifacts,
     summarize_events,
@@ -130,11 +131,41 @@ def _render(target: EnhancementTarget, root: str) -> str:
     return target.source.read_text(encoding="utf-8").replace(PLACEHOLDER, root)
 
 
-def _render_agents_block(root: str) -> str:
+def _render_agents_block(root: str, repo: Path | None = None) -> str:
     content = (_TEMPLATE_DIR / "AGENTS.md").read_text(encoding="utf-8").replace(
         PLACEHOLDER, root
     )
+    if repo is not None:
+        routing = _render_repo_routing(repo)
+        if routing:
+            content = f"{content.rstrip()}\n\n{routing}"
     return f"{AETHYME_BLOCK_BEGIN}\n{content.rstrip()}\n{AETHYME_BLOCK_END}\n"
+
+
+def _render_repo_routing(repo: Path) -> str:
+    onboarding_path = repo / ONBOARDING_JSON_PATH
+    act_path = repo / ACT_STARTER_JSON_PATH
+    if not onboarding_path.exists():
+        return ""
+    onboarding = json.loads(onboarding_path.read_text(encoding="utf-8"))
+    act = json.loads(act_path.read_text(encoding="utf-8")) if act_path.exists() else {}
+    primary_commands = onboarding.get("primary_commands") or {}
+    primary_entrypoints = onboarding.get("primary_entrypoints") or {}
+    act_commands = act.get("commands") or {}
+    fast_test = primary_commands.get("fast_test") or act_commands.get("fast_test")
+    app_entrypoint = primary_entrypoints.get("app") or {}
+    lines = [
+        "## Aethyme Repo Routing",
+        "",
+        f"- Onboarding skill: `{ONBOARDING_CODEX_PATH}` or `{ONBOARDING_CLAUDE_PATH}`",
+        f"- Act skill: `{ACT_CODEX_PATH}` or `{ACT_CLAUDE_PATH}`",
+        f"- Experience status: `{STATUS_MARKDOWN_PATH}`",
+    ]
+    if fast_test:
+        lines.append(f"- Primary fast test: `{fast_test}`")
+    if app_entrypoint.get("path"):
+        lines.append(f"- Primary app entrypoint: `{app_entrypoint['path']}`")
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -160,7 +191,6 @@ def deploy(repo: Path, *, force: bool = False) -> list[DeployAction]:
 
     root = aethyme_root()
     actions: list[DeployAction] = []
-    actions.append(_ensure_agents_block(repo, root, force=force))
     for t in TARGETS:
         dest = repo / t.relative_path
         content = _render(t, root)
@@ -192,6 +222,8 @@ def deploy(repo: Path, *, force: bool = False) -> list[DeployAction]:
         dest.write_text(content, encoding="utf-8")
         actions.append(DeployAction(target, "updated" if existed else "created"))
 
+    actions.insert(0, _ensure_agents_block(repo, root, force=force))
+
     # Merge-aware settings.local.json deployment.
     settings_action = _ensure_settings_hook(repo)
     actions.append(settings_action)
@@ -220,7 +252,7 @@ def _ensure_agents_block(repo: Path, root: str, *, force: bool) -> DeployAction:
         "Cross-product agent instructions (managed Aethyme block)",
     )
     dest = repo / target.relative_path
-    block = _render_agents_block(root)
+    block = _render_agents_block(root, repo)
     existed = dest.exists()
     if not existed:
         dest.write_text(block, encoding="utf-8")
@@ -419,7 +451,7 @@ def _verify_agents_block(repo: Path, root: str) -> VerifyResult:
     if not dest.exists():
         return VerifyResult(target, False, False, False)
     actual = dest.read_text(encoding="utf-8")
-    block = _render_agents_block(root)
+    block = _render_agents_block(root, repo)
     has_markers = AETHYME_BLOCK_BEGIN in actual and AETHYME_BLOCK_END in actual
     return VerifyResult(
         target=target,
