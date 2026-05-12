@@ -42,8 +42,8 @@ consumer. This file exists so that doesn't happen again.
 
 | Source | Deployed to | Invokes | Failure mode if entry point removed |
 |---|---|---|---|
-| `skills/aethyme/SKILL.md` | `.claude/skills/aethyme/SKILL.md`, `.codex/skills/aethyme/SKILL.md` | Documents `aethyme explore`, `aethyme query symbol`, `aethyme graph callers/callees`, `analyze dead-code`, `facts function-usage`, `task scope/anchors`, `intents`, `task context/pack` by name | Agent reads stale guidance, runs commands that no longer exist; user sees `Error: No such command 'X'`. Caught by `verify-playground.sh` greps. |
-| `skills/aethyme/AGENTS.md` | `AGENTS.md` (deployed at repo root by `enhance.py`) | Cross-product convention file — no exec |
+| `skills/aethyme/SKILL.md` | `.claude/skills/aethyme/SKILL.md`, `.codex/skills/aethyme/SKILL.md` | Documents `aethyme explore`, `aethyme query symbol`, `aethyme graph callers/callees`, `analyze dead-code`, `facts function-usage`, `task scope/anchors`, `intents`, `task context/pack` by name | Agent reads stale guidance, runs commands that no longer exist; user sees `Error: No such command 'X'`. Caught by `verify-playground.sh` greps and `scripts/check-cross-process-contract.py` text-consumer validation. |
+| `skills/aethyme/AGENTS.md` | `AGENTS.md` managed block (deployed at repo root by `enhance.py`) | Cross-product convention file with quick-start command guidance. Aethyme owns only the `AETHYME:BEGIN/END` block; maintainer text outside it is preserved. | Agent reads stale quick start before loading skill details. Caught by `scripts/check-cross-process-contract.py` text-consumer validation. |
 | `skills/aethyme/aethyme-explore` | `.codex/skills/aethyme/aethyme-explore` (executable) | `exec "{{AETHYME_ROOT}}/rust/target/release/aethyme" explore "$@"` | Wrapper produces `Error: No such command 'explore'`. Class-3 failure (silent until invoked). Rebuilt 2026-05-08 to point at native; previously called `python -m src.cli explore` (deleted). |
 | `skills/aethyme/aethyme-load-context.sh` | `.claude/hooks/aethyme-load-context.sh` (executable, wired via `.claude/settings.local.json`) | Reads `AGENTS.md` + `CLAUDE.md` from `$CLAUDE_PROJECT_DIR`; emits SessionStart hook JSON. **Does NOT invoke any Aethyme entry point.** | Hook fails to inject context; agent loses the in-repo discoverability surface. |
 
@@ -51,7 +51,7 @@ consumer. This file exists so that doesn't happen again.
 
 | Source | Deploys what | Notes |
 |---|---|---|
-| `src/enhance.py:TARGETS` | `AGENTS.md`, `CLAUDE.md`, `.claude/skills/aethyme/SKILL.md`, `.codex/skills/aethyme/SKILL.md`, `.claude/hooks/aethyme-load-context.sh`, `.claude/settings.local.json` (merge-aware) | Single canonical deploy pipeline for in-repo Aethyme discoverability. Substitutes `{{AETHYME_ROOT}}`. |
+| `src/enhance.py:TARGETS` + managed AGENTS helper | `AGENTS.md` managed block, `CLAUDE.md`, `.claude/skills/aethyme/SKILL.md`, `.codex/skills/aethyme/SKILL.md`, `.claude/hooks/aethyme-load-context.sh`, `.claude/settings.local.json` (merge-aware) | Single canonical deploy pipeline for in-repo Aethyme discoverability. Substitutes `{{AETHYME_ROOT}}`; preserves non-Aethyme `AGENTS.md` content outside the managed block. |
 | `src/indexing/skills.py:deploy_skills` | `.codex/skills/<name>/*` for each runtime skill in `skills/` | Different from `enhance.py` — used by `eval/repos.py` during eval prep. As of 2026-05-08 substitutes `{{AETHYME_ROOT}}` in `.md`, `.sh`, AND the `aethyme-explore` wrapper (no extension). |
 
 ### Shell scripts in `packages/aethyme/scripts/`

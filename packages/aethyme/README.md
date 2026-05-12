@@ -153,6 +153,7 @@ Runtime notes:
 - without those commands, it still emits the comparison artifacts only
 - the `leverage` condition uses a compact generic Aethyme Explore usage card; `task-conditioned` remains the full context-pack mode
 - `aethyme enhance deploy --repo <path>` is the primary real-repository enhancement path; it writes cross-product discoverability files plus generated repo-onboarding artifacts
+- Aethyme owns only the generated `AETHYME:BEGIN/END` block in `AGENTS.md`; maintainer-authored instructions outside that block are preserved
 - `aethyme repo deploy-skills` remains a compatibility path for the static runtime skill and benchmark-oriented consumers
 - generated onboarding lives at `.aethyme/generated/onboarding.json` and renders to `.codex/skills/repo-onboarding/SKILL.md` and `.claude/skills/repo-onboarding/SKILL.md`
 - generated Act starter lives at `.aethyme/generated/act-starter.json` and renders to `.codex/skills/repo-act/SKILL.md` and `.claude/skills/repo-act/SKILL.md`

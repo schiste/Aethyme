@@ -223,7 +223,7 @@ Avoid:
 Validation target:
 
 - `leverage` should outperform `explore` with only a small cost increase
-- reports should show whether `src.cli explore` / `src.cli intents` were actually called
+- reports should show whether native `aethyme explore` / `src.cli intents` were actually called
 
 Current implementation status:
 

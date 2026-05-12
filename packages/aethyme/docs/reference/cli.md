@@ -73,7 +73,8 @@ runtime navigation skill. For real repositories, prefer
 - `aethyme query impact /path/to/repo src/main.py`
 
 `enhance deploy` is the primary repo-facing discoverability path. It writes:
-- `AGENTS.md` and `CLAUDE.md`
+- `AGENTS.md` with an Aethyme-managed generated block
+- `CLAUDE.md`
 - `.claude/skills/aethyme/SKILL.md`
 - `.codex/skills/aethyme/SKILL.md`
 - `.claude/hooks/aethyme-load-context.sh`
@@ -83,6 +84,12 @@ runtime navigation skill. For real repositories, prefer
 - `.codex/skills/repo-onboarding/SKILL.md`
 - `.claude/skills/repo-act/SKILL.md`
 - `.codex/skills/repo-act/SKILL.md`
+
+For `AGENTS.md`, Aethyme owns only the block between
+`<!-- AETHYME:BEGIN generated -->` and `<!-- AETHYME:END generated -->`.
+Maintainer-authored instructions outside that block are preserved across
+redeploys. Existing full-file Aethyme templates are migrated into the managed
+block on the next deploy.
 
 `onboarding.json` is the canonical artifact. It includes:
 - repo identity
@@ -150,7 +157,7 @@ It does not yet claim actual agent adoption or downstream answer quality.
 
 ### High-Level Intent Surface
 
-> **Note (2026-05-07):** `aethyme explore` is now served by the native Rust binary (`aethyme-engine-cli explore`). The Python implementation at `python -m src.cli explore` is deprecated as a fallback only and prints a stderr warning when invoked directly. All examples below route through native; no behavior change for callers.
+> **Note (2026-05-12):** `aethyme explore` is served by the native Rust binary. The removed Python module form for Explore now prints a targeted recovery error if invoked. All examples below route through native.
 
 - `aethyme explore --repo /path/to/repo --request "Find public functions with no outside callers" --format answer-json`
 - `aethyme intents --request "Find public functions with no outside callers" --format compact-json`
