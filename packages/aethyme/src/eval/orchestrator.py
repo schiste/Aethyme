@@ -798,7 +798,7 @@ def _build_launch_phase(
     return {
         "name": "launch",
         "description": (
-            f"Launch {len(CONDITIONS)} agent sessions "
+            f"Launch {len(conditions_launch)} agent sessions "
             f"({model_config.backend}/{model_config.name})"
         ),
         "backend": model_config.backend,
