@@ -1,5 +1,5 @@
 use crate::context_pack::{Anchor, AnchorKind};
-use crate::graph::search::symbol_search;
+use crate::graph::search::symbol_search_multi;
 use crate::map::RepositoryMap;
 use crate::model::edge::EdgeKind;
 use crate::model::file::FileRole;
@@ -89,20 +89,21 @@ pub fn resolve_anchors(map: &RepositoryMap, task: &TaskInput, limit: usize) -> V
             if queries.is_empty() {
                 queries.push(task.normalized.clone());
             }
-            for query in &queries {
-                for hit in symbol_search(map, query, limit) {
-                    let reason = if task.kind == TaskKind::TraceImpact {
-                        format!("impact symbol via {}", hit.reason)
-                    } else {
-                        format!("change symbol via {}", hit.reason)
-                    };
-                    anchors.push(Anchor::new(
-                        AnchorKind::Symbol,
-                        hit.id,
-                        Some(hit.file),
-                        reason,
-                    ));
-                }
+            // Single multi-token call — same rationale as the Unknown
+            // arm at 2026-05-12. Per-token loops short-circuit the
+            // compound-name scoring.
+            let prefix = if task.kind == TaskKind::TraceImpact {
+                "impact symbol via "
+            } else {
+                "change symbol via "
+            };
+            for hit in symbol_search_multi(map, &queries, limit) {
+                anchors.push(Anchor::new(
+                    AnchorKind::Symbol,
+                    hit.id,
+                    Some(hit.file),
+                    format!("{}{}", prefix, hit.reason),
+                ));
             }
             if anchors.len() < limit {
                 for query in &queries {
@@ -162,32 +163,25 @@ pub fn resolve_anchors(map: &RepositoryMap, task: &TaskInput, limit: usize) -> V
             // These are the highest-signal anchors for any query whose
             // terms map to real code names.
             //
-            // Per-token cap: take ONE top-scoring symbol per query
-            // token. With many candidate tokens (narrative queries
-            // can produce 10+), a single high-density token would
-            // otherwise saturate the slot — e.g. "diff" alone returns
-            // 5+ DiffEngine-style matches and crowds out matches for
-            // "page", "view", "revision", etc. Capping at 1 surfaces
-            // ONE match per concept; the dedup-truncate step that
-            // follows keeps the first `limit` distinct anchors,
-            // giving the answer cross-token variety.
-            //
-            // Why 1 (not 2 or 3): with `limit=5` and 11 candidate
-            // tokens, 1-per-token still produces 5+ candidates after
-            // dedup; the bottleneck is the dedup step, not symbol
-            // density. If a future change reduces query-token count
-            // (more aggressive stopword filtering), raising this
-            // cap may be the right move.
-            const SYMBOLS_PER_TOKEN: usize = 1;
-            for query in &queries {
-                for hit in symbol_search(map, query, SYMBOLS_PER_TOKEN) {
-                    anchors.push(Anchor::new(
-                        AnchorKind::Symbol,
-                        hit.id,
-                        Some(hit.file),
-                        format!("{} via {}", hit.reason, query),
-                    ));
-                }
+            // Single call across ALL tokens (2026-05-12): the previous
+            // implementation looped per-token with `SYMBOLS_PER_TOKEN
+            // = 1`, calling `symbol_search` independently for each
+            // candidate token. With the new multi-signal scorer
+            // (`symbol_search_multi`), per-token calls effectively
+            // run the scorer in single-token mode — the compound
+            // bonus (which fires when a symbol's name matches 2+
+            // distinct tokens) never activates. Calling once with
+            // the full token set unlocks the compound scoring:
+            // `doViewUpdates` matching "viewing" + "viewed" via the
+            // `view` stem scores higher than `Page::page()` matching
+            // just one token.
+            for hit in symbol_search_multi(map, &queries, limit) {
+                anchors.push(Anchor::new(
+                    AnchorKind::Symbol,
+                    hit.id,
+                    Some(hit.file),
+                    hit.reason,
+                ));
             }
 
             // Code-file matches: source files whose basename matches a
