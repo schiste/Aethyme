@@ -123,6 +123,39 @@ def test_parse_contract_decision_handles_empty_body(cpcc):
     assert cpcc.parse_contract_decision(None) is None  # type: ignore[arg-type]
 
 
+def test_find_text_consumer_violations_flags_stale_executable_examples(cpcc, tmp_path):
+    skill = tmp_path / "SKILL.md"
+    skill.write_text(
+        "Quick start:\n"
+        '"$AETHYME_ROOT/.venv/bin/python" -m src.cli explore --repo "$PWD"\n',
+        encoding="utf-8",
+    )
+
+    violations = cpcc.find_text_consumer_violations(
+        ((skill, ('"$AETHYME_ROOT/.venv/bin/python" -m src.cli explore',)),)
+    )
+
+    assert str(skill) in violations
+
+
+def test_find_text_consumer_violations_allows_explicit_removed_command_warning(cpcc, tmp_path):
+    skill = tmp_path / "SKILL.md"
+    skill.write_text(
+        "Do not run `python -m src.cli explore`; it was removed.\n",
+        encoding="utf-8",
+    )
+
+    violations = cpcc.find_text_consumer_violations(
+        ((skill, ("python -m src.cli explore",)),)
+    )
+
+    assert violations == {}
+
+
+def test_current_text_consumers_have_no_executable_removed_explore_guidance(cpcc):
+    assert cpcc.find_text_consumer_violations() == {}
+
+
 def test_consumers_doc_yields_real_tracked_symbols(cpcc):
     """End-to-end: feeding the actual cross-process-consumers.md
     must produce a sane tracked set including the high-blast-radius

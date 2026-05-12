@@ -141,9 +141,11 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
         # The post-2026-05-08 SKILL.md should NOT mention `src.cli explore` —
         # that's the deleted Python entry point. Flip the check: if it's
         # there, the skill is stale.
-        grep -q 'src.cli explore' "$SKILL_FILE" \
-            && check_fail "Skill still references deleted 'src.cli explore' (Python explore_command was hard-deleted 2026-05-08; redeploy with current template)" \
-            || check_pass "Skill has no stale 'src.cli explore' references"
+        if grep 'src.cli explore' "$SKILL_FILE" | grep -Ev 'Do not run|not a valid command|was removed' >/dev/null; then
+            check_fail "Skill still contains executable guidance for deleted 'src.cli explore' (Python explore_command was hard-deleted 2026-05-08; redeploy with current template)"
+        else
+            check_pass "Skill has no stale executable 'src.cli explore' guidance"
+        fi
         grep -q 'analyze dead-code' "$SKILL_FILE" && check_pass "Skill includes current dead-code analyzer" || check_fail "Skill missing analyze dead-code guidance"
         grep -q 'facts function-usage' "$SKILL_FILE" && check_pass "Skill includes current usage facts command" || check_fail "Skill missing facts function-usage guidance"
         grep -q '\$ENGINE unused' "$SKILL_FILE" && check_fail "Skill still advertises stale \$ENGINE unused command" || check_pass "Skill has no stale unused command"

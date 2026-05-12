@@ -69,6 +69,26 @@ EXCLUDED_PATTERNS = (
     re.compile(r"^[A-Z]+\s*$"),  # bare ALLCAPS like "TODO"
     re.compile(r"^\d+$"),         # bare numbers
 )
+TEXT_CONSUMER_CHECKS = (
+    (
+        REPO_ROOT / "packages" / "aethyme" / "skills" / "aethyme" / "SKILL.md",
+        (
+            "python -m src.cli explore",
+            ".venv/bin/python -m src.cli explore",
+            '"$AETHYME_PY" -m src.cli explore',
+            '"$AETHYME_ROOT/.venv/bin/python" -m src.cli explore',
+        ),
+    ),
+    (
+        REPO_ROOT / "packages" / "aethyme" / "skills" / "aethyme" / "AGENTS.md",
+        (
+            "python -m src.cli explore",
+            ".venv/bin/python -m src.cli explore",
+            '"$AETHYME_PY" -m src.cli explore',
+            '"$AETHYME_ROOT/.venv/bin/python" -m src.cli explore',
+        ),
+    ),
+)
 
 
 def extract_tracked_symbols(doc_text: str) -> set[str]:
@@ -153,6 +173,35 @@ def parse_contract_decision(pr_body: str) -> str | None:
     return matches[0].lower()
 
 
+def find_text_consumer_violations(
+    checks: tuple[tuple[Path, tuple[str, ...]], ...] = TEXT_CONSUMER_CHECKS,
+) -> dict[str, list[str]]:
+    """Return forbidden command references in canonical text consumers."""
+    violations: dict[str, list[str]] = {}
+    for path, forbidden_patterns in checks:
+        if not path.exists():
+            continue
+        hits: list[str] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            normalized = line.strip().lower()
+            for pattern in forbidden_patterns:
+                if pattern not in line:
+                    continue
+                if any(
+                    marker in normalized
+                    for marker in ("do not run", "not a valid command", "was removed")
+                ):
+                    continue
+                hits.append(pattern)
+        if hits:
+            try:
+                display_path = str(path.relative_to(REPO_ROOT))
+            except ValueError:
+                display_path = str(path)
+            violations[display_path] = hits
+    return violations
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument(
@@ -182,6 +231,20 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    text_violations = find_text_consumer_violations()
+    if text_violations:
+        print("ERROR: forbidden removed command references found in text consumers:", file=sys.stderr)
+        for path, patterns in sorted(text_violations.items()):
+            print(f"  - {path}", file=sys.stderr)
+            for pattern in patterns:
+                print(f"    contains: {pattern}", file=sys.stderr)
+        print(
+            "Use the native Explore binary in skills/agent instructions: "
+            "`$AETHYME_ROOT/rust/target/release/aethyme explore ...`.",
+            file=sys.stderr,
+        )
+        return 1
 
     diff_lines = read_diff(args.base)
     if not diff_lines:
