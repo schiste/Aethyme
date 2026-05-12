@@ -36,6 +36,7 @@ from src.indexing.experience_telemetry import (
     append_event,
     event_payload_from_generated_artifacts,
     summarize_events,
+    write_status_artifacts,
 )
 from src.indexing.onboarding import (
     ACT_CLAUDE_PATH,
@@ -396,3 +397,8 @@ def summarize(repo: Path) -> dict[str, Any]:
         "freshness": override_freshness(repo),
         "experience_telemetry": summarize_events(repo),
     }
+
+
+def refresh_status(repo: Path) -> dict[str, Any]:
+    """Refresh repo-local experience status artifacts."""
+    return write_status_artifacts(repo)

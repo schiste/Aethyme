@@ -10,6 +10,8 @@ from typing import Any
 from .onboarding import ACT_STARTER_JSON_PATH, ONBOARDING_JSON_PATH, override_freshness
 
 TELEMETRY_LOG_PATH = ".aethyme/generated/experience-telemetry.jsonl"
+STATUS_JSON_PATH = ".aethyme/generated/experience-status.json"
+STATUS_MARKDOWN_PATH = ".aethyme/generated/experience-status.md"
 
 
 def append_event(repo_path: Path, event_type: str, payload: dict[str, Any]) -> Path:
@@ -157,6 +159,111 @@ def record_wrapper_invocation(
     return append_event(repo_path, "wrapper.invocation", payload)
 
 
+def build_status_artifact(repo_path: Path) -> dict[str, Any]:
+    """Build a compact repo experience status artifact."""
+    report = detailed_report(repo_path)
+    recommendation = _recommended_next_action(report)
+    return {
+        "schema_version": "aethyme-experience-status-v1",
+        "path": {
+            "telemetry": report["path"],
+            "status_json": STATUS_JSON_PATH,
+            "status_markdown": STATUS_MARKDOWN_PATH,
+        },
+        "enhancement": {
+            "installed": report["by_type"].get("enhance.deploy", 0) > 0,
+            "verified": report["by_type"].get("enhance.verify", 0) > 0,
+        },
+        "artifacts": {
+            "onboarding_present": _latest_onboarding_payload(report.get("latest_payloads", {})) != {},
+            "act_present": _latest_act_payload(report.get("latest_payloads", {})) != {},
+            "override_exists": bool(report.get("freshness", {}).get("override_exists")),
+            "override_regeneration_required": bool(
+                report.get("freshness", {}).get("regeneration_required")
+            ),
+            "stale_targets": list(report.get("freshness", {}).get("stale_targets") or []),
+        },
+        "kpis": report.get("kpis", {}),
+        "signals": report.get("kpis", {}).get("signals", []),
+        "suggestions": report.get("kpis", {}).get("suggestions", []),
+        "wrapper_invocations": report.get("wrapper_invocations", {}),
+        "recent_events": report.get("recent_events", [])[-5:],
+        "recommended_next_action": recommendation,
+    }
+
+
+def render_status_markdown(status: dict[str, Any]) -> str:
+    """Render the experience status artifact as compact Markdown."""
+    enhancement = status["enhancement"]
+    artifacts = status["artifacts"]
+    kpis = status["kpis"]
+    signals = status["signals"]
+    suggestions = status["suggestions"]
+    recommendation = status["recommended_next_action"]
+
+    lines = [
+        "# Aethyme Experience Status",
+        "",
+        "## Summary",
+        "",
+        f"- Enhancement installed: `{'yes' if enhancement['installed'] else 'no'}`",
+        f"- Enhancement verified: `{'yes' if enhancement['verified'] else 'no'}`",
+        f"- Onboarding present: `{'yes' if artifacts['onboarding_present'] else 'no'}`",
+        f"- Act starter present: `{'yes' if artifacts['act_present'] else 'no'}`",
+        f"- Override exists: `{'yes' if artifacts['override_exists'] else 'no'}`",
+        f"- Override regeneration required: `{'yes' if artifacts['override_regeneration_required'] else 'no'}`",
+        f"- Wrapper invocations: `{kpis.get('wrapper_total', 0)}`",
+        f"- Fast test detected: `{'yes' if kpis.get('act_has_fast_test') else 'no'}`",
+        "",
+        "## Attention Signals",
+        "",
+    ]
+    if signals:
+        for signal in signals:
+            lines.append(f"- `{signal['status']}` `{signal['code']}`: {signal['message']}")
+    else:
+        lines.append("- none")
+
+    lines.extend(["", "## Suggestions", ""])
+    if suggestions:
+        for suggestion in suggestions:
+            lines.append(f"- `{suggestion['code']}`: {suggestion['message']}")
+    else:
+        lines.append("- none")
+
+    lines.extend(
+        [
+            "",
+            "## Recommended Next Action",
+            "",
+            f"- Command: `{recommendation['command']}`",
+            f"- Reason: {recommendation['reason']}",
+        ]
+    )
+    if artifacts["stale_targets"]:
+        lines.append(f"- Stale targets: `{', '.join(artifacts['stale_targets'])}`")
+
+    recent_events = status.get("recent_events") or []
+    if recent_events:
+        lines.extend(["", "## Recent Events", ""])
+        for event in recent_events:
+            lines.append(f"- `{event['timestamp']}` `{event['event_type']}`")
+
+    return "\n".join(lines) + "\n"
+
+
+def write_status_artifacts(repo_path: Path) -> dict[str, Any]:
+    """Write repo-local experience status artifacts and return the status payload."""
+    repo_path = Path(repo_path).expanduser().resolve()
+    status = build_status_artifact(repo_path)
+    status_json_path = repo_path / STATUS_JSON_PATH
+    status_markdown_path = repo_path / STATUS_MARKDOWN_PATH
+    status_json_path.parent.mkdir(parents=True, exist_ok=True)
+    status_json_path.write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
+    status_markdown_path.write_text(render_status_markdown(status), encoding="utf-8")
+    return status
+
+
 def _derive_kpis(
     latest_payloads: dict[str, dict[str, Any]],
     wrapper_invocations: dict[str, int],
@@ -282,3 +389,33 @@ def _suggestions_from_signals(
             }
         )
     return suggestions
+
+
+def _recommended_next_action(report: dict[str, Any]) -> dict[str, str]:
+    kpis = report.get("kpis") or {}
+    suggestions = kpis.get("suggestions") or []
+    suggestion_codes = {suggestion["code"] for suggestion in suggestions}
+    if "regenerate_onboarding_artifacts" in suggestion_codes:
+        return {
+            "command": "aethyme enhance deploy --repo <repo>",
+            "reason": "Override file is newer than generated onboarding/Act artifacts.",
+        }
+    if "fix_or_reinitialize_override" in suggestion_codes:
+        return {
+            "command": "aethyme repo validate-onboarding-overrides <repo>",
+            "reason": "Override file is invalid and should be fixed before relying on generated skills.",
+        }
+    if "load_onboarding_and_use_wrapper" in suggestion_codes:
+        return {
+            "command": "aethyme repo experience-telemetry <repo>",
+            "reason": "Enhancement is installed but there is no wrapper usage recorded yet.",
+        }
+    if "add_fast_test_override" in suggestion_codes:
+        return {
+            "command": "aethyme repo init-onboarding-overrides <repo>",
+            "reason": "Generated Act starter has no fast test command and may need a maintainer override.",
+        }
+    return {
+        "command": "aethyme explore --repo <repo> --request \"<task>\" --format answer-json",
+        "reason": "Experience layer is in a healthy state; proceed with Explore.",
+    }

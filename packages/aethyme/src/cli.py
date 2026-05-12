@@ -650,6 +650,45 @@ def repo_experience_telemetry(repo_path: Path, json_output: bool, check_signals:
         raise SystemExit(1)
 
 
+@repo.command("experience-status")
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
+@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
+def repo_experience_status(repo_path: Path, json_output: bool) -> None:
+    """Write and show a compact repo experience status artifact."""
+    from src.indexing.experience_telemetry import write_status_artifacts
+
+    status = write_status_artifacts(repo_path)
+    if json_output:
+        click.echo(json.dumps(status, indent=2))
+        return
+
+    click.echo("Experience status:")
+    click.echo(
+        "  Enhancement: "
+        f"installed={status['enhancement']['installed']}, "
+        f"verified={status['enhancement']['verified']}"
+    )
+    click.echo(
+        "  Artifacts: "
+        f"onboarding={status['artifacts']['onboarding_present']}, "
+        f"act={status['artifacts']['act_present']}, "
+        f"override_exists={status['artifacts']['override_exists']}, "
+        f"regeneration_required={status['artifacts']['override_regeneration_required']}"
+    )
+    click.echo(
+        "  Recommended next action: "
+        f"{status['recommended_next_action']['command']}"
+    )
+    click.echo(f"  Reason: {status['recommended_next_action']['reason']}")
+    click.echo(
+        "  Wrote: "
+        ".aethyme/generated/experience-status.json, "
+        ".aethyme/generated/experience-status.md"
+    )
+
+
 @repo.command("engine-info")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 @click.option(
@@ -2776,7 +2815,7 @@ def enhance_deploy_command(repo_path: Path, force: bool) -> None:
 )
 def enhance_verify_command(repo_path: Path) -> None:
     """Check that discoverability and onboarding files are present and usable."""
-    from src.enhance import is_ok, summarize, verify
+    from src.enhance import is_ok, refresh_status, summarize, verify
     from src.indexing.experience_telemetry import append_event
 
     results = verify(repo_path)
@@ -2836,6 +2875,12 @@ def enhance_verify_command(repo_path: Path) -> None:
         "  Experience telemetry: "
         f"events={summary['experience_telemetry']['event_count']}, "
         f"last={summary['experience_telemetry']['last_event_type']}"
+    )
+    status = refresh_status(repo_path)
+    click.echo(
+        "  Experience status: "
+        f"next=`{status['recommended_next_action']['command']}`, "
+        "artifacts=.aethyme/generated/experience-status.json,.aethyme/generated/experience-status.md"
     )
     click.echo("All discoverability files present and substituted.")
 

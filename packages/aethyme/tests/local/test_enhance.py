@@ -142,6 +142,27 @@ def test_repo_experience_telemetry_reports_json_and_text(tmp_path: Path) -> None
     assert "aethyme-explore" in text_result.output
 
 
+def test_repo_experience_status_writes_artifacts(tmp_path: Path) -> None:
+    repo_path = tmp_path / "demo-repo"
+    _build_repo(repo_path)
+    deploy(repo_path)
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["repo", "experience-status", str(repo_path), "--json-output"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "aethyme-experience-status-v1"
+    assert "recommended_next_action" in payload
+    assert (repo_path / ".aethyme" / "generated" / "experience-status.json").exists()
+    assert (repo_path / ".aethyme" / "generated" / "experience-status.md").exists()
+
+    markdown = (repo_path / ".aethyme" / "generated" / "experience-status.md").read_text(
+        encoding="utf-8"
+    )
+    assert "# Aethyme Experience Status" in markdown
+    assert "Recommended Next Action" in markdown
+
+
 def test_repo_experience_telemetry_flags_no_wrapper_usage(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
@@ -215,3 +236,22 @@ def test_repo_experience_telemetry_detects_stale_override_artifacts(tmp_path: Pa
 
     check_result = runner.invoke(cli, ["repo", "experience-telemetry", str(repo_path), "--check"])
     assert check_result.exit_code == 1, check_result.output
+
+
+def test_enhance_verify_refreshes_experience_status(tmp_path: Path) -> None:
+    repo_path = tmp_path / "demo-repo"
+    _build_repo(repo_path)
+    deploy(repo_path)
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["enhance", "verify", "--repo", str(repo_path)])
+    assert result.exit_code == 0, result.output
+    assert "Experience status:" in result.output
+
+    status_json = repo_path / ".aethyme" / "generated" / "experience-status.json"
+    status_markdown = repo_path / ".aethyme" / "generated" / "experience-status.md"
+    assert status_json.exists()
+    assert status_markdown.exists()
+
+    payload = json.loads(status_json.read_text(encoding="utf-8"))
+    assert payload["recommended_next_action"]["command"]
