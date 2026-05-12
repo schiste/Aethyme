@@ -5,7 +5,7 @@ directory can find Aethyme without out-of-band context. We deploy several
 files, all derived from canonical templates under
 `packages/aethyme/skills/aethyme/`:
 
-    AGENTS.md                                  # cross-product convention
+    AGENTS.md                                  # cross-product convention, managed block only
     CLAUDE.md                                  # Claude Code project instructions
     .claude/skills/aethyme/SKILL.md            # Claude Skills detailed runbook
     .codex/skills/aethyme/SKILL.md             # Codex skills detailed runbook
@@ -16,6 +16,10 @@ The split between AGENTS.md/CLAUDE.md (root-level announcement) and
 SKILL.md (per-product detailed runbook) is intentional: agents that
 auto-load CLAUDE.md/AGENTS.md see the entry-point; agents that load
 their product's skills directory see the full reference.
+
+AGENTS.md is block-managed: Aethyme creates or updates only the
+`AETHYME:BEGIN/END` generated block and preserves maintainer-authored
+instructions outside that block.
 
 The SessionStart hook covers a real Claude Code limitation: when launched
 in headless mode (`--dangerously-skip-permissions`, e.g. by an eval
@@ -51,6 +55,8 @@ from src.indexing.onboarding import (
 )
 
 PLACEHOLDER = "{{AETHYME_ROOT}}"
+AETHYME_BLOCK_BEGIN = "<!-- AETHYME:BEGIN generated -->"
+AETHYME_BLOCK_END = "<!-- AETHYME:END generated -->"
 
 # packages/aethyme/, the canonical AETHYME_ROOT during install.
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -68,11 +74,6 @@ class EnhancementTarget:
 
 
 TARGETS: tuple[EnhancementTarget, ...] = (
-    EnhancementTarget(
-        "AGENTS.md",
-        _TEMPLATE_DIR / "AGENTS.md",
-        "Cross-product agent instructions (industry convention)",
-    ),
     EnhancementTarget(
         "CLAUDE.md",
         _TEMPLATE_DIR / "AGENTS.md",
@@ -129,6 +130,13 @@ def _render(target: EnhancementTarget, root: str) -> str:
     return target.source.read_text(encoding="utf-8").replace(PLACEHOLDER, root)
 
 
+def _render_agents_block(root: str) -> str:
+    content = (_TEMPLATE_DIR / "AGENTS.md").read_text(encoding="utf-8").replace(
+        PLACEHOLDER, root
+    )
+    return f"{AETHYME_BLOCK_BEGIN}\n{content.rstrip()}\n{AETHYME_BLOCK_END}\n"
+
+
 @dataclass(frozen=True)
 class DeployAction:
     target: EnhancementTarget
@@ -152,6 +160,7 @@ def deploy(repo: Path, *, force: bool = False) -> list[DeployAction]:
 
     root = aethyme_root()
     actions: list[DeployAction] = []
+    actions.append(_ensure_agents_block(repo, root, force=force))
     for t in TARGETS:
         dest = repo / t.relative_path
         content = _render(t, root)
@@ -201,6 +210,44 @@ def deploy(repo: Path, *, force: bool = False) -> list[DeployAction]:
     )
 
     return actions
+
+
+def _ensure_agents_block(repo: Path, root: str, *, force: bool) -> DeployAction:
+    """Create or refresh only Aethyme's managed block in AGENTS.md."""
+    target = EnhancementTarget(
+        "AGENTS.md",
+        _TEMPLATE_DIR / "AGENTS.md",
+        "Cross-product agent instructions (managed Aethyme block)",
+    )
+    dest = repo / target.relative_path
+    block = _render_agents_block(root)
+    existed = dest.exists()
+    if not existed:
+        dest.write_text(block, encoding="utf-8")
+        return DeployAction(target, "created")
+
+    existing = dest.read_text(encoding="utf-8")
+    next_content = _merge_agents_block(existing, block, root)
+    if not force and existing == next_content:
+        return DeployAction(target, "unchanged")
+    dest.write_text(next_content, encoding="utf-8")
+    return DeployAction(target, "updated")
+
+
+def _merge_agents_block(existing: str, block: str, root: str) -> str:
+    if AETHYME_BLOCK_BEGIN in existing and AETHYME_BLOCK_END in existing:
+        before, remainder = existing.split(AETHYME_BLOCK_BEGIN, 1)
+        _, after = remainder.split(AETHYME_BLOCK_END, 1)
+        return f"{before}{block.rstrip()}{after}"
+
+    rendered_template = (_TEMPLATE_DIR / "AGENTS.md").read_text(encoding="utf-8").replace(
+        PLACEHOLDER, root
+    )
+    if existing.strip() == rendered_template.strip():
+        return block
+
+    separator = "" if not existing.strip() else "\n\n"
+    return f"{block.rstrip()}{separator}{existing.lstrip()}"
 
 
 def _ensure_executable(path: Path) -> None:
@@ -288,6 +335,7 @@ def verify(repo: Path) -> list[VerifyResult]:
 
     root = aethyme_root()
     out: list[VerifyResult] = []
+    out.append(_verify_agents_block(repo, root))
     for t in TARGETS:
         dest = repo / t.relative_path
         if not dest.exists():
@@ -359,6 +407,26 @@ def verify(repo: Path) -> list[VerifyResult]:
             )
 
     return out
+
+
+def _verify_agents_block(repo: Path, root: str) -> VerifyResult:
+    target = EnhancementTarget(
+        "AGENTS.md",
+        _TEMPLATE_DIR / "AGENTS.md",
+        "Cross-product agent instructions (managed Aethyme block)",
+    )
+    dest = repo / target.relative_path
+    if not dest.exists():
+        return VerifyResult(target, False, False, False)
+    actual = dest.read_text(encoding="utf-8")
+    block = _render_agents_block(root)
+    has_markers = AETHYME_BLOCK_BEGIN in actual and AETHYME_BLOCK_END in actual
+    return VerifyResult(
+        target=target,
+        exists=has_markers,
+        placeholder_present=PLACEHOLDER in actual,
+        matches_canonical=has_markers and block.rstrip() in actual,
+    )
 
 
 def is_ok(results: Iterable[VerifyResult]) -> bool:

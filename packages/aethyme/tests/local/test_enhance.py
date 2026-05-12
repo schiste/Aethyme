@@ -9,7 +9,7 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from src.cli import cli
-from src.enhance import deploy, is_ok, verify
+from src.enhance import AETHYME_BLOCK_BEGIN, AETHYME_BLOCK_END, deploy, is_ok, verify
 
 
 def _build_repo(root: Path) -> None:
@@ -31,6 +31,7 @@ def test_enhance_deploy_writes_generated_onboarding(tmp_path: Path) -> None:
     written = {action.target.relative_path for action in actions}
 
     assert ".codex/skills/aethyme/SKILL.md" in written
+    assert "AGENTS.md" in written
     assert ".codex/skills/repo-onboarding/SKILL.md" in written
     assert ".claude/skills/repo-onboarding/SKILL.md" in written
     assert ".codex/skills/repo-act/SKILL.md" in written
@@ -56,6 +57,52 @@ def test_enhance_deploy_writes_generated_onboarding(tmp_path: Path) -> None:
     )
     assert "repo record-wrapper-invocation" in wrapper_text
     assert "--wrapper aethyme-sessionstart-hook" in wrapper_text
+
+    agents_text = (repo_path / "AGENTS.md").read_text(encoding="utf-8")
+    assert AETHYME_BLOCK_BEGIN in agents_text
+    assert AETHYME_BLOCK_END in agents_text
+    assert "python -m src.cli explore" in agents_text
+    assert "Do not run `python -m src.cli explore`" in agents_text
+
+
+def test_enhance_deploy_preserves_human_agents_content(tmp_path: Path) -> None:
+    repo_path = tmp_path / "demo-repo"
+    _build_repo(repo_path)
+    (repo_path / "AGENTS.md").write_text(
+        "# Maintainer Rules\n\nRun focused tests before broad suites.\n",
+        encoding="utf-8",
+    )
+
+    deploy(repo_path)
+    first_text = (repo_path / "AGENTS.md").read_text(encoding="utf-8")
+    assert first_text.startswith(AETHYME_BLOCK_BEGIN)
+    assert "# Maintainer Rules" in first_text
+    assert "Run focused tests before broad suites." in first_text
+
+    deploy(repo_path, force=True)
+    second_text = (repo_path / "AGENTS.md").read_text(encoding="utf-8")
+    assert second_text.count(AETHYME_BLOCK_BEGIN) == 1
+    assert second_text.count(AETHYME_BLOCK_END) == 1
+    assert "# Maintainer Rules" in second_text
+
+
+def test_enhance_deploy_migrates_old_full_file_agents_template(tmp_path: Path) -> None:
+    repo_path = tmp_path / "demo-repo"
+    _build_repo(repo_path)
+    template = Path("packages/aethyme/skills/aethyme/AGENTS.md").read_text(
+        encoding="utf-8"
+    )
+    rendered = template.replace(
+        "{{AETHYME_ROOT}}",
+        str(Path("packages/aethyme").resolve()),
+    )
+    (repo_path / "AGENTS.md").write_text(rendered, encoding="utf-8")
+
+    deploy(repo_path)
+    agents_text = (repo_path / "AGENTS.md").read_text(encoding="utf-8")
+    assert agents_text.startswith(AETHYME_BLOCK_BEGIN)
+    assert agents_text.count("# Agent Instructions") == 1
+    assert agents_text.count(AETHYME_BLOCK_BEGIN) == 1
 
 
 def test_init_and_validate_onboarding_overrides_cli(tmp_path: Path) -> None:
