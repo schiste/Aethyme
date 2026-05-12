@@ -111,6 +111,7 @@ def build_onboarding_artifact(
     manifests = _detect_manifests(repo_path)
     package_manager = _primary_package_manager(repo_path, manifests)
     commands = _collect_commands(repo_path, manifests, package_manager)
+    primary_commands = _primary_commands(commands)
     areas = _collect_areas(repo_path)
     entrypoints = _collect_entrypoints(repo_path, manifests)
     caution_zones = _collect_caution_zones(repo_path)
@@ -129,6 +130,7 @@ def build_onboarding_artifact(
             "manifests": manifests,
         },
         "commands": commands,
+        "primary_commands": primary_commands,
         "areas": areas,
         "entrypoints": entrypoints,
         "caution_zones": caution_zones,
@@ -152,6 +154,7 @@ def build_act_starter_artifact(onboarding_artifact: dict[str, Any]) -> dict[str,
     """Build a deterministic Act starter artifact from onboarding facts."""
     repo = onboarding_artifact["repo"]
     commands = onboarding_artifact.get("commands", [])
+    primary_commands = onboarding_artifact.get("primary_commands", {})
     entrypoints = onboarding_artifact.get("entrypoints", [])
     caution_zones = onboarding_artifact.get("caution_zones", [])
     return {
@@ -177,9 +180,11 @@ def build_act_starter_artifact(onboarding_artifact: dict[str, Any]) -> dict[str,
             ],
         },
         "commands": {
-            "fast_test": _first_command_of_kind(commands, "test"),
-            "lint": _first_command_of_kind(commands, "lint"),
-            "build": _first_command_of_kind(commands, "build"),
+            "fast_test": primary_commands.get("fast_test") or _first_command_of_kind(commands, "test"),
+            "full_test": primary_commands.get("full_test"),
+            "lint": primary_commands.get("lint") or _first_command_of_kind(commands, "lint"),
+            "build": primary_commands.get("build") or _first_command_of_kind(commands, "build"),
+            "dev": primary_commands.get("dev") or _first_command_of_kind(commands, "dev"),
         },
         "entrypoints": entrypoints[:3],
         "caution_zones": caution_zones[:5],
@@ -195,6 +200,7 @@ def render_onboarding_skill(artifact: dict[str, Any]) -> str:
     """Render the onboarding artifact into an agent-facing skill."""
     repo = artifact["repo"]
     commands = artifact["commands"]
+    primary_commands = artifact.get("primary_commands") or {}
     areas = artifact["areas"]
     entrypoints = artifact["entrypoints"]
     caution_zones = artifact["caution_zones"]
@@ -236,6 +242,14 @@ def render_onboarding_skill(artifact: dict[str, Any]) -> str:
             "",
         ]
     )
+    if primary_commands:
+        for label in ("install", "dev", "fast_test", "full_test", "lint", "build"):
+            command = primary_commands.get(label)
+            if command:
+                lines.append(f"- `{label}`: `{command}`")
+        lines.append("")
+        lines.append("## Supporting Commands")
+        lines.append("")
     for command in commands[:5]:
         lines.append(
             f"- `{command['command']}`"
@@ -343,6 +357,12 @@ def _detect_manifests(repo_path: Path) -> list[str]:
         "go.mod",
         "Makefile",
         "justfile",
+        "Justfile",
+        "Procfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
     ]
     return [name for name in manifests if (repo_path / name).exists()]
 
@@ -364,6 +384,8 @@ def _primary_package_manager(repo_path: Path, manifests: list[str]) -> str:
         return "python"
     if "Makefile" in manifests:
         return "make"
+    if "justfile" in manifests or "Justfile" in manifests:
+        return "just"
     return "unknown"
 
 
@@ -400,20 +422,34 @@ def _collect_commands(
         for script_name in ("test", "lint", "dev", "build", "start"):
             if script_name in scripts:
                 prefix = "npm run" if package_manager == "npm" else package_manager
-                add(script_name, f"{prefix} {script_name}", f"package.json:scripts.{script_name}", "high")
+                mapped_kind = {"test": "fast_test", "start": "dev"}.get(script_name, script_name)
+                add(
+                    mapped_kind,
+                    f"{prefix} {script_name}",
+                    f"package.json:scripts.{script_name}",
+                    "high",
+                )
+        for script_name in ("test:unit", "test:quick", "test:fast"):
+            if script_name in scripts:
+                prefix = "npm run" if package_manager == "npm" else package_manager
+                add("fast_test", f"{prefix} {script_name}", f"package.json:scripts.{script_name}", "high")
+        for script_name in ("test:integration", "test:e2e", "test:ci", "test:full"):
+            if script_name in scripts:
+                prefix = "npm run" if package_manager == "npm" else package_manager
+                add("full_test", f"{prefix} {script_name}", f"package.json:scripts.{script_name}", "high")
         if scripts:
             primary = _guess_primary_script(scripts)
             if primary:
                 add("primary-script", f"{package_manager} {primary}", f"package.json:scripts.{primary}", "medium")
 
     if "pyproject.toml" in manifests:
-        add("test", "pytest", "pyproject.toml", "medium")
+        add("fast_test", "pytest", "pyproject.toml", "medium")
         add("lint", "ruff check .", "pyproject.toml", "medium")
         add("install", "python -m pip install -e .", "pyproject.toml", "medium")
 
     if "Cargo.toml" in manifests:
         add("build", "cargo build", "Cargo.toml", "high")
-        add("test", "cargo test", "Cargo.toml", "high")
+        add("fast_test", "cargo test", "Cargo.toml", "high")
         add("dev", "cargo run", "Cargo.toml", "medium")
 
     if "composer.json" in manifests:
@@ -422,13 +458,49 @@ def _collect_commands(
         scripts = composer_json.get("scripts") or {}
         for script_name in ("test", "lint"):
             if script_name in scripts:
-                add(script_name, f"composer {script_name}", f"composer.json:scripts.{script_name}", "high")
+                mapped_kind = "fast_test" if script_name == "test" else script_name
+                add(mapped_kind, f"composer {script_name}", f"composer.json:scripts.{script_name}", "high")
 
     if "Makefile" in manifests:
         targets = _make_targets(repo_path / "Makefile")
-        for script_name in ("install", "test", "lint", "dev", "build"):
+        for script_name in ("install", "lint", "dev", "build"):
             if script_name in targets:
                 add(script_name, f"make {script_name}", f"Makefile:{script_name}", "medium")
+        for script_name in ("test", "unit-test", "test-fast", "quick-test"):
+            if script_name in targets:
+                add("fast_test", f"make {script_name}", f"Makefile:{script_name}", "medium")
+        for script_name in ("test-all", "integration-test", "e2e-test", "full-test"):
+            if script_name in targets:
+                add("full_test", f"make {script_name}", f"Makefile:{script_name}", "medium")
+
+    for justfile_name in ("justfile", "Justfile"):
+        if justfile_name in manifests:
+            targets = _make_targets(repo_path / justfile_name)
+            for script_name in ("install", "lint", "dev", "build"):
+                if script_name in targets:
+                    add(script_name, f"just {script_name}", f"{justfile_name}:{script_name}", "high")
+            for script_name in ("test", "unit-test", "test-fast", "quick-test"):
+                if script_name in targets:
+                    add("fast_test", f"just {script_name}", f"{justfile_name}:{script_name}", "high")
+            for script_name in ("test-all", "integration-test", "e2e-test", "full-test"):
+                if script_name in targets:
+                    add("full_test", f"just {script_name}", f"{justfile_name}:{script_name}", "high")
+
+    for inferred in _commands_from_procfile(repo_path):
+        add(
+            inferred["kind"],
+            inferred["command"],
+            inferred["source"],
+            inferred["confidence"],
+        )
+
+    for inferred in _commands_from_compose(repo_path):
+        add(
+            inferred["kind"],
+            inferred["command"],
+            inferred["source"],
+            inferred["confidence"],
+        )
 
     for inferred in _commands_from_github_actions(repo_path):
         add(
@@ -438,7 +510,15 @@ def _collect_commands(
             inferred["confidence"],
         )
 
-    return commands[:8]
+    return sorted(
+        commands,
+        key=lambda command: (
+            _kind_priority(command["kind"]),
+            -_confidence_rank(command["confidence"]),
+            command["source"],
+            command["command"],
+        ),
+    )[:12]
 
 
 def _make_targets(makefile_path: Path) -> set[str]:
@@ -610,10 +690,10 @@ def _commands_from_github_actions(repo_path: Path) -> list[dict[str, str]]:
             continue
     joined = "\n".join(lines)
     patterns = [
-        ("test", "pnpm test", "github-actions", "medium"),
-        ("test", "npm test", "github-actions", "medium"),
-        ("test", "cargo test", "github-actions", "medium"),
-        ("test", "pytest", "github-actions", "medium"),
+        ("fast_test", "pnpm test", "github-actions", "medium"),
+        ("fast_test", "npm test", "github-actions", "medium"),
+        ("fast_test", "cargo test", "github-actions", "medium"),
+        ("fast_test", "pytest", "github-actions", "medium"),
         ("lint", "ruff check .", "github-actions", "medium"),
         ("lint", "cargo clippy", "github-actions", "medium"),
         ("build", "cargo build", "github-actions", "medium"),
@@ -629,6 +709,121 @@ def _commands_from_github_actions(repo_path: Path) -> list[dict[str, str]]:
                 }
             )
     return commands
+
+
+def _commands_from_procfile(repo_path: Path) -> list[dict[str, str]]:
+    procfile_path = repo_path / "Procfile"
+    if not procfile_path.exists():
+        return []
+    commands: list[dict[str, str]] = []
+    for line in procfile_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or ":" not in stripped:
+            continue
+        name, command = stripped.split(":", 1)
+        role = name.strip().lower()
+        command = command.strip()
+        kind = "dev"
+        if role in {"worker", "job", "consumer"}:
+            kind = "dev"
+        elif role in {"web", "app", "server"}:
+            kind = "dev"
+        commands.append(
+            {
+                "kind": kind,
+                "command": command,
+                "source": f"Procfile:{role}",
+                "confidence": "medium",
+            }
+        )
+    return commands
+
+
+def _commands_from_compose(repo_path: Path) -> list[dict[str, str]]:
+    filenames = ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
+    compose_name = next((name for name in filenames if (repo_path / name).exists()), None)
+    if not compose_name:
+        return []
+    contents = (repo_path / compose_name).read_text(encoding="utf-8")
+    commands: list[dict[str, str]] = []
+    if "services:" in contents:
+        commands.append(
+            {
+                "kind": "dev",
+                "command": f"docker compose -f {compose_name} up",
+                "source": compose_name,
+                "confidence": "medium",
+            }
+        )
+    for service_name in ("test", "tests", "app", "web"):
+        if f"{service_name}:" in contents:
+            if service_name in {"test", "tests"}:
+                commands.append(
+                    {
+                        "kind": "fast_test",
+                        "command": f"docker compose -f {compose_name} run --rm {service_name}",
+                        "source": f"{compose_name}:{service_name}",
+                        "confidence": "low",
+                    }
+                )
+            break
+    return commands
+
+
+def _kind_priority(kind: str) -> int:
+    priority = {
+        "install": 0,
+        "dev": 1,
+        "fast_test": 2,
+        "full_test": 3,
+        "lint": 4,
+        "build": 5,
+        "primary-script": 6,
+    }
+    return priority.get(kind, 99)
+
+
+def _confidence_rank(confidence: str) -> int:
+    return {"high": 3, "medium": 2, "low": 1}.get(confidence, 0)
+
+
+def _primary_commands(commands: list[dict[str, str]]) -> dict[str, str]:
+    primary: dict[str, str] = {}
+    for kind in ("install", "dev", "fast_test", "full_test", "lint", "build"):
+        ranked = sorted(
+            [command for command in commands if command.get("kind") == kind],
+            key=lambda command: (
+                -_confidence_rank(str(command.get("confidence"))),
+                _source_priority(kind, str(command.get("source"))),
+                str(command.get("command")),
+            ),
+        )
+        if ranked:
+            primary[kind] = str(ranked[0]["command"])
+    return primary
+
+
+def _source_priority(kind: str, source: str) -> int:
+    if kind in {"install", "fast_test", "full_test", "lint", "build"}:
+        if source.startswith("justfile") or source.startswith("Justfile"):
+            return 0
+        if source.startswith("Makefile"):
+            return 1
+    if source.startswith("package.json"):
+        return 2
+    if source == "Cargo.toml":
+        return 3
+    if source == "pyproject.toml":
+        return 4
+    if source == "composer.json":
+        return 5
+    if source.startswith("Procfile"):
+        return 6
+    if source.startswith("docker-compose") or source.startswith("compose"):
+        return 7
+    if source == "github-actions":
+        return 8
+    return 99
 
 
 def _first_command_of_kind(commands: list[dict[str, str]], kind: str) -> str | None:
