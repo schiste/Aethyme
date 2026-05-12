@@ -100,6 +100,21 @@ logger = structlog.get_logger()
 CLIState: TypeAlias = dict[str, str | bool | None]
 
 
+class AethymeCLIGroup(click.Group):
+    """Custom command group for clearer recovery from removed entry points."""
+
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        if cmd_name == "explore":
+            raise click.UsageError(
+                "'explore' was removed from the Python CLI on 2026-05-08. "
+                "Use the native binary instead:\n\n"
+                '  "$AETHYME_ROOT/rust/target/release/aethyme" explore '
+                '--repo "$REPO" --request "<task>" --format answer-json\n\n'
+                "The Python CLI still handles graph, task, intents, facts, and analyze."
+            )
+        return super().get_command(ctx, cmd_name)
+
+
 class FixRecord(TypedDict):
     """Autofix change proposal emitted by individual fixers."""
 
@@ -161,7 +176,7 @@ def default_tenant_id() -> str | None:
     return str(result[0]["id"])
 
 
-@click.group()
+@click.group(cls=AethymeCLIGroup)
 @click.option(
     "--tenant-id",
     envvar="AETHYME_TENANT_ID",

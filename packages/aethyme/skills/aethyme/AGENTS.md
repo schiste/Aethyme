@@ -15,9 +15,13 @@ entrypoints, or where to begin.
 
 ```bash
 AETHYME_ROOT="{{AETHYME_ROOT}}"
-"$AETHYME_ROOT/.venv/bin/python" -m src.cli explore \
+"$AETHYME_ROOT/rust/target/release/aethyme" explore \
     --repo "$PWD" --request "<your task>" --format answer-json
 ```
+
+Do not run `python -m src.cli explore`; the Python `explore` subcommand was
+removed. Use the native binary above for Explore, and use the Python CLI for
+`graph`, `task`, `intents`, `facts`, and `analyze`.
 
 Read `trust_policy` and `safe_to_use_as_answer` first. Use `answer[]` as the
 primary result only when `safe_to_use_as_answer` is true. Otherwise treat

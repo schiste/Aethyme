@@ -20,6 +20,15 @@ AETHYME_BIN="$AETHYME_ROOT/rust/target/release/aethyme"
 REPO="$PWD"
 ```
 
+Important: `python -m src.cli explore` is not a valid command. `explore`
+only runs through the native binary:
+
+```bash
+"$AETHYME_BIN" explore --repo "$REPO" --request "<user request>" --format answer-json
+```
+
+Use the Python CLI for `graph`, `task`, `intents`, `facts`, and `analyze`.
+
 Command shapes:
 
 ```bash

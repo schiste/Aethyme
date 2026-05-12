@@ -11,6 +11,16 @@ from src.cli import cli
 from src.rendering.context_pack import render_pack_summary, render_prompt_pack
 
 
+def test_removed_python_explore_command_prints_native_recovery_hint() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["explore", "--repo", "/tmp/repo", "--request", "task"])
+
+    assert result.exit_code == 2
+    assert "'explore' was removed from the Python CLI on 2026-05-08" in result.output
+    assert '"$AETHYME_ROOT/rust/target/release/aethyme" explore' in result.output
+    assert "The Python CLI still handles graph, task, intents, facts, and analyze." in result.output
+
+
 def test_graph_node_non_json_surfaces_completeness_signals(
     monkeypatch,
     tmp_path: Path,
