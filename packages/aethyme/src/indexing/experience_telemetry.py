@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .onboarding import ACT_STARTER_JSON_PATH, ONBOARDING_JSON_PATH
+from .onboarding import ACT_STARTER_JSON_PATH, ONBOARDING_JSON_PATH, override_freshness
 
 TELEMETRY_LOG_PATH = ".aethyme/generated/experience-telemetry.jsonl"
 
@@ -71,12 +71,15 @@ def detailed_report(repo_path: Path) -> dict[str, Any]:
     repo_path = Path(repo_path).expanduser().resolve()
     log_path = repo_path / TELEMETRY_LOG_PATH
     summary = summarize_events(repo_path)
+    freshness = override_freshness(repo_path)
     if not log_path.exists():
         return {
             **summary,
             "recent_events": [],
             "wrapper_invocations": {},
             "latest_payloads": {},
+            "freshness": freshness,
+            "kpis": _derive_kpis({}, {}, {}, freshness),
         }
 
     recent_events: list[dict[str, Any]] = []
@@ -104,12 +107,13 @@ def detailed_report(repo_path: Path) -> dict[str, Any]:
             }
         )
 
-    kpis = _derive_kpis(latest_payloads, wrapper_invocations, summary["by_type"])
+    kpis = _derive_kpis(latest_payloads, wrapper_invocations, summary["by_type"], freshness)
     return {
         **summary,
         "recent_events": recent_events[-10:],
         "wrapper_invocations": wrapper_invocations,
         "latest_payloads": latest_payloads,
+        "freshness": freshness,
         "kpis": kpis,
     }
 
@@ -157,6 +161,7 @@ def _derive_kpis(
     latest_payloads: dict[str, dict[str, Any]],
     wrapper_invocations: dict[str, int],
     counts: dict[str, int],
+    freshness: dict[str, Any],
 ) -> dict[str, Any]:
     onboarding = _latest_onboarding_payload(latest_payloads)
     act = _latest_act_payload(latest_payloads)
@@ -195,12 +200,24 @@ def _derive_kpis(
                 "message": "Maintainer onboarding overrides are active for this repository.",
             }
         )
+    if freshness.get("regeneration_required"):
+        stale_targets = freshness.get("stale_targets") or []
+        signals.append(
+            {
+                "status": "attention",
+                "code": "override_regeneration_required",
+                "message": "Onboarding overrides changed after generated artifacts and require regeneration"
+                f" ({', '.join(stale_targets)}).",
+            }
+        )
 
     return {
         "wrapper_total": wrapper_total,
         "onboarding_commands": onboarding.get("commands", 0),
         "onboarding_notes": onboarding.get("notes", 0),
         "act_has_fast_test": act.get("has_fast_test", False),
+        "override_regeneration_required": bool(freshness.get("regeneration_required")),
+        "stale_targets": freshness.get("stale_targets", []),
         "signals": signals,
         "suggestions": _suggestions_from_signals(signals),
     }
@@ -255,6 +272,13 @@ def _suggestions_from_signals(
             {
                 "code": "review_override_drift",
                 "message": "Review whether the override notes and commands are still current after recent repo changes and regenerate onboarding if needed.",
+            }
+        )
+    if "override_regeneration_required" in codes:
+        suggestions.append(
+            {
+                "code": "regenerate_onboarding_artifacts",
+                "message": "Rerun `aethyme repo compile-skills <repo>` or `aethyme enhance deploy --repo <repo>` so onboarding and Act artifacts match the current override file.",
             }
         )
     return suggestions

@@ -585,13 +585,21 @@ def repo_record_wrapper_invocation(
     "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
 )
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-def repo_experience_telemetry(repo_path: Path, json_output: bool) -> None:
+@click.option(
+    "--check",
+    "check_signals",
+    is_flag=True,
+    help="Exit non-zero when attention signals require operator action.",
+)
+def repo_experience_telemetry(repo_path: Path, json_output: bool, check_signals: bool) -> None:
     """Show a stable report over repo-local experience telemetry."""
     from src.indexing.experience_telemetry import detailed_report
 
     report = detailed_report(repo_path)
     if json_output:
         click.echo(json.dumps(report, indent=2))
+        if check_signals and _experience_report_has_attention(report):
+            raise SystemExit(1)
         return
 
     click.echo(f"Path: {report['path']}")
@@ -613,6 +621,11 @@ def repo_experience_telemetry(repo_path: Path, json_output: bool) -> None:
         click.echo(f"- onboarding_commands: {kpis['onboarding_commands']}")
         click.echo(f"- onboarding_notes: {kpis['onboarding_notes']}")
         click.echo(f"- act_has_fast_test: {kpis['act_has_fast_test']}")
+        click.echo(f"- override_regeneration_required: {kpis['override_regeneration_required']}")
+        if report.get("freshness", {}).get("override_exists"):
+            click.echo(
+                f"- stale_targets: {', '.join(kpis['stale_targets']) or 'none'}"
+            )
         if kpis["signals"]:
             click.echo("Signals:")
             for signal in kpis["signals"]:
@@ -621,10 +634,20 @@ def repo_experience_telemetry(repo_path: Path, json_output: bool) -> None:
             click.echo("Suggestions:")
             for suggestion in kpis["suggestions"]:
                 click.echo(f"- {suggestion['code']}: {suggestion['message']}")
+    freshness = report.get("freshness") or {}
+    if freshness.get("override_exists"):
+        click.echo("Override freshness:")
+        click.echo(
+            f"- regeneration_required: {'yes' if freshness['regeneration_required'] else 'no'}"
+        )
+        if freshness.get("stale_targets"):
+            click.echo(f"- stale_targets: {', '.join(freshness['stale_targets'])}")
     if report["recent_events"]:
         click.echo("Recent events:")
         for event in report["recent_events"][-5:]:
             click.echo(f"- {event['timestamp']} {event['event_type']}")
+    if check_signals and _experience_report_has_attention(report):
+        raise SystemExit(1)
 
 
 @repo.command("engine-info")
@@ -2803,12 +2826,24 @@ def enhance_verify_command(repo_path: Path) -> None:
         f"entrypoints={summary['act']['entrypoints']}, "
         f"caution_zones={summary['act']['caution_zones']}"
     )
+    if summary["freshness"]["override_exists"]:
+        click.echo(
+            "  Override freshness: "
+            f"regeneration_required={summary['freshness']['regeneration_required']}, "
+            f"stale_targets={','.join(summary['freshness']['stale_targets']) or 'none'}"
+        )
     click.echo(
         "  Experience telemetry: "
         f"events={summary['experience_telemetry']['event_count']}, "
         f"last={summary['experience_telemetry']['last_event_type']}"
     )
     click.echo("All discoverability files present and substituted.")
+
+
+def _experience_report_has_attention(report: dict[str, Any]) -> bool:
+    kpis = report.get("kpis") or {}
+    signals = kpis.get("signals") or []
+    return any(signal.get("status") == "attention" for signal in signals)
 
 
 def main() -> None:

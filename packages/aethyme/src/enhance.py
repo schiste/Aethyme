@@ -45,6 +45,7 @@ from src.indexing.onboarding import (
     ONBOARDING_CODEX_PATH,
     ONBOARDING_JSON_PATH,
     expected_onboarding_files,
+    override_freshness,
     recommendation_summary,
 )
 
@@ -392,5 +393,6 @@ def summarize(repo: Path) -> dict[str, Any]:
             "entrypoints": act["telemetry"]["entrypoint_count"],
             "caution_zones": act["telemetry"]["caution_zone_count"],
         },
+        "freshness": override_freshness(repo),
         "experience_telemetry": summarize_events(repo),
     }

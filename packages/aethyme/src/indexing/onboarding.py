@@ -791,6 +791,49 @@ def validate_overrides(repo_path: Path) -> dict[str, Any]:
     }
 
 
+def override_freshness(repo_path: Path) -> dict[str, Any]:
+    """Return whether generated onboarding artifacts are fresh relative to overrides."""
+    repo_path = Path(repo_path).expanduser().resolve()
+    override_path = repo_path / ONBOARDING_OVERRIDE_PATH
+    onboarding_path = repo_path / ONBOARDING_JSON_PATH
+    act_path = repo_path / ACT_STARTER_JSON_PATH
+
+    if not override_path.exists():
+        return {
+            "override_exists": False,
+            "generated_exists": {
+                "onboarding": onboarding_path.exists(),
+                "act": act_path.exists(),
+            },
+            "regeneration_required": False,
+            "stale_targets": [],
+        }
+
+    override_mtime = override_path.stat().st_mtime
+    stale_targets: list[str] = []
+    generated_exists = {
+        "onboarding": onboarding_path.exists(),
+        "act": act_path.exists(),
+    }
+    if not onboarding_path.exists() or onboarding_path.stat().st_mtime < override_mtime:
+        stale_targets.append("onboarding")
+    if not act_path.exists() or act_path.stat().st_mtime < override_mtime:
+        stale_targets.append("act")
+
+    return {
+        "override_exists": True,
+        "override_path": ONBOARDING_OVERRIDE_PATH,
+        "override_mtime": override_mtime,
+        "generated_exists": generated_exists,
+        "generated_mtime": {
+            "onboarding": onboarding_path.stat().st_mtime if onboarding_path.exists() else None,
+            "act": act_path.stat().st_mtime if act_path.exists() else None,
+        },
+        "regeneration_required": bool(stale_targets),
+        "stale_targets": stale_targets,
+    }
+
+
 def recommendation_summary(repo_path: Path, *, aethyme_root: Path | None = None) -> dict[str, Any]:
     """Return a small deterministic recommendation surface for the repo."""
     artifact = build_onboarding_artifact(repo_path, aethyme_root=aethyme_root)

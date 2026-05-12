@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -159,3 +160,58 @@ def test_repo_experience_telemetry_flags_no_wrapper_usage(tmp_path: Path) -> Non
     assert text_result.exit_code == 0, text_result.output
     assert "Suggestions:" in text_result.output
     assert "load_onboarding_and_use_wrapper" in text_result.output
+
+    check_result = runner.invoke(cli, ["repo", "experience-telemetry", str(repo_path), "--check"])
+    assert check_result.exit_code == 1, check_result.output
+
+
+def test_repo_experience_telemetry_detects_stale_override_artifacts(tmp_path: Path) -> None:
+    repo_path = tmp_path / "demo-repo"
+    _build_repo(repo_path)
+    deploy(repo_path)
+    runner = CliRunner()
+
+    override_path = repo_path / ".aethyme" / "overrides" / "onboarding.json"
+    override_path.parent.mkdir(parents=True, exist_ok=True)
+    override_path.write_text(
+        json.dumps(
+            {
+                "notes": ["Local maintainer hint"],
+                "commands": [
+                    {
+                        "kind": "test",
+                        "command": "./scripts/test-fast.sh",
+                        "source": "manual-override",
+                        "confidence": "high",
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    onboarding_path = repo_path / ".aethyme" / "generated" / "onboarding.json"
+    act_path = repo_path / ".aethyme" / "generated" / "act-starter.json"
+    newer_mtime = max(onboarding_path.stat().st_mtime, act_path.stat().st_mtime) + 5
+    os.utime(override_path, (newer_mtime, newer_mtime))
+
+    result = runner.invoke(
+        cli,
+        ["repo", "experience-telemetry", str(repo_path), "--json-output"],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    codes = [signal["code"] for signal in payload["kpis"]["signals"]]
+    assert "override_regeneration_required" in codes
+    assert payload["freshness"]["regeneration_required"] is True
+    assert set(payload["freshness"]["stale_targets"]) == {"onboarding", "act"}
+    suggestion_codes = [suggestion["code"] for suggestion in payload["kpis"]["suggestions"]]
+    assert "regenerate_onboarding_artifacts" in suggestion_codes
+
+    text_result = runner.invoke(cli, ["repo", "experience-telemetry", str(repo_path)])
+    assert text_result.exit_code == 0, text_result.output
+    assert "Override freshness:" in text_result.output
+    assert "regeneration_required: yes" in text_result.output
+
+    check_result = runner.invoke(cli, ["repo", "experience-telemetry", str(repo_path), "--check"])
+    assert check_result.exit_code == 1, check_result.output
