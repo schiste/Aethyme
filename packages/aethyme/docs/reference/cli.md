@@ -22,6 +22,7 @@ Last Updated: 2026-05-11
 - `aethyme repo init-onboarding-overrides /path/to/repo`
 - `aethyme repo validate-onboarding-overrides /path/to/repo`
 - `aethyme repo experience-telemetry /path/to/repo`
+- `aethyme repo experience-telemetry /path/to/repo --check`
 - `aethyme repo deploy-skills /path/to/repo --force`
 
 `repo compile-skills` generates repo-specific skills, currently
@@ -95,7 +96,7 @@ runtime navigation skill. For real repositories, prefer
 - likely entrypoints and caution zones
 
 `enhance verify` also prints a compact summary: recommended skill/mode,
-onboarding counts, override presence, and Act starter readiness.
+onboarding counts, override presence, override freshness, and Act starter readiness.
 
 Stable experience-layer telemetry is written to:
 - `.aethyme/generated/experience-telemetry.jsonl`
@@ -103,11 +104,16 @@ Stable experience-layer telemetry is written to:
 Inspect it with:
 - `aethyme repo experience-telemetry /path/to/repo`
 - `aethyme repo experience-telemetry /path/to/repo --json-output`
+- `aethyme repo experience-telemetry /path/to/repo --check`
 
 The report now derives simple experience-layer KPIs, for example:
 - enhancement installed but no wrapper usage recorded yet
 - invalid onboarding override present
 - onboarding exists but no fast test command detected
+- onboarding overrides changed after generated artifacts and need regeneration
+
+`--check` exits nonzero when attention signals are present, so it can be used in
+CI or local verification gates without parsing the full report.
 
 It also emits concrete suggestions tied to those signals, for example:
 - load onboarding and use the Aethyme wrapper on the next broad task

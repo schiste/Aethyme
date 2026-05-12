@@ -97,6 +97,7 @@ Primary commands:
 - `aethyme repo compile-skills /path/to/repo`
 - `aethyme repo init-onboarding-overrides /path/to/repo`
 - `aethyme repo validate-onboarding-overrides /path/to/repo`
+- `aethyme repo experience-telemetry /path/to/repo --check`
 
 Supporting commands:
 
@@ -156,6 +157,7 @@ Runtime notes:
 - generated Act starter lives at `.aethyme/generated/act-starter.json` and renders to `.codex/skills/repo-act/SKILL.md` and `.claude/skills/repo-act/SKILL.md`
 - repo-local onboarding overrides live at `.aethyme/overrides/onboarding.json`; this side owns summon policy, overrides, compact rendering, and generation telemetry, while graph quality stays below the contract boundary
 - stable experience-layer lifecycle telemetry is written to `.aethyme/generated/experience-telemetry.jsonl`
+- `aethyme repo experience-telemetry --check` now exits nonzero on attention signals such as invalid overrides, no wrapper usage after enhancement, or override/artifact freshness drift
 - `explore --request ...` defaults to `task_localization_query`, a bounded general-purpose answer path that returns ranked candidate files/symbols/areas, compact evidence, verification steps, confidence, next actions, and observability; on large repos it returns degraded `needs_verification` output instead of blocking or claiming answer safety
 - `explore --intent usage_boundary_query` now uses a scope-first PHP analyzer path that returns answer/excluded/confidence/observability without building the full repository graph
 - reports include an Aethyme Usage section so availability is not confused with actual `src.cli` invocation
