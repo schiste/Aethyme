@@ -23,6 +23,8 @@ use crate::context::IndexerContext;
 use crate::filesystem::{
     walk_source_tree, FilesystemIndexerError, IndexedFile, WalkOptions,
 };
+use crate::language::{LanguageIndexError, LanguageRegistry};
+use crate::python::PythonIndexer;
 
 /// One indexed file's full storage footprint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,26 +33,44 @@ pub struct BuiltFragment {
     pub fragment: Fragment,
 }
 
-/// Build a Fragment from a single IndexedFile.
+/// Build a Fragment from a single IndexedFile, optionally enriched
+/// by a language-specific indexer.
 ///
-/// The IndexedFile carries one top-level node (File or NonCodeFile);
-/// the resulting Fragment wraps it with no edges. Language indexers
-/// (commit 3.3+) will produce IndexedFile records with richer
-/// `additional_nodes` / `additional_edges` fields once the AST
-/// layer lands.
+/// If `language_indexer_output` is Some, its nodes + edges are merged
+/// with the IndexedFile's top-level node. Pass None for non-code
+/// files (NonCodeFile) and for code files whose language has no
+/// registered indexer.
 pub fn build_fragment(
     indexed: &IndexedFile,
+    language_indexer_output: Option<crate::language::LanguageIndexResult>,
 ) -> Result<BuiltFragment, BuildFragmentError> {
+    let (additional_nodes, additional_edges) =
+        match language_indexer_output {
+            Some(r) => (r.additional_nodes, r.additional_edges),
+            None => (Vec::new(), Vec::new()),
+        };
+    let mut nodes = Vec::with_capacity(additional_nodes.len() + 1);
+    nodes.push(indexed.top_node.clone());
+    nodes.extend(additional_nodes);
     let fragment = Fragment::new(
         &indexed.source_path,
-        vec![indexed.top_node.clone()],
-        vec![],
+        nodes,
+        additional_edges,
     )
     .map_err(BuildFragmentError::Fragment)?;
     Ok(BuiltFragment {
         source_path: indexed.source_path.clone(),
         fragment,
     })
+}
+
+/// Default registry: includes every language indexer the crate
+/// ships. Called by `index_repo_to_disk`; callers who want
+/// per-call control can build their own registry and pass it.
+pub fn default_registry() -> LanguageRegistry {
+    let mut registry = LanguageRegistry::new();
+    registry.register(PythonIndexer::new());
+    registry
 }
 
 /// Build SymbolRecord entries from an indexed file's nodes, grouped
@@ -118,15 +138,25 @@ fn symbol_record_for(
     }
 }
 
-/// One-shot helper: walk the repo, build all fragments + index
-/// shards, write them through the storage layer to their canonical
-/// paths. Returns a summary of what was written.
+/// One-shot helper: walk the repo, dispatch each code file to its
+/// registered language indexer, build all fragments + index shards,
+/// write them through the storage layer to their canonical paths.
 ///
-/// Intended for the `aethyme index` CLI command (Phase 4+) once
-/// the engine wires this in.
+/// Uses the default registry (which currently includes only
+/// PythonIndexer). For per-call control, use `index_repo_to_disk_with`.
 pub fn index_repo_to_disk(
     ctx: &IndexerContext,
     options: &WalkOptions,
+) -> Result<IndexRepoSummary, IndexRepoError> {
+    let registry = default_registry();
+    index_repo_to_disk_with(ctx, options, &registry)
+}
+
+/// Same as [`index_repo_to_disk`] but accepts an explicit registry.
+pub fn index_repo_to_disk_with(
+    ctx: &IndexerContext,
+    options: &WalkOptions,
+    registry: &LanguageRegistry,
 ) -> Result<IndexRepoSummary, IndexRepoError> {
     let walk = walk_source_tree(ctx, options).map_err(IndexRepoError::Walk)?;
     let total_files = walk.files.len();
@@ -136,14 +166,37 @@ pub fn index_repo_to_disk(
     let mut counts_by_kind: BTreeMap<NodeKind, usize> = BTreeMap::new();
 
     for indexed in &walk.files {
-        let built = build_fragment(indexed).map_err(IndexRepoError::Build)?;
+        let lang_output = match registry.get(&indexed.language) {
+            Some(indexer) => {
+                let abs = ctx.repo_root().join(&*indexed.source_path);
+                let content = std::fs::read_to_string(&abs).map_err(|e| {
+                    IndexRepoError::ReadSource {
+                        source_path: indexed.source_path.clone(),
+                        message: e.to_string(),
+                    }
+                })?;
+                Some(
+                    indexer
+                        .index_file(ctx, indexed, &content)
+                        .map_err(IndexRepoError::Language)?,
+                )
+            }
+            None => None,
+        };
+
+        let built = build_fragment(indexed, lang_output)
+            .map_err(IndexRepoError::Build)?;
+
+        for node in built.fragment.nodes() {
+            *counts_by_kind.entry(node.kind()).or_default() += 1;
+        }
+
         let path = write_fragment(
             ctx.repo_root(),
             &built.source_path,
             &built.fragment,
         )
         .map_err(IndexRepoError::FragmentWrite)?;
-        *counts_by_kind.entry(indexed.top_node.kind()).or_default() += 1;
         fragments_written.push(path);
     }
 
@@ -194,6 +247,16 @@ pub enum IndexRepoError {
     Build(BuildFragmentError),
     FragmentWrite(FragmentWriteError),
     IndexShardWrite(IndexShardWriteError),
+    /// Reading a source file off disk failed (e.g., file disappeared
+    /// between the filesystem walk and the language-indexer read).
+    ReadSource {
+        source_path: Box<str>,
+        message: String,
+    },
+    /// A language indexer rejected its input. Wraps the underlying
+    /// LanguageIndexError so callers can distinguish parse failures
+    /// from other failure modes.
+    Language(LanguageIndexError),
 }
 
 impl std::fmt::Display for IndexRepoError {
@@ -203,6 +266,11 @@ impl std::fmt::Display for IndexRepoError {
             Self::Build(e) => write!(f, "index_repo: {e}"),
             Self::FragmentWrite(e) => write!(f, "index_repo: {e}"),
             Self::IndexShardWrite(e) => write!(f, "index_repo: {e}"),
+            Self::ReadSource { source_path, message } => write!(
+                f,
+                "index_repo: read {source_path:?}: {message}"
+            ),
+            Self::Language(e) => write!(f, "index_repo: {e}"),
         }
     }
 }

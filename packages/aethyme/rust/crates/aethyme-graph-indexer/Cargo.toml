@@ -25,5 +25,29 @@ blake3 = "1"
 # NonCodeFile nodes from the repo's source tree.
 walkdir = "2"
 
+# Python parsing (Phase 3.3). The Astral/Ruff team's parser, via
+# the RustPython project's published fork. Picked over
+# tree-sitter-python because:
+# (1) ~2-3× faster on cold parses (the perf we picked it for),
+# (2) zero C dependencies (keeps the indexer crate pure-Rust),
+# (3) the maturity signal of Ruff lint shipping the same parser
+#     in production at very high throughput.
+#
+# Note on the fork: Astral doesn't publish ruff_python_parser
+# directly to crates.io (they treat their parser crates as
+# in-tree implementation details). The RustPython team
+# republishes the same code under the `rustpython-` prefix
+# specifically so external consumers can depend on it. The 0.15.x
+# series tracks Ruff 0.15.x. PythonIndexer wraps this API so a
+# future version bump (or fork swap) lands in one file rather
+# than throughout the indexer.
+ruff_python_parser = { package = "rustpython-ruff_python_parser", version = "0.15" }
+ruff_python_ast = { package = "rustpython-ruff_python_ast", version = "0.15" }
+ruff_text_size = { package = "rustpython-ruff_text_size", version = "0.15" }
+
 [dev-dependencies]
 tempfile = "3"
+# serde_json is used by tests to inspect the JSON shape of produced
+# Node values (e.g., to assert visibility="private" without exposing
+# accessors on every per-kind struct just for testing).
+serde_json = "1"

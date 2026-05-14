@@ -30,7 +30,7 @@ fn build_fragment_wraps_a_single_indexed_file() {
     )
     .unwrap();
     assert_eq!(walked.files.len(), 1);
-    let built = build_fragment(&walked.files[0]).unwrap();
+    let built = build_fragment(&walked.files[0], None).unwrap();
     assert_eq!(&*built.source_path, "src/cli.py");
     assert_eq!(built.fragment.node_count(), 1);
     assert_eq!(built.fragment.edge_count(), 0);

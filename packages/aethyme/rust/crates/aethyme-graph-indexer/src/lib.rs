@@ -20,18 +20,26 @@
 
 pub mod context;
 pub mod filesystem;
+pub mod language;
 pub mod language_map;
 pub mod pipeline;
+pub mod python;
 
 pub use context::IndexerContext;
 pub use filesystem::{
     walk_source_tree, FilesystemIndexResult, FilesystemIndexerError,
     IndexedFile, SkipReason, SkippedFile, WalkOptions,
 };
+pub use language::{
+    LanguageIndexError, LanguageIndexResult, LanguageIndexer,
+    LanguageRegistry, LineIndex,
+};
 pub use language_map::{
     classify_file, infer_language_from_extension, FileClassification,
 };
 pub use pipeline::{
-    build_fragment, build_index_records, index_repo_to_disk,
-    BuildFragmentError, BuiltFragment, IndexRepoError, IndexRepoSummary,
+    build_fragment, build_index_records, default_registry,
+    index_repo_to_disk, BuildFragmentError, BuiltFragment, IndexRepoError,
+    IndexRepoSummary,
 };
+pub use python::PythonIndexer;
