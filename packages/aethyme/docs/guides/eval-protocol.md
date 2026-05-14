@@ -787,7 +787,7 @@ Use `quality_score` to judge task success. Use `global_score` / `recalculated_ev
 - **Scoring applies path normalization** before comparison: markdown links, line anchors, absolute repo prefixes, and leading `./` are stripped. Pass `repo_path` to scoring functions for full normalization.
 - **CLI commands need cd prefix**: The graph CLI commands must include `cd <AETHYME_PATH> &&` before `python -m src.cli` because the agent runs from the playground directory, not the Aethyme directory.
 - **Token tracking**: Agent token usage is visible in the session output after execution completes. Record it alongside scores for cost analysis.
-- **Reports**: Every eval run writes a markdown report under `docs/reports/evals/`.
+- **Reports**: Every eval run writes a local markdown report under `docs/reports/evals/`. The repository tracks only a curated subset there; the rest are generated local artifacts.
 
 ## Results
 

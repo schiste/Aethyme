@@ -1,6 +1,6 @@
 # Aethyme Core
 
-Last Updated: 2026-05-11
+Last Updated: 2026-05-14
 
 Aethyme Core is the deterministic repository tooling product in this repository.
 
@@ -97,6 +97,8 @@ Primary commands:
 - `aethyme repo compile-skills /path/to/repo`
 - `aethyme repo init-onboarding-overrides /path/to/repo`
 - `aethyme repo validate-onboarding-overrides /path/to/repo`
+- `aethyme repo init-agents-overrides /path/to/repo`
+- `aethyme repo validate-agents-overrides /path/to/repo`
 - `aethyme repo experience-telemetry /path/to/repo --check`
 - `aethyme repo experience-status /path/to/repo`
 - `aethyme repo commit-message-template --type fix --scope watchlist`
@@ -107,6 +109,7 @@ Supporting commands:
 - `aethyme repo ingest /path/to/repo`
 - `aethyme repo inspect /path/to/repo --json-output`
 - `aethyme repo clear-cache /path/to/repo`
+- `aethyme repo warm /path/to/repo`
 - `aethyme --engine-transport auto repo engine-info`
 - `aethyme --engine-transport pyo3 repo engine-info --check`
 - `aethyme query symbol /path/to/repo main`
@@ -121,6 +124,7 @@ Supporting commands:
 - `aethyme task scope --repo /path/to/repo --task "Update validate_token flow" --json-output`
 - `aethyme task next --repo /path/to/repo --task "Update validate_token flow" --json-output`
 - `aethyme task expand --repo /path/to/repo --node src/auth.py --json-output`
+- `aethyme task context --repo /path/to/repo --task "Update validate_token flow" --json-output`
 - `aethyme eval explain-repo --repo /path/to/repo --json-output`
 - `aethyme eval explain-repo --repo /path/to/repo --control-cmd "<cmd>" --explore-cmd "<cmd>" --leverage-cmd "<cmd>"`
 - `aethyme eval navigation-ctf --repo /path/to/repo --json-output`
@@ -155,7 +159,9 @@ Runtime notes:
 - without those commands, it still emits the comparison artifacts only
 - the `leverage` condition uses a compact generic Aethyme Explore usage card; `task-conditioned` remains the full context-pack mode
 - `aethyme enhance deploy --repo <path>` is the primary real-repository enhancement path; it writes cross-product discoverability files plus generated repo-onboarding artifacts
-- Aethyme owns only the generated `AETHYME:BEGIN/END` block in `AGENTS.md`; maintainer-authored instructions outside that block are preserved, and the block includes compact repo routing such as skill paths, fast test, app entrypoint, and experience status
+- `AGENTS.md` and `CLAUDE.md` are generated artifacts owned by Aethyme; customize them through `.aethyme/overrides/agents.json`, not by editing the root files directly
+- generated root instructions include compact repo routing such as skill paths, fast test, app entrypoint, experience status, and commit hygiene policy
+- legacy block-managed `AGENTS.md` files are migration-only now; deploy extracts legacy maintainer text into `.aethyme/overrides/agents.json` before rewriting the root file
 - `aethyme repo deploy-skills` remains a compatibility path for the static runtime skill and benchmark-oriented consumers
 - generated onboarding lives at `.aethyme/generated/onboarding.json` and renders to `.codex/skills/repo-onboarding/SKILL.md` and `.claude/skills/repo-onboarding/SKILL.md`
 - generated Act starter lives at `.aethyme/generated/act-starter.json` and renders to `.codex/skills/repo-act/SKILL.md` and `.claude/skills/repo-act/SKILL.md`
@@ -167,7 +173,8 @@ Runtime notes:
 - `explore --request ...` defaults to `task_localization_query`, a bounded general-purpose answer path that returns ranked candidate files/symbols/areas, compact evidence, verification steps, confidence, next actions, and observability; on large repos it returns degraded `needs_verification` output instead of blocking or claiming answer safety
 - `explore --intent usage_boundary_query` now uses a scope-first PHP analyzer path that returns answer/excluded/confidence/observability without building the full repository graph
 - reports include an Aethyme Usage section so availability is not confused with actual `src.cli` invocation
-- every `eval explain-repo` run writes a markdown report under `packages/aethyme/docs/reports/evals/`
+- every `eval explain-repo` run writes a local markdown report under `packages/aethyme/docs/reports/evals/`
+- the repository tracks only a curated subset of eval reports there; the rest are generated local artifacts
 - the report includes quality score, recalculated eval score vs control baseline, tool usage, tokens, duration, prompts, pack JSON, and verbose run results
 - eval outputs now include a structured output schema, scoring rubric, and reference answer
 

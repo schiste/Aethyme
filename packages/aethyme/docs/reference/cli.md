@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-05-11
+Last Updated: 2026-05-14
 
 ## Global Options
 
@@ -18,9 +18,12 @@ Last Updated: 2026-05-11
 - `aethyme repo ingest /path/to/repo`
 - `aethyme repo inspect /path/to/repo --json-output`
 - `aethyme repo clear-cache /path/to/repo`
+- `aethyme repo warm /path/to/repo`
 - `aethyme repo compile-skills /path/to/repo`
 - `aethyme repo init-onboarding-overrides /path/to/repo`
 - `aethyme repo validate-onboarding-overrides /path/to/repo`
+- `aethyme repo init-agents-overrides /path/to/repo`
+- `aethyme repo validate-agents-overrides /path/to/repo`
 - `aethyme repo experience-telemetry /path/to/repo`
 - `aethyme repo experience-telemetry /path/to/repo --check`
 - `aethyme repo experience-status /path/to/repo`
@@ -28,6 +31,8 @@ Last Updated: 2026-05-11
 - `aethyme repo lint-commit-message .git/COMMIT_EDITMSG`
 - `aethyme repo lint-commit-message --message "fix(scope): summary\n\nProblem:\n..."`
 - `aethyme repo deploy-skills /path/to/repo --force`
+- `aethyme repo engine-info --json-output`
+- `aethyme repo engine-info --check`
 
 `repo compile-skills` generates repo-specific skills, currently
 `repo-onboarding`, into `.aethyme/generated/` plus per-product skill paths.
@@ -63,6 +68,18 @@ regenerating onboarding, not by editing generated skill files directly.
 `repo init-onboarding-overrides` writes a starter override file.
 `repo validate-onboarding-overrides` checks that the override file is valid JSON
 and that key fields use the expected shapes.
+
+`repo init-agents-overrides` writes a starter `.aethyme/overrides/agents.json`
+file. Use it for repo-specific root instruction customization such as:
+- repo summary
+- hard constraints
+- validation rules
+- commit hygiene notes
+- summon policy notes
+- migrated maintainer markdown
+
+`repo validate-agents-overrides` checks that the agents override file is valid
+JSON and that those fields use the expected shapes.
 
 `repo deploy-skills` is now a compatibility path that deploys only the static
 runtime navigation skill. For real repositories, prefer
@@ -110,7 +127,7 @@ Watchlist seen-marking must remain revision-scoped.
 - `aethyme query impact /path/to/repo src/main.py`
 
 `enhance deploy` is the primary repo-facing discoverability path. It writes:
-- `AGENTS.md` with an Aethyme-managed generated block
+- fully generated `AGENTS.md`
 - `CLAUDE.md`
 - `.claude/skills/aethyme/SKILL.md`
 - `.codex/skills/aethyme/SKILL.md`
@@ -122,13 +139,20 @@ Watchlist seen-marking must remain revision-scoped.
 - `.claude/skills/repo-act/SKILL.md`
 - `.codex/skills/repo-act/SKILL.md`
 
-For `AGENTS.md`, Aethyme owns only the block between
-`<!-- AETHYME:BEGIN generated -->` and `<!-- AETHYME:END generated -->`.
-Maintainer-authored instructions outside that block are preserved across
-redeploys. Existing full-file Aethyme templates are migrated into the managed
-block on the next deploy. The block includes a compact repo-routing summary:
-repo-onboarding skill path, repo-act skill path, experience status path, primary
-fast test when detected, and primary app entrypoint when detected.
+`AGENTS.md` and `CLAUDE.md` are now generated artifacts owned by Aethyme.
+Customize them through `.aethyme/overrides/agents.json`, not by editing the
+root files directly. The generated root instructions include:
+- native Explore guidance
+- repo-onboarding and repo-act routing
+- experience status path
+- primary fast test when detected
+- primary app entrypoint when detected
+- commit hygiene policy and commands
+
+Legacy block-managed `AGENTS.md` files are migration-only now. On deploy,
+Aethyme extracts maintainer-authored legacy content into
+`.aethyme/overrides/agents.json` and then rewrites the root file as a fully
+generated artifact.
 
 `onboarding.json` is the canonical artifact. It includes:
 - repo identity
@@ -143,7 +167,9 @@ fast test when detected, and primary app entrypoint when detected.
 - likely entrypoints and caution zones
 
 `enhance verify` also prints a compact summary: recommended skill/mode,
-onboarding counts, override presence, override freshness, and Act starter readiness.
+onboarding counts, override presence, override freshness, and Act starter
+readiness. Direct edits to `AGENTS.md` or `CLAUDE.md` are now verification
+failures; use `.aethyme/overrides/agents.json` instead.
 
 Stable experience-layer telemetry is written to:
 - `.aethyme/generated/experience-telemetry.jsonl`
@@ -302,16 +328,18 @@ Optional params:
 
 ### Local Evaluation
 - `aethyme eval explain-repo --repo /path/to/repo --json-output`
-- `aethyme eval explain-repo --repo /path/to/repo --baseline-cmd "<cmd>" --aethyme-cmd "<cmd>"`
+- `aethyme eval explain-repo --repo /path/to/repo --control-cmd "<cmd>" --explore-cmd "<cmd>" --leverage-cmd "<cmd>"`
 - `aethyme eval navigation-ctf --repo /path/to/repo --json-output`
 - Example Codex wrapper command: `packages/aethyme/.venv/bin/python packages/aethyme/scripts/eval/run_codex_eval.py`
 
 Current behavior:
 - with no commands, this builds the control artifacts and comparison report only
-- with `--baseline-cmd` and `--aethyme-cmd`, it executes real runs through the evaluation runner contract
+- with `--control-cmd`, `--explore-cmd`, and `--leverage-cmd`, it executes real runs through the evaluation runner contract
+- `--baseline-cmd` and `--aethyme-cmd` remain accepted as legacy aliases for compatibility
 - external runners receive the prompt, navigation context, output schema, and Aethyme tool paths through `AETHYME_EVAL_*` env vars
 - the bundled Codex wrapper deletes its temporary prompt/event/schema files automatically; if you orchestrate runs through Chau7 MCP, close the tab after the report path is captured and the tab returns to idle
-- every run writes a markdown report under `packages/aethyme/docs/reports/evals/`
+- every run writes a local markdown report under `packages/aethyme/docs/reports/evals/`
+- the repository tracks only a curated subset of eval reports there; the rest are generated local artifacts
 - JSON output includes the generated `report_path`
 - evaluation JSON now includes `output_schema`, `scoring_rubric`, and `reference_output`
 
