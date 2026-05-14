@@ -41,6 +41,7 @@ dependencies = [
  "aethyme-graph-schema",
  "aethyme-graph-storage",
  "blake3",
+ "rayon",
  "rustpython-ruff_python_ast",
  "rustpython-ruff_python_parser",
  "rustpython-ruff_text_size",

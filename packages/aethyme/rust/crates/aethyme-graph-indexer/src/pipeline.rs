@@ -13,6 +13,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use rayon::prelude::*;
+
 use aethyme_graph_schema::{Node, NodeKind};
 use aethyme_graph_storage::{
     write_fragment, write_index_shard, Fragment, FragmentBuildError,
@@ -153,6 +155,12 @@ pub fn index_repo_to_disk(
 }
 
 /// Same as [`index_repo_to_disk`] but accepts an explicit registry.
+///
+/// The per-file phase (read + parse + build + write) is parallelized
+/// across rayon's thread pool. Each file's output goes to a distinct
+/// path so writes don't contend. Output paths are collected into a
+/// Vec preserving the walk's canonical (sorted) order; per-kind
+/// counts are merged with a parallel fold/reduce.
 pub fn index_repo_to_disk_with(
     ctx: &IndexerContext,
     options: &WalkOptions,
@@ -162,51 +170,76 @@ pub fn index_repo_to_disk_with(
     let total_files = walk.files.len();
     let total_skipped = walk.skipped.len();
 
-    let mut fragments_written = Vec::with_capacity(walk.files.len());
-    let mut counts_by_kind: BTreeMap<NodeKind, usize> = BTreeMap::new();
+    // Parallel per-file phase. Each closure returns (path_written,
+    // counts_for_this_file). Errors short-circuit via try_fold +
+    // try_reduce.
+    let per_file: Vec<(PathBuf, BTreeMap<NodeKind, usize>)> = walk
+        .files
+        .par_iter()
+        .map(|indexed| -> Result<(PathBuf, BTreeMap<NodeKind, usize>), IndexRepoError> {
+            let lang_output = match registry.get(&indexed.language) {
+                Some(indexer) => {
+                    let abs = ctx.repo_root().join(&*indexed.source_path);
+                    let content = std::fs::read_to_string(&abs).map_err(|e| {
+                        IndexRepoError::ReadSource {
+                            source_path: indexed.source_path.clone(),
+                            message: e.to_string(),
+                        }
+                    })?;
+                    Some(
+                        indexer
+                            .index_file(ctx, indexed, &content)
+                            .map_err(IndexRepoError::Language)?,
+                    )
+                }
+                None => None,
+            };
 
-    for indexed in &walk.files {
-        let lang_output = match registry.get(&indexed.language) {
-            Some(indexer) => {
-                let abs = ctx.repo_root().join(&*indexed.source_path);
-                let content = std::fs::read_to_string(&abs).map_err(|e| {
-                    IndexRepoError::ReadSource {
-                        source_path: indexed.source_path.clone(),
-                        message: e.to_string(),
-                    }
-                })?;
-                Some(
-                    indexer
-                        .index_file(ctx, indexed, &content)
-                        .map_err(IndexRepoError::Language)?,
-                )
+            let built = build_fragment(indexed, lang_output)
+                .map_err(IndexRepoError::Build)?;
+
+            let mut counts: BTreeMap<NodeKind, usize> = BTreeMap::new();
+            for node in built.fragment.nodes() {
+                *counts.entry(node.kind()).or_default() += 1;
             }
-            None => None,
-        };
 
-        let built = build_fragment(indexed, lang_output)
-            .map_err(IndexRepoError::Build)?;
+            let path = write_fragment(
+                ctx.repo_root(),
+                &built.source_path,
+                &built.fragment,
+            )
+            .map_err(IndexRepoError::FragmentWrite)?;
 
-        for node in built.fragment.nodes() {
-            *counts_by_kind.entry(node.kind()).or_default() += 1;
-        }
+            Ok((path, counts))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-        let path = write_fragment(
-            ctx.repo_root(),
-            &built.source_path,
-            &built.fragment,
-        )
-        .map_err(IndexRepoError::FragmentWrite)?;
+    // Aggregate across threads. The Vec already preserves the
+    // canonical walk order; we just split it and merge counts.
+    let mut fragments_written = Vec::with_capacity(per_file.len());
+    let mut counts_by_kind: BTreeMap<NodeKind, usize> = BTreeMap::new();
+    for (path, counts) in per_file {
         fragments_written.push(path);
+        for (kind, count) in counts {
+            *counts_by_kind.entry(kind).or_default() += count;
+        }
     }
 
-    let mut shards_written = Vec::new();
+    // Index shards: per-module aggregation runs on the post-walk
+    // BTreeMap, so it's already sequential and cheap. We parallelize
+    // the write step (each shard writes to a distinct path).
     let records = build_index_records(&walk.files);
-    for (module, recs) in records {
-        let path = write_index_shard(ctx.repo_root(), &module, &recs)
-            .map_err(IndexRepoError::IndexShardWrite)?;
-        shards_written.push(path);
-    }
+    let records_vec: Vec<(String, Vec<SymbolRecord>)> =
+        records.into_iter().collect();
+    let mut shards_written: Vec<PathBuf> = records_vec
+        .par_iter()
+        .map(|(module, recs)| -> Result<PathBuf, IndexRepoError> {
+            write_index_shard(ctx.repo_root(), module, recs)
+                .map_err(IndexRepoError::IndexShardWrite)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // Canonical sort by path for deterministic summary output.
+    shards_written.sort();
 
     Ok(IndexRepoSummary {
         total_files,

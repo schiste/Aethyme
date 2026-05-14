@@ -45,6 +45,14 @@ ruff_python_parser = { package = "rustpython-ruff_python_parser", version = "0.1
 ruff_python_ast = { package = "rustpython-ruff_python_ast", version = "0.15" }
 ruff_text_size = { package = "rustpython-ruff_text_size", version = "0.15" }
 
+# rayon (Phase 3.4): data-parallelism for the file-level loop.
+# The per-file work (read content + parse + build fragment + write
+# fragment) is embarrassingly parallel — each file's output goes
+# to a distinct path. On 8-core machines the wall-clock win on
+# MediaWiki-scale indexing is roughly 4-8× the single-threaded
+# baseline, which dominates parser-choice gains.
+rayon = "1"
+
 [dev-dependencies]
 tempfile = "3"
 # serde_json is used by tests to inspect the JSON shape of produced

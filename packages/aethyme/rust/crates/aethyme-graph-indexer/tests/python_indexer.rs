@@ -236,6 +236,84 @@ fn non_python_files_are_untouched_by_python_indexer() {
 }
 
 #[test]
+fn parallel_indexing_produces_correct_results_for_many_files() {
+    // Stress test for the rayon parallel file loop. Creates many
+    // Python files, runs the pipeline, asserts every file has the
+    // expected node count after indexing. With rayon enabled this
+    // exercises concurrent reads + parses + writes; without rayon
+    // it's a sanity sweep.
+    let tmp = tempfile::tempdir().unwrap();
+    for i in 0..50 {
+        let content = format!(
+            "def f{i}():\n    return {i}\n\nclass C{i}:\n    def m{i}(self):\n        pass\n",
+        );
+        write(
+            tmp.path(),
+            &format!("src/mod{i}.py"),
+            content.as_bytes(),
+        );
+    }
+
+    let summary =
+        index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    assert_eq!(summary.total_files, 50);
+
+    // Each file should have: 1 File + 1 Function + 1 Class + 1 Method = 4 nodes.
+    // 50 files × 4 = 200 nodes total.
+    let total_nodes: usize = summary.counts_by_kind.values().sum();
+    assert_eq!(total_nodes, 200);
+    assert_eq!(summary.counts_by_kind.get(&NodeKind::File), Some(&50));
+    assert_eq!(summary.counts_by_kind.get(&NodeKind::Function), Some(&50));
+    assert_eq!(summary.counts_by_kind.get(&NodeKind::Class), Some(&50));
+    assert_eq!(summary.counts_by_kind.get(&NodeKind::Method), Some(&50));
+
+    // Spot-check a few file fragments to confirm correct decoding.
+    for i in [0, 17, 49] {
+        let frag = read_fragment(tmp.path(), &format!("src/mod{i}.py")).unwrap();
+        assert_eq!(frag.node_count(), 4);
+    }
+}
+
+#[test]
+fn parallel_indexing_is_deterministic_across_runs() {
+    // The rayon parallel loop must still produce byte-identical
+    // output across runs (thread scheduling order must not leak
+    // into the on-disk bytes).
+    let tmp = tempfile::tempdir().unwrap();
+    for i in 0..20 {
+        let content = format!(
+            "def f{i}():\n    pass\n\nclass C{i}:\n    def m(self):\n        pass\n",
+        );
+        write(tmp.path(), &format!("src/a{i}.py"), content.as_bytes());
+    }
+
+    index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let snapshots_a: Vec<Vec<u8>> = (0..20)
+        .map(|i| {
+            std::fs::read(
+                tmp.path().join(format!(".aethyme/graph/src/a{i}.py.bin")),
+            )
+            .unwrap()
+        })
+        .collect();
+
+    // Clear and re-run.
+    std::fs::remove_dir_all(tmp.path().join(".aethyme")).unwrap();
+
+    index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let snapshots_b: Vec<Vec<u8>> = (0..20)
+        .map(|i| {
+            std::fs::read(
+                tmp.path().join(format!(".aethyme/graph/src/a{i}.py.bin")),
+            )
+            .unwrap()
+        })
+        .collect();
+
+    assert_eq!(snapshots_a, snapshots_b);
+}
+
+#[test]
 fn end_to_end_determinism_across_runs() {
     let tmp = tempfile::tempdir().unwrap();
     write(
