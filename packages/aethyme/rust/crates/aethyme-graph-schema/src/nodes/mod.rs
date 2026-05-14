@@ -9,6 +9,7 @@
 
 pub mod callables;
 pub mod containers;
+pub mod types;
 
 pub use callables::{
     Callable, Function, FunctionConstructionError, Lambda,
@@ -20,4 +21,9 @@ pub use containers::{
     Module, ModuleConstructionError, NonCodeFile,
     NonCodeFileConstructionError, NonCodeFormat, Repository,
     RepositoryConstructionError,
+};
+pub use types::{
+    Class, ClassConstructionError, Enum, EnumConstructionError, EnumVariant,
+    Interface, InterfaceConstructionError, Struct, StructConstructionError,
+    Trait, TraitConstructionError, TypeAlias, TypeAliasConstructionError,
 };

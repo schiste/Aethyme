@@ -70,10 +70,13 @@ pub use kinds::{
     UnknownNodeKind, UnknownNodeKindCategory,
 };
 pub use nodes::{
-    Callable, Directory, DirectoryConstructionError, File,
-    FileConstructionError, Function, FunctionConstructionError, Lambda,
-    LambdaConstructionError, Method, MethodConstructionError, Module,
-    ModuleConstructionError, NonCodeFile, NonCodeFileConstructionError,
-    NonCodeFormat, ParameterSignature, Repository,
-    RepositoryConstructionError,
+    Callable, Class, ClassConstructionError, Directory,
+    DirectoryConstructionError, Enum, EnumConstructionError, EnumVariant,
+    File, FileConstructionError, Function, FunctionConstructionError,
+    Interface, InterfaceConstructionError, Lambda, LambdaConstructionError,
+    Method, MethodConstructionError, Module, ModuleConstructionError,
+    NonCodeFile, NonCodeFileConstructionError, NonCodeFormat,
+    ParameterSignature, Repository, RepositoryConstructionError, Struct,
+    StructConstructionError, Trait, TraitConstructionError, TypeAlias,
+    TypeAliasConstructionError,
 };
