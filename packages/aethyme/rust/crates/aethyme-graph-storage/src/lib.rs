@@ -44,6 +44,7 @@
 pub mod binary;
 pub mod fragment;
 pub mod index_shard;
+pub mod layout;
 
 pub use binary::{
     read_fragment_bytes, write_fragment_bytes, FragmentDecodeError,
@@ -54,4 +55,10 @@ pub use index_shard::{
     dedupe_and_canonicalize, read_index_shard_bytes,
     write_index_shard_bytes, IndexShardDecodeError, IndexShardEncodeError,
     SymbolRecord,
+};
+pub use layout::{
+    cache_dir, engine_version_path, fragment_path, index_shard_path,
+    validate_module_name, validate_source_path, InvalidPath, AETHYME_DIR,
+    CACHE_SUBDIR, ENGINE_VERSION_FILE, FRAGMENT_EXT, GRAPH_SUBDIR,
+    INDEX_SHARD_EXT, INDEX_SUBDIR,
 };
