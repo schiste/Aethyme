@@ -22,6 +22,7 @@ pub mod context;
 pub mod filesystem;
 pub mod language;
 pub mod language_map;
+pub mod php;
 pub mod pipeline;
 pub mod python;
 pub mod rust_lang;
@@ -44,6 +45,7 @@ pub use pipeline::{
     index_repo_to_disk, BuildFragmentError, BuiltFragment, IndexRepoError,
     IndexRepoSummary,
 };
+pub use php::PhpIndexer;
 pub use python::PythonIndexer;
 pub use rust_lang::RustIndexer;
 pub use typescript::TypeScriptIndexer;

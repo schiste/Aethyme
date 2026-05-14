@@ -78,6 +78,21 @@ oxc_span = "=0.125"
 # is 1.92). Bumping is a follow-up after a workspace rustc bump.
 ra_ap_syntax = "=0.0.331"
 
+# PHP parsing (Phase 3.7) via tree-sitter. This is the ONE
+# documented C-dependency exception in the indexer crate. The
+# pure-Rust PHP parser ecosystem (`php-parser-rs`) is too thin
+# to ship against MediaWiki-scale workloads; tree-sitter-php is
+# the production-tested choice. Future work may swap in a
+# hand-rolled minimal PHP extractor for top-level declarations
+# (per the design conversation), at which point this dep drops.
+#
+# Pinned to tree-sitter 0.25 to match aethyme-engine's pin
+# (tree-sitter uses `links = "tree-sitter"`, which Cargo
+# enforces as one-version-per-build-graph). tree-sitter-php
+# 0.23.11 is compatible with tree-sitter 0.25.
+tree-sitter = "0.25"
+tree-sitter-php = "=0.23.11"
+
 [dev-dependencies]
 tempfile = "3"
 # serde_json is used by tests to inspect the JSON shape of produced

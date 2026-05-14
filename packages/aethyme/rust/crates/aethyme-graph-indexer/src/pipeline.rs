@@ -26,6 +26,7 @@ use crate::filesystem::{
     walk_source_tree, FilesystemIndexerError, IndexedFile, WalkOptions,
 };
 use crate::language::{LanguageIndexError, LanguageRegistry};
+use crate::php::PhpIndexer;
 use crate::python::PythonIndexer;
 use crate::rust_lang::RustIndexer;
 use crate::typescript::TypeScriptIndexer;
@@ -76,6 +77,14 @@ pub fn default_registry() -> LanguageRegistry {
     registry.register(PythonIndexer::new());
     registry.register(TypeScriptIndexer::new());
     registry.register(RustIndexer::new());
+    // PhpIndexer construction can fail (tree-sitter `set_language`
+    // returns Result). For the default registry we ignore the
+    // error — if PHP support is broken, files just fall through
+    // to the filesystem-only path, which is more graceful than
+    // failing the whole indexer.
+    if let Ok(php) = PhpIndexer::new() {
+        registry.register(php);
+    }
     registry
 }
 
