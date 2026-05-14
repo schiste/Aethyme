@@ -1,0 +1,34 @@
+[package]
+name = "aethyme-graph-storage"
+version = "0.1.0"
+edition = "2024"
+description = "Storage layer for Aethyme graph fragments: per-file binary fragments (bincode) and per-module NDJSON index shards. Built on top of aethyme-graph-schema's pure types."
+license = "UNLICENSED"
+
+[lib]
+name = "aethyme_graph_storage"
+path = "src/lib.rs"
+
+[dependencies]
+# The schema types we serialize/deserialize. This crate owns the
+# on-disk format; aethyme-graph-schema owns the in-memory types.
+# Strict layering: schema knows nothing about storage; storage
+# imports schema. No circular dep.
+aethyme-graph-schema = { path = "../aethyme-graph-schema" }
+
+# bincode is the wire format for per-file binary fragments. v1 to
+# match the engine's choice. Phase 1.13 verified bincode-roundtrip
+# works for every type the schema crate exposes (after the
+# externally-tagged Edge fix in Phase 2.1).
+bincode = "1"
+
+# serde + serde_json power the NDJSON index shards (Phase 2.4 commit).
+# Carrying them here rather than as dev-dependencies because index-
+# shard writing is a runtime concern, not just a testing concern.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Required to build sample nodes for round-trip tests without
+# duplicating the construction helpers.
+aethyme-graph-schema = { path = "../aethyme-graph-schema" }

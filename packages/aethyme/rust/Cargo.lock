@@ -38,8 +38,19 @@ dependencies = [
 name = "aethyme-graph-schema"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "blake3",
  "data-encoding",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "aethyme-graph-storage"
+version = "0.1.0"
+dependencies = [
+ "aethyme-graph-schema",
+ "bincode",
  "serde",
  "serde_json",
 ]

@@ -2,5 +2,6 @@
 members = [
     "crates/aethyme-engine",
     "crates/aethyme-graph-schema",
+    "crates/aethyme-graph-storage",
 ]
 resolver = "2"
