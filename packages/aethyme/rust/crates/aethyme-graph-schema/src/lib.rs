@@ -32,6 +32,7 @@
 //!
 //! - `kinds` — `NodeKind` enum (commit 1.2) ✓
 //! - `edges` — `EdgeKind` enum (commit 1.3) ✓
+//! - `edge_struct` — full `Edge` + `EdgeAttributes` + `EdgeSite` (commit 1.12) ✓
 //! - `identity` — `NodeId` content-hash scheme (commit 1.4) ✓
 //! - `attributes` — `Confidence`, `Source`, `BindingKind` (commit 1.5) ✓
 //! - `common` — shared building blocks: `SourceRange`, `Visibility`,
@@ -49,6 +50,7 @@
 
 pub mod attributes;
 pub mod common;
+pub mod edge_struct;
 pub mod edges;
 pub mod identity;
 pub mod kinds;
@@ -61,6 +63,10 @@ pub use attributes::{
 pub use common::{
     ALL_VISIBILITIES, InvalidSourceRange, Modification,
     ModificationHistory, SourceRange, UnknownVisibility, Visibility,
+};
+pub use edge_struct::{
+    ALL_DECISION_STATUSES, ALL_REFERENCE_KIND_HINTS, DecisionStatus, Edge,
+    EdgeAttributes, EdgeSite, ReferenceKindHint,
 };
 pub use edges::{
     ALL_EDGE_KIND_CATEGORIES, ALL_EDGE_KINDS, EdgeKind, EdgeKindCategory,
