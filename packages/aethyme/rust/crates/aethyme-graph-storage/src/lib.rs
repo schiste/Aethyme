@@ -42,6 +42,7 @@
 //! doc §5.4 was written to prevent.
 
 pub mod binary;
+pub mod bootstrap;
 pub mod disk;
 pub mod fragment;
 pub mod index_shard;
@@ -50,6 +51,10 @@ pub mod layout;
 pub use binary::{
     read_fragment_bytes, write_fragment_bytes, FragmentDecodeError,
     FragmentEncodeError,
+};
+pub use bootstrap::{
+    bootstrap_repo, read_engine_version, BootstrapError, BootstrapPaths,
+    EngineVersionReadError, GITATTRIBUTES_CONTENT,
 };
 pub use disk::{
     read_fragment, read_index_shard, write_fragment, write_index_shard,
