@@ -21,6 +21,7 @@
 pub mod context;
 pub mod filesystem;
 pub mod language_map;
+pub mod pipeline;
 
 pub use context::IndexerContext;
 pub use filesystem::{
@@ -29,4 +30,8 @@ pub use filesystem::{
 };
 pub use language_map::{
     classify_file, infer_language_from_extension, FileClassification,
+};
+pub use pipeline::{
+    build_fragment, build_index_records, index_repo_to_disk,
+    BuildFragmentError, BuiltFragment, IndexRepoError, IndexRepoSummary,
 };
