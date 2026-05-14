@@ -251,9 +251,12 @@ fn edge_serde_round_trip_preserves_all_fields() {
 }
 
 #[test]
-fn edge_attributes_tagged_serde_shape() {
-    // EdgeAttributes uses #[serde(tag = "kind")] — confirm the
-    // serialized form has a "kind" discriminator at the top level.
+fn edge_attributes_externally_tagged_serde_shape() {
+    // EdgeAttributes uses default serde enum tagging (externally
+    // tagged) — the variant name is the JSON object's outer field
+    // key. This shape works with bincode, unlike internally /
+    // adjacently tagged. See edge_struct.rs's EdgeAttributes
+    // doc-comment for the rationale.
     let a = EdgeAttributes::Imports {
         import_path: "x".into(),
         is_namespace: false,
@@ -261,7 +264,22 @@ fn edge_attributes_tagged_serde_shape() {
         is_named: true,
     };
     let json = serde_json::to_string(&a).unwrap();
-    assert!(json.contains("\"kind\":\"imports\""));
+    assert!(
+        json.starts_with("{\"imports\":{"),
+        "expected externally-tagged shape {{\"imports\":{{...}}}}, got {json}"
+    );
+    let back: EdgeAttributes = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, a);
+}
+
+#[test]
+fn unit_variant_edge_attributes_serialize_as_bare_string() {
+    // For unit-like variants, externally tagged emits just the
+    // variant name as a string (not wrapped in an object). Confirm
+    // and round-trip.
+    let a = EdgeAttributes::Contains;
+    let json = serde_json::to_string(&a).unwrap();
+    assert_eq!(json, "\"contains\"");
     let back: EdgeAttributes = serde_json::from_str(&json).unwrap();
     assert_eq!(back, a);
 }

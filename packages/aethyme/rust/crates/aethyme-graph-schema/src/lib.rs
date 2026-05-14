@@ -54,6 +54,7 @@ pub mod edge_struct;
 pub mod edges;
 pub mod identity;
 pub mod kinds;
+pub mod node;
 pub mod nodes;
 
 pub use attributes::{
@@ -73,6 +74,7 @@ pub use edges::{
     UnknownEdgeKind, UnknownEdgeKindCategory,
 };
 pub use identity::{NodeId, NodeIdConstructionError, NodeIdParseError};
+pub use node::Node;
 pub use kinds::{
     ALL_NODE_KIND_CATEGORIES, ALL_NODE_KINDS, NodeKind, NodeKindCategory,
     UnknownNodeKind, UnknownNodeKindCategory,

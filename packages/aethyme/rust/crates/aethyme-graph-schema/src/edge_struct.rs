@@ -95,15 +95,16 @@ pub const ALL_REFERENCE_KIND_HINTS: &[ReferenceKindHint] = &[
 /// can never drift out of sync — the kind is derived from the
 /// attributes, not stored alongside them.
 ///
-/// `#[serde(tag = "kind", content = "data")]` (adjacently tagged)
-/// rather than internally tagged because internally-tagged enums
-/// require serde's `deserialize_any`, which bincode (and other
-/// non-self-describing binary formats) doesn't support. Adjacent
-/// tagging puts the discriminator and payload in known positions,
-/// works with bincode, and keeps the human-readable JSON shape
-/// `{"kind": "imports", "data": {...}}` recognizable.
+/// Uses serde's default (externally tagged) representation rather
+/// than internally / adjacently tagged. This is the form bincode 1
+/// can actually serialize and deserialize — the tagged variants
+/// produce a `DeserializeAnyNotSupported` error from bincode
+/// because they require peeking at the discriminator field.
+/// Externally tagged JSON looks like `{"imports": {...}}` (variant
+/// name is the field key); slightly less self-explanatory than
+/// `{"kind": "imports", ...}` but it works on every serde format.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum EdgeAttributes {
     Contains,
     Defines,
