@@ -53,6 +53,20 @@ ruff_text_size = { package = "rustpython-ruff_text_size", version = "0.15" }
 # baseline, which dominates parser-choice gains.
 rayon = "1"
 
+# TypeScript / JavaScript parsing (Phase 3.5). The Oxc project's
+# parser. Pure Rust, MIT-licensed, faster than SWC by 2-3× and
+# than tree-sitter-typescript by ~6-10×. The companion crates
+# carry the AST types (oxc_ast), arena allocator (oxc_allocator),
+# and source-type metadata (oxc_span).
+# Pinned to 0.125 — the highest oxc release compatible with
+# rustc 1.92 (which is our workspace toolchain). 0.126+ requires
+# rustc 1.93. Bumping past 0.125 is a follow-up after a workspace
+# rustc bump.
+oxc_parser = "=0.125"
+oxc_ast = "=0.125"
+oxc_allocator = "=0.125"
+oxc_span = "=0.125"
+
 [dev-dependencies]
 tempfile = "3"
 # serde_json is used by tests to inspect the JSON shape of produced

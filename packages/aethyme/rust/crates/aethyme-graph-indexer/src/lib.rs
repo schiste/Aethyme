@@ -24,6 +24,7 @@ pub mod language;
 pub mod language_map;
 pub mod pipeline;
 pub mod python;
+pub mod typescript;
 
 pub use context::IndexerContext;
 pub use filesystem::{
@@ -43,3 +44,4 @@ pub use pipeline::{
     IndexRepoSummary,
 };
 pub use python::PythonIndexer;
+pub use typescript::TypeScriptIndexer;
