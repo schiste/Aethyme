@@ -704,6 +704,92 @@ def repo_experience_status(repo_path: Path, json_output: bool) -> None:
     )
 
 
+@repo.command("commit-message-template")
+@click.option(
+    "--type",
+    "commit_type",
+    type=click.Choice(
+        ["fix", "feat", "refactor", "perf", "test", "docs", "build", "chore", "revert"]
+    ),
+    default="fix",
+    show_default=True,
+    help="Commit type for the generated template subject.",
+)
+@click.option(
+    "--scope",
+    default="scope",
+    show_default=True,
+    help="Scope token used in the generated subject line.",
+)
+def repo_commit_message_template(commit_type: str, scope: str) -> None:
+    """Print the typed commit message template used by Aethyme commit hygiene."""
+    from src.indexing.commit_hygiene import default_template
+
+    click.echo(default_template(commit_type=commit_type, scope=scope), nl=False)
+
+
+@repo.command("lint-commit-message")
+@click.argument(
+    "message_path",
+    required=False,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option("--message", "inline_message", help="Lint an inline commit message string.")
+@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
+def repo_lint_commit_message(
+    message_path: Path | None,
+    inline_message: str | None,
+    json_output: bool,
+) -> None:
+    """Lint a commit message against the typed Aethyme hygiene contract."""
+    from src.indexing.commit_hygiene import lint_commit_message
+
+    if message_path is not None and inline_message is not None:
+        raise click.ClickException("Provide either MESSAGE_PATH or --message, not both.")
+
+    if message_path is not None:
+        message = message_path.read_text(encoding="utf-8")
+    elif inline_message is not None:
+        message = inline_message
+    else:
+        message = click.get_text_stream("stdin").read()
+
+    result = lint_commit_message(message)
+    if json_output:
+        click.echo(json.dumps(result, indent=2))
+        if not result["ok"]:
+            raise SystemExit(1)
+        return
+
+    subject = result.get("subject")
+    click.echo(f"Valid: {'yes' if result['ok'] else 'no'}")
+    if isinstance(subject, dict):
+        click.echo(f"Type: {subject['type']}")
+        click.echo(f"Scope: {subject['scope'] or 'none'}")
+        click.echo(f"Summary: {subject['summary']}")
+    click.echo(f"Body required: {'yes' if result['body_required'] else 'no'}")
+    recognized = result.get("recognized_sections") or []
+    click.echo(
+        "Sections: " + (", ".join(cast(list[str], recognized)) if recognized else "none")
+    )
+    memory_candidates = cast(list[dict[str, str]], result.get("memory_candidates") or [])
+    if memory_candidates:
+        click.echo("Memory candidates:")
+        for candidate in memory_candidates:
+            click.echo(f"- {candidate['type']}: {candidate['summary']}")
+    warnings = cast(list[str], result.get("warnings") or [])
+    if warnings:
+        click.echo("Warnings:")
+        for warning in warnings:
+            click.echo(f"- {warning}")
+    errors = cast(list[str], result.get("errors") or [])
+    if errors:
+        click.echo("Errors:")
+        for error in errors:
+            click.echo(f"- {error}")
+        raise SystemExit(1)
+
+
 @repo.command("engine-info")
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 @click.option(

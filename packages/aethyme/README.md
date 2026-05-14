@@ -99,6 +99,8 @@ Primary commands:
 - `aethyme repo validate-onboarding-overrides /path/to/repo`
 - `aethyme repo experience-telemetry /path/to/repo --check`
 - `aethyme repo experience-status /path/to/repo`
+- `aethyme repo commit-message-template --type fix --scope watchlist`
+- `aethyme repo lint-commit-message .git/COMMIT_EDITMSG`
 
 Supporting commands:
 
@@ -161,6 +163,7 @@ Runtime notes:
 - stable experience-layer lifecycle telemetry is written to `.aethyme/generated/experience-telemetry.jsonl`
 - `aethyme repo experience-telemetry --check` now exits nonzero on attention signals such as invalid overrides, no wrapper usage after enhancement, or override/artifact freshness drift
 - generated operator status artifacts now live at `.aethyme/generated/experience-status.json` and `.aethyme/generated/experience-status.md`
+- `aethyme repo commit-message-template` and `aethyme repo lint-commit-message` define and validate the typed commit contract Aethyme will later use for repo-memory extraction; substantive commit types (`fix`, `feat`, `refactor`, `perf`) require `Problem`, `Decision`, `Rationale`, and `Validation` sections
 - `explore --request ...` defaults to `task_localization_query`, a bounded general-purpose answer path that returns ranked candidate files/symbols/areas, compact evidence, verification steps, confidence, next actions, and observability; on large repos it returns degraded `needs_verification` output instead of blocking or claiming answer safety
 - `explore --intent usage_boundary_query` now uses a scope-first PHP analyzer path that returns answer/excluded/confidence/observability without building the full repository graph
 - reports include an Aethyme Usage section so availability is not confused with actual `src.cli` invocation

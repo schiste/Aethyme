@@ -24,6 +24,9 @@ Last Updated: 2026-05-11
 - `aethyme repo experience-telemetry /path/to/repo`
 - `aethyme repo experience-telemetry /path/to/repo --check`
 - `aethyme repo experience-status /path/to/repo`
+- `aethyme repo commit-message-template --type fix --scope watchlist`
+- `aethyme repo lint-commit-message .git/COMMIT_EDITMSG`
+- `aethyme repo lint-commit-message --message "fix(scope): summary\n\nProblem:\n..."`
 - `aethyme repo deploy-skills /path/to/repo --force`
 
 `repo compile-skills` generates repo-specific skills, currently
@@ -64,6 +67,40 @@ and that key fields use the expected shapes.
 `repo deploy-skills` is now a compatibility path that deploys only the static
 runtime navigation skill. For real repositories, prefer
 `aethyme enhance deploy --repo /path/to/repo`.
+
+`repo commit-message-template` prints the typed commit message skeleton Aethyme
+expects for durable commit hygiene. `repo lint-commit-message` validates a real
+message against that contract and emits structured JSON suitable for future
+memory extraction.
+
+Commit hygiene contract:
+- subject: `type(scope): short summary` or `type: short summary`
+- allowed types: `fix`, `feat`, `refactor`, `perf`, `test`, `docs`, `build`, `chore`, `revert`
+- substantive types `fix`, `feat`, `refactor`, and `perf` require structured
+  body sections: `Problem`, `Decision`, `Rationale`, `Validation`
+- optional sections: `Alternatives considered`, `Risks`, `Follow-up`, `Memory`
+
+Example:
+
+```text
+fix(watchlist): mark only viewed revision as seen
+
+Problem:
+Viewing a diff marked every revision as seen.
+
+Decision:
+Use the viewed revision id for seen-marking.
+
+Rationale:
+Seen state is revision-scoped.
+
+Validation:
+- Added regression coverage.
+- Ran watchlist tests.
+
+Memory:
+Watchlist seen-marking must remain revision-scoped.
+```
 
 ### Local Discoverability
 - `aethyme enhance deploy --repo /path/to/repo`
