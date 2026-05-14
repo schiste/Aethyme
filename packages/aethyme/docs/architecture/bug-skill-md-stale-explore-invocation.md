@@ -303,7 +303,7 @@ impact.
   the inventory this bug should have been caught by
 - [`eval-tuning-rejected.md`](./eval-tuning-rejected.md) — the
   2026-05-08 hard-delete is recorded there
-- [`docs/reports/evals/20260512-*.md`](../reports/evals/) — the
-  three MediaWiki bug-fix-1 samples that surfaced the deficit
+- [`docs/reports/evals/`](../reports/evals/) — generated eval
+  reports, including the MediaWiki bug-fix-1 samples that surfaced the deficit
 - `.github/workflows/cross-process-contract.yml` — the CI gate
   that Option 4 would extend
