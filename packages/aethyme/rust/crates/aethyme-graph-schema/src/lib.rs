@@ -38,8 +38,10 @@
 //!   `ModificationHistory` (commit 1.6) ✓
 //! - `nodes::containers` — Repository/Directory/Module/File/NonCodeFile (commit 1.7) ✓
 //! - `nodes::callables` — Function/Method/Lambda + Callable trait (commit 1.8) ✓
-//! - `nodes::{types,sub_symbols,non_code,unresolved}`
-//!   — per-kind required field structs (commits 1.9–1.11)
+//! - `nodes::types` — Class/Struct/Interface/Trait/Enum/TypeAlias (commit 1.9) ✓
+//! - `nodes::sub_symbols` — Field/GlobalVariable/Parameter/Statement/Expression (commit 1.10) ✓
+//! - `nodes::non_code` — DocSection/Docstring/Comment/ConfigValue (commit 1.11) ✓
+//! - `nodes::unresolved` — UnresolvedSymbol (commit 1.11) ✓
 //! - `edges` — full `Edge` struct + per-edge-kind attribute structs
 //!   (commit 1.12)
 //!
@@ -70,8 +72,11 @@ pub use kinds::{
     UnknownNodeKind, UnknownNodeKindCategory,
 };
 pub use nodes::{
-    Callable, Class, ClassConstructionError, Directory,
-    DirectoryConstructionError, Enum, EnumConstructionError, EnumVariant,
+    ALL_COMMENT_TAGS, Callable, Class, ClassConstructionError, Comment,
+    CommentConstructionError, CommentTag, ConfigValue,
+    ConfigValueConstructionError, Directory, DirectoryConstructionError,
+    DocSection, DocSectionConstructionError, Docstring,
+    DocstringConstructionError, Enum, EnumConstructionError, EnumVariant,
     Expression, ExpressionConstructionError, Field, FieldConstructionError,
     File, FileConstructionError, Function, FunctionConstructionError,
     GlobalVariable, GlobalVariableConstructionError, Interface,
@@ -81,5 +86,6 @@ pub use nodes::{
     ParameterConstructionError, ParameterSignature, Repository,
     RepositoryConstructionError, Statement, StatementConstructionError,
     Struct, StructConstructionError, Trait, TraitConstructionError,
-    TypeAlias, TypeAliasConstructionError,
+    TypeAlias, TypeAliasConstructionError, UnresolvedSymbol,
+    UnresolvedSymbolConstructionError,
 };

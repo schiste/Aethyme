@@ -9,8 +9,10 @@
 
 pub mod callables;
 pub mod containers;
+pub mod non_code;
 pub mod sub_symbols;
 pub mod types;
+pub mod unresolved;
 
 pub use callables::{
     Callable, Function, FunctionConstructionError, Lambda,
@@ -23,11 +25,17 @@ pub use containers::{
     NonCodeFileConstructionError, NonCodeFormat, Repository,
     RepositoryConstructionError,
 };
+pub use non_code::{
+    ALL_COMMENT_TAGS, Comment, CommentConstructionError, CommentTag,
+    ConfigValue, ConfigValueConstructionError, DocSection,
+    DocSectionConstructionError, Docstring, DocstringConstructionError,
+};
 pub use sub_symbols::{
     Expression, ExpressionConstructionError, Field, FieldConstructionError,
     GlobalVariable, GlobalVariableConstructionError, Parameter,
     ParameterConstructionError, Statement, StatementConstructionError,
 };
+pub use unresolved::{UnresolvedSymbol, UnresolvedSymbolConstructionError};
 pub use types::{
     Class, ClassConstructionError, Enum, EnumConstructionError, EnumVariant,
     Interface, InterfaceConstructionError, Struct, StructConstructionError,
