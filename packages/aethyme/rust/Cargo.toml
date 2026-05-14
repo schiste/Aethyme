@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/aethyme-engine",
+    "crates/aethyme-graph-indexer",
     "crates/aethyme-graph-schema",
     "crates/aethyme-graph-storage",
 ]

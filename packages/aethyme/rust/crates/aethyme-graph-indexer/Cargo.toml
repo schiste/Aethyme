@@ -1,0 +1,29 @@
+[package]
+name = "aethyme-graph-indexer"
+version = "0.1.0"
+edition = "2024"
+description = "Indexers that walk source repos and produce aethyme-graph-schema nodes + edges. Phase 3 of the graph rewrite: turns real source files into typed graph payloads suitable for committed per-file fragments."
+license = "UNLICENSED"
+
+[lib]
+name = "aethyme_graph_indexer"
+path = "src/lib.rs"
+
+[dependencies]
+# Types this indexer produces (the schema crate is the contract).
+aethyme-graph-schema = { path = "../aethyme-graph-schema" }
+# Storage crate for Fragment construction + SymbolRecord build-up.
+# The indexer doesn't itself write to disk in Phase 3 — that's the
+# caller's choice — but it produces Fragments and SymbolRecords
+# typed against this crate's contract.
+aethyme-graph-storage = { path = "../aethyme-graph-storage" }
+# BLAKE3 for computing content_hash on File nodes. Matches the
+# choice in aethyme-graph-schema for NodeId hashing.
+blake3 = "1"
+# walkdir is the standard way to walk a directory tree in Rust.
+# We use it for the filesystem-only indexer that produces File /
+# NonCodeFile nodes from the repo's source tree.
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
