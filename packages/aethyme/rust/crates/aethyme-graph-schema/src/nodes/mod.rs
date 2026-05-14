@@ -9,6 +9,7 @@
 
 pub mod callables;
 pub mod containers;
+pub mod sub_symbols;
 pub mod types;
 
 pub use callables::{
@@ -21,6 +22,11 @@ pub use containers::{
     Module, ModuleConstructionError, NonCodeFile,
     NonCodeFileConstructionError, NonCodeFormat, Repository,
     RepositoryConstructionError,
+};
+pub use sub_symbols::{
+    Expression, ExpressionConstructionError, Field, FieldConstructionError,
+    GlobalVariable, GlobalVariableConstructionError, Parameter,
+    ParameterConstructionError, Statement, StatementConstructionError,
 };
 pub use types::{
     Class, ClassConstructionError, Enum, EnumConstructionError, EnumVariant,
