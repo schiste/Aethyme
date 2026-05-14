@@ -338,6 +338,45 @@ impl NodeKindCategory {
     }
 }
 
+/// Every variant in declaration order. Used by tests and any consumer
+/// that needs to iterate the full kind set (e.g., schema validation,
+/// docs generation).
+///
+/// Order matches the enum source order — which, per the module docs,
+/// is also the bincode discriminant order. Tests assert this.
+pub const ALL_NODE_KINDS: &[NodeKind] = &[
+    // Containers (alphabetical)
+    NodeKind::Directory,
+    NodeKind::File,
+    NodeKind::Module,
+    NodeKind::NonCodeFile,
+    NodeKind::Repository,
+    // Callables (alphabetical)
+    NodeKind::Function,
+    NodeKind::Lambda,
+    NodeKind::Method,
+    // Type-defining (alphabetical)
+    NodeKind::Class,
+    NodeKind::Enum,
+    NodeKind::Interface,
+    NodeKind::Struct,
+    NodeKind::Trait,
+    NodeKind::TypeAlias,
+    // Sub-symbol (alphabetical)
+    NodeKind::Expression,
+    NodeKind::Field,
+    NodeKind::GlobalVariable,
+    NodeKind::Parameter,
+    NodeKind::Statement,
+    // Non-code (alphabetical)
+    NodeKind::Comment,
+    NodeKind::ConfigValue,
+    NodeKind::DocSection,
+    NodeKind::Docstring,
+    // Partial-knowledge
+    NodeKind::UnresolvedSymbol,
+];
+
 /// Every category in declaration order. Parallel to [`ALL_NODE_KINDS`]:
 /// gives consumers a canonical iteration handle that does not depend on
 /// reflecting the enum. Order is the same as the source enum, which
@@ -401,42 +440,3 @@ impl std::fmt::Display for UnknownNodeKindCategory {
 }
 
 impl std::error::Error for UnknownNodeKindCategory {}
-
-/// Every variant in declaration order. Used by tests and any consumer
-/// that needs to iterate the full kind set (e.g., schema validation,
-/// docs generation).
-///
-/// Order matches the enum source order — which, per the module docs,
-/// is also the bincode discriminant order. Tests assert this.
-pub const ALL_NODE_KINDS: &[NodeKind] = &[
-    // Containers (alphabetical)
-    NodeKind::Directory,
-    NodeKind::File,
-    NodeKind::Module,
-    NodeKind::NonCodeFile,
-    NodeKind::Repository,
-    // Callables (alphabetical)
-    NodeKind::Function,
-    NodeKind::Lambda,
-    NodeKind::Method,
-    // Type-defining (alphabetical)
-    NodeKind::Class,
-    NodeKind::Enum,
-    NodeKind::Interface,
-    NodeKind::Struct,
-    NodeKind::Trait,
-    NodeKind::TypeAlias,
-    // Sub-symbol (alphabetical)
-    NodeKind::Expression,
-    NodeKind::Field,
-    NodeKind::GlobalVariable,
-    NodeKind::Parameter,
-    NodeKind::Statement,
-    // Non-code (alphabetical)
-    NodeKind::Comment,
-    NodeKind::ConfigValue,
-    NodeKind::DocSection,
-    NodeKind::Docstring,
-    // Partial-knowledge
-    NodeKind::UnresolvedSymbol,
-];

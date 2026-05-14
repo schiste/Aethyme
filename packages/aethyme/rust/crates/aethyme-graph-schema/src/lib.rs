@@ -31,7 +31,7 @@
 //! ## Module layout (target, populated across Phase 1)
 //!
 //! - `kinds` — `NodeKind` enum (commit 1.2) ✓
-//! - `edges` — `EdgeKind` enum (commit 1.3)
+//! - `edges` — `EdgeKind` enum (commit 1.3) ✓
 //! - `identity` — `NodeId` content-hash scheme (commit 1.4)
 //! - `attributes` — `Confidence`, `Source`, `LanguageBoundary` (commit 1.5)
 //! - `nodes::{containers,callables,types,sub_symbols,non_code,unresolved}`
@@ -41,8 +41,13 @@
 //!
 //! Determinism tests live under `tests/determinism.rs` (commit 1.13).
 
+pub mod edges;
 pub mod kinds;
 
+pub use edges::{
+    ALL_EDGE_KIND_CATEGORIES, ALL_EDGE_KINDS, EdgeKind, EdgeKindCategory,
+    UnknownEdgeKind, UnknownEdgeKindCategory,
+};
 pub use kinds::{
     ALL_NODE_KIND_CATEGORIES, ALL_NODE_KINDS, NodeKind, NodeKindCategory,
     UnknownNodeKind, UnknownNodeKindCategory,
