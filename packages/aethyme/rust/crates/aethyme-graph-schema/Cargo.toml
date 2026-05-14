@@ -23,10 +23,15 @@ serde = { version = "1", features = ["derive"] }
 # finalize, reducing the surface for non-determinism bugs in the hashing path.
 blake3 = "1"
 
-# data-encoding handles the base32 step of the ID format. We truncate the
-# BLAKE3 output to 128 bits, then base32-encode for readability in logs.
-# Crockford base32 specifically: case-insensitive, no ambiguous chars
-# (0/O, 1/I/l), URL-safe.
+# data-encoding handles the base32 step of the NodeId format (commit 1.4).
+# We use BASE32_NOPAD, which is RFC 4648 standard base32 (A–Z plus 2–7,
+# no padding), and lowercase the output. The schema doc originally
+# specified Crockford base32 to avoid ambiguous characters (0/O, 1/I/l);
+# we switched to RFC 4648 because (a) `data-encoding` ships it without
+# a custom alphabet table, (b) the ambiguous-char benefit is moot once
+# we case-normalize and display IDs in monospace, and (c) RFC 4648 is
+# more universally understood. See identity.rs's module docs for the
+# full rationale.
 data-encoding = "2"
 
 [dev-dependencies]
