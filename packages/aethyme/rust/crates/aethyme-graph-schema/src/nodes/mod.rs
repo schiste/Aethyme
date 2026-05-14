@@ -7,8 +7,14 @@
 //! per-kind structs — they'll land alongside the unifying `Node`
 //! enum in commit 1.12.
 
+pub mod callables;
 pub mod containers;
 
+pub use callables::{
+    Callable, Function, FunctionConstructionError, Lambda,
+    LambdaConstructionError, Method, MethodConstructionError,
+    ParameterSignature,
+};
 pub use containers::{
     Directory, DirectoryConstructionError, File, FileConstructionError,
     Module, ModuleConstructionError, NonCodeFile,

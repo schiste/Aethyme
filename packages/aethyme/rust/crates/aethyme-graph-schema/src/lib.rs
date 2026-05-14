@@ -37,8 +37,9 @@
 //! - `common` — shared building blocks: `SourceRange`, `Visibility`,
 //!   `ModificationHistory` (commit 1.6) ✓
 //! - `nodes::containers` — Repository/Directory/Module/File/NonCodeFile (commit 1.7) ✓
-//! - `nodes::{callables,types,sub_symbols,non_code,unresolved}`
-//!   — per-kind required field structs (commits 1.8–1.11)
+//! - `nodes::callables` — Function/Method/Lambda + Callable trait (commit 1.8) ✓
+//! - `nodes::{types,sub_symbols,non_code,unresolved}`
+//!   — per-kind required field structs (commits 1.9–1.11)
 //! - `edges` — full `Edge` struct + per-edge-kind attribute structs
 //!   (commit 1.12)
 //!
@@ -69,8 +70,10 @@ pub use kinds::{
     UnknownNodeKind, UnknownNodeKindCategory,
 };
 pub use nodes::{
-    Directory, DirectoryConstructionError, File, FileConstructionError,
-    Module, ModuleConstructionError, NonCodeFile,
-    NonCodeFileConstructionError, NonCodeFormat, Repository,
+    Callable, Directory, DirectoryConstructionError, File,
+    FileConstructionError, Function, FunctionConstructionError, Lambda,
+    LambdaConstructionError, Method, MethodConstructionError, Module,
+    ModuleConstructionError, NonCodeFile, NonCodeFileConstructionError,
+    NonCodeFormat, ParameterSignature, Repository,
     RepositoryConstructionError,
 };
