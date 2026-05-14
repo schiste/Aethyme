@@ -43,3 +43,10 @@ data-encoding = "2"
 # keeps the leaf-crate property — consumers that don't need JSON don't
 # pull it in.
 serde_json = "1"
+
+# bincode is used by tests/determinism.rs to assert byte-determinism
+# of the binary fragment format. Matches the engine crate's bincode 1
+# choice. Same dev-only rationale as serde_json — production binary
+# fragment writing lives in the storage layer (Phase 2+), this crate
+# only tests that its types round-trip through bincode losslessly.
+bincode = "1"

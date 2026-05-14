@@ -94,8 +94,16 @@ pub const ALL_REFERENCE_KIND_HINTS: &[ReferenceKindHint] = &[
 /// returns it via a small lookup, so the (kind, attributes) pair
 /// can never drift out of sync — the kind is derived from the
 /// attributes, not stored alongside them.
+///
+/// `#[serde(tag = "kind", content = "data")]` (adjacently tagged)
+/// rather than internally tagged because internally-tagged enums
+/// require serde's `deserialize_any`, which bincode (and other
+/// non-self-describing binary formats) doesn't support. Adjacent
+/// tagging puts the discriminator and payload in known positions,
+/// works with bincode, and keeps the human-readable JSON shape
+/// `{"kind": "imports", "data": {...}}` recognizable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum EdgeAttributes {
     Contains,
     Defines,
