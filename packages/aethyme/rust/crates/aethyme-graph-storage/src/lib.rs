@@ -43,9 +43,15 @@
 
 pub mod binary;
 pub mod fragment;
+pub mod index_shard;
 
 pub use binary::{
     read_fragment_bytes, write_fragment_bytes, FragmentDecodeError,
     FragmentEncodeError,
 };
 pub use fragment::{Fragment, FragmentBuildError};
+pub use index_shard::{
+    dedupe_and_canonicalize, read_index_shard_bytes,
+    write_index_shard_bytes, IndexShardDecodeError, IndexShardEncodeError,
+    SymbolRecord,
+};
