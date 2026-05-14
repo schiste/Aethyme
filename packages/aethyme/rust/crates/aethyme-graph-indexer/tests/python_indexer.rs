@@ -220,11 +220,21 @@ fn non_python_files_are_untouched_by_python_indexer() {
 
     let summary =
         index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
-    // No registered Rust indexer yet, so lib.rs gets only a File node.
-    // Markdown gets only a NonCodeFile node.
+
+    // lib.rs gets a File node from the filesystem walker, plus
+    // (now that the Rust indexer is registered) a Function node
+    // for `fn main`. The test name still applies: the Python
+    // indexer doesn't touch this file. We verify the rust-derived
+    // nodes are NOT Method (the only Python-specific node the
+    // indexer would emit for trivial input).
     let rs_frag = read_fragment(tmp.path(), "src/lib.rs").unwrap();
-    assert_eq!(rs_frag.node_count(), 1);
-    assert_eq!(rs_frag.nodes()[0].kind(), NodeKind::File);
+    let rs_kinds: Vec<NodeKind> =
+        rs_frag.nodes().iter().map(|n| n.kind()).collect();
+    assert!(rs_kinds.contains(&NodeKind::File));
+    assert!(
+        !rs_kinds.contains(&NodeKind::Method),
+        "Python's Method node leaked into Rust file: kinds={rs_kinds:?}"
+    );
 
     let md_frag = read_fragment(tmp.path(), "README.md").unwrap();
     assert_eq!(md_frag.node_count(), 1);

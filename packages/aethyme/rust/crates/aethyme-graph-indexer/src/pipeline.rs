@@ -27,6 +27,7 @@ use crate::filesystem::{
 };
 use crate::language::{LanguageIndexError, LanguageRegistry};
 use crate::python::PythonIndexer;
+use crate::rust_lang::RustIndexer;
 use crate::typescript::TypeScriptIndexer;
 
 /// One indexed file's full storage footprint.
@@ -74,6 +75,7 @@ pub fn default_registry() -> LanguageRegistry {
     let mut registry = LanguageRegistry::new();
     registry.register(PythonIndexer::new());
     registry.register(TypeScriptIndexer::new());
+    registry.register(RustIndexer::new());
     registry
 }
 
