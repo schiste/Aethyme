@@ -1,3 +1,6 @@
 [workspace]
-members = ["crates/aethyme-engine"]
+members = [
+    "crates/aethyme-engine",
+    "crates/aethyme-graph-schema",
+]
 resolver = "2"

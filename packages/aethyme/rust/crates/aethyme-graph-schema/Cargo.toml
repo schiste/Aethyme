@@ -1,0 +1,30 @@
+[package]
+name = "aethyme-graph-schema"
+version = "0.1.0"
+edition = "2024"
+description = "Schema types for the Aethyme code graph: node kinds, edge kinds, IDs, serialization. Pure types — no I/O, no storage, no parsing. Implements the design locked in docs/architecture/graph-schema.md."
+license = "UNLICENSED"
+
+[lib]
+name = "aethyme_graph_schema"
+path = "src/lib.rs"
+
+[dependencies]
+# Serde is the universal serialization surface. Both binary fragments (bincode,
+# arriving in commit 1.12) and NDJSON index shards (serde_json, also 1.12)
+# route through the same Serialize/Deserialize derive — keeping one schema
+# vocabulary across both transports is the whole point of having this crate.
+serde = { version = "1", features = ["derive"] }
+
+# BLAKE3 powers the content-hash node IDs (commit 1.4). The schema doc locks
+# this choice for two reasons: (1) ~10x faster than SHA-256 on indexer
+# workloads, which matters at MediaWiki scale (~12K files × hashes per
+# symbol), and (2) the streaming API is simpler than sha2's reset/update/
+# finalize, reducing the surface for non-determinism bugs in the hashing path.
+blake3 = "1"
+
+# data-encoding handles the base32 step of the ID format. We truncate the
+# BLAKE3 output to 128 bits, then base32-encode for readability in logs.
+# Crockford base32 specifically: case-insensitive, no ambiguous chars
+# (0/O, 1/I/l), URL-safe.
+data-encoding = "2"
