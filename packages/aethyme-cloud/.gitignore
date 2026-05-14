@@ -45,6 +45,7 @@ dist/
 
 # Turbo
 .turbo/
+*.tsbuildinfo
 
 # Database
 *.db
