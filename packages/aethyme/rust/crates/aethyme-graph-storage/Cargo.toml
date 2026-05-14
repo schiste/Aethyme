@@ -32,3 +32,8 @@ serde_json = "1"
 # Required to build sample nodes for round-trip tests without
 # duplicating the construction helpers.
 aethyme-graph-schema = { path = "../aethyme-graph-schema" }
+
+# tempfile lets the disk-I/O integration tests use real
+# filesystem operations against an ephemeral directory. Avoids
+# polluting the developer's working tree with test artifacts.
+tempfile = "3"

@@ -42,6 +42,7 @@
 //! doc §5.4 was written to prevent.
 
 pub mod binary;
+pub mod disk;
 pub mod fragment;
 pub mod index_shard;
 pub mod layout;
@@ -49,6 +50,11 @@ pub mod layout;
 pub use binary::{
     read_fragment_bytes, write_fragment_bytes, FragmentDecodeError,
     FragmentEncodeError,
+};
+pub use disk::{
+    read_fragment, read_index_shard, write_fragment, write_index_shard,
+    FragmentReadError, FragmentWriteError, IndexShardReadError,
+    IndexShardWriteError,
 };
 pub use fragment::{Fragment, FragmentBuildError};
 pub use index_shard::{
