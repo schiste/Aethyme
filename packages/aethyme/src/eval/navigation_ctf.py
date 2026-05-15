@@ -8,9 +8,10 @@ Chau7 MCP or equivalent.
 
 from __future__ import annotations
 
+import json
 import shlex
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src.contracts.versions import contract_versions
 
@@ -22,6 +23,38 @@ from .report import EvaluationReport, estimate_report, write_navigation_ctf_mark
 from .runner import EVAL_TOOL_PYTHON, PROJECT_ROOT, CommandEvaluationRunner, EvaluationRunner
 from .schemas import navigation_ctf_output_schema, navigation_ctf_scoring_rubric
 from .scoring import parse_structured_output, score_navigation_ctf_output
+
+if TYPE_CHECKING:
+    from .tools import ToolAdapter
+
+
+def _resolve_task_pack(
+    repo_path: Path,
+    task: str,
+    tool: "ToolAdapter | None",
+) -> dict[str, Any]:
+    """Compute the task pack, optionally via tool adapter subprocess.
+
+    Note: navigation-CTF ALSO uses ``inspect_repository`` and
+    ``graph_expand`` from the engine, but these are eval-framework
+    infrastructure (reference/anchor-expansion generation), not
+    agent-facing leverage data. They stay as direct Python calls
+    regardless of which tool adapter is selected. The methodology
+    compromise is documented in the eval-protocol guide.
+    """
+    if tool is None:
+        return build_task_pack(repo_path, task)
+    if tool.name != "aethyme":
+        raise NotImplementedError(
+            f"navigation-ctf nav-context expects Aethyme's task_pack schema; "
+            f"tool {tool.name!r} requires reshaping _build_navigation_context "
+            f"to consume a tool-agnostic addendum string instead."
+        )
+    try:
+        result = tool.run_condition("leverage", repo_path, task)
+        return json.loads(result.raw_output) if result.raw_output else {}
+    except Exception:
+        return {}
 
 DEFAULT_TASK = "Find the managing config, owned area, and code entrypoint for the main runtime path."
 
@@ -35,6 +68,8 @@ def run_navigation_ctf_evaluation(
     # Backward-compat aliases
     baseline_runner: EvaluationRunner | None = None,
     aethyme_runner: EvaluationRunner | None = None,
+    *,
+    tool: "ToolAdapter | None" = None,
 ) -> dict[str, Any]:
     # Reconcile legacy parameter names
     if control_runner is None and baseline_runner is not None:
@@ -42,12 +77,16 @@ def run_navigation_ctf_evaluation(
     if leverage_runner is None and aethyme_runner is not None:
         leverage_runner = aethyme_runner
 
+    # inspect_repository is eval-infrastructure (reference generation),
+    # not agent-facing leverage data — stays a direct Python call.
     inspect = inspect_repository(repo_path)
 
     # Hard separation: task_spec is agent-safe, reference is scoring-only.
     task_spec, reference = _build_navigation_case(inspect)
 
-    task_pack = build_task_pack(repo_path, task_spec["task"])
+    # task_pack IS agent-facing leverage data; route via adapter when
+    # supplied for methodological symmetry with non-Aethyme tools.
+    task_pack = _resolve_task_pack(repo_path, task_spec["task"], tool)
     output_schema = navigation_ctf_output_schema()
     anchors_view = {
         "task": task_spec["task"],

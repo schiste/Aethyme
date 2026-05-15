@@ -8,9 +8,10 @@ or equivalent.
 
 from __future__ import annotations
 
+import json
 import shlex
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src.contracts.versions import contract_versions
 
@@ -26,6 +27,40 @@ from .runner import EVAL_TOOL_PYTHON, PROJECT_ROOT, CommandEvaluationRunner, Eva
 from .schemas import explain_repo_output_schema, explain_repo_scoring_rubric
 from .scoring import parse_structured_output, score_explain_repo_output
 
+if TYPE_CHECKING:
+    from .tools import ToolAdapter
+
+
+def _resolve_task_pack(
+    repo_path: Path,
+    task: str,
+    tool: "ToolAdapter | None",
+) -> dict[str, Any]:
+    """Compute the task pack for the leverage condition, optionally via adapter.
+
+    Mirrors bug_fix.py's adapter routing: when ``tool`` is None or its
+    name is "aethyme" via legacy path, calls ``build_task_pack`` directly;
+    when ``tool`` is an Aethyme adapter, routes through subprocess for
+    methodological symmetry. Non-Aethyme tools raise because the
+    explain-repo nav-context schema assumes Aethyme's task_pack shape.
+
+    Empirically verified byte-equivalent across both transports by
+    ``test_eval_explain_repo_adapter_parity``.
+    """
+    if tool is None:
+        return build_task_pack(repo_path, task)
+    if tool.name != "aethyme":
+        raise NotImplementedError(
+            f"explain-repo nav-context expects Aethyme's task_pack schema; "
+            f"tool {tool.name!r} would need its own leverage-data shape and "
+            f"a reshaped _build_explain_repo_navigation_context to consume it."
+        )
+    try:
+        result = tool.run_condition("leverage", repo_path, task)
+        return json.loads(result.raw_output) if result.raw_output else {}
+    except Exception:
+        return {}
+
 DEFAULT_TASK = "Explain this repo"
 
 
@@ -38,15 +73,23 @@ def run_explain_repo_evaluation(
     # Backward-compat aliases
     baseline_runner: EvaluationRunner | None = None,
     aethyme_runner: EvaluationRunner | None = None,
+    *,
+    tool: "ToolAdapter | None" = None,
 ) -> dict[str, Any]:
-    """Build control/explore/leverage artifacts; optionally execute command backends."""
+    """Build control/explore/leverage artifacts; optionally execute command backends.
+
+    When ``tool`` is supplied (only ``"aethyme"`` is currently supported for
+    this eval type), the leverage task pack is computed via the tool's CLI
+    subprocess instead of a direct Python call — same byte-identical
+    contract as bug_fix.py's _build_navigation_context migration.
+    """
     # Reconcile legacy parameter names
     if control_runner is None and baseline_runner is not None:
         control_runner = baseline_runner
     if leverage_runner is None and aethyme_runner is not None:
         leverage_runner = aethyme_runner
 
-    pack = build_task_pack(repo_path, task)
+    pack = _resolve_task_pack(repo_path, task, tool)
     summary = pack.get("summary", {})
     signals = pack.get("signals")
     navigation_context = _build_explain_repo_navigation_context(repo_path, task, pack)

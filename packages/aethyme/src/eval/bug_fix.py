@@ -17,11 +17,14 @@ import shutil
 import sys
 import threading
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src.contracts.versions import contract_versions
 
 from ..indexing.engine import build_task_context, build_task_pack
+
+if TYPE_CHECKING:
+    from .tools import ToolAdapter
 from .bug_fix_setup import (
     CROSS_PACKAGE_TEST_REL,
     RBAC_REL,
@@ -234,6 +237,7 @@ def prepare_bug_fix_benchmark(
     alternative_task: str | None = None,
     auto_cleanup: bool = True,
     cleanup_delay: float = _CLEANUP_DELAY_SECONDS,
+    tool: "ToolAdapter | None" = None,
 ) -> dict[str, Any]:
     """Create one clone per condition, plant the bug, generate all artifacts.
 
@@ -257,8 +261,11 @@ def prepare_bug_fix_benchmark(
     """
     from .repos import CONDITION_NAMES, create_condition_repos
 
-    # 1. Create one independent clone per condition
-    repos = create_condition_repos(source, dest_dir)
+    # 1. Create one independent clone per condition. When a tool adapter
+    # is supplied, it's used to install the tool into the explore/
+    # leverage/task-conditioned clones (replaces the legacy direct
+    # deploy_skills call).
+    repos = create_condition_repos(source, dest_dir, tool=tool)
 
     # 2. Plant bug + create test in every clone
     setup_results: dict[str, Any] = {}
@@ -283,8 +290,12 @@ def prepare_bug_fix_benchmark(
 
     # 4. Build navigation contexts.
     # Real nav-context (leverage) — generated against the actual task.
+    # When ``tool`` is supplied, the adapter routes Aethyme through
+    # subprocess for methodological symmetry with non-Aethyme tools.
+    # Parity with the legacy Python path is enforced by
+    # tests/local/test_eval_navigation_context_adapter_parity.py.
     leverage_repo = repos["leverage"]
-    navigation_context = _build_navigation_context(leverage_repo, task)
+    navigation_context = _build_navigation_context(leverage_repo, task, tool=tool)
 
     # Negative nav-context (plausibly-wrong) — generated against an
     # alternative task in the same repo, validated by the 5-property
@@ -506,13 +517,47 @@ def _build_bug_fix_prompt(
 def _build_navigation_context(
     repo_path: Path,
     task: str,
+    *,
+    tool: "ToolAdapter | None" = None,
 ) -> dict[str, Any]:
     """Build navigation context for the leverage condition.
 
     Uses the Aethyme engine to compute task-relevant context (anchors,
     scope, file contents) so the leverage agent starts with a map of
     the relevant code.
+
+    When ``tool`` is None (default): direct Python calls into the indexing
+    layer. This is the legacy path preserved for byte-identical
+    reproducibility of pre-manifest eval runs (cardinal rule #2).
+
+    When ``tool`` is supplied AND ``tool.name == "aethyme"``: routes
+    `task pack` / `task context` through Aethyme's CLI subprocess, then
+    parses the JSON output into the same dict shape. Equivalent to the
+    legacy path by construction (the CLI commands wrap the same Python
+    functions); the equivalence is enforced by
+    ``tests/local/test_eval_navigation_context_adapter_parity.py``.
+
+    When ``tool`` is supplied AND ``tool.name != "aethyme"`` (e.g.
+    graphify): the bug-fix nav-context schema is Aethyme-specific
+    (anchors/scope/file_contents). For non-Aethyme tools, the leverage
+    prompt is meant to point at the tool's own prompt_addendum directly,
+    not at a synthetic Aethyme-shape JSON. We raise so the caller
+    notices, rather than silently producing nonsense.
     """
+    # Adapter path — Aethyme only for now.
+    if tool is not None:
+        if tool.name == "aethyme":
+            return _build_navigation_context_via_adapter(repo_path, task, tool)
+        raise NotImplementedError(
+            f"bug-fix navigation context is Aethyme-specific (anchors/scope/"
+            f"file_contents schema). Tool {tool.name!r} should use its own "
+            f"prompt addendum directly in the leverage condition; supporting "
+            f"this requires reshaping _build_bug_fix_prompt to accept a tool-"
+            f"agnostic addendum string instead of a pointer to a fixed-shape "
+            f"JSON file. Tracked separately."
+        )
+
+    # Legacy direct-Python path.
     try:
         task_pack = build_task_pack(repo_path, task)
     except Exception:
@@ -523,6 +568,58 @@ def _build_navigation_context(
     except Exception:
         task_context = {}
 
+    scope_view = build_scope_view(task, task_pack)
+
+    return {
+        "mode": "bug_fix_navigation",
+        "repo_path": str(repo_path),
+        "task": task,
+        "test_file": TEST_REL,
+        "bug_area": "packages/auth/src/",
+        "anchors": task_pack.get("anchors", []),
+        "scope": scope_view,
+        "file_contents": task_context.get("file_contents", []),
+    }
+
+
+def _build_navigation_context_via_adapter(
+    repo_path: Path,
+    task: str,
+    tool: "ToolAdapter",
+) -> dict[str, Any]:
+    """Aethyme-via-CLI variant of :func:`_build_navigation_context`.
+
+    Runs ``aethyme task pack`` and ``aethyme task context`` as subprocesses
+    via the tool adapter, then parses the JSON outputs into the same dict
+    fields the legacy Python path produces. The two paths are designed to
+    be byte-equivalent — see the parity test for verification.
+
+    Failure mode: when an adapter command fails (CLI not built, daemon
+    unreachable, etc.), we substitute empty dicts so the eval prepare
+    flow doesn't crash — matching the legacy path's bare ``except:`` blocks.
+    The leverage condition's nav-context will be empty, the eval will
+    still run, and the failure surfaces as a degraded score rather than
+    a hard prepare error.
+    """
+    import json as _json
+
+    try:
+        leverage_result = tool.run_condition("leverage", repo_path, task)
+        # raw_output is the unwrapped subprocess stdout (just the JSON);
+        # prompt_addendum is the same JSON wrapped in a markdown header
+        # intended for prompt injection. The parser needs the bare JSON.
+        task_pack = _json.loads(leverage_result.raw_output) if leverage_result.raw_output else {}
+    except Exception:
+        task_pack = {}
+
+    try:
+        tc_result = tool.run_condition("task-conditioned", repo_path, task)
+        task_context = _json.loads(tc_result.raw_output) if tc_result.raw_output else {}
+    except Exception:
+        task_context = {}
+
+    # scope_view is a post-processing transformation on task_pack — not a
+    # tool capability, so it stays a Python call regardless of routing.
     scope_view = build_scope_view(task, task_pack)
 
     return {
