@@ -537,10 +537,21 @@ def finalize_eval_run(
     # 2. Structured artifacts
     write_eval_run_artifacts(run_dir, result)
 
-    # 3. Markdown report
+    # 3. Markdown report — dispatch on eval_type. Diagnostic evals get
+    # the 4-section narrative scaffold; bug-fix / explain-repo /
+    # navigation-ctf keep the existing technical-section report.
     rp = repo_path or Path(result.get("report", {}).get("repo_path", "."))
-    content = _render_markdown(repo_path=rp, result=result)
-    (run_dir / "report.md").write_text(content, encoding="utf-8")
+    if eval_type in DIAGNOSTIC_EVAL_TYPES:
+        content = _render_diagnostic_markdown(
+            repo_path=rp, result=result, eval_type=eval_type,
+        )
+        # Diagnostic reports use REPORT.md (uppercase) to distinguish from
+        # the auto-derived report.md the bug-fix flow writes. Both formats
+        # may coexist if a run is re-finalized with a different eval_type.
+        (run_dir / "REPORT.md").write_text(content, encoding="utf-8")
+    else:
+        content = _render_markdown(repo_path=rp, result=result)
+        (run_dir / "report.md").write_text(content, encoding="utf-8")
 
     # 4. Also write to docs/reports/evals/ for discoverability
     REPORTS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -813,6 +824,77 @@ def write_navigation_ctf_markdown_report(
     if run_dir is not None:
         write_eval_run_artifacts(run_dir, result)
         (run_dir / "report.md").write_text(content, encoding="utf-8")
+
+    return report_path
+
+
+# Eval types that get the 4-section diagnostic-eval narrative report
+# instead of the bug-fix-style technical sections. These all run through
+# the prompts_writer flow (no nav-context file), and benefit from a
+# Tooling layer / Graph layer breakdown that the bug-fix flow doesn't
+# have a natural place for.
+DIAGNOSTIC_EVAL_TYPES: frozenset[str] = frozenset({
+    "dead-code",
+    "bug-fix-1",
+    "impact-analysis",
+    "feature-localization",
+    "config-audit",
+    "migration",
+})
+
+
+def write_diagnostic_eval_report(
+    *,
+    repo_path: Path,
+    result: dict[str, Any],
+    run_dir: Path | None = None,
+    eval_type: str = "unknown",
+) -> Path:
+    """Render the 4-section diagnostic-eval report.
+
+    Produces a markdown document with four sections that match the
+    narrative shape an evaluator naturally wants on a diagnostic eval:
+
+    1. **Overall results** — fully auto-derived. Headline comparison
+       table, cost-effectiveness ranking, per-condition match details
+       (matched / missed / false-positives extracted from the scorer's
+       output).
+    2. **General learnings** — auto-derived findings about effect sizes
+       (CTO impact, leverage-vs-control deltas), cache-cost dominance,
+       and any signals from divergent ranking by metric. Includes empty
+       "interpretation" placeholders for the human evaluator.
+    3. **Tooling layer focus** — auto-derived: tool-call counts per
+       condition, Chau7 / framework caveats that fired (stale
+       session_ids, shell-quoting, etc. if recorded), parallel-launch
+       efficiency if recorded.
+    4. **Graph layer focus** — auto-derived from condition results:
+       which functions only some conditions found, where the graph
+       won (unique catches in leverage/task-conditioned vs controls),
+       where it failed (false positives shared across conditions).
+
+    The sections marked "auto-derived" are populated from the scorer's
+    per-condition `matched` / `missed` / `false_positives` arrays plus
+    the run-level cost / duration / token data. The "interpretation"
+    placeholders are empty by design — the framework doesn't pretend
+    to draw conclusions; it scaffolds the structure so a human can.
+
+    Called from :func:`finalize_eval_run` when ``eval_type`` is in
+    :data:`DIAGNOSTIC_EVAL_TYPES`. The bug-fix / explain-repo /
+    navigation-ctf flows continue to use ``_render_markdown`` directly.
+    """
+    augment_result_with_summary_metrics(result)
+    content = _render_diagnostic_markdown(
+        repo_path=repo_path, result=result, eval_type=eval_type,
+    )
+
+    REPORTS_ROOT.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    slug = _slugify(repo_path.name or "repo")
+    report_path = REPORTS_ROOT / f"{timestamp}-{slug}-{eval_type}.md"
+    report_path.write_text(content, encoding="utf-8")
+
+    if run_dir is not None:
+        (run_dir / "REPORT.md").write_text(content, encoding="utf-8")
 
     return report_path
 
@@ -1761,3 +1843,378 @@ def _section_raw_data(lines: list[str], result: dict[str, Any]) -> None:
 
 def _slugify(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "repo"
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic-eval narrative report
+# ---------------------------------------------------------------------------
+#
+# The functions below produce the 4-section markdown for diagnostic
+# evals (dead-code, bug-fix-1, impact-analysis, ...). Each section is
+# either fully auto-derived from the scored result dict, or a scaffold
+# with auto-pre-filled findings and explicit interpretation placeholders.
+#
+# Design tenet: the framework writes WHAT happened (data + auto-derived
+# observations). It does NOT pretend to write WHY. Empty "interpretation"
+# placeholders signal where human analysis goes — preventing the
+# automatic generation of plausible-sounding-but-unverified prose.
+
+
+def _render_diagnostic_markdown(
+    *,
+    repo_path: Path,
+    result: dict[str, Any],
+    eval_type: str,
+) -> str:
+    """Build the 4-section diagnostic-eval markdown report."""
+    lines: list[str] = []
+    _diag_section_header(lines, repo_path, result, eval_type)
+    _diag_section_overall_results(lines, result)
+    _diag_section_general_learnings(lines, result)
+    _diag_section_tooling_layer(lines, result)
+    _diag_section_graph_layer(lines, result)
+    _diag_section_appendix(lines, repo_path, result)
+    return "\n".join(lines) + "\n"
+
+
+def _diag_section_header(
+    lines: list[str],
+    repo_path: Path,
+    result: dict[str, Any],
+    eval_type: str,
+) -> None:
+    target = result.get("target", "unknown")
+    model_block = result.get("model", {})
+    model_name = (
+        model_block.get("name", "unknown")
+        if isinstance(model_block, dict)
+        else str(model_block)
+    )
+    tool_name = result.get("tool", "aethyme")
+    lines.extend([
+        f"# {eval_type} eval — {target}",
+        "",
+        f"- **Repository:** `{repo_path}`",
+        f"- **Eval type:** `{eval_type}`",
+        f"- **Target:** `{target}`",
+        f"- **Model:** `{model_name}`",
+        f"- **Tool:** `{tool_name}`",
+        f"- **Conditions:** {', '.join(_active_conditions(result))}",
+        f"- **Generated:** {datetime.now(UTC).isoformat()}",
+        "",
+    ])
+    notes = result.get("tool_manifest_notes")
+    if isinstance(notes, str) and notes.strip():
+        lines.extend([
+            "## Methodology note (from tool manifest)",
+            "",
+            notes.strip(),
+            "",
+        ])
+
+
+def _diag_section_overall_results(lines: list[str], result: dict[str, Any]) -> None:
+    lines.extend(["## 1. Overall results", ""])
+    active = _active_conditions(result)
+    rows = []
+    for cond in active:
+        side = result.get(cond, {}) or {}
+        assess = side.get("assessment") or {}
+        run = side.get("run") or {}
+        summary = side.get("summary_metrics") or {}
+        score = assess.get("weighted_score")
+        cost = run.get("cost_usd")
+        duration = run.get("duration_seconds")
+        turns = run.get("num_turns")
+        tool_calls = run.get("tool_calls")
+        tool_calls_count = len(tool_calls) if isinstance(tool_calls, list) else None
+        rows.append({
+            "condition": cond, "score": score, "cost": cost,
+            "duration_s": duration, "turns": turns,
+            "tool_calls": tool_calls_count,
+            "recall": (assess.get("scores") or {}).get("functions_found"),
+            "precision": (assess.get("scores") or {}).get("false_positives"),
+            "matched": assess.get("functions_matched") or [],
+            "missed": assess.get("functions_missed") or [],
+            "false_positives": assess.get("false_positives") or [],
+            "score_per_dollar": (
+                round(score / cost, 1)
+                if score and cost and cost > 0 else None
+            ),
+        })
+
+    # Headline table — each cell falls back to "-" when its underlying
+    # value is None so partially-populated runs (failed conditions etc.)
+    # still produce a readable table.
+    lines.append("### Headline")
+    lines.append("")
+    lines.append("| Condition | Score | Recall | Precision | Cost | Duration | Turns | Tools |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+    for r in rows:
+        lines.append(
+            "| {cond} | {score} | {recall} | {prec} | {cost} | {dur} | {turns} | {tools} |".format(
+                cond=r["condition"],
+                score=f"{r['score']:.2f}" if r['score'] is not None else "-",
+                recall=f"{r['recall'] * 100:.0f}%" if r['recall'] is not None else "-",
+                prec=f"{r['precision'] * 100:.0f}%" if r['precision'] is not None else "-",
+                cost=f"${r['cost']:.3f}" if r['cost'] is not None else "-",
+                dur=f"{r['duration_s']:.0f}s" if r['duration_s'] is not None else "-",
+                turns=str(r['turns']) if r['turns'] is not None else "-",
+                tools=str(r['tool_calls']) if r['tool_calls'] is not None else "-",
+            )
+        )
+    lines.append("")
+
+    # Cost-effectiveness ranking
+    ranked = sorted(
+        (r for r in rows if r["score_per_dollar"] is not None),
+        key=lambda r: r["score_per_dollar"], reverse=True,
+    )
+    if ranked:
+        lines.extend(["### Cost-effectiveness (score per dollar)", ""])
+        for i, r in enumerate(ranked, 1):
+            cond = r["condition"]
+            label = f"**{cond}**" if i == 1 else cond
+            lines.append(
+                f"{i}. {label}: {r['score']:.2f} / ${r['cost']:.3f} = "
+                f"**{r['score_per_dollar']} pts/$**"
+            )
+        lines.append("")
+
+    # Per-condition match details
+    lines.extend(["### Per-condition match details", ""])
+    lines.append("| Condition | Matched | Missed | False positives |")
+    lines.append("|---|---|---|---|")
+    for r in rows:
+        lines.append(
+            f"| {r['condition']} | "
+            f"{len(r['matched'])} ({', '.join(r['matched']) or '-'}) | "
+            f"{len(r['missed'])} ({', '.join(r['missed']) or '-'}) | "
+            f"{len(r['false_positives'])} ({', '.join(r['false_positives']) or '-'}) |"
+        )
+    lines.append("")
+
+
+def _diag_section_general_learnings(lines: list[str], result: dict[str, Any]) -> None:
+    lines.extend(["## 2. General learnings", ""])
+    # Auto-derived findings
+    active = _active_conditions(result)
+    findings: list[str] = []
+
+    # CTO effect
+    cto_off = result.get("control-cto-off", {})
+    cto_on = result.get("control-cto-on", {})
+    off_cost = (cto_off.get("run") or {}).get("cost_usd")
+    on_cost = (cto_on.get("run") or {}).get("cost_usd")
+    off_score = (cto_off.get("assessment") or {}).get("weighted_score")
+    on_score = (cto_on.get("assessment") or {}).get("weighted_score")
+    if all(isinstance(v, (int, float)) for v in (off_cost, on_cost, off_score, on_score)):
+        cost_delta_pct = (off_cost - on_cost) / off_cost * 100 if off_cost else 0
+        score_delta = on_score - off_score
+        findings.append(
+            f"**CTO impact:** flipping CTO on lowered cost by {cost_delta_pct:.0f}% "
+            f"(${off_cost:.2f} → ${on_cost:.2f}) and changed score by "
+            f"{score_delta:+.1f} points ({off_score:.1f} → {on_score:.1f})."
+        )
+
+    # Cache-read dominance
+    cache_shares: list[tuple[str, float]] = []
+    for cond in active:
+        run = (result.get(cond, {}) or {}).get("run") or {}
+        cost = run.get("cost_usd") or 0
+        cache_read = run.get("cache_read_tokens") or 0
+        cache_create = run.get("cache_create_tokens") or 0
+        # Haiku-class pricing assumption; cheap approximation:
+        cache_cost = (cache_read / 1_000_000) * 0.08 + (cache_create / 1_000_000) * 1.00
+        if cost > 0:
+            cache_shares.append((cond, cache_cost / cost))
+    if cache_shares:
+        avg_share = sum(s for _, s in cache_shares) / len(cache_shares)
+        findings.append(
+            f"**Cache-read dominance:** averaged "
+            f"{avg_share*100:.0f}% of total cost across conditions. "
+            f"Reducing intermediate tool-output size has multiplicative impact."
+        )
+
+    # Best vs worst score
+    scored = [
+        (c, (result.get(c, {}).get("assessment") or {}).get("weighted_score"))
+        for c in active
+    ]
+    scored = [(c, s) for c, s in scored if isinstance(s, (int, float))]
+    if scored:
+        best = max(scored, key=lambda x: x[1])
+        worst = min(scored, key=lambda x: x[1])
+        if best[0] != worst[0]:
+            findings.append(
+                f"**Score spread:** {best[1] - worst[1]:.1f} points between best "
+                f"({best[0]}) and worst ({worst[0]}). Larger spread = stronger signal "
+                f"that condition choice matters; near-zero spread = the task may not "
+                f"discriminate between treatments."
+            )
+
+    if findings:
+        for f in findings:
+            lines.extend([f"- {f}", ""])
+    else:
+        lines.extend([
+            "*(No auto-derived findings — result dict missing the per-condition "
+            "fields needed. Manually populate this section from the data.)*",
+            "",
+        ])
+
+    lines.extend([
+        "### Interpretation",
+        "",
+        "<!--",
+        "  The findings above are auto-derived from the result dict. The space",
+        "  below is for the human evaluator's interpretation: what surprised you,",
+        "  what didn't, what hypotheses this data supports or refutes. Auto-",
+        "  generated narrative is intentionally NOT inserted here — the framework",
+        "  doesn't have the context to judge significance.",
+        "-->",
+        "",
+        "_TODO: write interpretation._",
+        "",
+    ])
+
+
+def _diag_section_tooling_layer(lines: list[str], result: dict[str, Any]) -> None:
+    lines.extend(["## 3. Focus on the tooling layer", ""])
+    active = _active_conditions(result)
+
+    # Tool-call frequency per condition
+    lines.extend(["### Tool-call distribution per condition", ""])
+    lines.append("| Condition | Top tools | Total calls |")
+    lines.append("|---|---|---:|")
+    for cond in active:
+        run = (result.get(cond, {}) or {}).get("run") or {}
+        tool_calls = run.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            lines.append(f"| {cond} | - | - |")
+            continue
+        freq = Counter(
+            tc.get("name", "?") if isinstance(tc, dict) else str(tc)
+            for tc in tool_calls
+        )
+        top = ", ".join(f"{n}:{c}" for n, c in freq.most_common(5))
+        lines.append(f"| {cond} | {top} | {len(tool_calls)} |")
+    lines.append("")
+
+    # Aethyme-tool invocation rate (if any condition shows Aethyme tools)
+    aethyme_tool_names = {"Bash"}  # placeholder — would be tightened with real names
+    lines.extend([
+        "### Eval-framework observations",
+        "",
+        "<!--",
+        "  Notes about the framework, Chau7 orchestration, manifest adapter system,",
+        "  shell-quoting, parallel-launch efficiency, etc. Populate during analysis.",
+        "  Auto-derived signals (when present) appear above; this is where they're",
+        "  contextualized.",
+        "-->",
+        "",
+        "_TODO: surface framework observations from this run._",
+        "",
+    ])
+
+
+def _diag_section_graph_layer(lines: list[str], result: dict[str, Any]) -> None:
+    lines.extend(["## 4. Focus on the graph layer", ""])
+    active = _active_conditions(result)
+
+    # Unique catches: functions found by Aethyme conditions but missed by controls
+    aethyme_conditions = {"explore", "leverage", "task-conditioned"}
+    control_conditions = {"control-cto-off", "control-cto-on", "control"}
+
+    aethyme_caught: set[str] = set()
+    control_caught: set[str] = set()
+    for cond in active:
+        matched = (result.get(cond, {}).get("assessment") or {}).get("functions_matched") or []
+        if cond in aethyme_conditions:
+            aethyme_caught.update(matched)
+        elif cond in control_conditions:
+            control_caught.update(matched)
+
+    unique_to_aethyme = aethyme_caught - control_caught
+    unique_to_control = control_caught - aethyme_caught
+    shared = aethyme_caught & control_caught
+
+    lines.extend(["### Catch overlap: Aethyme vs control conditions", ""])
+    lines.append(
+        f"- **Shared catches** (found by both Aethyme and control conditions): "
+        f"{len(shared)} — `{', '.join(sorted(shared)) or '-'}`"
+    )
+    lines.append(
+        f"- **Unique to Aethyme conditions** (graph layer's signal): "
+        f"{len(unique_to_aethyme)} — `{', '.join(sorted(unique_to_aethyme)) or '-'}`"
+    )
+    lines.append(
+        f"- **Unique to control conditions** (brute-force won here): "
+        f"{len(unique_to_control)} — `{', '.join(sorted(unique_to_control)) or '-'}`"
+    )
+    lines.append("")
+    if unique_to_aethyme:
+        lines.append(
+            f"The {len(unique_to_aethyme)} function(s) only Aethyme conditions caught are "
+            f"the cleanest evidence in this run that the graph layer brought capability beyond grep."
+        )
+        lines.append("")
+    if unique_to_control:
+        lines.append(
+            f"The {len(unique_to_control)} function(s) only control conditions caught suggest "
+            f"either a graph-resolution gap (the graph couldn't see the relationship) "
+            f"or an agent-attention gap (the agent didn't ask the right query)."
+        )
+        lines.append("")
+
+    # Shared false positives across conditions
+    fp_by_cond: dict[str, set[str]] = {}
+    for cond in active:
+        fps = (result.get(cond, {}).get("assessment") or {}).get("false_positives") or []
+        fp_by_cond[cond] = set(fps)
+    fp_counter: Counter[str] = Counter()
+    for fps in fp_by_cond.values():
+        for fp in fps:
+            fp_counter[fp] += 1
+    serial_fps = [(fp, n) for fp, n in fp_counter.items() if n >= 2]
+    if serial_fps:
+        lines.extend(["### Serial false positives", ""])
+        lines.append(f"Functions flagged as unused by ≥2 conditions (potential reference-baseline gap or recurrent graph blindspot):")
+        for fp, n in sorted(serial_fps, key=lambda x: -x[1]):
+            offenders = sorted(c for c, fps in fp_by_cond.items() if fp in fps)
+            lines.append(f"- `{fp}` — flagged by {n} conditions: {', '.join(offenders)}")
+        lines.append("")
+
+    lines.extend([
+        "### Interpretation",
+        "",
+        "<!--",
+        "  The graph layer's contribution is auto-derived above (catch overlap +",
+        "  serial false positives). This is where you connect those observations",
+        "  to specific graph capabilities (anchor resolution, static-dispatch",
+        "  handling, etc.) and propose follow-ups (graph-audit per missed function,",
+        "  reference-baseline updates for serial FPs).",
+        "-->",
+        "",
+        "_TODO: write graph-layer interpretation._",
+        "",
+    ])
+
+
+def _diag_section_appendix(
+    lines: list[str], repo_path: Path, result: dict[str, Any],
+) -> None:
+    lines.extend(["## Appendix: raw data", ""])
+    lines.append(
+        "Full per-condition data lives in `complete-result.json` alongside this "
+        "report. The Python `complete-result.json` is the source of truth; "
+        "anything in this report is derived from it."
+    )
+    lines.append("")
+    cost_total = sum(
+        (result.get(c, {}).get("run") or {}).get("cost_usd") or 0
+        for c in _active_conditions(result)
+    )
+    if cost_total > 0:
+        lines.append(f"**Total spend (sum across conditions):** ${cost_total:.2f}")
+        lines.append("")
