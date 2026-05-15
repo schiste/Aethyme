@@ -42,25 +42,42 @@ fn build_fragment_wraps_a_single_indexed_file() {
 #[test]
 fn index_records_group_by_synthesized_module() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "src/cli.py", b"print('a')\n");
-    write(tmp.path(), "src/util.py", b"print('b')\n");
-    write(tmp.path(), "other/lib.rs", b"fn main() {}\n");
+    write(tmp.path(), "src/cli.py", b"def alpha():\n    pass\n");
+    write(tmp.path(), "src/util.py", b"def beta():\n    pass\n");
     let walked = aethyme_graph_indexer::walk_source_tree(
         &ctx(tmp.path()),
         &WalkOptions::default(),
     )
     .unwrap();
 
-    let groups = build_index_records(&walked.files);
+    // build_index_records now takes BuiltFragments (post-4.3) so
+    // we have to walk the pipeline a step further to construct
+    // them. Each built fragment holds the file's top node plus
+    // the Python indexer's extracted Function nodes.
+    let py_indexer = aethyme_graph_indexer::PythonIndexer::new();
+    use aethyme_graph_indexer::LanguageIndexer;
+    let mut built = Vec::new();
+    for indexed in &walked.files {
+        let content =
+            std::fs::read_to_string(tmp.path().join(&*indexed.source_path))
+                .unwrap();
+        let lang = py_indexer
+            .index_file(&ctx(tmp.path()), indexed, &content)
+            .unwrap();
+        built.push(build_fragment(indexed, Some(lang)).unwrap());
+    }
+
+    let groups = build_index_records(&built);
     let modules: Vec<&str> = groups.keys().map(String::as_str).collect();
     assert!(modules.contains(&"src.cli"));
     assert!(modules.contains(&"src.util"));
-    assert!(modules.contains(&"other.lib"));
 
     let cli_records = &groups["src.cli"];
-    assert_eq!(cli_records.len(), 1);
-    assert_eq!(&*cli_records[0].symbol, "cli");
-    assert_eq!(cli_records[0].kind, NodeKind::File);
+    // alpha (extracted Function); File and NonCodeFile are
+    // skipped by the name-only emission rule.
+    let symbol_names: Vec<&str> =
+        cli_records.iter().map(|r| r.symbol.as_ref()).collect();
+    assert!(symbol_names.contains(&"alpha"));
 }
 
 // ─── index_repo_to_disk ─────────────────────────────────────────────
@@ -68,7 +85,11 @@ fn index_records_group_by_synthesized_module() {
 #[test]
 fn index_repo_writes_fragments_to_canonical_paths() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "src/cli.py", b"print('hi')\n");
+    // Real Python content so the language indexer produces a
+    // Function node — the post-4.3 index shards only carry named
+    // symbols, so a trivial `print('hi')` would write zero shard
+    // records.
+    write(tmp.path(), "src/cli.py", b"def hello():\n    return 'hi'\n");
     write(tmp.path(), "README.md", b"# heading\n");
 
     let summary =
@@ -81,8 +102,11 @@ fn index_repo_writes_fragments_to_canonical_paths() {
     let readme_frag = tmp.path().join(".aethyme/graph/README.md.bin");
     assert!(readme_frag.exists());
 
-    // Each shard exists.
-    assert!(!summary.shards_written.is_empty());
+    // src/cli.py contains a Function so src.cli gets a shard.
+    // README.md contains only a NonCodeFile node (no extracted
+    // named symbols) so it produces no shard. shards_written is
+    // therefore exactly 1.
+    assert_eq!(summary.shards_written.len(), 1);
 }
 
 #[test]
@@ -100,14 +124,17 @@ fn index_repo_round_trip_fragment_decode_works() {
 #[test]
 fn index_repo_round_trip_index_shard_decode_works() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "src/cli.py", b"print('hi')\n");
+    write(tmp.path(), "src/cli.py", b"def hello():\n    return 'hi'\n");
 
     index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     let records = read_index_shard(tmp.path(), "src.cli").unwrap();
-    assert_eq!(records.len(), 1);
-    assert_eq!(&*records[0].symbol, "cli");
-    assert_eq!(records[0].kind, NodeKind::File);
-    assert_eq!(&*records[0].file, "src/cli.py");
+    // One record per extracted named symbol; the File node itself
+    // is unnamed and skipped.
+    assert!(!records.is_empty());
+    let names: Vec<&str> =
+        records.iter().map(|r| r.symbol.as_ref()).collect();
+    assert!(names.contains(&"hello"));
+    assert!(records.iter().any(|r| r.kind == NodeKind::Function));
 }
 
 #[test]
@@ -115,8 +142,8 @@ fn index_repo_is_idempotent() {
     // Two runs over the same repo state must produce identical
     // on-disk results.
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "src/cli.py", b"print('hi')\n");
-    write(tmp.path(), "src/util.py", b"print('u')\n");
+    write(tmp.path(), "src/cli.py", b"def hello():\n    pass\n");
+    write(tmp.path(), "src/util.py", b"def util_fn():\n    pass\n");
     write(tmp.path(), "README.md", b"# md\n");
 
     index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();

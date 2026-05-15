@@ -20,6 +20,15 @@ path = "src/lib.rs"
 name = "aethyme-graph-index"
 path = "src/bin/aethyme-graph-index.rs"
 
+# `aethyme-graph-query` (Phase 4.3) — read-side CLI exercising
+# the FragmentStore API. Sibling to aethyme-graph-index: index
+# writes, query reads. Same crate because the indexer + query
+# layer share types and dependencies; future engine integration
+# will exercise the same FragmentStore via a different surface.
+[[bin]]
+name = "aethyme-graph-query"
+path = "src/bin/aethyme-graph-query.rs"
+
 [dependencies]
 # Types this indexer produces (the schema crate is the contract).
 aethyme-graph-schema = { path = "../aethyme-graph-schema" }

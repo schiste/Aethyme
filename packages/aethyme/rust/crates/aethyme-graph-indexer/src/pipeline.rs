@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use rayon::prelude::*;
 
-use aethyme_graph_schema::{Node, NodeKind};
+use aethyme_graph_schema::NodeKind;
 use aethyme_graph_storage::{
     write_fragment, write_index_shard, Fragment, FragmentBuildError,
     FragmentWriteError, IndexShardWriteError, SymbolRecord,
@@ -88,30 +88,55 @@ pub fn default_registry() -> LanguageRegistry {
     registry
 }
 
-/// Build SymbolRecord entries from an indexed file's nodes, grouped
-/// by module. The grouping key is the synthesized module name
-/// (currently derived from the source path's directory part — once
-/// language indexers land, we'll prefer their module attribution
-/// over this fallback).
+/// Build SymbolRecord entries from a list of built fragments,
+/// grouped by module.
+///
+/// For each fragment, emit one record per named node (Function,
+/// Class, Method, Interface, etc.). The module name is synthesized
+/// from the source path (currently `/` → `.` with extension
+/// stripped). Container-only kinds without names (Directory,
+/// Statement, Expression, untagged Comments) are skipped — they
+/// have nothing useful to look up by name.
 ///
 /// Returns a `BTreeMap<module_name, Vec<SymbolRecord>>` so the
 /// caller can write one shard per module.
 pub fn build_index_records(
-    indexed_files: &[IndexedFile],
+    built_fragments: &[BuiltFragment],
 ) -> BTreeMap<String, Vec<SymbolRecord>> {
     let mut records_by_module: BTreeMap<String, Vec<SymbolRecord>> =
         BTreeMap::new();
-    for indexed in indexed_files {
-        let module = synthesize_module_name(&indexed.source_path);
-        // Top-level node: File or NonCodeFile. Only the named-symbol
-        // kinds get records; container kinds at the top of a file
-        // typically don't need to appear in symbol-search indices,
-        // but we include them anyway so "find me the README" works.
-        let record = symbol_record_for(&module, &indexed.source_path, &indexed.top_node);
-        records_by_module
-            .entry(module)
-            .or_default()
-            .push(record);
+    for built in built_fragments {
+        let module = synthesize_module_name(&built.source_path);
+        for node in built.fragment.nodes() {
+            let Some(symbol_name) = node.name() else {
+                // Unnamed kinds (Statement, Expression, anon
+                // comments) don't go into the symbol index.
+                continue;
+            };
+            // For the top-level File node, the basename without
+            // extension is more useful as the "symbol" than the
+            // path-derived synthesized name (which is already in
+            // the module field).
+            let symbol_text = if matches!(
+                node.kind(),
+                aethyme_graph_schema::NodeKind::File
+                    | aethyme_graph_schema::NodeKind::NonCodeFile
+            ) {
+                continue; // File/NonCodeFile name() returns None anyway
+            } else {
+                symbol_name.to_string()
+            };
+            records_by_module
+                .entry(module.clone())
+                .or_default()
+                .push(SymbolRecord {
+                    module: module.clone().into(),
+                    symbol: symbol_text.into(),
+                    kind: node.kind(),
+                    node_id: node.id().clone(),
+                    file: built.source_path.clone(),
+                });
+        }
     }
     records_by_module
 }
@@ -128,30 +153,6 @@ fn synthesize_module_name(source_path: &str) -> String {
     without_ext.replace('/', ".")
 }
 
-fn symbol_record_for(
-    module: &str,
-    source_path: &str,
-    node: &Node,
-) -> SymbolRecord {
-    // Use the file's basename (without extension) as the symbol
-    // name for File / NonCodeFile records.
-    let symbol = source_path
-        .rsplit_once('/')
-        .map(|(_, tail)| tail)
-        .unwrap_or(source_path);
-    let symbol = symbol
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(symbol);
-
-    SymbolRecord {
-        module: module.into(),
-        symbol: symbol.into(),
-        kind: node.kind(),
-        node_id: node.id().clone(),
-        file: source_path.into(),
-    }
-}
 
 /// One-shot helper: walk the repo, dispatch each code file to its
 /// registered language indexer, build all fragments + index shards,
@@ -183,13 +184,15 @@ pub fn index_repo_to_disk_with(
     let total_files = walk.files.len();
     let total_skipped = walk.skipped.len();
 
-    // Parallel per-file phase. Each closure returns (path_written,
-    // counts_for_this_file). Errors short-circuit via try_fold +
-    // try_reduce.
-    let per_file: Vec<(PathBuf, BTreeMap<NodeKind, usize>)> = walk
+    // Parallel per-file phase. Each closure returns
+    // (path_written, counts_for_this_file, BuiltFragment). The
+    // built fragment is captured so the post-loop step can emit
+    // SymbolRecords from each fragment's full node list (not just
+    // the IndexedFile's top-level node).
+    let per_file: Vec<(PathBuf, BTreeMap<NodeKind, usize>, BuiltFragment)> = walk
         .files
         .par_iter()
-        .map(|indexed| -> Result<(PathBuf, BTreeMap<NodeKind, usize>), IndexRepoError> {
+        .map(|indexed| -> Result<(PathBuf, BTreeMap<NodeKind, usize>, BuiltFragment), IndexRepoError> {
             let lang_output = match registry.get(&indexed.language) {
                 Some(indexer) => {
                     let abs = ctx.repo_root().join(&*indexed.source_path);
@@ -223,25 +226,29 @@ pub fn index_repo_to_disk_with(
             )
             .map_err(IndexRepoError::FragmentWrite)?;
 
-            Ok((path, counts))
+            Ok((path, counts, built))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     // Aggregate across threads. The Vec already preserves the
-    // canonical walk order; we just split it and merge counts.
+    // canonical walk order; split it into (paths, counts, built).
     let mut fragments_written = Vec::with_capacity(per_file.len());
     let mut counts_by_kind: BTreeMap<NodeKind, usize> = BTreeMap::new();
-    for (path, counts) in per_file {
+    let mut built_fragments: Vec<BuiltFragment> =
+        Vec::with_capacity(per_file.len());
+    for (path, counts, built) in per_file {
         fragments_written.push(path);
         for (kind, count) in counts {
             *counts_by_kind.entry(kind).or_default() += count;
         }
+        built_fragments.push(built);
     }
 
-    // Index shards: per-module aggregation runs on the post-walk
-    // BTreeMap, so it's already sequential and cheap. We parallelize
-    // the write step (each shard writes to a distinct path).
-    let records = build_index_records(&walk.files);
+    // Index shards: emit SymbolRecords from each built fragment's
+    // FULL node list, not just the file-level walk. This is what
+    // makes find_symbols by name work for AST-extracted symbols
+    // (Function, Class, Method, etc.).
+    let records = build_index_records(&built_fragments);
     let records_vec: Vec<(String, Vec<SymbolRecord>)> =
         records.into_iter().collect();
     let mut shards_written: Vec<PathBuf> = records_vec

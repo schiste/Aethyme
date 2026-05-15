@@ -93,6 +93,50 @@ impl Node {
         }
     }
 
+    /// The node's display name, if it has one. Returns `None` for
+    /// kinds that don't carry an addressable name (Directory,
+    /// File, NonCodeFile, Statement, Expression, etc. — they're
+    /// either identified by path or by anonymous position).
+    ///
+    /// Used by the storage layer's index-shard builder to emit
+    /// `SymbolRecord`s keyed by name. A `None` here means "don't
+    /// emit a record for this node."
+    pub fn name(&self) -> Option<&str> {
+        use crate::Callable;
+        match self {
+            // Container kinds: identified by path, not name.
+            Node::Directory(_) => None,
+            Node::File(_) => None,
+            Node::NonCodeFile(_) => None,
+            Node::Module(n) => Some(n.name()),
+            Node::Repository(n) => Some(n.name()),
+            // Callables: name() via the Callable trait.
+            Node::Function(n) => Some(n.name()),
+            Node::Lambda(n) => Some(n.name()),
+            Node::Method(n) => Some(n.name()),
+            // Type-defining kinds: all named.
+            Node::Class(n) => Some(n.name()),
+            Node::Enum(n) => Some(n.name()),
+            Node::Interface(n) => Some(n.name()),
+            Node::Struct(n) => Some(n.name()),
+            Node::Trait(n) => Some(n.name()),
+            Node::TypeAlias(n) => Some(n.name()),
+            // Sub-symbol kinds:
+            Node::Expression(_) => None, // anonymous, position-based
+            Node::Statement(_) => None,  // anonymous, position-based
+            Node::Field(n) => Some(n.name()),
+            Node::GlobalVariable(n) => Some(n.name()),
+            Node::Parameter(n) => Some(n.name()),
+            // Non-code kinds:
+            Node::Comment(_) => None,    // position-based
+            Node::DocSection(n) => Some(n.heading()),
+            Node::Docstring(_) => None,  // attached to a target
+            Node::ConfigValue(n) => Some(n.config_path()),
+            // Partial-knowledge:
+            Node::UnresolvedSymbol(n) => Some(n.name()),
+        }
+    }
+
     /// The node's identifier, regardless of kind.
     pub fn id(&self) -> &NodeId {
         // Callable trait is brought in scope so we can call .id()

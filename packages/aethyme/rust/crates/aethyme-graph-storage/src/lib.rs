@@ -47,6 +47,7 @@ pub mod disk;
 pub mod fragment;
 pub mod index_shard;
 pub mod layout;
+pub mod store;
 
 pub use binary::{
     read_fragment_bytes, write_fragment_bytes, FragmentDecodeError,
@@ -73,3 +74,4 @@ pub use layout::{
     CACHE_SUBDIR, ENGINE_VERSION_FILE, FRAGMENT_EXT, GRAPH_SUBDIR,
     INDEX_SHARD_EXT, INDEX_SUBDIR,
 };
+pub use store::{FragmentStore, StoreLookupError, StoreOpenError};
