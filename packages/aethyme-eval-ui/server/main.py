@@ -51,8 +51,18 @@ async def get_results(
     target: str | None = None,
     model: str | None = None,
     condition: str | None = None,
+    tool: str | None = None,
 ) -> list[dict[str, Any]]:
-    return query_results(eval_type=eval_type, target=target, model=model, condition=condition)
+    """List eval results with optional filters.
+
+    ``tool`` joins the dimension added by the pure-manifest migration.
+    Historical rows default to ``'aethyme'`` via the column default,
+    so ``tool='aethyme'`` returns both pre- and post-migration runs.
+    """
+    return query_results(
+        eval_type=eval_type, target=target, model=model,
+        condition=condition, tool=tool,
+    )
 
 
 @app.get("/api/batches")
@@ -516,6 +526,13 @@ async def _generate_plan(req: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         "--reasoning", reasoning_arg,
         "--json-output",
     ]
+    # Pass --tool only when the request explicitly selects one. Omitting
+    # the flag lets the orchestrator fall back to target.default_tool
+    # ("aethyme"), which preserves backward-compatible behavior for any
+    # UI client that doesn't yet know about the tool field.
+    tool_value = getattr(req, "tool", None)
+    if tool_value:
+        cmd.extend(["--tool", tool_value])
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -971,11 +988,51 @@ class PlanRequest(BaseModel):
     reasoning: str = "high"
     windowId: int | None = None
     cleanupDelaySeconds: int = Field(default=1, ge=0, le=3600)
+    # Tool adapter (matches packages/aethyme/evals/tools/<name>.toml).
+    # None → orchestrator falls back to target.default_tool ("aethyme"),
+    # preserving pre-migration UI behavior.
+    tool: str | None = None
 
 @app.post("/api/plan")
 async def generate_plan(req: PlanRequest) -> dict[str, Any]:
     plan, _ = await _generate_plan(req)
     return plan
+
+
+@app.get("/api/tools")
+async def list_eval_tools() -> dict[str, Any]:
+    """List tool adapters available to the eval framework.
+
+    Returns the manifests under ``packages/aethyme/evals/tools/`` so the
+    UI's tool-selector dropdown stays in sync with whatever manifests
+    are present.
+
+    The ``condition_mapping_note`` field is the methodology audit
+    trail mandated by manifest validation — surfacing it here lets the
+    UI render the prose alongside the dropdown so an evaluator sees the
+    apples-to-apples reasoning *at run-launch time*, not buried in a
+    file. See ``packages/aethyme/src/eval/tools/manifest.py`` for the
+    contract.
+    """
+    _ensure_aethyme_imports()
+    from src.eval.tools import get_adapter, list_tools
+
+    out: list[dict[str, Any]] = []
+    for name in list_tools():
+        try:
+            adapter = get_adapter(name)
+            manifest = adapter.manifest
+            out.append({
+                "name": manifest.name,
+                "display_name": manifest.display_name,
+                "in_tree": manifest.in_tree,
+                "homepage": manifest.homepage,
+                "conditions": sorted(manifest.conditions.keys()),
+                "condition_mapping_note": manifest.condition_mapping_note,
+            })
+        except Exception as exc:
+            out.append({"name": name, "error": str(exc)})
+    return {"tools": out}
 
 
 # ---------------------------------------------------------------------------
@@ -1063,6 +1120,18 @@ class RunRequest(BaseModel):
     windowId: int | None = None
     preparationId: str | None = None
     cleanupDelaySeconds: int = Field(default=1, ge=0, le=3600)
+    # Tool adapter (matches packages/aethyme/evals/tools/<name>.toml).
+    # See PlanRequest.tool for semantics. RunRequest needs the same
+    # field because the run flow re-generates the plan internally.
+    tool: str | None = None
+    # Max conditions to launch in parallel. Default 5 matches the
+    # memory bank's verified-working ceiling (5 simultaneous MCP-
+    # controlled tabs, observed 2026-05-07 and reconfirmed during
+    # the manual orchestration on 2026-05-15). Set to 1 to force the
+    # legacy sequential launch — useful for debugging an individual
+    # condition without other tabs in the same window competing for
+    # observer attention.
+    launchConcurrency: int = Field(default=5, ge=1, le=8)
     # P1: number of sequential eval repetitions.
     #
     # Protocol requires N>=3 for any *reported* comparison so single-run
@@ -2402,6 +2471,15 @@ def _run_eval_background(
         metadata_path = run_dir / "metadata.json"
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         metadata["plan_run_dir"] = plan.get("paths", {}).get("run_dir")
+        # Persist the tool adapter into metadata.json so db.py's
+        # import_eval_runs can stamp the tool column without having to
+        # parse plan.json. Pulls from the plan's meta block written by
+        # generate_run_plan (always populated post-manifest-migration).
+        plan_meta = plan.get("meta", {}) if isinstance(plan, dict) else {}
+        if "tool" in plan_meta:
+            metadata["tool"] = plan_meta["tool"]
+        if "tool_display" in plan_meta:
+            metadata["tool_display"] = plan_meta["tool_display"]
         if plan_snapshot is not None:
             metadata["plan"] = {
                 "id": plan_snapshot.get("id"),
@@ -2525,12 +2603,24 @@ def _run_eval_background(
     session_files: dict[str, Path] = {}  # condition_name → session JSONL path
     session_ids: dict[str, str] = {}  # condition_name → explicit Claude session id
 
-    for cond in conditions:
+    def _launch_one(cond: dict[str, Any]) -> None:
+        """Launch a single condition's agent.
+
+        Called concurrently from a ThreadPoolExecutor so per-condition
+        sleeps run in parallel. The per-condition wall-time (~41s of
+        gates) was the bottleneck of the original serial loop; with N
+        workers the wall-time approaches the per-condition cost rather
+        than N times it.
+
+        Thread-safety: log() appends to a shared list (CPython
+        list.append is atomic); session_files / session_ids assignments
+        are atomic per key; mcp_client calls open independent sockets.
+        """
         cond_name = cond["name"]
         tab_id = tabs.get(cond_name)
         if not tab_id:
             log(f"[{cond_name}] SKIP: no tab_id")
-            continue
+            return
 
         repo_dir = Path(cond["directory"])
         session_id = str(uuid.uuid4())
@@ -2564,12 +2654,18 @@ def _run_eval_background(
                 log(f"[{cond_name}] Waiting 12s for Claude to start...")
                 time.sleep(12)
 
-                # Send prompt first — session file is created when Claude receives first message
+                # Send prompt first — session file is created when Claude receives first message.
+                # `prompt_text` defaults to "" so the verification block
+                # below stays valid even when the condition has no
+                # prompt_file. The original loop relied on `continue`
+                # skipping the verify block; now in a function we use
+                # `return` and pre-init the variable.
+                prompt_text = ""
                 prompt_file = cond.get("prompt_file", "")
                 if prompt_file:
                     if not Path(prompt_file).exists():
                         log(f"[{cond_name}] ERROR: Prompt file missing: {prompt_file}")
-                        continue
+                        return
 
                     prompt_text = Path(prompt_file).read_text(encoding="utf-8")
                     log(f"[{cond_name}] Sending {len(prompt_text)} chars...")
@@ -2613,6 +2709,26 @@ def _run_eval_background(
         except Exception as e:
             log(f"[{cond_name}] ERROR: {e}")
             log(traceback.format_exc())
+
+    # Launch with bounded parallelism. Concurrency comes from the
+    # RunRequest; defaults to 5 (the verified-working ceiling per the
+    # memory bank's 2026-05-07 observation, reconfirmed 2026-05-15).
+    # concurrency=1 restores the legacy serial behavior — useful when
+    # debugging an individual condition without other tabs competing
+    # for observer attention.
+    from concurrent.futures import ThreadPoolExecutor as _Pool
+    launch_concurrency = max(1, min(getattr(req, "launchConcurrency", 5) or 5, 8))
+    log(
+        f"Launching {len(conditions)} condition(s) with max_workers="
+        f"{launch_concurrency} "
+        f"({'parallel' if launch_concurrency > 1 else 'sequential'})"
+    )
+    if launch_concurrency == 1:
+        for cond in conditions:
+            _launch_one(cond)
+    else:
+        with _Pool(max_workers=launch_concurrency, thread_name_prefix="eval-launch") as pool:
+            list(pool.map(_launch_one, conditions))
 
     log("All agents launched.")
     log(f"Tab mapping: {json.dumps({k: v[:12] for k, v in tabs.items()}, indent=2)}")

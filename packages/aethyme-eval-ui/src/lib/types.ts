@@ -37,6 +37,9 @@ export interface EvalResult {
   evalType: string;
   target: string;
   model: string;
+  /** Tool adapter used for this result. Added with the pure-manifest
+   * migration; historical rows resolve to "aethyme" via the DB default. */
+  tool?: string;
   condition: string;
   reasoning: string;
   cto: string;
@@ -133,11 +136,30 @@ export interface Repository {
 
 export type RunStatus = "idle" | "planning" | "running" | "complete" | "error";
 
+/** Tool adapter metadata returned by GET /api/tools.
+ * Mirrors packages/aethyme/evals/tools/<name>.toml manifests. */
+export interface ToolInfo {
+  name: string;
+  display_name: string;
+  in_tree: boolean;
+  homepage?: string | null;
+  conditions: string[];
+  /** Mandatory manifest field — explains how this tool's modes map to
+   * explore/leverage/task-conditioned conditions. Rendered at run-launch
+   * time so the methodology audit trail is visible before spending. */
+  condition_mapping_note?: string;
+  /** Present when the server failed to load the manifest. */
+  error?: string;
+}
+
 export interface EvalRunConfig {
   evalType: EvalType;
   target: string;
   model: ModelName;
   reasoning: Reasoning;
+  /** Tool adapter to use for tool-using conditions. Omitted → server
+   * uses orchestrator default (target.default_tool, currently "aethyme"). */
+  tool?: string;
   windowId?: number;
   preparationId?: string;
   cleanupDelaySeconds?: number;

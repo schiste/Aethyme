@@ -66,6 +66,9 @@ export default function Results() {
   const [evalTypeFilter, setEvalTypeFilter] = useState<string>(ALL);
   const [targetFilter, setTargetFilter] = useState<string>(ALL);
   const [modelFilter, setModelFilter] = useState<string>(ALL);
+  // Tool filter — joins the dimension added by the pure-manifest
+  // migration. Defaults to ALL so historical workflows are unchanged.
+  const [toolFilter, setToolFilter] = useState<string>(ALL);
   const [divergentOnly, setDivergentOnly] = useState(false);
 
   useEffect(() => {
@@ -90,14 +93,25 @@ export default function Results() {
       if (evalTypeFilter !== ALL && r.evalType !== evalTypeFilter) return false;
       if (targetFilter !== ALL && r.target !== targetFilter) return false;
       if (modelFilter !== ALL && r.model !== modelFilter) return false;
+      if (toolFilter !== ALL && (r.tool ?? "aethyme") !== toolFilter) return false;
       if (divergentOnly && r.scorerAgreementDivergent !== true) return false;
       return true;
     });
-  }, [results, evalTypeFilter, targetFilter, modelFilter, divergentOnly]);
+  }, [results, evalTypeFilter, targetFilter, modelFilter, toolFilter, divergentOnly]);
 
   const evalTypes: EvalType[] = ["bug-fix", "bug-fix-1", "explain-repo", "navigation-ctf", "cross-package", "impact-analysis", "feature-localization", "config-audit", "dead-code", "migration"];
   const targets: TargetName[] = ["grc", "mediawiki"];
   const models: ModelName[] = ["haiku", "sonnet", "opus", "gpt-5.4"];
+  // Tool list is derived from the loaded results rather than hardcoded:
+  // new manifests appearing in evals/tools/ surface in the dropdown
+  // as soon as any run uses them, without code changes.
+  const tools = useMemo(() => {
+    const set = new Set<string>();
+    for (const r of results) {
+      if (r.tool) set.add(r.tool);
+    }
+    return Array.from(set).sort();
+  }, [results]);
 
   function handleExportJSON() {
     download(
@@ -168,6 +182,30 @@ export default function Results() {
             ))}
           </select>
         </div>
+
+        {/* Tool filter — only shown when ≥2 tools appear in the data,
+            so single-tool deployments (the common case today) don't see
+            a redundant dropdown. As soon as a graphify (or other
+            competitor) run lands, the dropdown materializes. */}
+        {tools.length >= 2 && (
+          <div className="flex items-center gap-1.5">
+            <label className="text-xs text-[var(--color-text-muted)] uppercase tracking-wide">
+              Tool
+            </label>
+            <select
+              value={toolFilter}
+              onChange={(e) => setToolFilter(e.target.value)}
+              className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded px-2.5 py-1.5 text-sm text-[var(--color-text)] focus:outline-none focus:border-[var(--color-accent)]"
+            >
+              <option value={ALL}>All</option>
+              {tools.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
 
         <label
           className={[

@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS eval_results (
     score_per_1k_tokens REAL,
     score_per_minute REAL,
     top_tools TEXT,
-    deliverable_status TEXT
+    deliverable_status TEXT,
+    tool          TEXT DEFAULT 'aethyme'
 );
 
 CREATE INDEX IF NOT EXISTS idx_eval_type ON eval_results(eval_type);
@@ -55,6 +56,9 @@ CREATE INDEX IF NOT EXISTS idx_target ON eval_results(target);
 CREATE INDEX IF NOT EXISTS idx_model ON eval_results(model);
 CREATE INDEX IF NOT EXISTS idx_condition ON eval_results(condition);
 CREATE INDEX IF NOT EXISTS idx_date ON eval_results(date);
+-- idx_tool is created after the tool column migration runs (see MIGRATIONS).
+-- Adding it here would fail with "no such column: tool" on existing DBs
+-- where the column is added by ALTER TABLE rather than CREATE TABLE.
 
 -- Capability probes (navigation, graph-usage). One row per (eval_result, probe).
 -- result_id FKs to eval_results.id. Kept as a child table rather than
@@ -129,6 +133,12 @@ MIGRATIONS = [
     "ALTER TABLE eval_results ADD COLUMN leakage_raw_judge REAL",
     "ALTER TABLE eval_results ADD COLUMN leakage_probe_version TEXT",
     "ALTER TABLE eval_results ADD COLUMN leakage_error TEXT",
+    # Tool adapter (matches packages/aethyme/evals/tools/<name>.toml).
+    # Defaults to 'aethyme' for historical rows so cross-tool queries
+    # don't lose pre-migration runs. Added 2026-05-15 when the
+    # pure-manifest tool system shipped.
+    "ALTER TABLE eval_results ADD COLUMN tool TEXT DEFAULT 'aethyme'",
+    "CREATE INDEX IF NOT EXISTS idx_tool ON eval_results(tool)",
 ]
 
 
@@ -274,6 +284,16 @@ def import_eval_runs(eval_runs_dir: Path) -> int:
             reasoning = model_raw.get("reasoning", "default")
         scenario = data.get("scenario")
 
+        # Tool adapter — read from plan meta (the run's
+        # complete-result.json) or metadata.json. Falls back to "aethyme"
+        # for historical runs that pre-date the pure-manifest migration,
+        # consistent with the DB column default.
+        tool = (
+            data.get("tool")
+            or metadata.get("tool")
+            or "aethyme"
+        )
+
         timestamp = metadata.get("timestamp", "")
         date_str = timestamp[:19] if timestamp else entry.name[:15]
 
@@ -325,12 +345,12 @@ def import_eval_runs(eval_runs_dir: Path) -> int:
                     score_per_1k_tokens, score_per_minute, top_tools,
                     judge_score, judge_stdev, judge_model, judge_reliable,
                     judge_samples, judge_error, judge_cost_usd,
-                    deliverable_status)
+                    deliverable_status, tool)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                            ?, ?, ?, ?, ?, ?,
                            ?, ?, ?, ?, ?, ?, ?, ?, ?,
                            ?, ?, ?, ?, ?, ?, ?,
-                           ?)""",
+                           ?, ?)""",
                 (
                     result_id, entry.name, date_str,
                     eval_type.split("-reasoning")[0] if "-reasoning" in eval_type else eval_type,
@@ -361,6 +381,7 @@ def import_eval_runs(eval_runs_dir: Path) -> int:
                     judge.get("judgeError"),
                     judge.get("judgeCostUsd"),
                     summary.get("deliverable_status"),
+                    tool,
                 ),
             )
             imported += 1
@@ -388,7 +409,7 @@ def insert_result(result: dict[str, Any]) -> None:
             primary_metric, minimum_meaningful_delta,
             judge_elapsed_seconds,
             leakage_score_cold, leakage_is_clean, leakage_raw_judge,
-            leakage_probe_version, leakage_error)
+            leakage_probe_version, leakage_error, tool)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?,
@@ -396,7 +417,7 @@ def insert_result(result: dict[str, Any]) -> None:
                    ?, ?, ?, ?,
                    ?, ?,
                    ?,
-                   ?, ?, ?, ?, ?)""",
+                   ?, ?, ?, ?, ?, ?)""",
         (
             result["id"], result.get("runDir"), result["date"],
             result["evalType"], result["target"], result["model"],
@@ -448,6 +469,10 @@ def insert_result(result: dict[str, Any]) -> None:
             result.get("leakageRawJudge"),
             result.get("leakageProbeVersion"),
             result.get("leakageError"),
+            # Tool adapter — defaults to 'aethyme' for any caller that
+            # doesn't yet supply this field (preserves historical
+            # behavior of the eval framework).
+            result.get("tool", "aethyme"),
         ),
     )
     conn.commit()
@@ -459,8 +484,15 @@ def query_results(
     target: str | None = None,
     model: str | None = None,
     condition: str | None = None,
+    tool: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Query eval results with optional filters."""
+    """Query eval results with optional filters.
+
+    The ``tool`` filter joins the dimension introduced by the
+    pure-manifest migration (2026-05-15). Historical rows default to
+    ``'aethyme'`` via the column default, so passing ``tool='aethyme'``
+    returns both the pre-migration and post-migration aethyme runs.
+    """
     conn = get_db()
     where = []
     params: list[Any] = []
@@ -477,6 +509,9 @@ def query_results(
     if condition:
         where.append("condition = ?")
         params.append(condition)
+    if tool:
+        where.append("tool = ?")
+        params.append(tool)
 
     clause = f" WHERE {' AND '.join(where)}" if where else ""
     rows = conn.execute(
@@ -514,6 +549,10 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "condition": row["condition"],
         "reasoning": row["reasoning"],
         "cto": row["cto"],
+        # Tool adapter introduced by the pure-manifest migration. Older
+        # rows resolve via the column default ('aethyme'), so the field
+        # is always present and consumers can group/filter unconditionally.
+        "tool": row["tool"] if "tool" in row.keys() else "aethyme",
         "score": row["score"],
         "turns": row["turns"],
         "toolCalls": row["tool_calls"],

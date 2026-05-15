@@ -4,6 +4,7 @@ import LiveTabsPanel from "../components/LiveTabsPanel";
 import {
   fetchRepositories,
   fetchChau7Tabs,
+  fetchTools,
   generatePlan,
   launchRun,
   fetchRunStatus,
@@ -120,6 +121,13 @@ export default function RunEvals() {
   const [target, setTarget] = useState<string>("grc");
   const [model, setModel] = useState<ModelName>("haiku");
   const [reasoning, setReasoning] = useState<Reasoning>("high");
+  // Tool adapter (matches packages/aethyme/evals/tools/<name>.toml).
+  // Empty string → omit from request, server falls back to orchestrator
+  // default (target.default_tool, currently "aethyme"). The populated
+  // list comes from GET /api/tools so new manifests appear without UI
+  // code changes.
+  const [tool, setTool] = useState<string>("");
+  const [tools, setTools] = useState<import("../lib/types").ToolInfo[]>([]);
   const [windowId, setWindowId] = useState<string>("auto");
   const [cleanupDelaySeconds, setCleanupDelaySeconds] = useState<string>("1");
   // P1: sequential eval repetitions. Protocol requires N>=3 for any
@@ -191,6 +199,15 @@ export default function RunEvals() {
   }, []);
 
   useEffect(() => {
+    // Populate the tool dropdown from the manifest registry. Silent
+    // failure is fine — the empty option ("Default (aethyme)") keeps
+    // the form usable even if /api/tools is unreachable.
+    fetchTools()
+      .then((list) => setTools(list))
+      .catch(() => setTools([]));
+  }, []);
+
+  useEffect(() => {
     fetchLatestPreparation(target)
       .then((snapshot) => setPreparation(snapshot))
       .catch(() => setPreparation(null));
@@ -243,6 +260,10 @@ export default function RunEvals() {
       ...extra,
     };
     if (parsedWindowId !== undefined) base.windowId = parsedWindowId;
+    // Include tool only when explicitly chosen — empty selection means
+    // "use server/orchestrator default," letting backend logic stay the
+    // single source of truth for tool defaulting.
+    if (tool) base.tool = tool;
     return base;
   }
 
@@ -567,6 +588,29 @@ export default function RunEvals() {
               </div>
 
               <div>
+                <label
+                  className="block text-xs text-[var(--color-text-muted)] uppercase tracking-wide mb-1"
+                  title="Tool adapter (evals/tools/<name>.toml). Default omits the flag — server falls back to target.default_tool (currently 'aethyme'). Pick a competitor manifest to evaluate it against the same playground."
+                >
+                  Tool
+                </label>
+                <select
+                  value={tool}
+                  onChange={(e) => setTool(e.target.value)}
+                  className={selectClass}
+                >
+                  <option value="">Default (aethyme)</option>
+                  {tools.map((t) => (
+                    <option key={t.name} value={t.name} disabled={!!t.error}>
+                      {t.display_name}
+                      {t.in_tree ? " (in-tree)" : ""}
+                      {t.error ? " — load error" : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
                 <label className="block text-xs text-[var(--color-text-muted)] uppercase tracking-wide mb-1">
                   Chau7 Window
                 </label>
@@ -658,6 +702,33 @@ export default function RunEvals() {
                 />
               </div>
             </div>
+
+            {/* Manifest methodology audit trail. Renders only when the
+                evaluator picks a non-default tool — at that point the
+                comparison crosses tool boundaries, and the [notes].condition_mapping
+                prose from the manifest is the load-bearing fairness
+                statement (Why is `graphify query` being mapped to leverage?).
+                Surface here so it's visible *before* spending. */}
+            {tool && (() => {
+              const selectedTool = tools.find((t) => t.name === tool);
+              if (!selectedTool?.condition_mapping_note) return null;
+              return (
+                <div className="mt-3 rounded border border-amber-700/40 bg-amber-950/20 p-3 text-xs">
+                  <div className="font-semibold text-amber-300 mb-1">
+                    Methodology note — {selectedTool.display_name}
+                  </div>
+                  <div className="text-amber-100/80 whitespace-pre-wrap font-mono">
+                    {selectedTool.condition_mapping_note}
+                  </div>
+                  <div className="mt-2 text-amber-200/60">
+                    From <code>evals/tools/{selectedTool.name}.toml</code> ·
+                    {" "}<code>[notes].condition_mapping</code> · the fairness audit
+                    trail mandated by manifest validation.
+                  </div>
+                </div>
+              );
+            })()}
+
             <div className="space-y-1 text-xs text-[var(--color-text-muted)]">
               <p>
                 Auto uses Chau7&apos;s active/preferred window. Pick a window ID to force eval tabs into that window.

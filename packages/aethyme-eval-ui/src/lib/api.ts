@@ -6,9 +6,17 @@ import type {
   RepositoryPreparation,
   RepositorySetupRequest,
   RepositorySetupStatus,
+  ToolInfo,
 } from "./types";
 
 const API_BASE = "/api";
+
+export async function fetchTools(): Promise<ToolInfo[]> {
+  const res = await fetch(`${API_BASE}/tools`);
+  if (!res.ok) throw new Error(`Failed to fetch tools: ${res.statusText}`);
+  const data = await res.json();
+  return data.tools ?? [];
+}
 
 export async function fetchResults(): Promise<EvalResult[]> {
   const res = await fetch(`${API_BASE}/results`);
