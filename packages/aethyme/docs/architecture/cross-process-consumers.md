@@ -43,7 +43,7 @@ consumer. This file exists so that doesn't happen again.
 | Source | Deployed to | Invokes | Failure mode if entry point removed |
 |---|---|---|---|
 | `skills/aethyme/SKILL.md` | `.claude/skills/aethyme/SKILL.md`, `.codex/skills/aethyme/SKILL.md` | Documents `aethyme explore`, `aethyme query symbol`, `aethyme graph callers/callees`, `analyze dead-code`, `facts function-usage`, `task scope/anchors`, `intents`, `task context/pack` by name | Agent reads stale guidance, runs commands that no longer exist; user sees `Error: No such command 'X'`. Caught by `verify-playground.sh` greps and `scripts/check-cross-process-contract.py` text-consumer validation. |
-| `skills/aethyme/AGENTS.md` | `AGENTS.md` managed block (deployed at repo root by `enhance.py`) | Cross-product convention file with quick-start command guidance plus compact repo routing from generated onboarding/status artifacts. Aethyme owns only the `AETHYME:BEGIN/END` block; maintainer text outside it is preserved. | Agent reads stale quick start before loading skill details. Caught by `scripts/check-cross-process-contract.py` text-consumer validation. |
+| `skills/aethyme/AGENTS.md` | fully generated `AGENTS.md` and `CLAUDE.md` (deployed at repo root by `enhance.py`) | Cross-product convention file with quick-start command guidance, compact repo routing from generated onboarding/status artifacts, and commit hygiene policy. Root files are Aethyme-owned generated artifacts; repo-specific human customizations come from `.aethyme/overrides/agents.json`. | Agent reads stale quick start before loading skill details. Caught by `scripts/check-cross-process-contract.py` text-consumer validation and `enhance verify` canonical-match checks. |
 | `skills/aethyme/aethyme-explore` | `.codex/skills/aethyme/aethyme-explore` (executable) | `exec "{{AETHYME_ROOT}}/rust/target/release/aethyme" explore "$@"` | Wrapper produces `Error: No such command 'explore'`. Class-3 failure (silent until invoked). Rebuilt 2026-05-08 to point at native; previously called `python -m src.cli explore` (deleted). |
 | `skills/aethyme/aethyme-load-context.sh` | `.claude/hooks/aethyme-load-context.sh` (executable, wired via `.claude/settings.local.json`) | Reads `AGENTS.md` + `CLAUDE.md` from `$CLAUDE_PROJECT_DIR`; emits SessionStart hook JSON. **Does NOT invoke any Aethyme entry point.** | Hook fails to inject context; agent loses the in-repo discoverability surface. |
 
@@ -51,7 +51,7 @@ consumer. This file exists so that doesn't happen again.
 
 | Source | Deploys what | Notes |
 |---|---|---|
-| `src/enhance.py:TARGETS` + managed AGENTS helper | `AGENTS.md` managed block, `CLAUDE.md`, `.claude/skills/aethyme/SKILL.md`, `.codex/skills/aethyme/SKILL.md`, `.claude/hooks/aethyme-load-context.sh`, `.claude/settings.local.json` (merge-aware) | Single canonical deploy pipeline for in-repo Aethyme discoverability. Substitutes `{{AETHYME_ROOT}}`; preserves non-Aethyme `AGENTS.md` content outside the managed block. |
+| `src/enhance.py:TARGETS` + generated root render | fully generated `AGENTS.md`, `CLAUDE.md`, `.claude/skills/aethyme/SKILL.md`, `.codex/skills/aethyme/SKILL.md`, `.claude/hooks/aethyme-load-context.sh`, `.claude/settings.local.json` (merge-aware) | Single canonical deploy pipeline for in-repo Aethyme discoverability. Substitutes `{{AETHYME_ROOT}}`; repo-specific root customization comes from `.aethyme/overrides/agents.json`; direct edits to `AGENTS.md` / `CLAUDE.md` are unsupported and flagged by `enhance verify`. |
 | `src/indexing/skills.py:deploy_skills` | `.codex/skills/<name>/*` for each runtime skill in `skills/` | Different from `enhance.py` — used by `eval/repos.py` during eval prep. As of 2026-05-08 substitutes `{{AETHYME_ROOT}}` in `.md`, `.sh`, AND the `aethyme-explore` wrapper (no extension). |
 
 ### Shell scripts in `packages/aethyme/scripts/`
@@ -89,6 +89,22 @@ onboarding artifacts.
 | `.codex/skills/aethyme/SKILL.md` | `skills/aethyme/SKILL.md` | 2026-05-08 (post-redeploy) |
 | `.codex/skills/aethyme/aethyme-explore` | `skills/aethyme/aethyme-explore` | 2026-05-08 (post-redeploy) |
 | `AGENTS.md`, `CLAUDE.md` | `skills/aethyme/AGENTS.md` | 2026-05-08 |
+
+### Phase 4+ graph indexer (parallel to legacy graph store)
+
+These entry points belong to the Phase 1–4 graph rewrite (new
+`aethyme-graph-schema`, `aethyme-graph-storage`, `aethyme-graph-indexer`
+crates). They currently run alongside the legacy SurrealDB-backed
+graph store; the cutover to making them the primary path is a future
+phase.
+
+| Entry point | Source | Wire shape that becomes a contract |
+|---|---|---|
+| `aethyme-graph-index` binary | `crates/aethyme-graph-indexer/src/bin/aethyme-graph-index.rs` | `--repo-root`, `--repo-name`, `--engine-version`, `--skip-bootstrap`, `--max-file-size`, `--extra-ignore`, `--json` argv surface; text/JSON summary stdout; nonzero exit on failure. Eval harnesses, CI gates, and downstream scripts depend on this shape. |
+| Per-file binary fragments at `<repo>/.aethyme/graph/<source>.bin` | Produced by `aethyme-graph-storage::write_fragment` | Bincode 1 of `Fragment { file_path, schema_version=1, nodes, edges }`. Tagged-enum `EdgeAttributes` uses serde's *externally tagged* form (Phase 2.1 decision); changing it is a forever-format break. |
+| Per-module NDJSON shards at `<repo>/.aethyme/graph/_index/<module>.ndjson` | Produced by `aethyme-graph-storage::write_index_shard` | One `SymbolRecord` per line: `{module, symbol, kind, node_id, file}`. Sorted canonically. `merge=union` git attribute relies on the line-based form. |
+| `<repo>/.aethyme/engine-version` | Produced by `aethyme-graph-storage::bootstrap_repo` | Plain text, single line, no padding. CI's parser-version-drift check reads this; downgrading or empty-on-trim is an error. |
+| `<repo>/.aethyme/graph/.gitattributes` | Constant `aethyme_graph_storage::GITATTRIBUTES_CONTENT` | Two rules: `**/*.bin linguist-generated=true binary` and `_index/**/*.ndjson linguist-generated=true merge=union`. Git itself is the cross-process consumer. |
 
 ## Migration checklist
 

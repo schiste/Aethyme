@@ -9,6 +9,17 @@ license = "UNLICENSED"
 name = "aethyme_graph_indexer"
 path = "src/lib.rs"
 
+# The `aethyme-graph-index` CLI binary (Phase 4.1). Wraps the
+# library's index_repo_to_disk in a clap-driven command-line
+# interface so the indexer can be invoked from shells, CI, eval
+# harnesses, and the existing Aethyme engine. Separate binary
+# (rather than a subcommand of aethyme-engine-cli) so the
+# indexer's deps don't bloat the engine until the engine starts
+# actually querying the new fragments (later in Phase 4).
+[[bin]]
+name = "aethyme-graph-index"
+path = "src/bin/aethyme-graph-index.rs"
+
 [dependencies]
 # Types this indexer produces (the schema crate is the contract).
 aethyme-graph-schema = { path = "../aethyme-graph-schema" }
@@ -92,6 +103,11 @@ ra_ap_syntax = "=0.0.331"
 # 0.23.11 is compatible with tree-sitter 0.25.
 tree-sitter = "0.25"
 tree-sitter-php = "=0.23.11"
+
+# clap for the aethyme-graph-index CLI (Phase 4.1). v4 with
+# derive macros — keeps the subcommand-and-arg surface declarative
+# and the binary's source readable.
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
