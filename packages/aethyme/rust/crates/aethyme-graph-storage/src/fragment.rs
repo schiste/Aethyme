@@ -47,11 +47,19 @@ impl Fragment {
 
     /// Construct a Fragment, canonicalizing the inputs.
     ///
-    /// Nodes are sorted by `id`; edges are sorted by
-    /// `(src_id, dst_id, kind_discriminant)`. Duplicate node IDs
-    /// or duplicate `(src_id, dst_id, kind)` edges return errors —
-    /// a fragment must have a unique representation per logical
-    /// content.
+    /// Nodes are sorted by `id` and deduplicated (first occurrence
+    /// in canonical order wins). Edges are sorted by
+    /// `(src_id, dst_id, kind_discriminant)` and deduplicated the
+    /// same way.
+    ///
+    /// Silent deduplication (rather than erroring on duplicates)
+    /// matches the indexer's real-world output: Python `@overload`
+    /// definitions, conditional-branch `def foo` patterns, and TS
+    /// declaration merging all produce multiple AST nodes that
+    /// hash to the same NodeId. The "right" answer is one node per
+    /// NodeId; the indexer doesn't always know it's emitting
+    /// duplicates and shouldn't have to. The first one in
+    /// canonical sort order wins.
     pub fn new(
         file_path: &str,
         mut nodes: Vec<Node>,
@@ -61,18 +69,16 @@ impl Fragment {
             return Err(FragmentBuildError::EmptyFilePath);
         }
 
-        // Sort nodes by id for canonical order.
+        // Sort nodes by id, then dedup adjacent duplicates (the
+        // sort puts all entries with the same id consecutively).
         nodes.sort_by(|a, b| a.id().as_str().cmp(b.id().as_str()));
-        // Detect duplicate node ids.
-        for w in nodes.windows(2) {
-            if w[0].id() == w[1].id() {
-                return Err(FragmentBuildError::DuplicateNodeId {
-                    id: w[0].id().clone(),
-                });
-            }
-        }
+        nodes.dedup_by(|a, b| a.id() == b.id());
 
-        // Sort edges by (src_id, dst_id, kind).
+        // Sort edges by (src_id, dst_id, kind), then dedup the
+        // same way. Multi-edges (same logical edge from multiple
+        // call sites) collapse to one Edge with sites[] upstream
+        // of this layer; duplicates here are typically the
+        // dedup-of-overloads pattern that mirrors the node case.
         edges.sort_by(|a, b| {
             a.src_id()
                 .as_str()
@@ -80,21 +86,11 @@ impl Fragment {
                 .then_with(|| a.dst_id().as_str().cmp(b.dst_id().as_str()))
                 .then_with(|| (a.kind() as u8).cmp(&(b.kind() as u8)))
         });
-        // Detect duplicate (src, dst, kind) edges. Multi-edges
-        // (same (src,dst,kind) appearing from multiple call sites)
-        // must be collapsed into one Edge with sites[] before
-        // reaching here.
-        for w in edges.windows(2) {
-            if w[0].src_id() == w[1].src_id()
-                && w[0].dst_id() == w[1].dst_id()
-                && w[0].kind() == w[1].kind()
-            {
-                return Err(FragmentBuildError::DuplicateEdge {
-                    src: w[0].src_id().clone(),
-                    dst: w[0].dst_id().clone(),
-                });
-            }
-        }
+        edges.dedup_by(|a, b| {
+            a.src_id() == b.src_id()
+                && a.dst_id() == b.dst_id()
+                && a.kind() == b.kind()
+        });
 
         Ok(Fragment {
             file_path: file_path.into(),

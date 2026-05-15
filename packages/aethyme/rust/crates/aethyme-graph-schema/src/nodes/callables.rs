@@ -180,7 +180,20 @@ impl Method {
         if file_path.is_empty() {
             return Err(MethodConstructionError::EmptyFilePath);
         }
-        let id = NodeId::new(NodeKind::Method, repo, file_path, name)
+        // Fold the receiver_type's hash suffix into the symbol name
+        // before NodeId hashing. Without this, two methods with the
+        // same name on different classes/structs/traits in the same
+        // file (e.g. `__init__` on multiple classes, `new` on
+        // multiple structs) would produce identical NodeIds, which
+        // would be a correctness bug: the methods ARE distinct
+        // nodes. The receiver's hash suffix is a stable component
+        // of its NodeId, so it adds no instability the receiver
+        // didn't already have.
+        let symbol_name = format!(
+            "{name}#receiver:{}",
+            receiver_type.hash_suffix(),
+        );
+        let id = NodeId::new(NodeKind::Method, repo, file_path, &symbol_name)
             .map_err(MethodConstructionError::Id)?;
         Ok(Method {
             id,

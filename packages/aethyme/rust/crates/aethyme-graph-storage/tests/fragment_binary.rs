@@ -64,15 +64,19 @@ fn fragment_rejects_empty_file_path() {
 }
 
 #[test]
-fn fragment_rejects_duplicate_node_ids() {
+fn fragment_dedupes_duplicate_node_ids_silently() {
+    // The pre-fix behavior was an error on duplicates. The real-
+    // world Python @overload pattern produces multiple AST nodes
+    // that hash to the same NodeId; the indexer doesn't always
+    // know in advance, so Fragment silently keeps the first.
     let f = sample_function();
     let nodes = vec![Node::Function(f.clone()), Node::Function(f.clone())];
-    let err = Fragment::new("src/cli.py", nodes, vec![]).unwrap_err();
-    assert!(matches!(err, FragmentBuildError::DuplicateNodeId { .. }));
+    let frag = Fragment::new("src/cli.py", nodes, vec![]).unwrap();
+    assert_eq!(frag.node_count(), 1);
 }
 
 #[test]
-fn fragment_rejects_duplicate_edges() {
+fn fragment_dedupes_duplicate_edges_silently() {
     let f = sample_function();
     let c = sample_class();
     use aethyme_graph_schema::Callable;
@@ -81,8 +85,8 @@ fn fragment_rejects_duplicate_edges() {
         sample_call_edge(f.id().clone(), c.id().clone()),
     ];
     let nodes = vec![Node::Function(f), Node::Class(c)];
-    let err = Fragment::new("src/cli.py", nodes, edges).unwrap_err();
-    assert!(matches!(err, FragmentBuildError::DuplicateEdge { .. }));
+    let frag = Fragment::new("src/cli.py", nodes, edges).unwrap();
+    assert_eq!(frag.edge_count(), 1);
 }
 
 // ─── Canonical ordering ─────────────────────────────────────────────
