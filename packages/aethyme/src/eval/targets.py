@@ -27,6 +27,10 @@ class EvalTarget:
     setup_commit: str | None = None
     setup_control_dir_name: str | None = None
     setup_aethyme_dir_name: str | None = None
+    # Default tool for this target's "tool-using" conditions. Override at
+    # the CLI with --tool to swap in a competitor (e.g. graphify). The
+    # tool name must match a manifest under evals/tools/<name>.toml.
+    default_tool: str = "aethyme"
 
     def validate(self) -> list[str]:
         """Return validation error strings.  Empty list means valid."""

@@ -1,0 +1,113 @@
+# Graphify tool manifest.
+#
+# Source: https://github.com/safishamsi/graphify (MIT)
+#
+# Graphify converts repositories into a queryable knowledge graph via tree-sitter
+# AST parsing for code and (optional) LLM-driven extraction for docs/PDFs. It
+# ships its own Claude Code skill installer, so the explore condition relies on
+# Graphify's authors' chosen framing rather than an evaluator-authored SKILL.md.
+
+name = "graphify"
+display_name = "Graphify"
+homepage = "https://github.com/safishamsi/graphify"
+
+[source]
+git = "https://github.com/safishamsi/graphify.git"
+ref = "main"                     # TODO: pin to SHA after first smoke-test run
+
+[install]
+# Tool-level setup: install graphify via pipx (isolates from system Python).
+# CLI command is `graphify`; PyPI package is `graphifyy` (double-y).
+# Run once per eval run.
+commands = [
+    "pipx install graphifyy",
+]
+
+[register]
+# Per-clone setup: register graphify's Claude Code skill in the target repo.
+# This is what gives the explore condition its discoverability surface.
+# Run once per target-clone (i.e. once per tool-using condition).
+commands = [
+    "graphify install --claude --workdir {{TARGET_REPO}}",
+]
+
+[version]
+command = "graphify --version"
+
+[warm]
+# Pre-build the knowledge graph once before eval start. This is the analog of
+# Aethyme's daemon-warming step: the first `graphify query` would otherwise eat
+# graph-construction cost on the critical path.
+command = "graphify . --cluster-only"
+workdir = "{{TARGET_REPO}}"
+
+# ─── EXPLORE: discoverability ─────────────────────────────────────────────
+#
+# graphify ships its own Claude Code skill registration; we invoke it during
+# the per-target-clone install step (below) so the agent encounters the skill
+# natively, framed in graphify's authors' words.
+
+[conditions.explore]
+strategy = "tool_self_install"
+# graphify install --claude is invoked per-clone in [install_per_clone].
+# No prompt addendum: agent discovers via Claude Code's skill system.
+
+# ─── LEVERAGE: tool output pre-computed once, pasted into prompt ──────────
+[conditions.leverage]
+command = "graphify . --report-only"
+workdir = "{{TARGET_REPO}}"
+output_artifact = "{{TARGET_REPO}}/GRAPH_REPORT.md"
+output_format = "markdown"
+prompt_header = """Use the following Graphify-generated knowledge graph summary as context for the task.
+
+"""
+
+# ─── TASK-CONDITIONED: per-task graph query ───────────────────────────────
+[conditions.task_conditioned]
+command = "graphify query {{TASK_SHELL_ESCAPED}} --budget 1500"
+workdir = "{{TARGET_REPO}}"
+output_format = "json"
+prompt_header = """Graphify task-specific context (`graphify query <task>` output):
+
+"""
+
+# ─── Methodology audit trail ──────────────────────────────────────────────
+[notes]
+condition_mapping = """
+Graphify maps cleanly to all three tool-using conditions:
+
+- explore: uses graphify's own `graphify install --claude` rather than a
+  hand-authored SKILL.md. The tool presents itself with its authors'
+  chosen framing — the evaluator does not paraphrase Graphify's capabilities.
+  Fairness lever: SKILL.md content is bounded by Graphify's own design,
+  identical to how Aethyme's explore condition uses Aethyme's own SKILL.md.
+
+- leverage: `graphify . --report-only` produces GRAPH_REPORT.md, which is
+  pasted verbatim into the prompt. This is structurally analogous to
+  Aethyme's scope-view summary in the leverage condition: a static,
+  task-blind repository overview produced by the tool.
+
+- task_conditioned: `graphify query "<task>"` is structurally identical to
+  `aethyme explore --request "<task>"` — a per-task graph query that
+  returns task-relevant nodes and edges. Output is JSON; the prompt header
+  signals this so agents parse appropriately.
+
+Caveats and known asymmetries:
+
+1. Graphify's docs/PDFs extraction uses an external LLM (Anthropic / OpenAI
+   per its config). For the GRC and MediaWiki target repos this is largely
+   a no-op (code-only files), but any docs/markdown in the target will
+   trigger API calls. These costs are NOT included in eval cost metrics —
+   they accrue to Graphify-the-tool, not the agent under test. The
+   eval-runs report should call this out separately as a footnote.
+
+2. Graphify exposes an MCP stdio server (`query_graph`, `get_node`, etc.).
+   This eval uses the CLI surface only, to keep the comparison
+   apples-to-apples with Aethyme's CLI-first design. A future eval round
+   could add an "MCP-leverage" condition for both tools symmetrically.
+
+3. graphify's `--budget 1500` token limit on queries was chosen to roughly
+   match Aethyme's typical task-context payload size. Different budgets
+   would shift cost/quality trade-offs in either direction; documenting
+   the chosen budget here is part of the methodology audit trail.
+"""

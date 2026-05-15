@@ -2,8 +2,8 @@
 
 Creates 5 independent ``git clone --local`` copies of a source repo so each
 benchmark condition operates on a pristine copy. Control conditions get no
-``.codex/`` directory; explore/leverage/task-conditioned get the Aethyme skill
-deployed.
+``.codex/`` directory; explore/leverage/task-conditioned get the configured
+tool installed via its :class:`ToolAdapter`.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 
 from ..indexing.skills import AETHYME_PACKAGE_ROOT, deploy_skills
+from .tools import ToolAdapter
 
 CONDITION_NAMES = (
     "control-cto-off",
@@ -36,13 +37,18 @@ def create_condition_repos(
     source: Path,
     dest_dir: Path,
     *,
+    tool: ToolAdapter | None = None,
     aethyme_root: Path | None = None,
     install_deps: bool = True,
 ) -> dict[str, Path]:
     """Clone *source* once per condition into *dest_dir*.
 
     Uses ``git clone --local`` for speed (hard links on same filesystem).
-    Deploys the Aethyme skill to explore/leverage/task-conditioned clones.
+    Installs the configured tool into explore/leverage/task-conditioned
+    clones via the supplied :class:`ToolAdapter`. When ``tool`` is None,
+    falls back to the legacy direct ``deploy_skills()`` path for
+    backward compatibility (existing aethyme evals).
+
     When *install_deps* is True (default), runs ``pnpm install --frozen-lockfile``
     in each clone so node_modules is available for vitest.
 
@@ -70,7 +76,12 @@ def create_condition_repos(
         )
 
         if cond in AETHYME_CONDITIONS:
-            deploy_aethyme_skill(clone_path, aethyme_root)
+            if tool is not None:
+                tool.install(clone_path)
+            else:
+                # Legacy path — preserved so unchanged eval scripts still
+                # behave identically (cardinal rule: no output drift).
+                deploy_aethyme_skill(clone_path, aethyme_root)
 
         repos[cond] = clone_path
 

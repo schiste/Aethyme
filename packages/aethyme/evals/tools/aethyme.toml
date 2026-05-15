@@ -1,0 +1,123 @@
+# Aethyme tool manifest.
+#
+# Aethyme is the in-tree tool — the eval framework runs from inside this
+# repo, so `source.in_tree = true` skips cloning and resolves {{TOOL_ROOT}}
+# to the package root.
+#
+# This manifest is the methodological declaration that Aethyme is evaluated
+# under the same protocol as every other tool: same conditions, same
+# install/register/warm/query lifecycle, same prompt-addendum shape. The
+# only privilege Aethyme retains from being in-tree is "no git clone."
+
+name = "aethyme"
+display_name = "Aethyme"
+homepage = "https://github.com/aethyme/aethyme"
+
+[source]
+in_tree = true                   # this repo IS the tool; no clone
+
+[install]
+# No tool-level install — Aethyme's venv is presumed to exist (the
+# eval orchestrator runs inside it). Smoke-tested via the [version]
+# command below; missing venv surfaces there.
+commands = []
+
+[register]
+# Deploy Aethyme's runtime skill into the target repo. This is the
+# direct CLI-level equivalent of `deploy_skills()` (the Python function
+# currently called from src/eval/repos.py); routing through the CLI
+# keeps Aethyme on the same per-target-clone register path as Graphify.
+commands = [
+    "{{TOOL_ROOT}}/.venv/bin/python -m src.cli repo deploy-skills --force {{TARGET_REPO}}",
+]
+
+[version]
+# Aethyme's CLI has no --version flag (uses git SHA for run-metadata identity);
+# matches what the orchestrator's `aethyme_commit` field already records.
+command = "git rev-parse HEAD"
+
+[warm]
+# Warm the engine daemon against the target repo. Without this, the
+# first task-conditioned query eats daemon spin-up cost on the
+# critical path (see project_native_explore_parity_2026_05_07 memory).
+#
+# Shell sequence: short-circuit if the daemon is already running for
+# this repo; otherwise spawn it and poll the log until 'listening on'
+# appears. The legacy hardcoded warm phase used the same sequence; we
+# preserve it byte-for-byte to keep `--tool aethyme` runs reproducible.
+#
+# NOTE on quoting: {{TOOL_ROOT}} and {{TARGET_REPO}} expand to filesystem
+# paths that MAY contain spaces (e.g. "Mediawiki - Aethyme"). The warm
+# phase is executed by the orchestrating runner via shell, NOT via the
+# manifest adapter's quote-aware _substitute path, so each placeholder
+# is wrapped in double-quotes explicitly in the TOML. Without these
+# quotes, "Mediawiki - Aethyme" splits into three shell tokens and the
+# --repo flag breaks. The legacy hardcoded warm phase had the same
+# quoting; preserving it here keeps behavior identical.
+command = """"{{TOOL_ROOT}}/rust/target/release/aethyme-engine-cli" daemon status --repo "{{TARGET_REPO}}" || ("{{TOOL_ROOT}}/rust/target/release/aethyme-engine-cli" daemon start --repo "{{TARGET_REPO}}" && while ! tail -1 "{{TARGET_REPO}}/.aethyme/engine-daemon.log" 2>/dev/null | grep -q 'listening on'; do sleep 5; done)"""
+
+# ─── EXPLORE: discoverability via deployed skill ──────────────────────
+#
+# The [register] block above drops .codex/skills/aethyme/SKILL.md into
+# the target repo. Agent encounters it via Claude Code's skill system.
+# Same discovery surface as Graphify; same fairness contract.
+
+[conditions.explore]
+strategy = "tool_self_install"
+
+# ─── LEVERAGE: pre-computed task pack, pasted into prompt ─────────────
+[conditions.leverage]
+# `task pack` returns anchors/scope/relationships (no file contents).
+# Output is JSON; prompt header signals that to the agent.
+# workdir is the package root (default for in-tree tools) because
+# `python -m src.cli` needs the src/ package on the import path.
+# The --repo flag tells the CLI which repo to operate on.
+command = "{{TOOL_ROOT}}/.venv/bin/python -m src.cli task pack --repo {{TARGET_REPO}} --task {{TASK_SHELL_ESCAPED}} --json-output"
+output_format = "json"
+prompt_header = """Aethyme navigation context (`aethyme task pack` output, JSON):
+
+"""
+
+# ─── TASK-CONDITIONED: task pack + file contents (single-call nav) ────
+[conditions.task_conditioned]
+# `task context` is `task pack` plus file contents within a byte budget.
+# Larger payload than leverage — designed for direct task execution
+# without further tool calls. 40k content budget matches bug_fix.py's
+# current _build_navigation_context() call.
+command = "{{TOOL_ROOT}}/.venv/bin/python -m src.cli task context --repo {{TARGET_REPO}} --task {{TASK_SHELL_ESCAPED}} --content-budget 40000 --json-output"
+output_format = "json"
+prompt_header = """Aethyme task-conditioned context (`aethyme task context` output, JSON, includes file bodies):
+
+"""
+
+[notes]
+condition_mapping = """
+Aethyme is the in-tree tool, but is evaluated under the same protocol as
+every external tool:
+
+- explore: `aethyme repo deploy-skills` (run via [register]) drops the
+  same .codex/skills/aethyme/SKILL.md the prior eval flow used. No
+  prompt addendum — agent discovers via Claude Code's skill system.
+  Symmetric with Graphify's `graphify install --claude`.
+
+- leverage: `aethyme task pack` produces a task-aware navigation
+  scaffold (anchors, scope, relationships) without file bodies. JSON
+  output is pasted into the prompt verbatim, analogous to how the prior
+  flow's _build_navigation_context() built the same payload via Python
+  function calls. Migration is a transport change (Python → CLI), not
+  a semantic change.
+
+- task_conditioned: `aethyme task context` extends `task pack` with
+  inlined file contents within a 40k byte budget. This matches the
+  budget passed to build_task_context() in the prior bug_fix flow.
+
+Reason for migrating from Python function calls to CLI shell-outs:
+methodological symmetry. As long as Aethyme's eval integration was a
+Python function call and competitors' was a shell command, the
+framework gave Aethyme one less subprocess boundary (and thus a small
+unmeasured cost advantage). The CLI route equalizes the boundary cost.
+
+Reproducibility: pin via git SHA of the host repo (no [source].ref
+applies for in_tree tools). Run metadata's `aethyme_commit` field
+already captures this; no change needed.
+"""
