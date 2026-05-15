@@ -1,2 +1,0 @@
-**/*.bin linguist-generated=true binary
-_index/**/*.ndjson linguist-generated=true merge=union

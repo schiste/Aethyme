@@ -91,15 +91,21 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    if !cli.skip_bootstrap {
-        bootstrap_repo(&cli.repo_root, &cli.engine_version)?;
-    }
-
+    // Validate the context FIRST so a bad --repo-root (relative
+    // path, empty repo_name, etc.) doesn't cause bootstrap_repo to
+    // create directories at unexpected locations before bailing.
+    // The 2026-05-15 fix: previously bootstrap ran first, and a
+    // relative repo-root would create `relative/<path>/.aethyme/`
+    // under the CWD before the IndexerContext::new error surfaced.
     let ctx = IndexerContext::new(
         &cli.repo_name,
         cli.repo_root.clone(),
         &cli.engine_version,
     )?;
+
+    if !cli.skip_bootstrap {
+        bootstrap_repo(ctx.repo_root(), &cli.engine_version)?;
+    }
 
     let options = WalkOptions {
         extra_ignore_dirs: cli.extra_ignore.clone(),
