@@ -434,12 +434,18 @@ def generate_run_plan(
     scenario: str | None = None,
     reasoning: str = "default",
     dest_dir: str | None = None,
+    tool: str | None = None,
 ) -> dict[str, Any]:
     """Generate a complete eval run plan.
 
     PURE FUNCTION — no side effects, no Chau7 calls, no file writes.
     Returns a structured dict that the orchestrating agent (Claude)
     runs mechanically via Chau7 MCP.
+
+    ``tool`` selects which tool adapter populates the explore / leverage /
+    task-conditioned conditions. Defaults to the target's ``default_tool``
+    (currently always ``"aethyme"``), which preserves existing eval output.
+    Pass ``tool="graphify"`` to swap in a competitor manifest.
     """
     if eval_type not in _EVAL_TYPE_DEFAULTS:
         raise ValueError(
@@ -449,11 +455,45 @@ def generate_run_plan(
 
     eval_target = get_target(target)
     model_config = get_model(model, reasoning)
+    tool_name = tool or eval_target.default_tool
+
+    # Resolve the adapter early so manifest validation errors surface
+    # before any phase work happens. Imported here (not module-level) to
+    # avoid an import cycle with src.eval.tools, which depends on
+    # src.eval.targets via the registry's default lookup.
+    from .tools import get_adapter
+    tool_adapter = get_adapter(tool_name)
 
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
-    slug = f"{eval_target.name}-{eval_type}"
+
+    # Run-dir naming contract:
+    #
+    #   {timestamp}-{target}-[{scenario}-]{eval-type}-{model}[-{reasoning}][-{tool}]
+    #
+    # Each segment beyond timestamp+target+eval-type is included only when it
+    # adds discrimination value:
+    #   - `scenario`: present for bug-fix's cross-package variant; preserves
+    #     the prior naming convention exactly when scenario is set.
+    #   - `model`: ALWAYS present so eval-runs/ is greppable by model.
+    #   - `reasoning`: omitted when default; appended otherwise.
+    #   - `tool`: omitted when aethyme (the historical default — keeps existing
+    #     run names interpretable); appended when a competitor manifest is in use.
+    #
+    # Examples this generates:
+    #   20260515T055924-mediawiki-dead-code-haiku
+    #   20260515T155500-mediawiki-dead-code-haiku-low
+    #   20260515T155500-grc-bug-fix-haiku-graphify
+    #   20260515T155500-grc-cross-package-bug-fix-gpt-5.4-high-graphify
+    slug_parts: list[str] = [eval_target.name]
     if scenario:
-        slug = f"{eval_target.name}-{scenario}-{eval_type}"
+        slug_parts.append(scenario)
+    slug_parts.append(eval_type)
+    slug_parts.append(model_config.name)
+    if reasoning != "default":
+        slug_parts.append(reasoning)
+    if tool_name != "aethyme":
+        slug_parts.append(tool_name)
+    slug = "-".join(slug_parts)
 
     # Default dest_dir for bug-fix clones
     if eval_type == "bug-fix" and dest_dir is None:
@@ -473,6 +513,10 @@ def generate_run_plan(
         "model": model_config.to_dict(),
         "aethyme_commit": get_aethyme_commit(),
         "aethyme_root": _AETHYME_PKG,
+        "tool": tool_name,
+        "tool_display": tool_adapter.display_name,
+        "tool_manifest_notes": tool_adapter.manifest.condition_mapping_note
+            if hasattr(tool_adapter, "manifest") else "",
         "timestamp": datetime.now(UTC).isoformat(),
         "conditions": [c.name for c in active_conditions_for(eval_type)],
         # Comparison contract — propagated into the report header so a
@@ -484,8 +528,8 @@ def generate_run_plan(
 
     phases = [
         _build_validate_phase(eval_target),
-        _build_prepare_phase(eval_type, eval_target, scenario, dest_dir, paths),
-        _build_warm_phase(eval_target),
+        _build_prepare_phase(eval_type, eval_target, scenario, dest_dir, paths, tool_name),
+        _build_warm_phase(eval_target, tool_adapter),
         _build_launch_phase(eval_type, eval_target, model_config, dest_dir, paths),
         _build_monitor_phase(),
         _build_collect_phase(eval_type, model_config, paths),
@@ -596,21 +640,79 @@ def _build_validate_phase(target: EvalTarget) -> dict[str, Any]:
     }
 
 
-def _build_warm_phase(target: EvalTarget) -> dict[str, Any]:
-    """Pre-warm the engine daemon for the target's Aethyme repo.
+def _build_warm_phase(target: EvalTarget, tool_adapter: Any = None) -> dict[str, Any]:
+    """Pre-warm the configured tool against the target's repo.
 
     Cold start on MediaWiki is ~108s map_build + ~16s signals (measured
-    2026-05-07). If the daemon isn't pre-warmed, the leverage condition's
-    first `aethyme explore` call eats that cost serially. Warming before
-    `launch` makes per-condition timing comparable.
+    2026-05-07). If the tool isn't pre-warmed, the leverage condition's
+    first call eats that cost serially. Warming before `launch` makes
+    per-condition timing comparable.
 
     For small repos (e.g. Mockup, ~7K files) cold start is ~6s, but the
     phase is cheap to run and keeps the contract uniform across targets.
 
-    Phase shape mirrors `prepare` and `monitor`: structured fields the
-    runner executes. The `cli_cmd` is the canonical shell sequence; the
-    `wait_for` field tells the runner what to grep for in the log.
+    Reads ``[warm].command`` from the tool's manifest when an adapter is
+    supplied; falls back to the legacy hardcoded Aethyme daemon path when
+    ``tool_adapter`` is None (preserves existing plan output for callers
+    that haven't migrated yet).
     """
+    # Adapter-driven path (post-migration).
+    if tool_adapter is not None and getattr(tool_adapter, "manifest", None) is not None:
+        manifest = tool_adapter.manifest
+        if manifest.warm_command is not None:
+            tool_root = str(tool_adapter.tool_root)
+            target_repo = str(target.aethyme_path)
+            cli_cmd = (
+                manifest.warm_command.command
+                .replace("{{TOOL_ROOT}}", tool_root)
+                .replace("{{TARGET_REPO}}", target_repo)
+            )
+            phase: dict[str, Any] = {
+                "name": "warm",
+                "description": (
+                    f"Pre-warm {manifest.display_name} against "
+                    f"{target.display_name} so leverage condition doesn't eat "
+                    f"cold-start cost"
+                ),
+                "tool": manifest.name,
+                "tool_root": tool_root,
+                "target_repo": target_repo,
+                "cli_cmd": cli_cmd,
+                "wait_for": "listening on" if manifest.name == "aethyme" else None,
+                "max_wait_seconds": 240,
+                "instructions": (
+                    f"Run the cli_cmd to warm {manifest.display_name}'s "
+                    f"caches/indexes against {target.display_name}. The "
+                    f"command should be idempotent."
+                ),
+            }
+            # Legacy field projection for tool=aethyme so tests written
+            # against the pre-manifest warm phase continue to pass. New
+            # tests should consult cli_cmd directly; these fields are
+            # transitional and removable once test_eval_warm_phase.py is
+            # rewritten in a follow-up to inspect cli_cmd content.
+            if manifest.name == "aethyme":
+                engine_bin = str(
+                    PROJECT_ROOT / "rust" / "target" / "release" / "aethyme-engine-cli"
+                )
+                phase["engine_bin"] = engine_bin
+                phase["aethyme_repo"] = target_repo
+                phase["log_path"] = str(target.aethyme_path / ".aethyme" / "engine-daemon.log")
+            return phase
+        # Tool has no [warm] block — emit a no-op phase rather than dropping
+        # it entirely, so the plan's phase count stays stable across tools.
+        return {
+            "name": "warm",
+            "description": f"No warm step for {manifest.display_name}",
+            "tool": manifest.name,
+            "cli_cmd": ":",   # shell no-op
+            "wait_for": None,
+            "max_wait_seconds": 1,
+            "instructions": "This tool's manifest declares no [warm] block; skip.",
+        }
+
+    # Legacy path — preserved for callers that don't pass an adapter.
+    # Behavior identical to the pre-manifest plan output.
     engine_bin = str(
         PROJECT_ROOT / "rust" / "target" / "release" / "aethyme-engine-cli"
     )
@@ -656,10 +758,27 @@ def _build_prepare_phase(
     scenario: str | None,
     dest_dir: str | None,
     paths: dict[str, Any],
+    tool_name: str | None = None,
 ) -> dict[str, Any]:
-    """Build the artifact generation phase."""
+    """Build the artifact generation phase.
+
+    When ``tool_name`` is supplied (e.g. "aethyme", "graphify"), it is
+    injected into the emitted cli_cmd as a ``--tool`` flag. The
+    receiving CLI subcommand loads the matching adapter and routes
+    leverage-data generation through it. ``tool_name=None`` keeps the
+    legacy direct-Python path active, preserving byte-identical output
+    for callers that don't yet plumb --tool.
+
+    Tool-using adapter integration is currently supported for
+    ``bug-fix``, ``explain-repo``, and ``navigation-ctf``. Diagnostic
+    eval types (``bug-fix-1``, ``dead-code``, etc.) use the
+    ``prompts_writer`` flow which produces text prompts only — no
+    tool-mediated leverage data. We emit a soft warning in cli_cmd
+    description when --tool is set for a tool-unsupported eval.
+    """
     venv = paths["venv_python"]
     pkg = paths["aethyme_root"]
+    tool_flag = f" --tool {tool_name}" if tool_name else ""
 
     if eval_type == "bug-fix":
         scenario_flag = f" --scenario {scenario}" if scenario else ""
@@ -677,6 +796,7 @@ def _build_prepare_phase(
             f" --dest '{dest_dir}'"
             f"{scenario_flag}"
             f"{alt_flag}"
+            f"{tool_flag}"
             f" --json-output"
         )
         description = (
@@ -704,10 +824,16 @@ def _build_prepare_phase(
             f" {prompt_args}"
         )
         description = f"Generate {eval_type} prompts + schema for {target.display_name}"
+        if tool_name and tool_name != "aethyme":
+            description += (
+                f" (WARNING: --tool {tool_name!r} ignored for {eval_type} — "
+                f"diagnostic evals use prompts_writer which has no tool surface yet)"
+            )
     elif eval_type == "explain-repo":
         cli_cmd = (
             f"cd {pkg} && {venv} -m src.cli eval explain-repo"
             f" --repo '{target.aethyme_path}'"
+            f"{tool_flag}"
             f" --json-output"
         )
         description = f"Generate explain-repo artifacts for {target.display_name}"
@@ -715,6 +841,7 @@ def _build_prepare_phase(
         cli_cmd = (
             f"cd {pkg} && {venv} -m src.cli eval navigation-ctf"
             f" --repo '{target.aethyme_path}'"
+            f"{tool_flag}"
             f" --json-output"
         )
         description = f"Generate navigation-ctf artifacts for {target.display_name}"

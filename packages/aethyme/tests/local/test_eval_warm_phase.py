@@ -79,6 +79,38 @@ def test_warm_cli_cmd_short_circuits_when_daemon_running():
     assert "listening on" in cmd, "cli_cmd should grep for listening marker"
 
 
+@pytest.mark.parametrize("eval_type,target", [("bug-fix", "grc"), ("bug-fix-1", "mediawiki")])
+def test_warm_cli_cmd_quotes_paths_with_spaces(eval_type: str, target: str):
+    """Regression: warm cli_cmd must shell-quote paths to handle spaces.
+
+    Both target playgrounds have a space in their tool-variant path
+    name ("Mockup - Aethyme", "Mediawiki - Aethyme"). The cli_cmd is
+    fed to a shell; without quotes, the path splits across the space
+    and the ``--repo`` value gets truncated.
+
+    The adapter-driven warm phase generator does manual placeholder
+    substitution (NOT the quote-aware ``_substitute`` path the adapter
+    uses for ``run_condition``). It relies on the manifest TOML
+    wrapping ``{{TOOL_ROOT}}`` / ``{{TARGET_REPO}}`` in double-quotes.
+    This test pins that contract so a future TOML edit can't silently
+    re-introduce the bug observed during the dead-code mediawiki
+    smoke-test.
+    """
+    plan = _plan(eval_type, target)
+    warm = next(ph for ph in plan["phases"] if ph["name"] == "warm")
+    cmd = warm["cli_cmd"]
+    repo_path = warm.get("aethyme_repo") or warm.get("target_repo")
+    assert repo_path is not None, f"warm phase missing repo path field for {target}"
+    quoted_double = f'"{repo_path}"'
+    quoted_single = f"'{repo_path}'"
+    assert (quoted_double in cmd) or (quoted_single in cmd), (
+        f"warm cli_cmd for target={target!r} does not shell-quote the "
+        f"repo path {repo_path!r}. Path contains a space — unquoted "
+        f"occurrence will break the shell command. The manifest's "
+        f"[warm].command must wrap {{TARGET_REPO}} in quotes."
+    )
+
+
 @pytest.mark.parametrize(
     "eval_type,target",
     [

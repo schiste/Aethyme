@@ -1973,6 +1973,17 @@ def eval() -> None:
     default=None,
     help="Override dest dir for bug-fix clones",
 )
+@click.option(
+    "--tool",
+    "tool_name",
+    default=None,
+    help=(
+        "Tool to evaluate (matches evals/tools/<name>.toml). Defaults to the "
+        "target's default_tool, which is 'aethyme' today. Pass a competitor "
+        "name (e.g. 'graphify') to swap in a different tool's explore / "
+        "leverage / task-conditioned implementation."
+    ),
+)
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON plan")
 def eval_run(
     eval_type: str,
@@ -1981,6 +1992,7 @@ def eval_run(
     scenario: str | None,
     reasoning: str,
     dest_dir: Path | None,
+    tool_name: str | None,
     json_output: bool,
 ) -> None:
     """Generate a complete eval run plan for Chau7 MCP execution."""
@@ -1992,6 +2004,7 @@ def eval_run(
         model=model,
         scenario=scenario,
         reasoning=reasoning,
+        tool=tool_name,
         dest_dir=str(dest_dir) if dest_dir else None,
     )
 
@@ -2002,6 +2015,7 @@ def eval_run(
     meta = plan["meta"]
     click.echo(f"Eval Type:  {meta['eval_type']}")
     click.echo(f"Target:     {meta['target_display']}")
+    click.echo(f"Tool:       {meta.get('tool_display', meta.get('tool', 'aethyme'))}")
     click.echo(f"Model:      {meta['model']['name']} ({meta['model']['provider']})")
     click.echo(f"Backend:    {meta['model']['backend']}")
     click.echo(f"Conditions: {', '.join(meta['conditions'])}")
@@ -2109,11 +2123,23 @@ def _resolve_legacy_cmd_aliases(
     show_default=True,
     help="Task description",
 )
+@click.option(
+    "--tool",
+    "tool_name",
+    default=None,
+    help=(
+        "Tool adapter (evals/tools/<name>.toml) for leverage data. "
+        "Defaults to direct-Python path. Pass 'aethyme' to route through "
+        "Aethyme's CLI subprocess (byte-equivalent, methodologically "
+        "symmetric with non-Aethyme tools)."
+    ),
+)
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 @_condition_cmd_options
 def eval_explain_repo(
     repo_path: Path,
     task_text: str,
+    tool_name: str | None,
     json_output: bool,
     control_cmd: str | None,
     explore_cmd: str | None,
@@ -2125,6 +2151,13 @@ def eval_explain_repo(
     control_cmd, leverage_cmd = _resolve_legacy_cmd_aliases(
         control_cmd, leverage_cmd, baseline_cmd, aethyme_cmd
     )
+
+    # Resolve tool adapter when --tool is supplied. None → legacy
+    # direct-Python path (byte-identical behavior, no subprocess overhead).
+    tool_adapter = None
+    if tool_name:
+        from src.eval.tools import get_adapter
+        tool_adapter = get_adapter(tool_name)
 
     try:
         control_runner = (
@@ -2148,6 +2181,7 @@ def eval_explain_repo(
             control_runner=control_runner,
             explore_runner=explore_runner,
             leverage_runner=leverage_runner,
+            tool=tool_adapter,
         )
     except EngineError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -2189,11 +2223,21 @@ def eval_explain_repo(
     show_default=True,
     help="Task description",
 )
+@click.option(
+    "--tool",
+    "tool_name",
+    default=None,
+    help=(
+        "Tool adapter (evals/tools/<name>.toml) for leverage data. "
+        "Defaults to direct-Python path."
+    ),
+)
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 @_condition_cmd_options
 def eval_navigation_ctf(
     repo_path: Path,
     task_text: str,
+    tool_name: str | None,
     json_output: bool,
     control_cmd: str | None,
     explore_cmd: str | None,
@@ -2205,6 +2249,11 @@ def eval_navigation_ctf(
     control_cmd, leverage_cmd = _resolve_legacy_cmd_aliases(
         control_cmd, leverage_cmd, baseline_cmd, aethyme_cmd
     )
+
+    tool_adapter = None
+    if tool_name:
+        from src.eval.tools import get_adapter
+        tool_adapter = get_adapter(tool_name)
 
     try:
         control_runner = (
@@ -2228,6 +2277,7 @@ def eval_navigation_ctf(
             control_runner=control_runner,
             explore_runner=explore_runner,
             leverage_runner=leverage_runner,
+            tool=tool_adapter,
         )
     except EngineError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -2366,24 +2416,52 @@ def eval_bug_fix_generate(repo_path: Path, task_text: str, json_output: bool) ->
     show_default=True,
     help="Bug scenario to plant",
 )
+@click.option(
+    "--tool",
+    "tool_name",
+    default=None,
+    help=(
+        "Tool adapter (evals/tools/<name>.toml) for tool-using conditions. "
+        "When supplied, replaces the legacy direct-Python deploy_skills + "
+        "build_task_pack calls with subprocess-mediated equivalents from "
+        "the adapter. Pass 'aethyme' for the byte-equivalent self-route "
+        "(methodological symmetry with competitor tools)."
+    ),
+)
 @click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
 def eval_bug_fix_prepare(
     source: Path, dest: Path, task_text: str | None,
-    alternative_task: str | None, scenario: str, json_output: bool,
+    alternative_task: str | None, scenario: str, tool_name: str | None,
+    json_output: bool,
 ) -> None:
     """One-step: clone repos, plant bug, generate all artifacts."""
+    tool_adapter = None
+    if tool_name:
+        from src.eval.tools import get_adapter
+        tool_adapter = get_adapter(tool_name)
+
     try:
         if scenario == "cross-package":
             task = task_text or DEFAULT_CROSS_PACKAGE_TASK
             # cross-package doesn't yet support negative-context; the
             # alternative_task flag is ignored here. Future: add the same
             # plumbing once we have a sibling task in app-shared/.
+            # cross-package prepare doesn't yet accept a tool adapter —
+            # only main prepare_bug_fix_benchmark does. Surface to the
+            # operator that --tool is being ignored for this scenario.
+            if tool_adapter is not None:
+                click.echo(
+                    f"WARNING: --tool {tool_name!r} is ignored for "
+                    "scenario=cross-package (not yet wired). Falling back "
+                    "to legacy direct-Python path.", err=True,
+                )
             result = prepare_cross_package_benchmark(source, dest, task=task)
         else:
             task = task_text or DEFAULT_BUG_FIX_TASK
             result = prepare_bug_fix_benchmark(
                 source, dest, task=task,
                 alternative_task=alternative_task,
+                tool=tool_adapter,
             )
     except EngineError as exc:
         raise click.ClickException(str(exc)) from exc
