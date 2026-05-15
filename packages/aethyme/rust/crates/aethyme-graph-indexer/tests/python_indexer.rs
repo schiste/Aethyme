@@ -341,3 +341,235 @@ fn end_to_end_determinism_across_runs() {
     // Sanity check: Visibility::Public exists (compile-time check that the import is used).
     let _ = Visibility::Public;
 }
+
+// ─── Phase 4.4: import-statement extraction ─────────────────────────
+//
+// Each `import` / `from … import …` becomes one UnresolvedSymbol per
+// imported name plus an Imports edge from the file node. The
+// placeholder records the *binding* name (so callers in the same
+// file can later resolve `np.foo()` back through it); the edge's
+// `import_path` records the source-side dotted path.
+
+#[test]
+fn plain_import_emits_unresolved_and_imports_edge() {
+    let result = index_source("import numpy\n");
+    assert_eq!(result.additional_nodes.len(), 1);
+    assert_eq!(result.additional_edges.len(), 1);
+    let node = &result.additional_nodes[0];
+    assert_eq!(node.kind(), NodeKind::UnresolvedSymbol);
+    let json = serde_json::to_string(node).unwrap();
+    assert!(json.contains("\"name\":\"numpy\""), "node: {json}");
+    assert!(json.contains("\"expected_kind\":\"module\""), "node: {json}");
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
+    assert!(edge_json.contains("\"import_path\":\"numpy\""));
+    assert!(edge_json.contains("\"is_namespace\":true"));
+    assert!(edge_json.contains("\"is_named\":false"));
+    assert_eq!(result.additional_edges[0].kind(), EdgeKind::Imports);
+}
+
+#[test]
+fn aliased_import_uses_binding_name() {
+    let result = index_source("import numpy as np\n");
+    assert_eq!(result.additional_nodes.len(), 1);
+    let node_json =
+        serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    // Binding name is what other code in the file references.
+    assert!(node_json.contains("\"name\":\"np\""), "node: {node_json}");
+    let edge_json =
+        serde_json::to_string(&result.additional_edges[0]).unwrap();
+    // Source path is the unaliased module name.
+    assert!(edge_json.contains("\"import_path\":\"numpy\""));
+}
+
+#[test]
+fn dotted_import_binds_top_segment_path_keeps_full_dotted_form() {
+    // `import foo.bar.baz` — Python binds only `foo` in the local
+    // namespace (subsequent code reaches `foo.bar.baz` via attribute
+    // access on `foo`). The placeholder name must therefore be `foo`
+    // so the linker pass can later connect `foo.<...>` references
+    // back to the import. The edge's `import_path` carries the full
+    // dotted source-side path for the linker to follow.
+    let result = index_source("import foo.bar.baz\n");
+    let node_json =
+        serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    assert!(
+        node_json.contains("\"name\":\"foo\""),
+        "node: {node_json}"
+    );
+    let edge_json =
+        serde_json::to_string(&result.additional_edges[0]).unwrap();
+    assert!(edge_json.contains("\"import_path\":\"foo.bar.baz\""));
+}
+
+#[test]
+fn aliased_dotted_import_uses_alias_for_binding() {
+    // `import foo.bar as fb` — the alias is the binding name.
+    let result = index_source("import foo.bar as fb\n");
+    let node_json =
+        serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    assert!(
+        node_json.contains("\"name\":\"fb\""),
+        "node: {node_json}"
+    );
+    let edge_json =
+        serde_json::to_string(&result.additional_edges[0]).unwrap();
+    assert!(edge_json.contains("\"import_path\":\"foo.bar\""));
+}
+
+#[test]
+fn from_import_emits_one_placeholder_per_name() {
+    let result = index_source("from os import path, environ\n");
+    assert_eq!(result.additional_nodes.len(), 2);
+    assert_eq!(result.additional_edges.len(), 2);
+    let names: Vec<String> = result
+        .additional_nodes
+        .iter()
+        .map(|n| {
+            let j = serde_json::to_string(n).unwrap();
+            j.find("\"name\":\"")
+                .map(|i| {
+                    let rest = &j[i + 8..];
+                    rest[..rest.find('"').unwrap()].to_string()
+                })
+                .unwrap()
+        })
+        .collect();
+    assert!(names.contains(&"path".to_string()));
+    assert!(names.contains(&"environ".to_string()));
+    let edge_jsons: Vec<String> = result
+        .additional_edges
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect();
+    assert!(edge_jsons.iter().any(|j| j.contains("\"import_path\":\"os.path\"")));
+    assert!(edge_jsons
+        .iter()
+        .any(|j| j.contains("\"import_path\":\"os.environ\"")));
+    // from-imports flip namespace flag off, named flag on.
+    assert!(edge_jsons.iter().all(|j| j.contains("\"is_namespace\":false")));
+    assert!(edge_jsons.iter().all(|j| j.contains("\"is_named\":true")));
+}
+
+#[test]
+fn from_import_with_alias_records_binding() {
+    let result = index_source("from foo import bar as b\n");
+    let node_json =
+        serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    assert!(node_json.contains("\"name\":\"b\""), "node: {node_json}");
+    let edge_json =
+        serde_json::to_string(&result.additional_edges[0]).unwrap();
+    assert!(edge_json.contains("\"import_path\":\"foo.bar\""));
+}
+
+#[test]
+fn relative_import_prepends_dots_to_import_path() {
+    // `from . import sibling` — level=1, no module.
+    let result = index_source("from . import sibling\n");
+    assert_eq!(result.additional_nodes.len(), 1);
+    let edge_json =
+        serde_json::to_string(&result.additional_edges[0]).unwrap();
+    assert!(
+        edge_json.contains("\"import_path\":\".sibling\""),
+        "edge: {edge_json}"
+    );
+
+    // `from ..pkg import x` — level=2, module="pkg".
+    let result2 = index_source("from ..pkg import x\n");
+    let edge2 = serde_json::to_string(&result2.additional_edges[0]).unwrap();
+    assert!(
+        edge2.contains("\"import_path\":\"..pkg.x\""),
+        "edge: {edge2}"
+    );
+}
+
+#[test]
+fn star_import_emits_namespace_placeholder() {
+    let result = index_source("from foo import *\n");
+    assert_eq!(result.additional_nodes.len(), 1);
+    let node_json =
+        serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    assert!(node_json.contains("\"name\":\"*\""), "node: {node_json}");
+    let edge_json =
+        serde_json::to_string(&result.additional_edges[0]).unwrap();
+    assert!(edge_json.contains("\"import_path\":\"foo.*\""));
+    // Star-imports bring in everything → namespace, not named.
+    assert!(edge_json.contains("\"is_namespace\":true"));
+    assert!(edge_json.contains("\"is_named\":false"));
+}
+
+#[test]
+fn imports_coexist_with_function_extraction() {
+    // Verify imports don't disturb the existing Function/Class/etc.
+    // extraction — both kinds of nodes should appear in one pass.
+    let result = index_source(
+        "import os\nfrom sys import argv\n\ndef main():\n    return 1\n",
+    );
+    let kinds: Vec<NodeKind> =
+        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    let n_unresolved = kinds
+        .iter()
+        .filter(|&&k| k == NodeKind::UnresolvedSymbol)
+        .count();
+    let n_function = kinds
+        .iter()
+        .filter(|&&k| k == NodeKind::Function)
+        .count();
+    assert_eq!(n_unresolved, 2, "kinds = {kinds:?}");
+    assert_eq!(n_function, 1, "kinds = {kinds:?}");
+
+    let edge_kinds: Vec<EdgeKind> =
+        result.additional_edges.iter().map(|e| e.kind()).collect();
+    let n_imports = edge_kinds.iter().filter(|&&k| k == EdgeKind::Imports).count();
+    let n_contains = edge_kinds.iter().filter(|&&k| k == EdgeKind::Contains).count();
+    assert_eq!(n_imports, 2);
+    // File → Function (Contains).
+    assert_eq!(n_contains, 1);
+}
+
+#[test]
+fn duplicate_imports_are_deduped_via_fragment_layer() {
+    // Two identical `import os` lines produce two emitted placeholder
+    // nodes with the same NodeId (referenced_from_id + binding name
+    // are identical), which Fragment::new silently dedupes. The
+    // end-to-end on-disk fragment should contain exactly one
+    // UnresolvedSymbol for `os`.
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "src/x.py", b"import os\nimport os\n");
+    index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let frag = read_fragment(tmp.path(), "src/x.py").unwrap();
+    let n_unresolved = frag
+        .nodes()
+        .iter()
+        .filter(|n| n.kind() == NodeKind::UnresolvedSymbol)
+        .count();
+    assert_eq!(n_unresolved, 1, "expected single deduped placeholder");
+}
+
+#[test]
+fn imports_round_trip_through_fragment_on_disk() {
+    // End-to-end: write a Python file with imports, run the
+    // indexer, decode the binary fragment, and confirm the
+    // UnresolvedSymbol nodes and Imports edges survived
+    // serialization.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/cli.py",
+        b"import json\nfrom typing import List\n",
+    );
+    index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let frag = read_fragment(tmp.path(), "src/cli.py").unwrap();
+
+    let unresolved_count = frag
+        .nodes()
+        .iter()
+        .filter(|n| n.kind() == NodeKind::UnresolvedSymbol)
+        .count();
+    let imports_count = frag
+        .edges()
+        .iter()
+        .filter(|e| e.kind() == EdgeKind::Imports)
+        .count();
+    assert_eq!(unresolved_count, 2);
+    assert_eq!(imports_count, 2);
+}

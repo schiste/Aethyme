@@ -5,27 +5,43 @@
 //! Scope of the v1 indexer:
 //!
 //! - **Extracted node kinds:** Function (top-level), Method (inside
-//!   Class), Class, GlobalVariable (module-level Assign / AnnAssign).
+//!   Class), Class, GlobalVariable (module-level Assign / AnnAssign),
+//!   UnresolvedSymbol (import placeholders — Phase 4.4).
 //! - **Extracted edges:** Contains (file → top-level symbol),
-//!   Defines (class → method).
-//! - **NOT yet extracted:** call-graph edges (Calls), imports
-//!   (Imports), nested-function definitions inside function bodies
-//!   (we extract only the outermost function, plus methods inside
-//!   classes). These land in later commits as the indexer matures.
+//!   Defines (class → method), Imports (file → UnresolvedSymbol
+//!   per imported name).
+//! - **NOT yet extracted:** call-graph edges (Calls), nested-function
+//!   definitions inside function bodies (we extract only the outermost
+//!   function, plus methods inside classes). These land in later
+//!   commits as the indexer matures.
+//!
+//! Cross-file resolution model (Phase 4.4): for each `import` or
+//! `from … import …` statement we emit one `UnresolvedSymbol` per
+//! imported name plus a corresponding `Imports` edge from the file
+//! node. The `UnresolvedSymbol` carries the binding name (`np` for
+//! `import numpy as np`); the edge's `import_path` carries the
+//! dotted source path (`numpy`). A future linker pass will look up
+//! each `UnresolvedSymbol` in the global symbol index and rewrite
+//! edge targets to point at concrete nodes (resolved cross-file
+//! edges) — that pass needs no Python-specific code, only the
+//! placeholders this commit emits.
 //!
 //! The parser-error path returns `LanguageIndexError::Parse` —
 //! callers should log the diagnostic and continue with the
 //! filesystem-only File node for that file (better-than-nothing
 //! degradation).
 
-use ruff_python_ast::{ModModule, Stmt, StmtAnnAssign, StmtAssign, StmtClassDef, StmtFunctionDef};
+use ruff_python_ast::{
+    ModModule, Stmt, StmtAnnAssign, StmtAssign, StmtClassDef, StmtFunctionDef,
+    StmtImport, StmtImportFrom,
+};
 use ruff_python_parser::parse_module;
 use ruff_text_size::TextRange;
 
 use aethyme_graph_schema::{
     Callable, Class, Confidence, Edge, EdgeAttributes, Function,
-    GlobalVariable, Method, Node, NodeId, ParameterSignature, Source,
-    SourceRange, Visibility,
+    GlobalVariable, Method, Node, NodeId, NodeKind, ParameterSignature,
+    Source, SourceRange, UnresolvedSymbol, Visibility,
 };
 
 use crate::context::IndexerContext;
@@ -156,6 +172,26 @@ impl LanguageIndexer for PythonIndexer {
                             global_id,
                         ));
                     }
+                }
+                Stmt::Import(imp) => {
+                    emit_import_placeholders(
+                        repo,
+                        source_path,
+                        &file_id,
+                        imp,
+                        &mut nodes,
+                        &mut edges,
+                    )?;
+                }
+                Stmt::ImportFrom(imp) => {
+                    emit_import_from_placeholders(
+                        repo,
+                        source_path,
+                        &file_id,
+                        imp,
+                        &mut nodes,
+                        &mut edges,
+                    )?;
                 }
                 _ => {} // ignore other top-level statements in v1
             }
@@ -388,4 +424,139 @@ fn structural_edge(
         Source::Structure,
         Confidence::FULL,
     )
+}
+
+// ─── Imports (Phase 4.4) ─────────────────────────────────────────────
+//
+// For each `import X[.Y]` form we emit one UnresolvedSymbol per top-
+// level imported name (or its alias) plus an Imports edge from the
+// file node. The edge's `import_path` carries the dotted source-side
+// path; the `UnresolvedSymbol.name` carries the *binding* name that
+// other code in this file will reference. Examples:
+//   `import numpy`            → name="numpy",  import_path="numpy"
+//   `import numpy as np`      → name="np",     import_path="numpy"
+//   `import foo.bar`          → name="foo",    import_path="foo.bar"
+//   `import foo.bar as fb`    → name="fb",     import_path="foo.bar"
+//
+// Why first-segment for `import foo.bar`? Python's runtime binds only
+// the top-level package name into the local namespace: code that
+// later writes `foo.bar.thing()` looks up `foo`, then attribute-
+// accesses `bar` and `thing` on it. The placeholder must therefore
+// be named `foo` so the future linker pass can connect those
+// references back to the import statement.
+//
+// `is_namespace=true` for plain `import` statements because the whole
+// module is brought into scope. `expected_kind=Module` is set because
+// the right-hand side of a plain `import` is unambiguously a module.
+
+fn emit_import_placeholders(
+    repo: &str,
+    source_path: &str,
+    file_id: &NodeId,
+    imp: &StmtImport,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+) -> Result<(), LanguageIndexError> {
+    for alias in &imp.names {
+        let import_path = alias.name.as_str();
+        // When unaliased, the binding is the *first* segment of the
+        // dotted name (Python's runtime semantics, not the full path).
+        let binding = match alias.asname.as_ref() {
+            Some(n) => n.as_str(),
+            None => import_path.split('.').next().unwrap_or(import_path),
+        };
+        let placeholder = UnresolvedSymbol::new(
+            repo,
+            source_path,
+            binding,
+            Some(NodeKind::Module),
+            file_id.clone(),
+        )
+        .map_err(|e| LanguageIndexError::NodeConstruction {
+            message: e.to_string(),
+        })?;
+        let placeholder_id = placeholder.id().clone();
+        nodes.push(Node::UnresolvedSymbol(placeholder));
+        edges.push(Edge::new(
+            file_id.clone(),
+            placeholder_id,
+            EdgeAttributes::Imports {
+                import_path: import_path.into(),
+                is_namespace: true,
+                is_default: false,
+                is_named: false,
+            },
+            Source::Structure,
+            Confidence::FULL,
+        ));
+    }
+    Ok(())
+}
+
+// For `from M import X[, Y as Z, …]` we emit one placeholder + edge
+// per imported name. The edge's `import_path` is the fully qualified
+// source path (`M.X`); the placeholder's `name` is the binding (`Z`
+// when aliased, else `X`). Relative imports (`from . import x`,
+// `from ..pkg import y`) prepend `level` dots to the module path so
+// the linker pass can later distinguish `from os import path` from
+// `from . import path`.
+//
+// `from M import *` star-imports are emitted as a single placeholder
+// named `*` with `is_namespace=true`. The linker pass treats this as
+// a wildcard hint rather than a single resolvable symbol.
+
+fn emit_import_from_placeholders(
+    repo: &str,
+    source_path: &str,
+    file_id: &NodeId,
+    imp: &StmtImportFrom,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+) -> Result<(), LanguageIndexError> {
+    let module_part = imp.module.as_ref().map(|m| m.as_str()).unwrap_or("");
+    let dots: String = ".".repeat(imp.level as usize);
+    for alias in &imp.names {
+        let imported = alias.name.as_str();
+        let is_star = imported == "*";
+        let binding = if is_star {
+            "*"
+        } else {
+            alias
+                .asname
+                .as_ref()
+                .map(|n| n.as_str())
+                .unwrap_or(imported)
+        };
+        let import_path = match (module_part.is_empty(), is_star) {
+            (true, true) => format!("{dots}*"),
+            (true, false) => format!("{dots}{imported}"),
+            (false, true) => format!("{dots}{module_part}.*"),
+            (false, false) => format!("{dots}{module_part}.{imported}"),
+        };
+        let placeholder = UnresolvedSymbol::new(
+            repo,
+            source_path,
+            binding,
+            None, // can't infer kind from `from … import …`
+            file_id.clone(),
+        )
+        .map_err(|e| LanguageIndexError::NodeConstruction {
+            message: e.to_string(),
+        })?;
+        let placeholder_id = placeholder.id().clone();
+        nodes.push(Node::UnresolvedSymbol(placeholder));
+        edges.push(Edge::new(
+            file_id.clone(),
+            placeholder_id,
+            EdgeAttributes::Imports {
+                import_path: import_path.into(),
+                is_namespace: is_star,
+                is_default: false,
+                is_named: !is_star,
+            },
+            Source::Structure,
+            Confidence::FULL,
+        ));
+    }
+    Ok(())
 }
