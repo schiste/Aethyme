@@ -16,13 +16,19 @@
 //! Extracted edges:
 //! - Contains (file → top-level symbol)
 //! - Defines (class/interface/trait → method)
+//! - Imports (file → UnresolvedSymbol placeholder per imported
+//!   binding name from each `use` namespace statement; Phase 4.6
+//!   stage 1 — the linker resolves these to concrete nodes when
+//!   both ends of the import live in repo)
 //!
 //! Deferred for later commits:
 //! - `namespace` walking: namespace_definition nodes contain
 //!   nested classes/functions; v1 walks namespaced content as if
 //!   it were at file scope. Namespace-as-Module nodes lands later.
 //! - Property declarations as Field nodes.
-//! - Cross-file Imports / Calls edges.
+//! - `require`/`require_once`/`include`/`include_once` imports —
+//!   file-level rather than namespace-level; deferred.
+//! - Cross-file Calls edges.
 
 use std::sync::Mutex;
 
@@ -32,8 +38,8 @@ use aethyme_graph_schema::{
     Callable, Class as SchemaClass, Confidence, Edge, EdgeAttributes,
     Function as SchemaFunction, GlobalVariable,
     Interface as SchemaInterface, Method, Node as SchemaNode, NodeId,
-    ParameterSignature, Source, SourceRange,
-    Trait as SchemaTrait, Visibility,
+    NodeKind, ParameterSignature, Source, SourceRange,
+    Trait as SchemaTrait, UnresolvedSymbol, Visibility,
 };
 
 use crate::context::IndexerContext;
@@ -236,6 +242,11 @@ fn walk_top_level(
                     edges,
                 )?;
             }
+        }
+        "namespace_use_declaration" => {
+            emit_php_use_placeholders(
+                node, content, repo, source_path, file_id, nodes, edges,
+            )?;
         }
         "const_declaration" => {
             // Each const_element under a const_declaration is one
@@ -572,4 +583,191 @@ fn node_construction_err(
     LanguageIndexError::NodeConstruction {
         message: e.to_string(),
     }
+}
+
+// ─── Imports (Phase 4.6 stage 1) ─────────────────────────────────────
+//
+// PHP's `use` statement has two shapes:
+//
+//   Simple:  `use App\Models\User;`               (one clause)
+//            `use App\Models\User as U;`          (one clause, aliased)
+//            `use App\Models\User, App\Models\Post;`  (multiple flat clauses)
+//
+//   Group:   `use App\Models\{User, Post as P, Tag};`
+//            (prefix `App\Models` then a body with multiple clauses)
+//
+// tree-sitter-php's grammar splits these into:
+//   - `namespace_use_declaration` (top-level)
+//       children: `namespace_use_clause` (simple form) OR
+//                 `namespace_name` (the group prefix) + `namespace_use_group`
+//   - `namespace_use_clause` (one imported symbol)
+//       children: `name` or `qualified_name`
+//       field `alias`: optional `name`
+//       field `type`: optional `const`/`function` keyword
+//
+// For each leaf clause we emit a placeholder named after the
+// binding (alias if present, else last `\\`-separated segment of
+// the imported path) and an Imports edge with `import_path`
+// carrying the fully-qualified backslash-separated PHP path.
+
+#[allow(clippy::too_many_arguments)]
+fn emit_php_use_placeholders(
+    use_node: Node<'_>,
+    content: &str,
+    repo: &str,
+    source_path: &str,
+    file_id: &NodeId,
+    nodes: &mut Vec<SchemaNode>,
+    edges: &mut Vec<Edge>,
+) -> Result<(), LanguageIndexError> {
+    // The `type` field on namespace_use_declaration distinguishes
+    // `use function Foo\bar;` and `use const Foo\BAZ;` from a
+    // plain `use Foo\Bar;`. When the modifier is present, we can
+    // honestly populate the placeholder's `expected_kind` —
+    // function imports point at a Function node, const imports
+    // point at a GlobalVariable (constants are top-level
+    // value-bound names in PHP). Plain `use` imports usually
+    // target a class but PHP doesn't actually constrain it
+    // syntactically (an interface, trait, or enum is also valid),
+    // so we keep `expected_kind=None` for that case.
+    let declared_kind: Option<NodeKind> = use_node
+        .child_by_field_name("type")
+        .map(|n| n.kind())
+        .and_then(|k| match k {
+            "function" => Some(NodeKind::Function),
+            "const" => Some(NodeKind::GlobalVariable),
+            _ => None,
+        });
+
+    // First scan the top-level children to determine the form.
+    let mut prefix: Option<String> = None;
+    let mut group_node: Option<Node<'_>> = None;
+    let mut simple_clauses: Vec<Node<'_>> = Vec::new();
+    let mut cursor = use_node.walk();
+    for child in use_node.named_children(&mut cursor) {
+        match child.kind() {
+            "namespace_name" => {
+                // Group prefix: only meaningful when followed by a
+                // namespace_use_group sibling. tree-sitter still
+                // emits it as a child of namespace_use_declaration.
+                prefix = Some(node_text(child, content).to_string());
+            }
+            "namespace_use_group" => {
+                group_node = Some(child);
+            }
+            "namespace_use_clause" => {
+                simple_clauses.push(child);
+            }
+            _ => {} // ignore the `const`/`function` field tokens
+        }
+    }
+
+    // Collect (clause_node, optional_prefix) pairs to process.
+    let clauses: Vec<(Node<'_>, Option<String>)> = if let Some(group) =
+        group_node
+    {
+        let mut gcursor = group.walk();
+        group
+            .named_children(&mut gcursor)
+            .filter(|c| c.kind() == "namespace_use_clause")
+            .map(|c| (c, prefix.clone()))
+            .collect()
+    } else {
+        // Simple form. The prefix may exist on the
+        // namespace_use_declaration node as part of grammar quirks
+        // for edge cases like `use \Foo;`, but in the common case
+        // there's no prefix outside the group form.
+        simple_clauses
+            .into_iter()
+            .map(|c| (c, None))
+            .collect()
+    };
+
+    for (clause, prefix) in clauses {
+        // Find the imported path (`name` or `qualified_name`) and
+        // the optional alias.
+        let mut imported_path: Option<String> = None;
+        let mut ccursor = clause.walk();
+        for child in clause.named_children(&mut ccursor) {
+            match child.kind() {
+                "name" | "qualified_name" => {
+                    if imported_path.is_none() {
+                        imported_path = Some(
+                            node_text(child, content).to_string(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        let alias: Option<String> = clause
+            .child_by_field_name("alias")
+            .map(|n| node_text(n, content).to_string());
+
+        let Some(imported_path) = imported_path else {
+            continue;
+        };
+
+        let full_path = match prefix.as_ref() {
+            Some(p) if !p.is_empty() => format!("{p}\\{imported_path}"),
+            _ => imported_path.clone(),
+        };
+
+        // Binding: alias if present, else the last
+        // backslash-separated segment of the imported path.
+        let binding = match alias {
+            Some(a) if !a.is_empty() => a,
+            _ => imported_path
+                .rsplit('\\')
+                .next()
+                .unwrap_or(&imported_path)
+                .to_string(),
+        };
+        if binding.is_empty() {
+            continue;
+        }
+
+        // Per-clause `type` field overrides the declaration-level
+        // one (the grammar permits `use function Foo\bar, Baz\qux`
+        // where the modifier applies to all, but also permits
+        // per-clause overrides in some dialects). Prefer the
+        // clause-level field; fall back to the declaration-level.
+        let clause_kind: Option<NodeKind> = clause
+            .child_by_field_name("type")
+            .map(|n| n.kind())
+            .and_then(|k| match k {
+                "function" => Some(NodeKind::Function),
+                "const" => Some(NodeKind::GlobalVariable),
+                _ => None,
+            });
+        let expected_kind = clause_kind.or(declared_kind);
+        let placeholder = UnresolvedSymbol::new(
+            repo,
+            source_path,
+            &binding,
+            // `use function Foo\bar;`  → Function
+            // `use const Foo\BAZ;`     → GlobalVariable
+            // `use Foo\Bar;`           → None (could be Class,
+            //                            Interface, Trait, Enum;
+            //                            PHP doesn't constrain)
+            expected_kind,
+            file_id.clone(),
+        )
+        .map_err(node_construction_err)?;
+        let id = placeholder.id().clone();
+        nodes.push(SchemaNode::UnresolvedSymbol(placeholder));
+        edges.push(Edge::new(
+            file_id.clone(),
+            id,
+            EdgeAttributes::Imports {
+                import_path: full_path.into(),
+                is_namespace: false,
+                is_default: false,
+                is_named: true,
+            },
+            Source::Structure,
+            Confidence::FULL,
+        ));
+    }
+    Ok(())
 }

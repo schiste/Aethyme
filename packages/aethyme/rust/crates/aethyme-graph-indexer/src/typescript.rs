@@ -18,16 +18,20 @@
 //! Extracted edges:
 //! - Contains (file → top-level symbol)
 //! - Defines (class → method)
+//! - Imports (file → UnresolvedSymbol placeholder per imported
+//!   binding name; Phase 4.6 stage 1 — the linker resolves these
+//!   to concrete nodes when both ends of the import live in repo)
 //!
-//! Deferred for later commits: Imports edges (need cross-file
-//! resolution), Calls edges (need scope resolution), arrow-function
-//! expressions assigned to variables, nested function declarations.
+//! Deferred for later commits: Calls edges (need scope
+//! resolution), arrow-function expressions assigned to variables,
+//! nested function declarations.
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     BindingPattern, Class, ClassElement, Expression, Function as OxcFunction,
-    Program, PropertyKey, Statement, TSEnumDeclaration,
-    TSInterfaceDeclaration, TSTypeAliasDeclaration,
+    ImportDeclaration, ImportDeclarationSpecifier, ModuleExportName, Program,
+    PropertyKey, Statement, TSEnumDeclaration, TSInterfaceDeclaration,
+    TSTypeAliasDeclaration,
 };
 use oxc_parser::Parser;
 use oxc_span::{SourceType as OxcSourceType, Span};
@@ -35,8 +39,9 @@ use oxc_span::{SourceType as OxcSourceType, Span};
 use aethyme_graph_schema::{
     Callable, Class as SchemaClass, Confidence, Edge, EdgeAttributes,
     Enum as SchemaEnum, Function as SchemaFunction, GlobalVariable,
-    Interface as SchemaInterface, Method, Node, NodeId, ParameterSignature,
-    Source, SourceRange, TypeAlias, Visibility,
+    Interface as SchemaInterface, Method, Node, NodeId, NodeKind,
+    ParameterSignature, Source, SourceRange, TypeAlias, UnresolvedSymbol,
+    Visibility,
 };
 
 use crate::context::IndexerContext;
@@ -233,6 +238,11 @@ fn walk_top_level_statement(
                     ));
                 }
             }
+        }
+        Statement::ImportDeclaration(imp) => {
+            emit_ts_import_placeholders(
+                repo, source_path, file_id, imp, nodes, edges,
+            )?;
         }
         _ => {} // other statement kinds are ignored at top level in v1
     }
@@ -524,4 +534,149 @@ fn node_construction_err(
     LanguageIndexError::NodeConstruction {
         message: e.to_string(),
     }
+}
+
+// ─── Imports (Phase 4.6 stage 1) ─────────────────────────────────────
+//
+// For each ES module import declaration we emit one
+// `UnresolvedSymbol` placeholder per imported binding name plus a
+// corresponding `Imports` edge from the file node. The linker pass
+// (Phase 4.5) resolves these when both ends of the import live in
+// this repo.
+//
+//   `import "side-effect-module";`       → name="side-effect-module",
+//                                          import_path="side-effect-module",
+//                                          is_namespace=true (one placeholder)
+//   `import foo from "react";`           → name="foo",
+//                                          import_path="react",
+//                                          is_default=true
+//   `import * as ns from "./util";`      → name="ns",
+//                                          import_path="./util",
+//                                          is_namespace=true
+//   `import { x } from "./util";`        → name="x",
+//                                          import_path="./util::x",
+//                                          is_named=true
+//   `import { x as y } from "./util";`   → name="y",
+//                                          import_path="./util::x",
+//                                          is_named=true
+//
+// The `import_path` carries the module specifier joined to the
+// imported name by `::` rather than `.`. `::` is illegal in both
+// JS identifiers and ES module specifiers, so a future linker that
+// splits `import_path` to recover (module, symbol) has an
+// unambiguous separator. The `.` separator that Python uses is
+// fine for Python's dotted module paths but would conflate with
+// scoped package names and identifiers containing dots in JS
+// land.
+//
+// TypeScript's path resolution (`./x` → `<importing-dir>/x.ts`,
+// `@scope/pkg` → external) is the linker's responsibility;
+// today's linker does literal lookup and will leave TS imports
+// unresolved until that work lands. The stage-1 placeholders are
+// still valuable: they pin the *intent* of the import statement
+// into the graph for future resolution.
+
+fn emit_ts_import_placeholders(
+    repo: &str,
+    source_path: &str,
+    file_id: &NodeId,
+    imp: &ImportDeclaration,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+) -> Result<(), LanguageIndexError> {
+    let source = imp.source.value.as_str();
+    let Some(specifiers) = &imp.specifiers else {
+        // `import "side-effect-module";` — no local bindings; the
+        // file is pulling the module in for side effects only. We
+        // emit a single placeholder named after the module so the
+        // import statement is still discoverable in the graph.
+        let placeholder = UnresolvedSymbol::new(
+            repo,
+            source_path,
+            source,
+            Some(NodeKind::Module),
+            file_id.clone(),
+        )
+        .map_err(node_construction_err)?;
+        let id = placeholder.id().clone();
+        nodes.push(Node::UnresolvedSymbol(placeholder));
+        edges.push(Edge::new(
+            file_id.clone(),
+            id,
+            EdgeAttributes::Imports {
+                import_path: source.into(),
+                is_namespace: true,
+                is_default: false,
+                is_named: false,
+            },
+            Source::Structure,
+            Confidence::FULL,
+        ));
+        return Ok(());
+    };
+
+    for spec in specifiers {
+        let (binding, expected_kind, is_namespace, is_default, is_named, path_suffix) =
+            match spec {
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => (
+                    s.local.name.as_str().to_string(),
+                    None, // default export can be anything
+                    false,
+                    true,
+                    false,
+                    None,
+                ),
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => (
+                    s.local.name.as_str().to_string(),
+                    Some(NodeKind::Module),
+                    true,
+                    false,
+                    false,
+                    None,
+                ),
+                ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                    let imported_name = match &s.imported {
+                        ModuleExportName::IdentifierName(n) => n.name.as_str(),
+                        ModuleExportName::IdentifierReference(n) => n.name.as_str(),
+                        ModuleExportName::StringLiteral(sl) => sl.value.as_str(),
+                    };
+                    (
+                        s.local.name.as_str().to_string(),
+                        None,
+                        false,
+                        false,
+                        true,
+                        Some(imported_name.to_string()),
+                    )
+                }
+            };
+
+        let import_path = match &path_suffix {
+            Some(name) => format!("{source}::{name}"),
+            None => source.to_string(),
+        };
+        let placeholder = UnresolvedSymbol::new(
+            repo,
+            source_path,
+            &binding,
+            expected_kind,
+            file_id.clone(),
+        )
+        .map_err(node_construction_err)?;
+        let id = placeholder.id().clone();
+        nodes.push(Node::UnresolvedSymbol(placeholder));
+        edges.push(Edge::new(
+            file_id.clone(),
+            id,
+            EdgeAttributes::Imports {
+                import_path: import_path.into(),
+                is_namespace,
+                is_default,
+                is_named,
+            },
+            Source::Structure,
+            Confidence::FULL,
+        ));
+    }
+    Ok(())
 }

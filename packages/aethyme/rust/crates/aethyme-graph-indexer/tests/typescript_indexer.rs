@@ -235,3 +235,111 @@ fn end_to_end_determinism_for_typescript() {
         std::fs::read(tmp.path().join(".aethyme/graph/src/x.ts.bin")).unwrap();
     assert_eq!(bytes_a, bytes_b);
 }
+
+// ─── Phase 4.6 stage 1: import extraction ───────────────────────────
+
+#[test]
+fn ts_default_import_emits_placeholder() {
+    let result = index_source("src/x.ts", "import React from 'react';\n");
+    let n_unresolved = result
+        .additional_nodes
+        .iter()
+        .filter(|n| n.kind() == NodeKind::UnresolvedSymbol)
+        .count();
+    assert_eq!(n_unresolved, 1);
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    assert!(node_json.contains("\"name\":\"React\""), "node: {node_json}");
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
+    assert!(edge_json.contains("\"import_path\":\"react\""));
+    assert!(edge_json.contains("\"is_default\":true"));
+    assert!(edge_json.contains("\"is_named\":false"));
+}
+
+#[test]
+fn ts_named_import_emits_placeholder_per_name() {
+    let result = index_source(
+        "src/x.ts",
+        "import { useState, useEffect as ue } from 'react';\n",
+    );
+    let n_unresolved = result
+        .additional_nodes
+        .iter()
+        .filter(|n| n.kind() == NodeKind::UnresolvedSymbol)
+        .count();
+    assert_eq!(n_unresolved, 2);
+    let edge_jsons: Vec<String> = result
+        .additional_edges
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect();
+    // useState: binding=useState, import_path=react::useState
+    assert!(edge_jsons.iter().any(|j| j.contains("\"import_path\":\"react::useState\"")));
+    // useEffect aliased to ue: binding=ue, import_path=react::useEffect
+    assert!(edge_jsons.iter().any(|j| j.contains("\"import_path\":\"react::useEffect\"")));
+    // All named imports
+    assert!(edge_jsons.iter().all(|j| j.contains("\"is_named\":true")));
+    // Binding names visible in node JSON
+    let node_names: Vec<String> = result
+        .additional_nodes
+        .iter()
+        .map(|n| serde_json::to_string(n).unwrap())
+        .collect();
+    assert!(node_names.iter().any(|j| j.contains("\"name\":\"useState\"")));
+    assert!(node_names.iter().any(|j| j.contains("\"name\":\"ue\"")));
+}
+
+#[test]
+fn ts_namespace_import_emits_module_placeholder() {
+    let result = index_source(
+        "src/x.ts",
+        "import * as fs from 'node:fs';\n",
+    );
+    assert_eq!(result.additional_nodes.len(), 1);
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    assert!(node_json.contains("\"name\":\"fs\""), "node: {node_json}");
+    assert!(node_json.contains("\"expected_kind\":\"module\""));
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
+    assert!(edge_json.contains("\"is_namespace\":true"));
+}
+
+#[test]
+fn ts_side_effect_import_emits_one_placeholder() {
+    let result = index_source("src/x.ts", "import 'react-dom';\n");
+    assert_eq!(result.additional_nodes.len(), 1);
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    assert!(node_json.contains("\"name\":\"react-dom\""));
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
+    assert!(edge_json.contains("\"import_path\":\"react-dom\""));
+    assert!(edge_json.contains("\"is_namespace\":true"));
+}
+
+#[test]
+fn ts_relative_import_path_preserved() {
+    let result = index_source(
+        "src/x.ts",
+        "import { Helper } from './util/helper';\n",
+    );
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
+    assert!(
+        edge_json.contains("\"import_path\":\"./util/helper::Helper\""),
+        "edge: {edge_json}"
+    );
+}
+
+#[test]
+fn ts_imports_coexist_with_other_extractions() {
+    // Plain (non-exported) declarations — the v1 walker only
+    // matches top-level Function/Class statements, not the
+    // ExportNamedDeclaration wrappers around them. Imports use a
+    // separate Statement::ImportDeclaration arm so they aren't
+    // affected by the export-wrapping issue.
+    let result = index_source(
+        "src/x.ts",
+        "import { X } from './x';\n\nfunction f() {}\n\nclass C {}\n",
+    );
+    let kinds: Vec<NodeKind> =
+        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    assert!(kinds.contains(&NodeKind::UnresolvedSymbol));
+    assert!(kinds.contains(&NodeKind::Function));
+    assert!(kinds.contains(&NodeKind::Class));
+}

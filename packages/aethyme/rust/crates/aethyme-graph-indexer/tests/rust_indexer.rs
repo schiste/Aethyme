@@ -227,3 +227,128 @@ fn rust_indexing_determinism() {
             .unwrap();
     assert_eq!(bytes_a, bytes_b);
 }
+
+// ─── Phase 4.6 stage 1: import extraction ───────────────────────────
+
+#[test]
+fn rust_plain_use_emits_placeholder_for_last_segment() {
+    let result = index_source("use std::collections::HashMap;\n");
+    let n_unresolved = result
+        .additional_nodes
+        .iter()
+        .filter(|n| n.kind() == NodeKind::UnresolvedSymbol)
+        .count();
+    assert_eq!(n_unresolved, 1);
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    // Binding is the last segment: HashMap.
+    assert!(node_json.contains("\"name\":\"HashMap\""), "node: {node_json}");
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
+    assert!(
+        edge_json.contains("\"import_path\":\"std::collections::HashMap\""),
+        "edge: {edge_json}"
+    );
+    assert!(edge_json.contains("\"is_named\":true"));
+    assert!(edge_json.contains("\"is_namespace\":false"));
+}
+
+#[test]
+fn rust_aliased_use_uses_alias_as_binding() {
+    let result = index_source("use std::collections::HashMap as HM;\n");
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    assert!(node_json.contains("\"name\":\"HM\""), "node: {node_json}");
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
+    // import_path keeps the original (unaliased) path.
+    assert!(
+        edge_json.contains("\"import_path\":\"std::collections::HashMap\"")
+    );
+}
+
+#[test]
+fn rust_use_group_flattens_into_multiple_placeholders() {
+    let result = index_source(
+        "use std::collections::{HashMap, BTreeMap, HashSet as HS};\n",
+    );
+    let n_unresolved = result
+        .additional_nodes
+        .iter()
+        .filter(|n| n.kind() == NodeKind::UnresolvedSymbol)
+        .count();
+    assert_eq!(n_unresolved, 3);
+    let edge_jsons: Vec<String> = result
+        .additional_edges
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect();
+    assert!(edge_jsons
+        .iter()
+        .any(|j| j.contains("\"import_path\":\"std::collections::HashMap\"")));
+    assert!(edge_jsons
+        .iter()
+        .any(|j| j.contains("\"import_path\":\"std::collections::BTreeMap\"")));
+    assert!(edge_jsons
+        .iter()
+        .any(|j| j.contains("\"import_path\":\"std::collections::HashSet\"")));
+    // The aliased binding lives on the placeholder node.
+    let node_jsons: Vec<String> = result
+        .additional_nodes
+        .iter()
+        .map(|n| serde_json::to_string(n).unwrap())
+        .collect();
+    assert!(node_jsons.iter().any(|j| j.contains("\"name\":\"HS\"")));
+}
+
+#[test]
+fn rust_use_glob_marks_namespace_with_star_binding() {
+    let result = index_source("use std::collections::*;\n");
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    assert!(node_json.contains("\"name\":\"*\""), "node: {node_json}");
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
+    assert!(edge_json.contains("\"import_path\":\"std::collections::*\""));
+    assert!(edge_json.contains("\"is_namespace\":true"));
+}
+
+#[test]
+fn rust_nested_use_group_recurses() {
+    // `use a::{b::c, b::d as e};` → flattens to a::b::c and a::b::d.
+    let result = index_source("use a::{b::c, b::d as e};\n");
+    let n_unresolved = result
+        .additional_nodes
+        .iter()
+        .filter(|n| n.kind() == NodeKind::UnresolvedSymbol)
+        .count();
+    assert_eq!(n_unresolved, 2);
+    let edge_jsons: Vec<String> = result
+        .additional_edges
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect();
+    assert!(edge_jsons
+        .iter()
+        .any(|j| j.contains("\"import_path\":\"a::b::c\"")));
+    assert!(edge_jsons
+        .iter()
+        .any(|j| j.contains("\"import_path\":\"a::b::d\"")));
+}
+
+#[test]
+fn rust_use_crate_root_path_preserved() {
+    // `use crate::foo::bar;` — leading `crate::` is part of the path.
+    let result = index_source("use crate::foo::bar;\n");
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
+    assert!(
+        edge_json.contains("\"import_path\":\"crate::foo::bar\""),
+        "edge: {edge_json}"
+    );
+}
+
+#[test]
+fn rust_imports_coexist_with_other_extractions() {
+    let result = index_source(
+        "use std::collections::HashMap;\n\nfn helper() {}\n\nstruct S;\n",
+    );
+    let kinds: Vec<NodeKind> =
+        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    assert!(kinds.contains(&NodeKind::UnresolvedSymbol));
+    assert!(kinds.contains(&NodeKind::Function));
+    assert!(kinds.contains(&NodeKind::Struct));
+}

@@ -17,6 +17,10 @@
 //! Extracted edges:
 //! - Contains (file → top-level symbol)
 //! - Defines (trait → trait method)
+//! - Imports (file → UnresolvedSymbol placeholder per imported
+//!   binding name from each `use` statement; Phase 4.6 stage 1 —
+//!   the linker resolves these to concrete nodes when both ends
+//!   of the import live in repo)
 //!
 //! Deferred for later commits:
 //! - `impl` block methods. v1 emits these as Functions because
@@ -35,8 +39,9 @@ use ra_ap_syntax::{ast, AstNode, Edition, SourceFile, SyntaxNode};
 use aethyme_graph_schema::{
     Callable, Confidence, Edge, EdgeAttributes, Enum as SchemaEnum,
     Function as SchemaFunction, GlobalVariable, Method, Node, NodeId,
-    ParameterSignature, Source, SourceRange, Struct as SchemaStruct,
-    Trait as SchemaTrait, TypeAlias, Visibility,
+    NodeKind, ParameterSignature, Source, SourceRange,
+    Struct as SchemaStruct, Trait as SchemaTrait, TypeAlias,
+    UnresolvedSymbol, Visibility,
 };
 
 use crate::context::IndexerContext;
@@ -286,7 +291,20 @@ fn walk_top_level_item(
                 ));
             }
         }
-        // Module, Use, ExternBlock, ExternCrate, MacroCall, MacroDef,
+        ast::Item::Use(u) => {
+            if let Some(tree) = u.use_tree() {
+                flatten_use_tree(
+                    &tree,
+                    "",
+                    repo,
+                    source_path,
+                    file_id,
+                    nodes,
+                    edges,
+                )?;
+            }
+        }
+        // Module, ExternBlock, ExternCrate, MacroCall, MacroDef,
         // MacroRules, AsmExpr — ignored in v1.
         _ => {}
     }
@@ -557,5 +575,123 @@ fn node_construction_err(
     LanguageIndexError::NodeConstruction {
         message: e.to_string(),
     }
+}
+
+// ─── Imports (Phase 4.6 stage 1) ─────────────────────────────────────
+//
+// Rust's `use` tree can be deeply nested. The walker emits one
+// `UnresolvedSymbol` placeholder per leaf binding + one `Imports`
+// edge per placeholder. The recursion's `prefix` accumulates the
+// path segments above the current node so each leaf produces a
+// fully-qualified import_path.
+//
+//   `use a::b::c;`            → leaf c, prefix "a::b", path "a::b::c",
+//                                binding "c", is_named=true
+//   `use a::b::c as d;`       → leaf c, binding "d", path "a::b::c",
+//                                is_named=true
+//   `use a::*;`               → star leaf, binding "*", path "a::*",
+//                                is_namespace=true
+//   `use a::{b, c::d as e};`  → two leaves:
+//                                (b, path "a::b") + (e, path "a::c::d")
+//   `use crate::foo::bar;`    → binding "bar", path "crate::foo::bar"
+//
+// `extern crate foo;` is ignored in v1 — it's a 2015-edition
+// construct that's near-extinct in modern Rust.
+
+#[allow(clippy::too_many_arguments)]
+fn flatten_use_tree(
+    tree: &ast::UseTree,
+    prefix: &str,
+    repo: &str,
+    source_path: &str,
+    file_id: &NodeId,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+) -> Result<(), LanguageIndexError> {
+    let path_text = tree
+        .path()
+        .map(|p| p.syntax().text().to_string())
+        .unwrap_or_default();
+
+    let combined = if prefix.is_empty() {
+        path_text.clone()
+    } else if path_text.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}::{path_text}")
+    };
+
+    // Group form: `use a::{b, c}` — recurse on each child using
+    // `combined` as the new prefix.
+    if let Some(list) = tree.use_tree_list() {
+        for child in list.use_trees() {
+            flatten_use_tree(
+                &child,
+                &combined,
+                repo,
+                source_path,
+                file_id,
+                nodes,
+                edges,
+            )?;
+        }
+        return Ok(());
+    }
+
+    let is_star = tree.star_token().is_some();
+    let (binding, import_path) = if is_star {
+        ("*".to_string(), format!("{combined}::*"))
+    } else if let Some(rename) = tree.rename() {
+        // `use a::b as c;` — the binding is `c`. The rename's
+        // .name() returns the alias identifier.
+        let alias = rename
+            .name()
+            .map(|n| n.text().to_string())
+            .unwrap_or_default();
+        if alias.is_empty() {
+            return Ok(());
+        }
+        (alias, combined.clone())
+    } else {
+        // No alias, no star, no group — plain leaf. Binding is
+        // the last `::`-separated segment of `combined`.
+        let last = combined
+            .rsplit("::")
+            .next()
+            .unwrap_or(&combined)
+            .trim()
+            .to_string();
+        if last.is_empty() || combined.is_empty() {
+            return Ok(());
+        }
+        (last, combined.clone())
+    };
+
+    let placeholder = UnresolvedSymbol::new(
+        repo,
+        source_path,
+        &binding,
+        // Star imports bring in everything as a namespace; plain
+        // leaves are usually types / functions / consts — we
+        // don't know without resolution.
+        if is_star { Some(NodeKind::Module) } else { None },
+        file_id.clone(),
+    )
+    .map_err(node_construction_err)?;
+    let id = placeholder.id().clone();
+    nodes.push(Node::UnresolvedSymbol(placeholder));
+    edges.push(Edge::new(
+        file_id.clone(),
+        id,
+        EdgeAttributes::Imports {
+            import_path: import_path.into(),
+            is_namespace: is_star,
+            is_default: false,
+            is_named: !is_star,
+        },
+        Source::Structure,
+        Confidence::FULL,
+    ));
+    Ok(())
 }
 

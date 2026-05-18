@@ -228,3 +228,167 @@ fn php_indexing_determinism() {
         std::fs::read(tmp.path().join(".aethyme/graph/src/x.php.bin")).unwrap();
     assert_eq!(bytes_a, bytes_b);
 }
+
+// ─── Phase 4.6 stage 1: import extraction ───────────────────────────
+
+#[test]
+fn php_simple_use_emits_placeholder_for_last_segment() {
+    let result = index_source(
+        "<?php\nuse App\\Models\\User;\n",
+    );
+    let n_unresolved = result
+        .additional_nodes
+        .iter()
+        .filter(|n| n.kind() == NodeKind::UnresolvedSymbol)
+        .count();
+    assert_eq!(n_unresolved, 1);
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    assert!(node_json.contains("\"name\":\"User\""), "node: {node_json}");
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
+    assert!(
+        edge_json.contains("\"import_path\":\"App\\\\Models\\\\User\""),
+        "edge: {edge_json}"
+    );
+    assert!(edge_json.contains("\"is_named\":true"));
+}
+
+#[test]
+fn php_aliased_use_uses_alias_as_binding() {
+    let result = index_source(
+        "<?php\nuse App\\Models\\User as U;\n",
+    );
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    assert!(node_json.contains("\"name\":\"U\""), "node: {node_json}");
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
+    // import_path keeps the unaliased path.
+    assert!(
+        edge_json.contains("\"import_path\":\"App\\\\Models\\\\User\""),
+        "edge: {edge_json}"
+    );
+}
+
+#[test]
+fn php_group_use_flattens_into_multiple_placeholders() {
+    let result = index_source(
+        "<?php\nuse App\\Models\\{User, Post as P, Tag};\n",
+    );
+    let n_unresolved = result
+        .additional_nodes
+        .iter()
+        .filter(|n| n.kind() == NodeKind::UnresolvedSymbol)
+        .count();
+    assert_eq!(n_unresolved, 3);
+    let edge_jsons: Vec<String> = result
+        .additional_edges
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect();
+    assert!(edge_jsons
+        .iter()
+        .any(|j| j.contains("\"import_path\":\"App\\\\Models\\\\User\"")));
+    assert!(edge_jsons
+        .iter()
+        .any(|j| j.contains("\"import_path\":\"App\\\\Models\\\\Post\"")));
+    assert!(edge_jsons
+        .iter()
+        .any(|j| j.contains("\"import_path\":\"App\\\\Models\\\\Tag\"")));
+    // The aliased one's binding is P.
+    let node_jsons: Vec<String> = result
+        .additional_nodes
+        .iter()
+        .map(|n| serde_json::to_string(n).unwrap())
+        .collect();
+    assert!(node_jsons.iter().any(|j| j.contains("\"name\":\"P\"")));
+}
+
+#[test]
+fn php_imports_coexist_with_other_extractions() {
+    let result = index_source(
+        "<?php\nuse App\\Models\\User;\n\nfunction helper() {}\n\nclass C {\n    function m() {}\n}\n",
+    );
+    let kinds: Vec<NodeKind> =
+        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    assert!(kinds.contains(&NodeKind::UnresolvedSymbol));
+    assert!(kinds.contains(&NodeKind::Function));
+    assert!(kinds.contains(&NodeKind::Class));
+}
+
+#[test]
+fn php_use_function_sets_expected_kind_function() {
+    // `use function Foo\bar;` — the `type` field on
+    // namespace_use_declaration is set to `function`. The
+    // placeholder's `expected_kind` must reflect this so a future
+    // kind-aware linker can prefer Function nodes when resolving.
+    let result = index_source(
+        "<?php\nuse function Foo\\bar;\n",
+    );
+    assert_eq!(result.additional_nodes.len(), 1);
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    assert!(node_json.contains("\"name\":\"bar\""), "node: {node_json}");
+    assert!(
+        node_json.contains("\"expected_kind\":\"function\""),
+        "node: {node_json}"
+    );
+}
+
+#[test]
+fn php_use_const_sets_expected_kind_global_variable() {
+    // `use const Foo\BAZ;` — the `type` field is `const`. PHP
+    // constants live at top-level scope so the schema kind is
+    // GlobalVariable.
+    let result = index_source(
+        "<?php\nuse const Foo\\BAZ;\n",
+    );
+    assert_eq!(result.additional_nodes.len(), 1);
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    assert!(node_json.contains("\"name\":\"BAZ\""), "node: {node_json}");
+    assert!(
+        node_json.contains("\"expected_kind\":\"global_variable\""),
+        "node: {node_json}"
+    );
+}
+
+#[test]
+fn php_plain_use_leaves_expected_kind_none() {
+    // Plain `use Foo\Bar;` could target a Class, Interface, Trait,
+    // or Enum — PHP doesn't constrain it. The placeholder's
+    // expected_kind stays None to be honest about the ambiguity.
+    let result = index_source(
+        "<?php\nuse Foo\\Bar;\n",
+    );
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    // serde with `Option::None` skips the field entirely (or
+    // renders it as null depending on serde_json settings). Either
+    // way, the JSON must NOT carry a concrete kind.
+    assert!(!node_json.contains("\"expected_kind\":\"function\""));
+    assert!(!node_json.contains("\"expected_kind\":\"global_variable\""));
+    assert!(!node_json.contains("\"expected_kind\":\"class\""));
+}
+
+#[test]
+fn php_multiple_flat_clauses_each_emit_a_placeholder() {
+    // `use App\Models\User, App\Models\Post;` — multiple
+    // namespace_use_clause children at the top level of a
+    // namespace_use_declaration, no group syntax. The walker must
+    // collect all of them rather than just the first.
+    let result = index_source(
+        "<?php\nuse App\\Models\\User, App\\Models\\Post;\n",
+    );
+    let n_unresolved = result
+        .additional_nodes
+        .iter()
+        .filter(|n| n.kind() == NodeKind::UnresolvedSymbol)
+        .count();
+    assert_eq!(n_unresolved, 2);
+    let edge_jsons: Vec<String> = result
+        .additional_edges
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect();
+    assert!(edge_jsons
+        .iter()
+        .any(|j| j.contains("\"import_path\":\"App\\\\Models\\\\User\"")));
+    assert!(edge_jsons
+        .iter()
+        .any(|j| j.contains("\"import_path\":\"App\\\\Models\\\\Post\"")));
+}

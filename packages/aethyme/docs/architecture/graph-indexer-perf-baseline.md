@@ -288,6 +288,78 @@ Added `Edge::with_dst_id(NodeId)` builder for the linker to retarget edges. It
 is the only legitimate mutation primitive for an existing edge's destination —
 documented as such in the schema crate. No other consumer uses it today.
 
+## Phase 4.6 deltas (2026-05-18)
+
+Stage-1 imports extended to the three remaining language indexers: TypeScript,
+Rust, and PHP. Each emits `UnresolvedSymbol` placeholders + `Imports` edges in
+the same shape as the Python indexer (Phase 4.4). The linker (Phase 4.5)
+resolves them automatically — no linker change required.
+
+Real-world numbers on Aethyme self with all 4 languages emitting imports:
+
+| Metric | Phase 4.5 (Python only) | Phase 4.6 (Py+TS+Rust+PHP) |
+|---|---|---|
+| Placeholders pre-link | 1,300 | 2,613 |
+| Placeholders resolved | 297 (23%) | 1,143 (44%) |
+| Linker wall-clock | 0.67 s | 1.14 s |
+| Per-fragment linker cost | 0.22 ms | 0.38 ms |
+
+The resolution rate climbs because Rust/TS conventions favor distinctive
+PascalCase type names that the linker's "exactly one match" guard resolves
+more often than Python's flatter naming conventions. The added linker time
+scales linearly with placeholder count, well under a second at Aethyme scale.
+
+### Per-language extraction shape
+
+- **TypeScript** (oxc) — `Statement::ImportDeclaration` with three specifier
+  kinds: `ImportDefaultSpecifier` (binding = local, `is_default=true`),
+  `ImportNamespaceSpecifier` (binding = local, `is_namespace=true`,
+  `expected_kind=Module`), `ImportSpecifier` (binding = local, import_path =
+  `<source>::<imported>`, `is_named=true`). The `::` separator is illegal in
+  both JS identifiers and module specifiers, giving a future linker an
+  unambiguous split point. Side-effect imports (`import "foo";`) emit a
+  single namespace placeholder named after the source.
+
+- **Rust** (ra_ap_syntax) — `ast::Item::Use` recursively flattens the use tree.
+  Group syntax (`use a::{b, c}`) recurses with `a` as the prefix; rename
+  (`use a as b`) uses the alias as the binding; star (`use a::*`) emits a
+  `*` placeholder with `is_namespace=true`. `extern crate` is ignored.
+
+- **PHP** (tree-sitter-php) — `namespace_use_declaration` with both simple
+  (`use App\Models\User`) and group (`use App\Models\{User, Post as P}`)
+  syntax. Binding is the alias when present, else the last `\\`-separated
+  segment. `use function` and `use const` modifiers preserve the placeholder
+  shape unchanged (the `type` field on `namespace_use_declaration` is the only
+  difference and isn't part of the placeholder).
+
+### Linker behavior across languages — and the false-positive risk
+
+Today's linker does literal-string lookup of `import_path` against module
+names synthesized from source paths (`src/cli.py` → `src.cli`). This works
+naturally for Python (whose imports are dotted module paths) but matches less
+well for TS (relative paths like `./util`), Rust (`std::collections::HashMap`),
+and PHP (`App\Models\User`). For those three languages, the module+name fast
+path in `link_with_store` almost always misses, and resolution falls back to
+unqualified-name lookup (the `by_name.get(binding)` branch in
+`linker.rs:485-491`).
+
+**This makes the 44% resolution rate partly misleading.** When a Rust file
+imports `use std::collections::HashMap;`, the placeholder's binding is
+`HashMap` — and if any in-repo type happens to also be named `HashMap` and is
+globally unique, the linker resolves the import to that in-repo type. That
+edge is *structurally wrong*: the import refers to the standard library, not
+the repo. The same hazard applies to common names like `Error`, `Result`,
+`User`, `Builder`, `Config`, where collisions between vendored/stdlib types
+and repo-internal types are routine.
+
+Today the false-positive rate is bounded (the linker only resolves when the
+unqualified-name match is unique across the whole repo, which by definition
+excludes the most common names), but it's not zero. Language-aware path
+resolution closes the gap: `./x` → importing directory + extension lookup;
+`crate::foo` → repo-root-relative module map; `App\Models` → PSR-4 autoload
+conventions. That work is the natural next-phase linker upgrade and is what
+will turn the 44% from "mixed signal" into "high-precision cross-file edges."
+
 ## Next benchmarking work
 
 - **Per-language parser cost breakdown.** A per-file timing
