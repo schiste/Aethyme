@@ -8,9 +8,11 @@
 //! nodes), so reading the fragment lets you verify provenance
 //! without consulting the filesystem layout.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
-use aethyme_graph_schema::{Edge, Node, NodeId};
+use aethyme_graph_schema::{Edge, EdgeAttributes, Node, NodeId};
 
 /// One source file's nodes and outgoing edges.
 ///
@@ -74,11 +76,10 @@ impl Fragment {
         nodes.sort_by(|a, b| a.id().as_str().cmp(b.id().as_str()));
         nodes.dedup_by(|a, b| a.id() == b.id());
 
-        // Sort edges by (src_id, dst_id, kind), then dedup the
-        // same way. Multi-edges (same logical edge from multiple
+        // Sort edges by (src_id, dst_id, kind) for canonical
+        // ordering. Multi-edges (same logical edge from multiple
         // call sites) collapse to one Edge with sites[] upstream
-        // of this layer; duplicates here are typically the
-        // dedup-of-overloads pattern that mirrors the node case.
+        // of this layer.
         edges.sort_by(|a, b| {
             a.src_id()
                 .as_str()
@@ -86,10 +87,25 @@ impl Fragment {
                 .then_with(|| a.dst_id().as_str().cmp(b.dst_id().as_str()))
                 .then_with(|| (a.kind() as u8).cmp(&(b.kind() as u8)))
         });
-        edges.dedup_by(|a, b| {
-            a.src_id() == b.src_id()
-                && a.dst_id() == b.dst_id()
-                && a.kind() == b.kind()
+        // Dedup on (src, dst, attributes). Including the full
+        // attributes payload preserves edges that differ only in
+        // attribute fields — most importantly `Imports` edges
+        // whose `import_path` distinguishes `import a.b` from
+        // `from a import b` when both resolve to the same target
+        // (Phase 4.5 linker can produce this shape). The first
+        // occurrence in canonical order wins, matching the
+        // node-dedup discipline. HashSet retain (rather than
+        // dedup_by adjacency) is used because the sort key only
+        // includes src/dst/kind — true (src, dst, attributes)
+        // duplicates may not be adjacent after the sort.
+        let mut seen: HashSet<(NodeId, NodeId, EdgeAttributes)> =
+            HashSet::with_capacity(edges.len());
+        edges.retain(|e| {
+            seen.insert((
+                e.src_id().clone(),
+                e.dst_id().clone(),
+                e.attributes().clone(),
+            ))
         });
 
         Ok(Fragment {

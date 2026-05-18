@@ -22,6 +22,7 @@ pub mod context;
 pub mod filesystem;
 pub mod language;
 pub mod language_map;
+pub mod linker;
 pub mod php;
 pub mod pipeline;
 pub mod python;
@@ -40,6 +41,7 @@ pub use language::{
 pub use language_map::{
     classify_file, infer_language_from_extension, FileClassification,
 };
+pub use linker::{link_repo, link_repo_path, link_with_store, LinkError, LinkSummary};
 pub use pipeline::{
     build_fragment, build_index_records, default_registry,
     index_repo_to_disk, BuildFragmentError, BuiltFragment, IndexRepoError,

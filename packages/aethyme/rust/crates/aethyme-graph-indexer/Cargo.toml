@@ -29,6 +29,14 @@ path = "src/bin/aethyme-graph-index.rs"
 name = "aethyme-graph-query"
 path = "src/bin/aethyme-graph-query.rs"
 
+# `aethyme-graph-link` (Phase 4.5) — standalone linker pass.
+# `aethyme-graph-index` already runs the linker by default at
+# the end of indexing, but having a dedicated CLI lets the link
+# step be re-run after a linker-logic update without re-indexing.
+[[bin]]
+name = "aethyme-graph-link"
+path = "src/bin/aethyme-graph-link.rs"
+
 [dependencies]
 # Types this indexer produces (the schema crate is the contract).
 aethyme-graph-schema = { path = "../aethyme-graph-schema" }

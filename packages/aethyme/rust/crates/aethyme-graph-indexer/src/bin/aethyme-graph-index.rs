@@ -23,7 +23,8 @@ use std::time::Instant;
 use clap::Parser;
 
 use aethyme_graph_indexer::{
-    index_repo_to_disk, IndexerContext, IndexRepoSummary, WalkOptions,
+    index_repo_to_disk, link_repo, IndexerContext, IndexRepoSummary,
+    LinkSummary, WalkOptions,
 };
 use aethyme_graph_storage::bootstrap_repo;
 
@@ -77,6 +78,15 @@ struct Cli {
     /// when piping into eval harnesses or scripts.
     #[arg(long)]
     json: bool,
+
+    /// Skip the post-index linker pass (Phase 4.5). The linker
+    /// rewrites Imports edges that point at UnresolvedSymbol
+    /// placeholders to point at the resolved concrete nodes; with
+    /// this flag, placeholders are preserved as-is. Useful when
+    /// you want to inspect raw stage-1 output, or when re-running
+    /// the link step separately via `aethyme-graph-link`.
+    #[arg(long)]
+    skip_link: bool,
 }
 
 fn main() -> ExitCode {
@@ -114,10 +124,36 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let started = Instant::now();
     let summary = index_repo_to_disk(&ctx, &options)?;
+    let index_elapsed = started.elapsed();
+
+    // Phase 4.5: run the linker by default. Edge-rewriting is
+    // fast (in-memory symbol index + rayon-parallel fragment
+    // rewrite) and produces the cross-file edges most consumers
+    // expect. `--skip-link` opts out for tooling that needs to
+    // inspect raw stage-1 output.
+    let link_summary = if cli.skip_link {
+        None
+    } else {
+        let started_link = Instant::now();
+        let s = link_repo(&ctx)?;
+        eprintln!(
+            "aethyme-graph-index: linker resolved {}/{} placeholders, rewrote {} edges in {:.2}s",
+            s.placeholders_resolved,
+            s.placeholders_seen,
+            s.edges_rewritten,
+            started_link.elapsed().as_secs_f64(),
+        );
+        Some(s)
+    };
     let elapsed = started.elapsed();
 
     if cli.json {
-        emit_json_summary(&summary, elapsed.as_millis() as u64);
+        emit_json_summary(
+            &summary,
+            elapsed.as_millis() as u64,
+            index_elapsed.as_millis() as u64,
+            link_summary.as_ref(),
+        );
     } else {
         emit_text_summary(&summary, &elapsed);
     }
@@ -148,7 +184,12 @@ fn emit_text_summary(summary: &IndexRepoSummary, elapsed: &std::time::Duration) 
     }
 }
 
-fn emit_json_summary(summary: &IndexRepoSummary, elapsed_ms: u64) {
+fn emit_json_summary(
+    summary: &IndexRepoSummary,
+    elapsed_ms: u64,
+    index_elapsed_ms: u64,
+    link: Option<&LinkSummary>,
+) {
     // Hand-rolled JSON to avoid an extra serde_json dep in the
     // binary's compile graph and to keep the output shape
     // explicitly under our control (it's a wire format for
@@ -159,6 +200,7 @@ fn emit_json_summary(summary: &IndexRepoSummary, elapsed_ms: u64) {
     print!("\"fragments_written\":{},", summary.fragments_written.len());
     print!("\"shards_written\":{},", summary.shards_written.len());
     print!("\"elapsed_ms\":{},", elapsed_ms);
+    print!("\"index_elapsed_ms\":{},", index_elapsed_ms);
     print!("\"counts_by_kind\":{{");
     for (i, (kind, count)) in summary.counts_by_kind.iter().enumerate() {
         if i > 0 {
@@ -166,6 +208,17 @@ fn emit_json_summary(summary: &IndexRepoSummary, elapsed_ms: u64) {
         }
         print!("\"{}\":{}", kind.name(), count);
     }
-    print!("}}}}");
+    print!("}}");
+    if let Some(link) = link {
+        print!(",\"link\":{{");
+        print!("\"fragments_visited\":{},", link.fragments_visited);
+        print!("\"fragments_rewritten\":{},", link.fragments_rewritten);
+        print!("\"placeholders_seen\":{},", link.placeholders_seen);
+        print!("\"placeholders_resolved\":{},", link.placeholders_resolved);
+        print!("\"edges_rewritten\":{},", link.edges_rewritten);
+        print!("\"orphans_removed\":{}", link.orphans_removed);
+        print!("}}");
+    }
+    print!("}}");
     println!();
 }

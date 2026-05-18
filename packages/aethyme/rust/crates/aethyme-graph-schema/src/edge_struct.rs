@@ -223,6 +223,19 @@ impl Edge {
         self
     }
 
+    /// Builder: rewrite the destination node ID.
+    ///
+    /// Used by the linker pass (Phase 4.5) to point an edge from an
+    /// `UnresolvedSymbol` placeholder at a resolved concrete node.
+    /// Mutation goes through a builder rather than a plain setter so
+    /// the call site is grep-able — edges generally shouldn't be
+    /// mutated after construction; the linker is a controlled
+    /// exception.
+    pub fn with_dst_id(mut self, dst_id: NodeId) -> Self {
+        self.dst_id = dst_id;
+        self
+    }
+
     pub fn src_id(&self) -> &NodeId {
         &self.src_id
     }

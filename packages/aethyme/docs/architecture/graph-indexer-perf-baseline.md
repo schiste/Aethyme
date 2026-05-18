@@ -237,6 +237,57 @@ post-linking most of these will be replaced by resolved `Function` / `Class` /
    (>99% of Python code). Nested imports will be addressed when the linker
    pass needs them, since the resolution model is identical.
 
+## Phase 4.5 deltas (2026-05-18)
+
+Stage 2 of cross-file resolution: the **linker pass** now runs by default at the
+end of `aethyme-graph-index` (opt-out via `--skip-link`) and is also available as
+a standalone binary `aethyme-graph-link`. The linker:
+
+1. Builds an in-memory `GlobalSymbolIndex` from all index shards (one-pass walk).
+2. For each fragment in parallel via rayon, finds `UnresolvedSymbol` placeholders,
+   resolves them against the global index using the edge's `import_path` and
+   `is_namespace` / `is_named` flags as hints.
+3. Rewrites `Imports` edges' `dst_id` to the resolved concrete node.
+4. Removes placeholders that have no surviving incoming edge in the fragment.
+5. Persists rewritten fragments via atomic-rename.
+
+Real-world numbers on Aethyme self (2,983 fragments, release binary):
+
+| Metric | Value |
+|---|---|
+| Placeholders pre-link | 1,300 (from Phase 4.4) |
+| Placeholders resolved | 297 (≈23%) |
+| Edges rewritten | 297 |
+| Orphans removed | 297 |
+| Placeholders surviving | 1,000 (stdlib / third-party: `os`, `typing`, `collections`, …) |
+| Linker wall-clock | 0.67 s (~0.22 ms/fragment) |
+| Idempotent re-link | resolves 0 / rewrites 0 / bytes-stable on disk |
+
+The ~23% in-repo resolution rate is the legitimate signal: those are imports
+where both endpoints live in this codebase. The other 77% point at external
+modules (Python stdlib, third-party packages) that the linker correctly leaves
+unresolved. As stage-1 indexers land for TypeScript, Rust, and PHP, the
+linker will resolve cross-file edges for those languages automatically — the
+linker itself contains zero language-specific logic.
+
+### Storage layer change
+
+`Fragment::new`'s edge dedup is now **attribute-aware**: it uses the full
+`(src, dst, EdgeAttributes)` tuple as the dedup key rather than `(src, dst,
+kind_discriminant)`. This preserves edges that differ only in attributes — most
+importantly two `Imports` edges from the same file to the same target where
+the attribute payloads (one `is_namespace=true`, one `is_named=true`) reflect
+distinct import statements (`import pkg.sub` vs `from pkg import sub`). Pre-fix,
+one statement's `import_path` was silently dropped at dedup time. The dedup is
+implemented via an `O(n)` `HashSet<(NodeId, NodeId, EdgeAttributes)>` retain
+pass after the canonical sort, so determinism is preserved.
+
+### Schema layer change
+
+Added `Edge::with_dst_id(NodeId)` builder for the linker to retarget edges. It
+is the only legitimate mutation primitive for an existing edge's destination —
+documented as such in the schema crate. No other consumer uses it today.
+
 ## Next benchmarking work
 
 - **Per-language parser cost breakdown.** A per-file timing

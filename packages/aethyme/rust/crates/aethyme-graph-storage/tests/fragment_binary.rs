@@ -89,6 +89,59 @@ fn fragment_dedupes_duplicate_edges_silently() {
     assert_eq!(frag.edge_count(), 1);
 }
 
+#[test]
+fn fragment_keeps_edges_with_distinct_attributes_for_same_endpoints() {
+    // Phase 4.5 invariant: two edges with the same (src, dst, kind)
+    // but different `EdgeAttributes` payloads — for instance two
+    // Imports edges from the same file to the same target where
+    // one is `is_namespace=true` and the other is `is_named=true`
+    // (corresponds to `import pkg.sub` vs `from pkg import sub`
+    // both resolving to the same module file) — must BOTH survive
+    // the dedup. Pre-fix the dedup only compared (src, dst, kind)
+    // and silently dropped one, losing its `import_path`. The
+    // attribute-aware dedup keeps both edges intact.
+    let f = sample_function();
+    let c = sample_class();
+    use aethyme_graph_schema::Callable;
+    let src = f.id().clone();
+    let dst = c.id().clone();
+
+    let namespace_edge = Edge::new(
+        src.clone(),
+        dst.clone(),
+        EdgeAttributes::Imports {
+            import_path: "pkg.sub".into(),
+            is_namespace: true,
+            is_default: false,
+            is_named: false,
+        },
+        Source::Code,
+        Confidence::FULL,
+    );
+    let named_edge = Edge::new(
+        src.clone(),
+        dst.clone(),
+        EdgeAttributes::Imports {
+            import_path: "pkg.sub".into(),
+            is_namespace: false,
+            is_default: false,
+            is_named: true,
+        },
+        Source::Code,
+        Confidence::FULL,
+    );
+    // Also a true literal duplicate — should be deduped.
+    let dup_of_namespace = namespace_edge.clone();
+    let nodes = vec![Node::Function(f), Node::Class(c)];
+    let frag = Fragment::new(
+        "src/cli.py",
+        nodes,
+        vec![namespace_edge, named_edge, dup_of_namespace],
+    )
+    .unwrap();
+    assert_eq!(frag.edge_count(), 2, "namespace + named must both survive");
+}
+
 // ─── Canonical ordering ─────────────────────────────────────────────
 
 #[test]
