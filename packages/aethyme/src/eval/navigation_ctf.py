@@ -32,7 +32,7 @@ def _resolve_task_pack(
     repo_path: Path,
     task: str,
     tool: "ToolAdapter | None",
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Compute the task pack, optionally via tool adapter subprocess.
 
     Note: navigation-CTF ALSO uses ``inspect_repository`` and
@@ -45,11 +45,7 @@ def _resolve_task_pack(
     if tool is None:
         return build_task_pack(repo_path, task)
     if tool.name != "aethyme":
-        raise NotImplementedError(
-            f"navigation-ctf nav-context expects Aethyme's task_pack schema; "
-            f"tool {tool.name!r} requires reshaping _build_navigation_context "
-            f"to consume a tool-agnostic addendum string instead."
-        )
+        return None  # non-Aethyme: caller branches to tool-context-file flow
     try:
         result = tool.run_condition("leverage", repo_path, task)
         return json.loads(result.raw_output) if result.raw_output else {}
@@ -84,24 +80,55 @@ def run_navigation_ctf_evaluation(
     # Hard separation: task_spec is agent-safe, reference is scoring-only.
     task_spec, reference = _build_navigation_case(inspect)
 
-    # task_pack IS agent-facing leverage data; route via adapter when
-    # supplied for methodological symmetry with non-Aethyme tools.
+    # Tool dispatch. Aethyme/None uses the structured task_pack +
+    # anchor-expansion flow. Non-Aethyme tools take the file-pointer
+    # flow: adapter's leverage output is written into the repo as
+    # .aethyme-eval-tool-context.md, the leverage prompt points there,
+    # and the structured nav-context artifacts are skipped (the
+    # navigation-CTF reference is still computed via inspect_repository
+    # because that's eval-framework infrastructure, not agent data).
+    is_aethyme_tool = tool is None or tool.name == "aethyme"
+    tool_context_relpath = ".aethyme-eval-tool-context.md"
+
     task_pack = _resolve_task_pack(repo_path, task_spec["task"], tool)
     output_schema = navigation_ctf_output_schema()
-    anchors_view = {
-        "task": task_spec["task"],
-        "anchors": task_pack.get("anchors", []),
-    }
-    scope_view = build_scope_view(task_spec["task"], task_pack)
-    navigation_context = _build_navigation_context(repo_path, task_spec, anchors_view, scope_view)
+
+    if is_aethyme_tool:
+        assert task_pack is not None
+        anchors_view = {
+            "task": task_spec["task"],
+            "anchors": task_pack.get("anchors", []),
+        }
+        scope_view = build_scope_view(task_spec["task"], task_pack)
+        navigation_context = _build_navigation_context(
+            repo_path, task_spec, anchors_view, scope_view,
+        )
+    else:
+        assert tool is not None
+        try:
+            leverage_result = tool.run_condition("leverage", repo_path, task_spec["task"])
+            addendum = leverage_result.raw_output or leverage_result.prompt_addendum or ""
+        except Exception as exc:  # noqa: BLE001
+            addendum = (
+                f"<!-- tool '{tool.name}' leverage condition errored: "
+                f"{type(exc).__name__}: {exc} -->\n"
+            )
+        (repo_path / tool_context_relpath).write_text(addendum, encoding="utf-8")
+        anchors_view = {"task": task_spec["task"], "anchors": []}
+        scope_view = {}
+        navigation_context = None
 
     # --- Build prompts (agent-facing — no reference data) ---
     # Control and Explore get identical vanilla prompts.
-    # Explore's advantage comes solely from the Aethyme skill being
-    # auto-loaded in its runtime environment (Playground Aethyme).
+    # Explore's advantage comes from the deployed skill in the agent env
+    # (Aethyme's SKILL.md or the tool's equivalent installer output).
     control_prompt = build_baseline_prompt(repo_path, task_spec["task"])
     explore_prompt = build_baseline_prompt(repo_path, task_spec["task"])
-    leverage_prompt = build_leverage_prompt(repo_path, task_spec["task"])
+    leverage_prompt = build_leverage_prompt(
+        repo_path, task_spec["task"],
+        tool_name=(tool.name if tool is not None else None),
+        tool_context_relpath=(None if is_aethyme_tool else tool_context_relpath),
+    )
 
     # --- Execute conditions via command backends (if provided) ---
     control_run = (

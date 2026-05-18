@@ -84,20 +84,28 @@ def test_legacy_and_adapter_paths_produce_identical_context(mockup_repo: Path) -
         )
 
 
-def test_non_aethyme_tool_raises_on_bug_fix_nav_context(mockup_repo: Path) -> None:
-    """The bug-fix nav-context schema is Aethyme-specific.
+def test_non_aethyme_tool_returns_none_on_bug_fix_nav_context(mockup_repo: Path) -> None:
+    """Non-Aethyme tools opt out of the structured nav-context JSON.
 
-    When a non-Aethyme tool is passed, _build_navigation_context must
-    raise NotImplementedError rather than silently producing a dict with
-    empty anchors/scope/file_contents that would mislead the leverage
-    agent. The fix is to reshape the leverage-prompt construction to
-    accept the tool's own prompt_addendum directly; this test pins the
-    "raise, don't silently degrade" contract until that reshape lands.
+    Reshape (2026-05-18, Tier 1a): non-Aethyme tools no longer raise
+    NotImplementedError. Instead, _build_navigation_context returns
+    None — signaling to prepare_bug_fix_benchmark to write the tool's
+    leverage output to ``<repo>/.aethyme-eval-tool-context.md`` and
+    use a generic tool-pointer preamble in the leverage prompt.
+
+    The previous behavior ("raise") was a temporary guardrail while
+    the framework was Aethyme-only. With the file-pointer flow in
+    place, returning None is the correct signal — no schema mismatch,
+    no silently-empty dict; the caller chooses the per-tool flow.
     """
     from src.eval.bug_fix import _build_navigation_context
     from src.eval.tools import get_adapter
 
     adapter = get_adapter("graphify")
-
-    with pytest.raises(NotImplementedError, match="bug-fix navigation context is Aethyme-specific"):
-        _build_navigation_context(mockup_repo, _TASK, tool=adapter)
+    result = _build_navigation_context(mockup_repo, _TASK, tool=adapter)
+    assert result is None, (
+        f"Non-Aethyme tool should return None to signal the tool-context-file "
+        f"flow; got {type(result).__name__} instead. If you re-introduce "
+        f"structured nav-context support for non-Aethyme tools, update this "
+        f"test's contract."
+    )

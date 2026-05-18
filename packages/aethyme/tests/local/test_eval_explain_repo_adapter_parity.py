@@ -51,10 +51,18 @@ def test_explain_repo_legacy_and_adapter_paths_match(mockup_repo: Path) -> None:
         )
 
 
-def test_explain_repo_non_aethyme_tool_raises(mockup_repo: Path) -> None:
-    """Non-Aethyme tools must raise NotImplementedError on this eval type."""
+def test_explain_repo_non_aethyme_tool_returns_none(mockup_repo: Path) -> None:
+    """Non-Aethyme tools opt out of the Aethyme-shaped task_pack.
+
+    Reshape (Tier 1a): non-Aethyme tools no longer raise. Returning
+    None signals to run_explain_repo_evaluation that it should take
+    the tool-context-file flow (write adapter output to .aethyme-eval-
+    tool-context.md and use a tool-pointer leverage prompt) instead of
+    consuming Aethyme-specific pack.summary / signals / explanation
+    rendering.
+    """
     from src.eval.explain_repo import _resolve_task_pack
     from src.eval.tools import get_adapter
 
-    with pytest.raises(NotImplementedError, match="task_pack schema"):
-        _resolve_task_pack(mockup_repo, _TASK, tool=get_adapter("graphify"))
+    result = _resolve_task_pack(mockup_repo, _TASK, tool=get_adapter("graphify"))
+    assert result is None

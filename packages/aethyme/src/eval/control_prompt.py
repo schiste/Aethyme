@@ -34,13 +34,37 @@ build_control_prompt = build_baseline_prompt
 build_explore_prompt = build_baseline_prompt
 
 
-def build_leverage_prompt(repo_path: Path, task: str) -> str:
+def build_leverage_prompt(
+    repo_path: Path,
+    task: str,
+    *,
+    tool_name: str | None = None,
+    tool_context_relpath: str | None = None,
+) -> str:
     """Return the leverage prompt: vanilla task + power-user instruction.
 
-    The agent runs in a playground with the Aethyme skill auto-loaded.
-    This prompt nudges it to actively use those tools rather than
-    falling back to raw file exploration.
+    The agent runs in a playground with the configured tool's skill
+    auto-loaded. This prompt nudges it to actively use those tools
+    rather than falling back to raw file exploration.
+
+    When ``tool_name`` is None or ``"aethyme"``, the existing Aethyme-
+    specific hint is emitted (byte-identical for the default flow).
+    When ``tool_name`` is a competitor AND ``tool_context_relpath`` is
+    supplied, the prompt names the tool and points at the pre-computed
+    tool-context file — structurally identical to the Aethyme variant
+    for apples-to-apples comparison.
     """
+    is_non_aethyme = tool_name is not None and tool_name != "aethyme"
+    if is_non_aethyme and tool_context_relpath:
+        return (
+            f"Task: {task}\n"
+            f"Repository path: {repo_path}\n"
+            f"{tool_name} is available in this repository. Pre-computed "
+            f"task-specific context is at `{tool_context_relpath}` "
+            f"(produced by {tool_name} before this session started). "
+            f"Read it if useful; verify its output before acting on it. "
+            f"Explore the repository and produce a structured explanation."
+        )
     return (
         f"Task: {task}\n"
         f"Repository path: {repo_path}\n"

@@ -272,55 +272,101 @@ def prepare_bug_fix_benchmark(
     for cond, repo_path in repos.items():
         setup_results[cond] = setup_bug_fix(repo_path)
 
+    # Tool dispatch — Aethyme keeps the structured-JSON nav-context
+    # flow (anchors / scope / file_contents in navigation_context.json);
+    # non-Aethyme tools (graphify, future competitors) use a tool-
+    # context-file pointer in the leverage prompt and skip the Aethyme-
+    # specific negative-context plausibility flow entirely. The
+    # negative-context condition for non-Aethyme tools degenerates to
+    # a leverage replay with ``negative_context_status`` reflecting
+    # that it was auto-skipped — honest about not implementing a
+    # trust-calibration condition that the tool's data shape doesn't
+    # support.
+    is_aethyme_tool = tool is None or tool.name == "aethyme"
+    tool_context_relpath = ".aethyme-eval-tool-context.md"
+
     # 3. Build per-condition prompts (each embeds its own repo path).
-    # Three distinct prompt shapes:
-    #   - leverage / negative-context: pointer at a nav-context file
-    #   - everything else: bare task body
     prompts: dict[str, str] = {}
     for cond, repo_path in repos.items():
         if cond == "leverage":
-            prompt_condition = "leverage"
+            prompts[cond] = _build_bug_fix_prompt(
+                repo_path, task, condition="leverage",
+                tool_name=(tool.name if tool is not None else None),
+                tool_context_relpath=(
+                    None if is_aethyme_tool else tool_context_relpath
+                ),
+            )
         elif cond == "negative-context":
-            prompt_condition = "negative-context"
+            if is_aethyme_tool:
+                prompts[cond] = _build_bug_fix_prompt(
+                    repo_path, task, condition="negative-context",
+                )
+            else:
+                # Auto-skip semantics for non-Aethyme tools: deliver the
+                # same prompt as leverage so the agent still does
+                # *some* work and the table row isn't empty, but record
+                # the status as skipped so reports surface that no
+                # trust-calibration measurement was made.
+                prompts[cond] = _build_bug_fix_prompt(
+                    repo_path, task, condition="leverage",
+                    tool_name=(tool.name if tool is not None else None),
+                    tool_context_relpath=tool_context_relpath,
+                )
         else:
-            prompt_condition = "baseline"
-        prompts[cond] = _build_bug_fix_prompt(
-            repo_path, task, condition=prompt_condition
-        )
+            prompts[cond] = _build_bug_fix_prompt(
+                repo_path, task, condition="baseline",
+            )
 
     # 4. Build navigation contexts.
-    # Real nav-context (leverage) — generated against the actual task.
-    # When ``tool`` is supplied, the adapter routes Aethyme through
-    # subprocess for methodological symmetry with non-Aethyme tools.
-    # Parity with the legacy Python path is enforced by
-    # tests/local/test_eval_navigation_context_adapter_parity.py.
     leverage_repo = repos["leverage"]
     navigation_context = _build_navigation_context(leverage_repo, task, tool=tool)
 
-    # Negative nav-context (plausibly-wrong) — generated against an
-    # alternative task in the same repo, validated by the 5-property
-    # plausibility rule. If the candidate fails plausibility (e.g. the
-    # alternative task produces too narrow an anchor set), we fall back
-    # to the real nav-context — measured behavior degenerates to a
-    # leverage replay and the orchestrator can detect this via
-    # `negative_context_status` in the result.
-    negative_navigation_context: dict[str, Any] = navigation_context
-    negative_status = "fallback_no_alternative"
-    if alternative_task:
-        negative_repo = repos.get("negative-context")
-        if negative_repo is not None:
-            try:
-                negative_navigation_context = generate_plausible_error_context(
-                    navigation_context,
-                    repo_path=negative_repo,
-                    alternative_task=alternative_task,
-                )
-                negative_status = "ok"
-            except PlausibilityError as exc:
-                # Fall back to the real context but record why. The
-                # orchestrator surfaces this in the report so a reader
-                # knows the condition didn't run as intended.
-                negative_status = f"fallback_plausibility_failed: {exc}"
+    # Tool-context file (non-Aethyme only). Written into the leverage
+    # clone (and the negative-context clone too, since its prompt
+    # points at the same file when auto-skipped) so the agent's prompt
+    # can reference it via a relative path. The content is the
+    # adapter's prompt_addendum — whatever the tool emits for its
+    # leverage condition (e.g. graphify's GRAPH_REPORT.md). Failures
+    # in the adapter call produce an empty file with an inline note,
+    # rather than aborting the eval — agents can still run with no
+    # context just like the explore condition.
+    if not is_aethyme_tool and tool is not None:
+        try:
+            leverage_result = tool.run_condition("leverage", leverage_repo, task)
+            addendum = leverage_result.raw_output or leverage_result.prompt_addendum or ""
+        except Exception as exc:  # noqa: BLE001 — best-effort, see comment above
+            addendum = (
+                f"<!-- tool '{tool.name}' leverage condition errored: "
+                f"{type(exc).__name__}: {exc} -->\n"
+            )
+        for cond_name in ("leverage", "negative-context"):
+            target = repos.get(cond_name)
+            if target is not None:
+                (target / tool_context_relpath).write_text(addendum, encoding="utf-8")
+
+    # Negative nav-context (plausibly-wrong) — only meaningful for
+    # Aethyme tooling (the 5-property plausibility rule operates on
+    # Aethyme's anchor schema). For non-Aethyme tools, skip entirely
+    # and surface that in the status; the negative-context condition
+    # will execute as a leverage replay but the report knows it's not
+    # a real trust-calibration measurement.
+    negative_navigation_context: dict[str, Any] | None = navigation_context
+    if not is_aethyme_tool:
+        negative_status = "skipped_non_aethyme_tool"
+    else:
+        negative_status = "fallback_no_alternative"
+        if alternative_task:
+            negative_repo = repos.get("negative-context")
+            if negative_repo is not None:
+                try:
+                    negative_navigation_context = generate_plausible_error_context(
+                        navigation_context,
+                        repo_path=negative_repo,
+                        alternative_task=alternative_task,
+                    )
+                    negative_status = "ok"
+                except PlausibilityError as exc:
+                    negative_status = f"fallback_plausibility_failed: {exc}"
 
     # 5. Shared artifacts
     reference = _build_bug_fix_reference()
@@ -346,13 +392,20 @@ def prepare_bug_fix_benchmark(
     Path(rubric_path).write_text(json.dumps(scoring_rubric, indent=2))
     artifact_paths["scoring_rubric"] = rubric_path
 
-    nav_path = _LEVERAGE_NAV_CONTEXT_PATH
-    Path(nav_path).write_text(json.dumps(navigation_context, indent=2))
-    artifact_paths["navigation_context"] = nav_path
+    # Aethyme-specific nav-context JSON artifacts. Non-Aethyme tools
+    # use the tool-context file inside the leverage clone (written
+    # above) and don't produce these JSON artifacts; the report will
+    # surface ``navigation_context: null`` so downstream consumers can
+    # see the condition was wired differently.
+    if navigation_context is not None:
+        nav_path = _LEVERAGE_NAV_CONTEXT_PATH
+        Path(nav_path).write_text(json.dumps(navigation_context, indent=2))
+        artifact_paths["navigation_context"] = nav_path
 
-    neg_nav_path = _NEGATIVE_NAV_CONTEXT_PATH
-    Path(neg_nav_path).write_text(json.dumps(negative_navigation_context, indent=2))
-    artifact_paths["negative_navigation_context"] = neg_nav_path
+    if negative_navigation_context is not None:
+        neg_nav_path = _NEGATIVE_NAV_CONTEXT_PATH
+        Path(neg_nav_path).write_text(json.dumps(negative_navigation_context, indent=2))
+        artifact_paths["negative_navigation_context"] = neg_nav_path
 
     result = {
         "repos": {cond: str(path) for cond, path in repos.items()},
@@ -474,6 +527,8 @@ def _build_bug_fix_prompt(
     task: str,
     *,
     condition: str = "baseline",
+    tool_name: str | None = None,
+    tool_context_relpath: str | None = None,
 ) -> str:
     """Build the bug-fix prompt for one of three condition shapes.
 
@@ -482,16 +537,38 @@ def _build_bug_fix_prompt(
     - ``"baseline"`` (control + explore + task-conditioned): no preamble.
       Agents either don't have the skill (control) or have it without
       explicit instruction (explore).
-    - ``"leverage"``: minimal pointer at the deployed SKILL.md. No
-      nav-context blob path — the agent invokes the live tool on
-      demand via the depth ladder.
+    - ``"leverage"``: pointer at the tool. For Aethyme (the default),
+      uses the Aethyme-specific minimal pointer at SKILL.md. For other
+      tools, uses a generic pointer at the pre-computed tool-context
+      file (``tool_context_relpath``, relative to the repo root).
     - ``"negative-context"``: pointer at the *plausibly-wrong*
       nav-context blob file (asymmetric with leverage by design —
       this condition tests trust calibration when the agent is
-      handed wrong context upfront).
+      handed wrong context upfront). Aethyme-specific.
+
+    ``tool_name`` + ``tool_context_relpath`` are only meaningful for
+    the leverage condition with a non-Aethyme tool. When ``tool_name``
+    is None or "aethyme", the existing Aethyme-specific preamble is
+    used — preserving byte-identical prompts for the default flow.
     """
     if condition == "leverage":
-        preamble = _LEVERAGE_MINIMAL_POINTER
+        is_non_aethyme = tool_name is not None and tool_name != "aethyme"
+        if is_non_aethyme and tool_context_relpath:
+            # Mirrors Aethyme's _LEVERAGE_MINIMAL_POINTER shape: a small
+            # pointer hint that names the tool and tells the agent where
+            # to find pre-computed context. The agent decides whether
+            # to Read the file — same structural decision as the
+            # Aethyme leverage condition, so comparison stays apples-
+            # to-apples.
+            preamble = (
+                f"{tool_name} is available in this repository. Pre-computed "
+                f"task-specific context is at `{tool_context_relpath}` "
+                f"(produced by {tool_name}'s leverage command before this "
+                f"session started). Read it if useful; verify its output "
+                f"before acting on it.\n\n"
+            )
+        else:
+            preamble = _LEVERAGE_MINIMAL_POINTER
     elif condition == "negative-context":
         preamble = (
             "Use Aethyme tools to navigate the repository graph.\n"
@@ -519,8 +596,14 @@ def _build_navigation_context(
     task: str,
     *,
     tool: "ToolAdapter | None" = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Build navigation context for the leverage condition.
+
+    Returns ``None`` when the tool is non-Aethyme — those tools deliver
+    leverage context via a different mechanism (a tool-context file
+    pointer in the prompt) wired in :func:`prepare_bug_fix_benchmark`.
+    Returns the Aethyme-specific ``{anchors, scope, file_contents}``
+    dict otherwise.
 
     Uses the Aethyme engine to compute task-relevant context (anchors,
     scope, file contents) so the leverage agent starts with a map of
@@ -544,18 +627,15 @@ def _build_navigation_context(
     not at a synthetic Aethyme-shape JSON. We raise so the caller
     notices, rather than silently producing nonsense.
     """
-    # Adapter path — Aethyme only for now.
+    # Adapter path — Aethyme retains its structured nav-context JSON;
+    # non-Aethyme tools take a separate flow at the prepare-level (see
+    # prepare_bug_fix_benchmark below). Returning None here signals
+    # "don't try to write an Aethyme-shaped JSON for this tool" — the
+    # caller short-circuits to the tool-context-file flow instead.
     if tool is not None:
         if tool.name == "aethyme":
             return _build_navigation_context_via_adapter(repo_path, task, tool)
-        raise NotImplementedError(
-            f"bug-fix navigation context is Aethyme-specific (anchors/scope/"
-            f"file_contents schema). Tool {tool.name!r} should use its own "
-            f"prompt addendum directly in the leverage condition; supporting "
-            f"this requires reshaping _build_bug_fix_prompt to accept a tool-"
-            f"agnostic addendum string instead of a pointer to a fixed-shape "
-            f"JSON file. Tracked separately."
-        )
+        return None  # non-Aethyme: caller handles via tool-context file
 
     # Legacy direct-Python path.
     try:
