@@ -324,13 +324,27 @@ def prepare_bug_fix_benchmark(
     # Tool-context file (non-Aethyme only). Written into the leverage
     # clone (and the negative-context clone too, since its prompt
     # points at the same file when auto-skipped) so the agent's prompt
-    # can reference it via a relative path. The content is the
-    # adapter's prompt_addendum — whatever the tool emits for its
-    # leverage condition (e.g. graphify's GRAPH_REPORT.md). Failures
-    # in the adapter call produce an empty file with an inline note,
-    # rather than aborting the eval — agents can still run with no
-    # context just like the explore condition.
+    # can reference it via a relative path.
+    #
+    # For tools with per-clone state (e.g. graphify, whose `query`
+    # reads ./graphify-out/graph.json relative to cwd), we MUST warm
+    # the clone first — the per-eval daemon-warming the orchestrator's
+    # plan emits only runs against target.aethyme_path, not the agent
+    # clones. We do this synchronously here in prepare so the leverage
+    # query has the graph to read; failures degrade to an empty
+    # context file (same fallback as adapter call failures below).
     if not is_aethyme_tool and tool is not None:
+        try:
+            tool.warm(leverage_repo)
+        except Exception as exc:  # noqa: BLE001 — warm-failure is a degraded condition, not eval-killing
+            # Adapter raised — likely an LLM/backend issue. Log to
+            # stderr but continue; the run_condition call below may
+            # fall back to graceful failure as well.
+            print(
+                f"[bug_fix.prepare] {tool.name} warm() failed on "
+                f"{leverage_repo}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
         try:
             leverage_result = tool.run_condition("leverage", leverage_repo, task)
             addendum = leverage_result.raw_output or leverage_result.prompt_addendum or ""

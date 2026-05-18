@@ -105,6 +105,20 @@ def run_navigation_ctf_evaluation(
         )
     else:
         assert tool is not None
+        # Inline warm — per the bug_fix.py / explain_repo.py pattern:
+        # tools with per-dir state (graphify-out/) need warming before
+        # query, and the orchestrator's warm phase runs AFTER this
+        # function executes (build-inputs comes first). See bug_fix.py
+        # for full rationale.
+        import sys as _sys
+        try:
+            tool.warm(repo_path)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[navigation_ctf] {tool.name} warm() failed on "
+                f"{repo_path}: {type(exc).__name__}: {exc}",
+                file=_sys.stderr,
+            )
         try:
             leverage_result = tool.run_condition("leverage", repo_path, task_spec["task"])
             addendum = leverage_result.raw_output or leverage_result.prompt_addendum or ""

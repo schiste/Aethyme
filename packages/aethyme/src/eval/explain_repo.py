@@ -107,7 +107,24 @@ def run_explain_repo_evaluation(
         # skip the Aethyme-specific structured artifacts; downstream
         # consumers see ``navigation_context = None`` and the same
         # auto-skip semantics as bug_fix.py.
+        #
+        # Tools with per-dir state (graphify's graphify-out/) need to
+        # be warmed against repo_path BEFORE the query call, since the
+        # orchestrator's warm phase runs AFTER build-inputs (this
+        # function is part of build-inputs). Failures are non-fatal —
+        # query may degrade or also fail, in which case the tool-
+        # context file gets an inline error note and the eval still
+        # runs (the agent just won't have leverage context).
         assert tool is not None
+        import sys as _sys
+        try:
+            tool.warm(repo_path)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[explain_repo] {tool.name} warm() failed on "
+                f"{repo_path}: {type(exc).__name__}: {exc}",
+                file=_sys.stderr,
+            )
         try:
             leverage_result = tool.run_condition("leverage", repo_path, task)
             addendum = leverage_result.raw_output or leverage_result.prompt_addendum or ""
