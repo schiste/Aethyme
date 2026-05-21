@@ -1,0 +1,32 @@
+[package]
+name = "aethyme-producers"
+version = "0.1.0"
+edition = "2024"
+description = "OverlayProducer trait + determinism harness for Phase 4.7. Producers synthesize non-per-file payloads (structure, configs, docs, risks) and persist through the fragment-store overlay surface."
+license = "UNLICENSED"
+
+[lib]
+name = "aethyme_producers"
+path = "src/lib.rs"
+
+[dependencies]
+# OverlayFragment, FragmentStore, write_overlay_bytes — the contract
+# we produce against. We never write to disk from this crate; we
+# return OverlayFragments and let callers persist via the storage
+# crate's write_overlay path. Keeps producer logic testable without
+# tempdirs.
+aethyme-graph-storage = { path = "../aethyme-graph-storage" }
+# Schema types producers read out of the store (NodeId, NodeKind,
+# Edge, etc.). The schema crate is the contract for what fragments
+# contain.
+aethyme-graph-schema = { path = "../aethyme-graph-schema" }
+# Payload serde bounds — producers stamp Serialize + DeserializeOwned
+# on their payload types and the trait bound surfaces it here.
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# ProducerCtx wraps a real FragmentStore (which insists its on-disk
+# layout exists), so the harness test needs a tempdir + bootstrap_repo
+# call rather than an in-memory fake. tempfile = "3" matches the rest
+# of the workspace.
+tempfile = "3"

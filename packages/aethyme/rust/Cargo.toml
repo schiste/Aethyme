@@ -4,5 +4,6 @@ members = [
     "crates/aethyme-graph-indexer",
     "crates/aethyme-graph-schema",
     "crates/aethyme-graph-storage",
+    "crates/aethyme-producers",
 ]
 resolver = "2"
