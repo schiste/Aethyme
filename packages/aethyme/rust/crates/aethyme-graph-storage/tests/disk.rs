@@ -5,9 +5,12 @@ use aethyme_graph_schema::{
     Function, Node, NodeKind, ParameterSignature, SourceRange, Visibility,
 };
 use aethyme_graph_storage::{
-    read_fragment, read_index_shard, write_fragment, write_index_shard,
-    Fragment, FragmentReadError, FragmentWriteError, SymbolRecord,
+    read_fragment, read_index_shard, read_overlay, write_fragment,
+    write_index_shard, write_overlay, Fragment, FragmentReadError,
+    FragmentStore, FragmentWriteError, OverlayDecodeError, OverlayFragment,
+    OverlayReadError, SymbolRecord,
 };
+use std::collections::BTreeMap;
 
 fn sample_fragment() -> Fragment {
     let f = Function::new(
@@ -152,6 +155,157 @@ fn write_index_shard_rejects_path_chars_in_module_name() {
     let tmp = tempfile::tempdir().unwrap();
     let result = write_index_shard(tmp.path(), "evil/module", &[]);
     assert!(result.is_err());
+}
+
+// ─── Overlay disk I/O ───────────────────────────────────────────────
+
+/// Sample payload used by overlay tests. `BTreeMap` gives us
+/// deterministic serialization for free, so the tests stay focused
+/// on the wrapper rather than payload-author discipline.
+fn sample_overlay_payload() -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    m.insert("layer".into(), "domain".into());
+    m.insert("owner".into(), "platform".into());
+    m
+}
+
+#[test]
+fn write_then_read_overlay_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let overlay = OverlayFragment::new(
+        "structure",
+        "structure-producer/0.1.0",
+        sample_overlay_payload(),
+    )
+    .unwrap();
+    let written = write_overlay(tmp.path(), "structure", &overlay).unwrap();
+    assert!(written.exists());
+    let back: OverlayFragment<BTreeMap<String, String>> =
+        read_overlay(tmp.path(), "structure").unwrap();
+    assert_eq!(back, overlay);
+}
+
+#[test]
+fn write_overlay_lands_under_overlays_subdir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let overlay = OverlayFragment::new(
+        "configs",
+        "configs/0.1.0",
+        sample_overlay_payload(),
+    )
+    .unwrap();
+    write_overlay(tmp.path(), "configs", &overlay).unwrap();
+    let expected = tmp.path().join(".aethyme/graph/_overlays/configs.bin");
+    assert!(expected.exists());
+}
+
+#[test]
+fn read_overlay_kind_mismatch_fails_loudly() {
+    // Write the bytes under one kind, then hand-place them under
+    // another and try to decode. Simulates either tampering or a
+    // caller asking for the wrong kind.
+    let tmp = tempfile::tempdir().unwrap();
+    let overlay = OverlayFragment::new(
+        "risks",
+        "risks/0.1.0",
+        sample_overlay_payload(),
+    )
+    .unwrap();
+    write_overlay(tmp.path(), "risks", &overlay).unwrap();
+
+    // Copy risks.bin → structure.bin to simulate a kind/filename
+    // mismatch on disk.
+    let overlays_dir = tmp.path().join(".aethyme/graph/_overlays");
+    std::fs::copy(
+        overlays_dir.join("risks.bin"),
+        overlays_dir.join("structure.bin"),
+    )
+    .unwrap();
+
+    let err = read_overlay::<BTreeMap<String, String>>(
+        tmp.path(),
+        "structure",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            OverlayReadError::Decode(OverlayDecodeError::KindMismatch { .. })
+        ),
+        "expected KindMismatch, got {err:?}",
+    );
+}
+
+#[test]
+fn fragment_store_list_overlays_returns_sorted_kinds() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Write in non-alphabetical order to prove the sort.
+    for kind in ["risks", "configs", "structure"] {
+        let overlay = OverlayFragment::new(
+            kind,
+            &format!("{kind}/0.1.0"),
+            sample_overlay_payload(),
+        )
+        .unwrap();
+        write_overlay(tmp.path(), kind, &overlay).unwrap();
+    }
+
+    let store = FragmentStore::open(tmp.path()).unwrap();
+    let kinds = store.list_overlays().unwrap();
+    assert_eq!(kinds, vec!["configs", "risks", "structure"]);
+}
+
+#[test]
+fn fragment_store_list_overlays_empty_when_no_overlays() {
+    // Need a per-file fragment to make the graph dir exist (so
+    // FragmentStore::open succeeds) without creating _overlays/.
+    let tmp = tempfile::tempdir().unwrap();
+    write_fragment(tmp.path(), "src/cli.py", &sample_fragment()).unwrap();
+    let store = FragmentStore::open(tmp.path()).unwrap();
+    assert!(store.list_overlays().unwrap().is_empty());
+}
+
+#[test]
+fn fragment_store_does_not_enumerate_overlay_bins_as_source_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    // One real fragment, one overlay sitting next to it.
+    write_fragment(tmp.path(), "src/cli.py", &sample_fragment()).unwrap();
+    let overlay = OverlayFragment::new(
+        "structure",
+        "structure/0.1.0",
+        sample_overlay_payload(),
+    )
+    .unwrap();
+    write_overlay(tmp.path(), "structure", &overlay).unwrap();
+
+    let store = FragmentStore::open(tmp.path()).unwrap();
+    let paths = store.list_indexed_source_paths().unwrap();
+    assert_eq!(paths, vec!["src/cli.py"]);
+}
+
+#[test]
+fn overlay_bytes_on_disk_byte_identical_across_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let overlay = OverlayFragment::new(
+        "structure",
+        "structure/0.1.0",
+        sample_overlay_payload(),
+    )
+    .unwrap();
+
+    write_overlay(tmp.path(), "structure", &overlay).unwrap();
+    let bytes_a = std::fs::read(
+        tmp.path().join(".aethyme/graph/_overlays/structure.bin"),
+    )
+    .unwrap();
+
+    write_overlay(tmp.path(), "structure", &overlay).unwrap();
+    let bytes_b = std::fs::read(
+        tmp.path().join(".aethyme/graph/_overlays/structure.bin"),
+    )
+    .unwrap();
+
+    assert_eq!(bytes_a, bytes_b);
 }
 
 // ─── Determinism across disk round-trip ─────────────────────────────

@@ -9,8 +9,12 @@
 //! │   ├── graph/                   ← committed
 //! │   │   ├── <source-path>.bin    ← per-file binary fragment
 //! │   │   │                          (mirror source tree)
-//! │   │   └── _index/
-//! │   │       └── <module>.ndjson  ← per-module index shard
+//! │   │   ├── _index/
+//! │   │   │   └── <module>.ndjson  ← per-module index shard
+//! │   │   └── _overlays/
+//! │   │       └── <kind>.bin       ← non-per-file producer output
+//! │   │                              (structure, configs, docs,
+//! │   │                              risks, areas, …)
 //! │   └── cache/                   ← gitignored, daemon-managed
 //! │       └── *.redb
 //! ```
@@ -32,6 +36,17 @@ pub const GRAPH_SUBDIR: &str = "graph";
 /// when ls-ing `graph/` and prevents collision with any
 /// hypothetical source file or directory named `index`.
 pub const INDEX_SUBDIR: &str = "_index";
+
+/// Subdirectory of `GRAPH_SUBDIR` that holds non-per-file overlay
+/// fragments produced by indexer passes that synthesize repo-level
+/// structure rather than parsing one source file (structure,
+/// configs, docs, risks, areas, …). Same underscore-prefix
+/// convention as [`INDEX_SUBDIR`] for the same reasons: visual
+/// grouping plus collision guard against any hypothetical source
+/// directory literally named `overlays`. Per-kind payloads live in
+/// `<kind>.bin` files; see [`overlay_path`] and the
+/// [`overlay`](crate::overlay) module.
+pub const OVERLAYS_SUBDIR: &str = "_overlays";
 
 /// File extension for per-file binary fragments.
 pub const FRAGMENT_EXT: &str = "bin";
@@ -81,6 +96,24 @@ pub fn index_shard_path(repo_root: &Path, module: &str) -> PathBuf {
     p.push(GRAPH_SUBDIR);
     p.push(INDEX_SUBDIR);
     p.push(format!("{module}.{INDEX_SHARD_EXT}"));
+    p
+}
+
+/// Absolute path to an overlay fragment within the repo.
+///
+/// Example: `repo = "/path/to/repo"`, `kind = "structure"` →
+/// `/path/to/repo/.aethyme/graph/_overlays/structure.bin`.
+///
+/// The `kind` is the overlay's logical name (e.g. `"structure"`,
+/// `"configs"`, `"docs"`, `"risks"`, `"areas"`). It must pass
+/// [`validate_module_name`] — overlay kinds share the same
+/// path-safety rules as module names.
+pub fn overlay_path(repo_root: &Path, kind: &str) -> PathBuf {
+    let mut p = repo_root.to_path_buf();
+    p.push(AETHYME_DIR);
+    p.push(GRAPH_SUBDIR);
+    p.push(OVERLAYS_SUBDIR);
+    p.push(format!("{kind}.{FRAGMENT_EXT}"));
     p
 }
 

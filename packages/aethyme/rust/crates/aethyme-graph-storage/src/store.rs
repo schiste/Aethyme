@@ -13,15 +13,21 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use aethyme_graph_schema::{NodeId, NodeKind};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 use crate::disk::{
-    read_fragment, read_index_shard, FragmentReadError, IndexShardReadError,
+    read_fragment, read_index_shard, read_overlay, write_overlay,
+    FragmentReadError, IndexShardReadError, OverlayReadError,
+    OverlayWriteError,
 };
 use crate::fragment::Fragment;
 use crate::index_shard::SymbolRecord;
 use crate::layout::{
     AETHYME_DIR, FRAGMENT_EXT, GRAPH_SUBDIR, INDEX_SHARD_EXT, INDEX_SUBDIR,
+    OVERLAYS_SUBDIR,
 };
+use crate::overlay::OverlayFragment;
 
 /// A read-only view of a repo's committed Aethyme graph.
 ///
@@ -119,6 +125,61 @@ impl FragmentStore {
         }
         modules.sort();
         Ok(modules)
+    }
+
+    /// Read a typed overlay fragment for the given kind.
+    ///
+    /// The caller supplies the payload type `P` they expect; a
+    /// `KindMismatch` from the decoder means either the wrong `P`
+    /// was supplied or the file was tampered with. See
+    /// [`OverlayFragment`] for the versioning contract.
+    pub fn read_overlay<P: DeserializeOwned>(
+        &self,
+        kind: &str,
+    ) -> Result<OverlayFragment<P>, OverlayReadError> {
+        read_overlay(&self.repo_root, kind)
+    }
+
+    /// Write a typed overlay fragment for the given kind. The kind
+    /// must match `overlay.kind()`; the disk layer enforces this
+    /// belt-and-braces.
+    pub fn write_overlay<P: Serialize>(
+        &self,
+        kind: &str,
+        overlay: &OverlayFragment<P>,
+    ) -> Result<PathBuf, OverlayWriteError> {
+        write_overlay(&self.repo_root, kind, overlay)
+    }
+
+    /// Enumerate every overlay kind that has a file on disk.
+    /// Returns kinds with the `.bin` extension stripped, sorted.
+    pub fn list_overlays(&self) -> Result<Vec<String>, StoreOpenError> {
+        let overlays_dir = self.overlays_dir();
+        if !overlays_dir.is_dir() {
+            // No overlays yet — empty result rather than an error.
+            return Ok(Vec::new());
+        }
+        let mut kinds = Vec::new();
+        let entries = std::fs::read_dir(&overlays_dir).map_err(|e| {
+            StoreOpenError::Io {
+                path: overlays_dir.clone(),
+                message: e.to_string(),
+            }
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| StoreOpenError::Io {
+                path: overlays_dir.clone(),
+                message: e.to_string(),
+            })?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(kind) = name.strip_suffix(&format!(".{FRAGMENT_EXT}"))
+            {
+                kinds.push(kind.to_string());
+            }
+        }
+        kinds.sort();
+        Ok(kinds)
     }
 
     /// Look up symbols by (optional module, name, optional kind).
@@ -248,6 +309,10 @@ impl FragmentStore {
     fn index_dir(&self) -> PathBuf {
         self.graph_dir().join(INDEX_SUBDIR)
     }
+
+    fn overlays_dir(&self) -> PathBuf {
+        self.graph_dir().join(OVERLAYS_SUBDIR)
+    }
 }
 
 fn collect_bin_files(
@@ -263,7 +328,10 @@ fn collect_bin_files(
         let name = name.to_string_lossy();
         // Skip the index subdir and the .gitattributes file at
         // graph root.
-        if name == INDEX_SUBDIR || name.starts_with('.') {
+        if name == INDEX_SUBDIR
+            || name == OVERLAYS_SUBDIR
+            || name.starts_with('.')
+        {
             continue;
         }
         if path.is_dir() {

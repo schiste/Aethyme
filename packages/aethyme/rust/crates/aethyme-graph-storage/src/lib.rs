@@ -6,7 +6,7 @@
 //! (c) maintain the directory layout described in
 //! `docs/architecture/graph-schema.md §5`.
 //!
-//! ## Storage layout (Option C)
+//! ## Storage layout (Option C / variant C1)
 //!
 //! ```text
 //! <repo>/
@@ -15,9 +15,12 @@
 //! │   ├── graph/                   ← committed
 //! │   │   ├── <source-path>.bin    ← per-file binary fragment
 //! │   │   ├── ...
-//! │   │   └── _index/              ← committed per-module index shards
-//! │   │       ├── <module>.ndjson
-//! │   │       └── ...
+//! │   │   ├── _index/              ← committed per-module index shards
+//! │   │   │   ├── <module>.ndjson
+//! │   │   │   └── ...
+//! │   │   └── _overlays/           ← committed non-per-file producer output
+//! │   │       ├── <kind>.bin        (Phase 4.7+ — structure, configs,
+//! │   │       └── ...               docs, risks, areas, …)
 //! │   └── cache/                   ← gitignored
 //! │       └── *.redb               ← daemon's live mirror
 //! ```
@@ -32,6 +35,11 @@
 //!   (commit 2.4)
 //! - `layout` — filesystem layout helpers (resolves a source path
 //!   to its fragment path, etc.) (commit 2.5)
+//! - `overlay` — typed non-per-file producer payloads
+//!   (`OverlayFragment<P>`, commit 4.7.1+). Lets producers that
+//!   synthesize repo-level structure rather than parsing one source
+//!   file persist through the same crate, without forcing every
+//!   payload into one giant enum.
 //!
 //! ## Determinism contract
 //!
@@ -47,6 +55,7 @@ pub mod disk;
 pub mod fragment;
 pub mod index_shard;
 pub mod layout;
+pub mod overlay;
 pub mod store;
 
 pub use binary::{
@@ -58,9 +67,10 @@ pub use bootstrap::{
     EngineVersionReadError, GITATTRIBUTES_CONTENT,
 };
 pub use disk::{
-    read_fragment, read_index_shard, write_fragment, write_index_shard,
-    FragmentReadError, FragmentWriteError, IndexShardReadError,
-    IndexShardWriteError,
+    read_fragment, read_index_shard, read_overlay, write_fragment,
+    write_index_shard, write_overlay, FragmentReadError, FragmentWriteError,
+    IndexShardReadError, IndexShardWriteError, OverlayReadError,
+    OverlayWriteError,
 };
 pub use fragment::{Fragment, FragmentBuildError};
 pub use index_shard::{
@@ -70,8 +80,12 @@ pub use index_shard::{
 };
 pub use layout::{
     cache_dir, engine_version_path, fragment_path, index_shard_path,
-    validate_module_name, validate_source_path, InvalidPath, AETHYME_DIR,
-    CACHE_SUBDIR, ENGINE_VERSION_FILE, FRAGMENT_EXT, GRAPH_SUBDIR,
-    INDEX_SHARD_EXT, INDEX_SUBDIR,
+    overlay_path, validate_module_name, validate_source_path, InvalidPath,
+    AETHYME_DIR, CACHE_SUBDIR, ENGINE_VERSION_FILE, FRAGMENT_EXT,
+    GRAPH_SUBDIR, INDEX_SHARD_EXT, INDEX_SUBDIR, OVERLAYS_SUBDIR,
+};
+pub use overlay::{
+    read_overlay_bytes, write_overlay_bytes, OverlayBuildError,
+    OverlayDecodeError, OverlayEncodeError, OverlayFragment,
 };
 pub use store::{FragmentStore, StoreLookupError, StoreOpenError};

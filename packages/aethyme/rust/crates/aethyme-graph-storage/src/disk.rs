@@ -15,6 +15,9 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+
 use crate::binary::{
     read_fragment_bytes, write_fragment_bytes, FragmentDecodeError,
     FragmentEncodeError,
@@ -25,8 +28,12 @@ use crate::index_shard::{
     IndexShardEncodeError, SymbolRecord,
 };
 use crate::layout::{
-    fragment_path, index_shard_path, validate_module_name,
+    fragment_path, index_shard_path, overlay_path, validate_module_name,
     validate_source_path, InvalidPath,
+};
+use crate::overlay::{
+    read_overlay_bytes, write_overlay_bytes, OverlayDecodeError,
+    OverlayEncodeError, OverlayFragment,
 };
 
 /// Write a Fragment to its canonical location under `<repo>/.aethyme/
@@ -81,6 +88,46 @@ pub fn read_index_shard(
     let target = index_shard_path(repo_root, module);
     let bytes = read_file(&target).map_err(IndexShardReadError::Io)?;
     read_index_shard_bytes(&bytes).map_err(IndexShardReadError::Decode)
+}
+
+/// Write an OverlayFragment to its canonical location under
+/// `<repo>/.aethyme/graph/_overlays/<kind>.bin`. Creates parent
+/// directories as needed; atomic-renames into place.
+///
+/// The `kind` parameter is the on-disk filename and MUST equal
+/// `overlay.kind()` — passing them as separate args is a deliberate
+/// belt-and-braces check, since the kind is also embedded in the
+/// payload bytes for decode-time provenance. Producers should pass
+/// the same literal both places.
+pub fn write_overlay<P: Serialize>(
+    repo_root: &Path,
+    kind: &str,
+    overlay: &OverlayFragment<P>,
+) -> Result<PathBuf, OverlayWriteError> {
+    validate_module_name(kind).map_err(OverlayWriteError::Path)?;
+    let bytes =
+        write_overlay_bytes(overlay).map_err(OverlayWriteError::Encode)?;
+    let target = overlay_path(repo_root, kind);
+    atomic_write(&target, &bytes).map_err(OverlayWriteError::Io)?;
+    Ok(target)
+}
+
+/// Read an OverlayFragment from its canonical location, verifying
+/// that the bytes' embedded `kind` matches the filename's `kind`.
+///
+/// The caller must supply the payload type `P` they expect — there
+/// is no runtime registry mapping kinds to payload types, by design
+/// (see `overlay.rs` module docs). A `KindMismatch` decode error
+/// means either the wrong `P` was supplied or the file was renamed
+/// out from under us.
+pub fn read_overlay<P: DeserializeOwned>(
+    repo_root: &Path,
+    kind: &str,
+) -> Result<OverlayFragment<P>, OverlayReadError> {
+    validate_module_name(kind).map_err(OverlayReadError::Path)?;
+    let target = overlay_path(repo_root, kind);
+    let bytes = read_file(&target).map_err(OverlayReadError::Io)?;
+    read_overlay_bytes(&bytes, kind).map_err(OverlayReadError::Decode)
 }
 
 // ─── Internal helpers ────────────────────────────────────────────────
@@ -195,3 +242,41 @@ impl std::fmt::Display for IndexShardReadError {
 }
 
 impl std::error::Error for IndexShardReadError {}
+
+#[derive(Debug)]
+pub enum OverlayWriteError {
+    Path(InvalidPath),
+    Encode(OverlayEncodeError),
+    Io(io::Error),
+}
+
+impl std::fmt::Display for OverlayWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Path(e) => write!(f, "overlay write: {e}"),
+            Self::Encode(e) => write!(f, "overlay write: {e}"),
+            Self::Io(e) => write!(f, "overlay write I/O: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for OverlayWriteError {}
+
+#[derive(Debug)]
+pub enum OverlayReadError {
+    Path(InvalidPath),
+    Decode(OverlayDecodeError),
+    Io(io::Error),
+}
+
+impl std::fmt::Display for OverlayReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Path(e) => write!(f, "overlay read: {e}"),
+            Self::Decode(e) => write!(f, "overlay read: {e}"),
+            Self::Io(e) => write!(f, "overlay read I/O: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for OverlayReadError {}
