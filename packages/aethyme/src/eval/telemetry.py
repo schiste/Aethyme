@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 # The default output-path regex matches the canonical
 # `.aethyme-eval-output-<condition>.json` filename used by every eval
@@ -91,13 +93,14 @@ def map_sessions_by_prompt(
 
     for jsonl in candidate_jsonls:
         try:
-            cond = _extract_condition_from_jsonl(jsonl, output_path_pattern)
+            marker = _extract_condition_marker_from_jsonl(jsonl, output_path_pattern)
         except (OSError, json.JSONDecodeError):
             # Unreadable or corrupted JSONL — skip silently. The caller's
             # missing-conditions check will surface the gap.
             continue
-        if cond is None:
+        if marker is None:
             continue
+        cond = marker["condition"]
         mtime = jsonl.stat().st_mtime
         existing = by_condition.get(cond)
         if existing is None or mtime > existing[0]:
@@ -109,11 +112,132 @@ def map_sessions_by_prompt(
     return result
 
 
+def map_session_attributions_by_prompt(
+    candidate_jsonls: list[Path],
+    *,
+    expected_conditions: list[str] | None = None,
+    reported_session_ids: dict[str, str | None] | None = None,
+    reported_jsonl_paths: dict[str, str | Path | None] | None = None,
+    expected_session_ids: dict[str, str | None] | None = None,
+    output_path_pattern: re.Pattern[str] = DEFAULT_OUTPUT_PATH_PATTERN,
+    matched_at: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return per-condition transcript attribution records.
+
+    This is the auditable companion to :func:`map_sessions_by_prompt`.
+    The mapping helper intentionally hides Chau7's stale ``ai_session_id``
+    problem by returning the content-matched JSONL. This helper exposes the
+    evidence trail: what Chau7 reported, which JSONL matched the prompt marker,
+    and whether the two disagree.
+    """
+    matched_at = matched_at or datetime.now(UTC).isoformat()
+    reported_session_ids = reported_session_ids or {}
+    reported_jsonl_paths = reported_jsonl_paths or {}
+    expected_session_ids = expected_session_ids or {}
+
+    by_condition: dict[str, tuple[float, Path, dict[str, str]]] = {}
+
+    for jsonl in candidate_jsonls:
+        try:
+            marker = _extract_condition_marker_from_jsonl(jsonl, output_path_pattern)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if marker is None:
+            continue
+        cond = marker["condition"]
+        mtime = jsonl.stat().st_mtime
+        existing = by_condition.get(cond)
+        if existing is None or mtime > existing[0]:
+            by_condition[cond] = (mtime, jsonl, marker)
+
+    conditions = (
+        list(expected_conditions)
+        if expected_conditions is not None
+        else sorted(by_condition)
+    )
+    records: dict[str, dict[str, Any]] = {}
+    for cond in conditions:
+        item = by_condition.get(cond)
+        matched_path = item[1] if item else None
+        marker = item[2] if item else None
+        records[cond] = build_attribution_confidence(
+            condition=cond,
+            reported_chau7_session_id=reported_session_ids.get(cond),
+            reported_jsonl_path=reported_jsonl_paths.get(cond),
+            expected_session_id=expected_session_ids.get(cond),
+            content_matched_jsonl_path=matched_path,
+            matched_marker=marker.get("marker") if marker else None,
+            matched_condition=marker.get("condition") if marker else None,
+            matched_at=matched_at if marker else None,
+        )
+    return records
+
+
+def build_attribution_confidence(
+    *,
+    condition: str,
+    reported_chau7_session_id: str | None = None,
+    reported_jsonl_path: str | Path | None = None,
+    expected_session_id: str | None = None,
+    content_matched_jsonl_path: str | Path | None = None,
+    matched_marker: str | None = None,
+    matched_condition: str | None = None,
+    matched_at: str | None = None,
+) -> dict[str, Any]:
+    """Build the first-class per-condition attribution-confidence artifact."""
+    matched_path_str = (
+        str(content_matched_jsonl_path)
+        if content_matched_jsonl_path is not None
+        else None
+    )
+    reported_path_str = str(reported_jsonl_path) if reported_jsonl_path is not None else None
+    matched_session_id = (
+        Path(matched_path_str).stem
+        if matched_path_str
+        else None
+    )
+    reported = reported_chau7_session_id or None
+    mismatch = bool(reported and matched_session_id and reported != matched_session_id)
+
+    if matched_path_str and mismatch:
+        confidence = "content-match-overrode-reported-session"
+    elif matched_path_str and reported:
+        confidence = "high"
+    elif matched_path_str:
+        confidence = "content-matched-no-reported-session"
+    else:
+        confidence = "missing-transcript"
+
+    return {
+        "schema_version": "aethyme-attribution-confidence-v1",
+        "condition": condition,
+        "reported_chau7_session_id": reported,
+        "reported_jsonl_path": reported_path_str,
+        "expected_session_id": expected_session_id,
+        "content_matched_jsonl_path": matched_path_str,
+        "content_matched_session_id": matched_session_id,
+        "matched_marker": matched_marker,
+        "matched_condition": matched_condition,
+        "matched_at": matched_at,
+        "attribution_mismatch": mismatch,
+        "confidence": confidence,
+    }
+
+
 def _extract_condition_from_jsonl(
     jsonl: Path,
     output_path_pattern: re.Pattern[str],
 ) -> str | None:
     """Read the first user message from `jsonl` and regex out the condition."""
+    marker = _extract_condition_marker_from_jsonl(jsonl, output_path_pattern)
+    return marker["condition"] if marker else None
+
+
+def _extract_condition_marker_from_jsonl(
+    jsonl: Path,
+    output_path_pattern: re.Pattern[str],
+) -> dict[str, str] | None:
+    """Return condition + exact prompt marker from the first user message."""
     with jsonl.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -136,7 +260,7 @@ def _extract_condition_from_jsonl(
                 )
             m = output_path_pattern.search(text or "")
             if m:
-                return m.group(1)
+                return {"condition": m.group(1), "marker": m.group(0)}
             # First user message had no output-file path — this isn't
             # an eval session. Don't keep scanning.
             return None

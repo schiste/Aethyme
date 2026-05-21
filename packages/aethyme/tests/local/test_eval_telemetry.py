@@ -17,6 +17,7 @@ import pytest
 
 from src.eval.telemetry import (
     DEFAULT_OUTPUT_PATH_PATTERN,
+    map_session_attributions_by_prompt,
     map_sessions_by_prompt,
     missing_conditions,
     project_dir_for_repo,
@@ -154,6 +155,43 @@ def test_handles_list_content_format(tmp_path: Path):
     list_form.write_text(json.dumps(msg) + "\n")
     mapping = map_sessions_by_prompt([list_form])
     assert mapping == {"leverage": list_form}
+
+
+def test_attribution_records_surface_stale_chau7_session_id(tmp_path: Path):
+    """Content matching must be auditable when Chau7 reports swapped ids."""
+    leverage_jsonl = _write_jsonl(
+        tmp_path / "actual-leverage-session.jsonl",
+        output_path="/tmp/repo/.aethyme-eval-output-leverage.json",
+    )
+    task_jsonl = _write_jsonl(
+        tmp_path / "actual-task-session.jsonl",
+        output_path="/tmp/repo/.aethyme-eval-output-task-conditioned.json",
+    )
+
+    records = map_session_attributions_by_prompt(
+        [leverage_jsonl, task_jsonl],
+        expected_conditions=["leverage", "task-conditioned"],
+        reported_session_ids={
+            "leverage": "actual-task-session",
+            "task-conditioned": "actual-leverage-session",
+        },
+        reported_jsonl_paths={
+            "leverage": task_jsonl,
+            "task-conditioned": leverage_jsonl,
+        },
+        matched_at="2026-05-15T12:00:00+00:00",
+    )
+
+    leverage = records["leverage"]
+    assert leverage["reported_chau7_session_id"] == "actual-task-session"
+    assert leverage["content_matched_jsonl_path"] == str(leverage_jsonl)
+    assert leverage["matched_marker"] == ".aethyme-eval-output-leverage.json"
+    assert leverage["attribution_mismatch"] is True
+    assert leverage["confidence"] == "content-match-overrode-reported-session"
+
+    task = records["task-conditioned"]
+    assert task["content_matched_jsonl_path"] == str(task_jsonl)
+    assert task["attribution_mismatch"] is True
 
 
 # ── project_dir_for_repo ───────────────────────────────────────────────

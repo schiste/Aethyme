@@ -46,15 +46,12 @@ command = "git rev-parse HEAD"
 # appears. The legacy hardcoded warm phase used the same sequence; we
 # preserve it byte-for-byte to keep `--tool aethyme` runs reproducible.
 #
-# NOTE on quoting: {{TOOL_ROOT}} and {{TARGET_REPO}} expand to filesystem
-# paths that MAY contain spaces (e.g. "Mediawiki - Aethyme"). The warm
-# phase is executed by the orchestrating runner via shell, NOT via the
-# manifest adapter's quote-aware _substitute path, so each placeholder
-# is wrapped in double-quotes explicitly in the TOML. Without these
-# quotes, "Mediawiki - Aethyme" splits into three shell tokens and the
-# --repo flag breaks. The legacy hardcoded warm phase had the same
-# quoting; preserving it here keeps behavior identical.
-command = """"{{TOOL_ROOT}}/rust/target/release/aethyme-engine-cli" daemon status --repo "{{TARGET_REPO}}" || ("{{TOOL_ROOT}}/rust/target/release/aethyme-engine-cli" daemon start --repo "{{TARGET_REPO}}" && while ! tail -1 "{{TARGET_REPO}}/.aethyme/engine-daemon.log" 2>/dev/null | grep -q 'listening on'; do sleep 5; done)"""
+# NOTE on quoting: command placeholders must NOT be manually quoted here.
+# The manifest adapter's command renderer shell-quotes {{TOOL_ROOT}} and
+# {{TARGET_REPO}} exactly once. This keeps warm, register, and condition
+# commands on the same substitution path and prevents the path-with-spaces
+# bug from recurring in one ad hoc renderer.
+command = """{{TOOL_ROOT}}/rust/target/release/aethyme-engine-cli daemon status --repo {{TARGET_REPO}} || ({{TOOL_ROOT}}/rust/target/release/aethyme-engine-cli daemon start --repo {{TARGET_REPO}} && while ! tail -1 {{TARGET_REPO}}/.aethyme/engine-daemon.log 2>/dev/null | grep -q 'listening on'; do sleep 5; done)"""
 
 # ─── EXPLORE: discoverability via deployed skill ──────────────────────
 #

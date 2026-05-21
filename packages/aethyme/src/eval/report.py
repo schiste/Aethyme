@@ -40,6 +40,9 @@ _RELATIVE_SCORE_WEIGHTS = {
     "duration_log_multiplier": 10.0,
     "cost_log_multiplier": 5.0,
 }
+ATTRIBUTION_CONFIDENCE_SCHEMA_VERSION = "aethyme-attribution-confidence-v1"
+COMPLETION_PROVENANCE_SCHEMA_VERSION = "aethyme-completion-provenance-v1"
+HARNESS_HEALTH_SCHEMA_VERSION = "aethyme-harness-health-v1"
 
 
 def _active_conditions(result: dict[str, Any]) -> tuple[str, ...]:
@@ -228,6 +231,7 @@ def write_eval_run_artifacts(run_dir: Path, result: dict[str, Any]) -> None:
         ("task-spec.json", "task_spec"),
         ("challenge.json", "challenge"),
         ("signals.json", "signals"),
+        ("harness-health.json", "harness_health"),
     ]:
         value = result.get(key)
         if value is not None:
@@ -263,6 +267,16 @@ def write_eval_run_artifacts(run_dir: Path, result: dict[str, Any]) -> None:
             stderr = run_data.get("stderr", "")
             if stderr:
                 (cond_dir / "raw-stderr.txt").write_text(stderr, encoding="utf-8")
+            attribution = run_data.get("attribution_confidence")
+            if isinstance(attribution, dict):
+                store_condition_attribution_confidence(
+                    run_dir, cond, attribution_confidence=attribution
+                )
+            provenance = run_data.get("completion_provenance")
+            if isinstance(provenance, dict):
+                store_condition_completion_provenance(
+                    run_dir, cond, completion_provenance=provenance
+                )
 
         assessment = side.get("assessment")
         if assessment is not None:
@@ -336,6 +350,40 @@ def store_condition_raw(
     return cond_dir
 
 
+def store_condition_attribution_confidence(
+    run_dir: Path,
+    condition: str,
+    *,
+    attribution_confidence: dict[str, Any],
+) -> Path:
+    """Persist the per-condition transcript-attribution evidence record."""
+    cond_dir = run_dir / "conditions" / condition
+    cond_dir.mkdir(parents=True, exist_ok=True)
+    payload = dict(attribution_confidence)
+    payload.setdefault("schema_version", ATTRIBUTION_CONFIDENCE_SCHEMA_VERSION)
+    (cond_dir / "attribution-confidence.json").write_text(
+        json.dumps(payload, indent=2, default=str), encoding="utf-8"
+    )
+    return cond_dir
+
+
+def store_condition_completion_provenance(
+    run_dir: Path,
+    condition: str,
+    *,
+    completion_provenance: dict[str, Any],
+) -> Path:
+    """Persist how completion was detected and which source was collected."""
+    cond_dir = run_dir / "conditions" / condition
+    cond_dir.mkdir(parents=True, exist_ok=True)
+    payload = dict(completion_provenance)
+    payload.setdefault("schema_version", COMPLETION_PROVENANCE_SCHEMA_VERSION)
+    (cond_dir / "completion-provenance.json").write_text(
+        json.dumps(payload, indent=2, default=str), encoding="utf-8"
+    )
+    return cond_dir
+
+
 def store_condition_chau7(
     run_dir: Path,
     condition: str,
@@ -345,6 +393,8 @@ def store_condition_chau7(
     transcript: list[dict[str, Any]] | None = None,
     tool_calls: list[dict[str, Any]] | None = None,
     tab_output: str | None = None,
+    attribution_confidence: dict[str, Any] | None = None,
+    completion_provenance: dict[str, Any] | None = None,
 ) -> Path:
     """Store Chau7 telemetry for a condition.
 
@@ -376,6 +426,27 @@ def store_condition_chau7(
         )
     if tab_output:
         (chau7_dir / "tab-output.txt").write_text(tab_output, encoding="utf-8")
+    if attribution_confidence is not None:
+        meta["attribution_confidence"] = {
+            "confidence": attribution_confidence.get("confidence"),
+            "attribution_mismatch": attribution_confidence.get("attribution_mismatch"),
+        }
+        store_condition_attribution_confidence(
+            run_dir,
+            condition,
+            attribution_confidence=attribution_confidence,
+        )
+    if completion_provenance is not None:
+        meta["completion_provenance"] = {
+            "final_collection_source": completion_provenance.get("final_collection_source"),
+            "result_file_seen_at": completion_provenance.get("result_file_seen_at"),
+            "transcript_matched_at": completion_provenance.get("transcript_matched_at"),
+        }
+        store_condition_completion_provenance(
+            run_dir,
+            condition,
+            completion_provenance=completion_provenance,
+        )
 
     (chau7_dir / "metadata.json").write_text(
         json.dumps(meta, indent=2), encoding="utf-8"
@@ -719,7 +790,109 @@ def augment_result_with_summary_metrics(
     gap = _compute_discoverability_gap(result)
     if gap is not None:
         result["comparison"]["discoverability_gap"] = gap
+    result["harness_health"] = _build_harness_health_summary(result)
     return result
+
+
+def _build_harness_health_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """Derive the run-level harness health summary rendered in every report."""
+    active = _active_conditions(result)
+    provided = result.get("harness_health") if isinstance(result.get("harness_health"), dict) else {}
+
+    attribution_records = [
+        record
+        for cond in active
+        if isinstance((record := _condition_observability_record(result, cond, "attribution_confidence")), dict)
+    ]
+    completion_records = [
+        record
+        for cond in active
+        if isinstance((record := _condition_observability_record(result, cond, "completion_provenance")), dict)
+    ]
+
+    mismatched_conditions = [
+        str(record.get("condition"))
+        for record in attribution_records
+        if record.get("attribution_mismatch")
+    ]
+    missing_transcripts = [
+        cond
+        for cond in active
+        if not isinstance(_condition_observability_record(result, cond, "attribution_confidence"), dict)
+    ]
+
+    prompt_generation_ok = provided.get("prompt_generation_ok")
+    if prompt_generation_ok is None:
+        prompt_generation_ok = all(
+            bool((result.get(cond, {}) or {}).get("prompt"))
+            for cond in active
+        ) if active else None
+
+    warm_phase_ok = provided.get("warm_phase_ok")
+    completion_signal = provided.get("completion_signal")
+    if completion_signal is None:
+        sources = {
+            str(record.get("final_collection_source"))
+            for record in completion_records
+            if record.get("final_collection_source")
+        }
+        if any("result-file" in source for source in sources):
+            completion_signal = "result-file polling"
+        elif sources:
+            completion_signal = ", ".join(sorted(sources))
+        else:
+            completion_signal = "unknown"
+
+    status_field_trust = provided.get("status_field_trust")
+    if status_field_trust is None:
+        if mismatched_conditions:
+            status_field_trust = "degraded"
+        elif attribution_records:
+            status_field_trust = "verified"
+        else:
+            status_field_trust = "unknown"
+
+    transcript_matched = sum(
+        1
+        for record in attribution_records
+        if record.get("content_matched_jsonl_path")
+    )
+    completion_seen = sum(
+        1
+        for record in completion_records
+        if record.get("result_file_seen_at")
+    )
+
+    return {
+        "schema_version": HARNESS_HEALTH_SCHEMA_VERSION,
+        "prompt_generation_ok": prompt_generation_ok,
+        "warm_phase_ok": warm_phase_ok,
+        "session_attribution_mismatches": len(mismatched_conditions),
+        "conditions_with_attribution_mismatch": mismatched_conditions,
+        "conditions_missing_attribution": missing_transcripts,
+        "status_field_trust": status_field_trust,
+        "completion_signal": completion_signal,
+        "transcripts_content_matched": transcript_matched,
+        "result_files_seen": completion_seen,
+        "conditions_observed": len(active),
+    }
+
+
+def _condition_observability_record(
+    result: dict[str, Any],
+    condition: str,
+    key: str,
+) -> dict[str, Any] | None:
+    side = result.get(condition)
+    if not isinstance(side, dict):
+        return None
+    direct = side.get(key)
+    if isinstance(direct, dict):
+        return direct
+    run = side.get("run")
+    if isinstance(run, dict) and isinstance(run.get(key), dict):
+        return run[key]
+    return None
 
 
 def _compute_discoverability_gap(result: dict[str, Any]) -> dict[str, Any] | None:
@@ -894,6 +1067,7 @@ def write_diagnostic_eval_report(
     report_path.write_text(content, encoding="utf-8")
 
     if run_dir is not None:
+        write_eval_run_artifacts(run_dir, result)
         (run_dir / "REPORT.md").write_text(content, encoding="utf-8")
 
     return report_path
@@ -1134,10 +1308,10 @@ def _render_markdown(*, repo_path: Path, result: dict[str, Any]) -> str:
     """Render the definitive eval report markdown.
 
     Section order is fixed and non-negotiable:
-    Meta -> Objective -> Constraints -> Model -> Discoverability Gap ->
-    Scorecard -> Score Breakdown -> Prompts -> Agent Output ->
-    Tool Call Analysis -> Aethyme Usage -> Agent Policy Notes ->
-    (legacy diagnostics, when present) ->
+    Meta -> Objective -> Constraints -> Model -> Harness Health ->
+    Discoverability Gap -> Scorecard -> Score Breakdown -> Prompts ->
+    Agent Output -> Tool Call Analysis -> Aethyme Usage ->
+    Agent Policy Notes -> (legacy diagnostics, when present) ->
     Verdict -> Notes -> Raw Data
 
     Callers MUST run `augment_result_with_summary_metrics(result)`
@@ -1151,6 +1325,7 @@ def _render_markdown(*, repo_path: Path, result: dict[str, Any]) -> str:
     lines: list[str] = []
     _section_meta(lines, repo_path, result)
     _section_model(lines, result)
+    _section_harness_health(lines, result)
     _section_discoverability_gap(lines, result)
     _section_scorecard(lines, result)
     _section_score_breakdown(lines, result)
@@ -1297,6 +1472,37 @@ def _section_model(lines: list[str], result: dict[str, Any]) -> None:
         f"- Permission Mode: {model.get('permission_mode', 'N/A')}",
         "",
     ])
+
+
+def _section_harness_health(lines: list[str], result: dict[str, Any]) -> None:
+    """Render the harness evidence trail before score interpretation."""
+    health = _build_harness_health_summary(result)
+    lines.extend(["## Harness Health", ""])
+    lines.extend([
+        "| Signal | Value |",
+        "|---|---|",
+        f"| Prompt generation | {_status_value(health.get('prompt_generation_ok'))} |",
+        f"| Warm phase | {_status_value(health.get('warm_phase_ok'))} |",
+        f"| Session attribution mismatches | {health.get('session_attribution_mismatches', 0)} |",
+        f"| Status-field trust | {health.get('status_field_trust', 'unknown')} |",
+        f"| Completion signal | {health.get('completion_signal', 'unknown')} |",
+        f"| Transcripts content-matched | {health.get('transcripts_content_matched', 0)} / {health.get('conditions_observed', 0)} |",
+        f"| Result files seen | {health.get('result_files_seen', 0)} / {health.get('conditions_observed', 0)} |",
+    ])
+    mismatched = health.get("conditions_with_attribution_mismatch") or []
+    if mismatched:
+        lines.append(f"| Mismatched conditions | {', '.join(mismatched)} |")
+    lines.append("")
+
+
+def _status_value(value: Any) -> str:
+    if value is True:
+        return "ok"
+    if value is False:
+        return "degraded"
+    if value is None:
+        return "unknown"
+    return str(value)
 
 
 def _section_scorecard(lines: list[str], result: dict[str, Any]) -> None:
@@ -2082,6 +2288,64 @@ def _diag_section_general_learnings(lines: list[str], result: dict[str, Any]) ->
 def _diag_section_tooling_layer(lines: list[str], result: dict[str, Any]) -> None:
     lines.extend(["## 3. Focus on the tooling layer", ""])
     active = _active_conditions(result)
+
+    health = _build_harness_health_summary(result)
+    lines.extend(["### Harness health summary", ""])
+    lines.append("| Signal | Value |")
+    lines.append("|---|---|")
+    lines.append(f"| Prompt generation | {_status_value(health.get('prompt_generation_ok'))} |")
+    lines.append(f"| Warm phase | {_status_value(health.get('warm_phase_ok'))} |")
+    lines.append(
+        f"| Session attribution mismatches | "
+        f"{health.get('session_attribution_mismatches', 0)} |"
+    )
+    lines.append(f"| Status-field trust | {health.get('status_field_trust', 'unknown')} |")
+    lines.append(f"| Completion signal | {health.get('completion_signal', 'unknown')} |")
+    lines.append(
+        f"| Transcripts content-matched | "
+        f"{health.get('transcripts_content_matched', 0)} / "
+        f"{health.get('conditions_observed', 0)} |"
+    )
+    lines.append(
+        f"| Result files seen | {health.get('result_files_seen', 0)} / "
+        f"{health.get('conditions_observed', 0)} |"
+    )
+    mismatched = health.get("conditions_with_attribution_mismatch") or []
+    if mismatched:
+        lines.append(f"| Mismatched conditions | {', '.join(mismatched)} |")
+    lines.append("")
+
+    # Attribution confidence per condition
+    lines.extend(["### Attribution confidence per condition", ""])
+    lines.append("| Condition | Reported Chau7 session | Content-matched JSONL | Marker | Mismatch |")
+    lines.append("|---|---|---|---|---|")
+    for cond in active:
+        record = _condition_observability_record(result, cond, "attribution_confidence") or {}
+        lines.append(
+            "| {cond} | {reported} | {matched} | {marker} | {mismatch} |".format(
+                cond=cond,
+                reported=record.get("reported_chau7_session_id") or "-",
+                matched=Path(str(record.get("content_matched_jsonl_path"))).name
+                if record.get("content_matched_jsonl_path")
+                else "-",
+                marker=record.get("matched_marker") or "-",
+                mismatch="yes" if record.get("attribution_mismatch") else "no",
+            )
+        )
+    lines.append("")
+
+    # Completion provenance per condition
+    lines.extend(["### Completion provenance per condition", ""])
+    lines.append("| Condition | Result file seen | Transcript matched | Final source |")
+    lines.append("|---|---|---|---|")
+    for cond in active:
+        record = _condition_observability_record(result, cond, "completion_provenance") or {}
+        lines.append(
+            f"| {cond} | {record.get('result_file_seen_at') or '-'} | "
+            f"{record.get('transcript_matched_at') or '-'} | "
+            f"{record.get('final_collection_source') or '-'} |"
+        )
+    lines.append("")
 
     # Tool-call frequency per condition
     lines.extend(["### Tool-call distribution per condition", ""])

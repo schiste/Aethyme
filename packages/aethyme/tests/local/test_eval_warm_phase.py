@@ -88,11 +88,9 @@ def test_warm_cli_cmd_quotes_paths_with_spaces(eval_type: str, target: str):
     fed to a shell; without quotes, the path splits across the space
     and the ``--repo`` value gets truncated.
 
-    The adapter-driven warm phase generator does manual placeholder
-    substitution (NOT the quote-aware ``_substitute`` path the adapter
-    uses for ``run_condition``). It relies on the manifest TOML
-    wrapping ``{{TOOL_ROOT}}`` / ``{{TARGET_REPO}}`` in double-quotes.
-    This test pins that contract so a future TOML edit can't silently
+    The adapter-driven warm phase must use the same quote-aware command
+    renderer as register / condition commands. This test pins that
+    contract so a future ad hoc ``.replace()`` path can't silently
     re-introduce the bug observed during the dead-code mediawiki
     smoke-test.
     """
@@ -106,8 +104,8 @@ def test_warm_cli_cmd_quotes_paths_with_spaces(eval_type: str, target: str):
     assert (quoted_double in cmd) or (quoted_single in cmd), (
         f"warm cli_cmd for target={target!r} does not shell-quote the "
         f"repo path {repo_path!r}. Path contains a space — unquoted "
-        f"occurrence will break the shell command. The manifest's "
-        f"[warm].command must wrap {{TARGET_REPO}} in quotes."
+        f"occurrence will break the shell command. Warm commands must "
+        f"go through ManifestToolAdapter.render_command()."
     )
 
 

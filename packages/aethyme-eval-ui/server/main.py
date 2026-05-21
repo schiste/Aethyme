@@ -2381,6 +2381,7 @@ def _run_eval_background(
         store_condition_chau7,
         store_condition_raw,
     )
+    from src.eval.telemetry import map_session_attributions_by_prompt
 
     run_dir: Path | None = None
     phase_states: dict[str, dict[str, Any]] = {}
@@ -2760,6 +2761,7 @@ def _run_eval_background(
                 snapshot = snapshot_text_output(output_file) if output_file else {"exists": False}
                 output_snapshots[cond_name] = snapshot
                 if text_output_is_ready(snapshot):
+                    snapshot["seen_at"] = datetime.now(UTC).isoformat()
                     completed.add(cond_name)
                     output_ready[cond_name] = snapshot
                     log(
@@ -2779,6 +2781,7 @@ def _run_eval_background(
                     "status": st,
                     "raw_status": raw_st,
                     "is_at_prompt": at_prompt,
+                    "ai_session_id": status.get("ai_session_id"),
                 }
 
                 if poll_round % 3 == 0 and (snapshot.get("exists") or st in ("waitingForInput", "idle")):
@@ -2832,6 +2835,11 @@ def _run_eval_background(
     for cond_name, tab_id in tabs.items():
         output_file = output_files.get(cond_name)
         output_snapshot = snapshot_text_output(output_file) if output_file else {"exists": False}
+        if text_output_is_ready(output_snapshot):
+            output_snapshot["seen_at"] = (
+                output_ready.get(cond_name, {}).get("seen_at")
+                or datetime.now(UTC).isoformat()
+            )
         final_output_snapshots[cond_name] = output_snapshot
 
         # Try output file first
@@ -2856,6 +2864,67 @@ def _run_eval_background(
                 tab_outputs[cond_name] = ""
                 deliverable_statuses[cond_name] = "failed" if not output_snapshot.get("exists") else "degraded"
                 log(f"[{cond_name}] Failed to capture output: {e}")
+
+    # Refresh tab statuses once at collection time so attribution records
+    # capture the final Chau7-reported ai_session_id. This field is
+    # diagnostic only; transcript attribution below is content-matched.
+    for cond_name, tab_id in tabs.items():
+        try:
+            status = mcp_client.tab_status(tab_id)
+            last_tab_statuses[cond_name] = {
+                "active_app": status.get("active_app", "?"),
+                "status": status.get("status", "?"),
+                "raw_status": status.get("raw_status", ""),
+                "is_at_prompt": status.get("is_at_prompt", False),
+                "ai_session_id": status.get("ai_session_id"),
+            }
+        except Exception as exc:
+            last_tab_statuses.setdefault(cond_name, {})["status_error"] = str(exc)
+
+    candidate_jsonls: list[Path] = []
+    seen_jsonls: set[Path] = set()
+    for cond in conditions:
+        repo_dir = Path(cond["directory"])
+        session_dir = _session_dir_for_repo(repo_dir)
+        if session_dir.exists():
+            for jsonl_path in sorted(session_dir.glob("*.jsonl")):
+                resolved = jsonl_path.resolve()
+                if resolved not in seen_jsonls:
+                    seen_jsonls.add(resolved)
+                    candidate_jsonls.append(jsonl_path)
+    for session_file in session_files.values():
+        resolved = session_file.resolve()
+        if resolved not in seen_jsonls:
+            seen_jsonls.add(resolved)
+            candidate_jsonls.append(session_file)
+
+    reported_session_ids: dict[str, str | None] = {
+        cond_name: last_tab_statuses.get(cond_name, {}).get("ai_session_id")
+        for cond_name in tabs
+    }
+    reported_jsonl_paths: dict[str, Path | None] = {}
+    for cond in conditions:
+        cond_name = cond["name"]
+        reported_id = reported_session_ids.get(cond_name)
+        reported_jsonl_paths[cond_name] = (
+            _session_file_for_repo(Path(cond["directory"]), reported_id)
+            if reported_id
+            else None
+        )
+    attribution_records = map_session_attributions_by_prompt(
+        candidate_jsonls,
+        expected_conditions=list(tabs.keys()),
+        reported_session_ids=reported_session_ids,
+        reported_jsonl_paths=reported_jsonl_paths,
+        expected_session_ids=session_ids,
+    )
+    mismatches = [
+        cond
+        for cond, record in attribution_records.items()
+        if record.get("attribution_mismatch")
+    ]
+    if mismatches:
+        log(f"Session attribution mismatches detected by content match: {mismatches}")
 
     log(f"Session file mapping: {json.dumps({k: v.name for k, v in session_files.items()})}")
 
@@ -2957,7 +3026,9 @@ def _run_eval_background(
         }
 
     for cond_name in tabs:
-        session_file = session_files.get(cond_name)
+        attribution_confidence = attribution_records.get(cond_name, {})
+        matched_jsonl = attribution_confidence.get("content_matched_jsonl_path")
+        session_file = Path(matched_jsonl) if matched_jsonl else session_files.get(cond_name)
         if not session_file:
             log(f"[{cond_name}] No session file tracked — skipping collection")
             continue
@@ -3070,6 +3141,26 @@ def _run_eval_background(
                 finished_at=data.get("last_ts"),
                 status=deliverable_status,
             )
+            if deliverable_status == "success":
+                final_collection_source = "result-file"
+            elif full_output:
+                final_collection_source = "pty-log-fallback"
+            else:
+                final_collection_source = "none"
+            completion_provenance = {
+                "schema_version": "aethyme-completion-provenance-v1",
+                "condition": cond_name,
+                "result_file_path": (
+                    str(output_files.get(cond_name))
+                    if output_files.get(cond_name)
+                    else None
+                ),
+                "result_file_seen_at": output_snapshot.get("seen_at"),
+                "transcript_matched_at": attribution_confidence.get("matched_at"),
+                "final_collection_source": final_collection_source,
+                "content_matched_jsonl_path": str(session_file),
+                "deliverable_status": deliverable_status,
+            }
             structured_output = {
                 "raw_output": data.get("output", ""),
                 "expected_output_file": str(output_files.get(cond_name)) if output_files.get(cond_name) else None,
@@ -3101,6 +3192,8 @@ def _run_eval_background(
                 "final_output_message": data.get("output", ""),
                 "structured_output": structured_output,
                 "run_metadata": run_metadata,
+                "attribution_confidence": attribution_confidence,
+                "completion_provenance": completion_provenance,
             }
             condition_payloads[cond_name] = {
                 "prompt": cond_prompt,
@@ -3135,6 +3228,8 @@ def _run_eval_background(
                 transcript=transcript,
                 tool_calls=tool_calls,
                 tab_output=tab_outputs.get(cond_name, ""),
+                attribution_confidence=attribution_confidence,
+                completion_provenance=completion_provenance,
             )
 
             from db import insert_result
@@ -3298,6 +3393,7 @@ def _run_eval_background(
             "tab_outputs": {cond: len(text) for cond, text in tab_outputs.items()},
             "deliverable_statuses": deliverable_statuses,
             "output_snapshots": final_output_snapshots,
+            "attribution_confidence": attribution_records,
         },
     )
 
@@ -3307,7 +3403,18 @@ def _run_eval_background(
         "target": req.target,
         "scenario": plan.get("meta", {}).get("scenario"),
         "model": plan.get("meta", {}).get("model"),
+        "tool": plan.get("meta", {}).get("tool"),
+        "tool_display": plan.get("meta", {}).get("tool_display"),
         "run_id": run_id,
+        "harness_health": {
+            "schema_version": "aethyme-harness-health-v1",
+            "prompt_generation_ok": prepared_inputs["observability"]["status"] == "success",
+            "warm_phase_ok": None,
+            "session_attribution_mismatches": len(mismatches),
+            "conditions_with_attribution_mismatch": mismatches,
+            "status_field_trust": "degraded" if mismatches else "diagnostic-only",
+            "completion_signal": "result-file polling",
+        },
         **shared_artifacts,
     }
     result.update(condition_payloads)

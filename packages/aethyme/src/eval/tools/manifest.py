@@ -335,6 +335,45 @@ class ManifestToolAdapter:
             return Path(__file__).resolve().parents[3]
         return self.tool_cache_dir / self.manifest.name
 
+    def render_command(
+        self,
+        spec_or_template: CommandSpec | str,
+        *,
+        target_repo: Path | None = None,
+        task: str | None = None,
+    ) -> str:
+        """Render a manifest command through the single shell-safe path."""
+        template = (
+            spec_or_template.command
+            if isinstance(spec_or_template, CommandSpec)
+            else spec_or_template
+        )
+        return self._substitute(template, target_repo=target_repo, task=task)
+
+    def render_workdir(
+        self,
+        workdir_template: str | None,
+        *,
+        target_repo: Path,
+    ) -> Path:
+        """Render a manifest workdir through the single non-shell path."""
+        return self._resolve_workdir(workdir_template, target_repo=target_repo)
+
+    def render_path(
+        self,
+        path_template: str,
+        *,
+        target_repo: Path,
+    ) -> Path:
+        """Render a manifest path that will be passed as a filesystem path."""
+        return Path(
+            self._substitute(
+                path_template,
+                target_repo=target_repo,
+                quote_paths=False,
+            )
+        )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -362,7 +401,7 @@ class ManifestToolAdapter:
                 )
 
         for spec in self.manifest.install_commands:
-            cmd_str = self._substitute(spec.command, target_repo=None)
+            cmd_str = self.render_command(spec, target_repo=None)
             self._run_or_raise(
                 cmd_str,
                 cwd=root,
@@ -374,7 +413,7 @@ class ManifestToolAdapter:
 
     def version(self) -> str:
         self.ensure_cloned()
-        cmd = self._substitute(self.manifest.version_command.command, target_repo=None)
+        cmd = self.render_command(self.manifest.version_command, target_repo=None)
         try:
             out = subprocess.check_output(
                 cmd, cwd=self.tool_root, shell=True, text=True, timeout=30,
@@ -400,19 +439,16 @@ class ManifestToolAdapter:
         self.ensure_cloned()
         target = Path(target_repo).resolve()
         for spec in self.manifest.register_commands:
-            cmd_str = self._substitute(spec.command, target_repo=target)
-            workdir = self._resolve_workdir(spec.workdir, target_repo=target)
+            cmd_str = self.render_command(spec, target_repo=target)
+            workdir = self.render_workdir(spec.workdir, target_repo=target)
             self._run_or_raise(cmd_str, cwd=workdir, phase="register", shell=True)
 
     def warm(self, target_repo: Path) -> None:
         self.ensure_cloned()
         if self.manifest.warm_command is None:
             return
-        cmd = self._substitute(
-            self.manifest.warm_command.command,
-            target_repo=target_repo,
-        )
-        workdir = self._resolve_workdir(
+        cmd = self.render_command(self.manifest.warm_command, target_repo=target_repo)
+        workdir = self.render_workdir(
             self.manifest.warm_command.workdir, target_repo=target_repo
         )
         self._run_or_raise(cmd, cwd=workdir, phase="warm", shell=True)
@@ -444,12 +480,8 @@ class ManifestToolAdapter:
                 f"{self.name!r}: [conditions.{condition}] has no command"
             )
 
-        cmd = self._substitute(
-            spec.command.command,
-            target_repo=target_repo,
-            task=task,
-        )
-        workdir = self._resolve_workdir(spec.command.workdir, target_repo=target_repo)
+        cmd = self.render_command(spec.command, target_repo=target_repo, task=task)
+        workdir = self.render_workdir(spec.command.workdir, target_repo=target_repo)
 
         try:
             result = subprocess.run(
@@ -477,9 +509,7 @@ class ManifestToolAdapter:
 
         artifact_path: Path | None = None
         if spec.output_artifact:
-            artifact_path = Path(
-                self._substitute(spec.output_artifact, target_repo=target_repo)
-            )
+            artifact_path = self.render_path(spec.output_artifact, target_repo=target_repo)
 
         return ConditionResult(
             prompt_addendum=prompt_addendum,
@@ -499,9 +529,7 @@ class ManifestToolAdapter:
         stdout: str,
     ) -> str:
         if spec.output_artifact:
-            artifact = Path(
-                self._substitute(spec.output_artifact, target_repo=target_repo)
-            )
+            artifact = self.render_path(spec.output_artifact, target_repo=target_repo)
             if artifact.is_file():
                 return artifact.read_text(encoding="utf-8")
             # Artifact promised but not produced — surface stdout so the

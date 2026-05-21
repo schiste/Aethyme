@@ -11,8 +11,8 @@ Section ordering matters because:
 - Meta and contract come first so the reader sees what the eval
   measures before they look at numbers.
 - Discoverability Gap is the headline finding for two-condition
-  comparisons; it goes between Model and Scorecard so it's the
-  first quantitative result on the page.
+  comparisons; it goes after Harness Health so readers can first
+  verify that collection and attribution were trustworthy.
 - Agent Policy Notes goes after Tool Call Analysis / Aethyme
   Usage so the reader interprets tool counts before reading the
   orchestrator's commentary on what the agent actually did.
@@ -97,6 +97,7 @@ def test_section_order_matches_documented_sequence(populated_result):
         "## Objective",
         "## Constraints",
         "## Model",
+        "## Harness Health",
         "## Discoverability Gap",
         "## Scorecard",
         "## Prompts",

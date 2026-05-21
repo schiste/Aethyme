@@ -662,10 +662,9 @@ def _build_warm_phase(target: EvalTarget, tool_adapter: Any = None) -> dict[str,
         if manifest.warm_command is not None:
             tool_root = str(tool_adapter.tool_root)
             target_repo = str(target.aethyme_path)
-            cli_cmd = (
-                manifest.warm_command.command
-                .replace("{{TOOL_ROOT}}", tool_root)
-                .replace("{{TARGET_REPO}}", target_repo)
+            cli_cmd = tool_adapter.render_command(
+                manifest.warm_command,
+                target_repo=target.aethyme_path,
             )
             phase: dict[str, Any] = {
                 "name": "warm",
@@ -937,15 +936,14 @@ def _build_launch_phase(
 def _build_monitor_phase() -> dict[str, Any]:
     return {
         "name": "monitor",
-        "description": "Poll sessions until all complete",
+        "description": "Poll result files until all sessions complete",
         "poll_interval_seconds": 15,
         "timeout_seconds": 1800,
         "instructions": (
-            "Poll tab_status(tab_id) for every condition. "
-            "For Claude-backed tabs, use the explicit session_id to map session "
-            "JSONL files and treat tab_status as shell and tab lifecycle state. "
-            "For Codex-backed tabs, poll tab_status(tab_id) — "
-            "complete when is_at_prompt is true."
+            "Use result-file polling as the completion signal for every "
+            "condition. Poll tab_status(tab_id) only as diagnostic shell/tab "
+            "state; do not treat is_at_prompt or ai_session_id as authoritative "
+            "completion or attribution evidence."
         ),
     }
 
@@ -998,8 +996,20 @@ def _build_collect_phase(
         "per_condition": per_condition,
         "storage": [
             "store_condition_raw(run_dir, condition, stdout, structured_output)",
-            "store_condition_chau7(run_dir, condition, run_id, transcript, tool_calls)",
+            "store_condition_chau7(run_dir, condition, run_id, transcript, tool_calls, attribution_confidence, completion_provenance)",
+            "write conditions/<condition>/attribution-confidence.json",
+            "write conditions/<condition>/completion-provenance.json",
         ],
+        "attribution_contract": (
+            "Record reported Chau7 ai_session_id, content-matched JSONL path, "
+            "matched output-file marker, and mismatch boolean. Prefer "
+            "content-matched JSONL over tab_status.ai_session_id for collection."
+        ),
+        "completion_contract": (
+            "Record result-file-seen timestamp, transcript-matched timestamp, "
+            "and final collection source. Result-file polling is the primary "
+            "completion signal."
+        ),
     }
 
 
