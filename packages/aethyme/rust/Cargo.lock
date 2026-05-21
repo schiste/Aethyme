@@ -88,6 +88,7 @@ dependencies = [
 name = "aethyme-producers"
 version = "0.1.0"
 dependencies = [
+ "aethyme-engine",
  "aethyme-graph-schema",
  "aethyme-graph-storage",
  "serde",

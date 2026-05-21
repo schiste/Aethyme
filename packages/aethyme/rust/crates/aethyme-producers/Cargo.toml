@@ -30,3 +30,12 @@ serde = { version = "1", features = ["derive"] }
 # call rather than an in-memory fake. tempfile = "3" matches the rest
 # of the workspace.
 tempfile = "3"
+# Dev-only dep on the engine so the structure parity test can compare
+# producer output against the engine's `passes::structure::build`. This
+# is the ONLY allowed direction for engine↔producers coupling: the
+# producer crate never depends on the engine in production code (that
+# would invert the Phase 4.7 layering), but the parity test needs both
+# sides in the same process to assert set-equality on dir paths, file
+# paths, and dir-sourced Contains edges. Remove this dep once
+# `passes/structure.rs` is deleted in 4.7.10.
+aethyme-engine = { path = "../aethyme-engine" }
