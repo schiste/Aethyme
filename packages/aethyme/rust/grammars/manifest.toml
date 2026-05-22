@@ -1,0 +1,57 @@
+# Grammar asset provenance manifest.
+#
+# `source_ref = "UNPINNED"` means the checked-in grammar.wasm is attributed and
+# checksum-verified, but not yet reproducible from a recorded upstream commit or
+# release tag. Release automation should run the verifier with --require-pinned.
+
+manifest_version = 1
+
+[[grammar]]
+language = "javascript"
+wasm = "javascript/grammar.wasm"
+queries = "javascript/queries.scm"
+upstream = "https://github.com/tree-sitter/tree-sitter-javascript"
+license = "MIT"
+source_ref = "UNPINNED"
+tree_sitter_cli_version = "UNPINNED"
+sha256 = "fee5c525ac935d9c89bdce41520c023adb091c712492aa3d59059786c2aabd09"
+
+[[grammar]]
+language = "php"
+wasm = "php/grammar.wasm"
+queries = "php/queries.scm"
+upstream = "https://github.com/tree-sitter/tree-sitter-php"
+license = "MIT"
+source_ref = "UNPINNED"
+tree_sitter_cli_version = "UNPINNED"
+sha256 = "24a3fefb6ed747864b8b8a669482fa4987702361532eae99cbf6d467615d73bb"
+
+[[grammar]]
+language = "python"
+wasm = "python/grammar.wasm"
+queries = "python/queries.scm"
+upstream = "https://github.com/tree-sitter/tree-sitter-python"
+license = "MIT"
+source_ref = "UNPINNED"
+tree_sitter_cli_version = "UNPINNED"
+sha256 = "93310edbdbf785e412a56e6605bee61f401d6e258070df309c7a6e870d2e367b"
+
+[[grammar]]
+language = "rust"
+wasm = "rust/grammar.wasm"
+queries = "rust/queries.scm"
+upstream = "https://github.com/tree-sitter/tree-sitter-rust"
+license = "MIT"
+source_ref = "UNPINNED"
+tree_sitter_cli_version = "UNPINNED"
+sha256 = "252ad74d3ff41aa7214a52ba83be4087e83aac9150061ec81a99cfe504170227"
+
+[[grammar]]
+language = "typescript"
+wasm = "typescript/grammar.wasm"
+queries = "typescript/queries.scm"
+upstream = "https://github.com/tree-sitter/tree-sitter-typescript"
+license = "MIT"
+source_ref = "UNPINNED"
+tree_sitter_cli_version = "UNPINNED"
+sha256 = "c6da2a11fb4d8554d7ea019ebe0780a65917bace9cf198c9e102dd28cd20ed87"

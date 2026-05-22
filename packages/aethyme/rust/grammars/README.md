@@ -3,6 +3,9 @@
 This directory contains generated parser binaries and Aethyme-specific query
 files used by the Rust engine.
 
+`manifest.toml` is the machine-readable source of truth for upstream project,
+license, checksum, and source-pin status.
+
 ## Tracked Assets
 
 | Language | Parser asset | Query file | Upstream project | License |
@@ -20,6 +23,18 @@ commit, release tag, tree-sitter CLI version, or generation command.
 
 Before publishing binary releases, regenerate these files from pinned upstream
 grammar revisions or replace them with package-managed grammar artifacts.
+
+Development checksum verification:
+
+```bash
+packages/aethyme/.venv/bin/python packages/aethyme/scripts/verify-grammar-provenance.py
+```
+
+Release verification, expected to fail until all source refs are pinned:
+
+```bash
+packages/aethyme/.venv/bin/python packages/aethyme/scripts/verify-grammar-provenance.py --require-pinned
+```
 
 ## Checksums
 

@@ -28,6 +28,9 @@ The repository tracks five `grammar.wasm` parser binaries plus local query files
 The query files in the same directories appear to be Aethyme-specific minimal
 symbol/import queries rather than copied upstream query bundles.
 
+The machine-readable attribution and checksum manifest is
+`packages/aethyme/rust/grammars/manifest.toml`.
+
 ## Source Pin Gap
 
 The tracked `grammar.wasm` files do not currently record:
@@ -44,6 +47,19 @@ Before a public binary release, either:
    manifest, or
 2. remove checked-in parser binaries and fetch/build them from package-managed
    dependencies during the build.
+
+The development verifier checks current file integrity:
+
+```bash
+packages/aethyme/.venv/bin/python packages/aethyme/scripts/verify-grammar-provenance.py
+```
+
+The release verifier additionally requires pinned upstream refs and CLI
+versions:
+
+```bash
+packages/aethyme/.venv/bin/python packages/aethyme/scripts/verify-grammar-provenance.py --require-pinned
+```
 
 ## Direct Rust Dependency License Snapshot
 
@@ -83,7 +99,8 @@ No copyleft direct Rust dependency was identified in this pass.
 
 ## Follow-Up Before Public Release
 
-- Add a pinned grammar source manifest and regeneration command.
+- Replace all `UNPINNED` grammar manifest entries with exact upstream refs,
+  tree-sitter CLI versions, and regeneration commands.
 - Run a full transitive Rust license audit with `cargo metadata` or `cargo deny`
   in an environment with complete dependency cache/network access.
 - Run Python and pnpm license audits for cloud, eval UI, and SDK packages.
