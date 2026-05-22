@@ -5,6 +5,22 @@ This product includes software and documentation developed by the Aethyme
 contributors.
 
 Third-party dependency licenses are governed by their respective upstream
-packages. Before publishing binary distributions, update this file with any
-required notices for vendored or generated assets, including grammar artifacts
-under packages/aethyme/rust/grammars/.
+packages.
+
+Tracked generated grammar assets under packages/aethyme/rust/grammars/ are
+treated as third-party generated artifacts. See
+docs/third-party-license-audit.md and packages/aethyme/rust/grammars/README.md
+for the current attribution and source-pin audit.
+
+The grammar assets correspond to the following upstream MIT-licensed tree-sitter
+grammar projects:
+
+- tree-sitter-javascript
+- tree-sitter-php
+- tree-sitter-python
+- tree-sitter-rust
+- tree-sitter-typescript
+
+Before publishing binary distributions, regenerate these assets from pinned
+upstream source revisions or replace them with package-manager managed grammar
+artifacts that preserve upstream license notices.
