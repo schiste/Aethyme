@@ -63,10 +63,9 @@ FROM gcr.io/distroless/python3-debian12:nonroot
 # OCI Image Labels
 LABEL org.opencontainers.image.title="Aethyme Ops API (Distroless)"
 LABEL org.opencontainers.image.description="Python API service for Aethyme - Hardened Distroless Image"
-LABEL org.opencontainers.image.vendor="Aeptus"
-LABEL org.opencontainers.image.source="https://github.com/Aeptus/mockup"
+LABEL org.opencontainers.image.vendor="Aethyme contributors"
 LABEL org.opencontainers.image.version="1.0.0-distroless"
-LABEL maintainer="Aeptus Engineering <engineering@aeptus.com>"
+LABEL maintainer="Aethyme contributors"
 
 # Set working directory
 WORKDIR /app

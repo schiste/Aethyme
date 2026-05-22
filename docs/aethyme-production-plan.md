@@ -4,7 +4,7 @@
 
 This is the concise production plan for the repository as it exists today.
 
-For broader project sequencing, use [project-plan.md](/Users/christophehenner/Downloads/Repositories/Aethyme/docs/project-plan.md).
+For broader project sequencing, use [project-plan.md](project-plan.md).
 
 ## Production Goal
 

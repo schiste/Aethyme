@@ -24,7 +24,7 @@ The suite is split into unit and integration paths.
 
 ## Data Model
 - integration tests rebuild `aethyme_test` from migrations
-- [db_seed.py](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/tests/support/db_seed.py) seeds canonical org, tenant, repository, node, and edge data
-- [repo_builders.py](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/tests/support/repo_builders.py) creates temporary repositories on demand
+- [db_seed.py](support/db_seed.py) seeds canonical org, tenant, repository, node, and edge data
+- [repo_builders.py](support/repo_builders.py) creates temporary repositories on demand
 
 Do not add checked-in fake repos or SQL fixture dumps back into the active test path.

@@ -175,7 +175,7 @@ cp .env.production.example .env.production
 
 # 3. Verify
 kubectl get pods -n aethyme-cloud
-curl https://api.aethyme.com/health/detailed
+curl https://api.example.com/health/detailed
 ```
 
 ### Rollback (if needed)
@@ -280,7 +280,7 @@ kubectl get service aethyme-api -n aethyme-cloud
 kubectl logs -f deployment/aethyme-api -n aethyme-cloud
 
 # Check health
-curl https://api.aethyme.com/health/detailed
+curl https://api.example.com/health/detailed
 
 # Restart deployment
 kubectl rollout restart deployment/aethyme-api -n aethyme-cloud
@@ -302,9 +302,9 @@ See [PRODUCTION_deployment-guide.md](PRODUCTION_deployment-guide.md#troubleshoot
 - [PRODUCTION_COMPLETE.md](PRODUCTION_COMPLETE.md) - Feature checklist
 
 ### URLs
-- **API**: https://api.aethyme.com
-- **Health**: https://api.aethyme.com/health/detailed
-- **Docs**: https://api.aethyme.com/docs (dev only)
+- **API**: https://api.example.com
+- **Health**: https://api.example.com/health/detailed
+- **Docs**: https://api.example.com/docs (dev only)
 - **Jaeger**: http://localhost:16686 (local tracing UI)
 
 ---

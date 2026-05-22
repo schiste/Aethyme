@@ -56,7 +56,7 @@ pnpm --version          # pnpm 8+
 ### 1. Clone & Install
 
 ```bash
-# If in main Mockup repo
+# If in main monorepo
 cd packages/aethyme-cloud
 
 # Install dependencies

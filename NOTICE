@@ -1,0 +1,10 @@
+Aethyme
+Copyright 2026 Aethyme contributors
+
+This product includes software and documentation developed by the Aethyme
+contributors.
+
+Third-party dependency licenses are governed by their respective upstream
+packages. Before publishing binary distributions, update this file with any
+required notices for vendored or generated assets, including grammar artifacts
+under packages/aethyme/rust/grammars/.

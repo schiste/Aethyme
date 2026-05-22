@@ -4,8 +4,7 @@ FROM node:24-slim
 # OCI Image Labels
 LABEL org.opencontainers.image.title="Aethyme Cloud Web (Development)"
 LABEL org.opencontainers.image.description="Next.js web application for Aethyme Cloud - Development environment with hot reload"
-LABEL org.opencontainers.image.vendor="Aeptus"
-LABEL org.opencontainers.image.source="https://github.com/Aeptus/mockup"
+LABEL org.opencontainers.image.vendor="Aethyme contributors"
 LABEL org.opencontainers.image.version="1.0.0"
 
 WORKDIR /app

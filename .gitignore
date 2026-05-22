@@ -18,6 +18,10 @@ __pycache__/
 packages/aethyme-eval-ui/server/evals.db
 packages/aethyme-eval-ui/server/evals.db-shm
 packages/aethyme-eval-ui/server/evals.db-wal
+packages/aethyme-eval-ui/evals.db
+packages/aethyme-eval-ui/evals.db-shm
+packages/aethyme-eval-ui/evals.db-wal
+packages/aethyme/.eval-cache/
 packages/aethyme/rust/target/
 
 # Profiling artifacts (dhat / mediawiki build dumps)
@@ -26,4 +30,3 @@ packages/aethyme/dhat-heap.json
 
 # Claude Code per-project runtime files (settings.local.json, scheduled_tasks.lock, etc.)
 .claude/
-

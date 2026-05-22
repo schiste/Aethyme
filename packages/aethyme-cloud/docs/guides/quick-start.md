@@ -20,7 +20,7 @@ This guide will help you start the Aethyme Cloud platform locally and test the A
 ### Step 1: Start Infrastructure Services
 
 ```bash
-cd Mockup/packages/aethyme-cloud
+cd packages/aethyme-cloud
 
 # Start PostgreSQL, Redis, Elasticsearch
 docker-compose up -d
@@ -70,7 +70,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ```bash
 # Open new terminal
-cd Mockup/packages/aethyme-cloud/apps/web
+cd packages/aethyme-cloud/apps/web
 
 # Install dependencies
 pnpm install
@@ -92,7 +92,7 @@ pnpm dev
 
 ```bash
 # Open new terminal
-cd Mockup/packages/aethyme-cloud/apps/api
+cd packages/aethyme-cloud/apps/api
 source venv/bin/activate
 
 # Start Celery worker
@@ -255,7 +255,7 @@ curl http://localhost:9202
 **Error: `ModuleNotFoundError: No module named 'app'`**
 ```bash
 # Make sure you're in the right directory
-cd Mockup/packages/aethyme-cloud/apps/api
+cd packages/aethyme-cloud/apps/api
 
 # Make sure venv is activated
 source venv/bin/activate

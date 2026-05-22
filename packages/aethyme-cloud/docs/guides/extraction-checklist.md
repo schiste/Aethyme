@@ -14,7 +14,7 @@ This document ensures Aethyme Cloud can be extracted to a separate repository at
 - [ ] **Own infrastructure** - docker-compose.yml works standalone
 - [ ] **Own CI/CD** - .github/workflows/ has all necessary workflows
 - [ ] **Own database** - Uses separate database instance
-- [ ] **Own ports** - No port conflicts with Mockup (5433, 6380, 9201 vs 5432, 6379, 9200)
+- [ ] **Own ports** - No port conflicts with parent-repo services
 - [ ] **Own secrets** - No shared environment variables
 
 ### Functional Validation
@@ -80,7 +80,7 @@ When ready to extract to separate repository:
 ### Step 1: Create Extraction Branch
 
 ```bash
-cd Mockup
+cd /path/to/parent-repo
 
 # Create branch for extraction
 git checkout -b extract-aethyme-cloud
@@ -95,7 +95,7 @@ pnpm build
 ### Step 2: Extract with Git History
 
 ```bash
-cd Mockup
+cd /path/to/parent-repo
 
 # Extract subdirectory with full history
 git subtree split -P packages/aethyme-cloud -b aethyme-cloud-extraction
@@ -113,7 +113,7 @@ cd aethyme-cloud
 
 # Initialize with extracted history
 git init
-git pull ../Mockup aethyme-cloud-extraction
+git pull ../parent-repo aethyme-cloud-extraction
 
 # Verify structure
 ls -la
@@ -148,13 +148,13 @@ git push --tags
 ./scripts/deploy.sh production
 
 # Verify deployment
-curl https://api.aethyme.com/health
+curl https://api.example.com/health
 ```
 
-### Step 6: Cleanup Mockup Repository
+### Step 6: Cleanup Parent Repository
 
 ```bash
-cd Mockup
+cd /path/to/parent-repo
 
 # Remove aethyme-cloud (or keep as archive)
 git checkout main
@@ -187,7 +187,7 @@ git push
 ### ❌ Don't Do This:
 
 ```typescript
-// BAD: Importing from parent Mockup repo
+// BAD: Importing from parent monorepo
 import { config } from '../../../../config/config/app.config.json'
 import { getUserProfile } from '../../../../backend/accounts/models'
 
@@ -195,7 +195,7 @@ import { getUserProfile } from '../../../../backend/accounts/models'
 const db = new Database('postgresql://localhost/aeptus_grc')
 
 // BAD: Hardcoded paths
-const configPath = '/Users/you/Mockup/backend/config.json'
+const configPath = '/path/to/parent-repo/backend/config.json'
 ```
 
 ### ✅ Do This Instead:
@@ -257,7 +257,7 @@ jobs:
 
 After extraction is complete:
 
-- [ ] Update Mockup README to link to new repo
+- [ ] Update parent README to link to new repo
 - [ ] Update documentation references
 - [ ] Notify team of new repository
 - [ ] Archive old directory (or remove)
@@ -273,7 +273,7 @@ Extraction is successful when:
 1. ✅ New repository builds and deploys independently
 2. ✅ All tests pass in new repository
 3. ✅ Production deployment works
-4. ✅ No dependencies on Mockup repository
+4. ✅ No dependencies on parent repository
 5. ✅ Team can work in new repository
 6. ✅ Zero downtime during migration
 
@@ -292,7 +292,7 @@ Extraction is successful when:
 - ✅ Own configuration (.env.example with correct ports: 5434, 6381, 9202)
 - ✅ Own infrastructure (docker-compose.yml standalone)
 - ✅ Own database (separate instance on port 5434)
-- ✅ No port conflicts (using 5434, 6381, 9202 vs Mockup's 5432, 6379, 9200)
+- ✅ No port conflicts with parent-repo services
 - ✅ Own secrets (no shared environment variables)
 - ⚠️ CI/CD workflows (not yet implemented, planned for Week 3)
 

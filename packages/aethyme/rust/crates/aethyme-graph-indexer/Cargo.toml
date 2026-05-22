@@ -3,7 +3,7 @@ name = "aethyme-graph-indexer"
 version = "0.1.0"
 edition = "2024"
 description = "Indexers that walk source repos and produce aethyme-graph-schema nodes + edges. Phase 3 of the graph rewrite: turns real source files into typed graph payloads suitable for committed per-file fragments."
-license = "UNLICENSED"
+license = "Apache-2.0"
 
 [lib]
 name = "aethyme_graph_indexer"

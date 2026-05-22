@@ -46,8 +46,7 @@ ARG CI_PIPELINE_ID
 # OCI Image Labels
 LABEL org.opencontainers.image.title="Aethyme API" \
       org.opencontainers.image.description="Python API service for Aethyme - Production-optimized with Gunicorn" \
-      org.opencontainers.image.vendor="Aeptus" \
-      org.opencontainers.image.source="https://github.com/Aeptus/mockup" \
+      org.opencontainers.image.vendor="Aethyme contributors" \
       org.opencontainers.image.created=$BUILD_DATE \
       org.opencontainers.image.revision=$VCS_REF \
       org.opencontainers.image.version=$VERSION \

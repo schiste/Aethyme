@@ -1,0 +1,49 @@
+name: OSS CI
+
+on:
+  pull_request:
+  push:
+    branches: ["main", "master"]
+
+permissions:
+  contents: read
+
+jobs:
+  python-local-tests:
+    name: Python local tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/aethyme
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package and dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run local tests
+        run: pytest -q tests/local
+
+  rust-tests:
+    name: Rust workspace tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/aethyme/rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Rust tests
+        run: cargo test --workspace

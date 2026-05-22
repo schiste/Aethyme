@@ -3,7 +3,7 @@ name = "aethyme-graph-schema"
 version = "0.1.0"
 edition = "2024"
 description = "Schema types for the Aethyme code graph: node kinds, edge kinds, IDs, serialization. Pure types — no I/O, no storage, no parsing. Implements the design locked in docs/architecture/graph-schema.md."
-license = "UNLICENSED"
+license = "Apache-2.0"
 
 [lib]
 name = "aethyme_graph_schema"

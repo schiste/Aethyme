@@ -16,7 +16,7 @@ class AethymeClient:
     def __init__(
         self,
         token: str,
-        base_url: str = "https://api.aethyme.com",
+        base_url: str = "http://localhost:8001",
         timeout: float = 30.0,
     ):
         self.base_url = base_url.rstrip("/")

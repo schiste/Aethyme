@@ -34,10 +34,10 @@ Current auth position:
 
 ## Primary Documents
 
-- [../../docs/project-plan.md](/Users/christophehenner/Downloads/Repositories/Aethyme/docs/project-plan.md)
-- [status.md](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme-cloud/status.md)
-- [roadmap.md](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme-cloud/roadmap.md)
-- [docs/README.md](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme-cloud/docs/README.md)
+- [../../docs/project-plan.md](../../docs/project-plan.md)
+- [status.md](status.md)
+- [roadmap.md](roadmap.md)
+- [docs/README.md](docs/README.md)
 
 ## Immediate Goal
 

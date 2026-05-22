@@ -3,7 +3,7 @@ name = "aethyme-engine"
 version = "0.1.0"
 edition = "2024"
 description = "Deterministic engine components for Aethyme Core"
-license = "UNLICENSED"
+license = "Apache-2.0"
 
 [lib]
 name = "aethyme_engine"

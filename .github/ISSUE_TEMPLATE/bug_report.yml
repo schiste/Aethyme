@@ -1,0 +1,39 @@
+name: Bug Report
+description: Report a reproducible problem in the public Aethyme Core scope.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Do not include secrets, private repository contents, or customer data.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest command sequence or repository shape that reproduces the issue.
+      placeholder: |
+        cd packages/aethyme
+        aethyme explore --repo ... --request ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, Python version, Rust version, Aethyme commit, and relevant package manager versions.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs Or Output
+      description: Paste relevant output after removing secrets or private data.
+      render: shell

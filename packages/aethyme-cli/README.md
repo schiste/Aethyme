@@ -28,4 +28,4 @@ For interactive deck mode, run inside a TTY terminal.
 
 - The CLI uses Aethyme core (the Python indexer in `packages/aethyme`).
 - If the core is not found, set `AETHYME_CORE_PATH` to its location.
-- The investor deck content lives in `lib/decks/aethyme-investor-deck.js`.
+- Deck commands are experimental and are not part of the initial public support scope.

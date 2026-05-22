@@ -17,7 +17,7 @@ Ensure you have these installed:
 ### Step 1: Install Dependencies
 
 ```bash
-cd Mockup/packages/aethyme-cloud
+cd packages/aethyme-cloud
 
 # Install all dependencies (frontend + backend tools)
 pnpm install

@@ -91,7 +91,7 @@ Create and store AI provider credentials (encrypted at rest).
 
 **Example**:
 ```bash
-curl -X POST https://api.aethyme.com/api/ai/credentials \
+curl -X POST https://api.example.com/api/ai/credentials \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -313,7 +313,7 @@ Search your codebase using natural language queries.
 
 **Example**:
 ```bash
-curl -X POST https://api.aethyme.com/api/semantic/search \
+curl -X POST https://api.example.com/api/semantic/search \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{

@@ -12,7 +12,7 @@ Quick reference for OAuth 2.0 endpoints supporting GitHub, GitLab, and Bitbucket
 http://localhost:8000/api/oauth
 ```
 
-Production: `https://api.aethyme.com/api/oauth`
+Production example: `https://api.example.com/api/oauth`
 
 ---
 
