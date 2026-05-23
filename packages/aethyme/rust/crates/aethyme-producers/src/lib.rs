@@ -63,10 +63,14 @@
 
 use aethyme_graph_storage::{FragmentStore, OverlayFragment};
 
+pub mod configs;
 pub mod harness;
+pub mod packages;
 pub mod structure;
 
+pub use configs::{ConfigsOverlay, ConfigsProducer};
 pub use harness::assert_overlay_producer_is_deterministic;
+pub use packages::{PackageProducer, PackagesOverlay};
 pub use structure::{StructureOverlay, StructureProducer};
 
 /// Contract for a non-per-file overlay producer.
