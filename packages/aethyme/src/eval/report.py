@@ -18,6 +18,7 @@ from src.contracts.versions import (
     contract_versions,
 )
 
+from ._self import self_tool_name
 from .runner import EvaluationRunResult
 
 REPORTS_ROOT = Path(__file__).resolve().parents[2] / "docs" / "reports" / "evals"
@@ -194,10 +195,18 @@ def create_eval_run_dir(
         (run_dir / "conditions" / cond).mkdir(parents=True, exist_ok=True)
         (run_dir / "chau7" / cond).mkdir(parents=True, exist_ok=True)
 
+    # Lazy import: methodology.py imports CONDITIONS from orchestrator.py,
+    # and orchestrator.py imports report.py for run-dir creation. Importing
+    # at module scope would close that cycle; importing at call time breaks
+    # it because by the time create_eval_run_dir runs both modules are
+    # fully loaded.
+    from src.eval.methodology import methodology_hash
+
     metadata: dict[str, Any] = {
         "schema_version": RUN_METADATA_SCHEMA_VERSION,
         "timestamp": datetime.now(UTC).isoformat(),
         "aethyme_commit": get_aethyme_commit(),
+        "methodology_hash": methodology_hash(),
         "repo_path": str(repo_path),
         "eval_type": eval_type,
         "conditions": list(conditions or CONDITION_ORDER),
@@ -1309,10 +1318,10 @@ def _render_markdown(*, repo_path: Path, result: dict[str, Any]) -> str:
 
     Section order is fixed and non-negotiable:
     Meta -> Objective -> Constraints -> Model -> Harness Health ->
-    Discoverability Gap -> Scorecard -> Score Breakdown -> Prompts ->
-    Agent Output -> Tool Call Analysis -> Aethyme Usage ->
-    Agent Policy Notes -> (legacy diagnostics, when present) ->
-    Verdict -> Notes -> Raw Data
+    Pretraining Leakage (when present) -> Discoverability Gap ->
+    Scorecard -> Score Breakdown -> Prompts -> Agent Output ->
+    Tool Call Analysis -> Aethyme Usage -> Agent Policy Notes ->
+    (legacy diagnostics, when present) -> Verdict -> Notes -> Raw Data
 
     Callers MUST run `augment_result_with_summary_metrics(result)`
     before calling this function. The augment populates the
@@ -1326,6 +1335,7 @@ def _render_markdown(*, repo_path: Path, result: dict[str, Any]) -> str:
     _section_meta(lines, repo_path, result)
     _section_model(lines, result)
     _section_harness_health(lines, result)
+    _section_leakage(lines, result)
     _section_discoverability_gap(lines, result)
     _section_scorecard(lines, result)
     _section_score_breakdown(lines, result)
@@ -1503,6 +1513,39 @@ def _status_value(value: Any) -> str:
     if value is None:
         return "unknown"
     return str(value)
+
+
+def _section_leakage(lines: list[str], result: dict[str, Any]) -> None:
+    """Cold-probe pretraining-leakage summary.
+
+    Dormant unless the caller merged leakage fields onto the result dict.
+    The UI server computes leakage once per batch and stamps each DB row;
+    bare orchestrator callers don't surface those fields and the section
+    stays absent.
+    """
+    if result.get("leakage_score_cold") is None and not result.get("leakage_error"):
+        return
+    lines.extend(["## Pretraining Leakage", ""])
+    rows: list[str] = ["| Signal | Value |", "|---|---|"]
+    score = result.get("leakage_score_cold")
+    rows.append(
+        f"| Cold-probe score | {score:.2f} |" if isinstance(score, (int, float))
+        else "| Cold-probe score | unknown |"
+    )
+    rows.append(
+        f"| Clean (below 0.70) | {_status_value(result.get('leakage_is_clean'))} |"
+    )
+    raw = result.get("leakage_raw_judge")
+    if raw is not None:
+        rows.append(f"| Raw judge score (0-100) | {raw} |")
+    version = result.get("leakage_probe_version")
+    if version:
+        rows.append(f"| Probe version | `{version}` |")
+    err = result.get("leakage_error")
+    if err:
+        rows.append(f"| Error | {err} |")
+    lines.extend(rows)
+    lines.append("")
 
 
 def _section_scorecard(lines: list[str], result: dict[str, Any]) -> None:
@@ -2096,7 +2139,7 @@ def _diag_section_header(
         if isinstance(model_block, dict)
         else str(model_block)
     )
-    tool_name = result.get("tool", "aethyme")
+    tool_name = result.get("tool", self_tool_name())
     lines.extend([
         f"# {eval_type} eval — {target}",
         "",

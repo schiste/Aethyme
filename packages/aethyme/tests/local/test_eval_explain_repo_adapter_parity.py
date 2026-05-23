@@ -34,11 +34,16 @@ def mockup_repo() -> Path:
 
 def test_explain_repo_legacy_and_adapter_paths_match(mockup_repo: Path) -> None:
     """Direct Python build_task_pack must equal adapter-routed result."""
+    from src.eval._self import self_tool_name
     from src.eval.explain_repo import _resolve_task_pack
     from src.eval.tools import get_adapter
 
     legacy_pack = _resolve_task_pack(mockup_repo, _TASK, tool=None)
-    adapter_pack = _resolve_task_pack(mockup_repo, _TASK, tool=get_adapter("aethyme"))
+    # Load the framework's self-tool adapter — that's the one whose
+    # task_pack output must remain byte-identical to the legacy path.
+    # Hardcoding "aethyme" would skip the parity check under a fork that
+    # renames the framework subject via AETHYMEBENCH_SELF_TOOL.
+    adapter_pack = _resolve_task_pack(mockup_repo, _TASK, tool=get_adapter(self_tool_name()))
 
     legacy_json = json.dumps(legacy_pack, sort_keys=True)
     adapter_json = json.dumps(adapter_pack, sort_keys=True)

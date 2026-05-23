@@ -28,8 +28,10 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from ._self import self_tool_name
 from .prompts import build_prompts
 from .targets import TARGETS
+from .tools.registry import get_manifest
 
 
 # Map eval_type → output-schema constructor. Kept here rather than in
@@ -72,6 +74,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--eval-type", required=True)
     parser.add_argument("--target", required=True, choices=sorted(TARGETS))
+    parser.add_argument(
+        "--tool",
+        default=None,
+        help=(
+            "Tool whose manifest provides the leverage / task-conditioned "
+            "hint text. Defaults to the framework's self-tool "
+            "(AETHYMEBENCH_SELF_TOOL env var, or 'aethyme' if unset) to "
+            "preserve pre-Stage-B.2.1 wording for callers that have not "
+            "yet migrated. The orchestrator always passes this explicitly."
+        ),
+    )
     parser.add_argument("--schema-out", type=Path, required=True,
                         help="Path to write the output JSON schema.")
     parser.add_argument(
@@ -84,7 +97,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     target = TARGETS[args.target]
-    prompts = build_prompts(args.eval_type, target)
+    tool_name = args.tool if args.tool is not None else self_tool_name()
+    manifest = get_manifest(tool_name)
+    prompts = build_prompts(args.eval_type, target, manifest)
     schema = _schema_for(args.eval_type)
 
     # Validate that every requested condition is in the prompt builder's output.

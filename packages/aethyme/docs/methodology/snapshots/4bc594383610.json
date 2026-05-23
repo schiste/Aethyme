@@ -1,0 +1,65 @@
+{
+  "inputs": {
+    "conditions": [
+      {
+        "cto_override": "forceOff",
+        "name": "control-cto-off",
+        "prompt_variant": "baseline",
+        "repo_selector": "control",
+        "uses_aethyme": false
+      },
+      {
+        "cto_override": null,
+        "name": "control-cto-on",
+        "prompt_variant": "baseline",
+        "repo_selector": "control",
+        "uses_aethyme": false
+      },
+      {
+        "cto_override": null,
+        "name": "explore",
+        "prompt_variant": "baseline",
+        "repo_selector": "aethyme",
+        "uses_aethyme": true
+      },
+      {
+        "cto_override": null,
+        "name": "leverage",
+        "prompt_variant": "leverage",
+        "repo_selector": "aethyme",
+        "uses_aethyme": true
+      },
+      {
+        "cto_override": null,
+        "name": "task-conditioned",
+        "prompt_variant": "task-conditioned",
+        "repo_selector": "aethyme",
+        "uses_aethyme": true
+      },
+      {
+        "cto_override": null,
+        "name": "negative-context",
+        "prompt_variant": "negative-context",
+        "repo_selector": "aethyme",
+        "uses_aethyme": true
+      }
+    ],
+    "contract_versions": {
+      "eval_artifact": "1",
+      "graph_export": "1",
+      "output": "1",
+      "ranking": "1",
+      "repository_snapshot": "1",
+      "run_metadata": "1"
+    },
+    "framework_version": "0.1.0",
+    "manifests": {
+      "aethyme": "5be08f5f8235ba30d01ff13d690ad6b770140c7d83bd75aea910fca834386e30",
+      "graphify": "9ef7cbaa8bbb92b22f2a1cf737529a5adc64a2d9aa87c5ee7cba807bf09d7117"
+    },
+    "prompts_sha256": "a836c918d17dd25b6475494962f4044b43ad98a38fe762e652683602291d8130",
+    "scoring_sha256": "43fd270a12c10de9175e4a7f6aeeb9686b3d1e40220f859c7615fc7263894886"
+  },
+  "methodology_hash": "4bc594383610",
+  "sha256_full": "4bc5943836107a24b59406a039c9a5d98d5c2286f1b9735506ded0ed8bf3fda7"
+}

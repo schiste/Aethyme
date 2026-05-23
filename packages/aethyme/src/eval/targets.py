@@ -7,9 +7,11 @@ the canonical source of truth for where playground repos live.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from ._self import self_tool_name
 
 _PLAYGROUND_ROOT = Path.home() / "Downloads" / "Repositories" / "Playground"
 
@@ -30,7 +32,12 @@ class EvalTarget:
     # Default tool for this target's "tool-using" conditions. Override at
     # the CLI with --tool to swap in a competitor (e.g. graphify). The
     # tool name must match a manifest under evals/tools/<name>.toml.
-    default_tool: str = "aethyme"
+    #
+    # Factory (not literal default) so each EvalTarget construction re-reads
+    # ``AETHYMEBENCH_SELF_TOOL`` — a test that monkeypatches the env var
+    # before constructing a target gets the patched value. A literal
+    # ``= self_tool_name()`` default would freeze the env at import time.
+    default_tool: str = field(default_factory=self_tool_name)
 
     def validate(self) -> list[str]:
         """Return validation error strings.  Empty list means valid."""

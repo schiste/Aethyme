@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ._self import is_self_tool
 from .report import get_aethyme_commit
 from .runner import PROJECT_ROOT
 from .targets import EvalTarget, get_target
@@ -443,9 +444,10 @@ def generate_run_plan(
     runs mechanically via Chau7 MCP.
 
     ``tool`` selects which tool adapter populates the explore / leverage /
-    task-conditioned conditions. Defaults to the target's ``default_tool``
-    (currently always ``"aethyme"``), which preserves existing eval output.
-    Pass ``tool="graphify"`` to swap in a competitor manifest.
+    task-conditioned conditions. Defaults to the target's ``default_tool``,
+    which itself defaults to the framework's self-tool (see
+    :mod:`src.eval._self` — ``AETHYMEBENCH_SELF_TOOL`` env var, ``"aethyme"``
+    if unset). Pass ``tool="graphify"`` to swap in a competitor manifest.
     """
     if eval_type not in _EVAL_TYPE_DEFAULTS:
         raise ValueError(
@@ -476,8 +478,10 @@ def generate_run_plan(
     #     the prior naming convention exactly when scenario is set.
     #   - `model`: ALWAYS present so eval-runs/ is greppable by model.
     #   - `reasoning`: omitted when default; appended otherwise.
-    #   - `tool`: omitted when aethyme (the historical default — keeps existing
-    #     run names interpretable); appended when a competitor manifest is in use.
+    #   - `tool`: omitted when it's the framework's self-tool (see
+    #     :mod:`src.eval._self` — ``AETHYMEBENCH_SELF_TOOL`` env var, default
+    #     ``"aethyme"``). Bare slugs are reserved for runs of the framework's
+    #     own subject; competitor manifests always get an explicit suffix.
     #
     # Examples this generates:
     #   20260515T055924-mediawiki-dead-code-haiku
@@ -491,7 +495,11 @@ def generate_run_plan(
     slug_parts.append(model_config.name)
     if reasoning != "default":
         slug_parts.append(reasoning)
-    if tool_name != "aethyme":
+    # Omit tool suffix for the framework's self-tool (see :mod:`src.eval._self`):
+    # a fork that renames its subject via AETHYMEBENCH_SELF_TOOL gets bare slugs
+    # for *its* subject, and `-graphify` / `-aethyme` suffixes only when running
+    # a non-self-tool variant.
+    if not is_self_tool(tool_name):
         slug_parts.append(tool_name)
     slug = "-".join(slug_parts)
 
@@ -768,12 +776,14 @@ def _build_prepare_phase(
     legacy direct-Python path active, preserving byte-identical output
     for callers that don't yet plumb --tool.
 
-    Tool-using adapter integration is currently supported for
-    ``bug-fix``, ``explain-repo``, and ``navigation-ctf``. Diagnostic
-    eval types (``bug-fix-1``, ``dead-code``, etc.) use the
-    ``prompts_writer`` flow which produces text prompts only — no
-    tool-mediated leverage data. We emit a soft warning in cli_cmd
-    description when --tool is set for a tool-unsupported eval.
+    Tool-using adapter integration (subprocess-mediated leverage /
+    task-conditioned data) is currently supported for ``bug-fix``,
+    ``explain-repo``, and ``navigation-ctf``. Diagnostic eval types
+    (``bug-fix-1``, ``dead-code``, etc.) use the ``prompts_writer``
+    flow, which since Stage B.2.1 *does* honor ``--tool`` — but only
+    to bind the manifest's ``[prompts]`` hint text into the prompt
+    addendum, not to invoke any tool subprocess. Either way the flag
+    is methodologically meaningful for every eval type.
     """
     venv = paths["venv_python"]
     pkg = paths["aethyme_root"]
@@ -819,15 +829,11 @@ def _build_prepare_phase(
             f"cd {pkg} && {venv} -m src.eval.prompts_writer"
             f" --eval-type {eval_type}"
             f" --target {target.name}"
+            f"{tool_flag}"
             f" --schema-out {paths['schema_file']}"
             f" {prompt_args}"
         )
         description = f"Generate {eval_type} prompts + schema for {target.display_name}"
-        if tool_name and tool_name != "aethyme":
-            description += (
-                f" (WARNING: --tool {tool_name!r} ignored for {eval_type} — "
-                f"diagnostic evals use prompts_writer which has no tool surface yet)"
-            )
     elif eval_type == "explain-repo":
         cli_cmd = (
             f"cd {pkg} && {venv} -m src.cli eval explain-repo"

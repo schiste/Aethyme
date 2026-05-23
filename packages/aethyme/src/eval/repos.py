@@ -11,7 +11,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from ..indexing.skills import AETHYME_PACKAGE_ROOT, deploy_skills
+from ..indexing.skills import HOST_PACKAGE_ROOT, deploy_skills
 from .tools import ToolAdapter
 
 CONDITION_NAMES = (
@@ -23,12 +23,16 @@ CONDITION_NAMES = (
     # `negative-context` is the trust-calibration condition (added 2026-05-09).
     # Same setup as leverage but loads a *plausibly-wrong* nav-context (real
     # Aethyme artifact for a different task in the same module). Belongs to
-    # AETHYME_CONDITIONS — agent has the live skill, so what we measure is
+    # TOOL_USING_CONDITIONS — agent has the live skill, so what we measure is
     # behavior when the initial context is stale/wrong but verification tools
     # are available, mirroring real production failure modes.
     "negative-context",
 )
-AETHYME_CONDITIONS = frozenset({
+# Conditions that install the configured tool into the clone (vs. the
+# tool-less control baselines). Historically named AETHYME_CONDITIONS;
+# renamed 2026-05-19 to make the semantics tool-agnostic as part of the
+# AethymeBench extraction (Stage A.1.1).
+TOOL_USING_CONDITIONS = frozenset({
     "explore", "leverage", "task-conditioned", "negative-context",
 })
 
@@ -55,7 +59,7 @@ def create_condition_repos(
     Returns a mapping of condition name to repo path.
     """
     if aethyme_root is None:
-        aethyme_root = AETHYME_PACKAGE_ROOT
+        aethyme_root = HOST_PACKAGE_ROOT
 
     source = Path(source).resolve()
     dest_dir = Path(dest_dir).resolve()
@@ -75,7 +79,7 @@ def create_condition_repos(
             capture_output=True,
         )
 
-        if cond in AETHYME_CONDITIONS:
+        if cond in TOOL_USING_CONDITIONS:
             if tool is not None:
                 tool.install(clone_path)
             else:

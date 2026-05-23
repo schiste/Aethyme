@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from src.eval import bug_fix, explain_repo, navigation_ctf
+from src.eval._self import self_tool_name
 from src.eval.navigation_context import build_scope_view
 
 
@@ -37,35 +38,65 @@ def test_explain_repo_navigation_context_includes_detailed_scope_signals(tmp_pat
 
 
 def test_bug_fix_navigation_context_uses_file_contents_and_detailed_scope(
-    monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(
-        bug_fix,
-        "build_task_pack",
-        lambda *_args, **_kwargs: {
-            "anchors": [{"id": "src/auth.py"}],
-            "navigation_order": ["src/auth.py"],
-            "in_scope": {
-                "files": [{"value": "src/auth.py", "reason": "anchor"}],
-                "symbols": [],
-                "areas": [],
-            },
-            "out_of_scope": {"areas": []},
-            "risk_flags": [{"scope": "src/auth.py", "reason": "critical"}],
-            "confidence": {"anchor_confidence": 0.88, "scope_confidence": 0.66},
-            "budget": {"max_content_files": 2},
-        },
-    )
-    monkeypatch.setattr(
-        bug_fix,
-        "build_task_context",
-        lambda *_args, **_kwargs: {
-            "file_contents": [{"path": "src/auth.py", "end_line": 80, "total_lines": 120}],
-        },
-    )
+    """`_build_navigation_context` shapes adapter output into the leverage dict.
 
-    context = bug_fix._build_navigation_context(tmp_path, "Fix auth bug")
+    Uses a stub adapter to avoid spawning the real Aethyme CLI — the
+    function under test only cares that ``run_condition`` returns
+    JSON-parseable ``raw_output`` for ``leverage`` and ``task-conditioned``.
+    """
+    import json as _json
+
+    from src.eval.tools.base import ConditionResult
+
+    leverage_payload = {
+        "anchors": [{"id": "src/auth.py"}],
+        "navigation_order": ["src/auth.py"],
+        "in_scope": {
+            "files": [{"value": "src/auth.py", "reason": "anchor"}],
+            "symbols": [],
+            "areas": [],
+        },
+        "out_of_scope": {"areas": []},
+        "risk_flags": [{"scope": "src/auth.py", "reason": "critical"}],
+        "confidence": {"anchor_confidence": 0.88, "scope_confidence": 0.66},
+        "budget": {"max_content_files": 2},
+    }
+    task_conditioned_payload = {
+        "file_contents": [{"path": "src/auth.py", "end_line": 80, "total_lines": 120}],
+    }
+
+    class _StubAdapter:
+        # Mirror the framework's self-tool name so the adapter trips the
+        # self-tool privilege branch (structured task_pack flow). Hard-
+        # coding "aethyme" would skip the branch under a fork that runs
+        # with AETHYMEBENCH_SELF_TOOL=lapidary.
+        name = self_tool_name()
+        display_name = "Aethyme (stub)"
+
+        def version(self) -> str:
+            return "stub"
+
+        def install(self, target_repo: Path) -> None:
+            return None
+
+        def warm(self, target_repo: Path) -> None:
+            return None
+
+        def implements(self, condition: str) -> bool:
+            return True
+
+        def run_condition(
+            self,
+            condition: str,
+            target_repo: Path,
+            task: str,
+        ) -> ConditionResult:
+            payload = leverage_payload if condition == "leverage" else task_conditioned_payload
+            return ConditionResult(prompt_addendum="", raw_output=_json.dumps(payload))
+
+    context = bug_fix._build_navigation_context(tmp_path, "Fix auth bug", tool=_StubAdapter())
 
     assert context["scope"]["in_scope_files"] == ["src/auth.py"]
     assert context["scope"]["in_scope_files_detailed"][0]["reason"] == "anchor"

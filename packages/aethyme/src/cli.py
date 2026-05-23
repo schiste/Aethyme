@@ -568,6 +568,61 @@ def repo_validate_onboarding_overrides(repo_path: Path) -> None:
     raise SystemExit(1)
 
 
+@repo.command("init-agents-overrides")
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
+@click.option("--force", is_flag=True, help="Overwrite an existing override file")
+def repo_init_agents_overrides(repo_path: Path, force: bool) -> None:
+    """Write a starter agents override file for repo-specific root instructions."""
+    from src.enhance import AGENTS_OVERRIDE_PATH, agents_override_template
+    from src.indexing.experience_telemetry import append_event
+
+    dest = repo_path / AGENTS_OVERRIDE_PATH
+    if dest.exists() and not force:
+        raise click.ClickException(
+            f"{AGENTS_OVERRIDE_PATH} already exists. Use --force to overwrite."
+        )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(
+        json.dumps(agents_override_template(), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    append_event(
+        repo_path,
+        "repo.init-agents-overrides",
+        {"force": force, "path": AGENTS_OVERRIDE_PATH},
+    )
+    click.echo(f"Wrote {AGENTS_OVERRIDE_PATH}")
+
+
+@repo.command("validate-agents-overrides")
+@click.argument(
+    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
+def repo_validate_agents_overrides(repo_path: Path) -> None:
+    """Validate the agents override file if present."""
+    from src.enhance import validate_agents_overrides
+    from src.indexing.experience_telemetry import append_event
+
+    result = validate_agents_overrides(repo_path)
+    append_event(
+        repo_path,
+        "repo.validate-agents-overrides",
+        {"ok": result["ok"], "exists": result["exists"], "errors": result["errors"]},
+    )
+    if result["ok"]:
+        if result["exists"]:
+            click.echo(f"Valid override file: {result['path']}")
+        else:
+            click.echo(f"No override file present: {result['path']}")
+        return
+    click.echo(f"Invalid override file: {result['path']}", err=True)
+    for error in result["errors"]:
+        click.echo(f"  - {error}", err=True)
+    raise SystemExit(1)
+
+
 @repo.command("record-wrapper-invocation", hidden=True)
 @click.argument(
     "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
@@ -1919,6 +1974,73 @@ def _parse_json_object(raw_value: str, *, option_name: str) -> dict[str, Any]:
 
 
 @cli.group()
+def methodology() -> None:
+    """Inspect the evaluation framework's methodology fingerprint.
+
+    The methodology_hash is a content fingerprint over the framework
+    contract (conditions, prompts, scorers, tool manifests, contract
+    versions). Two runs with the same hash are directly comparable;
+    different hashes mean methodology drifted and results are not
+    apples-to-apples.
+
+    Subcommands:
+
+    \b
+      hash      Print the current 12-char methodology_hash.
+      snapshot  Write a golden snapshot of the current inputs to
+                docs/methodology/snapshots/<hash>.json.
+      diff      Show per-input differences between two snapshots.
+    """
+
+
+@methodology.command("hash")
+def methodology_hash_cmd() -> None:
+    """Print the current methodology_hash (12 hex chars)."""
+    from src.eval.methodology import methodology_hash
+
+    click.echo(methodology_hash())
+
+
+@methodology.command("snapshot")
+@click.option(
+    "--dir",
+    "snapshot_dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Override snapshot output directory (default: docs/methodology/snapshots/).",
+)
+def methodology_snapshot_cmd(snapshot_dir: Path | None) -> None:
+    """Write a golden snapshot of the current methodology inputs.
+
+    Idempotent: if a snapshot with the current hash already exists, the
+    file is left alone.
+    """
+    from src.eval.methodology import write_snapshot
+
+    path = write_snapshot(snapshot_dir)
+    click.echo(str(path))
+
+
+@methodology.command("diff")
+@click.argument("snapshot_a")
+@click.argument("snapshot_b")
+def methodology_diff_cmd(snapshot_a: str, snapshot_b: str) -> None:
+    """Show per-input differences between two snapshots.
+
+    Each argument is either a 12-char hash (resolved against
+    docs/methodology/snapshots/) or an explicit path.
+    """
+    from src.eval.methodology import diff_snapshots
+
+    lines = diff_snapshots(snapshot_a, snapshot_b)
+    if not lines:
+        click.echo("(snapshots have identical inputs)")
+        return
+    for line in lines:
+        click.echo(line)
+
+
+@cli.group()
 def eval() -> None:
     """Local evaluation harnesses for Aethyme Core."""
 
@@ -3000,14 +3122,22 @@ def enhance_verify_command(repo_path: Path) -> None:
     results = verify(repo_path)
     for r in results:
         ok = r.exists and not r.placeholder_present
-        marker = "OK" if ok else "FAIL"
+        strict_direct_edit = (
+            r.target.relative_path in {"AGENTS.md", "CLAUDE.md"} and r.exists and not r.matches_canonical
+        )
+        marker = "FAIL" if strict_direct_edit else ("OK" if ok else "FAIL")
         notes: list[str] = []
         if not r.exists:
             notes.append("missing")
         elif r.placeholder_present:
             notes.append("placeholder not substituted")
         if r.exists and not r.matches_canonical:
-            notes.append("content drift (allowed)")
+            if r.target.relative_path in {"AGENTS.md", "CLAUDE.md"}:
+                notes.append(
+                    "direct edits unsupported; use .aethyme/overrides/agents.json"
+                )
+            else:
+                notes.append("content drift (allowed)")
         suffix = f"  ({', '.join(notes)})" if notes else ""
         click.echo(f"  [{marker:4}] {r.target.relative_path}{suffix}")
     if not is_ok(results):

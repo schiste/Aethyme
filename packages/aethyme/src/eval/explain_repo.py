@@ -15,11 +15,13 @@ from typing import TYPE_CHECKING, Any
 
 from src.contracts.versions import contract_versions
 
+from ._self import is_self_tool
 from ..indexing.engine import (
     build_task_pack,
 )
 from ..rendering.context_pack import render_explain_repo_text
 from .control_prompt import build_baseline_prompt, build_leverage_prompt
+from .inline_warm import warm_and_query_leverage
 from .models import EvaluationSide
 from .navigation_context import build_scope_view
 from .report import EvaluationReport, estimate_report, write_explain_repo_markdown_report
@@ -38,16 +40,17 @@ def _resolve_task_pack(
 ) -> dict[str, Any] | None:
     """Compute the task pack for the leverage condition, optionally via adapter.
 
-    Returns ``None`` for non-Aethyme tools (signals that the caller
-    should take the tool-context-file flow instead). For Aethyme (or
-    None), returns the structured task_pack — direct Python call when
-    tool is None, CLI subprocess when an Aethyme adapter is supplied.
-    The two transports are byte-equivalent (parity test).
+    Returns ``None`` for non-self tools (signals that the caller should
+    take the tool-context-file flow instead). For the framework's
+    self-tool (Aethyme by default — see :mod:`src.eval._self`) or
+    ``None``, returns the structured task_pack — direct Python call
+    when tool is None, CLI subprocess when a self-tool adapter is
+    supplied. The two transports are byte-equivalent (parity test).
     """
     if tool is None:
         return build_task_pack(repo_path, task)
-    if tool.name != "aethyme":
-        return None  # non-Aethyme: caller branches to tool-context-file flow
+    if not is_self_tool(tool.name):
+        return None  # non-self tool: caller branches to tool-context-file flow
     try:
         result = tool.run_condition("leverage", repo_path, task)
         return json.loads(result.raw_output) if result.raw_output else {}
@@ -71,10 +74,11 @@ def run_explain_repo_evaluation(
 ) -> dict[str, Any]:
     """Build control/explore/leverage artifacts; optionally execute command backends.
 
-    When ``tool`` is supplied (only ``"aethyme"`` is currently supported for
-    this eval type), the leverage task pack is computed via the tool's CLI
-    subprocess instead of a direct Python call — same byte-identical
-    contract as bug_fix.py's _build_navigation_context migration.
+    When ``tool`` is supplied (only the framework's self-tool is
+    currently supported for this eval type — see :mod:`src.eval._self`),
+    the leverage task pack is computed via the tool's CLI subprocess
+    instead of a direct Python call — same byte-identical contract as
+    bug_fix.py's _build_navigation_context migration.
     """
     # Reconcile legacy parameter names
     if control_runner is None and baseline_runner is not None:
@@ -82,18 +86,18 @@ def run_explain_repo_evaluation(
     if leverage_runner is None and aethyme_runner is not None:
         leverage_runner = aethyme_runner
 
-    # Tool dispatch. For Aethyme (or no tool), use the structured
-    # task_pack flow (summary / signals / Aethyme-shaped nav-context).
-    # For non-Aethyme tools, write the adapter's leverage output to
-    # a tool-context file inside the repo and use a tool-pointer
-    # leverage prompt — same file-pointer pattern as bug_fix.py's
-    # non-Aethyme branch (cf. prepare_bug_fix_benchmark).
-    is_aethyme_tool = tool is None or tool.name == "aethyme"
+    # Tool dispatch. For the framework's self-tool (or no tool), use
+    # the structured task_pack flow (summary / signals / self-tool-
+    # shaped nav-context). For other tools, write the adapter's
+    # leverage output to a tool-context file inside the repo and use
+    # a tool-pointer leverage prompt — same file-pointer pattern as
+    # bug_fix.py's non-self branch (cf. prepare_bug_fix_benchmark).
+    is_self = is_self_tool(tool.name if tool is not None else None)
     tool_context_relpath = ".aethyme-eval-tool-context.md"
 
     pack = _resolve_task_pack(repo_path, task, tool)
-    if is_aethyme_tool:
-        # pack is guaranteed non-None for the Aethyme/legacy path.
+    if is_self:
+        # pack is guaranteed non-None for the self-tool/legacy path.
         assert pack is not None
         summary = pack.get("summary", {})
         signals = pack.get("signals")
@@ -102,9 +106,9 @@ def run_explain_repo_evaluation(
         )
         explanation = render_explain_repo_text(summary, pack)
     else:
-        # Non-Aethyme: write the adapter's leverage output to the
+        # Non-self tool: write the adapter's leverage output to the
         # tool-context file the leverage prompt will point at. We
-        # skip the Aethyme-specific structured artifacts; downstream
+        # skip the self-tool-specific structured artifacts; downstream
         # consumers see ``navigation_context = None`` and the same
         # auto-skip semantics as bug_fix.py.
         #
@@ -116,30 +120,17 @@ def run_explain_repo_evaluation(
         # context file gets an inline error note and the eval still
         # runs (the agent just won't have leverage context).
         assert tool is not None
-        import sys as _sys
-        try:
-            tool.warm(repo_path)
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"[explain_repo] {tool.name} warm() failed on "
-                f"{repo_path}: {type(exc).__name__}: {exc}",
-                file=_sys.stderr,
-            )
-        try:
-            leverage_result = tool.run_condition("leverage", repo_path, task)
-            addendum = leverage_result.raw_output or leverage_result.prompt_addendum or ""
-        except Exception as exc:  # noqa: BLE001 — degrade gracefully
-            addendum = (
-                f"<!-- tool '{tool.name}' leverage condition errored: "
-                f"{type(exc).__name__}: {exc} -->\n"
-            )
-        (repo_path / tool_context_relpath).write_text(addendum, encoding="utf-8")
+        warm_and_query_leverage(
+            tool, repo_path, task,
+            tool_context_path=repo_path / tool_context_relpath,
+            log_prefix="explain_repo",
+        )
         summary = {}
         signals = None
         navigation_context = None
         explanation = (
             f"explain-repo with tool={tool.name!r}: leverage context delivered "
-            f"via {tool_context_relpath}; Aethyme-shaped explanation "
+            f"via {tool_context_relpath}; self-tool-shaped explanation "
             f"render skipped (would require tool-specific renderer)."
         )
 
@@ -154,7 +145,7 @@ def run_explain_repo_evaluation(
     leverage_prompt = build_leverage_prompt(
         repo_path, task,
         tool_name=(tool.name if tool is not None else None),
-        tool_context_relpath=(None if is_aethyme_tool else tool_context_relpath),
+        tool_context_relpath=(None if is_self else tool_context_relpath),
     )
 
     # --- Execute conditions via command backends (if provided) ---

@@ -119,13 +119,15 @@ def test_objective_and_constraints_not_in_agent_prompts():
     handing the agent the rubric."""
     from src.eval.prompts import build_prompts
     from src.eval.targets import TARGETS
+    from src.eval.tools.registry import get_manifest
 
     target = TARGETS["mediawiki"]
+    manifest = get_manifest("aethyme")
     objective, constraints = get_eval_type_contract("bug-fix-1")
     # Take a salient phrase from each that is unlikely to appear by
     # accident in the task text.
     objective_phrase = "comparison axis"
-    prompts = build_prompts("bug-fix-1", target)
+    prompts = build_prompts("bug-fix-1", target, manifest)
     for cond, text in prompts.items():
         assert objective_phrase not in text, (
             f"bug-fix-1/{cond} prompt leaks the objective phrase "

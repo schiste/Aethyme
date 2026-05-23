@@ -16,7 +16,9 @@ from typing import TYPE_CHECKING, Any
 from src.contracts.versions import contract_versions
 
 from ..indexing.engine import build_task_pack, graph_expand, inspect_repository
+from ._self import is_self_tool
 from .control_prompt import build_baseline_prompt, build_leverage_prompt
+from .inline_warm import warm_and_query_leverage
 from .models import EvaluationSide
 from .navigation_context import build_scope_view
 from .report import EvaluationReport, estimate_report, write_navigation_ctf_markdown_report
@@ -44,8 +46,11 @@ def _resolve_task_pack(
     """
     if tool is None:
         return build_task_pack(repo_path, task)
-    if tool.name != "aethyme":
-        return None  # non-Aethyme: caller branches to tool-context-file flow
+    if not is_self_tool(tool.name):
+        # Non-self-tool: caller branches to tool-context-file flow.
+        # The framework's self-tool (see :mod:`src.eval._self`) gets the
+        # structured task_pack flow; everyone else writes a context file.
+        return None
     try:
         result = tool.run_condition("leverage", repo_path, task)
         return json.loads(result.raw_output) if result.raw_output else {}
@@ -80,20 +85,21 @@ def run_navigation_ctf_evaluation(
     # Hard separation: task_spec is agent-safe, reference is scoring-only.
     task_spec, reference = _build_navigation_case(inspect)
 
-    # Tool dispatch. Aethyme/None uses the structured task_pack +
-    # anchor-expansion flow. Non-Aethyme tools take the file-pointer
-    # flow: adapter's leverage output is written into the repo as
-    # .aethyme-eval-tool-context.md, the leverage prompt points there,
-    # and the structured nav-context artifacts are skipped (the
-    # navigation-CTF reference is still computed via inspect_repository
-    # because that's eval-framework infrastructure, not agent data).
-    is_aethyme_tool = tool is None or tool.name == "aethyme"
+    # Tool dispatch. The framework's self-tool (or no tool) uses the
+    # structured task_pack + anchor-expansion flow. Other tools take the
+    # file-pointer flow: the adapter's leverage output is written into
+    # the repo as .aethyme-eval-tool-context.md, the leverage prompt
+    # points there, and the structured nav-context artifacts are skipped
+    # (the navigation-CTF reference is still computed via
+    # inspect_repository because that's eval-framework infrastructure,
+    # not agent data).
+    is_self = is_self_tool(tool.name if tool is not None else None)
     tool_context_relpath = ".aethyme-eval-tool-context.md"
 
     task_pack = _resolve_task_pack(repo_path, task_spec["task"], tool)
     output_schema = navigation_ctf_output_schema()
 
-    if is_aethyme_tool:
+    if is_self:
         assert task_pack is not None
         anchors_view = {
             "task": task_spec["task"],
@@ -105,29 +111,15 @@ def run_navigation_ctf_evaluation(
         )
     else:
         assert tool is not None
-        # Inline warm — per the bug_fix.py / explain_repo.py pattern:
-        # tools with per-dir state (graphify-out/) need warming before
-        # query, and the orchestrator's warm phase runs AFTER this
-        # function executes (build-inputs comes first). See bug_fix.py
-        # for full rationale.
-        import sys as _sys
-        try:
-            tool.warm(repo_path)
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"[navigation_ctf] {tool.name} warm() failed on "
-                f"{repo_path}: {type(exc).__name__}: {exc}",
-                file=_sys.stderr,
-            )
-        try:
-            leverage_result = tool.run_condition("leverage", repo_path, task_spec["task"])
-            addendum = leverage_result.raw_output or leverage_result.prompt_addendum or ""
-        except Exception as exc:  # noqa: BLE001
-            addendum = (
-                f"<!-- tool '{tool.name}' leverage condition errored: "
-                f"{type(exc).__name__}: {exc} -->\n"
-            )
-        (repo_path / tool_context_relpath).write_text(addendum, encoding="utf-8")
+        # Inline warm — per the bug_fix.py / explain_repo.py pattern.
+        # See inline_warm.warm_and_query_leverage docstring for rationale
+        # (orchestrator's warm phase runs AFTER build-inputs, but per-dir
+        # tool state must exist before the leverage query).
+        warm_and_query_leverage(
+            tool, repo_path, task_spec["task"],
+            tool_context_path=repo_path / tool_context_relpath,
+            log_prefix="navigation_ctf",
+        )
         anchors_view = {"task": task_spec["task"], "anchors": []}
         scope_view = {}
         navigation_context = None
@@ -141,7 +133,7 @@ def run_navigation_ctf_evaluation(
     leverage_prompt = build_leverage_prompt(
         repo_path, task_spec["task"],
         tool_name=(tool.name if tool is not None else None),
-        tool_context_relpath=(None if is_aethyme_tool else tool_context_relpath),
+        tool_context_relpath=(None if is_self else tool_context_relpath),
     )
 
     # --- Execute conditions via command backends (if provided) ---

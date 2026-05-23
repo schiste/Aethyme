@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from ..rendering.context_pack import render_prompt_pack
+from ._self import is_self_tool
 
 
 def build_baseline_prompt(repo_path: Path, task: str) -> str:
@@ -47,15 +48,16 @@ def build_leverage_prompt(
     auto-loaded. This prompt nudges it to actively use those tools
     rather than falling back to raw file exploration.
 
-    When ``tool_name`` is None or ``"aethyme"``, the existing Aethyme-
-    specific hint is emitted (byte-identical for the default flow).
-    When ``tool_name`` is a competitor AND ``tool_context_relpath`` is
-    supplied, the prompt names the tool and points at the pre-computed
-    tool-context file — structurally identical to the Aethyme variant
-    for apples-to-apples comparison.
+    When ``tool_name`` is None or matches the framework's self-tool (see
+    :mod:`src.eval._self`), the existing self-tool-specific hint is
+    emitted (byte-identical for the default flow). When ``tool_name`` is
+    any *other* tool AND ``tool_context_relpath`` is supplied, the prompt
+    names the tool and points at the pre-computed tool-context file —
+    structurally identical to the self-tool variant for apples-to-apples
+    comparison.
     """
-    is_non_aethyme = tool_name is not None and tool_name != "aethyme"
-    if is_non_aethyme and tool_context_relpath:
+    is_other_tool = tool_name is not None and not is_self_tool(tool_name)
+    if is_other_tool and tool_context_relpath:
         return (
             f"Task: {task}\n"
             f"Repository path: {repo_path}\n"

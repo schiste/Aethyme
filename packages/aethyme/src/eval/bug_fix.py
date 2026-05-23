@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from src.contracts.versions import contract_versions
 
-from ..indexing.engine import build_task_context, build_task_pack
+from ._self import is_self_tool, self_tool_name
 
 if TYPE_CHECKING:
     from .tools import ToolAdapter
@@ -36,6 +36,7 @@ from .bug_fix_setup import (
     reset_bug,
     verify_setup,
 )
+from .inline_warm import fanout_tool_state, warm_and_query_leverage
 from .models import EvaluationSide
 from .navigation_context import build_scope_view
 from .report import (
@@ -272,17 +273,18 @@ def prepare_bug_fix_benchmark(
     for cond, repo_path in repos.items():
         setup_results[cond] = setup_bug_fix(repo_path)
 
-    # Tool dispatch — Aethyme keeps the structured-JSON nav-context
-    # flow (anchors / scope / file_contents in navigation_context.json);
-    # non-Aethyme tools (graphify, future competitors) use a tool-
-    # context-file pointer in the leverage prompt and skip the Aethyme-
-    # specific negative-context plausibility flow entirely. The
-    # negative-context condition for non-Aethyme tools degenerates to
+    # Tool dispatch — the framework's self-tool (the tool AethymeBench
+    # treats as its primary subject — see :mod:`src.eval._self`) keeps
+    # the structured-JSON nav-context flow (anchors / scope /
+    # file_contents in navigation_context.json); other tools use a
+    # tool-context-file pointer in the leverage prompt and skip the
+    # self-tool-specific negative-context plausibility flow entirely.
+    # The negative-context condition for non-self tools degenerates to
     # a leverage replay with ``negative_context_status`` reflecting
     # that it was auto-skipped — honest about not implementing a
     # trust-calibration condition that the tool's data shape doesn't
     # support.
-    is_aethyme_tool = tool is None or tool.name == "aethyme"
+    is_self = is_self_tool(tool.name if tool is not None else None)
     tool_context_relpath = ".aethyme-eval-tool-context.md"
 
     # 3. Build per-condition prompts (each embeds its own repo path).
@@ -293,11 +295,11 @@ def prepare_bug_fix_benchmark(
                 repo_path, task, condition="leverage",
                 tool_name=(tool.name if tool is not None else None),
                 tool_context_relpath=(
-                    None if is_aethyme_tool else tool_context_relpath
+                    None if is_self else tool_context_relpath
                 ),
             )
         elif cond == "negative-context":
-            if is_aethyme_tool:
+            if is_self:
                 prompts[cond] = _build_bug_fix_prompt(
                     repo_path, task, condition="negative-context",
                 )
@@ -321,42 +323,57 @@ def prepare_bug_fix_benchmark(
     leverage_repo = repos["leverage"]
     navigation_context = _build_navigation_context(leverage_repo, task, tool=tool)
 
-    # Tool-context file (non-Aethyme only). Written into the leverage
-    # clone (and the negative-context clone too, since its prompt
-    # points at the same file when auto-skipped) so the agent's prompt
-    # can reference it via a relative path.
+    # Tool-context file + per-clone graph state (non-Aethyme only).
     #
-    # For tools with per-clone state (e.g. graphify, whose `query`
-    # reads ./graphify-out/graph.json relative to cwd), we MUST warm
-    # the clone first — the per-eval daemon-warming the orchestrator's
-    # plan emits only runs against target.aethyme_path, not the agent
-    # clones. We do this synchronously here in prepare so the leverage
-    # query has the graph to read; failures degrade to an empty
-    # context file (same fallback as adapter call failures below).
-    if not is_aethyme_tool and tool is not None:
-        try:
-            tool.warm(leverage_repo)
-        except Exception as exc:  # noqa: BLE001 — warm-failure is a degraded condition, not eval-killing
-            # Adapter raised — likely an LLM/backend issue. Log to
-            # stderr but continue; the run_condition call below may
-            # fall back to graceful failure as well.
-            print(
-                f"[bug_fix.prepare] {tool.name} warm() failed on "
-                f"{leverage_repo}: {type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-        try:
-            leverage_result = tool.run_condition("leverage", leverage_repo, task)
-            addendum = leverage_result.raw_output or leverage_result.prompt_addendum or ""
-        except Exception as exc:  # noqa: BLE001 — best-effort, see comment above
-            addendum = (
-                f"<!-- tool '{tool.name}' leverage condition errored: "
-                f"{type(exc).__name__}: {exc} -->\n"
-            )
-        for cond_name in ("leverage", "negative-context"):
-            target = repos.get(cond_name)
-            if target is not None:
-                (target / tool_context_relpath).write_text(addendum, encoding="utf-8")
+    # Two artifacts to wire per tool-using clone:
+    #
+    # 1. Tool-specific state (e.g. graphify-out/graph.json). All
+    #    TOOL_USING_CONDITIONS clones need this — even explore and
+    #    task-conditioned, where the agent might INVOKE the tool
+    #    despite no prompt pointer. Without per-clone state, calls
+    #    fail. We extract once (in leverage_repo, where we'd run the
+    #    query anyway) and then copy graphify-out/ to the other
+    #    tool-using clones. ~225MB per clone on Mockup; copy is fast
+    #    on the same filesystem.
+    #
+    # 2. tool-context.md prompt addendum. ONLY in leverage and
+    #    negative-context, because those are the conditions whose
+    #    prompts explicitly point at the file. Explore and
+    #    task-conditioned use baseline prompts (no pointer) — having
+    #    the file there would be irrelevant since the prompt doesn't
+    #    reference it.
+    #
+    # Per the bug_fix.py / explain_repo.py / navigation_ctf.py
+    # pattern: failures in warm or run_condition are non-fatal. The
+    # eval still runs; the agent just doesn't get the leverage
+    # context.
+    if not is_self and tool is not None:
+        addendum = warm_and_query_leverage(
+            tool, leverage_repo, task,
+            tool_context_path=leverage_repo / tool_context_relpath,
+            log_prefix="bug_fix.prepare",
+        )
+
+        # Fan the same addendum out to negative-context (its prompt
+        # also points at tool-context.md). We don't re-query — same
+        # addendum by design, and re-querying would double tool cost
+        # and risk nondeterminism if the adapter isn't stable.
+        negative_target = repos.get("negative-context")
+        if negative_target is not None:
+            (negative_target / tool_context_relpath).write_text(addendum, encoding="utf-8")
+
+        # Per-clone tool state → explore, task-conditioned,
+        # negative-context. Leverage already has its own (it's where
+        # we warmed). Copy rather than re-warm: same rationale as
+        # inline_warm.fanout_tool_state's docstring.
+        fanout_targets = [
+            repos[c] for c in ("explore", "task-conditioned", "negative-context")
+            if c in repos
+        ]
+        fanout_tool_state(
+            leverage_repo, fanout_targets,
+            log_prefix="bug_fix.prepare",
+        )
 
     # Negative nav-context (plausibly-wrong) — only meaningful for
     # Aethyme tooling (the 5-property plausibility rule operates on
@@ -365,7 +382,7 @@ def prepare_bug_fix_benchmark(
     # will execute as a leverage replay but the report knows it's not
     # a real trust-calibration measurement.
     negative_navigation_context: dict[str, Any] | None = navigation_context
-    if not is_aethyme_tool:
+    if not is_self:
         negative_status = "skipped_non_aethyme_tool"
     else:
         negative_status = "fallback_no_alternative"
@@ -551,23 +568,25 @@ def _build_bug_fix_prompt(
     - ``"baseline"`` (control + explore + task-conditioned): no preamble.
       Agents either don't have the skill (control) or have it without
       explicit instruction (explore).
-    - ``"leverage"``: pointer at the tool. For Aethyme (the default),
-      uses the Aethyme-specific minimal pointer at SKILL.md. For other
-      tools, uses a generic pointer at the pre-computed tool-context
-      file (``tool_context_relpath``, relative to the repo root).
+    - ``"leverage"``: pointer at the tool. For the framework's self-tool
+      (Aethyme by default — see :mod:`src.eval._self`), uses the
+      self-tool-specific minimal pointer at SKILL.md. For other tools,
+      uses a generic pointer at the pre-computed tool-context file
+      (``tool_context_relpath``, relative to the repo root).
     - ``"negative-context"``: pointer at the *plausibly-wrong*
       nav-context blob file (asymmetric with leverage by design —
       this condition tests trust calibration when the agent is
-      handed wrong context upfront). Aethyme-specific.
+      handed wrong context upfront). Self-tool-specific.
 
     ``tool_name`` + ``tool_context_relpath`` are only meaningful for
-    the leverage condition with a non-Aethyme tool. When ``tool_name``
-    is None or "aethyme", the existing Aethyme-specific preamble is
-    used — preserving byte-identical prompts for the default flow.
+    the leverage condition with a non-self tool. When ``tool_name`` is
+    None or matches the framework's self-tool, the existing self-tool
+    preamble is used — preserving byte-identical prompts for the
+    default flow.
     """
     if condition == "leverage":
-        is_non_aethyme = tool_name is not None and tool_name != "aethyme"
-        if is_non_aethyme and tool_context_relpath:
+        is_other_tool = tool_name is not None and not is_self_tool(tool_name)
+        if is_other_tool and tool_context_relpath:
             # Mirrors Aethyme's _LEVERAGE_MINIMAL_POINTER shape: a small
             # pointer hint that names the tool and tells the agent where
             # to find pre-computed context. The agent decides whether
@@ -613,107 +632,44 @@ def _build_navigation_context(
 ) -> dict[str, Any] | None:
     """Build navigation context for the leverage condition.
 
-    Returns ``None`` when the tool is non-Aethyme — those tools deliver
-    leverage context via a different mechanism (a tool-context file
-    pointer in the prompt) wired in :func:`prepare_bug_fix_benchmark`.
-    Returns the Aethyme-specific ``{anchors, scope, file_contents}``
-    dict otherwise.
+    When ``tool`` is ``None`` the framework's self-tool adapter is
+    resolved via ``get_adapter(self_tool_name())`` — AethymeBench's
+    default subject (overridable via ``AETHYMEBENCH_SELF_TOOL``; see
+    :mod:`src.eval._self`). Routing everything through the adapter
+    (subprocess + JSON parse) is the single source of truth: no direct
+    Python calls into the indexing layer, no transport-dependent
+    divergence to keep parity-tested.
 
-    Uses the Aethyme engine to compute task-relevant context (anchors,
-    scope, file contents) so the leverage agent starts with a map of
-    the relevant code.
+    Returns the self-tool-shaped ``{anchors, scope, file_contents, ...}``
+    dict when ``tool`` is the self-tool. Returns ``None`` for any other
+    tool — non-self tools deliver leverage context via a separate
+    file-pointer mechanism wired in :func:`prepare_bug_fix_benchmark`,
+    so producing a synthetic self-tool-shape JSON would be misleading.
 
-    When ``tool`` is None (default): direct Python calls into the indexing
-    layer. This is the legacy path preserved for byte-identical
-    reproducibility of pre-manifest eval runs (cardinal rule #2).
-
-    When ``tool`` is supplied AND ``tool.name == "aethyme"``: routes
-    `task pack` / `task context` through Aethyme's CLI subprocess, then
-    parses the JSON output into the same dict shape. Equivalent to the
-    legacy path by construction (the CLI commands wrap the same Python
-    functions); the equivalence is enforced by
-    ``tests/local/test_eval_navigation_context_adapter_parity.py``.
-
-    When ``tool`` is supplied AND ``tool.name != "aethyme"`` (e.g.
-    graphify): the bug-fix nav-context schema is Aethyme-specific
-    (anchors/scope/file_contents). For non-Aethyme tools, the leverage
-    prompt is meant to point at the tool's own prompt_addendum directly,
-    not at a synthetic Aethyme-shape JSON. We raise so the caller
-    notices, rather than silently producing nonsense.
+    Failure mode: subprocess or JSON-parse failures fall back to empty
+    dicts so the prepare flow surfaces a degraded score rather than a
+    hard error. The leverage condition's nav-context will be empty in
+    that case.
     """
-    # Adapter path — Aethyme retains its structured nav-context JSON;
-    # non-Aethyme tools take a separate flow at the prepare-level (see
-    # prepare_bug_fix_benchmark below). Returning None here signals
-    # "don't try to write an Aethyme-shaped JSON for this tool" — the
-    # caller short-circuits to the tool-context-file flow instead.
-    if tool is not None:
-        if tool.name == "aethyme":
-            return _build_navigation_context_via_adapter(repo_path, task, tool)
-        return None  # non-Aethyme: caller handles via tool-context file
+    if tool is None:
+        from .tools import get_adapter
 
-    # Legacy direct-Python path.
-    try:
-        task_pack = build_task_pack(repo_path, task)
-    except Exception:
-        task_pack = {}
-
-    try:
-        task_context = build_task_context(repo_path, task, content_budget=40_000)
-    except Exception:
-        task_context = {}
-
-    scope_view = build_scope_view(task, task_pack)
-
-    return {
-        "mode": "bug_fix_navigation",
-        "repo_path": str(repo_path),
-        "task": task,
-        "test_file": TEST_REL,
-        "bug_area": "packages/auth/src/",
-        "anchors": task_pack.get("anchors", []),
-        "scope": scope_view,
-        "file_contents": task_context.get("file_contents", []),
-    }
-
-
-def _build_navigation_context_via_adapter(
-    repo_path: Path,
-    task: str,
-    tool: "ToolAdapter",
-) -> dict[str, Any]:
-    """Aethyme-via-CLI variant of :func:`_build_navigation_context`.
-
-    Runs ``aethyme task pack`` and ``aethyme task context`` as subprocesses
-    via the tool adapter, then parses the JSON outputs into the same dict
-    fields the legacy Python path produces. The two paths are designed to
-    be byte-equivalent — see the parity test for verification.
-
-    Failure mode: when an adapter command fails (CLI not built, daemon
-    unreachable, etc.), we substitute empty dicts so the eval prepare
-    flow doesn't crash — matching the legacy path's bare ``except:`` blocks.
-    The leverage condition's nav-context will be empty, the eval will
-    still run, and the failure surfaces as a degraded score rather than
-    a hard prepare error.
-    """
-    import json as _json
+        tool = get_adapter(self_tool_name())
+    if not is_self_tool(tool.name):
+        return None
 
     try:
         leverage_result = tool.run_condition("leverage", repo_path, task)
-        # raw_output is the unwrapped subprocess stdout (just the JSON);
-        # prompt_addendum is the same JSON wrapped in a markdown header
-        # intended for prompt injection. The parser needs the bare JSON.
-        task_pack = _json.loads(leverage_result.raw_output) if leverage_result.raw_output else {}
+        task_pack = json.loads(leverage_result.raw_output) if leverage_result.raw_output else {}
     except Exception:
         task_pack = {}
 
     try:
         tc_result = tool.run_condition("task-conditioned", repo_path, task)
-        task_context = _json.loads(tc_result.raw_output) if tc_result.raw_output else {}
+        task_context = json.loads(tc_result.raw_output) if tc_result.raw_output else {}
     except Exception:
         task_context = {}
 
-    # scope_view is a post-processing transformation on task_pack — not a
-    # tool capability, so it stays a Python call regardless of routing.
     scope_view = build_scope_view(task, task_pack)
 
     return {
@@ -957,7 +913,7 @@ def prepare_cross_package_benchmark(
     symptom-driven prompt (no file paths) and plants the execute bug
     with the test in app-shared instead of auth.
     """
-    from .repos import AETHYME_CONDITIONS, CONDITION_NAMES, create_condition_repos
+    from .repos import TOOL_USING_CONDITIONS, CONDITION_NAMES, create_condition_repos
 
     repos = create_condition_repos(source, dest_dir)
 
@@ -967,7 +923,7 @@ def prepare_cross_package_benchmark(
 
     prompts: dict[str, str] = {}
     for cond, repo_path in repos.items():
-        leverage = cond in AETHYME_CONDITIONS and cond == "leverage"
+        leverage = cond in TOOL_USING_CONDITIONS and cond == "leverage"
         prompts[cond] = _build_cross_package_prompt(repo_path, task, leverage=leverage)
 
     leverage_repo = repos["leverage"]

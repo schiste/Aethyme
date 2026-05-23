@@ -28,6 +28,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from .targets import EvalTarget
+from .tools.manifest import ToolManifest, _substitute_prompt_text
 
 CONDITION_NAMES: tuple[str, ...] = (
     "control-cto-off",
@@ -38,25 +39,57 @@ CONDITION_NAMES: tuple[str, ...] = (
 )
 
 
-# The leverage condition's prompt addition: a *minimal* pointer at the
-# tool, not a step-by-step guide. The whole point of the leverage-vs-
-# explore comparison is to measure the cost of "agent told the tool
-# exists" vs "agent has skill loaded but no instruction."
+# The leverage and task-conditioned conditions get a *minimal* prompt
+# pointer at the active tool — not a step-by-step guide. The whole
+# point of the leverage-vs-explore comparison is to measure the cost of
+# "agent told the tool exists" vs "agent has skill loaded but no
+# instruction." An earlier hardcoded version named the canonical
+# Aethyme intent (`usage_boundary_query`, `behavior_localization_query`)
+# and listed the response fields to read. That biased the
+# discoverability gap upward — we were measuring "great prompt
+# engineering" rather than "tool was pointed at." The current shape
+# just names the entry point; the agent must read SKILL.md (or
+# experiment) to learn how to invoke it. That's the honest measurement.
 #
-# An earlier version of this hint named the canonical intent
-# (`usage_boundary_query`, `behavior_localization_query`) and listed
-# the response fields to read. That biased the discoverability gap
-# upward — we were measuring "great prompt engineering" rather than
-# "tool was pointed at." The current shape just names the entry point;
-# the agent must read SKILL.md (or experiment) to learn how to invoke
-# it. That's the honest measurement.
-_LEVERAGE_HINT = (
-    "Aethyme is available in this repository. See "
-    "`.codex/skills/aethyme/SKILL.md` for usage; the wrapper at "
-    "`.codex/skills/aethyme/aethyme-explore` is the convenience "
-    "entry point. Use it where it helps; verify its output before "
-    "acting on it.\n\n"
-)
+# The hint templates now live in each tool's manifest under [prompts]
+# (see src/eval/tools/manifest.py and evals/tools/*.toml). This module
+# pulls them out via _resolve_hints and substitutes {{TOOL_NAME}} /
+# {{SKILL_PATH}}. {{TOOL_NAME}} binds to manifest.display_name, not the
+# slug — closest to the old hardcoded "Aethyme is available..."
+# capitalization, minimizing methodology drift on the casing axis.
+
+
+def _resolve_hints(manifest: ToolManifest) -> tuple[str, str]:
+    """Substitute manifest prompt templates into ready-to-emit hint strings.
+
+    Returns ``(leverage_hint, task_conditioned_hint)``, each with the
+    trailing ``\\n\\n`` separator the prompt assembler expects. The
+    trailing whitespace is appended here, not in the TOML template —
+    centralizing it makes it impossible for a manifest author to forget.
+
+    Raises ``ValueError`` if the manifest declares ``leverage`` or
+    ``task-conditioned`` conditions but lacks a ``[prompts]`` table.
+    (The manifest loader normally catches this; the check here is a
+    second line of defense if a hand-constructed ``ToolManifest``
+    sneaks past validation.)
+    """
+    if manifest.prompts is None:
+        raise ValueError(
+            f"Manifest {manifest.name!r} has no [prompts] table; cannot "
+            "render leverage / task-conditioned hints. Add a [prompts] "
+            "table or remove the leverage / task-conditioned conditions."
+        )
+    leverage = _substitute_prompt_text(
+        manifest.prompts.leverage_hint,
+        tool_name=manifest.display_name,
+        skill_path=manifest.prompts.skill_path,
+    )
+    task_conditioned = _substitute_prompt_text(
+        manifest.prompts.task_conditioned_hint,
+        tool_name=manifest.display_name,
+        skill_path=manifest.prompts.skill_path,
+    )
+    return (leverage + "\n\n", task_conditioned + "\n\n")
 
 
 # ---------------------------------------------------------------------------
@@ -90,29 +123,24 @@ def _build_per_condition(
     target: EvalTarget,
     task: str,
     schema_shape: str,
-    leverage_hint: str = "",
-    task_conditioned_hint: str = "",
+    *,
+    leverage_hint: str,
+    task_conditioned_hint: str,
 ) -> dict[str, str]:
     """Standard 5-condition prompt assembly.
 
-    The `leverage_hint` is the Aethyme-specific guidance that appears
-    only in the leverage condition. `task_conditioned_hint` is similar
-    but for the task-conditioned condition; if empty, defaults to a
-    generic "use task-conditioned context artifacts" line.
+    Both hints are required keyword arguments now — they come from
+    ``_resolve_hints(manifest)`` upstream and carry their trailing
+    ``\\n\\n``. The control-* and explore conditions ignore the hints
+    by design (those conditions test discoverability without a prompt
+    addendum).
     """
-    if not task_conditioned_hint:
-        task_conditioned_hint = (
-            "Use Aethyme tools and any task-conditioned context "
-            "artifacts to navigate the repository graph, but do your "
-            "own analysis.\n\n"
-        )
-
     out: dict[str, str] = {}
     for cond in CONDITION_NAMES:
         prefix = ""
-        if cond == "leverage" and leverage_hint:
+        if cond == "leverage":
             prefix = leverage_hint
-        elif cond == "task-conditioned" and task_conditioned_hint:
+        elif cond == "task-conditioned":
             prefix = task_conditioned_hint
         out[cond] = (
             _preamble(target, cond, schema_shape)
@@ -151,13 +179,19 @@ _BUG_FIX_1_SCHEMA_SHAPE = (
 )
 
 
-def build_bug_fix_1_prompts(target: EvalTarget) -> dict[str, str]:
+def build_bug_fix_1_prompts(
+    target: EvalTarget,
+    *,
+    leverage_hint: str,
+    task_conditioned_hint: str,
+) -> dict[str, str]:
     """T419918 watchlist diagnostic. MediaWiki-only."""
     return _build_per_condition(
         target=target,
         task=_BUG_FIX_1_TASK,
         schema_shape=_BUG_FIX_1_SCHEMA_SHAPE,
-        leverage_hint=_LEVERAGE_HINT,
+        leverage_hint=leverage_hint,
+        task_conditioned_hint=task_conditioned_hint,
     )
 
 
@@ -197,12 +231,18 @@ _DEAD_CODE_SCHEMA_SHAPE = (
 )
 
 
-def build_dead_code_prompts(target: EvalTarget) -> dict[str, str]:
+def build_dead_code_prompts(
+    target: EvalTarget,
+    *,
+    leverage_hint: str,
+    task_conditioned_hint: str,
+) -> dict[str, str]:
     return _build_per_condition(
         target=target,
         task=_DEAD_CODE_TASK,
         schema_shape=_DEAD_CODE_SCHEMA_SHAPE,
-        leverage_hint=_LEVERAGE_HINT,
+        leverage_hint=leverage_hint,
+        task_conditioned_hint=task_conditioned_hint,
     )
 
 
@@ -230,12 +270,18 @@ _IMPACT_ANALYSIS_SCHEMA_SHAPE = (
 )
 
 
-def build_impact_analysis_prompts(target: EvalTarget) -> dict[str, str]:
+def build_impact_analysis_prompts(
+    target: EvalTarget,
+    *,
+    leverage_hint: str,
+    task_conditioned_hint: str,
+) -> dict[str, str]:
     return _build_per_condition(
         target=target,
         task=_IMPACT_ANALYSIS_TASK,
         schema_shape=_IMPACT_ANALYSIS_SCHEMA_SHAPE,
-        leverage_hint=_LEVERAGE_HINT,
+        leverage_hint=leverage_hint,
+        task_conditioned_hint=task_conditioned_hint,
     )
 
 
@@ -269,12 +315,18 @@ _FEATURE_LOCALIZATION_SCHEMA_SHAPE = (
 )
 
 
-def build_feature_localization_prompts(target: EvalTarget) -> dict[str, str]:
+def build_feature_localization_prompts(
+    target: EvalTarget,
+    *,
+    leverage_hint: str,
+    task_conditioned_hint: str,
+) -> dict[str, str]:
     return _build_per_condition(
         target=target,
         task=_FEATURE_LOCALIZATION_TASK,
         schema_shape=_FEATURE_LOCALIZATION_SCHEMA_SHAPE,
-        leverage_hint=_LEVERAGE_HINT,
+        leverage_hint=leverage_hint,
+        task_conditioned_hint=task_conditioned_hint,
     )
 
 
@@ -303,12 +355,18 @@ _CONFIG_AUDIT_SCHEMA_SHAPE = (
 )
 
 
-def build_config_audit_prompts(target: EvalTarget) -> dict[str, str]:
+def build_config_audit_prompts(
+    target: EvalTarget,
+    *,
+    leverage_hint: str,
+    task_conditioned_hint: str,
+) -> dict[str, str]:
     return _build_per_condition(
         target=target,
         task=_CONFIG_AUDIT_TASK,
         schema_shape=_CONFIG_AUDIT_SCHEMA_SHAPE,
-        leverage_hint=_LEVERAGE_HINT,
+        leverage_hint=leverage_hint,
+        task_conditioned_hint=task_conditioned_hint,
     )
 
 
@@ -342,12 +400,18 @@ _MIGRATION_SCHEMA_SHAPE = (
 )
 
 
-def build_migration_prompts(target: EvalTarget) -> dict[str, str]:
+def build_migration_prompts(
+    target: EvalTarget,
+    *,
+    leverage_hint: str,
+    task_conditioned_hint: str,
+) -> dict[str, str]:
     return _build_per_condition(
         target=target,
         task=_MIGRATION_TASK,
         schema_shape=_MIGRATION_SCHEMA_SHAPE,
-        leverage_hint=_LEVERAGE_HINT,
+        leverage_hint=leverage_hint,
+        task_conditioned_hint=task_conditioned_hint,
     )
 
 
@@ -356,7 +420,11 @@ def build_migration_prompts(target: EvalTarget) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-BUILDERS: dict[str, Callable[[EvalTarget], dict[str, str]]] = {
+# Builder signature is `(target, *, leverage_hint, task_conditioned_hint) ->
+# dict[str, str]`. `Callable[..., dict[str, str]]` is the simplest typing
+# that admits keyword-only parameters — PEP 612's ParamSpec would be more
+# precise but overkill for an internal lookup table.
+BUILDERS: dict[str, Callable[..., dict[str, str]]] = {
     "bug-fix-1": build_bug_fix_1_prompts,
     "dead-code": build_dead_code_prompts,
     "impact-analysis": build_impact_analysis_prompts,
@@ -366,13 +434,29 @@ BUILDERS: dict[str, Callable[[EvalTarget], dict[str, str]]] = {
 }
 
 
-def build_prompts(eval_type: str, target: EvalTarget) -> dict[str, str]:
+def build_prompts(
+    eval_type: str,
+    target: EvalTarget,
+    manifest: ToolManifest,
+) -> dict[str, str]:
     """Public dispatch: return the 5-condition prompt dict for an eval type.
+
+    ``manifest`` supplies the leverage / task-conditioned hint templates;
+    {{TOOL_NAME}} is bound to ``manifest.display_name`` and {{SKILL_PATH}}
+    to ``manifest.prompts.skill_path``. The hint substitution happens once
+    here, then both resolved strings are forwarded to the per-eval-type
+    builder.
 
     Raises KeyError if the eval type isn't a diagnostic with codified prompts
     (e.g. `bug-fix` uses cloning and has its own prompt builder in
     `bug_fix.py`; `explain-repo` and `navigation-ctf` go through their own
-    Click commands).
+    Click commands). Raises ValueError via ``_resolve_hints`` if the
+    manifest has no ``[prompts]`` table.
     """
+    leverage_hint, task_conditioned_hint = _resolve_hints(manifest)
     builder = BUILDERS[eval_type]
-    return builder(target)
+    return builder(
+        target,
+        leverage_hint=leverage_hint,
+        task_conditioned_hint=task_conditioned_hint,
+    )

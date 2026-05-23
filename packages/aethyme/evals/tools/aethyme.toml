@@ -32,9 +32,16 @@ commands = [
 ]
 
 [version]
-# Aethyme's CLI has no --version flag (uses git SHA for run-metadata identity);
-# matches what the orchestrator's `aethyme_commit` field already records.
-command = "git rev-parse HEAD"
+# Output format contract: a single line "<tool-name> <version-id>", matching
+# graphify's `graphify 0.8.11`. Aethyme has no semver release stream, so the
+# version-id is the host repo's HEAD SHA — the same identity the orchestrator
+# already records as `aethyme_commit` via `get_aethyme_commit()` in report.py.
+#
+# The leading "aethyme " prefix is load-bearing: when Stage B wires
+# methodology_hash to consume [version].command output, the parser will split
+# on the first space to separate tool-name from version-id. Without the
+# prefix, a bare SHA collides with any other tool that might output a hash.
+command = "echo \"aethyme $(git rev-parse HEAD)\""
 
 [warm]
 # Warm the engine daemon against the target repo. Without this, the
@@ -86,6 +93,31 @@ output_format = "json"
 prompt_header = """Aethyme task-conditioned context (`aethyme task context` output, JSON, includes file bodies):
 
 """
+
+[prompts]
+# Per-tool prompt hints rendered by src/eval/prompts.py for the
+# `leverage` and `task-conditioned` conditions. Substituted placeholders
+# are {{TOOL_NAME}} (the manifest's `name` field) and {{SKILL_PATH}}
+# (the value below). Substitution is plain string replacement — NOT
+# shlex-quoted — because these strings land directly in the agent's
+# prompt, not in a subprocess argv. See manifest.py module docstring.
+leverage_hint = """\
+{{TOOL_NAME}} is available in this repository. \
+See `{{SKILL_PATH}}` for usage. Use it where it \
+helps; verify its output before acting on it.
+"""
+
+task_conditioned_hint = """\
+Use {{TOOL_NAME}} tools and any task-conditioned \
+context artifacts to navigate the repository, \
+but do your own analysis.
+"""
+
+# Aethyme's discoverability surface is the in-repo skill installed by
+# `aethyme repo deploy-skills` (see [register].commands). The leverage
+# hint points the agent at this file so reading SKILL.md is the
+# canonical "how to use this tool" answer.
+skill_path = ".codex/skills/aethyme/SKILL.md"
 
 [notes]
 condition_mapping = """

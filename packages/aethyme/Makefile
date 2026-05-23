@@ -1,4 +1,4 @@
-.PHONY: help dev dev-down dev-logs test test-unit test-integration test-full lint format type-check security migrate seed clean build install-dev check-all ci ps restart health metrics openapi rust-test rust-fmt rust-check
+.PHONY: help dev dev-down dev-logs test test-unit test-integration test-full lint format type-check security migrate seed clean build install-dev check-all ci ps restart health metrics openapi rust-test rust-fmt rust-check audit-aethyme-references
 
 .DEFAULT_GOAL := help
 
@@ -126,3 +126,25 @@ rust-fmt:
 ## rust-check: Check Rust engine code
 rust-check:
 	cargo check --manifest-path rust/Cargo.toml
+
+## audit-aethyme-references: Count hardcoded 'aethyme' strings in the eval framework (Stage B decoupling tracker)
+# Policy: case-insensitive grep across src/eval/, src/scorecard/, and evals/tools/,
+# excluding evals/tools/aethyme.toml (legitimately Aethyme-specific). Comments count —
+# a hardcoded "aethyme" in a comment is still coupling. The total should monotonically
+# decrease as Stage B's plugin-Protocol work (items 2.1-2.17) progresses; if it goes
+# up, a regression has snuck in. Tweak the scope by editing this target.
+audit-aethyme-references:
+	@echo "Hardcoded 'aethyme' references in eval framework (excluding evals/tools/aethyme.toml):"
+	@echo "---"
+	@grep -rni "aethyme" \
+	    src/eval/ src/scorecard/ evals/tools/ \
+	    --include="*.py" --include="*.toml" --include="*.md" \
+	    | grep -v "^evals/tools/aethyme.toml:" \
+	    || true
+	@echo "---"
+	@printf "Total hits: "
+	@grep -rni "aethyme" \
+	    src/eval/ src/scorecard/ evals/tools/ \
+	    --include="*.py" --include="*.toml" --include="*.md" \
+	    | grep -v "^evals/tools/aethyme.toml:" \
+	    | wc -l | tr -d ' '

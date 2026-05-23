@@ -8,14 +8,32 @@ commands, version probe, and per-condition behavior.  See
 Template substitution
 =====================
 
-Three placeholders are expanded in command strings and ``workdir`` fields:
+Two substitution regimes coexist, and **mixing them is a load-bearing bug** —
+keep them strictly separate.
+
+*Command/path substitution* (:meth:`ManifestToolAdapter._substitute`) handles
+strings that become shell tokens. Three placeholders:
 
 * ``{{TOOL_ROOT}}`` — absolute path to the cloned tool repo on disk.
 * ``{{TARGET_REPO}}`` — absolute path to the target repo the eval runs against.
 * ``{{TASK_SHELL_ESCAPED}}`` — the per-task prompt text, ``shlex.quote``-d.
 
-Only ``{{TASK_SHELL_ESCAPED}}`` is condition-specific
-(``task-conditioned`` only). The first two are stable across the run.
+These are ``shlex.quote``-d on expansion (with ``quote_paths=False`` for
+``workdir`` strings that go to ``cwd=``, never to a shell).
+
+*Prompt-text substitution* (:func:`_substitute_prompt_text`) handles strings
+that become agent-facing prompt copy. Two placeholders:
+
+* ``{{TOOL_NAME}}`` — the manifest's ``name`` field.
+* ``{{SKILL_PATH}}`` — the manifest's ``[prompts].skill_path`` field.
+
+These are **never** ``shlex.quote``-d — quoting prompt copy would emit literal
+backslashes to the agent. Reusing the command substituter for prompt text is
+the trap.
+
+The two regimes operate on disjoint placeholder sets, so a stray
+``{{TASK_SHELL_ESCAPED}}`` in a ``leverage_hint`` will survive expansion as a
+literal — visible at QA time rather than silently shell-quoted.
 
 Methodology notes
 =================
@@ -80,6 +98,21 @@ class ConditionSpec:
 
 
 @dataclass(frozen=True)
+class PromptsSpec:
+    """Per-tool prompt fragments used by :mod:`src.eval.prompts` builders.
+
+    These strings are agent-facing copy, not shell commands — they are subject
+    to *prompt-text substitution* only (``{{TOOL_NAME}}`` / ``{{SKILL_PATH}}``)
+    and must never go through :meth:`ManifestToolAdapter._substitute`. See the
+    module docstring's "Template substitution" section for the contract.
+    """
+
+    leverage_hint: str
+    task_conditioned_hint: str
+    skill_path: str
+
+
+@dataclass(frozen=True)
 class ToolManifest:
     """Parsed and validated TOML manifest."""
 
@@ -96,6 +129,7 @@ class ToolManifest:
     warm_command: CommandSpec | None
     conditions: dict[str, ConditionSpec]
     condition_mapping_note: str
+    prompts: PromptsSpec | None  # required iff leverage or task-conditioned declared
     raw: dict[str, Any] = field(repr=False, compare=False, default_factory=dict)
 
 
@@ -183,6 +217,22 @@ def load_manifest(manifest_path: Path) -> ToolManifest:
             "Articulate how this tool's modes map to explore/leverage/task-conditioned."
         )
 
+    # [prompts] table — required when the manifest declares either a
+    # `leverage` or `task-conditioned` condition (those are the two prompt
+    # builders that consume per-tool hints). An `explore`-only manifest does
+    # not need it; the [prompts] table is optional in that case. Gating on
+    # the condition set (not on a separate flag) keeps the schema small and
+    # makes "did I forget to write hints?" a load-time failure rather than a
+    # silent "agent gets no hint" at eval runtime.
+    needs_prompts = "leverage" in conditions or "task-conditioned" in conditions
+    prompts_raw = raw.get("prompts")
+    if needs_prompts and prompts_raw is None:
+        raise ManifestValidationError(
+            f"{path}: [prompts] table is required when [conditions.leverage] "
+            "or [conditions.task_conditioned] is declared"
+        )
+    prompts = _parse_prompts(prompts_raw, path) if prompts_raw is not None else None
+
     return ToolManifest(
         path=path,
         name=name,
@@ -197,6 +247,7 @@ def load_manifest(manifest_path: Path) -> ToolManifest:
         warm_command=warm_command,
         conditions=conditions,
         condition_mapping_note=condition_mapping,
+        prompts=prompts,
         raw=raw,
     )
 
@@ -243,6 +294,52 @@ def _parse_condition(
         output_format=section.get("output_format", "raw"),
         strategy=strategy,
         skill_doc=skill_doc,
+    )
+
+
+def _parse_prompts(
+    section: Any,
+    manifest_path: Path,
+) -> PromptsSpec:
+    if not isinstance(section, dict):
+        raise ManifestValidationError(
+            f"{manifest_path}: [prompts] must be a table"
+        )
+    return PromptsSpec(
+        leverage_hint=_require_str(
+            section, "leverage_hint", manifest_path,
+            key_path="prompts.leverage_hint",
+        ),
+        task_conditioned_hint=_require_str(
+            section, "task_conditioned_hint", manifest_path,
+            key_path="prompts.task_conditioned_hint",
+        ),
+        skill_path=_require_str(
+            section, "skill_path", manifest_path,
+            key_path="prompts.skill_path",
+        ),
+    )
+
+
+def _substitute_prompt_text(
+    template: str,
+    *,
+    tool_name: str,
+    skill_path: str,
+) -> str:
+    """Expand prompt-text placeholders for the leverage / task-conditioned hints.
+
+    Prompt-text substitution is intentionally NOT shlex-quoted — these strings
+    are rendered directly into the agent's prompt, not into a subprocess
+    argv. Using the shell-quoting `_substitute` helper here would emit literal
+    backslashes ahead of every special character, which the agent would then
+    see as visible noise. See the module docstring for the full two-regime
+    contract.
+    """
+    return (
+        template
+        .replace("{{TOOL_NAME}}", tool_name)
+        .replace("{{SKILL_PATH}}", skill_path)
     )
 
 

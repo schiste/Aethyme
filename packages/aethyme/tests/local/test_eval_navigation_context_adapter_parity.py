@@ -1,18 +1,19 @@
-"""Parity test: _build_navigation_context legacy path vs adapter path.
+"""Adapter-path smoke test: _build_navigation_context for bug-fix.
 
-The pure-manifest migration routes Aethyme's leverage/task-conditioned
-context-building through the CLI subprocess instead of direct Python
-calls into ``build_task_pack`` / ``build_task_context``. Cardinal rule
-#2 requires that switching the transport does NOT change the eval's
-agent-facing output — the navigation_context.json a leverage-condition
-agent reads must be byte-identical whether produced via the legacy
-direct-Python path or the new adapter path.
+History: this file used to enforce byte-identical parity between a
+"legacy" direct-Python path (``build_task_pack`` / ``build_task_context``
+called in-process) and the new adapter path (CLI subprocess + JSON
+parse). The pure-manifest migration deleted the legacy path entirely
+in Stage B item 2.3, collapsing ``_build_navigation_context`` to a
+single adapter-routed implementation — divergence is no longer
+*possible*, so parity comparison no longer has anything to compare.
 
-This test enforces that invariant. It runs both paths against the same
-target repo + task, normalizes for known-benign serialization details
-(JSON round-trip of dict key ordering on Python 3.7+ is insertion-
-ordered for both paths), and asserts equality. Any divergence here
-blocks the manifest migration from being considered "complete."
+What remains is a structural smoke test: the surviving adapter path
+must produce a dict with the documented top-level shape
+(``{mode, repo_path, task, test_file, bug_area, anchors, scope,
+file_contents}``) and the correct ``mode`` discriminator. Future
+refactors of ``run_condition`` or the JSON-shape contract between
+the Aethyme CLI and the Python eval harness will trip this test.
 
 The test is skipped if the Mockup playground isn't present, so CI on a
 machine without the playground checkout still passes.
@@ -20,7 +21,6 @@ machine without the playground checkout still passes.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -50,38 +50,61 @@ def mockup_repo() -> Path:
     return _MOCKUP_AETHYME
 
 
-def test_legacy_and_adapter_paths_produce_identical_context(mockup_repo: Path) -> None:
-    """The two transports must produce byte-identical navigation_context dicts."""
+_EXPECTED_TOP_LEVEL_KEYS = {
+    "mode",
+    "repo_path",
+    "task",
+    "test_file",
+    "bug_area",
+    "anchors",
+    "scope",
+    "file_contents",
+}
+
+
+def test_adapter_path_produces_expected_nav_context_shape(mockup_repo: Path) -> None:
+    """The single surviving transport must produce the documented dict shape.
+
+    Previously this was a parity test against a legacy direct-Python path.
+    That path was removed in Stage B item 2.3 — see this module's docstring
+    for history. The smoke test that remains pins the public contract: any
+    leverage-condition agent reads ``json.dumps(nav_context)``, so a missing
+    or renamed top-level key silently degrades the eval. Catching it here
+    is faster than catching it via a regression in scorer output.
+    """
+    from src.eval._self import self_tool_name
     from src.eval.bug_fix import _build_navigation_context
     from src.eval.tools import get_adapter
 
-    adapter = get_adapter("aethyme")
+    # The self-tool's manifest exercises the structured nav-context flow.
+    # Hardcoding "aethyme" would skip this branch under a fork that
+    # renames the framework subject via AETHYMEBENCH_SELF_TOOL.
+    adapter = get_adapter(self_tool_name())
+    nav_context = _build_navigation_context(mockup_repo, _TASK, tool=adapter)
 
-    legacy = _build_navigation_context(mockup_repo, _TASK)
-    via_adapter = _build_navigation_context(mockup_repo, _TASK, tool=adapter)
+    assert nav_context is not None, (
+        "Aethyme adapter must return a dict for bug-fix nav-context. None "
+        "is reserved for non-Aethyme tools (see the second test in this file)."
+    )
 
-    # Compare via JSON serialization with sorted keys — this catches
-    # any value-level divergence while being robust to dict iteration
-    # quirks. The eval's prepare flow ultimately writes
-    # `json.dumps(nav_context, indent=2)` to a file the agent reads,
-    # so JSON-level equality is the contract that matters.
-    legacy_json = json.dumps(legacy, sort_keys=True, indent=2)
-    adapter_json = json.dumps(via_adapter, sort_keys=True, indent=2)
-
-    if legacy_json != adapter_json:
-        # Surface the first divergent top-level key for fast debugging.
-        diverged: list[str] = []
-        for key in sorted(set(legacy) | set(via_adapter)):
-            if legacy.get(key) != via_adapter.get(key):
-                diverged.append(key)
-        pytest.fail(
-            f"Navigation context divergence between legacy and adapter paths.\n"
-            f"Divergent top-level keys: {diverged}\n"
-            f"Legacy JSON length:  {len(legacy_json)}\n"
-            f"Adapter JSON length: {len(adapter_json)}\n"
-            f"This blocks the pure-manifest migration — the adapter path "
-            f"must produce byte-identical output for tool=aethyme."
-        )
+    actual_keys = set(nav_context.keys())
+    missing = _EXPECTED_TOP_LEVEL_KEYS - actual_keys
+    extra = actual_keys - _EXPECTED_TOP_LEVEL_KEYS
+    assert not missing, (
+        f"Adapter-path nav-context is missing required top-level keys: "
+        f"{sorted(missing)}. If you intentionally removed a key, update "
+        f"_EXPECTED_TOP_LEVEL_KEYS above and the docstring of "
+        f"_build_navigation_context in src/eval/bug_fix.py."
+    )
+    assert not extra, (
+        f"Adapter-path nav-context has unexpected extra top-level keys: "
+        f"{sorted(extra)}. Add them to _EXPECTED_TOP_LEVEL_KEYS if "
+        f"intentional, and document them in _build_navigation_context."
+    )
+    assert nav_context["mode"] == "bug_fix_navigation", (
+        f"Expected mode='bug_fix_navigation' (the discriminator agents "
+        f"use to select the leverage prompt), got {nav_context['mode']!r}."
+    )
 
 
 def test_non_aethyme_tool_returns_none_on_bug_fix_nav_context(mockup_repo: Path) -> None:

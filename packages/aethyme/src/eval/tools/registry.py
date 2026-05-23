@@ -36,6 +36,31 @@ def list_tools(manifest_dir: Path | None = None) -> list[str]:
     return sorted(p.stem for p in directory.glob("*.toml"))
 
 
+def get_manifest(
+    name: str,
+    *,
+    manifest_dir: Path | None = None,
+) -> ToolManifest:
+    """Resolve a tool name to its parsed :class:`ToolManifest`.
+
+    Looks for ``<manifest_dir>/<name>.toml``. Raises :class:`KeyError` if no
+    manifest matches. Use this when a caller needs the manifest's declared
+    data (e.g. ``manifest.prompts`` for prompt-hint templating) but does
+    NOT need a full :class:`ManifestToolAdapter` with its cache directory
+    and subprocess machinery — for example ``src.eval.prompts_writer``,
+    which only renders prompt text.
+    """
+    directory = (manifest_dir or _DEFAULT_MANIFEST_DIR).resolve()
+    manifest_path = directory / f"{name}.toml"
+    if not manifest_path.is_file():
+        available = ", ".join(list_tools(directory)) or "(none)"
+        raise KeyError(
+            f"Unknown tool {name!r}. Available manifests: {available}. "
+            f"Looked in {directory}."
+        )
+    return load_manifest(manifest_path)
+
+
 def get_adapter(
     name: str,
     *,
@@ -47,20 +72,6 @@ def get_adapter(
     Looks for ``<manifest_dir>/<name>.toml``. Raises :class:`KeyError` if no
     manifest matches (so the CLI can surface a clean "unknown tool" message).
     """
-    directory = (manifest_dir or _DEFAULT_MANIFEST_DIR).resolve()
     cache = (tool_cache_dir or _DEFAULT_TOOL_CACHE).resolve()
-
-    manifest_path = directory / f"{name}.toml"
-    if not manifest_path.is_file():
-        available = ", ".join(list_tools(directory)) or "(none)"
-        raise KeyError(
-            f"Unknown tool {name!r}. Available manifests: {available}. "
-            f"Looked in {directory}."
-        )
-
-    try:
-        manifest: ToolManifest = load_manifest(manifest_path)
-    except ManifestValidationError:
-        raise
-
+    manifest = get_manifest(name, manifest_dir=manifest_dir)
     return ManifestToolAdapter(manifest=manifest, tool_cache_dir=cache)

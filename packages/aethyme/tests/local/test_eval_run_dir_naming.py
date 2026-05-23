@@ -18,6 +18,7 @@ import re
 
 import pytest
 
+from src.eval._self import self_tool_name
 from src.eval.orchestrator import generate_run_plan
 
 
@@ -58,10 +59,18 @@ def test_reasoning_default_is_omitted():
                     reasoning="default") == "mediawiki-dead-code-haiku"
 
 
-def test_tool_omitted_when_aethyme():
-    """Default tool=aethyme is omitted to preserve historical naming compatibility."""
+def test_tool_omitted_when_self_tool():
+    """The framework's self-tool slug is omitted from run-dir names.
+
+    Historically this was hard-coded to ``"aethyme"`` so default-tool
+    runs kept the pre-multi-tool naming. With Stage B's generalization,
+    the omitted slug tracks ``AETHYMEBENCH_SELF_TOOL`` — a fork running
+    as ``lapidary`` will omit ``lapidary`` here. The contract is "the
+    self-tool is the default and therefore implicit," not "the literal
+    string 'aethyme' is special."
+    """
     assert _run_dir(eval_type="bug-fix", target="grc", model="haiku",
-                    tool="aethyme") == "grc-bug-fix-haiku"
+                    tool=self_tool_name()) == "grc-bug-fix-haiku"
 
 
 def test_tool_appended_when_competitor():

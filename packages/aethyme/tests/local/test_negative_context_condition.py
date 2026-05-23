@@ -1,7 +1,7 @@
 """Tests for the negative-context condition wiring.
 
 The 6th condition is plumbed across `repos.py` (CONDITION_NAMES,
-AETHYME_CONDITIONS), `orchestrator.py` (CONDITIONS,
+TOOL_USING_CONDITIONS), `orchestrator.py` (CONDITIONS,
 _EVAL_TYPE_DEFAULTS), `bug_fix.py` (prompt builder, prepare), and
 the CLI (`--alternative-task` flag).
 
@@ -27,7 +27,7 @@ from src.eval.orchestrator import (
     _EVAL_TYPE_DEFAULTS,
     generate_run_plan,
 )
-from src.eval.repos import AETHYME_CONDITIONS, CONDITION_NAMES
+from src.eval.repos import TOOL_USING_CONDITIONS, CONDITION_NAMES
 
 
 # ---------------------------------------------------------------------------
@@ -55,11 +55,11 @@ def test_negative_context_present_in_both_arrays():
     assert "negative-context" in {c.name for c in CONDITIONS}
 
 
-def test_negative_context_is_aethyme_condition():
+def test_negative_context_is_tool_using_condition():
     """The condition gets the deployed skill — agent has live tools to
     detect/correct misdirection. This is what makes the test mirror a
     stale-graph production scenario rather than a pure deception trick."""
-    assert "negative-context" in AETHYME_CONDITIONS
+    assert "negative-context" in TOOL_USING_CONDITIONS
 
 
 # ---------------------------------------------------------------------------

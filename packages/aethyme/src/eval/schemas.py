@@ -335,6 +335,28 @@ def bug_fix_probe_targets() -> dict[str, object]:
     }
 
 
+def bug_fix_reference() -> dict[str, object]:
+    """Ground truth for the GRC bug-fix eval (Action.SHARE removed from manage).
+
+    Shape mirrors `bug_fix_output_schema`. Sourced from `RBAC_REL` in the leaf
+    `bug_fix_setup` module to avoid a cycle with `bug_fix.py`, which imports
+    from this module.
+    """
+    from .bug_fix_setup import RBAC_REL
+
+    return {
+        "bug_file": RBAC_REL,
+        "root_cause": (
+            "Action.SHARE was removed from PERMISSION_IMPLICATIONS[manage]"
+        ),
+        "fix_applied": True,
+        "fix_description": (
+            "Restored Action.SHARE to the PERMISSION_IMPLICATIONS[manage] "
+            "array in rbac-canonical.ts"
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # MediaWiki bug-fix-1: T419918 — watchlist marks all revisions as seen
 # ---------------------------------------------------------------------------
