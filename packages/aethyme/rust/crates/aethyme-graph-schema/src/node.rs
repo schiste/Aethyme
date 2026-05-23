@@ -1,6 +1,6 @@
 //! The unifying `Node` enum.
 //!
-//! Each of the 24 node kinds has its own struct (commits 1.7-1.11).
+//! Each of the 25 node kinds has its own struct (commits 1.7-1.11).
 //! The `Node` enum unifies them under one type so callers that
 //! handle "any node" (storage layer, graph traversal, query
 //! infrastructure) can do so without 24-way trait-object pointers.
@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Class, Comment, ConfigValue, Directory, DocSection, Docstring, Enum,
     Expression, Field, File, Function, GlobalVariable, Interface, Lambda,
-    Method, Module, NodeId, NodeKind, NonCodeFile, Parameter, Repository,
-    Statement, Struct, Trait, TypeAlias, UnresolvedSymbol,
+    Method, Module, NodeId, NodeKind, NonCodeFile, Package, Parameter,
+    Repository, Statement, Struct, Trait, TypeAlias, UnresolvedSymbol,
 };
 
 /// A node of any kind. Every variant wraps the corresponding
@@ -28,12 +28,13 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Node {
-    // Containers (alphabetical)
+    // Containers (alphabetical initial set; Package tail-appended)
     Directory(Directory),
     File(File),
     Module(Module),
     NonCodeFile(NonCodeFile),
     Repository(Repository),
+    Package(Package),
     // Callables (alphabetical)
     Function(Function),
     Lambda(Lambda),
@@ -71,6 +72,7 @@ impl Node {
             Node::Module(_) => NodeKind::Module,
             Node::NonCodeFile(_) => NodeKind::NonCodeFile,
             Node::Repository(_) => NodeKind::Repository,
+            Node::Package(_) => NodeKind::Package,
             Node::Function(_) => NodeKind::Function,
             Node::Lambda(_) => NodeKind::Lambda,
             Node::Method(_) => NodeKind::Method,
@@ -110,6 +112,7 @@ impl Node {
             Node::NonCodeFile(_) => None,
             Node::Module(n) => Some(n.name()),
             Node::Repository(n) => Some(n.name()),
+            Node::Package(n) => Some(n.name()),
             // Callables: name() via the Callable trait.
             Node::Function(n) => Some(n.name()),
             Node::Lambda(n) => Some(n.name()),
@@ -149,6 +152,7 @@ impl Node {
             Node::Module(n) => n.id(),
             Node::NonCodeFile(n) => n.id(),
             Node::Repository(n) => n.id(),
+            Node::Package(n) => n.id(),
             Node::Function(n) => n.id(),
             Node::Lambda(n) => n.id(),
             Node::Method(n) => n.id(),
@@ -189,6 +193,7 @@ impl_node_from!(File, File);
 impl_node_from!(Module, Module);
 impl_node_from!(NonCodeFile, NonCodeFile);
 impl_node_from!(Repository, Repository);
+impl_node_from!(Package, Package);
 impl_node_from!(Function, Function);
 impl_node_from!(Lambda, Lambda);
 impl_node_from!(Method, Method);

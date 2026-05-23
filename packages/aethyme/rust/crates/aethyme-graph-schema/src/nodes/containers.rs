@@ -367,3 +367,117 @@ impl std::fmt::Display for NonCodeFileConstructionError {
 }
 
 impl std::error::Error for NonCodeFileConstructionError {}
+
+// ─── Package ─────────────────────────────────────────────────────────
+
+/// A package: a build/distribution unit rooted at a manifest file
+/// (a Cargo crate's `Cargo.toml`, an npm package's `package.json`,
+/// a Python project's `pyproject.toml`, a Godot project's
+/// `project.godot`, etc.).
+///
+/// Distinct from [`Module`]:
+/// - `Module` is a **language-level** construct (Python package,
+///   TS module, PHP namespace) — what the language's import
+///   resolver sees.
+/// - `Package` is a **build/distribution** unit — what the package
+///   manager publishes and what dependencies pin against.
+///
+/// One repository can contain many packages (monorepo); one
+/// package can contain many modules. The two are produced by
+/// different overlays and live side-by-side.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Package {
+    id: NodeId,
+    /// The manifest's parent directory, relative to the repo root.
+    /// This is the package's "home" — sibling files belong to this
+    /// package by default.
+    path: Box<str>,
+    /// The package's declared name (parsed from the manifest when
+    /// present, falling back to the directory basename when the
+    /// manifest format has no name field).
+    name: Box<str>,
+    /// The manifest path, relative to the repo root. Always points
+    /// at a single file (Cargo.toml, package.json, …).
+    manifest_path: Box<str>,
+    /// A short tag identifying which manifest family produced this
+    /// package: `cargo`, `npm`, `pyproject`, `godot`, `docker`,
+    /// `tsconfig`, `jsconfig`, `turbo`, `biome`, `deno`,
+    /// `pnpm-workspace`. Free-form string so producers can extend
+    /// the set without a schema change.
+    manifest_kind: Box<str>,
+}
+
+impl Package {
+    pub fn new(
+        repo: &str,
+        path: &str,
+        name: &str,
+        manifest_path: &str,
+        manifest_kind: &str,
+    ) -> Result<Self, PackageConstructionError> {
+        if path.is_empty() {
+            return Err(PackageConstructionError::EmptyPath);
+        }
+        if name.is_empty() {
+            return Err(PackageConstructionError::EmptyName);
+        }
+        if manifest_path.is_empty() {
+            return Err(PackageConstructionError::EmptyManifestPath);
+        }
+        if manifest_kind.is_empty() {
+            return Err(PackageConstructionError::EmptyManifestKind);
+        }
+        let id = NodeId::new(NodeKind::Package, repo, path, name)
+            .map_err(PackageConstructionError::Id)?;
+        Ok(Package {
+            id,
+            path: path.into(),
+            name: name.into(),
+            manifest_path: manifest_path.into(),
+            manifest_kind: manifest_kind.into(),
+        })
+    }
+
+    pub fn id(&self) -> &NodeId {
+        &self.id
+    }
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn manifest_path(&self) -> &str {
+        &self.manifest_path
+    }
+    pub fn manifest_kind(&self) -> &str {
+        &self.manifest_kind
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageConstructionError {
+    EmptyPath,
+    EmptyName,
+    EmptyManifestPath,
+    EmptyManifestKind,
+    Id(crate::NodeIdConstructionError),
+}
+
+impl std::fmt::Display for PackageConstructionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyPath => f.write_str("Package: path must not be empty"),
+            Self::EmptyName => f.write_str("Package: name must not be empty"),
+            Self::EmptyManifestPath => {
+                f.write_str("Package: manifest_path must not be empty")
+            }
+            Self::EmptyManifestKind => {
+                f.write_str("Package: manifest_kind must not be empty")
+            }
+            Self::Id(e) => write!(f, "Package: ID construction failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for PackageConstructionError {}

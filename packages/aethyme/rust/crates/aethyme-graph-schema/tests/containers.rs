@@ -3,8 +3,8 @@
 use aethyme_graph_schema::{
     Directory, DirectoryConstructionError, File, FileConstructionError,
     Module, ModuleConstructionError, NodeKind, NonCodeFile,
-    NonCodeFileConstructionError, NonCodeFormat, Repository,
-    RepositoryConstructionError,
+    NonCodeFileConstructionError, NonCodeFormat, Package,
+    PackageConstructionError, Repository, RepositoryConstructionError,
 };
 
 // ─── Repository ──────────────────────────────────────────────────────
@@ -167,6 +167,57 @@ fn non_code_file_serde_round_trip() {
         let back: NonCodeFile = serde_json::from_str(&json).unwrap();
         assert_eq!(back, n);
     }
+}
+
+// ─── Package ─────────────────────────────────────────────────────────
+
+#[test]
+fn package_construction_validates_required_fields() {
+    let p = Package::new(
+        "aethyme",
+        "rust",
+        "aethyme-engine",
+        "rust/Cargo.toml",
+        "cargo",
+    )
+    .unwrap();
+    assert_eq!(p.path(), "rust");
+    assert_eq!(p.name(), "aethyme-engine");
+    assert_eq!(p.manifest_path(), "rust/Cargo.toml");
+    assert_eq!(p.manifest_kind(), "cargo");
+    assert_eq!(p.id().kind(), NodeKind::Package);
+
+    assert!(matches!(
+        Package::new("aethyme", "", "n", "m", "k"),
+        Err(PackageConstructionError::EmptyPath)
+    ));
+    assert!(matches!(
+        Package::new("aethyme", "p", "", "m", "k"),
+        Err(PackageConstructionError::EmptyName)
+    ));
+    assert!(matches!(
+        Package::new("aethyme", "p", "n", "", "k"),
+        Err(PackageConstructionError::EmptyManifestPath)
+    ));
+    assert!(matches!(
+        Package::new("aethyme", "p", "n", "m", ""),
+        Err(PackageConstructionError::EmptyManifestKind)
+    ));
+}
+
+#[test]
+fn package_serde_round_trip() {
+    let p = Package::new(
+        "aethyme",
+        "rust",
+        "aethyme-engine",
+        "rust/Cargo.toml",
+        "cargo",
+    )
+    .unwrap();
+    let json = serde_json::to_string(&p).unwrap();
+    let back: Package = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, p);
 }
 
 // ─── Cross-kind: same inputs give same NodeId ────────────────────────

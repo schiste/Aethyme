@@ -122,8 +122,8 @@ fn all_node_kinds_is_exhaustive() {
     // to ALL_NODE_KINDS, this test traps the omission.
     //
     // We can't reflect the enum's variant count, so we compare against
-    // an explicit count: 24 variants across 6 categories
-    // (5 containers + 3 callables + 6 type-defining + 5 sub-symbol +
+    // an explicit count: 25 variants across 6 categories
+    // (6 containers + 3 callables + 6 type-defining + 5 sub-symbol +
     // 4 non-code + 1 partial-knowledge). The schema doc's prose says
     // "23" in places due to whether `non_code_file` is double-counted
     // (it's listed in §3.1 as a container AND in §3.5 as the parent of
@@ -132,7 +132,7 @@ fn all_node_kinds_is_exhaustive() {
     //
     // Bumping the count here is the one-line change required when a
     // new kind lands.
-    const EXPECTED_TOTAL: usize = 24;
+    const EXPECTED_TOTAL: usize = 25;
     assert_eq!(
         ALL_NODE_KINDS.len(),
         EXPECTED_TOTAL,
@@ -147,7 +147,7 @@ fn all_node_kinds_is_exhaustive() {
 #[test]
 fn all_node_kinds_is_unique() {
     // Defends against duplicate entries in ALL_NODE_KINDS (a copy-paste
-    // hazard given the slice has 24 entries). A duplicate would silently
+    // hazard given the slice has 25 entries). A duplicate would silently
     // make iteration miscount in any consumer that relies on the slice
     // length matching the variant count.
     //
@@ -213,22 +213,78 @@ fn json_form_matches_canonical_name() {
 #[test]
 fn variants_are_alphabetical_within_each_category() {
     // The module docs claim "within a group, order by canonical
-    // snake_case name's alphabetical order". This test makes that
-    // claim load-bearing for the *initial* set of variants.
+    // snake_case name's alphabetical order" — and they qualify that
+    // the rule applies to the *initial* set of kinds only. New
+    // variants append to the tail of their group, never insert
+    // mid-list, and may therefore deviate from alphabetical order
+    // relative to their neighbors.
     //
-    // Future additions break this invariant intentionally (the docs
-    // say new variants append to the tail of their group, never
-    // insert mid-list). When the next variant lands, this test will
-    // start failing; the dev should:
+    // The implementation strategy here is to freeze the initial-set
+    // names as a constant, assert each is present at a contiguous
+    // prefix of its category's block in ALL_NODE_KINDS, and require
+    // alphabetical order *within that prefix only*. Tail-appended
+    // variants past the prefix are accepted as-is — the contract is
+    // already protected by `all_node_kinds_is_unique`,
+    // `categories_appear_contiguously_in_all_node_kinds`, and the
+    // per-variant `category()` arm.
     //
-    //   - update the test to acknowledge the tail-appended variant
-    //     (e.g., by partitioning the assertion to "initial set
-    //     alphabetical, tail can deviate"), and
-    //   - confirm they appended to the tail rather than inserted.
-    //
-    // For now (commit 1.2, initial 24 kinds), the entire slice must
-    // be alphabetical-within-category. This is the strongest form of
-    // the rule and it's reachable today.
+    // To add a new variant to the initial set, you must instead add
+    // it to INITIAL_KINDS below in alphabetical position — but you
+    // shouldn't: the whole point of the partition is that the
+    // initial set is closed. New variants go in the tail.
+    const INITIAL_KINDS: &[&str] = &[
+        // Containers (5)
+        "directory",
+        "file",
+        "module",
+        "non_code_file",
+        "repository",
+        // Callables (3)
+        "function",
+        "lambda",
+        "method",
+        // Type-defining (6)
+        "class",
+        "enum",
+        "interface",
+        "struct",
+        "trait",
+        "type_alias",
+        // Sub-symbol (5)
+        "expression",
+        "field",
+        "global_variable",
+        "parameter",
+        "statement",
+        // Non-code (4)
+        "comment",
+        "config_value",
+        "doc_section",
+        "docstring",
+        // Partial-knowledge (1)
+        "unresolved_symbol",
+    ];
+
+    // Index ALL_NODE_KINDS by name for partition-aware lookup.
+    let positions: BTreeMap<&str, usize> = ALL_NODE_KINDS
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (k.name(), i))
+        .collect();
+
+    // Every initial-set name must still be present.
+    for &name in INITIAL_KINDS {
+        assert!(
+            positions.contains_key(name),
+            "initial-set kind {name:?} is missing from ALL_NODE_KINDS; \
+             initial kinds are closed and may not be removed"
+        );
+    }
+
+    // For each category, find the contiguous prefix of its block
+    // that consists of initial-set names, and assert that prefix is
+    // alphabetical. Tail entries past the prefix are accepted.
+    let initial_set: BTreeSet<&str> = INITIAL_KINDS.iter().copied().collect();
     let mut group_start = 0;
     while group_start < ALL_NODE_KINDS.len() {
         let head_category = ALL_NODE_KINDS[group_start].category();
@@ -239,15 +295,37 @@ fn variants_are_alphabetical_within_each_category() {
             group_end += 1;
         }
 
-        // Assert names within [group_start, group_end) are alphabetical.
-        for i in group_start..group_end.saturating_sub(1) {
+        // Walk the prefix of initial-set names within this group.
+        let mut prefix_end = group_start;
+        while prefix_end < group_end
+            && initial_set.contains(ALL_NODE_KINDS[prefix_end].name())
+        {
+            prefix_end += 1;
+        }
+
+        // Assert that the initial-set prefix is alphabetical.
+        for i in group_start..prefix_end.saturating_sub(1) {
             let a = ALL_NODE_KINDS[i].name();
             let b = ALL_NODE_KINDS[i + 1].name();
             assert!(
                 a < b,
-                "ALL_NODE_KINDS not alphabetical within {head_category:?}: \
-                 {a:?} appears before {b:?} (positions {i} and {})",
+                "ALL_NODE_KINDS not alphabetical within initial-set \
+                 prefix of {head_category:?}: {a:?} appears before \
+                 {b:?} (positions {i} and {})",
                 i + 1,
+            );
+        }
+
+        // Anything past the prefix must NOT be an initial-set name
+        // (an initial-set kind appearing after a tail-appended one
+        // would mean someone inserted mid-block, not appended).
+        for i in prefix_end..group_end {
+            let name = ALL_NODE_KINDS[i].name();
+            assert!(
+                !initial_set.contains(name),
+                "initial-set kind {name:?} appears after a tail-appended \
+                 variant in {head_category:?} (position {i}); initial \
+                 kinds must occupy the leading prefix of their group"
             );
         }
 
@@ -280,8 +358,8 @@ fn categories_appear_contiguously_in_all_node_kinds() {
 #[test]
 fn categories_are_exhaustive_and_well_defined() {
     // Every kind reports a category, and the category counts match the
-    // schema doc's grouping (5 containers, 3 callables, 6 type-defining,
-    // 5 sub-symbol, 4 non-code, 1 partial-knowledge = 24 total).
+    // schema doc's grouping (6 containers, 3 callables, 6 type-defining,
+    // 5 sub-symbol, 4 non-code, 1 partial-knowledge = 25 total).
     //
     // BTreeMap (rather than HashMap) keeps test code aligned with the
     // crate-wide determinism discipline.
@@ -290,7 +368,7 @@ fn categories_are_exhaustive_and_well_defined() {
         *counts.entry(kind.category()).or_insert(0) += 1;
     }
 
-    assert_eq!(counts.get(&NodeKindCategory::Container), Some(&5));
+    assert_eq!(counts.get(&NodeKindCategory::Container), Some(&6));
     assert_eq!(counts.get(&NodeKindCategory::Callable), Some(&3));
     assert_eq!(counts.get(&NodeKindCategory::TypeDefining), Some(&6));
     assert_eq!(counts.get(&NodeKindCategory::SubSymbol), Some(&5));

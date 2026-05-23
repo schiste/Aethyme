@@ -1,7 +1,7 @@
 //! The canonical node-kind taxonomy.
 //!
 //! `NodeKind` is the flat enum of every node type the graph admits. There
-//! are 24 variants grouped into six categories (containers, callables,
+//! are 25 variants grouped into six categories (containers, callables,
 //! type-defining, sub-symbol, non-code, partial-knowledge). Each variant
 //! has a stable snake_case canonical name (used in node IDs, in NDJSON
 //! index shards, and in logs).
@@ -67,6 +67,18 @@ pub enum NodeKind {
     NonCodeFile,
     /// Top of the namespace. One per repo.
     Repository,
+    /// A package: a build/distribution unit rooted at a manifest file
+    /// (Cargo crate's `Cargo.toml`, npm package's `package.json`,
+    /// Python project's `pyproject.toml`, Godot project's
+    /// `project.godot`, etc.). Distinct from [`NodeKind::Module`]:
+    /// `Module` is a *language-level* construct (Python package, TS
+    /// module, PHP namespace); `Package` is a *build/distribution*
+    /// unit. One repository can contain many packages (monorepo);
+    /// one package can contain many modules.
+    ///
+    /// Appended to the tail of the Containers group per the
+    /// "no schema versioning" ordering rule — see module docs.
+    Package,
 
     // ─── Callables (alphabetical) ────────────────────────────────────
     /// A function. Top-level or nested. Satisfies the `Callable`
@@ -172,6 +184,7 @@ impl NodeKind {
             NodeKind::Module => "module",
             NodeKind::NonCodeFile => "non_code_file",
             NodeKind::Repository => "repository",
+            NodeKind::Package => "package",
             // Callables
             NodeKind::Function => "function",
             NodeKind::Lambda => "lambda",
@@ -220,6 +233,7 @@ impl NodeKind {
             "module" => NodeKind::Module,
             "non_code_file" => NodeKind::NonCodeFile,
             "repository" => NodeKind::Repository,
+            "package" => NodeKind::Package,
             // Callables
             "function" => NodeKind::Function,
             "lambda" => NodeKind::Lambda,
@@ -257,7 +271,8 @@ impl NodeKind {
             | NodeKind::File
             | NodeKind::Module
             | NodeKind::NonCodeFile
-            | NodeKind::Repository => NodeKindCategory::Container,
+            | NodeKind::Repository
+            | NodeKind::Package => NodeKindCategory::Container,
 
             NodeKind::Function | NodeKind::Lambda | NodeKind::Method => {
                 NodeKindCategory::Callable
@@ -351,6 +366,7 @@ pub const ALL_NODE_KINDS: &[NodeKind] = &[
     NodeKind::Module,
     NodeKind::NonCodeFile,
     NodeKind::Repository,
+    NodeKind::Package,
     // Callables (alphabetical)
     NodeKind::Function,
     NodeKind::Lambda,

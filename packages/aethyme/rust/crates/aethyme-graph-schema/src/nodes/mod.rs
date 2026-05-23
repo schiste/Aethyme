@@ -22,8 +22,8 @@ pub use callables::{
 pub use containers::{
     Directory, DirectoryConstructionError, File, FileConstructionError,
     Module, ModuleConstructionError, NonCodeFile,
-    NonCodeFileConstructionError, NonCodeFormat, Repository,
-    RepositoryConstructionError,
+    NonCodeFileConstructionError, NonCodeFormat, Package,
+    PackageConstructionError, Repository, RepositoryConstructionError,
 };
 pub use non_code::{
     ALL_COMMENT_TAGS, Comment, CommentConstructionError, CommentTag,

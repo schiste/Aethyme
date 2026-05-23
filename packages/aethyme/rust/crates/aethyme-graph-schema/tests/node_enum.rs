@@ -1,8 +1,8 @@
 //! Integration tests for the unifying `Node` enum.
 
 use aethyme_graph_schema::{
-    Class, Function, Module, Node, NodeKind, ParameterSignature, Repository,
-    SourceRange, Visibility,
+    Class, Function, Module, Node, NodeKind, Package, ParameterSignature,
+    Repository, SourceRange, Visibility,
 };
 
 fn sample_function() -> Function {
@@ -48,6 +48,17 @@ fn kind_method_returns_correct_node_kind_for_every_variant() {
     let r = Repository::new("aethyme", "/p", "git").unwrap();
     let n: Node = r.into();
     assert_eq!(n.kind(), NodeKind::Repository);
+
+    let p = Package::new(
+        "aethyme",
+        "rust",
+        "aethyme-engine",
+        "rust/Cargo.toml",
+        "cargo",
+    )
+    .unwrap();
+    let n: Node = p.into();
+    assert_eq!(n.kind(), NodeKind::Package);
 }
 
 #[test]
@@ -77,6 +88,10 @@ fn from_impl_works_for_each_variant() {
     )
     .unwrap()
     .into();
+    let _: Node =
+        Package::new("a", "rust", "a-engine", "rust/Cargo.toml", "cargo")
+            .unwrap()
+            .into();
 }
 
 #[test]
