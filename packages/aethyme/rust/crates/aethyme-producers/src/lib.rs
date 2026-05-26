@@ -67,12 +67,14 @@ pub mod configs;
 pub mod docs;
 pub mod harness;
 pub mod packages;
+pub mod risks;
 pub mod structure;
 
 pub use configs::{ConfigsOverlay, ConfigsProducer};
 pub use docs::{DocsOverlay, DocsProducer};
 pub use harness::assert_overlay_producer_is_deterministic;
 pub use packages::{PackageProducer, PackagesOverlay};
+pub use risks::{RisksOverlay, RisksProducer};
 pub use structure::{StructureOverlay, StructureProducer};
 
 /// Contract for a non-per-file overlay producer.
