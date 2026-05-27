@@ -41,6 +41,11 @@ fn run() -> Result<(), String> {
     }
 
     let no_cache = has_flag(&args, "--no-cache");
+    // Phase 4.7.7 (gated): opt in to populating the map FROM the on-disk
+    // graph (fragments + overlay producers) instead of the legacy pass
+    // pipeline. Falls back to the pass pipeline when no graph dir exists,
+    // and bypasses the map cache by design, so it overrides --no-cache.
+    let from_fragments = has_flag(&args, "--from-fragments");
     let command = args.remove(0);
     match command.as_str() {
         "daemon" => return run_daemon_subcommand(&args, no_cache),
@@ -48,7 +53,7 @@ fn run() -> Result<(), String> {
         "inspect" => {
             let repo = read_option(&args, "--repo")?;
             let mode = read_option(&args, "--mode").unwrap_or_else(|_| "full".to_string());
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let mut stdout = std::io::stdout().lock();
             match mode.as_str() {
                 "brief" => writeln!(stdout, "{}", aethyme_engine::json::inspect_brief(&map))
@@ -68,7 +73,9 @@ fn run() -> Result<(), String> {
         }
         "build-profile" => {
             let repo = read_option(&args, "--repo")?;
-            let (_map, profile) = if no_cache {
+            let (_map, profile) = if from_fragments {
+                RepositoryMap::build_from_fragments(&PathBuf::from(&repo))?
+            } else if no_cache {
                 RepositoryMap::build_no_cache(&PathBuf::from(&repo))?
             } else {
                 RepositoryMap::build_with_profile_and_progress(&PathBuf::from(&repo), |stage| {
@@ -80,7 +87,7 @@ fn run() -> Result<(), String> {
         "symbol" => {
             let repo = read_option(&args, "--repo")?;
             let query = read_option(&args, "--query")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let hits = symbol_search(&map, &query, 20);
             println!("{}", aethyme_engine::json::search_hits(&hits));
         }
@@ -94,7 +101,7 @@ fn run() -> Result<(), String> {
                 .ok()
                 .and_then(|raw| raw.parse::<usize>().ok())
                 .unwrap_or(20);
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let results = queries
                 .iter()
                 .map(|query| (query.clone(), symbol_search(&map, query, limit)))
@@ -104,7 +111,7 @@ fn run() -> Result<(), String> {
         "graph-node" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let view =
                 node_view(&map, &target).ok_or_else(|| format!("node not found: {target}"))?;
             println!("{}", aethyme_engine::json::graph_node_view(&view));
@@ -112,7 +119,7 @@ fn run() -> Result<(), String> {
         "graph-children" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             println!(
                 "{}",
                 aethyme_engine::json::graph_relation(&children_view(&map, &target))
@@ -121,7 +128,7 @@ fn run() -> Result<(), String> {
         "graph-parents" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             println!(
                 "{}",
                 aethyme_engine::json::graph_relation(&parents_view(&map, &target))
@@ -130,7 +137,7 @@ fn run() -> Result<(), String> {
         "graph-callers" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             println!(
                 "{}",
                 aethyme_engine::json::graph_relation(&callers_view(&map, &target))
@@ -139,7 +146,7 @@ fn run() -> Result<(), String> {
         "graph-callees" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             println!(
                 "{}",
                 aethyme_engine::json::graph_relation(&callees_view(&map, &target))
@@ -148,7 +155,7 @@ fn run() -> Result<(), String> {
         "graph-docs" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             println!(
                 "{}",
                 aethyme_engine::json::graph_relation(&docs_view(&map, &target))
@@ -157,7 +164,7 @@ fn run() -> Result<(), String> {
         "graph-configs" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             println!(
                 "{}",
                 aethyme_engine::json::graph_relation(&configs_view(&map, &target))
@@ -166,14 +173,14 @@ fn run() -> Result<(), String> {
         "graph-expand" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let view = graph_expand_view(&map, &target)
                 .ok_or_else(|| format!("node not found: {target}"))?;
             println!("{}", aethyme_engine::json::graph_expand_view(&view));
         }
         "graph-overview" => {
             let repo = read_option(&args, "--repo")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             println!(
                 "{}",
                 aethyme_engine::json::repo_overview_view(&graph_overview_view(&map))
@@ -182,14 +189,14 @@ fn run() -> Result<(), String> {
         "graph-deps" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let deps = dependency_frontier(&map, &target);
             println!("{}", aethyme_engine::json::string_list(&deps));
         }
         "impact" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let impact = impact_frontier(&map, &target);
             println!("{}", aethyme_engine::json::string_list(&impact));
         }
@@ -197,7 +204,7 @@ fn run() -> Result<(), String> {
             let repo = read_option(&args, "--repo")?;
             let task_value = read_option(&args, "--task")?;
             let root = PathBuf::from(&repo);
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let task = TaskInput::from_task_text(&task_value);
             let pack = build_context_pack(&root, &map, task);
             let mut stdout = std::io::stdout().lock();
@@ -213,7 +220,7 @@ fn run() -> Result<(), String> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(80_000);
             let root = PathBuf::from(&repo);
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let task = TaskInput::from_task_text(&task_value);
             let pack = build_context_pack_with_content(&root, &map, task, content_budget);
             let mut stdout = std::io::stdout().lock();
@@ -223,7 +230,7 @@ fn run() -> Result<(), String> {
         }
         "task-anchors" => {
             let repo = read_option(&args, "--repo")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let task_value = read_option(&args, "--task")?;
             let task = TaskInput::from_task_text(&task_value);
             println!(
@@ -233,7 +240,7 @@ fn run() -> Result<(), String> {
         }
         "task-scope" => {
             let repo = read_option(&args, "--repo")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let task_value = read_option(&args, "--task")?;
             let task = TaskInput::from_task_text(&task_value);
             println!(
@@ -243,7 +250,7 @@ fn run() -> Result<(), String> {
         }
         "task-next" => {
             let repo = read_option(&args, "--repo")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let task_value = read_option(&args, "--task")?;
             let task = TaskInput::from_task_text(&task_value);
             println!(
@@ -262,7 +269,9 @@ fn run() -> Result<(), String> {
             // our profiler output. `RepositoryMap::build` only returned the
             // map, so previously we could only see total map_build time.
             let (map, build_profile) = profiler.stage("map_build", || {
-                if no_cache {
+                if from_fragments {
+                    RepositoryMap::build_from_fragments(&PathBuf::from(&repo))
+                } else if no_cache {
                     RepositoryMap::build_no_cache(&PathBuf::from(&repo))
                 } else {
                     RepositoryMap::build_with_profile(&PathBuf::from(&repo))
@@ -285,7 +294,7 @@ fn run() -> Result<(), String> {
         }
         "task-expand" => {
             let repo = read_option(&args, "--repo")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let target = read_option(&args, "--target")?;
             println!(
                 "{}",
@@ -297,7 +306,7 @@ fn run() -> Result<(), String> {
             let task_value =
                 read_option(&args, "--task").unwrap_or_else(|_| "Explain this repo".to_string());
             let root = PathBuf::from(&repo);
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let task = TaskInput::from_task_text(&task_value);
             let pack = build_context_pack(&root, &map, task);
             print_explanation(&map, &pack);
@@ -312,7 +321,7 @@ fn run() -> Result<(), String> {
         "activate" => {
             let repo = read_option(&args, "--repo")?;
             let task_value = read_option(&args, "--task")?;
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let task = TaskInput::from_task_text(&task_value);
             let anchor_limit = if task.kind.is_explain_repo() { 5 } else { 3 };
             let anchors = resolve_anchors(&map, &task, anchor_limit);
@@ -327,7 +336,7 @@ fn run() -> Result<(), String> {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(3);
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let activation = spread_from_seed(&map, &seed, hops);
             println!("{}", aethyme_engine::json::activation_map(&activation));
         }
@@ -345,7 +354,7 @@ fn run() -> Result<(), String> {
             let repo = read_option(&args, "--repo")?;
             let scope = read_option(&args, "--scope")?;
             let include_methods = has_flag(&args, "--include-methods");
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let facts = public_function_facts(&map, &scope, include_methods);
             println!(
                 "{}",
@@ -366,7 +375,7 @@ fn run() -> Result<(), String> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let fact = public_function_facts(&map, &boundary, true)
                 .into_iter()
                 .find(|fact| {
@@ -393,7 +402,7 @@ fn run() -> Result<(), String> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let answer = analyze_dead_code(&map, &scope, &roots, include_methods);
             println!(
                 "{}",
@@ -437,13 +446,13 @@ fn run() -> Result<(), String> {
         }
         "warm" => {
             let repo = read_option(&args, "--repo")?;
-            let _map = build_map(&repo, no_cache)?;
+            let _map = build_map(&repo, no_cache, from_fragments)?;
             eprintln!("map cached");
         }
         "index" => {
             let repo = read_option(&args, "--repo")?;
             eprintln!("Building repository map...");
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             eprintln!(
                 "Map built: {} areas, {} files, {} functions, {} classes, {} edges",
                 map.areas.len(),
@@ -470,7 +479,7 @@ fn run() -> Result<(), String> {
                 .unwrap_or_else(|_| "Explain this repository".to_string());
             let focus = read_option(&args, "--focus").ok();
             let subsystem = read_option(&args, "--subsystem").ok();
-            let map = build_map(&repo, no_cache)?;
+            let map = build_map(&repo, no_cache, from_fragments)?;
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
@@ -1122,8 +1131,18 @@ fn daemon_status_action(repo: &Path) -> Result<(), String> {
     }
 }
 
-fn build_map(repo: &str, no_cache: bool) -> Result<RepositoryMap, String> {
-    if no_cache {
+fn build_map(
+    repo: &str,
+    no_cache: bool,
+    from_fragments: bool,
+) -> Result<RepositoryMap, String> {
+    if from_fragments {
+        // Fragments build bypasses the map cache by design and falls
+        // back to the pass pipeline when no on-disk graph exists, so it
+        // is safe to prefer over --no-cache when both flags are set.
+        RepositoryMap::build_from_fragments(&PathBuf::from(repo))
+            .map(|(map, _)| map)
+    } else if no_cache {
         RepositoryMap::build_no_cache(&PathBuf::from(repo)).map(|(map, _)| map)
     } else {
         RepositoryMap::build(&PathBuf::from(repo))

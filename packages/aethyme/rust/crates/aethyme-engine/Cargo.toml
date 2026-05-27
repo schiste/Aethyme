@@ -29,6 +29,13 @@ redb = "2"
 regex = "1"
 libc = "0.2"
 dhat = { version = "0.3", optional = true }
+aethyme-graph-storage = { path = "../aethyme-graph-storage" }
+aethyme-graph-schema = { path = "../aethyme-graph-schema" }
+aethyme-producers = { path = "../aethyme-producers" }
+
+[dev-dependencies]
+aethyme-graph-indexer = { path = "../aethyme-graph-indexer" }
+tempfile = "3"
 
 [features]
 dhat-heap = ["dep:dhat"]

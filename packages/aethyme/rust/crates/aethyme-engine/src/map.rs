@@ -15,10 +15,15 @@ use crate::model::edge::Edge;
 use crate::model::file::FileNode;
 use crate::model::function::FunctionNode;
 use crate::model::graph::{GraphNode, GraphNodeKind, NormalizedGraph};
-use crate::model::risk::RiskFlag;
+use crate::model::risk::{RiskArea, RiskFlag, RiskLevel};
 use crate::model::symbol::Symbol;
 use crate::passes;
 use crate::repo::{RepoSnapshot, discover_repo};
+use aethyme_graph_storage::{AETHYME_DIR, FragmentStore, GRAPH_SUBDIR};
+use aethyme_producers::{
+    ConfigsProducer, DocsProducer, OverlayProducer, ProducerCtx,
+    RepoFileView, RepoView, RisksProducer,
+};
 
 /// Pre-computed HashMap indexes for O(1) lookups on entity id → area_id and display string.
 /// Built lazily via `OnceLock` on first access; not serialized (derived data).
@@ -191,7 +196,7 @@ impl RepositoryMap {
     }
 
     pub fn build_no_cache(root: &Path) -> Result<(Self, RepositoryBuildProfile), String> {
-        Self::build_internal(root, |_| {}, true)
+        Self::build_internal(root, |_| {}, true, false)
     }
 
     pub fn build_with_profile_and_progress<F>(
@@ -201,19 +206,55 @@ impl RepositoryMap {
     where
         F: FnMut(&BuildStageProfile),
     {
-        Self::build_internal(root, progress, false)
+        Self::build_internal(root, progress, false, false)
+    }
+
+    /// Explicit opt-in to the Variant C1 fragments path: source the
+    /// overlay planes (docs/configs/risks) from the on-disk graph via
+    /// the producer crate instead of the legacy engine passes. Falls
+    /// back to the pass pipeline when no `.aethyme/graph` directory is
+    /// present, so this is always safe to call. The default build path
+    /// (`build`/`build_with_profile*`) is unaffected.
+    pub fn build_from_fragments(
+        root: &Path,
+    ) -> Result<(Self, RepositoryBuildProfile), String> {
+        Self::build_internal(root, |_| {}, true, true)
     }
 
     fn build_internal<F>(
         root: &Path,
         mut progress: F,
         no_cache: bool,
+        from_fragments: bool,
     ) -> Result<(Self, RepositoryBuildProfile), String>
     where
         F: FnMut(&BuildStageProfile),
     {
         let total_started = Instant::now();
         let mut stages = Vec::new();
+
+        // Variant C1 gate. When explicitly requested AND an on-disk
+        // graph exists, populate the map from fragments + producers.
+        // This branch deliberately neither reads nor writes the map
+        // cache: reading would let a stale pass-built cache shadow the
+        // requested fragments build, and writing would let a
+        // fragments-built map leak into the default (pass) path on a
+        // later run. Both would violate "old path still default".
+        if from_fragments && fragments_dir_exists(root) {
+            let started = Instant::now();
+            let map = Self::populate_from_fragments(root)?;
+            push_stage(
+                &mut stages,
+                "populate_from_fragments",
+                started.elapsed().as_millis(),
+                &mut progress,
+            );
+            let profile = map.derive_build_profile(
+                total_started.elapsed().as_millis(),
+                stages,
+            );
+            return Ok((map, profile));
+        }
 
         // Try loading a cached map BEFORE discover_repo (avoids 20s+ file walk)
         if !no_cache {
@@ -554,6 +595,289 @@ impl RepositoryMap {
             .get(target_id)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// Variant C1 fragments path: build the map's **overlay planes**
+    /// (docs / configs / risks) by running the `aethyme-producers`
+    /// producers against the on-disk graph, while the **structure** and
+    /// **code** planes still come from the legacy passes.
+    ///
+    /// ## Why structure + code stay on passes (this commit)
+    ///
+    /// Phase 4.7.7 cuts over only what the producer crate has already
+    /// ported. Structure and code have no producer yet, so we run their
+    /// passes exactly as the default path does, then feed
+    /// `structure.files` into the producers' [`RepoView`]. Sourcing the
+    /// producers from the engine's own structure-filtered file list
+    /// (not a fresh repo walk) keeps both pipelines classifying a
+    /// byte-identical path set — the isolation the parity gate relies
+    /// on.
+    ///
+    /// ## The schema → model impedance
+    ///
+    /// Producers emit *schema* types (`NonCodeFile`, producer
+    /// `RiskFlag`) that are deliberately lossier than the engine *model*
+    /// types this map holds. The conversions below are therefore
+    /// one-directional and stamp empty/derived values for fields the
+    /// producers dropped: `DocNode::title`/`doc_type` and
+    /// `ConfigNode::config_type` become `""`, and overlay-emitted edges
+    /// are discarded. `area_id` is recovered by joining each overlay
+    /// file back to its `FileNode` by path. These gaps are pinned (and
+    /// explained) by the fragments-vs-passes parity test.
+    fn populate_from_fragments(root: &Path) -> Result<Self, String> {
+        // -- Structure + code planes: legacy passes (unchanged) --------
+        let snapshot = discover_repo(root)?;
+        let structure = passes::structure::build(&snapshot);
+
+        let grammar_registry =
+            default_grammars_dir().map(|dir| GrammarRegistry::load(&dir));
+        let parse_store = match ParseStore::open(root) {
+            Ok(store) => Some(store),
+            Err(err) => {
+                eprintln!(
+                    "aethyme: parse store unavailable, falling back to no-cache: {err}"
+                );
+                None
+            }
+        };
+        let (code, _code_profile, _cache_stats) = passes::code::build_with_profile(
+            root,
+            &structure,
+            parse_store.as_ref(),
+            grammar_registry.as_ref(),
+        );
+
+        let repo_name = snapshot.repo_name();
+
+        // -- Overlay planes: run the producers against the graph -------
+        let store = FragmentStore::open(root).map_err(|err| {
+            format!("open fragment store at {}: {err}", root.display())
+        })?;
+        let view = StructureFilesView {
+            name: repo_name.clone(),
+            root_path: snapshot.root.clone(),
+            files: structure
+                .files
+                .iter()
+                .map(|f| RepoFileView {
+                    path: f.path.clone(),
+                    language: f.language.clone(),
+                    byte_size: f.size_bytes,
+                    // Doc/config/risk classification is path-only; a
+                    // stub hash keeps view construction cheap without
+                    // touching any compared surface.
+                    content_hash: format!("stub-{}", f.path),
+                })
+                .collect(),
+        };
+        let ctx = ProducerCtx::with_repo(&store, &view);
+
+        // path → FileNode, for sourcing file_id + area_id by path.
+        let file_index: HashMap<&str, &FileNode> =
+            structure.files.iter().map(|f| (f.path.as_str(), f)).collect();
+        let file_id_of = |path: &str| -> String {
+            file_index
+                .get(path)
+                .map(|f| f.id.clone())
+                .unwrap_or_else(|| format!("file:{repo_name}:{path}"))
+        };
+        let area_of =
+            |path: &str| -> Option<String> { file_index.get(path).and_then(|f| f.area_id.clone()) };
+
+        let configs_overlay =
+            ConfigsProducer.produce(&ctx).map_err(|e| e.to_string())?;
+        let configs: Vec<ConfigNode> = configs_overlay
+            .payload()
+            .files
+            .iter()
+            .map(|nc| {
+                let path = nc.path();
+                // config_type is graph-derived in the engine model and
+                // is not carried by the producer overlay; stamp empty.
+                ConfigNode::new(&repo_name, &file_id_of(path), path, "", area_of(path))
+            })
+            .collect();
+
+        let docs_overlay = DocsProducer.produce(&ctx).map_err(|e| e.to_string())?;
+        let docs: Vec<DocNode> = docs_overlay
+            .payload()
+            .files
+            .iter()
+            .map(|nc| {
+                let path = nc.path();
+                // title + doc_type are dropped by the docs producer.
+                DocNode::new(&repo_name, &file_id_of(path), path, "", "", area_of(path))
+            })
+            .collect();
+
+        let risks_overlay = RisksProducer.produce(&ctx).map_err(|e| e.to_string())?;
+        let risk_flags: Vec<RiskFlag> = risks_overlay
+            .payload()
+            .risks
+            .iter()
+            .map(|r| {
+                RiskFlag::new(
+                    r.scope.clone(),
+                    convert_risk_area(&r.area),
+                    convert_risk_level(&r.level),
+                    r.reason.clone(),
+                )
+            })
+            .collect();
+
+        // -- Edges: structure + code only; overlay edges are dropped ---
+        let mut edges = Vec::new();
+        edges.extend(structure.edges.clone());
+        edges.extend(code.edges.clone());
+        edges.sort();
+        edges.dedup();
+
+        // `file_index` borrows `structure.files`; its last use (via the
+        // closures above) precedes the move below, so NLL permits it.
+        let mut map = Self {
+            snapshot,
+            areas: structure.areas,
+            directories: structure.directories,
+            files: structure.files,
+            classes: code.classes,
+            functions: code.functions,
+            docs,
+            configs,
+            symbols: code.compatibility_symbols,
+            edges,
+            risk_flags,
+            graph: NormalizedGraph {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                annotations: Vec::new(),
+            },
+            index: OnceLock::new(),
+            signals: OnceLock::new(),
+        };
+
+        let (graph, _graph_profile) = build_graph_with_profile(&map);
+        map.graph = graph;
+        Ok(map)
+    }
+
+    /// Assemble a [`RepositoryBuildProfile`] for a fragments-sourced
+    /// map. Mirrors the cache-hit profile block: per-plane counts are
+    /// read straight off the finished map, and `cache_hits` /
+    /// `cache_misses` are zero because the fragments path bypasses the
+    /// map cache entirely (see the gate comment in `build_internal`).
+    fn derive_build_profile(
+        &self,
+        total_duration_ms: u128,
+        stages: Vec<BuildStageProfile>,
+    ) -> RepositoryBuildProfile {
+        use crate::model::file::FileRole;
+        RepositoryBuildProfile {
+            total_duration_ms,
+            stages,
+            repo_files: self.snapshot.files.len(),
+            source_files: self
+                .files
+                .iter()
+                .filter(|file| matches!(file.role, FileRole::Source))
+                .count(),
+            doc_files: self
+                .files
+                .iter()
+                .filter(|file| matches!(file.role, FileRole::Doc))
+                .count(),
+            config_files: self
+                .files
+                .iter()
+                .filter(|file| matches!(file.role, FileRole::Config))
+                .count(),
+            areas: self.areas.len(),
+            directories: self.directories.len(),
+            classes: self.classes.len(),
+            functions: self.functions.len(),
+            docs: self.docs.len(),
+            configs: self.configs.len(),
+            graph_nodes: self.graph.nodes.len(),
+            graph_edges: self.graph.edges.len(),
+            graph_annotations: self.graph.annotations.len(),
+            cache_hits: 0,
+            cache_misses: 0,
+        }
+    }
+}
+
+/// True when `root` already holds a materialized on-disk graph at
+/// `<root>/.aethyme/graph/`. The fragments build path is gated on this:
+/// `--from-fragments` falls back to the legacy pass pipeline when no
+/// graph directory is present, so a fresh checkout never hard-fails.
+fn fragments_dir_exists(root: &Path) -> bool {
+    root.join(AETHYME_DIR).join(GRAPH_SUBDIR).is_dir()
+}
+
+/// Convert the producer crate's
+/// [`RiskArea`](aethyme_producers::risks::RiskArea) into the engine
+/// model's [`RiskArea`](crate::model::risk::RiskArea). The two enums are
+/// verbatim mirrors — the producer's was copied from the model during
+/// the Phase 4.7.6 port — so this is a total, variant-for-variant map;
+/// the `UserDefined` payload is cloned across the type boundary.
+fn convert_risk_area(
+    area: &aethyme_producers::risks::RiskArea,
+) -> RiskArea {
+    use aethyme_producers::risks::RiskArea as P;
+    match area {
+        P::Auth => RiskArea::Auth,
+        P::Permissions => RiskArea::Permissions,
+        P::Secrets => RiskArea::Secrets,
+        P::Migrations => RiskArea::Migrations,
+        P::Infra => RiskArea::Infra,
+        P::Billing => RiskArea::Billing,
+        P::SharedCore => RiskArea::SharedCore,
+        P::Destructive => RiskArea::Destructive,
+        P::UserDefined(s) => RiskArea::UserDefined(s.clone()),
+    }
+}
+
+/// Convert the producer crate's
+/// [`RiskLevel`](aethyme_producers::risks::RiskLevel) into the engine
+/// model's. Total mirror map (Low/Medium/High); see [`convert_risk_area`].
+fn convert_risk_level(
+    level: &aethyme_producers::risks::RiskLevel,
+) -> RiskLevel {
+    use aethyme_producers::risks::RiskLevel as P;
+    match level {
+        P::Low => RiskLevel::Low,
+        P::Medium => RiskLevel::Medium,
+        P::High => RiskLevel::High,
+    }
+}
+
+/// Minimal [`RepoView`] backed by a structure pass's file list. The
+/// overlay producers (`ConfigsProducer` / `DocsProducer` /
+/// `RisksProducer`) classify on path shape alone, so handing them the
+/// engine's already structure-filtered `FileNode` paths makes them see
+/// the exact file set the legacy passes saw — the precondition for
+/// fragments-vs-passes parity. Owns its fields and lends them back
+/// through the trait.
+struct StructureFilesView {
+    name: String,
+    root_path: String,
+    files: Vec<RepoFileView>,
+}
+
+impl RepoView for StructureFilesView {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn root_path(&self) -> &str {
+        &self.root_path
+    }
+
+    fn vcs(&self) -> &str {
+        "git"
+    }
+
+    fn files(&self) -> &[RepoFileView] {
+        &self.files
     }
 }
 
