@@ -1228,10 +1228,25 @@ def _first_user_message_text(session_file: Path) -> str:
 
 
 def _ensure_aethyme_imports() -> None:
+    """Make ``src.eval`` importable in both in-tree and extracted modes.
+
+    Primary path: ``aethyme`` is pip-installed (its ``[project.scripts]``
+    exposes ``src.cli:main``), so ``src`` is already discoverable and this
+    is a no-op. Fallback (in-tree monorepo dev, package not installed): we
+    splice ``packages/aethyme/`` onto ``sys.path`` so the sibling source
+    tree resolves. The ``find_spec`` probe also makes this idempotent —
+    once the fallback runs, ``src`` becomes findable and later calls
+    short-circuit. Post-extraction ``AETHYME_PKG`` won't be a real
+    directory and the guard skips the insert entirely.
+    """
+    import importlib.util
     import sys
 
+    if importlib.util.find_spec("src") is not None:
+        return  # pip-installed or already bootstrapped — nothing to do
+
     root = str(AETHYME_PKG)
-    if root not in sys.path:
+    if AETHYME_PKG.is_dir() and root not in sys.path:
         sys.path.insert(0, root)
 
 
@@ -1601,9 +1616,7 @@ def _parse_and_score_bug_fix_1_output(
     cost: float,
     repo_path: Path,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    import sys
-
-    sys.path.insert(0, str(AETHYME_PKG))
+    _ensure_aethyme_imports()
     from src.eval.scoring import parse_structured_output, score_mediawiki_bug_fix_1
     from src.eval.schemas import mediawiki_bug_fix_1_reference
 
@@ -1650,9 +1663,7 @@ def _parse_and_score_dead_code_output(
     target: str,
     repo_path: Path,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    import sys
-
-    sys.path.insert(0, str(AETHYME_PKG))
+    _ensure_aethyme_imports()
     from src.eval.scoring import parse_structured_output, score_dead_code
     from src.eval.schemas import dead_code_reference_for_target
 
@@ -2100,8 +2111,7 @@ def _score_output(eval_type: str, output: str, cost: float, prompt: str = "") ->
 
     if eval_type == "bug-fix-1":
         try:
-            import sys
-            sys.path.insert(0, str(AETHYME_PKG))
+            _ensure_aethyme_imports()
             from src.eval.schemas import mediawiki_bug_fix_1_reference
             ref = mediawiki_bug_fix_1_reference()
         except Exception:
@@ -2142,8 +2152,7 @@ def _score_output(eval_type: str, output: str, cost: float, prompt: str = "") ->
     if eval_type in ("dead-code", "migration"):
         # Keyword-based scoring using reference keywords
         try:
-            import sys
-            sys.path.insert(0, str(AETHYME_PKG))
+            _ensure_aethyme_imports()
             if eval_type == "dead-code":
                 from src.eval.schemas import mediawiki_dead_code_reference
                 ref = mediawiki_dead_code_reference()
