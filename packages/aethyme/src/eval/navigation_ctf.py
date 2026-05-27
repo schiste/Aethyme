@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING, Any
 
 from src.contracts.versions import contract_versions
 
-from ..indexing.engine import build_task_pack, graph_expand, inspect_repository
-from ._self import is_self_tool
+from ..indexing.engine import graph_expand, inspect_repository
+from ._self import is_self_tool, self_tool_name
 from .control_prompt import build_baseline_prompt, build_leverage_prompt
 from .inline_warm import warm_and_query_leverage
 from .models import EvaluationSide
@@ -35,7 +35,13 @@ def _resolve_task_pack(
     task: str,
     tool: "ToolAdapter | None",
 ) -> dict[str, Any] | None:
-    """Compute the task pack, optionally via tool adapter subprocess.
+    """Compute the leverage task pack, always via a tool adapter.
+
+    ``tool=None`` defaults to the framework's self-tool adapter. The
+    legacy direct-Python ``build_task_pack`` path was removed in Stage B
+    item 2.3 so all leverage data flows through a single transport (CLI
+    subprocess + JSON parse). Returns ``None`` for non-self tools
+    (caller takes the tool-context-file flow); failures degrade to {}.
 
     Note: navigation-CTF ALSO uses ``inspect_repository`` and
     ``graph_expand`` from the engine, but these are eval-framework
@@ -45,12 +51,10 @@ def _resolve_task_pack(
     compromise is documented in the eval-protocol guide.
     """
     if tool is None:
-        return build_task_pack(repo_path, task)
+        from .tools import get_adapter
+        tool = get_adapter(self_tool_name())
     if not is_self_tool(tool.name):
-        # Non-self-tool: caller branches to tool-context-file flow.
-        # The framework's self-tool (see :mod:`src.eval._self`) gets the
-        # structured task_pack flow; everyone else writes a context file.
-        return None
+        return None  # non-self tool: caller branches to tool-context-file flow
     try:
         result = tool.run_condition("leverage", repo_path, task)
         return json.loads(result.raw_output) if result.raw_output else {}

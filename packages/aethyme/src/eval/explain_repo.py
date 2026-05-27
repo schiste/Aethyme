@@ -15,10 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from src.contracts.versions import contract_versions
 
-from ._self import is_self_tool
-from ..indexing.engine import (
-    build_task_pack,
-)
+from ._self import is_self_tool, self_tool_name
 from ..rendering.context_pack import render_explain_repo_text
 from .control_prompt import build_baseline_prompt, build_leverage_prompt
 from .inline_warm import warm_and_query_leverage
@@ -38,17 +35,20 @@ def _resolve_task_pack(
     task: str,
     tool: "ToolAdapter | None",
 ) -> dict[str, Any] | None:
-    """Compute the task pack for the leverage condition, optionally via adapter.
+    """Compute the leverage task pack, always via a tool adapter.
 
-    Returns ``None`` for non-self tools (signals that the caller should
-    take the tool-context-file flow instead). For the framework's
-    self-tool (Aethyme by default — see :mod:`src.eval._self`) or
-    ``None``, returns the structured task_pack — direct Python call
-    when tool is None, CLI subprocess when a self-tool adapter is
-    supplied. The two transports are byte-equivalent (parity test).
+    ``tool=None`` defaults to the framework's self-tool adapter (Aethyme
+    by default — see :mod:`src.eval._self`). The legacy direct-Python
+    ``build_task_pack`` path was removed in Stage B item 2.3 so that all
+    leverage data flows through a single transport (CLI subprocess + JSON
+    parse) — no transport-dependent divergence left to parity-test.
+    Returns ``None`` for non-self tools, signalling the caller to take
+    the tool-context-file flow. Subprocess / JSON-parse failures degrade
+    to an empty dict.
     """
     if tool is None:
-        return build_task_pack(repo_path, task)
+        from .tools import get_adapter
+        tool = get_adapter(self_tool_name())
     if not is_self_tool(tool.name):
         return None  # non-self tool: caller branches to tool-context-file flow
     try:
