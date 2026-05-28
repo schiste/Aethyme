@@ -52,9 +52,9 @@
 //!    below; matches a fixed allow-list of exact filenames, dotfile
 //!    prefixes, and path-prefix-gated extensions.
 //!
-//! `tests/configs_parity.rs` pins this predicate against the
-//! engine's pass over a shared fixture. Any drift trips there
-//! before the 4.7.10 deletion can land.
+//! The predicate remains a direct port of the old engine branch so
+//! historical fixture expectations continue to hold after the pass
+//! pipeline deletion.
 //!
 //! ## Format mapping — parsing-class, not semantic-class
 //!
@@ -140,8 +140,8 @@ impl OverlayProducer for ConfigsProducer {
 
         // Walk the view, classify each path, drop the misses, mint
         // a NonCodeFile for the hits. `classify_non_code` is the
-        // single point of policy — both the parity test and any
-        // future predicate change route through it.
+        // single point of policy — any future predicate change
+        // routes through it.
         let mut files: Vec<NonCodeFile> = view
             .files()
             .iter()
@@ -212,7 +212,7 @@ fn classify_non_code(path: &str) -> Option<NonCodeFormat> {
 
 /// Allow-list predicate for operational config paths. Mirrors
 /// engine's `passes/structure.rs::is_operational_config_path`
-/// byte-for-byte — parity test enforces this.
+/// byte-for-byte.
 fn is_operational_config_path(lower_path: &str) -> bool {
     let file_name = lower_path.rsplit('/').next().unwrap_or(lower_path);
 

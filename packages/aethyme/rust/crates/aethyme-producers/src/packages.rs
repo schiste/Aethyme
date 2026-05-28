@@ -19,22 +19,18 @@
 //! | `package.json`  | `npm`            |
 //! | `pyproject.toml`| `pyproject`      |
 //!
-//! That narrowing buys clean byte-for-byte parity with the engine
-//! pass: `tests/packages_parity.rs` filters the engine's emitted
-//! [`ConfigNode`]s by `config_type == "manifest"` and compares the
-//! resulting path set against the producer's emitted
-//! [`Package::manifest_path`]s. Any drift trips there before the
-//! 4.7.10 deletion can land.
+//! That narrowing keeps this producer focused on manifest facts. Any
+//! future widening of "manifest" semantics should update the
+//! producer tests first so the deliberate scope remains obvious.
 //!
 //! The broader manifest set the engine *also* recognizes
 //! (`project.godot`, `Dockerfile`, `tsconfig.json`, `turbo.json`,
 //! `biome.json`, `deno.json[c]`, `pnpm-workspace.{yaml,yml}`) is
 //! deferred to a follow-up commit *after* the engine pass deletion.
 //! Those manifests carry different `config_type` tags (`project`,
-//! `runtime`, `config`) in the engine, so they aren't in the parity
-//! oracle for this commit — adding them here would emit Packages
-//! the engine never claimed as manifests, and the parity test would
-//! reject them.
+//! `runtime`, `config`) in the engine, so they aren't in the original
+//! narrow baseline for this producer — adding them here would silently widen
+//! what this producer means by "package".
 //!
 //! ## What this producer drops vs. the engine's pass
 //!
@@ -70,8 +66,6 @@
 //! stamp, a parallel collect) trips here rather than at the §5.7
 //! CI gate.
 //!
-//! [`classify_config_type`]: # "engine's passes/configs.rs::classify_config_type"
-//! [`ConfigNode`]: # "engine's passes/configs.rs::ConfigNode"
 
 use aethyme_graph_schema::Package;
 use aethyme_graph_storage::OverlayFragment;
@@ -117,8 +111,8 @@ impl OverlayProducer for PackageProducer {
 
         // Walk the view, classify each path, drop the misses, mint
         // a Package for each hit. `classify_manifest` is the single
-        // point of policy — both the parity test and any future
-        // predicate change route through it.
+        // point of policy — any future predicate change routes
+        // through it.
         let mut packages: Vec<Package> = view
             .files()
             .iter()
@@ -280,9 +274,9 @@ mod tests {
     #[test]
     fn classify_rejects_other_manifests() {
         // These are real manifests the engine recognizes, but their
-        // `config_type` tag is not "manifest" — so emitting Packages
-        // for them would break parity. Deferred to a follow-up
-        // commit after engine deletion.
+        // `config_type` tag was not "manifest" in the old engine pass,
+        // so keep them deferred rather than widening this producer
+        // silently.
         assert!(classify_manifest("project.godot").is_none());
         assert!(classify_manifest("Dockerfile").is_none());
         assert!(classify_manifest("tsconfig.json").is_none());

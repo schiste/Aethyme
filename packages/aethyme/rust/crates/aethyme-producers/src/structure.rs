@@ -118,7 +118,7 @@ impl OverlayProducer for StructureProducer {
         // BTreeSet handles dedupe-and-sort in one pass. The engine
         // does the same with a `BTreeSet<String>` collector, so the
         // implied-directory set across both implementations matches
-        // by construction — the parity test relies on that.
+        // by construction.
         let mut implied: BTreeSet<String> = BTreeSet::new();
         for f in view.files() {
             for parent in parent_directories(&f.path) {
@@ -221,11 +221,10 @@ impl OverlayProducer for StructureProducer {
 ///
 /// `"a/b/c.py"` → `["a", "a/b"]`. `"top.py"` → `[]`.
 ///
-/// Mirrors the engine's helper in `passes/structure.rs` —
-/// duplicated rather than shared because this crate can't depend
-/// on the engine in production code, and a six-line pure function
-/// is cheaper to mirror than the alternative crate split would
-/// be.
+/// Historical copy of the engine helper that produced implied parent
+/// directories before the pass pipeline was deleted. Duplicated here
+/// rather than hidden behind another crate split because the function
+/// is small and pure.
 fn parent_directories(path: &str) -> Vec<String> {
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() < 2 {

@@ -87,7 +87,7 @@ fn fixture_repo() -> MockRepoView {
         mock_file("services/api/pyproject.toml", Some("toml"), 384),
         // REJECT: tsconfig.json is a manifest the engine recognizes
         // but tags as `config`, not `manifest` — out of scope for
-        // 4.7.4b. Producer must skip it to preserve parity.
+        // 4.7.4b. Producer must skip it to preserve the narrow package scope.
         mock_file("tsconfig.json", Some("json"), 256),
         // cargo — nested under crates/.
         mock_file("crates/foo/Cargo.toml", Some("toml"), 640),

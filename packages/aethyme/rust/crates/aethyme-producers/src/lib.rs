@@ -57,9 +57,9 @@
 //!   synthesize from already-indexed fragments. Co-locating would
 //!   force every overlay consumer to inherit gigabytes of parser
 //!   deps.
-//! - The engine's eventual `populate_from_fragments` cutover
-//!   (commit 4.7.7) reads producers but doesn't index anything; a
-//!   thin `aethyme-producers` dep matches that consumption pattern.
+//! - The engine's fragments-only `RepositoryMap` build reads
+//!   producers but doesn't index anything; a thin
+//!   `aethyme-producers` dep matches that consumption pattern.
 
 use aethyme_graph_storage::{FragmentStore, OverlayFragment};
 

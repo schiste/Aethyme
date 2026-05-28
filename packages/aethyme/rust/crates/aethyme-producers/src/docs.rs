@@ -16,7 +16,8 @@
 //! path like `docs/generated-api.md` is excluded from **both**
 //! overlays: `contains("generated")` fires before the doc branch is
 //! ever reached. Mirroring that gate ordering — not just the accept
-//! set — is what keeps both producers byte-parity with the engine.
+//! set — is what keeps both producers aligned with the fragment-era
+//! file-role classifier.
 //!
 //! ## What this producer drops vs. the engine's pass
 //!
@@ -63,9 +64,9 @@
 //!    `.mypy_cache` segment.
 //! 3. **IS doc** — ends with `.md`, `.mdx`, `.rst`, or `readme`.
 //!
-//! `tests/docs_parity.rs` pins this predicate against the engine's
-//! `passes::docs::build` over a shared fixture. Any drift trips
-//! there before the 4.7.10 deletion can land.
+//! The predicate remains a direct port of the old engine branch so
+//! historical fixture expectations continue to hold after the pass
+//! pipeline deletion.
 //!
 //! ## Format mapping — parsing-class, not semantic-class
 //!
@@ -141,8 +142,8 @@ impl OverlayProducer for DocsProducer {
 
         // Walk the view, classify each path, drop the misses, mint a
         // NonCodeFile for the hits. `classify_doc` is the single
-        // point of policy — both the parity test and any future
-        // predicate change route through it.
+        // point of policy — any future predicate change routes
+        // through it.
         let mut files: Vec<NonCodeFile> = view
             .files()
             .iter()

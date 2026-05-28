@@ -25,19 +25,17 @@
 //! - **`destructive_risks`** scans function-node names for
 //!   destructive verbs, grouped by the file each fragment belongs to.
 //!
-//! ## Two independent extraction pipelines — why parity is scoped
+//! ## Two independent extraction pipelines — why risk facts are scoped
 //!
 //! The engine derives risks from its own `RepositoryMap`; this
 //! producer derives them from the `aethyme-graph-indexer` fragment
 //! store. These are **independent extraction pipelines** that need
 //! not agree on the exact symbol/import sets they recover. The
-//! `tests/risks_parity.rs` gate therefore compares only the
-//! **`path_risks`-derived subset** (Auth / Permissions / Secrets /
-//! Migrations / Infra / Billing) — the surface both pipelines derive
-//! *identically* from file paths. `SharedCore` and `Destructive` are
-//! pinned by `tests/risks_determinism.rs` plus the hand-built-fragment
-//! unit tests at the bottom of this file, not by engine parity. This
-//! is the same Path-2 scoping precedent set in `docs_parity.rs`.
+//! path-derived subset (Auth / Permissions / Secrets / Migrations /
+//! Infra / Billing) is intentionally kept byte-for-byte with the old
+//! predicate, while `SharedCore` and `Destructive` are pinned by
+//! `tests/risks_determinism.rs` plus the hand-built-fragment unit
+//! tests at the bottom of this file.
 //!
 //! ## What this producer drops vs. the engine's pass
 //!
@@ -234,7 +232,7 @@ fn read_all_fragments(
 /// Flag a file by its *path shape* alone. Verbatim port of the
 /// engine's `passes/overlays.rs::path_risks` — the predicate set, the
 /// levels, and the reason strings are byte-for-byte identical so the
-/// `risks_parity.rs` gate can compare this subset against the engine.
+/// historical path-risk fixtures continue to hold.
 fn path_risks(path: &str) -> Vec<RiskFlag> {
     let lower = path.to_ascii_lowercase();
     let mut risks = Vec::new();
