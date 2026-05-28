@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-05-09
+Last Updated: 2026-05-28
 
 When code outside the `packages/aethyme/` Python or Rust source tree
 invokes an Aethyme command, it crosses a process boundary. Static
@@ -58,23 +58,39 @@ consumer. This file exists so that doesn't happen again.
 
 | Script | Invokes | Failure mode |
 |---|---|---|
-| `scripts/eval/setup-playground.sh:151,172` | `python -m src.cli enhance deploy/verify` | Setup fails if `enhance` Click group is renamed/removed. |
-| `scripts/eval/setup-playground.sh:58` | `$AETHYME_ROOT/rust/target/release/aethyme-engine-cli` | Setup fails if Rust binary path changes (e.g. workspace restructure). |
-| `scripts/eval/verify-playground.sh:45` | `$AETHYME_ROOT/rust/target/release/aethyme-engine-cli` | Same as above. |
+| `scripts/eval/setup-playground.sh` | `python -m src.cli enhance deploy/verify` | Setup fails if `enhance` Click group is renamed/removed. |
+| `scripts/eval/setup-playground.sh` | `$AETHYME_ROOT/rust/target/release/aethyme-graph-index` followed by `$AETHYME_ROOT/rust/target/release/aethyme-engine-cli index --repo .` | Fresh Playground setup fails if either binary path changes, if fragments are not produced before engine indexing, or if `graph_store.redb` stops being materialized from fragments. |
+| `scripts/eval/setup-playground.sh` | Asserts `<target>/.aethyme/graph/` and `<target>/.aethyme/graph_store.redb` exist after graph-index + engine-index. | False failure if the fragment layout or redb graph-store path changes. |
+| `scripts/eval/verify-playground.sh` | `$AETHYME_ROOT/rust/target/release/aethyme-engine-cli`; checks deployed skill, `.aethyme/graph/`, and `.aethyme/graph_store.redb`. | False failure if binary path, fragment layout, or redb graph-store path changes. |
 | `scripts/eval/verify-playground.sh:131-138` | Greps deployed SKILL.md for command names (`src.cli intents`, `aethyme explore`, `analyze dead-code`, `facts function-usage`) | False positive/negative on health check if SKILL.md template changes wording but verify-playground doesn't update its grep patterns. **Updated 2026-05-08 after the explore hard-delete to expect native `aethyme explore` not `src.cli explore`.** |
 | `scripts/docs/generate-docs.sh:38` | Reads `src/cli.py` to extract command help | Doc generation fails if `cli.py` moved/renamed. |
 | `scripts/migrate.sh` | psql / `alembic upgrade head` (no Aethyme entry point) | DB migration; not a cross-process Aethyme consumer. |
 | `scripts/start-api.sh` | `uvicorn src.api.main:app` | API server start; depends on `src.api.main` existing. |
 
+### Python engine adapter and eval warm phases
+
+| Source | Invokes / assumes | Failure mode |
+|---|---|---|
+| `src/indexing/engine.py` | Resolves/builds `rust/target/{debug,release}/aethyme-engine-cli`; calls many subcommands through `_run_binary_command`, including `inspect`, `symbol`, `symbol-batch`, `graph-*`, `task-*`, `pack`, `context`, `facts-*`, `analyze-dead-code`, `warm`, `workspace-inspect`, and `workspace-blast-radius`. It does **not** pass `--from-fragments` or `--no-fragments`, so it consumes the engine CLI default build mode. | Python CLI/API/eval helpers silently inherit changed engine CLI defaults. If a subcommand is renamed or a global build flag becomes required, Python callers fail at runtime. |
+| `src/indexing/engine.py:CACHE_ROOT` | Caches command output JSON under `AETHYME_CACHE_DIR` or `/tmp/aethyme-cache`, keyed by repo snapshot and engine identity. This is **not** `.aethyme/cache` and is separate from the removed Rust `map_cache`. | Removing Rust `map_cache` does not clear this Python output cache. If command semantics change without engine identity changing, stale output can survive until repo or binary mtime changes. |
+| `src/cli.py:repo clear-cache` | Calls `clear_repository_cache(repo_path)` for the Python output cache. | If cache layout changes, user-facing cache clearing may leave stale output behind. |
+| `evals/tools/aethyme.toml:[warm].command` | Runs `aethyme-engine-cli daemon status --repo {{TARGET_REPO}} || (aethyme-engine-cli daemon start --repo {{TARGET_REPO}} && tail ... engine-daemon.log ... 'listening on')`. No fragment flags are passed. | Eval warm phase inherits the default fragment-preferred daemon behavior. If daemon command names, log path, or `listening on` marker change, eval warm-up hangs or times out. |
+| `src/eval/orchestrator.py:_build_warm_phase` | Emits the same daemon status/start shell sequence when no tool adapter is supplied, plus legacy fields `engine_bin`, `aethyme_repo`, and `log_path`. | Same as the manifest warm command; tests assert the command shape. |
+| `tests/local/test_eval_warm_phase.py` | Asserts warm phase contains `aethyme-engine-cli`, `daemon status`, `daemon start`, `||`, `.aethyme/engine-daemon.log`, and `listening on`. | Tests fail if the warm command contract changes without updating the test and this registry. |
+
 ### CI / GitHub Actions
 
 | Workflow | Calls | Failure mode |
 |---|---|---|
-| `.github/workflows/aethyme-local-tests.yml` | `pytest`, `cargo test`, `ruff`, etc. | Standard. Doesn't directly invoke Aethyme CLI. |
-| `packages/aethyme/.github/workflows/evals.yml` | Eval harness commands; should be checked when eval-type defaults change | (Audit pending — flag if you find specific entry-point references during a future migration.) |
-| `packages/aethyme/.github/workflows/performance.yml` | Performance benchmarks | Same. |
-| `packages/aethyme/.github/workflows/cd.yml` | Release/deploy steps | Same. |
-| `packages/aethyme/.github/workflows/aethyme-example.yml` | Example invocations | Same. |
+| `.github/workflows/aethyme-local-tests.yml` | Runs `pytest -q tests/local`; strict-engine lane builds `cargo build --manifest-path rust/Cargo.toml --bin aethyme-engine-cli` before running the same tests. No fragment flags or redb/cache paths are passed by the workflow. | Local tests can fail if the engine binary target moves or if Python engine-adapter defaults change. The workflow itself does not consume `map_cache`, `parse_store.redb`, `.aethyme/cache`, or `.aethyme/graph_store.redb`. |
+| `.github/workflows/oss-ci.yml` | Runs `pytest -q tests/local` and `cargo test --workspace`. No direct Aethyme CLI, fragment flag, or redb/cache path references. | Indirect failures surface through tests; no workflow-level path contract for 4.7 storage deletion. |
+| `.github/workflows/cross-process-contract.yml` | Runs `python scripts/check-cross-process-contract.py --base ... --pr-body ...`; the script treats this document as the source of truth for protected entry-point strings. | PR contract check becomes stale if this registry misses a consumer or if the PR-template contract language changes without updating the script. |
+| `packages/aethyme/.github/workflows/evals.yml` | Runs pytest eval suites and benchmark scripts. No direct `aethyme-engine-cli`, fragment flag, `map_cache`, `parse_store.redb`, `.aethyme/cache`, or `.aethyme/graph_store.redb` reference found in the workflow. | Indirect failures surface through eval/test code; update this row if a workflow step starts invoking engine commands directly. |
+| `packages/aethyme/.github/workflows/ci.yml` | Runs Python tests, integration tests, Docker build/scan, and deployment-oriented checks. No 4.7 redb/cache path or fragment-flag reference found in the workflow. | Indirect failures surface through tests or service startup; no workflow-level path contract for 4.7 storage deletion. |
+| `packages/aethyme/.github/workflows/performance.yml` | Runs performance benchmarks against Postgres-backed service configuration. No 4.7 redb/cache path or fragment-flag reference found in the workflow. | Indirect benchmark failures may still surface behavior regressions, but this workflow does not read the local engine storage artifacts directly. |
+| `packages/aethyme/.github/workflows/cd.yml` | Helm/package/deploy workflow. No 4.7 redb/cache path or fragment-flag reference found in the workflow. | Deployment checks can fail if packaged service entry points move; no workflow-level path contract for local Redb storage deletion. |
+| `packages/aethyme/.github/actions/aethyme-scorecard/index.js` | Installs `aethyme-cli` and invokes `aethyme` with scorecard/autofix args. Used by `packages/aethyme/.github/workflows/aethyme-example.yml`. | Breaks if the published `aethyme` CLI scorecard/autofix surface changes. Not a Redb storage consumer in the 4.7 audit. |
+| `packages/aethyme/.github/workflows/aethyme-example.yml` | Calls the local `aethyme-scorecard` action. No direct engine CLI, fragment flag, or redb/cache path reference. | Inherits the scorecard action's CLI contract; no direct 4.7 storage deletion blocker. |
 
 ### Externally deployed runtime files (under `~/Downloads/Repositories/Playground/`)
 
@@ -90,13 +106,14 @@ onboarding artifacts.
 | `.codex/skills/aethyme/aethyme-explore` | `skills/aethyme/aethyme-explore` | 2026-05-08 (post-redeploy) |
 | `AGENTS.md`, `CLAUDE.md` | `skills/aethyme/AGENTS.md` | 2026-05-08 |
 
-### Phase 4+ graph indexer (parallel to legacy graph store)
+### Phase 4+ graph indexer and redb graph store
 
 These entry points belong to the Phase 1–4 graph rewrite (new
 `aethyme-graph-schema`, `aethyme-graph-storage`, `aethyme-graph-indexer`
-crates). They currently run alongside the legacy SurrealDB-backed
-graph store; the cutover to making them the primary path is a future
-phase.
+crates) and the Phase-3 redb graph store. The fragment path is now
+required by the engine: the legacy pass pipeline was deleted in 4.7.12.
+The redb graph store remains the local query artifact written by
+`aethyme-engine-cli index`.
 
 | Entry point | Source | Wire shape that becomes a contract |
 |---|---|---|
@@ -105,6 +122,37 @@ phase.
 | Per-module NDJSON shards at `<repo>/.aethyme/graph/_index/<module>.ndjson` | Produced by `aethyme-graph-storage::write_index_shard` | One `SymbolRecord` per line: `{module, symbol, kind, node_id, file}`. Sorted canonically. `merge=union` git attribute relies on the line-based form. |
 | `<repo>/.aethyme/engine-version` | Produced by `aethyme-graph-storage::bootstrap_repo` | Plain text, single line, no padding. CI's parser-version-drift check reads this; downgrading or empty-on-trim is an error. |
 | `<repo>/.aethyme/graph/.gitattributes` | Constant `aethyme_graph_storage::GITATTRIBUTES_CONTENT` | Two rules: `**/*.bin linguist-generated=true binary` and `_index/**/*.ndjson linguist-generated=true merge=union`. Git itself is the cross-process consumer. |
+| `<repo>/.aethyme/graph_store.redb` | Written by `aethyme-engine-cli index --repo <repo>` through `store::redb::graph_store::GraphStore::reset/open` | Playground setup and verification assert this file exists. Do not rename or relocate without updating both scripts and docs. |
+| `aethyme-engine-cli --from-fragments` | Compatibility spelling in `src/bin/aethyme-engine-cli.rs`; it now selects the same fragments-only build surface as the default. | Existing diagnostics/tests may keep passing it, but it no longer bypasses or proves a separate fallback. |
+| `aethyme-engine-cli --no-fragments` | Removed rollback flag retained as a hard error in `src/bin/aethyme-engine-cli.rs`; `daemon.rs` also rejects non-fragment builds. | No in-repo manifest or workflow passed it in the 4.7.9 audit. Out-of-repo callers must remove the flag and ensure `<repo>/.aethyme/graph/` exists. |
+
+### Phase 4.7.9 redb/cache deletion audit
+
+Audit command run on 2026-05-28:
+
+```bash
+rg -n -- "map_cache|AETHYME_MAP_CACHE_MAX_MB|parse_store\.redb|ParseStore|\.aethyme/cache|graph_store\.redb|--from-fragments|--no-fragments|build_from_fragments|build_with_fragment_preference" packages/aethyme
+rg -n -- "aethyme-engine-cli|target/release/aethyme-engine-cli|target/debug/aethyme-engine-cli|AETHYME_ENGINE|ENGINE=|engine_bin|daemon start|daemon serve|build-profile" packages/aethyme
+rg -n -- "AETHYME_CACHE_DIR|CACHE_ROOT|clear_repository_cache|_cached_text|_run_binary_command\(" packages/aethyme/src packages/aethyme/tests packages/aethyme/docs
+rg -n -- "cache_dir\(|CACHE_SUBDIR|\.aethyme/cache|AETHYME_MAP_CACHE_MAX_MB" packages/aethyme/rust packages/aethyme/src packages/aethyme/scripts packages/aethyme/docs packages/aethyme/tests
+```
+
+Findings:
+
+| Surface | Confirmed consumers | 4.7 deletion implication |
+|---|---|---|
+| Rust `map_cache.rs` and `AETHYME_MAP_CACHE_MAX_MB` | Rust engine internals only: before 4.7.10, `map.rs` loaded/saved the cache and `lib.rs` exported the module. No Python, shell, eval manifest, or skill consumer found. | Deleted in 4.7.10. This does not affect Python's separate `/tmp/aethyme-cache` output cache. |
+| `<repo>/.aethyme/cache/map-*.bin` | Deleted Rust `map_cache.rs` only. `aethyme-graph-storage::cache_dir` also reserves `.aethyme/cache` as a layout helper for future local mirrors, but no external script consumes files in that directory. | 4.7.10 may orphan old `map-*.bin` files. Do not delete or rename the generic `cache_dir` layout helper; it belongs to graph-storage layout, not the removed map-cache implementation. |
+| `ParseStore` and `<repo>/.aethyme/parse_store.redb` | Rust engine internals only before 4.7.11. No Python, shell, eval manifest, or skill consumer found. | Deleted in 4.7.11; the legacy passes that used it were deleted in 4.7.12. The on-disk `parse_store.redb` is now an orphan local cache file. |
+| `<repo>/.aethyme/graph_store.redb` | `scripts/eval/setup-playground.sh`, `scripts/eval/verify-playground.sh`, `docs/guides/playground-setup.md`, `docs/architecture/graph-schema.md`, and `store/redb/graph_store.rs`. | Keep stable. It is the externally asserted redb graph-store artifact and is separate from deleted `ParseStore`. |
+| Engine CLI fragment flags | `aethyme-engine-cli.rs` accepts `--from-fragments` as compatibility spelling and rejects `--no-fragments`; daemon builds require fragments. No external manifest currently passes either flag. | 4.7.12 removed the rollback path. Keep the hard-error message stable enough for operators to diagnose stale scripts. |
+| Engine daemon warm command | `evals/tools/aethyme.toml`, `src/eval/orchestrator.py`, and `tests/local/test_eval_warm_phase.py`. | Daemon start/status names, `engine-daemon.log`, and `listening on` are cross-process contracts. Fragment-only behavior can change underneath, but command/log shape should not change in the 4.7 cutover. |
+
+Outstanding risks after 4.7.12:
+
+- The audit only covers in-repo consumers under `packages/aethyme/`; already-deployed playground repos can still contain stale generated skills. Run `scripts/eval/verify-playground.sh` against active playground targets after any template change.
+- Python output caches under `AETHYME_CACHE_DIR` are independent of the removed Rust `map_cache`; deletion of `map_cache.rs` does not clear cached JSON command output.
+- Any out-of-repo scripts that read orphaned `.aethyme/cache/map-*.bin` or `.aethyme/parse_store.redb` files directly, or pass `--no-fragments`, are unsupported and were not found by this repo-local audit.
 
 ## Migration checklist
 

@@ -86,10 +86,15 @@ After this, `git log --all` only shows commits reachable from the detached HEAD.
 ```bash
 AETHYME_ROOT=~/Downloads/Repositories/Aethyme/packages/aethyme
 ENGINE="$AETHYME_ROOT/rust/target/release/aethyme-engine-cli"
+GRAPH_INDEXER="$AETHYME_ROOT/rust/target/release/aethyme-graph-index"
 
 cd "$DEST/Mediawiki - Aethyme"
 
-# Build the graph index
+# Build committed fragments, then materialize the local Redb graph store
+$GRAPH_INDEXER \
+  --repo-root "$DEST/Mediawiki - Aethyme" \
+  --repo-name "Mediawiki - Aethyme" \
+  --engine-version local
 $ENGINE index --repo .
 
 # Deploy the skill
@@ -113,9 +118,10 @@ ls "$DEST/Mediawiki - Control/.codex" 2>/dev/null && echo "FAIL: .codex exists" 
 ls "$DEST/Mediawiki - Control/.aethyme" 2>/dev/null && echo "FAIL: .aethyme exists" || echo "OK"
 ls "$DEST/Mediawiki - Control/.chau7" 2>/dev/null && echo "FAIL: .chau7 exists" || echo "OK"
 
-# Aethyme: must have skill + index
+# Aethyme: must have skill + fragments + local Redb store
 ls "$DEST/Mediawiki - Aethyme/.codex/skills/aethyme/SKILL.md" || echo "FAIL: no skill"
-ls "$DEST/Mediawiki - Aethyme/.aethyme/graph.db" || echo "FAIL: no graph"
+ls "$DEST/Mediawiki - Aethyme/.aethyme/graph" || echo "FAIL: no fragment graph"
+ls "$DEST/Mediawiki - Aethyme/.aethyme/graph_store.redb" || echo "FAIL: no Redb graph store"
 
 # Both: same commit
 CONTROL_HEAD=$(cd "$DEST/Mediawiki - Control" && git rev-parse HEAD)

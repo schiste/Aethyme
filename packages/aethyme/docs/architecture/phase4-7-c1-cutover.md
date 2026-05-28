@@ -1,15 +1,18 @@
 # Phase 4.7 — Fragments-Only Cutover Plan (Variant C1)
 
-Last Updated: 2026-05-21
+Last Updated: 2026-05-28
 
 ## Forcing function
 
-Two pre-computed graph stores are dragging behind the live one:
+At the start of Phase 4.7, two pre-computed graph stores were dragging
+behind the live one:
 
 1. `map_cache` — a bincode dump of the entire `RepositoryMap` under
-   `.aethyme/cache/`, sized-capped at 1 GiB, gitignored.
-2. `ParseStore` — the redb parse cache under `.aethyme/cache/parse_store.redb`
-   that backs the per-file parser fast-path (Phase 1+2).
+   `.aethyme/cache/`, sized-capped at 1 GiB, gitignored. **Deleted in
+   4.7.10.**
+2. `ParseStore` — the redb parse cache under `.aethyme/parse_store.redb`
+   that backed the per-file parser fast-path (Phase 1+2). **Deleted in
+   4.7.11.**
 
 Both predate `aethyme-graph-storage` (the per-file `.bin` fragments +
 `_index/*.ndjson` shards under `.aethyme/graph/`, committed to git, byte-pinned
@@ -46,10 +49,10 @@ the last commit, `map_cache.rs`, the `ParseStore` surface, and the engine's
 
 | File | Lines | Disappears in commit |
 |---|---|---|
-| `engine/src/map_cache.rs` | ~250 | 4.7.10 |
-| `engine/src/cache.rs` (re-export shell) | ~20 | 4.7.10 (or with 11) |
-| `engine/src/store/redb/parse_store.rs` | ~600 | 4.7.11 |
-| `engine/src/store/redb/mod.rs` (`parse_store` re-export) | trivial | 4.7.11 |
+| `engine/src/map_cache.rs` | deleted | 4.7.10 (done 2026-05-28) |
+| `engine/src/cache.rs` (parse-cache value type + hash helper) | deleted | 4.7.11 (done 2026-05-28) |
+| `engine/src/store/redb/parse_store.rs` | deleted | 4.7.11 (done 2026-05-28) |
+| `engine/src/store/redb/mod.rs` (`parse_store` re-export) | deleted | 4.7.11 (done 2026-05-28) |
 | `engine/src/passes/code.rs` | ~55K | 4.7.12 |
 | `engine/src/passes/structure.rs` | ~13K | 4.7.12 |
 | `engine/src/passes/configs.rs` | ~16K | 4.7.12 |
@@ -119,11 +122,11 @@ Two version axes carried by every overlay payload:
 | **4.7.5** | `feat(producers): port docs → OverlayProducer` | Same shape for `docs` | Small | `git revert` |
 | **4.7.6** | `feat(producers): port risks → OverlayProducer` | Same shape for `risks`. Carries `shared_core_risks` + `destructive_risks` thresholds verbatim from `passes/overlays.rs` (`SHARED_CORE_HIGH_THRESHOLD = 5`, `SHARED_CORE_LOW_THRESHOLD = 3`, `DESTRUCTIVE_PATTERNS = [delete, drop, destroy, remove, truncate, reset, purge, wipe]`) | Small | `git revert` |
 | **4.7.7** | `feat(engine): populate_from_fragments cutover (gated)` | `engine/src/map.rs`: new `populate_from_fragments(root) -> RepositoryMap`; `build_internal` (line 207) gains an `if fragments_dir_exists { populate_from_fragments } else { old path }` guard. New `--from-fragments` CLI flag for explicit invocation. Tests assert: build via fragments == build via passes (byte-equal for fields covered by `§5.7`; structural-equal otherwise). | **Medium-High** | `git revert` — guarded, old path still default |
-| **4.7.8** | `refactor(engine): daemon defaults to fragments` | `engine/src/daemon.rs:165-168` switches `RepositoryMap::build_no_cache` → `populate_from_fragments`. CLI flag flips to opt-*out* (`--no-fragments`). Bench: build time on Mockup + MediaWiki recorded in commit body. | Medium | `git revert` — flag flip only |
+| **4.7.8** | `refactor(engine): daemon defaults to fragments` | `engine/src/daemon.rs:165-168` switches to fragment-preferred `RepositoryMap` builds. CLI flag flips to opt-*out* (`--no-fragments`), while legacy `--from-fragments` remains the explicit cache-bypassing diagnostic path. Bench: build time on Mockup + MediaWiki recorded in commit body. | Medium | `git revert` — flag flip only |
 | **4.7.9** | `chore(engine): cross-process consumer audit` | Grep `docs/architecture/cross-process-consumers.md` for callers of map-cache or parse-store paths; update each; record outstanding items inline in the consumer registry. (Per Cardinal Rule 3 — this must land *before* the deletes.) | Low | `git revert` — doc-only |
-| **4.7.10** | `chore(engine): delete map_cache.rs` | Delete `map_cache.rs` + `cache.rs` shell; remove `mod map_cache;` from `lib.rs`; drop the two call sites in `map.rs:221` (`try_load_cached_map`) and `map.rs:448` (`save_cached_map`); delete bincode dep if no other user. | Medium | `git revert` works but daemon will re-parse from scratch until restart |
-| **4.7.11** | `chore(engine): delete ParseStore` | Delete `store/redb/parse_store.rs`; trim `store/redb/mod.rs`; remove `ParseStore` parameter from `passes::code` (which is itself slated for 4.7.12 deletion); drop `redb` dep if `GraphStore` doesn't also use it (it does today — keep the dep). | Medium | `git revert` — parse-store DB on disk becomes orphan |
-| **4.7.12** | `chore(engine): delete passes/ + overlays/` | Delete `passes/{code,structure,configs,docs,overlays,mod}.rs`. The engine binary now contains zero parsing code. | Medium | `git revert` — but this is the "no going back" line; once shipped, producers own the parsing surface |
+| **4.7.10** | `chore(engine): delete map_cache.rs` | Delete `map_cache.rs`; remove `mod map_cache;` from `lib.rs`; drop the two call sites in `map.rs` (`try_load_cached_map` and `save_cached_map`). Keep the engine's direct `bincode` dependency because `ParseStore` and `GraphStore` still use it at this point. | Medium | `git revert` works but daemon will re-parse from scratch until restart |
+| **4.7.11** | `chore(engine): delete ParseStore` | Delete `store/redb/parse_store.rs` and `cache.rs`; trim `store/redb/mod.rs`; remove `ParseStore` parameters/call sites from `map.rs` and `passes::code`. Keep `redb` and `bincode` because `GraphStore` still uses both. | Medium | `git revert` — parse-store DB on disk becomes orphan |
+| **4.7.12** | `chore(engine): delete passes/ + engine indexer` | Delete `passes/{code,structure,configs,docs,overlays,mod}.rs`, the legacy `indexer/` module, and parity tests that compared against them. `RepositoryMap` is now fragments-only; `--from-fragments` is compatibility spelling and `--no-fragments` hard-errors. | Medium | `git revert` — but this is the "no going back" line; once shipped, fragments/producers own the parsing surface |
 | **4.7.13** | (no commit) Validate: full Rust test suite + Mockup + MediaWiki build-profile + cross-process audit (Cardinal Rule 1 — evals on Playground only) | — | — | — |
 
 12 implementation commits + 1 validation step. Each lands with green tests. The
@@ -151,28 +154,26 @@ Captured here so a future reader doesn't relitigate them:
 - **No runtime registry mapping kinds → payload types**. Callers supply the
   expected `P`. A `KindMismatch` is the load-bearing signal that you asked
   for the wrong type.
-- **Parity tests, not "trust me" cutover**: every `passes/*` → producer port
-  (4.7.3 through 4.7.6) lands with a test that byte-compares producer
-  output against engine output on a fixture repo. The deletes (4.7.10–12)
-  can only land after the parity tests have been green on `main` for
-  the intervening commits.
+- **Historical parity gates, not "trust me" cutover**: every `passes/*` →
+  producer port (4.7.3 through 4.7.6) landed with a test that byte-compared
+  producer output against engine output on a fixture repo. Those parity tests
+  were removed with the legacy engine path in 4.7.12; determinism tests remain
+  on the producer side.
 
 ## Risks
 
-- **Parity drift on the cutover commit (4.7.7)**: `populate_from_fragments`
-  must reproduce the same `RepositoryMap` the old `passes/` pipeline did.
-  Fields the `§5.7` gate covers are byte-pinned, but `RepositoryMap` has
-  derived in-memory state (cluster IDs, computed scores) the gate doesn't
-  see. Mitigation: 4.7.7's tests assert structural equality on the full
-  map, not just the byte-pinned fields.
-- **Cross-process consumer breakage** (Cardinal Rule 3): `map_cache.rs` is
-  internal but `ParseStore` may have external callers (Python via FFI,
-  scripts). 4.7.9 is the gate — if it surfaces an unlisted consumer, that
-  consumer is updated in the same commit window, not deferred.
-- **Daemon restart cost spikes during cutover**: once 4.7.10 lands,
+- **Fragment-era compatibility drift**: after 4.7.12, there is no engine
+  fallback to the old `passes/` pipeline. Compatibility now means the
+  fragments/producers-backed `RepositoryMap` preserves the public model
+  surfaces existing engine consumers use: readable IDs, file/config/doc
+  roles, area overlays, and fragment edges remapped into model IDs.
+- **Cross-process consumer breakage** (Cardinal Rule 3): `map_cache.rs` and
+  `ParseStore` were internal in the 4.7.9 audit; no Python, shell, eval
+  manifest, skill, or CI consumer was found before deletion.
+- **Daemon restart cost spikes during cutover**: after 4.7.10,
   cold-start no longer has `map_cache` to fall back on. Mitigation:
-  4.7.7→4.7.8 land first; benchmarks at 4.7.8 confirm `populate_from_fragments`
-  is fast enough that `map_cache`'s value is gone before its delete lands.
+  4.7.7→4.7.8 landed first; 4.7.12 now uses the same fragments-only
+  path for CLI and daemon builds.
 - **Eval interference** (Cardinal Rule 2): tempting to tune
   `populate_from_fragments` performance based on eval-run timings.
   Don't — measure against the build-profile harness, not eval token counts.
@@ -182,9 +183,10 @@ Captured here so a future reader doesn't relitigate them:
   4.7.2's test harness pins this with double-run byte-equality, but only
   on the harness's fixture — a real producer could regress if the author
   forgets. The harness pattern is the only durable defense.
-- **bincode dep removal at 4.7.10**: confirm `aethyme-graph-storage` still
-  depends on bincode (it does, for fragments) before dropping the engine's
-  direct dep. A grep + `cargo tree | grep bincode` covers it.
+- **bincode dep removal**: do not drop the engine's direct `bincode`
+  dependency with `map_cache.rs` or `ParseStore`; `GraphStore` still encodes
+  Redb values with it. `aethyme-graph-storage` also depends on bincode for
+  fragments, but that does not satisfy the engine crate's direct uses.
 
 ## Estimated effort
 
@@ -217,7 +219,7 @@ for the parity test fixture.
 2. `docs/architecture/graph-schema.md §5.4` describes the overlay envelope
    and §5.1's tree shows `_overlays/`. ← already true.
 3. `cross-process-consumers.md` is up-to-date with current consumers of
-   `map_cache` and `parse_store`. ← verify at start of 4.7.9.
+   `map_cache` and `parse_store`. ← verified in 4.7.9.
 4. A scratch branch (off `main`) is open for the 12-commit sequence; the
    parity tests added in 4.7.3–6 are visible on it before 4.7.7 lands.
 

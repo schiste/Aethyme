@@ -151,8 +151,11 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
         grep -q '\$ENGINE unused' "$SKILL_FILE" && check_fail "Skill still advertises stale \$ENGINE unused command" || check_pass "Skill has no stale unused command"
     fi
 
-    # Graph index
-    [[ -d .aethyme/graph.db ]] && check_pass "Graph index present" || check_fail "Missing .aethyme/graph.db — run: $ENGINE index --repo ."
+    # Fragment graph + Redb graph store. Since 4.7.12 the engine
+    # materializes the Redb store from committed fragments; the old
+    # pass/parser fallback is gone.
+    [[ -d .aethyme/graph ]] && check_pass "Fragment graph present" || check_fail "Missing .aethyme/graph — run aethyme-graph-index before $ENGINE index --repo ."
+    [[ -f .aethyme/graph_store.redb ]] && check_pass "Redb graph store present" || check_fail "Missing .aethyme/graph_store.redb — run: $ENGINE index --repo ."
 fi
 
 echo ""

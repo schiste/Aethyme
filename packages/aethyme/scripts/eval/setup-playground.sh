@@ -56,6 +56,8 @@ AETHYME_DIR="$DEST/$AETHYME_DIR_NAME"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AETHYME_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ENGINE="$AETHYME_ROOT/rust/target/release/aethyme-engine-cli"
+GRAPH_INDEXER="$AETHYME_ROOT/rust/target/release/aethyme-graph-index"
+GRAPH_ENGINE_VERSION="${AETHYME_GRAPH_ENGINE_VERSION:-local}"
 
 count_git_refs() {
     git for-each-ref --format='%(refname)' refs/heads refs/remotes 2>/dev/null | wc -l | tr -d ' '
@@ -69,6 +71,8 @@ echo "  Dest:    $DEST"
 echo "  Control: $CONTROL_DIR"
 echo "  Aethyme: $AETHYME_DIR"
 echo "  Engine:  $ENGINE"
+echo "  Graph indexer: $GRAPH_INDEXER"
+echo "  Graph version: $GRAPH_ENGINE_VERSION"
 echo ""
 
 # ── Preflight checks ────────────────────────────────────────────────
@@ -76,6 +80,12 @@ echo ""
 if [[ ! -f "$ENGINE" ]]; then
     echo "ERROR: Engine binary not found at $ENGINE"
     echo "Build it: cd $AETHYME_ROOT/rust && cargo build --release"
+    exit 1
+fi
+
+if [[ ! -f "$GRAPH_INDEXER" ]]; then
+    echo "ERROR: Graph indexer binary not found at $GRAPH_INDEXER"
+    echo "Build it: cd $AETHYME_ROOT/rust && cargo build --release --bin aethyme-graph-index"
     exit 1
 fi
 
@@ -143,8 +153,14 @@ echo "  Removed: .codex .aethyme .chau7 .claude AGENTS.md CLAUDE.md (if present)
 
 # ── Step 3: Deploy Aethyme tooling ───────────────────────────────────
 
-echo ">>> Indexing Aethyme repo..."
+echo ">>> Building Aethyme fragment graph..."
 cd "$AETHYME_DIR"
+"$GRAPH_INDEXER" \
+    --repo-root "$AETHYME_DIR" \
+    --repo-name "$AETHYME_DIR_NAME" \
+    --engine-version "$GRAPH_ENGINE_VERSION"
+
+echo ">>> Materializing Redb graph store..."
 "$ENGINE" index --repo . 2>&1 | tail -5
 
 echo ">>> Deploying enhancement files..."
@@ -175,6 +191,7 @@ else
     echo "  FAIL: Aethyme enhancement verification failed"
     ((ERRORS++))
 fi
+[[ -d .aethyme/graph ]] && echo "  Aethyme: fragment graph present" || { echo "  FAIL: Aethyme missing .aethyme/graph"; ((ERRORS++)); }
 [[ -f .aethyme/graph_store.redb ]] && echo "  Aethyme: graph_store.redb present" || { echo "  FAIL: Aethyme missing graph_store.redb"; ((ERRORS++)); }
 
 # Same commit
