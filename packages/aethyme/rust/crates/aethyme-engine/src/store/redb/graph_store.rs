@@ -543,7 +543,7 @@ impl GraphStore {
 }
 
 /// One open redb write transaction that accepts many node/edge inserts and
-/// commits/rotates based on a policy. Mirrors `parse_store::BuildSession`.
+/// commits/rotates based on a policy.
 ///
 /// "Op" counts every primary-table or adjacency insert; secondary-index
 /// updates are folded into the parent op (one logical edge insert =
@@ -694,10 +694,10 @@ impl<'db> IndexSession<'db> {
     // Returning `true` after an insert triggers commit + fresh transaction.
     // Returning `false` keeps batching.
     //
-    // Workload differs from parse_store: graph_store sees many small writes
-    // (one node = one row, one edge = two adjacency rows). On MediaWiki the
-    // ballpark is ~25k files + ~80k functions + ~10k classes + ~1M edges =
-    // O(1M) ops. Per-op payload is small (tens to a few hundred bytes).
+    // GraphStore sees many small writes (one node = one row, one edge = two
+    // adjacency rows). On MediaWiki the ballpark is ~25k files + ~80k
+    // functions + ~10k classes + ~1M edges = O(1M) ops. Per-op payload is
+    // small (tens to a few hundred bytes).
     //
     // Three counter shapes to consider:
     //
@@ -708,7 +708,7 @@ impl<'db> IndexSession<'db> {
     //     directly, which is the actual scarce resource. But on tiny-row
     //     workloads, a 16 MiB threshold could mean 200k+ ops in one txn —
     //     long fsync stall when it finally rotates.
-    //   • HYBRID (parse_store style): rotate on either threshold. Caps both.
+    //   • HYBRID: rotate on either threshold. Caps both.
     //
     // Constants today: ROTATE_EVERY_OPS = 4096, ROTATE_EVERY_BYTES = 8 MiB.
     // For ~1M ops on MediaWiki that's ~244 commits, ~244 ms of fsync
@@ -727,8 +727,8 @@ impl<'db> IndexSession<'db> {
 fn ensure_schema(db: &Database) -> Result<(), GraphStoreError> {
     let txn = db.begin_write()?;
     {
-        // Schema-version check. Same shape as parse_store: read existing into
-        // an owned [u8;4], release the borrow, then write only if absent.
+        // Schema-version check: read existing into an owned [u8;4], release
+        // the borrow, then write only if absent.
         let mut meta = txn.open_table(META)?;
         let existing: Option<[u8; 4]> = match meta.get(META_KEY_SCHEMA_VERSION)? {
             Some(v) => {

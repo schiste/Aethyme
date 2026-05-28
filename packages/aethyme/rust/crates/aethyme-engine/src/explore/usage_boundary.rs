@@ -77,9 +77,9 @@ impl Default for UsageBoundaryParams {
 /// repo.
 ///
 /// This intent does NOT use the engine daemon. The analyzer walks the
-/// scope filesystem, parses with tree-sitter, scans for callers
-/// across `search_roots` (or the whole repo). It runs in-process, so
-/// the binary's own startup cost is the only fixed overhead.
+/// scope filesystem and scans source text for callers across
+/// `search_roots` (or the whole repo). It runs in-process, so the
+/// binary's own startup cost is the only fixed overhead.
 pub fn explore_usage_boundary(
     repo: &Path,
     request: &str,

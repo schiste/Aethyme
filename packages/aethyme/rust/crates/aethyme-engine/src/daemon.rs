@@ -6,9 +6,9 @@
 //! the 14-second steady-state cost of `aethyme explore` is dominated by
 //! per-call setup that has nothing to do with the user's request:
 //!
-//!   - `RepositoryMap::build` reconstructs the in-memory graph from the
-//!     parse cache on every invocation (~70-130s on cold map; ~unbounded
-//!     when we rebuild end-to-end).
+//!   - `RepositoryMap` construction reconstructs the in-memory graph on
+//!     every invocation (~70-130s on cold legacy builds; much lower when
+//!     committed fragments are available).
 //!   - The Python wrapper spawns the engine binary as a subprocess for
 //!     `task-localize`, `task-anchors`, `symbol-batch`, etc. Each spawn
 //!     pays the build cost from scratch.
@@ -108,6 +108,8 @@ pub struct DaemonConfig {
     pub repo: PathBuf,
     pub idle_timeout: Duration,
     pub no_cache: bool,
+    pub use_fragments: bool,
+    pub force_fragments: bool,
 }
 
 impl DaemonConfig {
@@ -116,6 +118,8 @@ impl DaemonConfig {
             repo,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECONDS),
             no_cache: false,
+            use_fragments: true,
+            force_fragments: false,
         }
     }
 
@@ -126,6 +130,16 @@ impl DaemonConfig {
 
     pub fn with_no_cache(mut self, no_cache: bool) -> Self {
         self.no_cache = no_cache;
+        self
+    }
+
+    pub fn with_use_fragments(mut self, use_fragments: bool) -> Self {
+        self.use_fragments = use_fragments;
+        self
+    }
+
+    pub fn with_force_fragments(mut self, force_fragments: bool) -> Self {
+        self.force_fragments = force_fragments;
         self
     }
 }
@@ -162,17 +176,34 @@ pub fn serve_forever(config: DaemonConfig) -> Result<(), String> {
         config.repo.display()
     );
     let build_started = Instant::now();
-    let map = if config.no_cache {
-        RepositoryMap::build_no_cache(&config.repo)
-            .map(|(map, _)| map)
-            .map_err(|e| format!("build_no_cache: {e}"))?
+    if !config.use_fragments {
+        return Err(
+            "legacy pass pipeline was deleted in 4.7.12; daemon builds require .aethyme/graph fragments"
+                .to_string(),
+        );
+    }
+
+    let (map, build_profile) = if config.force_fragments {
+        RepositoryMap::build_from_fragments(&config.repo)
+            .map_err(|e| format!("build_from_fragments: {e}"))?
     } else {
-        RepositoryMap::build(&config.repo).map_err(|e| format!("build: {e}"))?
+        RepositoryMap::build_with_fragment_preference(&config.repo, config.no_cache, |_| {})
+            .map_err(|e| format!("build_with_fragment_preference: {e}"))?
+    };
+    let build_mode = if build_profile
+        .stages
+        .iter()
+        .any(|stage| stage.name == "populate_from_fragments")
+    {
+        "fragments"
+    } else {
+        "fragments"
     };
     eprintln!(
-        "aethyme-engine-daemon: map ready ({} files, {} functions, build {:?})",
+        "aethyme-engine-daemon: map ready ({} files, {} functions, mode {}, build {:?})",
         map.files.len(),
         map.functions.len(),
+        build_mode,
         build_started.elapsed()
     );
 

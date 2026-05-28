@@ -1,28 +1,30 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::store::redb::parse_store::ParseStore;
-use crate::indexer::tree_sitter::{GrammarRegistry, default_grammars_dir};
-use crate::map_cache;
 use crate::model::area::AreaNode;
 use crate::model::class::ClassNode;
 use crate::model::config::ConfigNode;
 use crate::model::directory::DirectoryNode;
 use crate::model::doc::DocNode;
-use crate::model::edge::Edge;
-use crate::model::file::FileNode;
+use crate::model::edge::{Edge, EdgeKind};
+use crate::model::file::{FileNode, FileRole};
 use crate::model::function::FunctionNode;
-use crate::model::graph::{GraphNode, GraphNodeKind, NormalizedGraph};
+use crate::model::graph::{
+    GraphAnnotation, GraphNode, GraphNodeKind, NormalizedGraph,
+};
+use crate::model::intern::InternedStr;
 use crate::model::risk::{RiskArea, RiskFlag, RiskLevel};
-use crate::model::symbol::Symbol;
-use crate::passes;
-use crate::repo::{RepoSnapshot, discover_repo};
-use aethyme_graph_storage::{AETHYME_DIR, FragmentStore, GRAPH_SUBDIR};
+use crate::model::symbol::{Symbol, SymbolKind};
+use crate::repo::{RepoFile, RepoSnapshot};
+use aethyme_graph_schema::{
+    Callable, EdgeKind as SchemaEdgeKind, Node, NonCodeFormat, SourceRange,
+};
+use aethyme_graph_storage::{Fragment, FragmentStore};
 use aethyme_producers::{
     ConfigsProducer, DocsProducer, OverlayProducer, ProducerCtx,
-    RepoFileView, RepoView, RisksProducer,
+    RepoFileView, RepoView, RisksProducer, StructureProducer,
 };
 
 /// Pre-computed HashMap indexes for O(1) lookups on entity id → area_id and display string.
@@ -196,7 +198,7 @@ impl RepositoryMap {
     }
 
     pub fn build_no_cache(root: &Path) -> Result<(Self, RepositoryBuildProfile), String> {
-        Self::build_internal(root, |_| {}, true, false)
+        Self::build_internal(root, |_| {}, true)
     }
 
     pub fn build_with_profile_and_progress<F>(
@@ -206,26 +208,38 @@ impl RepositoryMap {
     where
         F: FnMut(&BuildStageProfile),
     {
-        Self::build_internal(root, progress, false, false)
+        Self::build_internal(root, progress, false)
     }
 
-    /// Explicit opt-in to the Variant C1 fragments path: source the
-    /// overlay planes (docs/configs/risks) from the on-disk graph via
-    /// the producer crate instead of the legacy engine passes. Falls
-    /// back to the pass pipeline when no `.aethyme/graph` directory is
-    /// present, so this is always safe to call. The default build path
-    /// (`build`/`build_with_profile*`) is unaffected.
+    /// Compatibility spelling for the fragments-only build path.
+    ///
+    /// Phase 4.7.12 deleted the legacy pass pipeline, so every
+    /// `RepositoryMap` build now consumes the committed
+    /// `.aethyme/graph` store. Missing fragments are a hard error.
     pub fn build_from_fragments(
         root: &Path,
     ) -> Result<(Self, RepositoryBuildProfile), String> {
-        Self::build_internal(root, |_| {}, true, true)
+        Self::build_internal(root, |_| {}, true)
+    }
+
+    /// Default-facing build API. The `no_cache` argument is retained
+    /// for CLI compatibility; parse-store caching was deleted in
+    /// 4.7.11 and the pass pipeline was deleted in 4.7.12.
+    pub fn build_with_fragment_preference<F>(
+        root: &Path,
+        _no_cache: bool,
+        progress: F,
+    ) -> Result<(Self, RepositoryBuildProfile), String>
+    where
+        F: FnMut(&BuildStageProfile),
+    {
+        Self::build_internal(root, progress, false)
     }
 
     fn build_internal<F>(
         root: &Path,
         mut progress: F,
-        no_cache: bool,
-        from_fragments: bool,
+        _no_cache: bool,
     ) -> Result<(Self, RepositoryBuildProfile), String>
     where
         F: FnMut(&BuildStageProfile),
@@ -233,262 +247,21 @@ impl RepositoryMap {
         let total_started = Instant::now();
         let mut stages = Vec::new();
 
-        // Variant C1 gate. When explicitly requested AND an on-disk
-        // graph exists, populate the map from fragments + producers.
-        // This branch deliberately neither reads nor writes the map
-        // cache: reading would let a stale pass-built cache shadow the
-        // requested fragments build, and writing would let a
-        // fragments-built map leak into the default (pass) path on a
-        // later run. Both would violate "old path still default".
-        if from_fragments && fragments_dir_exists(root) {
-            let started = Instant::now();
-            let map = Self::populate_from_fragments(root)?;
-            push_stage(
-                &mut stages,
-                "populate_from_fragments",
-                started.elapsed().as_millis(),
-                &mut progress,
-            );
-            let profile = map.derive_build_profile(
-                total_started.elapsed().as_millis(),
-                stages,
-            );
-            return Ok((map, profile));
-        }
-
-        // Try loading a cached map BEFORE discover_repo (avoids 20s+ file walk)
-        if !no_cache {
-            let cache_started = Instant::now();
-            if let Some(cached_map) = map_cache::try_load_cached_map(root) {
-                push_stage(
-                    &mut stages,
-                    "map_cache_hit",
-                    cache_started.elapsed().as_millis(),
-                    &mut progress,
-                );
-                let profile = RepositoryBuildProfile {
-                    total_duration_ms: total_started.elapsed().as_millis(),
-                    stages,
-                    repo_files: cached_map.snapshot.files.len(),
-                    source_files: cached_map
-                        .files
-                        .iter()
-                        .filter(|f| matches!(f.role, crate::model::file::FileRole::Source))
-                        .count(),
-                    doc_files: cached_map
-                        .files
-                        .iter()
-                        .filter(|f| matches!(f.role, crate::model::file::FileRole::Doc))
-                        .count(),
-                    config_files: cached_map
-                        .files
-                        .iter()
-                        .filter(|f| matches!(f.role, crate::model::file::FileRole::Config))
-                        .count(),
-                    areas: cached_map.areas.len(),
-                    directories: cached_map.directories.len(),
-                    classes: cached_map.classes.len(),
-                    functions: cached_map.functions.len(),
-                    docs: cached_map.docs.len(),
-                    configs: cached_map.configs.len(),
-                    graph_nodes: cached_map.graph.nodes.len(),
-                    graph_edges: cached_map.graph.edges.len(),
-                    graph_annotations: cached_map.graph.annotations.len(),
-                    cache_hits: 0,
-                    cache_misses: 0,
-                };
-                return Ok((cached_map, profile));
-            }
-        }
+        #[cfg(test)]
+        ensure_test_fragments(root)?;
 
         let started = Instant::now();
-        let snapshot = discover_repo(root)?;
+        let map = Self::populate_from_fragments(root)?;
         push_stage(
             &mut stages,
-            "discover_repo",
+            "populate_from_fragments",
             started.elapsed().as_millis(),
             &mut progress,
         );
-
-        let started = Instant::now();
-        let structure = passes::structure::build(&snapshot);
-        push_stage(
-            &mut stages,
-            "structure",
-            started.elapsed().as_millis(),
-            &mut progress,
-        );
-
-        let grammar_registry = default_grammars_dir().map(|dir| GrammarRegistry::load(&dir));
-
-        // Option X: when --no-cache is set, do not open the parse store at all.
-        // No reads, no writes, no transactions opened. The flag now matches its name.
-        let parse_store = if no_cache {
-            None
-        } else {
-            match ParseStore::open(root) {
-                Ok(store) => Some(store),
-                Err(err) => {
-                    eprintln!("aethyme: parse store unavailable, falling back to no-cache: {err}");
-                    None
-                }
-            }
-        };
-        let (code, code_profile, cache_stats) = passes::code::build_with_profile(
-            root,
-            &structure,
-            parse_store.as_ref(),
-            grammar_registry.as_ref(),
-        );
-        push_stage(
-            &mut stages,
-            "code_parse_files",
-            code_profile.parse_files_ms,
-            &mut progress,
-        );
-        push_stage(
-            &mut stages,
-            "code_normalize_symbols",
-            code_profile.normalize_symbols_ms,
-            &mut progress,
-        );
-        push_stage(
-            &mut stages,
-            "code_resolve_imports",
-            code_profile.resolve_imports_ms,
-            &mut progress,
-        );
-        push_stage(
-            &mut stages,
-            "code_resolve_calls",
-            code_profile.resolve_calls_ms,
-            &mut progress,
-        );
-        push_stage(
-            &mut stages,
-            "code_resolve_references",
-            code_profile.resolve_references_ms,
-            &mut progress,
-        );
-
-        let (configs, _configs_profile) = passes::configs::build_with_profile_and_progress(
-            root,
-            &structure,
-            &code,
-            |name, duration_ms| push_stage(&mut stages, name, duration_ms, &mut progress),
-        );
-
-        let (docs, _docs_profile) = passes::docs::build_with_profile_and_progress(
-            root,
-            &structure,
-            &code,
-            Some(&configs),
-            |name, duration_ms| push_stage(&mut stages, name, duration_ms, &mut progress),
-        );
-
-        let started = Instant::now();
-        let mut edges = Vec::new();
-        edges.extend(structure.edges.clone());
-        edges.extend(code.edges.clone());
-        edges.extend(docs.edges.clone());
-        edges.extend(configs.edges.clone());
-        edges.sort();
-        edges.dedup();
-        push_stage(
-            &mut stages,
-            "edge_normalization",
-            started.elapsed().as_millis(),
-            &mut progress,
-        );
-
-        let mut map = Self {
-            snapshot,
-            areas: structure.areas,
-            directories: structure.directories,
-            files: structure.files,
-            classes: code.classes,
-            functions: code.functions,
-            docs: docs.docs,
-            configs: configs.configs,
-            symbols: code.compatibility_symbols,
-            edges,
-            risk_flags: Vec::new(),
-            graph: NormalizedGraph {
-                nodes: Vec::new(),
-                edges: Vec::new(),
-                annotations: Vec::new(),
-            },
-            index: OnceLock::new(),
-            signals: OnceLock::new(),
-        };
-
-        let started = Instant::now();
-        map.risk_flags = passes::overlays::detect_risks(&map);
-        push_stage(
-            &mut stages,
-            "overlays",
-            started.elapsed().as_millis(),
-            &mut progress,
-        );
-
-        let (graph, graph_profile) = build_graph_with_profile(&map);
-        map.graph = graph;
-        push_stage(
-            &mut stages,
-            "graph_nodes",
-            graph_profile.node_materialization_ms,
-            &mut progress,
-        );
-        push_stage(
-            &mut stages,
-            "graph_annotations",
-            graph_profile.annotation_build_ms,
-            &mut progress,
-        );
-        push_stage(
-            &mut stages,
-            "graph_sort",
-            graph_profile.sort_ms,
-            &mut progress,
-        );
-
-        let profile = RepositoryBuildProfile {
-            total_duration_ms: total_started.elapsed().as_millis(),
+        let profile = map.derive_build_profile(
+            total_started.elapsed().as_millis(),
             stages,
-            repo_files: map.snapshot.files.len(),
-            source_files: map
-                .files
-                .iter()
-                .filter(|file| matches!(file.role, crate::model::file::FileRole::Source))
-                .count(),
-            doc_files: map
-                .files
-                .iter()
-                .filter(|file| matches!(file.role, crate::model::file::FileRole::Doc))
-                .count(),
-            config_files: map
-                .files
-                .iter()
-                .filter(|file| matches!(file.role, crate::model::file::FileRole::Config))
-                .count(),
-            areas: map.areas.len(),
-            directories: map.directories.len(),
-            classes: map.classes.len(),
-            functions: map.functions.len(),
-            docs: map.docs.len(),
-            configs: map.configs.len(),
-            graph_nodes: map.graph.nodes.len(),
-            graph_edges: map.graph.edges.len(),
-            graph_annotations: map.graph.annotations.len(),
-            cache_hits: cache_stats.hits,
-            cache_misses: cache_stats.misses,
-        };
-
-        // Save the built map to cache for future runs
-        if !no_cache {
-            map_cache::save_cached_map(root, &map);
-        }
-
+        );
         Ok((map, profile))
     }
 
@@ -597,118 +370,138 @@ impl RepositoryMap {
             .unwrap_or(&[])
     }
 
-    /// Variant C1 fragments path: build the map's **overlay planes**
-    /// (docs / configs / risks) by running the `aethyme-producers`
-    /// producers against the on-disk graph, while the **structure** and
-    /// **code** planes still come from the legacy passes.
-    ///
-    /// ## Why structure + code stay on passes (this commit)
-    ///
-    /// Phase 4.7.7 cuts over only what the producer crate has already
-    /// ported. Structure and code have no producer yet, so we run their
-    /// passes exactly as the default path does, then feed
-    /// `structure.files` into the producers' [`RepoView`]. Sourcing the
-    /// producers from the engine's own structure-filtered file list
-    /// (not a fresh repo walk) keeps both pipelines classifying a
-    /// byte-identical path set — the isolation the parity gate relies
-    /// on.
-    ///
-    /// ## The schema → model impedance
-    ///
-    /// Producers emit *schema* types (`NonCodeFile`, producer
-    /// `RiskFlag`) that are deliberately lossier than the engine *model*
-    /// types this map holds. The conversions below are therefore
-    /// one-directional and stamp empty/derived values for fields the
-    /// producers dropped: `DocNode::title`/`doc_type` and
-    /// `ConfigNode::config_type` become `""`, and overlay-emitted edges
-    /// are discarded. `area_id` is recovered by joining each overlay
-    /// file back to its `FileNode` by path. These gaps are pinned (and
-    /// explained) by the fragments-vs-passes parity test.
+    /// Fragments-only map build: consume committed per-file fragments
+    /// plus overlay producers, then adapt schema nodes into the
+    /// engine's compatibility model types.
     fn populate_from_fragments(root: &Path) -> Result<Self, String> {
-        // -- Structure + code planes: legacy passes (unchanged) --------
-        let snapshot = discover_repo(root)?;
-        let structure = passes::structure::build(&snapshot);
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|err| format!("Failed to canonicalize repo path: {err}"))?;
+        let repo_name = canonical_root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("repo")
+            .to_string();
+        let root_path = canonical_root.to_string_lossy().to_string();
 
-        let grammar_registry =
-            default_grammars_dir().map(|dir| GrammarRegistry::load(&dir));
-        let parse_store = match ParseStore::open(root) {
-            Ok(store) => Some(store),
-            Err(err) => {
-                eprintln!(
-                    "aethyme: parse store unavailable, falling back to no-cache: {err}"
-                );
-                None
-            }
-        };
-        let (code, _code_profile, _cache_stats) = passes::code::build_with_profile(
-            root,
-            &structure,
-            parse_store.as_ref(),
-            grammar_registry.as_ref(),
-        );
-
-        let repo_name = snapshot.repo_name();
-
-        // -- Overlay planes: run the producers against the graph -------
         let store = FragmentStore::open(root).map_err(|err| {
-            format!("open fragment store at {}: {err}", root.display())
+            format!(
+                "open fragment store at {}: {err}. The legacy pass pipeline was deleted in 4.7.12; run `aethyme-graph-index` before using the engine.",
+                root.display()
+            )
         })?;
-        let view = StructureFilesView {
+        let fragments = read_all_fragments(&store)?;
+        if fragments.is_empty() {
+            return Err(format!(
+                "fragment store at {} contains no source fragments; run `aethyme-graph-index` before using the engine",
+                root.display()
+            ));
+        }
+
+        let fragment_files = collect_fragment_files(&fragments);
+        let view = FragmentFilesView {
             name: repo_name.clone(),
-            root_path: snapshot.root.clone(),
-            files: structure
-                .files
-                .iter()
+            root_path: root_path.clone(),
+            files: fragment_files
+                .values()
                 .map(|f| RepoFileView {
                     path: f.path.clone(),
                     language: f.language.clone(),
-                    byte_size: f.size_bytes,
-                    // Doc/config/risk classification is path-only; a
-                    // stub hash keeps view construction cheap without
-                    // touching any compared surface.
-                    content_hash: format!("stub-{}", f.path),
+                    byte_size: f.byte_size,
+                    content_hash: f.content_hash.clone(),
                 })
                 .collect(),
         };
         let ctx = ProducerCtx::with_repo(&store, &view);
 
-        // path → FileNode, for sourcing file_id + area_id by path.
+        let structure_overlay =
+            StructureProducer.produce(&ctx).map_err(|e| e.to_string())?;
+        let structure = structure_overlay.payload();
+
+        let mut top_level_dirs = BTreeSet::new();
+        for file in &structure.files {
+            if let Some((top, _rest)) = file.path().split_once('/') {
+                top_level_dirs.insert(top.to_string());
+            }
+        }
+        let top_level_dirs = top_level_dirs.into_iter().collect::<Vec<_>>();
+        let areas: Vec<AreaNode> = top_level_dirs
+            .iter()
+            .map(|path| AreaNode::new(&repo_name, path, false))
+            .collect();
+        let mut model_id_by_schema: HashMap<String, String> = HashMap::new();
+        let mut directories = Vec::with_capacity(structure.directories.len());
+        for d in &structure.directories {
+            let directory = DirectoryNode::new(
+                &repo_name,
+                d.path(),
+                compatibility_area_id(&repo_name, d.path(), &top_level_dirs),
+            );
+            model_id_by_schema.insert(d.id().as_str().to_string(), directory.id.clone());
+            directories.push(directory);
+        }
+        let mut files = Vec::with_capacity(structure.files.len());
+        for f in &structure.files {
+            let language = optional_language(f.language());
+            let generated = is_generated(f.path());
+            let role = classify_file_role(f.path(), language.as_deref(), generated);
+            let file = FileNode::new(
+                &repo_name,
+                f.path(),
+                language,
+                role,
+                0,
+                f.byte_size(),
+                generated,
+                compatibility_area_id(&repo_name, f.path(), &top_level_dirs),
+            );
+            model_id_by_schema.insert(f.id().as_str().to_string(), file.id.clone());
+            files.push(file);
+        }
+
+        let snapshot = snapshot_from_files(root_path, &files);
         let file_index: HashMap<&str, &FileNode> =
-            structure.files.iter().map(|f| (f.path.as_str(), f)).collect();
+            files.iter().map(|f| (f.path.as_str(), f)).collect();
         let file_id_of = |path: &str| -> String {
             file_index
                 .get(path)
                 .map(|f| f.id.clone())
-                .unwrap_or_else(|| format!("file:{repo_name}:{path}"))
+                .unwrap_or_else(|| path.to_string())
         };
         let area_of =
             |path: &str| -> Option<String> { file_index.get(path).and_then(|f| f.area_id.clone()) };
 
         let configs_overlay =
             ConfigsProducer.produce(&ctx).map_err(|e| e.to_string())?;
-        let configs: Vec<ConfigNode> = configs_overlay
-            .payload()
-            .files
-            .iter()
-            .map(|nc| {
-                let path = nc.path();
-                // config_type is graph-derived in the engine model and
-                // is not carried by the producer overlay; stamp empty.
-                ConfigNode::new(&repo_name, &file_id_of(path), path, "", area_of(path))
-            })
-            .collect();
+        let mut configs = Vec::with_capacity(configs_overlay.payload().files.len());
+        for nc in &configs_overlay.payload().files {
+            let path = nc.path();
+            let config = ConfigNode::new(
+                &repo_name,
+                &file_id_of(path),
+                path,
+                &classify_config_type(path),
+                area_of(path),
+            );
+            model_id_by_schema.insert(nc.id().as_str().to_string(), config.id.clone());
+            configs.push(config);
+        }
 
         let docs_overlay = DocsProducer.produce(&ctx).map_err(|e| e.to_string())?;
-        let docs: Vec<DocNode> = docs_overlay
-            .payload()
-            .files
-            .iter()
-            .map(|nc| {
-                let path = nc.path();
-                // title + doc_type are dropped by the docs producer.
-                DocNode::new(&repo_name, &file_id_of(path), path, "", "", area_of(path))
-            })
-            .collect();
+        let mut docs = Vec::with_capacity(docs_overlay.payload().files.len());
+        for nc in &docs_overlay.payload().files {
+            let path = nc.path();
+            let doc = DocNode::new(
+                &repo_name,
+                &file_id_of(path),
+                path,
+                leaf_name(path),
+                &classify_doc_type(path, ""),
+                area_of(path),
+            );
+            model_id_by_schema.insert(nc.id().as_str().to_string(), doc.id.clone());
+            docs.push(doc);
+        }
 
         let risks_overlay = RisksProducer.produce(&ctx).map_err(|e| e.to_string())?;
         let risk_flags: Vec<RiskFlag> = risks_overlay
@@ -725,25 +518,82 @@ impl RepositoryMap {
             })
             .collect();
 
-        // -- Edges: structure + code only; overlay edges are dropped ---
+        let mut classes = Vec::new();
+        for fragment in &fragments {
+            let Some(file) = file_index.get(fragment.file_path()) else {
+                continue;
+            };
+            for node in fragment.nodes() {
+                if let Some((schema_id, class)) =
+                    class_from_schema_node(node, file, &repo_name)
+                {
+                    model_id_by_schema.insert(schema_id, class.id.to_string());
+                    classes.push(class);
+                }
+            }
+        }
+        classes.sort();
+        classes.dedup();
+
+        let mut functions = Vec::new();
+        for fragment in &fragments {
+            let Some(file) = file_index.get(fragment.file_path()) else {
+                continue;
+            };
+            for node in fragment.nodes() {
+                if let Some((schema_id, function)) =
+                    function_from_schema_node(node, file, &repo_name, &model_id_by_schema)
+                {
+                    model_id_by_schema.insert(schema_id, function.id.to_string());
+                    functions.push(function);
+                }
+            }
+        }
+        functions.sort();
+        functions.dedup();
+
+        let mut symbols = compatibility_symbols(&classes, &functions);
+
         let mut edges = Vec::new();
-        edges.extend(structure.edges.clone());
-        edges.extend(code.edges.clone());
+        let model_repo_id = format!("repo:{repo_name}");
+        edges.extend(structure.edges.iter().map(|edge| {
+            schema_edge_to_model_with_repo(
+                edge,
+                structure.repository.id().as_str(),
+                &model_repo_id,
+                &model_id_by_schema,
+            )
+        }));
+        edges.extend(compatibility_area_edges(
+            &model_repo_id,
+            &areas,
+            &directories,
+            &files,
+        ));
+        edges.extend(compatibility_overlay_edges(&docs, &configs));
+        for fragment in &fragments {
+            edges.extend(
+                fragment
+                    .edges()
+                    .iter()
+                    .map(|edge| schema_edge_to_model(edge, &model_id_by_schema)),
+            );
+        }
         edges.sort();
         edges.dedup();
+        symbols.sort();
+        symbols.dedup();
 
-        // `file_index` borrows `structure.files`; its last use (via the
-        // closures above) precedes the move below, so NLL permits it.
         let mut map = Self {
             snapshot,
-            areas: structure.areas,
-            directories: structure.directories,
-            files: structure.files,
-            classes: code.classes,
-            functions: code.functions,
+            areas,
+            directories,
+            files,
+            classes,
+            functions,
             docs,
             configs,
-            symbols: code.compatibility_symbols,
+            symbols,
             edges,
             risk_flags,
             graph: NormalizedGraph {
@@ -761,10 +611,9 @@ impl RepositoryMap {
     }
 
     /// Assemble a [`RepositoryBuildProfile`] for a fragments-sourced
-    /// map. Mirrors the cache-hit profile block: per-plane counts are
-    /// read straight off the finished map, and `cache_hits` /
-    /// `cache_misses` are zero because the fragments path bypasses the
-    /// map cache entirely (see the gate comment in `build_internal`).
+    /// map. Per-plane counts are read straight off the finished map, and
+    /// `cache_hits` / `cache_misses` are zero because the parse-store
+    /// cache was deleted in 4.7.11.
     fn derive_build_profile(
         &self,
         total_duration_ms: u128,
@@ -805,14 +654,6 @@ impl RepositoryMap {
     }
 }
 
-/// True when `root` already holds a materialized on-disk graph at
-/// `<root>/.aethyme/graph/`. The fragments build path is gated on this:
-/// `--from-fragments` falls back to the legacy pass pipeline when no
-/// graph directory is present, so a fresh checkout never hard-fails.
-fn fragments_dir_exists(root: &Path) -> bool {
-    root.join(AETHYME_DIR).join(GRAPH_SUBDIR).is_dir()
-}
-
 /// Convert the producer crate's
 /// [`RiskArea`](aethyme_producers::risks::RiskArea) into the engine
 /// model's [`RiskArea`](crate::model::risk::RiskArea). The two enums are
@@ -850,20 +691,22 @@ fn convert_risk_level(
     }
 }
 
-/// Minimal [`RepoView`] backed by a structure pass's file list. The
-/// overlay producers (`ConfigsProducer` / `DocsProducer` /
-/// `RisksProducer`) classify on path shape alone, so handing them the
-/// engine's already structure-filtered `FileNode` paths makes them see
-/// the exact file set the legacy passes saw — the precondition for
-/// fragments-vs-passes parity. Owns its fields and lends them back
-/// through the trait.
-struct StructureFilesView {
+#[derive(Debug, Clone)]
+struct FragmentFileInfo {
+    path: String,
+    language: Option<String>,
+    byte_size: u64,
+    content_hash: String,
+}
+
+/// Minimal [`RepoView`] backed by committed fragment paths.
+struct FragmentFilesView {
     name: String,
     root_path: String,
     files: Vec<RepoFileView>,
 }
 
-impl RepoView for StructureFilesView {
+impl RepoView for FragmentFilesView {
     fn name(&self) -> &str {
         &self.name
     }
@@ -879,6 +722,640 @@ impl RepoView for StructureFilesView {
     fn files(&self) -> &[RepoFileView] {
         &self.files
     }
+}
+
+fn read_all_fragments(store: &FragmentStore) -> Result<Vec<Fragment>, String> {
+    let paths = store
+        .list_indexed_source_paths()
+        .map_err(|err| format!("list indexed fragments: {err}"))?;
+    let mut fragments = Vec::with_capacity(paths.len());
+    for path in paths {
+        let fragment = store
+            .read_fragment(&path)
+            .map_err(|err| format!("read fragment {path}: {err}"))?;
+        fragments.push(fragment);
+    }
+    Ok(fragments)
+}
+
+fn collect_fragment_files(
+    fragments: &[Fragment],
+) -> std::collections::BTreeMap<String, FragmentFileInfo> {
+    let mut files = std::collections::BTreeMap::new();
+    for fragment in fragments {
+        let mut info = None;
+        for node in fragment.nodes() {
+            match node {
+                Node::File(file) => {
+                    info = Some(FragmentFileInfo {
+                        path: file.path().to_string(),
+                        language: optional_language(file.language()),
+                        byte_size: file.byte_size(),
+                        content_hash: file.content_hash().to_string(),
+                    });
+                    break;
+                }
+                Node::NonCodeFile(file) => {
+                    info = Some(FragmentFileInfo {
+                        path: file.path().to_string(),
+                        language: Some(non_code_format_label(file.format()).to_string()),
+                        byte_size: 0,
+                        content_hash: format!("fragment-{}", file.path()),
+                    });
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let info = info.unwrap_or_else(|| FragmentFileInfo {
+            path: fragment.file_path().to_string(),
+            language: None,
+            byte_size: 0,
+            content_hash: format!("fragment-{}", fragment.file_path()),
+        });
+        files.insert(info.path.clone(), info);
+    }
+    files
+}
+
+fn snapshot_from_files(root_path: String, files: &[FileNode]) -> RepoSnapshot {
+    let mut languages = BTreeSet::new();
+    let mut top_level_dirs = BTreeSet::new();
+    let mut readme_path = None;
+    let mut repo_files = Vec::with_capacity(files.len());
+
+    for file in files {
+        if let Some(language) = &file.language {
+            languages.insert(language.clone());
+        }
+        if let Some((top, _rest)) = file.path.split_once('/') {
+            top_level_dirs.insert(top.to_string());
+        }
+        if readme_path.is_none() {
+            let lowercase = leaf_name(&file.path).to_ascii_lowercase();
+            if lowercase == "readme.md" || lowercase == "readme" {
+                readme_path = Some(file.path.clone());
+            }
+        }
+        repo_files.push(RepoFile {
+            path: file.path.clone(),
+            language: file.language.clone(),
+            line_count: file.line_count,
+            size_bytes: file.size_bytes,
+        });
+    }
+
+    repo_files.sort_by(|left, right| left.path.cmp(&right.path));
+
+    RepoSnapshot {
+        root: root_path,
+        files: repo_files,
+        languages: languages.into_iter().collect(),
+        top_level_dirs: top_level_dirs.into_iter().collect(),
+        readme_path,
+    }
+}
+
+fn class_from_schema_node(
+    node: &Node,
+    file: &FileNode,
+    repo_name: &str,
+) -> Option<(String, ClassNode)> {
+    match node {
+        Node::Class(value) => Some((
+            value.id().as_str().to_string(),
+            class_node(repo_name, value.name(), value.source_range(), "class", file),
+        )),
+        Node::Struct(value) => Some((
+            value.id().as_str().to_string(),
+            class_node(repo_name, value.name(), value.source_range(), "struct", file),
+        )),
+        Node::Interface(value) => Some((
+            value.id().as_str().to_string(),
+            class_node(
+                repo_name,
+                value.name(),
+                value.source_range(),
+                "interface",
+                file,
+            ),
+        )),
+        Node::Trait(value) => Some((
+            value.id().as_str().to_string(),
+            class_node(repo_name, value.name(), value.source_range(), "trait", file),
+        )),
+        Node::Enum(value) => Some((
+            value.id().as_str().to_string(),
+            class_node(repo_name, value.name(), value.source_range(), "enum", file),
+        )),
+        Node::TypeAlias(value) => Some((
+            value.id().as_str().to_string(),
+            class_node(repo_name, value.name(), value.source_range(), "type", file),
+        )),
+        _ => None,
+    }
+}
+
+fn class_node(
+    repo_name: &str,
+    name: &str,
+    source_range: SourceRange,
+    kind: &str,
+    file: &FileNode,
+) -> ClassNode {
+    let file_path = InternedStr::from(file.path.clone());
+    ClassNode::new(
+        repo_name,
+        InternedStr::from(file.id.clone()),
+        file_path,
+        file.area_id.clone().map(InternedStr::from),
+        InternedStr::from(file.language.clone().unwrap_or_else(|| "unknown".to_string())),
+        InternedStr::from(name),
+        source_range.start_line() as usize,
+        InternedStr::from(format!("{kind} {name}")),
+    )
+}
+
+fn function_from_schema_node(
+    node: &Node,
+    file: &FileNode,
+    repo_name: &str,
+    model_id_by_schema: &HashMap<String, String>,
+) -> Option<(String, FunctionNode)> {
+    match node {
+        Node::Function(value) => Some((
+            value.id().as_str().to_string(),
+            function_node(
+                repo_name,
+                value.name(),
+                value.signature(),
+                value.source_range(),
+                None,
+                file,
+            ),
+        )),
+        Node::Method(value) => Some((
+            value.id().as_str().to_string(),
+            function_node(
+                repo_name,
+                value.name(),
+                value.signature(),
+                value.source_range(),
+                model_id_by_schema
+                    .get(value.receiver_type().as_str())
+                    .cloned()
+                    .map(InternedStr::from),
+                file,
+            ),
+        )),
+        Node::Lambda(value) => Some((
+            value.id().as_str().to_string(),
+            function_node(
+                repo_name,
+                value.name(),
+                value.signature(),
+                value.source_range(),
+                model_id_by_schema
+                    .get(value.enclosing_callable_id().as_str())
+                    .cloned()
+                    .map(InternedStr::from),
+                file,
+            ),
+        )),
+        _ => None,
+    }
+}
+
+fn function_node(
+    repo_name: &str,
+    name: &str,
+    signature: &str,
+    source_range: SourceRange,
+    parent_class_id: Option<InternedStr>,
+    file: &FileNode,
+) -> FunctionNode {
+    let file_path = InternedStr::from(file.path.clone());
+    FunctionNode::new(
+        repo_name,
+        InternedStr::from(file.id.clone()),
+        file_path,
+        file.area_id.clone().map(InternedStr::from),
+        parent_class_id,
+        InternedStr::from(file.language.clone().unwrap_or_else(|| "unknown".to_string())),
+        InternedStr::from(name),
+        source_range.start_line() as usize,
+        InternedStr::from(signature),
+    )
+}
+
+fn compatibility_symbols(
+    classes: &[ClassNode],
+    functions: &[FunctionNode],
+) -> Vec<Symbol> {
+    let mut symbols = Vec::with_capacity(classes.len() + functions.len());
+    for class in classes {
+        symbols.push(
+            Symbol::new(
+                class.name.clone(),
+                SymbolKind::Class,
+                class.file_path.clone(),
+                class.line,
+                class.signature.clone(),
+            )
+            .with_context(Some(class.language.clone()), class.area_id.clone()),
+        );
+    }
+    for function in functions {
+        symbols.push(
+            Symbol::new(
+                function.name.clone(),
+                SymbolKind::Function,
+                function.file_path.clone(),
+                function.line,
+                function.signature.clone(),
+            )
+            .with_context(Some(function.language.clone()), function.area_id.clone()),
+        );
+    }
+    symbols
+}
+
+fn compatibility_area_id(
+    repo_name: &str,
+    path: &str,
+    top_level_dirs: &[String],
+) -> Option<String> {
+    let first = path.split('/').next()?;
+    if top_level_dirs.iter().any(|dir| dir == first) {
+        Some(format!("area:{repo_name}:{first}"))
+    } else {
+        None
+    }
+}
+
+fn compatibility_area_edges(
+    repo_id: &str,
+    areas: &[AreaNode],
+    directories: &[DirectoryNode],
+    files: &[FileNode],
+) -> Vec<Edge> {
+    let mut edges = Vec::new();
+    for area in areas {
+        edges.push(Edge::new(
+            repo_id,
+            &area.id,
+            EdgeKind::Contains,
+            1000,
+            "structure",
+        ));
+    }
+    for directory in directories {
+        if let Some(area_id) = &directory.area_id {
+            edges.push(Edge::new(
+                area_id,
+                &directory.id,
+                EdgeKind::Contains,
+                1000,
+                "structure",
+            ));
+            edges.push(Edge::new(
+                &directory.id,
+                area_id,
+                EdgeKind::BelongsTo,
+                1000,
+                "structure",
+            ));
+        }
+    }
+    for file in files {
+        if let Some(area_id) = &file.area_id {
+            edges.push(Edge::new(
+                &file.id,
+                area_id,
+                EdgeKind::BelongsTo,
+                1000,
+                "structure",
+            ));
+        }
+    }
+    edges
+}
+
+fn compatibility_overlay_edges(
+    docs: &[DocNode],
+    configs: &[ConfigNode],
+) -> Vec<Edge> {
+    let mut edges = Vec::with_capacity(docs.len() + configs.len());
+    for doc in docs {
+        edges.push(Edge::new(
+            &doc.file_id,
+            &doc.id,
+            EdgeKind::Documents,
+            900,
+            "docs",
+        ));
+    }
+    for config in configs {
+        edges.push(Edge::new(
+            &config.file_id,
+            &config.id,
+            EdgeKind::Configures,
+            900,
+            "config",
+        ));
+        if let Some(area_id) = &config.area_id {
+            edges.push(Edge::new(
+                &config.id,
+                area_id,
+                EdgeKind::Configures,
+                700,
+                "config",
+            ));
+        }
+    }
+    edges
+}
+
+fn schema_edge_to_model(
+    edge: &aethyme_graph_schema::Edge,
+    model_id_by_schema: &HashMap<String, String>,
+) -> Edge {
+    schema_edge_to_model_with_repo(edge, "", "", model_id_by_schema)
+}
+
+fn schema_edge_to_model_with_repo(
+    edge: &aethyme_graph_schema::Edge,
+    schema_repo_id: &str,
+    model_repo_id: &str,
+    model_id_by_schema: &HashMap<String, String>,
+) -> Edge {
+    let from = schema_endpoint_to_model_id(
+        edge.src_id().as_str(),
+        schema_repo_id,
+        model_repo_id,
+        model_id_by_schema,
+    );
+    let to = schema_endpoint_to_model_id(
+        edge.dst_id().as_str(),
+        schema_repo_id,
+        model_repo_id,
+        model_id_by_schema,
+    );
+    Edge::new(
+        &from,
+        &to,
+        schema_edge_kind_to_model(edge.kind()),
+        edge.confidence().as_milli(),
+        edge.source().name(),
+    )
+}
+
+fn schema_endpoint_to_model_id(
+    schema_id: &str,
+    schema_repo_id: &str,
+    model_repo_id: &str,
+    model_id_by_schema: &HashMap<String, String>,
+) -> String {
+    if !schema_repo_id.is_empty() && schema_id == schema_repo_id {
+        model_repo_id.to_string()
+    } else {
+        model_id_by_schema
+            .get(schema_id)
+            .cloned()
+            .unwrap_or_else(|| schema_id.to_string())
+    }
+}
+
+fn schema_edge_kind_to_model(kind: SchemaEdgeKind) -> EdgeKind {
+    match kind {
+        SchemaEdgeKind::Contains => EdgeKind::Contains,
+        SchemaEdgeKind::Defines => EdgeKind::Defines,
+        SchemaEdgeKind::Imports => EdgeKind::Imports,
+        SchemaEdgeKind::Calls => EdgeKind::Calls,
+        SchemaEdgeKind::Configures => EdgeKind::Configures,
+        SchemaEdgeKind::Documents => EdgeKind::Documents,
+        SchemaEdgeKind::References
+        | SchemaEdgeKind::Decides
+        | SchemaEdgeKind::Deprecates
+        | SchemaEdgeKind::Implements
+        | SchemaEdgeKind::Inherits
+        | SchemaEdgeKind::Reads
+        | SchemaEdgeKind::Uses
+        | SchemaEdgeKind::Writes
+        | SchemaEdgeKind::Mocks
+        | SchemaEdgeKind::Tests => EdgeKind::References,
+    }
+}
+
+fn optional_language(language: &str) -> Option<String> {
+    if language == "unknown" {
+        None
+    } else {
+        Some(language.to_string())
+    }
+}
+
+fn non_code_format_label(format: &NonCodeFormat) -> &'static str {
+    match format {
+        NonCodeFormat::Markdown => "markdown",
+        NonCodeFormat::Yaml => "yaml",
+        NonCodeFormat::Json => "json",
+        NonCodeFormat::Toml => "toml",
+        NonCodeFormat::Plain => "plain",
+        NonCodeFormat::Other(_) => "other",
+    }
+}
+
+fn leaf_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn is_generated(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("generated") || lower.ends_with(".min.js") || lower.ends_with(".lock")
+}
+
+fn classify_file_role(
+    path: &str,
+    language: Option<&str>,
+    generated: bool,
+) -> FileRole {
+    if generated {
+        return FileRole::Generated;
+    }
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("__pycache__")
+        || lower.contains(".pytest_cache")
+        || lower.contains(".mypy_cache")
+    {
+        return FileRole::Cache;
+    }
+    if lower.ends_with(".md")
+        || lower.ends_with(".mdx")
+        || lower.ends_with(".rst")
+        || lower.ends_with("readme")
+    {
+        return FileRole::Doc;
+    }
+    if is_operational_config_path(&lower) {
+        return FileRole::Config;
+    }
+    if lower.contains("test") || lower.contains("spec") {
+        return FileRole::Test;
+    }
+    if language.is_some_and(is_code_language) {
+        return FileRole::Source;
+    }
+    if lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".svg")
+        || lower.ends_with(".db")
+        || lower.ends_with(".sqlite")
+        || lower.ends_with(".tres")
+        || lower.ends_with(".tscn")
+    {
+        return FileRole::Asset;
+    }
+    FileRole::Unknown
+}
+
+fn is_code_language(language: &str) -> bool {
+    !matches!(
+        language,
+        "markdown" | "yaml" | "json" | "toml" | "plain" | "other"
+    )
+}
+
+fn classify_config_type(path: &str) -> String {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with("cargo.toml")
+        || lower.ends_with("package.json")
+        || lower.ends_with("pyproject.toml")
+    {
+        "manifest".to_string()
+    } else if lower.ends_with("project.godot") {
+        "project".to_string()
+    } else if lower.ends_with("dockerfile")
+        || lower.ends_with("docker-compose.yml")
+        || lower.ends_with("docker-compose.yaml")
+    {
+        "runtime".to_string()
+    } else if lower.ends_with(".yaml") || lower.ends_with(".yml") {
+        "yaml".to_string()
+    } else if lower.ends_with(".toml") {
+        "toml".to_string()
+    } else if lower.ends_with(".json") {
+        "json".to_string()
+    } else {
+        "config".to_string()
+    }
+}
+
+fn classify_doc_type(path: &str, title: &str) -> String {
+    let lower_path = path.to_ascii_lowercase();
+    let lower_title = title.to_ascii_lowercase();
+    if lower_path.ends_with("readme.md") {
+        "readme".to_string()
+    } else if lower_path.contains("architecture") || lower_title.contains("architecture") {
+        "architecture".to_string()
+    } else if lower_path.contains("guide") || lower_title.contains("guide") {
+        "guide".to_string()
+    } else if lower_path.contains("spec") || lower_title.contains("spec") {
+        "spec".to_string()
+    } else {
+        "documentation".to_string()
+    }
+}
+
+fn is_operational_config_path(lower_path: &str) -> bool {
+    let file_name = lower_path.rsplit('/').next().unwrap_or(lower_path);
+
+    if matches!(
+        file_name,
+        "cargo.toml"
+            | "package.json"
+            | "pyproject.toml"
+            | "project.godot"
+            | "dockerfile"
+            | "docker-compose.yml"
+            | "docker-compose.yaml"
+            | "tsconfig.json"
+            | "jsconfig.json"
+            | "turbo.json"
+            | "biome.json"
+            | "deno.json"
+            | "deno.jsonc"
+            | "pnpm-workspace.yaml"
+            | "pnpm-workspace.yml"
+    ) {
+        return true;
+    }
+
+    if file_name.starts_with(".env")
+        || file_name.starts_with(".gitignore")
+        || file_name.starts_with(".dockerignore")
+        || file_name.starts_with(".npmrc")
+        || file_name.starts_with(".yarnrc")
+        || file_name.starts_with(".prettierrc")
+        || file_name.starts_with(".eslintrc")
+        || file_name.starts_with(".stylelintrc")
+        || file_name.starts_with(".editorconfig")
+    {
+        return true;
+    }
+
+    if lower_path.starts_with(".github/workflows/")
+        || lower_path.contains("/.github/workflows/")
+        || lower_path.starts_with("config/")
+        || lower_path.contains("/config/")
+        || lower_path.starts_with("configs/")
+        || lower_path.contains("/configs/")
+        || lower_path.starts_with("deploy/")
+        || lower_path.contains("/deploy/")
+        || lower_path.starts_with("deployment/")
+        || lower_path.contains("/deployment/")
+        || lower_path.starts_with("infra/")
+        || lower_path.contains("/infra/")
+        || lower_path.starts_with("k8s/")
+        || lower_path.contains("/k8s/")
+        || lower_path.starts_with("helm/")
+        || lower_path.contains("/helm/")
+    {
+        return lower_path.ends_with(".yaml")
+            || lower_path.ends_with(".yml")
+            || lower_path.ends_with(".toml")
+            || lower_path.ends_with(".json");
+    }
+
+    lower_path.ends_with(".env")
+}
+
+#[cfg(test)]
+fn ensure_test_fragments(root: &Path) -> Result<(), String> {
+    if root.join(".aethyme").join("graph").is_dir() {
+        return Ok(());
+    }
+    let canonical = root
+        .canonicalize()
+        .map_err(|err| format!("test repo canonicalize: {err}"))?;
+    let repo_name = canonical
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("testrepo");
+    aethyme_graph_storage::bootstrap_repo(&canonical, "test")
+        .map_err(|err| format!("test repo bootstrap: {err}"))?;
+    let ctx =
+        aethyme_graph_indexer::IndexerContext::new(repo_name, canonical.clone(), "test")
+            .map_err(|err| format!("test index context: {err}"))?;
+    aethyme_graph_indexer::index_repo_to_disk(
+        &ctx,
+        &aethyme_graph_indexer::WalkOptions::default(),
+    )
+    .map_err(|err| format!("test index repo: {err}"))?;
+    aethyme_graph_indexer::link_repo(&ctx)
+        .map_err(|err| format!("test link repo: {err}"))?;
+    Ok(())
 }
 
 fn stage_profile(name: &str, duration_ms: u128) -> BuildStageProfile {
@@ -905,6 +1382,68 @@ fn push_unique(values: &mut Vec<String>, candidate: String) {
     if !values.contains(&candidate) {
         values.push(candidate);
     }
+}
+
+fn graph_annotations(map: &RepositoryMap) -> Vec<GraphAnnotation> {
+    let mut annotations = Vec::new();
+    let file_ids_by_path = map
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file.id.clone()))
+        .collect::<HashMap<_, _>>();
+    annotations.reserve(map.risk_flags.len() + map.docs.len() + map.configs.len());
+    for risk in &map.risk_flags {
+        if let Some(file_id) = file_ids_by_path.get(risk.scope.as_str()) {
+            let (confidence, level_str) = match risk.level {
+                RiskLevel::High => (1000, "high"),
+                RiskLevel::Medium => (800, "medium"),
+                RiskLevel::Low => (600, "low"),
+            };
+            annotations.push(GraphAnnotation {
+                target_id: file_id.clone(),
+                kind: "risk".to_string(),
+                value: format!("{:?}", risk.area).to_ascii_lowercase(),
+                confidence,
+                source: "risk-overlay".to_string(),
+                reason: format!("{} ({})", risk.reason, level_str),
+            });
+        }
+    }
+    for doc in &map.docs {
+        annotations.push(GraphAnnotation {
+            target_id: doc.id.clone(),
+            kind: "doc_type".to_string(),
+            value: doc.doc_type.clone(),
+            confidence: 900,
+            source: "docs".to_string(),
+            reason: format!("documentation classified as {}", doc.doc_type),
+        });
+    }
+    for config in &map.configs {
+        annotations.push(GraphAnnotation {
+            target_id: config.id.clone(),
+            kind: "config_type".to_string(),
+            value: config.config_type.clone(),
+            confidence: 900,
+            source: "config".to_string(),
+            reason: format!("configuration classified as {}", config.config_type),
+        });
+    }
+    for edge in &map.edges {
+        if matches!(edge.kind, EdgeKind::EntrypointFor) {
+            annotations.push(GraphAnnotation {
+                target_id: edge.from.to_string(),
+                kind: "navigation".to_string(),
+                value: "entrypoint".to_string(),
+                confidence: edge.confidence,
+                source: edge.source.to_string(),
+                reason: "edge inferred as navigation entrypoint".to_string(),
+            });
+        }
+    }
+    annotations.sort();
+    annotations.dedup();
+    annotations
 }
 
 fn build_graph_with_profile(map: &RepositoryMap) -> (NormalizedGraph, GraphBuildProfile) {
@@ -1021,7 +1560,7 @@ fn build_graph_with_profile(map: &RepositoryMap) -> (NormalizedGraph, GraphBuild
     let node_materialization_ms = nodes_started.elapsed().as_millis();
 
     let annotation_started = Instant::now();
-    let annotations = passes::overlays::graph_annotations(map);
+    let annotations = graph_annotations(map);
     let annotation_build_ms = annotation_started.elapsed().as_millis();
     let mut graph = NormalizedGraph {
         nodes,
@@ -1063,7 +1602,6 @@ mod tests {
 
         let map = RepositoryMap::build(&root).expect("build repository map");
 
-        assert!(!map.areas.is_empty());
         assert!(!map.directories.is_empty());
         assert!(
             map.functions
@@ -1099,10 +1637,14 @@ mod tests {
             profile
                 .stages
                 .iter()
-                .any(|stage| stage.name == "discover_repo")
+                .any(|stage| stage.name == "populate_from_fragments")
         );
         assert_eq!(profile.repo_files, map.snapshot.files.len());
         assert_eq!(profile.graph_nodes, map.graph.nodes.len());
+        assert!(
+            !root.join(".aethyme/parse_store.redb").exists(),
+            "RepositoryMap builds must not recreate the deleted ParseStore"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -24,6 +24,34 @@ use aethyme_engine::model::task::TaskInput;
 use aethyme_engine::pipeline::{build_context_pack, build_context_pack_with_content};
 use aethyme_engine::workspace::{build_workspace_graph, cross_repo_blast_radius};
 
+#[derive(Clone, Copy)]
+enum FragmentBuildMode {
+    /// Use committed fragments. The legacy pass pipeline was removed
+    /// in 4.7.12, so missing fragments are a build error.
+    Prefer,
+    /// Legacy diagnostic spelling; equivalent to `Prefer` after 4.7.12.
+    Force,
+}
+
+impl FragmentBuildMode {
+    fn from_flags(no_fragments: bool, legacy_from_fragments: bool) -> Result<Self, String> {
+        if no_fragments && legacy_from_fragments {
+            return Err(legacy_pass_removed_error());
+        }
+        if no_fragments {
+            Err(legacy_pass_removed_error())
+        } else if legacy_from_fragments {
+            Ok(Self::Force)
+        } else {
+            Ok(Self::Prefer)
+        }
+    }
+
+    fn forces_fragments(self) -> bool {
+        matches!(self, Self::Force)
+    }
+}
+
 fn main() {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
@@ -41,19 +69,20 @@ fn run() -> Result<(), String> {
     }
 
     let no_cache = has_flag(&args, "--no-cache");
-    // Phase 4.7.7 (gated): opt in to populating the map FROM the on-disk
-    // graph (fragments + overlay producers) instead of the legacy pass
-    // pipeline. Falls back to the pass pipeline when no graph dir exists,
-    // and bypasses the map cache by design, so it overrides --no-cache.
-    let from_fragments = has_flag(&args, "--from-fragments");
+    let no_fragments = has_flag(&args, "--no-fragments");
+    let legacy_from_fragments = has_flag(&args, "--from-fragments");
+    // Phase 4.7.12: the on-disk graph is the only build source.
+    // `--from-fragments` remains a compatibility spelling;
+    // `--no-fragments` errors because the rollback path is gone.
+    let fragment_mode = FragmentBuildMode::from_flags(no_fragments, legacy_from_fragments)?;
     let command = args.remove(0);
     match command.as_str() {
-        "daemon" => return run_daemon_subcommand(&args, no_cache),
+        "daemon" => return run_daemon_subcommand(&args, no_cache, fragment_mode),
         "explore" => return run_explore_subcommand(&args),
         "inspect" => {
             let repo = read_option(&args, "--repo")?;
             let mode = read_option(&args, "--mode").unwrap_or_else(|_| "full".to_string());
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let mut stdout = std::io::stdout().lock();
             match mode.as_str() {
                 "brief" => writeln!(stdout, "{}", aethyme_engine::json::inspect_brief(&map))
@@ -73,21 +102,22 @@ fn run() -> Result<(), String> {
         }
         "build-profile" => {
             let repo = read_option(&args, "--repo")?;
-            let (_map, profile) = if from_fragments {
-                RepositoryMap::build_from_fragments(&PathBuf::from(&repo))?
-            } else if no_cache {
-                RepositoryMap::build_no_cache(&PathBuf::from(&repo))?
-            } else {
-                RepositoryMap::build_with_profile_and_progress(&PathBuf::from(&repo), |stage| {
-                    eprintln!("stage={} duration_ms={}", stage.name, stage.duration_ms)
-                })?
+            let (_map, profile) = match fragment_mode {
+                FragmentBuildMode::Force => {
+                    RepositoryMap::build_from_fragments(&PathBuf::from(&repo))?
+                }
+                FragmentBuildMode::Prefer => RepositoryMap::build_with_fragment_preference(
+                    &PathBuf::from(&repo),
+                    no_cache,
+                    |stage| eprintln!("stage={} duration_ms={}", stage.name, stage.duration_ms),
+                )?,
             };
             println!("{}", aethyme_engine::json::build_profile(&profile));
         }
         "symbol" => {
             let repo = read_option(&args, "--repo")?;
             let query = read_option(&args, "--query")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let hits = symbol_search(&map, &query, 20);
             println!("{}", aethyme_engine::json::search_hits(&hits));
         }
@@ -101,7 +131,7 @@ fn run() -> Result<(), String> {
                 .ok()
                 .and_then(|raw| raw.parse::<usize>().ok())
                 .unwrap_or(20);
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let results = queries
                 .iter()
                 .map(|query| (query.clone(), symbol_search(&map, query, limit)))
@@ -111,7 +141,7 @@ fn run() -> Result<(), String> {
         "graph-node" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let view =
                 node_view(&map, &target).ok_or_else(|| format!("node not found: {target}"))?;
             println!("{}", aethyme_engine::json::graph_node_view(&view));
@@ -119,7 +149,7 @@ fn run() -> Result<(), String> {
         "graph-children" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             println!(
                 "{}",
                 aethyme_engine::json::graph_relation(&children_view(&map, &target))
@@ -128,7 +158,7 @@ fn run() -> Result<(), String> {
         "graph-parents" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             println!(
                 "{}",
                 aethyme_engine::json::graph_relation(&parents_view(&map, &target))
@@ -137,7 +167,7 @@ fn run() -> Result<(), String> {
         "graph-callers" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             println!(
                 "{}",
                 aethyme_engine::json::graph_relation(&callers_view(&map, &target))
@@ -146,7 +176,7 @@ fn run() -> Result<(), String> {
         "graph-callees" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             println!(
                 "{}",
                 aethyme_engine::json::graph_relation(&callees_view(&map, &target))
@@ -155,7 +185,7 @@ fn run() -> Result<(), String> {
         "graph-docs" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             println!(
                 "{}",
                 aethyme_engine::json::graph_relation(&docs_view(&map, &target))
@@ -164,7 +194,7 @@ fn run() -> Result<(), String> {
         "graph-configs" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             println!(
                 "{}",
                 aethyme_engine::json::graph_relation(&configs_view(&map, &target))
@@ -173,14 +203,14 @@ fn run() -> Result<(), String> {
         "graph-expand" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let view = graph_expand_view(&map, &target)
                 .ok_or_else(|| format!("node not found: {target}"))?;
             println!("{}", aethyme_engine::json::graph_expand_view(&view));
         }
         "graph-overview" => {
             let repo = read_option(&args, "--repo")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             println!(
                 "{}",
                 aethyme_engine::json::repo_overview_view(&graph_overview_view(&map))
@@ -189,14 +219,14 @@ fn run() -> Result<(), String> {
         "graph-deps" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let deps = dependency_frontier(&map, &target);
             println!("{}", aethyme_engine::json::string_list(&deps));
         }
         "impact" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let impact = impact_frontier(&map, &target);
             println!("{}", aethyme_engine::json::string_list(&impact));
         }
@@ -204,7 +234,7 @@ fn run() -> Result<(), String> {
             let repo = read_option(&args, "--repo")?;
             let task_value = read_option(&args, "--task")?;
             let root = PathBuf::from(&repo);
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let task = TaskInput::from_task_text(&task_value);
             let pack = build_context_pack(&root, &map, task);
             let mut stdout = std::io::stdout().lock();
@@ -220,7 +250,7 @@ fn run() -> Result<(), String> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(80_000);
             let root = PathBuf::from(&repo);
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let task = TaskInput::from_task_text(&task_value);
             let pack = build_context_pack_with_content(&root, &map, task, content_budget);
             let mut stdout = std::io::stdout().lock();
@@ -230,7 +260,7 @@ fn run() -> Result<(), String> {
         }
         "task-anchors" => {
             let repo = read_option(&args, "--repo")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let task_value = read_option(&args, "--task")?;
             let task = TaskInput::from_task_text(&task_value);
             println!(
@@ -240,7 +270,7 @@ fn run() -> Result<(), String> {
         }
         "task-scope" => {
             let repo = read_option(&args, "--repo")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let task_value = read_option(&args, "--task")?;
             let task = TaskInput::from_task_text(&task_value);
             println!(
@@ -250,7 +280,7 @@ fn run() -> Result<(), String> {
         }
         "task-next" => {
             let repo = read_option(&args, "--repo")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let task_value = read_option(&args, "--task")?;
             let task = TaskInput::from_task_text(&task_value);
             println!(
@@ -264,18 +294,19 @@ fn run() -> Result<(), String> {
             let profile = has_flag(&args, "--profile");
             let mut profiler = StageProfiler::new("task-localize", profile);
 
-            // Use build_with_profile so we can fold the internal per-stage
-            // timings (discover_repo, structure, code_parse_files, etc.) into
-            // our profiler output. `RepositoryMap::build` only returned the
-            // map, so previously we could only see total map_build time.
-            let (map, build_profile) = profiler.stage("map_build", || {
-                if from_fragments {
+            // Use build_with_profile so we can fold the fragments build
+            // timing into our profiler output. `RepositoryMap::build` only
+            // returned the map, so previously we could only see total
+            // map_build time.
+            let (map, build_profile) = profiler.stage("map_build", || match fragment_mode {
+                FragmentBuildMode::Force => {
                     RepositoryMap::build_from_fragments(&PathBuf::from(&repo))
-                } else if no_cache {
-                    RepositoryMap::build_no_cache(&PathBuf::from(&repo))
-                } else {
-                    RepositoryMap::build_with_profile(&PathBuf::from(&repo))
                 }
+                FragmentBuildMode::Prefer => RepositoryMap::build_with_fragment_preference(
+                    &PathBuf::from(&repo),
+                    no_cache,
+                    |_| {},
+                ),
             })?;
             if profile {
                 profiler.attach_substages("map_build", &build_profile);
@@ -294,7 +325,7 @@ fn run() -> Result<(), String> {
         }
         "task-expand" => {
             let repo = read_option(&args, "--repo")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let target = read_option(&args, "--target")?;
             println!(
                 "{}",
@@ -306,7 +337,7 @@ fn run() -> Result<(), String> {
             let task_value =
                 read_option(&args, "--task").unwrap_or_else(|_| "Explain this repo".to_string());
             let root = PathBuf::from(&repo);
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let task = TaskInput::from_task_text(&task_value);
             let pack = build_context_pack(&root, &map, task);
             print_explanation(&map, &pack);
@@ -321,7 +352,7 @@ fn run() -> Result<(), String> {
         "activate" => {
             let repo = read_option(&args, "--repo")?;
             let task_value = read_option(&args, "--task")?;
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let task = TaskInput::from_task_text(&task_value);
             let anchor_limit = if task.kind.is_explain_repo() { 5 } else { 3 };
             let anchors = resolve_anchors(&map, &task, anchor_limit);
@@ -336,7 +367,7 @@ fn run() -> Result<(), String> {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(3);
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let activation = spread_from_seed(&map, &seed, hops);
             println!("{}", aethyme_engine::json::activation_map(&activation));
         }
@@ -354,7 +385,7 @@ fn run() -> Result<(), String> {
             let repo = read_option(&args, "--repo")?;
             let scope = read_option(&args, "--scope")?;
             let include_methods = has_flag(&args, "--include-methods");
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let facts = public_function_facts(&map, &scope, include_methods);
             println!(
                 "{}",
@@ -375,7 +406,7 @@ fn run() -> Result<(), String> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let fact = public_function_facts(&map, &boundary, true)
                 .into_iter()
                 .find(|fact| {
@@ -402,7 +433,7 @@ fn run() -> Result<(), String> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let answer = analyze_dead_code(&map, &scope, &roots, include_methods);
             println!(
                 "{}",
@@ -446,13 +477,13 @@ fn run() -> Result<(), String> {
         }
         "warm" => {
             let repo = read_option(&args, "--repo")?;
-            let _map = build_map(&repo, no_cache, from_fragments)?;
+            let _map = build_map(&repo, no_cache, fragment_mode)?;
             eprintln!("map cached");
         }
         "index" => {
             let repo = read_option(&args, "--repo")?;
             eprintln!("Building repository map...");
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             eprintln!(
                 "Map built: {} areas, {} files, {} functions, {} classes, {} edges",
                 map.areas.len(),
@@ -479,7 +510,7 @@ fn run() -> Result<(), String> {
                 .unwrap_or_else(|_| "Explain this repository".to_string());
             let focus = read_option(&args, "--focus").ok();
             let subsystem = read_option(&args, "--subsystem").ok();
-            let map = build_map(&repo, no_cache, from_fragments)?;
+            let map = build_map(&repo, no_cache, fragment_mode)?;
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
@@ -506,9 +537,8 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let store =
-                aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
-                    .map_err(|e| e.to_string())?;
+            let store = aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
+                .map_err(|e| e.to_string())?;
             let areas = store.list_areas(depth).map_err(|e| e.to_string())?;
             println!("{}", serde_json::to_string_pretty(&areas).unwrap());
         }
@@ -518,9 +548,8 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let store =
-                aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
-                    .map_err(|e| e.to_string())?;
+            let store = aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
+                .map_err(|e| e.to_string())?;
             let edges = store.edges_to(&file).map_err(|e| e.to_string())?;
             for edge in &edges {
                 if let Some(path) = file_path_from_id(edge.other.as_str()) {
@@ -534,9 +563,8 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let store =
-                aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
-                    .map_err(|e| e.to_string())?;
+            let store = aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
+                .map_err(|e| e.to_string())?;
             let edges = store.edges_from(&file).map_err(|e| e.to_string())?;
             for edge in &edges {
                 if let Some(path) = file_path_from_id(edge.other.as_str()) {
@@ -550,9 +578,8 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let store =
-                aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
-                    .map_err(|e| e.to_string())?;
+            let store = aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
+                .map_err(|e| e.to_string())?;
 
             // Step 1: grep -rl to find files containing the symbol name
             let grep_output = std::process::Command::new("grep")
@@ -621,9 +648,8 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let store =
-                aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
-                    .map_err(|e| e.to_string())?;
+            let store = aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
+                .map_err(|e| e.to_string())?;
             let overview = store.overview(20, 10, 20).map_err(|e| e.to_string())?;
             // Hand-roll JSON to keep the output stable: native Overview isn't
             // serde::Serialize on the AreaNode/RiskFlag side either, so we
@@ -837,8 +863,7 @@ fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
     // friction. `--intent default` (or task_localization_query
     // explicitly) restores the conservative pre-auto behavior for
     // callers that prefer to opt out of the heuristic.
-    let intent_str = read_option(args, "--intent")
-        .unwrap_or_else(|_| "auto".to_string());
+    let intent_str = read_option(args, "--intent").unwrap_or_else(|_| "auto".to_string());
     let (intent, intent_source) = match intent_str.as_str() {
         "task_localization_query" | "default" => (
             aethyme_engine::explore::Intent::TaskLocalization,
@@ -919,9 +944,8 @@ fn run_explore_usage_boundary(
     repo_str: &str,
     request: &str,
 ) -> Result<(), String> {
-    let scope = read_option(args, "--scope").map_err(|_| {
-        "usage_boundary_query requires --scope <repo-relative-path>".to_string()
-    })?;
+    let scope = read_option(args, "--scope")
+        .map_err(|_| "usage_boundary_query requires --scope <repo-relative-path>".to_string())?;
     let search_roots: Vec<String> = read_options(args, "--search-root");
     let include_methods = !has_flag(args, "--no-methods");
     let budget_ms: u64 = read_option(args, "--budget-ms")
@@ -971,11 +995,14 @@ fn run_explore_usage_boundary(
 // pidfile management, kill via libc) live here because they're shell-tied
 // concerns rather than core engine concerns.
 
-fn run_daemon_subcommand(args: &[String], no_cache: bool) -> Result<(), String> {
+fn run_daemon_subcommand(
+    args: &[String],
+    no_cache: bool,
+    fragment_mode: FragmentBuildMode,
+) -> Result<(), String> {
     if args.is_empty() {
         return Err(
-            "usage: aethyme-engine-cli daemon <serve|start|stop|status> --repo <path>"
-                .to_string(),
+            "usage: aethyme-engine-cli daemon <serve|start|stop|status> --repo <path>".to_string(),
         );
     }
     let action = &args[0];
@@ -986,8 +1013,8 @@ fn run_daemon_subcommand(args: &[String], no_cache: bool) -> Result<(), String> 
     }
 
     match action.as_str() {
-        "serve" => daemon_serve_action(&repo, no_cache, args),
-        "start" => daemon_start_action(&repo, no_cache, args),
+        "serve" => daemon_serve_action(&repo, no_cache, fragment_mode, args),
+        "start" => daemon_start_action(&repo, no_cache, fragment_mode, args),
         "stop" => daemon_stop_action(&repo),
         "status" => daemon_status_action(&repo),
         other => Err(format!("daemon: unknown action {other:?}")),
@@ -1007,15 +1034,26 @@ fn parse_daemon_idle_timeout(args: &[String]) -> Result<std::time::Duration, Str
     ))
 }
 
-fn daemon_serve_action(repo: &Path, no_cache: bool, args: &[String]) -> Result<(), String> {
+fn daemon_serve_action(
+    repo: &Path,
+    no_cache: bool,
+    fragment_mode: FragmentBuildMode,
+    args: &[String],
+) -> Result<(), String> {
     let idle_timeout = parse_daemon_idle_timeout(args)?;
     let config = aethyme_engine::daemon::DaemonConfig::new(repo.to_path_buf())
         .with_idle_timeout(idle_timeout)
-        .with_no_cache(no_cache);
+        .with_no_cache(no_cache)
+        .with_force_fragments(fragment_mode.forces_fragments());
     aethyme_engine::daemon::serve_forever(config)
 }
 
-fn daemon_start_action(repo: &Path, no_cache: bool, args: &[String]) -> Result<(), String> {
+fn daemon_start_action(
+    repo: &Path,
+    no_cache: bool,
+    fragment_mode: FragmentBuildMode,
+    args: &[String],
+) -> Result<(), String> {
     let pidfile = aethyme_engine::daemon::pidfile_path_for(repo);
     if pidfile.exists() {
         if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
@@ -1046,12 +1084,14 @@ fn daemon_start_action(repo: &Path, no_cache: bool, args: &[String]) -> Result<(
         .try_clone()
         .map_err(|e| format!("clone log fd: {e}"))?;
 
-    let self_path = std::env::current_exe()
-        .map_err(|e| format!("current_exe: {e}"))?;
+    let self_path = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
 
     let mut cmd = std::process::Command::new(&self_path);
     if no_cache {
         cmd.arg("--no-cache");
+    }
+    if fragment_mode.forces_fragments() {
+        cmd.arg("--from-fragments");
     }
     cmd.arg("daemon").arg("serve").arg("--repo").arg(repo);
     if let Ok(idle) = read_option(args, "--idle-timeout") {
@@ -1112,13 +1152,13 @@ fn daemon_stop_action(repo: &Path) -> Result<(), String> {
 fn daemon_status_action(repo: &Path) -> Result<(), String> {
     let socket = aethyme_engine::daemon::socket_path_for(repo);
     if !socket.exists() {
-        eprintln!("engine daemon: not running ({} does not exist)", socket.display());
+        eprintln!(
+            "engine daemon: not running ({} does not exist)",
+            socket.display()
+        );
         std::process::exit(1);
     }
-    match aethyme_engine::daemon::send_request(
-        &socket,
-        &serde_json::json!({"command":"ping"}),
-    ) {
+    match aethyme_engine::daemon::send_request(&socket, &serde_json::json!({"command":"ping"})) {
         Ok(response) => {
             let trimmed = response.trim();
             println!("engine daemon: {trimmed}");
@@ -1134,19 +1174,23 @@ fn daemon_status_action(repo: &Path) -> Result<(), String> {
 fn build_map(
     repo: &str,
     no_cache: bool,
-    from_fragments: bool,
+    fragment_mode: FragmentBuildMode,
 ) -> Result<RepositoryMap, String> {
-    if from_fragments {
-        // Fragments build bypasses the map cache by design and falls
-        // back to the pass pipeline when no on-disk graph exists, so it
-        // is safe to prefer over --no-cache when both flags are set.
-        RepositoryMap::build_from_fragments(&PathBuf::from(repo))
-            .map(|(map, _)| map)
-    } else if no_cache {
-        RepositoryMap::build_no_cache(&PathBuf::from(repo)).map(|(map, _)| map)
-    } else {
-        RepositoryMap::build(&PathBuf::from(repo))
+    match fragment_mode {
+        FragmentBuildMode::Force => {
+            RepositoryMap::build_from_fragments(&PathBuf::from(repo)).map(|(map, _)| map)
+        }
+        FragmentBuildMode::Prefer => {
+            // Default path as of Phase 4.7.12: committed fragments are the
+            // only map source. Missing `.aethyme/graph` is a build error.
+            RepositoryMap::build_with_fragment_preference(&PathBuf::from(repo), no_cache, |_| {})
+                .map(|(map, _)| map)
+        }
     }
+}
+
+fn legacy_pass_removed_error() -> String {
+    "--no-fragments is no longer supported: the legacy pass pipeline was deleted in 4.7.12; remove the flag and ensure .aethyme/graph is indexed".to_string()
 }
 
 /// Per-stage wall-time profiler for one engine command.

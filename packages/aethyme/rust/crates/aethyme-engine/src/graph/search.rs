@@ -213,8 +213,12 @@ fn score_symbol(
         .map(|c| c.to_ascii_lowercase())
         .collect();
     let mut name_matched_tokens: Vec<String> = Vec::new();
+    let name_lower = name.to_ascii_lowercase();
     for token in lowered_tokens {
-        if component_lowers.iter().any(|c| shares_stem(c, token)) {
+        if name_lower == *token
+            || name_lower.contains(token.as_str())
+            || component_lowers.iter().any(|c| shares_stem(c, token))
+        {
             if !name_matched_tokens.contains(token) {
                 name_matched_tokens.push(token.clone());
             }
