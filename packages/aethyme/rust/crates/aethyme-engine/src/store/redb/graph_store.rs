@@ -6,6 +6,7 @@
 //! Phase 3.1 (this file): schema, error type, `open()`, schema-version
 //! sentinel. Insert / query APIs land in 3.2–3.4.
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use redb::{
@@ -160,6 +161,9 @@ impl From<redb::CommitError> for GraphStoreError {
 impl From<redb::CompactionError> for GraphStoreError {
     fn from(e: redb::CompactionError) -> Self { Self::Db(e.into()) }
 }
+impl From<redb::SetDurabilityError> for GraphStoreError {
+    fn from(e: redb::SetDurabilityError) -> Self { Self::Db(e.into()) }
+}
 impl From<bincode::Error> for GraphStoreError {
     fn from(e: bincode::Error) -> Self { Self::Encode(e) }
 }
@@ -186,6 +190,28 @@ pub struct ReadOnlyGraphStore {
 }
 
 const DB_FILE_NAME: &str = "graph_store.redb";
+const STAGING_DB_FILE_NAME: &str = "graph_store.redb.indexing";
+
+/// Durability policy for bulk graph-store index transactions.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IndexDurability {
+    /// Every redb commit is durable when `commit()` returns.
+    Immediate,
+    /// Bulk commits may remain non-durable until followed by an immediate
+    /// commit. Only use this for disposable rebuilds from committed fragments.
+    None,
+}
+
+impl IndexDurability {
+    fn apply(self, txn: &mut WriteTransaction) -> Result<(), GraphStoreError> {
+        let durability = match self {
+            Self::Immediate => redb::Durability::Immediate,
+            Self::None => redb::Durability::None,
+        };
+        txn.set_durability(durability)?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncompatibleGraphStore {
@@ -198,12 +224,7 @@ impl GraphStore {
     /// schema version sentinel and ensures every table exists so downstream
     /// reads on a fresh DB don't trip on `TableDoesNotExist`.
     pub fn open(repo_root: &Path) -> Result<Self, GraphStoreError> {
-        let dir = repo_root.join(".aethyme");
-        std::fs::create_dir_all(&dir)?;
-        let db_path = dir.join(DB_FILE_NAME);
-        let db = open_or_create_database(&db_path)?;
-        ensure_schema(&db)?;
-        Ok(Self { db, db_path })
+        Self::open_path(Self::final_path(repo_root))
     }
 
     /// Open an existing graph store for read-only queries.
@@ -239,6 +260,16 @@ impl GraphStore {
         &self.db_path
     }
 
+    /// Public graph-store path consumed by query commands and verification.
+    pub fn final_path(repo_root: &Path) -> PathBuf {
+        repo_root.join(".aethyme").join(DB_FILE_NAME)
+    }
+
+    /// Private staging path used by disposable-fast rebuilds.
+    pub fn staging_path(repo_root: &Path) -> PathBuf {
+        repo_root.join(".aethyme").join(STAGING_DB_FILE_NAME)
+    }
+
     /// Borrow the underlying redb `Database` — used by the build session and
     /// query primitives that land in 3.2–3.4.
     #[allow(dead_code)]
@@ -256,10 +287,20 @@ impl GraphStore {
     /// `WriteTransaction` and rotates it periodically based on
     /// `IndexSession::should_rotate`. Drop without `commit()` aborts.
     pub fn begin_index(&self) -> Result<IndexSession<'_>, GraphStoreError> {
-        let txn = self.db.begin_write()?;
+        self.begin_index_with_durability(IndexDurability::Immediate)
+    }
+
+    /// Open an index session with an explicit redb durability policy.
+    pub fn begin_index_with_durability(
+        &self,
+        durability: IndexDurability,
+    ) -> Result<IndexSession<'_>, GraphStoreError> {
+        let mut txn = self.db.begin_write()?;
+        durability.apply(&mut txn)?;
         Ok(IndexSession {
             db: &self.db,
             txn: Some(txn),
+            durability,
             ops_since_rotate: 0,
             bytes_since_rotate: 0,
         })
@@ -270,11 +311,48 @@ impl GraphStore {
     /// "delete the file, recreate it" — cheaper and simpler than range-deleting
     /// every table.
     pub fn reset(repo_root: &Path) -> Result<Self, GraphStoreError> {
-        let db_path = repo_root.join(".aethyme").join(DB_FILE_NAME);
+        let staging_path = Self::staging_path(repo_root);
+        if staging_path.exists() {
+            std::fs::remove_file(&staging_path)?;
+        }
+        let db_path = Self::final_path(repo_root);
         if db_path.exists() {
             std::fs::remove_file(&db_path)?;
         }
         Self::open(repo_root)
+    }
+
+    /// Reset the disposable staging store without touching the public store.
+    pub fn reset_staging(repo_root: &Path) -> Result<Self, GraphStoreError> {
+        let db_path = Self::staging_path(repo_root);
+        if db_path.exists() {
+            std::fs::remove_file(&db_path)?;
+        }
+        Self::open_path(db_path)
+    }
+
+    /// Publish a fully-built staging store over the public graph-store path.
+    pub fn publish_staging(repo_root: &Path) -> Result<(), GraphStoreError> {
+        let staging_path = Self::staging_path(repo_root);
+        let final_path = Self::final_path(repo_root);
+        match std::fs::rename(&staging_path, &final_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists && final_path.exists() => {
+                std::fs::remove_file(&final_path)?;
+                std::fs::rename(&staging_path, &final_path)?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn open_path(db_path: PathBuf) -> Result<Self, GraphStoreError> {
+        if let Some(dir) = db_path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let db = open_or_create_database(&db_path)?;
+        ensure_schema(&db)?;
+        Ok(Self { db, db_path })
     }
 
     /// Write repo-level metadata (root_path, commit, indexed_at, file_count,
@@ -696,6 +774,7 @@ impl ReadOnlyGraphStore {
 pub struct IndexSession<'db> {
     db: &'db Database,
     txn: Option<WriteTransaction>,
+    durability: IndexDurability,
     ops_since_rotate: usize,
     bytes_since_rotate: usize,
 }
@@ -826,7 +905,9 @@ impl<'db> IndexSession<'db> {
     pub fn rotate(&mut self) -> Result<(), GraphStoreError> {
         let txn = self.txn.take().expect("IndexSession invariant: txn present");
         txn.commit()?;
-        self.txn = Some(self.db.begin_write()?);
+        let mut txn = self.db.begin_write()?;
+        self.durability.apply(&mut txn)?;
+        self.txn = Some(txn);
         self.ops_since_rotate = 0;
         self.bytes_since_rotate = 0;
         Ok(())
@@ -1273,6 +1354,87 @@ mod tests {
 
         let readonly = GraphStore::open_read_only(&root).expect("read-only reopen");
         assert_eq!(readonly.list_areas(Some(1)).expect("areas"), vec![area]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_durable_index_commits_are_persisted_by_final_metadata_commit() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let area = AreaNode::new("Repo", "src", false);
+        let mut session = store
+            .begin_index_with_durability(IndexDurability::None)
+            .expect("session");
+        insert_area(&mut session, &area).expect("area");
+        session.commit().expect("commit");
+        store
+            .set_repo_metadata(&RepoMetadata {
+                root_path: root.to_string_lossy().to_string(),
+                commit_hash: None,
+                indexed_at_unix: 1,
+                file_count: 0,
+                languages: Vec::new(),
+            })
+            .expect("metadata");
+        drop(store);
+
+        let readonly = GraphStore::open_read_only(&root).expect("read-only reopen");
+        assert_eq!(readonly.list_areas(Some(1)).expect("areas"), vec![area]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn staging_store_does_not_replace_public_store_until_publish() {
+        let root = tmp_root(function_name!());
+        let old_area = AreaNode::new("Repo", "old", false);
+        let new_area = AreaNode::new("Repo", "new", false);
+        let store = GraphStore::reset(&root).expect("open public");
+        let mut session = store.begin_index().expect("public session");
+        insert_area(&mut session, &old_area).expect("old area");
+        session.commit().expect("public commit");
+        drop(store);
+
+        let staging = GraphStore::reset_staging(&root).expect("open staging");
+        let mut session = staging
+            .begin_index_with_durability(IndexDurability::None)
+            .expect("staging session");
+        insert_area(&mut session, &new_area).expect("new area");
+        session.commit().expect("staging commit");
+        staging
+            .set_repo_metadata(&RepoMetadata {
+                root_path: root.to_string_lossy().to_string(),
+                commit_hash: None,
+                indexed_at_unix: 1,
+                file_count: 0,
+                languages: Vec::new(),
+            })
+            .expect("metadata");
+        drop(staging);
+
+        let readonly = GraphStore::open_read_only(&root).expect("read public");
+        assert_eq!(readonly.list_areas(Some(1)).expect("areas"), vec![old_area]);
+        drop(readonly);
+
+        GraphStore::publish_staging(&root).expect("publish staging");
+        let readonly = GraphStore::open_read_only(&root).expect("read published");
+        assert_eq!(readonly.list_areas(Some(1)).expect("areas"), vec![new_area]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reset_removes_stale_staging_store() {
+        let root = tmp_root(function_name!());
+        let staging = GraphStore::reset_staging(&root).expect("open staging");
+        let staging_path = GraphStore::staging_path(&root);
+        assert!(staging_path.exists(), "staging file exists");
+        drop(staging);
+
+        let store = GraphStore::reset(&root).expect("reset public");
+        assert!(!staging_path.exists(), "normal reset cleans stale staging");
+        assert!(store.path().exists(), "public store exists");
 
         let _ = std::fs::remove_dir_all(&root);
     }

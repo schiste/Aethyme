@@ -484,6 +484,7 @@ fn run() -> Result<(), String> {
             let repo = read_option(&args, "--repo")?;
             let profile = has_flag(&args, "--profile");
             let compact = has_flag(&args, "--compact");
+            let disposable_fast = has_flag(&args, "--disposable-fast");
             let mut profiler = StageProfiler::new("index", profile);
             eprintln!("Building repository map...");
             let (map, build_profile) = profiler.stage("map_build", || {
@@ -501,7 +502,13 @@ fn run() -> Result<(), String> {
                 map.edges.len(),
             );
             eprintln!("Writing to redb graph store...");
-            index_to_store(&PathBuf::from(&repo), &map, &mut profiler, compact)?;
+            index_to_store(
+                &PathBuf::from(&repo),
+                &map,
+                &mut profiler,
+                compact,
+                disposable_fast,
+            )?;
             eprintln!("Generating Chau7 snippets...");
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
@@ -1419,9 +1426,10 @@ fn index_to_store(
     map: &RepositoryMap,
     profiler: &mut StageProfiler,
     compact: bool,
+    disposable_fast: bool,
 ) -> Result<(), String> {
     use aethyme_engine::store::redb::graph_store::{
-        self as gs, GraphStore, RepoMetadata,
+        self as gs, GraphStore, IndexDurability, RepoMetadata,
     };
 
     let canonical = repo_root.canonicalize().map_err(|e| e.to_string())?;
@@ -1437,12 +1445,29 @@ fn index_to_store(
     }
     // reset() = delete file + recreate. Mirrors what surreal's REMOVE DATABASE
     // gave us: every index pass starts from a clean slate.
+    if disposable_fast {
+        eprintln!(
+            "Using disposable-fast Redb index mode: bulk commits are non-durable; \
+             graph_store.redb is replaced only after the final durable metadata commit."
+        );
+    }
     let mut store = profiler.stage("redb_reset_open", || {
-        GraphStore::reset(&canonical).map_err(|e| e.to_string())
+        if disposable_fast {
+            GraphStore::reset_staging(&canonical).map_err(|e| e.to_string())
+        } else {
+            GraphStore::reset(&canonical).map_err(|e| e.to_string())
+        }
     })?;
 
+    let durability = if disposable_fast {
+        IndexDurability::None
+    } else {
+        IndexDurability::Immediate
+    };
     let mut session = profiler.stage("redb_begin_index", || {
-        store.begin_index().map_err(|e| e.to_string())
+        store
+            .begin_index_with_durability(durability)
+            .map_err(|e| e.to_string())
     })?;
 
     let mut file_ok = 0usize;
@@ -1556,16 +1581,17 @@ fn index_to_store(
             .map_err(|e| e.to_string())
     })?;
 
-    let db_path = canonical.join(".aethyme").join("graph_store.redb");
+    let db_path = GraphStore::final_path(&canonical);
+    let active_db_path = store.path().to_path_buf();
     if compact {
-        let before = file_size_bytes(&db_path)?;
+        let before = file_size_bytes(&active_db_path)?;
         eprintln!("Compacting redb graph store...");
         let compacted = profiler.stage("redb_compact", || {
             store.compact().map_err(|e| e.to_string())
         })?;
         // Drop before stat so the reported size is what later processes see.
         drop(store);
-        let after = file_size_bytes(&db_path)?;
+        let after = file_size_bytes(&active_db_path)?;
         let delta = after as i128 - before as i128;
         let delta_pct = if before == 0 {
             0.0
@@ -1583,6 +1609,11 @@ fn index_to_store(
         );
     } else {
         drop(store);
+    }
+    if disposable_fast {
+        profiler.stage("redb_publish", || {
+            GraphStore::publish_staging(&canonical).map_err(|e| e.to_string())
+        })?;
     }
     eprintln!("Store written to: {}", db_path.display());
     Ok(())
