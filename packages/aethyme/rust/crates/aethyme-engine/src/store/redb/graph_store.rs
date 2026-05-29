@@ -157,6 +157,9 @@ impl From<redb::StorageError> for GraphStoreError {
 impl From<redb::CommitError> for GraphStoreError {
     fn from(e: redb::CommitError) -> Self { Self::Db(e.into()) }
 }
+impl From<redb::CompactionError> for GraphStoreError {
+    fn from(e: redb::CompactionError) -> Self { Self::Db(e.into()) }
+}
 impl From<bincode::Error> for GraphStoreError {
     fn from(e: bincode::Error) -> Self { Self::Encode(e) }
 }
@@ -241,6 +244,12 @@ impl GraphStore {
     #[allow(dead_code)]
     pub(crate) fn db(&self) -> &Database {
         &self.db
+    }
+
+    /// Compact the underlying redb file after all write transactions have
+    /// committed. Returns whether redb moved pages during compaction.
+    pub fn compact(&mut self) -> Result<bool, GraphStoreError> {
+        Ok(self.db.compact()?)
     }
 
     /// Open a Variant-B index session. The session holds one open
@@ -1246,6 +1255,24 @@ mod tests {
                 .as_str(),
             file_a.id
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compact_preserves_committed_query_data() {
+        let root = tmp_root(function_name!());
+        let mut store = GraphStore::open(&root).expect("open");
+        let area = AreaNode::new("Repo", "src", false);
+        let mut session = store.begin_index().expect("session");
+        insert_area(&mut session, &area).expect("area");
+        session.commit().expect("commit");
+
+        let _ = store.compact().expect("compact");
+        drop(store);
+
+        let readonly = GraphStore::open_read_only(&root).expect("read-only reopen");
+        assert_eq!(readonly.list_areas(Some(1)).expect("areas"), vec![area]);
 
         let _ = std::fs::remove_dir_all(&root);
     }

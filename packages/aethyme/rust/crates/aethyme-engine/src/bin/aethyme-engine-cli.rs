@@ -483,6 +483,7 @@ fn run() -> Result<(), String> {
         "index" => {
             let repo = read_option(&args, "--repo")?;
             let profile = has_flag(&args, "--profile");
+            let compact = has_flag(&args, "--compact");
             let mut profiler = StageProfiler::new("index", profile);
             eprintln!("Building repository map...");
             let (map, build_profile) = profiler.stage("map_build", || {
@@ -500,7 +501,7 @@ fn run() -> Result<(), String> {
                 map.edges.len(),
             );
             eprintln!("Writing to redb graph store...");
-            index_to_store(&PathBuf::from(&repo), &map, &mut profiler)?;
+            index_to_store(&PathBuf::from(&repo), &map, &mut profiler, compact)?;
             eprintln!("Generating Chau7 snippets...");
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
@@ -1417,6 +1418,7 @@ fn index_to_store(
     repo_root: &std::path::Path,
     map: &RepositoryMap,
     profiler: &mut StageProfiler,
+    compact: bool,
 ) -> Result<(), String> {
     use aethyme_engine::store::redb::graph_store::{
         self as gs, GraphStore, RepoMetadata,
@@ -1435,7 +1437,7 @@ fn index_to_store(
     }
     // reset() = delete file + recreate. Mirrors what surreal's REMOVE DATABASE
     // gave us: every index pass starts from a clean slate.
-    let store = profiler.stage("redb_reset_open", || {
+    let mut store = profiler.stage("redb_reset_open", || {
         GraphStore::reset(&canonical).map_err(|e| e.to_string())
     })?;
 
@@ -1555,6 +1557,39 @@ fn index_to_store(
     })?;
 
     let db_path = canonical.join(".aethyme").join("graph_store.redb");
+    if compact {
+        let before = file_size_bytes(&db_path)?;
+        eprintln!("Compacting redb graph store...");
+        let compacted = profiler.stage("redb_compact", || {
+            store.compact().map_err(|e| e.to_string())
+        })?;
+        // Drop before stat so the reported size is what later processes see.
+        drop(store);
+        let after = file_size_bytes(&db_path)?;
+        let delta = after as i128 - before as i128;
+        let delta_pct = if before == 0 {
+            0.0
+        } else {
+            (delta as f64 / before as f64) * 100.0
+        };
+        let (size_word, size_delta) = if delta <= 0 {
+            ("saved", (-delta) as u128)
+        } else {
+            ("grew", delta as u128)
+        };
+        eprintln!(
+            "  compacted: {compacted}; size: {before} -> {after} bytes \
+             ({size_word} {size_delta}, delta {delta_pct:+.1}%)"
+        );
+    } else {
+        drop(store);
+    }
     eprintln!("Store written to: {}", db_path.display());
     Ok(())
+}
+
+fn file_size_bytes(path: &Path) -> Result<u64, String> {
+    std::fs::metadata(path)
+        .map(|meta| meta.len())
+        .map_err(|e| format!("stat {}: {e}", path.display()))
 }
