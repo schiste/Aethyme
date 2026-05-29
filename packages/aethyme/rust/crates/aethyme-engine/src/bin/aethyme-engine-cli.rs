@@ -548,8 +548,9 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let store = aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
-                .map_err(|e| e.to_string())?;
+            let store =
+                aethyme_engine::store::redb::graph_store::GraphStore::open_read_only(&canonical)
+                    .map_err(|e| e.to_string())?;
             let areas = store.list_areas(depth).map_err(|e| e.to_string())?;
             println!("{}", serde_json::to_string_pretty(&areas).unwrap());
         }
@@ -559,8 +560,9 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let store = aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
-                .map_err(|e| e.to_string())?;
+            let store =
+                aethyme_engine::store::redb::graph_store::GraphStore::open_read_only(&canonical)
+                    .map_err(|e| e.to_string())?;
             let edges = store.edges_to(&file).map_err(|e| e.to_string())?;
             for edge in &edges {
                 if let Some(path) = file_path_from_id(edge.other.as_str()) {
@@ -574,8 +576,9 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let store = aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
-                .map_err(|e| e.to_string())?;
+            let store =
+                aethyme_engine::store::redb::graph_store::GraphStore::open_read_only(&canonical)
+                    .map_err(|e| e.to_string())?;
             let edges = store.edges_from(&file).map_err(|e| e.to_string())?;
             for edge in &edges {
                 if let Some(path) = file_path_from_id(edge.other.as_str()) {
@@ -589,8 +592,9 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let store = aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
-                .map_err(|e| e.to_string())?;
+            let store =
+                aethyme_engine::store::redb::graph_store::GraphStore::open_read_only(&canonical)
+                    .map_err(|e| e.to_string())?;
 
             // Step 1: grep -rl to find files containing the symbol name
             let grep_output = std::process::Command::new("grep")
@@ -659,8 +663,9 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let store = aethyme_engine::store::redb::graph_store::GraphStore::open(&canonical)
-                .map_err(|e| e.to_string())?;
+            let store =
+                aethyme_engine::store::redb::graph_store::GraphStore::open_read_only(&canonical)
+                    .map_err(|e| e.to_string())?;
             let overview = store.overview(20, 10, 20).map_err(|e| e.to_string())?;
             // Hand-roll JSON to keep the output stable: native Overview isn't
             // serde::Serialize on the AreaNode/RiskFlag side either, so we

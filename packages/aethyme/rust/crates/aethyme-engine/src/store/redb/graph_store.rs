@@ -9,8 +9,8 @@
 use std::path::{Path, PathBuf};
 
 use redb::{
-    Database, MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable, ReadableTable,
-    TableDefinition, WriteTransaction,
+    Database, MultimapTableDefinition, ReadOnlyDatabase, ReadableDatabase, ReadableMultimapTable,
+    ReadableTable, TableDefinition, WriteTransaction,
 };
 use serde::{Deserialize, Serialize};
 
@@ -171,6 +171,17 @@ pub struct GraphStore {
     db_path: PathBuf,
 }
 
+/// Read-only handle for commands that inspect an existing graph store.
+///
+/// Unlike `GraphStore::open`, this never creates or mutates
+/// `<repo_root>/.aethyme/graph_store.redb`. Use it for query CLI paths so
+/// inspectors do not take a writable database handle.
+pub struct ReadOnlyGraphStore {
+    db: ReadOnlyDatabase,
+    #[allow(dead_code)]
+    db_path: PathBuf,
+}
+
 const DB_FILE_NAME: &str = "graph_store.redb";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +201,15 @@ impl GraphStore {
         let db = open_or_create_database(&db_path)?;
         ensure_schema(&db)?;
         Ok(Self { db, db_path })
+    }
+
+    /// Open an existing graph store for read-only queries.
+    ///
+    /// This is intentionally stricter than `open()`: it will not create
+    /// `.aethyme/` or initialize an empty DB. Query commands should fail with
+    /// a clear error if the materialized store has not been built yet.
+    pub fn open_read_only(repo_root: &Path) -> Result<ReadOnlyGraphStore, GraphStoreError> {
+        ReadOnlyGraphStore::open(repo_root)
     }
 
     /// Detect an existing redb file that the current engine cannot open
@@ -264,11 +284,7 @@ impl GraphStore {
 
     /// Read previously-written repo metadata, if any.
     pub fn repo_metadata(&self) -> Result<Option<RepoMetadata>, GraphStoreError> {
-        let txn = self.db.begin_read()?;
-        let t = txn.open_table(META)?;
-        let Some(value) = t.get(META_KEY_REPO_METADATA)? else { return Ok(None) };
-        let meta: RepoMetadata = bincode::deserialize(value.value())?;
-        Ok(Some(meta))
+        repo_metadata_from(&self.db)
     }
 
     /// Remove the file row at `file_id` and every adjacency row touching it.
@@ -359,6 +375,29 @@ impl GraphStore {
     }
 }
 
+impl ReadOnlyGraphStore {
+    /// Open an existing Redb graph store without acquiring a writable handle.
+    pub fn open(repo_root: &Path) -> Result<Self, GraphStoreError> {
+        let db_path = repo_root.join(".aethyme").join(DB_FILE_NAME);
+        let db = open_read_only_database(&db_path)?;
+        verify_schema_read_only(&db)?;
+        Ok(Self { db, db_path })
+    }
+
+    /// Path to the DB file on disk.
+    #[allow(dead_code)]
+    pub fn path(&self) -> &Path {
+        &self.db_path
+    }
+
+    /// Borrow the underlying redb `ReadOnlyDatabase` for tests and future
+    /// read-only query primitives.
+    #[allow(dead_code)]
+    pub(crate) fn db(&self) -> &ReadOnlyDatabase {
+        &self.db
+    }
+}
+
 // ── Typed write wrappers ────────────────────────────────────────────────────
 // Thin shims over IndexSession primitives. The mapping is structured ID →
 // raw redb key (no sanitization), entity → bincoded value, plus the secondary
@@ -425,8 +464,18 @@ fn area_depth(area: &AreaNode) -> u32 {
     (area.path_prefix.matches('/').count() + 1) as u32
 }
 
-fn collect_adjacency(
-    db: &Database,
+fn repo_metadata_from<D: ReadableDatabase>(
+    db: &D,
+) -> Result<Option<RepoMetadata>, GraphStoreError> {
+    let txn = db.begin_read()?;
+    let t = txn.open_table(META)?;
+    let Some(value) = t.get(META_KEY_REPO_METADATA)? else { return Ok(None) };
+    let meta: RepoMetadata = bincode::deserialize(value.value())?;
+    Ok(Some(meta))
+}
+
+fn collect_adjacency<D: ReadableDatabase>(
+    db: &D,
     table: MultimapTableDefinition<&str, &[u8]>,
     key: &str,
 ) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
@@ -445,6 +494,107 @@ fn collect_adjacency(
     Ok(out)
 }
 
+fn list_areas_from<D: ReadableDatabase>(
+    db: &D,
+    depth: Option<u32>,
+) -> Result<Vec<AreaNode>, GraphStoreError> {
+    let txn = db.begin_read()?;
+    let t = txn.open_table(AREAS)?;
+    let mut out = Vec::new();
+    for entry in t.iter()? {
+        let (_, value) = entry?;
+        let area: AreaNode = bincode::deserialize(value.value())?;
+        if let Some(d) = depth {
+            if area_depth(&area) != d {
+                continue;
+            }
+        }
+        out.push(area);
+    }
+    // Stable sort by depth then path_prefix so callers don't see redb's
+    // iteration order (which is sorted-by-key but the keys are structured
+    // IDs, not path_prefixes).
+    out.sort_by(|a, b| {
+        area_depth(a)
+            .cmp(&area_depth(b))
+            .then_with(|| a.path_prefix.cmp(&b.path_prefix))
+    });
+    Ok(out)
+}
+
+fn overview_from<D: ReadableDatabase>(
+    db: &D,
+    area_limit: usize,
+    entrypoint_limit: usize,
+    risk_limit: usize,
+) -> Result<Overview, GraphStoreError> {
+    let repo = repo_metadata_from(db)?;
+
+    // Top areas at depth 1, in path_prefix order.
+    let mut areas = list_areas_from(db, Some(1))?;
+    areas.truncate(area_limit);
+
+    // Entrypoints: scan EDGES_OUT once, collect distinct sources whose
+    // adjacency carries kind = EntrypointFor. O(E) but no per-file lookups.
+    // Resolve src node_id → file path via FILES so the output matches what
+    // surreal returned.
+    let entrypoint_paths = {
+        let txn = db.begin_read()?;
+        let edges = txn.open_multimap_table(EDGES_OUT)?;
+        let files = txn.open_table(FILES)?;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut paths = Vec::new();
+        'outer: for kv in edges.iter()? {
+            let (key, mut values) = kv?;
+            let src = key.value().to_string();
+            let mut has_entrypoint = false;
+            while let Some(v) = values.next() {
+                let row = v?;
+                let rec: AdjacencyRecord = bincode::deserialize(row.value())?;
+                if matches!(rec.kind, EdgeKind::EntrypointFor) {
+                    has_entrypoint = true;
+                    break;
+                }
+            }
+            if !has_entrypoint || !seen.insert(src.clone()) {
+                continue;
+            }
+            let Some(blob) = files.get(src.as_str())? else { continue };
+            let file: FileNode = bincode::deserialize(blob.value())?;
+            paths.push(file.path);
+            if paths.len() >= entrypoint_limit {
+                break 'outer;
+            }
+        }
+        paths
+    };
+
+    // Risks: collect from RISK_FLAGS multimap, sort by level desc, truncate.
+    let risks = {
+        let txn = db.begin_read()?;
+        let t = txn.open_multimap_table(RISK_FLAGS)?;
+        let mut all = Vec::new();
+        for kv in t.iter()? {
+            let (_, mut values) = kv?;
+            while let Some(v) = values.next() {
+                let row = v?;
+                let risk: RiskFlag = bincode::deserialize(row.value())?;
+                all.push(risk);
+            }
+        }
+        all.sort_by(|a, b| b.level.cmp(&a.level));
+        all.truncate(risk_limit);
+        all
+    };
+
+    Ok(Overview {
+        repo,
+        areas,
+        entrypoint_paths,
+        risks,
+    })
+}
+
 impl GraphStore {
     /// List all areas, optionally filtered by depth (1 = top-level, 2 =
     /// nested under top-level, etc). Depth is computed from `path_prefix`.
@@ -452,28 +602,7 @@ impl GraphStore {
         &self,
         depth: Option<u32>,
     ) -> Result<Vec<AreaNode>, GraphStoreError> {
-        let txn = self.db.begin_read()?;
-        let t = txn.open_table(AREAS)?;
-        let mut out = Vec::new();
-        for entry in t.iter()? {
-            let (_, value) = entry?;
-            let area: AreaNode = bincode::deserialize(value.value())?;
-            if let Some(d) = depth {
-                if area_depth(&area) != d {
-                    continue;
-                }
-            }
-            out.push(area);
-        }
-        // Stable sort by depth then path_prefix so callers don't see
-        // redb's iteration order (which is sorted-by-key but the keys are
-        // structured IDs, not path_prefixes).
-        out.sort_by(|a, b| {
-            area_depth(a)
-                .cmp(&area_depth(b))
-                .then_with(|| a.path_prefix.cmp(&b.path_prefix))
-        });
-        Ok(out)
+        list_areas_from(&self.db, depth)
     }
 
     /// Outgoing adjacency rows for `entity_id`. Each row carries the partner
@@ -504,71 +633,48 @@ impl GraphStore {
         entrypoint_limit: usize,
         risk_limit: usize,
     ) -> Result<Overview, GraphStoreError> {
-        let repo = self.repo_metadata()?;
+        overview_from(&self.db, area_limit, entrypoint_limit, risk_limit)
+    }
+}
 
-        // Top areas at depth 1, in path_prefix order.
-        let mut areas = self.list_areas(Some(1))?;
-        areas.truncate(area_limit);
+impl ReadOnlyGraphStore {
+    /// Read previously-written repo metadata, if any.
+    pub fn repo_metadata(&self) -> Result<Option<RepoMetadata>, GraphStoreError> {
+        repo_metadata_from(&self.db)
+    }
 
-        // Entrypoints: scan EDGES_OUT once, collect distinct sources whose
-        // adjacency carries kind = EntrypointFor. O(E) but no per-file
-        // lookups. Resolve src node_id → file path via FILES so the output
-        // matches what surreal returned.
-        let entrypoint_paths = {
-            let txn = self.db.begin_read()?;
-            let edges = txn.open_multimap_table(EDGES_OUT)?;
-            let files = txn.open_table(FILES)?;
-            let mut seen = std::collections::BTreeSet::new();
-            let mut paths = Vec::new();
-            'outer: for kv in edges.iter()? {
-                let (key, mut values) = kv?;
-                let src = key.value().to_string();
-                let mut has_entrypoint = false;
-                while let Some(v) = values.next() {
-                    let row = v?;
-                    let rec: AdjacencyRecord = bincode::deserialize(row.value())?;
-                    if matches!(rec.kind, EdgeKind::EntrypointFor) {
-                        has_entrypoint = true;
-                        break;
-                    }
-                }
-                if !has_entrypoint || !seen.insert(src.clone()) {
-                    continue;
-                }
-                let Some(blob) = files.get(src.as_str())? else { continue };
-                let file: FileNode = bincode::deserialize(blob.value())?;
-                paths.push(file.path);
-                if paths.len() >= entrypoint_limit {
-                    break 'outer;
-                }
-            }
-            paths
-        };
+    /// List all areas, optionally filtered by depth.
+    pub fn list_areas(
+        &self,
+        depth: Option<u32>,
+    ) -> Result<Vec<AreaNode>, GraphStoreError> {
+        list_areas_from(&self.db, depth)
+    }
 
-        // Risks: collect from RISK_FLAGS multimap, sort by level desc, truncate.
-        let risks = {
-            let txn = self.db.begin_read()?;
-            let t = txn.open_multimap_table(RISK_FLAGS)?;
-            let mut all = Vec::new();
-            for kv in t.iter()? {
-                let (_, mut values) = kv?;
-                while let Some(v) = values.next() {
-                    let row = v?;
-                    let risk: RiskFlag = bincode::deserialize(row.value())?;
-                    all.push(risk);
-                }
-            }
-            all.sort_by(|a, b| b.level.cmp(&a.level));
-            all.truncate(risk_limit);
-            all
-        };
+    /// Outgoing adjacency rows for `entity_id`.
+    pub fn edges_from(
+        &self,
+        entity_id: &str,
+    ) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
+        collect_adjacency(&self.db, EDGES_OUT, entity_id)
+    }
 
-        Ok(Overview {
-            repo,
-            areas,
-            entrypoint_paths,
-            risks,
-        })
+    /// Incoming adjacency rows for `entity_id`.
+    pub fn edges_to(
+        &self,
+        entity_id: &str,
+    ) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
+        collect_adjacency(&self.db, EDGES_IN, entity_id)
+    }
+
+    /// One-shot summary for query commands.
+    pub fn overview(
+        &self,
+        area_limit: usize,
+        entrypoint_limit: usize,
+        risk_limit: usize,
+    ) -> Result<Overview, GraphStoreError> {
+        overview_from(&self.db, area_limit, entrypoint_limit, risk_limit)
     }
 }
 
@@ -767,6 +873,19 @@ fn open_or_create_database(db_path: &Path) -> Result<Database, GraphStoreError> 
     }
 }
 
+fn open_read_only_database(db_path: &Path) -> Result<ReadOnlyDatabase, GraphStoreError> {
+    match ReadOnlyDatabase::open(db_path) {
+        Ok(db) => Ok(db),
+        Err(redb::DatabaseError::UpgradeRequired(found)) => {
+            Err(GraphStoreError::IncompatibleRedbFileFormat {
+                path: db_path.to_path_buf(),
+                found,
+            })
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn ensure_schema(db: &Database) -> Result<(), GraphStoreError> {
     let txn = db.begin_write()?;
     {
@@ -818,6 +937,49 @@ fn ensure_schema(db: &Database) -> Result<(), GraphStoreError> {
         let _ = txn.open_multimap_table(RISK_FLAGS)?;
     }
     txn.commit()?;
+    Ok(())
+}
+
+fn verify_schema_read_only(db: &ReadOnlyDatabase) -> Result<(), GraphStoreError> {
+    let txn = db.begin_read()?;
+    {
+        let meta = txn.open_table(META)?;
+        let value = meta.get(META_KEY_SCHEMA_VERSION)?.ok_or(
+            GraphStoreError::SchemaMismatch {
+                found: 0,
+                expected: SCHEMA_VERSION,
+            },
+        )?;
+        let bytes = value.value();
+        if bytes.len() != 4 {
+            return Err(GraphStoreError::SchemaMismatch {
+                found: 0,
+                expected: SCHEMA_VERSION,
+            });
+        }
+        let found = u32::from_le_bytes(bytes.try_into().unwrap());
+        if found != SCHEMA_VERSION {
+            return Err(GraphStoreError::SchemaMismatch {
+                found,
+                expected: SCHEMA_VERSION,
+            });
+        }
+
+        // Query commands expect the same tables as the writable store. Read-only
+        // open validates the materialized store instead of creating anything.
+        let _ = txn.open_table(FILES)?;
+        let _ = txn.open_table(AREAS)?;
+        let _ = txn.open_table(FUNCTIONS)?;
+        let _ = txn.open_table(CLASSES)?;
+        let _ = txn.open_table(DOCS)?;
+        let _ = txn.open_table(CONFIGS)?;
+        let _ = txn.open_multimap_table(EDGES_OUT)?;
+        let _ = txn.open_multimap_table(EDGES_IN)?;
+        let _ = txn.open_multimap_table(FUNCTIONS_BY_PATH)?;
+        let _ = txn.open_multimap_table(NODES_BY_PATH)?;
+        let _ = txn.open_multimap_table(SYMBOL_BY_NAME)?;
+        let _ = txn.open_multimap_table(RISK_FLAGS)?;
+    }
     Ok(())
 }
 
@@ -922,6 +1084,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn read_only_open_does_not_create_missing_store() {
+        let root = tmp_root(function_name!());
+        assert!(GraphStore::open_read_only(&root).is_err());
+        assert!(
+            !root.join(".aethyme").exists(),
+            "read-only open must not initialize .aethyme"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Test-only sample node — small Serialize/Deserialize struct so we can
     /// exercise insert_node without depending on FileNode/FunctionNode shape.
     #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
@@ -999,6 +1172,80 @@ mod tests {
         let in_rec: AdjacencyRecord = bincode::deserialize(&inv[0]).expect("decode");
         assert_eq!(in_rec.kind, EdgeKind::Imports);
         assert_eq!(in_rec.other.as_str(), "file:Repo:a.rs");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_store_reads_query_surfaces() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let area = AreaNode::new("Repo", "src", false);
+        let file_a = FileNode::new(
+            "Repo",
+            "src/a.rs",
+            Some("Rust".to_string()),
+            crate::model::file::FileRole::Source,
+            10,
+            100,
+            false,
+            Some(area.id.clone()),
+        );
+        let file_b = FileNode::new(
+            "Repo",
+            "src/b.rs",
+            Some("Rust".to_string()),
+            crate::model::file::FileRole::Source,
+            20,
+            200,
+            false,
+            Some(area.id.clone()),
+        );
+        let edge = Edge::new(
+            file_a.id.clone(),
+            file_b.id.clone(),
+            EdgeKind::Imports,
+            100,
+            "read-only-test",
+        );
+
+        let mut session = store.begin_index().expect("session");
+        insert_area(&mut session, &area).expect("area");
+        insert_file(&mut session, &file_a).expect("file a");
+        insert_file(&mut session, &file_b).expect("file b");
+        insert_edge(&mut session, &edge).expect("edge");
+        session.commit().expect("commit");
+        store
+            .set_repo_metadata(&RepoMetadata {
+                root_path: root.to_string_lossy().to_string(),
+                commit_hash: Some("abc123".to_string()),
+                indexed_at_unix: 1,
+                file_count: 2,
+                languages: vec!["Rust".to_string()],
+            })
+            .expect("metadata");
+        drop(store);
+
+        let readonly = GraphStore::open_read_only(&root).expect("read-only open");
+        assert_eq!(
+            readonly.repo_metadata().expect("metadata").unwrap().file_count,
+            2
+        );
+        assert_eq!(readonly.list_areas(Some(1)).expect("areas"), vec![area]);
+        assert_eq!(
+            readonly
+                .edges_from(&file_a.id)
+                .expect("edges from")[0]
+                .other
+                .as_str(),
+            file_b.id
+        );
+        assert_eq!(
+            readonly.edges_to(&file_b.id).expect("edges to")[0]
+                .other
+                .as_str(),
+            file_a.id
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
