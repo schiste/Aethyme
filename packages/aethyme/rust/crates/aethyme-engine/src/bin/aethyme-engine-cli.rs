@@ -482,8 +482,15 @@ fn run() -> Result<(), String> {
         }
         "index" => {
             let repo = read_option(&args, "--repo")?;
+            let profile = has_flag(&args, "--profile");
+            let mut profiler = StageProfiler::new("index", profile);
             eprintln!("Building repository map...");
-            let map = build_map(&repo, no_cache, fragment_mode)?;
+            let (map, build_profile) = profiler.stage("map_build", || {
+                build_map_with_profile(&repo, no_cache, fragment_mode)
+            })?;
+            if profile {
+                profiler.attach_substages("map_build", &build_profile);
+            }
             eprintln!(
                 "Map built: {} areas, {} files, {} functions, {} classes, {} edges",
                 map.areas.len(),
@@ -493,16 +500,20 @@ fn run() -> Result<(), String> {
                 map.edges.len(),
             );
             eprintln!("Writing to redb graph store...");
-            index_to_store(&PathBuf::from(&repo), &map)?;
+            index_to_store(&PathBuf::from(&repo), &map, &mut profiler)?;
             eprintln!("Generating Chau7 snippets...");
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            aethyme_engine::context::snippets::generate_and_write(&canonical, &map)?;
+            profiler.stage("snippet_generation", || {
+                aethyme_engine::context::snippets::generate_and_write(&canonical, &map)
+                    .map_err(|e| e.to_string())
+            })?;
             eprintln!(
                 "Snippets written to {}/.chau7/snippets.json",
                 canonical.display()
             );
+            profiler.report();
         }
         "prompt" => {
             let repo = read_option(&args, "--repo")?;
@@ -1176,15 +1187,20 @@ fn build_map(
     no_cache: bool,
     fragment_mode: FragmentBuildMode,
 ) -> Result<RepositoryMap, String> {
+    build_map_with_profile(repo, no_cache, fragment_mode).map(|(map, _)| map)
+}
+
+fn build_map_with_profile(
+    repo: &str,
+    no_cache: bool,
+    fragment_mode: FragmentBuildMode,
+) -> Result<(RepositoryMap, aethyme_engine::map::RepositoryBuildProfile), String> {
     match fragment_mode {
-        FragmentBuildMode::Force => {
-            RepositoryMap::build_from_fragments(&PathBuf::from(repo)).map(|(map, _)| map)
-        }
+        FragmentBuildMode::Force => RepositoryMap::build_from_fragments(&PathBuf::from(repo)),
         FragmentBuildMode::Prefer => {
             // Default path as of Phase 4.7.12: committed fragments are the
             // only map source. Missing `.aethyme/graph` is a build error.
             RepositoryMap::build_with_fragment_preference(&PathBuf::from(repo), no_cache, |_| {})
-                .map(|(map, _)| map)
         }
     }
 }
@@ -1195,12 +1211,10 @@ fn legacy_pass_removed_error() -> String {
 
 /// Per-stage wall-time profiler for one engine command.
 ///
-/// Diagnostic for "where does the 14s actually go?" — the daemon mode
-/// shipped in `aethyme` (Rust binary) eliminates the ~1.5-3s of Python
-/// startup but the engine subprocess still dominates per-call cost. The
-/// profiler reports stage timings to stderr so we can decide whether
-/// (a) `RepositoryMap::build` rebuild is the bottleneck (→ engine daemon)
-/// or (b) the localization views themselves are heavy (→ answer cache).
+/// Diagnostic for "where does the time actually go?" The profiler reports
+/// stage timings to stderr so command-specific work can be separated from
+/// shared `RepositoryMap` construction. `task-localize --profile` uses it for
+/// navigation latency, while `index --profile` uses it for Redb materialization.
 ///
 /// Output line example (only when `--profile` is set):
 ///   [profile] task-localize: map_build=12480ms task_parse=0ms anchors=210ms \
@@ -1394,7 +1408,11 @@ fn file_path_from_id(id: &str) -> Option<String> {
     Some(after_repo.to_string())
 }
 
-fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Result<(), String> {
+fn index_to_store(
+    repo_root: &std::path::Path,
+    map: &RepositoryMap,
+    profiler: &mut StageProfiler,
+) -> Result<(), String> {
     use aethyme_engine::store::redb::graph_store::{
         self as gs, GraphStore, RepoMetadata,
     };
@@ -1412,38 +1430,45 @@ fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Result<()
     }
     // reset() = delete file + recreate. Mirrors what surreal's REMOVE DATABASE
     // gave us: every index pass starts from a clean slate.
-    let store = GraphStore::reset(&canonical).map_err(|e| e.to_string())?;
+    let store = profiler.stage("redb_reset_open", || {
+        GraphStore::reset(&canonical).map_err(|e| e.to_string())
+    })?;
 
-    let mut session = store.begin_index().map_err(|e| e.to_string())?;
+    let mut session = profiler.stage("redb_begin_index", || {
+        store.begin_index().map_err(|e| e.to_string())
+    })?;
 
-    // Areas
-    for area in &map.areas {
-        gs::insert_area(&mut session, area).map_err(|e| e.to_string())?;
-    }
-    eprintln!("  areas: {}", map.areas.len());
-
-    // Files
     let mut file_ok = 0usize;
     let mut file_errors = 0usize;
-    for file in &map.files {
-        if let Err(e) = gs::insert_file(&mut session, file) {
-            if file_errors < 3 {
-                eprintln!(
-                    "  file error: {} (area={:?}): {}",
-                    &file.path, &file.area_id, e
-                );
-            }
-            file_errors += 1;
-        } else {
-            file_ok += 1;
+    profiler.stage("redb_node_writes", || -> Result<(), String> {
+        // Areas
+        for area in &map.areas {
+            gs::insert_area(&mut session, area).map_err(|e| e.to_string())?;
         }
-    }
-    eprintln!(
-        "  files: {} ok, {} errors (of {} total)",
-        file_ok,
-        file_errors,
-        map.files.len()
-    );
+        eprintln!("  areas: {}", map.areas.len());
+
+        // Files
+        for file in &map.files {
+            if let Err(e) = gs::insert_file(&mut session, file) {
+                if file_errors < 3 {
+                    eprintln!(
+                        "  file error: {} (area={:?}): {}",
+                        &file.path, &file.area_id, e
+                    );
+                }
+                file_errors += 1;
+            } else {
+                file_ok += 1;
+            }
+        }
+        eprintln!(
+            "  files: {} ok, {} errors (of {} total)",
+            file_ok,
+            file_errors,
+            map.files.len()
+        );
+        Ok(())
+    })?;
 
     // Edges — skip unresolved imports and any symbol-level endpoints. With
     // raw structured IDs we just inspect the prefix; redb keys are not
@@ -1451,71 +1476,78 @@ fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Result<()
     let mut edge_errors = 0usize;
     let mut edge_ok = 0usize;
     let mut edge_skipped = 0usize;
-    for edge in &map.edges {
-        let from = edge.from.as_str();
-        let to = edge.to.as_str();
-        if to.starts_with("import:")
-            || from.starts_with("fn:")
-            || from.starts_with("class:")
-            || to.starts_with("fn:")
-            || to.starts_with("class:")
-        {
-            edge_skipped += 1;
-            continue;
-        }
-        if let Err(e) = gs::insert_edge(&mut session, edge) {
-            if edge_errors < 5 {
-                eprintln!(
-                    "  edge error: {} -> {} ({:?}): {}",
-                    &from[..from.len().min(50)],
-                    &to[..to.len().min(50)],
-                    edge.kind,
-                    e
-                );
+    profiler.stage("redb_edge_writes", || -> Result<(), String> {
+        for edge in &map.edges {
+            let from = edge.from.as_str();
+            let to = edge.to.as_str();
+            if to.starts_with("import:")
+                || from.starts_with("fn:")
+                || from.starts_with("class:")
+                || to.starts_with("fn:")
+                || to.starts_with("class:")
+            {
+                edge_skipped += 1;
+                continue;
             }
-            edge_errors += 1;
-        } else {
-            edge_ok += 1;
+            if let Err(e) = gs::insert_edge(&mut session, edge) {
+                if edge_errors < 5 {
+                    eprintln!(
+                        "  edge error: {} -> {} ({:?}): {}",
+                        &from[..from.len().min(50)],
+                        &to[..to.len().min(50)],
+                        edge.kind,
+                        e
+                    );
+                }
+                edge_errors += 1;
+            } else {
+                edge_ok += 1;
+            }
         }
-    }
-    eprintln!(
-        "  edges: {} ok, {} errors, {} skipped (symbol-level) (of {} total)",
-        edge_ok,
-        edge_errors,
-        edge_skipped,
-        map.edges.len()
-    );
+        eprintln!(
+            "  edges: {} ok, {} errors, {} skipped (symbol-level) (of {} total)",
+            edge_ok,
+            edge_errors,
+            edge_skipped,
+            map.edges.len()
+        );
+        Ok(())
+    })?;
 
-    // Risk flags
-    for risk in &map.risk_flags {
-        gs::insert_risk(&mut session, risk).map_err(|e| e.to_string())?;
-    }
-    eprintln!("  risks: {}", map.risk_flags.len());
+    profiler.stage("redb_risk_writes", || -> Result<(), String> {
+        for risk in &map.risk_flags {
+            gs::insert_risk(&mut session, risk).map_err(|e| e.to_string())?;
+        }
+        eprintln!("  risks: {}", map.risk_flags.len());
+        Ok(())
+    })?;
 
-    session.commit().map_err(|e| e.to_string())?;
+    profiler.stage("redb_commit", || session.commit().map_err(|e| e.to_string()))?;
 
     // Repo metadata — outside the IndexSession because it's a one-shot
     // META write and we want it persisted only after the bulk load succeeded.
-    let commit = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&canonical)
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string());
-    let indexed_at_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    store
-        .set_repo_metadata(&RepoMetadata {
-            root_path: canonical.to_string_lossy().to_string(),
-            commit_hash: commit,
-            indexed_at_unix,
-            file_count: map.files.len() as u64,
-            languages: map.snapshot.languages.clone(),
-        })
-        .map_err(|e| e.to_string())?;
+    profiler.stage("metadata_write", || {
+        let commit = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&canonical)
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string());
+        let indexed_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        store
+            .set_repo_metadata(&RepoMetadata {
+                root_path: canonical.to_string_lossy().to_string(),
+                commit_hash: commit,
+                indexed_at_unix,
+                file_count: map.files.len() as u64,
+                languages: map.snapshot.languages.clone(),
+            })
+            .map_err(|e| e.to_string())
+    })?;
 
     let db_path = canonical.join(".aethyme").join("graph_store.redb");
     eprintln!("Store written to: {}", db_path.display());
