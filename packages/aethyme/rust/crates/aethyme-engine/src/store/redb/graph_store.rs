@@ -9,8 +9,8 @@
 use std::path::{Path, PathBuf};
 
 use redb::{
-    Database, MultimapTableDefinition, ReadableMultimapTable, ReadableTable, TableDefinition,
-    WriteTransaction,
+    Database, MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable, ReadableTable,
+    TableDefinition, WriteTransaction,
 };
 use serde::{Deserialize, Serialize};
 
@@ -781,7 +781,7 @@ fn ensure_schema(db: &Database) -> Result<(), GraphStoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use redb::{ReadableMultimapTable, ReadableTableMetadata};
+    use redb::{ReadableDatabase, ReadableMultimapTable, ReadableTableMetadata};
     use serde::Deserialize;
 
     macro_rules! function_name {
