@@ -126,6 +126,65 @@ The redb graph store remains the local query artifact written by
 | `aethyme-engine-cli --from-fragments` | Compatibility spelling in `src/bin/aethyme-engine-cli.rs`; it now selects the same fragments-only build surface as the default. | Existing diagnostics/tests may keep passing it, but it no longer bypasses or proves a separate fallback. |
 | `aethyme-engine-cli --no-fragments` | Removed rollback flag retained as a hard error in `src/bin/aethyme-engine-cli.rs`; `daemon.rs` also rejects non-fragment builds. | No in-repo manifest or workflow passed it in the 4.7.9 audit. Out-of-repo callers must remove the flag and ensure `<repo>/.aethyme/graph/` exists. |
 
+### Redb graph-store contract
+
+`<repo>/.aethyme/graph_store.redb` is a stable local artifact path. It is
+not a committed graph format and must remain derived from committed
+fragments under `<repo>/.aethyme/graph/`.
+
+File-format policy:
+
+- The engine currently builds against redb 4.x. The redb file format is
+  owned by redb, not by Aethyme, so Aethyme does not promise in-place
+  migration for old `graph_store.redb` files.
+- If redb reports `UpgradeRequired(found)`, Aethyme treats the file as
+  disposable and incompatible with the current engine. The operator fix is
+  to regenerate it from fragments with `aethyme-engine-cli index --repo
+  <repo>`.
+- Query-only commands report the incompatibility and stop. They must not
+  delete or regenerate the store because they are read-only consumers.
+
+Regeneration behavior:
+
+- `aethyme-engine-cli index --repo <repo>` is the normal writer. It detects
+  old redb file formats, prints an operator message, deletes/recreates
+  only `.aethyme/graph_store.redb`, and rebuilds it from
+  `.aethyme/graph/`. It must not modify `.aethyme/graph/` fragments.
+- `index --compact` is an opt-in post-index experiment on the same final
+  store path. It is not enabled by default.
+- `index --disposable-fast` is an opt-in staged writer. It writes
+  `.aethyme/graph_store.redb.indexing` first, uses relaxed durability for
+  bulk graph rows, performs a final durable metadata write, then publishes
+  the staged file over `graph_store.redb`. The `.indexing` path is private
+  and must not become a cross-process dependency.
+- Normal `index` also removes stale `.indexing` files before rebuilding the
+  public store, so a previously interrupted staged build does not affect
+  the default writer.
+
+Reader/writer split:
+
+| Store access | Commands / callers | Required handle |
+|---|---|---|
+| Write/rebuild final store | `aethyme-engine-cli index --repo <repo>`; indirectly `scripts/eval/setup-playground.sh` after `aethyme-graph-index` writes fragments | Writable `GraphStore::reset/open` |
+| Write staged store then publish | `aethyme-engine-cli index --disposable-fast --repo <repo>` | Writable `GraphStore::reset_staging`, then `publish_staging` after close |
+| Optional post-write compaction | `aethyme-engine-cli index --compact --repo <repo>` | Writable `GraphStore::compact` after all write transactions commit |
+| Read areas / overview | `query-areas`, `query-overview` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
+| Read adjacency | `importers`, `deps`, `callers` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
+| Assert artifact exists | `scripts/eval/setup-playground.sh`, `scripts/eval/verify-playground.sh`, `docs/guides/playground-setup.md` | Filesystem existence check only |
+
+Read-only open policy:
+
+- Query-only CLI commands must use `GraphStore::open_read_only`. This is
+  required, not optional: read-only commands must not create `.aethyme/`,
+  initialize empty stores, repair incompatible files, or take a writable
+  database handle.
+- Writable `GraphStore::open/reset` is only for indexing, staging,
+  schema initialization, tests that intentionally mutate the store, and
+  future writer-only maintenance commands.
+- Read-only opens reduce accidental writer contention, but they do not
+  override redb's single-writer/file-lock behavior. Operators should run
+  query-only commands after the index writer has released the store.
+
 ### Phase 4.7.9 redb/cache deletion audit
 
 Audit command run on 2026-05-28:
