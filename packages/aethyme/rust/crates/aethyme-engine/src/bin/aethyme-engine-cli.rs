@@ -1400,6 +1400,16 @@ fn index_to_store(repo_root: &std::path::Path, map: &RepositoryMap) -> Result<()
     };
 
     let canonical = repo_root.canonicalize().map_err(|e| e.to_string())?;
+    if let Some(incompatible) = GraphStore::detect_incompatible_file_format(&canonical) {
+        eprintln!(
+            "Existing Redb graph store uses old redb file format v{}: {}",
+            incompatible.found_redb_format,
+            incompatible.path.display()
+        );
+        eprintln!(
+            "Deleting graph_store.redb and regenerating it from .aethyme/graph fragments; fragments are untouched."
+        );
+    }
     // reset() = delete file + recreate. Mirrors what surreal's REMOVE DATABASE
     // gave us: every index pass starts from a clean slate.
     let store = GraphStore::reset(&canonical).map_err(|e| e.to_string())?;

@@ -113,6 +113,7 @@ pub enum GraphStoreError {
     Db(redb::Error),
     Encode(bincode::Error),
     SchemaMismatch { found: u32, expected: u32 },
+    IncompatibleRedbFileFormat { path: PathBuf, found: u8 },
 }
 
 impl std::fmt::Display for GraphStoreError {
@@ -124,6 +125,11 @@ impl std::fmt::Display for GraphStoreError {
             Self::SchemaMismatch { found, expected } => {
                 write!(f, "graph store schema mismatch: found v{found}, expected v{expected}")
             }
+            Self::IncompatibleRedbFileFormat { path, found } => write!(
+                f,
+                "graph store at {} uses old redb file format v{found}; regenerate it from committed fragments with `aethyme-engine-cli index --repo <repo>`. The `.aethyme/graph/` fragments are not modified.",
+                path.display()
+            ),
         }
     }
 }
@@ -167,6 +173,12 @@ pub struct GraphStore {
 
 const DB_FILE_NAME: &str = "graph_store.redb";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompatibleGraphStore {
+    pub path: PathBuf,
+    pub found_redb_format: u8,
+}
+
 impl GraphStore {
     /// Open or create the graph store for a repository. Verifies / writes the
     /// schema version sentinel and ensures every table exists so downstream
@@ -175,9 +187,27 @@ impl GraphStore {
         let dir = repo_root.join(".aethyme");
         std::fs::create_dir_all(&dir)?;
         let db_path = dir.join(DB_FILE_NAME);
-        let db = Database::create(&db_path)?;
+        let db = open_or_create_database(&db_path)?;
         ensure_schema(&db)?;
         Ok(Self { db, db_path })
+    }
+
+    /// Detect an existing redb file that the current engine cannot open
+    /// because it was written by an older redb file format. Used by the index
+    /// CLI to print an explicit regeneration notice before deleting the local
+    /// materialized store.
+    pub fn detect_incompatible_file_format(repo_root: &Path) -> Option<IncompatibleGraphStore> {
+        let db_path = repo_root.join(".aethyme").join(DB_FILE_NAME);
+        if !db_path.exists() {
+            return None;
+        }
+        match Database::open(&db_path) {
+            Err(redb::DatabaseError::UpgradeRequired(found)) => Some(IncompatibleGraphStore {
+                path: db_path,
+                found_redb_format: found,
+            }),
+            _ => None,
+        }
     }
 
     /// Path to the DB file on disk.
@@ -724,6 +754,19 @@ impl<'db> IndexSession<'db> {
     }
 }
 
+fn open_or_create_database(db_path: &Path) -> Result<Database, GraphStoreError> {
+    match Database::create(db_path) {
+        Ok(db) => Ok(db),
+        Err(redb::DatabaseError::UpgradeRequired(found)) => {
+            Err(GraphStoreError::IncompatibleRedbFileFormat {
+                path: db_path.to_path_buf(),
+                found,
+            })
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn ensure_schema(db: &Database) -> Result<(), GraphStoreError> {
     let txn = db.begin_write()?;
     {
@@ -781,7 +824,7 @@ fn ensure_schema(db: &Database) -> Result<(), GraphStoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use redb::{ReadableDatabase, ReadableMultimapTable, ReadableTableMetadata};
+    use redb::{ReadableDatabase, ReadableTableMetadata};
     use serde::Deserialize;
 
     macro_rules! function_name {
@@ -799,6 +842,19 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("aethyme_graph_store_{name}_{nonce}"))
+    }
+
+    fn mark_graph_store_as_redb_v2(root: &Path) {
+        let db_path = root.join(".aethyme").join(DB_FILE_NAME);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .expect("open db file");
+        for offset in [64u64, 192u64] {
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
+                .expect("seek version byte");
+            std::io::Write::write_all(&mut file, &[2]).expect("write v2 marker");
+        }
     }
 
     #[test]
@@ -1409,6 +1465,56 @@ mod tests {
             }
             Err(other) => panic!("expected SchemaMismatch, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn incompatible_redb_file_format_is_reported() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        drop(store);
+        mark_graph_store_as_redb_v2(&root);
+
+        match GraphStore::open(&root) {
+            Ok(_) => panic!("expected IncompatibleRedbFileFormat, got Ok"),
+            Err(GraphStoreError::IncompatibleRedbFileFormat { path, found }) => {
+                assert_eq!(found, 2);
+                assert_eq!(path, root.join(".aethyme").join(DB_FILE_NAME));
+            }
+            Err(other) => panic!("expected IncompatibleRedbFileFormat, got {other:?}"),
+        }
+
+        let message = match GraphStore::open(&root) {
+            Ok(_) => panic!("expected old redb format to fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(message.contains("aethyme-engine-cli index --repo <repo>"));
+        assert!(message.contains(".aethyme/graph/"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reset_replaces_incompatible_graph_store_without_touching_fragments() {
+        let root = tmp_root(function_name!());
+        let fragment_marker = root.join(".aethyme/graph/fragments.marker");
+        std::fs::create_dir_all(fragment_marker.parent().unwrap()).expect("fragment dir");
+        std::fs::write(&fragment_marker, b"source-of-truth").expect("fragment marker");
+
+        let store = GraphStore::open(&root).expect("open");
+        drop(store);
+        mark_graph_store_as_redb_v2(&root);
+
+        let incompatible = GraphStore::detect_incompatible_file_format(&root)
+            .expect("old redb format detected");
+        assert_eq!(incompatible.found_redb_format, 2);
+
+        let rebuilt = GraphStore::reset(&root).expect("reset");
+        assert!(rebuilt.path().exists(), "graph_store.redb recreated");
+        assert_eq!(
+            std::fs::read(&fragment_marker).expect("fragment marker"),
+            b"source-of-truth"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }
