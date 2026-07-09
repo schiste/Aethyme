@@ -270,8 +270,8 @@ def test_explain_repo_generates_artifacts_and_invokes_backends(monkeypatch, tmp_
     )
 
     monkeypatch.setattr(
-        "src.eval.explain_repo.build_task_pack",
-        lambda repo, task: {
+        "src.eval.explain_repo._resolve_task_pack",
+        lambda repo, task, tool: {
             "task": {"raw": task, "kind": "explain_repo"},
             "summary": {
                 "snapshot": {
@@ -506,8 +506,8 @@ def test_navigation_ctf_builds_reference_output(monkeypatch, tmp_path: Path) -> 
         },
     )
     monkeypatch.setattr(
-        "src.eval.navigation_ctf.build_task_pack",
-        lambda repo, task: {
+        "src.eval.navigation_ctf._resolve_task_pack",
+        lambda repo, task, tool: {
             "task": {"raw": task, "kind": "change_symbol"},
             "anchors": [],
             "navigation_order": ["pyproject.toml", "src/main.py"],

@@ -119,7 +119,7 @@ def test_navigation_ctf_scope_view_passes_detailed_signals(monkeypatch, tmp_path
     )
     monkeypatch.setattr(
         navigation_ctf,
-        "build_task_pack",
+        "_resolve_task_pack",
         lambda *_args, **_kwargs: {
             "anchors": [{"id": "src/main.py"}],
             "navigation_order": ["src/main.py"],
