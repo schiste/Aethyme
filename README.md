@@ -7,11 +7,36 @@ The initial open-source scope is **Aethyme Core**: local repository indexing,
 graph traversal, search, task context generation, and evaluation tooling in
 `packages/aethyme`.
 
-## Status
+## Status: what exists today vs what is planned
 
-Aethyme is early-stage developer tooling. The core local workflow is the public
-entry point. Cloud, hosted SaaS, and eval dashboard packages are present in this
-monorepo but are not the initial public support surface.
+**Exists and works today**
+
+- A deterministic **Rust graph engine** (`packages/aethyme/rust`): repo
+  indexing into committed binary fragments plus a local redb store, graph
+  navigation, impact frontiers, task-context packs, and a warm unix-socket
+  daemon.
+- A **Python CLI** (`aethyme`, click-based) that shells out to the engine:
+  `repo`, `query`, `graph`, `task`, `facts`, `analyze`, `enhance`, `ai-ready`,
+  `autofix`, `eval`.
+- An **eval harness** with a playground protocol and a local eval dashboard
+  (`packages/aethyme-eval-ui`).
+
+**Planned, not implemented**
+
+- A **local agent broker** for high-concurrency AI development: per-agent git
+  worktrees, an agent session registry, file leases and overlapping-edit
+  detection, an affected gate runner, merge simulation, and a promotion flow.
+  This will be a **new local subsystem**; the graph engine remains a
+  supporting repo-intelligence service and may later provide impact hints to
+  the broker. See
+  [`docs/aethyme-local-agent-broker.md`](docs/aethyme-local-agent-broker.md).
+
+**Present but out of scope / frozen**
+
+- `packages/aethyme-cloud` (SaaS scaffold) and the PostgreSQL/SCIP API lineage
+  inside `packages/aethyme/src` are earlier cloud-oriented work. They are not
+  part of the current local-first direction and are not required by any local
+  workflow. No cloud execution, auth, or team sync is part of broker v0.
 
 ## Repository Layout
 
@@ -40,8 +65,17 @@ pip install -e '.[dev]'
 cd rust
 cargo build --quiet --bin aethyme-engine-cli
 cd ..
-aethyme explore --repo . --request "Explain the main repository structure" --format answer-json
+aethyme repo inspect . --mode brief
+rust/target/debug/aethyme-engine-cli explore --repo . \
+  --request "Explain the main repository structure" --format answer-json
 ```
+
+Note on `explore`: the `explore` command was removed from the Python CLI on
+2026-05-08 and is served natively by the Rust binaries (`aethyme-engine-cli
+explore`, or the `aethyme` Rust router binary). Because `pip install` also
+puts a Python `aethyme` entrypoint on your PATH, invoke the Rust binary by
+path as shown above unless you have arranged for the Rust `aethyme` binary to
+take precedence.
 
 For the longer setup guide, see
 [`packages/aethyme/docs/getting-started/quickstart.md`](packages/aethyme/docs/getting-started/quickstart.md).
@@ -49,10 +83,12 @@ For the longer setup guide, see
 ## Core Commands
 
 ```bash
-aethyme explore --repo /path/to/repo --request "Find the auth flow" --format answer-json
 aethyme repo warm /path/to/repo
+aethyme repo inspect /path/to/repo --mode brief
 aethyme task context --repo /path/to/repo --task "Update validate_token flow" --json-output
 aethyme query symbol /path/to/repo main
+rust/target/debug/aethyme-engine-cli explore --repo /path/to/repo \
+  --request "Find the auth flow" --format answer-json
 ```
 
 The Python CLI shells out to the Rust engine binary for deterministic repository
