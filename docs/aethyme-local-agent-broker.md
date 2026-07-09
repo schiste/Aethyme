@@ -21,9 +21,32 @@ Aethyme is explicitly **not**:
 - a Claude/Codex-specific wrapper
 - a Chau7-dependent feature
 
-The long-term architecture is portable, local-first, and high-performance,
-able to become a SaaS-connected system later without ever requiring cloud
-execution.
+The long-term architecture is portable, local-first, and high-performance.
+SaaS is dropped from planning entirely (decision 2026-07-09): the focus is
+the core engine and its capabilities, delivered through a CLI (at best a
+TUI later) — but everything runs through APIs with clear, versioned
+contracts, so any future delivery surface is a client, not a rewrite.
+
+## Product theses (decided 2026-07-09)
+
+1. **Neutral substrate — multi-vendor is the point.** Vendors will each
+   coordinate their own agents; none will coordinate each other's. Aethyme
+   is agent-agnostic by construction: a session is a worktree producing
+   diffs, regardless of whether Claude Code, Codex, Aider, or a shell
+   script is driving it. Multi-vendor operation is a v0 requirement, not a
+   later adapter story.
+2. **Attach-first, from day one.** Real usage starts inside an agent tool
+   the user already launched. Session identity is the (worktree, branch)
+   pair — `broker adopt` registers an existing worktree; `broker
+   start-agent` is a convenience spawner layered on the same model. PID is
+   optional metadata captured when the broker did the spawning; liveness
+   derives from diff/file activity, with process state as a bonus signal.
+   No design may assume the broker owns the agent process.
+3. **API-first.** The broker core is a Rust library crate with a typed
+   public API; the CLI is a thin client of it, every command has a
+   `--json` form, and the append-only events schema is a versioned
+   contract from day one. A TUI, editor integrations, or anything else
+   consume the same surface.
 
 ## Current state (be precise about this)
 
@@ -71,23 +94,36 @@ the graph is cold or stale.
 Aethyme v0 local broker should eventually provide:
 
 - one isolated git worktree per agent/task
-- an agent session registry (task, branch, worktree path, command, logs,
-  status, exit state)
+- an agent session registry keyed on (worktree, branch): `broker adopt`
+  registers an existing worktree (attach-first); `broker start-agent`
+  creates worktree + spawns a command template as a convenience; task,
+  logs, status, and exit state are recorded where known
 - changed-file tracking per session
 - overlapping-edit detection across live sessions
 - a simple gate runner (configured gates, run on changed files, results
   cached)
 - merge simulation against an integration branch before promotion
 - a promotion flow (submit → simulate → gate → promote/reject)
-- an append-only event log
-- CLI status commands (`status`, `agents`, `leases`, `events`, ...)
+- an append-only event log with a versioned schema (the integration
+  contract for any future surface)
+- CLI status commands (`status`, `agents`, `leases`, `events`, ...), each
+  with a `--json` form backed by the library API
+
+**v0 success criterion (decided 2026-07-09): dogfooding, not a staged
+demo.** v0 is done when the broker is used for real multi-agent development
+on this repository's own day-to-day work — with at least two different
+agent vendors (e.g. Claude Code and Codex) attached concurrently — and has
+produced a written friction log of blockers, pros, and cons. A
+deterministic scripted-agent integration test exists alongside for CI, but
+passing it is not the bar.
 
 ## Explicitly out of scope for v0
 
-- SaaS or any cloud execution
+- SaaS, cloud execution, or SaaS-oriented design work of any kind
 - remote multi-machine coordination
-- rich per-agent adapters (an agent is a command template in v0)
-- a dashboard or TUI
+- rich per-agent adapters (multi-vendor works because sessions are
+  vendor-agnostic worktrees, not because of adapters)
+- a dashboard; a TUI is a possible later client of the same API, not v0
 - graph-based affected **test selection** (the graph does not populate
   test-coverage edges today; v0 gate selection is config/glob-driven, with
   graph impact hints as an optional advisory layer only)
@@ -97,12 +133,16 @@ Aethyme v0 local broker should eventually provide:
 
 ## Implementation choice (decided, not yet implemented)
 
-- **Rust broker core.** Product-grade broker components are written in Rust,
-  living alongside the existing engine crates in
-  `packages/aethyme/rust/crates/`.
-- **CLI wrapper.** Broker commands are exposed through a Rust binary and/or
-  the existing click CLI as thin delivery, matching the current
-  Python-delivery / Rust-engine split.
+- **Rust broker core as a library crate.** Product-grade broker components
+  are written in Rust, living alongside the existing engine crates in
+  `packages/aethyme/rust/crates/`. The crate's typed public API is the
+  product surface; delivery layers are clients of it.
+- **CLI as a thin client.** Broker commands are exposed through a Rust
+  binary (and/or the existing click CLI) that only calls the library API.
+  Every command has a `--json` output form; those JSON shapes and the
+  events schema are versioned contracts, registered in
+  `packages/aethyme/docs/architecture/cross-process-consumers.md` once
+  external callers exist.
 - **SQLite for broker operational state** at `.aethyme/broker.db` (WAL mode).
   redb remains appropriate for the graph/cache-style storage where it is
   already used; operational, multi-writer, queryable state belongs in SQLite.
@@ -142,8 +182,10 @@ and are labeled as experiments.
 
 1. **Phase 1 — local state model**: SQLite schema (sessions, leases, gates,
    gate_results, merge_queue, events) behind a typed store layer.
-2. **Phase 2 — worktree & session broker**: `start-agent`, `agents`,
-   `cleanup`; worktree lifecycle; subprocess spawn with log capture.
+2. **Phase 2 — worktree & session broker**: `adopt` (attach-first session
+   registration on existing worktrees), `start-agent` (worktree + spawn
+   convenience), `agents`, `cleanup`; worktree lifecycle; activity-based
+   liveness with PID as optional metadata.
 3. **Phase 3 — leases & conflict detection**: diff-derived implicit leases,
    overlap warnings, TTL expiry.
 4. **Phase 4 — affected gate runner**: `gates.toml`, glob-triggered
