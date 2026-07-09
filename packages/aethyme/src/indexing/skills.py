@@ -14,9 +14,15 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-# Aethyme package root — two levels up from this file (src/indexing/skills.py).
-AETHYME_PACKAGE_ROOT = Path(__file__).resolve().parent.parent.parent
-SKILLS_SOURCE_DIR = AETHYME_PACKAGE_ROOT / "skills"
+# Host package root — two levels up from this file (src/indexing/skills.py).
+# Historically named AETHYME_PACKAGE_ROOT; renamed 2026-05-19 to make the
+# semantics tool-agnostic as part of the AethymeBench extraction (Stage A.1.2).
+# The function parameter `aethyme_root` is intentionally NOT renamed — it points
+# at the Aethyme package specifically (which owns the skill templates), not at
+# the host package. The two concepts will diverge once skill ownership moves to
+# the tool adapter in Stage B (plan item 2.4).
+HOST_PACKAGE_ROOT = Path(__file__).resolve().parent.parent.parent
+SKILLS_SOURCE_DIR = HOST_PACKAGE_ROOT / "skills"
 DEFAULT_RUNTIME_SKILLS = ("aethyme",)
 
 PLACEHOLDER = "{{AETHYME_ROOT}}"
@@ -50,7 +56,7 @@ def deploy_skills(
     List of skill names that were deployed.
     """
     if aethyme_root is None:
-        aethyme_root = AETHYME_PACKAGE_ROOT
+        aethyme_root = HOST_PACKAGE_ROOT
 
     if not SKILLS_SOURCE_DIR.is_dir():
         return []
