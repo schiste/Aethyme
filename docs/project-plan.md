@@ -2,6 +2,15 @@
 
 Last Updated: 2026-03-06
 
+> **Repositioning note (2026-07-09):** Aethyme's product direction is now a
+> **local-first agent broker** for high-concurrency AI development, with the
+> graph engine as a supporting repo-intelligence service. The tenant/API
+> "Verified Flow" below describes the earlier cloud lineage and is no longer
+> the priority path. See
+> [`aethyme-local-agent-broker.md`](aethyme-local-agent-broker.md) for the
+> current direction. The "First Local Proof" section below remains accurate
+> for the graph engine.
+
 ## Goal
 
 Keep `packages/aethyme` as a small, verified backend for:

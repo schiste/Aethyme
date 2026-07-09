@@ -78,7 +78,11 @@ consumer. This file exists so that doesn't happen again.
 | `src/eval/orchestrator.py:_build_warm_phase` | Emits the same daemon status/start shell sequence when no tool adapter is supplied, plus legacy fields `engine_bin`, `aethyme_repo`, and `log_path`. | Same as the manifest warm command; tests assert the command shape. |
 | `tests/local/test_eval_warm_phase.py` | Asserts warm phase contains `aethyme-engine-cli`, `daemon status`, `daemon start`, `||`, `.aethyme/engine-daemon.log`, and `listening on`. | Tests fail if the warm command contract changes without updating the test and this registry. |
 
-### CI / GitHub Actions
+### Rust `aethyme` router ↔ Python daemon (previously unlisted; added 2026-07-09)
+
+| Source | Invokes / assumes | Failure mode |
+|---|---|---|
+| `rust/crates/aethyme-engine/src/bin/aethyme.rs` | Spawns `src/daemon.py` (`aethyme daemon start/stop/status`), keeps its socket-path logic (`<repo>/.aethyme/aethyme.sock`, `aethyme-socket.path`) byte-compatible with `src/daemon.py`, and routes `explore` through the Python daemon socket as fallback #2 after the native engine path. | **Known-dead route:** since the 2026-05-08 Python `explore` deletion, `src/daemon.py:_dispatch` answers everything except `ping` with `unknown daemon command`, so the router's Python-daemon fallback can no longer serve `explore`. The router still degrades to the cold `python -m src.cli` path (fallback #3), which also rejects `explore`. Removing `src/daemon.py` or changing its socket layout requires a coordinated change to `aethyme.rs` — do not delete one side alone. |
 
 | Workflow | Calls | Failure mode |
 |---|---|---|

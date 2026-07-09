@@ -1,5 +1,12 @@
 # Aethyme Cloud
 
+> **Status (2026-07-09): frozen / out of scope.** Aethyme's active direction
+> is a local-first agent broker (see
+> [`docs/aethyme-local-agent-broker.md`](../../docs/aethyme-local-agent-broker.md)).
+> This package is retained as an earlier cloud-oriented scaffold. It is not
+> maintained as part of the current product path, is not required by any local
+> workflow, and no SaaS/cloud execution is part of broker v0.
+
 Aethyme Cloud is the SaaS-oriented package in this repository.
 
 It contains:
