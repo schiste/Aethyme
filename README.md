@@ -18,7 +18,6 @@ monorepo but are not the initial public support surface.
 - `packages/aethyme`: core Python CLI/API code, Rust engine workspace, graph
   indexing, search, scorecard, and eval harnesses.
 - `packages/aethyme/rust`: deterministic Rust engine and graph crates.
-- `packages/aethyme-cli`: experimental npm wrapper around the core tooling.
 - `packages/aethyme-cloud`: SaaS-oriented application shell. Experimental for
   public OSS purposes.
 - `packages/aethyme-eval-ui`: local evaluation dashboard. Experimental for
