@@ -168,6 +168,40 @@ _METRIC_KEY_MAP: dict[str, str] = {
 }
 
 
+def _aggregate_condition_rows(cond_rows: list[sqlite3.Row]) -> dict[str, Any]:
+    """Quantile stats + success/reliability rates for one condition slice.
+
+    Pulled out of ``aggregate_batch()`` so the same logic can run over a
+    filtered subset (e.g. only rows that passed the cold-probe leakage
+    check) without duplicating the per-field aggregation loop.
+    """
+    stats: dict[str, Any] = {}
+    for col, out_key in _AGG_FIELDS.items():
+        # duration is the odd one out — stored as text. Skip.
+        values = [float(r[col]) for r in cond_rows if r[col] is not None]
+        stats[out_key] = _quantile_stats(values)
+
+    successes = sum(
+        1 for r in cond_rows
+        if (r["deliverable_status"] or "success") == "success"
+    )
+    total = len(cond_rows)
+    stats["deliverable_success_rate"] = {
+        "successes": successes,
+        "total": total,
+        "rate": round(successes / total, 4) if total else None,
+    }
+
+    reliable = sum(1 for r in cond_rows if r["judge_reliable"] == 1)
+    has_judge = sum(1 for r in cond_rows if r["judge_reliable"] is not None)
+    stats["judge_reliability_rate"] = {
+        "reliable": reliable,
+        "scored": has_judge,
+        "rate": round(reliable / has_judge, 4) if has_judge else None,
+    }
+    return stats
+
+
 def aggregate_batch(batch_id: str) -> dict[str, Any]:
     """Return {batch: meta, conditions: {cond: {field: stats}}, comparisons: {...}}."""
     if not DB_PATH.exists():
@@ -189,39 +223,10 @@ def aggregate_batch(batch_id: str) -> dict[str, Any]:
     for r in rows:
         by_cond.setdefault(r["condition"], []).append(r)
 
-    # Aggregate per condition
-    conditions: dict[str, dict[str, Any]] = {}
-    for cond, cond_rows in by_cond.items():
-        stats: dict[str, Any] = {}
-        for col, out_key in _AGG_FIELDS.items():
-            # duration is the odd one out — stored as text. Skip.
-            values = [
-                float(r[col]) for r in cond_rows
-                if r[col] is not None
-            ]
-            stats[out_key] = _quantile_stats(values)
-
-        # Deliverable success rate
-        successes = sum(
-            1 for r in cond_rows
-            if (r["deliverable_status"] or "success") == "success"
-        )
-        total = len(cond_rows)
-        stats["deliverable_success_rate"] = {
-            "successes": successes,
-            "total": total,
-            "rate": round(successes / total, 4) if total else None,
-        }
-
-        # Judge reliability rate (share of runs with reliable=1)
-        reliable = sum(1 for r in cond_rows if r["judge_reliable"] == 1)
-        has_judge = sum(1 for r in cond_rows if r["judge_reliable"] is not None)
-        stats["judge_reliability_rate"] = {
-            "reliable": reliable,
-            "scored": has_judge,
-            "rate": round(reliable / has_judge, 4) if has_judge else None,
-        }
-        conditions[cond] = stats
+    conditions: dict[str, dict[str, Any]] = {
+        cond: _aggregate_condition_rows(cond_rows)
+        for cond, cond_rows in by_cond.items()
+    }
 
     # Batch metadata
     first = rows[0]
@@ -280,6 +285,52 @@ def aggregate_batch(batch_id: str) -> dict[str, Any]:
                 ),
             }
 
+    # Stratify by leakage cleanliness. The cold-probe (P1) detects when
+    # the model has seen the scenario during pretraining; contaminated
+    # runs inflate baselines and can mask real tool gains. The clean-only
+    # stratum recomputes per-condition stats and comparisons over rows
+    # the probe judged clean, so the user can read the same scorecard
+    # against an uncontaminated subset side-by-side with the overall numbers.
+    # Gated on the column existing and at least one row carrying probe
+    # data, so legacy batches keep their existing payload shape.
+    stratified: dict[str, Any] | None = None
+    if "leakage_is_clean" in rows[0].keys() and any(
+        r["leakage_is_clean"] is not None for r in rows
+    ):
+        clean_by_cond = {
+            cond: [r for r in cond_rows if r["leakage_is_clean"] == 1]
+            for cond, cond_rows in by_cond.items()
+        }
+        clean_conditions = {
+            cond: _aggregate_condition_rows(rows_)
+            for cond, rows_ in clean_by_cond.items() if rows_
+        }
+        clean_comparisons: dict[str, dict[str, Any]] = {}
+        if baseline_cond and baseline_cond in clean_conditions:
+            baseline_clean = clean_conditions[baseline_cond].get(metric_key, {})
+            for cond, stats in clean_conditions.items():
+                if cond == baseline_cond:
+                    continue
+                clean_comparisons[cond] = {
+                    "vs": baseline_cond,
+                    "metric": metric_key,
+                    **compare_conditions(
+                        stats.get(metric_key, {}),
+                        baseline_clean,
+                        margin=pre_reg_margin,
+                    ),
+                }
+        stratified = {
+            "clean_only": {
+                "conditions": clean_conditions,
+                "comparisons_vs_baseline": clean_comparisons,
+                "rows_per_condition": {
+                    cond: len(rows_) for cond, rows_ in clean_by_cond.items()
+                },
+                "rows_total": sum(len(rows_) for rows_ in clean_by_cond.values()),
+            },
+        }
+
     discrimination_info = _scenario_discrimination(conditions)
 
     # G-theory variance decomposition (signal/noise breakdown).
@@ -333,6 +384,7 @@ def aggregate_batch(batch_id: str) -> dict[str, Any]:
         "scenario_discrimination": discrimination_info,
         "variance_components": variance_components,
         "judge_overhead": judge_overhead,
+        "stratified": stratified,
     }
 
 
