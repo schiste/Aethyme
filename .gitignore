@@ -12,6 +12,7 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .venv/
+*.egg-info/
 .env
 .env.*
 *.log
