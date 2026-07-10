@@ -213,11 +213,14 @@ pub fn cancel_obsolete_runs(
             continue;
         }
         // Kill the whole process group (the runner spawns each gate in
-        // its own group for exactly this purpose).
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &format!("-{pgid}")])
-            .stderr(std::process::Stdio::null())
-            .status();
+        // its own group for exactly this purpose). killpg directly:
+        // the external `kill` utility on Linux parses "-<pgid>" as an
+        // option and silently does nothing.
+        if let Ok(pgid) = pgid.parse::<i32>() {
+            unsafe {
+                libc::killpg(pgid, libc::SIGTERM);
+            }
+        }
         let _ = std::fs::remove_file(entry.path());
         let _ = store.record_gate_result(&NewGateResult {
             gate_name: gate_name.to_string(),
