@@ -2513,6 +2513,44 @@ def _run_eval_background(
 
     # Artifact build is separate from repository preparation and from tab execution.
     start_phase("build inputs", order=1, details={"prompt_files": list(plan.get("paths", {}).get("prompt_files", {}).keys())})
+
+    # Plan is the source of truth: run its build-inputs cli_cmd (clone+plant
+    # for bug-fix, prompt/schema generation for diagnostic types) before
+    # _materialize_eval_inputs layers per-condition wrappers on top. Skipping
+    # this step leaves condition dirs missing and downstream phases crash.
+    build_inputs_phase = next(
+        (p for p in plan["phases"] if p.get("name") == "build-inputs"),
+        None,
+    )
+    if build_inputs_phase and build_inputs_phase.get("cli_cmd"):
+        cli_cmd = build_inputs_phase["cli_cmd"]
+        description = build_inputs_phase.get("description", "")
+        if description:
+            log(f"build-inputs: {description}")
+        log(f"  $ {cli_cmd}")
+        proc = subprocess.run(cli_cmd, shell=True, capture_output=True, text=True)
+        if proc.stdout:
+            log(f"  stdout (tail): {proc.stdout[-2000:]}")
+        if proc.stderr:
+            log(f"  stderr (tail): {proc.stderr[-2000:]}")
+        if proc.returncode != 0:
+            finish_phase(
+                "build inputs",
+                status="error",
+                details={
+                    "returncode": proc.returncode,
+                    "cli_cmd": cli_cmd,
+                    "stderr_tail": proc.stderr[-500:] if proc.stderr else "",
+                },
+            )
+            _run_state["status"] = "error"
+            _run_state["error"] = (
+                f"build-inputs cli failed (rc={proc.returncode}): "
+                f"{(proc.stderr or '').strip()[-500:]}"
+            )
+            log(f"ERROR: build-inputs phase failed with rc={proc.returncode}")
+            return
+
     prepared_inputs = _materialize_eval_inputs(plan, req, conditions, log=log)
     prompt_files = prepared_inputs["prompt_files"]
     output_files = prepared_inputs["output_files"]
@@ -3676,6 +3714,7 @@ async def launch_run(req: RunRequest, background_tasks: BackgroundTasks) -> dict
             batch_id=None,
             run_index=1,
             runs_in_batch=1,
+            leakage_row=None,
         )
         launch_message = (
             "Plan generated. Building evaluation inputs, then launching agents via Chau7 MCP..."

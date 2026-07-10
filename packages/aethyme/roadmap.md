@@ -2,6 +2,12 @@
 
 Last Updated: 2026-03-06
 
+> **Repositioning note (2026-07-09):** the next product milestone is a
+> **local-first agent broker** (per-agent worktrees, session registry, leases,
+> gate runner, merge simulation) built as a new local subsystem alongside the
+> graph engine. This roadmap remains valid for the engine itself. See
+> [`../../docs/aethyme-local-agent-broker.md`](../../docs/aethyme-local-agent-broker.md).
+
 ## Goal
 
 Keep Aethyme Core small, verified, and technically honest while moving its

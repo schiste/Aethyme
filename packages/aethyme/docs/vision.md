@@ -2,6 +2,17 @@
 
 Last Updated: 2026-03-08
 
+> **Status (2026-07-09): aspirational document — read with care.**
+> The mechanics this document treats as the product — Lenses, Learning /
+> weight adjustment, Live Session trajectory tracking, enriched non-raw-file
+> responses, the replay engine — have **no implementing code** in this
+> repository. What exists today is the deterministic graph engine and CLI
+> ("the paper map"). Product direction has since shifted toward a
+> **local-first agent broker** (see
+> [`docs/aethyme-local-agent-broker.md`](../../../docs/aethyme-local-agent-broker.md)
+> at the repository root), which supersedes parts of this vision. This file is
+> retained as historical thinking, not as a roadmap.
+
 ## Core Thesis
 
 Aethyme Core is a GPS for AI coding agents navigating repositories.

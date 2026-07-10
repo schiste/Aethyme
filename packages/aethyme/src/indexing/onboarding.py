@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .skills import AETHYME_PACKAGE_ROOT
+from .skills import HOST_PACKAGE_ROOT
 
 ONBOARDING_JSON_PATH = ".aethyme/generated/onboarding.json"
 ACT_STARTER_JSON_PATH = ".aethyme/generated/act-starter.json"
@@ -106,7 +106,7 @@ def build_onboarding_artifact(
     """Build a deterministic onboarding artifact for a repository."""
     repo_path = Path(repo_path).expanduser().resolve()
     snapshot = _snapshot_metadata(repo_path)
-    aethyme_root = (aethyme_root or AETHYME_PACKAGE_ROOT).resolve()
+    aethyme_root = (aethyme_root or HOST_PACKAGE_ROOT).resolve()
 
     manifests = _detect_manifests(repo_path)
     package_manager = _primary_package_manager(repo_path, manifests)

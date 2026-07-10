@@ -5,6 +5,7 @@ import {
   fetchBatchProbes,
   type BatchAggregate,
   type BatchSummary,
+  type ConditionComparison,
   type ProbeRow,
 } from "../lib/api";
 import VarianceBreakdown from "../components/VarianceBreakdown";
@@ -19,6 +20,18 @@ import ProbesPanel from "../components/ProbesPanel";
  * runs >= 2 shows up here; runs=1 rows have no batch_id and aren't
  * listed.
  */
+
+function verdictColor(verdict: ConditionComparison["verdict"]): string {
+  if (verdict === "A>B") return "text-[var(--color-score-green)]";
+  if (verdict === "B>A") return "text-[var(--color-score-red)]";
+  return "text-[var(--color-text-muted)]";
+}
+
+function fmtDelta(c: ConditionComparison | undefined): string {
+  if (!c || c.delta === null) return "—";
+  const sign = c.delta >= 0 ? "+" : "";
+  return `${sign}${c.delta}`;
+}
 export default function Batches() {
   const [batches, setBatches] = useState<BatchSummary[]>([]);
   const [loading, setLoading] = useState(true);
@@ -209,9 +222,115 @@ export default function Batches() {
                 </tbody>
               </table>
             </section>
+
+            {aggregate.stratified?.clean_only && (
+              <LeakageStratificationTile
+                clean={aggregate.stratified.clean_only}
+                overallComparisons={aggregate.comparisons_vs_baseline}
+                primaryMetric={String(
+                  aggregate.batch?.primary_metric ?? "quality",
+                )}
+              />
+            )}
           </>
         )}
       </section>
     </div>
+  );
+}
+
+/**
+ * Pretraining-leakage stratification tile.
+ *
+ * Renders the same baseline comparisons in two strata side-by-side:
+ * overall (all runs) vs clean-only (runs that passed the cold probe with
+ * leakage_is_clean = 1). If a tool's verdict flips from "meaningful" in the
+ * overall stratum to "inconclusive" in clean-only, that's evidence the
+ * effect was driven by contaminated runs. The reverse — inconclusive overall,
+ * meaningful clean-only — means contamination noise was *masking* a real
+ * gain.
+ */
+function LeakageStratificationTile({
+  clean,
+  overallComparisons,
+  primaryMetric,
+}: {
+  clean: NonNullable<BatchAggregate["stratified"]>["clean_only"];
+  overallComparisons: Record<string, ConditionComparison> | undefined;
+  primaryMetric: string;
+}) {
+  const conditions = Object.keys(clean.comparisons_vs_baseline);
+  const overall = overallComparisons ?? {};
+  return (
+    <section className="p-3 border border-[var(--color-border)] rounded text-xs">
+      <h3 className="text-sm font-semibold mb-1">
+        Leakage stratification{" "}
+        <span className="text-[var(--color-text-muted)] font-normal">
+          (clean-only vs overall)
+        </span>
+      </h3>
+      <p className="text-[11px] text-[var(--color-text-muted)] mb-2">
+        Clean stratum keeps only runs where the cold probe judged the agent
+        had no prior knowledge of the scenario.{" "}
+        <span className="font-mono">
+          {clean.rows_total}
+        </span>{" "}
+        clean row{clean.rows_total === 1 ? "" : "s"} across conditions; metric:{" "}
+        <code>{primaryMetric}</code>.
+      </p>
+      <table className="w-full font-mono text-[11px]">
+        <thead>
+          <tr className="text-[var(--color-text-muted)] text-left">
+            <th className="py-1">Condition</th>
+            <th className="py-1">n clean</th>
+            <th className="py-1">Δ overall</th>
+            <th className="py-1">Δ clean</th>
+            <th className="py-1">Flip?</th>
+          </tr>
+        </thead>
+        <tbody>
+          {conditions.map((cond) => {
+            const o = overall[cond];
+            const c = clean.comparisons_vs_baseline[cond];
+            const flipped =
+              o && c && o.verdict !== c.verdict
+                ? `${o.verdict} → ${c.verdict}`
+                : "";
+            return (
+              <tr
+                key={cond}
+                className="border-t border-[var(--color-border)]"
+              >
+                <td className="py-1">{cond}</td>
+                <td className="py-1">
+                  {clean.rows_per_condition[cond] ?? 0}
+                </td>
+                <td className={`py-1 ${o ? verdictColor(o.verdict) : ""}`}>
+                  {fmtDelta(o)}
+                  {o && (
+                    <span className="text-[var(--color-text-muted)] ml-1">
+                      ({o.verdict})
+                    </span>
+                  )}
+                </td>
+                <td className={`py-1 ${verdictColor(c.verdict)}`}>
+                  {fmtDelta(c)}
+                  <span className="text-[var(--color-text-muted)] ml-1">
+                    ({c.verdict})
+                  </span>
+                </td>
+                <td
+                  className={`py-1 ${
+                    flipped ? "text-[var(--color-score-yellow)]" : ""
+                  }`}
+                >
+                  {flipped || "—"}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </section>
   );
 }

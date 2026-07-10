@@ -27,13 +27,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install package + dev dependencies
+      # The eval self-tool contract (evals/tools/aethyme.toml) invokes the
+      # package via .venv/bin/python, matching the documented dev setup —
+      # so CI must provide the same venv layout.
+      - name: Install package + dev dependencies (into .venv)
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e ".[dev]"
 
       - name: Run local test suite (default lane)
-        run: pytest -q tests/local
+        run: .venv/bin/python -m pytest -q tests/local
 
   local-tests-strict-engine:
     name: Local tests (strict engine lane)
@@ -55,13 +59,14 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install package + dev dependencies
+      - name: Install package + dev dependencies (into .venv)
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e ".[dev]"
 
       - name: Build Rust engine binary
         run: cargo build --quiet --manifest-path rust/Cargo.toml --bin aethyme-engine-cli
 
       - name: Run strict engine local tests
-        run: pytest -q tests/local
+        run: .venv/bin/python -m pytest -q tests/local

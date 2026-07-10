@@ -66,7 +66,12 @@ def _send(method: str, params: dict[str, Any] | None = None) -> Any:
                 try:
                     return json.loads(text_block["text"])
                 except json.JSONDecodeError:
-                    return text_block["text"]
+                    # Surface parse failures structurally so the dict return
+                    # contract isn't violated by a bare-string leak.
+                    return {
+                        "error": "Non-JSON response from MCP server",
+                        "raw_text": text_block["text"],
+                    }
         return result
     finally:
         sock.close()

@@ -1,8 +1,18 @@
 # Aethyme Core
 
-Last Updated: 2026-05-14
+Last Updated: 2026-07-09
 
 Aethyme Core is the deterministic repository tooling product in this repository.
+
+> **Direction note (2026-07):** Aethyme is repositioning toward a **local-first
+> agent broker** for high-concurrency AI development. The broker (per-agent
+> worktrees, session registry, leases, gate runner, merge simulation) is
+> **planned, not implemented** — see
+> [`../../docs/aethyme-local-agent-broker.md`](../../docs/aethyme-local-agent-broker.md).
+> The graph engine described below remains the supporting repo-intelligence
+> service. The tenant/auth/API sections further down describe an earlier
+> cloud-oriented lineage that still exists and is tested, but is not part of
+> the local-first direction and is not required by any local workflow.
 
 It owns:
 
@@ -27,11 +37,13 @@ Today, `Explore` is the implemented primary entry point. Lower-level graph,
 query, facts, and task commands remain available as supporting primitives, not
 the default operator path.
 
-## Canonical Model
+## Canonical Model (cloud lineage — not the active local-first direction)
 
 `Platform > Org > Tenant > Repository > Graph`
 
-Runtime isolation is tenant-scoped.
+Runtime isolation is tenant-scoped. This model applies to the PostgreSQL/API
+lineage (`src/api`, `src/auth`, `src/graph`, `src/database`), not to the local
+Rust engine path, which operates directly on a repository with no tenancy.
 
 ## Language Direction
 
@@ -91,7 +103,10 @@ For the first product proof, Aethyme can run against one local repository withou
 
 Primary commands:
 
-- `aethyme explore --repo /path/to/repo --request "<task>" --format answer-json`
+- `rust/target/debug/aethyme-engine-cli explore --repo /path/to/repo --request "<task>" --format answer-json`
+  (`explore` was removed from the Python CLI on 2026-05-08; it is served only
+  by the Rust binaries, so invoke them by path — the pip-installed Python
+  `aethyme` entrypoint otherwise shadows the Rust `aethyme` router binary)
 - `aethyme enhance deploy --repo /path/to/repo`
 - `aethyme enhance verify --repo /path/to/repo`
 - `aethyme repo compile-skills /path/to/repo`

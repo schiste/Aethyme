@@ -192,13 +192,32 @@ export interface VarianceComponents {
   notes: string[];
 }
 
+export interface ConditionComparison {
+  vs: string;
+  metric: string;
+  verdict: "A>B" | "B>A" | "inconclusive" | "no-data";
+  delta: number | null;
+  noise: number | null;
+  threshold?: number;
+  effect_size: number | null;
+  margin: number;
+}
+
+export interface StratifiedCleanOnly {
+  conditions: Record<string, Record<string, unknown>>;
+  comparisons_vs_baseline: Record<string, ConditionComparison>;
+  rows_per_condition: Record<string, number>;
+  rows_total: number;
+}
+
 export interface BatchAggregate {
   batch: Record<string, unknown> | null;
   conditions: Record<string, Record<string, unknown>>;
-  comparisons_vs_baseline?: Record<string, unknown>;
+  comparisons_vs_baseline?: Record<string, ConditionComparison>;
   scenario_discrimination?: Record<string, unknown>;
   variance_components?: VarianceComponents;
   judge_overhead?: Record<string, unknown>;
+  stratified?: { clean_only: StratifiedCleanOnly } | null;
 }
 
 export async function fetchBatches(limit = 50): Promise<BatchSummary[]> {
