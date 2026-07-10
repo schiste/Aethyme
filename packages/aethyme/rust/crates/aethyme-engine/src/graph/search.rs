@@ -83,20 +83,13 @@ const BASENAME_EXACT_BONUS: i32 = 80;
 /// the daemon RPC handler and `aethyme-engine-cli search-symbol`
 /// commands without churning callers.
 pub fn symbol_search(map: &RepositoryMap, query: &str, limit: usize) -> Vec<SearchHit> {
-    let tokens: Vec<String> = query
-        .split_whitespace()
-        .map(|s| s.to_string())
-        .collect();
+    let tokens: Vec<String> = query.split_whitespace().map(|s| s.to_string()).collect();
     symbol_search_multi(map, &tokens, limit)
 }
 
 /// Multi-token symbol search. Use this directly when callers already
 /// have a pre-tokenized query (e.g. anchors.rs's `candidate_queries`).
-pub fn symbol_search_multi(
-    map: &RepositoryMap,
-    tokens: &[String],
-    limit: usize,
-) -> Vec<SearchHit> {
+pub fn symbol_search_multi(map: &RepositoryMap, tokens: &[String], limit: usize) -> Vec<SearchHit> {
     if tokens.is_empty() {
         return Vec::new();
     }
@@ -131,12 +124,9 @@ pub fn symbol_search_multi(
             .area_id
             .as_ref()
             .and_then(|id| area_names.get(id.as_str()).map(|s| s.as_str()));
-        if let Some((score, matched)) = score_symbol(
-            &class.name,
-            &class.file_path,
-            area_name,
-            &lowered_tokens,
-        ) {
+        if let Some((score, matched)) =
+            score_symbol(&class.name, &class.file_path, area_name, &lowered_tokens)
+        {
             hits.push(SearchHit {
                 id: class.id.to_string(),
                 name: class.name.to_string(),
@@ -208,10 +198,7 @@ fn score_symbol(
 ) -> Option<(i32, Vec<String>)> {
     // Name match via acronym-aware components.
     let components = split_components(name);
-    let component_lowers: Vec<String> = components
-        .iter()
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
+    let component_lowers: Vec<String> = components.iter().map(|c| c.to_ascii_lowercase()).collect();
     let mut name_matched_tokens: Vec<String> = Vec::new();
     let name_lower = name.to_ascii_lowercase();
     for token in lowered_tokens {
@@ -268,13 +255,12 @@ fn score_symbol(
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    let basename_bonus = if !basename_lower.is_empty()
-        && lowered_tokens.iter().any(|t| *t == basename_lower)
-    {
-        BASENAME_EXACT_BONUS
-    } else {
-        0
-    };
+    let basename_bonus =
+        if !basename_lower.is_empty() && lowered_tokens.iter().any(|t| *t == basename_lower) {
+            BASENAME_EXACT_BONUS
+        } else {
+            0
+        };
 
     let total = name_score + path_score + area_score + basename_bonus;
     if total == 0 {
@@ -335,8 +321,7 @@ fn split_components(name: &str) -> Vec<String> {
         // split before/after digits in other directions (`Foo123`
         // stays together — the "acronym-aware" preset doesn't split
         // on digit boundaries, only across them).
-        let lc_uc =
-            (prev.is_ascii_lowercase() || prev.is_ascii_digit()) && ch.is_ascii_uppercase();
+        let lc_uc = (prev.is_ascii_lowercase() || prev.is_ascii_digit()) && ch.is_ascii_uppercase();
         // uppercase-run ending: previous char was uppercase, current
         // is uppercase, AND the NEXT char is lowercase. That marks
         // the boundary inside an acronym followed by a CamelWord —
@@ -394,7 +379,10 @@ mod component_splitter_tests {
 
     #[test]
     fn camel_case_basic() {
-        assert_eq!(split_components("doViewUpdates"), vec!["do", "View", "Updates"]);
+        assert_eq!(
+            split_components("doViewUpdates"),
+            vec!["do", "View", "Updates"]
+        );
     }
 
     #[test]
@@ -405,12 +393,18 @@ mod component_splitter_tests {
         // `MWException`, `XMLHttpRequest`, etc.
         assert_eq!(split_components("HTTPResponse"), vec!["HTTP", "Response"]);
         assert_eq!(split_components("MWException"), vec!["MW", "Exception"]);
-        assert_eq!(split_components("XMLHttpRequest"), vec!["XML", "Http", "Request"]);
+        assert_eq!(
+            split_components("XMLHttpRequest"),
+            vec!["XML", "Http", "Request"]
+        );
     }
 
     #[test]
     fn snake_case() {
-        assert_eq!(split_components("parse_html_tag"), vec!["parse", "html", "tag"]);
+        assert_eq!(
+            split_components("parse_html_tag"),
+            vec!["parse", "html", "tag"]
+        );
     }
 
     #[test]
@@ -554,14 +548,17 @@ mod tests {
             hits.first().map(|h| h.name.as_str()),
             Some("showDiffPage"),
             "expected showDiffPage to outrank bare `page`; got: {:?}",
-            hits.iter().map(|h| (h.name.as_str(), h.score)).collect::<Vec<_>>()
+            hits.iter()
+                .map(|h| (h.name.as_str(), h.score))
+                .collect::<Vec<_>>()
         );
         let show_diff_page = hits.iter().find(|h| h.name == "showDiffPage").unwrap();
         let page = hits.iter().find(|h| h.name == "page").unwrap();
         assert!(
             show_diff_page.score > page.score,
             "showDiffPage score ({}) should exceed page score ({})",
-            show_diff_page.score, page.score,
+            show_diff_page.score,
+            page.score,
         );
     }
 

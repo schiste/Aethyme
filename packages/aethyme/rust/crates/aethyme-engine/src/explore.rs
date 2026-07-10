@@ -193,37 +193,100 @@ impl Intent {
     pub fn auto_select(request: &str) -> Self {
         const CHANGE_VERBS: &[&str] = &[
             // Additive
-            "add", "adds", "adding", "implement", "implements",
-            "implementing", "introduce", "introduces", "introducing",
-            "create", "creates", "creating", "build", "builds",
-            "building", "wire", "wires", "wiring",
+            "add",
+            "adds",
+            "adding",
+            "implement",
+            "implements",
+            "implementing",
+            "introduce",
+            "introduces",
+            "introducing",
+            "create",
+            "creates",
+            "creating",
+            "build",
+            "builds",
+            "building",
+            "wire",
+            "wires",
+            "wiring",
             // Modifying
-            "modify", "modifies", "modifying", "edit", "edits", "editing",
-            "change", "changes", "changing", "update", "updates",
-            "updating", "tweak", "tweaks",
+            "modify",
+            "modifies",
+            "modifying",
+            "edit",
+            "edits",
+            "editing",
+            "change",
+            "changes",
+            "changing",
+            "update",
+            "updates",
+            "updating",
+            "tweak",
+            "tweaks",
             // Restructuring
-            "refactor", "refactors", "refactoring", "restructure",
-            "restructures", "restructuring", "rewrite", "rewrites",
-            "rewriting", "rename", "renames", "renaming", "extract",
-            "extracts", "extracting",
+            "refactor",
+            "refactors",
+            "refactoring",
+            "restructure",
+            "restructures",
+            "restructuring",
+            "rewrite",
+            "rewrites",
+            "rewriting",
+            "rename",
+            "renames",
+            "renaming",
+            "extract",
+            "extracts",
+            "extracting",
             // Fixing
-            "fix", "fixes", "fixing", "repair", "repairs", "repairing",
-            "resolve", "resolves", "resolving", "patch", "patches",
+            "fix",
+            "fixes",
+            "fixing",
+            "repair",
+            "repairs",
+            "repairing",
+            "resolve",
+            "resolves",
+            "resolving",
+            "patch",
+            "patches",
             "patching",
             // Removing
-            "remove", "removes", "removing", "delete", "deletes",
-            "deleting", "drop", "drops", "dropping", "deprecate",
-            "deprecates", "deprecating", "retire", "retires", "retiring",
+            "remove",
+            "removes",
+            "removing",
+            "delete",
+            "deletes",
+            "deleting",
+            "drop",
+            "drops",
+            "dropping",
+            "deprecate",
+            "deprecates",
+            "deprecating",
+            "retire",
+            "retires",
+            "retiring",
             // Migrating
-            "migrate", "migrates", "migrating", "port", "ports",
-            "porting", "convert", "converts", "converting",
+            "migrate",
+            "migrates",
+            "migrating",
+            "port",
+            "ports",
+            "porting",
+            "convert",
+            "converts",
+            "converting",
         ];
         let lower = request.to_ascii_lowercase();
         // Look only at the first ~10 tokens — verbs front-load.
         let token_iter = lower
             .split(|c: char| {
-                c.is_whitespace()
-                    || matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'')
+                c.is_whitespace() || matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'')
             })
             .filter(|s| !s.is_empty())
             .take(10);
@@ -436,16 +499,12 @@ impl Detail {
             Detail::Full => 4,
         };
         params.max_answer_items = params.max_answer_items.saturating_mul(factor);
-        params.max_symbol_queries =
-            params.max_symbol_queries.saturating_mul(factor);
-        params.max_symbol_results =
-            params.max_symbol_results.saturating_mul(factor);
+        params.max_symbol_queries = params.max_symbol_queries.saturating_mul(factor);
+        params.max_symbol_results = params.max_symbol_results.saturating_mul(factor);
         params.max_symbol_files = params.max_symbol_files.saturating_mul(factor);
         params.max_text_files = params.max_text_files.saturating_mul(factor);
-        params.max_text_line_refs =
-            params.max_text_line_refs.saturating_mul(factor);
-        params.max_filename_hints =
-            params.max_filename_hints.saturating_mul(factor);
+        params.max_text_line_refs = params.max_text_line_refs.saturating_mul(factor);
+        params.max_filename_hints = params.max_filename_hints.saturating_mul(factor);
     }
 }
 
@@ -461,8 +520,8 @@ impl Default for ExploreParams {
             max_text_files: 5,   // matches Python compact default
             max_text_line_refs: 2,
             max_filename_hints: 3,
-            max_callsite_symbols: 4,  // Python compact default
-            max_callsite_results: 4,  // Python compact default
+            max_callsite_symbols: 4,   // Python compact default
+            max_callsite_results: 4,   // Python compact default
             show_observability: false, // Python default; --show-observability flips it
         }
     }
@@ -705,11 +764,7 @@ pub fn explore_with_intent(
     //    symbols don't (e.g. `suppliers_grader.py` for "find
     //    suppliers grader" — its functions are named
     //    `_default_graders` etc).
-    let filename_items = filename_token_matches(
-        repo,
-        &symbol_queries,
-        params.max_filename_hints,
-    );
+    let filename_items = filename_token_matches(repo, &symbol_queries, params.max_filename_hints);
 
     // 5. Callsite expansion. For each strong symbol hit, look up
     //    its callers (via the daemon's callers-of RPC) and emit
@@ -746,16 +801,13 @@ pub fn explore_with_intent(
 mod callsite;
 use callsite::compute_callsite_files;
 
-fn call_task_localize(
-    socket: &Path,
-    request: &str,
-) -> Result<serde_json::Value, ExploreError> {
+fn call_task_localize(socket: &Path, request: &str) -> Result<serde_json::Value, ExploreError> {
     let rpc_request = serde_json::json!({
         "command": "task-localize",
         "task": request,
     });
-    let response_text = daemon::send_request(socket, &rpc_request)
-        .map_err(ExploreError::DaemonRpc)?;
+    let response_text =
+        daemon::send_request(socket, &rpc_request).map_err(ExploreError::DaemonRpc)?;
     let envelope: serde_json::Value = serde_json::from_str(response_text.trim())
         .map_err(|e| ExploreError::InvalidResponse(format!("not JSON: {e}")))?;
     if envelope.get("ok") != Some(&serde_json::Value::Bool(true)) {
@@ -781,8 +833,8 @@ fn call_symbol_batch(
         "queries": queries,
         "limit": limit,
     });
-    let response_text = daemon::send_request(socket, &rpc_request)
-        .map_err(ExploreError::DaemonRpc)?;
+    let response_text =
+        daemon::send_request(socket, &rpc_request).map_err(ExploreError::DaemonRpc)?;
     let envelope: serde_json::Value = serde_json::from_str(response_text.trim())
         .map_err(|e| ExploreError::InvalidResponse(format!("not JSON: {e}")))?;
     if envelope.get("ok") != Some(&serde_json::Value::Bool(true)) {
@@ -804,10 +856,7 @@ fn call_symbol_batch(
             Some(a) => a,
             None => continue,
         };
-        let parsed: Vec<SymbolHit> = arr
-            .iter()
-            .filter_map(SymbolHit::from_value)
-            .collect();
+        let parsed: Vec<SymbolHit> = arr.iter().filter_map(SymbolHit::from_value).collect();
         by_query.insert(query.clone(), parsed);
     }
     Ok(SymbolBatchResults {
@@ -849,7 +898,6 @@ impl SymbolHit {
 mod filename_match;
 use filename_match::filename_token_matches;
 
-
 mod text_search;
 pub(crate) use text_search::extract_text_search_terms;
 
@@ -861,21 +909,85 @@ pub(crate) use text_search::extract_text_search_terms;
 // also queries `addwatch`). Order-preserving + de-duplicated lowercase.
 
 const STOP_WORDS: &[&str] = &[
-    "about", "after", "against", "also", "and", "before", "being", "between",
-    "bug", "code", "command", "could", "defined", "does", "done", "file",
-    "files", "find", "fix", "for", "from", "have", "here", "how", "implement",
-    "implemented", "implementation", "into", "issue", "json", "located",
-    "make", "marked", "marks", "need", "object", "not", "only", "output",
-    "path", "prose", "question", "relative", "report", "repo", "repository",
-    "request", "rules", "shape", "the", "should", "specific", "that", "their",
-    "there", "this", "ticket", "seen", "viewed", "viewing", "what", "when",
-    "where", "which", "who", "why", "with", "would", "you",
+    "about",
+    "after",
+    "against",
+    "also",
+    "and",
+    "before",
+    "being",
+    "between",
+    "bug",
+    "code",
+    "command",
+    "could",
+    "defined",
+    "does",
+    "done",
+    "file",
+    "files",
+    "find",
+    "fix",
+    "for",
+    "from",
+    "have",
+    "here",
+    "how",
+    "implement",
+    "implemented",
+    "implementation",
+    "into",
+    "issue",
+    "json",
+    "located",
+    "make",
+    "marked",
+    "marks",
+    "need",
+    "object",
+    "not",
+    "only",
+    "output",
+    "path",
+    "prose",
+    "question",
+    "relative",
+    "report",
+    "repo",
+    "repository",
+    "request",
+    "rules",
+    "shape",
+    "the",
+    "should",
+    "specific",
+    "that",
+    "their",
+    "there",
+    "this",
+    "ticket",
+    "seen",
+    "viewed",
+    "viewing",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "would",
+    "you",
 ];
 
 pub(crate) fn extract_symbol_queries(request: &str) -> Vec<String> {
     let normalized = request.replace('`', " ");
     let mut raw_terms: Vec<String> = Vec::new();
-    for token in normalized.replace('/', " ").replace('-', " ").split_whitespace() {
+    for token in normalized
+        .replace('/', " ")
+        .replace('-', " ")
+        .split_whitespace()
+    {
         let term: String = token
             .chars()
             .filter(|c| c.is_alphanumeric() || *c == '_')
@@ -891,8 +1003,7 @@ pub(crate) fn extract_symbol_queries(request: &str) -> Vec<String> {
     }
 
     let mut queries: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for term in &raw_terms {
         let mut variants: Vec<String> = vec![term.clone()];
         if term.contains('_') {
@@ -1199,7 +1310,10 @@ fn build_response(
         if answers.len() >= params.max_answer_items {
             break;
         }
-        if answers.iter().any(|a| a.path.as_deref() == Some(file.as_str())) {
+        if answers
+            .iter()
+            .any(|a| a.path.as_deref() == Some(file.as_str()))
+        {
             continue;
         }
         answers.push(AnswerItem {
@@ -1279,10 +1393,7 @@ fn build_response(
     //                                              suite); weaker shapes
     //                                              degrade gracefully.
     //   session 4+: callsite expansion            → tighter still
-    let high_confidence_count = answers
-        .iter()
-        .filter(|a| a.confidence >= 0.85)
-        .count();
+    let high_confidence_count = answers.iter().filter(|a| a.confidence >= 0.85).count();
     let multi_query_symbol_files: Vec<&str> = symbol_items
         .iter()
         .filter(|item| {
@@ -1327,14 +1438,11 @@ fn build_response(
         .filter_map(|item| item.path.as_deref())
         .collect();
     let triple_corroborated: bool = !strong_callsite_files.is_empty()
-        && (!cross_corroborated.is_empty()
-            || !multi_query_symbol_files.is_empty());
+        && (!cross_corroborated.is_empty() || !multi_query_symbol_files.is_empty());
 
     let policy_kind = if answers.is_empty() && nav_hints.is_empty() {
         "failed"
-    } else if !cross_corroborated.is_empty()
-        || !multi_query_symbol_files.is_empty()
-    {
+    } else if !cross_corroborated.is_empty() || !multi_query_symbol_files.is_empty() {
         "answer_candidate"
     } else if !text_items.is_empty() || !symbol_items.is_empty() {
         // Some text or symbol evidence but not strong enough to defend.
@@ -1381,10 +1489,7 @@ fn build_response(
                 .max()
                 .unwrap_or(2)
         ),
-        "failed" => {
-            "No anchors, in-scope files, symbol matches, or source-text hits."
-                .to_string()
-        }
+        "failed" => "No anchors, in-scope files, symbol matches, or source-text hits.".to_string(),
         _ => "Evidence present but not strong enough to defend as an \
               authoritative answer. Verify before acting."
             .to_string(),
@@ -1424,12 +1529,8 @@ fn build_response(
     // into the response struct.
     let safe_to_use_as_answer = trust_policy.safe_to_use_as_answer;
     let safe_to_use_as_navigation = trust_policy.safe_to_use_as_navigation;
-    let verification_steps = build_verification_steps(
-        &answers,
-        &nav_hints,
-        &trust_policy,
-        text_items,
-    );
+    let verification_steps =
+        build_verification_steps(&answers, &nav_hints, &trust_policy, text_items);
 
     // Build output_adapters and resolved_parameters only when the
     // caller has asked for verbose shaping. Mirrors Python's
@@ -1456,13 +1557,12 @@ fn build_response(
     // At compact, truncate verification_steps to 2 (mirrors Python's
     // _trim_explore_response at cli.py:1752-1755). Agents follow 1-2
     // before deciding; emitting all 5+ inflates response by ~30%.
-    let verification_steps = if matches!(params.detail, Detail::Compact)
-        && !params.show_observability
-    {
-        verification_steps.into_iter().take(2).collect()
-    } else {
-        verification_steps
-    };
+    let verification_steps =
+        if matches!(params.detail, Detail::Compact) && !params.show_observability {
+            verification_steps.into_iter().take(2).collect()
+        } else {
+            verification_steps
+        };
 
     // Post-conditions for `answers[]`. These are debug-only; they
     // document the response contract that a downstream agent or scoring
@@ -1548,10 +1648,7 @@ fn build_response(
         degraded_reasons: Vec::new(),
         verification_steps,
         next_actions,
-        available_specialized_intents: vec![
-            "behavior_localization_query",
-            "usage_boundary_query",
-        ],
+        available_specialized_intents: vec!["behavior_localization_query", "usage_boundary_query"],
         output_adapters,
         resolved_parameters,
     }
@@ -1580,25 +1677,23 @@ fn build_output_adapters(
     let candidate_files: Vec<&AnswerItem> = answers
         .iter()
         .filter(|item| item.path.is_some())
-        .filter(|item| matches!(
-            item.kind.as_str(),
-            "symbol_search_file"
-                | "source_text_file"
-                | "call_site_file"
-                | "filesystem_file"
-                | "anchor"
-                | "in_scope_file"
-        ))
+        .filter(|item| {
+            matches!(
+                item.kind.as_str(),
+                "symbol_search_file"
+                    | "source_text_file"
+                    | "call_site_file"
+                    | "filesystem_file"
+                    | "anchor"
+                    | "in_scope_file"
+            )
+        })
         .collect();
     let candidate_symbols: Vec<&AnswerItem> = answers
         .iter()
         .filter(|item| {
             matches!(item.kind.as_str(), "symbol_search" | "in_scope_symbol")
-                || item
-                    .evidence
-                    .get("anchor_kind")
-                    .and_then(|v| v.as_str())
-                    == Some("symbol")
+                || item.evidence.get("anchor_kind").and_then(|v| v.as_str()) == Some("symbol")
         })
         .collect();
     let navigation_hints_field: Vec<&AnswerItem> = match detail {
@@ -1640,8 +1735,10 @@ fn build_verification_steps(
 
     // Step 1: cite a specific line ref the agent can read.
     if let Some(top_text) = text_items.first() {
-        if let Some(line_refs) =
-            top_text.evidence.get("line_refs").and_then(|v| v.as_array())
+        if let Some(line_refs) = top_text
+            .evidence
+            .get("line_refs")
+            .and_then(|v| v.as_array())
         {
             if let Some(first_ref) = line_refs.first() {
                 let line = first_ref.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1672,7 +1769,11 @@ fn build_verification_steps(
             .evidence
             .get("matched_queries")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|t| t.as_str().map(String::from)).collect());
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            });
         let term_hint = match matched {
             Some(t) if !t.is_empty() => format!(" (matched {})", t.join(", ")),
             _ => String::new(),
@@ -1690,9 +1791,7 @@ fn build_verification_steps(
     }
 
     // Step 3: degraded/failed → suggest rerun.
-    if trust_policy.trust_policy == "failed"
-        || trust_policy.trust_policy == "needs_verification"
-    {
+    if trust_policy.trust_policy == "failed" || trust_policy.trust_policy == "needs_verification" {
         if answers.is_empty() && nav_hints.is_empty() {
             steps.push(serde_json::json!({
                 "step": "Broaden the request: include domain terms (entity \
@@ -1741,10 +1840,7 @@ fn build_verification_steps(
 ///
 /// These are the same numbers Python uses; preserving them keeps the
 /// trust-policy heuristics consistent across implementations.
-fn build_symbol_file_items(
-    symbol_matches: &SymbolBatchResults,
-    cap: usize,
-) -> Vec<AnswerItem> {
+fn build_symbol_file_items(symbol_matches: &SymbolBatchResults, cap: usize) -> Vec<AnswerItem> {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
 
@@ -1799,8 +1895,7 @@ fn build_symbol_file_items(
         } else {
             "A request term matched a symbol in this file."
         };
-        let symbols_preview: Vec<serde_json::Value> =
-            summary.symbols.into_iter().take(5).collect();
+        let symbols_preview: Vec<serde_json::Value> = summary.symbols.into_iter().take(5).collect();
         items.push(AnswerItem {
             kind: "symbol_search_file".into(),
             target: file_path.clone(),
@@ -1891,7 +1986,8 @@ mod disclosure_tests {
             assert!(
                 budgets[i] < budgets[i + 1],
                 "budgets {} -> {} not strictly increasing: {budgets:?}",
-                i, i + 1,
+                i,
+                i + 1,
             );
         }
     }
@@ -2065,17 +2161,24 @@ mod tests {
         );
         assert!(!response.answer.is_empty(), "expected at least one answer");
         assert!(
-            response.answer.iter().any(|a| a.path.as_deref()
-                == Some("includes/Watchlist/WatchedItemStore.php")),
+            response
+                .answer
+                .iter()
+                .any(|a| a.path.as_deref() == Some("includes/Watchlist/WatchedItemStore.php")),
             "anchor file should land in answer[]"
         );
         assert!(
-            response.answer.iter().any(|a| a.path.as_deref()
-                == Some("includes/Specials/SpecialEditWatchlist.php")),
+            response
+                .answer
+                .iter()
+                .any(|a| a.path.as_deref() == Some("includes/Specials/SpecialEditWatchlist.php")),
             "in-scope file should land in answer[]"
         );
         assert!(
-            response.navigation_hints.iter().any(|h| h.target == "includes/Watchlist"),
+            response
+                .navigation_hints
+                .iter()
+                .any(|h| h.target == "includes/Watchlist"),
             "folder anchor should land in navigation_hints[]"
         );
     }
@@ -2145,7 +2248,10 @@ mod tests {
         // `debug_assert!` at line ~1454 unchanged.
         assert_eq!(promoted.kind, "anchor");
         assert_eq!(
-            promoted.evidence.get("anchor_kind").and_then(|v| v.as_str()),
+            promoted
+                .evidence
+                .get("anchor_kind")
+                .and_then(|v| v.as_str()),
             Some("symbol")
         );
 
@@ -2227,7 +2333,7 @@ mod tests {
             IntentSource::Default,
             &view,
             &empty_symbols(),
-            &[text_match],  // text-match for same file as symbol anchor
+            &[text_match], // text-match for same file as symbol anchor
             &[],
             &[],
             &ExploreParams::default(),
@@ -2237,8 +2343,7 @@ mod tests {
         let matches: Vec<_> = response
             .answer
             .iter()
-            .filter(|a| a.path.as_deref()
-                == Some("includes/Watchlist/WatchedItemStore.php"))
+            .filter(|a| a.path.as_deref() == Some("includes/Watchlist/WatchedItemStore.php"))
             .collect();
         assert_eq!(
             matches.len(),
@@ -2256,9 +2361,8 @@ mod tests {
     fn build_response_caps_answer_count() {
         let mut view = sample_view();
         let scope = view.get_mut("scope").unwrap();
-        scope["in_scope_files"] = serde_json::json!(
-            ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
-        );
+        scope["in_scope_files"] =
+            serde_json::json!(["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]);
         let response = build_response(
             "test",
             Intent::TaskLocalization,
@@ -2381,11 +2485,13 @@ mod tests {
 
     #[test]
     fn extract_symbol_queries_drops_stop_words_and_short_terms() {
-        let queries = extract_symbol_queries(
-            "Find the file that handles WatchedItem revisions",
-        );
+        let queries = extract_symbol_queries("Find the file that handles WatchedItem revisions");
         // "find", "the", "that" are stop words. "Watcheditem" stays.
-        assert!(queries.iter().any(|q| q.eq_ignore_ascii_case("WatchedItem")));
+        assert!(
+            queries
+                .iter()
+                .any(|q| q.eq_ignore_ascii_case("WatchedItem"))
+        );
         assert!(queries.iter().any(|q| q.eq_ignore_ascii_case("revisions")));
         assert!(!queries.iter().any(|q| q.eq_ignore_ascii_case("the")));
         assert!(!queries.iter().any(|q| q.eq_ignore_ascii_case("find")));
@@ -2395,8 +2501,7 @@ mod tests {
     fn extract_symbol_queries_adds_underscore_collapsed_variant() {
         let queries = extract_symbol_queries("trace add_watch behavior");
         // Both `add_watch` and `addwatch` should be present.
-        let lower: Vec<String> =
-            queries.iter().map(|q| q.to_ascii_lowercase()).collect();
+        let lower: Vec<String> = queries.iter().map(|q| q.to_ascii_lowercase()).collect();
         assert!(lower.contains(&"add_watch".to_string()));
         assert!(lower.contains(&"addwatch".to_string()));
     }
@@ -2407,9 +2512,8 @@ mod tests {
         // "seen" that the symbol-query helper drops. The trigger is
         // matching them in the request itself; if the request mentions
         // "watchlist" we add domain synonyms ("watched", "notification").
-        let terms = extract_text_search_terms(
-            "Bug: viewing a diff revision marks watchlist as seen",
-        );
+        let terms =
+            extract_text_search_terms("Bug: viewing a diff revision marks watchlist as seen");
         let lower: Vec<String> = terms.iter().map(|t| t.to_ascii_lowercase()).collect();
         // The request word "viewing" survives (symbol-search would drop it
         // as too noisy, text-search keeps it).
@@ -2492,10 +2596,7 @@ mod tests {
         let request = "Where does the file that the recent CI failure last \
                        Tuesday refers to add a new feature live?";
         // "add" appears at token ~13. Should still be TaskLocalization.
-        assert_eq!(
-            Intent::auto_select(request),
-            Intent::TaskLocalization,
-        );
+        assert_eq!(Intent::auto_select(request), Intent::TaskLocalization,);
     }
 
     #[test]
@@ -2708,9 +2809,9 @@ mod tests {
         ];
 
         for (key, expected_type) in expectations {
-            let value = obj.get(*key).unwrap_or_else(|| {
-                panic!("missing required key {key} in response")
-            });
+            let value = obj
+                .get(*key)
+                .unwrap_or_else(|| panic!("missing required key {key} in response"));
             let actual_type = match value {
                 serde_json::Value::Null => "null",
                 serde_json::Value::Bool(_) => "boolean",
@@ -2730,7 +2831,10 @@ mod tests {
     fn trust_policy_inner_shape_is_stable() {
         let response = build_minimal_response(Detail::Compact, false);
         let json = serde_json::to_value(&response).unwrap();
-        let trust = json.get("trust_policy").and_then(|v| v.as_object()).unwrap();
+        let trust = json
+            .get("trust_policy")
+            .and_then(|v| v.as_object())
+            .unwrap();
 
         // The trust_policy object's keys are read by every downstream
         // consumer that branches on whether to act on `answer[]`.
@@ -2750,7 +2854,12 @@ mod tests {
         // The `trust_policy` enum value is one of the documented values
         // (mirrors Python's `_intent_catalog` declaration in cli.py:1571).
         let policy = trust.get("trust_policy").and_then(|v| v.as_str()).unwrap();
-        let allowed = ["answer_candidate", "needs_verification", "navigation_only", "failed"];
+        let allowed = [
+            "answer_candidate",
+            "needs_verification",
+            "navigation_only",
+            "failed",
+        ];
         assert!(
             allowed.contains(&policy),
             "trust_policy enum value {policy:?} not in documented set {allowed:?}"

@@ -1,8 +1,8 @@
 pub mod context;
 pub mod context_pack;
 pub mod daemon;
-pub mod explore;
 pub mod deps;
+pub mod explore;
 pub mod graph;
 pub mod json;
 pub mod map;

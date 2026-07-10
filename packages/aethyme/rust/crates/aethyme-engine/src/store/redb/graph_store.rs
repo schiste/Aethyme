@@ -35,22 +35,20 @@ const META_KEY_SCHEMA_VERSION: &str = "schema_version";
 // `path/` don't have to skip over unrelated kinds. Key = node id (raw &str so
 // scope queries can range over it). Value = bincoded entity record.
 
-const FILES:     TableDefinition<&str, &[u8]> = TableDefinition::new("files");
-const AREAS:     TableDefinition<&str, &[u8]> = TableDefinition::new("areas");
+const FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
+const AREAS: TableDefinition<&str, &[u8]> = TableDefinition::new("areas");
 const FUNCTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("functions");
-const CLASSES:   TableDefinition<&str, &[u8]> = TableDefinition::new("classes");
-const DOCS:      TableDefinition<&str, &[u8]> = TableDefinition::new("docs");
-const CONFIGS:   TableDefinition<&str, &[u8]> = TableDefinition::new("configs");
+const CLASSES: TableDefinition<&str, &[u8]> = TableDefinition::new("classes");
+const DOCS: TableDefinition<&str, &[u8]> = TableDefinition::new("docs");
+const CONFIGS: TableDefinition<&str, &[u8]> = TableDefinition::new("configs");
 
 // ── Adjacency (the wedge for ego/impact/dead-code queries) ──────────────────
 // Both directions are first-class (informed by the `edges_by_target`
 // algorithmic fix that turned MediaWiki dead-code from O(F·E) to O(F·in_deg)).
 // Value = bincoded AdjacencyRecord (kind, other_node_id, confidence, source).
 
-const EDGES_OUT: MultimapTableDefinition<&str, &[u8]> =
-    MultimapTableDefinition::new("edges_out");
-const EDGES_IN: MultimapTableDefinition<&str, &[u8]> =
-    MultimapTableDefinition::new("edges_in");
+const EDGES_OUT: MultimapTableDefinition<&str, &[u8]> = MultimapTableDefinition::new("edges_out");
+const EDGES_IN: MultimapTableDefinition<&str, &[u8]> = MultimapTableDefinition::new("edges_in");
 
 // ── Scope-bounded lookups (raw paths give free prefix range reads) ──────────
 // Key = file_path. Value = node id. A range scan from "includes/" to
@@ -69,8 +67,7 @@ const SYMBOL_BY_NAME: MultimapTableDefinition<&str, &str> =
 
 // ── Risk overlays ───────────────────────────────────────────────────────────
 
-const RISK_FLAGS: MultimapTableDefinition<&str, &[u8]> =
-    MultimapTableDefinition::new("risk_flags");
+const RISK_FLAGS: MultimapTableDefinition<&str, &[u8]> = MultimapTableDefinition::new("risk_flags");
 
 /// Rotate the in-flight write transaction after this many ops.
 /// Bounds fsync rate and the size of any single committed batch.
@@ -124,7 +121,10 @@ impl std::fmt::Display for GraphStoreError {
             Self::Db(e) => write!(f, "redb: {e}"),
             Self::Encode(e) => write!(f, "bincode: {e}"),
             Self::SchemaMismatch { found, expected } => {
-                write!(f, "graph store schema mismatch: found v{found}, expected v{expected}")
+                write!(
+                    f,
+                    "graph store schema mismatch: found v{found}, expected v{expected}"
+                )
             }
             Self::IncompatibleRedbFileFormat { path, found } => write!(
                 f,
@@ -138,34 +138,54 @@ impl std::fmt::Display for GraphStoreError {
 impl std::error::Error for GraphStoreError {}
 
 impl From<std::io::Error> for GraphStoreError {
-    fn from(e: std::io::Error) -> Self { Self::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
 }
 impl From<redb::Error> for GraphStoreError {
-    fn from(e: redb::Error) -> Self { Self::Db(e) }
+    fn from(e: redb::Error) -> Self {
+        Self::Db(e)
+    }
 }
 impl From<redb::DatabaseError> for GraphStoreError {
-    fn from(e: redb::DatabaseError) -> Self { Self::Db(e.into()) }
+    fn from(e: redb::DatabaseError) -> Self {
+        Self::Db(e.into())
+    }
 }
 impl From<redb::TransactionError> for GraphStoreError {
-    fn from(e: redb::TransactionError) -> Self { Self::Db(e.into()) }
+    fn from(e: redb::TransactionError) -> Self {
+        Self::Db(e.into())
+    }
 }
 impl From<redb::TableError> for GraphStoreError {
-    fn from(e: redb::TableError) -> Self { Self::Db(e.into()) }
+    fn from(e: redb::TableError) -> Self {
+        Self::Db(e.into())
+    }
 }
 impl From<redb::StorageError> for GraphStoreError {
-    fn from(e: redb::StorageError) -> Self { Self::Db(e.into()) }
+    fn from(e: redb::StorageError) -> Self {
+        Self::Db(e.into())
+    }
 }
 impl From<redb::CommitError> for GraphStoreError {
-    fn from(e: redb::CommitError) -> Self { Self::Db(e.into()) }
+    fn from(e: redb::CommitError) -> Self {
+        Self::Db(e.into())
+    }
 }
 impl From<redb::CompactionError> for GraphStoreError {
-    fn from(e: redb::CompactionError) -> Self { Self::Db(e.into()) }
+    fn from(e: redb::CompactionError) -> Self {
+        Self::Db(e.into())
+    }
 }
 impl From<redb::SetDurabilityError> for GraphStoreError {
-    fn from(e: redb::SetDurabilityError) -> Self { Self::Db(e.into()) }
+    fn from(e: redb::SetDurabilityError) -> Self {
+        Self::Db(e.into())
+    }
 }
 impl From<bincode::Error> for GraphStoreError {
-    fn from(e: bincode::Error) -> Self { Self::Encode(e) }
+    fn from(e: bincode::Error) -> Self {
+        Self::Encode(e)
+    }
 }
 
 /// Handle to a redb database holding the graph for one repository.
@@ -491,20 +511,14 @@ impl ReadOnlyGraphStore {
 // indexes each kind requires. Mirrors the surface of `super::super::write`.
 
 /// Insert (or overwrite) an area. Key = `area.id` (e.g. `area:Repo:src`).
-pub fn insert_area(
-    session: &mut IndexSession<'_>,
-    area: &AreaNode,
-) -> Result<(), GraphStoreError> {
+pub fn insert_area(session: &mut IndexSession<'_>, area: &AreaNode) -> Result<(), GraphStoreError> {
     session.insert_node(AREAS, &area.id, area)
 }
 
 /// Insert (or overwrite) a file. Key = `file.id` (e.g. `file:Repo:src/lib.rs`).
 /// Also adds `path → file.id` to NODES_BY_PATH so a path can be resolved to
 /// the structured ID.
-pub fn insert_file(
-    session: &mut IndexSession<'_>,
-    file: &FileNode,
-) -> Result<(), GraphStoreError> {
+pub fn insert_file(session: &mut IndexSession<'_>, file: &FileNode) -> Result<(), GraphStoreError> {
     session.insert_node(FILES, &file.id, file)?;
     session.add_path_index(NODES_BY_PATH, &file.path, &file.id)?;
     Ok(())
@@ -512,10 +526,7 @@ pub fn insert_file(
 
 /// Insert one logical edge. Composes into `IndexSession::insert_edge` with
 /// `Edge`'s fields unpacked.
-pub fn insert_edge(
-    session: &mut IndexSession<'_>,
-    edge: &Edge,
-) -> Result<(), GraphStoreError> {
+pub fn insert_edge(session: &mut IndexSession<'_>, edge: &Edge) -> Result<(), GraphStoreError> {
     session.insert_edge(
         edge.from.as_str(),
         edge.to.as_str(),
@@ -526,10 +537,7 @@ pub fn insert_edge(
 }
 
 /// Insert a risk flag under its scope.
-pub fn insert_risk(
-    session: &mut IndexSession<'_>,
-    risk: &RiskFlag,
-) -> Result<(), GraphStoreError> {
+pub fn insert_risk(session: &mut IndexSession<'_>, risk: &RiskFlag) -> Result<(), GraphStoreError> {
     session.add_risk(&risk.scope, risk)
 }
 
@@ -556,7 +564,9 @@ fn repo_metadata_from<D: ReadableDatabase>(
 ) -> Result<Option<RepoMetadata>, GraphStoreError> {
     let txn = db.begin_read()?;
     let t = txn.open_table(META)?;
-    let Some(value) = t.get(META_KEY_REPO_METADATA)? else { return Ok(None) };
+    let Some(value) = t.get(META_KEY_REPO_METADATA)? else {
+        return Ok(None);
+    };
     let meta: RepoMetadata = bincode::deserialize(value.value())?;
     Ok(Some(meta))
 }
@@ -646,7 +656,9 @@ fn overview_from<D: ReadableDatabase>(
             if !has_entrypoint || !seen.insert(src.clone()) {
                 continue;
             }
-            let Some(blob) = files.get(src.as_str())? else { continue };
+            let Some(blob) = files.get(src.as_str())? else {
+                continue;
+            };
             let file: FileNode = bincode::deserialize(blob.value())?;
             paths.push(file.path);
             if paths.len() >= entrypoint_limit {
@@ -685,29 +697,20 @@ fn overview_from<D: ReadableDatabase>(
 impl GraphStore {
     /// List all areas, optionally filtered by depth (1 = top-level, 2 =
     /// nested under top-level, etc). Depth is computed from `path_prefix`.
-    pub fn list_areas(
-        &self,
-        depth: Option<u32>,
-    ) -> Result<Vec<AreaNode>, GraphStoreError> {
+    pub fn list_areas(&self, depth: Option<u32>) -> Result<Vec<AreaNode>, GraphStoreError> {
         list_areas_from(&self.db, depth)
     }
 
     /// Outgoing adjacency rows for `entity_id`. Each row carries the partner
     /// (`other`) so callers don't need a second lookup.
-    pub fn edges_from(
-        &self,
-        entity_id: &str,
-    ) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
+    pub fn edges_from(&self, entity_id: &str) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
         collect_adjacency(&self.db, EDGES_OUT, entity_id)
     }
 
     /// Incoming adjacency rows for `entity_id`. The `O(in_degree)` shape
     /// from the dead-code algorithm fix — the whole reason EDGES_IN exists
     /// from day one in this schema.
-    pub fn edges_to(
-        &self,
-        entity_id: &str,
-    ) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
+    pub fn edges_to(&self, entity_id: &str) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
         collect_adjacency(&self.db, EDGES_IN, entity_id)
     }
 
@@ -731,26 +734,17 @@ impl ReadOnlyGraphStore {
     }
 
     /// List all areas, optionally filtered by depth.
-    pub fn list_areas(
-        &self,
-        depth: Option<u32>,
-    ) -> Result<Vec<AreaNode>, GraphStoreError> {
+    pub fn list_areas(&self, depth: Option<u32>) -> Result<Vec<AreaNode>, GraphStoreError> {
         list_areas_from(&self.db, depth)
     }
 
     /// Outgoing adjacency rows for `entity_id`.
-    pub fn edges_from(
-        &self,
-        entity_id: &str,
-    ) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
+    pub fn edges_from(&self, entity_id: &str) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
         collect_adjacency(&self.db, EDGES_OUT, entity_id)
     }
 
     /// Incoming adjacency rows for `entity_id`.
-    pub fn edges_to(
-        &self,
-        entity_id: &str,
-    ) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
+    pub fn edges_to(&self, entity_id: &str) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
         collect_adjacency(&self.db, EDGES_IN, entity_id)
     }
 
@@ -792,7 +786,10 @@ impl<'db> IndexSession<'db> {
         let bytes = bincode::serialize(value)?;
         let written = bytes.len();
         {
-            let txn = self.txn.as_ref().expect("IndexSession invariant: txn present");
+            let txn = self
+                .txn
+                .as_ref()
+                .expect("IndexSession invariant: txn present");
             let mut t = txn.open_table(table)?;
             t.insert(key, bytes.as_slice())?;
         }
@@ -830,7 +827,10 @@ impl<'db> IndexSession<'db> {
         let in_bytes = bincode::serialize(&in_record)?;
         let written = out_bytes.len() + in_bytes.len();
         {
-            let txn = self.txn.as_ref().expect("IndexSession invariant: txn present");
+            let txn = self
+                .txn
+                .as_ref()
+                .expect("IndexSession invariant: txn present");
             let mut out = txn.open_multimap_table(EDGES_OUT)?;
             out.insert(src, out_bytes.as_slice())?;
             let mut inv = txn.open_multimap_table(EDGES_IN)?;
@@ -853,7 +853,10 @@ impl<'db> IndexSession<'db> {
         path: &str,
         node_id: &str,
     ) -> Result<(), GraphStoreError> {
-        let txn = self.txn.as_ref().expect("IndexSession invariant: txn present");
+        let txn = self
+            .txn
+            .as_ref()
+            .expect("IndexSession invariant: txn present");
         let mut t = txn.open_multimap_table(table)?;
         t.insert(path, node_id)?;
         Ok(())
@@ -866,22 +869,24 @@ impl<'db> IndexSession<'db> {
         name_lower: &str,
         node_id: &str,
     ) -> Result<(), GraphStoreError> {
-        let txn = self.txn.as_ref().expect("IndexSession invariant: txn present");
+        let txn = self
+            .txn
+            .as_ref()
+            .expect("IndexSession invariant: txn present");
         let mut t = txn.open_multimap_table(SYMBOL_BY_NAME)?;
         t.insert(name_lower, node_id)?;
         Ok(())
     }
 
     /// Append a bincoded risk record under `scope` in RISK_FLAGS.
-    pub fn add_risk(
-        &mut self,
-        scope: &str,
-        value: &impl Serialize,
-    ) -> Result<(), GraphStoreError> {
+    pub fn add_risk(&mut self, scope: &str, value: &impl Serialize) -> Result<(), GraphStoreError> {
         let bytes = bincode::serialize(value)?;
         let written = bytes.len();
         {
-            let txn = self.txn.as_ref().expect("IndexSession invariant: txn present");
+            let txn = self
+                .txn
+                .as_ref()
+                .expect("IndexSession invariant: txn present");
             let mut t = txn.open_multimap_table(RISK_FLAGS)?;
             t.insert(scope, bytes.as_slice())?;
         }
@@ -895,7 +900,10 @@ impl<'db> IndexSession<'db> {
 
     /// Commit all pending writes. Consumes the session.
     pub fn commit(mut self) -> Result<(), GraphStoreError> {
-        let txn = self.txn.take().expect("IndexSession invariant: txn present");
+        let txn = self
+            .txn
+            .take()
+            .expect("IndexSession invariant: txn present");
         txn.commit()?;
         Ok(())
     }
@@ -903,7 +911,10 @@ impl<'db> IndexSession<'db> {
     /// Force a rotation now (commit current txn, open a fresh one). Useful at
     /// natural pipeline boundaries (e.g. between indexing passes).
     pub fn rotate(&mut self) -> Result<(), GraphStoreError> {
-        let txn = self.txn.take().expect("IndexSession invariant: txn present");
+        let txn = self
+            .txn
+            .take()
+            .expect("IndexSession invariant: txn present");
         txn.commit()?;
         let mut txn = self.db.begin_write()?;
         self.durability.apply(&mut txn)?;
@@ -945,8 +956,7 @@ impl<'db> IndexSession<'db> {
     //   - returning `true` is ALWAYS safe (just slower); returning `false`
     //     too aggressively risks unbounded memory growth on big repos.
     fn should_rotate(&self) -> bool {
-        self.ops_since_rotate >= ROTATE_EVERY_OPS
-            || self.bytes_since_rotate >= ROTATE_EVERY_BYTES
+        self.ops_since_rotate >= ROTATE_EVERY_OPS || self.bytes_since_rotate >= ROTATE_EVERY_BYTES
     }
 }
 
@@ -1006,10 +1016,7 @@ fn ensure_schema(db: &Database) -> Result<(), GraphStoreError> {
                 }
             }
             None => {
-                meta.insert(
-                    META_KEY_SCHEMA_VERSION,
-                    &SCHEMA_VERSION.to_le_bytes()[..],
-                )?;
+                meta.insert(META_KEY_SCHEMA_VERSION, &SCHEMA_VERSION.to_le_bytes()[..])?;
             }
         }
         // Touch every table so they exist on a fresh DB.
@@ -1034,12 +1041,12 @@ fn verify_schema_read_only(db: &ReadOnlyDatabase) -> Result<(), GraphStoreError>
     let txn = db.begin_read()?;
     {
         let meta = txn.open_table(META)?;
-        let value = meta.get(META_KEY_SCHEMA_VERSION)?.ok_or(
-            GraphStoreError::SchemaMismatch {
+        let value = meta
+            .get(META_KEY_SCHEMA_VERSION)?
+            .ok_or(GraphStoreError::SchemaMismatch {
                 found: 0,
                 expected: SCHEMA_VERSION,
-            },
-        )?;
+            })?;
         let bytes = value.value();
         if bytes.len() != 4 {
             return Err(GraphStoreError::SchemaMismatch {
@@ -1082,7 +1089,9 @@ mod tests {
     macro_rules! function_name {
         () => {{
             fn f() {}
-            fn type_name<T>(_: T) -> &'static str { std::any::type_name::<T>() }
+            fn type_name<T>(_: T) -> &'static str {
+                std::any::type_name::<T>()
+            }
             let n = type_name(f);
             &n[..n.len() - 3]
         }};
@@ -1149,9 +1158,12 @@ mod tests {
         let edges_in = txn.open_multimap_table(EDGES_IN).expect("EDGES_IN");
         assert_eq!(edges_out.len().unwrap(), 0);
         assert_eq!(edges_in.len().unwrap(), 0);
-        txn.open_multimap_table(FUNCTIONS_BY_PATH).expect("FUNCTIONS_BY_PATH");
-        txn.open_multimap_table(NODES_BY_PATH).expect("NODES_BY_PATH");
-        txn.open_multimap_table(SYMBOL_BY_NAME).expect("SYMBOL_BY_NAME");
+        txn.open_multimap_table(FUNCTIONS_BY_PATH)
+            .expect("FUNCTIONS_BY_PATH");
+        txn.open_multimap_table(NODES_BY_PATH)
+            .expect("NODES_BY_PATH");
+        txn.open_multimap_table(SYMBOL_BY_NAME)
+            .expect("SYMBOL_BY_NAME");
         txn.open_multimap_table(RISK_FLAGS).expect("RISK_FLAGS");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1226,8 +1238,7 @@ mod tests {
         session.insert_node(FILES, &node.id, &node).expect("insert");
         session.commit().expect("commit");
 
-        let bytes = read_node_bytes(store.db(), FILES, "file:Repo:src/lib.rs")
-            .expect("present");
+        let bytes = read_node_bytes(store.db(), FILES, "file:Repo:src/lib.rs").expect("present");
         let got: SampleNode = bincode::deserialize(&bytes).expect("decode");
         assert_eq!(got, node);
 
@@ -1318,14 +1329,16 @@ mod tests {
 
         let readonly = GraphStore::open_read_only(&root).expect("read-only open");
         assert_eq!(
-            readonly.repo_metadata().expect("metadata").unwrap().file_count,
+            readonly
+                .repo_metadata()
+                .expect("metadata")
+                .unwrap()
+                .file_count,
             2
         );
         assert_eq!(readonly.list_areas(Some(1)).expect("areas"), vec![area]);
         assert_eq!(
-            readonly
-                .edges_from(&file_a.id)
-                .expect("edges from")[0]
+            readonly.edges_from(&file_a.id).expect("edges from")[0]
                 .other
                 .as_str(),
             file_b.id
@@ -1465,18 +1478,30 @@ mod tests {
         let store = GraphStore::open(&root).expect("open");
         let mut session = store.begin_index().expect("session");
 
-        let a = SampleNode { id: "a".into(), path: "a.rs".into() };
+        let a = SampleNode {
+            id: "a".into(),
+            path: "a.rs".into(),
+        };
         session.insert_node(FILES, &a.id, &a).expect("insert a");
         session.rotate().expect("rotate");
 
         // After rotate, `a` is durable; subsequent inserts continue in a fresh txn.
-        assert!(read_node_bytes(store.db(), FILES, "a").is_some(), "a is durable");
+        assert!(
+            read_node_bytes(store.db(), FILES, "a").is_some(),
+            "a is durable"
+        );
 
-        let b = SampleNode { id: "b".into(), path: "b.rs".into() };
+        let b = SampleNode {
+            id: "b".into(),
+            path: "b.rs".into(),
+        };
         session.insert_node(FILES, &b.id, &b).expect("insert b");
         session.commit().expect("commit");
 
-        assert!(read_node_bytes(store.db(), FILES, "b").is_some(), "b after second commit");
+        assert!(
+            read_node_bytes(store.db(), FILES, "b").is_some(),
+            "b after second commit"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1569,7 +1594,9 @@ mod tests {
 
         // NODES_BY_PATH lookup.
         let txn = store.db().begin_read().expect("read");
-        let by_path = txn.open_multimap_table(NODES_BY_PATH).expect("NODES_BY_PATH");
+        let by_path = txn
+            .open_multimap_table(NODES_BY_PATH)
+            .expect("NODES_BY_PATH");
         let hits: Vec<String> = by_path
             .get("src/lib.rs")
             .expect("get")
@@ -1732,8 +1759,7 @@ mod tests {
         let mut session = store.begin_index().expect("session");
         // Insert areas in non-sorted order to verify the sort.
         for prefix in ["src/lib", "tests", "src", "src/bin", "docs"] {
-            insert_area(&mut session, &AreaNode::new("Repo", prefix, false))
-                .expect("insert");
+            insert_area(&mut session, &AreaNode::new("Repo", prefix, false)).expect("insert");
         }
         session.commit().expect("commit");
 
@@ -1855,11 +1881,7 @@ mod tests {
         let store = GraphStore::open(&root).expect("open");
         let mut session = store.begin_index().expect("session");
         for i in 0..5 {
-            insert_area(
-                &mut session,
-                &AreaNode::new("R", &format!("a{i}"), false),
-            )
-            .expect("area");
+            insert_area(&mut session, &AreaNode::new("R", &format!("a{i}"), false)).expect("area");
             insert_risk(
                 &mut session,
                 &RiskFlag::new(format!("r{i}"), RiskArea::Auth, RiskLevel::Low, "x"),
@@ -1940,8 +1962,8 @@ mod tests {
         drop(store);
         mark_graph_store_as_redb_v2(&root);
 
-        let incompatible = GraphStore::detect_incompatible_file_format(&root)
-            .expect("old redb format detected");
+        let incompatible =
+            GraphStore::detect_incompatible_file_format(&root).expect("old redb format detected");
         assert_eq!(incompatible.found_redb_format, 2);
 
         let rebuilt = GraphStore::reset(&root).expect("reset");

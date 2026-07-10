@@ -311,10 +311,8 @@ fn run() -> Result<(), String> {
             if profile {
                 profiler.attach_substages("map_build", &build_profile);
             }
-            let task = profiler
-                .stage_pure("task_parse", || TaskInput::from_task_text(&task_value));
-            let anchors =
-                profiler.stage_pure("anchors", || task_anchors_view(&map, &task));
+            let task = profiler.stage_pure("task_parse", || TaskInput::from_task_text(&task_value));
+            let anchors = profiler.stage_pure("anchors", || task_anchors_view(&map, &task));
             let scope = profiler.stage_pure("scope", || task_scope_view(&map, &task));
             let next = profiler.stage_pure("next", || task_next_view(&map, &task));
             let rendered = profiler.stage_pure("json_render", || {
@@ -1233,8 +1231,15 @@ fn legacy_pass_removed_error() -> String {
 ///   [profile] task-localize: map_build=12480ms task_parse=0ms anchors=210ms \
 ///             scope=830ms next=305ms json_render=12ms total=13837ms
 enum StageEntry {
-    Top { name: String, ms: u128 },
-    Sub { parent: String, name: String, ms: u128 },
+    Top {
+        name: String,
+        ms: u128,
+    },
+    Sub {
+        parent: String,
+        name: String,
+        ms: u128,
+    },
 }
 
 struct StageProfiler {
@@ -1554,7 +1559,9 @@ fn index_to_store(
         Ok(())
     })?;
 
-    profiler.stage("redb_commit", || session.commit().map_err(|e| e.to_string()))?;
+    profiler.stage("redb_commit", || {
+        session.commit().map_err(|e| e.to_string())
+    })?;
 
     // Repo metadata — outside the IndexSession because it's a one-shot
     // META write and we want it persisted only after the bulk load succeeded.

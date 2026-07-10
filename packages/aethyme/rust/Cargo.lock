@@ -22,6 +22,8 @@ name = "aethyme-broker"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
@@ -30,6 +32,7 @@ dependencies = [
 name = "aethyme-engine"
 version = "0.1.0"
 dependencies = [
+ "aethyme-broker",
  "aethyme-graph-indexer",
  "aethyme-graph-schema",
  "aethyme-graph-storage",

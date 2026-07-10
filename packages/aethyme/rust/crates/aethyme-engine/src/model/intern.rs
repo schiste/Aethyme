@@ -25,7 +25,9 @@ pub struct ArcInterner {
 
 impl ArcInterner {
     pub fn new() -> Self {
-        Self { table: HashSet::new() }
+        Self {
+            table: HashSet::new(),
+        }
     }
 
     /// Return the canonical `Arc<str>` for `value`, allocating a new heap
@@ -242,10 +244,7 @@ pub mod arc_str_opt {
 
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(
-        value: &Option<Arc<str>>,
-        ser: S,
-    ) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(value: &Option<Arc<str>>, ser: S) -> Result<S::Ok, S::Error> {
         match value {
             Some(s) => ser.serialize_some(s.as_ref()),
             None => ser.serialize_none(),

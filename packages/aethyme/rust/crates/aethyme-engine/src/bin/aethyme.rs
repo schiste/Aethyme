@@ -55,6 +55,9 @@ fn main() -> ExitCode {
         }
         "explore" => run_explore(&args[1..]),
         "daemon" => run_daemon_subcommand(&args[1..]),
+        // Broker commands are native Rust from birth (issue #31) — never
+        // delegated to Python.
+        "broker" => ExitCode::from(aethyme_broker::cli::run(&args[1..])),
         other => {
             // Unknown to the Rust client — pass straight through to Python.
             // This includes commands like `intents`, `enhance`, `eval`, etc.
@@ -76,6 +79,9 @@ fn print_top_level_help() {
     eprintln!("  daemon start --repo <path>  start the warm-state daemon for a repo");
     eprintln!("  daemon stop  --repo <path>  terminate the daemon");
     eprintln!("  daemon status --repo <path> health-check the daemon");
+    eprintln!();
+    eprintln!("Agent broker:");
+    eprintln!("  broker adopt|start-agent|agents|cleanup   (see `broker --help`)");
     eprintln!();
     eprintln!("Everything else delegates to the Python CLI:");
     eprintln!("  intents, enhance, eval, analyze, task, graph, ...");
@@ -230,9 +236,7 @@ fn run_daemon_subcommand(args: &[String]) -> ExitCode {
     let repo = match resolve_repo(&args[1..]) {
         Some(p) => p,
         None => {
-            eprintln!(
-                "aethyme daemon: --repo <path> is required (or set $AETHYME_REPO)"
-            );
+            eprintln!("aethyme daemon: --repo <path> is required (or set $AETHYME_REPO)");
             return ExitCode::from(2);
         }
     };
@@ -250,11 +254,17 @@ fn run_daemon_subcommand(args: &[String]) -> ExitCode {
 
 fn daemon_status(repo: &Path) -> ExitCode {
     let Some(socket_path) = daemon_socket_path(repo) else {
-        println!("daemon: not running (no socket pointer for {})", repo.display());
+        println!(
+            "daemon: not running (no socket pointer for {})",
+            repo.display()
+        );
         return ExitCode::from(1);
     };
     if !socket_path.exists() {
-        println!("daemon: not running ({} does not exist)", socket_path.display());
+        println!(
+            "daemon: not running ({} does not exist)",
+            socket_path.display()
+        );
         return ExitCode::from(1);
     }
     match UnixStream::connect(&socket_path) {
@@ -276,11 +286,17 @@ fn daemon_start(repo: &Path) -> ExitCode {
     // Delegate to the Python daemon implementation. The Python CLI owns the
     // explore orchestration logic; the daemon just keeps the interpreter and
     // its imports warm across many calls.
-    delegate_to_python("daemon", &["start".into(), "--repo".into(), repo.display().to_string()])
+    delegate_to_python(
+        "daemon",
+        &["start".into(), "--repo".into(), repo.display().to_string()],
+    )
 }
 
 fn daemon_stop(repo: &Path) -> ExitCode {
-    delegate_to_python("daemon", &["stop".into(), "--repo".into(), repo.display().to_string()])
+    delegate_to_python(
+        "daemon",
+        &["stop".into(), "--repo".into(), repo.display().to_string()],
+    )
 }
 
 // ── delegation to Python ────────────────────────────────────────────────────
@@ -317,7 +333,10 @@ fn delegate_to_python(subcommand: &str, args: &[String]) -> ExitCode {
             _ => ExitCode::from(1),
         },
         Err(e) => {
-            eprintln!("aethyme: failed to spawn {} -m src.cli: {e}", python_bin.display());
+            eprintln!(
+                "aethyme: failed to spawn {} -m src.cli: {e}",
+                python_bin.display()
+            );
             ExitCode::from(127)
         }
     }

@@ -59,10 +59,8 @@ pub(crate) fn extract_text_search_terms(request: &str) -> Vec<String> {
     if lowered.contains("revision") || lowered.contains("oldid") {
         extras.extend(["revision", "revisions", "oldid"]);
     }
-    let mut seen: std::collections::HashSet<String> = terms
-        .iter()
-        .map(|t| t.to_ascii_lowercase())
-        .collect();
+    let mut seen: std::collections::HashSet<String> =
+        terms.iter().map(|t| t.to_ascii_lowercase()).collect();
     for extra in extras {
         let lower = extra.to_ascii_lowercase();
         if seen.insert(lower) {
@@ -97,8 +95,7 @@ pub(super) fn source_text_files(
         if pattern.is_empty() {
             continue;
         }
-        let lowered_terms: Vec<String> =
-            chunk.iter().map(|t| t.to_ascii_lowercase()).collect();
+        let lowered_terms: Vec<String> = chunk.iter().map(|t| t.to_ascii_lowercase()).collect();
         let output = match std::process::Command::new(RIPGREP_BIN)
             .arg("-i")
             .arg("--no-heading")
@@ -116,12 +113,7 @@ pub(super) fn source_text_files(
             Err(_) => continue,
         };
         if !output.stdout.is_empty() {
-            ingest_rg_output(
-                &output.stdout,
-                repo,
-                &lowered_terms,
-                &mut hits_by_file,
-            );
+            ingest_rg_output(&output.stdout, repo, &lowered_terms, &mut hits_by_file);
         }
     }
 
@@ -356,8 +348,14 @@ mod tests {
         // Source-language test files should rank BELOW non-test source
         // (4 vs 5). Pre-bugfix, the test arm was unreachable for these.
         assert!(suffix_class_rank("src/auth.rs") > suffix_class_rank("tests/auth_test.rs"));
-        assert!(suffix_class_rank("backend/grader.py") > suffix_class_rank("backend/tests/test_grader.py"));
-        assert!(suffix_class_rank("packages/auth/src/login.ts") > suffix_class_rank("packages/auth/src/login.test.ts"));
+        assert!(
+            suffix_class_rank("backend/grader.py")
+                > suffix_class_rank("backend/tests/test_grader.py")
+        );
+        assert!(
+            suffix_class_rank("packages/auth/src/login.ts")
+                > suffix_class_rank("packages/auth/src/login.test.ts")
+        );
     }
 
     #[test]

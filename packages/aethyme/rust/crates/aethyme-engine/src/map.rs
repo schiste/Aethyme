@@ -11,9 +11,7 @@ use crate::model::doc::DocNode;
 use crate::model::edge::{Edge, EdgeKind};
 use crate::model::file::{FileNode, FileRole};
 use crate::model::function::FunctionNode;
-use crate::model::graph::{
-    GraphAnnotation, GraphNode, GraphNodeKind, NormalizedGraph,
-};
+use crate::model::graph::{GraphAnnotation, GraphNode, GraphNodeKind, NormalizedGraph};
 use crate::model::intern::InternedStr;
 use crate::model::risk::{RiskArea, RiskFlag, RiskLevel};
 use crate::model::symbol::{Symbol, SymbolKind};
@@ -23,8 +21,8 @@ use aethyme_graph_schema::{
 };
 use aethyme_graph_storage::{Fragment, FragmentStore};
 use aethyme_producers::{
-    ConfigsProducer, DocsProducer, OverlayProducer, ProducerCtx,
-    RepoFileView, RepoView, RisksProducer, StructureProducer,
+    ConfigsProducer, DocsProducer, OverlayProducer, ProducerCtx, RepoFileView, RepoView,
+    RisksProducer, StructureProducer,
 };
 
 /// Pre-computed HashMap indexes for O(1) lookups on entity id → area_id and display string.
@@ -216,9 +214,7 @@ impl RepositoryMap {
     /// Phase 4.7.12 deleted the legacy pass pipeline, so every
     /// `RepositoryMap` build now consumes the committed
     /// `.aethyme/graph` store. Missing fragments are a hard error.
-    pub fn build_from_fragments(
-        root: &Path,
-    ) -> Result<(Self, RepositoryBuildProfile), String> {
+    pub fn build_from_fragments(root: &Path) -> Result<(Self, RepositoryBuildProfile), String> {
         Self::build_internal(root, |_| {}, true)
     }
 
@@ -258,10 +254,7 @@ impl RepositoryMap {
             started.elapsed().as_millis(),
             &mut progress,
         );
-        let profile = map.derive_build_profile(
-            total_started.elapsed().as_millis(),
-            stages,
-        );
+        let profile = map.derive_build_profile(total_started.elapsed().as_millis(), stages);
         Ok((map, profile))
     }
 
@@ -414,8 +407,7 @@ impl RepositoryMap {
         };
         let ctx = ProducerCtx::with_repo(&store, &view);
 
-        let structure_overlay =
-            StructureProducer.produce(&ctx).map_err(|e| e.to_string())?;
+        let structure_overlay = StructureProducer.produce(&ctx).map_err(|e| e.to_string())?;
         let structure = structure_overlay.payload();
 
         let mut top_level_dirs = BTreeSet::new();
@@ -471,8 +463,7 @@ impl RepositoryMap {
         let area_of =
             |path: &str| -> Option<String> { file_index.get(path).and_then(|f| f.area_id.clone()) };
 
-        let configs_overlay =
-            ConfigsProducer.produce(&ctx).map_err(|e| e.to_string())?;
+        let configs_overlay = ConfigsProducer.produce(&ctx).map_err(|e| e.to_string())?;
         let mut configs = Vec::with_capacity(configs_overlay.payload().files.len());
         for nc in &configs_overlay.payload().files {
             let path = nc.path();
@@ -524,9 +515,7 @@ impl RepositoryMap {
                 continue;
             };
             for node in fragment.nodes() {
-                if let Some((schema_id, class)) =
-                    class_from_schema_node(node, file, &repo_name)
-                {
+                if let Some((schema_id, class)) = class_from_schema_node(node, file, &repo_name) {
                     model_id_by_schema.insert(schema_id, class.id.to_string());
                     classes.push(class);
                 }
@@ -660,9 +649,7 @@ impl RepositoryMap {
 /// verbatim mirrors — the producer's was copied from the model during
 /// the Phase 4.7.6 port — so this is a total, variant-for-variant map;
 /// the `UserDefined` payload is cloned across the type boundary.
-fn convert_risk_area(
-    area: &aethyme_producers::risks::RiskArea,
-) -> RiskArea {
+fn convert_risk_area(area: &aethyme_producers::risks::RiskArea) -> RiskArea {
     use aethyme_producers::risks::RiskArea as P;
     match area {
         P::Auth => RiskArea::Auth,
@@ -680,9 +667,7 @@ fn convert_risk_area(
 /// Convert the producer crate's
 /// [`RiskLevel`](aethyme_producers::risks::RiskLevel) into the engine
 /// model's. Total mirror map (Low/Medium/High); see [`convert_risk_area`].
-fn convert_risk_level(
-    level: &aethyme_producers::risks::RiskLevel,
-) -> RiskLevel {
+fn convert_risk_level(level: &aethyme_producers::risks::RiskLevel) -> RiskLevel {
     use aethyme_producers::risks::RiskLevel as P;
     match level {
         P::Low => RiskLevel::Low,
@@ -828,7 +813,13 @@ fn class_from_schema_node(
         )),
         Node::Struct(value) => Some((
             value.id().as_str().to_string(),
-            class_node(repo_name, value.name(), value.source_range(), "struct", file),
+            class_node(
+                repo_name,
+                value.name(),
+                value.source_range(),
+                "struct",
+                file,
+            ),
         )),
         Node::Interface(value) => Some((
             value.id().as_str().to_string(),
@@ -869,7 +860,11 @@ fn class_node(
         InternedStr::from(file.id.clone()),
         file_path,
         file.area_id.clone().map(InternedStr::from),
-        InternedStr::from(file.language.clone().unwrap_or_else(|| "unknown".to_string())),
+        InternedStr::from(
+            file.language
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
         InternedStr::from(name),
         source_range.start_line() as usize,
         InternedStr::from(format!("{kind} {name}")),
@@ -941,17 +936,18 @@ fn function_node(
         file_path,
         file.area_id.clone().map(InternedStr::from),
         parent_class_id,
-        InternedStr::from(file.language.clone().unwrap_or_else(|| "unknown".to_string())),
+        InternedStr::from(
+            file.language
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
         InternedStr::from(name),
         source_range.start_line() as usize,
         InternedStr::from(signature),
     )
 }
 
-fn compatibility_symbols(
-    classes: &[ClassNode],
-    functions: &[FunctionNode],
-) -> Vec<Symbol> {
+fn compatibility_symbols(classes: &[ClassNode], functions: &[FunctionNode]) -> Vec<Symbol> {
     let mut symbols = Vec::with_capacity(classes.len() + functions.len());
     for class in classes {
         symbols.push(
@@ -980,11 +976,7 @@ fn compatibility_symbols(
     symbols
 }
 
-fn compatibility_area_id(
-    repo_name: &str,
-    path: &str,
-    top_level_dirs: &[String],
-) -> Option<String> {
+fn compatibility_area_id(repo_name: &str, path: &str, top_level_dirs: &[String]) -> Option<String> {
     let first = path.split('/').next()?;
     if top_level_dirs.iter().any(|dir| dir == first) {
         Some(format!("area:{repo_name}:{first}"))
@@ -1041,10 +1033,7 @@ fn compatibility_area_edges(
     edges
 }
 
-fn compatibility_overlay_edges(
-    docs: &[DocNode],
-    configs: &[ConfigNode],
-) -> Vec<Edge> {
+fn compatibility_overlay_edges(docs: &[DocNode], configs: &[ConfigNode]) -> Vec<Edge> {
     let mut edges = Vec::with_capacity(docs.len() + configs.len());
     for doc in docs {
         edges.push(Edge::new(
@@ -1175,11 +1164,7 @@ fn is_generated(path: &str) -> bool {
     lower.contains("generated") || lower.ends_with(".min.js") || lower.ends_with(".lock")
 }
 
-fn classify_file_role(
-    path: &str,
-    language: Option<&str>,
-    generated: bool,
-) -> FileRole {
+fn classify_file_role(path: &str, language: Option<&str>, generated: bool) -> FileRole {
     if generated {
         return FileRole::Generated;
     }
@@ -1345,16 +1330,11 @@ fn ensure_test_fragments(root: &Path) -> Result<(), String> {
         .unwrap_or("testrepo");
     aethyme_graph_storage::bootstrap_repo(&canonical, "test")
         .map_err(|err| format!("test repo bootstrap: {err}"))?;
-    let ctx =
-        aethyme_graph_indexer::IndexerContext::new(repo_name, canonical.clone(), "test")
-            .map_err(|err| format!("test index context: {err}"))?;
-    aethyme_graph_indexer::index_repo_to_disk(
-        &ctx,
-        &aethyme_graph_indexer::WalkOptions::default(),
-    )
-    .map_err(|err| format!("test index repo: {err}"))?;
-    aethyme_graph_indexer::link_repo(&ctx)
-        .map_err(|err| format!("test link repo: {err}"))?;
+    let ctx = aethyme_graph_indexer::IndexerContext::new(repo_name, canonical.clone(), "test")
+        .map_err(|err| format!("test index context: {err}"))?;
+    aethyme_graph_indexer::index_repo_to_disk(&ctx, &aethyme_graph_indexer::WalkOptions::default())
+        .map_err(|err| format!("test index repo: {err}"))?;
+    aethyme_graph_indexer::link_repo(&ctx).map_err(|err| format!("test link repo: {err}"))?;
     Ok(())
 }
 
