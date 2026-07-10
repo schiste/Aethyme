@@ -1,0 +1,636 @@
+//! Typed store over `.aethyme/broker.db`.
+//!
+//! All SQL in the crate lives here and in `schema.rs`. Callers (CLI, TUI,
+//! tests) go through these methods only — that is the API-first contract.
+//!
+//! One `BrokerStore` wraps one connection and is intended per-process
+//! (CLI invocations are short-lived). Cross-process safety comes from
+//! SQLite WAL + a 5s busy timeout; nothing here assumes in-process locks.
+
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::error::BrokerError;
+use crate::schema::{self, EVENTS_SCHEMA_VERSION};
+use crate::types::{
+    Event, GateDef, GateResult, GateStatus, Lease, LeaseKind, MergeQueueEntry, MergeStatus,
+    NewGateResult, NewSession, Session, SessionOrigin, SessionStatus,
+};
+
+/// Milliseconds a writer waits on a locked database before erroring.
+const BUSY_TIMEOUT_MS: u64 = 5_000;
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+pub struct BrokerStore {
+    conn: Connection,
+    path: PathBuf,
+}
+
+impl BrokerStore {
+    /// Open (creating and migrating if needed) the broker database for a
+    /// repository root: `<repo>/.aethyme/broker.db`.
+    pub fn open_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
+        Self::open(&repo_root.join(crate::BROKER_DB_RELPATH))
+    }
+
+    /// Open (creating and migrating if needed) a broker database at an
+    /// explicit path. Parent directories are created.
+    pub fn open(db_path: &Path) -> Result<Self, BrokerError> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| BrokerError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let conn = Connection::open(db_path)?;
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        // WAL: readers never block the writer and vice versa. NORMAL sync
+        // is durable-enough for operational state (a crash may lose the
+        // last transaction, never corrupt).
+        conn.pragma_update(None, "journal_mode", "wal")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        schema::migrate(&conn)?;
+        Ok(Self {
+            conn,
+            path: db_path.to_path_buf(),
+        })
+    }
+
+    pub fn db_path(&self) -> &Path {
+        &self.path
+    }
+
+    // ── sessions ──────────────────────────────────────────────────────
+
+    /// Register a session (adopt an existing worktree, or record a spawn).
+    /// Also emits a `session.registered` event in the same transaction.
+    pub fn register_session(&mut self, new: &NewSession) -> Result<Session, BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let inserted = tx.execute(
+            "INSERT INTO sessions (worktree_path, branch, origin, status, task, diff_base,
+                                   pid, command, log_path, created_at, updated_at,
+                                   last_activity_at)
+             VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?9)",
+            params![
+                new.worktree_path,
+                new.branch,
+                new.origin.as_str(),
+                new.task,
+                new.diff_base,
+                new.pid,
+                new.command,
+                new.log_path,
+                now,
+            ],
+        );
+        match inserted {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(BrokerError::WorktreeAlreadyRegistered(
+                    new.worktree_path.clone(),
+                ));
+            }
+            Err(err) => return Err(err.into()),
+        }
+        let id = tx.last_insert_rowid();
+        insert_event(
+            &tx,
+            now,
+            "session.registered",
+            Some(id),
+            Some(&format!(
+                "{{\"origin\":\"{}\",\"branch\":{}}}",
+                new.origin.as_str(),
+                json_string(&new.branch)
+            )),
+        )?;
+        tx.commit()?;
+        self.session(id)
+    }
+
+    pub fn session(&self, id: i64) -> Result<Session, BrokerError> {
+        self.conn
+            .query_row(
+                &format!("{SESSION_SELECT} WHERE id = ?1"),
+                [id],
+                session_from_row,
+            )
+            .optional()?
+            .ok_or(BrokerError::SessionNotFound(id))?
+    }
+
+    /// All sessions not yet cleaned, oldest first.
+    pub fn live_sessions(&self) -> Result<Vec<Session>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SESSION_SELECT} WHERE status <> 'cleaned' ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], session_from_row)?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row??);
+        }
+        Ok(sessions)
+    }
+
+    pub fn touch_session_activity(&mut self, id: i64, at_ms: i64) -> Result<(), BrokerError> {
+        let changed = self.conn.execute(
+            "UPDATE sessions SET last_activity_at = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, at_ms, now_ms()],
+        )?;
+        if changed == 0 {
+            return Err(BrokerError::SessionNotFound(id));
+        }
+        Ok(())
+    }
+
+    /// Transition a session's status; emits `session.<status>` in the same
+    /// transaction. `exit_code` is recorded for `Exited`.
+    pub fn set_session_status(
+        &mut self,
+        id: i64,
+        status: SessionStatus,
+        exit_code: Option<i64>,
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE sessions SET status = ?2, exit_code = COALESCE(?3, exit_code),
+                                 updated_at = ?4
+             WHERE id = ?1",
+            params![id, status.as_str(), exit_code, now],
+        )?;
+        if changed == 0 {
+            return Err(BrokerError::SessionNotFound(id));
+        }
+        insert_event(
+            &tx,
+            now,
+            &format!("session.{}", status.as_str()),
+            Some(id),
+            exit_code
+                .map(|code| format!("{{\"exit_code\":{code}}}"))
+                .as_deref(),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ── leases ────────────────────────────────────────────────────────
+
+    /// Replace a session's implicit (diff-derived) leases with `paths`.
+    /// Explicit leases are untouched.
+    pub fn set_implicit_leases(
+        &mut self,
+        session_id: i64,
+        paths: &[String],
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM leases WHERE session_id = ?1 AND kind = 'implicit'",
+            [session_id],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO leases (session_id, path, kind, created_at)
+                 VALUES (?1, ?2, 'implicit', ?3)",
+            )?;
+            for path in paths {
+                stmt.execute(params![session_id, path, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Claim an explicit lease. `ttl_ms = None` means no expiry.
+    pub fn claim_lease(
+        &mut self,
+        session_id: i64,
+        path: &str,
+        ttl_ms: Option<i64>,
+    ) -> Result<Lease, BrokerError> {
+        let now = now_ms();
+        let expires_at = ttl_ms.map(|ttl| now + ttl);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO leases (session_id, path, kind, created_at, expires_at)
+             VALUES (?1, ?2, 'explicit', ?3, ?4)
+             ON CONFLICT (session_id, path, kind)
+             DO UPDATE SET created_at = excluded.created_at,
+                           expires_at = excluded.expires_at,
+                           released_at = NULL",
+            params![session_id, path, now, expires_at],
+        )?;
+        insert_event(
+            &tx,
+            now,
+            "lease.claimed",
+            Some(session_id),
+            Some(&format!("{{\"path\":{}}}", json_string(path))),
+        )?;
+        tx.commit()?;
+        let lease = self.conn.query_row(
+            &format!("{LEASE_SELECT} WHERE session_id = ?1 AND path = ?2 AND kind = 'explicit'"),
+            params![session_id, path],
+            lease_from_row,
+        )??;
+        Ok(lease)
+    }
+
+    pub fn release_lease(&mut self, session_id: i64, path: &str) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE leases SET released_at = ?3
+             WHERE session_id = ?1 AND path = ?2 AND released_at IS NULL",
+            params![session_id, path, now],
+        )?;
+        insert_event(
+            &tx,
+            now,
+            "lease.released",
+            Some(session_id),
+            Some(&format!("{{\"path\":{}}}", json_string(path))),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Live leases across all live sessions: unreleased, unexpired, and
+    /// belonging to a session that is not cleaned/exited. Overlap detection
+    /// (Phase 3) is computed over this set.
+    pub fn active_leases(&self) -> Result<Vec<Lease>, BrokerError> {
+        let now = now_ms();
+        let mut stmt = self.conn.prepare(&format!(
+            "{LEASE_SELECT}
+             WHERE released_at IS NULL
+               AND (expires_at IS NULL OR expires_at > ?1)
+               AND session_id IN
+                   (SELECT id FROM sessions WHERE status IN ('active', 'idle', 'stale'))
+             ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([now], lease_from_row)?;
+        let mut leases = Vec::new();
+        for row in rows {
+            leases.push(row??);
+        }
+        Ok(leases)
+    }
+
+    // ── gates ─────────────────────────────────────────────────────────
+
+    /// Sync the gate-definition snapshot from parsed `gates.toml` content.
+    pub fn upsert_gate(&mut self, gate: &GateDef) -> Result<(), BrokerError> {
+        self.conn.execute(
+            "INSERT INTO gates (name, command, cost_tier, triggers_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (name) DO UPDATE SET command = excluded.command,
+                                              cost_tier = excluded.cost_tier,
+                                              triggers_json = excluded.triggers_json,
+                                              updated_at = excluded.updated_at",
+            params![
+                gate.name,
+                gate.command,
+                gate.cost_tier,
+                gate.triggers_json,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn gates(&self) -> Result<Vec<GateDef>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, command, cost_tier, triggers_json, updated_at
+             FROM gates ORDER BY cost_tier, name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(GateDef {
+                name: row.get(0)?,
+                command: row.get(1)?,
+                cost_tier: row.get(2)?,
+                triggers_json: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Record a gate run; emits `gate.<status>` in the same transaction.
+    pub fn record_gate_result(&mut self, result: &NewGateResult) -> Result<i64, BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO gate_results (gate_name, tree_hash, status, exit_code,
+                                       duration_ms, log_path, session_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                result.gate_name,
+                result.tree_hash,
+                result.status.as_str(),
+                result.exit_code,
+                result.duration_ms,
+                result.log_path,
+                result.session_id,
+                now
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        insert_event(
+            &tx,
+            now,
+            &format!("gate.{}", result.status.as_str()),
+            result.session_id,
+            Some(&format!(
+                "{{\"gate\":{},\"tree\":{}}}",
+                json_string(&result.gate_name),
+                json_string(&result.tree_hash)
+            )),
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Cache lookup: the most recent *conclusive* (pass/fail) result for
+    /// this gate against this exact tree. Cancelled/error runs never
+    /// satisfy the cache.
+    pub fn cached_gate_result(
+        &self,
+        gate_name: &str,
+        tree_hash: &str,
+    ) -> Result<Option<GateResult>, BrokerError> {
+        let result = self
+            .conn
+            .query_row(
+                &format!(
+                    "{GATE_RESULT_SELECT}
+                     WHERE gate_name = ?1 AND tree_hash = ?2
+                       AND status IN ('pass', 'fail')
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                params![gate_name, tree_hash],
+                gate_result_from_row,
+            )
+            .optional()?;
+        result.transpose()
+    }
+
+    // ── merge queue ───────────────────────────────────────────────────
+
+    /// Submit a session head. Idempotent per (session, head): resubmitting
+    /// the same commit returns the existing entry.
+    pub fn submit(
+        &mut self,
+        session_id: i64,
+        head_commit: &str,
+        base_commit: &str,
+    ) -> Result<MergeQueueEntry, BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let inserted = tx.execute(
+            "INSERT INTO merge_queue (session_id, head_commit, base_commit, created_at,
+                                      updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT (session_id, head_commit) DO NOTHING",
+            params![session_id, head_commit, base_commit, now],
+        )?;
+        if inserted > 0 {
+            insert_event(
+                &tx,
+                now,
+                "merge.submitted",
+                Some(session_id),
+                Some(&format!("{{\"head\":{}}}", json_string(head_commit))),
+            )?;
+        }
+        tx.commit()?;
+        let entry = self.conn.query_row(
+            &format!("{MERGE_SELECT} WHERE session_id = ?1 AND head_commit = ?2"),
+            params![session_id, head_commit],
+            merge_from_row,
+        )??;
+        Ok(entry)
+    }
+
+    /// Transition a queue entry; emits `merge.<status>` in the same
+    /// transaction and stores updated details/merged tree when given.
+    pub fn set_merge_status(
+        &mut self,
+        entry_id: i64,
+        status: MergeStatus,
+        merged_tree: Option<&str>,
+        details_json: Option<&str>,
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let session_id: Option<i64> = tx
+            .query_row(
+                "SELECT session_id FROM merge_queue WHERE id = ?1",
+                [entry_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        tx.execute(
+            "UPDATE merge_queue
+             SET status = ?2,
+                 merged_tree = COALESCE(?3, merged_tree),
+                 details_json = COALESCE(?4, details_json),
+                 updated_at = ?5
+             WHERE id = ?1",
+            params![entry_id, status.as_str(), merged_tree, details_json, now],
+        )?;
+        insert_event(
+            &tx,
+            now,
+            &format!("merge.{}", status.as_str()),
+            session_id,
+            details_json,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn merge_queue(&self) -> Result<Vec<MergeQueueEntry>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!("{MERGE_SELECT} ORDER BY id"))?;
+        let rows = stmt.query_map([], merge_from_row)?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row??);
+        }
+        Ok(entries)
+    }
+
+    // ── events ────────────────────────────────────────────────────────
+
+    /// Append one event. Most mutations already emit their own event in
+    /// the same transaction; this is for kinds with no store mutation
+    /// (e.g. `lease.overlap`, `worktree.stale`).
+    pub fn append_event(
+        &mut self,
+        kind: &str,
+        session_id: Option<i64>,
+        payload_json: Option<&str>,
+    ) -> Result<i64, BrokerError> {
+        let tx = self.conn.transaction()?;
+        let id = insert_event(&tx, now_ms(), kind, session_id, payload_json)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Events with id > `after_id`, oldest first, up to `limit`. This is
+    /// the tail/replay cursor API (`events --follow` polls it).
+    pub fn events_after(&self, after_id: i64, limit: i64) -> Result<Vec<Event>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, schema_version, ts, kind, session_id, payload_json
+             FROM events WHERE id > ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![after_id, limit], |row| {
+            Ok(Event {
+                id: row.get(0)?,
+                schema_version: row.get(1)?,
+                ts: row.get(2)?,
+                kind: row.get(3)?,
+                session_id: row.get(4)?,
+                payload_json: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+}
+
+// ── row mapping helpers ──────────────────────────────────────────────
+
+const SESSION_SELECT: &str = "SELECT id, worktree_path, branch, origin, status, task, \
+     diff_base, pid, command, log_path, exit_code, created_at, updated_at, last_activity_at \
+     FROM sessions";
+
+const LEASE_SELECT: &str =
+    "SELECT id, session_id, path, kind, created_at, expires_at, released_at FROM leases";
+
+const GATE_RESULT_SELECT: &str = "SELECT id, gate_name, tree_hash, status, exit_code, \
+     duration_ms, log_path, session_id, created_at FROM gate_results";
+
+const MERGE_SELECT: &str = "SELECT id, session_id, head_commit, base_commit, status, \
+     merged_tree, details_json, created_at, updated_at FROM merge_queue";
+
+type RowResult<T> = Result<Result<T, BrokerError>, rusqlite::Error>;
+
+fn session_from_row(row: &rusqlite::Row<'_>) -> RowResult<Session> {
+    let origin: String = row.get(3)?;
+    let status: String = row.get(4)?;
+    Ok((|| {
+        Ok(Session {
+            id: row.get(0)?,
+            worktree_path: row.get(1)?,
+            branch: row.get(2)?,
+            origin: SessionOrigin::parse(&origin)?,
+            status: SessionStatus::parse(&status)?,
+            task: row.get(5)?,
+            diff_base: row.get(6)?,
+            pid: row.get(7)?,
+            command: row.get(8)?,
+            log_path: row.get(9)?,
+            exit_code: row.get(10)?,
+            created_at: row.get(11)?,
+            updated_at: row.get(12)?,
+            last_activity_at: row.get(13)?,
+        })
+    })())
+}
+
+fn lease_from_row(row: &rusqlite::Row<'_>) -> RowResult<Lease> {
+    let kind: String = row.get(3)?;
+    Ok((|| {
+        Ok(Lease {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            path: row.get(2)?,
+            kind: LeaseKind::parse(&kind)?,
+            created_at: row.get(4)?,
+            expires_at: row.get(5)?,
+            released_at: row.get(6)?,
+        })
+    })())
+}
+
+fn gate_result_from_row(row: &rusqlite::Row<'_>) -> RowResult<GateResult> {
+    let status: String = row.get(3)?;
+    Ok((|| {
+        Ok(GateResult {
+            id: row.get(0)?,
+            gate_name: row.get(1)?,
+            tree_hash: row.get(2)?,
+            status: GateStatus::parse(&status)?,
+            exit_code: row.get(4)?,
+            duration_ms: row.get(5)?,
+            log_path: row.get(6)?,
+            session_id: row.get(7)?,
+            created_at: row.get(8)?,
+        })
+    })())
+}
+
+fn merge_from_row(row: &rusqlite::Row<'_>) -> RowResult<MergeQueueEntry> {
+    let status: String = row.get(4)?;
+    Ok((|| {
+        Ok(MergeQueueEntry {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            head_commit: row.get(2)?,
+            base_commit: row.get(3)?,
+            status: MergeStatus::parse(&status)?,
+            merged_tree: row.get(5)?,
+            details_json: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+        })
+    })())
+}
+
+fn insert_event(
+    conn: &Connection,
+    ts: i64,
+    kind: &str,
+    session_id: Option<i64>,
+    payload_json: Option<&str>,
+) -> Result<i64, BrokerError> {
+    conn.execute(
+        "INSERT INTO events (schema_version, ts, kind, session_id, payload_json)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![EVENTS_SCHEMA_VERSION, ts, kind, session_id, payload_json],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Minimal JSON string quoting for the tiny inline payloads this module
+/// writes itself (no serde dependency in Phase 1).
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}

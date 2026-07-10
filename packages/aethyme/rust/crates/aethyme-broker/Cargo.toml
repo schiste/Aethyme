@@ -1,0 +1,25 @@
+[package]
+name = "aethyme-broker"
+version = "0.1.0"
+edition = "2024"
+description = "Local agent broker: operational state (sessions, worktrees, leases, gates, merge queue, events) for high-concurrency AI development. Library-first — the CLI is a thin client of this crate's typed API. Broker state lives in SQLite (.aethyme/broker.db); the graph engine's redb/fragment storage is a separate, read-only advisory concern."
+license = "Apache-2.0"
+
+[lib]
+name = "aethyme_broker"
+path = "src/lib.rs"
+
+[[bin]]
+# Worker binary used exclusively by the multi-process stress test
+# (tests/stress.rs). Not a user-facing entrypoint.
+name = "broker-stress-worker"
+path = "src/bin/broker-stress-worker.rs"
+
+[dependencies]
+# Bundled SQLite so the broker has zero system dependencies and one
+# known SQLite version across platforms (macOS/Linux are the v0 targets).
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
