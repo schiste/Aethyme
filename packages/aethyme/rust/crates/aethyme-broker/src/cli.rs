@@ -220,8 +220,8 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 println!("No live sessions. Register one with `aethyme broker adopt`.");
             } else {
                 println!(
-                    "{:<4} {:<8} {:<8} {:<24} {}",
-                    "ID", "STATUS", "ORIGIN", "BRANCH", "TASK"
+                    "{:<4} {:<8} {:<8} {:<24} TASK",
+                    "ID", "STATUS", "ORIGIN", "BRANCH"
                 );
                 for view in views {
                     println!(
@@ -253,7 +253,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     } else if leases.is_empty() {
                         println!("No active leases.");
                     } else {
-                        println!("{:<4} {:<9} {}", "SID", "KIND", "PATH");
+                        println!("{:<4} {:<9} PATH", "SID", "KIND");
                         for lease in leases {
                             println!(
                                 "{:<4} {:<9} {}",
