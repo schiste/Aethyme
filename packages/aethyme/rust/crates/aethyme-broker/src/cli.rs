@@ -21,10 +21,19 @@ Usage:
       Create a worktree + branch and spawn <command> in it (sh -c),
       logging to .aethyme/logs/.
   aethyme broker agents [--json]
-      List live sessions with activity-derived liveness.
+      List live sessions with activity-derived liveness, refreshing
+      diff-derived leases and warning on overlapping edits.
+  aethyme broker leases [--json]
+      Refresh and list active leases plus current overlaps.
+  aethyme broker leases claim <path> --session <id> [--ttl <seconds>] [--json]
+      Explicitly claim a path (end it with / for a directory claim).
+  aethyme broker leases release <path> --session <id> [--json]
+      Release an explicit claim.
   aethyme broker cleanup <session-id> [--force] [--json]
       Remove a session's worktree. Refuses on uncommitted changes or
       unmerged commits unless --force.
+
+Overlaps warn — they never block (v0 policy).
 ";
 
 fn now_ms() -> i64 {
@@ -64,6 +73,8 @@ struct Parsed {
     positional: Vec<String>,
     task: Option<String>,
     cmd: Option<String>,
+    session: Option<i64>,
+    ttl_seconds: Option<i64>,
     json: bool,
     force: bool,
 }
@@ -73,6 +84,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         positional: Vec::new(),
         task: None,
         cmd: None,
+        session: None,
+        ttl_seconds: None,
         json: false,
         force: false,
     };
@@ -95,6 +108,22 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                         .clone(),
                 )
             }
+            "--session" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--session requires a value".into()))?;
+                parsed.session = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--session must be an integer session id".into())
+                })?);
+            }
+            "--ttl" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--ttl requires a value".into()))?;
+                parsed.ttl_seconds = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--ttl must be an integer number of seconds".into())
+                })?);
+            }
             "-h" | "--help" => return Err(UsageError::Help),
             other if other.starts_with('-') => {
                 return Err(UsageError::Message(format!("unknown flag {other}")));
@@ -103,6 +132,15 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         }
     }
     Ok(parsed)
+}
+
+fn print_overlap_warnings(overlaps: &[crate::Overlap]) {
+    for overlap in overlaps {
+        eprintln!(
+            "⚠ overlap: sessions {} and {} are both touching {}",
+            overlap.session_a, overlap.session_b, overlap.path
+        );
+    }
 }
 
 fn open_broker() -> Result<Broker, UsageError> {
@@ -157,9 +195,16 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
         }
         "agents" => {
             let mut broker = open_broker()?;
+            let overlaps = broker.refresh_leases()?;
             let views = broker.agents(now_ms())?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&views)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "agents": views,
+                        "overlaps": overlaps,
+                    }))?
+                );
             } else if views.is_empty() {
                 println!("No live sessions. Register one with `aethyme broker adopt`.");
             } else {
@@ -176,6 +221,77 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         view.session.branch,
                         view.session.task.as_deref().unwrap_or("-"),
                     );
+                }
+                print_overlap_warnings(&overlaps);
+            }
+        }
+        "leases" => {
+            let mut broker = open_broker()?;
+            match parsed.positional.first().map(String::as_str) {
+                None => {
+                    let overlaps = broker.refresh_leases()?;
+                    let leases = broker.store().active_leases()?;
+                    if parsed.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "leases": leases,
+                                "overlaps": overlaps,
+                            }))?
+                        );
+                    } else if leases.is_empty() {
+                        println!("No active leases.");
+                    } else {
+                        println!("{:<4} {:<9} {}", "SID", "KIND", "PATH");
+                        for lease in leases {
+                            println!(
+                                "{:<4} {:<9} {}",
+                                lease.session_id,
+                                lease.kind.as_str(),
+                                lease.path
+                            );
+                        }
+                        print_overlap_warnings(&overlaps);
+                    }
+                }
+                Some("claim") => {
+                    let path = parsed
+                        .positional
+                        .get(1)
+                        .ok_or(UsageError::Message("claim requires a path".into()))?;
+                    let session = parsed
+                        .session
+                        .ok_or(UsageError::Message("claim requires --session <id>".into()))?;
+                    let lease = broker.store().claim_lease(
+                        session,
+                        path,
+                        parsed.ttl_seconds.map(|s| s * 1000),
+                    )?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&lease)?);
+                    } else {
+                        println!("Session {session} claimed {path}.");
+                    }
+                }
+                Some("release") => {
+                    let path = parsed
+                        .positional
+                        .get(1)
+                        .ok_or(UsageError::Message("release requires a path".into()))?;
+                    let session = parsed.session.ok_or(UsageError::Message(
+                        "release requires --session <id>".into(),
+                    ))?;
+                    broker.store().release_lease(session, path)?;
+                    if parsed.json {
+                        println!("{{\"released\":{}}}", serde_json::to_string(path)?);
+                    } else {
+                        println!("Session {session} released {path}.");
+                    }
+                }
+                Some(other) => {
+                    return Err(UsageError::Message(format!(
+                        "unknown leases action {other:?} — expected claim or release"
+                    )));
                 }
             }
         }
