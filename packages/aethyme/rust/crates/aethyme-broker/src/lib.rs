@@ -24,6 +24,7 @@ mod broker;
 pub mod cli;
 mod error;
 mod git;
+mod leases;
 mod schema;
 mod store;
 mod types;
@@ -31,6 +32,7 @@ mod types;
 pub use broker::{AgentView, Broker, BrokerOpError};
 pub use error::BrokerError;
 pub use git::{GitError, GitRepo};
+pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use store::BrokerStore;
 pub use types::{

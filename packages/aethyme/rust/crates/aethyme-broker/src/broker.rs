@@ -32,6 +32,8 @@ pub enum BrokerOpError {
         command: String,
         source: std::io::Error,
     },
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 /// A session enriched with liveness derived at read time — what
@@ -199,6 +201,60 @@ impl Broker {
             });
         }
         Ok(views)
+    }
+
+    // ── leases (Phase 3) ──────────────────────────────────────────────
+
+    /// Recompute every live session's implicit leases from its diff
+    /// against its recorded base (ignore rules applied), then return the
+    /// current overlap set. Emits one `lease.overlap` event per pair that
+    /// is NEW relative to before the refresh — repeated status calls do
+    /// not re-announce known overlaps.
+    ///
+    /// Sessions whose worktree is gone or whose base no longer resolves
+    /// are skipped, never fatal: lease freshness must not take the broker
+    /// down.
+    pub fn refresh_leases(&mut self) -> Result<Vec<crate::leases::Overlap>, BrokerOpError> {
+        use crate::leases::{LeaseIgnoreRules, detect_overlaps};
+
+        let before: std::collections::HashSet<crate::leases::Overlap> =
+            detect_overlaps(&self.store.active_leases()?)
+                .into_iter()
+                .collect();
+
+        let rules = LeaseIgnoreRules::load(&self.main_root);
+        for session in self.store.live_sessions()? {
+            if !matches!(
+                session.status,
+                SessionStatus::Active | SessionStatus::Idle | SessionStatus::Stale
+            ) {
+                continue;
+            }
+            let Ok(checkout) = GitRepo::discover(Path::new(&session.worktree_path)) else {
+                continue;
+            };
+            let base = session.diff_base.as_deref().unwrap_or("HEAD");
+            let Ok(changed) = checkout.changed_files(base) else {
+                continue;
+            };
+            let paths: Vec<String> = changed
+                .into_iter()
+                .filter(|path| !rules.is_ignored(path))
+                .collect();
+            self.store.set_implicit_leases(session.id, &paths)?;
+        }
+
+        let after = detect_overlaps(&self.store.active_leases()?);
+        for overlap in &after {
+            if !before.contains(overlap) {
+                self.store.append_event(
+                    "lease.overlap",
+                    Some(overlap.session_a),
+                    Some(&serde_json::to_string(overlap)?),
+                )?;
+            }
+        }
+        Ok(after)
     }
 
     // ── cleanup ───────────────────────────────────────────────────────
