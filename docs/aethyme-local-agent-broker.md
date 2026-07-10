@@ -48,6 +48,27 @@ contracts, so any future delivery surface is a client, not a rewrite.
    contract from day one. A TUI, editor integrations, or anything else
    consume the same surface.
 
+## Scope decisions (2026-07-10)
+
+- **Single entrypoint, Rust-focused:** one user-facing `aethyme` command —
+  the Rust router binary — with broker commands under `aethyme broker ...`;
+  the Python CLI is delegated or ported over time (issue #31).
+- **Conflict handling messages the agent:** on a rejected submit the broker
+  writes actionable instructions into the session's worktree (vendor-neutral
+  file drop; the generated AGENTS.md points agents at it) rather than only
+  reporting to the human.
+- **Design ceiling: 15 concurrent sessions** (stress-tested at 20), CLI +
+  SQLite coordination, still no daemon in v0.
+- **Platforms: macOS and Linux.** Windows is a non-goal for v0.
+- **Vendor artifacts may be read for liveness** — opt-in per vendor,
+  read-only, metadata/mtime only, never content.
+- **Whole-repo worktrees only.** Package-awareness comes from gate globs
+  and path-scoped leases; cross-repo coordination is v2+.
+- **Everything is built as if public** (contracts, docs, history), even
+  while the repository is private.
+- **Kill criterion for the dogfood:** stop if costs increase too much AND
+  no time is saved; the friction log includes cost/time accounting.
+
 ## Current state (be precise about this)
 
 Nothing described in the "v0 scope" below exists yet. As of the Phase 0 truth
