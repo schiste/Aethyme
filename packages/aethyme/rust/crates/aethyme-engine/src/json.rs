@@ -1220,8 +1220,7 @@ mod tests {
     use serde_json::Value;
 
     fn parse(s: &str) -> Value {
-        serde_json::from_str(s)
-            .unwrap_or_else(|e| panic!("expected valid JSON, got {s:?}: {e}"))
+        serde_json::from_str(s).unwrap_or_else(|e| panic!("expected valid JSON, got {s:?}: {e}"))
     }
 
     // ── escape() ─────────────────────────────────────────────────
@@ -1318,9 +1317,8 @@ mod tests {
         ];
         for raw in inputs {
             let wrapped = format!("\"{}\"", escape(raw));
-            let parsed: String = serde_json::from_str(&wrapped).unwrap_or_else(|e| {
-                panic!("escape({raw:?}) → {wrapped:?} failed to parse: {e}")
-            });
+            let parsed: String = serde_json::from_str(&wrapped)
+                .unwrap_or_else(|e| panic!("escape({raw:?}) → {wrapped:?} failed to parse: {e}"));
             assert_eq!(parsed, raw, "round-trip failed for {raw:?}");
         }
     }
@@ -1443,10 +1441,7 @@ mod tests {
         assert_eq!(risk_area(&RiskArea::Billing), "billing");
         assert_eq!(risk_area(&RiskArea::SharedCore), "shared-core");
         assert_eq!(risk_area(&RiskArea::Destructive), "destructive");
-        assert_eq!(
-            risk_area(&RiskArea::UserDefined("custom".into())),
-            "custom"
-        );
+        assert_eq!(risk_area(&RiskArea::UserDefined("custom".into())), "custom");
     }
 
     #[test]

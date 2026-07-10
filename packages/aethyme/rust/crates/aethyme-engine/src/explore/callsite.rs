@@ -41,8 +41,7 @@ pub(super) fn compute_callsite_files(
     // to find files that bridge the user's distinct concepts, so each
     // concept must contribute.
     let mut symbol_ids: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut pass = 0usize;
     loop {
         if symbol_ids.len() >= max_symbols {
@@ -80,11 +79,9 @@ pub(super) fn compute_callsite_files(
         "command": "callers-of",
         "targets": symbol_ids,
     });
-    let response_text = daemon::send_request(socket, &rpc)
-        .map_err(ExploreError::DaemonRpc)?;
-    let envelope: serde_json::Value =
-        serde_json::from_str(response_text.trim())
-            .map_err(|e| ExploreError::InvalidResponse(format!("not JSON: {e}")))?;
+    let response_text = daemon::send_request(socket, &rpc).map_err(ExploreError::DaemonRpc)?;
+    let envelope: serde_json::Value = serde_json::from_str(response_text.trim())
+        .map_err(|e| ExploreError::InvalidResponse(format!("not JSON: {e}")))?;
     if envelope.get("ok") != Some(&serde_json::Value::Bool(true)) {
         return Ok(Vec::new());
     }
@@ -121,13 +118,9 @@ pub(super) fn compute_callsite_files(
             let Some(file_path) = file_path_from_caller_id(id) else {
                 continue;
             };
-            let entry = by_file.entry(file_path.clone()).or_insert_with(|| {
-                (
-                    std::collections::BTreeSet::new(),
-                    0,
-                    Vec::new(),
-                )
-            });
+            let entry = by_file
+                .entry(file_path.clone())
+                .or_insert_with(|| (std::collections::BTreeSet::new(), 0, Vec::new()));
             entry.0.insert(symbol.clone());
             entry.1 += 1;
             if entry.2.len() < 5 {
@@ -142,11 +135,15 @@ pub(super) fn compute_callsite_files(
 
     // Rank: more distinct symbols routing through this file = stronger
     // evidence. Tiebreak on hit_count then path (alphabetical).
-    let mut ranked: Vec<(String, std::collections::BTreeSet<String>, usize, Vec<serde_json::Value>)> =
-        by_file
-            .into_iter()
-            .map(|(path, (syms, hits, samples))| (path, syms, hits, samples))
-            .collect();
+    let mut ranked: Vec<(
+        String,
+        std::collections::BTreeSet<String>,
+        usize,
+        Vec<serde_json::Value>,
+    )> = by_file
+        .into_iter()
+        .map(|(path, (syms, hits, samples))| (path, syms, hits, samples))
+        .collect();
     ranked.sort_by(|a, b| {
         b.1.len()
             .cmp(&a.1.len())
@@ -207,7 +204,11 @@ pub(super) fn compute_callsite_files(
     );
     debug_assert_eq!(
         result.len(),
-        result.iter().filter_map(|i| i.path.as_deref()).collect::<std::collections::HashSet<_>>().len(),
+        result
+            .iter()
+            .filter_map(|i| i.path.as_deref())
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
         "callsite items have duplicate paths"
     );
     Ok(result)

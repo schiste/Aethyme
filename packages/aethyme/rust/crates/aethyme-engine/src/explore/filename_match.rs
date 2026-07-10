@@ -17,8 +17,8 @@ use std::path::Path;
 use super::AnswerItem;
 
 const FILENAME_ALLOWED_SUFFIXES: &[&str] = &[
-    "c", "cc", "cpp", "cs", "go", "h", "hpp", "java", "js", "jsx",
-    "kt", "mjs", "php", "py", "rb", "rs", "swift", "ts", "tsx", "vue",
+    "c", "cc", "cpp", "cs", "go", "h", "hpp", "java", "js", "jsx", "kt", "mjs", "php", "py", "rb",
+    "rs", "swift", "ts", "tsx", "vue",
 ];
 
 // Local copy of the ripgrep binary path. Also defined in
@@ -52,8 +52,7 @@ pub(super) fn filename_token_matches(
         Err(_) => return Vec::new(),
     };
 
-    let lowered_terms: Vec<String> =
-        terms.iter().map(|t| t.to_ascii_lowercase()).collect();
+    let lowered_terms: Vec<String> = terms.iter().map(|t| t.to_ascii_lowercase()).collect();
     let mut scored: Vec<(i32, Vec<String>, String)> = Vec::new();
     for abs_line in stdout.lines() {
         if abs_line.is_empty() {

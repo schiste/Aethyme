@@ -190,9 +190,8 @@ pub fn resolve_anchors(map: &RepositoryMap, task: &TaskInput, limit: usize) -> V
             // "watchlist".
             if anchors.len() < limit {
                 for query in &queries {
-                    for anchor in code_file_anchors(
-                        map, query, limit.saturating_sub(anchors.len()),
-                    ) {
+                    for anchor in code_file_anchors(map, query, limit.saturating_sub(anchors.len()))
+                    {
                         if !anchors.contains(&anchor) {
                             anchors.push(anchor);
                         }
@@ -211,12 +210,9 @@ pub fn resolve_anchors(map: &RepositoryMap, task: &TaskInput, limit: usize) -> V
             // configured" genuinely benefit. Lower priority than
             // symbols / code files.
             if anchors.len() < limit {
-                for config in config_anchors(
-                    map,
-                    task,
-                    &queries,
-                    limit.saturating_sub(anchors.len()),
-                ) {
+                for config in
+                    config_anchors(map, task, &queries, limit.saturating_sub(anchors.len()))
+                {
                     if !anchors.contains(&config) {
                         anchors.push(config);
                     }
@@ -490,17 +486,15 @@ fn config_anchors(
                 map.files.iter().any(|file| {
                     file.id == edge.to
                         && (matched_area_ids.is_empty()
-                            || file
-                                .area_id
-                                .as_ref()
-                                .is_some_and(|area| matched_area_ids.iter().any(|a| a == area.as_str())))
+                            || file.area_id.as_ref().is_some_and(|area| {
+                                matched_area_ids.iter().any(|a| a == area.as_str())
+                            }))
                 }) || map.functions.iter().any(|function| {
                     function.id == edge.to
                         && (matched_area_ids.is_empty()
-                            || function
-                                .area_id
-                                .as_ref()
-                                .is_some_and(|area| matched_area_ids.iter().any(|a| a == area.as_str())))
+                            || function.area_id.as_ref().is_some_and(|area| {
+                                matched_area_ids.iter().any(|a| a == area.as_str())
+                            }))
                 })
             })
         {
@@ -1030,10 +1024,7 @@ mod tests {
             symbol_count >= 1,
             "expected at least 1 Symbol anchor; got {}: {:?}",
             symbol_count,
-            anchors
-                .iter()
-                .map(|a| (&a.kind, &a.id))
-                .collect::<Vec<_>>()
+            anchors.iter().map(|a| (&a.kind, &a.id)).collect::<Vec<_>>()
         );
         // And the showDiffPage symbol specifically should be among
         // the anchors — that's the canonical recall test.
@@ -1062,16 +1053,10 @@ mod tests {
         // surface.
         fs::create_dir_all(root.join("Inventory/src")).expect("create dir");
         fs::create_dir_all(root.join("Auth/src")).expect("create dir");
-        fs::write(
-            root.join("Inventory/src/lib.py"),
-            "def stub():\n    pass\n",
-        )
-        .expect("write inventory file");
-        fs::write(
-            root.join("Auth/src/lib.py"),
-            "def stub():\n    pass\n",
-        )
-        .expect("write auth file");
+        fs::write(root.join("Inventory/src/lib.py"), "def stub():\n    pass\n")
+            .expect("write inventory file");
+        fs::write(root.join("Auth/src/lib.py"), "def stub():\n    pass\n")
+            .expect("write auth file");
 
         let map = RepositoryMap::build(&root).expect("build repository map");
         // Query with no token matching any planted symbol name.

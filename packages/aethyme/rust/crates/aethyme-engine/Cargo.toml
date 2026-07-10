@@ -18,6 +18,10 @@ name = "aethyme"
 path = "src/bin/aethyme.rs"
 
 [dependencies]
+# Broker CLI dispatch: the `aethyme` router binary exposes `aethyme broker ...`
+# by calling aethyme_broker::cli (bin-only usage; engine library code must not
+# depend on broker state).
+aethyme-broker = { path = "../aethyme-broker" }
 rayon = "1.10"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }

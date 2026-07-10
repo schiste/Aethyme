@@ -56,9 +56,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::graph::navigation::{
-    callers_view, task_anchors_view, task_next_view, task_scope_view,
-};
+use crate::graph::navigation::{callers_view, task_anchors_view, task_next_view, task_scope_view};
 use crate::graph::search::symbol_search;
 use crate::map::RepositoryMap;
 use crate::model::task::TaskInput;
@@ -256,10 +254,7 @@ pub fn serve_forever(config: DaemonConfig) -> Result<(), String> {
                     s.last_activity.elapsed()
                 };
                 if idle >= idle_timeout {
-                    eprintln!(
-                        "aethyme-engine-daemon: idle for {:?}, shutting down",
-                        idle
-                    );
+                    eprintln!("aethyme-engine-daemon: idle for {:?}, shutting down", idle);
                     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
                     // Wake the accept() blocking call by connecting to ourself.
                     let _ = UnixStream::connect(&socket_path);
@@ -354,17 +349,13 @@ fn handle_request(mut stream: UnixStream, state: &Arc<Mutex<DaemonState>>) -> bo
             true
         }
         "task-localize" => {
-            let task_text = request
-                .get("task")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let task_text = request.get("task").and_then(|v| v.as_str()).unwrap_or("");
             let s = state.lock().expect("daemon state lock poisoned");
             let task = TaskInput::from_task_text(task_text);
             let anchors = task_anchors_view(&s.map, &task);
             let scope = task_scope_view(&s.map, &task);
             let next = task_next_view(&s.map, &task);
-            let view =
-                crate::json::task_localization_view(&anchors, &scope, &next);
+            let view = crate::json::task_localization_view(&anchors, &scope, &next);
             send_ok_raw(&mut stream, &view);
             false
         }
@@ -382,10 +373,7 @@ fn handle_request(mut stream: UnixStream, state: &Arc<Mutex<DaemonState>>) -> bo
                         .collect()
                 })
                 .unwrap_or_default();
-            let limit = request
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(20) as usize;
+            let limit = request.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
             if queries.is_empty() {
                 send_error(&mut stream, "missing or empty `queries` array");
@@ -393,8 +381,7 @@ fn handle_request(mut stream: UnixStream, state: &Arc<Mutex<DaemonState>>) -> bo
             }
 
             let s = state.lock().expect("daemon state lock poisoned");
-            let mut results: serde_json::Map<String, serde_json::Value> =
-                serde_json::Map::new();
+            let mut results: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
             for query in &queries {
                 let hits = symbol_search(&s.map, query, limit);
                 let arr: Vec<serde_json::Value> = hits
@@ -443,8 +430,7 @@ fn handle_request(mut stream: UnixStream, state: &Arc<Mutex<DaemonState>>) -> bo
                 return false;
             }
             let s = state.lock().expect("daemon state lock poisoned");
-            let mut results: serde_json::Map<String, serde_json::Value> =
-                serde_json::Map::new();
+            let mut results: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
             for target in &targets {
                 let view = callers_view(&s.map, target);
                 let arr: Vec<serde_json::Value> = view
@@ -485,7 +471,10 @@ struct ErrorEnvelope<'a> {
 }
 
 fn send_error(stream: &mut UnixStream, message: &str) {
-    let env = ErrorEnvelope { ok: false, error: message };
+    let env = ErrorEnvelope {
+        ok: false,
+        error: message,
+    };
     if let Ok(s) = serde_json::to_string(&env) {
         let _ = stream.write_all(s.as_bytes());
         let _ = stream.write_all(b"\n");
@@ -508,12 +497,9 @@ fn send_ok_raw(stream: &mut UnixStream, raw_json: &str) {
 
 /// Convenience client: send one JSON request to the daemon and read the
 /// response line. Used by the CLI's `daemon status` and by tests.
-pub fn send_request(
-    socket: &Path,
-    request: &serde_json::Value,
-) -> Result<String, String> {
-    let mut stream = UnixStream::connect(socket)
-        .map_err(|e| format!("connect {}: {}", socket.display(), e))?;
+pub fn send_request(socket: &Path, request: &serde_json::Value) -> Result<String, String> {
+    let mut stream =
+        UnixStream::connect(socket).map_err(|e| format!("connect {}: {}", socket.display(), e))?;
     let bytes = serde_json::to_vec(request).map_err(|e| format!("encode: {e}"))?;
     stream
         .write_all(&bytes)

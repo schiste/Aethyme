@@ -20,12 +20,17 @@
 //!   WAL mode + busy_timeout, no daemon. Designed for 15 concurrent
 //!   sessions, stress-tested at 20 (see `tests/stress.rs`).
 
+mod broker;
+pub mod cli;
 mod error;
+mod git;
 mod schema;
 mod store;
 mod types;
 
+pub use broker::{AgentView, Broker, BrokerOpError};
 pub use error::BrokerError;
+pub use git::{GitError, GitRepo};
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use store::BrokerStore;
 pub use types::{

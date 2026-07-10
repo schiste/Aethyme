@@ -30,6 +30,14 @@ macro_rules! text_enum {
                 }
             }
         }
+
+        // JSON output uses exactly the on-disk strings, so the --json
+        // contract and the storage contract can never drift apart.
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str(self.as_str())
+            }
+        }
     };
 }
 
@@ -84,7 +92,7 @@ pub struct NewSession {
     pub log_path: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Session {
     pub id: i64,
     pub worktree_path: String,
@@ -103,7 +111,7 @@ pub struct Session {
     pub last_activity_at: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Lease {
     pub id: i64,
     pub session_id: i64,
@@ -118,7 +126,7 @@ pub struct Lease {
 
 /// Snapshot of a gate definition (source of truth is `.aethyme/gates.toml`;
 /// the row exists so gate_results stay interpretable after config changes).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct GateDef {
     pub name: String,
     pub command: String,
@@ -141,7 +149,7 @@ pub struct NewGateResult {
     pub session_id: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct GateResult {
     pub id: i64,
     pub gate_name: String,
@@ -155,7 +163,7 @@ pub struct GateResult {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct MergeQueueEntry {
     pub id: i64,
     pub session_id: i64,
@@ -172,7 +180,7 @@ pub struct MergeQueueEntry {
 
 /// One append-only event. `schema_version` is per-row so readers can
 /// interpret old rows after the event contract evolves.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Event {
     pub id: i64,
     pub schema_version: i64,
