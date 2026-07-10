@@ -11,6 +11,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -24,7 +25,11 @@ from src.contracts.run_metadata import build_run_metadata
 from src.indexing.repository_snapshot import capture_snapshot
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-EVAL_TOOL_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
+_VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
+# Prefer the project venv interpreter; fall back to the running interpreter
+# when no venv exists (e.g. CI installs into the system environment). Local
+# behavior is unchanged whenever .venv is present.
+EVAL_TOOL_PYTHON = _VENV_PYTHON if _VENV_PYTHON.exists() else Path(sys.executable)
 
 
 @dataclass(frozen=True)

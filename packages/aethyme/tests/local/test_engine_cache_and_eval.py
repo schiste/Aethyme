@@ -11,7 +11,7 @@ from pathlib import Path
 from src.eval.control_prompt import build_aethyme_prompt
 from src.eval.explain_repo import command_runner, run_explain_repo_evaluation
 from src.eval.navigation_ctf import run_navigation_ctf_evaluation
-from src.eval.runner import _resolve_command
+from src.eval.runner import EVAL_TOOL_PYTHON, _resolve_command
 from src.indexing import engine as engine_module
 from src.indexing.repository_snapshot import capture_snapshot
 
@@ -334,7 +334,7 @@ def test_explain_repo_generates_artifacts_and_invokes_backends(monkeypatch, tmp_
     assert result["aethyme_run"]["structured_output"]["ok"] is True
     assert result["aethyme_run"]["structured_output"]["schema_type"] == "object"
     assert result["aethyme_run"]["structured_output"]["tool_repo"].endswith("packages/aethyme")
-    assert result["aethyme_run"]["structured_output"]["tool_python"].endswith(".venv/bin/python")
+    assert result["aethyme_run"]["structured_output"]["tool_python"] == str(EVAL_TOOL_PYTHON)
     assert result["aethyme_run"]["run_metadata"]["phase"] == "eval:leverage"
     assert result["report"]["condition_runs"]["control"]["retries"] == 1
     assert result["report"]["condition_runs"]["leverage"]["retries"] == 0
@@ -526,7 +526,7 @@ def test_navigation_ctf_builds_reference_output(monkeypatch, tmp_path: Path) -> 
     assert result["reference_output"]["code_target"]["path"] == "src/main.py"
     assert result["reference_output"]["management_area"]["name"] == "src"
     assert result["navigation_context"]["tool_repo_path"].endswith("packages/aethyme")
-    assert result["navigation_context"]["tool_python"].endswith(".venv/bin/python")
-    assert ".venv/bin/python -m src.cli" in result["navigation_context"]["commands"][0]
+    assert result["navigation_context"]["tool_python"] == str(EVAL_TOOL_PYTHON)
+    assert f"{EVAL_TOOL_PYTHON} -m src.cli" in result["navigation_context"]["commands"][0]
     assert f"task anchors --repo {repo_path} --task <task> --json-output" in result["navigation_context"]["commands"][0]
     assert result["report_path"].endswith("navigation.md")

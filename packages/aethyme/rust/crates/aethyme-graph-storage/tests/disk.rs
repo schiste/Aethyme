@@ -110,8 +110,14 @@ fn write_fragment_rejects_path_traversal() {
     let err = write_fragment(tmp.path(), "../../etc/passwd", &frag)
         .unwrap_err();
     assert!(matches!(err, FragmentWriteError::Path(_)));
-    // No file created.
-    assert!(!tmp.path().join("../../etc/passwd").exists());
+    // No file created inside the fragment root. (Joining the traversal
+    // path would resolve to the real /etc/passwd on Linux, where tempdirs
+    // sit directly under /tmp, so inspect the tempdir contents instead.)
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        0,
+        "traversal attempt must not create any file in the fragment root"
+    );
 }
 
 #[test]
