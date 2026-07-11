@@ -36,6 +36,16 @@ Usage:
   aethyme broker gates run --session <id> [--json]
       Run affected gates cheap-first with tree-hash caching; cancels this
       session's obsolete in-flight runs; stops at first failure.
+  aethyme broker submit --session <id> [--json]
+      Submit the session's head commit: simulate the merge onto the local
+      integration branch, run affected gates on the merged tree, and (in
+      auto mode) promote. Conflicts reject before any gate runs and write
+      instructions to <worktree>/.aethyme/broker-action-required.md.
+  aethyme broker queue [--json]
+      Show the merge queue.
+  aethyme broker promote --entry <id> [--json]
+      Advance the local integration branch to a verified entry's merge
+      commit; other in-flight entries are re-simulated. Never pushes.
   aethyme broker cleanup <session-id> [--force] [--json]
       Remove a session's worktree. Refuses on uncommitted changes or
       unmerged commits unless --force.
@@ -81,6 +91,7 @@ struct Parsed {
     task: Option<String>,
     cmd: Option<String>,
     session: Option<i64>,
+    entry: Option<i64>,
     ttl_seconds: Option<i64>,
     json: bool,
     force: bool,
@@ -92,6 +103,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         task: None,
         cmd: None,
         session: None,
+        entry: None,
         ttl_seconds: None,
         json: false,
         force: false,
@@ -121,6 +133,14 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                     .ok_or(UsageError::Message("--session requires a value".into()))?;
                 parsed.session = Some(value.parse().map_err(|_| {
                     UsageError::Message("--session must be an integer session id".into())
+                })?);
+            }
+            "--entry" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--entry requires a value".into()))?;
+                parsed.entry = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--entry must be an integer queue entry id".into())
                 })?);
             }
             "--ttl" => {
@@ -409,6 +429,82 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         "unknown gates action {other:?} — expected validate, affected, or run"
                     )));
                 }
+            }
+        }
+        "submit" => {
+            let session = parsed
+                .session
+                .ok_or(UsageError::Message("submit requires --session <id>".into()))?;
+            let mut broker = open_broker()?;
+            let outcome = broker.submit(session)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else if !outcome.conflicts.is_empty() {
+                eprintln!("✗ conflict — rejected before any gate ran. Conflicting files:");
+                for file in &outcome.conflicts {
+                    eprintln!("  - {file}");
+                }
+                eprintln!(
+                    "Instructions written to the session worktree at {}",
+                    crate::ACTION_REQUIRED_RELPATH
+                );
+                return Err(UsageError::Message("submission conflicted".into()));
+            } else {
+                for gate in &outcome.gate_outcomes {
+                    println!(
+                        "gate {:<20} {}{}",
+                        gate.gate,
+                        gate.status.as_str(),
+                        if gate.cached { " (cached)" } else { "" }
+                    );
+                }
+                println!(
+                    "entry {} → {}{}",
+                    outcome.entry.id,
+                    outcome.entry.status.as_str(),
+                    if outcome.promoted {
+                        " (auto-promoted)"
+                    } else {
+                        ""
+                    }
+                );
+                if outcome.entry.status.as_str() == "rejected" {
+                    return Err(UsageError::Message(
+                        "gates failed on the merged tree".into(),
+                    ));
+                }
+            }
+        }
+        "queue" => {
+            let mut broker = open_broker()?;
+            let entries = broker.store().merge_queue()?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if entries.is_empty() {
+                println!("Merge queue is empty.");
+            } else {
+                println!("{:<4} {:<4} {:<11} HEAD", "ID", "SID", "STATUS");
+                for entry in entries {
+                    println!(
+                        "{:<4} {:<4} {:<11} {}",
+                        entry.id,
+                        entry.session_id,
+                        entry.status.as_str(),
+                        &entry.head_commit[..12.min(entry.head_commit.len())]
+                    );
+                }
+            }
+        }
+        "promote" => {
+            let entry = parsed
+                .entry
+                .ok_or(UsageError::Message("promote requires --entry <id>".into()))?;
+            let mut broker = open_broker()?;
+            broker.promote(entry)?;
+            if parsed.json {
+                println!("{{\"promoted\":{entry}}}");
+            } else {
+                println!("Promoted entry {entry} to the local integration branch.");
             }
         }
         "cleanup" => {
