@@ -26,6 +26,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # .aethyme/config.toml ([leases] ignore, later [gates]/[promote]).
 toml = "0.8"
+# Gate trigger globs (gates.toml). Same matcher family ripgrep uses.
+globset = "0.4"
+# killpg for gate-run cancellation (the external `kill` utility parses
+# negative pgids as options on Linux).
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

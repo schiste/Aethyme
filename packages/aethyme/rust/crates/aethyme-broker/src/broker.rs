@@ -34,6 +34,8 @@ pub enum BrokerOpError {
     },
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    GateConfig(#[from] crate::gates::GateConfigError),
 }
 
 /// A session enriched with liveness derived at read time — what
@@ -255,6 +257,80 @@ impl Broker {
             }
         }
         Ok(after)
+    }
+
+    // ── gates (Phase 4) ───────────────────────────────────────────────
+
+    /// Affected-gate selection for a session's current diff, without
+    /// running anything (`gates affected [--why]`).
+    pub fn affected_gates(
+        &mut self,
+        session_id: i64,
+    ) -> Result<Vec<(String, Option<String>)>, BrokerOpError> {
+        let (_, gates, changed) = self.gate_inputs(session_id)?;
+        Ok(crate::gates::select_gates(&gates, &changed)
+            .into_iter()
+            .map(|s| (s.gate.name.clone(), s.triggered_by))
+            .collect())
+    }
+
+    /// Run the affected gates for a session's worktree: cheap-first,
+    /// tree-hash cached, cancelling this session's obsolete in-flight
+    /// runs first. Stops at the first failure.
+    pub fn run_gates(
+        &mut self,
+        session_id: i64,
+    ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
+        let (checkout, gates, changed) = self.gate_inputs(session_id)?;
+        crate::gates::run_affected(
+            &mut self.store,
+            &self.main_root,
+            &checkout,
+            &gates,
+            &changed,
+            Some(session_id),
+        )
+    }
+
+    /// Cancel this session's in-flight gate runs whose tree differs from
+    /// the worktree's current state (also done automatically at the start
+    /// of [`Self::run_gates`]). Returns the cancelled gate names.
+    pub fn cancel_obsolete_gate_runs(
+        &mut self,
+        session_id: i64,
+    ) -> Result<Vec<String>, BrokerOpError> {
+        let session = self.store.session(session_id)?;
+        let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+        let tree = checkout.working_tree_hash()?;
+        Ok(crate::gates::cancel_obsolete_runs(
+            &mut self.store,
+            &self.main_root,
+            session_id,
+            &tree,
+        ))
+    }
+
+    fn gate_inputs(
+        &mut self,
+        session_id: i64,
+    ) -> Result<(GitRepo, Vec<crate::gates::Gate>, Vec<String>), BrokerOpError> {
+        let session = self.store.session(session_id)?;
+        let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+        let gates = crate::gates::load_gates(&self.main_root)?;
+        // Sync the definition snapshot so recorded results stay
+        // interpretable after config edits.
+        for gate in &gates {
+            self.store.upsert_gate(&crate::types::GateDef {
+                name: gate.name.clone(),
+                command: gate.command.clone(),
+                cost_tier: gate.cost,
+                triggers_json: serde_json::to_string(&gate.triggers)?,
+                updated_at: 0,
+            })?;
+        }
+        let base = session.diff_base.as_deref().unwrap_or("HEAD");
+        let changed = checkout.changed_files(base)?;
+        Ok((checkout, gates, changed))
     }
 
     // ── cleanup ───────────────────────────────────────────────────────

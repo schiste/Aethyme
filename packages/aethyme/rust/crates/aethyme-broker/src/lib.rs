@@ -23,6 +23,7 @@
 mod broker;
 pub mod cli;
 mod error;
+mod gates;
 mod git;
 mod leases;
 mod schema;
@@ -31,6 +32,7 @@ mod types;
 
 pub use broker::{AgentView, Broker, BrokerOpError};
 pub use error::BrokerError;
+pub use gates::{Gate, GateConfigError, GateRunOutcome, load_gates, select_gates};
 pub use git::{GitError, GitRepo};
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};

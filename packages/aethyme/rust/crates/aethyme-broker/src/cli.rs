@@ -29,6 +29,13 @@ Usage:
       Explicitly claim a path (end it with / for a directory claim).
   aethyme broker leases release <path> --session <id> [--json]
       Release an explicit claim.
+  aethyme broker gates validate [--json]
+      Parse and validate .aethyme/gates.toml.
+  aethyme broker gates affected --session <id> [--json]
+      Show which gates the session's diff selects and why.
+  aethyme broker gates run --session <id> [--json]
+      Run affected gates cheap-first with tree-hash caching; cancels this
+      session's obsolete in-flight runs; stops at first failure.
   aethyme broker cleanup <session-id> [--force] [--json]
       Remove a session's worktree. Refuses on uncommitted changes or
       unmerged commits unless --force.
@@ -134,6 +141,10 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
     Ok(parsed)
 }
 
+fn aethyme_gates_load(main_root: &std::path::Path) -> Result<Vec<crate::Gate>, UsageError> {
+    Ok(crate::load_gates(main_root)?)
+}
+
 fn print_overlap_warnings(overlaps: &[crate::Overlap]) {
     for overlap in overlaps {
         eprintln!(
@@ -209,8 +220,8 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 println!("No live sessions. Register one with `aethyme broker adopt`.");
             } else {
                 println!(
-                    "{:<4} {:<8} {:<8} {:<24} {}",
-                    "ID", "STATUS", "ORIGIN", "BRANCH", "TASK"
+                    "{:<4} {:<8} {:<8} {:<24} TASK",
+                    "ID", "STATUS", "ORIGIN", "BRANCH"
                 );
                 for view in views {
                     println!(
@@ -242,7 +253,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     } else if leases.is_empty() {
                         println!("No active leases.");
                     } else {
-                        println!("{:<4} {:<9} {}", "SID", "KIND", "PATH");
+                        println!("{:<4} {:<9} PATH", "SID", "KIND");
                         for lease in leases {
                             println!(
                                 "{:<4} {:<9} {}",
@@ -291,6 +302,111 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 Some(other) => {
                     return Err(UsageError::Message(format!(
                         "unknown leases action {other:?} — expected claim or release"
+                    )));
+                }
+            }
+        }
+        "gates" => {
+            let action =
+                parsed
+                    .positional
+                    .first()
+                    .map(String::as_str)
+                    .ok_or(UsageError::Message(
+                        "gates requires an action: validate, affected, or run".into(),
+                    ))?;
+            match action {
+                "validate" => {
+                    let broker = open_broker()?;
+                    let gates = aethyme_gates_load(broker.main_root())?;
+                    if parsed.json {
+                        let summary: Vec<_> = gates
+                            .iter()
+                            .map(|g| {
+                                serde_json::json!({
+                                    "name": g.name, "command": g.command,
+                                    "cost": g.cost, "triggers": g.triggers,
+                                })
+                            })
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&summary)?);
+                    } else {
+                        println!("gates.toml OK — {} gate(s), cheap-first:", gates.len());
+                        for gate in gates {
+                            println!(
+                                "  [{}] {} — {} (triggers: {})",
+                                gate.cost,
+                                gate.name,
+                                gate.command,
+                                if gate.triggers.is_empty() {
+                                    "always".to_string()
+                                } else {
+                                    gate.triggers.join(", ")
+                                }
+                            );
+                        }
+                    }
+                }
+                "affected" => {
+                    let session = parsed.session.ok_or(UsageError::Message(
+                        "gates affected requires --session <id>".into(),
+                    ))?;
+                    let mut broker = open_broker()?;
+                    let selections = broker.affected_gates(session)?;
+                    if parsed.json {
+                        let out: Vec<_> = selections
+                            .iter()
+                            .map(|(gate, why)| {
+                                serde_json::json!({"gate": gate, "triggered_by": why})
+                            })
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                    } else if selections.is_empty() {
+                        println!("No gates affected by this session's diff.");
+                    } else {
+                        for (gate, why) in selections {
+                            match why {
+                                Some(path) => println!("{gate}  (triggered by {path})"),
+                                None => println!("{gate}  (always runs)"),
+                            }
+                        }
+                    }
+                }
+                "run" => {
+                    let session = parsed.session.ok_or(UsageError::Message(
+                        "gates run requires --session <id>".into(),
+                    ))?;
+                    let mut broker = open_broker()?;
+                    let outcomes = broker.run_gates(session)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&outcomes)?);
+                    } else if outcomes.is_empty() {
+                        println!("No gates affected — nothing to run.");
+                    } else {
+                        let mut failed = false;
+                        for outcome in &outcomes {
+                            println!(
+                                "{:<20} {:<10} {}{}",
+                                outcome.gate,
+                                outcome.status.as_str(),
+                                if outcome.cached { "(cached) " } else { "" },
+                                outcome
+                                    .duration_ms
+                                    .map(|ms| format!("{ms}ms"))
+                                    .unwrap_or_default(),
+                            );
+                            failed |= outcome.status.as_str() != "pass";
+                        }
+                        if failed {
+                            return Err(UsageError::Message(
+                                "one or more gates did not pass".into(),
+                            ));
+                        }
+                    }
+                }
+                other => {
+                    return Err(UsageError::Message(format!(
+                        "unknown gates action {other:?} — expected validate, affected, or run"
                     )));
                 }
             }

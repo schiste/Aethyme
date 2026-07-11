@@ -27,14 +27,25 @@ pub enum GitError {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .map_err(|source| GitError::Spawn {
-            args: args.join(" "),
-            source,
-        })?;
+    run_git_inner(cwd, None, args)
+}
+
+/// Like [`run_git`] but against a private index file (GIT_INDEX_FILE) so
+/// staging operations never disturb the checkout's real index.
+fn run_git_with_index(cwd: &Path, index_file: &str, args: &[&str]) -> Result<String, GitError> {
+    run_git_inner(cwd, Some(index_file), args)
+}
+
+fn run_git_inner(cwd: &Path, index_file: Option<&str>, args: &[&str]) -> Result<String, GitError> {
+    let mut command = Command::new("git");
+    command.args(args).current_dir(cwd);
+    if let Some(index) = index_file {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    let output = command.output().map_err(|source| GitError::Spawn {
+        args: args.join(" "),
+        source,
+    })?;
     if !output.status.success() {
         return Err(GitError::Git {
             args: args.join(" "),
@@ -96,6 +107,23 @@ impl GitRepo {
 
     pub fn merge_base(&self, a: &str, b: &str) -> Result<String, GitError> {
         run_git(&self.root, &["merge-base", a, b])
+    }
+
+    /// Deterministic tree hash of the checkout's current *working state*
+    /// (HEAD + staged + unstaged + untracked, .gitignore respected) — the
+    /// gate-result cache key. Uses a throwaway index so the real index is
+    /// never touched; identical content in different worktrees hashes
+    /// identically, which is what makes cross-agent gate dedup work.
+    pub fn working_tree_hash(&self) -> Result<String, GitError> {
+        let tmp = self.root.join(".git-broker-index.tmp");
+        let tmp_str = tmp.to_string_lossy().into_owned();
+        let result = (|| {
+            run_git_with_index(&self.root, &tmp_str, &["read-tree", "HEAD"])?;
+            run_git_with_index(&self.root, &tmp_str, &["add", "-A", "."])?;
+            run_git_with_index(&self.root, &tmp_str, &["write-tree"])
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        result
     }
 
     /// Tracked-file changes (committed + staged + unstaged) against
