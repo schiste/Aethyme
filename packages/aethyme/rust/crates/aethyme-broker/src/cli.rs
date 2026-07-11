@@ -483,7 +483,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             } else if entries.is_empty() {
                 println!("Merge queue is empty.");
             } else {
-                println!("{:<4} {:<4} {:<11} {}", "ID", "SID", "STATUS", "HEAD");
+                println!("{:<4} {:<4} {:<11} HEAD", "ID", "SID", "STATUS");
                 for entry in entries {
                     println!(
                         "{:<4} {:<4} {:<11} {}",
