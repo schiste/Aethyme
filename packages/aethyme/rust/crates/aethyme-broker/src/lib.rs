@@ -26,6 +26,7 @@ mod error;
 mod gates;
 mod git;
 mod leases;
+mod merge;
 mod schema;
 mod store;
 mod types;
@@ -33,8 +34,9 @@ mod types;
 pub use broker::{AgentView, Broker, BrokerOpError};
 pub use error::BrokerError;
 pub use gates::{Gate, GateConfigError, GateRunOutcome, load_gates, select_gates};
-pub use git::{GitError, GitRepo};
+pub use git::{GitError, GitRepo, MergeSimulation};
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
+pub use merge::{ACTION_REQUIRED_RELPATH, PromoteConfig, SubmitOutcome};
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use store::BrokerStore;
 pub use types::{

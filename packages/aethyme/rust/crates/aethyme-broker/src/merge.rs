@@ -1,0 +1,388 @@
+//! Merge simulation & promotion queue (Phase 5).
+//!
+//! Flow: `submit` snapshots a session's head into the queue, simulates
+//! the merge onto the local integration branch (`git merge-tree`, no
+//! worktree mutation), and — when clean — runs the affected gates on the
+//! materialized merged tree in a throwaway worktree. Conflicts reject
+//! the submission *before any gate runs* and write actionable
+//! instructions into the session's worktree (the broker messages the
+//! agent — decision 2026-07-10). `promote` advances the integration
+//! branch to the verified merge commit; other queued entries whose base
+//! moved are re-simulated.
+//!
+//! Boundary contract: the integration branch is **local only** — the
+//! broker never pushes and never opens PRs. The promotion trigger is a
+//! config setting (`[promote] mode = "manual" | "auto"`), manual by
+//! default.
+
+use std::path::Path;
+
+use crate::broker::{Broker, BrokerOpError};
+use crate::gates::GateRunOutcome;
+use crate::git::GitRepo;
+use crate::types::{MergeQueueEntry, MergeStatus};
+
+pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
+pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
+
+/// `[promote]` section of `.aethyme/config.toml`.
+#[derive(Debug, Clone)]
+pub struct PromoteConfig {
+    pub branch: String,
+    pub auto: bool,
+}
+
+impl PromoteConfig {
+    pub fn load(main_root: &Path) -> Self {
+        let mut config = Self {
+            branch: DEFAULT_INTEGRATION_BRANCH.to_string(),
+            auto: false,
+        };
+        let Ok(text) = std::fs::read_to_string(main_root.join(".aethyme/config.toml")) else {
+            return config;
+        };
+        let Ok(value) = text.parse::<toml::Value>() else {
+            return config;
+        };
+        if let Some(promote) = value.get("promote") {
+            if let Some(branch) = promote.get("branch").and_then(|v| v.as_str()) {
+                config.branch = branch.to_string();
+            }
+            if let Some(mode) = promote.get("mode").and_then(|v| v.as_str()) {
+                config.auto = mode == "auto";
+            }
+        }
+        config
+    }
+}
+
+/// Result of one submit: the queue entry after simulate (+ gates when
+/// clean, + promotion when auto mode and verified).
+#[derive(Debug, serde::Serialize)]
+pub struct SubmitOutcome {
+    pub entry: MergeQueueEntry,
+    pub conflicts: Vec<String>,
+    pub gate_outcomes: Vec<GateRunOutcome>,
+    pub promoted: bool,
+}
+
+impl Broker {
+    /// Ensure the integration branch exists (created from the main
+    /// checkout's HEAD with an explanatory event — issue #20) and return
+    /// its current commit.
+    pub fn integration_head(&mut self) -> Result<(String, String), BrokerOpError> {
+        let config = PromoteConfig::load(&self.main_root_path());
+        let repo = self.repo_handle();
+        if let Some(commit) = repo.resolve_ref(&config.branch) {
+            return Ok((config.branch, commit));
+        }
+        let head = repo.head_commit()?;
+        repo.update_branch_ref(&config.branch, &head)?;
+        self.store().append_event(
+            "merge.integration_branch_created",
+            None,
+            Some(&format!(
+                "{{\"branch\":{},\"at\":{}}}",
+                serde_json::to_string(&config.branch)?,
+                serde_json::to_string(&head)?
+            )),
+        )?;
+        Ok((config.branch, head))
+    }
+
+    /// Submit a session's committed head for promotion: queue (idempotent
+    /// per head), simulate, gate on the merged tree, and auto-promote if
+    /// configured. Uncommitted changes are NOT included — the head commit
+    /// is the unit of promotion.
+    pub fn submit(&mut self, session_id: i64) -> Result<SubmitOutcome, BrokerOpError> {
+        let session = self.store().session(session_id)?;
+        let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+        let head = checkout.head_commit()?;
+        let (_branch, base) = self.integration_head()?;
+
+        let entry = self.store().submit(session_id, &head, &base)?;
+        self.simulate_and_gate(entry.id)
+    }
+
+    /// Simulate (and, when clean, gate) one queue entry against the
+    /// CURRENT integration head. Rebinds the entry's base if the branch
+    /// moved since submission.
+    pub fn simulate_and_gate(&mut self, entry_id: i64) -> Result<SubmitOutcome, BrokerOpError> {
+        let (_branch, base) = self.integration_head()?;
+        let entry = self
+            .store()
+            .merge_queue()?
+            .into_iter()
+            .find(|e| e.id == entry_id)
+            .ok_or(crate::BrokerError::SessionNotFound(entry_id))?;
+        let session = self.store().session(entry.session_id)?;
+
+        self.store()
+            .set_merge_status(entry.id, MergeStatus::Simulating, None, None)?;
+        let simulation = self
+            .repo_handle()
+            .merge_tree_simulate(&base, &entry.head_commit)?;
+
+        if !simulation.conflicts.is_empty() {
+            // Conflict: reject before any gate runs, name the blocking
+            // session when a lease matches, and message the agent via a
+            // file drop in its worktree (#21).
+            let blocking = self.blocking_sessions(entry.session_id, &simulation.conflicts)?;
+            let details = serde_json::json!({
+                "conflicts": simulation.conflicts,
+                "blocking_sessions": blocking,
+                "base": base,
+            });
+            self.store().set_merge_status(
+                entry.id,
+                MergeStatus::Conflict,
+                Some(&simulation.tree),
+                Some(&details.to_string()),
+            )?;
+            write_action_required(
+                Path::new(&session.worktree_path),
+                &entry,
+                &simulation.conflicts,
+                &blocking,
+                &base,
+            );
+            let entry = self.queue_entry(entry.id)?;
+            return Ok(SubmitOutcome {
+                entry,
+                conflicts: simulation.conflicts,
+                gate_outcomes: Vec::new(),
+                promoted: false,
+            });
+        }
+
+        // Clean merge: materialize as a commit and run affected gates on
+        // it in a throwaway detached worktree (#22).
+        let merge_commit = self.repo_handle().commit_tree(
+            &simulation.tree,
+            &[&base, &entry.head_commit],
+            &format!(
+                "broker: promote session {} ({})",
+                session.id,
+                session.task.as_deref().unwrap_or("no task")
+            ),
+        )?;
+        let changed = self.repo_handle().changed_between(&base, &merge_commit)?;
+        let gates = crate::gates::load_gates(&self.main_root_path())?;
+        let tmp_dir = self
+            .main_root_path()
+            .join(".aethyme/run/merge-sim")
+            .join(format!("entry-{}", entry.id));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let sim_worktree = self
+            .repo_handle()
+            .worktree_add_detached(&tmp_dir, &merge_commit)?;
+        let main_root = self.main_root_path();
+        let gate_outcomes = crate::gates::run_affected(
+            self.store(),
+            &main_root,
+            &sim_worktree,
+            &gates,
+            &changed,
+            Some(entry.session_id),
+        );
+        let _ = self.repo_handle().worktree_remove(&tmp_dir, true);
+        let gate_outcomes = gate_outcomes?;
+
+        let all_pass = gate_outcomes
+            .iter()
+            .all(|o| o.status == crate::types::GateStatus::Pass);
+        let details = serde_json::json!({
+            "merge_commit": merge_commit,
+            "base": base,
+            "gates": gate_outcomes.iter().map(|o| serde_json::json!({
+                "gate": o.gate, "status": o.status, "cached": o.cached,
+            })).collect::<Vec<_>>(),
+        });
+        if all_pass {
+            self.store().set_merge_status(
+                entry.id,
+                MergeStatus::Verified,
+                Some(&simulation.tree),
+                Some(&details.to_string()),
+            )?;
+        } else {
+            self.store().set_merge_status(
+                entry.id,
+                MergeStatus::Rejected,
+                Some(&simulation.tree),
+                Some(&details.to_string()),
+            )?;
+        }
+
+        let mut promoted = false;
+        if all_pass && PromoteConfig::load(&self.main_root_path()).auto {
+            self.promote(entry.id)?;
+            promoted = true;
+        }
+        let entry = self.queue_entry(entry.id)?;
+        Ok(SubmitOutcome {
+            entry,
+            conflicts: Vec::new(),
+            gate_outcomes,
+            promoted,
+        })
+    }
+
+    /// Advance the integration branch to a verified entry's merge commit,
+    /// then re-simulate every other non-terminal entry whose base moved.
+    /// Never pushes; never touches GitHub.
+    pub fn promote(&mut self, entry_id: i64) -> Result<(), BrokerOpError> {
+        let entry = self.queue_entry(entry_id)?;
+        if entry.status != MergeStatus::Verified {
+            return Err(BrokerOpError::NotVerified {
+                entry: entry_id,
+                status: entry.status.as_str(),
+            });
+        }
+        let details: serde_json::Value = entry
+            .details_json
+            .as_deref()
+            .and_then(|d| serde_json::from_str(d).ok())
+            .unwrap_or_default();
+        let base_at_verify = details
+            .get("base")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let merge_commit = details
+            .get("merge_commit")
+            .and_then(|v| v.as_str())
+            .ok_or(crate::BrokerError::SessionNotFound(entry_id))?
+            .to_string();
+
+        let (branch, current_base) = self.integration_head()?;
+        if current_base != base_at_verify {
+            // Base moved since verification: verification is stale —
+            // re-simulate instead of promoting a stale merge.
+            let outcome = self.simulate_and_gate(entry_id)?;
+            if outcome.entry.status != MergeStatus::Verified {
+                return Err(BrokerOpError::NotVerified {
+                    entry: entry_id,
+                    status: outcome.entry.status.as_str(),
+                });
+            }
+            return self.promote(entry_id);
+        }
+
+        self.repo_handle()
+            .update_branch_ref(&branch, &merge_commit)?;
+        self.store().set_merge_status(
+            entry_id,
+            MergeStatus::Promoted,
+            None,
+            Some(&serde_json::json!({"branch": branch, "commit": merge_commit}).to_string()),
+        )?;
+
+        // Requeue: everything still in flight was verified/conflicted
+        // against a base that just moved (#23).
+        let stale: Vec<i64> = self
+            .store()
+            .merge_queue()?
+            .into_iter()
+            .filter(|e| {
+                e.id != entry_id
+                    && matches!(
+                        e.status,
+                        MergeStatus::Submitted
+                            | MergeStatus::Simulating
+                            | MergeStatus::Verified
+                            | MergeStatus::Conflict
+                    )
+            })
+            .map(|e| e.id)
+            .collect();
+        for stale_id in stale {
+            // Best effort: a failure re-simulating one entry must not
+            // abort the promotion that already happened.
+            let _ = self.simulate_and_gate(stale_id);
+        }
+        Ok(())
+    }
+
+    fn queue_entry(&mut self, entry_id: i64) -> Result<MergeQueueEntry, BrokerOpError> {
+        self.store()
+            .merge_queue()?
+            .into_iter()
+            .find(|e| e.id == entry_id)
+            .ok_or(crate::BrokerError::SessionNotFound(entry_id).into())
+    }
+
+    /// Sessions (other than `submitter`) holding active leases on any of
+    /// the conflicted paths — the "who am I fighting with" signal.
+    fn blocking_sessions(
+        &mut self,
+        submitter: i64,
+        conflicts: &[String],
+    ) -> Result<Vec<i64>, BrokerOpError> {
+        let leases = self.store().active_leases()?;
+        let mut blocking: Vec<i64> = leases
+            .iter()
+            .filter(|lease| lease.session_id != submitter)
+            .filter(|lease| {
+                conflicts.iter().any(|conflict| {
+                    conflict == &lease.path
+                        || (lease.path.ends_with('/') && conflict.starts_with(&lease.path))
+                })
+            })
+            .map(|lease| lease.session_id)
+            .collect();
+        blocking.sort_unstable();
+        blocking.dedup();
+        Ok(blocking)
+    }
+}
+
+/// The agent-facing conflict message (#21): machine- and human-readable,
+/// dropped into the session's worktree. The Aethyme-generated AGENTS.md
+/// can point agents at this path; no vendor-specific injection.
+fn write_action_required(
+    worktree: &Path,
+    entry: &MergeQueueEntry,
+    conflicts: &[String],
+    blocking: &[i64],
+    base: &str,
+) {
+    let blocking_note = if blocking.is_empty() {
+        "No live session currently holds leases on these paths.".to_string()
+    } else {
+        format!(
+            "Blocking session(s): {} — coordinate or wait for their promotion.",
+            blocking
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let body = format!(
+        "# Broker: action required — merge conflict\n\n\
+         Your submission (commit `{head}`) conflicts with the integration\n\
+         branch (base `{base}`) and was rejected before any CI ran.\n\n\
+         Conflicting files:\n{files}\n\n{blocking_note}\n\n\
+         To resolve, in this worktree:\n\n\
+         1. `git fetch . {base}` (the base is a local commit; no network)\n\
+         2. `git rebase {base}` and resolve the conflicts above\n\
+         3. resubmit: `aethyme broker submit --session {session}`\n\n\
+         This file is regenerated on each conflicted submission; it is\n\
+         gitignored broker state (delete freely).\n",
+        head = entry.head_commit,
+        base = base,
+        files = conflicts
+            .iter()
+            .map(|c| format!("- {c}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        blocking_note = blocking_note,
+        session = entry.session_id,
+    );
+    let path = worktree.join(ACTION_REQUIRED_RELPATH);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, body);
+}

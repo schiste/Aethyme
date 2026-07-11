@@ -55,6 +55,15 @@ fn run_git_inner(cwd: &Path, index_file: Option<&str>, args: &[&str]) -> Result<
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Result of a `git merge-tree --write-tree` simulation.
+#[derive(Debug)]
+pub struct MergeSimulation {
+    /// The merged tree oid (written even when conflicted).
+    pub tree: String,
+    /// Conflicted paths; empty means the merge is clean.
+    pub conflicts: Vec<String>,
+}
+
 /// A handle on one git checkout (the main repository or a linked
 /// worktree). Constructed via [`GitRepo::discover`].
 pub struct GitRepo {
@@ -107,6 +116,135 @@ impl GitRepo {
 
     pub fn merge_base(&self, a: &str, b: &str) -> Result<String, GitError> {
         run_git(&self.root, &["merge-base", a, b])
+    }
+
+    /// Resolve a ref (branch name, tag, ...) to a commit, `None` when it
+    /// does not exist.
+    pub fn resolve_ref(&self, name: &str) -> Option<String> {
+        run_git(
+            &self.root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{name}^{{commit}}"),
+            ],
+        )
+        .ok()
+    }
+
+    /// Create or fast-move a local branch ref to `commit` (no checkout).
+    pub fn update_branch_ref(&self, branch: &str, commit: &str) -> Result<(), GitError> {
+        run_git(
+            &self.root,
+            &["update-ref", &format!("refs/heads/{branch}"), commit],
+        )?;
+        Ok(())
+    }
+
+    /// Simulate merging `head` onto `base` without touching any worktree
+    /// (`git merge-tree --write-tree`). Returns the resulting tree and
+    /// the conflicted file list (empty = clean).
+    pub fn merge_tree_simulate(&self, base: &str, head: &str) -> Result<MergeSimulation, GitError> {
+        // Exit code 1 = conflicts (still writes a tree); >1 = real error.
+        let output = Command::new("git")
+            .args([
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--no-messages",
+                base,
+                head,
+            ])
+            .current_dir(&self.root)
+            .output()
+            .map_err(|source| GitError::Spawn {
+                args: "merge-tree --write-tree".into(),
+                source,
+            })?;
+        let code = output.status.code().unwrap_or(-1);
+        if code != 0 && code != 1 {
+            return Err(GitError::Git {
+                args: "merge-tree --write-tree".into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut lines = stdout.lines();
+        let tree = lines.next().unwrap_or_default().trim().to_string();
+        let conflicts: Vec<String> = lines
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        Ok(MergeSimulation { tree, conflicts })
+    }
+
+    /// Create a commit object for `tree` with `parents` (no checkout,
+    /// no ref update). Used to materialize simulated merges.
+    pub fn commit_tree(
+        &self,
+        tree: &str,
+        parents: &[&str],
+        message: &str,
+    ) -> Result<String, GitError> {
+        let mut args: Vec<String> = vec!["commit-tree".into(), tree.into()];
+        for parent in parents {
+            args.push("-p".into());
+            args.push((*parent).into());
+        }
+        args.push("-m".into());
+        args.push(message.into());
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = Command::new("git")
+            .args(&arg_refs)
+            .current_dir(&self.root)
+            .env("GIT_AUTHOR_NAME", "aethyme-broker")
+            .env("GIT_AUTHOR_EMAIL", "broker@aethyme.local")
+            .env("GIT_COMMITTER_NAME", "aethyme-broker")
+            .env("GIT_COMMITTER_EMAIL", "broker@aethyme.local")
+            .output()
+            .map_err(|source| GitError::Spawn {
+                args: "commit-tree".into(),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: "commit-tree".into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Changed files between two commits (for affected-gate selection on
+    /// a simulated merged tree).
+    pub fn changed_between(&self, from: &str, to: &str) -> Result<Vec<String>, GitError> {
+        Ok(run_git(&self.root, &["diff", "--name-only", from, to])?
+            .lines()
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Create a detached worktree at `dest` checked out at `commit`.
+    pub fn worktree_add_detached(&self, dest: &Path, commit: &str) -> Result<GitRepo, GitError> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| GitError::Spawn {
+                args: format!("create_dir_all {}", parent.display()),
+                source,
+            })?;
+        }
+        run_git(
+            &self.root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                dest.to_str().unwrap_or_default(),
+                commit,
+            ],
+        )?;
+        GitRepo::discover(dest)
     }
 
     /// Deterministic tree hash of the checkout's current *working state*

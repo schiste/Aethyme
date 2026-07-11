@@ -36,6 +36,8 @@ pub enum BrokerOpError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     GateConfig(#[from] crate::gates::GateConfigError),
+    #[error("queue entry {entry} is not verified (status: {status}) — submit/simulate first")]
+    NotVerified { entry: i64, status: &'static str },
 }
 
 /// A session enriched with liveness derived at read time — what
@@ -83,6 +85,14 @@ impl Broker {
 
     pub fn store(&mut self) -> &mut BrokerStore {
         &mut self.store
+    }
+
+    pub(crate) fn main_root_path(&self) -> PathBuf {
+        self.main_root.clone()
+    }
+
+    pub(crate) fn repo_handle(&self) -> &GitRepo {
+        &self.repo
     }
 
     // ── adopt (attach-first) ──────────────────────────────────────────
