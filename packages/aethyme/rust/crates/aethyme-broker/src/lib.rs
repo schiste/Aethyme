@@ -31,7 +31,7 @@ mod schema;
 mod store;
 mod types;
 
-pub use broker::{AgentView, Broker, BrokerOpError};
+pub use broker::{AgentView, Broker, BrokerOpError, StatusView};
 pub use error::BrokerError;
 pub use gates::{Gate, GateConfigError, GateRunOutcome, load_gates, select_gates};
 pub use git::{GitError, GitRepo, MergeSimulation};
