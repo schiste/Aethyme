@@ -23,8 +23,7 @@ It owns:
 4. scorecard analysis
 5. controlled autofix tooling from the CLI
 6. deterministic navigation primitives for AI agents
-7. navigation evaluation benchmarks — see [`docs/guides/eval-protocol.md`](docs/guides/eval-protocol.md)
-8. evaluation tooling roadmap — see [`docs/guides/eval-tooling-roadmap.md`](docs/guides/eval-tooling-roadmap.md)
+7. agent broker + certification (`rust/crates/aethyme-broker`)
 
 ## Public Product Model
 
@@ -43,7 +42,7 @@ the default operator path.
 Aethyme is moving toward:
 
 - Rust for deterministic engine components
-- Python for CLI surfaces, enhance/onboarding, scorecard orchestration, and the eval harness
+- Python for CLI surfaces, enhance/onboarding, and scorecard orchestration
 
 See [`docs/architecture/rust-transition.md`](docs/architecture/rust-transition.md) and [`rust/README.md`](rust/README.md).
 
@@ -53,7 +52,6 @@ See [`docs/architecture/rust-transition.md`](docs/architecture/rust-transition.m
 - `src/indexing` (engine adapter, onboarding, skills)
 - `src/scorecard`
 - `src/autofixers`
-- `src/eval`
 - `rust` (engine + broker crates)
 
 ### Delivery
@@ -107,12 +105,8 @@ Supporting commands:
 - `aethyme task next --repo /path/to/repo --task "Update validate_token flow" --json-output`
 - `aethyme task expand --repo /path/to/repo --node src/auth.py --json-output`
 - `aethyme task context --repo /path/to/repo --task "Update validate_token flow" --json-output`
-- `aethyme eval explain-repo --repo /path/to/repo --json-output`
-- `aethyme eval explain-repo --repo /path/to/repo --control-cmd "<cmd>" --explore-cmd "<cmd>" --leverage-cmd "<cmd>"`
-- `aethyme eval navigation-ctf --repo /path/to/repo --json-output`
-
-See [`docs/guides/eval-protocol.md`](docs/guides/eval-protocol.md) for the canonical 5-condition playground eval protocol, repository setup flow, and Chau7 execution method.
-See [`docs/guides/eval-tooling-roadmap.md`](docs/guides/eval-tooling-roadmap.md) for the current repository-agnostic priority order: strengthen `explore`, then `leverage`, then revisit `task-conditioned`.
+The evaluation harness was removed on 2026-07-13 — design knowledge preserved
+at [`docs/architecture/eval-mining-notes.md`](docs/architecture/eval-mining-notes.md).
 
 ### Local workflow test lanes
 
@@ -128,18 +122,12 @@ This local path is the shortest route to proving:
 2. discoverability
 3. graph-mediated navigation
 4. deterministic task-context packs
-5. explain-repo evaluation artifacts
 
 Runtime notes:
 
 - the Python layer now executes a built Rust binary rather than `cargo run` for every call
 - local repo artifacts are cached by snapshot key under `AETHYME_CACHE_DIR` or `/tmp/aethyme-cache`
 - Git repositories use commit plus dirty-state metadata for cache keys instead of a full recursive fingerprint on every call
-- `eval explain-repo` can execute local comparison runs when `--control-cmd`, `--explore-cmd`, and `--leverage-cmd` are provided
-- external runners receive `AETHYME_EVAL_OUTPUT_SCHEMA_FILE`, `AETHYME_EVAL_TOOL_REPO`, and `AETHYME_EVAL_TOOL_PYTHON` so agent wrappers can enforce structured output and call back into Aethyme
-- the canonical playground protocol is Chau7 MCP with 5 conditions: `control-cto-off`, `control-cto-on`, `explore`, `leverage`, `task-conditioned`
-- without those commands, it still emits the comparison artifacts only
-- the `leverage` condition uses a compact generic Aethyme Explore usage card; `task-conditioned` remains the full context-pack mode
 - `aethyme enhance deploy --repo <path>` is the primary real-repository enhancement path; it writes cross-product discoverability files plus generated repo-onboarding artifacts
 - `AGENTS.md` and `CLAUDE.md` are generated artifacts owned by Aethyme; customize them through `.aethyme/overrides/agents.json`, not by editing the root files directly
 - generated root instructions include compact repo routing such as skill paths, fast test, app entrypoint, experience status, and commit hygiene policy
@@ -155,10 +143,6 @@ Runtime notes:
 - `explore --request ...` defaults to `task_localization_query`, a bounded general-purpose answer path that returns ranked candidate files/symbols/areas, compact evidence, verification steps, confidence, next actions, and observability; on large repos it returns degraded `needs_verification` output instead of blocking or claiming answer safety
 - `explore --intent usage_boundary_query` now uses a scope-first PHP analyzer path that returns answer/excluded/confidence/observability without building the full repository graph
 - reports include an Aethyme Usage section so availability is not confused with actual `src.cli` invocation
-- every `eval explain-repo` run writes a local markdown report under `packages/aethyme/docs/reports/evals/`
-- the repository tracks only a curated subset of eval reports there; the rest are generated local artifacts
-- the report includes quality score, recalculated eval score vs control baseline, tool usage, tokens, duration, prompts, pack JSON, and verbose run results
-- eval outputs now include a structured output schema, scoring rubric, and reference answer
 
 ## Start Here
 

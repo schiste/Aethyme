@@ -25,6 +25,6 @@ CLA later if the contributor model changes.
 
 ## Stability Policy
 
-The initial OSS surface is Aethyme Core. Cloud, eval UI, and private deployment
+The initial OSS surface is Aethyme Core. Cloud and private deployment
 surfaces may change without compatibility guarantees until maintainers publish a
 separate stability policy for them.

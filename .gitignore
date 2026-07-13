@@ -29,12 +29,6 @@ __pycache__/
 .env
 .env.*
 *.log
-packages/aethyme-eval-ui/server/evals.db
-packages/aethyme-eval-ui/server/evals.db-shm
-packages/aethyme-eval-ui/server/evals.db-wal
-packages/aethyme-eval-ui/evals.db
-packages/aethyme-eval-ui/evals.db-shm
-packages/aethyme-eval-ui/evals.db-wal
 packages/aethyme/.eval-cache/
 packages/aethyme/rust/target/
 

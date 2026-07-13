@@ -17,7 +17,6 @@ Unless maintainers explicitly move them into public support scope, these areas
 are experimental or internal:
 
 - `packages/aethyme-cloud`
-- `packages/aethyme-eval-ui`
 - private deployment configuration
 - unpublished benchmark/eval operations
 

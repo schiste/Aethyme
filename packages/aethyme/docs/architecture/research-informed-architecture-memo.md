@@ -482,9 +482,7 @@ These should stay adapters and orchestration layers:
 - [`../../src/indexing/engine.py`](../../src/indexing/engine.py)
 - [`../../src/indexing/repository_snapshot.py`](../../src/indexing/repository_snapshot.py)
 - [`../../src/cli.py`](../../src/cli.py)
-- [`../../src/eval/control_prompt.py`](../../src/eval/control_prompt.py)
-- [`../../src/eval/explain_repo.py`](../../src/eval/explain_repo.py)
-- [`../../src/eval/report.py`](../../src/eval/report.py)
+- `src/eval/` orchestration (removed 2026-07-13 with the eval harness; see [`eval-mining-notes.md`](eval-mining-notes.md))
 - [`../../src/rendering/context_pack.py`](../../src/rendering/context_pack.py)
 
 They should not become the place where graph truth is invented.

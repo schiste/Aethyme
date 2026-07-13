@@ -4,7 +4,7 @@ Aethyme is repository-intelligence tooling for mapping source code into a
 deterministic graph that agents and developers can query.
 
 The initial open-source scope is **Aethyme Core**: local repository indexing,
-graph traversal, search, task context generation, and evaluation tooling in
+graph traversal, search, and task context generation in
 `packages/aethyme`.
 
 ## Status: what exists today vs what is planned
@@ -17,9 +17,7 @@ graph traversal, search, task context generation, and evaluation tooling in
   daemon.
 - A **Python CLI** (`aethyme`, click-based) that shells out to the engine:
   `repo`, `query`, `graph`, `task`, `facts`, `analyze`, `enhance`, `ai-ready`,
-  `autofix`, `eval`.
-- An **eval harness** with a playground protocol and a local eval dashboard
-  (`packages/aethyme-eval-ui`).
+  `autofix`.
 
 **Planned, not implemented**
 
@@ -40,12 +38,10 @@ graph traversal, search, task context generation, and evaluation tooling in
 
 ## Repository Layout
 
-- `packages/aethyme`: core Python CLI/API code, Rust engine workspace, graph
-  indexing, search, scorecard, and eval harnesses.
+- `packages/aethyme`: core Python CLI code, Rust engine and broker workspace,
+  graph indexing, search, and scorecard.
 - `packages/aethyme/rust`: deterministic Rust engine and graph crates.
 - `packages/aethyme-cloud`: SaaS-oriented application shell. Experimental for
-  public OSS purposes.
-- `packages/aethyme-eval-ui`: local evaluation dashboard. Experimental for
   public OSS purposes.
 - `docs`: project-level planning and architecture notes.
 
@@ -106,9 +102,11 @@ cd rust
 cargo test --workspace
 ```
 
-Eval work has stricter rules: evaluations run against Playground repositories,
-never against Aethyme itself. See
-[`packages/aethyme/docs/guides/eval-protocol.md`](packages/aethyme/docs/guides/eval-protocol.md).
+The evaluation harness was removed on 2026-07-13; its design knowledge is
+preserved at
+[`packages/aethyme/docs/architecture/eval-mining-notes.md`](packages/aethyme/docs/architecture/eval-mining-notes.md).
+Any future eval work keeps the Cardinal Rules: run only against Playground
+repositories, never tune the tool to a score.
 
 ## Security And Support
 

@@ -147,39 +147,6 @@ def test_local_repo_inspect_and_pack(tmp_path: Path) -> None:
     assert pack_payload["in_scope"]["areas"]
 
 
-def test_local_eval_explain_repo(monkeypatch, tmp_path: Path) -> None:
-    require_local_engine_or_skip()
-    repo_path = tmp_path / "demo-repo"
-    build_demo_repo(repo_path)
-    runner = CliRunner()
-    monkeypatch.setattr(
-        "src.eval.explain_repo.write_explain_repo_markdown_report",
-        lambda **kwargs: tmp_path / "report.md",
-    )
-
-    result = runner.invoke(
-        cli,
-        ["eval", "explain-repo", "--repo", str(repo_path), "--json-output"],
-    )
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["task"] == "Explain this repo"
-    assert payload["eval_type"] == "explain-repo"
-    assert payload["contract_versions"]["run_metadata"] == "1"
-    assert "signals" in payload
-    assert payload["signals"]["parser_visibility"]["score"] >= 0
-    assert payload["report"]["baseline_prompt_chars"] > 0
-    assert payload["report"]["condition_prompt_chars"]["control"] == payload["report"]["condition_prompt_chars"]["explore"]
-    assert payload["report"]["condition_prompt_chars"]["leverage"] > payload["report"]["condition_prompt_chars"]["control"]
-    assert "Use Aethyme tools" in payload["leverage"]["prompt"]
-    assert payload["report_path"].endswith(".md")
-    assert payload["output_schema"]["type"] == "object"
-    assert payload["reference_output"]["code_areas"]
-    assert "representative_code_files" in payload["reference_output"]
-    assert "Navigation order:" in payload["explanation"]
-
-
 def test_local_graph_navigation_commands(tmp_path: Path) -> None:
     require_local_engine_or_skip()
     repo_path = tmp_path / "demo-repo"

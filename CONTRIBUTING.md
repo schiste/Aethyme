@@ -8,7 +8,7 @@ The initial open-source contribution scope is Aethyme Core:
 - `packages/aethyme/rust`
 - root documentation and CI that support Aethyme Core
 
-`packages/aethyme-cloud` and `packages/aethyme-eval-ui` are not the initial
+`packages/aethyme-cloud` is not the initial
 community support surface unless maintainers explicitly mark them as such.
 
 ## Development Setup
@@ -38,8 +38,6 @@ cargo test --workspace
 - Update docs when commands, contracts, or public behavior change.
 - Do not commit generated local artifacts, runtime databases, secrets, or private
   repository data.
-- For eval-related changes, follow
-  `packages/aethyme/docs/guides/eval-protocol.md`.
 
 ## Eval Rules
 

@@ -26,7 +26,7 @@ Why this split exists:
 - that is not the same thing as “safe to remove dead code”
 
 Source of truth:
-- [mediawiki_dead_code_watchlist.json](../../src/eval/baselines/mediawiki_dead_code_watchlist.json)
+- `mediawiki_dead_code_watchlist.json` (removed 2026-07-13 with the eval harness; recover at git ref `16cfa5e:packages/aethyme/src/eval/baselines/`)
 
 Preferred analyzer path for collecting candidates:
 ```bash

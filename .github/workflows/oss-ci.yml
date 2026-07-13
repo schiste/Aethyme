@@ -24,9 +24,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      # The eval self-tool contract (evals/tools/aethyme.toml) invokes the
-      # package via .venv/bin/python, matching the documented dev setup —
-      # so CI must provide the same venv layout.
+      # The documented dev setup uses a package-local .venv (the layout the
+      # broker gates and docs assume), so CI provides the same venv layout.
       - name: Install package and dev dependencies (into .venv)
         run: |
           python -m venv .venv

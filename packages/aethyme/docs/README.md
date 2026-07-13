@@ -19,7 +19,7 @@ This directory documents the code that is active in `packages/aethyme`.
 - [`getting-started/quickstart.md`](getting-started/quickstart.md)
 - [`reference/api.md`](reference/api.md)
 - [`reference/cli.md`](reference/cli.md)
-- [`guides/eval-protocol.md`](guides/eval-protocol.md)
+- [`architecture/eval-mining-notes.md`](architecture/eval-mining-notes.md)
 - [`guides/testing.md`](guides/testing.md)
 - [`guides/troubleshooting.md`](guides/troubleshooting.md)
 
