@@ -7,8 +7,9 @@
 .aethyme/worktrees/
 .aethyme/broker-action-required.md
 
-# Local strategy/progress board (personal working view, kept out of git)
+# Local strategy/progress boards (personal working views, kept out of git)
 docs/strategy.html
+docs/legacy.html
 
 node_modules/
 dist/
