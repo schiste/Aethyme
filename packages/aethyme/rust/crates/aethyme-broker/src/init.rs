@@ -9,15 +9,20 @@
 //! report, with a scriptable exit code. This is the recurring
 //! inspection; it never writes a byte.
 //!
-//! **`scaffold()`** — the adaptive setup. Drafts what a repo is missing
-//! (gates.toml from manifest sniffing, config.toml skeleton, .gitignore
-//! block). Heuristic by nature, clearly labeled as drafts, never
-//! overwrites anything, and is NOT certification — run `certify` after
-//! reviewing its output.
+//! **`scaffold()`** — deterministic writes only: the artifacts the
+//! broker itself needs, whose bytes are ALWAYS identical regardless of
+//! the repo (config.toml skeleton, .gitignore block, broker database
+//! with its fixed schema). Never overwrites; a second run changes
+//! nothing. Certify and scaffold are the "always exactly the same"
+//! pair — one reads, one writes.
 //!
-//! Shared determinism rules: no network, no clocks; generated files
-//! contain no timestamps and no absolute paths; detector and report
-//! ordering are fixed; a second scaffold run is byte-identical.
+//! **`draft_gates()`** — adaptive, deliberately separate (`aethyme
+//! broker gates draft`): sniffs the repo's manifests and drafts a
+//! gates.toml. Its output depends on the repo, which is exactly why it
+//! is neither certification nor scaffolding.
+//!
+//! Shared rules: no network, no clocks; generated files contain no
+//! timestamps and no absolute paths; report ordering is fixed.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -172,32 +177,15 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     })
 }
 
-/// Adaptive setup: draft what is missing. Never overwrites; not
-/// certification — review the drafts, then run `certify`.
+/// Deterministic scaffolding: ONLY what the broker needs to work, and
+/// ONLY artifacts whose content is identical for every repo (fixed
+/// config skeleton, fixed .gitignore block, fixed database schema).
+/// Adaptive generation (gates drafting, docs, charts) lives elsewhere.
 pub fn scaffold(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     let mut checks = Vec::new();
     let repo = crate::GitRepo::discover(repo_hint).map_err(BrokerOpError::Git)?;
     let main_root = repo.main_root()?;
 
-    checks.push(match draft_gates_toml(&main_root) {
-        Some(draft) => ensure_file(
-            &main_root.join(".aethyme/gates.toml"),
-            "scaffold.gates-toml",
-            || draft,
-        ),
-        None if main_root.join(".aethyme/gates.toml").exists() => Check {
-            id: "scaffold.gates-toml",
-            status: CheckStatus::Pass,
-            detail: ".aethyme/gates.toml present (never overwritten)".into(),
-        },
-        None => Check {
-            id: "scaffold.gates-toml",
-            status: CheckStatus::Warn,
-            detail: "no manifests recognized — define .aethyme/gates.toml yourself; \
-                     until then the broker runs conflict-only (no verification)"
-                .into(),
-        },
-    });
     checks.push(ensure_file(
         &main_root.join(".aethyme/config.toml"),
         "scaffold.config-toml",
@@ -205,9 +193,55 @@ pub fn scaffold(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     ));
     checks.push(ensure_gitignore_block(&main_root));
 
+    let db_existed = main_root.join(crate::BROKER_DB_RELPATH).exists();
+    let store = crate::BrokerStore::open_in_repo(&main_root)?;
+    let integrity = store.integrity_check()?;
+    checks.push(Check {
+        id: "scaffold.broker-db",
+        status: if integrity != "ok" {
+            CheckStatus::Fail
+        } else if db_existed {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Created
+        },
+        detail: format!("integrity: {integrity}"),
+    });
+
     Ok(InitReport {
         check_mode: false,
         checks,
+    })
+}
+
+/// Adaptive gate drafting (`aethyme broker gates draft`): sniff the
+/// repo's manifests and write a draft gates.toml. Never overwrites.
+/// NOT scaffolding, NOT certification — output depends on the repo.
+pub fn draft_gates(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
+    let repo = crate::GitRepo::discover(repo_hint).map_err(BrokerOpError::Git)?;
+    let main_root = repo.main_root()?;
+    let check = match draft_gates_toml(&main_root) {
+        Some(draft) => ensure_file(
+            &main_root.join(".aethyme/gates.toml"),
+            "gates.draft",
+            || draft,
+        ),
+        None if main_root.join(".aethyme/gates.toml").exists() => Check {
+            id: "gates.draft",
+            status: CheckStatus::Pass,
+            detail: ".aethyme/gates.toml present (never overwritten)".into(),
+        },
+        None => Check {
+            id: "gates.draft",
+            status: CheckStatus::Warn,
+            detail: "no manifests recognized — define .aethyme/gates.toml yourself; \
+                     until then the broker runs conflict-only (no verification)"
+                .into(),
+        },
+    };
+    Ok(InitReport {
+        check_mode: false,
+        checks: vec![check],
     })
 }
 

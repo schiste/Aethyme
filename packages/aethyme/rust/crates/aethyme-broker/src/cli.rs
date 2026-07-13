@@ -20,9 +20,14 @@ Usage:
       db integrity). Exits non-zero on failures — CI/cron-able as the
       recurring inspection. Never writes anything.
   aethyme broker scaffold [--json]
-      Adaptive setup (NOT certification): draft gates.toml from this
-      repo's manifests, config.toml skeleton, .gitignore block. Never
-      overwrites existing files. Review drafts, then run certify.
+      Deterministic setup: ONLY what the broker needs, with content that
+      is identical for every repo (config.toml skeleton, .gitignore
+      block, broker database). Never overwrites. Certify + scaffold are
+      the 'always exactly the same' pair — one reads, one writes.
+  aethyme broker gates draft [--json]
+      Adaptive (NOT scaffolding): sniff this repo's manifests and draft
+      a gates.toml. Output depends on the repo — review it, then run
+      certify.
   aethyme broker adopt [<path>] [--task <text>] [--json]
       Register an existing worktree (attach-first). Defaults to the
       current directory.
@@ -396,6 +401,22 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         "gates requires an action: validate, affected, or run".into(),
                     ))?;
             match action {
+                "draft" => {
+                    let cwd = std::env::current_dir()
+                        .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
+                    let report = crate::init::draft_gates(&cwd)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        for check in &report.checks {
+                            println!(
+                                "{:<8} {}",
+                                format!("{:?}", check.status).to_lowercase(),
+                                check.detail
+                            );
+                        }
+                    }
+                }
                 "validate" => {
                     let broker = open_broker()?;
                     let gates = aethyme_gates_load(broker.main_root())?;
@@ -486,7 +507,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 }
                 other => {
                     return Err(UsageError::Message(format!(
-                        "unknown gates action {other:?} — expected validate, affected, or run"
+                        "unknown gates action {other:?} — expected draft, validate, affected, or run"
                     )));
                 }
             }

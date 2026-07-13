@@ -68,21 +68,36 @@ fn certify_is_always_read_only_and_scaffold_rerun_is_byte_identical() {
         "certify must never create the database"
     );
 
-    // Scaffold: drafts config + gitignore. No manifests here, so no
-    // gates.toml is drafted (a file defining nothing is dishonest).
+    // Scaffold: only the invariant broker artifacts — config skeleton,
+    // gitignore block, database. Gate drafting is NOT scaffolding.
     let report = init::scaffold(tmp.path()).unwrap();
     assert!(report.certified());
-    assert_eq!(status_of(&report, "scaffold.gates-toml"), CheckStatus::Warn);
-    for id in ["scaffold.config-toml", "scaffold.gitignore"] {
+    assert!(
+        report.checks.iter().all(|c| !c.id.contains("gates")),
+        "scaffold never touches gates"
+    );
+    for id in [
+        "scaffold.config-toml",
+        "scaffold.gitignore",
+        "scaffold.broker-db",
+    ] {
         assert_eq!(status_of(&report, id), CheckStatus::Created, "{id}");
     }
+    assert!(
+        !tmp.path().join(".aethyme/gates.toml").exists(),
+        "no gates.toml from scaffold"
+    );
     let first = snapshot(tmp.path());
     assert!(!first.is_empty());
 
     // Determinism: a second scaffold changes nothing, byte for byte.
     let report = init::scaffold(tmp.path()).unwrap();
     assert!(report.certified());
-    for id in ["scaffold.config-toml", "scaffold.gitignore"] {
+    for id in [
+        "scaffold.config-toml",
+        "scaffold.gitignore",
+        "scaffold.broker-db",
+    ] {
         assert_eq!(status_of(&report, id), CheckStatus::Pass, "{id}");
     }
     assert_eq!(snapshot(tmp.path()), first, "re-run is byte-identical");
@@ -111,7 +126,12 @@ fn gates_draft_detects_manifests_deterministically() {
     std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
     init_repo(tmp.path());
 
-    init::scaffold(tmp.path()).unwrap();
+    // Gate drafting is its own adaptive command, not scaffold.
+    let report = init::draft_gates(tmp.path()).unwrap();
+    assert_eq!(status_of(&report, "gates.draft"), CheckStatus::Created);
+    // Re-run: never overwritten.
+    let report = init::draft_gates(tmp.path()).unwrap();
+    assert_eq!(status_of(&report, "gates.draft"), CheckStatus::Pass);
     let gates = std::fs::read_to_string(tmp.path().join(".aethyme/gates.toml")).unwrap();
     for expected in [
         "name = \"cargo-test\"",
@@ -144,6 +164,8 @@ fn existing_files_are_never_touched_and_gitignore_appends_preserving_content() {
 
     let report = init::scaffold(tmp.path()).unwrap();
     assert!(report.certified());
+    let draft = init::draft_gates(tmp.path()).unwrap();
+    assert_eq!(status_of(&draft, "gates.draft"), CheckStatus::Pass);
     let gates = std::fs::read_to_string(tmp.path().join(".aethyme/gates.toml")).unwrap();
     assert!(gates.contains("mine"), "user's gates.toml untouched");
     assert!(!gates.contains("Draft generated"));
