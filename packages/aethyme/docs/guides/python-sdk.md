@@ -1,34 +1,8 @@
-# Python SDK
+# Python SDK (removed)
 
-Last Updated: 2026-03-06
+Last Updated: 2026-07-13
 
-The Python SDK is a thin client for the active core API.
-
-## Install
-
-```bash
-cd packages/aethyme/sdk/python
-python3 -m pip install -e .
-```
-
-## Authenticate
-
-```python
-from aethyme_sdk import AethymeClient
-
-client = AethymeClient(token="your-bearer-token-or-api-key")
-```
-
-## Use
-
-```python
-from aethyme_sdk import AethymeClient
-
-client = AethymeClient(token="your-bearer-token-or-api-key")
-search = client.search.query("GraphStore", limit=5)
-print(search)
-```
-
-## Scope Rule
-
-The SDK should stay minimal and only cover endpoints that are active in core.
+The Python SDK wrapped the Gen-0 cloud API and was removed with that
+lineage on 2026-07-13 (final #30 sweep). Local integration surfaces are
+the `aethyme` CLI (`--json` everywhere) and the broker event stream
+contract — see `../../../../docs/events-contract.md`.
