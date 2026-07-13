@@ -57,6 +57,16 @@ pub struct AgentView {
     pub pid_alive: Option<bool>,
 }
 
+/// Everything `broker status` renders, in one serializable shape.
+#[derive(Debug, serde::Serialize)]
+pub struct StatusView {
+    pub agents: Vec<AgentView>,
+    pub overlaps: Vec<crate::leases::Overlap>,
+    pub queue: Vec<crate::types::MergeQueueEntry>,
+    pub integration_branch: String,
+    pub integration_head: String,
+}
+
 /// One broker instance per repository: git handle on the main checkout +
 /// the shared store. Open from ANY path inside the repo (including a
 /// linked worktree) — state always resolves to the main checkout.
@@ -203,6 +213,13 @@ impl Broker {
                     } else {
                         SessionStatus::Active
                     };
+                    // Persist liveness *transitions* so they land in the
+                    // event timeline exactly once (session.stale is the
+                    // "stale worktree detected" signal from issue #24).
+                    if derived_status != session.status {
+                        self.store
+                            .set_session_status(session.id, derived_status, None)?;
+                    }
                 }
             }
             views.push(AgentView {
@@ -341,6 +358,24 @@ impl Broker {
         let base = session.diff_base.as_deref().unwrap_or("HEAD");
         let changed = checkout.changed_files(base)?;
         Ok((checkout, gates, changed))
+    }
+
+    // ── status (Phase 6) ──────────────────────────────────────────────
+
+    /// The whole picture in one call: refreshed leases + overlaps, agent
+    /// views, the merge queue, and the integration branch head.
+    pub fn status(&mut self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
+        let overlaps = self.refresh_leases()?;
+        let agents = self.agents(now_ms)?;
+        let queue = self.store.merge_queue()?;
+        let (integration_branch, integration_head) = self.integration_head()?;
+        Ok(StatusView {
+            agents,
+            overlaps,
+            queue,
+            integration_branch,
+            integration_head,
+        })
     }
 
     // ── cleanup ───────────────────────────────────────────────────────

@@ -101,6 +101,31 @@ impl Broker {
         let (_branch, base) = self.integration_head()?;
 
         let entry = self.store().submit(session_id, &head, &base)?;
+        // A new head supersedes this session's older in-flight entries:
+        // without this, a stale conflicted entry would be re-simulated
+        // (and re-announced) on every future promotion.
+        let stale: Vec<i64> = self
+            .store()
+            .merge_queue()?
+            .into_iter()
+            .filter(|e| {
+                e.session_id == session_id
+                    && e.id != entry.id
+                    && matches!(
+                        e.status,
+                        MergeStatus::Submitted
+                            | MergeStatus::Simulating
+                            | MergeStatus::Verified
+                            | MergeStatus::Conflict
+                            | MergeStatus::Rejected
+                    )
+            })
+            .map(|e| e.id)
+            .collect();
+        for stale_id in stale {
+            self.store()
+                .set_merge_status(stale_id, MergeStatus::Superseded, None, None)?;
+        }
         self.simulate_and_gate(entry.id)
     }
 

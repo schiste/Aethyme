@@ -46,6 +46,10 @@ Usage:
   aethyme broker promote --entry <id> [--json]
       Advance the local integration branch to a verified entry's merge
       commit; other in-flight entries are re-simulated. Never pushes.
+  aethyme broker status [--json]
+      The whole picture: agents, overlaps, merge queue, integration head.
+  aethyme broker events [--since <event-id>] [--follow] [--json]
+      Show the append-only event log; --follow polls for new events.
   aethyme broker cleanup <session-id> [--force] [--json]
       Remove a session's worktree. Refuses on uncommitted changes or
       unmerged commits unless --force.
@@ -93,6 +97,8 @@ struct Parsed {
     session: Option<i64>,
     entry: Option<i64>,
     ttl_seconds: Option<i64>,
+    since: Option<i64>,
+    follow: bool,
     json: bool,
     force: bool,
 }
@@ -105,6 +111,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         session: None,
         entry: None,
         ttl_seconds: None,
+        since: None,
+        follow: false,
         json: false,
         force: false,
     };
@@ -112,6 +120,15 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--json" => parsed.json = true,
+            "--follow" => parsed.follow = true,
+            "--since" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--since requires a value".into()))?;
+                parsed.since = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--since must be an integer event id".into())
+                })?);
+            }
             "--force" => parsed.force = true,
             "--task" => {
                 parsed.task = Some(
@@ -505,6 +522,81 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 println!("{{\"promoted\":{entry}}}");
             } else {
                 println!("Promoted entry {entry} to the local integration branch.");
+            }
+        }
+        "status" => {
+            let mut broker = open_broker()?;
+            let status = broker.status(now_ms())?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!(
+                    "Integration: {} @ {}",
+                    status.integration_branch,
+                    &status.integration_head[..12.min(status.integration_head.len())]
+                );
+                println!();
+                if status.agents.is_empty() {
+                    println!("No live sessions.");
+                } else {
+                    println!(
+                        "{:<4} {:<8} {:<8} {:<24} TASK",
+                        "ID", "STATUS", "ORIGIN", "BRANCH"
+                    );
+                    for view in &status.agents {
+                        println!(
+                            "{:<4} {:<8} {:<8} {:<24} {}",
+                            view.session.id,
+                            view.derived_status.as_str(),
+                            view.session.origin.as_str(),
+                            view.session.branch,
+                            view.session.task.as_deref().unwrap_or("-"),
+                        );
+                    }
+                }
+                if !status.queue.is_empty() {
+                    println!();
+                    println!("{:<4} {:<4} {:<11} HEAD", "QID", "SID", "QSTATUS");
+                    for entry in &status.queue {
+                        println!(
+                            "{:<4} {:<4} {:<11} {}",
+                            entry.id,
+                            entry.session_id,
+                            entry.status.as_str(),
+                            &entry.head_commit[..12.min(entry.head_commit.len())]
+                        );
+                    }
+                }
+                print_overlap_warnings(&status.overlaps);
+            }
+        }
+        "events" => {
+            let mut broker = open_broker()?;
+            let mut cursor = parsed.since.unwrap_or(0);
+            loop {
+                let events = broker.store().events_after(cursor, 1000)?;
+                for event in &events {
+                    cursor = event.id;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string(event)?);
+                    } else {
+                        println!(
+                            "{:<6} {} {:<28} sid={} {}",
+                            event.id,
+                            event.ts,
+                            event.kind,
+                            event
+                                .session_id
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "-".into()),
+                            event.payload_json.as_deref().unwrap_or(""),
+                        );
+                    }
+                }
+                if !parsed.follow {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(700));
             }
         }
         "cleanup" => {
