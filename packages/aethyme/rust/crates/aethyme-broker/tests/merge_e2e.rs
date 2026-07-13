@@ -71,9 +71,16 @@ fn resolve(root: &Path, rev: &str) -> String {
 }
 
 #[test]
-fn two_clean_sessions_promote_with_requeue_on_base_move() {
+fn two_clean_sessions_promote_with_requeue_on_base_move_manual_mode() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
+    // Manual mode opt-in: this test exercises the explicit promote path
+    // and requeue-on-base-move of already-verified entries.
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[promote]\nmode = \"manual\"\n",
+    )
+    .unwrap();
     let mut broker = Broker::open(tmp.path()).unwrap();
 
     let wt_a = agent_worktree(tmp.path(), "a");
@@ -87,7 +94,7 @@ fn two_clean_sessions_promote_with_requeue_on_base_move() {
     let out_a = broker.submit(a.id).unwrap();
     assert_eq!(out_a.entry.status, MergeStatus::Verified);
     assert_eq!(out_a.gate_outcomes.len(), 1);
-    assert!(!out_a.promoted, "manual mode by default");
+    assert!(!out_a.promoted, "manual mode holds verified entries");
     let out_b = broker.submit(b.id).unwrap();
     assert_eq!(out_b.entry.status, MergeStatus::Verified);
 
@@ -155,7 +162,7 @@ fn conflicting_submission_rejected_pre_gate_with_instruction_drop() {
     broker.refresh_leases().unwrap();
 
     let out_a = broker.submit(a.id).unwrap();
-    broker.promote(out_a.entry.id).unwrap();
+    assert!(out_a.promoted, "A lands immediately (auto default)");
 
     let out_b = broker.submit(b.id).unwrap();
     assert_eq!(out_b.entry.status, MergeStatus::Conflict);
@@ -199,19 +206,15 @@ fn failing_gate_on_merged_tree_rejects_and_auto_mode_promotes() {
         "rejected entries cannot be promoted"
     );
 
-    // Flip to a passing gate + auto mode: submit-through-promote in one.
+    // Flip to a passing gate: with the DEFAULT config (no config.toml),
+    // verified promotes immediately — auto is the default (2026-07-13).
     std::fs::write(
         tmp.path().join(".aethyme/gates.toml"),
         "[[gate]]\nname = \"ok\"\ncommand = \"true\"\ntriggers = [\"**/*.py\"]\n",
     )
     .unwrap();
-    std::fs::write(
-        tmp.path().join(".aethyme/config.toml"),
-        "[promote]\nmode = \"auto\"\n",
-    )
-    .unwrap();
     commit_edit(&wt, "src/a.py", "a = 4\n");
     let outcome = broker.submit(session.id).unwrap();
     assert_eq!(outcome.entry.status, MergeStatus::Promoted);
-    assert!(outcome.promoted);
+    assert!(outcome.promoted, "auto-promote is the default");
 }

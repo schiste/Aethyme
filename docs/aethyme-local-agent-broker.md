@@ -71,9 +71,11 @@ contracts, so any future delivery surface is a client, not a rewrite.
 - **Promotion lands on a local integration branch only.** The broker never
   pushes and never opens PRs; GitHub review/PR flow stays fully human and
   unchanged in v0.
-- **Promotion trigger is configurable, manual by default.** Gates passing
-  marks a submission verified; `promote = "auto"` in config flips to
-  immediate promotion once gates have earned trust during the dogfood.
+- **Promotion trigger is configurable — auto by default** (amended
+  2026-07-13 after the first dogfood run: verified means verified, and a
+  human promote step makes the human the bottleneck). Gates passing
+  promotes immediately; `[promote] mode = "manual"` restores the explicit
+  `broker promote` step.
 
 ## Current state (be precise about this)
 

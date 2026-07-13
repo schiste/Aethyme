@@ -41,8 +41,10 @@ aethyme broker status
 aethyme broker events --since <id>       # or --follow in a spare terminal
 
 # An agent's work is committed and ready:
-aethyme broker submit --session <id>     # simulate → affected gates on the merged tree
-aethyme broker promote --entry <id>      # advance the LOCAL integration branch
+aethyme broker submit --session <id>     # simulate → affected gates on merged tree
+                                         # → auto-promotes to the LOCAL integration
+                                         # branch when verified (default; [promote]
+                                         # mode = "manual" for an explicit step)
 
 # Shipping stays yours — the broker never pushes:
 git merge aethyme/integration            # or cherry-pick / branch + PR, your call

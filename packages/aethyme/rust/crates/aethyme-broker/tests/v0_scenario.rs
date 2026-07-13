@@ -89,17 +89,19 @@ fn v0_three_agents_end_to_end() {
     assert_eq!(overlaps[0].session_b, bob.id);
     assert_eq!(overlaps[0].path, "src/auth.py");
 
-    // ── alice submits: clean, gated, verified; then promoted ─────────
+    // ── alice submits: clean, gated, verified → auto-promoted ────────
     let alice_out = broker.submit(alice.id).unwrap();
-    assert_eq!(alice_out.entry.status, MergeStatus::Verified);
+    assert_eq!(alice_out.entry.status, MergeStatus::Promoted);
+    assert!(
+        alice_out.promoted,
+        "verified promotes immediately by default"
+    );
     assert_eq!(alice_out.gate_outcomes.len(), 1);
     assert!(!alice_out.gate_outcomes[0].cached, "first run executes");
-    broker.promote(alice_out.entry.id).unwrap();
 
-    // ── carol submits: clean vs the MOVED base, verified, promoted ───
+    // ── carol submits: clean vs the MOVED base → auto-promoted ───────
     let carol_out = broker.submit(carol.id).unwrap();
-    assert_eq!(carol_out.entry.status, MergeStatus::Verified);
-    broker.promote(carol_out.entry.id).unwrap();
+    assert_eq!(carol_out.entry.status, MergeStatus::Promoted);
 
     // ── bob submits: conflict, rejected before any gate ran ──────────
     let bob_out = broker.submit(bob.id).unwrap();
@@ -115,8 +117,7 @@ fn v0_three_agents_end_to_end() {
     sh(&bob_wt, &["reset", "-q", "--hard", "FETCH_HEAD"]);
     commit_edit(&bob_wt, "src/auth.py", "auth = 300\n");
     let bob_retry = broker.submit(bob.id).unwrap();
-    assert_eq!(bob_retry.entry.status, MergeStatus::Verified);
-    broker.promote(bob_retry.entry.id).unwrap();
+    assert_eq!(bob_retry.entry.status, MergeStatus::Promoted);
 
     // ── the integration branch contains everyone's final work ────────
     let show = |path: &str| {

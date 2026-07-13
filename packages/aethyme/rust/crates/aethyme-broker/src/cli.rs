@@ -38,14 +38,17 @@ Usage:
       session's obsolete in-flight runs; stops at first failure.
   aethyme broker submit --session <id> [--json]
       Submit the session's head commit: simulate the merge onto the local
-      integration branch, run affected gates on the merged tree, and (in
-      auto mode) promote. Conflicts reject before any gate runs and write
-      instructions to <worktree>/.aethyme/broker-action-required.md.
+      integration branch, run affected gates on the merged tree, and
+      promote when verified (default; set [promote] mode = 'manual' to
+      hold verified entries for explicit promote). Conflicts reject
+      before any gate runs and write instructions to
+      <worktree>/.aethyme/broker-action-required.md.
   aethyme broker queue [--json]
       Show the merge queue.
   aethyme broker promote --entry <id> [--json]
-      Advance the local integration branch to a verified entry's merge
-      commit; other in-flight entries are re-simulated. Never pushes.
+      Manual-mode only: advance the local integration branch to a verified
+      entry's merge commit; other in-flight entries are re-simulated.
+      Never pushes.
   aethyme broker status [--json]
       The whole picture: agents, overlaps, merge queue, integration head.
   aethyme broker events [--since <event-id>] [--follow] [--json]

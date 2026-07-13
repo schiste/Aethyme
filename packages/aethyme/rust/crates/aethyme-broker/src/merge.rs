@@ -12,8 +12,10 @@
 //!
 //! Boundary contract: the integration branch is **local only** — the
 //! broker never pushes and never opens PRs. The promotion trigger is a
-//! config setting (`[promote] mode = "manual" | "auto"`), manual by
-//! default.
+//! config setting (`[promote] mode = "auto" | "manual"`) — **auto by
+//! default** (decision 2026-07-13, after the first dogfood run: verified
+//! means verified; holding it for a human command makes the human the
+//! bottleneck). `mode = "manual"` restores explicit `broker promote`.
 
 use std::path::Path;
 
@@ -36,7 +38,7 @@ impl PromoteConfig {
     pub fn load(main_root: &Path) -> Self {
         let mut config = Self {
             branch: DEFAULT_INTEGRATION_BRANCH.to_string(),
-            auto: false,
+            auto: true,
         };
         let Ok(text) = std::fs::read_to_string(main_root.join(".aethyme/config.toml")) else {
             return config;
@@ -49,7 +51,7 @@ impl PromoteConfig {
                 config.branch = branch.to_string();
             }
             if let Some(mode) = promote.get("mode").and_then(|v| v.as_str()) {
-                config.auto = mode == "auto";
+                config.auto = mode != "manual";
             }
         }
         config
