@@ -2,8 +2,8 @@
 //! certification"). Three Rust-native phases today:
 //!
 //!   1. certify  — tech preflight (git version, repo, HEAD, binary shadowing)
-//!   2. regulate — generate the document requirements (gates.toml draft,
-//!                 config.toml, .gitignore block)
+//!   2. regulate — generate the document requirements (gates.toml
+//!      draft, config.toml, .gitignore block)
 //!   5. control  — broker store ready, doctor, gates validate
 //!
 //! (Phases 3 `document` and 4 `chart` compose in the Python enhance stack
