@@ -71,6 +71,13 @@ contracts, so any future delivery surface is a client, not a rewrite.
 - **Promotion lands on a local integration branch only.** The broker never
   pushes and never opens PRs; GitHub review/PR flow stays fully human and
   unchanged in v0.
+- **The broker manages conflicts; quality is repo-owned and optional**
+  (clarified 2026-07-13). `gates.toml` is repo policy, not broker policy —
+  the broker is pure mechanism (selection, ordering, caching,
+  cancellation) and runs the repo's checks on the merged tree because
+  that is the only place *semantic* conflicts are detectable. A repo with
+  no `gates.toml` is a valid conflict-only deployment: textual simulation
+  and promotion on clean merges, zero verification, recorded as such.
 - **Promotion trigger is configurable — auto by default** (amended
   2026-07-13 after the first dogfood run: verified means verified, and a
   human promote step makes the human the bottleneck). Gates passing

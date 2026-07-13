@@ -194,7 +194,16 @@ impl Broker {
             ),
         )?;
         let changed = self.repo_handle().changed_between(&base, &merge_commit)?;
-        let gates = crate::gates::load_gates(&self.main_root_path())?;
+        // Conflict-only brokering is valid: a repo with no gates.toml gets
+        // textual merge simulation and promotion on clean merges, with zero
+        // verification — recorded explicitly so nobody mistakes it for a
+        // passing check run. A *malformed* gates.toml stays a hard error
+        // (broken intent, not absent intent).
+        let gates = match crate::gates::load_gates(&self.main_root_path()) {
+            Ok(gates) => gates,
+            Err(crate::gates::GateConfigError::Missing(_)) => Vec::new(),
+            Err(err) => return Err(err.into()),
+        };
         let tmp_dir = self
             .main_root_path()
             .join(".aethyme/run/merge-sim")

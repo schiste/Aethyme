@@ -218,3 +218,29 @@ fn failing_gate_on_merged_tree_rejects_and_auto_mode_promotes() {
     assert_eq!(outcome.entry.status, MergeStatus::Promoted);
     assert!(outcome.promoted, "auto-promote is the default");
 }
+
+#[test]
+fn repo_without_gates_is_a_pure_conflict_manager() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    // Remove the gate config entirely: conflict-only mode.
+    std::fs::remove_file(tmp.path().join(".aethyme/gates.toml")).unwrap();
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let wt = agent_worktree(tmp.path(), "solo");
+    let session = broker.adopt(&wt, None).unwrap();
+    commit_edit(&wt, "src/a.py", "a = 9\n");
+
+    // Clean merge, zero gates configured -> promoted with no verification,
+    // and the outcome makes that visible (empty gate_outcomes).
+    let outcome = broker.submit(session.id).unwrap();
+    assert_eq!(outcome.entry.status, MergeStatus::Promoted);
+    assert!(outcome.gate_outcomes.is_empty());
+
+    // Conflicts are still caught: a second session editing the same line.
+    let wt_b = agent_worktree(tmp.path(), "rival");
+    let rival = broker.adopt(&wt_b, None).unwrap();
+    commit_edit(&wt_b, "src/a.py", "a = 10\n");
+    let out = broker.submit(rival.id).unwrap();
+    assert_eq!(out.entry.status, MergeStatus::Conflict);
+}
