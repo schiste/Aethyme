@@ -15,3 +15,18 @@ Monorepo with primary package at `packages/aethyme/`.
 3. **Audit cross-process consumers before any CLI rename or delete.** Static analysis does not see shell wrappers, deployed skill scripts, hooks, or CI invocations. Before deleting/renaming any Python `cli.py` command or Rust binary subcommand, grep [`packages/aethyme/docs/architecture/cross-process-consumers.md`](packages/aethyme/docs/architecture/cross-process-consumers.md) for callers and update each in the same commit (or accept the breakage with explicit reasoning). If you discover an unlisted consumer mid-migration, add it to the registry — that's how it stays complete.
 
 See [`packages/aethyme/docs/guides/eval-protocol.md`](packages/aethyme/docs/guides/eval-protocol.md) for the full eval protocol including detailed examples of forbidden vs allowed changes.
+
+## Broker Coordination (multi-agent sessions on this repo)
+
+This repository dogfoods the Aethyme broker. If you are one of several
+agent sessions working here concurrently:
+
+1. Before editing, check activity and register your worktree:
+   `aethyme broker status --json`, then `aethyme broker adopt --task "<task>"`
+   (binary: `packages/aethyme/rust/target/release/aethyme`).
+2. Commit early and small; only committed work integrates.
+3. When done, `aethyme broker submit --session <id>` — never merge or push
+   yourself, and never touch the `aethyme/integration` branch directly.
+4. If `.aethyme/broker-action-required.md` appears in your worktree, your
+   submission conflicted: it contains the files, the blocking session, and
+   the exact rebase steps. Resolve and resubmit.

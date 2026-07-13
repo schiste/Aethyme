@@ -143,10 +143,69 @@ def _render_agents_document(root: str, repo: Path | None = None) -> str:
         routing = _render_repo_routing(repo)
         if routing:
             content = f"{content.rstrip()}\n\n{routing}"
+        broker = _render_broker_protocol(repo, root)
+        if broker:
+            content = f"{content.rstrip()}\n\n{broker}"
         override_sections = _render_agents_override_sections(repo)
         if override_sections:
             content = f"{content.rstrip()}\n\n{override_sections}"
     return f"{content.rstrip()}\n"
+
+
+def _render_broker_protocol(repo: Path, root: str) -> str:
+    """Agent-facing broker coordination protocol.
+
+    Rendered only when the repo is broker-configured (gates.toml or
+    config.toml under .aethyme/), so repos that never adopted the broker
+    don't get instructions that fail. Vendor-neutral by design: the
+    protocol is plain shell commands + a file-drop convention, the two
+    integration surfaces every coding agent already has.
+    """
+    if not (
+        (repo / ".aethyme/gates.toml").exists()
+        or (repo / ".aethyme/config.toml").exists()
+    ):
+        return ""
+    binary = f"{root}/rust/target/release/aethyme"
+    return f"""## Broker Coordination (multi-agent repository)
+
+This repository coordinates concurrent agent sessions through the Aethyme
+broker. Other agents may be working in sibling worktrees right now. Follow
+this protocol:
+
+1. **Before editing**, check current activity and register yourself:
+
+   ```bash
+   "{binary}" broker status --json    # who is working on what
+   "{binary}" broker adopt --task "<your task>"   # once, from your worktree
+   ```
+
+   If `status` shows another session holding leases on the files you plan
+   to change, prefer working elsewhere first or say so in your report —
+   overlapping edits will conflict at merge time.
+
+2. **While working**: commit early and small. Only committed work can be
+   verified and integrated. Never switch branches inside someone else's
+   worktree; never edit files outside your own worktree.
+
+3. **When your task is complete**, submit your head commit for verified
+   integration instead of merging anything yourself:
+
+   ```bash
+   "{binary}" broker submit --session <your-session-id>
+   ```
+
+   This simulates the merge and runs only the checks your diff affects.
+   Report the outcome (verified / rejected / conflict) in your summary.
+
+4. **If a file named `.aethyme/broker-action-required.md` appears in your
+   worktree**, read it immediately: your submission conflicted. It names
+   the conflicting files, the blocking session, and the exact rebase
+   steps. Resolve, commit, and resubmit.
+
+5. **Never** push, merge to the default branch, or touch the
+   `aethyme/integration` branch directly — integration and shipping are
+   handled through the broker and the human operator."""
 
 
 def _render_repo_routing(repo: Path) -> str:

@@ -27,6 +27,37 @@ def _build_repo(root: Path) -> None:
     (root / "src" / "main.ts").write_text("console.log('demo')\n", encoding="utf-8")
 
 
+def test_agents_document_includes_broker_protocol_only_when_configured(
+    tmp_path: Path,
+) -> None:
+    repo_path = tmp_path / "demo-repo"
+    _build_repo(repo_path)
+
+    # No broker config → no broker section, no failing instructions.
+    deploy(repo_path)
+    agents_text = (repo_path / "AGENTS.md").read_text(encoding="utf-8")
+    assert "Broker Coordination" not in agents_text
+
+    # Broker-configured repo → the protocol appears, with the essentials:
+    # status-before-editing, submit-not-merge, the action-required file,
+    # and the never-touch-integration rule.
+    (repo_path / ".aethyme").mkdir(exist_ok=True)
+    (repo_path / ".aethyme/gates.toml").write_text(
+        '[[gate]]\nname = "ok"\ncommand = "true"\n', encoding="utf-8"
+    )
+    deploy(repo_path, force=True)
+    agents_text = (repo_path / "AGENTS.md").read_text(encoding="utf-8")
+    assert "## Broker Coordination" in agents_text
+    assert "broker status --json" in agents_text
+    assert "broker adopt" in agents_text
+    assert "broker submit" in agents_text
+    assert ".aethyme/broker-action-required.md" in agents_text
+    assert "aethyme/integration" in agents_text
+    # CLAUDE.md renders from the same generated document.
+    claude_text = (repo_path / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "## Broker Coordination" in claude_text
+
+
 def test_enhance_deploy_writes_generated_onboarding(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
