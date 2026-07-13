@@ -79,11 +79,11 @@ consumer. This file exists so that doesn't happen again.
 | `src/eval/orchestrator.py:_build_warm_phase` | Emits the same daemon status/start shell sequence when no tool adapter is supplied, plus legacy fields `engine_bin`, `aethyme_repo`, and `log_path`. | Same as the manifest warm command; tests assert the command shape. |
 | `tests/local/test_eval_warm_phase.py` | Asserts warm phase contains `aethyme-engine-cli`, `daemon status`, `daemon start`, `||`, `.aethyme/engine-daemon.log`, and `listening on`. | Tests fail if the warm command contract changes without updating the test and this registry. |
 
-### Rust `aethyme` router ↔ Python daemon (previously unlisted; added 2026-07-09)
+### Rust `aethyme` router ↔ Python daemon (REMOVED 2026-07-13, issue #29)
 
 | Source | Invokes / assumes | Failure mode |
 |---|---|---|
-| `rust/crates/aethyme-engine/src/bin/aethyme.rs` | Spawns `src/daemon.py` (`aethyme daemon start/stop/status`), keeps its socket-path logic (`<repo>/.aethyme/aethyme.sock`, `aethyme-socket.path`) byte-compatible with `src/daemon.py`, and routes `explore` through the Python daemon socket as fallback #2 after the native engine path. | **Known-dead route:** since the 2026-05-08 Python `explore` deletion, `src/daemon.py:_dispatch` answers everything except `ping` with `unknown daemon command`, so the router's Python-daemon fallback can no longer serve `explore`. The router still degrades to the cold `python -m src.cli` path (fallback #3), which also rejects `explore`. Removing `src/daemon.py` or changing its socket layout requires a coordinated change to `aethyme.rs` — do not delete one side alone. |
+| ~~`rust/crates/aethyme-engine/src/bin/aethyme.rs` ↔ `src/daemon.py`~~ | Both sides removed in the same commit (the coordinated change this row demanded). The router's `daemon` subcommand, Python-daemon socket fallback, and socket-path logic are gone; `explore` routes native engine → cold `python -m src.cli` only. `src/daemon.py` and its `cli.py` registration are deleted. | Any out-of-repo script calling `aethyme daemon start/stop/status` (repo-socket flavor, `aethyme.sock` / `aethyme-socket.path`) now falls through to the Python CLI, which reports an unknown command. The **engine** daemon (`aethyme-engine-cli daemon ...`, `engine-<hash>.sock`, eval warm phase) is a separate live contract and is unaffected — see the engine-daemon rows above. |
 
 | Workflow | Calls | Failure mode |
 |---|---|---|

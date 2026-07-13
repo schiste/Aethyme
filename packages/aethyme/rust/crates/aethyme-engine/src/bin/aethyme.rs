@@ -2,44 +2,31 @@
 //! `aethyme` command.
 //!
 //! Today this is a thin client that:
-//!   1. Detects whether an `aethyme` daemon is running for the target repo
-//!      (`<repo>/.aethyme/aethyme.sock`) and routes the request through it
-//!      if so. Daemon mode amortizes Python interpreter + import startup
-//!      cost across many calls — the headline latency win.
-//!   2. Falls back to invoking the Python CLI (`python -m src.cli ...`)
-//!      when no daemon is present. Same behaviour as today; just a friendlier
-//!      entry point.
+//!   1. Serves `explore` natively via the sibling `aethyme-engine-cli`
+//!      binary (in-process engine, no Python involved).
+//!   2. Serves `broker` and `certify` natively (aethyme-broker crate).
+//!   3. Delegates everything else to the Python CLI
+//!      (`python -m src.cli ...`).
 //!
-//! Future direction: individual hot-path subcommands (explore in particular)
-//! move to native Rust by linking `aethyme-engine` as a library and
-//! reimplementing the orchestration layer that currently lives in Python.
-//! See packages/aethyme/docs/architecture/aethyme-cli-design.md (TBD).
+//! The Python warm-state daemon (`src/daemon.py`) and its socket routing
+//! were removed on 2026-07-13 (issue #29): the route had been dead since
+//! the 2026-05-08 Python `explore` deletion — the daemon answered nothing
+//! but `ping`. Warm-state serving is owned by the engine daemon
+//! (`aethyme-engine-cli daemon ...`), which is a separate, live contract.
 //!
 //! Subcommands today:
-//!   aethyme explore --repo X --request "..."   → daemon-routed if available
-//!   aethyme daemon start --repo X              → spawn the Python daemon
-//!   aethyme daemon stop --repo X               → terminate the daemon
-//!   aethyme daemon status --repo X             → check daemon health
-//!   aethyme <anything else>                    → delegate to Python CLI
+//!   aethyme explore --repo X --request "..."   → native engine path
+//!   aethyme certify / aethyme broker ...        → native broker crate
+//!   aethyme <anything else>                     → delegate to Python CLI
 //!
-//! The repo path is required for daemon routing and is found by:
+//! The repo path for explore is found by:
 //!   1. `--repo <path>` flag (explicit)
 //!   2. `$AETHYME_REPO` env var
 //!   3. current directory
 
 use std::env;
-use std::fs;
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
-use std::time::Duration;
-
-use sha2::{Digest, Sha256};
-
-const AETHYME_DIR: &str = ".aethyme";
-const SOCKET_INFO_FILENAME: &str = "aethyme-socket.path";
-const DAEMON_CONNECT_TIMEOUT_MS: u64 = 200;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -54,7 +41,6 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "explore" => run_explore(&args[1..]),
-        "daemon" => run_daemon_subcommand(&args[1..]),
         // Broker commands are native Rust from birth (issue #31) — never
         // delegated to Python.
         "broker" => ExitCode::from(aethyme_broker::cli::run(&args[1..])),
@@ -77,12 +63,7 @@ fn print_top_level_help() {
     eprintln!();
     eprintln!("Hot path:");
     eprintln!("  explore --repo <path> --request \"<task>\" [--format answer-json]");
-    eprintln!("                              high-level localization, daemon-routed if available");
-    eprintln!();
-    eprintln!("Daemon:");
-    eprintln!("  daemon start --repo <path>  start the warm-state daemon for a repo");
-    eprintln!("  daemon stop  --repo <path>  terminate the daemon");
-    eprintln!("  daemon status --repo <path> health-check the daemon");
+    eprintln!("                              high-level localization via the native engine");
     eprintln!();
     eprintln!("Agent broker:");
     eprintln!("  certify                     read-only certification checks for this repo");
@@ -96,33 +77,14 @@ fn print_top_level_help() {
 //
 // Routing precedence (best to worst):
 //   1. Native Rust path via the engine daemon (in-process, no subprocess
-//      spawn). Returns answer-json directly. Session-1 scope: anchors +
-//      in-scope files only; trust capped at needs_verification.
-//   2. Python daemon socket (the Python explore orchestrator running as a
-//      long-lived process). Richer evidence — symbol search, source-text,
-//      callsite expansion. Pays Python startup once at daemon start.
-//   3. Python subprocess fallback. Pays Python startup every call.
-//
-// Each step falls through on failure so the caller always gets an answer
-// (or a clean "daemon not running" + subprocess output).
+//      spawn). Returns answer-json directly.
+//   2. Python subprocess fallback (cold start every call). Kept only so a
+//      broken engine install degrades with a readable error instead of
+//      nothing.
 
 fn run_explore(args: &[String]) -> ExitCode {
-    let repo = resolve_repo(args);
-
-    if let Some(repo_path) = repo.as_ref() {
-        // Native Rust path is the preferred route when the engine daemon
-        // is up. In-process call into the engine library; no subprocess
-        // overhead, no inter-binary roundtrip.
-        if let Some(exit) = try_native_explore(repo_path, args) {
-            return exit;
-        }
-
-        // Python daemon (warm Python state). One subprocess hop instead
-        // of two (skips the per-call interpreter startup).
-        if let Some(response) = try_daemon(repo_path, "explore", args) {
-            print!("{response}");
-            return ExitCode::SUCCESS;
-        }
+    if let Some(exit) = try_native_explore(args) {
+        return exit;
     }
 
     // Cold Python subprocess.
@@ -141,15 +103,8 @@ fn run_explore(args: &[String]) -> ExitCode {
 /// always honor whatever exit code the engine CLI returned, including
 /// failures); only returns None on infrastructure errors (binary
 /// missing, fork failure) so the caller can fall through to the
-/// Python daemon / Python subprocess path.
-///
-/// Pre-widening this used to gate on session-1 limitations (compact
-/// detail only, no --intent, no --params) and bail to Python for
-/// anything richer. Since sessions 2-5 + the four deployment items
-/// closed those gaps, the native binary handles everything; the gate
-/// is now removed.
-fn try_native_explore(repo: &Path, args: &[String]) -> Option<ExitCode> {
-    let _ = repo; // No longer needed for capability gating.
+/// Python subprocess path.
+fn try_native_explore(args: &[String]) -> Option<ExitCode> {
     let cli_path = engine_cli_binary_path()?;
     let mut cmd = Command::new(&cli_path);
     cmd.arg("explore");
@@ -161,7 +116,7 @@ fn try_native_explore(repo: &Path, args: &[String]) -> Option<ExitCode> {
         Ok(status) => {
             // exit code 2 from aethyme-engine-cli is the documented
             // "daemon not running" signal; falling back to the Python
-            // daemon / subprocess path is the right move.
+            // subprocess path is the right move.
             if status.code() == Some(2) {
                 return None;
             }
@@ -189,119 +144,6 @@ fn engine_cli_binary_path() -> Option<PathBuf> {
     // PATH fallback — useful when the binaries aren't co-located
     // (e.g. installed separately into different bin dirs).
     Some(PathBuf::from("aethyme-engine-cli"))
-}
-
-fn try_daemon(repo: &Path, command: &str, args: &[String]) -> Option<String> {
-    let socket_path = daemon_socket_path(repo)?;
-    if !socket_path.exists() {
-        return None;
-    }
-
-    let mut stream = match UnixStream::connect(&socket_path) {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
-
-    // Bound the read so a hung daemon doesn't block forever; falling back to
-    // the Python CLI is always safe.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(DAEMON_CONNECT_TIMEOUT_MS * 5)));
-
-    let request = serde_json::json!({
-        "command": command,
-        "args": args,
-    });
-    let request_line = format!("{}\n", request);
-    if stream.write_all(request_line.as_bytes()).is_err() {
-        return None;
-    }
-    if stream.flush().is_err() {
-        return None;
-    }
-
-    let mut response = String::new();
-    if stream.read_to_string(&mut response).is_err() {
-        return None;
-    }
-    if response.is_empty() {
-        return None;
-    }
-    Some(response)
-}
-
-// ── daemon subcommand ───────────────────────────────────────────────────────
-
-fn run_daemon_subcommand(args: &[String]) -> ExitCode {
-    if args.is_empty() {
-        eprintln!("usage: aethyme daemon <start|stop|status> --repo <path>");
-        return ExitCode::from(2);
-    }
-
-    let action = &args[0];
-    let repo = match resolve_repo(&args[1..]) {
-        Some(p) => p,
-        None => {
-            eprintln!("aethyme daemon: --repo <path> is required (or set $AETHYME_REPO)");
-            return ExitCode::from(2);
-        }
-    };
-
-    match action.as_str() {
-        "status" => daemon_status(&repo),
-        "start" => daemon_start(&repo),
-        "stop" => daemon_stop(&repo),
-        other => {
-            eprintln!("aethyme daemon: unknown action '{other}'");
-            ExitCode::from(2)
-        }
-    }
-}
-
-fn daemon_status(repo: &Path) -> ExitCode {
-    let Some(socket_path) = daemon_socket_path(repo) else {
-        println!(
-            "daemon: not running (no socket pointer for {})",
-            repo.display()
-        );
-        return ExitCode::from(1);
-    };
-    if !socket_path.exists() {
-        println!(
-            "daemon: not running ({} does not exist)",
-            socket_path.display()
-        );
-        return ExitCode::from(1);
-    }
-    match UnixStream::connect(&socket_path) {
-        Ok(_) => {
-            println!("daemon: running ({})", socket_path.display());
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            println!(
-                "daemon: socket exists but connection failed: {e} ({})",
-                socket_path.display()
-            );
-            ExitCode::from(1)
-        }
-    }
-}
-
-fn daemon_start(repo: &Path) -> ExitCode {
-    // Delegate to the Python daemon implementation. The Python CLI owns the
-    // explore orchestration logic; the daemon just keeps the interpreter and
-    // its imports warm across many calls.
-    delegate_to_python(
-        "daemon",
-        &["start".into(), "--repo".into(), repo.display().to_string()],
-    )
-}
-
-fn daemon_stop(repo: &Path) -> ExitCode {
-    delegate_to_python(
-        "daemon",
-        &["stop".into(), "--repo".into(), repo.display().to_string()],
-    )
 }
 
 // ── delegation to Python ────────────────────────────────────────────────────
@@ -345,72 +187,4 @@ fn delegate_to_python(subcommand: &str, args: &[String]) -> ExitCode {
             ExitCode::from(127)
         }
     }
-}
-
-// ── socket path resolution (must match src/daemon.py) ──────────────────────
-//
-// The daemon binds to $TMPDIR/aethyme/daemon-<hash>.sock, where <hash> is the
-// first 16 hex chars of SHA-256 of the repo's resolved (canonical) path.
-// macOS limits AF_UNIX paths to ~104 bytes, which many Aethyme-enhanced repo
-// paths exceed; the indirection is mandatory.
-//
-// As a safety net we also read .aethyme/aethyme-socket.path inside the repo
-// when present — that's the pointer file the daemon writes for any tool that
-// would rather not recompute the hash.
-
-fn daemon_socket_path(repo: &Path) -> Option<PathBuf> {
-    let canonical = match repo.canonicalize() {
-        Ok(p) => p,
-        Err(_) => repo.to_path_buf(),
-    };
-
-    // Pointer file path takes priority: it's authoritative for any daemon
-    // started with a different convention (or via a different binary).
-    let info = canonical.join(AETHYME_DIR).join(SOCKET_INFO_FILENAME);
-    if let Ok(text) = fs::read_to_string(&info) {
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
-
-    let mut hasher = Sha256::new();
-    hasher.update(canonical.to_string_lossy().as_bytes());
-    let digest = hasher.finalize();
-    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    let tmp = env::var("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"));
-    Some(tmp.join("aethyme").join(format!("daemon-{hex}.sock")))
-}
-
-// ── helpers ─────────────────────────────────────────────────────────────────
-
-fn resolve_repo(args: &[String]) -> Option<PathBuf> {
-    if let Some(value) = find_arg(args, "--repo") {
-        return Some(PathBuf::from(value));
-    }
-    if let Ok(repo) = env::var("AETHYME_REPO") {
-        if !repo.is_empty() {
-            return Some(PathBuf::from(repo));
-        }
-    }
-    env::current_dir().ok()
-}
-
-fn find_arg(args: &[String], flag: &str) -> Option<String> {
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == flag {
-            if i + 1 < args.len() {
-                return Some(args[i + 1].clone());
-            }
-            return None;
-        }
-        if let Some(rest) = args[i].strip_prefix(&format!("{flag}=")) {
-            return Some(rest.to_string());
-        }
-        i += 1;
-    }
-    None
 }
