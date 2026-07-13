@@ -58,6 +58,9 @@ fn main() -> ExitCode {
         // Broker commands are native Rust from birth (issue #31) — never
         // delegated to Python.
         "broker" => ExitCode::from(aethyme_broker::cli::run(&args[1..])),
+        // Certification pipeline — top-level by design (the "airport
+        // certification" umbrella), implemented in the broker crate.
+        "init" => ExitCode::from(aethyme_broker::cli::run(&args)),
         other => {
             // Unknown to the Rust client — pass straight through to Python.
             // This includes commands like `intents`, `enhance`, `eval`, etc.
@@ -81,6 +84,7 @@ fn print_top_level_help() {
     eprintln!("  daemon status --repo <path> health-check the daemon");
     eprintln!();
     eprintln!("Agent broker:");
+    eprintln!("  init [--check]              certify + set up this repo for the broker");
     eprintln!("  broker adopt|start-agent|agents|cleanup   (see `broker --help`)");
     eprintln!();
     eprintln!("Everything else delegates to the Python CLI:");

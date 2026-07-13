@@ -14,6 +14,11 @@ const USAGE: &str = "\
 aethyme broker — coordinate concurrent AI agent sessions on this repository
 
 Usage:
+  aethyme init [--check] [--json]      (also: aethyme broker init)
+      Certification pipeline: preflight the repo, generate missing broker
+      config (gates.toml draft, config.toml, .gitignore block), verify.
+      --check is strictly read-only and exits non-zero on failed checks —
+      run it in CI/cron as a recurring inspection.
   aethyme broker adopt [<path>] [--task <text>] [--json]
       Register an existing worktree (attach-first). Defaults to the
       current directory.
@@ -114,6 +119,7 @@ struct Parsed {
     follow: bool,
     json: bool,
     force: bool,
+    check: bool,
 }
 
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
@@ -130,6 +136,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         follow: false,
         json: false,
         force: false,
+        check: false,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -145,6 +152,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 })?);
             }
             "--force" => parsed.force = true,
+            "--check" => parsed.check = true,
             "--kind" => {
                 parsed.kind = Some(
                     iter.next()
@@ -689,6 +697,44 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 } else {
                     return Err(UsageError::Message("doctor found problems".into()));
                 }
+            }
+        }
+        "init" => {
+            let cwd = std::env::current_dir()
+                .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
+            let check_mode = parsed.check;
+            let report = crate::init::run(&cwd, check_mode)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for check in &report.checks {
+                    let tag = match check.status {
+                        crate::init::CheckStatus::Pass => "pass",
+                        crate::init::CheckStatus::Created => "created",
+                        crate::init::CheckStatus::Warn => "warn",
+                        crate::init::CheckStatus::Fail => "FAIL",
+                        crate::init::CheckStatus::Skipped => "skip",
+                    };
+                    println!("{tag:<8} {:<28} {}", check.id, check.detail);
+                }
+                println!();
+                if report.certified() {
+                    println!(
+                        "Certified{}. Next: adopt a worktree (`aethyme broker adopt --task \"...\"`), then `aethyme broker status`.",
+                        if check_mode {
+                            " (check mode — nothing written)"
+                        } else {
+                            ""
+                        }
+                    );
+                } else {
+                    return Err(UsageError::Message(
+                        "certification failed — fix the FAIL items above".into(),
+                    ));
+                }
+            }
+            if !report.certified() {
+                return Err(UsageError::Message("certification failed".into()));
             }
         }
         "cleanup" => {

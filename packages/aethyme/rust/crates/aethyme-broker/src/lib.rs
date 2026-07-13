@@ -26,6 +26,7 @@ mod error;
 pub mod events;
 mod gates;
 mod git;
+pub mod init;
 mod leases;
 mod merge;
 mod schema;
