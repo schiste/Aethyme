@@ -76,6 +76,23 @@ impl Broker {
         let config = PromoteConfig::load(&self.main_root_path());
         let repo = self.repo_handle();
         if let Some(commit) = repo.resolve_ref(&config.branch) {
+            // Issue #40: the integration branch follows main. Fast-forward
+            // it when it is an ancestor of the main checkout's HEAD — i.e.
+            // everything it holds is already in main, so nothing promoted
+            // can be lost. When it holds unmerged promotions (not
+            // reachable from HEAD), it is left strictly alone.
+            let head = repo.head_commit()?;
+            if commit != head && repo.is_ancestor(&commit, &head) {
+                repo.update_branch_ref(&config.branch, &head)?;
+                let payload =
+                    crate::events::integration_refreshed_payload(&config.branch, &commit, &head);
+                self.store().append_event(
+                    crate::events::MERGE_INTEGRATION_REFRESHED,
+                    None,
+                    Some(&payload),
+                )?;
+                return Ok((config.branch, head));
+            }
             return Ok((config.branch, commit));
         }
         let head = repo.head_commit()?;
