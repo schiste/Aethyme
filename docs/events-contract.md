@@ -59,6 +59,7 @@ One JSON object per line:
 | `merge.promoted` | the session | `branch`, `commit` | integration branch advanced |
 | `merge.superseded` | the session | — | a newer head from the same session replaced this entry |
 | `merge.integration_branch_created` | — | `branch`, `at` | first submit created the local integration branch |
+| `merge.integration_refreshed` | — | `branch`, `from`, `to` | integration fast-forwarded to main's HEAD (only when it held no unmerged promotions) |
 
 ## Operational commands
 

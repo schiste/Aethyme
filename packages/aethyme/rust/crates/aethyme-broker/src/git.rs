@@ -133,6 +133,17 @@ impl GitRepo {
         .ok()
     }
 
+    /// True when `ancestor` is reachable from `descendant`
+    /// (`git merge-base --is-ancestor`).
+    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
+        Command::new("git")
+            .args(["merge-base", "--is-ancestor", ancestor, descendant])
+            .current_dir(&self.root)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
     /// Create or fast-move a local branch ref to `commit` (no checkout).
     pub fn update_branch_ref(&self, branch: &str, commit: &str) -> Result<(), GitError> {
         run_git(

@@ -244,3 +244,44 @@ fn repo_without_gates_is_a_pure_conflict_manager() {
     let out = broker.submit(rival.id).unwrap();
     assert_eq!(out.entry.status, MergeStatus::Conflict);
 }
+
+#[test]
+fn integration_follows_main_but_never_clobbers_unmerged_promotions() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    // Branch created at main HEAD; main then advances → integration
+    // fast-forwards on the next touch (issue #40), with an event.
+    let (_branch, base) = broker.integration_head().unwrap();
+    assert_eq!(base, resolve(tmp.path(), "main"));
+    std::fs::write(tmp.path().join("src/new.py"), "n\n").unwrap();
+    sh(tmp.path(), &["add", "-A"]);
+    sh(tmp.path(), &["commit", "-qm", "main advances"]);
+    let (_branch, refreshed) = broker.integration_head().unwrap();
+    assert_eq!(refreshed, resolve(tmp.path(), "main"), "fast-forwarded");
+    let events = broker.store().events_after(0, i64::MAX).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "merge.integration_refreshed")
+    );
+
+    // A promotion puts a merge commit on integration that main lacks:
+    // advancing main afterwards must NOT clobber it.
+    let wt = agent_worktree(tmp.path(), "keeper");
+    let session = broker.adopt(&wt, None).unwrap();
+    commit_edit(&wt, "src/a.py", "a = 40\n");
+    let out = broker.submit(session.id).unwrap();
+    assert!(out.promoted);
+    let promoted_tip = resolve(tmp.path(), "aethyme/integration");
+
+    std::fs::write(tmp.path().join("src/other.py"), "o\n").unwrap();
+    sh(tmp.path(), &["add", "-A"]);
+    sh(tmp.path(), &["commit", "-qm", "main advances again"]);
+    let (_branch, still) = broker.integration_head().unwrap();
+    assert_eq!(
+        still, promoted_tip,
+        "unmerged promotions are never clobbered by a refresh"
+    );
+}

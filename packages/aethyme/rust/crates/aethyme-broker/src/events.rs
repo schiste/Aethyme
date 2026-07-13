@@ -24,6 +24,7 @@ pub const LEASE_OVERLAP: &str = "lease.overlap";
 // gate.<status> kinds derive from GateStatus::as_str (pass/fail/cancelled/error).
 // merge.<status> kinds derive from MergeStatus::as_str.
 pub const MERGE_INTEGRATION_BRANCH_CREATED: &str = "merge.integration_branch_created";
+pub const MERGE_INTEGRATION_REFRESHED: &str = "merge.integration_refreshed";
 
 // ── payload constructors ─────────────────────────────────────────────
 // Each returns the canonical JSON payload for its kind. Field names are
@@ -51,6 +52,10 @@ pub fn merge_submitted_payload(head: &str) -> String {
 
 pub fn integration_branch_created_payload(branch: &str, at_commit: &str) -> String {
     json!({ "branch": branch, "at": at_commit }).to_string()
+}
+
+pub fn integration_refreshed_payload(branch: &str, from: &str, to: &str) -> String {
+    json!({ "branch": branch, "from": from, "to": to }).to_string()
 }
 
 pub fn merge_promoted_payload(branch: &str, commit: &str) -> String {
