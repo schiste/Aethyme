@@ -22,6 +22,28 @@ use crate::types::{
 /// Milliseconds a writer waits on a locked database before erroring.
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 
+/// Retries for the fresh-database open race (see [`BrokerStore::open`]).
+/// Backoff is 25ms × attempt, so 10 retries bound the wait at ~1.4s —
+/// far longer than the one-time WAL switch ever takes.
+const OPEN_RETRIES: u64 = 10;
+
+/// Errors that racing fresh openers legitimately see while another
+/// connection holds the exclusive lock for the journal-mode switch or
+/// the first migration. Everything else is real and must propagate.
+fn is_transient_open_error(err: &BrokerError) -> bool {
+    let BrokerError::Sqlite(sqlite_err) = err else {
+        return false;
+    };
+    matches!(
+        sqlite_err.sqlite_error_code(),
+        Some(
+            rusqlite::ErrorCode::DatabaseBusy
+                | rusqlite::ErrorCode::DatabaseLocked
+                | rusqlite::ErrorCode::SystemIoFailure
+        )
+    )
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -43,6 +65,14 @@ impl BrokerStore {
 
     /// Open (creating and migrating if needed) a broker database at an
     /// explicit path. Parent directories are created.
+    ///
+    /// The very first open of a database is contended in a way steady-state
+    /// opens are not: the delete→WAL journal-mode switch takes an exclusive
+    /// lock that `busy_timeout` does not reliably cover, so simultaneous
+    /// fresh openers can see SQLITE_BUSY — and on macOS the mid-switch
+    /// shm/wal transition can surface as SQLITE_IOERR. Both are transient
+    /// and resolve as soon as one opener wins, so retry with backoff
+    /// instead of failing the losing agents.
     pub fn open(db_path: &Path) -> Result<Self, BrokerError> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| BrokerError::Io {
@@ -50,6 +80,20 @@ impl BrokerStore {
                 source,
             })?;
         }
+        let mut attempt: u64 = 0;
+        loop {
+            match Self::open_once(db_path) {
+                Ok(store) => return Ok(store),
+                Err(err) if attempt < OPEN_RETRIES && is_transient_open_error(&err) => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(25 * attempt));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn open_once(db_path: &Path) -> Result<Self, BrokerError> {
         let conn = Connection::open(db_path)?;
         conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
         // WAL: readers never block the writer and vice versa. NORMAL sync
