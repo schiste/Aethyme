@@ -394,6 +394,18 @@ impl BrokerStore {
         result.transpose()
     }
 
+    /// Aggregate executed gate runs (pass/fail only): (gate, runs,
+    /// total_duration_ms). For the metrics/kill-criterion report.
+    pub fn gate_execution_totals(&self) -> Result<Vec<(String, i64, i64)>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT gate_name, COUNT(*), SUM(COALESCE(duration_ms, 0))
+             FROM gate_results WHERE status IN ('pass', 'fail')
+             GROUP BY gate_name ORDER BY gate_name",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     // ── merge queue ───────────────────────────────────────────────────
 
     /// Submit a session head. Idempotent per (session, head): resubmitting

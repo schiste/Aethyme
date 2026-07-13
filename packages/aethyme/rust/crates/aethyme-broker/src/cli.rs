@@ -72,6 +72,11 @@ Usage:
   aethyme broker events prune --keep-days <n> [--json]
       Retention: delete events older than <n> days. Event ids stay
       strictly increasing, so existing --since cursors remain valid.
+  aethyme broker metrics [--json]
+      Cost/benefit accounting from safe local telemetry: broker command
+      latency (names + numbers only, never task text or paths), gate
+      executions vs cache hits with time saved, conflicts caught before
+      any gate ran, overlaps warned.
   aethyme broker doctor [--json]
       Health checks: database integrity, sessions whose worktree is
       gone, and orphaned gate pidfiles.
@@ -91,7 +96,8 @@ fn now_ms() -> i64 {
 
 /// Entry point for the router. Returns a process exit code.
 pub fn run(args: &[String]) -> u8 {
-    match run_inner(args) {
+    let started = std::time::Instant::now();
+    let code = match run_inner(args) {
         Ok(()) => 0,
         Err(UsageError::Help) => {
             eprint!("{USAGE}");
@@ -101,6 +107,75 @@ pub fn run(args: &[String]) -> u8 {
             eprintln!("Error: {message}");
             1
         }
+    };
+    record_command_metric(args, code, started.elapsed().as_millis() as i64);
+    code
+}
+
+/// Safe-by-construction command telemetry: the label is built ONLY from
+/// an allowlist of known subcommand words, so positional values (paths,
+/// session ids, task text) can never leak into the metrics file. Best
+/// effort — any failure is silently ignored.
+fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
+    const KNOWN: &[&str] = &[
+        "adopt",
+        "start-agent",
+        "agents",
+        "leases",
+        "claim",
+        "release",
+        "gates",
+        "draft",
+        "validate",
+        "affected",
+        "run",
+        "submit",
+        "queue",
+        "promote",
+        "status",
+        "events",
+        "prune",
+        "metrics",
+        "doctor",
+        "cleanup",
+        "certify",
+        "scaffold",
+    ];
+    let label: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| KNOWN.contains(a))
+        .take(2)
+        .collect();
+    if label.is_empty() || label == ["metrics"] {
+        return; // nothing recognizable, or reading metrics itself
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let Ok(repo) = crate::GitRepo::discover(&cwd) else {
+        return;
+    };
+    let Ok(main_root) = repo.main_root() else {
+        return;
+    };
+    let dir = main_root.join(".aethyme/logs");
+    let _ = std::fs::create_dir_all(&dir);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let line = format!(
+        "{{\"ts\":{ts},\"command\":\"{}\",\"duration_ms\":{duration_ms},\"exit\":{exit}}}\n",
+        label.join(".")
+    );
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("command-metrics.jsonl"))
+    {
+        let _ = file.write_all(line.as_bytes());
     }
 }
 
@@ -694,6 +769,85 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(700));
+            }
+        }
+        "metrics" => {
+            let mut broker = open_broker()?;
+            // Gate executions (pass/fail) vs cache hits with saved time.
+            let executed = broker.store().gate_execution_totals()?;
+            let cached = broker
+                .store()
+                .events_after_filtered(0, i64::MAX, Some("gate.cached"))?;
+            let saved_ms: i64 = cached
+                .iter()
+                .filter_map(|e| e.payload_json.as_deref())
+                .filter_map(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                .filter_map(|v| v.get("saved_ms").and_then(|s| s.as_i64()))
+                .sum();
+            let conflicts = broker
+                .store()
+                .events_after_filtered(0, i64::MAX, Some("merge.conflict"))?
+                .len();
+            let overlaps = broker
+                .store()
+                .events_after_filtered(0, i64::MAX, Some("lease.overlap"))?
+                .len();
+
+            // Command latency from the safe telemetry file.
+            let mut commands: std::collections::BTreeMap<String, (i64, i64)> =
+                std::collections::BTreeMap::new();
+            let metrics_path = broker
+                .main_root()
+                .join(".aethyme/logs/command-metrics.jsonl");
+            if let Ok(text) = std::fs::read_to_string(&metrics_path) {
+                for line in text.lines() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                        let name = v
+                            .get("command")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("?")
+                            .to_string();
+                        let ms = v.get("duration_ms").and_then(|d| d.as_i64()).unwrap_or(0);
+                        let entry = commands.entry(name).or_insert((0, 0));
+                        entry.0 += 1;
+                        entry.1 += ms;
+                    }
+                }
+            }
+
+            if parsed.json {
+                let out = serde_json::json!({
+                    "gates_executed": executed.iter().map(|(g, n, ms)| serde_json::json!({
+                        "gate": g, "runs": n, "total_ms": ms,
+                    })).collect::<Vec<_>>(),
+                    "gate_cache_hits": cached.len(),
+                    "gate_time_saved_ms": saved_ms,
+                    "conflicts_caught_pre_gate": conflicts,
+                    "overlaps_warned": overlaps,
+                    "commands": commands.iter().map(|(name, (count, ms))| serde_json::json!({
+                        "command": name, "count": count, "total_ms": ms,
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                println!("Gate executions:");
+                for (gate, runs, ms) in &executed {
+                    println!("  {gate:<20} {runs} run(s), {ms}ms total");
+                }
+                println!(
+                    "Cache hits: {} (≈{}s of checks skipped)",
+                    cached.len(),
+                    saved_ms / 1000
+                );
+                println!("Conflicts caught before any gate ran: {conflicts}");
+                println!("Overlap warnings: {overlaps}");
+                println!("Broker command overhead:");
+                for (name, (count, ms)) in &commands {
+                    println!(
+                        "  {name:<20} {count} call(s), {ms}ms total, {}ms avg",
+                        ms / count.max(&1)
+                    );
+                }
             }
         }
         "doctor" => {

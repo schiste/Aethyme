@@ -51,6 +51,7 @@ One JSON object per line:
 | `lease.overlap` | lower session of the pair | `session_a`, `session_b`, `path` | a NEW overlapping-edit pair is detected (never re-announced) |
 | `gate.pass` / `.fail` / `.error` | submitting session (nullable) | `gate`, `tree` | a gate run concluded against tree `tree` |
 | `gate.cancelled` | the session | `gate`, `tree` | a superseded in-flight run was killed |
+| `gate.cached` | requesting session (nullable) | `gate`, `tree`, `saved_ms` | a cache hit avoided executing a gate (`saved_ms` = the cached run's duration) |
 | `merge.submitted` | the session | `head` | head commit entered the queue (idempotent: once per head) |
 | `merge.simulating` | the session | — | merge-tree simulation started |
 | `merge.conflict` | the session | `conflicts[]`, `blocking_sessions[]`, `base` | simulation found textual conflicts (rejected pre-gate) |
@@ -67,6 +68,12 @@ One JSON object per line:
   with missing worktrees, orphaned gate pidfiles (removed on sight).
   Exit code 0 = healthy; non-zero otherwise (scriptable).
 - `aethyme broker events prune --keep-days <n>` — retention.
+- `aethyme broker metrics [--json]` — cost/benefit accounting: gate
+  executions vs cache hits (time saved), conflicts caught pre-gate,
+  overlap warnings, and broker command latency. Command telemetry
+  (`.aethyme/logs/command-metrics.jsonl`) is safe by construction: the
+  command label is allowlisted subcommand words only — task text, paths,
+  and ids can never appear in it.
 
 ## Rules for broker developers
 

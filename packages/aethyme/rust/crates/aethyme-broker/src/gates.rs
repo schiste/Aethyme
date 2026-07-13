@@ -262,8 +262,19 @@ pub fn run_affected(
     let mut outcomes = Vec::new();
     for selection in selections {
         let gate = selection.gate;
-        // Cache: conclusive result for this exact tree, any session.
+        // Cache: conclusive result for this exact tree, any session. The
+        // hit is recorded as an event so saved execution time is
+        // measurable (kill-criterion accounting).
         if let Some(hit) = store.cached_gate_result(&gate.name, &tree)? {
+            let _ = store.append_event(
+                crate::events::GATE_CACHED,
+                session_id,
+                Some(&crate::events::gate_cached_payload(
+                    &gate.name,
+                    &tree,
+                    hit.duration_ms.unwrap_or(0),
+                )),
+            );
             let failed = hit.status == GateStatus::Fail;
             outcomes.push(GateRunOutcome {
                 gate: gate.name.clone(),

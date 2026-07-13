@@ -22,6 +22,7 @@ pub const LEASE_CLAIMED: &str = "lease.claimed";
 pub const LEASE_RELEASED: &str = "lease.released";
 pub const LEASE_OVERLAP: &str = "lease.overlap";
 // gate.<status> kinds derive from GateStatus::as_str (pass/fail/cancelled/error).
+pub const GATE_CACHED: &str = "gate.cached";
 // merge.<status> kinds derive from MergeStatus::as_str.
 pub const MERGE_INTEGRATION_BRANCH_CREATED: &str = "merge.integration_branch_created";
 pub const MERGE_INTEGRATION_REFRESHED: &str = "merge.integration_refreshed";
@@ -44,6 +45,12 @@ pub fn lease_path_payload(path: &str) -> String {
 
 pub fn gate_result_payload(gate: &str, tree: &str) -> String {
     json!({ "gate": gate, "tree": tree }).to_string()
+}
+
+/// `saved_ms` is the cached run's recorded duration — the execution time
+/// this cache hit avoided.
+pub fn gate_cached_payload(gate: &str, tree: &str, saved_ms: i64) -> String {
+    json!({ "gate": gate, "tree": tree, "saved_ms": saved_ms }).to_string()
 }
 
 pub fn merge_submitted_payload(head: &str) -> String {
