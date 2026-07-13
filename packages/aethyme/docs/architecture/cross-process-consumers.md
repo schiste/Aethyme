@@ -65,7 +65,7 @@ consumer. This file exists so that doesn't happen again.
 | `scripts/eval/verify-playground.sh:131-138` | Greps deployed SKILL.md for command names (`src.cli intents`, `aethyme explore`, `analyze dead-code`, `facts function-usage`) | False positive/negative on health check if SKILL.md template changes wording but verify-playground doesn't update its grep patterns. **Updated 2026-05-08 after the explore hard-delete to expect native `aethyme explore` not `src.cli explore`.** |
 | `scripts/docs/generate-docs.sh:38` | Reads `src/cli.py` to extract command help | Doc generation fails if `cli.py` moved/renamed. |
 | `scripts/migrate.sh` | psql / `alembic upgrade head` (no Aethyme entry point) | DB migration; not a cross-process Aethyme consumer. |
-| `scripts/start-api.sh` | `uvicorn src.api.main:app` | API server start; depends on `src.api.main` existing. |
+| `scripts/start-api.sh` (REMOVED 2026-07-13) | Deleted with the Gen-0 PostgreSQL lineage (`src/api`, `src/graph`, tenant CLI commands `index/stats/ego/impact/search`). Any external caller of those entry points was already dead or must migrate to the engine CLI (`query`/`graph` commands). | — |
 
 ### Python engine adapter and eval warm phases
 

@@ -39,9 +39,9 @@ Core does not expose login or registration routes.
 
 Use one of these:
 
-- a bearer token issued by `packages/aethyme-cloud`
-- a scoped API key
-- the local test helpers in [`../../tests/support/auth_db.py`](../../tests/support/auth_db.py)
+- (removed 2026-07-13) the bearer-token/API-key flow belonged to the
+  Gen-0 PostgreSQL lineage, deleted with `src/graph`; local workflows
+  need no credentials
 
 ```bash
 export TOKEN='<trusted-bearer-token>'

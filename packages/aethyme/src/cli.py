@@ -37,8 +37,6 @@ from src.eval.navigation_ctf import (
     run_navigation_ctf_evaluation,
 )
 from src.eval.repos import create_condition_repos
-from src.graph.connection_pool import db_pool
-from src.graph.store import GraphStore
 from src.indexing.engine import (
     EngineError,
     build_task_context,
@@ -75,7 +73,6 @@ from src.indexing.engine import (
     impact_frontier as rust_impact_frontier,
 )
 from src.indexing.repository_snapshot import capture_snapshot
-from src.indexing.service import RepositoryIndexRequest, run_indexing
 from src.rendering.context_pack import render_explain_repo_text, render_pack_summary
 
 # Configure logging
@@ -167,13 +164,8 @@ def get_state(ctx: click.Context) -> CLIState:
 
 
 def default_tenant_id() -> str | None:
-    """Resolve the default tenant for local CLI workflows."""
-    result = db_pool.execute(
-        "SELECT id FROM aethyme.tenants WHERE slug = 'default' LIMIT 1"
-    )
-    if not result:
-        return None
-    return str(result[0]["id"])
+    """Tenant resolution retired with the Gen-0 PostgreSQL lineage (2026-07-13)."""
+    return None
 
 
 @click.group(cls=AethymeCLIGroup)
@@ -233,92 +225,6 @@ def cli(
             )
         os.environ["AETHYME_ENGINE_TRANSPORT"] = normalized_transport
         state["engine_transport"] = normalized_transport
-
-
-@cli.command()
-@click.argument("repo_path", type=click.Path(exists=True))
-@click.option(
-    "--name",
-    "-n",
-    help="Repository name (defaults to directory name)",
-)
-@click.option(
-    "--languages",
-    "-l",
-    default="python,typescript",
-    help="Languages to index (comma-separated)",
-)
-@click.option(
-    "--use-fallback",
-    is_flag=True,
-    help="Force use of fallback indexer",
-)
-@click.pass_context
-def index(
-    ctx: click.Context,
-    repo_path: str,
-    name: str | None,
-    languages: str,
-    use_fallback: bool,
-) -> None:
-    """Index a repository and build the code graph."""
-    request = RepositoryIndexRequest(
-        repo_path=Path(repo_path),
-        repo_name=name,
-        languages=[lang.strip() for lang in languages.split(",")],
-        tenant_id=cast(str | None, get_state(ctx).get("tenant_id")),
-        use_fallback=use_fallback,
-        clear_existing=True,
-    )
-
-    # Initialize graph builder
-    def progress_callback(current: int, total: int, message: str) -> None:
-        click.echo(f"Progress: {current}/{total} - {message}")
-
-    result = run_indexing(request, progress_callback=progress_callback)
-
-    # Print summary
-    click.echo("\n" + "=" * 60)
-    click.echo("Indexing Complete!")
-    click.echo("=" * 60)
-    click.echo(f"Repository: {result.repository_name}")
-    click.echo(f"Path: {result.repository_path}")
-    click.echo(f"Languages: {', '.join(result.languages)}")
-    click.echo("-" * 60)
-    click.echo(f"Total Nodes: {result.graph_statistics.get('total_nodes', 0):,}")
-    click.echo(f"Total Edges: {result.graph_statistics.get('total_edges', 0):,}")
-    click.echo(f"Total Files: {result.graph_statistics.get('total_files', 0):,}")
-    click.echo("-" * 60)
-    for language_result in result.language_results:
-        click.echo(
-            f"{language_result.language}: {language_result.engine} "
-            f"({language_result.nodes} nodes, {language_result.edges} edges, {language_result.files} files)"
-        )
-
-
-@cli.command()
-@click.pass_context
-def stats(ctx: click.Context) -> None:
-    """Show graph statistics."""
-    tenant_id = cast(str | None, get_state(ctx).get("tenant_id"))
-
-    if not tenant_id:
-        tenant_id = default_tenant_id()
-        if tenant_id is None:
-            click.echo("No tenant found. Please index a repository first.")
-            return
-
-    store = GraphStore(tenant_id=tenant_id)
-    stats = store.get_statistics()
-
-    click.echo("Graph Statistics")
-    click.echo("=" * 40)
-    click.echo(f"Total Nodes: {stats.get('total_nodes', 0):,}")
-    click.echo(f"Total Edges: {stats.get('total_edges', 0):,}")
-    click.echo(f"Node Types: {stats.get('node_types', 0)}")
-    click.echo(f"Edge Types: {stats.get('edge_types', 0)}")
-    click.echo(f"Total Files: {stats.get('total_files', 0):,}")
-    click.echo(f"Languages: {stats.get('languages', 0)}")
 
 
 @cli.command("intents")
@@ -2608,124 +2514,6 @@ def eval_bug_fix_prepare(
         click.echo(f"  {name}: {cmd}")
 
 
-@cli.command()
-@click.argument("symbol")
-@click.option("--depth", "-d", default=2, help="Depth for ego graph traversal")
-@click.pass_context
-def ego(ctx: click.Context, symbol: str, depth: int) -> None:
-    """Get ego graph for a symbol."""
-    tenant_id = cast(str | None, get_state(ctx).get("tenant_id"))
-
-    if not tenant_id:
-        tenant_id = default_tenant_id()
-        if tenant_id is None:
-            click.echo("No tenant found. Please index a repository first.")
-            return
-
-    store = GraphStore(tenant_id=tenant_id)
-    result = store.ego_graph(symbol, depth=depth, limit=100)
-
-    if "error" in result:
-        click.echo(f"Error: {result['error']}")
-        return
-
-    click.echo(f"\nEgo Graph for: {symbol}")
-    click.echo("=" * 60)
-
-    if result.get("definition"):
-        defn = result["definition"]
-        click.echo("\nDefinition:")
-        click.echo(f"  File: {defn['file_path']}:{defn['line_number']}")
-        click.echo(f"  Kind: {defn['kind']}")
-        click.echo(f"  Language: {defn['language']}")
-
-    for depth_level, nodes in result.get("nodes_by_depth", {}).items():
-        if depth_level == 0:
-            continue  # Skip definition
-
-        click.echo(f"\nDepth {depth_level}: {len(nodes)} nodes")
-        for node in nodes[:5]:  # Show first 5
-            click.echo(
-                f"  - {node['symbol']} ({node['kind']}) at {node['file_path']}:{node['line_number']}"
-            )
-        if len(nodes) > 5:
-            click.echo(f"  ... and {len(nodes) - 5} more")
-
-
-@cli.command()
-@click.argument("symbol")
-@click.option("--max-depth", "-d", default=10, help="Maximum depth for impact analysis")
-@click.pass_context
-def impact(ctx: click.Context, symbol: str, max_depth: int) -> None:
-    """Analyze impact of changes to a symbol."""
-    tenant_id = cast(str | None, get_state(ctx).get("tenant_id"))
-
-    if not tenant_id:
-        tenant_id = default_tenant_id()
-        if tenant_id is None:
-            click.echo("No tenant found. Please index a repository first.")
-            return
-
-    store = GraphStore(tenant_id=tenant_id)
-    result = store.impact_analysis(symbol, max_depth=max_depth)
-
-    if "error" in result:
-        click.echo(f"Error: {result['error']}")
-        return
-
-    click.echo(f"\nImpact Analysis for: {symbol}")
-    click.echo("=" * 60)
-    click.echo(f"Total Impacted: {result['total_impacted']} symbols")
-    click.echo(f"Max Depth Reached: {result['max_depth_reached']}")
-
-    for depth, symbols in result.get("by_depth", {}).items():
-        click.echo(f"\nDepth {depth}: {len(symbols)} symbols")
-        for sym in symbols[:10]:  # Show first 10
-            click.echo(f"  - {sym['symbol']} in {sym['file']}")
-        if len(symbols) > 10:
-            click.echo(f"  ... and {len(symbols) - 10} more")
-
-
-@cli.command()
-@click.argument("query")
-@click.option("--limit", "-l", default=20, help="Maximum number of results")
-@click.option(
-    "--type",
-    "-t",
-    default="hybrid",
-    type=click.Choice(["exact", "fuzzy", "hybrid"]),
-    help="Search type",
-)
-@click.pass_context
-def search(ctx: click.Context, query: str, limit: int, type: str) -> None:
-    """Search for symbols in the graph."""
-    tenant_id = cast(str | None, get_state(ctx).get("tenant_id"))
-
-    if not tenant_id:
-        tenant_id = default_tenant_id()
-        if tenant_id is None:
-            click.echo("No tenant found. Please index a repository first.")
-            return
-
-    store = GraphStore(tenant_id=tenant_id)
-    results = store.search(query, limit=limit, search_type=type)
-
-    click.echo(f"\nSearch Results for: '{query}'")
-    click.echo("=" * 60)
-    click.echo(f"Found {len(results)} results (search type: {type})")
-    click.echo()
-
-    for i, result in enumerate(results, 1):
-        score = result.get("score", 0)
-        click.echo(
-            f"{i:2}. {result['symbol']} " f"({result['kind']}) " f"[score: {score:.3f}]"
-        )
-        click.echo(f"    {result['file_path']}:{result['line_number']}")
-        if result.get("documentation"):
-            doc = result["documentation"][:100]
-            click.echo(f"    {doc}...")
-
-
 @cli.command(name="ai-ready")
 @click.option(
     "--repo",
@@ -2786,15 +2574,8 @@ def ai_ready(
     click.echo(f"Running AI-readiness scorecard on: {repo_path}")
     click.echo()
 
-    # Get tenant_id if using API mode
+    # Tenant/org lookups retired with the PostgreSQL lineage (2026-07-13).
     tenant_id = cast(str | None, get_state(ctx).get("tenant_id"))
-    if org and not tenant_id:
-        # Look up tenant by org name
-        tenant_lookup = db_pool.execute(
-            "SELECT id FROM aethyme.tenants WHERE slug = %s LIMIT 1", (org,)
-        )
-        if tenant_lookup:
-            tenant_id = str(tenant_lookup[0]["id"])
 
     # Parse detectors list
     detector_list = None

@@ -1,5 +1,7 @@
 # Parity-test contract: byte-identical, not just functional
 
+Last Reviewed: 2026-07-13
+
 This note documents the methodological rationale for the three parity
 tests in `tests/local/`:
 

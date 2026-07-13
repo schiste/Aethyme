@@ -7,7 +7,7 @@ Last Updated: 2026-05-09
 This document records changes to the eval framework, prompts, scoring,
 or skill that were **proposed and rejected** because they would have
 been forms of eval-overfitting. The cardinal rule is in
-[`CLAUDE.md`](../../../CLAUDE.md):
+[`CLAUDE.md`](../../../../CLAUDE.md):
 
 > **Never modify tools, engine, pipeline, or skills to improve eval
 > scores.** Evals are diagnostics, not targets.

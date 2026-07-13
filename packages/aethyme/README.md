@@ -10,15 +10,16 @@ Aethyme Core is the deterministic repository tooling product in this repository.
 > **planned, not implemented** — see
 > [`../../docs/aethyme-local-agent-broker.md`](../../docs/aethyme-local-agent-broker.md).
 > The graph engine described below remains the supporting repo-intelligence
-> service. The tenant/auth/API sections further down describe an earlier
-> cloud-oriented lineage that still exists and is tested, but is not part of
-> the local-first direction and is not required by any local workflow.
+> service. The Gen-0 PostgreSQL graph, the FastAPI service, and the
+> tenant CLI commands were REMOVED on 2026-07-13 (partial execution of the
+> cloud-lineage decision); `src/auth`, the SDK, and Postgres deps remain
+> for the final #30 sweep.
 
 It owns:
 
 1. repository indexing
-2. graph persistence and traversal
-3. search, ego graph, and impact analysis
+2. graph persistence and traversal (Rust fragments + redb)
+3. symbol, dependency, and impact queries via the engine
 4. scorecard analysis
 5. controlled autofix tooling from the CLI
 6. deterministic navigation primitives for AI agents
@@ -37,65 +38,31 @@ Today, `Explore` is the implemented primary entry point. Lower-level graph,
 query, facts, and task commands remain available as supporting primitives, not
 the default operator path.
 
-## Canonical Model (cloud lineage — not the active local-first direction)
-
-`Platform > Org > Tenant > Repository > Graph`
-
-Runtime isolation is tenant-scoped. This model applies to the PostgreSQL/API
-lineage (`src/api`, `src/auth`, `src/graph`, `src/database`), not to the local
-Rust engine path, which operates directly on a repository with no tenancy.
-
 ## Language Direction
 
 Aethyme is moving toward:
 
 - Rust for deterministic engine components
-- Python for API, CLI, auth enforcement, scorecard orchestration, and SDKs
+- Python for CLI surfaces, enhance/onboarding, scorecard orchestration, and the eval harness
 
 See [`docs/architecture/rust-transition.md`](docs/architecture/rust-transition.md) and [`rust/README.md`](rust/README.md).
-
-## Auth Boundary
-
-- cloud owns login, registration, sessions, and user lifecycle
-- core validates bearer credentials and API keys
-- core enforces `org`, `tenant_id`, and `scopes`
-- local development can mint a cloud-issued token for an existing user via `POST /api/auth/dev/token`
 
 ## Active Surface
 
 ### Core Logic
-- `src/indexer`
-- `src/indexing`
-- `src/graph`
-- `src/models`
+- `src/indexing` (engine adapter, onboarding, skills)
 - `src/scorecard`
 - `src/autofixers`
-- `rust`
+- `src/eval`
+- `rust` (engine + broker crates)
 
 ### Delivery
-- `src/api`
-- `src/cli.py`
-- `sdk/python`
+- `src/cli.py` (Python surfaces) and the Rust `aethyme` router (explore,
+  certify, broker)
 
 ### Verification
-- `tests/api`
-- `tests/queries`
-- `tests/indexing`
-- `tests/scorecard`
-- `tests/autofixers`
-
-## Current Standard
-
-Only document and defend the verified path:
-
-- trusted bearer token or API key required
-- `POST /api/v1/index/repositories`
-- `POST /api/v1/search/`
-- `POST /api/v1/ego/`
-- `POST /api/v1/impact/`
-- `POST /api/v1/scorecard/scan`
-
-API and CLI indexing both run through [`src/indexing/service.py`](src/indexing/service.py).
+- `tests/local` (CI lane), `tests/indexing`, `tests/scorecard`,
+  `tests/autofixers`, `tests/contracts`, `tests/docs`, Rust workspace tests
 
 ## Local-First Workflow
 

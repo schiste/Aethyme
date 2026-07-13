@@ -47,9 +47,9 @@ The active test model covers:
 
 ## Test Support
 
-- seeded DB support: [`../../tests/support/db_seed.py`](../../tests/support/db_seed.py)
-- token helpers: [`../../tests/support/auth_db.py`](../../tests/support/auth_db.py)
 - generated repository builders: [`../../tests/support/repo_builders.py`](../../tests/support/repo_builders.py)
+  (the seeded-DB and token helpers were removed 2026-07-13 with the
+  Gen-0 PostgreSQL lineage)
 
 ## Static Analysis
 

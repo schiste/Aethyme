@@ -1,5 +1,7 @@
 # AethymeBench methodology
 
+Last Updated: 2026-07-13
+
 This document is the canonical specification of what running the
 AethymeBench eval framework *means*. It is the referent for the
 `methodology_hash` (item 2.16 in [`extraction-plan.md`](extraction-plan.md))
@@ -56,7 +58,7 @@ Authoritative definition: [`src/eval/orchestrator.py:122-138`](../../src/eval/or
 | 5 | `task-conditioned` | Tool clone | default | invoked + result pasted | task-conditioned | Same as #4 but the prompt addendum includes file bodies up to a 40k-byte budget. Tests whether handing the agent the full reading-list payoff up front changes its trajectory. |
 
 The `CTO` column refers to Claude Code's *command token optimization*
-setting (see [`feedback_eval_cto_settings.md`](../../../../.claude/projects/-Users-christophehenner-Downloads-Repositories-Aethyme/memory/feedback_eval_cto_settings.md)).
+setting (see `feedback_eval_cto_settings.md` (memory note; private, machine-local)).
 Only `control-cto-off` forces it off; conditions 3–5 use the default
 (which is normally on) so that the Aethyme-vs-control comparison is
 *Aethyme-with-CTO-on* vs *control-with-CTO-on* — the apples-to-apples
@@ -264,7 +266,7 @@ are fixed:
 The 4-section structure is not advisory — it is generated mechanically
 by [`_render_diagnostic_markdown`](../../src/eval/report.py). Hand-written
 markdown reports are forbidden by the
-[standardized-reports rule](../../../../.claude/projects/-Users-christophehenner-Downloads-Repositories-Aethyme/memory/feedback_standardized_reports.md);
+standardized-reports rule (memory note; private, machine-local);
 every published report must come out of the code path so the structure
 itself is part of the methodology contract.
 

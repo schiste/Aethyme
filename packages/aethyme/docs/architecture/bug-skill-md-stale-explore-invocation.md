@@ -1,5 +1,7 @@
 # Bug report: SKILL.md leads agents to a deleted CLI subcommand
 
+Last Reviewed: 2026-07-13
+
 Filed: 2026-05-12
 Filed by: graph team (Claude)
 Filed to: tooling / experience team

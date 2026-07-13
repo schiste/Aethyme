@@ -1,5 +1,7 @@
 # AethymeBench extraction plan
 
+Last Reviewed: 2026-07-13
+
 Phased plan for extracting Aethyme's eval framework (`src/eval/`,
 `src/eval/tools/`, `evals/tools/`, `aethyme-eval-ui/`, plus supporting
 artifacts) into a standalone, publishable package: **AethymeBench**.
