@@ -1,0 +1,16 @@
+# Aethyme broker configuration for this repository.
+# Reference: docs/aethyme-local-agent-broker.md
+
+[promote]
+# "manual": gates passing marks a submission verified; a human runs
+# `aethyme broker promote`. Flip to "auto" once the gates have earned
+# trust during the dogfood (decision 2026-07-10: autonomy is a setting,
+# not an architecture).
+mode = "manual"
+# branch = "aethyme/integration"   # the default; local-only, never pushed
+
+# [leases]
+# Extra ignore rules beyond the built-ins (lockfiles, node_modules/, ...).
+# Entries ending in "/" are directory prefixes. Gitignored paths never
+# produce leases, so most generated artifacts need no entry here.
+# ignore = ["docs/reports/"]

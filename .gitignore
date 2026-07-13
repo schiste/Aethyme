@@ -1,3 +1,12 @@
+# Aethyme broker runtime state (per-repo). The configs — .aethyme/gates.toml
+# and .aethyme/config.toml — are tracked; everything the broker writes at
+# runtime is not.
+.aethyme/broker.db*
+.aethyme/logs/
+.aethyme/run/
+.aethyme/worktrees/
+.aethyme/broker-action-required.md
+
 node_modules/
 dist/
 build/

@@ -1,0 +1,38 @@
+# Gates for the Aethyme monorepo (dogfood config — issue #33).
+#
+# Contract notes:
+# - Commands run with cwd = the worktree being verified — including the
+#   throwaway merge-simulation worktrees — so nothing here may assume the
+#   main checkout's cwd. $MAIN resolves the main checkout from any
+#   worktree, letting gates reuse its .venv (linked worktrees have none).
+#   Caveat: pytest then runs the worktree's code/tests (cwd wins sys.path)
+#   with the main venv's dependencies — good enough for v0; log friction
+#   if a dependency-changing diff slips through.
+# - CARGO_TARGET_DIR is shared so merge-sim worktrees don't cold-build the
+#   whole workspace on every submit.
+# - Gate outputs must be gitignored or they change the working-tree hash
+#   and bust the result cache.
+
+[[gate]]
+name = "ruff"
+command = 'MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && cd packages/aethyme && "$MAIN/packages/aethyme/.venv/bin/python" -m ruff check .'
+cost = 1
+triggers = ["packages/aethyme/**/*.py"]
+
+[[gate]]
+name = "pytest-local"
+command = 'MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && cd packages/aethyme && "$MAIN/packages/aethyme/.venv/bin/python" -m pytest -q tests/local'
+cost = 2
+triggers = [
+    "packages/aethyme/src/**",
+    "packages/aethyme/tests/**",
+    "packages/aethyme/skills/**",
+    "packages/aethyme/evals/**",
+    "packages/aethyme/pyproject.toml",
+]
+
+[[gate]]
+name = "cargo-test"
+command = 'CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/aethyme-cargo-target}" cargo test --workspace --quiet --manifest-path packages/aethyme/rust/Cargo.toml'
+cost = 3
+triggers = ["**/*.rs", "**/Cargo.toml"]
