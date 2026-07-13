@@ -28,7 +28,7 @@ commands = []
 # currently called from src/eval/repos.py); routing through the CLI
 # keeps Aethyme on the same per-target-clone register path as Graphify.
 commands = [
-    "{{TOOL_ROOT}}/.venv/bin/python -m src.cli repo deploy-skills --force {{TARGET_REPO}}",
+    "{{TOOL_PYTHON}} -m src.cli repo deploy-skills --force {{TARGET_REPO}}",
 ]
 
 [version]
@@ -76,7 +76,7 @@ strategy = "tool_self_install"
 # workdir is the package root (default for in-tree tools) because
 # `python -m src.cli` needs the src/ package on the import path.
 # The --repo flag tells the CLI which repo to operate on.
-command = "{{TOOL_ROOT}}/.venv/bin/python -m src.cli task pack --repo {{TARGET_REPO}} --task {{TASK_SHELL_ESCAPED}} --json-output"
+command = "{{TOOL_PYTHON}} -m src.cli task pack --repo {{TARGET_REPO}} --task {{TASK_SHELL_ESCAPED}} --json-output"
 output_format = "json"
 prompt_header = """Aethyme navigation context (`aethyme task pack` output, JSON):
 
@@ -88,7 +88,7 @@ prompt_header = """Aethyme navigation context (`aethyme task pack` output, JSON)
 # Larger payload than leverage — designed for direct task execution
 # without further tool calls. 40k content budget matches bug_fix.py's
 # current _build_navigation_context() call.
-command = "{{TOOL_ROOT}}/.venv/bin/python -m src.cli task context --repo {{TARGET_REPO}} --task {{TASK_SHELL_ESCAPED}} --content-budget 40000 --json-output"
+command = "{{TOOL_PYTHON}} -m src.cli task context --repo {{TARGET_REPO}} --task {{TASK_SHELL_ESCAPED}} --content-budget 40000 --json-output"
 output_format = "json"
 prompt_header = """Aethyme task-conditioned context (`aethyme task context` output, JSON, includes file bodies):
 

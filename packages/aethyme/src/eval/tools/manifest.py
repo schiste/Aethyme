@@ -12,9 +12,14 @@ Two substitution regimes coexist, and **mixing them is a load-bearing bug** —
 keep them strictly separate.
 
 *Command/path substitution* (:meth:`ManifestToolAdapter._substitute`) handles
-strings that become shell tokens. Three placeholders:
+strings that become shell tokens. Four placeholders:
 
 * ``{{TOOL_ROOT}}`` — absolute path to the cloned tool repo on disk.
+* ``{{TOOL_PYTHON}}`` — the tool's Python interpreter: ``TOOL_ROOT/.venv/bin/python``
+  when that venv exists, else the interpreter running the eval framework.
+  Manifests must use this instead of hardcoding ``.venv/bin/python`` so
+  commands survive checkouts without a venv (CI, linked git worktrees,
+  broker merge-simulation worktrees).
 * ``{{TARGET_REPO}}`` — absolute path to the target repo the eval runs against.
 * ``{{TASK_SHELL_ESCAPED}}`` — the per-task prompt text, ``shlex.quote``-d.
 
@@ -51,6 +56,7 @@ from __future__ import annotations
 import shlex
 import shutil
 import subprocess
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -654,15 +660,19 @@ class ManifestToolAdapter:
         is delivered verbatim to ``chdir`` and quoting would corrupt it.
         """
         tool_root_str = str(self.tool_root)
+        venv_python = self.tool_root / ".venv" / "bin" / "python"
+        tool_python_str = str(venv_python) if venv_python.exists() else sys.executable
         target_repo_str = (
             str(Path(target_repo).resolve()) if target_repo is not None else None
         )
         if quote_paths:
             tool_root_str = shlex.quote(tool_root_str)
+            tool_python_str = shlex.quote(tool_python_str)
             if target_repo_str is not None:
                 target_repo_str = shlex.quote(target_repo_str)
 
-        out = template.replace("{{TOOL_ROOT}}", tool_root_str)
+        out = template.replace("{{TOOL_PYTHON}}", tool_python_str)
+        out = out.replace("{{TOOL_ROOT}}", tool_root_str)
         if target_repo_str is not None:
             out = out.replace("{{TARGET_REPO}}", target_repo_str)
         if task is not None:
