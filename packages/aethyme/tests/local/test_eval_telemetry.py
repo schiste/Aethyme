@@ -13,8 +13,6 @@ import json
 import time
 from pathlib import Path
 
-import pytest
-
 from src.eval.telemetry import (
     DEFAULT_OUTPUT_PATH_PATTERN,
     map_session_attributions_by_prompt,
@@ -55,7 +53,7 @@ def _write_jsonl(
             "timestamp": "2026-05-09T00:00:01Z",
         },
     ]
-    path.write_text("\n".join(json.dumps(l) for l in lines))
+    path.write_text("\n".join(json.dumps(line) for line in lines))
     return path
 
 

@@ -12,8 +12,6 @@ list without the other trips a deterministic failure.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
-from unittest.mock import patch
 
 import pytest
 
@@ -23,12 +21,11 @@ from src.eval.bug_fix import (
     _build_bug_fix_prompt,
 )
 from src.eval.orchestrator import (
-    CONDITIONS,
     _EVAL_TYPE_DEFAULTS,
+    CONDITIONS,
     generate_run_plan,
 )
-from src.eval.repos import TOOL_USING_CONDITIONS, CONDITION_NAMES
-
+from src.eval.repos import CONDITION_NAMES, TOOL_USING_CONDITIONS
 
 # ---------------------------------------------------------------------------
 # Alignment between CONDITION_NAMES (repos.py) and CONDITIONS (orchestrator)

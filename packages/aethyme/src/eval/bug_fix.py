@@ -238,7 +238,7 @@ def prepare_bug_fix_benchmark(
     alternative_task: str | None = None,
     auto_cleanup: bool = True,
     cleanup_delay: float = _CLEANUP_DELAY_SECONDS,
-    tool: "ToolAdapter | None" = None,
+    tool: ToolAdapter | None = None,
 ) -> dict[str, Any]:
     """Create one clone per condition, plant the bug, generate all artifacts.
 
@@ -628,7 +628,7 @@ def _build_navigation_context(
     repo_path: Path,
     task: str,
     *,
-    tool: "ToolAdapter | None" = None,
+    tool: ToolAdapter | None = None,
 ) -> dict[str, Any] | None:
     """Build navigation context for the leverage condition.
 
@@ -913,7 +913,7 @@ def prepare_cross_package_benchmark(
     symptom-driven prompt (no file paths) and plants the execute bug
     with the test in app-shared instead of auth.
     """
-    from .repos import TOOL_USING_CONDITIONS, CONDITION_NAMES, create_condition_repos
+    from .repos import CONDITION_NAMES, TOOL_USING_CONDITIONS, create_condition_repos
 
     repos = create_condition_repos(source, dest_dir)
 

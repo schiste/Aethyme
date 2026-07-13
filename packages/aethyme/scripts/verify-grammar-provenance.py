@@ -14,7 +14,6 @@ import sys
 import tomllib
 from pathlib import Path
 
-
 UNPINNED_VALUES = {"", "UNPINNED", "UNKNOWN", "TODO"}
 
 

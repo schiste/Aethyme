@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING, Any
 
 from src.contracts.versions import contract_versions
 
-from ._self import is_self_tool, self_tool_name
 from ..rendering.context_pack import render_explain_repo_text
+from ._self import is_self_tool, self_tool_name
 from .control_prompt import build_baseline_prompt, build_leverage_prompt
 from .inline_warm import warm_and_query_leverage
 from .models import EvaluationSide
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 def _resolve_task_pack(
     repo_path: Path,
     task: str,
-    tool: "ToolAdapter | None",
+    tool: ToolAdapter | None,
 ) -> dict[str, Any] | None:
     """Compute the leverage task pack, always via a tool adapter.
 
@@ -70,7 +70,7 @@ def run_explain_repo_evaluation(
     baseline_runner: EvaluationRunner | None = None,
     aethyme_runner: EvaluationRunner | None = None,
     *,
-    tool: "ToolAdapter | None" = None,
+    tool: ToolAdapter | None = None,
 ) -> dict[str, Any]:
     """Build control/explore/leverage artifacts; optionally execute command backends.
 

@@ -18,7 +18,6 @@ from pathlib import Path
 from .base import ToolAdapter
 from .manifest import (
     ManifestToolAdapter,
-    ManifestValidationError,
     ToolManifest,
     load_manifest,
 )

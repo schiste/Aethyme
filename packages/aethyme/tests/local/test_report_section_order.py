@@ -113,7 +113,7 @@ def test_section_order_matches_documented_sequence(populated_result):
         idx = rendered.find(header)
         assert idx != -1, (
             f"missing section {header!r} in rendered report. "
-            f"Got headers: {[l for l in rendered.splitlines() if l.startswith('## ')]}"
+            f"Got headers: {[ln for ln in rendered.splitlines() if ln.startswith('## ')]}"
         )
         positions.append((header, idx))
 

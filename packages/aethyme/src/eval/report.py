@@ -2170,7 +2170,6 @@ def _diag_section_overall_results(lines: list[str], result: dict[str, Any]) -> N
         side = result.get(cond, {}) or {}
         assess = side.get("assessment") or {}
         run = side.get("run") or {}
-        summary = side.get("summary_metrics") or {}
         score = assess.get("weighted_score")
         cost = run.get("cost_usd")
         duration = run.get("duration_seconds")
@@ -2409,7 +2408,6 @@ def _diag_section_tooling_layer(lines: list[str], result: dict[str, Any]) -> Non
     lines.append("")
 
     # Aethyme-tool invocation rate (if any condition shows Aethyme tools)
-    aethyme_tool_names = {"Bash"}  # placeholder — would be tightened with real names
     lines.extend([
         "### Eval-framework observations",
         "",
@@ -2486,7 +2484,7 @@ def _diag_section_graph_layer(lines: list[str], result: dict[str, Any]) -> None:
     serial_fps = [(fp, n) for fp, n in fp_counter.items() if n >= 2]
     if serial_fps:
         lines.extend(["### Serial false positives", ""])
-        lines.append(f"Functions flagged as unused by ≥2 conditions (potential reference-baseline gap or recurrent graph blindspot):")
+        lines.append("Functions flagged as unused by ≥2 conditions (potential reference-baseline gap or recurrent graph blindspot):")
         for fp, n in sorted(serial_fps, key=lambda x: -x[1]):
             offenders = sorted(c for c, fps in fp_by_cond.items() if fp in fps)
             lines.append(f"- `{fp}` — flagged by {n} conditions: {', '.join(offenders)}")

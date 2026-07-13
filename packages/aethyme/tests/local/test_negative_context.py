@@ -19,8 +19,6 @@ GRC-marked test (which the strict-engine CI lane runs).
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -272,6 +270,7 @@ def test_generator_signature_takes_alternative_task():
     A future refactor that adds an in-function 'task mutation'
     feature should explicitly justify why."""
     import inspect
+
     from src.eval.bug_fix import generate_plausible_error_context
 
     sig = inspect.signature(generate_plausible_error_context)
