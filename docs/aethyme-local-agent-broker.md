@@ -1,6 +1,6 @@
 # Aethyme Local Agent Broker — Direction (v0)
 
-Status: **planned, not implemented** (as of 2026-07-09)
+Status: **v0 built and in dogfood** (as of 2026-07-13; planned 2026-07-09)
 Owner: Aethyme core
 Related: [`project-plan.md`](project-plan.md), [`../packages/aethyme/docs/vision.md`](../packages/aethyme/docs/vision.md) (historical)
 
@@ -79,21 +79,18 @@ contracts, so any future delivery surface is a client, not a rewrite.
 
 ## Current state (be precise about this)
 
-Nothing described in the "v0 scope" below exists yet. As of the Phase 0 truth
-audit (2026-07):
+**Everything in the "v0 scope" below is built** (Phases 1–6, 2026-07-10 →
+2026-07-13): the `aethyme-broker` crate implements sessions, leases, the
+affected gate runner, the merge queue with auto-promotion, and the event
+log, exposed as `aethyme broker ...` in the Rust router. The deterministic
+v0 scenario test covers the three-agent story end to end, and the first
+live dogfood loop ran on this repository on 2026-07-13 (see
+`docs/dogfood-friction.md`). Current stage: **the dogfood week (#33)**.
 
-- there is **no** worktree management code in the repository
-- there is **no** agent session registry
-- there is **no** lease/lock/conflict system
-- there is **no** merge simulation
-- there is **no** event bus
-- there is **no** affected-gate runner
-
-What does exist is the **deterministic Rust graph engine** (repo indexing,
-redb store, committed graph fragments, navigation and impact-frontier
-queries, a warm engine daemon) and the Python CLI and eval harness around
-it. The engine remains a supporting repo-intelligence service for the broker;
-the broker itself is a **new local subsystem**.
+The **deterministic Rust graph engine** (repo indexing, redb store,
+committed graph fragments, navigation and impact-frontier queries) remains
+a separate, supporting repo-intelligence service; graph-aware broker
+features are deliberately deferred (#28, #19).
 
 ## Core architectural split
 
