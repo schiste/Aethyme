@@ -14,11 +14,15 @@ const USAGE: &str = "\
 aethyme broker — coordinate concurrent AI agent sessions on this repository
 
 Usage:
-  aethyme init [--check] [--json]      (also: aethyme broker init)
-      Certification pipeline: preflight the repo, generate missing broker
-      config (gates.toml draft, config.toml, .gitignore block), verify.
-      --check is strictly read-only and exits non-zero on failed checks —
-      run it in CI/cron as a recurring inspection.
+  aethyme certify [--json]             (also: aethyme broker certify)
+      The certification method: deterministic, strictly read-only checks
+      (git version, repo, configs valid, gitignore contract, protocol,
+      db integrity). Exits non-zero on failures — CI/cron-able as the
+      recurring inspection. Never writes anything.
+  aethyme broker scaffold [--json]
+      Adaptive setup (NOT certification): draft gates.toml from this
+      repo's manifests, config.toml skeleton, .gitignore block. Never
+      overwrites existing files. Review drafts, then run certify.
   aethyme broker adopt [<path>] [--task <text>] [--json]
       Register an existing worktree (attach-first). Defaults to the
       current directory.
@@ -699,11 +703,14 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 }
             }
         }
-        "init" => {
+        "certify" | "scaffold" => {
             let cwd = std::env::current_dir()
                 .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
-            let check_mode = parsed.check;
-            let report = crate::init::run(&cwd, check_mode)?;
+            let report = if subcommand == "certify" {
+                crate::init::certify(&cwd)?
+            } else {
+                crate::init::scaffold(&cwd)?
+            };
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -719,18 +726,15 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 }
                 println!();
                 if report.certified() {
-                    println!(
-                        "Certified{}. Next: adopt a worktree (`aethyme broker adopt --task \"...\"`), then `aethyme broker status`.",
-                        if check_mode {
-                            " (check mode — nothing written)"
-                        } else {
-                            ""
-                        }
-                    );
+                    if subcommand == "certify" {
+                        println!("Certified (read-only — nothing written).");
+                    } else {
+                        println!(
+                            "Scaffolding done — review the drafts, then run `aethyme certify`."
+                        );
+                    }
                 } else {
-                    return Err(UsageError::Message(
-                        "certification failed — fix the FAIL items above".into(),
-                    ));
+                    return Err(UsageError::Message("FAIL items above must be fixed".into()));
                 }
             }
             if !report.certified() {

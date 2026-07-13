@@ -1,6 +1,6 @@
-//! Certification pipeline tests: generation, the determinism contract
-//! (second run is byte-identical), read-only --check, and manifest
-//! detection.
+//! Certify/scaffold split tests: certify is ALWAYS read-only and
+//! deterministic; scaffold generates drafts (byte-identical on re-run,
+//! never overwriting); manifest detection.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -51,59 +51,48 @@ fn status_of(report: &init::InitReport, id: &str) -> CheckStatus {
 }
 
 #[test]
-fn check_mode_is_read_only_then_init_creates_then_rerun_is_byte_identical() {
+fn certify_is_always_read_only_and_scaffold_rerun_is_byte_identical() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
 
-    // --check on a virgin repo: warns about everything missing, writes
-    // NOTHING (read-only contract).
+    // Certify on a virgin repo: warns about what is missing, writes
+    // NOTHING — including never creating the database.
     let before = snapshot(tmp.path());
-    let report = init::run(tmp.path(), true).unwrap();
+    let report = init::certify(tmp.path()).unwrap();
     assert!(report.certified(), "missing config is warn, not fail");
-    assert_eq!(status_of(&report, "regulate.gates-toml"), CheckStatus::Warn);
-    assert_eq!(snapshot(tmp.path()), before, "--check wrote nothing");
+    assert_eq!(status_of(&report, "certify.gates"), CheckStatus::Warn);
+    assert_eq!(status_of(&report, "certify.config"), CheckStatus::Warn);
+    assert_eq!(snapshot(tmp.path()), before, "certify wrote nothing");
     assert!(
         !tmp.path().join(".aethyme/broker.db").exists(),
-        "--check must not create the database"
+        "certify must never create the database"
     );
 
-    // Write mode: creates the document requirements + broker db. This
-    // repo has no recognizable manifests, so no gates.toml is drafted —
-    // the broker runs conflict-only, honestly warned.
-    let report = init::run(tmp.path(), false).unwrap();
+    // Scaffold: drafts config + gitignore. No manifests here, so no
+    // gates.toml is drafted (a file defining nothing is dishonest).
+    let report = init::scaffold(tmp.path()).unwrap();
     assert!(report.certified());
-    assert_eq!(status_of(&report, "regulate.gates-toml"), CheckStatus::Warn);
-    assert_eq!(status_of(&report, "control.gates-valid"), CheckStatus::Warn);
-    for id in [
-        "regulate.config-toml",
-        "regulate.gitignore",
-        "control.broker-db",
-    ] {
+    assert_eq!(status_of(&report, "scaffold.gates-toml"), CheckStatus::Warn);
+    for id in ["scaffold.config-toml", "scaffold.gitignore"] {
         assert_eq!(status_of(&report, id), CheckStatus::Created, "{id}");
     }
     let first = snapshot(tmp.path());
     assert!(!first.is_empty());
 
-    // Determinism contract: a second run changes NOTHING, byte for byte,
-    // and reports pass instead of created.
-    let report = init::run(tmp.path(), false).unwrap();
+    // Determinism: a second scaffold changes nothing, byte for byte.
+    let report = init::scaffold(tmp.path()).unwrap();
     assert!(report.certified());
-    for id in [
-        "regulate.config-toml",
-        "regulate.gitignore",
-        "control.broker-db",
-    ] {
+    for id in ["scaffold.config-toml", "scaffold.gitignore"] {
         assert_eq!(status_of(&report, id), CheckStatus::Pass, "{id}");
     }
     assert_eq!(snapshot(tmp.path()), first, "re-run is byte-identical");
 
-    // And --check on a certified repo agrees with write mode.
-    let report = init::run(tmp.path(), true).unwrap();
+    // Certify agrees with the scaffolded state and is still read-only.
+    let report = init::certify(tmp.path()).unwrap();
     assert!(report.certified());
-    assert_eq!(
-        status_of(&report, "regulate.config-toml"),
-        CheckStatus::Pass
-    );
+    assert_eq!(status_of(&report, "certify.config"), CheckStatus::Pass);
+    assert_eq!(status_of(&report, "certify.gitignore"), CheckStatus::Pass);
+    assert_eq!(snapshot(tmp.path()), first, "certify still wrote nothing");
 }
 
 #[test]
@@ -122,7 +111,7 @@ fn gates_draft_detects_manifests_deterministically() {
     std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
     init_repo(tmp.path());
 
-    init::run(tmp.path(), false).unwrap();
+    init::scaffold(tmp.path()).unwrap();
     let gates = std::fs::read_to_string(tmp.path().join(".aethyme/gates.toml")).unwrap();
     for expected in [
         "name = \"cargo-test\"",
@@ -153,7 +142,7 @@ fn existing_files_are_never_touched_and_gitignore_appends_preserving_content() {
     .unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "node_modules/\n").unwrap();
 
-    let report = init::run(tmp.path(), false).unwrap();
+    let report = init::scaffold(tmp.path()).unwrap();
     assert!(report.certified());
     let gates = std::fs::read_to_string(tmp.path().join(".aethyme/gates.toml")).unwrap();
     assert!(gates.contains("mine"), "user's gates.toml untouched");

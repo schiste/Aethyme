@@ -1,21 +1,23 @@
-//! `aethyme init` — the certification pipeline (strategy: "airport
-//! certification"). Three Rust-native phases today:
+//! Certification and scaffolding — two deliberately separate concerns
+//! (decision 2026-07-13: certification covers ONLY highly deterministic
+//! topics; anything that adapts to the repo sits elsewhere).
 //!
-//!   1. certify  — tech preflight (git version, repo, HEAD, binary shadowing)
-//!   2. regulate — generate the document requirements (gates.toml
-//!      draft, config.toml, .gitignore block)
-//!   5. control  — broker store ready, doctor, gates validate
+//! **`certify()`** — the certification method. Strictly read-only, no
+//! judgment, no generation: verifies facts (git version, repo, HEAD,
+//! binary shadowing, config presence + validity, gitignore contract,
+//! protocol presence, db integrity). Same repository state → same
+//! report, with a scriptable exit code. This is the recurring
+//! inspection; it never writes a byte.
 //!
-//! (Phases 3 `document` and 4 `chart` compose in the Python enhance stack
-//! and the graph indexer; they are reported as `skipped` until wired.)
+//! **`scaffold()`** — the adaptive setup. Drafts what a repo is missing
+//! (gates.toml from manifest sniffing, config.toml skeleton, .gitignore
+//! block). Heuristic by nature, clearly labeled as drafts, never
+//! overwrites anything, and is NOT certification — run `certify` after
+//! reviewing its output.
 //!
-//! Determinism contract:
-//! - No network, no clocks: generated files contain no timestamps and no
-//!   absolute paths; detector order is fixed; report ordering is fixed.
-//! - Idempotent: a second run changes nothing on disk (byte-identical),
-//!   and reports `exists` instead of `created`.
-//! - `--check` is strictly read-only and reports the same findings for
-//!   the same repository state, with a scriptable exit code.
+//! Shared determinism rules: no network, no clocks; generated files
+//! contain no timestamps and no absolute paths; detector and report
+//! ordering are fixed; a second scaffold run is byte-identical.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -58,11 +60,10 @@ impl InitReport {
     }
 }
 
-/// Run the pipeline. `check_mode` = read-only inspection.
-pub fn run(repo_hint: &Path, check_mode: bool) -> Result<InitReport, BrokerOpError> {
+/// The certification method: read-only, deterministic checks only.
+pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     let mut checks = Vec::new();
 
-    // ── phase 1: certify ─────────────────────────────────────────────
     checks.push(check_git_version());
     let main_root = match crate::GitRepo::discover(repo_hint) {
         Ok(repo) => {
@@ -94,50 +95,35 @@ pub fn run(repo_hint: &Path, check_mode: bool) -> Result<InitReport, BrokerOpErr
                 status: CheckStatus::Fail,
                 detail: "not a git repository — run `git init` and make one commit".into(),
             });
-            return Ok(InitReport { check_mode, checks });
+            return Ok(InitReport {
+                check_mode: true,
+                checks,
+            });
         }
     };
     checks.push(check_binary_shadowing());
 
-    // ── phase 2: regulate ────────────────────────────────────────────
-    // A gates.toml is only drafted when manifests were recognized —
-    // writing a file that defines nothing would be dishonest config.
-    // Without one the broker runs in conflict-only mode.
-    checks.push(match draft_gates_toml(&main_root) {
-        Some(draft) => ensure_file(
-            &main_root.join(".aethyme/gates.toml"),
-            "regulate.gates-toml",
-            check_mode,
-            || draft,
-        ),
-        None if main_root.join(".aethyme/gates.toml").exists() => Check {
-            id: "regulate.gates-toml",
-            status: CheckStatus::Pass,
-            detail: ".aethyme/gates.toml present (never overwritten)".into(),
-        },
-        None => Check {
-            id: "regulate.gates-toml",
+    // Document requirements: presence + validity, never generation.
+    checks.push(if main_root.join(".aethyme/gates.toml").exists() {
+        validate_gates(&main_root)
+    } else {
+        Check {
+            id: "certify.gates",
             status: CheckStatus::Warn,
-            detail: "no manifests recognized — define .aethyme/gates.toml yourself;                      until then the broker runs conflict-only (no verification)"
+            detail: "no gates.toml — broker runs conflict-only (no verification); \
+                     `aethyme broker scaffold` can draft one"
                 .into(),
-        },
+        }
     });
-    checks.push(ensure_file(
-        &main_root.join(".aethyme/config.toml"),
-        "regulate.config-toml",
-        check_mode,
-        || CONFIG_TEMPLATE.to_string(),
-    ));
-    checks.push(ensure_gitignore_block(&main_root, check_mode));
-
-    // ── phases 3 & 4: document / chart (not yet in the Rust pipeline) ─
+    checks.push(check_config_valid(&main_root));
+    checks.push(check_gitignore_contract(&main_root));
     checks.push(Check {
-        id: "document.agents-protocol",
+        id: "certify.agents-protocol",
         status: protocol_status(&main_root),
         detail: protocol_detail(&main_root),
     });
     checks.push(Check {
-        id: "chart.graph",
+        id: "certify.graph",
         status: if main_root.join(".aethyme/graph").is_dir() {
             CheckStatus::Pass
         } else {
@@ -150,28 +136,16 @@ pub fn run(repo_hint: &Path, check_mode: bool) -> Result<InitReport, BrokerOpErr
         },
     });
 
-    // ── phase 5: control ─────────────────────────────────────────────
+    // Broker state: verified only when it exists (certification creates
+    // nothing — the db appears on first adopt/scaffold use).
     let db_path = main_root.join(crate::BROKER_DB_RELPATH);
-    if check_mode && !db_path.exists() {
-        checks.push(Check {
-            id: "control.broker-db",
-            status: CheckStatus::Warn,
-            detail: "broker database not created yet (created on first init/adopt)".into(),
-        });
-    } else {
-        // Opening creates + migrates the db (write mode) or verifies it
-        // opens and passes integrity (both modes when it exists).
-        let existed = db_path.exists();
+    if db_path.exists() {
         let mut broker = Broker::open(&main_root)?;
         let report = broker.doctor()?;
         checks.push(Check {
-            id: "control.broker-db",
+            id: "certify.broker-db",
             status: if report.integrity == "ok" {
-                if existed {
-                    CheckStatus::Pass
-                } else {
-                    CheckStatus::Created
-                }
+                CheckStatus::Pass
             } else {
                 CheckStatus::Fail
             },
@@ -179,15 +153,109 @@ pub fn run(repo_hint: &Path, check_mode: bool) -> Result<InitReport, BrokerOpErr
         });
         for id in &report.missing_worktrees {
             checks.push(Check {
-                id: "control.missing-worktree",
+                id: "certify.missing-worktree",
                 status: CheckStatus::Warn,
                 detail: format!("session {id} worktree is missing (cleanup or re-adopt)"),
             });
         }
+    } else {
+        checks.push(Check {
+            id: "certify.broker-db",
+            status: CheckStatus::Warn,
+            detail: "broker database not created yet (appears on first adopt)".into(),
+        });
     }
-    checks.push(validate_gates(&main_root));
 
-    Ok(InitReport { check_mode, checks })
+    Ok(InitReport {
+        check_mode: true,
+        checks,
+    })
+}
+
+/// Adaptive setup: draft what is missing. Never overwrites; not
+/// certification — review the drafts, then run `certify`.
+pub fn scaffold(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
+    let mut checks = Vec::new();
+    let repo = crate::GitRepo::discover(repo_hint).map_err(BrokerOpError::Git)?;
+    let main_root = repo.main_root()?;
+
+    checks.push(match draft_gates_toml(&main_root) {
+        Some(draft) => ensure_file(
+            &main_root.join(".aethyme/gates.toml"),
+            "scaffold.gates-toml",
+            || draft,
+        ),
+        None if main_root.join(".aethyme/gates.toml").exists() => Check {
+            id: "scaffold.gates-toml",
+            status: CheckStatus::Pass,
+            detail: ".aethyme/gates.toml present (never overwritten)".into(),
+        },
+        None => Check {
+            id: "scaffold.gates-toml",
+            status: CheckStatus::Warn,
+            detail: "no manifests recognized — define .aethyme/gates.toml yourself; \
+                     until then the broker runs conflict-only (no verification)"
+                .into(),
+        },
+    });
+    checks.push(ensure_file(
+        &main_root.join(".aethyme/config.toml"),
+        "scaffold.config-toml",
+        || CONFIG_TEMPLATE.to_string(),
+    ));
+    checks.push(ensure_gitignore_block(&main_root));
+
+    Ok(InitReport {
+        check_mode: false,
+        checks,
+    })
+}
+
+fn check_config_valid(main_root: &Path) -> Check {
+    let path = main_root.join(".aethyme/config.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Check {
+            id: "certify.config",
+            status: CheckStatus::Warn,
+            detail: "no config.toml — defaults apply (auto-promote, aethyme/integration)".into(),
+        };
+    };
+    match text.parse::<toml::Value>() {
+        Ok(_) => Check {
+            id: "certify.config",
+            status: CheckStatus::Pass,
+            detail: "config.toml present and parseable".into(),
+        },
+        Err(err) => Check {
+            id: "certify.config",
+            status: CheckStatus::Fail,
+            detail: format!("config.toml invalid: {err}"),
+        },
+    }
+}
+
+fn check_gitignore_contract(main_root: &Path) -> Check {
+    let existing = std::fs::read_to_string(main_root.join(".gitignore")).unwrap_or_default();
+    let satisfied = existing.contains("aethyme-broker:begin")
+        || GITIGNORE_BLOCK
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .all(|line| existing.lines().any(|have| have.trim() == line));
+    if satisfied {
+        Check {
+            id: "certify.gitignore",
+            status: CheckStatus::Pass,
+            detail: ".gitignore covers broker runtime state".into(),
+        }
+    } else {
+        Check {
+            id: "certify.gitignore",
+            status: CheckStatus::Warn,
+            detail: ".gitignore is missing broker entries — \
+                     `aethyme broker scaffold` appends the managed block"
+                .into(),
+        }
+    }
 }
 
 // ── certify helpers ──────────────────────────────────────────────────
@@ -262,24 +330,12 @@ fn which_aethyme() -> Option<std::path::PathBuf> {
 
 // ── regulate helpers ─────────────────────────────────────────────────
 
-fn ensure_file(
-    path: &Path,
-    id: &'static str,
-    check_mode: bool,
-    generate: impl FnOnce() -> String,
-) -> Check {
+fn ensure_file(path: &Path, id: &'static str, generate: impl FnOnce() -> String) -> Check {
     if path.exists() {
         return Check {
             id,
             status: CheckStatus::Pass,
             detail: format!("{} present (never overwritten)", rel(path)),
-        };
-    }
-    if check_mode {
-        return Check {
-            id,
-            status: CheckStatus::Warn,
-            detail: format!("{} missing — init would create a draft", rel(path)),
         };
     }
     if let Some(parent) = path.parent() {
@@ -322,7 +378,7 @@ const GITIGNORE_BLOCK: &str = "\
 # aethyme-broker:end
 ";
 
-fn ensure_gitignore_block(main_root: &Path, check_mode: bool) -> Check {
+fn ensure_gitignore_block(main_root: &Path) -> Check {
     let path = main_root.join(".gitignore");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     // Consider the contract satisfied if the managed block OR all its
@@ -334,17 +390,9 @@ fn ensure_gitignore_block(main_root: &Path, check_mode: bool) -> Check {
             .all(|line| existing.lines().any(|have| have.trim() == line));
     if satisfied {
         return Check {
-            id: "regulate.gitignore",
+            id: "scaffold.gitignore",
             status: CheckStatus::Pass,
             detail: ".gitignore covers broker runtime state".into(),
-        };
-    }
-    if check_mode {
-        return Check {
-            id: "regulate.gitignore",
-            status: CheckStatus::Warn,
-            detail: ".gitignore is missing broker entries — init would append the managed block"
-                .into(),
         };
     }
     let mut updated = existing;
@@ -357,12 +405,12 @@ fn ensure_gitignore_block(main_root: &Path, check_mode: bool) -> Check {
     updated.push_str(GITIGNORE_BLOCK);
     match std::fs::write(&path, updated) {
         Ok(()) => Check {
-            id: "regulate.gitignore",
+            id: "scaffold.gitignore",
             status: CheckStatus::Created,
             detail: "appended the aethyme-broker block to .gitignore".into(),
         },
         Err(err) => Check {
-            id: "regulate.gitignore",
+            id: "scaffold.gitignore",
             status: CheckStatus::Fail,
             detail: format!("cannot update .gitignore: {err}"),
         },
@@ -488,17 +536,17 @@ fn protocol_detail(main_root: &Path) -> String {
 fn validate_gates(main_root: &Path) -> Check {
     match crate::gates::load_gates(main_root) {
         Ok(gates) => Check {
-            id: "control.gates-valid",
+            id: "certify.gates",
             status: CheckStatus::Pass,
             detail: format!("gates.toml valid — {} gate(s), cheap-first", gates.len()),
         },
         Err(crate::gates::GateConfigError::Missing(_)) => Check {
-            id: "control.gates-valid",
+            id: "certify.gates",
             status: CheckStatus::Warn,
             detail: "no gates.toml — broker runs in conflict-only mode (no verification)".into(),
         },
         Err(err) => Check {
-            id: "control.gates-valid",
+            id: "certify.gates",
             status: CheckStatus::Fail,
             detail: format!("gates.toml invalid: {err}"),
         },
