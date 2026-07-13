@@ -81,12 +81,11 @@ impl Broker {
         let head = repo.head_commit()?;
         repo.update_branch_ref(&config.branch, &head)?;
         self.store().append_event(
-            "merge.integration_branch_created",
+            crate::events::MERGE_INTEGRATION_BRANCH_CREATED,
             None,
-            Some(&format!(
-                "{{\"branch\":{},\"at\":{}}}",
-                serde_json::to_string(&config.branch)?,
-                serde_json::to_string(&head)?
+            Some(&crate::events::integration_branch_created_payload(
+                &config.branch,
+                &head,
             )),
         )?;
         Ok((config.branch, head))
@@ -311,7 +310,10 @@ impl Broker {
             entry_id,
             MergeStatus::Promoted,
             None,
-            Some(&serde_json::json!({"branch": branch, "commit": merge_commit}).to_string()),
+            Some(&crate::events::merge_promoted_payload(
+                &branch,
+                &merge_commit,
+            )),
         )?;
 
         // Requeue: everything still in flight was verified/conflicted

@@ -167,3 +167,33 @@ fn cleanup_refuses_dirty_and_unmerged_then_force_discards() {
     let views = broker.agents(now_ms()).unwrap();
     assert!(views.iter().all(|v| v.session.id != session.id));
 }
+
+#[test]
+fn doctor_reports_healthy_then_finds_missing_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let report = broker.doctor().unwrap();
+    assert_eq!(report.integrity, "ok");
+    assert!(report.healthy());
+
+    // A session whose worktree vanishes out-of-band is a finding.
+    let wt = tmp.path().join("doomed-wt");
+    sh(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "agent/doomed",
+            wt.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let session = broker.adopt(&wt, None).unwrap();
+    std::fs::remove_dir_all(&wt).unwrap();
+    let report = broker.doctor().unwrap();
+    assert_eq!(report.missing_worktrees, vec![session.id]);
+    assert!(!report.healthy());
+}

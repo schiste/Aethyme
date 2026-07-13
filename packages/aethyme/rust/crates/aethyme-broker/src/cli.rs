@@ -51,8 +51,16 @@ Usage:
       Never pushes.
   aethyme broker status [--json]
       The whole picture: agents, overlaps, merge queue, integration head.
-  aethyme broker events [--since <event-id>] [--follow] [--json]
-      Show the append-only event log; --follow polls for new events.
+  aethyme broker events [--since <id>] [--kind <prefix>] [--follow] [--json]
+      Show the append-only event log (see docs/events-contract.md).
+      --kind filters by prefix (e.g. merge. or lease.overlap); --follow
+      polls for new events and survives transient read errors.
+  aethyme broker events prune --keep-days <n> [--json]
+      Retention: delete events older than <n> days. Event ids stay
+      strictly increasing, so existing --since cursors remain valid.
+  aethyme broker doctor [--json]
+      Health checks: database integrity, sessions whose worktree is
+      gone, and orphaned gate pidfiles.
   aethyme broker cleanup <session-id> [--force] [--json]
       Remove a session's worktree. Refuses on uncommitted changes or
       unmerged commits unless --force.
@@ -101,6 +109,8 @@ struct Parsed {
     entry: Option<i64>,
     ttl_seconds: Option<i64>,
     since: Option<i64>,
+    kind: Option<String>,
+    keep_days: Option<i64>,
     follow: bool,
     json: bool,
     force: bool,
@@ -115,6 +125,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         entry: None,
         ttl_seconds: None,
         since: None,
+        kind: None,
+        keep_days: None,
         follow: false,
         json: false,
         force: false,
@@ -133,6 +145,22 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 })?);
             }
             "--force" => parsed.force = true,
+            "--kind" => {
+                parsed.kind = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--kind requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--keep-days" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--keep-days requires a value".into()))?;
+                parsed.keep_days =
+                    Some(value.parse().map_err(|_| {
+                        UsageError::Message("--keep-days must be an integer".into())
+                    })?);
+            }
             "--task" => {
                 parsed.task = Some(
                     iter.next()
@@ -574,10 +602,43 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             }
         }
         "events" => {
+            if parsed.positional.first().map(String::as_str) == Some("prune") {
+                let keep_days = parsed.keep_days.ok_or(UsageError::Message(
+                    "events prune requires --keep-days <n>".into(),
+                ))?;
+                let mut broker = open_broker()?;
+                let cutoff = now_ms() - keep_days * 24 * 60 * 60 * 1000;
+                let removed = broker.store().prune_events_before(cutoff)?;
+                if parsed.json {
+                    println!("{{\"pruned\":{removed}}}");
+                } else {
+                    println!("Pruned {removed} event(s) older than {keep_days} day(s).");
+                }
+                return Ok(());
+            }
             let mut broker = open_broker()?;
             let mut cursor = parsed.since.unwrap_or(0);
+            // --follow survives transient read errors (e.g. a checkpoint
+            // or a busy writer) with bounded retries instead of dying.
+            let mut consecutive_errors = 0u32;
             loop {
-                let events = broker.store().events_after(cursor, 1000)?;
+                let events =
+                    match broker
+                        .store()
+                        .events_after_filtered(cursor, 1000, parsed.kind.as_deref())
+                    {
+                        Ok(events) => {
+                            consecutive_errors = 0;
+                            events
+                        }
+                        Err(err) if parsed.follow && consecutive_errors < 5 => {
+                            consecutive_errors += 1;
+                            eprintln!("events: transient read error ({err}); retrying");
+                            std::thread::sleep(std::time::Duration::from_millis(700));
+                            continue;
+                        }
+                        Err(err) => return Err(err.into()),
+                    };
                 for event in &events {
                     cursor = event.id;
                     if parsed.json {
@@ -600,6 +661,34 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(700));
+            }
+        }
+        "doctor" => {
+            let mut broker = open_broker()?;
+            let report = broker.doctor()?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("integrity: {}", report.integrity);
+                if report.missing_worktrees.is_empty() {
+                    println!("worktrees: all live session worktrees exist");
+                } else {
+                    for id in &report.missing_worktrees {
+                        println!("worktrees: session {id} worktree is missing (adopt gone stale?)");
+                    }
+                }
+                if report.orphaned_pidfiles.is_empty() {
+                    println!("gate runs: no orphaned pidfiles");
+                } else {
+                    for name in &report.orphaned_pidfiles {
+                        println!("gate runs: orphaned pidfile removed: {name}");
+                    }
+                }
+                if report.healthy() {
+                    println!("doctor: healthy");
+                } else {
+                    return Err(UsageError::Message("doctor found problems".into()));
+                }
             }
         }
         "cleanup" => {

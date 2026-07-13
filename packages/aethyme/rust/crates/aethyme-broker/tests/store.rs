@@ -268,3 +268,34 @@ fn events_are_versioned_ordered_and_cursorable() {
     assert_eq!(tail.len(), 1);
     assert_eq!(tail[0].kind, "lease.overlap");
 }
+
+#[test]
+fn event_stream_filter_prune_and_cursor_survival() {
+    let (_tmp, mut store) = open_temp();
+    let session = sample_session(&mut store);
+    store
+        .append_event("lease.overlap", Some(session.id), Some("{}"))
+        .unwrap();
+    store.submit(session.id, "head1", "base1").unwrap();
+
+    // Prefix filter narrows to a domain.
+    let merges = store
+        .events_after_filtered(0, i64::MAX, Some("merge."))
+        .unwrap();
+    assert!(!merges.is_empty());
+    assert!(merges.iter().all(|e| e.kind.starts_with("merge.")));
+    let exact = store
+        .events_after_filtered(0, i64::MAX, Some("lease.overlap"))
+        .unwrap();
+    assert_eq!(exact.len(), 1);
+
+    // Prune everything (cutoff in the future), then verify ids are NOT
+    // reused: the next event continues the sequence, so --since cursors
+    // held by consumers remain valid.
+    let last_id = store.events_after(0, i64::MAX).unwrap().last().unwrap().id;
+    let removed = store.prune_events_before(i64::MAX).unwrap();
+    assert!(removed > 0);
+    assert!(store.events_after(0, i64::MAX).unwrap().is_empty());
+    let new_id = store.append_event("lease.overlap", None, None).unwrap();
+    assert!(new_id > last_id, "ids strictly increase across prune");
+}

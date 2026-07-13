@@ -57,6 +57,23 @@ pub struct AgentView {
     pub pid_alive: Option<bool>,
 }
 
+/// `broker doctor` findings, serializable for the --json contract.
+#[derive(Debug, serde::Serialize)]
+pub struct DoctorReport {
+    /// SQLite PRAGMA integrity_check result ("ok" when healthy).
+    pub integrity: String,
+    /// Live sessions whose worktree path no longer exists on disk.
+    pub missing_worktrees: Vec<i64>,
+    /// Stale gate pidfiles found (and removed) whose process is gone.
+    pub orphaned_pidfiles: Vec<String>,
+}
+
+impl DoctorReport {
+    pub fn healthy(&self) -> bool {
+        self.integrity == "ok" && self.missing_worktrees.is_empty()
+    }
+}
+
 /// Everything `broker status` renders, in one serializable shape.
 #[derive(Debug, serde::Serialize)]
 pub struct StatusView {
@@ -375,6 +392,53 @@ impl Broker {
             queue,
             integration_branch,
             integration_head,
+        })
+    }
+
+    // ── doctor (operational health) ───────────────────────────────────
+
+    /// Health checks an operator (or CI) can run cheaply: database
+    /// integrity, live sessions whose worktree no longer exists, and
+    /// orphaned gate pidfiles (whose process group is gone) — the latter
+    /// are removed as part of the check.
+    pub fn doctor(&mut self) -> Result<DoctorReport, BrokerOpError> {
+        let integrity = self.store.integrity_check()?;
+
+        let mut missing_worktrees = Vec::new();
+        for session in self.store.live_sessions()? {
+            if matches!(
+                session.status,
+                SessionStatus::Active | SessionStatus::Idle | SessionStatus::Stale
+            ) && !Path::new(&session.worktree_path).exists()
+            {
+                missing_worktrees.push(session.id);
+            }
+        }
+
+        let mut orphaned_pidfiles = Vec::new();
+        let run_dir = self.main_root.join(".aethyme/run/gates");
+        if let Ok(entries) = std::fs::read_dir(&run_dir) {
+            for entry in entries.flatten() {
+                let Ok(content) = std::fs::read_to_string(entry.path()) else {
+                    continue;
+                };
+                let alive = content
+                    .split_whitespace()
+                    .next()
+                    .and_then(|pid| pid.parse::<i64>().ok())
+                    .map(pid_alive)
+                    .unwrap_or(false);
+                if !alive {
+                    let _ = std::fs::remove_file(entry.path());
+                    orphaned_pidfiles.push(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+
+        Ok(DoctorReport {
+            integrity,
+            missing_worktrees,
+            orphaned_pidfiles,
         })
     }
 

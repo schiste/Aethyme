@@ -69,6 +69,13 @@ impl BrokerStore {
         &self.path
     }
 
+    /// SQLite integrity check ("ok" when the database is healthy).
+    pub fn integrity_check(&self) -> Result<String, BrokerError> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))?)
+    }
+
     // ── sessions ──────────────────────────────────────────────────────
 
     /// Register a session (adopt an existing worktree, or record a spawn).
@@ -108,12 +115,12 @@ impl BrokerStore {
         insert_event(
             &tx,
             now,
-            "session.registered",
+            crate::events::SESSION_REGISTERED,
             Some(id),
-            Some(&format!(
-                "{{\"origin\":\"{}\",\"branch\":{}}}",
+            Some(&crate::events::session_registered_payload(
                 new.origin.as_str(),
-                json_string(&new.branch)
+                &new.branch,
+                &new.worktree_path,
             )),
         )?;
         tx.commit()?;
@@ -180,7 +187,7 @@ impl BrokerStore {
             &format!("session.{}", status.as_str()),
             Some(id),
             exit_code
-                .map(|code| format!("{{\"exit_code\":{code}}}"))
+                .map(crate::events::session_exit_payload)
                 .as_deref(),
         )?;
         tx.commit()?;
@@ -237,9 +244,9 @@ impl BrokerStore {
         insert_event(
             &tx,
             now,
-            "lease.claimed",
+            crate::events::LEASE_CLAIMED,
             Some(session_id),
-            Some(&format!("{{\"path\":{}}}", json_string(path))),
+            Some(&crate::events::lease_path_payload(path)),
         )?;
         tx.commit()?;
         let lease = self.conn.query_row(
@@ -261,9 +268,9 @@ impl BrokerStore {
         insert_event(
             &tx,
             now,
-            "lease.released",
+            crate::events::LEASE_RELEASED,
             Some(session_id),
-            Some(&format!("{{\"path\":{}}}", json_string(path))),
+            Some(&crate::events::lease_path_payload(path)),
         )?;
         tx.commit()?;
         Ok(())
@@ -354,10 +361,9 @@ impl BrokerStore {
             now,
             &format!("gate.{}", result.status.as_str()),
             result.session_id,
-            Some(&format!(
-                "{{\"gate\":{},\"tree\":{}}}",
-                json_string(&result.gate_name),
-                json_string(&result.tree_hash)
+            Some(&crate::events::gate_result_payload(
+                &result.gate_name,
+                &result.tree_hash,
             )),
         )?;
         tx.commit()?;
@@ -413,7 +419,7 @@ impl BrokerStore {
                 now,
                 "merge.submitted",
                 Some(session_id),
-                Some(&format!("{{\"head\":{}}}", json_string(head_commit))),
+                Some(&crate::events::merge_submitted_payload(head_commit)),
             )?;
         }
         tx.commit()?;
@@ -488,6 +494,45 @@ impl BrokerStore {
         let id = insert_event(&tx, now_ms(), kind, session_id, payload_json)?;
         tx.commit()?;
         Ok(id)
+    }
+
+    /// Events with id > `after_id`, optionally filtered to kinds starting
+    /// with `kind_prefix` (e.g. "merge." or the exact "lease.overlap"),
+    /// oldest first, up to `limit`.
+    pub fn events_after_filtered(
+        &self,
+        after_id: i64,
+        limit: i64,
+        kind_prefix: Option<&str>,
+    ) -> Result<Vec<Event>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, schema_version, ts, kind, session_id, payload_json
+             FROM events WHERE id > ?1 AND (?3 IS NULL OR kind LIKE ?3 || '%')
+             ORDER BY id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![after_id, limit, kind_prefix], |row| {
+            Ok(Event {
+                id: row.get(0)?,
+                schema_version: row.get(1)?,
+                ts: row.get(2)?,
+                kind: row.get(3)?,
+                session_id: row.get(4)?,
+                payload_json: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Retention: delete events strictly older than `before_ts_ms`,
+    /// returning the number removed. Event ids stay strictly increasing
+    /// forever (AUTOINCREMENT never reuses rowids), so existing `--since`
+    /// cursors remain valid after a prune. This is an explicit operator
+    /// action — the log is append-only in normal operation.
+    pub fn prune_events_before(&mut self, before_ts_ms: i64) -> Result<usize, BrokerError> {
+        let removed = self
+            .conn
+            .execute("DELETE FROM events WHERE ts < ?1", [before_ts_ms])?;
+        Ok(removed)
     }
 
     /// Events with id > `after_id`, oldest first, up to `limit`. This is
@@ -613,24 +658,4 @@ fn insert_event(
         params![EVENTS_SCHEMA_VERSION, ts, kind, session_id, payload_json],
     )?;
     Ok(conn.last_insert_rowid())
-}
-
-/// Minimal JSON string quoting for the tiny inline payloads this module
-/// writes itself (no serde dependency in Phase 1).
-fn json_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
