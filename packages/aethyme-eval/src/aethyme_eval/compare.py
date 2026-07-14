@@ -77,7 +77,9 @@ def compare_aggregates(
     ]
     summary = {
         "pass": sum(row.status == "pass" for row in rows),
-        "warn": sum(row.status in {"warn", "environment-drift", "missing-baseline"} for row in rows),
+        "warn": sum(row.status == "warn" for row in rows),
+        "environment_drift": sum(row.status == "environment-drift" for row in rows),
+        "missing_baseline": sum(row.status == "missing-baseline" for row in rows),
         "fail": sum(row.status == "fail" for row in rows),
         "total": len(rows),
     }
@@ -191,6 +193,13 @@ def _tool_status(
         return "fail"
     if cost_ratio is not None and cost_ratio >= thresholds["fail_cost_ratio"] and not quality_tradeoff:
         reasons.append(f"Cost rose {cost_ratio:.2f}x without enough quality gain.")
+        return "fail"
+    if (
+        duration_ratio is not None
+        and duration_ratio >= thresholds["fail_duration_ratio"]
+        and not quality_tradeoff
+    ):
+        reasons.append(f"Duration rose {duration_ratio:.2f}x without enough quality gain.")
         return "fail"
     warned = False
     if raw_token_ratio is not None and raw_token_ratio >= thresholds["warn_token_ratio"]:

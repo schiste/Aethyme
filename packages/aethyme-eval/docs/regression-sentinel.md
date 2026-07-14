@@ -48,7 +48,9 @@ The default policy is conservative:
 - fail at `1.50x` tokens without a quality gain
 - fail at `1.75x` cost without a quality gain
 - warn at `1.50x` duration
+- fail at `2.00x` duration without a quality gain
 - mark control token drift separately as environment drift
+- fail the gate when a current row has no exact baseline
 
 For tool conditions, if the matching control condition drifted, the sentinel
 divides the tool token ratio by the control token ratio before deciding whether
@@ -72,4 +74,5 @@ Compare a new run:
 aethyme-eval compare ../aethyme/eval-runs/<run-dir> --fail-on-regression
 ```
 
-The command exits with code `2` when any row fails.
+The command exits with code `2` when any row fails, when any row is missing a
+baseline, or when the input contains no comparable rows.

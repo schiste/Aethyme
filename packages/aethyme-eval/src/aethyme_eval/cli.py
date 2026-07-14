@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
             args.output.write_text(text, encoding="utf-8")
         else:
             print(text, end="")
-        if args.fail_on_regression and payload["summary"]["fail"]:
+        if args.fail_on_regression and _gate_failed(payload):
             return 2
         return 0
 
@@ -108,6 +108,15 @@ def _quote(part: str) -> str:
     if not part or any(ch.isspace() for ch in part):
         return "'" + part.replace("'", "'\\''") + "'"
     return part
+
+
+def _gate_failed(payload: dict) -> bool:
+    summary = payload.get("summary") or {}
+    return bool(
+        summary.get("fail")
+        or summary.get("missing_baseline")
+        or summary.get("total", 0) == 0
+    )
 
 
 if __name__ == "__main__":

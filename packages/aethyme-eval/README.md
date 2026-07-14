@@ -29,7 +29,7 @@ tracked regression sentinel baseline.
 Compare new run records against the default baseline:
 
 ```bash
-aethyme-eval compare ../aethyme/eval-runs/20260521T121950-grc-bug-fix-haiku \
+aethyme-eval compare ../aethyme/eval-runs/<run-dir> \
   --format markdown \
   --fail-on-regression
 ```
@@ -48,7 +48,9 @@ Defaults are intentionally broad:
 - warn if tokens rise by more than 25%
 - fail if tokens rise by more than 50% without at least a 5 point quality gain
 - warn if duration rises by more than 50%
+- fail if duration rises by more than 100% without at least a 5 point quality gain
 - mark control-condition token growth separately as environment drift
+- fail the gate when a current result has no exact baseline
 
 When control drift is present, tool-condition token ratios are adjusted by
 the control ratio before declaring a regression. This prevents model/runtime
@@ -57,3 +59,7 @@ drift from being misattributed to Aethyme.
 Fresh evaluation inputs must be built from Playground repositories. The
 package can read old self-run artifacts for auditability, but shipped
 baselines and ongoing gates should not run against Aethyme itself.
+
+With `--fail-on-regression`, the command exits with code `2` when any row
+fails, when any row is missing a baseline, or when the input contains no
+comparable result rows.

@@ -117,6 +117,68 @@ def test_compare_cli_returns_2_when_fail_on_regression_is_set(tmp_path):
     assert code == 2
 
 
+def test_compare_cli_returns_2_when_baseline_is_missing(tmp_path):
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps({"name": "fixture", "thresholds": {}, "groups": []}),
+        encoding="utf-8",
+    )
+    run_dir = tmp_path / "20260521T121950-new-playground-bug-fix-haiku"
+    run_dir.mkdir()
+    (run_dir / "complete-result.json").write_text(
+        json.dumps(
+            {
+                "model": "haiku",
+                "target": "new-playground",
+                "eval_type": "bug-fix",
+                "explore": {
+                    "summary_metrics": {
+                        "total_tokens": 100,
+                        "cost_usd": 1,
+                        "duration_seconds": 10,
+                        "quality_score": 80,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = main(
+        [
+            "compare",
+            str(run_dir),
+            "--baseline",
+            str(baseline),
+            "--fail-on-regression",
+        ]
+    )
+
+    assert code == 2
+
+
+def test_compare_cli_returns_2_when_there_are_no_comparable_rows(tmp_path):
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps({"name": "fixture", "thresholds": {}, "groups": []}),
+        encoding="utf-8",
+    )
+    empty_results = tmp_path / "empty-results"
+    empty_results.mkdir()
+
+    code = main(
+        [
+            "compare",
+            str(empty_results),
+            "--baseline",
+            str(baseline),
+            "--fail-on-regression",
+        ]
+    )
+
+    assert code == 2
+
+
 def test_playground_command_uses_existing_setup_script(capsys):
     code = main(
         [
