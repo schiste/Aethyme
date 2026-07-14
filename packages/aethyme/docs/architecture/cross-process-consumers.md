@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-05-29
+Last Updated: 2026-07-14
 
 When code outside the `packages/aethyme/` Python or Rust source tree
 invokes an Aethyme command, it crosses a process boundary. Static
@@ -80,7 +80,7 @@ consumer. This file exists so that doesn't happen again.
 
 | Source | Invokes / assumes | Failure mode |
 |---|---|---|
-| ~~`rust/crates/aethyme-engine/src/bin/aethyme.rs` ↔ `src/daemon.py`~~ | Both sides removed in the same commit (the coordinated change this row demanded). The router's `daemon` subcommand, Python-daemon socket fallback, and socket-path logic are gone; `explore` routes native engine → cold `python -m src.cli` only. `src/daemon.py` and its `cli.py` registration are deleted. | Any out-of-repo script calling `aethyme daemon start/stop/status` (repo-socket flavor, `aethyme.sock` / `aethyme-socket.path`) now falls through to the Python CLI, which reports an unknown command. The **engine** daemon (`aethyme-engine-cli daemon ...`, `engine-<hash>.sock`, eval warm phase) is a separate live contract and is unaffected — see the engine-daemon rows above. |
+| ~~`rust/crates/aethyme-engine/src/bin/aethyme.rs` ↔ `src/daemon.py`~~ | Both sides removed in the same commit (the coordinated change this row demanded). The router's repo-daemon subcommand, Python-daemon socket fallback, and socket-path logic are gone. `src/daemon.py` and its `cli.py` registration are deleted. `aethyme explore` is a native-engine-owned surface; delegated non-explore commands may still fall through to `python -m src.cli`, but they must not depend on the deleted Python daemon. | Any out-of-repo script calling `aethyme daemon start/stop/status` (repo-socket flavor, `aethyme.sock` / `aethyme-socket.path`) now falls through to the Python CLI, which reports an unknown command. The **engine** daemon (`aethyme-engine-cli daemon ...`, `engine-<hash>.sock`, eval warm phase) is a separate live contract and is unaffected — see the engine-daemon rows above. |
 
 | Workflow | Calls | Failure mode |
 |---|---|---|
@@ -109,7 +109,9 @@ These entry points belong to the Phase 1–4 graph rewrite (new
 `aethyme-graph-schema`, `aethyme-graph-storage`, `aethyme-graph-indexer`
 crates) and the Phase-3 redb graph store. The fragment path is now
 required by the engine: the legacy pass pipeline was deleted in 4.7.12.
-The redb graph store remains the local query artifact written by
+The durable graph contract is `.aethyme/graph/`; it is the committed
+source of truth. The redb graph store at `.aethyme/graph_store.redb`
+is only a derived local query artifact written by
 `aethyme-engine-cli index`.
 
 | Entry point | Source | Wire shape that becomes a contract |
@@ -126,8 +128,19 @@ The redb graph store remains the local query artifact written by
 ### Redb graph-store contract
 
 `<repo>/.aethyme/graph_store.redb` is a stable local artifact path. It is
-not a committed graph format and must remain derived from committed
-fragments under `<repo>/.aethyme/graph/`.
+not a committed graph format, not the source of truth, and must remain
+derived from committed fragments under `<repo>/.aethyme/graph/`.
+
+Supported V1 redb surfaces:
+
+| Surface | Access | Contract |
+|---|---|---|
+| `index` | Writer | `aethyme-engine-cli index --repo <repo>` rebuilds only the derived redb store from `.aethyme/graph/` fragments. It must not modify fragments. |
+| `query-areas` | Read-only | Reads area rows through `GraphStore::open_read_only` / redb `ReadOnlyDatabase`. |
+| `query-overview` | Read-only | Reads repo metadata, depth-1 areas, entrypoints, and risks through the redb store. |
+| `deps` | Read-only | Reads outgoing file adjacency from the redb store. |
+| `importers` | Read-only | Reads incoming file adjacency from the redb store. |
+| `callers` | Hybrid grep + graph | Greps for the requested symbol, then uses redb adjacency to expand candidate files. It is not a pure redb symbol-query contract in V1. |
 
 File-format policy:
 
@@ -166,7 +179,8 @@ Reader/writer split:
 | Write staged store then publish | `aethyme-engine-cli index --disposable-fast --repo <repo>` | Writable `GraphStore::reset_staging`, then `publish_staging` after close |
 | Optional post-write compaction | `aethyme-engine-cli index --compact --repo <repo>` | Writable `GraphStore::compact` after all write transactions commit |
 | Read areas / overview | `query-areas`, `query-overview` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
-| Read adjacency | `importers`, `deps`, `callers` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
+| Read adjacency | `importers`, `deps` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
+| Hybrid grep + adjacency | `callers` | Grep first, then `GraphStore::open_read_only` / redb `ReadOnlyDatabase` for candidate expansion |
 | Assert artifact exists | `scripts/eval/setup-playground.sh`, `scripts/eval/verify-playground.sh`, `docs/guides/playground-setup.md` | Filesystem existence check only |
 
 Read-only open policy:
