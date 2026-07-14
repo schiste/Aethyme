@@ -145,14 +145,10 @@ impl OverlayProducer for ConfigsProducer {
         let mut files: Vec<NonCodeFile> = view
             .files()
             .iter()
-            .filter_map(|f| {
-                classify_non_code(&f.path).map(|format| (f.path.as_str(), format))
-            })
+            .filter_map(|f| classify_non_code(&f.path).map(|format| (f.path.as_str(), format)))
             .map(|(path, format)| NonCodeFile::new(repo, path, format))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                ProducerError::Other(format!("NonCodeFile::new failed: {e}"))
-            })?;
+            .map_err(|e| ProducerError::Other(format!("NonCodeFile::new failed: {e}")))?;
 
         // Canonical ordering. Path is unique within a repo so this
         // is a total order — no tiebreaker needed.
@@ -177,10 +173,7 @@ fn classify_non_code(path: &str) -> Option<NonCodeFormat> {
     let lower = path.to_ascii_lowercase();
 
     // 1. Generated — engine's `is_generated`.
-    if lower.contains("generated")
-        || lower.ends_with(".min.js")
-        || lower.ends_with(".lock")
-    {
+    if lower.contains("generated") || lower.ends_with(".min.js") || lower.ends_with(".lock") {
         return None;
     }
 
@@ -356,18 +349,12 @@ mod tests {
 
     #[test]
     fn classify_maps_json() {
-        assert_eq!(
-            classify_non_code("package.json"),
-            Some(NonCodeFormat::Json)
-        );
+        assert_eq!(classify_non_code("package.json"), Some(NonCodeFormat::Json));
         assert_eq!(
             classify_non_code("tsconfig.json"),
             Some(NonCodeFormat::Json)
         );
-        assert_eq!(
-            classify_non_code("deno.jsonc"),
-            Some(NonCodeFormat::Json)
-        );
+        assert_eq!(classify_non_code("deno.jsonc"), Some(NonCodeFormat::Json));
     }
 
     #[test]
@@ -394,14 +381,8 @@ mod tests {
     fn classify_maps_dockerfile_and_dotfiles_to_plain() {
         assert_eq!(classify_non_code("Dockerfile"), Some(NonCodeFormat::Plain));
         assert_eq!(classify_non_code(".env"), Some(NonCodeFormat::Plain));
-        assert_eq!(
-            classify_non_code(".gitignore"),
-            Some(NonCodeFormat::Plain)
-        );
-        assert_eq!(
-            classify_non_code(".prettierrc"),
-            Some(NonCodeFormat::Plain)
-        );
+        assert_eq!(classify_non_code(".gitignore"), Some(NonCodeFormat::Plain));
+        assert_eq!(classify_non_code(".prettierrc"), Some(NonCodeFormat::Plain));
     }
 
     #[test]

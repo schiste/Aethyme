@@ -1,14 +1,11 @@
 //! Integration tests for disk I/O. Uses tempfile for filesystem
 //! isolation.
 
-use aethyme_graph_schema::{
-    Function, Node, NodeKind, ParameterSignature, SourceRange, Visibility,
-};
+use aethyme_graph_schema::{Function, Node, NodeKind, ParameterSignature, SourceRange, Visibility};
 use aethyme_graph_storage::{
-    read_fragment, read_index_shard, read_overlay, write_fragment,
-    write_index_shard, write_overlay, Fragment, FragmentReadError,
-    FragmentStore, FragmentWriteError, OverlayDecodeError, OverlayFragment,
-    OverlayReadError, SymbolRecord,
+    Fragment, FragmentReadError, FragmentStore, FragmentWriteError, OverlayDecodeError,
+    OverlayFragment, OverlayReadError, SymbolRecord, read_fragment, read_index_shard, read_overlay,
+    write_fragment, write_index_shard, write_overlay,
 };
 use std::collections::BTreeMap;
 
@@ -55,8 +52,7 @@ fn sample_record() -> SymbolRecord {
 fn write_then_read_fragment_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
     let frag = sample_fragment();
-    let written =
-        write_fragment(tmp.path(), "src/cli.py", &frag).unwrap();
+    let written = write_fragment(tmp.path(), "src/cli.py", &frag).unwrap();
     assert!(written.exists());
     let back = read_fragment(tmp.path(), "src/cli.py").unwrap();
     assert_eq!(back, frag);
@@ -66,16 +62,11 @@ fn write_then_read_fragment_round_trip() {
 fn write_fragment_creates_parent_directories() {
     let tmp = tempfile::tempdir().unwrap();
     // Deeply nested source path; parent dirs don't exist yet.
-    let frag = Fragment::new(
-        "packages/auth/src/jwt.rs",
-        vec![],
-        vec![],
-    )
-    .unwrap();
+    let frag = Fragment::new("packages/auth/src/jwt.rs", vec![], vec![]).unwrap();
     write_fragment(tmp.path(), "packages/auth/src/jwt.rs", &frag).unwrap();
-    let expected = tmp.path().join(
-        ".aethyme/graph/packages/auth/src/jwt.rs.bin",
-    );
+    let expected = tmp
+        .path()
+        .join(".aethyme/graph/packages/auth/src/jwt.rs.bin");
     assert!(expected.exists());
 }
 
@@ -107,8 +98,7 @@ fn write_fragment_is_atomic_no_partial_file_after_success() {
 fn write_fragment_rejects_path_traversal() {
     let tmp = tempfile::tempdir().unwrap();
     let frag = Fragment::new("evil.py", vec![], vec![]).unwrap();
-    let err = write_fragment(tmp.path(), "../../etc/passwd", &frag)
-        .unwrap_err();
+    let err = write_fragment(tmp.path(), "../../etc/passwd", &frag).unwrap_err();
     assert!(matches!(err, FragmentWriteError::Path(_)));
     // No file created inside the fragment root. (Joining the traversal
     // path would resolve to the real /etc/passwd on Linux, where tempdirs
@@ -194,12 +184,8 @@ fn write_then_read_overlay_round_trip() {
 #[test]
 fn write_overlay_lands_under_overlays_subdir() {
     let tmp = tempfile::tempdir().unwrap();
-    let overlay = OverlayFragment::new(
-        "configs",
-        "configs/0.1.0",
-        sample_overlay_payload(),
-    )
-    .unwrap();
+    let overlay =
+        OverlayFragment::new("configs", "configs/0.1.0", sample_overlay_payload()).unwrap();
     write_overlay(tmp.path(), "configs", &overlay).unwrap();
     let expected = tmp.path().join(".aethyme/graph/_overlays/configs.bin");
     assert!(expected.exists());
@@ -211,12 +197,7 @@ fn read_overlay_kind_mismatch_fails_loudly() {
     // another and try to decode. Simulates either tampering or a
     // caller asking for the wrong kind.
     let tmp = tempfile::tempdir().unwrap();
-    let overlay = OverlayFragment::new(
-        "risks",
-        "risks/0.1.0",
-        sample_overlay_payload(),
-    )
-    .unwrap();
+    let overlay = OverlayFragment::new("risks", "risks/0.1.0", sample_overlay_payload()).unwrap();
     write_overlay(tmp.path(), "risks", &overlay).unwrap();
 
     // Copy risks.bin → structure.bin to simulate a kind/filename
@@ -228,11 +209,7 @@ fn read_overlay_kind_mismatch_fails_loudly() {
     )
     .unwrap();
 
-    let err = read_overlay::<BTreeMap<String, String>>(
-        tmp.path(),
-        "structure",
-    )
-    .unwrap_err();
+    let err = read_overlay::<BTreeMap<String, String>>(tmp.path(), "structure").unwrap_err();
     assert!(
         matches!(
             err,
@@ -247,12 +224,8 @@ fn fragment_store_list_overlays_returns_sorted_kinds() {
     let tmp = tempfile::tempdir().unwrap();
     // Write in non-alphabetical order to prove the sort.
     for kind in ["risks", "configs", "structure"] {
-        let overlay = OverlayFragment::new(
-            kind,
-            &format!("{kind}/0.1.0"),
-            sample_overlay_payload(),
-        )
-        .unwrap();
+        let overlay =
+            OverlayFragment::new(kind, &format!("{kind}/0.1.0"), sample_overlay_payload()).unwrap();
         write_overlay(tmp.path(), kind, &overlay).unwrap();
     }
 
@@ -276,12 +249,8 @@ fn fragment_store_does_not_enumerate_overlay_bins_as_source_paths() {
     let tmp = tempfile::tempdir().unwrap();
     // One real fragment, one overlay sitting next to it.
     write_fragment(tmp.path(), "src/cli.py", &sample_fragment()).unwrap();
-    let overlay = OverlayFragment::new(
-        "structure",
-        "structure/0.1.0",
-        sample_overlay_payload(),
-    )
-    .unwrap();
+    let overlay =
+        OverlayFragment::new("structure", "structure/0.1.0", sample_overlay_payload()).unwrap();
     write_overlay(tmp.path(), "structure", &overlay).unwrap();
 
     let store = FragmentStore::open(tmp.path()).unwrap();
@@ -292,24 +261,14 @@ fn fragment_store_does_not_enumerate_overlay_bins_as_source_paths() {
 #[test]
 fn overlay_bytes_on_disk_byte_identical_across_writes() {
     let tmp = tempfile::tempdir().unwrap();
-    let overlay = OverlayFragment::new(
-        "structure",
-        "structure/0.1.0",
-        sample_overlay_payload(),
-    )
-    .unwrap();
+    let overlay =
+        OverlayFragment::new("structure", "structure/0.1.0", sample_overlay_payload()).unwrap();
 
     write_overlay(tmp.path(), "structure", &overlay).unwrap();
-    let bytes_a = std::fs::read(
-        tmp.path().join(".aethyme/graph/_overlays/structure.bin"),
-    )
-    .unwrap();
+    let bytes_a = std::fs::read(tmp.path().join(".aethyme/graph/_overlays/structure.bin")).unwrap();
 
     write_overlay(tmp.path(), "structure", &overlay).unwrap();
-    let bytes_b = std::fs::read(
-        tmp.path().join(".aethyme/graph/_overlays/structure.bin"),
-    )
-    .unwrap();
+    let bytes_b = std::fs::read(tmp.path().join(".aethyme/graph/_overlays/structure.bin")).unwrap();
 
     assert_eq!(bytes_a, bytes_b);
 }
@@ -322,17 +281,11 @@ fn fragment_bytes_on_disk_byte_identical_across_writes() {
     let frag = sample_fragment();
 
     write_fragment(tmp.path(), "src/cli.py", &frag).unwrap();
-    let bytes_a = std::fs::read(
-        tmp.path().join(".aethyme/graph/src/cli.py.bin"),
-    )
-    .unwrap();
+    let bytes_a = std::fs::read(tmp.path().join(".aethyme/graph/src/cli.py.bin")).unwrap();
 
     // Rewrite from scratch
     write_fragment(tmp.path(), "src/cli.py", &frag).unwrap();
-    let bytes_b = std::fs::read(
-        tmp.path().join(".aethyme/graph/src/cli.py.bin"),
-    )
-    .unwrap();
+    let bytes_b = std::fs::read(tmp.path().join(".aethyme/graph/src/cli.py.bin")).unwrap();
 
     assert_eq!(bytes_a, bytes_b);
 }

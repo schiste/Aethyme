@@ -47,13 +47,9 @@ impl UnresolvedSymbol {
         // distinct UnresolvedSymbol nodes. Without this, every
         // unresolved `print` call in a Python repo would collapse
         // to one node.
-        let symbol = format!(
-            "unresolved#{}:{name}",
-            referenced_from_id.hash_suffix(),
-        );
-        let id =
-            NodeId::new(NodeKind::UnresolvedSymbol, repo, file_path, &symbol)
-                .map_err(UnresolvedSymbolConstructionError::Id)?;
+        let symbol = format!("unresolved#{}:{name}", referenced_from_id.hash_suffix(),);
+        let id = NodeId::new(NodeKind::UnresolvedSymbol, repo, file_path, &symbol)
+            .map_err(UnresolvedSymbolConstructionError::Id)?;
         Ok(UnresolvedSymbol {
             id,
             name: name.into(),
@@ -86,16 +82,9 @@ pub enum UnresolvedSymbolConstructionError {
 impl std::fmt::Display for UnresolvedSymbolConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyName => {
-                f.write_str("UnresolvedSymbol: name must not be empty")
-            }
-            Self::EmptyFilePath => {
-                f.write_str("UnresolvedSymbol: file_path must not be empty")
-            }
-            Self::Id(e) => write!(
-                f,
-                "UnresolvedSymbol: ID construction failed: {e}"
-            ),
+            Self::EmptyName => f.write_str("UnresolvedSymbol: name must not be empty"),
+            Self::EmptyFilePath => f.write_str("UnresolvedSymbol: file_path must not be empty"),
+            Self::Id(e) => write!(f, "UnresolvedSymbol: ID construction failed: {e}"),
         }
     }
 }

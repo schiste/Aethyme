@@ -34,10 +34,9 @@
 //! is doing real work — if it weren't, the harness would silently
 //! accept input-order bytes into the on-disk envelope.
 
-use aethyme_graph_storage::{bootstrap_repo, FragmentStore};
+use aethyme_graph_storage::{FragmentStore, bootstrap_repo};
 use aethyme_producers::{
-    assert_overlay_producer_is_deterministic, PackageProducer, ProducerCtx,
-    RepoFileView, RepoView,
+    PackageProducer, ProducerCtx, RepoFileView, RepoView, assert_overlay_producer_is_deterministic,
 };
 use tempfile::TempDir;
 

@@ -28,27 +28,22 @@
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    BindingPattern, Class, ClassElement, Expression, Function as OxcFunction,
-    ImportDeclaration, ImportDeclarationSpecifier, ModuleExportName, Program,
-    PropertyKey, Statement, TSEnumDeclaration, TSInterfaceDeclaration,
-    TSTypeAliasDeclaration,
+    BindingPattern, Class, ClassElement, Expression, Function as OxcFunction, ImportDeclaration,
+    ImportDeclarationSpecifier, ModuleExportName, Program, PropertyKey, Statement,
+    TSEnumDeclaration, TSInterfaceDeclaration, TSTypeAliasDeclaration,
 };
 use oxc_parser::Parser;
 use oxc_span::{SourceType as OxcSourceType, Span};
 
 use aethyme_graph_schema::{
-    Callable, Class as SchemaClass, Confidence, Edge, EdgeAttributes,
-    Enum as SchemaEnum, Function as SchemaFunction, GlobalVariable,
-    Interface as SchemaInterface, Method, Node, NodeId, NodeKind,
-    ParameterSignature, Source, SourceRange, TypeAlias, UnresolvedSymbol,
-    Visibility,
+    Callable, Class as SchemaClass, Confidence, Edge, EdgeAttributes, Enum as SchemaEnum,
+    Function as SchemaFunction, GlobalVariable, Interface as SchemaInterface, Method, Node, NodeId,
+    NodeKind, ParameterSignature, Source, SourceRange, TypeAlias, UnresolvedSymbol, Visibility,
 };
 
 use crate::context::IndexerContext;
 use crate::filesystem::IndexedFile;
-use crate::language::{
-    LanguageIndexError, LanguageIndexResult, LanguageIndexer, LineIndex,
-};
+use crate::language::{LanguageIndexError, LanguageIndexResult, LanguageIndexer, LineIndex};
 
 /// Indexer for `.ts`/`.tsx`/`.js`/`.jsx`/`.cjs`/`.mjs` files via oxc.
 ///
@@ -85,8 +80,7 @@ impl LanguageIndexer for TypeScriptIndexer {
         // within the same scope where the Allocator is alive.
         let allocator = Allocator::default();
         let source_type = source_type_for(&indexed_file.source_path);
-        let parser_return =
-            Parser::new(&allocator, content, source_type).parse();
+        let parser_return = Parser::new(&allocator, content, source_type).parse();
 
         if !parser_return.errors.is_empty() {
             // Hard parse errors. Even oxc's recoverable cases set
@@ -141,9 +135,7 @@ fn walk_top_level_statement(
 ) -> Result<(), LanguageIndexError> {
     match stmt {
         Statement::FunctionDeclaration(f) => {
-            if let Some(node) =
-                build_function(repo, source_path, f, line_index, true)?
-            {
+            if let Some(node) = build_function(repo, source_path, f, line_index, true)? {
                 let id = node.id().clone();
                 nodes.push(Node::Function(node));
                 edges.push(structural_edge(
@@ -154,8 +146,7 @@ fn walk_top_level_statement(
             }
         }
         Statement::ClassDeclaration(c) => {
-            if let Some(class) = build_class(repo, source_path, c, line_index)?
-            {
+            if let Some(class) = build_class(repo, source_path, c, line_index)? {
                 let class_id = class.id().clone();
                 nodes.push(Node::Class(class));
                 edges.push(structural_edge(
@@ -222,13 +213,8 @@ fn walk_top_level_statement(
         Statement::VariableDeclaration(v) => {
             for decl in &v.declarations {
                 if let BindingPattern::BindingIdentifier(id) = &decl.id {
-                    let global = build_global(
-                        repo,
-                        source_path,
-                        id.name.as_str(),
-                        decl.span,
-                        line_index,
-                    )?;
+                    let global =
+                        build_global(repo, source_path, id.name.as_str(), decl.span, line_index)?;
                     let global_id = global.id().clone();
                     nodes.push(Node::GlobalVariable(global));
                     edges.push(structural_edge(
@@ -240,9 +226,7 @@ fn walk_top_level_statement(
             }
         }
         Statement::ImportDeclaration(imp) => {
-            emit_ts_import_placeholders(
-                repo, source_path, file_id, imp, nodes, edges,
-            )?;
+            emit_ts_import_placeholders(repo, source_path, file_id, imp, nodes, edges)?;
         }
         _ => {} // other statement kinds are ignored at top level in v1
     }
@@ -266,8 +250,7 @@ fn build_function(
     };
     let name = id.name.as_str();
     let parameters = parameter_signatures_for_function(f);
-    let signature =
-        synthesize_function_signature(name, &parameters, f.r#async);
+    let signature = synthesize_function_signature(name, &parameters, f.r#async);
     let source_range = span_to_source_range(f.span, line_index)?;
     let visibility = Visibility::Public;
     let function = SchemaFunction::new(
@@ -302,8 +285,7 @@ fn build_method(
     method_span: Span,
 ) -> Result<Method, LanguageIndexError> {
     let parameters = parameter_signatures_for_function(value);
-    let signature =
-        synthesize_function_signature(name, &parameters, value.r#async);
+    let signature = synthesize_function_signature(name, &parameters, value.r#async);
     let source_range = span_to_source_range(method_span, line_index)?;
     let visibility = Visibility::Public;
     // TypeScript methods are conventionally overridable in subclasses
@@ -415,8 +397,7 @@ fn build_global(
     line_index: &LineIndex,
 ) -> Result<GlobalVariable, LanguageIndexError> {
     let source_range = span_to_source_range(span, line_index)?;
-    GlobalVariable::new(repo, source_path, name, None, source_range)
-        .map_err(node_construction_err)
+    GlobalVariable::new(repo, source_path, name, None, source_range).map_err(node_construction_err)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────
@@ -433,9 +414,7 @@ fn property_key_name<'a>(key: &'a PropertyKey<'a>) -> Option<&'a str> {
     }
 }
 
-fn parameter_signatures_for_function(
-    f: &OxcFunction,
-) -> Vec<ParameterSignature> {
+fn parameter_signatures_for_function(f: &OxcFunction) -> Vec<ParameterSignature> {
     let mut out = Vec::new();
     for p in &f.params.items {
         let name = match &p.pattern {
@@ -448,10 +427,7 @@ fn parameter_signatures_for_function(
         };
         // type_annotation lives on the FormalParameter in 0.125,
         // not on the BindingPattern.
-        let type_str = p
-            .type_annotation
-            .as_ref()
-            .map(|_| "<annotated>".into());
+        let type_str = p.type_annotation.as_ref().map(|_| "<annotated>".into());
         out.push(ParameterSignature {
             name: name.into(),
             type_str,
@@ -466,7 +442,11 @@ fn synthesize_function_signature(
     parameters: &[ParameterSignature],
     is_async: bool,
 ) -> String {
-    let prefix = if is_async { "async function" } else { "function" };
+    let prefix = if is_async {
+        "async function"
+    } else {
+        "function"
+    };
     let params_str = parameters
         .iter()
         .map(|p| {
@@ -487,10 +467,8 @@ fn span_to_source_range(
 ) -> Result<SourceRange, LanguageIndexError> {
     let start = line_index.line_at(span.start as usize);
     let end = line_index.line_at(span.end as usize);
-    SourceRange::new(start, end).map_err(|e| {
-        LanguageIndexError::NodeConstruction {
-            message: format!("source range: {e}"),
-        }
+    SourceRange::new(start, end).map_err(|e| LanguageIndexError::NodeConstruction {
+        message: format!("source range: {e}"),
     })
 }
 
@@ -520,17 +498,11 @@ fn format_diagnostics<D: std::fmt::Display>(diagnostics: &[D]) -> String {
         .join("; ")
 }
 
-fn structural_edge(
-    attributes: EdgeAttributes,
-    src: NodeId,
-    dst: NodeId,
-) -> Edge {
+fn structural_edge(attributes: EdgeAttributes, src: NodeId, dst: NodeId) -> Edge {
     Edge::new(src, dst, attributes, Source::Structure, Confidence::FULL)
 }
 
-fn node_construction_err(
-    e: impl std::fmt::Display,
-) -> LanguageIndexError {
+fn node_construction_err(e: impl std::fmt::Display) -> LanguageIndexError {
     LanguageIndexError::NodeConstruction {
         message: e.to_string(),
     }
@@ -616,53 +588,47 @@ fn emit_ts_import_placeholders(
     };
 
     for spec in specifiers {
-        let (binding, expected_kind, is_namespace, is_default, is_named, path_suffix) =
-            match spec {
-                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => (
+        let (binding, expected_kind, is_namespace, is_default, is_named, path_suffix) = match spec {
+            ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => (
+                s.local.name.as_str().to_string(),
+                None, // default export can be anything
+                false,
+                true,
+                false,
+                None,
+            ),
+            ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => (
+                s.local.name.as_str().to_string(),
+                Some(NodeKind::Module),
+                true,
+                false,
+                false,
+                None,
+            ),
+            ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                let imported_name = match &s.imported {
+                    ModuleExportName::IdentifierName(n) => n.name.as_str(),
+                    ModuleExportName::IdentifierReference(n) => n.name.as_str(),
+                    ModuleExportName::StringLiteral(sl) => sl.value.as_str(),
+                };
+                (
                     s.local.name.as_str().to_string(),
-                    None, // default export can be anything
+                    None,
+                    false,
                     false,
                     true,
-                    false,
-                    None,
-                ),
-                ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => (
-                    s.local.name.as_str().to_string(),
-                    Some(NodeKind::Module),
-                    true,
-                    false,
-                    false,
-                    None,
-                ),
-                ImportDeclarationSpecifier::ImportSpecifier(s) => {
-                    let imported_name = match &s.imported {
-                        ModuleExportName::IdentifierName(n) => n.name.as_str(),
-                        ModuleExportName::IdentifierReference(n) => n.name.as_str(),
-                        ModuleExportName::StringLiteral(sl) => sl.value.as_str(),
-                    };
-                    (
-                        s.local.name.as_str().to_string(),
-                        None,
-                        false,
-                        false,
-                        true,
-                        Some(imported_name.to_string()),
-                    )
-                }
-            };
+                    Some(imported_name.to_string()),
+                )
+            }
+        };
 
         let import_path = match &path_suffix {
             Some(name) => format!("{source}::{name}"),
             None => source.to_string(),
         };
-        let placeholder = UnresolvedSymbol::new(
-            repo,
-            source_path,
-            &binding,
-            expected_kind,
-            file_id.clone(),
-        )
-        .map_err(node_construction_err)?;
+        let placeholder =
+            UnresolvedSymbol::new(repo, source_path, &binding, expected_kind, file_id.clone())
+                .map_err(node_construction_err)?;
         let id = placeholder.id().clone();
         nodes.push(Node::UnresolvedSymbol(placeholder));
         edges.push(Edge::new(

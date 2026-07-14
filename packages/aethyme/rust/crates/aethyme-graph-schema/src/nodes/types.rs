@@ -36,8 +36,7 @@ macro_rules! basic_type_defining_struct {
                 if file_path.is_empty() {
                     return Err($err::EmptyFilePath);
                 }
-                let id = NodeId::new($kind, repo, file_path, name)
-                    .map_err($err::Id)?;
+                let id = NodeId::new($kind, repo, file_path, name).map_err($err::Id)?;
                 Ok(Self {
                     id,
                     name: name.into(),
@@ -70,21 +69,11 @@ macro_rules! basic_type_defining_struct {
         impl std::fmt::Display for $err {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match self {
-                    Self::EmptyName => write!(
-                        f,
-                        "{}: name must not be empty",
-                        stringify!($name)
-                    ),
-                    Self::EmptyFilePath => write!(
-                        f,
-                        "{}: file_path must not be empty",
-                        stringify!($name)
-                    ),
-                    Self::Id(e) => write!(
-                        f,
-                        "{}: ID construction failed: {e}",
-                        stringify!($name)
-                    ),
+                    Self::EmptyName => write!(f, "{}: name must not be empty", stringify!($name)),
+                    Self::EmptyFilePath => {
+                        write!(f, "{}: file_path must not be empty", stringify!($name))
+                    }
+                    Self::Id(e) => write!(f, "{}: ID construction failed: {e}", stringify!($name)),
                 }
             }
         }
@@ -95,11 +84,7 @@ macro_rules! basic_type_defining_struct {
 
 basic_type_defining_struct!(Class, NodeKind::Class, ClassConstructionError);
 basic_type_defining_struct!(Struct, NodeKind::Struct, StructConstructionError);
-basic_type_defining_struct!(
-    Interface,
-    NodeKind::Interface,
-    InterfaceConstructionError
-);
+basic_type_defining_struct!(Interface, NodeKind::Interface, InterfaceConstructionError);
 basic_type_defining_struct!(Trait, NodeKind::Trait, TraitConstructionError);
 
 // ─── Enum (variants[] additional) ────────────────────────────────────
@@ -178,9 +163,7 @@ impl std::fmt::Display for EnumConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyName => f.write_str("Enum: name must not be empty"),
-            Self::EmptyFilePath => {
-                f.write_str("Enum: file_path must not be empty")
-            }
+            Self::EmptyFilePath => f.write_str("Enum: file_path must not be empty"),
             Self::Id(e) => write!(f, "Enum: ID construction failed: {e}"),
         }
     }
@@ -256,15 +239,9 @@ pub enum TypeAliasConstructionError {
 impl std::fmt::Display for TypeAliasConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyName => {
-                f.write_str("TypeAlias: name must not be empty")
-            }
-            Self::EmptyFilePath => {
-                f.write_str("TypeAlias: file_path must not be empty")
-            }
-            Self::EmptyTargetType => {
-                f.write_str("TypeAlias: target_type must not be empty")
-            }
+            Self::EmptyName => f.write_str("TypeAlias: name must not be empty"),
+            Self::EmptyFilePath => f.write_str("TypeAlias: file_path must not be empty"),
+            Self::EmptyTargetType => f.write_str("TypeAlias: target_type must not be empty"),
             Self::Id(e) => {
                 write!(f, "TypeAlias: ID construction failed: {e}")
             }

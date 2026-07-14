@@ -12,10 +12,12 @@ use std::path::Path;
 use blake3::Hasher;
 use walkdir::WalkDir;
 
-use aethyme_graph_schema::{File, FileConstructionError, Node, NonCodeFile, NonCodeFileConstructionError};
+use aethyme_graph_schema::{
+    File, FileConstructionError, Node, NonCodeFile, NonCodeFileConstructionError,
+};
 
 use crate::context::IndexerContext;
-use crate::language_map::{classify_file, FileClassification};
+use crate::language_map::{FileClassification, classify_file};
 
 /// One file's contribution to the per-file fragment: the top-level
 /// File or NonCodeFile node, ready to be the seed of a Fragment.
@@ -108,8 +110,7 @@ pub fn walk_source_tree(
     ctx: &IndexerContext,
     options: &WalkOptions,
 ) -> Result<FilesystemIndexResult, FilesystemIndexerError> {
-    let max_size =
-        options.max_file_size_bytes.unwrap_or(DEFAULT_MAX_FILE_SIZE);
+    let max_size = options.max_file_size_bytes.unwrap_or(DEFAULT_MAX_FILE_SIZE);
     let mut files = Vec::new();
     let mut skipped = Vec::new();
 
@@ -134,10 +135,7 @@ pub fn walk_source_tree(
             continue;
         };
 
-        let file_name = entry
-            .file_name()
-            .to_string_lossy()
-            .into_owned();
+        let file_name = entry.file_name().to_string_lossy().into_owned();
         match classify_file(&file_name) {
             FileClassification::Ignored => {
                 skipped.push(SkippedFile {
@@ -176,12 +174,8 @@ pub fn walk_source_tree(
             }
             FileClassification::NonCode { format } => {
                 let lang_label = non_code_format_label(&format);
-                let node = NonCodeFile::new(
-                    ctx.repo_name(),
-                    &source_path,
-                    format,
-                )
-                .map_err(FilesystemIndexerError::NonCodeNode)?;
+                let node = NonCodeFile::new(ctx.repo_name(), &source_path, format)
+                    .map_err(FilesystemIndexerError::NonCodeNode)?;
                 files.push(IndexedFile {
                     source_path: source_path.into(),
                     top_node: Node::NonCodeFile(node),
@@ -198,15 +192,14 @@ pub fn walk_source_tree(
     Ok(FilesystemIndexResult { files, skipped })
 }
 
-fn is_ignored_dir(
-    path: &Path,
-    root: &Path,
-    extra: &[String],
-) -> bool {
+fn is_ignored_dir(path: &Path, root: &Path, extra: &[String]) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    if DEFAULT_IGNORE_DIRS.iter().any(|ig| ig.eq_ignore_ascii_case(name)) {
+    if DEFAULT_IGNORE_DIRS
+        .iter()
+        .any(|ig| ig.eq_ignore_ascii_case(name))
+    {
         return true;
     }
     if let Ok(rel) = path.strip_prefix(root) {
@@ -238,10 +231,7 @@ struct FileMeta {
     content_hash: String,
 }
 
-fn read_metadata(
-    path: &Path,
-    max_size: u64,
-) -> std::io::Result<Option<FileMeta>> {
+fn read_metadata(path: &Path, max_size: u64) -> std::io::Result<Option<FileMeta>> {
     let metadata = std::fs::metadata(path)?;
     let byte_size = metadata.len();
     if byte_size > max_size {

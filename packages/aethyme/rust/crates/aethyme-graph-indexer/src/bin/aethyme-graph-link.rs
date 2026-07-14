@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use aethyme_graph_indexer::{link_repo_path, LinkSummary};
+use aethyme_graph_indexer::{LinkSummary, link_repo_path};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -95,7 +95,10 @@ fn emit_json_summary(summary: &LinkSummary, elapsed_ms: u64) {
     print!("\"fragments_visited\":{},", summary.fragments_visited);
     print!("\"fragments_rewritten\":{},", summary.fragments_rewritten);
     print!("\"placeholders_seen\":{},", summary.placeholders_seen);
-    print!("\"placeholders_resolved\":{},", summary.placeholders_resolved);
+    print!(
+        "\"placeholders_resolved\":{},",
+        summary.placeholders_resolved
+    );
     print!("\"edges_rewritten\":{},", summary.edges_rewritten);
     print!("\"orphans_removed\":{}", summary.orphans_removed);
     print!("}}");

@@ -116,19 +116,14 @@ impl OverlayProducer for PackageProducer {
         let mut packages: Vec<Package> = view
             .files()
             .iter()
-            .filter_map(|f| {
-                classify_manifest(&f.path)
-                    .map(|kind| (f.path.as_str(), kind))
-            })
+            .filter_map(|f| classify_manifest(&f.path).map(|kind| (f.path.as_str(), kind)))
             .map(|(manifest_path, kind)| {
                 let dir = parent_dir_or_root(manifest_path);
                 let name = package_name(dir, repo);
                 Package::new(repo, dir, &name, manifest_path, kind)
             })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                ProducerError::Other(format!("Package::new failed: {e}"))
-            })?;
+            .map_err(|e| ProducerError::Other(format!("Package::new failed: {e}")))?;
 
         // Canonical ordering. `manifest_path` is unique within a
         // repo (one Package per manifest file) so this is a total
@@ -159,10 +154,7 @@ fn classify_manifest(path: &str) -> Option<&'static str> {
     let lower = path.to_ascii_lowercase();
 
     // 1. Generated — engine's `is_generated`.
-    if lower.contains("generated")
-        || lower.ends_with(".min.js")
-        || lower.ends_with(".lock")
-    {
+    if lower.contains("generated") || lower.ends_with(".min.js") || lower.ends_with(".lock") {
         return None;
     }
 
@@ -256,10 +248,7 @@ mod tests {
     #[test]
     fn classify_accepts_npm() {
         assert_eq!(classify_manifest("package.json"), Some("npm"));
-        assert_eq!(
-            classify_manifest("packages/web/package.json"),
-            Some("npm")
-        );
+        assert_eq!(classify_manifest("packages/web/package.json"), Some("npm"));
     }
 
     #[test]
@@ -315,7 +304,10 @@ mod tests {
     #[test]
     fn parent_dir_handles_root_and_nested() {
         assert_eq!(parent_dir_or_root("Cargo.toml"), ".");
-        assert_eq!(parent_dir_or_root("packages/foo/Cargo.toml"), "packages/foo");
+        assert_eq!(
+            parent_dir_or_root("packages/foo/Cargo.toml"),
+            "packages/foo"
+        );
         assert_eq!(parent_dir_or_root("frontend/package.json"), "frontend");
     }
 

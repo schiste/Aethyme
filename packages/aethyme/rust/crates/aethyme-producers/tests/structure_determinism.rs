@@ -18,10 +18,10 @@
 //! That's enough to exercise both the `parent_dir → ...` and
 //! `repo → top_level` branches of the producer's edge logic.
 
-use aethyme_graph_storage::{bootstrap_repo, FragmentStore};
+use aethyme_graph_storage::{FragmentStore, bootstrap_repo};
 use aethyme_producers::{
-    assert_overlay_producer_is_deterministic, ProducerCtx, RepoFileView,
-    RepoView, StructureProducer,
+    ProducerCtx, RepoFileView, RepoView, StructureProducer,
+    assert_overlay_producer_is_deterministic,
 };
 use tempfile::TempDir;
 

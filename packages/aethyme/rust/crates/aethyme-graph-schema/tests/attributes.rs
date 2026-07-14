@@ -1,9 +1,7 @@
 //! Integration tests for the common attribute types: `Confidence`,
 //! `Source`, `BindingKind`.
 
-use aethyme_graph_schema::{
-    ALL_BINDING_KINDS, ALL_SOURCES, BindingKind, Confidence, Source,
-};
+use aethyme_graph_schema::{ALL_BINDING_KINDS, ALL_SOURCES, BindingKind, Confidence, Source};
 
 // ─── Confidence ──────────────────────────────────────────────────────
 
@@ -190,8 +188,7 @@ fn binding_kind_wasm_bindgen_uses_underscore() {
 #[test]
 fn source_and_binding_kind_canonical_names_are_disjoint() {
     use std::collections::BTreeSet;
-    let source_names: BTreeSet<&'static str> =
-        ALL_SOURCES.iter().map(|s| s.name()).collect();
+    let source_names: BTreeSet<&'static str> = ALL_SOURCES.iter().map(|s| s.name()).collect();
     for &b in ALL_BINDING_KINDS {
         assert!(
             !source_names.contains(b.name()),

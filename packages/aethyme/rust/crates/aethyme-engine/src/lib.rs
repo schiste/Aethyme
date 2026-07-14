@@ -3,6 +3,7 @@ pub mod context_pack;
 pub mod daemon;
 pub mod deps;
 pub mod explore;
+pub mod explore_cli;
 pub mod graph;
 pub mod json;
 pub mod map;

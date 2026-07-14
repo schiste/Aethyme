@@ -32,16 +32,15 @@
 //! degradation).
 
 use ruff_python_ast::{
-    ModModule, Stmt, StmtAnnAssign, StmtAssign, StmtClassDef, StmtFunctionDef,
-    StmtImport, StmtImportFrom,
+    ModModule, Stmt, StmtAnnAssign, StmtAssign, StmtClassDef, StmtFunctionDef, StmtImport,
+    StmtImportFrom,
 };
 use ruff_python_parser::parse_module;
 use ruff_text_size::TextRange;
 
 use aethyme_graph_schema::{
-    Callable, Class, Confidence, Edge, EdgeAttributes, Function,
-    GlobalVariable, Method, Node, NodeId, NodeKind, ParameterSignature,
-    Source, SourceRange, UnresolvedSymbol, Visibility,
+    Callable, Class, Confidence, Edge, EdgeAttributes, Function, GlobalVariable, Method, Node,
+    NodeId, NodeKind, ParameterSignature, Source, SourceRange, UnresolvedSymbol, Visibility,
 };
 
 use crate::context::IndexerContext;
@@ -74,10 +73,8 @@ impl LanguageIndexer for PythonIndexer {
         indexed_file: &IndexedFile,
         content: &str,
     ) -> Result<LanguageIndexResult, LanguageIndexError> {
-        let parsed = parse_module(content).map_err(|e| {
-            LanguageIndexError::Parse {
-                message: format!("{e:?}"),
-            }
+        let parsed = parse_module(content).map_err(|e| LanguageIndexError::Parse {
+            message: format!("{e:?}"),
         })?;
         let module: &ModModule = parsed.syntax();
         let line_index = LineIndex::new(content);
@@ -107,12 +104,7 @@ impl LanguageIndexer for PythonIndexer {
                     ));
                 }
                 Stmt::ClassDef(c) => {
-                    let class = build_class(
-                        repo,
-                        source_path,
-                        c,
-                        &line_index,
-                    )?;
+                    let class = build_class(repo, source_path, c, &line_index)?;
                     let class_id = class.id().clone();
                     nodes.push(Node::Class(class));
                     edges.push(structural_edge(
@@ -124,13 +116,8 @@ impl LanguageIndexer for PythonIndexer {
                     // Walk class body for methods.
                     for member in &c.body {
                         if let Stmt::FunctionDef(m) = member {
-                            let method = build_method(
-                                repo,
-                                source_path,
-                                m,
-                                class_id.clone(),
-                                &line_index,
-                            )?;
+                            let method =
+                                build_method(repo, source_path, m, class_id.clone(), &line_index)?;
                             let method_id = method.id().clone();
                             nodes.push(Node::Method(method));
                             edges.push(structural_edge(
@@ -142,12 +129,9 @@ impl LanguageIndexer for PythonIndexer {
                     }
                 }
                 Stmt::Assign(a) => {
-                    if let Some(global) = build_global_from_assign(
-                        repo,
-                        source_path,
-                        a,
-                        &line_index,
-                    )? {
+                    if let Some(global) =
+                        build_global_from_assign(repo, source_path, a, &line_index)?
+                    {
                         let global_id = global.id().clone();
                         nodes.push(Node::GlobalVariable(global));
                         edges.push(structural_edge(
@@ -158,12 +142,9 @@ impl LanguageIndexer for PythonIndexer {
                     }
                 }
                 Stmt::AnnAssign(a) => {
-                    if let Some(global) = build_global_from_ann_assign(
-                        repo,
-                        source_path,
-                        a,
-                        &line_index,
-                    )? {
+                    if let Some(global) =
+                        build_global_from_ann_assign(repo, source_path, a, &line_index)?
+                    {
                         let global_id = global.id().clone();
                         nodes.push(Node::GlobalVariable(global));
                         edges.push(structural_edge(
@@ -281,11 +262,11 @@ fn build_class(
     let name = c.name.as_str();
     let source_range = range_to_source_range(c.range, line_index)?;
     let visibility = visibility_from_name(name);
-    Class::new(repo, source_path, name, source_range, visibility).map_err(
-        |e| LanguageIndexError::NodeConstruction {
+    Class::new(repo, source_path, name, source_range, visibility).map_err(|e| {
+        LanguageIndexError::NodeConstruction {
             message: e.to_string(),
-        },
-    )
+        }
+    })
 }
 
 fn build_global_from_assign(
@@ -342,9 +323,7 @@ fn decorator_name(d: &ruff_python_ast::Decorator) -> Option<&str> {
     }
 }
 
-fn parameter_signatures(
-    params: &ruff_python_ast::Parameters,
-) -> Vec<ParameterSignature> {
+fn parameter_signatures(params: &ruff_python_ast::Parameters) -> Vec<ParameterSignature> {
     let mut out = Vec::new();
     for p in params.iter_non_variadic_params() {
         let name: &str = p.parameter.name.as_str();
@@ -390,10 +369,8 @@ fn range_to_source_range(
 ) -> Result<SourceRange, LanguageIndexError> {
     let start = line_index.line_at(u32::from(range.start()) as usize);
     let end = line_index.line_at(u32::from(range.end()) as usize);
-    SourceRange::new(start, end).map_err(|e| {
-        LanguageIndexError::NodeConstruction {
-            message: format!("source range: {e}"),
-        }
+    SourceRange::new(start, end).map_err(|e| LanguageIndexError::NodeConstruction {
+        message: format!("source range: {e}"),
     })
 }
 
@@ -412,18 +389,8 @@ fn visibility_from_name(name: &str) -> Visibility {
     }
 }
 
-fn structural_edge(
-    attributes: EdgeAttributes,
-    src: NodeId,
-    dst: NodeId,
-) -> Edge {
-    Edge::new(
-        src,
-        dst,
-        attributes,
-        Source::Structure,
-        Confidence::FULL,
-    )
+fn structural_edge(attributes: EdgeAttributes, src: NodeId, dst: NodeId) -> Edge {
+    Edge::new(src, dst, attributes, Source::Structure, Confidence::FULL)
 }
 
 // ─── Imports (Phase 4.4) ─────────────────────────────────────────────

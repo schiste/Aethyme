@@ -13,19 +13,17 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use aethyme_graph_schema::{NodeId, NodeKind};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::disk::{
-    read_fragment, read_index_shard, read_overlay, write_overlay,
-    FragmentReadError, IndexShardReadError, OverlayReadError,
-    OverlayWriteError,
+    FragmentReadError, IndexShardReadError, OverlayReadError, OverlayWriteError, read_fragment,
+    read_index_shard, read_overlay, write_overlay,
 };
 use crate::fragment::Fragment;
 use crate::index_shard::SymbolRecord;
 use crate::layout::{
-    AETHYME_DIR, FRAGMENT_EXT, GRAPH_SUBDIR, INDEX_SHARD_EXT, INDEX_SUBDIR,
-    OVERLAYS_SUBDIR,
+    AETHYME_DIR, FRAGMENT_EXT, GRAPH_SUBDIR, INDEX_SHARD_EXT, INDEX_SUBDIR, OVERLAYS_SUBDIR,
 };
 use crate::overlay::OverlayFragment;
 
@@ -46,9 +44,7 @@ impl FragmentStore {
     /// `.aethyme/graph/` directory exists; returns
     /// [`StoreOpenError::MissingLayout`] if not (typical cause:
     /// the repo hasn't been bootstrapped via `bootstrap_repo`).
-    pub fn open(
-        repo_root: impl Into<PathBuf>,
-    ) -> Result<Self, StoreOpenError> {
+    pub fn open(repo_root: impl Into<PathBuf>) -> Result<Self, StoreOpenError> {
         let repo_root = repo_root.into();
         let graph_dir = repo_root.join(AETHYME_DIR).join(GRAPH_SUBDIR);
         if !graph_dir.is_dir() {
@@ -65,18 +61,12 @@ impl FragmentStore {
     }
 
     /// Read the fragment for the given source path.
-    pub fn read_fragment(
-        &self,
-        source_path: &str,
-    ) -> Result<Fragment, FragmentReadError> {
+    pub fn read_fragment(&self, source_path: &str) -> Result<Fragment, FragmentReadError> {
         read_fragment(&self.repo_root, source_path)
     }
 
     /// Read the per-module index shard for the given module.
-    pub fn read_index_shard(
-        &self,
-        module: &str,
-    ) -> Result<Vec<SymbolRecord>, IndexShardReadError> {
+    pub fn read_index_shard(&self, module: &str) -> Result<Vec<SymbolRecord>, IndexShardReadError> {
         read_index_shard(&self.repo_root, module)
     }
 
@@ -88,11 +78,10 @@ impl FragmentStore {
     pub fn list_indexed_source_paths(&self) -> Result<Vec<String>, StoreOpenError> {
         let graph_dir = self.graph_dir();
         let mut paths = Vec::new();
-        collect_bin_files(&graph_dir, &graph_dir, &mut paths)
-            .map_err(|e| StoreOpenError::Io {
-                path: graph_dir.clone(),
-                message: e.to_string(),
-            })?;
+        collect_bin_files(&graph_dir, &graph_dir, &mut paths).map_err(|e| StoreOpenError::Io {
+            path: graph_dir.clone(),
+            message: e.to_string(),
+        })?;
         paths.sort();
         Ok(paths)
     }
@@ -105,11 +94,9 @@ impl FragmentStore {
             return Ok(Vec::new());
         }
         let mut modules = Vec::new();
-        let entries = std::fs::read_dir(&index_dir).map_err(|e| {
-            StoreOpenError::Io {
-                path: index_dir.clone(),
-                message: e.to_string(),
-            }
+        let entries = std::fs::read_dir(&index_dir).map_err(|e| StoreOpenError::Io {
+            path: index_dir.clone(),
+            message: e.to_string(),
         })?;
         for entry in entries {
             let entry = entry.map_err(|e| StoreOpenError::Io {
@@ -118,8 +105,7 @@ impl FragmentStore {
             })?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(module) = name.strip_suffix(&format!(".{INDEX_SHARD_EXT}"))
-            {
+            if let Some(module) = name.strip_suffix(&format!(".{INDEX_SHARD_EXT}")) {
                 modules.push(module.to_string());
             }
         }
@@ -160,11 +146,9 @@ impl FragmentStore {
             return Ok(Vec::new());
         }
         let mut kinds = Vec::new();
-        let entries = std::fs::read_dir(&overlays_dir).map_err(|e| {
-            StoreOpenError::Io {
-                path: overlays_dir.clone(),
-                message: e.to_string(),
-            }
+        let entries = std::fs::read_dir(&overlays_dir).map_err(|e| StoreOpenError::Io {
+            path: overlays_dir.clone(),
+            message: e.to_string(),
         })?;
         for entry in entries {
             let entry = entry.map_err(|e| StoreOpenError::Io {
@@ -173,8 +157,7 @@ impl FragmentStore {
             })?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(kind) = name.strip_suffix(&format!(".{FRAGMENT_EXT}"))
-            {
+            if let Some(kind) = name.strip_suffix(&format!(".{FRAGMENT_EXT}")) {
                 kinds.push(kind.to_string());
             }
         }
@@ -260,10 +243,8 @@ impl FragmentStore {
     /// observability/health checks.
     pub fn count_nodes_by_kind(
         &self,
-    ) -> Result<std::collections::BTreeMap<NodeKind, usize>, StoreLookupError>
-    {
-        let mut counts: std::collections::BTreeMap<NodeKind, usize> =
-            Default::default();
+    ) -> Result<std::collections::BTreeMap<NodeKind, usize>, StoreLookupError> {
+        let mut counts: std::collections::BTreeMap<NodeKind, usize> = Default::default();
         let source_paths = self
             .list_indexed_source_paths()
             .map_err(StoreLookupError::Open)?;
@@ -315,11 +296,7 @@ impl FragmentStore {
     }
 }
 
-fn collect_bin_files(
-    root: &Path,
-    current: &Path,
-    out: &mut Vec<String>,
-) -> std::io::Result<()> {
+fn collect_bin_files(root: &Path, current: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
     let entries = std::fs::read_dir(current)?;
     for entry in entries {
         let entry = entry?;
@@ -328,16 +305,12 @@ fn collect_bin_files(
         let name = name.to_string_lossy();
         // Skip the index subdir and the .gitattributes file at
         // graph root.
-        if name == INDEX_SUBDIR
-            || name == OVERLAYS_SUBDIR
-            || name.starts_with('.')
-        {
+        if name == INDEX_SUBDIR || name == OVERLAYS_SUBDIR || name.starts_with('.') {
             continue;
         }
         if path.is_dir() {
             collect_bin_files(root, &path, out)?;
-        } else if let Some(rel_with_ext) = name.strip_suffix(&format!(".{FRAGMENT_EXT}"))
-        {
+        } else if let Some(rel_with_ext) = name.strip_suffix(&format!(".{FRAGMENT_EXT}")) {
             // Reconstruct repo-relative source path.
             let parent_rel = path
                 .parent()

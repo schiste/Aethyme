@@ -15,29 +15,27 @@ pub mod types;
 pub mod unresolved;
 
 pub use callables::{
-    Callable, Function, FunctionConstructionError, Lambda,
-    LambdaConstructionError, Method, MethodConstructionError,
-    ParameterSignature,
+    Callable, Function, FunctionConstructionError, Lambda, LambdaConstructionError, Method,
+    MethodConstructionError, ParameterSignature,
 };
 pub use containers::{
-    Directory, DirectoryConstructionError, File, FileConstructionError,
-    Module, ModuleConstructionError, NonCodeFile,
-    NonCodeFileConstructionError, NonCodeFormat, Package,
+    Directory, DirectoryConstructionError, File, FileConstructionError, Module,
+    ModuleConstructionError, NonCodeFile, NonCodeFileConstructionError, NonCodeFormat, Package,
     PackageConstructionError, Repository, RepositoryConstructionError,
 };
 pub use non_code::{
-    ALL_COMMENT_TAGS, Comment, CommentConstructionError, CommentTag,
-    ConfigValue, ConfigValueConstructionError, DocSection,
-    DocSectionConstructionError, Docstring, DocstringConstructionError,
+    ALL_COMMENT_TAGS, Comment, CommentConstructionError, CommentTag, ConfigValue,
+    ConfigValueConstructionError, DocSection, DocSectionConstructionError, Docstring,
+    DocstringConstructionError,
 };
 pub use sub_symbols::{
-    Expression, ExpressionConstructionError, Field, FieldConstructionError,
-    GlobalVariable, GlobalVariableConstructionError, Parameter,
-    ParameterConstructionError, Statement, StatementConstructionError,
+    Expression, ExpressionConstructionError, Field, FieldConstructionError, GlobalVariable,
+    GlobalVariableConstructionError, Parameter, ParameterConstructionError, Statement,
+    StatementConstructionError,
+};
+pub use types::{
+    Class, ClassConstructionError, Enum, EnumConstructionError, EnumVariant, Interface,
+    InterfaceConstructionError, Struct, StructConstructionError, Trait, TraitConstructionError,
+    TypeAlias, TypeAliasConstructionError,
 };
 pub use unresolved::{UnresolvedSymbol, UnresolvedSymbolConstructionError};
-pub use types::{
-    Class, ClassConstructionError, Enum, EnumConstructionError, EnumVariant,
-    Interface, InterfaceConstructionError, Struct, StructConstructionError,
-    Trait, TraitConstructionError, TypeAlias, TypeAliasConstructionError,
-};

@@ -1,8 +1,8 @@
 //! Integration tests for the unifying `Node` enum.
 
 use aethyme_graph_schema::{
-    Class, Function, Module, Node, NodeKind, Package, ParameterSignature,
-    Repository, SourceRange, Visibility,
+    Class, Function, Module, Node, NodeKind, Package, ParameterSignature, Repository, SourceRange,
+    Visibility,
 };
 
 fn sample_function() -> Function {
@@ -88,10 +88,9 @@ fn from_impl_works_for_each_variant() {
     )
     .unwrap()
     .into();
-    let _: Node =
-        Package::new("a", "rust", "a-engine", "rust/Cargo.toml", "cargo")
-            .unwrap()
-            .into();
+    let _: Node = Package::new("a", "rust", "a-engine", "rust/Cargo.toml", "cargo")
+        .unwrap()
+        .into();
 }
 
 #[test]

@@ -3,12 +3,11 @@
 //! existing disk helpers, then exercises the store's read API.
 
 use aethyme_graph_schema::{
-    Confidence, Edge, EdgeAttributes, Function, Node, NodeId, NodeKind,
-    ParameterSignature, Source, SourceRange, Visibility,
+    Confidence, Edge, EdgeAttributes, Function, Node, NodeId, NodeKind, ParameterSignature, Source,
+    SourceRange, Visibility,
 };
 use aethyme_graph_storage::{
-    write_fragment, write_index_shard, Fragment, FragmentStore,
-    StoreOpenError, SymbolRecord,
+    Fragment, FragmentStore, StoreOpenError, SymbolRecord, write_fragment, write_index_shard,
 };
 
 fn ctx_repo(tmp: &std::path::Path) -> std::path::PathBuf {
@@ -186,9 +185,7 @@ fn fragment_for_node_locates_the_owning_fragment() {
     write_test_fragment(tmp.path());
 
     let store = FragmentStore::open(tmp.path()).unwrap();
-    let id =
-        NodeId::new(NodeKind::Function, "testrepo", "src/x.py", "run")
-            .unwrap();
+    let id = NodeId::new(NodeKind::Function, "testrepo", "src/x.py", "run").unwrap();
     let frag = store.fragment_for_node(&id).unwrap();
     assert!(frag.is_some());
     assert_eq!(frag.unwrap().file_path(), "src/x.py");
@@ -200,9 +197,7 @@ fn fragment_for_node_returns_none_for_missing_node() {
     write_test_fragment(tmp.path());
 
     let store = FragmentStore::open(tmp.path()).unwrap();
-    let id =
-        NodeId::new(NodeKind::Function, "testrepo", "src/x.py", "absent")
-            .unwrap();
+    let id = NodeId::new(NodeKind::Function, "testrepo", "src/x.py", "absent").unwrap();
     let frag = store.fragment_for_node(&id).unwrap();
     assert!(frag.is_none());
 }

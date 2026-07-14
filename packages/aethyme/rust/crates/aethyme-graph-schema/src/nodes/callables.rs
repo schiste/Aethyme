@@ -131,9 +131,7 @@ impl std::fmt::Display for FunctionConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyName => f.write_str("Function: name must not be empty"),
-            Self::EmptyFilePath => {
-                f.write_str("Function: file_path must not be empty")
-            }
+            Self::EmptyFilePath => f.write_str("Function: file_path must not be empty"),
             Self::Id(e) => write!(f, "Function: ID construction failed: {e}"),
         }
     }
@@ -189,10 +187,7 @@ impl Method {
         // nodes. The receiver's hash suffix is a stable component
         // of its NodeId, so it adds no instability the receiver
         // didn't already have.
-        let symbol_name = format!(
-            "{name}#receiver:{}",
-            receiver_type.hash_suffix(),
-        );
+        let symbol_name = format!("{name}#receiver:{}", receiver_type.hash_suffix(),);
         let id = NodeId::new(NodeKind::Method, repo, file_path, &symbol_name)
             .map_err(MethodConstructionError::Id)?;
         Ok(Method {
@@ -255,9 +250,7 @@ impl std::fmt::Display for MethodConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyName => f.write_str("Method: name must not be empty"),
-            Self::EmptyFilePath => {
-                f.write_str("Method: file_path must not be empty")
-            }
+            Self::EmptyFilePath => f.write_str("Method: file_path must not be empty"),
             Self::Id(e) => write!(f, "Method: ID construction failed: {e}"),
         }
     }
@@ -364,9 +357,7 @@ impl std::fmt::Display for LambdaConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyName => f.write_str("Lambda: name must not be empty"),
-            Self::EmptyFilePath => {
-                f.write_str("Lambda: file_path must not be empty")
-            }
+            Self::EmptyFilePath => f.write_str("Lambda: file_path must not be empty"),
             Self::Id(e) => write!(f, "Lambda: ID construction failed: {e}"),
         }
     }

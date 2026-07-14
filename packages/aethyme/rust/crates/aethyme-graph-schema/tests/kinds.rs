@@ -20,9 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aethyme_graph_schema::{
-    ALL_NODE_KIND_CATEGORIES, ALL_NODE_KINDS, NodeKind, NodeKindCategory,
-};
+use aethyme_graph_schema::{ALL_NODE_KIND_CATEGORIES, ALL_NODE_KINDS, NodeKind, NodeKindCategory};
 
 // ─── NodeKind: bijection and exhaustiveness ──────────────────────────
 
@@ -54,17 +52,16 @@ fn from_name_returns_err_for_unknown_strings() {
     // informative diagnostics without re-passing the input.
     let bad_inputs = [
         "",
-        "Function",   // TitleCase
-        "FUNCTION",   // ALLCAPS
-        "func",       // truncated
-        "functions",  // plural
-        "doc-section", // kebab
+        "Function",      // TitleCase
+        "FUNCTION",      // ALLCAPS
+        "func",          // truncated
+        "functions",     // plural
+        "doc-section",   // kebab
         "non.code.file", // dotted
     ];
     for bad in bad_inputs {
-        let err = NodeKind::from_name(bad).expect_err(&format!(
-            "from_name({bad:?}) should have returned Err"
-        ));
+        let err = NodeKind::from_name(bad)
+            .expect_err(&format!("from_name({bad:?}) should have returned Err"));
         assert_eq!(
             err.given(),
             bad,
@@ -297,9 +294,7 @@ fn variants_are_alphabetical_within_each_category() {
 
         // Walk the prefix of initial-set names within this group.
         let mut prefix_end = group_start;
-        while prefix_end < group_end
-            && initial_set.contains(ALL_NODE_KINDS[prefix_end].name())
-        {
+        while prefix_end < group_end && initial_set.contains(ALL_NODE_KINDS[prefix_end].name()) {
             prefix_end += 1;
         }
 
@@ -404,9 +399,8 @@ fn category_name_and_from_name_round_trip_for_every_variant() {
 fn category_from_name_returns_err_for_unknown_strings() {
     let bad_inputs = ["", "Container", "containers", "type-defining", "unknown"];
     for bad in bad_inputs {
-        let err = NodeKindCategory::from_name(bad).expect_err(&format!(
-            "from_name({bad:?}) should have returned Err"
-        ));
+        let err = NodeKindCategory::from_name(bad)
+            .expect_err(&format!("from_name({bad:?}) should have returned Err"));
         assert_eq!(err.given(), bad);
     }
 }

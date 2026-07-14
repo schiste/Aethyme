@@ -1,9 +1,8 @@
 //! Integration tests for callable node kinds and the Callable protocol.
 
 use aethyme_graph_schema::{
-    Callable, Function, FunctionConstructionError, Lambda, Method,
-    MethodConstructionError, NodeId, NodeKind, ParameterSignature,
-    SourceRange, Visibility,
+    Callable, Function, FunctionConstructionError, Lambda, Method, MethodConstructionError, NodeId,
+    NodeKind, ParameterSignature, SourceRange, Visibility,
 };
 
 fn range(s: u32, e: u32) -> SourceRange {

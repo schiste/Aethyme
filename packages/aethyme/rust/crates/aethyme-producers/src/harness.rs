@@ -35,10 +35,8 @@ use crate::{OverlayProducer, ProducerCtx};
 /// This is a test helper. It panics rather than returning a Result
 /// because the only thing a test would do with a Result here is
 /// `.unwrap()` it anyway.
-pub fn assert_overlay_producer_is_deterministic<P>(
-    producer: &P,
-    ctx: &ProducerCtx<'_>,
-) where
+pub fn assert_overlay_producer_is_deterministic<P>(producer: &P, ctx: &ProducerCtx<'_>)
+where
     P: OverlayProducer,
 {
     let first = producer.produce(ctx).unwrap_or_else(|e| {

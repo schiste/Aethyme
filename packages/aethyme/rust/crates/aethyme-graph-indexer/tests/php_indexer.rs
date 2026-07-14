@@ -1,8 +1,7 @@
 //! Integration tests for the PHP indexer (tree-sitter-php).
 
 use aethyme_graph_indexer::{
-    index_repo_to_disk, IndexerContext, LanguageIndexer, PhpIndexer,
-    WalkOptions,
+    IndexerContext, LanguageIndexer, PhpIndexer, WalkOptions, index_repo_to_disk,
 };
 use aethyme_graph_schema::NodeKind;
 use aethyme_graph_storage::read_fragment;
@@ -14,18 +13,14 @@ fn write(root: &std::path::Path, rel: &str, content: &[u8]) {
 }
 
 fn ctx(repo_root: &std::path::Path) -> IndexerContext {
-    IndexerContext::new("testrepo", repo_root.to_path_buf(), "0.1.0")
-        .unwrap()
+    IndexerContext::new("testrepo", repo_root.to_path_buf(), "0.1.0").unwrap()
 }
 
 fn index_source(content: &str) -> aethyme_graph_indexer::LanguageIndexResult {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "src/x.php", content.as_bytes());
-    let walked = aethyme_graph_indexer::walk_source_tree(
-        &ctx(tmp.path()),
-        &WalkOptions::default(),
-    )
-    .unwrap();
+    let walked =
+        aethyme_graph_indexer::walk_source_tree(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     let indexed = walked
         .files
         .iter()
@@ -57,30 +52,24 @@ fn extracts_class_and_its_methods() {
     let result = index_source(
         "<?php\nclass User {\n    public function getName(): string { return 'x'; }\n    public function getId(): int { return 1; }\n}\n",
     );
-    let kinds: Vec<NodeKind> =
-        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    let kinds: Vec<NodeKind> = result.additional_nodes.iter().map(|n| n.kind()).collect();
     assert_eq!(kinds.iter().filter(|k| **k == NodeKind::Class).count(), 1);
     assert_eq!(kinds.iter().filter(|k| **k == NodeKind::Method).count(), 2);
 }
 
 #[test]
 fn extracts_interface_with_methods() {
-    let result = index_source(
-        "<?php\ninterface Greet {\n    public function hello(): string;\n}\n",
-    );
-    let kinds: Vec<NodeKind> =
-        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    let result =
+        index_source("<?php\ninterface Greet {\n    public function hello(): string;\n}\n");
+    let kinds: Vec<NodeKind> = result.additional_nodes.iter().map(|n| n.kind()).collect();
     assert!(kinds.contains(&NodeKind::Interface));
     assert!(kinds.contains(&NodeKind::Method));
 }
 
 #[test]
 fn extracts_trait_with_methods() {
-    let result = index_source(
-        "<?php\ntrait Sayable {\n    public function say(): void {}\n}\n",
-    );
-    let kinds: Vec<NodeKind> =
-        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    let result = index_source("<?php\ntrait Sayable {\n    public function say(): void {}\n}\n");
+    let kinds: Vec<NodeKind> = result.additional_nodes.iter().map(|n| n.kind()).collect();
     assert!(kinds.contains(&NodeKind::Trait));
     assert!(kinds.contains(&NodeKind::Method));
 }
@@ -89,9 +78,7 @@ fn extracts_trait_with_methods() {
 
 #[test]
 fn private_method_marks_private_visibility() {
-    let result = index_source(
-        "<?php\nclass Foo {\n    private function helper(): void {}\n}\n",
-    );
+    let result = index_source("<?php\nclass Foo {\n    private function helper(): void {}\n}\n");
     let method = result
         .additional_nodes
         .iter()
@@ -106,9 +93,7 @@ fn private_method_marks_private_visibility() {
 
 #[test]
 fn protected_method_marks_protected_visibility() {
-    let result = index_source(
-        "<?php\nclass Foo {\n    protected function helper(): void {}\n}\n",
-    );
+    let result = index_source("<?php\nclass Foo {\n    protected function helper(): void {}\n}\n");
     let method = result
         .additional_nodes
         .iter()
@@ -120,9 +105,8 @@ fn protected_method_marks_protected_visibility() {
 
 #[test]
 fn static_method_marks_is_static_true() {
-    let result = index_source(
-        "<?php\nclass Foo {\n    public static function helper(): void {}\n}\n",
-    );
+    let result =
+        index_source("<?php\nclass Foo {\n    public static function helper(): void {}\n}\n");
     let method = result
         .additional_nodes
         .iter()
@@ -136,9 +120,7 @@ fn static_method_marks_is_static_true() {
 
 #[test]
 fn extracts_const_declarations_as_globals() {
-    let result = index_source(
-        "<?php\nconst PI = 3.14;\nconst MAX = 100;\n",
-    );
+    let result = index_source("<?php\nconst PI = 3.14;\nconst MAX = 100;\n");
     let globals: Vec<_> = result
         .additional_nodes
         .iter()
@@ -154,8 +136,7 @@ fn namespace_body_walked_as_top_level_in_v1() {
     let result = index_source(
         "<?php\nnamespace App\\Domain;\n\nclass User {}\nfunction make_user(): User { return new User; }\n",
     );
-    let kinds: Vec<NodeKind> =
-        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    let kinds: Vec<NodeKind> = result.additional_nodes.iter().map(|n| n.kind()).collect();
     assert!(kinds.contains(&NodeKind::Class));
     assert!(kinds.contains(&NodeKind::Function));
 }
@@ -178,8 +159,7 @@ fn end_to_end_php_file_produces_enriched_fragment() {
         b"<?php\nnamespace MediaWiki;\n\nclass User {\n    public function getId(): int { return 1; }\n    private function helper(): void {}\n}\n",
     );
 
-    let summary =
-        index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let summary = index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     assert_eq!(summary.total_files, 1);
 
     let frag = read_fragment(tmp.path(), "includes/User.php").unwrap();
@@ -203,8 +183,7 @@ fn end_to_end_mediawiki_style_repo_indexed() {
         b"<?php\nclass Article {\n    public function view(): void {}\n}\n",
     );
 
-    let summary =
-        index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let summary = index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     assert_eq!(summary.total_files, 2);
     assert_eq!(summary.counts_by_kind.get(&NodeKind::Class), Some(&2));
     assert_eq!(summary.counts_by_kind.get(&NodeKind::Method), Some(&3));
@@ -220,12 +199,10 @@ fn php_indexing_determinism() {
     );
 
     index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
-    let bytes_a =
-        std::fs::read(tmp.path().join(".aethyme/graph/src/x.php.bin")).unwrap();
+    let bytes_a = std::fs::read(tmp.path().join(".aethyme/graph/src/x.php.bin")).unwrap();
     std::fs::remove_dir_all(tmp.path().join(".aethyme")).unwrap();
     index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
-    let bytes_b =
-        std::fs::read(tmp.path().join(".aethyme/graph/src/x.php.bin")).unwrap();
+    let bytes_b = std::fs::read(tmp.path().join(".aethyme/graph/src/x.php.bin")).unwrap();
     assert_eq!(bytes_a, bytes_b);
 }
 
@@ -233,9 +210,7 @@ fn php_indexing_determinism() {
 
 #[test]
 fn php_simple_use_emits_placeholder_for_last_segment() {
-    let result = index_source(
-        "<?php\nuse App\\Models\\User;\n",
-    );
+    let result = index_source("<?php\nuse App\\Models\\User;\n");
     let n_unresolved = result
         .additional_nodes
         .iter()
@@ -254,9 +229,7 @@ fn php_simple_use_emits_placeholder_for_last_segment() {
 
 #[test]
 fn php_aliased_use_uses_alias_as_binding() {
-    let result = index_source(
-        "<?php\nuse App\\Models\\User as U;\n",
-    );
+    let result = index_source("<?php\nuse App\\Models\\User as U;\n");
     let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
     assert!(node_json.contains("\"name\":\"U\""), "node: {node_json}");
     let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
@@ -269,9 +242,7 @@ fn php_aliased_use_uses_alias_as_binding() {
 
 #[test]
 fn php_group_use_flattens_into_multiple_placeholders() {
-    let result = index_source(
-        "<?php\nuse App\\Models\\{User, Post as P, Tag};\n",
-    );
+    let result = index_source("<?php\nuse App\\Models\\{User, Post as P, Tag};\n");
     let n_unresolved = result
         .additional_nodes
         .iter()
@@ -283,15 +254,21 @@ fn php_group_use_flattens_into_multiple_placeholders() {
         .iter()
         .map(|e| serde_json::to_string(e).unwrap())
         .collect();
-    assert!(edge_jsons
-        .iter()
-        .any(|j| j.contains("\"import_path\":\"App\\\\Models\\\\User\"")));
-    assert!(edge_jsons
-        .iter()
-        .any(|j| j.contains("\"import_path\":\"App\\\\Models\\\\Post\"")));
-    assert!(edge_jsons
-        .iter()
-        .any(|j| j.contains("\"import_path\":\"App\\\\Models\\\\Tag\"")));
+    assert!(
+        edge_jsons
+            .iter()
+            .any(|j| j.contains("\"import_path\":\"App\\\\Models\\\\User\""))
+    );
+    assert!(
+        edge_jsons
+            .iter()
+            .any(|j| j.contains("\"import_path\":\"App\\\\Models\\\\Post\""))
+    );
+    assert!(
+        edge_jsons
+            .iter()
+            .any(|j| j.contains("\"import_path\":\"App\\\\Models\\\\Tag\""))
+    );
     // The aliased one's binding is P.
     let node_jsons: Vec<String> = result
         .additional_nodes
@@ -306,8 +283,7 @@ fn php_imports_coexist_with_other_extractions() {
     let result = index_source(
         "<?php\nuse App\\Models\\User;\n\nfunction helper() {}\n\nclass C {\n    function m() {}\n}\n",
     );
-    let kinds: Vec<NodeKind> =
-        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    let kinds: Vec<NodeKind> = result.additional_nodes.iter().map(|n| n.kind()).collect();
     assert!(kinds.contains(&NodeKind::UnresolvedSymbol));
     assert!(kinds.contains(&NodeKind::Function));
     assert!(kinds.contains(&NodeKind::Class));
@@ -319,9 +295,7 @@ fn php_use_function_sets_expected_kind_function() {
     // namespace_use_declaration is set to `function`. The
     // placeholder's `expected_kind` must reflect this so a future
     // kind-aware linker can prefer Function nodes when resolving.
-    let result = index_source(
-        "<?php\nuse function Foo\\bar;\n",
-    );
+    let result = index_source("<?php\nuse function Foo\\bar;\n");
     assert_eq!(result.additional_nodes.len(), 1);
     let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
     assert!(node_json.contains("\"name\":\"bar\""), "node: {node_json}");
@@ -336,9 +310,7 @@ fn php_use_const_sets_expected_kind_global_variable() {
     // `use const Foo\BAZ;` — the `type` field is `const`. PHP
     // constants live at top-level scope so the schema kind is
     // GlobalVariable.
-    let result = index_source(
-        "<?php\nuse const Foo\\BAZ;\n",
-    );
+    let result = index_source("<?php\nuse const Foo\\BAZ;\n");
     assert_eq!(result.additional_nodes.len(), 1);
     let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
     assert!(node_json.contains("\"name\":\"BAZ\""), "node: {node_json}");
@@ -353,9 +325,7 @@ fn php_plain_use_leaves_expected_kind_none() {
     // Plain `use Foo\Bar;` could target a Class, Interface, Trait,
     // or Enum — PHP doesn't constrain it. The placeholder's
     // expected_kind stays None to be honest about the ambiguity.
-    let result = index_source(
-        "<?php\nuse Foo\\Bar;\n",
-    );
+    let result = index_source("<?php\nuse Foo\\Bar;\n");
     let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
     // serde with `Option::None` skips the field entirely (or
     // renders it as null depending on serde_json settings). Either
@@ -371,9 +341,7 @@ fn php_multiple_flat_clauses_each_emit_a_placeholder() {
     // namespace_use_clause children at the top level of a
     // namespace_use_declaration, no group syntax. The walker must
     // collect all of them rather than just the first.
-    let result = index_source(
-        "<?php\nuse App\\Models\\User, App\\Models\\Post;\n",
-    );
+    let result = index_source("<?php\nuse App\\Models\\User, App\\Models\\Post;\n");
     let n_unresolved = result
         .additional_nodes
         .iter()
@@ -385,10 +353,14 @@ fn php_multiple_flat_clauses_each_emit_a_placeholder() {
         .iter()
         .map(|e| serde_json::to_string(e).unwrap())
         .collect();
-    assert!(edge_jsons
-        .iter()
-        .any(|j| j.contains("\"import_path\":\"App\\\\Models\\\\User\"")));
-    assert!(edge_jsons
-        .iter()
-        .any(|j| j.contains("\"import_path\":\"App\\\\Models\\\\Post\"")));
+    assert!(
+        edge_jsons
+            .iter()
+            .any(|j| j.contains("\"import_path\":\"App\\\\Models\\\\User\""))
+    );
+    assert!(
+        edge_jsons
+            .iter()
+            .any(|j| j.contains("\"import_path\":\"App\\\\Models\\\\Post\""))
+    );
 }

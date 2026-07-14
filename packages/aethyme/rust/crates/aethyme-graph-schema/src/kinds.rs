@@ -274,9 +274,7 @@ impl NodeKind {
             | NodeKind::Repository
             | NodeKind::Package => NodeKindCategory::Container,
 
-            NodeKind::Function | NodeKind::Lambda | NodeKind::Method => {
-                NodeKindCategory::Callable
-            }
+            NodeKind::Function | NodeKind::Lambda | NodeKind::Method => NodeKindCategory::Callable,
 
             NodeKind::Class
             | NodeKind::Enum
@@ -336,9 +334,7 @@ impl NodeKindCategory {
     /// Inverse of [`NodeKindCategory::name`]. Mirrors
     /// [`NodeKind::from_name`]'s `Result` shape so that consumers see a
     /// uniform error-handling pattern across the two enums.
-    pub fn from_name(
-        name: &str,
-    ) -> Result<NodeKindCategory, UnknownNodeKindCategory> {
+    pub fn from_name(name: &str) -> Result<NodeKindCategory, UnknownNodeKindCategory> {
         Ok(match name {
             "container" => NodeKindCategory::Container,
             "callable" => NodeKindCategory::Callable,

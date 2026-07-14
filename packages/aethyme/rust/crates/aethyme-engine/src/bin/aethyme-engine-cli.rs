@@ -78,7 +78,7 @@ fn run() -> Result<(), String> {
     let command = args.remove(0);
     match command.as_str() {
         "daemon" => return run_daemon_subcommand(&args, no_cache, fragment_mode),
-        "explore" => return run_explore_subcommand(&args),
+        "explore" => return run_explore_via_shared_cli(&args),
         "inspect" => {
             let repo = read_option(&args, "--repo")?;
             let mode = read_option(&args, "--mode").unwrap_or_else(|_| "full".to_string());
@@ -823,129 +823,17 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
 }
 
-// explore subcommand — native Rust path through the engine daemon.
-//
-// Compatible with the answer-json shape Python emits at `--detail compact`
-// for the task_localization_query intent. Exits with status 2 and a
-// recognizable error when the daemon isn't running, so callers can detect
-// the fallback condition and route to Python.
+// explore subcommand — thin adapter over the shared front end in
+// aethyme_engine::explore_cli (also used by the top-level `aethyme`
+// router). This binary keeps the documented exit-code contract:
+// exit 2 with a recognizable message when the engine daemon isn't
+// running, so out-of-repo callers can detect the condition.
 
-fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
-    let repo_str = read_option(args, "--repo")?;
-    let request = read_option(args, "--request")?;
-    let format = read_option(args, "--format").unwrap_or_else(|_| "answer-json".to_string());
-    if format != "answer-json" {
-        return Err(format!(
-            "explore: only --format answer-json is supported in the native \
-             path; got {format:?}"
-        ));
-    }
-    let detail = read_option(args, "--detail").unwrap_or_else(|_| "compact".to_string());
-    let detail_enum = match detail.as_str() {
-        "compact" => aethyme_engine::explore::Detail::Compact,
-        "standard" => aethyme_engine::explore::Detail::Standard,
-        "full" => aethyme_engine::explore::Detail::Full,
-        other => return Err(format!("explore: unknown --detail {other:?}")),
-    };
-
-    let max_answer_items: usize = read_option(args, "--max-answer-items")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
-    // --depth N (0..=3) selects a rung on the progressive-disclosure
-    // ladder defined in `DISCLOSURE_LEVELS`. Overrides --detail and
-    // --max-answer-items when set: the depth table is the budget,
-    // not the per-knob defaults. When --depth is omitted, behavior is
-    // pre-2026-05-09 (legacy detail-based path).
-    let depth: Option<u8> = match read_option(args, "--depth") {
-        Ok(s) => match s.parse::<u8>() {
-            Ok(n) if (n as usize) < aethyme_engine::explore::DISCLOSURE_LEVELS.len() => Some(n),
-            Ok(n) => {
-                return Err(format!(
-                    "explore: --depth {n} out of range (0..={})",
-                    aethyme_engine::explore::DISCLOSURE_LEVELS.len() - 1,
-                ));
-            }
-            Err(e) => return Err(format!("explore: --depth must be 0..=3: {e}")),
-        },
-        Err(_) => None,
-    };
-    // --show-observability toggles richer observability shaping in the
-    // response. Default is compact; setting the flag mirrors Python's
-    // `--show-observability` at cli.py:396-401.
-    let show_observability = has_flag(args, "--show-observability");
-
-    // --intent picks the orchestration shape. The default when no
-    // --intent is passed is `auto`: scan the first ~10 tokens of the
-    // request for change-verbs and pick behavior_localization when
-    // we see one, else task_localization. Pre-fix the default was
-    // hard-coded to task_localization, but real agent flows mix
-    // change-tasks ("Add X") with read-tasks ("Where is Y?") freely
-    // and forcing the agent to specify --intent every time is
-    // friction. `--intent default` (or task_localization_query
-    // explicitly) restores the conservative pre-auto behavior for
-    // callers that prefer to opt out of the heuristic.
-    let intent_str = read_option(args, "--intent").unwrap_or_else(|_| "auto".to_string());
-    let (intent, intent_source) = match intent_str.as_str() {
-        "task_localization_query" | "default" => (
-            aethyme_engine::explore::Intent::TaskLocalization,
-            aethyme_engine::explore::IntentSource::Explicit,
-        ),
-        "behavior_localization_query" | "behavior" => (
-            aethyme_engine::explore::Intent::BehaviorLocalization,
-            aethyme_engine::explore::IntentSource::Explicit,
-        ),
-        "auto" | "" => {
-            // Heuristic-based intent selection: scans the first ~10
-            // tokens of the request for change-task verbs. Defaults
-            // to `task_localization_query` when no signal is found.
-            (
-                aethyme_engine::explore::Intent::auto_select(&request),
-                aethyme_engine::explore::IntentSource::Auto,
-            )
-        }
-        "usage_boundary_query" => {
-            // Different orchestrator: doesn't go through the daemon,
-            // calls `analyze_usage_boundary_scope_first` directly.
-            return run_explore_usage_boundary(args, &repo_str, &request);
-        }
-        other => return Err(format!("explore: unknown --intent {other:?}")),
-    };
-
-    let mut params = aethyme_engine::explore::ExploreParams {
-        max_answer_items,
-        detail: detail_enum,
-        depth,
-        show_observability,
-        ..aethyme_engine::explore::ExploreParams::default()
-    };
-    // When --depth is set, the disclosure-level table overrides the
-    // per-knob defaults. Apply AFTER struct construction so the
-    // table values land on the right fields without callers having
-    // to remember the order.
-    params.apply_disclosure_level();
-
-    let repo = PathBuf::from(&repo_str);
-    if !repo.is_dir() {
-        return Err(format!("--repo path is not a directory: {repo_str}"));
-    }
-
-    match aethyme_engine::explore::explore_with_intent(
-        &repo,
-        &request,
-        intent,
-        intent_source,
-        &params,
-    ) {
-        Ok(response) => {
-            let json = serde_json::to_string_pretty(&response)
-                .map_err(|e| format!("serialize response: {e}"))?;
-            println!("{json}");
-            Ok(())
-        }
-        Err(aethyme_engine::explore::ExploreError::DaemonNotRunning) => {
-            // Distinct exit code so callers (e.g. the top-level `aethyme`
-            // binary) can fall back to the Python orchestrator.
+fn run_explore_via_shared_cli(args: &[String]) -> Result<(), String> {
+    use aethyme_engine::explore_cli::{ExploreCliOutcome, run};
+    match run(args) {
+        ExploreCliOutcome::Done => Ok(()),
+        ExploreCliOutcome::DaemonNotRunning { repo } => {
             eprintln!(
                 "explore: engine daemon not running; \
                  start one with `aethyme-engine-cli daemon start --repo {}`",
@@ -953,62 +841,11 @@ fn run_explore_subcommand(args: &[String]) -> Result<(), String> {
             );
             std::process::exit(2);
         }
-        Err(other) => Err(format!("explore: {other}")),
-    }
-}
-
-/// Run the `usage_boundary_query` intent path. Doesn't go through the
-/// engine daemon — calls `analyze_usage_boundary_scope_first` directly.
-/// All flags pre-validated in `run_explore_subcommand`; this path
-/// reads its own usage-boundary-specific flags.
-fn run_explore_usage_boundary(
-    args: &[String],
-    repo_str: &str,
-    request: &str,
-) -> Result<(), String> {
-    let scope = read_option(args, "--scope")
-        .map_err(|_| "usage_boundary_query requires --scope <repo-relative-path>".to_string())?;
-    let search_roots: Vec<String> = read_options(args, "--search-root");
-    let include_methods = !has_flag(args, "--no-methods");
-    let budget_ms: u64 = read_option(args, "--budget-ms")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10_000);
-    let max_evidence: usize = read_option(args, "--max-evidence-per-symbol")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
-    let max_answer_items: usize = read_option(args, "--max-answer-items")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(25);
-
-    let params = aethyme_engine::explore::UsageBoundaryParams {
-        scope,
-        search_roots,
-        include_methods,
-        budget_ms,
-        max_evidence_per_symbol: max_evidence,
-        max_answer_items,
-    };
-
-    let repo = PathBuf::from(repo_str);
-    if !repo.is_dir() {
-        return Err(format!("--repo path is not a directory: {repo_str}"));
-    }
-
-    match aethyme_engine::explore::explore_usage_boundary(&repo, request, &params) {
-        Ok(response) => {
-            let json = serde_json::to_string_pretty(&response)
-                .map_err(|e| format!("serialize response: {e}"))?;
-            println!("{json}");
-            Ok(())
-        }
-        Err(aethyme_engine::explore::ExploreError::BadParams(msg)) => {
-            eprintln!("explore (usage_boundary_query): {msg}");
+        ExploreCliOutcome::BadUsage(msg) => {
+            eprintln!("{msg}");
             std::process::exit(2);
         }
-        Err(err) => Err(format!("explore (usage_boundary_query): {err}")),
+        ExploreCliOutcome::Failed(msg) => Err(msg),
     }
 }
 
@@ -1076,71 +913,25 @@ fn daemon_start_action(
     fragment_mode: FragmentBuildMode,
     args: &[String],
 ) -> Result<(), String> {
-    let pidfile = aethyme_engine::daemon::pidfile_path_for(repo);
-    if pidfile.exists() {
-        if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                let alive = unsafe { libc::kill(pid, 0) };
-                if alive == 0 {
-                    eprintln!("engine daemon already running (pid {pid})");
-                    return Ok(());
-                }
-            }
-        }
-        let _ = std::fs::remove_file(&pidfile);
-    }
-
-    let aethyme_dir = repo.join(".aethyme");
-    std::fs::create_dir_all(&aethyme_dir).map_err(|e| format!("create .aethyme: {e}"))?;
-
-    let log_path = aethyme_engine::daemon::logfile_path_for(repo);
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|e| format!("open logfile {}: {}", log_path.display(), e))?;
-    let log_stdout = log_file
-        .try_clone()
-        .map_err(|e| format!("clone log fd: {e}"))?;
-    let log_stderr = log_file
-        .try_clone()
-        .map_err(|e| format!("clone log fd: {e}"))?;
-
     let self_path = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-
-    let mut cmd = std::process::Command::new(&self_path);
-    if no_cache {
-        cmd.arg("--no-cache");
+    let opts = aethyme_engine::daemon::StartOptions {
+        no_cache,
+        force_fragments: fragment_mode.forces_fragments(),
+        idle_timeout: read_option(args, "--idle-timeout").ok(),
+    };
+    match aethyme_engine::daemon::start_detached(repo, &self_path, &opts)? {
+        aethyme_engine::daemon::StartOutcome::AlreadyRunning(pid) => {
+            eprintln!("engine daemon already running (pid {pid})");
+        }
+        aethyme_engine::daemon::StartOutcome::Spawned(child) => {
+            let log_path = aethyme_engine::daemon::logfile_path_for(repo);
+            eprintln!(
+                "engine daemon spawned (pid {}, log {})\n  building map will take ~70s on a 12K-file repo",
+                child.id(),
+                log_path.display()
+            );
+        }
     }
-    if fragment_mode.forces_fragments() {
-        cmd.arg("--from-fragments");
-    }
-    cmd.arg("daemon").arg("serve").arg("--repo").arg(repo);
-    if let Ok(idle) = read_option(args, "--idle-timeout") {
-        cmd.arg("--idle-timeout").arg(idle);
-    }
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log_stdout))
-        .stderr(std::process::Stdio::from(log_stderr));
-
-    use std::os::unix::process::CommandExt;
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
-    let child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
-    let pid = child.id();
-    std::fs::write(&pidfile, pid.to_string()).map_err(|e| format!("write pidfile: {e}"))?;
-
-    eprintln!(
-        "engine daemon spawned (pid {pid}, log {})\n  building map will take ~70s on a 12K-file repo",
-        log_path.display()
-    );
     Ok(())
 }
 

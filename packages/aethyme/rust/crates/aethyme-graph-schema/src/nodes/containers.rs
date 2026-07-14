@@ -72,9 +72,7 @@ impl std::fmt::Display for RepositoryConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyName => f.write_str("Repository: name must not be empty"),
-            Self::EmptyRootPath => {
-                f.write_str("Repository: root_path must not be empty")
-            }
+            Self::EmptyRootPath => f.write_str("Repository: root_path must not be empty"),
             Self::EmptyVcs => f.write_str("Repository: vcs must not be empty"),
             Self::Id(e) => write!(f, "Repository: ID construction failed: {e}"),
         }
@@ -93,10 +91,7 @@ pub struct Directory {
 }
 
 impl Directory {
-    pub fn new(
-        repo: &str,
-        path: &str,
-    ) -> Result<Self, DirectoryConstructionError> {
+    pub fn new(repo: &str, path: &str) -> Result<Self, DirectoryConstructionError> {
         if path.is_empty() {
             return Err(DirectoryConstructionError::EmptyPath);
         }
@@ -160,8 +155,8 @@ impl Module {
         if language.is_empty() {
             return Err(ModuleConstructionError::EmptyLanguage);
         }
-        let id = NodeId::new(NodeKind::Module, repo, path, name)
-            .map_err(ModuleConstructionError::Id)?;
+        let id =
+            NodeId::new(NodeKind::Module, repo, path, name).map_err(ModuleConstructionError::Id)?;
         Ok(Module {
             id,
             path: path.into(),
@@ -197,9 +192,7 @@ impl std::fmt::Display for ModuleConstructionError {
         match self {
             Self::EmptyPath => f.write_str("Module: path must not be empty"),
             Self::EmptyName => f.write_str("Module: name must not be empty"),
-            Self::EmptyLanguage => {
-                f.write_str("Module: language must not be empty")
-            }
+            Self::EmptyLanguage => f.write_str("Module: language must not be empty"),
             Self::Id(e) => write!(f, "Module: ID construction failed: {e}"),
         }
     }
@@ -241,8 +234,7 @@ impl File {
         if content_hash.is_empty() {
             return Err(FileConstructionError::EmptyContentHash);
         }
-        let id = NodeId::new(NodeKind::File, repo, path, "")
-            .map_err(FileConstructionError::Id)?;
+        let id = NodeId::new(NodeKind::File, repo, path, "").map_err(FileConstructionError::Id)?;
         Ok(File {
             id,
             path: path.into(),
@@ -281,12 +273,8 @@ impl std::fmt::Display for FileConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyPath => f.write_str("File: path must not be empty"),
-            Self::EmptyLanguage => {
-                f.write_str("File: language must not be empty")
-            }
-            Self::EmptyContentHash => {
-                f.write_str("File: content_hash must not be empty")
-            }
+            Self::EmptyLanguage => f.write_str("File: language must not be empty"),
+            Self::EmptyContentHash => f.write_str("File: content_hash must not be empty"),
             Self::Id(e) => write!(f, "File: ID construction failed: {e}"),
         }
     }
@@ -356,9 +344,7 @@ pub enum NonCodeFileConstructionError {
 impl std::fmt::Display for NonCodeFileConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyPath => {
-                f.write_str("NonCodeFile: path must not be empty")
-            }
+            Self::EmptyPath => f.write_str("NonCodeFile: path must not be empty"),
             Self::Id(e) => {
                 write!(f, "NonCodeFile: ID construction failed: {e}")
             }
@@ -469,12 +455,8 @@ impl std::fmt::Display for PackageConstructionError {
         match self {
             Self::EmptyPath => f.write_str("Package: path must not be empty"),
             Self::EmptyName => f.write_str("Package: name must not be empty"),
-            Self::EmptyManifestPath => {
-                f.write_str("Package: manifest_path must not be empty")
-            }
-            Self::EmptyManifestKind => {
-                f.write_str("Package: manifest_kind must not be empty")
-            }
+            Self::EmptyManifestPath => f.write_str("Package: manifest_path must not be empty"),
+            Self::EmptyManifestKind => f.write_str("Package: manifest_kind must not be empty"),
             Self::Id(e) => write!(f, "Package: ID construction failed: {e}"),
         }
     }

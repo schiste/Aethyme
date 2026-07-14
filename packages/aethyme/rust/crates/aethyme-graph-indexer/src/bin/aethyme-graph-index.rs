@@ -23,8 +23,7 @@ use std::time::Instant;
 use clap::Parser;
 
 use aethyme_graph_indexer::{
-    index_repo_to_disk, link_repo, IndexerContext, IndexRepoSummary,
-    LinkSummary, WalkOptions,
+    IndexRepoSummary, IndexerContext, LinkSummary, WalkOptions, index_repo_to_disk, link_repo,
 };
 use aethyme_graph_storage::bootstrap_repo;
 
@@ -107,11 +106,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // The 2026-05-15 fix: previously bootstrap ran first, and a
     // relative repo-root would create `relative/<path>/.aethyme/`
     // under the CWD before the IndexerContext::new error surfaced.
-    let ctx = IndexerContext::new(
-        &cli.repo_name,
-        cli.repo_root.clone(),
-        &cli.engine_version,
-    )?;
+    let ctx = IndexerContext::new(&cli.repo_name, cli.repo_root.clone(), &cli.engine_version)?;
 
     if !cli.skip_bootstrap {
         bootstrap_repo(ctx.repo_root(), &cli.engine_version)?;

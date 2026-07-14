@@ -235,8 +235,7 @@ impl std::fmt::Display for UnknownBindingKind {
 impl std::error::Error for UnknownBindingKind {}
 
 /// Every [`Source`] in declaration order.
-pub const ALL_SOURCES: &[Source] =
-    &[Source::Structure, Source::Code, Source::Derived];
+pub const ALL_SOURCES: &[Source] = &[Source::Structure, Source::Code, Source::Derived];
 
 /// Every [`BindingKind`] in declaration order.
 pub const ALL_BINDING_KINDS: &[BindingKind] = &[

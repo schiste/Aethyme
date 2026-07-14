@@ -94,9 +94,7 @@ const DESTRUCTIVE_PATTERNS: &[&str] = &[
 /// A coarse risk category. Producer-local mirror of the engine's
 /// `model::risk::RiskArea`. Variant order is load-bearing: it feeds
 /// the derived [`Ord`] that canonicalizes the overlay's bytes.
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum RiskArea {
     Auth,
     Permissions,
@@ -112,9 +110,7 @@ pub enum RiskArea {
 /// Severity of a flagged surface. Producer-local mirror of the
 /// engine's `model::risk::RiskLevel`; variant order matters for the
 /// derived [`Ord`] (Low < Medium < High).
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum RiskLevel {
     Low,
     Medium,
@@ -124,9 +120,7 @@ pub enum RiskLevel {
 /// One flagged surface: a scope (a file path), its risk area and
 /// level, and a human-readable reason. Field order is fixed at
 /// `scope, area, level, reason` to match the engine's derived sort.
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RiskFlag {
     pub scope: String,
     pub area: RiskArea,
@@ -213,17 +207,15 @@ impl OverlayProducer for RisksProducer {
 /// `StoreOpenError` / `FragmentReadError` (not `StoreLookupError`),
 /// so these map to [`ProducerError::Other`] rather than the typed
 /// `Storage` bucket.
-fn read_all_fragments(
-    store: &FragmentStore,
-) -> Result<Vec<Fragment>, ProducerError> {
-    let paths = store.list_indexed_source_paths().map_err(|e| {
-        ProducerError::Other(format!("list_indexed_source_paths failed: {e}"))
-    })?;
+fn read_all_fragments(store: &FragmentStore) -> Result<Vec<Fragment>, ProducerError> {
+    let paths = store
+        .list_indexed_source_paths()
+        .map_err(|e| ProducerError::Other(format!("list_indexed_source_paths failed: {e}")))?;
     let mut fragments = Vec::with_capacity(paths.len());
     for path in paths {
-        let fragment = store.read_fragment(&path).map_err(|e| {
-            ProducerError::Other(format!("read_fragment({path}) failed: {e}"))
-        })?;
+        let fragment = store
+            .read_fragment(&path)
+            .map_err(|e| ProducerError::Other(format!("read_fragment({path}) failed: {e}")))?;
         fragments.push(fragment);
     }
     Ok(fragments)
@@ -252,10 +244,7 @@ fn path_risks(path: &str) -> Vec<RiskFlag> {
             "permission boundary",
         ));
     }
-    if lower.contains("secret")
-        || lower.contains("token")
-        || lower.contains("credential")
-    {
+    if lower.contains("secret") || lower.contains("token") || lower.contains("credential") {
         risks.push(RiskFlag::new(
             path,
             RiskArea::Secrets,
@@ -271,10 +260,7 @@ fn path_risks(path: &str) -> Vec<RiskFlag> {
             "schema change area",
         ));
     }
-    if lower.contains("deploy")
-        || lower.contains("infra")
-        || lower.contains("terraform")
-    {
+    if lower.contains("deploy") || lower.contains("infra") || lower.contains("terraform") {
         let level = if lower.contains("helper") || lower.contains("util") {
             RiskLevel::Low
         } else {
@@ -326,9 +312,7 @@ fn shared_core_risks(fragments: &[Fragment]) -> Vec<RiskFlag> {
             }
         }
         for edge in fragment.edges() {
-            if edge.kind() == EdgeKind::Imports
-                && edge.dst_id().kind() == NodeKind::File
-            {
+            if edge.kind() == EdgeKind::Imports && edge.dst_id().kind() == NodeKind::File {
                 importers
                     .entry(edge.dst_id())
                     .or_default()
@@ -409,8 +393,8 @@ fn destructive_risks(fragments: &[Fragment]) -> Vec<RiskFlag> {
 mod tests {
     use super::*;
     use aethyme_graph_schema::{
-        Callable, Confidence, Edge, EdgeAttributes, File, Function,
-        ParameterSignature, Source, SourceRange, Visibility,
+        Callable, Confidence, Edge, EdgeAttributes, File, Function, ParameterSignature, Source,
+        SourceRange, Visibility,
     };
 
     const REPO: &str = "test-repo";
@@ -462,15 +446,13 @@ mod tests {
     /// → the single `dst_path` File. We mint distinct *source* File
     /// nodes (one per edge) so in-degree counts distinct importers.
     fn importer_fragment(dst_path: &str, src_paths: &[&str]) -> Fragment {
-        let dst = File::new(REPO, dst_path, "typescript", 100, "h")
-            .expect("dst node");
+        let dst = File::new(REPO, dst_path, "typescript", 100, "h").expect("dst node");
         let dst_id = dst.id().clone();
 
         let mut nodes: Vec<Node> = Vec::new();
         let mut edges: Vec<Edge> = Vec::new();
         for src_path in src_paths {
-            let src = File::new(REPO, src_path, "typescript", 100, "h")
-                .expect("src node");
+            let src = File::new(REPO, src_path, "typescript", 100, "h").expect("src node");
             let edge = Edge::new(
                 src.id().clone(),
                 dst_id.clone(),
@@ -502,26 +484,19 @@ mod tests {
     #[test]
     fn shared_core_at_low_threshold_is_low() {
         // in-degree 3 (== LOW, < HIGH) → Low / moderate coupling.
-        let frag =
-            importer_fragment("core/db.ts", &["a.ts", "b.ts", "c.ts"]);
+        let frag = importer_fragment("core/db.ts", &["a.ts", "b.ts", "c.ts"]);
         let flags = shared_core_risks(&[frag]);
         assert_eq!(flags.len(), 1);
         assert_eq!(flags[0].area, RiskArea::SharedCore);
         assert_eq!(flags[0].level, RiskLevel::Low);
         assert_eq!(flags[0].scope, "core/db.ts");
-        assert_eq!(
-            flags[0].reason,
-            "imported by 3 files (moderate coupling)"
-        );
+        assert_eq!(flags[0].reason, "imported by 3 files (moderate coupling)");
     }
 
     #[test]
     fn shared_core_at_high_threshold_is_medium() {
         // in-degree 5 (== HIGH) → Medium / shared core.
-        let frag = importer_fragment(
-            "core/db.ts",
-            &["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"],
-        );
+        let frag = importer_fragment("core/db.ts", &["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"]);
         let flags = shared_core_risks(&[frag]);
         assert_eq!(flags.len(), 1);
         assert_eq!(flags[0].level, RiskLevel::Medium);
@@ -613,8 +588,14 @@ mod tests {
     fn destructive_matches_every_pattern() {
         // One function per pattern, all in one file → all listed.
         let names = [
-            "deleteIt", "dropTable", "destroyAll", "removeKey", "truncateLog",
-            "resetState", "purgeCache", "wipeDisk",
+            "deleteIt",
+            "dropTable",
+            "destroyAll",
+            "removeKey",
+            "truncateLog",
+            "resetState",
+            "purgeCache",
+            "wipeDisk",
         ];
         let frag = fn_fragment("ops.ts", &names);
         let flags = destructive_risks(&[frag]);

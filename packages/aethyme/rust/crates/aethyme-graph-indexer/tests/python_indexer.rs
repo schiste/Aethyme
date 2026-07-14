@@ -1,8 +1,7 @@
 //! Integration tests for the Python language indexer.
 
 use aethyme_graph_indexer::{
-    index_repo_to_disk, IndexerContext, LanguageIndexer, PythonIndexer,
-    WalkOptions,
+    IndexerContext, LanguageIndexer, PythonIndexer, WalkOptions, index_repo_to_disk,
 };
 use aethyme_graph_schema::{EdgeKind, NodeKind, Visibility};
 use aethyme_graph_storage::read_fragment;
@@ -14,8 +13,7 @@ fn write(root: &std::path::Path, rel: &str, content: &[u8]) {
 }
 
 fn ctx(repo_root: &std::path::Path) -> IndexerContext {
-    IndexerContext::new("testrepo", repo_root.to_path_buf(), "0.1.0")
-        .unwrap()
+    IndexerContext::new("testrepo", repo_root.to_path_buf(), "0.1.0").unwrap()
 }
 
 // ─── Direct indexer tests (unit-style, in-memory) ───────────────────
@@ -23,11 +21,8 @@ fn ctx(repo_root: &std::path::Path) -> IndexerContext {
 fn index_source(content: &str) -> aethyme_graph_indexer::LanguageIndexResult {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "src/x.py", content.as_bytes());
-    let walked = aethyme_graph_indexer::walk_source_tree(
-        &ctx(tmp.path()),
-        &WalkOptions::default(),
-    )
-    .unwrap();
+    let walked =
+        aethyme_graph_indexer::walk_source_tree(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     let indexed = walked
         .files
         .iter()
@@ -41,9 +36,7 @@ fn index_source(content: &str) -> aethyme_graph_indexer::LanguageIndexResult {
 
 #[test]
 fn extracts_top_level_function() {
-    let result = index_source(
-        "def hello(name):\n    return f'hi {name}'\n",
-    );
+    let result = index_source("def hello(name):\n    return f'hi {name}'\n");
     assert_eq!(result.additional_nodes.len(), 1);
     assert_eq!(result.additional_edges.len(), 1);
     assert_eq!(result.additional_nodes[0].kind(), NodeKind::Function);
@@ -62,8 +55,7 @@ fn extracts_top_level_class_and_its_methods() {
     // Class + 2 methods = 3 nodes; Contains(file→class) + 2×Defines(class→method) = 3 edges
     assert_eq!(result.additional_nodes.len(), 3);
     assert_eq!(result.additional_edges.len(), 3);
-    let kinds: Vec<NodeKind> =
-        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    let kinds: Vec<NodeKind> = result.additional_nodes.iter().map(|n| n.kind()).collect();
     assert!(kinds.contains(&NodeKind::Class));
     assert!(kinds.contains(&NodeKind::Method));
     let methods: Vec<_> = result
@@ -105,9 +97,7 @@ fn private_name_convention_maps_to_private_visibility() {
 
 #[test]
 fn dunder_method_name_maps_to_public_visibility() {
-    let result = index_source(
-        "class Foo:\n    def __init__(self):\n        pass\n",
-    );
+    let result = index_source("class Foo:\n    def __init__(self):\n        pass\n");
     let method = result
         .additional_nodes
         .iter()
@@ -139,9 +129,7 @@ fn staticmethod_decorator_marks_is_static() {
 
 #[test]
 fn async_function_signature_carries_async_keyword() {
-    let result = index_source(
-        "async def fetch():\n    pass\n",
-    );
+    let result = index_source("async def fetch():\n    pass\n");
     let function = &result.additional_nodes[0];
     let json = serde_json::to_string(function).unwrap();
     assert!(json.contains("\"signature\":\"async def fetch()\""));
@@ -151,19 +139,12 @@ fn async_function_signature_carries_async_keyword() {
 fn parse_error_returns_structured_error() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "src/x.py", b"def broken(:\n    pass\n");
-    let walked = aethyme_graph_indexer::walk_source_tree(
-        &ctx(tmp.path()),
-        &WalkOptions::default(),
-    )
-    .unwrap();
+    let walked =
+        aethyme_graph_indexer::walk_source_tree(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     let indexed = walked.files.first().unwrap();
     let indexer = PythonIndexer::new();
     let err = indexer
-        .index_file(
-            &ctx(tmp.path()),
-            indexed,
-            "def broken(:\n    pass\n",
-        )
+        .index_file(&ctx(tmp.path()), indexed, "def broken(:\n    pass\n")
         .unwrap_err();
     assert!(matches!(
         err,
@@ -173,9 +154,7 @@ fn parse_error_returns_structured_error() {
 
 #[test]
 fn function_has_correct_line_range() {
-    let result = index_source(
-        "# header\ndef target():\n    return 1\n",
-    );
+    let result = index_source("# header\ndef target():\n    return 1\n");
     let function = &result.additional_nodes[0];
     let json = serde_json::to_string(function).unwrap();
     // The def statement starts on line 2; range expectation is
@@ -197,8 +176,7 @@ fn end_to_end_python_file_produces_enriched_fragment_on_disk() {
         b"def explore_command():\n    return 'hi'\n\nclass Helper:\n    def run(self):\n        pass\n",
     );
 
-    let summary =
-        index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let summary = index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     assert_eq!(summary.total_files, 1);
     // File + Function + Class + Method = 4 nodes
     assert_eq!(summary.counts_by_kind.get(&NodeKind::File), Some(&1));
@@ -218,8 +196,7 @@ fn non_python_files_are_untouched_by_python_indexer() {
     write(tmp.path(), "README.md", b"# heading\n");
     write(tmp.path(), "src/lib.rs", b"fn main() {}\n");
 
-    let summary =
-        index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let summary = index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
 
     // lib.rs gets a File node from the filesystem walker, plus
     // (now that the Rust indexer is registered) a Function node
@@ -228,8 +205,7 @@ fn non_python_files_are_untouched_by_python_indexer() {
     // nodes are NOT Method (the only Python-specific node the
     // indexer would emit for trivial input).
     let rs_frag = read_fragment(tmp.path(), "src/lib.rs").unwrap();
-    let rs_kinds: Vec<NodeKind> =
-        rs_frag.nodes().iter().map(|n| n.kind()).collect();
+    let rs_kinds: Vec<NodeKind> = rs_frag.nodes().iter().map(|n| n.kind()).collect();
     assert!(rs_kinds.contains(&NodeKind::File));
     assert!(
         !rs_kinds.contains(&NodeKind::Method),
@@ -257,15 +233,10 @@ fn parallel_indexing_produces_correct_results_for_many_files() {
         let content = format!(
             "def f{i}():\n    return {i}\n\nclass C{i}:\n    def m{i}(self):\n        pass\n",
         );
-        write(
-            tmp.path(),
-            &format!("src/mod{i}.py"),
-            content.as_bytes(),
-        );
+        write(tmp.path(), &format!("src/mod{i}.py"), content.as_bytes());
     }
 
-    let summary =
-        index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let summary = index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     assert_eq!(summary.total_files, 50);
 
     // Each file should have: 1 File + 1 Function + 1 Class + 1 Method = 4 nodes.
@@ -291,20 +262,14 @@ fn parallel_indexing_is_deterministic_across_runs() {
     // into the on-disk bytes).
     let tmp = tempfile::tempdir().unwrap();
     for i in 0..20 {
-        let content = format!(
-            "def f{i}():\n    pass\n\nclass C{i}:\n    def m(self):\n        pass\n",
-        );
+        let content =
+            format!("def f{i}():\n    pass\n\nclass C{i}:\n    def m(self):\n        pass\n",);
         write(tmp.path(), &format!("src/a{i}.py"), content.as_bytes());
     }
 
     index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     let snapshots_a: Vec<Vec<u8>> = (0..20)
-        .map(|i| {
-            std::fs::read(
-                tmp.path().join(format!(".aethyme/graph/src/a{i}.py.bin")),
-            )
-            .unwrap()
-        })
+        .map(|i| std::fs::read(tmp.path().join(format!(".aethyme/graph/src/a{i}.py.bin"))).unwrap())
         .collect();
 
     // Clear and re-run.
@@ -312,12 +277,7 @@ fn parallel_indexing_is_deterministic_across_runs() {
 
     index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     let snapshots_b: Vec<Vec<u8>> = (0..20)
-        .map(|i| {
-            std::fs::read(
-                tmp.path().join(format!(".aethyme/graph/src/a{i}.py.bin")),
-            )
-            .unwrap()
-        })
+        .map(|i| std::fs::read(tmp.path().join(format!(".aethyme/graph/src/a{i}.py.bin"))).unwrap())
         .collect();
 
     assert_eq!(snapshots_a, snapshots_b);
@@ -359,7 +319,10 @@ fn plain_import_emits_unresolved_and_imports_edge() {
     assert_eq!(node.kind(), NodeKind::UnresolvedSymbol);
     let json = serde_json::to_string(node).unwrap();
     assert!(json.contains("\"name\":\"numpy\""), "node: {json}");
-    assert!(json.contains("\"expected_kind\":\"module\""), "node: {json}");
+    assert!(
+        json.contains("\"expected_kind\":\"module\""),
+        "node: {json}"
+    );
     let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
     assert!(edge_json.contains("\"import_path\":\"numpy\""));
     assert!(edge_json.contains("\"is_namespace\":true"));
@@ -371,12 +334,10 @@ fn plain_import_emits_unresolved_and_imports_edge() {
 fn aliased_import_uses_binding_name() {
     let result = index_source("import numpy as np\n");
     assert_eq!(result.additional_nodes.len(), 1);
-    let node_json =
-        serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
     // Binding name is what other code in the file references.
     assert!(node_json.contains("\"name\":\"np\""), "node: {node_json}");
-    let edge_json =
-        serde_json::to_string(&result.additional_edges[0]).unwrap();
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
     // Source path is the unaliased module name.
     assert!(edge_json.contains("\"import_path\":\"numpy\""));
 }
@@ -390,14 +351,9 @@ fn dotted_import_binds_top_segment_path_keeps_full_dotted_form() {
     // back to the import. The edge's `import_path` carries the full
     // dotted source-side path for the linker to follow.
     let result = index_source("import foo.bar.baz\n");
-    let node_json =
-        serde_json::to_string(&result.additional_nodes[0]).unwrap();
-    assert!(
-        node_json.contains("\"name\":\"foo\""),
-        "node: {node_json}"
-    );
-    let edge_json =
-        serde_json::to_string(&result.additional_edges[0]).unwrap();
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    assert!(node_json.contains("\"name\":\"foo\""), "node: {node_json}");
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
     assert!(edge_json.contains("\"import_path\":\"foo.bar.baz\""));
 }
 
@@ -405,14 +361,9 @@ fn dotted_import_binds_top_segment_path_keeps_full_dotted_form() {
 fn aliased_dotted_import_uses_alias_for_binding() {
     // `import foo.bar as fb` — the alias is the binding name.
     let result = index_source("import foo.bar as fb\n");
-    let node_json =
-        serde_json::to_string(&result.additional_nodes[0]).unwrap();
-    assert!(
-        node_json.contains("\"name\":\"fb\""),
-        "node: {node_json}"
-    );
-    let edge_json =
-        serde_json::to_string(&result.additional_edges[0]).unwrap();
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    assert!(node_json.contains("\"name\":\"fb\""), "node: {node_json}");
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
     assert!(edge_json.contains("\"import_path\":\"foo.bar\""));
 }
 
@@ -441,23 +392,31 @@ fn from_import_emits_one_placeholder_per_name() {
         .iter()
         .map(|e| serde_json::to_string(e).unwrap())
         .collect();
-    assert!(edge_jsons.iter().any(|j| j.contains("\"import_path\":\"os.path\"")));
-    assert!(edge_jsons
-        .iter()
-        .any(|j| j.contains("\"import_path\":\"os.environ\"")));
+    assert!(
+        edge_jsons
+            .iter()
+            .any(|j| j.contains("\"import_path\":\"os.path\""))
+    );
+    assert!(
+        edge_jsons
+            .iter()
+            .any(|j| j.contains("\"import_path\":\"os.environ\""))
+    );
     // from-imports flip namespace flag off, named flag on.
-    assert!(edge_jsons.iter().all(|j| j.contains("\"is_namespace\":false")));
+    assert!(
+        edge_jsons
+            .iter()
+            .all(|j| j.contains("\"is_namespace\":false"))
+    );
     assert!(edge_jsons.iter().all(|j| j.contains("\"is_named\":true")));
 }
 
 #[test]
 fn from_import_with_alias_records_binding() {
     let result = index_source("from foo import bar as b\n");
-    let node_json =
-        serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
     assert!(node_json.contains("\"name\":\"b\""), "node: {node_json}");
-    let edge_json =
-        serde_json::to_string(&result.additional_edges[0]).unwrap();
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
     assert!(edge_json.contains("\"import_path\":\"foo.bar\""));
 }
 
@@ -466,8 +425,7 @@ fn relative_import_prepends_dots_to_import_path() {
     // `from . import sibling` — level=1, no module.
     let result = index_source("from . import sibling\n");
     assert_eq!(result.additional_nodes.len(), 1);
-    let edge_json =
-        serde_json::to_string(&result.additional_edges[0]).unwrap();
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
     assert!(
         edge_json.contains("\"import_path\":\".sibling\""),
         "edge: {edge_json}"
@@ -486,11 +444,9 @@ fn relative_import_prepends_dots_to_import_path() {
 fn star_import_emits_namespace_placeholder() {
     let result = index_source("from foo import *\n");
     assert_eq!(result.additional_nodes.len(), 1);
-    let node_json =
-        serde_json::to_string(&result.additional_nodes[0]).unwrap();
+    let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
     assert!(node_json.contains("\"name\":\"*\""), "node: {node_json}");
-    let edge_json =
-        serde_json::to_string(&result.additional_edges[0]).unwrap();
+    let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
     assert!(edge_json.contains("\"import_path\":\"foo.*\""));
     // Star-imports bring in everything → namespace, not named.
     assert!(edge_json.contains("\"is_namespace\":true"));
@@ -501,26 +457,25 @@ fn star_import_emits_namespace_placeholder() {
 fn imports_coexist_with_function_extraction() {
     // Verify imports don't disturb the existing Function/Class/etc.
     // extraction — both kinds of nodes should appear in one pass.
-    let result = index_source(
-        "import os\nfrom sys import argv\n\ndef main():\n    return 1\n",
-    );
-    let kinds: Vec<NodeKind> =
-        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    let result = index_source("import os\nfrom sys import argv\n\ndef main():\n    return 1\n");
+    let kinds: Vec<NodeKind> = result.additional_nodes.iter().map(|n| n.kind()).collect();
     let n_unresolved = kinds
         .iter()
         .filter(|&&k| k == NodeKind::UnresolvedSymbol)
         .count();
-    let n_function = kinds
-        .iter()
-        .filter(|&&k| k == NodeKind::Function)
-        .count();
+    let n_function = kinds.iter().filter(|&&k| k == NodeKind::Function).count();
     assert_eq!(n_unresolved, 2, "kinds = {kinds:?}");
     assert_eq!(n_function, 1, "kinds = {kinds:?}");
 
-    let edge_kinds: Vec<EdgeKind> =
-        result.additional_edges.iter().map(|e| e.kind()).collect();
-    let n_imports = edge_kinds.iter().filter(|&&k| k == EdgeKind::Imports).count();
-    let n_contains = edge_kinds.iter().filter(|&&k| k == EdgeKind::Contains).count();
+    let edge_kinds: Vec<EdgeKind> = result.additional_edges.iter().map(|e| e.kind()).collect();
+    let n_imports = edge_kinds
+        .iter()
+        .filter(|&&k| k == EdgeKind::Imports)
+        .count();
+    let n_contains = edge_kinds
+        .iter()
+        .filter(|&&k| k == EdgeKind::Contains)
+        .count();
     assert_eq!(n_imports, 2);
     // File → Function (Contains).
     assert_eq!(n_contains, 1);

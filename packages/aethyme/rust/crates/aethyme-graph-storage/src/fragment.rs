@@ -162,9 +162,7 @@ pub enum FragmentBuildError {
 impl std::fmt::Display for FragmentBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyFilePath => {
-                f.write_str("Fragment: file_path must not be empty")
-            }
+            Self::EmptyFilePath => f.write_str("Fragment: file_path must not be empty"),
             Self::DuplicateNodeId { id } => write!(
                 f,
                 "Fragment: duplicate node id {:?}; each NodeId may \

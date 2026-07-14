@@ -1,0 +1,255 @@
+//! Binary-level tests for the redb-backed engine CLI surfaces.
+//!
+//! The fixture writes `.aethyme/graph/` fragments in-process, then exercises
+//! `aethyme-engine-cli` as a subprocess. That keeps the repos tiny while still
+//! pinning the CLI contract that scripts and playground setup consume.
+
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::path::Path;
+use std::process::{Command, Output};
+
+use aethyme_graph_indexer::{index_repo_to_disk, IndexerContext, WalkOptions};
+use aethyme_graph_storage::bootstrap_repo;
+
+fn engine_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_aethyme-engine-cli")
+}
+
+fn write(root: &Path, rel: &str, content: &[u8]) {
+    let full = root.join(rel);
+    std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+    std::fs::write(full, content).unwrap();
+}
+
+fn run_engine<I, S>(args: I) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Command::new(engine_bin())
+        .args(args)
+        .output()
+        .expect("spawn aethyme-engine-cli")
+}
+
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn assert_failure(output: &Output) {
+    assert!(
+        !output.status.success(),
+        "command unexpectedly succeeded: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn build_fragment_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/auth/token.py",
+        b"SECRET_TOKEN = 'test'\n\ndef load_token():\n    return SECRET_TOKEN\n",
+    );
+    write(
+        tmp.path(),
+        "tests/test_token.py",
+        b"from src.auth.token import load_token\n\ndef test_token():\n    assert load_token()\n",
+    );
+
+    let root = tmp.path().canonicalize().unwrap();
+    bootstrap_repo(&root, "test-engine").expect("bootstrap graph layout");
+    let ctx = IndexerContext::new("TinyRepo", root.clone(), "test-engine").unwrap();
+    let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
+    assert_eq!(summary.total_files, 2);
+    tmp
+}
+
+fn build_redb_fixture() -> tempfile::TempDir {
+    let tmp = build_fragment_fixture();
+    let output = run_engine([
+        "index",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&output);
+    assert!(tmp.path().join(".aethyme/graph_store.redb").is_file());
+    tmp
+}
+
+#[test]
+fn index_creates_graph_store_redb() {
+    let tmp = build_fragment_fixture();
+
+    let output = run_engine(["index", "--repo", tmp.path().to_str().unwrap()]);
+    assert_success(&output);
+
+    let store_path = tmp.path().join(".aethyme/graph_store.redb");
+    assert!(store_path.is_file(), "missing {}", store_path.display());
+}
+
+#[test]
+fn query_areas_reads_existing_store() {
+    let tmp = build_redb_fixture();
+
+    let output = run_engine([
+        "query-areas",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--depth",
+        "1",
+    ]);
+    assert_success(&output);
+
+    let areas: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("query-areas JSON parses");
+    let prefixes: Vec<&str> = areas
+        .as_array()
+        .expect("areas array")
+        .iter()
+        .map(|area| area["path_prefix"].as_str().expect("path_prefix"))
+        .collect();
+    assert_eq!(prefixes, vec!["src", "tests"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn query_areas_reads_with_read_only_graph_store() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = build_redb_fixture();
+    let store_path = tmp.path().join(".aethyme/graph_store.redb");
+    let mut perms = std::fs::metadata(&store_path).unwrap().permissions();
+    perms.set_mode(0o444);
+    std::fs::set_permissions(&store_path, perms).unwrap();
+
+    let output = run_engine([
+        "query-areas",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--depth",
+        "1",
+    ]);
+    assert_success(&output);
+}
+
+#[test]
+fn query_overview_json_shape_is_stable() {
+    let tmp = build_redb_fixture();
+
+    let output = run_engine(["query-overview", "--repo", tmp.path().to_str().unwrap()]);
+    assert_success(&output);
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("query-overview JSON parses");
+    let obj = parsed.as_object().expect("overview object");
+    let keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from(["areas", "entrypoints", "repo", "risks"])
+    );
+
+    let repo = parsed["repo"].as_object().expect("repo object");
+    let repo_keys: BTreeSet<&str> = repo.keys().map(String::as_str).collect();
+    assert_eq!(
+        repo_keys,
+        BTreeSet::from([
+            "commit_hash",
+            "file_count",
+            "indexed_at_unix",
+            "languages",
+            "root_path",
+        ])
+    );
+    assert_eq!(parsed["repo"]["file_count"], 2);
+    assert!(parsed["repo"]["languages"]
+        .as_array()
+        .expect("languages array")
+        .iter()
+        .any(|lang| lang == "python"));
+
+    let areas = parsed["areas"].as_array().expect("areas array");
+    assert_eq!(areas.len(), 2);
+    let area_keys: BTreeSet<&str> = areas[0]
+        .as_object()
+        .expect("area object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        area_keys,
+        BTreeSet::from(["id", "inferred", "name", "path_prefix"])
+    );
+    assert!(parsed["entrypoints"].as_array().is_some());
+    assert!(parsed["risks"].as_array().is_some());
+}
+
+#[test]
+fn query_commands_fail_cleanly_when_store_is_missing() {
+    let tmp = build_fragment_fixture();
+    let store_path = tmp.path().join(".aethyme/graph_store.redb");
+    assert!(!store_path.exists());
+
+    let cases: Vec<Vec<&str>> = vec![
+        vec!["query-areas", "--repo", tmp.path().to_str().unwrap()],
+        vec!["query-overview", "--repo", tmp.path().to_str().unwrap()],
+        vec![
+            "deps",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--file",
+            "src/auth/token.py",
+        ],
+        vec![
+            "importers",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--file",
+            "src/auth/token.py",
+        ],
+        vec![
+            "callers",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--symbol",
+            "load_token",
+        ],
+    ];
+
+    for args in cases {
+        let output = run_engine(args.clone());
+        assert_failure(&output);
+        assert!(
+            output.stdout.is_empty(),
+            "missing-store query should not emit stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(".aethyme/graph_store.redb"),
+            "stderr={stderr}"
+        );
+        assert!(
+            stderr.contains("aethyme-engine-cli index --repo <repo>"),
+            "stderr={stderr}"
+        );
+        assert!(
+            stderr.contains("Query commands are read-only"),
+            "stderr={stderr}"
+        );
+    }
+
+    assert!(
+        !store_path.exists(),
+        "read-only query commands must not create {}",
+        store_path.display()
+    );
+}

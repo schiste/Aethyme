@@ -16,7 +16,7 @@ use aethyme_graph_storage::FragmentStore;
 #[derive(Parser, Debug)]
 #[command(
     name = "aethyme-graph-query",
-    about = "Query the committed Aethyme graph for symbols, modules, and counts.",
+    about = "Query the committed Aethyme graph for symbols, modules, and counts."
 )]
 struct Cli {
     /// Absolute path to the repo root. The store reads from
@@ -70,14 +70,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let store = FragmentStore::open(cli.repo_root.clone())?;
 
     match cli.command {
-        Command::FindSymbol {
-            name,
-            module,
-            kind,
-        } => {
+        Command::FindSymbol { name, module, kind } => {
             let kind = parse_kind(kind.as_deref())?;
-            let hits =
-                store.find_symbols(module.as_deref(), &name, kind)?;
+            let hits = store.find_symbols(module.as_deref(), &name, kind)?;
             if hits.is_empty() {
                 println!("aethyme-graph-query: no matches for name={name:?}");
             } else {

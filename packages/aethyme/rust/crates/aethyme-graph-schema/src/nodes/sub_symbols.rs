@@ -80,9 +80,7 @@ impl std::fmt::Display for FieldConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyName => f.write_str("Field: name must not be empty"),
-            Self::EmptyFilePath => {
-                f.write_str("Field: file_path must not be empty")
-            }
+            Self::EmptyFilePath => f.write_str("Field: file_path must not be empty"),
             Self::EmptyType => f.write_str("Field: type_str must not be empty"),
             Self::Id(e) => write!(f, "Field: ID construction failed: {e}"),
         }
@@ -151,12 +149,8 @@ pub enum GlobalVariableConstructionError {
 impl std::fmt::Display for GlobalVariableConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyName => {
-                f.write_str("GlobalVariable: name must not be empty")
-            }
-            Self::EmptyFilePath => {
-                f.write_str("GlobalVariable: file_path must not be empty")
-            }
+            Self::EmptyName => f.write_str("GlobalVariable: name must not be empty"),
+            Self::EmptyFilePath => f.write_str("GlobalVariable: file_path must not be empty"),
             Self::Id(e) => {
                 write!(f, "GlobalVariable: ID construction failed: {e}")
             }
@@ -238,12 +232,8 @@ pub enum ParameterConstructionError {
 impl std::fmt::Display for ParameterConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyName => {
-                f.write_str("Parameter: name must not be empty")
-            }
-            Self::EmptyFilePath => {
-                f.write_str("Parameter: file_path must not be empty")
-            }
+            Self::EmptyName => f.write_str("Parameter: name must not be empty"),
+            Self::EmptyFilePath => f.write_str("Parameter: file_path must not be empty"),
             Self::Id(e) => {
                 write!(f, "Parameter: ID construction failed: {e}")
             }
@@ -335,12 +325,8 @@ pub enum StatementConstructionError {
 impl std::fmt::Display for StatementConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyFilePath => {
-                f.write_str("Statement: file_path must not be empty")
-            }
-            Self::EmptyKindTag => {
-                f.write_str("Statement: kind_tag must not be empty")
-            }
+            Self::EmptyFilePath => f.write_str("Statement: file_path must not be empty"),
+            Self::EmptyKindTag => f.write_str("Statement: kind_tag must not be empty"),
             Self::Id(e) => {
                 write!(f, "Statement: ID construction failed: {e}")
             }
@@ -382,9 +368,8 @@ impl Expression {
             "stmt#{}:expr{position_in_statement}:{kind_tag}",
             enclosing_statement_id.hash_suffix(),
         );
-        let id =
-            NodeId::new(NodeKind::Expression, repo, file_path, &symbol)
-                .map_err(ExpressionConstructionError::Id)?;
+        let id = NodeId::new(NodeKind::Expression, repo, file_path, &symbol)
+            .map_err(ExpressionConstructionError::Id)?;
         Ok(Expression {
             id,
             source_range,
@@ -421,12 +406,8 @@ pub enum ExpressionConstructionError {
 impl std::fmt::Display for ExpressionConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyFilePath => {
-                f.write_str("Expression: file_path must not be empty")
-            }
-            Self::EmptyKindTag => {
-                f.write_str("Expression: kind_tag must not be empty")
-            }
+            Self::EmptyFilePath => f.write_str("Expression: file_path must not be empty"),
+            Self::EmptyKindTag => f.write_str("Expression: kind_tag must not be empty"),
             Self::Id(e) => {
                 write!(f, "Expression: ID construction failed: {e}")
             }

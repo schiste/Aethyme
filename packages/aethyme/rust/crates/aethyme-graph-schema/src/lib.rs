@@ -58,43 +58,38 @@ pub mod node;
 pub mod nodes;
 
 pub use attributes::{
-    ALL_BINDING_KINDS, ALL_SOURCES, BindingKind, Confidence,
-    ConfidenceOutOfRange, Source, UnknownBindingKind, UnknownSource,
+    ALL_BINDING_KINDS, ALL_SOURCES, BindingKind, Confidence, ConfidenceOutOfRange, Source,
+    UnknownBindingKind, UnknownSource,
 };
 pub use common::{
-    ALL_VISIBILITIES, InvalidSourceRange, Modification,
-    ModificationHistory, SourceRange, UnknownVisibility, Visibility,
+    ALL_VISIBILITIES, InvalidSourceRange, Modification, ModificationHistory, SourceRange,
+    UnknownVisibility, Visibility,
 };
 pub use edge_struct::{
-    ALL_DECISION_STATUSES, ALL_REFERENCE_KIND_HINTS, DecisionStatus, Edge,
-    EdgeAttributes, EdgeSite, ReferenceKindHint,
+    ALL_DECISION_STATUSES, ALL_REFERENCE_KIND_HINTS, DecisionStatus, Edge, EdgeAttributes,
+    EdgeSite, ReferenceKindHint,
 };
 pub use edges::{
-    ALL_EDGE_KIND_CATEGORIES, ALL_EDGE_KINDS, EdgeKind, EdgeKindCategory,
-    UnknownEdgeKind, UnknownEdgeKindCategory,
+    ALL_EDGE_KIND_CATEGORIES, ALL_EDGE_KINDS, EdgeKind, EdgeKindCategory, UnknownEdgeKind,
+    UnknownEdgeKindCategory,
 };
 pub use identity::{NodeId, NodeIdConstructionError, NodeIdParseError};
-pub use node::Node;
 pub use kinds::{
-    ALL_NODE_KIND_CATEGORIES, ALL_NODE_KINDS, NodeKind, NodeKindCategory,
-    UnknownNodeKind, UnknownNodeKindCategory,
+    ALL_NODE_KIND_CATEGORIES, ALL_NODE_KINDS, NodeKind, NodeKindCategory, UnknownNodeKind,
+    UnknownNodeKindCategory,
 };
+pub use node::Node;
 pub use nodes::{
-    ALL_COMMENT_TAGS, Callable, Class, ClassConstructionError, Comment,
-    CommentConstructionError, CommentTag, ConfigValue,
-    ConfigValueConstructionError, Directory, DirectoryConstructionError,
-    DocSection, DocSectionConstructionError, Docstring,
-    DocstringConstructionError, Enum, EnumConstructionError, EnumVariant,
-    Expression, ExpressionConstructionError, Field, FieldConstructionError,
-    File, FileConstructionError, Function, FunctionConstructionError,
-    GlobalVariable, GlobalVariableConstructionError, Interface,
-    InterfaceConstructionError, Lambda, LambdaConstructionError, Method,
-    MethodConstructionError, Module, ModuleConstructionError, NonCodeFile,
-    NonCodeFileConstructionError, NonCodeFormat, Package,
-    PackageConstructionError, Parameter, ParameterConstructionError,
-    ParameterSignature, Repository,
-    RepositoryConstructionError, Statement, StatementConstructionError,
-    Struct, StructConstructionError, Trait, TraitConstructionError,
-    TypeAlias, TypeAliasConstructionError, UnresolvedSymbol,
-    UnresolvedSymbolConstructionError,
+    ALL_COMMENT_TAGS, Callable, Class, ClassConstructionError, Comment, CommentConstructionError,
+    CommentTag, ConfigValue, ConfigValueConstructionError, Directory, DirectoryConstructionError,
+    DocSection, DocSectionConstructionError, Docstring, DocstringConstructionError, Enum,
+    EnumConstructionError, EnumVariant, Expression, ExpressionConstructionError, Field,
+    FieldConstructionError, File, FileConstructionError, Function, FunctionConstructionError,
+    GlobalVariable, GlobalVariableConstructionError, Interface, InterfaceConstructionError, Lambda,
+    LambdaConstructionError, Method, MethodConstructionError, Module, ModuleConstructionError,
+    NonCodeFile, NonCodeFileConstructionError, NonCodeFormat, Package, PackageConstructionError,
+    Parameter, ParameterConstructionError, ParameterSignature, Repository,
+    RepositoryConstructionError, Statement, StatementConstructionError, Struct,
+    StructConstructionError, Trait, TraitConstructionError, TypeAlias, TypeAliasConstructionError,
+    UnresolvedSymbol, UnresolvedSymbolConstructionError,
 };

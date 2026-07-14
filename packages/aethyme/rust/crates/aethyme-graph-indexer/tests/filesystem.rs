@@ -1,14 +1,13 @@
 //! Integration tests for the filesystem-only indexer.
 
 use aethyme_graph_indexer::{
-    classify_file, infer_language_from_extension, walk_source_tree,
-    FileClassification, IndexerContext, SkipReason, WalkOptions,
+    FileClassification, IndexerContext, SkipReason, WalkOptions, classify_file,
+    infer_language_from_extension, walk_source_tree,
 };
 use aethyme_graph_schema::{NodeKind, NonCodeFormat};
 
 fn ctx(repo_root: &std::path::Path) -> IndexerContext {
-    IndexerContext::new("testrepo", repo_root.to_path_buf(), "0.1.0")
-        .unwrap()
+    IndexerContext::new("testrepo", repo_root.to_path_buf(), "0.1.0").unwrap()
 }
 
 fn write(root: &std::path::Path, rel: &str, content: &[u8]) {
@@ -35,12 +34,7 @@ fn context_rejects_relative_repo_root() {
 fn context_rejects_repo_name_with_colon() {
     use aethyme_graph_indexer::context::IndexerContextError;
     let tmp = tempfile::tempdir().unwrap();
-    let err = IndexerContext::new(
-        "bad:name",
-        tmp.path().to_path_buf(),
-        "0.1.0",
-    )
-    .unwrap_err();
+    let err = IndexerContext::new("bad:name", tmp.path().to_path_buf(), "0.1.0").unwrap_err();
     assert!(matches!(
         err,
         IndexerContextError::RepoNameContainsColon { .. }
@@ -100,10 +94,12 @@ fn walks_basic_source_tree() {
     write(tmp.path(), "src/lib.rs", b"// Rust file\n");
     write(tmp.path(), "README.md", b"# Heading\n");
 
-    let result = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default())
-        .unwrap();
-    let paths: Vec<&str> =
-        result.files.iter().map(|f| f.source_path.as_ref()).collect();
+    let result = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let paths: Vec<&str> = result
+        .files
+        .iter()
+        .map(|f| f.source_path.as_ref())
+        .collect();
     assert_eq!(paths, vec!["README.md", "src/cli.py", "src/lib.rs"]);
     assert!(result.skipped.is_empty());
 }
@@ -117,10 +113,12 @@ fn ignores_default_ignore_dirs() {
     write(tmp.path(), "target/debug/foo.rs", b"// build artifact\n");
     write(tmp.path(), ".aethyme/graph/something.bin", b"\x00");
 
-    let result = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default())
-        .unwrap();
-    let paths: Vec<&str> =
-        result.files.iter().map(|f| f.source_path.as_ref()).collect();
+    let result = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let paths: Vec<&str> = result
+        .files
+        .iter()
+        .map(|f| f.source_path.as_ref())
+        .collect();
     assert_eq!(paths, vec!["src/cli.py"]);
 }
 
@@ -134,8 +132,11 @@ fn extra_ignore_dirs_extend_defaults() {
     options.extra_ignore_dirs.push("vendor".into());
 
     let result = walk_source_tree(&ctx(tmp.path()), &options).unwrap();
-    let paths: Vec<&str> =
-        result.files.iter().map(|f| f.source_path.as_ref()).collect();
+    let paths: Vec<&str> = result
+        .files
+        .iter()
+        .map(|f| f.source_path.as_ref())
+        .collect();
     assert_eq!(paths, vec!["src/cli.py"]);
 }
 
@@ -152,8 +153,11 @@ fn skips_files_over_size_limit() {
     };
 
     let result = walk_source_tree(&ctx(tmp.path()), &options).unwrap();
-    let kept: Vec<&str> =
-        result.files.iter().map(|f| f.source_path.as_ref()).collect();
+    let kept: Vec<&str> = result
+        .files
+        .iter()
+        .map(|f| f.source_path.as_ref())
+        .collect();
     assert_eq!(kept, vec!["src/small.py"]);
 
     let skipped: Vec<(&str, SkipReason)> = result
@@ -171,14 +175,19 @@ fn skips_unrecognized_extensions() {
     write(tmp.path(), "image.png", b"\x89PNG\r\n");
     write(tmp.path(), "data.bin", b"\x00\x01\x02");
 
-    let result = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default())
-        .unwrap();
-    let kept: Vec<&str> =
-        result.files.iter().map(|f| f.source_path.as_ref()).collect();
+    let result = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let kept: Vec<&str> = result
+        .files
+        .iter()
+        .map(|f| f.source_path.as_ref())
+        .collect();
     assert_eq!(kept, vec!["src/cli.py"]);
 
-    let skipped: Vec<&str> =
-        result.skipped.iter().map(|s| s.source_path.as_ref()).collect();
+    let skipped: Vec<&str> = result
+        .skipped
+        .iter()
+        .map(|s| s.source_path.as_ref())
+        .collect();
     assert!(skipped.contains(&"image.png"));
     assert!(skipped.contains(&"data.bin"));
 }
@@ -189,10 +198,13 @@ fn indexed_file_nodes_carry_correct_kind_and_language() {
     write(tmp.path(), "cli.py", b"print('hi')\n");
     write(tmp.path(), "README.md", b"# md\n");
 
-    let result = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default())
-        .unwrap();
+    let result = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
 
-    let py = result.files.iter().find(|f| &*f.source_path == "cli.py").unwrap();
+    let py = result
+        .files
+        .iter()
+        .find(|f| &*f.source_path == "cli.py")
+        .unwrap();
     assert_eq!(py.top_node.kind(), NodeKind::File);
     assert_eq!(&*py.language, "python");
 
@@ -212,18 +224,19 @@ fn output_is_canonically_sorted_by_source_path() {
     write(tmp.path(), "a/first.py", b"# a\n");
     write(tmp.path(), "m/middle.py", b"# m\n");
 
-    let result = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default())
-        .unwrap();
-    let paths: Vec<&str> =
-        result.files.iter().map(|f| f.source_path.as_ref()).collect();
+    let result = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let paths: Vec<&str> = result
+        .files
+        .iter()
+        .map(|f| f.source_path.as_ref())
+        .collect();
     assert_eq!(paths, vec!["a/first.py", "m/middle.py", "z/last.py"]);
 }
 
 #[test]
 fn empty_repo_produces_empty_result() {
     let tmp = tempfile::tempdir().unwrap();
-    let result = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default())
-        .unwrap();
+    let result = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     assert!(result.files.is_empty());
     assert!(result.skipped.is_empty());
 }
@@ -238,9 +251,7 @@ fn same_repo_state_produces_byte_identical_results_across_walks() {
     write(tmp.path(), "src/lib.rs", b"fn main() {}\n");
     write(tmp.path(), "README.md", b"# md\n");
 
-    let a = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default())
-        .unwrap();
-    let b = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default())
-        .unwrap();
+    let a = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let b = walk_source_tree(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     assert_eq!(a, b);
 }

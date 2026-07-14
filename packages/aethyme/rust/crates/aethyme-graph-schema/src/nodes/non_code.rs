@@ -79,12 +79,8 @@ pub enum DocSectionConstructionError {
 impl std::fmt::Display for DocSectionConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyFilePath => {
-                f.write_str("DocSection: file_path must not be empty")
-            }
-            Self::EmptyHeading => {
-                f.write_str("DocSection: heading must not be empty")
-            }
+            Self::EmptyFilePath => f.write_str("DocSection: file_path must not be empty"),
+            Self::EmptyHeading => f.write_str("DocSection: heading must not be empty"),
             Self::Id(e) => {
                 write!(f, "DocSection: ID construction failed: {e}")
             }
@@ -127,8 +123,7 @@ impl Docstring {
         }
         // Docstring ID is keyed on target_symbol_id so the same
         // target always produces the same docstring NodeId.
-        let symbol =
-            format!("doc#{}", target_symbol_id.hash_suffix());
+        let symbol = format!("doc#{}", target_symbol_id.hash_suffix());
         let id = NodeId::new(NodeKind::Docstring, repo, file_path, &symbol)
             .map_err(DocstringConstructionError::Id)?;
         Ok(Docstring {
@@ -163,12 +158,8 @@ pub enum DocstringConstructionError {
 impl std::fmt::Display for DocstringConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyFilePath => {
-                f.write_str("Docstring: file_path must not be empty")
-            }
-            Self::EmptyTextHash => {
-                f.write_str("Docstring: text_hash must not be empty")
-            }
+            Self::EmptyFilePath => f.write_str("Docstring: file_path must not be empty"),
+            Self::EmptyTextHash => f.write_str("Docstring: text_hash must not be empty"),
             Self::Id(e) => {
                 write!(f, "Docstring: ID construction failed: {e}")
             }
@@ -244,8 +235,7 @@ impl Comment {
         if text_hash.is_empty() {
             return Err(CommentConstructionError::EmptyTextHash);
         }
-        let symbol =
-            format!("comment#{}:{start_line}:{}", tag.name(), text_hash);
+        let symbol = format!("comment#{}:{start_line}:{}", tag.name(), text_hash);
         let id = NodeId::new(NodeKind::Comment, repo, file_path, &symbol)
             .map_err(CommentConstructionError::Id)?;
         Ok(Comment {
@@ -285,15 +275,9 @@ pub enum CommentConstructionError {
 impl std::fmt::Display for CommentConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyFilePath => {
-                f.write_str("Comment: file_path must not be empty")
-            }
-            Self::StartLineZero => {
-                f.write_str("Comment: start_line must be >= 1")
-            }
-            Self::EmptyTextHash => {
-                f.write_str("Comment: text_hash must not be empty")
-            }
+            Self::EmptyFilePath => f.write_str("Comment: file_path must not be empty"),
+            Self::StartLineZero => f.write_str("Comment: start_line must be >= 1"),
+            Self::EmptyTextHash => f.write_str("Comment: text_hash must not be empty"),
             Self::Id(e) => write!(f, "Comment: ID construction failed: {e}"),
         }
     }
@@ -339,9 +323,8 @@ impl ConfigValue {
             enclosing_non_code_file_id.hash_suffix(),
             config_path,
         );
-        let id =
-            NodeId::new(NodeKind::ConfigValue, repo, file_path, &symbol)
-                .map_err(ConfigValueConstructionError::Id)?;
+        let id = NodeId::new(NodeKind::ConfigValue, repo, file_path, &symbol)
+            .map_err(ConfigValueConstructionError::Id)?;
         Ok(ConfigValue {
             id,
             enclosing_non_code_file_id,
@@ -379,15 +362,9 @@ pub enum ConfigValueConstructionError {
 impl std::fmt::Display for ConfigValueConstructionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyFilePath => {
-                f.write_str("ConfigValue: file_path must not be empty")
-            }
-            Self::EmptyConfigPath => {
-                f.write_str("ConfigValue: config_path must not be empty")
-            }
-            Self::EmptyValueHash => {
-                f.write_str("ConfigValue: value_hash must not be empty")
-            }
+            Self::EmptyFilePath => f.write_str("ConfigValue: file_path must not be empty"),
+            Self::EmptyConfigPath => f.write_str("ConfigValue: config_path must not be empty"),
+            Self::EmptyValueHash => f.write_str("ConfigValue: value_hash must not be empty"),
             Self::Id(e) => {
                 write!(f, "ConfigValue: ID construction failed: {e}")
             }

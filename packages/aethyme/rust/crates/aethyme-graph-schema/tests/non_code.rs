@@ -1,10 +1,9 @@
 //! Integration tests for non-code + unresolved node kinds.
 
 use aethyme_graph_schema::{
-    ALL_COMMENT_TAGS, Comment, CommentConstructionError, CommentTag,
-    ConfigValue, ConfigValueConstructionError, DocSection,
-    DocSectionConstructionError, Docstring, DocstringConstructionError,
-    NodeId, NodeKind, NonCodeFile, NonCodeFormat, SourceRange,
+    ALL_COMMENT_TAGS, Comment, CommentConstructionError, CommentTag, ConfigValue,
+    ConfigValueConstructionError, DocSection, DocSectionConstructionError, Docstring,
+    DocstringConstructionError, NodeId, NodeKind, NonCodeFile, NonCodeFormat, SourceRange,
     UnresolvedSymbol,
 };
 
@@ -23,8 +22,7 @@ fn statement_id() -> NodeId {
     // Build a Statement and grab its id. Using NodeId::new directly
     // for brevity — the Statement struct's tests live in
     // tests/sub_symbols.rs.
-    NodeId::new(NodeKind::Statement, "aethyme", "src/x.py", "fake_stmt")
-        .unwrap()
+    NodeId::new(NodeKind::Statement, "aethyme", "src/x.py", "fake_stmt").unwrap()
 }
 
 fn range() -> SourceRange {
@@ -35,14 +33,7 @@ fn range() -> SourceRange {
 
 #[test]
 fn doc_section_uses_enclosing_file_in_id() {
-    let s = DocSection::new(
-        "aethyme",
-        "README.md",
-        "Setup",
-        range(),
-        non_code_file_id(),
-    )
-    .unwrap();
+    let s = DocSection::new("aethyme", "README.md", "Setup", range(), non_code_file_id()).unwrap();
     assert_eq!(s.id().kind(), NodeKind::DocSection);
     assert_eq!(s.heading(), "Setup");
 
@@ -82,14 +73,7 @@ fn doc_section_id_disambiguates_repeated_headings() {
 fn docstring_id_is_stable_for_target() {
     // Same target → same docstring ID, even if other fields differ.
     let target = function_id();
-    let d1 = Docstring::new(
-        "aethyme",
-        "src/x.py",
-        target.clone(),
-        range(),
-        "hashA",
-    )
-    .unwrap();
+    let d1 = Docstring::new("aethyme", "src/x.py", target.clone(), range(), "hashA").unwrap();
     let d2 = Docstring::new(
         "aethyme",
         "src/x.py",
@@ -103,14 +87,7 @@ fn docstring_id_is_stable_for_target() {
 
 #[test]
 fn docstring_rejects_empty_text_hash() {
-    let err = Docstring::new(
-        "aethyme",
-        "src/x.py",
-        function_id(),
-        range(),
-        "",
-    )
-    .unwrap_err();
+    let err = Docstring::new("aethyme", "src/x.py", function_id(), range(), "").unwrap_err();
     assert!(matches!(err, DocstringConstructionError::EmptyTextHash));
 }
 
@@ -158,15 +135,7 @@ fn comment_carries_optional_statement_target() {
 
 #[test]
 fn comment_rejects_zero_start_line() {
-    let err = Comment::new(
-        "aethyme",
-        "src/x.py",
-        0,
-        CommentTag::Todo,
-        "abc",
-        None,
-    )
-    .unwrap_err();
+    let err = Comment::new("aethyme", "src/x.py", 0, CommentTag::Todo, "abc", None).unwrap_err();
     assert!(matches!(err, CommentConstructionError::StartLineZero));
 }
 
@@ -228,8 +197,7 @@ fn config_value_distinct_paths_distinct_ids() {
 fn unresolved_symbol_disambiguates_by_callsite() {
     // Same unresolved name, different call sites → different IDs.
     let site_a = function_id();
-    let site_b =
-        NodeId::new(NodeKind::Function, "aethyme", "src/x.py", "bar").unwrap();
+    let site_b = NodeId::new(NodeKind::Function, "aethyme", "src/x.py", "bar").unwrap();
     let u_a = UnresolvedSymbol::new(
         "aethyme",
         "src/x.py",
@@ -253,14 +221,8 @@ fn unresolved_symbol_disambiguates_by_callsite() {
 
 #[test]
 fn unresolved_symbol_accepts_none_expected_kind() {
-    let u = UnresolvedSymbol::new(
-        "aethyme",
-        "src/x.py",
-        "magic_thing",
-        None,
-        function_id(),
-    )
-    .unwrap();
+    let u =
+        UnresolvedSymbol::new("aethyme", "src/x.py", "magic_thing", None, function_id()).unwrap();
     assert_eq!(u.expected_kind(), None);
 }
 
@@ -268,27 +230,12 @@ fn unresolved_symbol_accepts_none_expected_kind() {
 
 #[test]
 fn non_code_kinds_round_trip() {
-    let s = DocSection::new(
-        "aethyme",
-        "README.md",
-        "Setup",
-        range(),
-        non_code_file_id(),
-    )
-    .unwrap();
+    let s = DocSection::new("aethyme", "README.md", "Setup", range(), non_code_file_id()).unwrap();
     let json = serde_json::to_string(&s).unwrap();
     let back: DocSection = serde_json::from_str(&json).unwrap();
     assert_eq!(back, s);
 
-    let c = Comment::new(
-        "aethyme",
-        "src/x.py",
-        42,
-        CommentTag::Todo,
-        "abc",
-        None,
-    )
-    .unwrap();
+    let c = Comment::new("aethyme", "src/x.py", 42, CommentTag::Todo, "abc", None).unwrap();
     let json = serde_json::to_string(&c).unwrap();
     let back: Comment = serde_json::from_str(&json).unwrap();
     assert_eq!(back, c);

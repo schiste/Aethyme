@@ -2,8 +2,8 @@
 //! `SourceRange`, `Visibility`, `Modification`, `ModificationHistory`.
 
 use aethyme_graph_schema::{
-    ALL_VISIBILITIES, InvalidSourceRange, Modification,
-    ModificationHistory, SourceRange, Visibility,
+    ALL_VISIBILITIES, InvalidSourceRange, Modification, ModificationHistory, SourceRange,
+    Visibility,
 };
 
 // ─── SourceRange ─────────────────────────────────────────────────────
@@ -136,15 +136,12 @@ fn modification_history_push_most_recent_orders_correctly() {
 #[test]
 fn modification_history_evicts_oldest_at_capacity() {
     let mut h = ModificationHistory::new();
-    for (sha, ts) in
-        [("aaa", 100), ("bbb", 200), ("ccc", 300), ("ddd", 400)]
-    {
+    for (sha, ts) in [("aaa", 100), ("bbb", 200), ("ccc", 300), ("ddd", 400)] {
         h.push_most_recent(modif(sha, ts));
     }
     assert_eq!(h.len(), 3); // Capped at 3
     // ddd is most recent; aaa was evicted
-    let commits: Vec<&str> =
-        h.entries().iter().map(|m| &*m.commit).collect();
+    let commits: Vec<&str> = h.entries().iter().map(|m| &*m.commit).collect();
     assert_eq!(commits, vec!["ddd", "ccc", "bbb"]);
 }
 
@@ -158,8 +155,7 @@ fn modification_history_from_most_recent_first_truncates() {
     ];
     let h = ModificationHistory::from_most_recent_first(entries);
     assert_eq!(h.len(), 3);
-    let commits: Vec<&str> =
-        h.entries().iter().map(|m| &*m.commit).collect();
+    let commits: Vec<&str> = h.entries().iter().map(|m| &*m.commit).collect();
     assert_eq!(commits, vec!["aaa", "bbb", "ccc"]);
 }
 
@@ -184,8 +180,7 @@ fn modification_history_deserialize_rejects_oversize() {
         { "commit": "c", "unix_timestamp": 3, "author": "x" },
         { "commit": "d", "unix_timestamp": 4, "author": "x" },
     ]);
-    let result: Result<ModificationHistory, _> =
-        serde_json::from_value(bad);
+    let result: Result<ModificationHistory, _> = serde_json::from_value(bad);
     assert!(result.is_err());
 }
 

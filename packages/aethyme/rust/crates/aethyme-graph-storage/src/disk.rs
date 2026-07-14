@@ -15,25 +15,24 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::binary::{
-    read_fragment_bytes, write_fragment_bytes, FragmentDecodeError,
-    FragmentEncodeError,
+    FragmentDecodeError, FragmentEncodeError, read_fragment_bytes, write_fragment_bytes,
 };
 use crate::fragment::Fragment;
 use crate::index_shard::{
-    read_index_shard_bytes, write_index_shard_bytes, IndexShardDecodeError,
-    IndexShardEncodeError, SymbolRecord,
+    IndexShardDecodeError, IndexShardEncodeError, SymbolRecord, read_index_shard_bytes,
+    write_index_shard_bytes,
 };
 use crate::layout::{
-    fragment_path, index_shard_path, overlay_path, validate_module_name,
-    validate_source_path, InvalidPath,
+    InvalidPath, fragment_path, index_shard_path, overlay_path, validate_module_name,
+    validate_source_path,
 };
 use crate::overlay::{
-    read_overlay_bytes, write_overlay_bytes, OverlayDecodeError,
-    OverlayEncodeError, OverlayFragment,
+    OverlayDecodeError, OverlayEncodeError, OverlayFragment, read_overlay_bytes,
+    write_overlay_bytes,
 };
 
 /// Write a Fragment to its canonical location under `<repo>/.aethyme/
@@ -45,18 +44,14 @@ pub fn write_fragment(
     fragment: &Fragment,
 ) -> Result<PathBuf, FragmentWriteError> {
     validate_source_path(source_path).map_err(FragmentWriteError::Path)?;
-    let bytes = write_fragment_bytes(fragment)
-        .map_err(FragmentWriteError::Encode)?;
+    let bytes = write_fragment_bytes(fragment).map_err(FragmentWriteError::Encode)?;
     let target = fragment_path(repo_root, source_path);
     atomic_write(&target, &bytes).map_err(FragmentWriteError::Io)?;
     Ok(target)
 }
 
 /// Read a Fragment from its canonical location.
-pub fn read_fragment(
-    repo_root: &Path,
-    source_path: &str,
-) -> Result<Fragment, FragmentReadError> {
+pub fn read_fragment(repo_root: &Path, source_path: &str) -> Result<Fragment, FragmentReadError> {
     validate_source_path(source_path).map_err(FragmentReadError::Path)?;
     let target = fragment_path(repo_root, source_path);
     let bytes = read_file(&target).map_err(FragmentReadError::Io)?;
@@ -72,8 +67,7 @@ pub fn write_index_shard(
     records: &[SymbolRecord],
 ) -> Result<PathBuf, IndexShardWriteError> {
     validate_module_name(module).map_err(IndexShardWriteError::Path)?;
-    let bytes = write_index_shard_bytes(records)
-        .map_err(IndexShardWriteError::Encode)?;
+    let bytes = write_index_shard_bytes(records).map_err(IndexShardWriteError::Encode)?;
     let target = index_shard_path(repo_root, module);
     atomic_write(&target, &bytes).map_err(IndexShardWriteError::Io)?;
     Ok(target)
@@ -105,8 +99,7 @@ pub fn write_overlay<P: Serialize>(
     overlay: &OverlayFragment<P>,
 ) -> Result<PathBuf, OverlayWriteError> {
     validate_module_name(kind).map_err(OverlayWriteError::Path)?;
-    let bytes =
-        write_overlay_bytes(overlay).map_err(OverlayWriteError::Encode)?;
+    let bytes = write_overlay_bytes(overlay).map_err(OverlayWriteError::Encode)?;
     let target = overlay_path(repo_root, kind);
     atomic_write(&target, &bytes).map_err(OverlayWriteError::Io)?;
     Ok(target)

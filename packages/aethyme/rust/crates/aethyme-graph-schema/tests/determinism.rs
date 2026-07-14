@@ -28,9 +28,8 @@
 //!    positions.
 
 use aethyme_graph_schema::{
-    ALL_EDGE_KINDS, ALL_NODE_KINDS, Class, Confidence, Edge, EdgeAttributes,
-    EdgeKind, EdgeSite, File, Function, NodeKind, ParameterSignature,
-    Repository, Source, SourceRange, Visibility,
+    ALL_EDGE_KINDS, ALL_NODE_KINDS, Class, Confidence, Edge, EdgeAttributes, EdgeKind, EdgeSite,
+    File, Function, NodeKind, ParameterSignature, Repository, Source, SourceRange, Visibility,
 };
 
 // ─── Bincode round-trip for every kind enum variant ─────────────────
@@ -145,20 +144,10 @@ fn edge_with_sites_serializes_identically_across_constructions() {
     // discriminator as a known-position u8.
     fn build() -> Edge {
         Edge::new(
-            aethyme_graph_schema::NodeId::new(
-                NodeKind::Function,
-                "aethyme",
-                "src/x.py",
-                "a",
-            )
-            .unwrap(),
-            aethyme_graph_schema::NodeId::new(
-                NodeKind::Function,
-                "aethyme",
-                "src/x.py",
-                "b",
-            )
-            .unwrap(),
+            aethyme_graph_schema::NodeId::new(NodeKind::Function, "aethyme", "src/x.py", "a")
+                .unwrap(),
+            aethyme_graph_schema::NodeId::new(NodeKind::Function, "aethyme", "src/x.py", "b")
+                .unwrap(),
             EdgeAttributes::Calls,
             Source::Code,
             Confidence::FULL,
@@ -207,14 +196,7 @@ fn repository_round_trips_through_bincode() {
 
 #[test]
 fn file_round_trips_through_bincode() {
-    let f = File::new(
-        "aethyme",
-        "src/cli.py",
-        "python",
-        12345,
-        "abc123",
-    )
-    .unwrap();
+    let f = File::new("aethyme", "src/cli.py", "python", 12345, "abc123").unwrap();
     let bytes = bincode::serialize(&f).unwrap();
     let back: File = bincode::deserialize(&bytes).unwrap();
     assert_eq!(back, f);

@@ -94,6 +94,152 @@ pub fn logfile_path_for(repo: &Path) -> PathBuf {
     repo.join(".aethyme").join("engine-daemon.log")
 }
 
+/// Options for [`start_detached`].
+#[derive(Default)]
+pub struct StartOptions {
+    pub no_cache: bool,
+    pub force_fragments: bool,
+    pub idle_timeout: Option<String>,
+}
+
+/// Outcome of [`start_detached`].
+pub enum StartOutcome {
+    /// A live daemon already owns the pidfile.
+    AlreadyRunning(i32),
+    /// A new server process was spawned (detached, own session). The
+    /// caller receives the [`std::process::Child`] handle: a spawned
+    /// server that dies on startup becomes a zombie of the *caller*
+    /// until reaped, so liveness must be checked with `try_wait()` on
+    /// this handle — a `kill(pid, 0)` probe reports zombies as alive.
+    Spawned(std::process::Child),
+}
+
+/// Spawn a detached engine-daemon server for `repo`, using `serve_exe` as
+/// the server binary (it must understand `daemon serve --repo <path>` —
+/// i.e. `aethyme-engine-cli`). Shared by both front-end binaries so the
+/// pidfile/logfile/setsid lifecycle cannot drift between them.
+///
+/// Idempotent: returns [`StartOutcome::AlreadyRunning`] when a live pid
+/// holds the pidfile; stale pidfiles are cleaned and respawned.
+pub fn start_detached(
+    repo: &Path,
+    serve_exe: &Path,
+    opts: &StartOptions,
+) -> Result<StartOutcome, String> {
+    let pidfile = pidfile_path_for(repo);
+    if pidfile.exists() {
+        if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                let alive = unsafe { libc::kill(pid, 0) };
+                if alive == 0 {
+                    return Ok(StartOutcome::AlreadyRunning(pid));
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&pidfile);
+    }
+
+    let aethyme_dir = repo.join(".aethyme");
+    std::fs::create_dir_all(&aethyme_dir).map_err(|e| format!("create .aethyme: {e}"))?;
+
+    let log_path = logfile_path_for(repo);
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("open logfile {}: {}", log_path.display(), e))?;
+    let log_stdout = log_file
+        .try_clone()
+        .map_err(|e| format!("clone log fd: {e}"))?;
+    let log_stderr = log_file
+        .try_clone()
+        .map_err(|e| format!("clone log fd: {e}"))?;
+
+    let mut cmd = std::process::Command::new(serve_exe);
+    if opts.no_cache {
+        cmd.arg("--no-cache");
+    }
+    if opts.force_fragments {
+        cmd.arg("--from-fragments");
+    }
+    cmd.arg("daemon").arg("serve").arg("--repo").arg(repo);
+    if let Some(idle) = &opts.idle_timeout {
+        cmd.arg("--idle-timeout").arg(idle);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_stdout))
+        .stderr(std::process::Stdio::from(log_stderr));
+
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    let pid = child.id();
+    std::fs::write(&pidfile, pid.to_string()).map_err(|e| format!("write pidfile: {e}"))?;
+    Ok(StartOutcome::Spawned(child))
+}
+
+/// Outcome of [`wait_until_ready`].
+#[derive(PartialEq, Eq, Debug)]
+pub enum ReadyOutcome {
+    /// The daemon accepted a socket connection.
+    Ready,
+    /// The watched server process exited before the socket appeared —
+    /// failing fast beats sitting out the timeout (a daemon that dies on
+    /// startup, e.g. un-indexed repo, dies within milliseconds).
+    ProcessExited,
+    /// Deadline passed with the process still alive but no socket.
+    TimedOut,
+}
+
+/// Block until the daemon for `repo` accepts a socket connection, the
+/// watched process dies, or the deadline passes. The socket binds only
+/// after the initial map build, so on large repos this legitimately takes
+/// tens of seconds — callers should surface progress to the user.
+pub fn wait_until_ready(
+    repo: &Path,
+    mut watch: Option<&mut std::process::Child>,
+    timeout: std::time::Duration,
+) -> ReadyOutcome {
+    let socket = socket_path_for(repo);
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            return ReadyOutcome::Ready;
+        }
+        // try_wait() reaps: a kill(pid, 0) probe would report the child
+        // as alive forever once it zombifies under the waiting caller.
+        if let Some(child) = watch.as_deref_mut()
+            && matches!(child.try_wait(), Ok(Some(_)))
+        {
+            return ReadyOutcome::ProcessExited;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    ReadyOutcome::TimedOut
+}
+
+/// Last few lines of the daemon logfile — the diagnostic callers show
+/// when startup fails.
+pub fn log_tail(repo: &Path, lines: usize) -> String {
+    let path = logfile_path_for(repo);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let all: Vec<&str> = text.lines().collect();
+            let start = all.len().saturating_sub(lines);
+            all[start..].join("\n")
+        }
+        Err(_) => format!("(no log at {})", path.display()),
+    }
+}
+
 /// Server state held across requests.
 struct DaemonState {
     repo: PathBuf,

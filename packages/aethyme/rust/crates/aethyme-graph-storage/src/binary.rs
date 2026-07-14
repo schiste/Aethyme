@@ -9,9 +9,7 @@
 use crate::fragment::Fragment;
 
 /// Encode a Fragment as bincode bytes.
-pub fn write_fragment_bytes(
-    fragment: &Fragment,
-) -> Result<Vec<u8>, FragmentEncodeError> {
+pub fn write_fragment_bytes(fragment: &Fragment) -> Result<Vec<u8>, FragmentEncodeError> {
     bincode::serialize(fragment).map_err(|e| FragmentEncodeError::Bincode {
         message: e.to_string(),
     })
@@ -23,14 +21,11 @@ pub fn write_fragment_bytes(
 /// than attempting any forward/backward compatibility. Per the
 /// "no schema versioning" rule, version bumps are forever-format
 /// changes; loud failure is the right behavior.
-pub fn read_fragment_bytes(
-    bytes: &[u8],
-) -> Result<Fragment, FragmentDecodeError> {
-    let fragment: Fragment = bincode::deserialize(bytes).map_err(|e| {
-        FragmentDecodeError::Bincode {
+pub fn read_fragment_bytes(bytes: &[u8]) -> Result<Fragment, FragmentDecodeError> {
+    let fragment: Fragment =
+        bincode::deserialize(bytes).map_err(|e| FragmentDecodeError::Bincode {
             message: e.to_string(),
-        }
-    })?;
+        })?;
     if fragment.schema_version() != Fragment::SCHEMA_VERSION {
         return Err(FragmentDecodeError::SchemaVersionMismatch {
             expected: Fragment::SCHEMA_VERSION,
