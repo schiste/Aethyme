@@ -21,6 +21,8 @@ def render_markdown(payload: dict[str, Any]) -> str:
         f"- Methodology hash: `{baseline.get('methodology_hash') or '-'}`",
         (
             f"- Summary: {summary.get('fail', 0)} fail, "
+            f"{summary.get('missing_baseline', 0)} missing baseline, "
+            f"{summary.get('environment_drift', 0)} environment drift, "
             f"{summary.get('warn', 0)} warn, {summary.get('pass', 0)} pass"
         ),
         "",

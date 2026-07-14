@@ -129,14 +129,11 @@ def test_required_documentation_exists(docs_dir: Path) -> None:
     required_docs = [
         "getting-started/quickstart.md",
         "getting-started/onboarding.md",
-        "architecture/auth-boundary.md",
-        "reference/api.md",
         "reference/cli.md",
         "guides/testing.md",
         "guides/troubleshooting.md",
         "runbooks/index-failure.md",
         "runbooks/rollback.md",
-        "security/security-overview.md",
     ]
 
     missing_docs: list[str] = []

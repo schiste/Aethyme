@@ -8,7 +8,7 @@ The initial open-source contribution scope is Aethyme Core:
 - `packages/aethyme/rust`
 - root documentation and CI that support Aethyme Core
 
-`packages/aethyme-cloud` is not the initial
+Historical packages removed from the tree are not the initial
 community support surface unless maintainers explicitly mark them as such.
 
 ## Development Setup

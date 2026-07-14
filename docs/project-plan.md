@@ -23,19 +23,8 @@ Keep `packages/aethyme` as a small, verified backend for:
 
 ## Product Boundary
 
-- `packages/aethyme` owns core logic and scoped enforcement
-- `packages/aethyme-cloud` owns login, registration, sessions, and SaaS lifecycle
-
-## Canonical Model
-
-`Platform > Org > Tenant > Repository > Graph`
-
-Working rules:
-
-- `tenant` is the runtime isolation boundary
-- `org` owns one or more tenants
-- repositories, nodes, edges, indexing jobs, and scorecards are tenant-scoped
-- core accepts trusted credentials carrying `org`, `tenant_id`, and `scopes`
+- `packages/aethyme` owns all product logic (the cloud package was removed
+  2026-07-14; the tenant model went with the #30 cloud lineage)
 
 ## Language Direction
 
@@ -52,12 +41,9 @@ Aethyme Core is moving toward a split architecture:
 - later, policy evaluation
 
 ### Python Retained Targets
-- API
 - CLI
-- auth enforcement
 - scorecard orchestration
-- SDKs
-- migration and product experimentation layers
+- enhance/onboarding and product experimentation layers
 
 ## Core Surface
 

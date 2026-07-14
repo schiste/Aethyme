@@ -95,30 +95,22 @@ Owns:
 - advisory guidance and later policy enforcement
 - scorecard and repo quality signals
 - local autofix/operator tooling
-- auth enforcement and tenant isolation
-- MCP server, API, and CLI adapters over the core engine
+- CLI adapters over the core engine
 
-### `packages/aethyme-cloud`
+### `packages/aethyme-cloud` (removed 2026-07-14)
 
-Owns:
-
-- identity issuance
-- user, org, tenant, and admin lifecycle
-- SaaS UX and management surfaces
-- later agent management and policy UX
-- later fleet-level performance reporting UI
+The SaaS/identity package was removed with the rest of the cloud lineage;
+recoverable from git history.
 
 ## Canonical Model
 
-The canonical business hierarchy is:
+The canonical hierarchy is:
 
-- Platform
-- Org
-- Tenant
 - Repository
 - Graph
 
-The business hierarchy describes ownership and isolation.
+(The Platform/Org/Tenant tiers above Repository were part of the removed
+cloud lineage.)
 
 ## Tiered Architecture
 

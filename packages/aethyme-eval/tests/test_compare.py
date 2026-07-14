@@ -116,6 +116,30 @@ def test_compare_treats_quality_gain_as_tradeoff_not_failure():
     assert any("trade-off" in reason for reason in row["reasons"])
 
 
+def test_compare_fails_large_duration_regression_without_quality_gain():
+    baseline = _baseline(_aggregate("explore", tokens=100, duration=10, quality=80))
+    current = [_aggregate("explore", tokens=100, duration=21, quality=80)]
+
+    payload = compare_aggregates(current, baseline)
+
+    row = _row_by_condition(payload, "explore")
+    assert row["status"] == "fail"
+    assert row["duration_ratio"] == 2.1
+    assert payload["summary"]["fail"] == 1
+
+
+def test_compare_counts_missing_baselines_separately_from_warnings():
+    baseline = _baseline(_aggregate("explore", target="grc", tokens=100))
+    current = [_aggregate("explore", target="mediawiki", tokens=100)]
+
+    payload = compare_aggregates(current, baseline)
+
+    row = _row_by_condition(payload, "explore")
+    assert row["status"] == "missing-baseline"
+    assert payload["summary"]["missing_baseline"] == 1
+    assert payload["summary"]["warn"] == 0
+
+
 def test_build_baseline_excludes_aethyme_target_by_default(tmp_path):
     history = tmp_path / "runs.jsonl"
     history.write_text(

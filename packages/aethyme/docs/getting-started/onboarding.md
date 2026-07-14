@@ -15,9 +15,8 @@ Aethyme Core is a backend for:
 
 1. [`../README.md`](../README.md)
 2. [`quickstart.md`](quickstart.md)
-3. [`../architecture/auth-boundary.md`](../architecture/auth-boundary.md)
-4. [`../reference/api.md`](../reference/api.md)
-5. [`../guides/testing.md`](../guides/testing.md)
+3. [`../reference/cli.md`](../reference/cli.md)
+4. [`../guides/testing.md`](../guides/testing.md)
 
 ## Working Rules
 

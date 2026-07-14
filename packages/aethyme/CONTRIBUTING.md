@@ -4,11 +4,10 @@
 
 Work against the current core flow only:
 
-1. authenticate or seed a tenant
-2. index a repository
-3. run search, ego, or impact
-4. run scorecard
-5. keep tests and docs aligned with that flow
+1. ingest and inspect a repository (`aethyme repo ingest` / `inspect`)
+2. run `explore`, graph, and task-context queries
+3. run scorecard and broker workflows
+4. keep tests and docs aligned with that flow
 
 Do not add speculative status docs, sprint reports, or checked-in fake fixture repositories.
 
@@ -40,6 +39,5 @@ If behavior changes, update one of these instead of adding a new status file:
 - `README.md`
 - `roadmap.md`
 - `docs/getting-started/quickstart.md`
-- `docs/reference/api.md`
 - `docs/reference/cli.md`
 - `tests/README.md`
