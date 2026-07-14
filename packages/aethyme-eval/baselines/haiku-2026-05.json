@@ -1,0 +1,1385 @@
+{
+  "filters": {
+    "exclude_targets": [
+      "aethyme"
+    ],
+    "model": "haiku"
+  },
+  "generated_at": "2026-07-14T10:37:47.271480+00:00",
+  "groups": [
+    {
+      "first_timestamp": "2026-05-21T12:57:27.104548+00:00",
+      "key": {
+        "condition": "control-cto-off",
+        "eval_type": "bug-fix",
+        "model": "haiku",
+        "scenario": null,
+        "target": "grc"
+      },
+      "last_timestamp": "2026-05-21T12:57:27.104548+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": null,
+          "max": 2.3451,
+          "median": 2.3451,
+          "min": 2.3451,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "duration_seconds": {
+          "iqr": null,
+          "max": 93.3,
+          "median": 93.3,
+          "min": 93.3,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "global_score": {
+          "iqr": null,
+          "max": 100.0,
+          "median": 100.0,
+          "min": 100.0,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "quality_score": {
+          "iqr": null,
+          "max": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "total_tokens": {
+          "iqr": null,
+          "max": 2874337.0,
+          "median": 2874337.0,
+          "min": 2874337.0,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        }
+      },
+      "n": 1,
+      "run_dirs": [
+        "20260521T121950-grc-bug-fix-haiku"
+      ]
+    },
+    {
+      "first_timestamp": "2026-05-21T12:57:27.104548+00:00",
+      "key": {
+        "condition": "control-cto-on",
+        "eval_type": "bug-fix",
+        "model": "haiku",
+        "scenario": null,
+        "target": "grc"
+      },
+      "last_timestamp": "2026-05-21T12:57:27.104548+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": null,
+          "max": 2.2307,
+          "median": 2.2307,
+          "min": 2.2307,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "duration_seconds": {
+          "iqr": null,
+          "max": 99.4,
+          "median": 99.4,
+          "min": 99.4,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "global_score": {
+          "iqr": null,
+          "max": 100.12,
+          "median": 100.12,
+          "min": 100.12,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "quality_score": {
+          "iqr": null,
+          "max": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "total_tokens": {
+          "iqr": null,
+          "max": 2732673.0,
+          "median": 2732673.0,
+          "min": 2732673.0,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        }
+      },
+      "n": 1,
+      "run_dirs": [
+        "20260521T121950-grc-bug-fix-haiku"
+      ]
+    },
+    {
+      "first_timestamp": "2026-05-21T12:57:27.104548+00:00",
+      "key": {
+        "condition": "explore",
+        "eval_type": "bug-fix",
+        "model": "haiku",
+        "scenario": null,
+        "target": "grc"
+      },
+      "last_timestamp": "2026-05-21T12:57:27.104548+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": null,
+          "max": 2.0207,
+          "median": 2.0207,
+          "min": 2.0207,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "duration_seconds": {
+          "iqr": null,
+          "max": 75.0,
+          "median": 75.0,
+          "min": 75.0,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "global_score": {
+          "iqr": null,
+          "max": 104.36,
+          "median": 104.36,
+          "min": 104.36,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "quality_score": {
+          "iqr": null,
+          "max": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "total_tokens": {
+          "iqr": null,
+          "max": 2491660.0,
+          "median": 2491660.0,
+          "min": 2491660.0,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        }
+      },
+      "n": 1,
+      "run_dirs": [
+        "20260521T121950-grc-bug-fix-haiku"
+      ]
+    },
+    {
+      "first_timestamp": "2026-05-20T10:05:04.765949+00:00",
+      "key": {
+        "condition": "leverage",
+        "eval_type": "bug-fix",
+        "model": "haiku",
+        "scenario": null,
+        "target": "grc"
+      },
+      "last_timestamp": "2026-05-21T12:57:27.104548+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": null,
+          "max": 11.16,
+          "median": 8.1579,
+          "min": 6.9642,
+          "n": 3,
+          "q1": null,
+          "q3": null
+        },
+        "duration_seconds": {
+          "iqr": null,
+          "max": 1331.1,
+          "median": 369.7,
+          "min": 129.5,
+          "n": 3,
+          "q1": null,
+          "q3": null
+        },
+        "global_score": {
+          "iqr": null,
+          "max": 100.0,
+          "median": 100.0,
+          "min": 54.62,
+          "n": 3,
+          "q1": null,
+          "q3": null
+        },
+        "quality_score": {
+          "iqr": null,
+          "max": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "n": 3,
+          "q1": null,
+          "q3": null
+        },
+        "total_tokens": {
+          "iqr": null,
+          "max": 13849072.0,
+          "median": 10095951.0,
+          "min": 8628310.0,
+          "n": 3,
+          "q1": null,
+          "q3": null
+        }
+      },
+      "n": 3,
+      "run_dirs": [
+        "20260520T100208-grc-bug-fix-haiku",
+        "20260520T103433-grc-bug-fix-haiku",
+        "20260521T121950-grc-bug-fix-haiku"
+      ]
+    },
+    {
+      "first_timestamp": "2026-05-21T12:57:27.104548+00:00",
+      "key": {
+        "condition": "task-conditioned",
+        "eval_type": "bug-fix",
+        "model": "haiku",
+        "scenario": null,
+        "target": "grc"
+      },
+      "last_timestamp": "2026-05-21T12:57:27.104548+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": null,
+          "max": 6.3594,
+          "median": 6.3594,
+          "min": 6.3594,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "duration_seconds": {
+          "iqr": null,
+          "max": 540.1,
+          "median": 540.1,
+          "min": 540.1,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "global_score": {
+          "iqr": null,
+          "max": 67.39,
+          "median": 67.39,
+          "min": 67.39,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "quality_score": {
+          "iqr": null,
+          "max": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "total_tokens": {
+          "iqr": null,
+          "max": 7861946.0,
+          "median": 7861946.0,
+          "min": 7861946.0,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        }
+      },
+      "n": 1,
+      "run_dirs": [
+        "20260521T121950-grc-bug-fix-haiku"
+      ]
+    },
+    {
+      "first_timestamp": "2026-05-07T19:11:39.813650+00:00",
+      "key": {
+        "condition": "control-cto-off",
+        "eval_type": "bug-fix",
+        "model": "haiku",
+        "scenario": "implication-share",
+        "target": "grc"
+      },
+      "last_timestamp": "2026-05-09T11:39:11.898419+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": null,
+          "max": 0.3965,
+          "median": 0.3794,
+          "min": 0.3622,
+          "n": 2,
+          "q1": null,
+          "q3": null
+        },
+        "duration_seconds": {
+          "iqr": null,
+          "max": 142.1,
+          "median": 125.35,
+          "min": 108.6,
+          "n": 2,
+          "q1": null,
+          "q3": null
+        },
+        "global_score": {
+          "iqr": null,
+          "max": 100.0,
+          "median": 100.0,
+          "min": 100.0,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "quality_score": {
+          "iqr": null,
+          "max": 92.01,
+          "median": 92.01,
+          "min": 92.01,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "total_tokens": {
+          "iqr": null,
+          "max": 1453943.0,
+          "median": 1314351.5,
+          "min": 1174760.0,
+          "n": 2,
+          "q1": null,
+          "q3": null
+        }
+      },
+      "n": 2,
+      "run_dirs": [
+        "20260507T152450-grc-bug-fix",
+        "20260509T105448-grc-bug-fix"
+      ]
+    },
+    {
+      "first_timestamp": "2026-05-07T19:11:39.813650+00:00",
+      "key": {
+        "condition": "control-cto-on",
+        "eval_type": "bug-fix",
+        "model": "haiku",
+        "scenario": "implication-share",
+        "target": "grc"
+      },
+      "last_timestamp": "2026-05-09T11:39:11.898419+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": null,
+          "max": 0.4461,
+          "median": 0.3213,
+          "min": 0.1965,
+          "n": 2,
+          "q1": null,
+          "q3": null
+        },
+        "duration_seconds": {
+          "iqr": null,
+          "max": 108.1,
+          "median": 86.3,
+          "min": 64.5,
+          "n": 2,
+          "q1": null,
+          "q3": null
+        },
+        "global_score": {
+          "iqr": null,
+          "max": 114.14,
+          "median": 114.14,
+          "min": 114.14,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "quality_score": {
+          "iqr": null,
+          "max": 93.37,
+          "median": 93.37,
+          "min": 93.37,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "total_tokens": {
+          "iqr": null,
+          "max": 1336237.0,
+          "median": 1302319.0,
+          "min": 1268401.0,
+          "n": 2,
+          "q1": null,
+          "q3": null
+        }
+      },
+      "n": 2,
+      "run_dirs": [
+        "20260507T152450-grc-bug-fix",
+        "20260509T105448-grc-bug-fix"
+      ]
+    },
+    {
+      "first_timestamp": "2026-05-07T19:11:39.813650+00:00",
+      "key": {
+        "condition": "explore",
+        "eval_type": "bug-fix",
+        "model": "haiku",
+        "scenario": "implication-share",
+        "target": "grc"
+      },
+      "last_timestamp": "2026-05-09T11:39:11.898419+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": null,
+          "max": 0.3642,
+          "median": 0.2848,
+          "min": 0.2053,
+          "n": 2,
+          "q1": null,
+          "q3": null
+        },
+        "duration_seconds": {
+          "iqr": null,
+          "max": 109.1,
+          "median": 87.25,
+          "min": 65.4,
+          "n": 2,
+          "q1": null,
+          "q3": null
+        },
+        "global_score": {
+          "iqr": null,
+          "max": 112.35,
+          "median": 112.35,
+          "min": 112.35,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "quality_score": {
+          "iqr": null,
+          "max": 93.28,
+          "median": 93.28,
+          "min": 93.28,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "total_tokens": {
+          "iqr": null,
+          "max": 1449881.0,
+          "median": 1312632.5,
+          "min": 1175384.0,
+          "n": 2,
+          "q1": null,
+          "q3": null
+        }
+      },
+      "n": 2,
+      "run_dirs": [
+        "20260507T152450-grc-bug-fix",
+        "20260509T105448-grc-bug-fix"
+      ]
+    },
+    {
+      "first_timestamp": "2026-05-07T19:11:39.813650+00:00",
+      "key": {
+        "condition": "leverage",
+        "eval_type": "bug-fix",
+        "model": "haiku",
+        "scenario": "implication-share",
+        "target": "grc"
+      },
+      "last_timestamp": "2026-05-09T11:39:11.898419+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": null,
+          "max": 0.4393,
+          "median": 0.3067,
+          "min": 0.1741,
+          "n": 2,
+          "q1": null,
+          "q3": null
+        },
+        "duration_seconds": {
+          "iqr": null,
+          "max": 105.0,
+          "median": 84.95,
+          "min": 64.9,
+          "n": 2,
+          "q1": null,
+          "q3": null
+        },
+        "global_score": {
+          "iqr": null,
+          "max": 115.74,
+          "median": 115.74,
+          "min": 115.74,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "quality_score": {
+          "iqr": null,
+          "max": 93.65,
+          "median": 93.65,
+          "min": 93.65,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "total_tokens": {
+          "iqr": null,
+          "max": 1173435.0,
+          "median": 1095473.0,
+          "min": 1017511.0,
+          "n": 2,
+          "q1": null,
+          "q3": null
+        }
+      },
+      "n": 2,
+      "run_dirs": [
+        "20260507T152450-grc-bug-fix",
+        "20260509T105448-grc-bug-fix"
+      ]
+    },
+    {
+      "first_timestamp": "2026-05-07T19:11:39.813650+00:00",
+      "key": {
+        "condition": "task-conditioned",
+        "eval_type": "bug-fix",
+        "model": "haiku",
+        "scenario": "implication-share",
+        "target": "grc"
+      },
+      "last_timestamp": "2026-05-09T11:39:11.898419+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": null,
+          "max": 0.4398,
+          "median": 0.3488,
+          "min": 0.2578,
+          "n": 2,
+          "q1": null,
+          "q3": null
+        },
+        "duration_seconds": {
+          "iqr": null,
+          "max": 115.8,
+          "median": 96.25,
+          "min": 76.7,
+          "n": 2,
+          "q1": null,
+          "q3": null
+        },
+        "global_score": {
+          "iqr": null,
+          "max": 107.31,
+          "median": 107.31,
+          "min": 107.31,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "quality_score": {
+          "iqr": null,
+          "max": 92.79,
+          "median": 92.79,
+          "min": 92.79,
+          "n": 1,
+          "q1": null,
+          "q3": null
+        },
+        "total_tokens": {
+          "iqr": null,
+          "max": 1805838.0,
+          "median": 1772031.5,
+          "min": 1738225.0,
+          "n": 2,
+          "q1": null,
+          "q3": null
+        }
+      },
+      "n": 2,
+      "run_dirs": [
+        "20260507T152450-grc-bug-fix",
+        "20260509T105448-grc-bug-fix"
+      ]
+    },
+    {
+      "first_timestamp": "2026-04-15T16:41:11.130728+00:00",
+      "key": {
+        "condition": "control-cto-off",
+        "eval_type": "bug-fix-1",
+        "model": "haiku",
+        "scenario": null,
+        "target": "mediawiki"
+      },
+      "last_timestamp": "2026-05-12T14:01:39.474713+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": 5.0855,
+          "max": 6.5394,
+          "median": 5.8381,
+          "min": 0.92,
+          "n": 15,
+          "q1": 1.1178,
+          "q3": 6.2032
+        },
+        "duration_seconds": {
+          "iqr": 43.2,
+          "max": 361.3,
+          "median": 188.2,
+          "min": 71.5,
+          "n": 15,
+          "q1": 170.2,
+          "q3": 213.4
+        },
+        "global_score": {
+          "iqr": 1.9,
+          "max": 103.48,
+          "median": 100.0,
+          "min": 87.88,
+          "n": 15,
+          "q1": 98.1,
+          "q3": 100.0
+        },
+        "quality_score": {
+          "iqr": 9.99,
+          "max": 50.91,
+          "median": 43.6,
+          "min": 12.9,
+          "n": 15,
+          "q1": 36.195,
+          "q3": 46.185
+        },
+        "total_tokens": {
+          "iqr": 711718.0,
+          "max": 10040889.0,
+          "median": 7650320.0,
+          "min": 4606527.0,
+          "n": 15,
+          "q1": 7229588.0,
+          "q3": 7941306.0
+        }
+      },
+      "n": 15,
+      "run_dirs": [
+        "20260415T163129-mediawiki-bug-fix-1",
+        "20260415T175219-mediawiki-bug-fix-1",
+        "20260416T091844-mediawiki-bug-fix-1",
+        "20260420T141853-mediawiki-bug-fix-1",
+        "20260421T132810-mediawiki-bug-fix-1",
+        "20260421T143057-mediawiki-bug-fix-1",
+        "20260422T083648-mediawiki-bug-fix-1",
+        "20260422T102253-mediawiki-bug-fix-1",
+        "20260422T104137-mediawiki-bug-fix-1",
+        "20260422T151839-mediawiki-bug-fix-1",
+        "20260507T192449-mediawiki-bug-fix-1",
+        "20260510T161722-mediawiki-bug-fix-1",
+        "20260512T112533-mediawiki-bug-fix-1-regression",
+        "20260512T154000-mediawiki-bug-fix-1-sample2",
+        "20260512T155500-mediawiki-bug-fix-1-sample3"
+      ]
+    },
+    {
+      "first_timestamp": "2026-04-15T16:41:11.130728+00:00",
+      "key": {
+        "condition": "control-cto-on",
+        "eval_type": "bug-fix-1",
+        "model": "haiku",
+        "scenario": null,
+        "target": "mediawiki"
+      },
+      "last_timestamp": "2026-05-12T14:01:39.474713+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": 4.8674,
+          "max": 6.7497,
+          "median": 5.3991,
+          "min": 0.6518,
+          "n": 15,
+          "q1": 1.2223,
+          "q3": 6.0897
+        },
+        "duration_seconds": {
+          "iqr": 52.6,
+          "max": 2113.7,
+          "median": 182.2,
+          "min": 113.7,
+          "n": 15,
+          "q1": 147.75,
+          "q3": 200.35
+        },
+        "global_score": {
+          "iqr": 16.61,
+          "max": 132.25,
+          "median": 94.57,
+          "min": 68.31,
+          "n": 15,
+          "q1": 86.735,
+          "q3": 103.345
+        },
+        "quality_score": {
+          "iqr": 8.935,
+          "max": 48.99,
+          "median": 42.05,
+          "min": 0.0,
+          "n": 15,
+          "q1": 36.21,
+          "q3": 45.145
+        },
+        "total_tokens": {
+          "iqr": 1498771.0,
+          "max": 9690826.0,
+          "median": 7592838.0,
+          "min": 5008383.0,
+          "n": 15,
+          "q1": 6744587.0,
+          "q3": 8243358.0
+        }
+      },
+      "n": 15,
+      "run_dirs": [
+        "20260415T163129-mediawiki-bug-fix-1",
+        "20260415T175219-mediawiki-bug-fix-1",
+        "20260416T091844-mediawiki-bug-fix-1",
+        "20260420T141853-mediawiki-bug-fix-1",
+        "20260421T132810-mediawiki-bug-fix-1",
+        "20260421T143057-mediawiki-bug-fix-1",
+        "20260422T083648-mediawiki-bug-fix-1",
+        "20260422T102253-mediawiki-bug-fix-1",
+        "20260422T104137-mediawiki-bug-fix-1",
+        "20260422T151839-mediawiki-bug-fix-1",
+        "20260507T192449-mediawiki-bug-fix-1",
+        "20260510T161722-mediawiki-bug-fix-1",
+        "20260512T112533-mediawiki-bug-fix-1-regression",
+        "20260512T154000-mediawiki-bug-fix-1-sample2",
+        "20260512T155500-mediawiki-bug-fix-1-sample3"
+      ]
+    },
+    {
+      "first_timestamp": "2026-04-15T16:41:11.130728+00:00",
+      "key": {
+        "condition": "explore",
+        "eval_type": "bug-fix-1",
+        "model": "haiku",
+        "scenario": null,
+        "target": "mediawiki"
+      },
+      "last_timestamp": "2026-05-12T14:01:39.474713+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": 4.1468,
+          "max": 6.3148,
+          "median": 4.5857,
+          "min": 0.789,
+          "n": 15,
+          "q1": 1.2481,
+          "q3": 5.395
+        },
+        "duration_seconds": {
+          "iqr": 45.9,
+          "max": 745.4,
+          "median": 178.6,
+          "min": 112.8,
+          "n": 15,
+          "q1": 155.25,
+          "q3": 201.15
+        },
+        "global_score": {
+          "iqr": 17.0,
+          "max": 121.93,
+          "median": 101.72,
+          "min": 76.58,
+          "n": 15,
+          "q1": 88.415,
+          "q3": 105.415
+        },
+        "quality_score": {
+          "iqr": 14.05,
+          "max": 55.02,
+          "median": 37.01,
+          "min": 14.57,
+          "n": 15,
+          "q1": 33.06,
+          "q3": 47.11
+        },
+        "total_tokens": {
+          "iqr": 1248931.0,
+          "max": 8845661.0,
+          "median": 6479275.0,
+          "min": 4406293.0,
+          "n": 15,
+          "q1": 5950618.0,
+          "q3": 7199549.0
+        }
+      },
+      "n": 15,
+      "run_dirs": [
+        "20260415T163129-mediawiki-bug-fix-1",
+        "20260415T175219-mediawiki-bug-fix-1",
+        "20260416T091844-mediawiki-bug-fix-1",
+        "20260420T141853-mediawiki-bug-fix-1",
+        "20260421T132810-mediawiki-bug-fix-1",
+        "20260421T143057-mediawiki-bug-fix-1",
+        "20260422T083648-mediawiki-bug-fix-1",
+        "20260422T102253-mediawiki-bug-fix-1",
+        "20260422T104137-mediawiki-bug-fix-1",
+        "20260422T151839-mediawiki-bug-fix-1",
+        "20260507T192449-mediawiki-bug-fix-1",
+        "20260510T161722-mediawiki-bug-fix-1",
+        "20260512T112533-mediawiki-bug-fix-1-regression",
+        "20260512T154000-mediawiki-bug-fix-1-sample2",
+        "20260512T155500-mediawiki-bug-fix-1-sample3"
+      ]
+    },
+    {
+      "first_timestamp": "2026-04-15T16:41:11.130728+00:00",
+      "key": {
+        "condition": "leverage",
+        "eval_type": "bug-fix-1",
+        "model": "haiku",
+        "scenario": null,
+        "target": "mediawiki"
+      },
+      "last_timestamp": "2026-05-12T14:01:39.474713+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": 4.8963,
+          "max": 8.8353,
+          "median": 5.1535,
+          "min": 0.6651,
+          "n": 15,
+          "q1": 1.2133,
+          "q3": 6.1096
+        },
+        "duration_seconds": {
+          "iqr": 77.2,
+          "max": 488.8,
+          "median": 195.3,
+          "min": 134.3,
+          "n": 15,
+          "q1": 160.2,
+          "q3": 237.4
+        },
+        "global_score": {
+          "iqr": 22.025,
+          "max": 134.29,
+          "median": 91.84,
+          "min": 16.2,
+          "n": 15,
+          "q1": 84.895,
+          "q3": 106.92
+        },
+        "quality_score": {
+          "iqr": 16.265,
+          "max": 57.83,
+          "median": 38.48,
+          "min": 0.0,
+          "n": 15,
+          "q1": 30.5,
+          "q3": 46.765
+        },
+        "total_tokens": {
+          "iqr": 1813045.0,
+          "max": 10921352.0,
+          "median": 7354233.0,
+          "min": 4892826.0,
+          "n": 15,
+          "q1": 6439435.0,
+          "q3": 8252480.0
+        }
+      },
+      "n": 15,
+      "run_dirs": [
+        "20260415T163129-mediawiki-bug-fix-1",
+        "20260415T175219-mediawiki-bug-fix-1",
+        "20260416T091844-mediawiki-bug-fix-1",
+        "20260420T141853-mediawiki-bug-fix-1",
+        "20260421T132810-mediawiki-bug-fix-1",
+        "20260421T143057-mediawiki-bug-fix-1",
+        "20260422T083648-mediawiki-bug-fix-1",
+        "20260422T102253-mediawiki-bug-fix-1",
+        "20260422T104137-mediawiki-bug-fix-1",
+        "20260422T151839-mediawiki-bug-fix-1",
+        "20260507T192449-mediawiki-bug-fix-1",
+        "20260510T161722-mediawiki-bug-fix-1",
+        "20260512T112533-mediawiki-bug-fix-1-regression",
+        "20260512T154000-mediawiki-bug-fix-1-sample2",
+        "20260512T155500-mediawiki-bug-fix-1-sample3"
+      ]
+    },
+    {
+      "first_timestamp": "2026-04-15T16:41:11.130728+00:00",
+      "key": {
+        "condition": "task-conditioned",
+        "eval_type": "bug-fix-1",
+        "model": "haiku",
+        "scenario": null,
+        "target": "mediawiki"
+      },
+      "last_timestamp": "2026-05-12T14:01:39.474713+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": 5.013,
+          "max": 9.1189,
+          "median": 5.2133,
+          "min": 0.6551,
+          "n": 15,
+          "q1": 1.2422,
+          "q3": 6.2553
+        },
+        "duration_seconds": {
+          "iqr": 106.4,
+          "max": 480.1,
+          "median": 208.9,
+          "min": 97.2,
+          "n": 15,
+          "q1": 149.05,
+          "q3": 255.45
+        },
+        "global_score": {
+          "iqr": 22.93,
+          "max": 130.95,
+          "median": 97.1,
+          "min": 75.07,
+          "n": 15,
+          "q1": 85.455,
+          "q3": 108.385
+        },
+        "quality_score": {
+          "iqr": 15.91,
+          "max": 55.56,
+          "median": 46.83,
+          "min": 25.25,
+          "n": 15,
+          "q1": 33.665,
+          "q3": 49.575
+        },
+        "total_tokens": {
+          "iqr": 2641666.0,
+          "max": 11299115.0,
+          "median": 8000426.0,
+          "min": 4925903.0,
+          "n": 15,
+          "q1": 6502131.5,
+          "q3": 9143797.5
+        }
+      },
+      "n": 15,
+      "run_dirs": [
+        "20260415T163129-mediawiki-bug-fix-1",
+        "20260415T175219-mediawiki-bug-fix-1",
+        "20260416T091844-mediawiki-bug-fix-1",
+        "20260420T141853-mediawiki-bug-fix-1",
+        "20260421T132810-mediawiki-bug-fix-1",
+        "20260421T143057-mediawiki-bug-fix-1",
+        "20260422T083648-mediawiki-bug-fix-1",
+        "20260422T102253-mediawiki-bug-fix-1",
+        "20260422T104137-mediawiki-bug-fix-1",
+        "20260422T151839-mediawiki-bug-fix-1",
+        "20260507T192449-mediawiki-bug-fix-1",
+        "20260510T161722-mediawiki-bug-fix-1",
+        "20260512T112533-mediawiki-bug-fix-1-regression",
+        "20260512T154000-mediawiki-bug-fix-1-sample2",
+        "20260512T155500-mediawiki-bug-fix-1-sample3"
+      ]
+    },
+    {
+      "first_timestamp": "2026-04-14T08:33:47.141851+00:00",
+      "key": {
+        "condition": "control-cto-off",
+        "eval_type": "dead-code",
+        "model": "haiku",
+        "scenario": null,
+        "target": "mediawiki"
+      },
+      "last_timestamp": "2026-05-08T19:12:12.729262+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": 2.5798,
+          "max": 8.8172,
+          "median": 5.5745,
+          "min": 0.8257,
+          "n": 9,
+          "q1": 4.1943,
+          "q3": 6.7741
+        },
+        "duration_seconds": {
+          "iqr": 352.4,
+          "max": 950.4,
+          "median": 381.4,
+          "min": 77.8,
+          "n": 9,
+          "q1": 107.7,
+          "q3": 460.1
+        },
+        "global_score": {
+          "iqr": 18.69,
+          "max": 145.16,
+          "median": 125.74,
+          "min": 100.0,
+          "n": 5,
+          "q1": 108.18,
+          "q3": 126.87
+        },
+        "quality_score": {
+          "iqr": 50.6,
+          "max": 77.11,
+          "median": 52.57,
+          "min": 4.9,
+          "n": 9,
+          "q1": 9.4,
+          "q3": 60.0
+        },
+        "total_tokens": {
+          "iqr": 3161729.0,
+          "max": 10724384.0,
+          "median": 6850621.0,
+          "min": 3978683.0,
+          "n": 9,
+          "q1": 5175997.0,
+          "q3": 8337726.0
+        }
+      },
+      "n": 9,
+      "run_dirs": [
+        "20260414T082854-mediawiki-dead-code",
+        "20260414T134340-mediawiki-dead-code",
+        "20260415T073229-mediawiki-dead-code",
+        "20260415T075923-mediawiki-dead-code",
+        "20260421T090719-mediawiki-dead-code",
+        "20260504T170231-mediawiki-dead-code",
+        "20260505T065434-mediawiki-dead-code",
+        "20260505T073213-mediawiki-dead-code",
+        "20260508T203900-mediawiki-dead-code"
+      ]
+    },
+    {
+      "first_timestamp": "2026-04-14T08:33:47.141851+00:00",
+      "key": {
+        "condition": "control-cto-on",
+        "eval_type": "dead-code",
+        "model": "haiku",
+        "scenario": null,
+        "target": "mediawiki"
+      },
+      "last_timestamp": "2026-05-08T19:12:12.729262+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": 3.0048,
+          "max": 10.7319,
+          "median": 4.1662,
+          "min": 1.0619,
+          "n": 9,
+          "q1": 2.7472,
+          "q3": 5.752
+        },
+        "duration_seconds": {
+          "iqr": 228.7,
+          "max": 526.8,
+          "median": 171.6,
+          "min": 56.5,
+          "n": 9,
+          "q1": 82.3,
+          "q3": 311.0
+        },
+        "global_score": {
+          "iqr": 36.53,
+          "max": 177.73,
+          "median": 128.21,
+          "min": 97.58,
+          "n": 5,
+          "q1": 113.09,
+          "q3": 149.62
+        },
+        "quality_score": {
+          "iqr": 59.17,
+          "max": 82.0,
+          "median": 35.96,
+          "min": 7.7,
+          "n": 9,
+          "q1": 15.2,
+          "q3": 74.37
+        },
+        "total_tokens": {
+          "iqr": 3481514.0,
+          "max": 13168804.0,
+          "median": 5734540.0,
+          "min": 2384216.0,
+          "n": 9,
+          "q1": 4226000.0,
+          "q3": 7707514.0
+        }
+      },
+      "n": 9,
+      "run_dirs": [
+        "20260414T082854-mediawiki-dead-code",
+        "20260414T134340-mediawiki-dead-code",
+        "20260415T073229-mediawiki-dead-code",
+        "20260415T075923-mediawiki-dead-code",
+        "20260421T090719-mediawiki-dead-code",
+        "20260504T170231-mediawiki-dead-code",
+        "20260505T065434-mediawiki-dead-code",
+        "20260505T073213-mediawiki-dead-code",
+        "20260508T203900-mediawiki-dead-code"
+      ]
+    },
+    {
+      "first_timestamp": "2026-04-14T08:33:47.141851+00:00",
+      "key": {
+        "condition": "explore",
+        "eval_type": "dead-code",
+        "model": "haiku",
+        "scenario": null,
+        "target": "mediawiki"
+      },
+      "last_timestamp": "2026-05-08T19:12:12.729262+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": 3.8925,
+          "max": 10.7282,
+          "median": 3.0015,
+          "min": 0.8657,
+          "n": 9,
+          "q1": 2.3381,
+          "q3": 6.2306
+        },
+        "duration_seconds": {
+          "iqr": 343.7,
+          "max": 730.8,
+          "median": 106.1,
+          "min": 36.4,
+          "n": 9,
+          "q1": 59.6,
+          "q3": 403.3
+        },
+        "global_score": {
+          "iqr": 25.18,
+          "max": 191.55,
+          "median": 132.04,
+          "min": 93.79,
+          "n": 5,
+          "q1": 119.03,
+          "q3": 144.21
+        },
+        "quality_score": {
+          "iqr": 66.7,
+          "max": 80.95,
+          "median": 59.29,
+          "min": 10.0,
+          "n": 9,
+          "q1": 13.3,
+          "q3": 80.0
+        },
+        "total_tokens": {
+          "iqr": 4343889.0,
+          "max": 13194823.0,
+          "median": 6147745.0,
+          "min": 2296037.0,
+          "n": 9,
+          "q1": 3252742.0,
+          "q3": 7596631.0
+        }
+      },
+      "n": 9,
+      "run_dirs": [
+        "20260414T082854-mediawiki-dead-code",
+        "20260414T134340-mediawiki-dead-code",
+        "20260415T073229-mediawiki-dead-code",
+        "20260415T075923-mediawiki-dead-code",
+        "20260421T090719-mediawiki-dead-code",
+        "20260504T170231-mediawiki-dead-code",
+        "20260505T065434-mediawiki-dead-code",
+        "20260505T073213-mediawiki-dead-code",
+        "20260508T203900-mediawiki-dead-code"
+      ]
+    },
+    {
+      "first_timestamp": "2026-04-14T13:47:30.539568+00:00",
+      "key": {
+        "condition": "leverage",
+        "eval_type": "dead-code",
+        "model": "haiku",
+        "scenario": null,
+        "target": "mediawiki"
+      },
+      "last_timestamp": "2026-05-08T19:12:12.729262+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": 7.2309,
+          "max": 11.0836,
+          "median": 6.7766,
+          "min": 0.6616,
+          "n": 8,
+          "q1": 1.9584,
+          "q3": 9.1894
+        },
+        "duration_seconds": {
+          "iqr": 188.025,
+          "max": 517.1,
+          "median": 273.4,
+          "min": 27.6,
+          "n": 8,
+          "q1": 150.125,
+          "q3": 338.15
+        },
+        "global_score": {
+          "iqr": 47.89,
+          "max": 125.3,
+          "median": 81.19,
+          "min": 70.33,
+          "n": 5,
+          "q1": 77.35,
+          "q3": 125.24
+        },
+        "quality_score": {
+          "iqr": 47.365,
+          "max": 76.77,
+          "median": 26.72,
+          "min": 0.0,
+          "n": 8,
+          "q1": 11.4,
+          "q3": 58.765
+        },
+        "total_tokens": {
+          "iqr": 6483054.25,
+          "max": 13583795.0,
+          "median": 8353009.0,
+          "min": 2364928.0,
+          "n": 8,
+          "q1": 4847191.0,
+          "q3": 11330245.25
+        }
+      },
+      "n": 8,
+      "run_dirs": [
+        "20260414T134340-mediawiki-dead-code",
+        "20260415T073229-mediawiki-dead-code",
+        "20260415T075923-mediawiki-dead-code",
+        "20260421T090719-mediawiki-dead-code",
+        "20260504T170231-mediawiki-dead-code",
+        "20260505T065434-mediawiki-dead-code",
+        "20260505T073213-mediawiki-dead-code",
+        "20260508T203900-mediawiki-dead-code"
+      ]
+    },
+    {
+      "first_timestamp": "2026-04-14T13:47:30.539568+00:00",
+      "key": {
+        "condition": "task-conditioned",
+        "eval_type": "dead-code",
+        "model": "haiku",
+        "scenario": null,
+        "target": "mediawiki"
+      },
+      "last_timestamp": "2026-05-08T19:12:12.729262+00:00",
+      "metrics": {
+        "cost_usd": {
+          "iqr": 5.8625,
+          "max": 7.7348,
+          "median": 5.6421,
+          "min": 1.0788,
+          "n": 8,
+          "q1": 1.3544,
+          "q3": 7.2169
+        },
+        "duration_seconds": {
+          "iqr": 332.575,
+          "max": 973.7,
+          "median": 315.8,
+          "min": 15.3,
+          "n": 8,
+          "q1": 103.2,
+          "q3": 435.775
+        },
+        "global_score": {
+          "iqr": 10.95,
+          "max": 152.79,
+          "median": 136.8,
+          "min": 72.94,
+          "n": 5,
+          "q1": 136.71,
+          "q3": 147.66
+        },
+        "quality_score": {
+          "iqr": 39.735,
+          "max": 83.31,
+          "median": 59.47,
+          "min": 17.8,
+          "n": 8,
+          "q1": 39.985,
+          "q3": 79.72
+        },
+        "total_tokens": {
+          "iqr": 4022470.25,
+          "max": 9665596.0,
+          "median": 8211752.5,
+          "min": 1319834.0,
+          "n": 8,
+          "q1": 5051631.25,
+          "q3": 9074101.5
+        }
+      },
+      "n": 8,
+      "run_dirs": [
+        "20260414T134340-mediawiki-dead-code",
+        "20260415T073229-mediawiki-dead-code",
+        "20260415T075923-mediawiki-dead-code",
+        "20260421T090719-mediawiki-dead-code",
+        "20260504T170231-mediawiki-dead-code",
+        "20260505T065434-mediawiki-dead-code",
+        "20260505T073213-mediawiki-dead-code",
+        "20260508T203900-mediawiki-dead-code"
+      ]
+    }
+  ],
+  "methodology_hash": "4bc594383610",
+  "name": "haiku-2026-05",
+  "schema_version": "aethyme-eval-baseline-v1",
+  "source": "../aethyme/eval-runs/runs.jsonl",
+  "source_date_range": {
+    "first": "2026-04-14T08:33:47.141851+00:00",
+    "last": "2026-05-21T12:57:27.104548+00:00"
+  },
+  "source_note": "Historical Haiku regression baseline generated from local pre-removal runs.jsonl; Playground targets only; used as an internal sentinel, not a public benchmark claim.",
+  "thresholds": {
+    "control_drift_token_ratio": 1.25,
+    "fail_cost_ratio": 1.75,
+    "fail_duration_ratio": 2.0,
+    "fail_token_ratio": 1.5,
+    "quality_tradeoff_points": 5.0,
+    "warn_cost_ratio": 1.25,
+    "warn_duration_ratio": 1.5,
+    "warn_token_ratio": 1.25
+  }
+}
