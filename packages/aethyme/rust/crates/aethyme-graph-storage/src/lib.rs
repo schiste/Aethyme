@@ -21,7 +21,7 @@
 //! │   │   └── _overlays/           ← committed non-per-file producer output
 //! │   │       ├── <kind>.bin        (Phase 4.7+ — structure, configs,
 //! │   │       └── ...               docs, risks, areas, …)
-//! │   ├── graph_store.redb         ← current local engine redb graph store
+//! │   ├── graph_store.redb         ← derived local redb query artifact
 //! │   └── cache/                   ← gitignored
 //! │       └── *.redb               ← future daemon-local mirrors
 //! ```

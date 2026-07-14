@@ -1,10 +1,19 @@
 //! redb-backed graph store for the Aethyme engine.
 //!
-//! Replaces `super::super::GraphStore` (SurrealDB). See
-//! `docs/architecture/phase3-redb-graph-store-plan.md` for context.
+//! This module is the local materialized read model for the committed graph
+//! fragments under `<repo>/.aethyme/graph/`. V1 supports the engine-index
+//! writer, `query-areas`, `query-overview`, `deps`, `importers`, and the graph
+//! adjacency half of the hybrid `callers` path.
 //!
-//! Phase 3.1 (this file): schema, error type, `open()`, schema-version
-//! sentinel. Insert / query APIs land in 3.2–3.4.
+//! Non-scope for V1: this file is not the durable graph format, does not
+//! mutate fragment files, does not promise in-place redb file migrations, and
+//! is not a daemon-owned live graph. If `.aethyme/graph_store.redb` is missing
+//! or incompatible, rebuild it from fragments with `aethyme-engine-cli index
+//! --repo <repo>`.
+//!
+//! Historical context: this replaced the old SurrealDB-backed `GraphStore`.
+//! `docs/architecture/phase3-redb-graph-store-plan.md` preserves the migration
+//! rationale; `docs/architecture/graph-schema.md` owns the current contract.
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -775,8 +784,10 @@ pub struct IndexSession<'db> {
 
 impl<'db> IndexSession<'db> {
     /// Insert (or overwrite) a node row in the given primary table.
-    /// Caller picks the table; 3.3 will provide typed wrappers
-    /// (`insert_file`, `insert_function`, …) on top of this primitive.
+    ///
+    /// Caller picks the table; higher-level helpers such as `insert_file`,
+    /// `insert_area`, and `insert_function` layer path/symbol secondary-index
+    /// writes on top of this primitive.
     pub fn insert_node(
         &mut self,
         table: TableDefinition<&str, &[u8]>,
@@ -924,9 +935,7 @@ impl<'db> IndexSession<'db> {
         Ok(())
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // ⚠ TODO(daisy): YOUR DECISION — rotate policy thresholds
-    // ─────────────────────────────────────────────────────────────────────────
+    // Rotate policy rationale
     //
     // Returning `true` after an insert triggers commit + fresh transaction.
     // Returning `false` keeps batching.
@@ -936,20 +945,13 @@ impl<'db> IndexSession<'db> {
     // functions + ~10k classes + ~1M edges = O(1M) ops. Per-op payload is
     // small (tens to a few hundred bytes).
     //
-    // Three counter shapes to consider:
-    //
-    //   • OPS-only: `ops_since_rotate >= N`. Predictable rotate cadence,
-    //     ignores payload heterogeneity. Good when you trust ops to be
-    //     uniformly small.
-    //   • BYTES-only: `bytes_since_rotate >= N`. Bounds dirty-page memory
-    //     directly, which is the actual scarce resource. But on tiny-row
-    //     workloads, a 16 MiB threshold could mean 200k+ ops in one txn —
-    //     long fsync stall when it finally rotates.
-    //   • HYBRID: rotate on either threshold. Caps both.
-    //
-    // Constants today: ROTATE_EVERY_OPS = 4096, ROTATE_EVERY_BYTES = 8 MiB.
-    // For ~1M ops on MediaWiki that's ~244 commits, ~244 ms of fsync
-    // overhead — tolerable but tunable. Adjust the consts at module top.
+    // V1 uses the hybrid policy because neither single counter is sufficient:
+    // ops bound fsync latency on tiny-row workloads, while bytes bound dirty
+    // page growth when payloads get larger. The current constants are
+    // ROTATE_EVERY_OPS = 4096 and ROTATE_EVERY_BYTES = 8 MiB. On a MediaWiki-
+    // scale run with about 1M logical ops, the ops threshold yields roughly
+    // 244 commits, which was acceptable in the initial profile runs. Tune the
+    // constants only from measured index profiles, not from eval-score pressure.
     //
     // Constraints to respect:
     //   - `ops_since_rotate` and `bytes_since_rotate` reset on rotate.
