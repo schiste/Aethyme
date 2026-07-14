@@ -150,9 +150,7 @@ impl OverlayProducer for DocsProducer {
             .filter_map(|f| classify_doc(&f.path).map(|format| (f.path.as_str(), format)))
             .map(|(path, format)| NonCodeFile::new(repo, path, format))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                ProducerError::Other(format!("NonCodeFile::new failed: {e}"))
-            })?;
+            .map_err(|e| ProducerError::Other(format!("NonCodeFile::new failed: {e}")))?;
 
         // Canonical ordering. Path is unique within a repo so this
         // is a total order — no tiebreaker needed.
@@ -177,10 +175,7 @@ fn classify_doc(path: &str) -> Option<NonCodeFormat> {
 
     // 1. Generated — engine's `is_generated`. Must come first so
     // `docs/generated-api.md` lands in neither overlay.
-    if lower.contains("generated")
-        || lower.ends_with(".min.js")
-        || lower.ends_with(".lock")
-    {
+    if lower.contains("generated") || lower.ends_with(".min.js") || lower.ends_with(".lock") {
         return None;
     }
 

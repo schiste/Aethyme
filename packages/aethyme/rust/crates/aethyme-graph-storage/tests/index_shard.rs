@@ -2,8 +2,8 @@
 
 use aethyme_graph_schema::{NodeId, NodeKind};
 use aethyme_graph_storage::{
-    dedupe_and_canonicalize, read_index_shard_bytes,
-    write_index_shard_bytes, IndexShardDecodeError, SymbolRecord,
+    IndexShardDecodeError, SymbolRecord, dedupe_and_canonicalize, read_index_shard_bytes,
+    write_index_shard_bytes,
 };
 
 fn record(module: &str, symbol: &str, kind: NodeKind, file: &str) -> SymbolRecord {
@@ -20,7 +20,12 @@ fn record(module: &str, symbol: &str, kind: NodeKind, file: &str) -> SymbolRecor
 #[test]
 fn write_then_read_round_trips() {
     let records = vec![
-        record("src.cli", "explore_command", NodeKind::Function, "src/cli.py"),
+        record(
+            "src.cli",
+            "explore_command",
+            NodeKind::Function,
+            "src/cli.py",
+        ),
         record("src.cli", "Helper", NodeKind::Class, "src/cli.py"),
         record("src.cli", "run", NodeKind::Function, "src/cli.py"),
     ];
@@ -46,15 +51,9 @@ fn write_sorts_records_canonically() {
     let r2 = record("src.cli", "beta", NodeKind::Function, "src/cli.py");
     let r3 = record("src.util", "alpha", NodeKind::Function, "src/util.py");
 
-    let bytes_a =
-        write_index_shard_bytes(&[r1.clone(), r2.clone(), r3.clone()])
-            .unwrap();
-    let bytes_b =
-        write_index_shard_bytes(&[r3.clone(), r1.clone(), r2.clone()])
-            .unwrap();
-    let bytes_c =
-        write_index_shard_bytes(&[r2.clone(), r3.clone(), r1.clone()])
-            .unwrap();
+    let bytes_a = write_index_shard_bytes(&[r1.clone(), r2.clone(), r3.clone()]).unwrap();
+    let bytes_b = write_index_shard_bytes(&[r3.clone(), r1.clone(), r2.clone()]).unwrap();
+    let bytes_c = write_index_shard_bytes(&[r2.clone(), r3.clone(), r1.clone()]).unwrap();
     assert_eq!(bytes_a, bytes_b);
     assert_eq!(bytes_a, bytes_c);
 }
@@ -110,8 +109,7 @@ fn dedupe_canonicalizes_and_removes_duplicates() {
     let r2 = record("src.cli", "beta", NodeKind::Function, "src/cli.py");
 
     // Simulate a post-merge state with duplicates and unsorted order.
-    let messy =
-        vec![r2.clone(), r1.clone(), r1.clone(), r2.clone(), r1.clone()];
+    let messy = vec![r2.clone(), r1.clone(), r1.clone(), r2.clone(), r1.clone()];
     let cleaned = dedupe_and_canonicalize(messy);
     assert_eq!(cleaned.len(), 2);
     // Sorted (alpha < beta lexicographically)
@@ -124,7 +122,12 @@ fn determinism_across_constructions() {
     // 100 builds of the same input must produce byte-identical
     // output.
     let records = vec![
-        record("src.cli", "explore_command", NodeKind::Function, "src/cli.py"),
+        record(
+            "src.cli",
+            "explore_command",
+            NodeKind::Function,
+            "src/cli.py",
+        ),
         record("src.cli", "Helper", NodeKind::Class, "src/cli.py"),
         record("src.util", "alpha", NodeKind::Function, "src/util.py"),
     ];
@@ -146,12 +149,9 @@ fn empty_shard_round_trips() {
 fn sort_key_includes_kind() {
     // Same module, same symbol, different kinds — sort by kind name
     // distinguishes them.
-    let fn_record =
-        record("m", "x", NodeKind::Function, "src/x.py");
+    let fn_record = record("m", "x", NodeKind::Function, "src/x.py");
     let class_record = record("m", "x", NodeKind::Class, "src/x.py");
-    let bytes =
-        write_index_shard_bytes(&[fn_record.clone(), class_record.clone()])
-            .unwrap();
+    let bytes = write_index_shard_bytes(&[fn_record.clone(), class_record.clone()]).unwrap();
     let parsed = read_index_shard_bytes(&bytes).unwrap();
     // "class" < "function" lexicographically, so Class comes first.
     assert_eq!(parsed[0].kind, NodeKind::Class);

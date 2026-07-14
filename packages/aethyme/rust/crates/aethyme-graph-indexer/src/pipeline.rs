@@ -17,14 +17,12 @@ use rayon::prelude::*;
 
 use aethyme_graph_schema::NodeKind;
 use aethyme_graph_storage::{
-    write_fragment, write_index_shard, Fragment, FragmentBuildError,
-    FragmentWriteError, IndexShardWriteError, SymbolRecord,
+    Fragment, FragmentBuildError, FragmentWriteError, IndexShardWriteError, SymbolRecord,
+    write_fragment, write_index_shard,
 };
 
 use crate::context::IndexerContext;
-use crate::filesystem::{
-    walk_source_tree, FilesystemIndexerError, IndexedFile, WalkOptions,
-};
+use crate::filesystem::{FilesystemIndexerError, IndexedFile, WalkOptions, walk_source_tree};
 use crate::language::{LanguageIndexError, LanguageRegistry};
 use crate::php::PhpIndexer;
 use crate::python::PythonIndexer;
@@ -49,20 +47,15 @@ pub fn build_fragment(
     indexed: &IndexedFile,
     language_indexer_output: Option<crate::language::LanguageIndexResult>,
 ) -> Result<BuiltFragment, BuildFragmentError> {
-    let (additional_nodes, additional_edges) =
-        match language_indexer_output {
-            Some(r) => (r.additional_nodes, r.additional_edges),
-            None => (Vec::new(), Vec::new()),
-        };
+    let (additional_nodes, additional_edges) = match language_indexer_output {
+        Some(r) => (r.additional_nodes, r.additional_edges),
+        None => (Vec::new(), Vec::new()),
+    };
     let mut nodes = Vec::with_capacity(additional_nodes.len() + 1);
     nodes.push(indexed.top_node.clone());
     nodes.extend(additional_nodes);
-    let fragment = Fragment::new(
-        &indexed.source_path,
-        nodes,
-        additional_edges,
-    )
-    .map_err(BuildFragmentError::Fragment)?;
+    let fragment = Fragment::new(&indexed.source_path, nodes, additional_edges)
+        .map_err(BuildFragmentError::Fragment)?;
     Ok(BuiltFragment {
         source_path: indexed.source_path.clone(),
         fragment,
@@ -103,8 +96,7 @@ pub fn default_registry() -> LanguageRegistry {
 pub fn build_index_records(
     built_fragments: &[BuiltFragment],
 ) -> BTreeMap<String, Vec<SymbolRecord>> {
-    let mut records_by_module: BTreeMap<String, Vec<SymbolRecord>> =
-        BTreeMap::new();
+    let mut records_by_module: BTreeMap<String, Vec<SymbolRecord>> = BTreeMap::new();
     for built in built_fragments {
         let module = synthesize_module_name(&built.source_path);
         for node in built.fragment.nodes() {
@@ -119,8 +111,7 @@ pub fn build_index_records(
             // the module field).
             let symbol_text = if matches!(
                 node.kind(),
-                aethyme_graph_schema::NodeKind::File
-                    | aethyme_graph_schema::NodeKind::NonCodeFile
+                aethyme_graph_schema::NodeKind::File | aethyme_graph_schema::NodeKind::NonCodeFile
             ) {
                 continue; // File/NonCodeFile name() returns None anyway
             } else {
@@ -152,7 +143,6 @@ fn synthesize_module_name(source_path: &str) -> String {
         .unwrap_or(source_path);
     without_ext.replace('/', ".")
 }
-
 
 /// One-shot helper: walk the repo, dispatch each code file to its
 /// registered language indexer, build all fragments + index shards,
@@ -234,8 +224,7 @@ pub fn index_repo_to_disk_with(
     // canonical walk order; split it into (paths, counts, built).
     let mut fragments_written = Vec::with_capacity(per_file.len());
     let mut counts_by_kind: BTreeMap<NodeKind, usize> = BTreeMap::new();
-    let mut built_fragments: Vec<BuiltFragment> =
-        Vec::with_capacity(per_file.len());
+    let mut built_fragments: Vec<BuiltFragment> = Vec::with_capacity(per_file.len());
     for (path, counts, built) in per_file {
         fragments_written.push(path);
         for (kind, count) in counts {
@@ -249,8 +238,7 @@ pub fn index_repo_to_disk_with(
     // makes find_symbols by name work for AST-extracted symbols
     // (Function, Class, Method, etc.).
     let records = build_index_records(&built_fragments);
-    let records_vec: Vec<(String, Vec<SymbolRecord>)> =
-        records.into_iter().collect();
+    let records_vec: Vec<(String, Vec<SymbolRecord>)> = records.into_iter().collect();
     let mut shards_written: Vec<PathBuf> = records_vec
         .par_iter()
         .map(|(module, recs)| -> Result<PathBuf, IndexRepoError> {
@@ -319,10 +307,10 @@ impl std::fmt::Display for IndexRepoError {
             Self::Build(e) => write!(f, "index_repo: {e}"),
             Self::FragmentWrite(e) => write!(f, "index_repo: {e}"),
             Self::IndexShardWrite(e) => write!(f, "index_repo: {e}"),
-            Self::ReadSource { source_path, message } => write!(
-                f,
-                "index_repo: read {source_path:?}: {message}"
-            ),
+            Self::ReadSource {
+                source_path,
+                message,
+            } => write!(f, "index_repo: read {source_path:?}: {message}"),
             Self::Language(e) => write!(f, "index_repo: {e}"),
         }
     }

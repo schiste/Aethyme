@@ -31,23 +31,19 @@ pub mod typescript;
 
 pub use context::IndexerContext;
 pub use filesystem::{
-    walk_source_tree, FilesystemIndexResult, FilesystemIndexerError,
-    IndexedFile, SkipReason, SkippedFile, WalkOptions,
+    FilesystemIndexResult, FilesystemIndexerError, IndexedFile, SkipReason, SkippedFile,
+    WalkOptions, walk_source_tree,
 };
 pub use language::{
-    LanguageIndexError, LanguageIndexResult, LanguageIndexer,
-    LanguageRegistry, LineIndex,
+    LanguageIndexError, LanguageIndexResult, LanguageIndexer, LanguageRegistry, LineIndex,
 };
-pub use language_map::{
-    classify_file, infer_language_from_extension, FileClassification,
-};
-pub use linker::{link_repo, link_repo_path, link_with_store, LinkError, LinkSummary};
-pub use pipeline::{
-    build_fragment, build_index_records, default_registry,
-    index_repo_to_disk, BuildFragmentError, BuiltFragment, IndexRepoError,
-    IndexRepoSummary,
-};
+pub use language_map::{FileClassification, classify_file, infer_language_from_extension};
+pub use linker::{LinkError, LinkSummary, link_repo, link_repo_path, link_with_store};
 pub use php::PhpIndexer;
+pub use pipeline::{
+    BuildFragmentError, BuiltFragment, IndexRepoError, IndexRepoSummary, build_fragment,
+    build_index_records, default_registry, index_repo_to_disk,
+};
 pub use python::PythonIndexer;
 pub use rust_lang::RustIndexer;
 pub use typescript::TypeScriptIndexer;

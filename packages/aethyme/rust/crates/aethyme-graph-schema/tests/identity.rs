@@ -15,9 +15,7 @@
 //! 4. **Validation**: construction and parse both reject malformed
 //!    inputs with informative errors.
 
-use aethyme_graph_schema::{
-    NodeId, NodeIdConstructionError, NodeIdParseError, NodeKind,
-};
+use aethyme_graph_schema::{NodeId, NodeIdConstructionError, NodeIdParseError, NodeKind};
 
 // ─── Determinism ─────────────────────────────────────────────────────
 
@@ -73,32 +71,25 @@ fn ref_id() -> NodeId {
 
 #[test]
 fn different_kind_produces_different_id() {
-    let other = NodeId::new(NodeKind::Method, "aethyme", "src/cli.py", "foo")
-        .unwrap();
+    let other = NodeId::new(NodeKind::Method, "aethyme", "src/cli.py", "foo").unwrap();
     assert_ne!(ref_id(), other);
 }
 
 #[test]
 fn different_repo_produces_different_id() {
-    let other =
-        NodeId::new(NodeKind::Function, "playground", "src/cli.py", "foo")
-            .unwrap();
+    let other = NodeId::new(NodeKind::Function, "playground", "src/cli.py", "foo").unwrap();
     assert_ne!(ref_id(), other);
 }
 
 #[test]
 fn different_file_path_produces_different_id() {
-    let other =
-        NodeId::new(NodeKind::Function, "aethyme", "src/other.py", "foo")
-            .unwrap();
+    let other = NodeId::new(NodeKind::Function, "aethyme", "src/other.py", "foo").unwrap();
     assert_ne!(ref_id(), other);
 }
 
 #[test]
 fn different_symbol_name_produces_different_id() {
-    let other =
-        NodeId::new(NodeKind::Function, "aethyme", "src/cli.py", "bar")
-            .unwrap();
+    let other = NodeId::new(NodeKind::Function, "aethyme", "src/cli.py", "bar").unwrap();
     assert_ne!(ref_id(), other);
 }
 
@@ -155,13 +146,7 @@ fn kind_accessor_returns_constructed_kind() {
 
 #[test]
 fn repo_accessor_returns_constructed_repo() {
-    let id = NodeId::new(
-        NodeKind::Function,
-        "playground-mediawiki",
-        "src/x.py",
-        "y",
-    )
-    .unwrap();
+    let id = NodeId::new(NodeKind::Function, "playground-mediawiki", "src/x.py", "y").unwrap();
     assert_eq!(id.repo(), "playground-mediawiki");
 }
 
@@ -191,8 +176,7 @@ fn parse_extracts_correct_kind_and_repo() {
 
 #[test]
 fn new_rejects_empty_repo() {
-    let err =
-        NodeId::new(NodeKind::Function, "", "src/x.py", "y").unwrap_err();
+    let err = NodeId::new(NodeKind::Function, "", "src/x.py", "y").unwrap_err();
     assert!(
         matches!(err, NodeIdConstructionError::EmptyRepo),
         "expected EmptyRepo, got {err:?}"
@@ -201,8 +185,7 @@ fn new_rejects_empty_repo() {
 
 #[test]
 fn new_rejects_repo_containing_colon() {
-    let err = NodeId::new(NodeKind::Function, "bad:repo", "src/x.py", "y")
-        .unwrap_err();
+    let err = NodeId::new(NodeKind::Function, "bad:repo", "src/x.py", "y").unwrap_err();
     match err {
         NodeIdConstructionError::RepoContainsColon { given } => {
             assert_eq!(&*given, "bad:repo");
@@ -252,8 +235,7 @@ fn parse_rejects_wrong_component_count() {
 fn parse_rejects_unknown_kind() {
     // Build a syntactically valid string but with a non-NodeKind first
     // component.
-    let valid = NodeId::new(NodeKind::Function, "aethyme", "x.py", "y")
-        .unwrap();
+    let valid = NodeId::new(NodeKind::Function, "aethyme", "x.py", "y").unwrap();
     let suffix = valid.hash_suffix();
     let bad = format!("zorblat:aethyme:{suffix}");
     let err = NodeId::parse(&bad).unwrap_err();
@@ -287,8 +269,7 @@ fn parse_rejects_empty_kind_component() {
     // close cousins; this test pins the exact input shape that
     // triggers `EmptyKindComponent` (3 components with the first
     // one empty: leading colon).
-    let valid =
-        NodeId::new(NodeKind::Function, "aethyme", "x.py", "y").unwrap();
+    let valid = NodeId::new(NodeKind::Function, "aethyme", "x.py", "y").unwrap();
     let suffix = valid.hash_suffix();
     let bad = format!(":aethyme:{suffix}");
     let err = NodeId::parse(&bad).unwrap_err();
@@ -302,8 +283,7 @@ fn parse_rejects_empty_kind_component() {
 fn parse_rejects_empty_repo_component() {
     // Parallel to the empty-kind case: 3 components, middle empty
     // (adjacent colons).
-    let valid =
-        NodeId::new(NodeKind::Function, "aethyme", "x.py", "y").unwrap();
+    let valid = NodeId::new(NodeKind::Function, "aethyme", "x.py", "y").unwrap();
     let suffix = valid.hash_suffix();
     let bad = format!("function::{suffix}");
     let err = NodeId::parse(&bad).unwrap_err();
@@ -371,20 +351,8 @@ fn nul_byte_in_path_or_name_produces_valid_id() {
     // byte. Confirm it doesn't crash, produces a valid ID, and that
     // NUL placement matters (i.e., length-prefixing prevents
     // NUL-as-separator-collision).
-    let a = NodeId::new(
-        NodeKind::Function,
-        "aethyme",
-        "src/cli\0.py",
-        "foo",
-    )
-    .unwrap();
-    let b = NodeId::new(
-        NodeKind::Function,
-        "aethyme",
-        "src/cli",
-        "\0.py:foo",
-    )
-    .unwrap();
+    let a = NodeId::new(NodeKind::Function, "aethyme", "src/cli\0.py", "foo").unwrap();
+    let b = NodeId::new(NodeKind::Function, "aethyme", "src/cli", "\0.py:foo").unwrap();
     // Both should parse and be different IDs.
     assert!(NodeId::parse(a.as_str()).is_ok());
     assert!(NodeId::parse(b.as_str()).is_ok());
@@ -408,8 +376,7 @@ fn deserialize_rejects_malformed_strings() {
 fn deserialize_rejects_unknown_kind_string() {
     // A string with the right shape but an unknown kind component
     // must be rejected at deserialization, not silently constructed.
-    let valid =
-        NodeId::new(NodeKind::Function, "aethyme", "x.py", "y").unwrap();
+    let valid = NodeId::new(NodeKind::Function, "aethyme", "x.py", "y").unwrap();
     let suffix = valid.hash_suffix();
     let bad_json = format!(r#""zorblat:aethyme:{suffix}""#);
     let result: Result<NodeId, _> = serde_json::from_str(&bad_json);

@@ -143,8 +143,7 @@ pub fn validate_source_path(source_path: &str) -> Result<(), InvalidPath> {
     }
     if source_path.starts_with('/')
         || source_path.starts_with('\\')
-        || (source_path.len() >= 2
-            && source_path.as_bytes()[1] == b':')
+        || (source_path.len() >= 2 && source_path.as_bytes()[1] == b':')
     {
         return Err(InvalidPath::Absolute {
             given: source_path.into(),
@@ -207,10 +206,7 @@ impl std::fmt::Display for InvalidPath {
             Self::InvalidChar {
                 given,
                 invalid_char,
-            } => write!(
-                f,
-                "name {given:?} contains invalid char {invalid_char:?}"
-            ),
+            } => write!(f, "name {given:?} contains invalid char {invalid_char:?}"),
         }
     }
 }

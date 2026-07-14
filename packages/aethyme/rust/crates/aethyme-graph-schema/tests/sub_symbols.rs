@@ -1,8 +1,8 @@
 //! Integration tests for sub-symbol node kinds.
 
 use aethyme_graph_schema::{
-    Expression, Field, FieldConstructionError, GlobalVariable, NodeId,
-    NodeKind, Parameter, SourceRange, Statement, Visibility,
+    Expression, Field, FieldConstructionError, GlobalVariable, NodeId, NodeKind, Parameter,
+    SourceRange, Statement, Visibility,
 };
 
 fn class_id() -> NodeId {
@@ -59,24 +59,11 @@ fn field_construction_carries_enclosing_type() {
 
 #[test]
 fn global_variable_accepts_optional_type() {
-    let with_type = GlobalVariable::new(
-        "aethyme",
-        "src/x.py",
-        "VERSION",
-        Some("str"),
-        range(),
-    )
-    .unwrap();
+    let with_type =
+        GlobalVariable::new("aethyme", "src/x.py", "VERSION", Some("str"), range()).unwrap();
     assert_eq!(with_type.type_str(), Some("str"));
 
-    let without = GlobalVariable::new(
-        "aethyme",
-        "src/x.py",
-        "INSTANCE",
-        None,
-        range(),
-    )
-    .unwrap();
+    let without = GlobalVariable::new("aethyme", "src/x.py", "INSTANCE", None, range()).unwrap();
     assert_eq!(without.type_str(), None);
 }
 
@@ -97,12 +84,8 @@ fn statement_id_includes_position_and_kind_tag() {
     // Two statements in the same callable with the same kind_tag
     // but different positions must produce different NodeIds.
     let f = function_id();
-    let s1 =
-        Statement::new("aethyme", "src/x.py", "assign", range(), f.clone(), 0)
-            .unwrap();
-    let s2 =
-        Statement::new("aethyme", "src/x.py", "assign", range(), f.clone(), 1)
-            .unwrap();
+    let s1 = Statement::new("aethyme", "src/x.py", "assign", range(), f.clone(), 0).unwrap();
+    let s2 = Statement::new("aethyme", "src/x.py", "assign", range(), f.clone(), 1).unwrap();
     assert_ne!(s1.id(), s2.id());
     assert_eq!(s1.kind_tag(), "assign");
     assert_eq!(s1.position_in_body(), 0);
@@ -111,33 +94,9 @@ fn statement_id_includes_position_and_kind_tag() {
 #[test]
 fn expression_id_includes_position_and_kind_tag() {
     let f = function_id();
-    let s = Statement::new(
-        "aethyme",
-        "src/x.py",
-        "if",
-        range(),
-        f,
-        0,
-    )
-    .unwrap();
-    let e1 = Expression::new(
-        "aethyme",
-        "src/x.py",
-        "call",
-        range(),
-        s.id().clone(),
-        0,
-    )
-    .unwrap();
-    let e2 = Expression::new(
-        "aethyme",
-        "src/x.py",
-        "call",
-        range(),
-        s.id().clone(),
-        1,
-    )
-    .unwrap();
+    let s = Statement::new("aethyme", "src/x.py", "if", range(), f, 0).unwrap();
+    let e1 = Expression::new("aethyme", "src/x.py", "call", range(), s.id().clone(), 0).unwrap();
+    let e2 = Expression::new("aethyme", "src/x.py", "call", range(), s.id().clone(), 1).unwrap();
     assert_ne!(e1.id(), e2.id());
     assert_eq!(e1.kind_tag(), "call");
 }
@@ -157,14 +116,7 @@ fn sub_symbol_kinds_round_trip_through_serde() {
     let back: Field = serde_json::from_str(&json).unwrap();
     assert_eq!(back, f);
 
-    let g = GlobalVariable::new(
-        "aethyme",
-        "src/x.py",
-        "GLOBAL",
-        None,
-        range(),
-    )
-    .unwrap();
+    let g = GlobalVariable::new("aethyme", "src/x.py", "GLOBAL", None, range()).unwrap();
     let json = serde_json::to_string(&g).unwrap();
     let back: GlobalVariable = serde_json::from_str(&json).unwrap();
     assert_eq!(back, g);

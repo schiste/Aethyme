@@ -3,18 +3,15 @@
 use std::path::Path;
 
 use aethyme_graph_storage::{
-    cache_dir, engine_version_path, fragment_path, index_shard_path,
-    validate_module_name, validate_source_path, InvalidPath,
+    InvalidPath, cache_dir, engine_version_path, fragment_path, index_shard_path,
+    validate_module_name, validate_source_path,
 };
 
 #[test]
 fn fragment_path_mirrors_source_tree() {
     let repo = Path::new("/repo");
     let p = fragment_path(repo, "src/cli.py");
-    assert_eq!(
-        p.to_str().unwrap(),
-        "/repo/.aethyme/graph/src/cli.py.bin"
-    );
+    assert_eq!(p.to_str().unwrap(), "/repo/.aethyme/graph/src/cli.py.bin");
 }
 
 #[test]

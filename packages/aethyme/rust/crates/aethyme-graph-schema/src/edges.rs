@@ -228,9 +228,7 @@ impl EdgeKindCategory {
 
     /// Inverse of [`EdgeKindCategory::name`]. Returns
     /// [`UnknownEdgeKindCategory`] for unknown names.
-    pub fn from_name(
-        name: &str,
-    ) -> Result<EdgeKindCategory, UnknownEdgeKindCategory> {
+    pub fn from_name(name: &str) -> Result<EdgeKindCategory, UnknownEdgeKindCategory> {
         Ok(match name {
             "structural" => EdgeKindCategory::Structural,
             "behavioral" => EdgeKindCategory::Behavioral,

@@ -53,9 +53,7 @@ pub struct SymbolRecord {
 /// appending another record (rare, but legal under git's
 /// `merge=union`) doesn't accidentally concatenate two JSON
 /// objects on one line.
-pub fn write_index_shard_bytes(
-    records: &[SymbolRecord],
-) -> Result<Vec<u8>, IndexShardEncodeError> {
+pub fn write_index_shard_bytes(records: &[SymbolRecord]) -> Result<Vec<u8>, IndexShardEncodeError> {
     let mut sorted: Vec<&SymbolRecord> = records.iter().collect();
     sorted.sort_by(|a, b| {
         a.module
@@ -66,10 +64,8 @@ pub fn write_index_shard_bytes(
 
     let mut out = Vec::with_capacity(records.len() * 128);
     for record in sorted {
-        let line = serde_json::to_string(record).map_err(|e| {
-            IndexShardEncodeError::Json {
-                message: e.to_string(),
-            }
+        let line = serde_json::to_string(record).map_err(|e| IndexShardEncodeError::Json {
+            message: e.to_string(),
         })?;
         out.extend_from_slice(line.as_bytes());
         out.push(b'\n');
@@ -83,25 +79,20 @@ pub fn write_index_shard_bytes(
 /// `merge=union` if one side ended without a trailing newline).
 /// Does NOT deduplicate; that's the indexer's job during the next
 /// re-index pass.
-pub fn read_index_shard_bytes(
-    bytes: &[u8],
-) -> Result<Vec<SymbolRecord>, IndexShardDecodeError> {
-    let text = std::str::from_utf8(bytes).map_err(|e| {
-        IndexShardDecodeError::Utf8 {
-            message: e.to_string(),
-        }
+pub fn read_index_shard_bytes(bytes: &[u8]) -> Result<Vec<SymbolRecord>, IndexShardDecodeError> {
+    let text = std::str::from_utf8(bytes).map_err(|e| IndexShardDecodeError::Utf8 {
+        message: e.to_string(),
     })?;
     let mut out = Vec::new();
     for (line_index, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let record: SymbolRecord = serde_json::from_str(line).map_err(|e| {
-            IndexShardDecodeError::Json {
+        let record: SymbolRecord =
+            serde_json::from_str(line).map_err(|e| IndexShardDecodeError::Json {
                 line: line_index + 1,
                 message: e.to_string(),
-            }
-        })?;
+            })?;
         out.push(record);
     }
     Ok(out)
@@ -115,9 +106,7 @@ pub fn read_index_shard_bytes(
 /// Called by the re-index pass after git auto-merge: union-merged
 /// shards may have duplicates if two contributors added the same
 /// symbol; this resolves them.
-pub fn dedupe_and_canonicalize(
-    mut records: Vec<SymbolRecord>,
-) -> Vec<SymbolRecord> {
+pub fn dedupe_and_canonicalize(mut records: Vec<SymbolRecord>) -> Vec<SymbolRecord> {
     records.sort();
     records.dedup();
     records
@@ -161,10 +150,9 @@ impl std::fmt::Display for IndexShardDecodeError {
             Self::Utf8 { message } => {
                 write!(f, "index shard decode (utf-8) failed: {message}")
             }
-            Self::Json { line, message } => write!(
-                f,
-                "index shard decode failed at line {line}: {message}"
-            ),
+            Self::Json { line, message } => {
+                write!(f, "index shard decode failed at line {line}: {message}")
+            }
             Self::InvalidNodeId { line, cause } => write!(
                 f,
                 "index shard decode failed at line {line}: invalid \

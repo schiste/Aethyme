@@ -1,8 +1,8 @@
 //! Integration tests for repo bootstrap.
 
 use aethyme_graph_storage::{
-    bootstrap_repo, read_engine_version, BootstrapError,
-    EngineVersionReadError, GITATTRIBUTES_CONTENT,
+    BootstrapError, EngineVersionReadError, GITATTRIBUTES_CONTENT, bootstrap_repo,
+    read_engine_version,
 };
 
 #[test]
@@ -36,9 +36,7 @@ fn bootstrap_writes_canonical_gitattributes() {
     assert_eq!(content, GITATTRIBUTES_CONTENT);
     // Sanity-check the actual lines present.
     assert!(content.contains("**/*.bin linguist-generated=true binary"));
-    assert!(content.contains(
-        "_index/**/*.ndjson linguist-generated=true merge=union"
-    ));
+    assert!(content.contains("_index/**/*.ndjson linguist-generated=true merge=union"));
 }
 
 #[test]
@@ -85,8 +83,7 @@ fn read_engine_version_reports_missing_file() {
 fn read_engine_version_rejects_empty_after_trim() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
-    std::fs::write(tmp.path().join(".aethyme/engine-version"), "\n\n")
-        .unwrap();
+    std::fs::write(tmp.path().join(".aethyme/engine-version"), "\n\n").unwrap();
     let err = read_engine_version(tmp.path()).unwrap_err();
     assert!(matches!(err, EngineVersionReadError::Empty));
 }
@@ -95,8 +92,7 @@ fn read_engine_version_rejects_empty_after_trim() {
 fn read_engine_version_trims_trailing_newline() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
-    std::fs::write(tmp.path().join(".aethyme/engine-version"), "1.2.3\n")
-        .unwrap();
+    std::fs::write(tmp.path().join(".aethyme/engine-version"), "1.2.3\n").unwrap();
     assert_eq!(read_engine_version(tmp.path()).unwrap(), "1.2.3");
 }
 

@@ -22,10 +22,9 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use aethyme_graph_storage::{bootstrap_repo, FragmentStore, OverlayFragment};
+use aethyme_graph_storage::{FragmentStore, OverlayFragment, bootstrap_repo};
 use aethyme_producers::{
-    assert_overlay_producer_is_deterministic, OverlayProducer, ProducerCtx,
-    ProducerError,
+    OverlayProducer, ProducerCtx, ProducerError, assert_overlay_producer_is_deterministic,
 };
 use tempfile::TempDir;
 
@@ -143,12 +142,8 @@ fn payload_bounds_compile_for_btreemap() {
 
     let mut payload: BTreeMap<String, String> = BTreeMap::new();
     payload.insert("k".into(), "v".into());
-    let frag = OverlayFragment::new(
-        "test_bounds",
-        "test_bounds/0.1.0",
-        payload.clone(),
-    )
-    .expect("build overlay");
+    let frag = OverlayFragment::new("test_bounds", "test_bounds/0.1.0", payload.clone())
+        .expect("build overlay");
     assert_eq!(frag.payload(), &payload);
 }
 

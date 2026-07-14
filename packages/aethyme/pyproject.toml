@@ -50,9 +50,6 @@ dev = [
     "vulture>=2.10",
 ]
 
-[project.scripts]
-aethyme = "src.cli:main"
-
 [build-system]
 requires = ["setuptools>=68.0.0", "wheel"]
 build-backend = "setuptools.build_meta"

@@ -8,9 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aethyme_graph_schema::{
-    ALL_EDGE_KIND_CATEGORIES, ALL_EDGE_KINDS, EdgeKind, EdgeKindCategory,
-};
+use aethyme_graph_schema::{ALL_EDGE_KIND_CATEGORIES, ALL_EDGE_KINDS, EdgeKind, EdgeKindCategory};
 
 // ─── EdgeKind: bijection and exhaustiveness ──────────────────────────
 
@@ -37,17 +35,16 @@ fn name_and_from_name_round_trip_for_every_variant() {
 fn from_name_returns_err_for_unknown_strings() {
     let bad_inputs = [
         "",
-        "Calls",      // TitleCase
-        "CALLS",      // ALLCAPS
-        "call",       // truncated
-        "called",     // wrong form
-        "in-herits",  // kebab
+        "Calls",            // TitleCase
+        "CALLS",            // ALLCAPS
+        "call",             // truncated
+        "called",           // wrong form
+        "in-herits",        // kebab
         "implements_trait", // suffixed
     ];
     for bad in bad_inputs {
-        let err = EdgeKind::from_name(bad).expect_err(&format!(
-            "from_name({bad:?}) should have returned Err"
-        ));
+        let err = EdgeKind::from_name(bad)
+            .expect_err(&format!("from_name({bad:?}) should have returned Err"));
         assert_eq!(err.given(), bad);
         let displayed = format!("{err}");
         assert!(
@@ -208,9 +205,8 @@ fn categories_are_exhaustive_and_well_defined() {
 fn category_name_and_from_name_round_trip_for_every_variant() {
     for &cat in ALL_EDGE_KIND_CATEGORIES {
         let name = cat.name();
-        let back = EdgeKindCategory::from_name(name).unwrap_or_else(|err| {
-            panic!("from_name({name:?}) returned Err({err}) for {cat:?}")
-        });
+        let back = EdgeKindCategory::from_name(name)
+            .unwrap_or_else(|err| panic!("from_name({name:?}) returned Err({err}) for {cat:?}"));
         assert_eq!(back, cat);
     }
 }
@@ -219,9 +215,8 @@ fn category_name_and_from_name_round_trip_for_every_variant() {
 fn category_from_name_returns_err_for_unknown_strings() {
     let bad_inputs = ["", "Structural", "structurals", "type-defining"];
     for bad in bad_inputs {
-        let err = EdgeKindCategory::from_name(bad).expect_err(&format!(
-            "from_name({bad:?}) should have returned Err"
-        ));
+        let err = EdgeKindCategory::from_name(bad)
+            .expect_err(&format!("from_name({bad:?}) should have returned Err"));
         assert_eq!(err.given(), bad);
     }
 }
@@ -283,4 +278,3 @@ fn category_round_trips_through_json() {
         assert_eq!(back, category);
     }
 }
-

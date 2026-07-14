@@ -1,8 +1,8 @@
 //! Integration tests for the full Edge struct and per-kind attributes.
 
 use aethyme_graph_schema::{
-    BindingKind, Confidence, DecisionStatus, Edge, EdgeAttributes, EdgeKind,
-    EdgeSite, NodeId, NodeKind, ReferenceKindHint, Source,
+    BindingKind, Confidence, DecisionStatus, Edge, EdgeAttributes, EdgeKind, EdgeSite, NodeId,
+    NodeKind, ReferenceKindHint, Source,
 };
 
 fn fn_id(name: &str) -> NodeId {
@@ -74,10 +74,8 @@ fn every_edge_attribute_variant_maps_to_a_distinct_kind() {
             kind_hint: ReferenceKindHint::SeeAlso,
         },
     ];
-    let kinds: std::collections::BTreeSet<EdgeKind> =
-        attrs.iter().map(|a| a.kind()).collect();
-    let expected: std::collections::BTreeSet<EdgeKind> =
-        ALL_EDGE_KINDS.iter().copied().collect();
+    let kinds: std::collections::BTreeSet<EdgeKind> = attrs.iter().map(|a| a.kind()).collect();
+    let expected: std::collections::BTreeSet<EdgeKind> = ALL_EDGE_KINDS.iter().copied().collect();
     assert_eq!(kinds, expected);
 }
 
@@ -190,9 +188,11 @@ fn imports_attributes_carry_import_metadata() {
 
 #[test]
 fn decides_carries_decision_status() {
-    for status in
-        [DecisionStatus::Active, DecisionStatus::Superseded, DecisionStatus::Rejected]
-    {
+    for status in [
+        DecisionStatus::Active,
+        DecisionStatus::Superseded,
+        DecisionStatus::Rejected,
+    ] {
         let e = Edge::new(
             fn_id("doc"),
             fn_id("target"),

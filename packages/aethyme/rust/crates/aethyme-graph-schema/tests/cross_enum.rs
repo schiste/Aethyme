@@ -26,8 +26,7 @@
 use std::collections::BTreeSet;
 
 use aethyme_graph_schema::{
-    ALL_EDGE_KIND_CATEGORIES, ALL_EDGE_KINDS, ALL_NODE_KIND_CATEGORIES,
-    ALL_NODE_KINDS,
+    ALL_EDGE_KIND_CATEGORIES, ALL_EDGE_KINDS, ALL_NODE_KIND_CATEGORIES, ALL_NODE_KINDS,
 };
 
 /// Collect the canonical names of an iterable of items with a

@@ -1,10 +1,9 @@
 //! Integration tests for the container node kinds.
 
 use aethyme_graph_schema::{
-    Directory, DirectoryConstructionError, File, FileConstructionError,
-    Module, ModuleConstructionError, NodeKind, NonCodeFile,
-    NonCodeFileConstructionError, NonCodeFormat, Package,
-    PackageConstructionError, Repository, RepositoryConstructionError,
+    Directory, DirectoryConstructionError, File, FileConstructionError, Module,
+    ModuleConstructionError, NodeKind, NonCodeFile, NonCodeFileConstructionError, NonCodeFormat,
+    Package, PackageConstructionError, Repository, RepositoryConstructionError,
 };
 
 // ─── Repository ──────────────────────────────────────────────────────
@@ -97,8 +96,7 @@ fn module_serde_round_trip() {
 
 #[test]
 fn file_construction_validates_required_fields() {
-    let f = File::new("aethyme", "src/cli.py", "python", 12345, "abc123")
-        .unwrap();
+    let f = File::new("aethyme", "src/cli.py", "python", 12345, "abc123").unwrap();
     assert_eq!(f.path(), "src/cli.py");
     assert_eq!(f.language(), "python");
     assert_eq!(f.byte_size(), 12345);
@@ -121,8 +119,7 @@ fn file_construction_validates_required_fields() {
 
 #[test]
 fn file_serde_round_trip() {
-    let f =
-        File::new("aethyme", "src/cli.py", "python", 12345, "abc123").unwrap();
+    let f = File::new("aethyme", "src/cli.py", "python", 12345, "abc123").unwrap();
     let json = serde_json::to_string(&f).unwrap();
     let back: File = serde_json::from_str(&json).unwrap();
     assert_eq!(back, f);
@@ -132,8 +129,7 @@ fn file_serde_round_trip() {
 
 #[test]
 fn non_code_file_construction_works() {
-    let n = NonCodeFile::new("aethyme", "README.md", NonCodeFormat::Markdown)
-        .unwrap();
+    let n = NonCodeFile::new("aethyme", "README.md", NonCodeFormat::Markdown).unwrap();
     assert_eq!(n.path(), "README.md");
     assert_eq!(n.format(), &NonCodeFormat::Markdown);
     assert_eq!(n.id().kind(), NodeKind::NonCodeFile);
@@ -226,10 +222,8 @@ fn package_serde_round_trip() {
 fn same_logical_inputs_give_same_node_id_across_constructions() {
     // Smoke check that the per-kind constructors thread through to
     // the same NodeId::new path deterministically.
-    let f1 =
-        File::new("aethyme", "src/cli.py", "python", 100, "abc").unwrap();
-    let f2 =
-        File::new("aethyme", "src/cli.py", "python", 999, "xyz").unwrap();
+    let f1 = File::new("aethyme", "src/cli.py", "python", 100, "abc").unwrap();
+    let f2 = File::new("aethyme", "src/cli.py", "python", 999, "xyz").unwrap();
     // Same kind, repo, path → same ID regardless of size/content_hash
     // (those aren't in the ID's hash inputs).
     assert_eq!(f1.id(), f2.id());

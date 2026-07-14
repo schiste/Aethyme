@@ -43,8 +43,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aethyme_graph_schema::{
-    Confidence, Directory, Edge, EdgeAttributes, File, NodeId, Repository,
-    Source,
+    Confidence, Directory, Edge, EdgeAttributes, File, NodeId, Repository, Source,
 };
 use aethyme_graph_storage::OverlayFragment;
 use serde::{Deserialize, Serialize};
@@ -106,13 +105,8 @@ impl OverlayProducer for StructureProducer {
         let view = ctx.repo_view()?;
 
         // -- Repository ----------------------------------------------
-        let repository =
-            Repository::new(view.name(), view.root_path(), view.vcs())
-                .map_err(|e| {
-                    ProducerError::Other(format!(
-                        "Repository::new failed: {e}"
-                    ))
-                })?;
+        let repository = Repository::new(view.name(), view.root_path(), view.vcs())
+            .map_err(|e| ProducerError::Other(format!("Repository::new failed: {e}")))?;
 
         // -- Directories (one per implied parent path) ---------------
         // BTreeSet handles dedupe-and-sort in one pass. The engine
@@ -129,9 +123,7 @@ impl OverlayProducer for StructureProducer {
             .iter()
             .map(|p| Directory::new(view.name(), p))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                ProducerError::Other(format!("Directory::new failed: {e}"))
-            })?;
+            .map_err(|e| ProducerError::Other(format!("Directory::new failed: {e}")))?;
 
         // -- Files ---------------------------------------------------
         // Iterate the view in its given order, then sort by NodeId
@@ -152,9 +144,7 @@ impl OverlayProducer for StructureProducer {
                 )
             })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                ProducerError::Other(format!("File::new failed: {e}"))
-            })?;
+            .map_err(|e| ProducerError::Other(format!("File::new failed: {e}")))?;
         files.sort_by(|a, b| a.path().cmp(b.path()));
 
         // -- Contains edges ------------------------------------------
@@ -176,8 +166,7 @@ impl OverlayProducer for StructureProducer {
             )
         };
 
-        let mut edges: Vec<Edge> =
-            Vec::with_capacity(directories.len() + files.len());
+        let mut edges: Vec<Edge> = Vec::with_capacity(directories.len() + files.len());
 
         for d in &directories {
             let src = parent_path(d.path())
@@ -200,9 +189,7 @@ impl OverlayProducer for StructureProducer {
         // Canonical edge ordering. NodeId implements Ord
         // structurally (string-shaped), so this is stable across
         // platforms.
-        edges.sort_by(|a, b| {
-            (a.src_id(), a.dst_id()).cmp(&(b.src_id(), b.dst_id()))
-        });
+        edges.sort_by(|a, b| (a.src_id(), a.dst_id()).cmp(&(b.src_id(), b.dst_id())));
 
         let payload = StructureOverlay {
             repository,

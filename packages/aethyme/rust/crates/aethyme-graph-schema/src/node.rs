@@ -13,10 +13,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Class, Comment, ConfigValue, Directory, DocSection, Docstring, Enum,
-    Expression, Field, File, Function, GlobalVariable, Interface, Lambda,
-    Method, Module, NodeId, NodeKind, NonCodeFile, Package, Parameter,
-    Repository, Statement, Struct, Trait, TypeAlias, UnresolvedSymbol,
+    Class, Comment, ConfigValue, Directory, DocSection, Docstring, Enum, Expression, Field, File,
+    Function, GlobalVariable, Interface, Lambda, Method, Module, NodeId, NodeKind, NonCodeFile,
+    Package, Parameter, Repository, Statement, Struct, Trait, TypeAlias, UnresolvedSymbol,
 };
 
 /// A node of any kind. Every variant wraps the corresponding
@@ -131,9 +130,9 @@ impl Node {
             Node::GlobalVariable(n) => Some(n.name()),
             Node::Parameter(n) => Some(n.name()),
             // Non-code kinds:
-            Node::Comment(_) => None,    // position-based
+            Node::Comment(_) => None, // position-based
             Node::DocSection(n) => Some(n.heading()),
-            Node::Docstring(_) => None,  // attached to a target
+            Node::Docstring(_) => None, // attached to a target
             Node::ConfigValue(n) => Some(n.config_path()),
             // Partial-knowledge:
             Node::UnresolvedSymbol(n) => Some(n.name()),

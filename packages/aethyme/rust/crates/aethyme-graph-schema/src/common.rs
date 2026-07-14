@@ -42,10 +42,7 @@ impl SourceRange {
     /// Construct a SourceRange. Returns [`InvalidSourceRange`] if
     /// `start_line == 0` (lines are 1-based) or
     /// `end_line < start_line`.
-    pub const fn new(
-        start_line: u32,
-        end_line: u32,
-    ) -> Result<Self, InvalidSourceRange> {
+    pub const fn new(start_line: u32, end_line: u32) -> Result<Self, InvalidSourceRange> {
         if start_line == 0 {
             return Err(InvalidSourceRange::StartLineZero);
         }
@@ -83,8 +80,7 @@ impl<'de> Deserialize<'de> for SourceRange {
             end_line: u32,
         }
         let raw = Raw::deserialize(d)?;
-        SourceRange::new(raw.start_line, raw.end_line)
-            .map_err(serde::de::Error::custom)
+        SourceRange::new(raw.start_line, raw.end_line).map_err(serde::de::Error::custom)
     }
 }
 

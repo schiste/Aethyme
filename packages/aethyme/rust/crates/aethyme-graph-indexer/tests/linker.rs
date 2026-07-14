@@ -8,11 +8,10 @@
 use std::path::Path;
 
 use aethyme_graph_indexer::{
-    index_repo_to_disk, link_repo, link_with_store, IndexerContext,
-    WalkOptions,
+    IndexerContext, WalkOptions, index_repo_to_disk, link_repo, link_with_store,
 };
 use aethyme_graph_schema::{EdgeKind, NodeKind};
-use aethyme_graph_storage::{read_fragment, FragmentStore};
+use aethyme_graph_storage::{FragmentStore, read_fragment};
 
 fn write(root: &Path, rel: &str, content: &[u8]) {
     let full = root.join(rel);
@@ -108,11 +107,7 @@ fn dotted_namespace_import_resolves_to_nested_file() {
     // because that's the module the import points at.
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "app.py", b"import pkg.sub\n");
-    write(
-        tmp.path(),
-        "pkg/sub.py",
-        b"def fn():\n    return 1\n",
-    );
+    write(tmp.path(), "pkg/sub.py", b"def fn():\n    return 1\n");
     index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     let summary = link_repo(&ctx(tmp.path())).unwrap();
     assert_eq!(summary.placeholders_resolved, 1);
@@ -139,11 +134,7 @@ fn from_import_with_dotted_module_resolves() {
     // looking for symbol "fn" in module "pkg.sub".
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "app.py", b"from pkg.sub import fn\n");
-    write(
-        tmp.path(),
-        "pkg/sub.py",
-        b"def fn():\n    return 1\n",
-    );
+    write(tmp.path(), "pkg/sub.py", b"def fn():\n    return 1\n");
     index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     let summary = link_repo(&ctx(tmp.path())).unwrap();
     assert_eq!(summary.placeholders_resolved, 1);
@@ -295,8 +286,7 @@ fn link_is_idempotent_when_rerun() {
 
     let first = link_repo(&ctx(tmp.path())).unwrap();
     assert_eq!(first.placeholders_resolved, 1);
-    let bytes_after_first =
-        std::fs::read(tmp.path().join(".aethyme/graph/cli.py.bin")).unwrap();
+    let bytes_after_first = std::fs::read(tmp.path().join(".aethyme/graph/cli.py.bin")).unwrap();
 
     let second = link_repo(&ctx(tmp.path())).unwrap();
     // Only the unresolvable `os` placeholder remains; the second
@@ -304,8 +294,7 @@ fn link_is_idempotent_when_rerun() {
     assert_eq!(second.placeholders_seen, 1);
     assert_eq!(second.edges_rewritten, 0);
 
-    let bytes_after_second =
-        std::fs::read(tmp.path().join(".aethyme/graph/cli.py.bin")).unwrap();
+    let bytes_after_second = std::fs::read(tmp.path().join(".aethyme/graph/cli.py.bin")).unwrap();
     assert_eq!(bytes_after_first, bytes_after_second);
 }
 
@@ -349,11 +338,7 @@ fn link_summary_counts_are_sane() {
         "a.py",
         b"from util import h1\nfrom util import h2\nimport os\n",
     );
-    write(
-        tmp.path(),
-        "b.py",
-        b"from util import h1\nimport sys\n",
-    );
+    write(tmp.path(), "b.py", b"from util import h1\nimport sys\n");
     write(
         tmp.path(),
         "util.py",
@@ -414,7 +399,10 @@ fn star_import_stays_unresolved_with_documented_behavior() {
         .nodes()
         .iter()
         .find(|n| n.kind() == NodeKind::UnresolvedSymbol);
-    assert!(star_placeholder.is_some(), "star-import placeholder must survive");
+    assert!(
+        star_placeholder.is_some(),
+        "star-import placeholder must survive"
+    );
 }
 
 #[test]
@@ -467,11 +455,7 @@ fn two_imports_resolving_to_same_target_keep_both_with_distinct_paths() {
         "cli.py",
         b"import pkg.sub\nfrom pkg import sub\n",
     );
-    write(
-        tmp.path(),
-        "pkg/sub.py",
-        b"def fn():\n    return 1\n",
-    );
+    write(tmp.path(), "pkg/sub.py", b"def fn():\n    return 1\n");
     index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     let summary = link_repo(&ctx(tmp.path())).unwrap();
     assert_eq!(summary.placeholders_resolved, 2);
@@ -541,16 +525,14 @@ fn repo_without_imports_makes_no_changes() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "util.py", b"def helper():\n    return 1\n");
     index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
-    let bytes_before =
-        std::fs::read(tmp.path().join(".aethyme/graph/util.py.bin")).unwrap();
+    let bytes_before = std::fs::read(tmp.path().join(".aethyme/graph/util.py.bin")).unwrap();
 
     let summary = link_repo(&ctx(tmp.path())).unwrap();
     assert_eq!(summary.fragments_visited, 1);
     assert_eq!(summary.placeholders_seen, 0);
     assert_eq!(summary.fragments_rewritten, 0);
 
-    let bytes_after =
-        std::fs::read(tmp.path().join(".aethyme/graph/util.py.bin")).unwrap();
+    let bytes_after = std::fs::read(tmp.path().join(".aethyme/graph/util.py.bin")).unwrap();
     assert_eq!(bytes_before, bytes_after);
 }
 

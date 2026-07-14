@@ -1,12 +1,11 @@
 //! Integration tests for Fragment construction + binary encoding.
 
 use aethyme_graph_schema::{
-    Class, Confidence, Edge, EdgeAttributes, EdgeSite, Function, Node,
-    NodeId, ParameterSignature, Source, SourceRange, Visibility,
+    Class, Confidence, Edge, EdgeAttributes, EdgeSite, Function, Node, NodeId, ParameterSignature,
+    Source, SourceRange, Visibility,
 };
 use aethyme_graph_storage::{
-    read_fragment_bytes, write_fragment_bytes, Fragment,
-    FragmentBuildError, FragmentDecodeError,
+    Fragment, FragmentBuildError, FragmentDecodeError, read_fragment_bytes, write_fragment_bytes,
 };
 
 fn sample_function() -> Function {
@@ -153,24 +152,12 @@ fn fragment_canonicalizes_node_order() {
     let n_f = Node::Function(f);
     let n_c = Node::Class(c);
 
-    let frag_a = Fragment::new(
-        "src/cli.py",
-        vec![n_f.clone(), n_c.clone()],
-        vec![],
-    )
-    .unwrap();
-    let frag_b = Fragment::new(
-        "src/cli.py",
-        vec![n_c.clone(), n_f.clone()],
-        vec![],
-    )
-    .unwrap();
+    let frag_a = Fragment::new("src/cli.py", vec![n_f.clone(), n_c.clone()], vec![]).unwrap();
+    let frag_b = Fragment::new("src/cli.py", vec![n_c.clone(), n_f.clone()], vec![]).unwrap();
     assert_eq!(frag_a, frag_b);
     // Verify the sorted order matches both.
-    let ids_a: Vec<&str> =
-        frag_a.nodes().iter().map(|n| n.id().as_str()).collect();
-    let ids_b: Vec<&str> =
-        frag_b.nodes().iter().map(|n| n.id().as_str()).collect();
+    let ids_a: Vec<&str> = frag_a.nodes().iter().map(|n| n.id().as_str()).collect();
+    let ids_b: Vec<&str> = frag_b.nodes().iter().map(|n| n.id().as_str()).collect();
     assert_eq!(ids_a, ids_b);
     // And that the sort actually happened: ids are in lex order.
     let mut sorted = ids_a.clone();
@@ -278,12 +265,8 @@ fn different_input_order_produces_same_bytes() {
     let n_f = Node::Function(f);
     let n_c = Node::Class(c);
 
-    let frag_a =
-        Fragment::new("src/cli.py", vec![n_f.clone(), n_c.clone()], vec![])
-            .unwrap();
-    let frag_b =
-        Fragment::new("src/cli.py", vec![n_c.clone(), n_f.clone()], vec![])
-            .unwrap();
+    let frag_a = Fragment::new("src/cli.py", vec![n_f.clone(), n_c.clone()], vec![]).unwrap();
+    let frag_b = Fragment::new("src/cli.py", vec![n_c.clone(), n_f.clone()], vec![]).unwrap();
     let bytes_a = write_fragment_bytes(&frag_a).unwrap();
     let bytes_b = write_fragment_bytes(&frag_b).unwrap();
     assert_eq!(bytes_a, bytes_b);

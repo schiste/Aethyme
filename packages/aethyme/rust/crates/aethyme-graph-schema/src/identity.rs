@@ -115,9 +115,7 @@ impl NodeId {
             return Err(NodeIdConstructionError::EmptyRepo);
         }
         if repo.contains(':') {
-            return Err(NodeIdConstructionError::RepoContainsColon {
-                given: repo.into(),
-            });
+            return Err(NodeIdConstructionError::RepoContainsColon { given: repo.into() });
         }
 
         let hash = compute_hash(kind, repo, file_path, symbol_name);
@@ -150,23 +148,17 @@ impl NodeId {
         let (kind_str, repo, hash) = (parts[0], parts[1], parts[2]);
 
         if kind_str.is_empty() {
-            return Err(NodeIdParseError::EmptyKindComponent {
-                given: s.into(),
-            });
+            return Err(NodeIdParseError::EmptyKindComponent { given: s.into() });
         }
         // Validate kind is a known variant — this is the strongest
         // cheap check we can do without recomputing the hash.
-        NodeKind::from_name(kind_str).map_err(|_| {
-            NodeIdParseError::UnknownKind {
-                given: s.into(),
-                kind_str: kind_str.into(),
-            }
+        NodeKind::from_name(kind_str).map_err(|_| NodeIdParseError::UnknownKind {
+            given: s.into(),
+            kind_str: kind_str.into(),
         })?;
 
         if repo.is_empty() {
-            return Err(NodeIdParseError::EmptyRepoComponent {
-                given: s.into(),
-            });
+            return Err(NodeIdParseError::EmptyRepoComponent { given: s.into() });
         }
 
         if hash.len() != HASH_SUFFIX_LEN {
@@ -239,12 +231,7 @@ impl std::fmt::Display for NodeId {
 ///
 /// Length-prefixing prevents concatenation ambiguity: without it,
 /// repo="foo"+path="bar" hashes the same as repo="foob"+path="ar".
-fn compute_hash(
-    kind: NodeKind,
-    repo: &str,
-    file_path: &str,
-    symbol_name: &str,
-) -> [u8; 16] {
+fn compute_hash(kind: NodeKind, repo: &str, file_path: &str, symbol_name: &str) -> [u8; 16] {
     let mut hasher = Hasher::new();
     write_length_prefixed(&mut hasher, repo.as_bytes());
     write_length_prefixed(&mut hasher, file_path.as_bytes());

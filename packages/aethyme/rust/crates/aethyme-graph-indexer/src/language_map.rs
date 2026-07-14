@@ -42,10 +42,18 @@ pub fn classify_file(file_name: &str) -> FileClassification {
         "project.godot" => {
             return FileClassification::NonCode {
                 format: NonCodeFormat::Other("godot".into()),
-            }
+            };
         }
-        "dockerfile" => return FileClassification::Code { language: "dockerfile" },
-        "makefile" => return FileClassification::Code { language: "makefile" },
+        "dockerfile" => {
+            return FileClassification::Code {
+                language: "dockerfile",
+            };
+        }
+        "makefile" => {
+            return FileClassification::Code {
+                language: "makefile",
+            };
+        }
         _ => {}
     }
 

@@ -138,10 +138,7 @@ impl LineIndex {
     /// Convert a byte offset to a 1-based line number.
     pub fn line_at(&self, byte_offset: usize) -> u32 {
         let clamped = byte_offset.min(self.content_len);
-        let line = self
-            .newline_offsets
-            .partition_point(|&pos| pos < clamped)
-            + 1;
+        let line = self.newline_offsets.partition_point(|&pos| pos < clamped) + 1;
         line as u32
     }
 }

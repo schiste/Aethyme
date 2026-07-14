@@ -111,8 +111,8 @@ fn binary_json_output_parses_as_object() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Hand-rolled JSON must round-trip through serde_json.
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("CLI --json output must parse as JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("CLI --json output must parse as JSON");
     assert_eq!(parsed["total_files"], 1);
     assert!(parsed["counts_by_kind"]["function"].as_u64().unwrap() >= 1);
 }
@@ -126,8 +126,7 @@ fn binary_skip_bootstrap_does_not_overwrite_engine_version() {
         b"PRE-EXISTING-VERSION\n",
     )
     .unwrap();
-    std::fs::create_dir_all(tmp.path().join(".aethyme/graph/_index"))
-        .unwrap();
+    std::fs::create_dir_all(tmp.path().join(".aethyme/graph/_index")).unwrap();
 
     write(tmp.path(), "src/cli.py", b"def f(): pass\n");
 
@@ -145,10 +144,7 @@ fn binary_skip_bootstrap_does_not_overwrite_engine_version() {
 
     // Pre-existing engine-version file is preserved (we didn't
     // re-bootstrap).
-    let v = std::fs::read_to_string(
-        tmp.path().join(".aethyme/engine-version"),
-    )
-    .unwrap();
+    let v = std::fs::read_to_string(tmp.path().join(".aethyme/engine-version")).unwrap();
     assert_eq!(v.trim(), "PRE-EXISTING-VERSION");
 }
 
@@ -194,8 +190,7 @@ fn binary_rejects_relative_repo_root() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.to_lowercase().contains("relative")
-            || stderr.contains("absolute"),
+        stderr.to_lowercase().contains("relative") || stderr.contains("absolute"),
         "expected an absolute-path complaint in stderr, got: {stderr}"
     );
 }

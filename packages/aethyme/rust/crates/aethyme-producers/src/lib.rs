@@ -93,10 +93,7 @@ pub trait OverlayProducer {
     /// The bounds match what the storage layer needs to round-trip
     /// the payload through bincode and what the harness needs to
     /// compare two consecutive outputs.
-    type Payload: serde::Serialize
-        + serde::de::DeserializeOwned
-        + Clone
-        + PartialEq;
+    type Payload: serde::Serialize + serde::de::DeserializeOwned + Clone + PartialEq;
 
     /// Stable identifier for this overlay. Used as the filename
     /// under `_overlays/<kind>.bin` and embedded in the on-disk
@@ -173,10 +170,7 @@ impl<'a> ProducerCtx<'a> {
     /// Construct a context with both the store and a repo view.
     /// Used by structure-class producers (4.7.3+) that synthesize
     /// overlay payloads from the discovered repo snapshot.
-    pub fn with_repo(
-        store: &'a FragmentStore,
-        repo: &'a dyn RepoView,
-    ) -> Self {
+    pub fn with_repo(store: &'a FragmentStore, repo: &'a dyn RepoView) -> Self {
         Self {
             store,
             repo: Some(repo),

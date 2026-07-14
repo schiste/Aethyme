@@ -202,10 +202,7 @@ impl Edge {
     }
 
     /// Builder: mark this as a cross-language edge.
-    pub fn with_language_boundary(
-        mut self,
-        binding_kind: BindingKind,
-    ) -> Self {
+    pub fn with_language_boundary(mut self, binding_kind: BindingKind) -> Self {
         self.language_boundary = true;
         self.binding_kind = Some(binding_kind);
         self

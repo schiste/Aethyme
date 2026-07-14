@@ -34,21 +34,17 @@
 //!   the file's top-level items.
 
 use ra_ap_syntax::ast::{HasModuleItem, HasName, HasVisibility};
-use ra_ap_syntax::{ast, AstNode, Edition, SourceFile, SyntaxNode};
+use ra_ap_syntax::{AstNode, Edition, SourceFile, SyntaxNode, ast};
 
 use aethyme_graph_schema::{
-    Callable, Confidence, Edge, EdgeAttributes, Enum as SchemaEnum,
-    Function as SchemaFunction, GlobalVariable, Method, Node, NodeId,
-    NodeKind, ParameterSignature, Source, SourceRange,
-    Struct as SchemaStruct, Trait as SchemaTrait, TypeAlias,
-    UnresolvedSymbol, Visibility,
+    Callable, Confidence, Edge, EdgeAttributes, Enum as SchemaEnum, Function as SchemaFunction,
+    GlobalVariable, Method, Node, NodeId, NodeKind, ParameterSignature, Source, SourceRange,
+    Struct as SchemaStruct, Trait as SchemaTrait, TypeAlias, UnresolvedSymbol, Visibility,
 };
 
 use crate::context::IndexerContext;
 use crate::filesystem::IndexedFile;
-use crate::language::{
-    LanguageIndexError, LanguageIndexResult, LanguageIndexer, LineIndex,
-};
+use crate::language::{LanguageIndexError, LanguageIndexResult, LanguageIndexer, LineIndex};
 
 /// Indexer for `.rs` files via ra_ap_syntax.
 pub struct RustIndexer;
@@ -120,9 +116,7 @@ fn walk_top_level_item(
 ) -> Result<(), LanguageIndexError> {
     match item {
         ast::Item::Fn(f) => {
-            if let Some(fn_node) =
-                build_function(repo, source_path, f, line_index, true)?
-            {
+            if let Some(fn_node) = build_function(repo, source_path, f, line_index, true)? {
                 let id = fn_node.id().clone();
                 nodes.push(Node::Function(fn_node));
                 edges.push(structural_edge(
@@ -133,8 +127,7 @@ fn walk_top_level_item(
             }
         }
         ast::Item::Struct(s) => {
-            if let Some(node) = build_struct(repo, source_path, s, line_index)?
-            {
+            if let Some(node) = build_struct(repo, source_path, s, line_index)? {
                 let id = node.id().clone();
                 nodes.push(Node::Struct(node));
                 edges.push(structural_edge(
@@ -146,7 +139,9 @@ fn walk_top_level_item(
         }
         // Rust unions map to Struct in our schema (no Union kind).
         ast::Item::Union(u) => {
-            let Some(name) = u.name() else { return Ok(()); };
+            let Some(name) = u.name() else {
+                return Ok(());
+            };
             let source_range = node_range(u.syntax(), line_index)?;
             let visibility = visibility_from_rust(u.visibility());
             let node = SchemaStruct::new(
@@ -177,9 +172,7 @@ fn walk_top_level_item(
             }
         }
         ast::Item::Trait(t) => {
-            if let Some(trait_node) =
-                build_trait(repo, source_path, t, line_index)?
-            {
+            if let Some(trait_node) = build_trait(repo, source_path, t, line_index)? {
                 let trait_id = trait_node.id().clone();
                 nodes.push(Node::Trait(trait_node));
                 edges.push(structural_edge(
@@ -213,9 +206,7 @@ fn walk_top_level_item(
             }
         }
         ast::Item::TypeAlias(t) => {
-            if let Some(node) =
-                build_type_alias(repo, source_path, t, line_index)?
-            {
+            if let Some(node) = build_type_alias(repo, source_path, t, line_index)? {
                 let id = node.id().clone();
                 nodes.push(Node::TypeAlias(node));
                 edges.push(structural_edge(
@@ -293,15 +284,7 @@ fn walk_top_level_item(
         }
         ast::Item::Use(u) => {
             if let Some(tree) = u.use_tree() {
-                flatten_use_tree(
-                    &tree,
-                    "",
-                    repo,
-                    source_path,
-                    file_id,
-                    nodes,
-                    edges,
-                )?;
+                flatten_use_tree(&tree, "", repo, source_path, file_id, nodes, edges)?;
             }
         }
         // Module, ExternBlock, ExternCrate, MacroCall, MacroDef,
@@ -320,14 +303,12 @@ fn build_function(
     line_index: &LineIndex,
     is_top_level: bool,
 ) -> Result<Option<SchemaFunction>, LanguageIndexError> {
-    let Some(name) = f.name() else { return Ok(None); };
+    let Some(name) = f.name() else {
+        return Ok(None);
+    };
     let parameters = parameter_signatures(f);
     let is_async = f.async_token().is_some();
-    let signature = synthesize_function_signature(
-        name.text().as_ref(),
-        &parameters,
-        is_async,
-    );
+    let signature = synthesize_function_signature(name.text().as_ref(), &parameters, is_async);
     let source_range = node_range(f.syntax(), line_index)?;
     let visibility = visibility_from_rust(f.visibility());
     SchemaFunction::new(
@@ -352,14 +333,12 @@ fn build_method_for_trait(
     receiver_type: NodeId,
     line_index: &LineIndex,
 ) -> Result<Option<Method>, LanguageIndexError> {
-    let Some(name) = f.name() else { return Ok(None); };
+    let Some(name) = f.name() else {
+        return Ok(None);
+    };
     let parameters = parameter_signatures(f);
     let is_async = f.async_token().is_some();
-    let signature = synthesize_function_signature(
-        name.text().as_ref(),
-        &parameters,
-        is_async,
-    );
+    let signature = synthesize_function_signature(name.text().as_ref(), &parameters, is_async);
     let source_range = node_range(f.syntax(), line_index)?;
     let visibility = visibility_from_rust(f.visibility());
     // Trait method without a body is the abstract/default-method
@@ -390,7 +369,9 @@ fn build_struct(
     s: &ast::Struct,
     line_index: &LineIndex,
 ) -> Result<Option<SchemaStruct>, LanguageIndexError> {
-    let Some(name) = s.name() else { return Ok(None); };
+    let Some(name) = s.name() else {
+        return Ok(None);
+    };
     let source_range = node_range(s.syntax(), line_index)?;
     let visibility = visibility_from_rust(s.visibility());
     SchemaStruct::new(
@@ -410,7 +391,9 @@ fn build_enum(
     e: &ast::Enum,
     line_index: &LineIndex,
 ) -> Result<Option<SchemaEnum>, LanguageIndexError> {
-    let Some(name) = e.name() else { return Ok(None); };
+    let Some(name) = e.name() else {
+        return Ok(None);
+    };
     let source_range = node_range(e.syntax(), line_index)?;
     let visibility = visibility_from_rust(e.visibility());
     SchemaEnum::new(
@@ -431,7 +414,9 @@ fn build_trait(
     t: &ast::Trait,
     line_index: &LineIndex,
 ) -> Result<Option<SchemaTrait>, LanguageIndexError> {
-    let Some(name) = t.name() else { return Ok(None); };
+    let Some(name) = t.name() else {
+        return Ok(None);
+    };
     let source_range = node_range(t.syntax(), line_index)?;
     let visibility = visibility_from_rust(t.visibility());
     SchemaTrait::new(
@@ -451,7 +436,9 @@ fn build_type_alias(
     t: &ast::TypeAlias,
     line_index: &LineIndex,
 ) -> Result<Option<TypeAlias>, LanguageIndexError> {
-    let Some(name) = t.name() else { return Ok(None); };
+    let Some(name) = t.name() else {
+        return Ok(None);
+    };
     let source_range = node_range(t.syntax(), line_index)?;
     let visibility = visibility_from_rust(t.visibility());
     // v1: target_type is a placeholder. Faithful reproduction
@@ -473,7 +460,9 @@ fn build_type_alias(
 
 fn parameter_signatures(f: &ast::Fn) -> Vec<ParameterSignature> {
     let mut out = Vec::new();
-    let Some(params) = f.param_list() else { return out; };
+    let Some(params) = f.param_list() else {
+        return out;
+    };
     // Include self_param as the first parameter when present, to keep
     // the signature recognizable. Its name is always "self".
     if let Some(_self_param) = params.self_param() {
@@ -499,9 +488,7 @@ fn parameter_signatures(f: &ast::Fn) -> Vec<ParameterSignature> {
 }
 
 fn has_self_param(f: &ast::Fn) -> bool {
-    f.param_list()
-        .and_then(|p| p.self_param())
-        .is_some()
+    f.param_list().and_then(|p| p.self_param()).is_some()
 }
 
 fn synthesize_function_signature(
@@ -531,10 +518,8 @@ fn node_range(
     let range = node.text_range();
     let start = line_index.line_at(u32::from(range.start()) as usize);
     let end = line_index.line_at(u32::from(range.end()) as usize);
-    SourceRange::new(start, end).map_err(|e| {
-        LanguageIndexError::NodeConstruction {
-            message: format!("source range: {e}"),
-        }
+    SourceRange::new(start, end).map_err(|e| LanguageIndexError::NodeConstruction {
+        message: format!("source range: {e}"),
     })
 }
 
@@ -561,17 +546,11 @@ fn visibility_from_rust(vis: Option<ast::Visibility>) -> Visibility {
     }
 }
 
-fn structural_edge(
-    attributes: EdgeAttributes,
-    src: NodeId,
-    dst: NodeId,
-) -> Edge {
+fn structural_edge(attributes: EdgeAttributes, src: NodeId, dst: NodeId) -> Edge {
     Edge::new(src, dst, attributes, Source::Structure, Confidence::FULL)
 }
 
-fn node_construction_err(
-    e: impl std::fmt::Display,
-) -> LanguageIndexError {
+fn node_construction_err(e: impl std::fmt::Display) -> LanguageIndexError {
     LanguageIndexError::NodeConstruction {
         message: e.to_string(),
     }
@@ -625,15 +604,7 @@ fn flatten_use_tree(
     // `combined` as the new prefix.
     if let Some(list) = tree.use_tree_list() {
         for child in list.use_trees() {
-            flatten_use_tree(
-                &child,
-                &combined,
-                repo,
-                source_path,
-                file_id,
-                nodes,
-                edges,
-            )?;
+            flatten_use_tree(&child, &combined, repo, source_path, file_id, nodes, edges)?;
         }
         return Ok(());
     }
@@ -674,7 +645,11 @@ fn flatten_use_tree(
         // Star imports bring in everything as a namespace; plain
         // leaves are usually types / functions / consts — we
         // don't know without resolution.
-        if is_star { Some(NodeKind::Module) } else { None },
+        if is_star {
+            Some(NodeKind::Module)
+        } else {
+            None
+        },
         file_id.clone(),
     )
     .map_err(node_construction_err)?;
@@ -694,4 +669,3 @@ fn flatten_use_tree(
     ));
     Ok(())
 }
-

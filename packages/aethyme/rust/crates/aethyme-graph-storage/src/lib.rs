@@ -60,33 +60,29 @@ pub mod overlay;
 pub mod store;
 
 pub use binary::{
-    read_fragment_bytes, write_fragment_bytes, FragmentDecodeError,
-    FragmentEncodeError,
+    FragmentDecodeError, FragmentEncodeError, read_fragment_bytes, write_fragment_bytes,
 };
 pub use bootstrap::{
-    bootstrap_repo, read_engine_version, BootstrapError, BootstrapPaths,
-    EngineVersionReadError, GITATTRIBUTES_CONTENT,
+    BootstrapError, BootstrapPaths, EngineVersionReadError, GITATTRIBUTES_CONTENT, bootstrap_repo,
+    read_engine_version,
 };
 pub use disk::{
-    read_fragment, read_index_shard, read_overlay, write_fragment,
-    write_index_shard, write_overlay, FragmentReadError, FragmentWriteError,
-    IndexShardReadError, IndexShardWriteError, OverlayReadError,
-    OverlayWriteError,
+    FragmentReadError, FragmentWriteError, IndexShardReadError, IndexShardWriteError,
+    OverlayReadError, OverlayWriteError, read_fragment, read_index_shard, read_overlay,
+    write_fragment, write_index_shard, write_overlay,
 };
 pub use fragment::{Fragment, FragmentBuildError};
 pub use index_shard::{
-    dedupe_and_canonicalize, read_index_shard_bytes,
-    write_index_shard_bytes, IndexShardDecodeError, IndexShardEncodeError,
-    SymbolRecord,
+    IndexShardDecodeError, IndexShardEncodeError, SymbolRecord, dedupe_and_canonicalize,
+    read_index_shard_bytes, write_index_shard_bytes,
 };
 pub use layout::{
-    cache_dir, engine_version_path, fragment_path, index_shard_path,
-    overlay_path, validate_module_name, validate_source_path, InvalidPath,
-    AETHYME_DIR, CACHE_SUBDIR, ENGINE_VERSION_FILE, FRAGMENT_EXT,
-    GRAPH_SUBDIR, INDEX_SHARD_EXT, INDEX_SUBDIR, OVERLAYS_SUBDIR,
+    AETHYME_DIR, CACHE_SUBDIR, ENGINE_VERSION_FILE, FRAGMENT_EXT, GRAPH_SUBDIR, INDEX_SHARD_EXT,
+    INDEX_SUBDIR, InvalidPath, OVERLAYS_SUBDIR, cache_dir, engine_version_path, fragment_path,
+    index_shard_path, overlay_path, validate_module_name, validate_source_path,
 };
 pub use overlay::{
-    read_overlay_bytes, write_overlay_bytes, OverlayBuildError,
-    OverlayDecodeError, OverlayEncodeError, OverlayFragment,
+    OverlayBuildError, OverlayDecodeError, OverlayEncodeError, OverlayFragment, read_overlay_bytes,
+    write_overlay_bytes,
 };
 pub use store::{FragmentStore, StoreLookupError, StoreOpenError};

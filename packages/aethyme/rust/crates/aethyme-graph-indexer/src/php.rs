@@ -35,18 +35,14 @@ use std::sync::Mutex;
 use tree_sitter::{Node, Parser, Tree};
 
 use aethyme_graph_schema::{
-    Callable, Class as SchemaClass, Confidence, Edge, EdgeAttributes,
-    Function as SchemaFunction, GlobalVariable,
-    Interface as SchemaInterface, Method, Node as SchemaNode, NodeId,
-    NodeKind, ParameterSignature, Source, SourceRange,
-    Trait as SchemaTrait, UnresolvedSymbol, Visibility,
+    Callable, Class as SchemaClass, Confidence, Edge, EdgeAttributes, Function as SchemaFunction,
+    GlobalVariable, Interface as SchemaInterface, Method, Node as SchemaNode, NodeId, NodeKind,
+    ParameterSignature, Source, SourceRange, Trait as SchemaTrait, UnresolvedSymbol, Visibility,
 };
 
 use crate::context::IndexerContext;
 use crate::filesystem::IndexedFile;
-use crate::language::{
-    LanguageIndexError, LanguageIndexResult, LanguageIndexer, LineIndex,
-};
+use crate::language::{LanguageIndexError, LanguageIndexResult, LanguageIndexer, LineIndex};
 
 /// Indexer for `.php` files via tree-sitter-php.
 ///
@@ -62,13 +58,12 @@ pub struct PhpIndexer {
 impl PhpIndexer {
     pub fn new() -> Result<Self, LanguageIndexError> {
         let mut parser = Parser::new();
-        let language: tree_sitter::Language =
-            tree_sitter_php::LANGUAGE_PHP.into();
-        parser.set_language(&language).map_err(|e| {
-            LanguageIndexError::Parse {
+        let language: tree_sitter::Language = tree_sitter_php::LANGUAGE_PHP.into();
+        parser
+            .set_language(&language)
+            .map_err(|e| LanguageIndexError::Parse {
                 message: format!("set tree-sitter-php language: {e}"),
-            }
-        })?;
+            })?;
         Ok(PhpIndexer {
             parser: Mutex::new(parser),
         })
@@ -87,16 +82,14 @@ impl LanguageIndexer for PhpIndexer {
         content: &str,
     ) -> Result<LanguageIndexResult, LanguageIndexError> {
         let tree: Tree = {
-            let mut parser = self.parser.lock().map_err(|_| {
-                LanguageIndexError::Parse {
-                    message: "PHP parser mutex poisoned".to_string(),
-                }
+            let mut parser = self.parser.lock().map_err(|_| LanguageIndexError::Parse {
+                message: "PHP parser mutex poisoned".to_string(),
             })?;
-            parser.parse(content, None).ok_or_else(|| {
-                LanguageIndexError::Parse {
+            parser
+                .parse(content, None)
+                .ok_or_else(|| LanguageIndexError::Parse {
                     message: "tree-sitter-php returned no tree".to_string(),
-                }
-            })?
+                })?
         };
 
         let root = tree.root_node();
@@ -155,9 +148,7 @@ fn walk_top_level(
             }
         }
         "class_declaration" => {
-            if let Some(class) =
-                build_class(node, content, repo, source_path, line_index)?
-            {
+            if let Some(class) = build_class(node, content, repo, source_path, line_index)? {
                 let class_id = class.id().clone();
                 nodes.push(SchemaNode::Class(class));
                 edges.push(structural_edge(
@@ -179,9 +170,7 @@ fn walk_top_level(
             }
         }
         "interface_declaration" => {
-            if let Some(iface) =
-                build_interface(node, content, repo, source_path, line_index)?
-            {
+            if let Some(iface) = build_interface(node, content, repo, source_path, line_index)? {
                 let iface_id = iface.id().clone();
                 nodes.push(SchemaNode::Interface(iface));
                 edges.push(structural_edge(
@@ -203,9 +192,7 @@ fn walk_top_level(
             }
         }
         "trait_declaration" => {
-            if let Some(t) =
-                build_trait(node, content, repo, source_path, line_index)?
-            {
+            if let Some(t) = build_trait(node, content, repo, source_path, line_index)? {
                 let trait_id = t.id().clone();
                 nodes.push(SchemaNode::Trait(t));
                 edges.push(structural_edge(
@@ -244,9 +231,7 @@ fn walk_top_level(
             }
         }
         "namespace_use_declaration" => {
-            emit_php_use_placeholders(
-                node, content, repo, source_path, file_id, nodes, edges,
-            )?;
+            emit_php_use_placeholders(node, content, repo, source_path, file_id, nodes, edges)?;
         }
         "const_declaration" => {
             // Each const_element under a const_declaration is one
@@ -259,14 +244,8 @@ fn walk_top_level(
                         .or_else(|| first_named_child_text(el, content))
                 {
                     let source_range = node_range(node, line_index)?;
-                    let g = GlobalVariable::new(
-                        repo,
-                        source_path,
-                        &name,
-                        None,
-                        source_range,
-                    )
-                    .map_err(node_construction_err)?;
+                    let g = GlobalVariable::new(repo, source_path, &name, None, source_range)
+                        .map_err(node_construction_err)?;
                     let id = g.id().clone();
                     nodes.push(SchemaNode::GlobalVariable(g));
                     edges.push(structural_edge(
@@ -372,8 +351,7 @@ fn build_method(
     let visibility = php_method_visibility(node, content);
     let is_static = php_method_is_static(node, content);
     // PHP methods are virtual by default unless declared `final`.
-    let is_virtual =
-        !node_text(node, content).contains("final ");
+    let is_virtual = !node_text(node, content).contains("final ");
     Method::new(
         repo,
         source_path,
@@ -418,15 +396,9 @@ fn build_interface(
         return Ok(None);
     };
     let source_range = node_range(node, line_index)?;
-    SchemaInterface::new(
-        repo,
-        source_path,
-        &name,
-        source_range,
-        Visibility::Public,
-    )
-    .map(Some)
-    .map_err(node_construction_err)
+    SchemaInterface::new(repo, source_path, &name, source_range, Visibility::Public)
+        .map(Some)
+        .map_err(node_construction_err)
 }
 
 fn build_trait(
@@ -447,10 +419,7 @@ fn build_trait(
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-fn parameter_signatures(
-    function_or_method: Node<'_>,
-    content: &str,
-) -> Vec<ParameterSignature> {
+fn parameter_signatures(function_or_method: Node<'_>, content: &str) -> Vec<ParameterSignature> {
     let mut out = Vec::new();
     let Some(params) = function_or_method.child_by_field_name("parameters") else {
         return out;
@@ -479,10 +448,7 @@ fn parameter_signatures(
     out
 }
 
-fn synthesize_function_signature(
-    name: &str,
-    parameters: &[ParameterSignature],
-) -> String {
+fn synthesize_function_signature(name: &str, parameters: &[ParameterSignature]) -> String {
     let params_str = parameters
         .iter()
         .map(|p| {
@@ -517,33 +483,21 @@ fn php_method_is_static(node: Node<'_>, content: &str) -> bool {
     node_text(node, content).contains("static ")
 }
 
-fn node_range(
-    node: Node<'_>,
-    line_index: &LineIndex,
-) -> Result<SourceRange, LanguageIndexError> {
+fn node_range(node: Node<'_>, line_index: &LineIndex) -> Result<SourceRange, LanguageIndexError> {
     let start = line_index.line_at(node.start_byte());
     let end = line_index.line_at(node.end_byte());
-    SourceRange::new(start, end).map_err(|e| {
-        LanguageIndexError::NodeConstruction {
-            message: format!("source range: {e}"),
-        }
+    SourceRange::new(start, end).map_err(|e| LanguageIndexError::NodeConstruction {
+        message: format!("source range: {e}"),
     })
 }
 
-fn field_text(
-    node: Node<'_>,
-    field: &str,
-    content: &str,
-) -> Option<String> {
+fn field_text(node: Node<'_>, field: &str, content: &str) -> Option<String> {
     node.child_by_field_name(field)
         .and_then(|c| c.utf8_text(content.as_bytes()).ok())
         .map(|s| s.to_string())
 }
 
-fn first_named_child_text(
-    node: Node<'_>,
-    content: &str,
-) -> Option<String> {
+fn first_named_child_text(node: Node<'_>, content: &str) -> Option<String> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .next()
@@ -551,11 +505,7 @@ fn first_named_child_text(
         .map(|s| s.to_string())
 }
 
-fn first_named_child_named(
-    node: Node<'_>,
-    kind: &str,
-    content: &str,
-) -> Option<String> {
+fn first_named_child_named(node: Node<'_>, kind: &str, content: &str) -> Option<String> {
     let mut cursor = node.walk();
     for c in node.named_children(&mut cursor) {
         if c.kind() == kind {
@@ -569,17 +519,11 @@ fn node_text<'a>(node: Node<'_>, content: &'a str) -> &'a str {
     node.utf8_text(content.as_bytes()).unwrap_or("")
 }
 
-fn structural_edge(
-    attributes: EdgeAttributes,
-    src: NodeId,
-    dst: NodeId,
-) -> Edge {
+fn structural_edge(attributes: EdgeAttributes, src: NodeId, dst: NodeId) -> Edge {
     Edge::new(src, dst, attributes, Source::Structure, Confidence::FULL)
 }
 
-fn node_construction_err(
-    e: impl std::fmt::Display,
-) -> LanguageIndexError {
+fn node_construction_err(e: impl std::fmt::Display) -> LanguageIndexError {
     LanguageIndexError::NodeConstruction {
         message: e.to_string(),
     }
@@ -663,9 +607,7 @@ fn emit_php_use_placeholders(
     }
 
     // Collect (clause_node, optional_prefix) pairs to process.
-    let clauses: Vec<(Node<'_>, Option<String>)> = if let Some(group) =
-        group_node
-    {
+    let clauses: Vec<(Node<'_>, Option<String>)> = if let Some(group) = group_node {
         let mut gcursor = group.walk();
         group
             .named_children(&mut gcursor)
@@ -677,10 +619,7 @@ fn emit_php_use_placeholders(
         // namespace_use_declaration node as part of grammar quirks
         // for edge cases like `use \Foo;`, but in the common case
         // there's no prefix outside the group form.
-        simple_clauses
-            .into_iter()
-            .map(|c| (c, None))
-            .collect()
+        simple_clauses.into_iter().map(|c| (c, None)).collect()
     };
 
     for (clause, prefix) in clauses {
@@ -692,9 +631,7 @@ fn emit_php_use_placeholders(
             match child.kind() {
                 "name" | "qualified_name" => {
                     if imported_path.is_none() {
-                        imported_path = Some(
-                            node_text(child, content).to_string(),
-                        );
+                        imported_path = Some(node_text(child, content).to_string());
                     }
                 }
                 _ => {}

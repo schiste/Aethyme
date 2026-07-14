@@ -18,7 +18,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::layout::{engine_version_path, AETHYME_DIR, GRAPH_SUBDIR, INDEX_SUBDIR};
+use crate::layout::{AETHYME_DIR, GRAPH_SUBDIR, INDEX_SUBDIR, engine_version_path};
 
 /// The exact `.gitattributes` content the storage layer expects to
 /// live at `<repo>/.aethyme/graph/.gitattributes`. Three lines:
@@ -61,12 +61,10 @@ pub fn bootstrap_repo(
     fs::create_dir_all(&index_dir).map_err(BootstrapError::Io)?;
 
     let gitattributes = graph_dir.join(".gitattributes");
-    fs::write(&gitattributes, GITATTRIBUTES_CONTENT)
-        .map_err(BootstrapError::Io)?;
+    fs::write(&gitattributes, GITATTRIBUTES_CONTENT).map_err(BootstrapError::Io)?;
 
     let version_file = engine_version_path(repo_root);
-    fs::write(&version_file, format!("{engine_version}\n"))
-        .map_err(BootstrapError::Io)?;
+    fs::write(&version_file, format!("{engine_version}\n")).map_err(BootstrapError::Io)?;
 
     Ok(BootstrapPaths {
         graph_dir,
@@ -78,12 +76,9 @@ pub fn bootstrap_repo(
 
 /// Read the pinned engine version. Trims the trailing newline that
 /// `bootstrap_repo` writes.
-pub fn read_engine_version(
-    repo_root: &Path,
-) -> Result<String, EngineVersionReadError> {
+pub fn read_engine_version(repo_root: &Path) -> Result<String, EngineVersionReadError> {
     let path = engine_version_path(repo_root);
-    let contents = fs::read_to_string(&path)
-        .map_err(EngineVersionReadError::Io)?;
+    let contents = fs::read_to_string(&path).map_err(EngineVersionReadError::Io)?;
     let trimmed = contents.trim_end_matches('\n').trim_end_matches('\r');
     if trimmed.is_empty() {
         return Err(EngineVersionReadError::Empty);
@@ -123,9 +118,7 @@ pub enum BootstrapError {
 impl std::fmt::Display for BootstrapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyEngineVersion => {
-                f.write_str("bootstrap: engine_version must not be empty")
-            }
+            Self::EmptyEngineVersion => f.write_str("bootstrap: engine_version must not be empty"),
             Self::Io(e) => write!(f, "bootstrap I/O: {e}"),
         }
     }
@@ -142,9 +135,7 @@ pub enum EngineVersionReadError {
 impl std::fmt::Display for EngineVersionReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Empty => {
-                f.write_str("engine-version file is empty after trimming")
-            }
+            Self::Empty => f.write_str("engine-version file is empty after trimming"),
             Self::Io(e) => write!(f, "engine-version read I/O: {e}"),
         }
     }

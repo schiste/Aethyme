@@ -1,8 +1,7 @@
 //! Integration tests for the TypeScript / JavaScript indexer.
 
 use aethyme_graph_indexer::{
-    index_repo_to_disk, IndexerContext, LanguageIndexer, TypeScriptIndexer,
-    WalkOptions,
+    IndexerContext, LanguageIndexer, TypeScriptIndexer, WalkOptions, index_repo_to_disk,
 };
 use aethyme_graph_schema::NodeKind;
 use aethyme_graph_storage::read_fragment;
@@ -14,21 +13,14 @@ fn write(root: &std::path::Path, rel: &str, content: &[u8]) {
 }
 
 fn ctx(repo_root: &std::path::Path) -> IndexerContext {
-    IndexerContext::new("testrepo", repo_root.to_path_buf(), "0.1.0")
-        .unwrap()
+    IndexerContext::new("testrepo", repo_root.to_path_buf(), "0.1.0").unwrap()
 }
 
-fn index_source(
-    rel: &str,
-    content: &str,
-) -> aethyme_graph_indexer::LanguageIndexResult {
+fn index_source(rel: &str, content: &str) -> aethyme_graph_indexer::LanguageIndexResult {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), rel, content.as_bytes());
-    let walked = aethyme_graph_indexer::walk_source_tree(
-        &ctx(tmp.path()),
-        &WalkOptions::default(),
-    )
-    .unwrap();
+    let walked =
+        aethyme_graph_indexer::walk_source_tree(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     let indexed = walked
         .files
         .iter()
@@ -59,8 +51,7 @@ fn extracts_class_and_its_methods() {
         "class Foo {\n  bar() { return 1; }\n  baz(x: number) { return x; }\n}\n",
     );
     // Class + 2 Methods
-    let kinds: Vec<NodeKind> =
-        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    let kinds: Vec<NodeKind> = result.additional_nodes.iter().map(|n| n.kind()).collect();
     assert_eq!(kinds.iter().filter(|k| **k == NodeKind::Class).count(), 1);
     assert_eq!(kinds.iter().filter(|k| **k == NodeKind::Method).count(), 2);
     // 1 Contains + 2 Defines
@@ -90,30 +81,21 @@ fn extracts_interface() {
         "src/x.ts",
         "interface User {\n  id: number;\n  name: string;\n}\n",
     );
-    let kinds: Vec<NodeKind> =
-        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    let kinds: Vec<NodeKind> = result.additional_nodes.iter().map(|n| n.kind()).collect();
     assert!(kinds.contains(&NodeKind::Interface));
 }
 
 #[test]
 fn extracts_type_alias() {
-    let result = index_source(
-        "src/x.ts",
-        "type UserId = number;\n",
-    );
-    let kinds: Vec<NodeKind> =
-        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    let result = index_source("src/x.ts", "type UserId = number;\n");
+    let kinds: Vec<NodeKind> = result.additional_nodes.iter().map(|n| n.kind()).collect();
     assert!(kinds.contains(&NodeKind::TypeAlias));
 }
 
 #[test]
 fn extracts_enum() {
-    let result = index_source(
-        "src/x.ts",
-        "enum Color { Red, Green, Blue }\n",
-    );
-    let kinds: Vec<NodeKind> =
-        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    let result = index_source("src/x.ts", "enum Color { Red, Green, Blue }\n");
+    let kinds: Vec<NodeKind> = result.additional_nodes.iter().map(|n| n.kind()).collect();
     assert!(kinds.contains(&NodeKind::Enum));
 }
 
@@ -173,8 +155,7 @@ fn handles_javascript_files() {
         "src/x.js",
         "function hello() { return 'hi'; }\nclass Foo { bar() {} }\n",
     );
-    let kinds: Vec<NodeKind> =
-        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    let kinds: Vec<NodeKind> = result.additional_nodes.iter().map(|n| n.kind()).collect();
     assert!(kinds.contains(&NodeKind::Function));
     assert!(kinds.contains(&NodeKind::Class));
 }
@@ -191,8 +172,7 @@ fn end_to_end_typescript_file_produces_enriched_fragment() {
           class Component {\n  render(props: Props) { return null; }\n}\n",
     );
 
-    let summary =
-        index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let summary = index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     assert_eq!(summary.total_files, 1);
 
     let frag = read_fragment(tmp.path(), "src/component.ts").unwrap();
@@ -204,14 +184,9 @@ fn end_to_end_typescript_file_produces_enriched_fragment() {
 fn end_to_end_mixed_python_and_typescript_indexed_separately() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "src/cli.py", b"def foo():\n    pass\n");
-    write(
-        tmp.path(),
-        "src/web.ts",
-        b"function bar() { return 1; }\n",
-    );
+    write(tmp.path(), "src/web.ts", b"function bar() { return 1; }\n");
 
-    let summary =
-        index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let summary = index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     // Each file has File + Function = 2 nodes; total 4 nodes.
     assert_eq!(summary.counts_by_kind.get(&NodeKind::File), Some(&2));
     assert_eq!(summary.counts_by_kind.get(&NodeKind::Function), Some(&2));
@@ -227,12 +202,10 @@ fn end_to_end_determinism_for_typescript() {
     );
 
     index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
-    let bytes_a =
-        std::fs::read(tmp.path().join(".aethyme/graph/src/x.ts.bin")).unwrap();
+    let bytes_a = std::fs::read(tmp.path().join(".aethyme/graph/src/x.ts.bin")).unwrap();
     std::fs::remove_dir_all(tmp.path().join(".aethyme")).unwrap();
     index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
-    let bytes_b =
-        std::fs::read(tmp.path().join(".aethyme/graph/src/x.ts.bin")).unwrap();
+    let bytes_b = std::fs::read(tmp.path().join(".aethyme/graph/src/x.ts.bin")).unwrap();
     assert_eq!(bytes_a, bytes_b);
 }
 
@@ -248,7 +221,10 @@ fn ts_default_import_emits_placeholder() {
         .count();
     assert_eq!(n_unresolved, 1);
     let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
-    assert!(node_json.contains("\"name\":\"React\""), "node: {node_json}");
+    assert!(
+        node_json.contains("\"name\":\"React\""),
+        "node: {node_json}"
+    );
     let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
     assert!(edge_json.contains("\"import_path\":\"react\""));
     assert!(edge_json.contains("\"is_default\":true"));
@@ -273,9 +249,17 @@ fn ts_named_import_emits_placeholder_per_name() {
         .map(|e| serde_json::to_string(e).unwrap())
         .collect();
     // useState: binding=useState, import_path=react::useState
-    assert!(edge_jsons.iter().any(|j| j.contains("\"import_path\":\"react::useState\"")));
+    assert!(
+        edge_jsons
+            .iter()
+            .any(|j| j.contains("\"import_path\":\"react::useState\""))
+    );
     // useEffect aliased to ue: binding=ue, import_path=react::useEffect
-    assert!(edge_jsons.iter().any(|j| j.contains("\"import_path\":\"react::useEffect\"")));
+    assert!(
+        edge_jsons
+            .iter()
+            .any(|j| j.contains("\"import_path\":\"react::useEffect\""))
+    );
     // All named imports
     assert!(edge_jsons.iter().all(|j| j.contains("\"is_named\":true")));
     // Binding names visible in node JSON
@@ -284,16 +268,17 @@ fn ts_named_import_emits_placeholder_per_name() {
         .iter()
         .map(|n| serde_json::to_string(n).unwrap())
         .collect();
-    assert!(node_names.iter().any(|j| j.contains("\"name\":\"useState\"")));
+    assert!(
+        node_names
+            .iter()
+            .any(|j| j.contains("\"name\":\"useState\""))
+    );
     assert!(node_names.iter().any(|j| j.contains("\"name\":\"ue\"")));
 }
 
 #[test]
 fn ts_namespace_import_emits_module_placeholder() {
-    let result = index_source(
-        "src/x.ts",
-        "import * as fs from 'node:fs';\n",
-    );
+    let result = index_source("src/x.ts", "import * as fs from 'node:fs';\n");
     assert_eq!(result.additional_nodes.len(), 1);
     let node_json = serde_json::to_string(&result.additional_nodes[0]).unwrap();
     assert!(node_json.contains("\"name\":\"fs\""), "node: {node_json}");
@@ -315,10 +300,7 @@ fn ts_side_effect_import_emits_one_placeholder() {
 
 #[test]
 fn ts_relative_import_path_preserved() {
-    let result = index_source(
-        "src/x.ts",
-        "import { Helper } from './util/helper';\n",
-    );
+    let result = index_source("src/x.ts", "import { Helper } from './util/helper';\n");
     let edge_json = serde_json::to_string(&result.additional_edges[0]).unwrap();
     assert!(
         edge_json.contains("\"import_path\":\"./util/helper::Helper\""),
@@ -337,8 +319,7 @@ fn ts_imports_coexist_with_other_extractions() {
         "src/x.ts",
         "import { X } from './x';\n\nfunction f() {}\n\nclass C {}\n",
     );
-    let kinds: Vec<NodeKind> =
-        result.additional_nodes.iter().map(|n| n.kind()).collect();
+    let kinds: Vec<NodeKind> = result.additional_nodes.iter().map(|n| n.kind()).collect();
     assert!(kinds.contains(&NodeKind::UnresolvedSymbol));
     assert!(kinds.contains(&NodeKind::Function));
     assert!(kinds.contains(&NodeKind::Class));

@@ -49,7 +49,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::layout::{validate_module_name, InvalidPath};
+use crate::layout::{InvalidPath, validate_module_name};
 
 /// A typed overlay payload written to `_overlays/<kind>.bin`.
 ///
@@ -88,11 +88,7 @@ impl<P> OverlayFragment<P> {
     /// [`validate_module_name`] (overlay kinds share the same
     /// path-safety rules as module names — no separators, no NUL,
     /// no `.`/`..`).
-    pub fn new(
-        kind: &str,
-        producer_version: &str,
-        payload: P,
-    ) -> Result<Self, OverlayBuildError> {
+    pub fn new(kind: &str, producer_version: &str, payload: P) -> Result<Self, OverlayBuildError> {
         validate_module_name(kind).map_err(OverlayBuildError::Kind)?;
         if producer_version.is_empty() {
             return Err(OverlayBuildError::EmptyProducerVersion);
@@ -165,11 +161,10 @@ pub fn read_overlay_bytes<P: DeserializeOwned>(
     bytes: &[u8],
     expected_kind: &str,
 ) -> Result<OverlayFragment<P>, OverlayDecodeError> {
-    let overlay: OverlayFragment<P> = bincode::deserialize(bytes).map_err(
-        |e| OverlayDecodeError::Bincode {
+    let overlay: OverlayFragment<P> =
+        bincode::deserialize(bytes).map_err(|e| OverlayDecodeError::Bincode {
             message: e.to_string(),
-        },
-    )?;
+        })?;
     if overlay.schema_version() != OverlayFragment::<P>::SCHEMA_VERSION {
         return Err(OverlayDecodeError::SchemaVersionMismatch {
             expected: OverlayFragment::<P>::SCHEMA_VERSION,
@@ -200,9 +195,9 @@ impl std::fmt::Display for OverlayBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Kind(e) => write!(f, "OverlayFragment: invalid kind: {e}"),
-            Self::EmptyProducerVersion => f.write_str(
-                "OverlayFragment: producer_version must not be empty",
-            ),
+            Self::EmptyProducerVersion => {
+                f.write_str("OverlayFragment: producer_version must not be empty")
+            }
         }
     }
 }

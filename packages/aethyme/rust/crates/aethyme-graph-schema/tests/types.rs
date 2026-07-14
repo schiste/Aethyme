@@ -1,9 +1,8 @@
 //! Integration tests for type-defining node kinds.
 
 use aethyme_graph_schema::{
-    Class, Enum, EnumConstructionError, EnumVariant, Interface, NodeKind,
-    SourceRange, Struct, Trait, TypeAlias, TypeAliasConstructionError,
-    Visibility,
+    Class, Enum, EnumConstructionError, EnumVariant, Interface, NodeKind, SourceRange, Struct,
+    Trait, TypeAlias, TypeAliasConstructionError, Visibility,
 };
 
 fn range() -> SourceRange {
@@ -13,34 +12,16 @@ fn range() -> SourceRange {
 #[test]
 fn class_struct_interface_trait_share_construction_shape() {
     // Spot-check each of the four "basic" type-defining kinds.
-    let c =
-        Class::new("aethyme", "src/x.py", "Foo", range(), Visibility::Public)
-            .unwrap();
+    let c = Class::new("aethyme", "src/x.py", "Foo", range(), Visibility::Public).unwrap();
     assert_eq!(c.id().kind(), NodeKind::Class);
 
-    let s = Struct::new(
-        "aethyme",
-        "src/x.rs",
-        "Bar",
-        range(),
-        Visibility::Public,
-    )
-    .unwrap();
+    let s = Struct::new("aethyme", "src/x.rs", "Bar", range(), Visibility::Public).unwrap();
     assert_eq!(s.id().kind(), NodeKind::Struct);
 
-    let i = Interface::new(
-        "aethyme",
-        "src/x.ts",
-        "Baz",
-        range(),
-        Visibility::Public,
-    )
-    .unwrap();
+    let i = Interface::new("aethyme", "src/x.ts", "Baz", range(), Visibility::Public).unwrap();
     assert_eq!(i.id().kind(), NodeKind::Interface);
 
-    let t =
-        Trait::new("aethyme", "src/x.rs", "Qux", range(), Visibility::Public)
-            .unwrap();
+    let t = Trait::new("aethyme", "src/x.rs", "Qux", range(), Visibility::Public).unwrap();
     assert_eq!(t.id().kind(), NodeKind::Trait);
 }
 
@@ -54,9 +35,7 @@ fn class_rejects_empty_inputs() {
 
 #[test]
 fn basic_kinds_round_trip_through_serde() {
-    let c =
-        Class::new("aethyme", "src/x.py", "Foo", range(), Visibility::Public)
-            .unwrap();
+    let c = Class::new("aethyme", "src/x.py", "Foo", range(), Visibility::Public).unwrap();
     let json = serde_json::to_string(&c).unwrap();
     let back: Class = serde_json::from_str(&json).unwrap();
     assert_eq!(back, c);

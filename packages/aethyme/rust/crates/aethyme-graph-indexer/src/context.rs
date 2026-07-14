@@ -47,9 +47,7 @@ impl IndexerContext {
         }
         let repo_root = repo_root.into();
         if !repo_root.is_absolute() {
-            return Err(IndexerContextError::RelativeRepoRoot {
-                given: repo_root,
-            });
+            return Err(IndexerContextError::RelativeRepoRoot { given: repo_root });
         }
         Ok(IndexerContext {
             repo_name: repo_name.into(),
@@ -80,17 +78,15 @@ pub enum IndexerContextError {
 impl std::fmt::Display for IndexerContextError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyRepoName => {
-                f.write_str("IndexerContext: repo_name must not be empty")
-            }
+            Self::EmptyRepoName => f.write_str("IndexerContext: repo_name must not be empty"),
             Self::RepoNameContainsColon { given } => write!(
                 f,
                 "IndexerContext: repo_name {given:?} contains ':', \
                  which is forbidden by NodeId's identifier format"
             ),
-            Self::EmptyEngineVersion => f.write_str(
-                "IndexerContext: engine_version must not be empty",
-            ),
+            Self::EmptyEngineVersion => {
+                f.write_str("IndexerContext: engine_version must not be empty")
+            }
             Self::RelativeRepoRoot { given } => write!(
                 f,
                 "IndexerContext: repo_root {given:?} is relative; \

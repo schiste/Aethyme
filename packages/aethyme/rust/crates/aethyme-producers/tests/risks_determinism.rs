@@ -51,15 +51,12 @@
 //! weren't, the harness would accept input-order bytes.
 
 use aethyme_graph_schema::{
-    Confidence, Edge, EdgeAttributes, File, Function, Node,
-    ParameterSignature, Source, SourceRange, Visibility,
+    Confidence, Edge, EdgeAttributes, File, Function, Node, ParameterSignature, Source,
+    SourceRange, Visibility,
 };
-use aethyme_graph_storage::{
-    bootstrap_repo, write_fragment, Fragment, FragmentStore,
-};
+use aethyme_graph_storage::{Fragment, FragmentStore, bootstrap_repo, write_fragment};
 use aethyme_producers::{
-    assert_overlay_producer_is_deterministic, ProducerCtx, RepoFileView,
-    RepoView, RisksProducer,
+    ProducerCtx, RepoFileView, RepoView, RisksProducer, assert_overlay_producer_is_deterministic,
 };
 use tempfile::TempDir;
 
@@ -155,15 +152,13 @@ fn store_fixture() -> (TempDir, FragmentStore) {
 /// `dst_path` File. In-degree = number of distinct importers; mirrors
 /// the unit-test helper in `src/risks.rs`.
 fn importer_fragment(dst_path: &str, src_paths: &[&str]) -> Fragment {
-    let dst = File::new(REPO, dst_path, "typescript", 100, "h")
-        .expect("dst node");
+    let dst = File::new(REPO, dst_path, "typescript", 100, "h").expect("dst node");
     let dst_id = dst.id().clone();
 
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     for src_path in src_paths {
-        let src = File::new(REPO, src_path, "typescript", 100, "h")
-            .expect("src node");
+        let src = File::new(REPO, src_path, "typescript", 100, "h").expect("src node");
         let edge = Edge::new(
             src.id().clone(),
             dst_id.clone(),

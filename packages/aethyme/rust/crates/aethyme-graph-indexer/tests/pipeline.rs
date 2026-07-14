@@ -1,8 +1,7 @@
 //! Integration tests for the IndexedFile → Fragment → disk pipeline.
 
 use aethyme_graph_indexer::{
-    build_fragment, build_index_records, index_repo_to_disk,
-    IndexerContext, WalkOptions,
+    IndexerContext, WalkOptions, build_fragment, build_index_records, index_repo_to_disk,
 };
 use aethyme_graph_schema::NodeKind;
 use aethyme_graph_storage::{read_fragment, read_index_shard};
@@ -14,8 +13,7 @@ fn write(root: &std::path::Path, rel: &str, content: &[u8]) {
 }
 
 fn ctx(repo_root: &std::path::Path) -> IndexerContext {
-    IndexerContext::new("testrepo", repo_root.to_path_buf(), "0.1.0")
-        .unwrap()
+    IndexerContext::new("testrepo", repo_root.to_path_buf(), "0.1.0").unwrap()
 }
 
 // ─── build_fragment ─────────────────────────────────────────────────
@@ -24,11 +22,8 @@ fn ctx(repo_root: &std::path::Path) -> IndexerContext {
 fn build_fragment_wraps_a_single_indexed_file() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "src/cli.py", b"print('hi')\n");
-    let walked = aethyme_graph_indexer::walk_source_tree(
-        &ctx(tmp.path()),
-        &WalkOptions::default(),
-    )
-    .unwrap();
+    let walked =
+        aethyme_graph_indexer::walk_source_tree(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     assert_eq!(walked.files.len(), 1);
     let built = build_fragment(&walked.files[0], None).unwrap();
     assert_eq!(&*built.source_path, "src/cli.py");
@@ -44,11 +39,8 @@ fn index_records_group_by_synthesized_module() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "src/cli.py", b"def alpha():\n    pass\n");
     write(tmp.path(), "src/util.py", b"def beta():\n    pass\n");
-    let walked = aethyme_graph_indexer::walk_source_tree(
-        &ctx(tmp.path()),
-        &WalkOptions::default(),
-    )
-    .unwrap();
+    let walked =
+        aethyme_graph_indexer::walk_source_tree(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
 
     // build_index_records now takes BuiltFragments (post-4.3) so
     // we have to walk the pipeline a step further to construct
@@ -58,9 +50,7 @@ fn index_records_group_by_synthesized_module() {
     use aethyme_graph_indexer::LanguageIndexer;
     let mut built = Vec::new();
     for indexed in &walked.files {
-        let content =
-            std::fs::read_to_string(tmp.path().join(&*indexed.source_path))
-                .unwrap();
+        let content = std::fs::read_to_string(tmp.path().join(&*indexed.source_path)).unwrap();
         let lang = py_indexer
             .index_file(&ctx(tmp.path()), indexed, &content)
             .unwrap();
@@ -75,8 +65,7 @@ fn index_records_group_by_synthesized_module() {
     let cli_records = &groups["src.cli"];
     // alpha (extracted Function); File and NonCodeFile are
     // skipped by the name-only emission rule.
-    let symbol_names: Vec<&str> =
-        cli_records.iter().map(|r| r.symbol.as_ref()).collect();
+    let symbol_names: Vec<&str> = cli_records.iter().map(|r| r.symbol.as_ref()).collect();
     assert!(symbol_names.contains(&"alpha"));
 }
 
@@ -92,8 +81,7 @@ fn index_repo_writes_fragments_to_canonical_paths() {
     write(tmp.path(), "src/cli.py", b"def hello():\n    return 'hi'\n");
     write(tmp.path(), "README.md", b"# heading\n");
 
-    let summary =
-        index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let summary = index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     assert_eq!(summary.total_files, 2);
     assert_eq!(summary.fragments_written.len(), 2);
 
@@ -131,8 +119,7 @@ fn index_repo_round_trip_index_shard_decode_works() {
     // One record per extracted named symbol; the File node itself
     // is unnamed and skipped.
     assert!(!records.is_empty());
-    let names: Vec<&str> =
-        records.iter().map(|r| r.symbol.as_ref()).collect();
+    let names: Vec<&str> = records.iter().map(|r| r.symbol.as_ref()).collect();
     assert!(names.contains(&"hello"));
     assert!(records.iter().any(|r| r.kind == NodeKind::Function));
 }
@@ -147,20 +134,14 @@ fn index_repo_is_idempotent() {
     write(tmp.path(), "README.md", b"# md\n");
 
     index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
-    let bytes_first =
-        std::fs::read(tmp.path().join(".aethyme/graph/src/cli.py.bin")).unwrap();
-    let shard_first = std::fs::read(
-        tmp.path().join(".aethyme/graph/_index/src.cli.ndjson"),
-    )
-    .unwrap();
+    let bytes_first = std::fs::read(tmp.path().join(".aethyme/graph/src/cli.py.bin")).unwrap();
+    let shard_first =
+        std::fs::read(tmp.path().join(".aethyme/graph/_index/src.cli.ndjson")).unwrap();
 
     index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
-    let bytes_second =
-        std::fs::read(tmp.path().join(".aethyme/graph/src/cli.py.bin")).unwrap();
-    let shard_second = std::fs::read(
-        tmp.path().join(".aethyme/graph/_index/src.cli.ndjson"),
-    )
-    .unwrap();
+    let bytes_second = std::fs::read(tmp.path().join(".aethyme/graph/src/cli.py.bin")).unwrap();
+    let shard_second =
+        std::fs::read(tmp.path().join(".aethyme/graph/_index/src.cli.ndjson")).unwrap();
 
     assert_eq!(bytes_first, bytes_second);
     assert_eq!(shard_first, shard_second);
@@ -174,8 +155,7 @@ fn index_repo_counts_by_kind() {
     write(tmp.path(), "src/c.rs", b"// rs\n");
     write(tmp.path(), "README.md", b"# md\n");
 
-    let summary =
-        index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let summary = index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     assert_eq!(summary.total_files, 4);
     // 3 File nodes (py + py + rs) and 1 NonCodeFile node (md)
     assert_eq!(summary.counts_by_kind.get(&NodeKind::File), Some(&3));
@@ -185,8 +165,7 @@ fn index_repo_counts_by_kind() {
 #[test]
 fn index_repo_handles_empty_tree() {
     let tmp = tempfile::tempdir().unwrap();
-    let summary =
-        index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    let summary = index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     assert_eq!(summary.total_files, 0);
     assert!(summary.fragments_written.is_empty());
     assert!(summary.shards_written.is_empty());

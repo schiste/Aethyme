@@ -76,9 +76,8 @@ use rayon::prelude::*;
 
 use aethyme_graph_schema::{Edge, EdgeAttributes, EdgeKind, Node, NodeId, NodeKind};
 use aethyme_graph_storage::{
-    write_fragment, Fragment, FragmentBuildError, FragmentReadError,
-    FragmentStore, FragmentWriteError, IndexShardReadError, StoreOpenError,
-    SymbolRecord,
+    Fragment, FragmentBuildError, FragmentReadError, FragmentStore, FragmentWriteError,
+    IndexShardReadError, StoreOpenError, SymbolRecord, write_fragment,
 };
 
 use crate::context::IndexerContext;
@@ -109,8 +108,7 @@ pub struct LinkSummary {
 /// (the only placeholders left are the unresolvable ones, which
 /// resolve again to the same outcome). Tests cover this.
 pub fn link_repo(ctx: &IndexerContext) -> Result<LinkSummary, LinkError> {
-    let store = FragmentStore::open(ctx.repo_root())
-        .map_err(LinkError::OpenStore)?;
+    let store = FragmentStore::open(ctx.repo_root()).map_err(LinkError::OpenStore)?;
     link_with_store(&store)
 }
 
@@ -220,9 +218,7 @@ fn link_one_fragment(
             if edge.kind() != EdgeKind::Imports {
                 return edge.clone();
             }
-            match global_index
-                .resolve_imports_edge(placeholder, edge.attributes())
-            {
+            match global_index.resolve_imports_edge(placeholder, edge.attributes()) {
                 Some(target) => {
                     edges_rewritten += 1;
                     resolved_placeholders.insert(edge.dst_id().clone());
@@ -268,19 +264,18 @@ fn link_one_fragment(
             was_rewritten,
         });
     }
-    let new_fragment =
-        Fragment::new(fragment.file_path(), new_nodes, new_edges).map_err(
-            |e| LinkError::RebuildFragment {
-                source_path: source_path.to_string(),
-                inner: e,
-            },
-        )?;
-    write_fragment(store.repo_root(), source_path, &new_fragment).map_err(
-        |e| LinkError::WriteFragment {
+    let new_fragment = Fragment::new(fragment.file_path(), new_nodes, new_edges).map_err(|e| {
+        LinkError::RebuildFragment {
             source_path: source_path.to_string(),
             inner: e,
-        },
-    )?;
+        }
+    })?;
+    write_fragment(store.repo_root(), source_path, &new_fragment).map_err(|e| {
+        LinkError::WriteFragment {
+            source_path: source_path.to_string(),
+            inner: e,
+        }
+    })?;
     Ok(FragmentResolution {
         placeholders_seen,
         placeholders_resolved,
@@ -347,19 +342,19 @@ impl GlobalSymbolIndex {
         //   1. Walk fragments to populate `module_to_file_node`
         //      (needed for namespace-import resolution).
         //   2. Walk index shards to populate the symbol maps.
-        let mut module_to_file_node: HashMap<String, ResolvedRecord> =
-            HashMap::new();
+        let mut module_to_file_node: HashMap<String, ResolvedRecord> = HashMap::new();
 
         for source_path in store
             .list_indexed_source_paths()
             .map_err(LinkError::OpenStore)?
         {
-            let fragment = store.read_fragment(&source_path).map_err(|e| {
-                LinkError::ReadFragment {
-                    source_path: source_path.clone(),
-                    inner: e,
-                }
-            })?;
+            let fragment =
+                store
+                    .read_fragment(&source_path)
+                    .map_err(|e| LinkError::ReadFragment {
+                        source_path: source_path.clone(),
+                        inner: e,
+                    })?;
             for node in fragment.nodes() {
                 if let Node::File(_) = node {
                     let module = synthesize_module_name(&source_path);
@@ -378,19 +373,17 @@ impl GlobalSymbolIndex {
         }
 
         let mut by_name: HashMap<String, Vec<ResolvedRecord>> = HashMap::new();
-        let mut by_module_and_name: HashMap<
-            (String, String),
-            Vec<ResolvedRecord>,
-        > = HashMap::new();
+        let mut by_module_and_name: HashMap<(String, String), Vec<ResolvedRecord>> = HashMap::new();
 
         let modules = store.list_modules().map_err(LinkError::OpenStore)?;
         for module in &modules {
-            let records = store.read_index_shard(module).map_err(|e| {
-                LinkError::ReadIndexShard {
-                    module: module.clone(),
-                    inner: e,
-                }
-            })?;
+            let records =
+                store
+                    .read_index_shard(module)
+                    .map_err(|e| LinkError::ReadIndexShard {
+                        module: module.clone(),
+                        inner: e,
+                    })?;
             for record in records {
                 if record.kind == NodeKind::UnresolvedSymbol {
                     // Imports-from-imports: skip these in the
@@ -460,8 +453,7 @@ impl GlobalSymbolIndex {
             if import_path.starts_with('.') {
                 return None;
             }
-            let (module_part, symbol_part) = match import_path.rsplit_once('.')
-            {
+            let (module_part, symbol_part) = match import_path.rsplit_once('.') {
                 Some(pair) => pair,
                 None => ("", import_path),
             };
@@ -554,22 +546,18 @@ impl std::fmt::Display for LinkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::OpenStore(e) => write!(f, "link_repo: open store: {e}"),
-            Self::ReadFragment { source_path, inner } => write!(
-                f,
-                "link_repo: read fragment {source_path:?}: {inner}"
-            ),
-            Self::ReadIndexShard { module, inner } => write!(
-                f,
-                "link_repo: read index shard {module:?}: {inner}"
-            ),
-            Self::RebuildFragment { source_path, inner } => write!(
-                f,
-                "link_repo: rebuild fragment {source_path:?}: {inner}"
-            ),
-            Self::WriteFragment { source_path, inner } => write!(
-                f,
-                "link_repo: write fragment {source_path:?}: {inner}"
-            ),
+            Self::ReadFragment { source_path, inner } => {
+                write!(f, "link_repo: read fragment {source_path:?}: {inner}")
+            }
+            Self::ReadIndexShard { module, inner } => {
+                write!(f, "link_repo: read index shard {module:?}: {inner}")
+            }
+            Self::RebuildFragment { source_path, inner } => {
+                write!(f, "link_repo: rebuild fragment {source_path:?}: {inner}")
+            }
+            Self::WriteFragment { source_path, inner } => {
+                write!(f, "link_repo: write fragment {source_path:?}: {inner}")
+            }
         }
     }
 }
@@ -593,10 +581,7 @@ mod tests {
         // one — they must stay aligned or linker lookups by module
         // diverge from indexer-emitted shard module names.
         assert_eq!(synthesize_module_name("src/cli.py"), "src.cli");
-        assert_eq!(
-            synthesize_module_name("a/b/c.rs"),
-            "a.b.c"
-        );
+        assert_eq!(synthesize_module_name("a/b/c.rs"), "a.b.c");
         assert_eq!(synthesize_module_name("README.md"), "README");
     }
 }
