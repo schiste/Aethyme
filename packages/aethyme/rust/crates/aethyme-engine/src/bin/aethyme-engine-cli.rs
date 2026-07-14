@@ -830,7 +830,7 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 // running, so out-of-repo callers can detect the condition.
 
 fn run_explore_via_shared_cli(args: &[String]) -> Result<(), String> {
-    use aethyme_engine::explore_cli::{ExploreCliOutcome, run};
+    use aethyme_engine::explore_cli::{run, ExploreCliOutcome};
     match run(args) {
         ExploreCliOutcome::Done => Ok(()),
         ExploreCliOutcome::DaemonNotRunning { repo } => {
@@ -1357,6 +1357,7 @@ fn index_to_store(
     // Repo metadata — outside the IndexSession because it's a one-shot
     // META write and we want it persisted only after the bulk load succeeded.
     profiler.stage("metadata_write", || {
+        fail_metadata_write_for_test()?;
         let commit = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(&canonical)
@@ -1421,4 +1422,17 @@ fn file_size_bytes(path: &Path) -> Result<u64, String> {
     std::fs::metadata(path)
         .map(|meta| meta.len())
         .map_err(|e| format!("stat {}: {e}", path.display()))
+}
+
+#[cfg(debug_assertions)]
+fn fail_metadata_write_for_test() -> Result<(), String> {
+    if std::env::var("AETHYME_TEST_FAIL_REDB_METADATA_WRITE").as_deref() == Ok("1") {
+        return Err("test-injected redb metadata write failure".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn fail_metadata_write_for_test() -> Result<(), String> {
+    Ok(())
 }

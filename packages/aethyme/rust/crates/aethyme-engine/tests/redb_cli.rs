@@ -33,6 +33,18 @@ where
         .expect("spawn aethyme-engine-cli")
 }
 
+fn run_engine_with_env<I, S>(args: I, env_key: &str, env_value: &str) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Command::new(engine_bin())
+        .args(args)
+        .env(env_key, env_value)
+        .output()
+        .expect("spawn aethyme-engine-cli")
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -85,6 +97,30 @@ fn build_redb_fixture() -> tempfile::TempDir {
     tmp
 }
 
+fn query_area_prefixes(repo: &Path) -> Vec<String> {
+    let output = run_engine([
+        "query-areas",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--depth",
+        "1",
+    ]);
+    assert_success(&output);
+    let areas: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("query-areas JSON parses");
+    areas
+        .as_array()
+        .expect("areas array")
+        .iter()
+        .map(|area| {
+            area["path_prefix"]
+                .as_str()
+                .expect("path_prefix")
+                .to_string()
+        })
+        .collect()
+}
+
 #[test]
 fn index_creates_graph_store_redb() {
     let tmp = build_fragment_fixture();
@@ -94,6 +130,24 @@ fn index_creates_graph_store_redb() {
 
     let store_path = tmp.path().join(".aethyme/graph_store.redb");
     assert!(store_path.is_file(), "missing {}", store_path.display());
+}
+
+#[test]
+fn normal_index_removes_stale_staging_store() {
+    let tmp = build_fragment_fixture();
+    let staging_path = tmp.path().join(".aethyme/graph_store.redb.indexing");
+    std::fs::write(&staging_path, b"stale staged store").unwrap();
+    assert!(staging_path.exists(), "test setup creates stale staging");
+
+    let output = run_engine(["index", "--repo", tmp.path().to_str().unwrap()]);
+    assert_success(&output);
+
+    assert!(tmp.path().join(".aethyme/graph_store.redb").is_file());
+    assert!(
+        !staging_path.exists(),
+        "normal index must remove stale {}",
+        staging_path.display()
+    );
 }
 
 #[test]
@@ -193,7 +247,7 @@ fn query_overview_json_shape_is_stable() {
 }
 
 #[test]
-fn query_commands_fail_cleanly_when_store_is_missing() {
+fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
     let tmp = build_fragment_fixture();
     let store_path = tmp.path().join(".aethyme/graph_store.redb");
     assert!(!store_path.exists());
@@ -251,5 +305,63 @@ fn query_commands_fail_cleanly_when_store_is_missing() {
         !store_path.exists(),
         "read-only query commands must not create {}",
         store_path.display()
+    );
+}
+
+#[test]
+fn disposable_fast_only_publishes_after_successful_metadata_write() {
+    let tmp = build_redb_fixture();
+    let final_path = tmp.path().join(".aethyme/graph_store.redb");
+    let staging_path = tmp.path().join(".aethyme/graph_store.redb.indexing");
+    assert!(final_path.is_file(), "public store exists before rebuild");
+    assert!(!staging_path.exists(), "no staging before rebuild");
+    assert_eq!(query_area_prefixes(tmp.path()), vec!["src", "tests"]);
+
+    write(
+        tmp.path(),
+        "app/main.py",
+        b"def main():\n    return 'new top-level area'\n",
+    );
+    let root = tmp.path().canonicalize().unwrap();
+    let ctx = IndexerContext::new("TinyRepo", root, "test-engine").unwrap();
+    let summary = index_repo_to_disk(
+        &ctx,
+        &WalkOptions {
+            extra_ignore_dirs: vec![".chau7".to_string()],
+            max_file_size_bytes: None,
+        },
+    )
+    .expect("refresh fragments");
+    assert_eq!(summary.total_files, 3);
+
+    let output = run_engine_with_env(
+        [
+            "index",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--disposable-fast",
+        ],
+        "AETHYME_TEST_FAIL_REDB_METADATA_WRITE",
+        "1",
+    );
+    assert_failure(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("test-injected redb metadata write failure"),
+        "stderr={stderr}"
+    );
+
+    assert!(
+        final_path.is_file(),
+        "failed disposable-fast rebuild must leave public store in place"
+    );
+    assert!(
+        staging_path.is_file(),
+        "failed disposable-fast rebuild should not publish staging"
+    );
+    assert_eq!(
+        query_area_prefixes(tmp.path()),
+        vec!["src", "tests"],
+        "public store must still reflect the pre-failure index"
     );
 }
