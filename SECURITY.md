@@ -5,7 +5,7 @@
 The public open-source support scope is `packages/aethyme`, the Aethyme Core
 tooling package.
 
-`packages/aethyme-cloud` is not production
+Removed historical packages (recoverable from git history) are not production
 security support surfaces unless they are explicitly moved into the public
 release scope.
 

@@ -29,20 +29,18 @@ graph traversal, search, and task context generation in
   the broker. See
   [`docs/aethyme-local-agent-broker.md`](docs/aethyme-local-agent-broker.md).
 
-**Present but out of scope / frozen**
+**Removed**
 
-- `packages/aethyme-cloud` (SaaS scaffold) and the PostgreSQL/SCIP API lineage
-  inside `packages/aethyme/src` are earlier cloud-oriented work. They are not
-  part of the current local-first direction and are not required by any local
-  workflow. No cloud execution, auth, or team sync is part of broker v0.
+- The earlier cloud-oriented work (the `packages/aethyme-cloud` SaaS scaffold
+  and the PostgreSQL/SCIP API lineage) was removed on 2026-07-13/14. No cloud
+  execution, auth, or team sync is part of the product. Recoverable from git
+  history.
 
 ## Repository Layout
 
 - `packages/aethyme`: core Python CLI code, Rust engine and broker workspace,
   graph indexing, search, and scorecard.
 - `packages/aethyme/rust`: deterministic Rust engine and graph crates.
-- `packages/aethyme-cloud`: SaaS-oriented application shell. Experimental for
-  public OSS purposes.
 - `docs`: project-level planning and architecture notes.
 
 ## Quick Start
