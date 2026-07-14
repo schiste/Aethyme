@@ -1,6 +1,15 @@
 # Phase 3 — SurrealDB Graph Store → redb Migration Plan
 
-Last Updated: 2026-05-04
+Last Updated: 2026-07-14
+
+Status: **Historical migration plan.** The SurrealDB-to-redb replacement
+described here has completed for the V1 materialized-store contract. This
+document preserves the rationale and original worklist; it is not the
+current graph contract. The current contract lives in
+[`graph-schema.md`](graph-schema.md) and
+[`cross-process-consumers.md`](cross-process-consumers.md): committed
+`.aethyme/graph/` fragments are the source of truth, and
+`.aethyme/graph_store.redb` is a derived local query artifact.
 
 ## Forcing function
 
@@ -22,7 +31,11 @@ parse-cache workload (`store/redb/parse_store.rs`).
 | Per-snapshot files give free GC and immutable freezing | One redb DB per `(repo, snapshot)`; old snapshots GC by `unlink` |
 | Test suite (57 tests) catches regressions | Run after each migration commit |
 
-## Current SurrealDB surface (the work)
+## Original SurrealDB surface (historical worklist)
+
+The section below describes the pre-migration surface that had to be
+removed or ported. Do not read it as current SurrealDB parity or as a
+supported Python-daemon graph path.
 
 **Code that uses SurrealDB directly** (8 files, ~2,500 lines):
 
