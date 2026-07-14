@@ -120,6 +120,7 @@ pub enum GraphStoreError {
     Db(redb::Error),
     Encode(bincode::Error),
     SchemaMismatch { found: u32, expected: u32 },
+    MissingGraphStore { path: PathBuf },
     IncompatibleRedbFileFormat { path: PathBuf, found: u8 },
 }
 
@@ -135,6 +136,11 @@ impl std::fmt::Display for GraphStoreError {
                     "graph store schema mismatch: found v{found}, expected v{expected}"
                 )
             }
+            Self::MissingGraphStore { path } => write!(
+                f,
+                "graph store at {} is missing; rebuild it from committed fragments with `aethyme-engine-cli index --repo <repo>`. Query commands are read-only and will not create it.",
+                path.display()
+            ),
             Self::IncompatibleRedbFileFormat { path, found } => write!(
                 f,
                 "graph store at {} uses old redb file format v{found}; regenerate it from committed fragments with `aethyme-engine-cli index --repo <repo>`. The `.aethyme/graph/` fragments are not modified.",
@@ -976,6 +982,11 @@ fn open_or_create_database(db_path: &Path) -> Result<Database, GraphStoreError> 
 }
 
 fn open_read_only_database(db_path: &Path) -> Result<ReadOnlyDatabase, GraphStoreError> {
+    if !db_path.exists() {
+        return Err(GraphStoreError::MissingGraphStore {
+            path: db_path.to_path_buf(),
+        });
+    }
     match ReadOnlyDatabase::open(db_path) {
         Ok(db) => Ok(db),
         Err(redb::DatabaseError::UpgradeRequired(found)) => {
