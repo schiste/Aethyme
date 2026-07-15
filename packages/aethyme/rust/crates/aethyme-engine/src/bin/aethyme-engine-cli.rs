@@ -1298,8 +1298,10 @@ fn index_to_store(
         Ok(())
     })?;
 
-    // Edges — skip unresolved imports and any symbol-level endpoints. With
-    // raw structured IDs we just inspect the prefix; redb keys are not
+    // V1 redb persists file-level adjacency only. Symbol-level edges whose
+    // source or target is `fn:` / `class:` remain available through
+    // RepositoryMap-backed graph navigation, not through redb query surfaces.
+    // With raw structured IDs we just inspect the prefix; redb keys are not
     // sanitized so what the engine produced is what we filter on.
     let mut edge_errors = 0usize;
     let mut edge_ok = 0usize;

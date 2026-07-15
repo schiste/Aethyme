@@ -149,6 +149,21 @@ Supported V1 redb surfaces:
 | `importers` | Read-only | Reads incoming file adjacency from the redb store. |
 | `callers` | Hybrid grep + graph | Greps for the requested symbol, then uses redb adjacency to expand candidate files. It is not a pure redb symbol-query contract in V1. |
 
+Supported V1 limitations:
+
+- Symbol-level redb persistence is not complete. The redb schema includes
+  `functions`, `classes`, `functions_by_path`, and `symbol_by_name` tables as
+  schema-ready surfaces, but the current `index` writer does not fully
+  populate them from `RepositoryMap`.
+- The `index` writer skips edges with `fn:` or `class:` endpoints before
+  writing redb adjacency. `deps`, `importers`, and the graph half of
+  `callers` are file-adjacency surfaces, not general symbol-callgraph
+  surfaces.
+- Most graph navigation is still served by `RepositoryMap` rebuilt from
+  `.aethyme/graph/` fragments. The legacy `graph-*`, task, context-pack, and
+  `explore` surfaces should not be described as redb-backed until they are
+  explicitly moved to `GraphStore::open_read_only`.
+
 File-format policy:
 
 - The engine currently builds against redb 4.x. The redb file format is

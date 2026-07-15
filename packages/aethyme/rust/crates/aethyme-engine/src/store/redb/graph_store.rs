@@ -4,12 +4,17 @@
 //! fragments under `<repo>/.aethyme/graph/`. V1 supports the engine-index
 //! writer, `query-areas`, `query-overview`, `deps`, `importers`, and the graph
 //! adjacency half of the hybrid `callers` path.
+//! Most graph navigation still uses an in-memory `RepositoryMap` rebuilt from
+//! fragments rather than this redb store.
 //!
 //! Non-scope for V1: this file is not the durable graph format, does not
 //! mutate fragment files, does not promise in-place redb file migrations, and
 //! is not a daemon-owned live graph. If `.aethyme/graph_store.redb` is missing
 //! or incompatible, rebuild it from fragments with `aethyme-engine-cli index
 //! --repo <repo>`.
+//! V1 also does not fully persist symbol-level graph data: `fn:` / `class:`
+//! edges are skipped by the current writer, and the symbol tables below are
+//! schema-ready but not fully populated by `aethyme-engine-cli index`.
 //!
 //! Historical context: this replaced the old SurrealDB-backed `GraphStore`.
 //! `docs/architecture/phase3-redb-graph-store-plan.md` preserves the migration
@@ -43,6 +48,10 @@ const META_KEY_SCHEMA_VERSION: &str = "schema_version";
 // One table per kind keeps tablespaces separate so prefix-range scans on
 // `path/` don't have to skip over unrelated kinds. Key = node id (raw &str so
 // scope queries can range over it). Value = bincoded entity record.
+//
+// V1 writer note: FILES and AREAS are populated by the current index command.
+// FUNCTIONS and CLASSES are schema-ready for symbol-level redb work, but the
+// current writer does not bulk-persist `RepositoryMap::functions/classes`.
 
 const FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
 const AREAS: TableDefinition<&str, &[u8]> = TableDefinition::new("areas");
@@ -62,6 +71,9 @@ const EDGES_IN: MultimapTableDefinition<&str, &[u8]> = MultimapTableDefinition::
 // ── Scope-bounded lookups (raw paths give free prefix range reads) ──────────
 // Key = file_path. Value = node id. A range scan from "includes/" to
 // "includes/\xff" yields all symbols under that scope.
+//
+// V1 writer note: NODES_BY_PATH is populated for files. FUNCTIONS_BY_PATH is
+// schema-ready but not fully populated by the current writer.
 
 const FUNCTIONS_BY_PATH: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("functions_by_path");
@@ -70,6 +82,9 @@ const NODES_BY_PATH: MultimapTableDefinition<&str, &str> =
 
 // ── Symbol search ───────────────────────────────────────────────────────────
 // Key = lowercased name. Value = node id.
+//
+// V1 writer note: schema-ready only. The current writer does not fully
+// populate symbol-name lookup rows from `RepositoryMap`.
 
 const SYMBOL_BY_NAME: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("symbol_by_name");
@@ -524,6 +539,10 @@ impl ReadOnlyGraphStore {
 // Thin shims over IndexSession primitives. The mapping is structured ID →
 // raw redb key (no sanitization), entity → bincoded value, plus the secondary
 // indexes each kind requires. Mirrors the surface of `super::super::write`.
+//
+// V1 coverage note: these primitives can write symbol rows/indexes in tests or
+// future writers, but `aethyme-engine-cli index` currently populates only the
+// area/file/risk subset plus file-level adjacency.
 
 /// Insert (or overwrite) an area. Key = `area.id` (e.g. `area:Repo:src`).
 pub fn insert_area(session: &mut IndexSession<'_>, area: &AreaNode) -> Result<(), GraphStoreError> {

@@ -374,6 +374,19 @@ V1 redb is not the full persisted graph backend. It does not make
 fragments as the durable graph. V2 may broaden redb-backed reads, but should
 still treat fragments as the regeneration source.
 
+V1 redb limitations:
+
+- Symbol-level redb persistence is deliberately incomplete. The schema has
+  tables and secondary indexes for functions/classes and symbol lookup, but
+  the current writer does not fully populate them from `RepositoryMap`.
+- The V1 writer skips adjacency whose source or target is a symbol id such as
+  `fn:` or `class:`. File-level dependency/importer adjacency is the supported
+  redb edge plane.
+- Most graph navigation still comes from an in-memory `RepositoryMap` rebuilt
+  from `.aethyme/graph/` fragments. Commands such as `graph-*`, task views,
+  context packs, and `explore` should not be assumed to read from redb just
+  because `.aethyme/graph_store.redb` exists.
+
 ## 6. Update propagation
 
 V1 propagation is explicit indexing. There is no supported Python daemon
