@@ -18,12 +18,13 @@
 //! `docs/architecture/phase3-redb-graph-store-plan.md` preserves the migration
 //! rationale; `docs/architecture/graph-schema.md` owns the current contract.
 
+use std::collections::BTreeSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use redb::{
-    Database, MultimapTableDefinition, ReadOnlyDatabase, ReadableDatabase, ReadableMultimapTable,
-    ReadableTable, TableDefinition, WriteTransaction,
+    Database, MultimapTableDefinition, ReadOnlyDatabase, ReadTransaction, ReadableDatabase,
+    ReadableMultimapTable, ReadableTable, TableDefinition, WriteTransaction,
 };
 use serde::{Deserialize, Serialize};
 
@@ -650,8 +651,380 @@ pub struct Overview {
     pub risks: Vec<RiskFlag>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StoredNodeKind {
+    File,
+    Area,
+    Function,
+    Class,
+    Doc,
+    Config,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredNode {
+    File(FileNode),
+    Area(AreaNode),
+    Function(FunctionNode),
+    Class(ClassNode),
+    Doc(DocNode),
+    Config(ConfigNode),
+}
+
+impl StoredNode {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::File(node) => &node.id,
+            Self::Area(node) => &node.id,
+            Self::Function(node) => node.id.as_str(),
+            Self::Class(node) => node.id.as_str(),
+            Self::Doc(node) => &node.id,
+            Self::Config(node) => &node.id,
+        }
+    }
+
+    pub fn kind(&self) -> StoredNodeKind {
+        match self {
+            Self::File(_) => StoredNodeKind::File,
+            Self::Area(_) => StoredNodeKind::Area,
+            Self::Function(_) => StoredNodeKind::Function,
+            Self::Class(_) => StoredNodeKind::Class,
+            Self::Doc(_) => StoredNodeKind::Doc,
+            Self::Config(_) => StoredNodeKind::Config,
+        }
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::File(node) => Some(&node.path),
+            Self::Area(node) => Some(&node.path_prefix),
+            Self::Function(node) => Some(node.file_path.as_str()),
+            Self::Class(node) => Some(node.file_path.as_str()),
+            Self::Doc(node) => Some(&node.path),
+            Self::Config(node) => Some(&node.path),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolLookup {
+    pub id: String,
+    pub kind: StoredNodeKind,
+    pub name: String,
+    pub path: String,
+    pub line: usize,
+    pub signature: String,
+    pub language: String,
+    pub area_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeighborDirection {
+    Outgoing,
+    Incoming,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverviewV2Limits {
+    pub area_limit: usize,
+    pub entrypoint_limit: usize,
+    pub risk_limit: usize,
+    pub file_limit: usize,
+    pub function_limit: usize,
+    pub class_limit: usize,
+    pub doc_limit: usize,
+    pub config_limit: usize,
+}
+
+impl Default for OverviewV2Limits {
+    fn default() -> Self {
+        Self {
+            area_limit: 20,
+            entrypoint_limit: 10,
+            risk_limit: 20,
+            file_limit: 20,
+            function_limit: 20,
+            class_limit: 20,
+            doc_limit: 10,
+            config_limit: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverviewV2 {
+    pub repo: Option<RepoMetadata>,
+    pub areas: Vec<AreaNode>,
+    pub entrypoint_paths: Vec<String>,
+    pub risks: Vec<RiskFlag>,
+    pub files: Vec<FileNode>,
+    pub functions: Vec<FunctionNode>,
+    pub classes: Vec<ClassNode>,
+    pub docs: Vec<DocNode>,
+    pub configs: Vec<ConfigNode>,
+}
+
 fn area_depth(area: &AreaNode) -> u32 {
     (area.path_prefix.matches('/').count() + 1) as u32
+}
+
+fn node_kind_from_id(id: &str) -> Option<StoredNodeKind> {
+    if id.starts_with("file:") {
+        Some(StoredNodeKind::File)
+    } else if id.starts_with("area:") {
+        Some(StoredNodeKind::Area)
+    } else if id.starts_with("fn:") {
+        Some(StoredNodeKind::Function)
+    } else if id.starts_with("class:") {
+        Some(StoredNodeKind::Class)
+    } else if id.starts_with("doc:") {
+        Some(StoredNodeKind::Doc)
+    } else if id.starts_with("config:") {
+        Some(StoredNodeKind::Config)
+    } else {
+        None
+    }
+}
+
+fn read_table_node<T: for<'de> Deserialize<'de>>(
+    txn: &ReadTransaction,
+    table: TableDefinition<&str, &[u8]>,
+    id: &str,
+) -> Result<Option<T>, GraphStoreError> {
+    let t = txn.open_table(table)?;
+    let Some(value) = t.get(id)? else {
+        return Ok(None);
+    };
+    Ok(Some(bincode::deserialize(value.value())?))
+}
+
+fn get_node_in_txn(txn: &ReadTransaction, id: &str) -> Result<Option<StoredNode>, GraphStoreError> {
+    let Some(kind) = node_kind_from_id(id) else {
+        return Ok(None);
+    };
+    match kind {
+        StoredNodeKind::File => {
+            Ok(read_table_node::<FileNode>(txn, FILES, id)?.map(StoredNode::File))
+        }
+        StoredNodeKind::Area => {
+            Ok(read_table_node::<AreaNode>(txn, AREAS, id)?.map(StoredNode::Area))
+        }
+        StoredNodeKind::Function => {
+            Ok(read_table_node::<FunctionNode>(txn, FUNCTIONS, id)?.map(StoredNode::Function))
+        }
+        StoredNodeKind::Class => {
+            Ok(read_table_node::<ClassNode>(txn, CLASSES, id)?.map(StoredNode::Class))
+        }
+        StoredNodeKind::Doc => Ok(read_table_node::<DocNode>(txn, DOCS, id)?.map(StoredNode::Doc)),
+        StoredNodeKind::Config => {
+            Ok(read_table_node::<ConfigNode>(txn, CONFIGS, id)?.map(StoredNode::Config))
+        }
+    }
+}
+
+fn get_node_from<D: ReadableDatabase>(
+    db: &D,
+    id: &str,
+) -> Result<Option<StoredNode>, GraphStoreError> {
+    let txn = db.begin_read()?;
+    get_node_in_txn(&txn, id)
+}
+
+fn symbol_lookup_from_node(node: StoredNode) -> Option<SymbolLookup> {
+    match node {
+        StoredNode::Function(function) => Some(SymbolLookup {
+            id: function.id.to_string(),
+            kind: StoredNodeKind::Function,
+            name: function.name.to_string(),
+            path: function.file_path.to_string(),
+            line: function.line,
+            signature: function.signature.to_string(),
+            language: function.language.to_string(),
+            area_id: function.area_id.map(|id| id.to_string()),
+        }),
+        StoredNode::Class(class) => Some(SymbolLookup {
+            id: class.id.to_string(),
+            kind: StoredNodeKind::Class,
+            name: class.name.to_string(),
+            path: class.file_path.to_string(),
+            line: class.line,
+            signature: class.signature.to_string(),
+            language: class.language.to_string(),
+            area_id: class.area_id.map(|id| id.to_string()),
+        }),
+        _ => None,
+    }
+}
+
+fn find_symbols_from<D: ReadableDatabase>(
+    db: &D,
+    name: &str,
+    kind: Option<StoredNodeKind>,
+) -> Result<Vec<SymbolLookup>, GraphStoreError> {
+    if matches!(
+        kind,
+        Some(
+            StoredNodeKind::File
+                | StoredNodeKind::Area
+                | StoredNodeKind::Doc
+                | StoredNodeKind::Config
+        )
+    ) {
+        return Ok(Vec::new());
+    }
+
+    let key = symbol_index_key(name);
+    let ids = {
+        let txn = db.begin_read()?;
+        let t = txn.open_multimap_table(SYMBOL_BY_NAME)?;
+        let mut ids = BTreeSet::new();
+        for row in t.get(key.as_str())? {
+            ids.insert(row?.value().to_string());
+        }
+        ids
+    };
+
+    let txn = db.begin_read()?;
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(node) = get_node_in_txn(&txn, &id)? else {
+            continue;
+        };
+        if let Some(expected) = kind {
+            if node.kind() != expected {
+                continue;
+            }
+        }
+        if let Some(symbol) = symbol_lookup_from_node(node) {
+            out.push(symbol);
+        }
+    }
+    out.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(out)
+}
+
+fn prefix_end(prefix: &str) -> String {
+    format!("{prefix}\u{10ffff}")
+}
+
+fn ids_under_path_from<D: ReadableDatabase>(
+    db: &D,
+    table: MultimapTableDefinition<&str, &str>,
+    prefix: &str,
+) -> Result<Vec<String>, GraphStoreError> {
+    let txn = db.begin_read()?;
+    let t = txn.open_multimap_table(table)?;
+    let end = prefix_end(prefix);
+    let mut ids = BTreeSet::new();
+    for entry in t.range(prefix..end.as_str())? {
+        let (key, mut values) = entry?;
+        if !key.value().starts_with(prefix) {
+            continue;
+        }
+        while let Some(value) = values.next() {
+            ids.insert(value?.value().to_string());
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
+fn sort_nodes(nodes: &mut [StoredNode]) {
+    nodes.sort_by(|left, right| {
+        left.path()
+            .unwrap_or("")
+            .cmp(right.path().unwrap_or(""))
+            .then_with(|| left.kind().cmp(&right.kind()))
+            .then_with(|| left.id().cmp(right.id()))
+    });
+}
+
+fn nodes_under_path_from<D: ReadableDatabase>(
+    db: &D,
+    prefix: &str,
+) -> Result<Vec<StoredNode>, GraphStoreError> {
+    let ids = ids_under_path_from(db, NODES_BY_PATH, prefix)?;
+    let txn = db.begin_read()?;
+    let mut nodes = Vec::new();
+    for id in ids {
+        if let Some(node) = get_node_in_txn(&txn, &id)? {
+            nodes.push(node);
+        }
+    }
+    sort_nodes(&mut nodes);
+    Ok(nodes)
+}
+
+fn functions_under_path_from<D: ReadableDatabase>(
+    db: &D,
+    prefix: &str,
+) -> Result<Vec<FunctionNode>, GraphStoreError> {
+    let ids = ids_under_path_from(db, FUNCTIONS_BY_PATH, prefix)?;
+    let txn = db.begin_read()?;
+    let mut functions = Vec::new();
+    for id in ids {
+        if let Some(function) = read_table_node::<FunctionNode>(&txn, FUNCTIONS, &id)? {
+            functions.push(function);
+        }
+    }
+    functions.sort_by(|left, right| {
+        left.file_path
+            .cmp(&right.file_path)
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(functions)
+}
+
+fn resolve_file_path_from<D: ReadableDatabase>(
+    db: &D,
+    path: &str,
+) -> Result<Option<FileNode>, GraphStoreError> {
+    let ids = {
+        let txn = db.begin_read()?;
+        let t = txn.open_multimap_table(NODES_BY_PATH)?;
+        let mut ids = Vec::new();
+        for row in t.get(path)? {
+            ids.push(row?.value().to_string());
+        }
+        ids
+    };
+    let txn = db.begin_read()?;
+    for id in ids {
+        if let Some(file) = read_table_node::<FileNode>(&txn, FILES, &id)? {
+            return Ok(Some(file));
+        }
+    }
+    Ok(None)
+}
+
+fn neighbors_from<D: ReadableDatabase>(
+    db: &D,
+    id: &str,
+    direction: NeighborDirection,
+    kind: Option<EdgeKind>,
+) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
+    let table = match direction {
+        NeighborDirection::Outgoing => EDGES_OUT,
+        NeighborDirection::Incoming => EDGES_IN,
+    };
+    let mut rows = collect_adjacency(db, table, id)?;
+    if let Some(expected) = kind {
+        rows.retain(|row| row.kind == expected);
+    }
+    rows.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.other.cmp(&right.other))
+            .then_with(|| left.source.cmp(&right.source))
+    });
+    Ok(rows)
 }
 
 fn repo_metadata_from<D: ReadableDatabase>(
@@ -789,7 +1162,193 @@ fn overview_from<D: ReadableDatabase>(
     })
 }
 
+fn list_files_from<D: ReadableDatabase>(
+    db: &D,
+    limit: usize,
+) -> Result<Vec<FileNode>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let txn = db.begin_read()?;
+    let t = txn.open_table(FILES)?;
+    let mut out = Vec::new();
+    for entry in t.iter()? {
+        let (_, value) = entry?;
+        out.push(bincode::deserialize::<FileNode>(value.value())?);
+    }
+    out.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    out.truncate(limit);
+    Ok(out)
+}
+
+fn list_functions_from<D: ReadableDatabase>(
+    db: &D,
+    limit: usize,
+) -> Result<Vec<FunctionNode>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let txn = db.begin_read()?;
+    let t = txn.open_table(FUNCTIONS)?;
+    let mut out = Vec::new();
+    for entry in t.iter()? {
+        let (_, value) = entry?;
+        out.push(bincode::deserialize::<FunctionNode>(value.value())?);
+    }
+    out.sort_by(|left, right| {
+        left.file_path
+            .cmp(&right.file_path)
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    out.truncate(limit);
+    Ok(out)
+}
+
+fn list_classes_from<D: ReadableDatabase>(
+    db: &D,
+    limit: usize,
+) -> Result<Vec<ClassNode>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let txn = db.begin_read()?;
+    let t = txn.open_table(CLASSES)?;
+    let mut out = Vec::new();
+    for entry in t.iter()? {
+        let (_, value) = entry?;
+        out.push(bincode::deserialize::<ClassNode>(value.value())?);
+    }
+    out.sort_by(|left, right| {
+        left.file_path
+            .cmp(&right.file_path)
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    out.truncate(limit);
+    Ok(out)
+}
+
+fn list_docs_from<D: ReadableDatabase>(
+    db: &D,
+    limit: usize,
+) -> Result<Vec<DocNode>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let txn = db.begin_read()?;
+    let t = txn.open_table(DOCS)?;
+    let mut out = Vec::new();
+    for entry in t.iter()? {
+        let (_, value) = entry?;
+        out.push(bincode::deserialize::<DocNode>(value.value())?);
+    }
+    out.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    out.truncate(limit);
+    Ok(out)
+}
+
+fn list_configs_from<D: ReadableDatabase>(
+    db: &D,
+    limit: usize,
+) -> Result<Vec<ConfigNode>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let txn = db.begin_read()?;
+    let t = txn.open_table(CONFIGS)?;
+    let mut out = Vec::new();
+    for entry in t.iter()? {
+        let (_, value) = entry?;
+        out.push(bincode::deserialize::<ConfigNode>(value.value())?);
+    }
+    out.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    out.truncate(limit);
+    Ok(out)
+}
+
+fn overview_v2_from<D: ReadableDatabase>(
+    db: &D,
+    limits: OverviewV2Limits,
+) -> Result<OverviewV2, GraphStoreError> {
+    let overview = overview_from(
+        db,
+        limits.area_limit,
+        limits.entrypoint_limit,
+        limits.risk_limit,
+    )?;
+    Ok(OverviewV2 {
+        repo: overview.repo,
+        areas: overview.areas,
+        entrypoint_paths: overview.entrypoint_paths,
+        risks: overview.risks,
+        files: list_files_from(db, limits.file_limit)?,
+        functions: list_functions_from(db, limits.function_limit)?,
+        classes: list_classes_from(db, limits.class_limit)?,
+        docs: list_docs_from(db, limits.doc_limit)?,
+        configs: list_configs_from(db, limits.config_limit)?,
+    })
+}
+
 impl GraphStore {
+    /// Read a typed node by canonical id.
+    pub fn get_node(&self, id: &str) -> Result<Option<StoredNode>, GraphStoreError> {
+        get_node_from(&self.db, id)
+    }
+
+    /// Find function/class symbols by exact simple name, case-insensitive.
+    pub fn find_symbols(
+        &self,
+        name: &str,
+        kind: Option<StoredNodeKind>,
+    ) -> Result<Vec<SymbolLookup>, GraphStoreError> {
+        find_symbols_from(&self.db, name, kind)
+    }
+
+    /// Return all typed nodes whose indexed path starts with `prefix`.
+    pub fn nodes_under_path(&self, prefix: &str) -> Result<Vec<StoredNode>, GraphStoreError> {
+        nodes_under_path_from(&self.db, prefix)
+    }
+
+    /// Return all functions whose file path starts with `prefix`.
+    pub fn functions_under_path(&self, prefix: &str) -> Result<Vec<FunctionNode>, GraphStoreError> {
+        functions_under_path_from(&self.db, prefix)
+    }
+
+    /// Return incoming or outgoing adjacency, optionally filtered by edge kind.
+    pub fn neighbors(
+        &self,
+        id: &str,
+        direction: NeighborDirection,
+        kind: Option<EdgeKind>,
+    ) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
+        neighbors_from(&self.db, id, direction, kind)
+    }
+
+    /// Resolve an exact repo-relative path to the persisted file node.
+    pub fn resolve_file_path(&self, path: &str) -> Result<Option<FileNode>, GraphStoreError> {
+        resolve_file_path_from(&self.db, path)
+    }
+
+    /// Bounded V2 overview slice over typed nodes plus existing overview data.
+    pub fn overview_v2(&self, limits: OverviewV2Limits) -> Result<OverviewV2, GraphStoreError> {
+        overview_v2_from(&self.db, limits)
+    }
+
     /// List all areas, optionally filtered by depth (1 = top-level, 2 =
     /// nested under top-level, etc). Depth is computed from `path_prefix`.
     pub fn list_areas(&self, depth: Option<u32>) -> Result<Vec<AreaNode>, GraphStoreError> {
@@ -826,6 +1385,50 @@ impl ReadOnlyGraphStore {
     /// Read previously-written repo metadata, if any.
     pub fn repo_metadata(&self) -> Result<Option<RepoMetadata>, GraphStoreError> {
         repo_metadata_from(&self.db)
+    }
+
+    /// Read a typed node by canonical id.
+    pub fn get_node(&self, id: &str) -> Result<Option<StoredNode>, GraphStoreError> {
+        get_node_from(&self.db, id)
+    }
+
+    /// Find function/class symbols by exact simple name, case-insensitive.
+    pub fn find_symbols(
+        &self,
+        name: &str,
+        kind: Option<StoredNodeKind>,
+    ) -> Result<Vec<SymbolLookup>, GraphStoreError> {
+        find_symbols_from(&self.db, name, kind)
+    }
+
+    /// Return all typed nodes whose indexed path starts with `prefix`.
+    pub fn nodes_under_path(&self, prefix: &str) -> Result<Vec<StoredNode>, GraphStoreError> {
+        nodes_under_path_from(&self.db, prefix)
+    }
+
+    /// Return all functions whose file path starts with `prefix`.
+    pub fn functions_under_path(&self, prefix: &str) -> Result<Vec<FunctionNode>, GraphStoreError> {
+        functions_under_path_from(&self.db, prefix)
+    }
+
+    /// Return incoming or outgoing adjacency, optionally filtered by edge kind.
+    pub fn neighbors(
+        &self,
+        id: &str,
+        direction: NeighborDirection,
+        kind: Option<EdgeKind>,
+    ) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
+        neighbors_from(&self.db, id, direction, kind)
+    }
+
+    /// Resolve an exact repo-relative path to the persisted file node.
+    pub fn resolve_file_path(&self, path: &str) -> Result<Option<FileNode>, GraphStoreError> {
+        resolve_file_path_from(&self.db, path)
+    }
+
+    /// Bounded V2 overview slice over typed nodes plus existing overview data.
+    pub fn overview_v2(&self, limits: OverviewV2Limits) -> Result<OverviewV2, GraphStoreError> {
+        overview_v2_from(&self.db, limits)
     }
 
     /// List all areas, optionally filtered by depth.
@@ -2051,6 +2654,182 @@ mod tests {
 
         // Unknown id: empty, not error.
         assert!(store.edges_from("file:R:nope.rs").expect("ok").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_v2_apis_resolve_nodes_symbols_paths_neighbors_and_overview() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+
+        let area = AreaNode::new("Repo", "src", false);
+        let file = sample_file("Repo", "src/lib.rs", Some("area:Repo:src"));
+        let test_file = sample_file("Repo", "tests/test_lib.rs", None);
+        let class = sample_class(&file, "TokenLoader");
+        let function = sample_function(&file, "LoadToken", Some(class.id.clone()));
+        let doc = DocNode::new(
+            "Repo",
+            "file:Repo:docs/auth.md",
+            "docs/auth.md",
+            "Auth",
+            "markdown",
+            Some(area.id.clone()),
+        );
+        let config = ConfigNode::new(
+            "Repo",
+            "file:Repo:pyproject.toml",
+            "pyproject.toml",
+            "toml",
+            None,
+        );
+
+        let mut session = store.begin_index().expect("session");
+        insert_area(&mut session, &area).expect("area");
+        insert_file(&mut session, &file).expect("file");
+        insert_file(&mut session, &test_file).expect("test file");
+        insert_class(&mut session, &class).expect("class");
+        insert_function(&mut session, &function).expect("function");
+        insert_doc(&mut session, &doc).expect("doc");
+        insert_config(&mut session, &config).expect("config");
+        insert_edge(
+            &mut session,
+            &Edge::new(
+                &file.id,
+                function.id.as_str(),
+                EdgeKind::Contains,
+                1000,
+                "structure",
+            ),
+        )
+        .expect("file contains function");
+        insert_edge(
+            &mut session,
+            &Edge::new(
+                function.id.as_str(),
+                &config.id,
+                EdgeKind::Configures,
+                900,
+                "config",
+            ),
+        )
+        .expect("function configures config");
+        insert_edge(
+            &mut session,
+            &Edge::new(
+                &file.id,
+                &area.id,
+                EdgeKind::EntrypointFor,
+                800,
+                "entrypoint",
+            ),
+        )
+        .expect("entrypoint");
+        session.commit().expect("commit");
+
+        store
+            .set_repo_metadata(&RepoMetadata {
+                root_path: root.to_string_lossy().to_string(),
+                commit_hash: Some("abc123".to_string()),
+                indexed_at_unix: 1,
+                file_count: 2,
+                languages: vec!["rust".to_string()],
+            })
+            .expect("metadata");
+        drop(store);
+
+        let readonly = GraphStore::open_read_only(&root).expect("read-only");
+
+        match readonly
+            .get_node(function.id.as_str())
+            .expect("function node")
+            .expect("present")
+        {
+            StoredNode::Function(got) => assert_eq!(got, function),
+            other => panic!("expected function node, got {other:?}"),
+        }
+        assert!(readonly
+            .get_node("unknown:Repo:x")
+            .expect("unknown")
+            .is_none());
+
+        let symbols = readonly
+            .find_symbols("LoadToken", None)
+            .expect("find symbols");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].id, function.id.to_string());
+        assert_eq!(symbols[0].kind, StoredNodeKind::Function);
+        assert!(readonly
+            .find_symbols("LoadToken", Some(StoredNodeKind::Class))
+            .expect("class filter")
+            .is_empty());
+
+        let nodes = readonly.nodes_under_path("src/").expect("nodes under src");
+        let node_ids: BTreeSet<String> = nodes.iter().map(|node| node.id().to_string()).collect();
+        assert!(node_ids.contains(&file.id));
+        assert!(node_ids.contains(function.id.as_str()));
+        assert!(node_ids.contains(class.id.as_str()));
+
+        let functions = readonly
+            .functions_under_path("src/")
+            .expect("functions under src");
+        assert_eq!(functions, vec![function.clone()]);
+
+        let resolved = readonly
+            .resolve_file_path("src/lib.rs")
+            .expect("resolve file")
+            .expect("present");
+        assert_eq!(resolved, file);
+        assert!(readonly
+            .resolve_file_path("src/missing.rs")
+            .expect("missing")
+            .is_none());
+
+        let incoming = readonly
+            .neighbors(
+                function.id.as_str(),
+                NeighborDirection::Incoming,
+                Some(EdgeKind::Contains),
+            )
+            .expect("incoming");
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].other.as_str(), file.id.as_str());
+
+        let outgoing = readonly
+            .neighbors(
+                function.id.as_str(),
+                NeighborDirection::Outgoing,
+                Some(EdgeKind::Configures),
+            )
+            .expect("outgoing");
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].other.as_str(), config.id.as_str());
+        assert!(readonly
+            .neighbors(
+                function.id.as_str(),
+                NeighborDirection::Outgoing,
+                Some(EdgeKind::Imports),
+            )
+            .expect("wrong kind")
+            .is_empty());
+
+        let overview = readonly
+            .overview_v2(OverviewV2Limits {
+                file_limit: 10,
+                function_limit: 10,
+                class_limit: 10,
+                doc_limit: 10,
+                config_limit: 10,
+                ..OverviewV2Limits::default()
+            })
+            .expect("overview v2");
+        assert_eq!(overview.repo.as_ref().unwrap().file_count, 2);
+        assert_eq!(overview.entrypoint_paths, vec!["src/lib.rs".to_string()]);
+        assert_eq!(overview.files.len(), 2);
+        assert_eq!(overview.functions, vec![function]);
+        assert_eq!(overview.classes, vec![class]);
+        assert_eq!(overview.docs, vec![doc]);
+        assert_eq!(overview.configs, vec![config]);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
