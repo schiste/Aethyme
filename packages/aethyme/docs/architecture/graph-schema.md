@@ -417,12 +417,12 @@ Required V2 read APIs for replacing `RepositoryMap` reads:
 
 | API family | Required capability | Current graph-module consumer |
 |---|---|---|
-| Node lookup | `node_by_id(id)` and batch lookup for ids already present in navigation order or adjacency results. | `node_view`, relation rendering, risk/doc/config display. |
-| Symbol lookup | Exact and bounded fuzzy/prefix lookup by `name` and optional `kind`, returning canonical ids plus path/range signals. | `task_anchors_view`, symbol query surfaces, graph target resolution. |
-| Path prefix lookup | Bounded lookup by file path or directory prefix, with kind filters for files/functions/classes/docs/configs. | Scope expansion, area views, task-local navigation seeds. |
-| Adjacency | `outgoing(id, kind_filter, limit)` and `incoming(id, kind_filter, limit)` over the full persisted edge set. | `children_view`, `parents_view`, `callers_view`, `callees_view`, `docs_view`, `configs_view`, `task_expand_view`, `graph_expand_view`. |
+| Node lookup | Implemented as `get_node(id)` for typed file/area/function/class/doc/config rows. Batch lookup is still caller-side composition over this primitive. | `node_view`, relation rendering, risk/doc/config display. |
+| Symbol lookup | Implemented as `find_symbols(name, kind?)` over exact ASCII-lowercased function/class names, returning canonical ids plus path/line/signature/language/area signals. Bounded fuzzy/prefix ranking still belongs above the store. | `task_anchors_view`, symbol query surfaces, graph target resolution. |
+| Path prefix lookup | Implemented as `nodes_under_path(prefix)`, `functions_under_path(prefix)`, and `resolve_file_path(path)` over redb path indexes. | Scope expansion, area views, task-local navigation seeds. |
+| Adjacency | Implemented as `neighbors(id, direction, kind?)`; existing `edges_from` / `edges_to` remain compatibility wrappers for unfiltered directions. | `children_view`, `parents_view`, `callers_view`, `callees_view`, `docs_view`, `configs_view`, `task_expand_view`, `graph_expand_view`. |
 | Task anchor candidates | Query by task text tokens against symbols, paths, docs/configs, areas, and unresolved/import names, returning typed candidates and ranking signals. Ranking may stay in the graph module, but the store must provide the bounded candidate rows without rebuilding `RepositoryMap`. | `task_anchors_view`, `task_scope_view`, `task_next_view`, context-pack assembly. |
-| Overview/navigation slices | Bounded repo overview, area tree/top-area slices, entrypoints, representative docs/configs/code files, risk slices, and node-neighborhood slices. | `graph_overview_view`, `task_next_view`, `explore`, context-pack navigation order. |
+| Overview/navigation slices | Implemented as `overview_v2(...)` for bounded repo metadata, areas, entrypoints, risks, files, functions, classes, docs, and configs. Higher-level task/navigation slices still need graph-module adapters. | `graph_overview_view`, `task_next_view`, `explore`, context-pack navigation order. |
 
 V2 is complete only when the graph module can serve node, relation, task,
 overview, and context-pack navigation paths from read-only redb queries
