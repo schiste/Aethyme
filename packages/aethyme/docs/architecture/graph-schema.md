@@ -441,6 +441,31 @@ Bridge decisions as of 2026-07-15:
 | `usage boundary` | Keep using `RepositoryMap` and grep/analyzer logic. | The current analyzer is scope-first and language-specific; redb can provide symbol/path seeds later but should not own the policy yet. |
 | Trait abstraction | Defer. | A trait is useful only once two consumers need the same read contract; today the low-risk commands can call redb directly and higher-level flows still need richer candidate APIs. |
 
+V2 correctness and performance gates:
+
+- Tiny read-API gates live in
+  `rust/crates/aethyme-engine/src/store/redb/graph_store.rs` and cover
+  `get_node`, `find_symbols`, `nodes_under_path`, `functions_under_path`,
+  `resolve_file_path`, `neighbors`, and `overview_v2` on a tiny typed store
+  fixture.
+- Binary integration gates live in
+  `rust/crates/aethyme-engine/tests/redb_cli.rs` and cover indexing from
+  fragments, redb exact symbol query, graph callers/callees query shape,
+  deterministic query snapshots after rebuilding from identical fragments,
+  missing-store read-only behavior, and disposable-fast publish boundaries.
+- The default performance smoke is intentionally tiny and bounded by
+  environment-overridable thresholds:
+  `AETHYME_REDB_PERF_MAX_INDEX_MS`,
+  `AETHYME_REDB_PERF_MAX_QUERY_OVERVIEW_MS`, and
+  `AETHYME_REDB_PERF_MAX_SYMBOL_MS`.
+- MediaWiki-scale verification is an opt-in ignored Rust test:
+  `cargo test -p aethyme-engine --test redb_cli mediawiki_scale_redb_smoke_before_v2_default -- --ignored --nocapture`
+  with `AETHYME_MEDIAWIKI_REPO=/path/to/mediawiki`. Run it before enabling
+  any V2 redb-backed path by default. Thresholds are configurable with
+  `AETHYME_REDB_MEDIAWIKI_MAX_INDEX_MS`,
+  `AETHYME_REDB_MEDIAWIKI_MAX_QUERY_OVERVIEW_MS`, and
+  `AETHYME_REDB_MEDIAWIKI_MAX_SYMBOL_MS`.
+
 V2 is complete only when the graph module can serve node, relation, task,
 overview, and context-pack navigation paths from read-only redb queries
 without constructing a full `RepositoryMap`. Parity tests should compare the

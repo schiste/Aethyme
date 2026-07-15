@@ -5,9 +5,11 @@
 //! pinning the CLI contract that scripts and playground setup consume.
 
 use std::collections::BTreeSet;
+use std::env;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::time::Instant;
 
 use aethyme_graph_indexer::{index_repo_to_disk, IndexerContext, WalkOptions};
 use aethyme_graph_storage::bootstrap_repo;
@@ -56,6 +58,16 @@ where
         .expect("spawn aethyme-engine-cli")
 }
 
+fn run_engine_timed<I, S>(args: I) -> (Output, u128)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let start = Instant::now();
+    let output = run_engine(args);
+    (output, start.elapsed().as_millis())
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -71,6 +83,17 @@ fn assert_failure(output: &Output) {
         "command unexpectedly succeeded: stdout={}\nstderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn assert_duration_below(label: &str, elapsed_ms: u128, env_key: &str, default_ms: u128) {
+    let limit_ms = env::var(env_key)
+        .ok()
+        .and_then(|raw| raw.parse::<u128>().ok())
+        .unwrap_or(default_ms);
+    assert!(
+        elapsed_ms <= limit_ms,
+        "{label} took {elapsed_ms}ms, above {limit_ms}ms ({env_key})"
     );
 }
 
@@ -92,6 +115,55 @@ fn build_fragment_fixture() -> tempfile::TempDir {
     let ctx = IndexerContext::new("TinyRepo", root.clone(), "test-engine").unwrap();
     let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
     assert_eq!(summary.total_files, 2);
+    tmp
+}
+
+fn build_medium_fragment_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/auth/token.py",
+        b"class TokenLoader:\n    def load(self):\n        return load_token()\n\ndef load_token():\n    return 'token'\n",
+    );
+    write(
+        tmp.path(),
+        "src/web/handler.py",
+        b"from src.auth.token import load_token\n\ndef handle_request():\n    return load_token()\n",
+    );
+    write(
+        tmp.path(),
+        "src/cli/main.py",
+        b"from src.web.handler import handle_request\n\ndef main():\n    return handle_request()\n",
+    );
+    write(
+        tmp.path(),
+        "docs/auth.md",
+        b"# Auth\n\nToken loading notes.\n",
+    );
+    write(
+        tmp.path(),
+        "pyproject.toml",
+        b"[project]\nname = \"medium-fixture\"\n",
+    );
+
+    let root = tmp.path().canonicalize().unwrap();
+    bootstrap_repo(&root, "test-engine").expect("bootstrap graph layout");
+    let ctx = IndexerContext::new("MediumRepo", root, "test-engine").unwrap();
+    let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
+    assert_eq!(summary.total_files, 5);
+    tmp
+}
+
+fn build_medium_redb_fixture() -> tempfile::TempDir {
+    let tmp = build_medium_fragment_fixture();
+    let output = run_engine([
+        "index",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&output);
+    assert!(tmp.path().join(".aethyme/graph_store.redb").is_file());
     tmp
 }
 
@@ -213,6 +285,70 @@ fn query_area_prefixes(repo: &Path) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+fn stdout_lines(output: &Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn query_json<I, S>(args: I) -> serde_json::Value
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = run_engine(args);
+    assert_success(&output);
+    serde_json::from_slice(&output.stdout).expect("JSON parses")
+}
+
+fn stable_redb_query_snapshot(repo: &Path) -> serde_json::Value {
+    let mut overview = query_json(["query-overview", "--repo", repo.to_str().unwrap()]);
+    if let Some(repo) = overview
+        .get_mut("repo")
+        .and_then(|value| value.as_object_mut())
+    {
+        repo.insert("indexed_at_unix".to_string(), serde_json::json!(0));
+    }
+
+    let deps = run_engine([
+        "deps",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--file",
+        "tests/test_token.py",
+    ]);
+    assert_success(&deps);
+    let importers = run_engine([
+        "importers",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--file",
+        "src/auth/token.py",
+    ]);
+    assert_success(&importers);
+
+    serde_json::json!({
+        "overview": overview,
+        "areas": query_json([
+            "query-areas",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--depth",
+            "1",
+        ]),
+        "symbol": query_json([
+            "symbol",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--query",
+            "load_token",
+        ]),
+        "deps": stdout_lines(&deps),
+        "importers": stdout_lines(&importers),
+    })
 }
 
 #[test]
@@ -350,6 +486,179 @@ fn symbol_batch_uses_redb_exact_lookup_when_fragments_are_unavailable() {
     assert_eq!(load_hits[0]["name"], "load_token");
     assert_eq!(class_hits[0]["name"], "TokenLoader");
     assert_eq!(class_hits[0]["kind"], "class");
+}
+
+#[test]
+fn medium_fixture_indexes_and_queries_symbol_callers_and_callees() {
+    let tmp = build_medium_redb_fixture();
+
+    let symbol_hits = query_json([
+        "symbol",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--query",
+        "load_token",
+    ]);
+    let first_hit = symbol_hits
+        .as_array()
+        .expect("symbol hits array")
+        .first()
+        .expect("symbol hit");
+    let target_id = first_hit["id"].as_str().expect("symbol id");
+    assert_eq!(first_hit["name"], "load_token");
+
+    let callers = query_json([
+        "graph-callers",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--target",
+        target_id,
+    ]);
+    assert_eq!(callers["target"], target_id);
+    assert_eq!(callers["relation"], "callers");
+    assert!(
+        callers["items"].as_array().is_some(),
+        "callers items should be an array"
+    );
+
+    let callees = query_json([
+        "graph-callees",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--target",
+        target_id,
+    ]);
+    assert_eq!(callees["target"], target_id);
+    assert_eq!(callees["relation"], "callees");
+    assert!(
+        callees["items"].as_array().is_some(),
+        "callees items should be an array"
+    );
+}
+
+#[test]
+fn same_fragments_produce_same_redb_query_outputs() {
+    let tmp = build_redb_fixture();
+    let first = stable_redb_query_snapshot(tmp.path());
+
+    let rebuild = run_engine([
+        "index",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&rebuild);
+
+    let second = stable_redb_query_snapshot(tmp.path());
+    assert_eq!(first, second);
+}
+
+#[test]
+fn redb_performance_smoke_tiny_fixture() {
+    let tmp = build_fragment_fixture();
+
+    let (index_output, index_ms) =
+        run_engine_timed(["index", "--repo", tmp.path().to_str().unwrap()]);
+    assert_success(&index_output);
+    assert_duration_below(
+        "redb index",
+        index_ms,
+        "AETHYME_REDB_PERF_MAX_INDEX_MS",
+        15_000,
+    );
+
+    let (overview_output, overview_ms) =
+        run_engine_timed(["query-overview", "--repo", tmp.path().to_str().unwrap()]);
+    assert_success(&overview_output);
+    assert_duration_below(
+        "query-overview",
+        overview_ms,
+        "AETHYME_REDB_PERF_MAX_QUERY_OVERVIEW_MS",
+        2_000,
+    );
+
+    let (symbol_output, symbol_ms) = run_engine_timed([
+        "symbol",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--query",
+        "load_token",
+    ]);
+    assert_success(&symbol_output);
+    assert_duration_below(
+        "symbol search",
+        symbol_ms,
+        "AETHYME_REDB_PERF_MAX_SYMBOL_MS",
+        2_000,
+    );
+    let hits: serde_json::Value =
+        serde_json::from_slice(&symbol_output.stdout).expect("symbol JSON parses");
+    assert!(!hits.as_array().expect("symbol hits").is_empty());
+}
+
+#[test]
+#[ignore = "requires AETHYME_MEDIAWIKI_REPO; run before enabling V2 redb paths by default"]
+fn mediawiki_scale_redb_smoke_before_v2_default() {
+    let Ok(repo) = env::var("AETHYME_MEDIAWIKI_REPO") else {
+        eprintln!("skipping: set AETHYME_MEDIAWIKI_REPO to run MediaWiki-scale redb smoke");
+        return;
+    };
+    let repo = Path::new(&repo);
+    assert!(
+        repo.is_dir(),
+        "MediaWiki repo does not exist: {}",
+        repo.display()
+    );
+    assert!(
+        repo.join(".aethyme/graph").is_dir(),
+        "MediaWiki-scale gate expects committed fragments under {}",
+        repo.join(".aethyme/graph").display()
+    );
+
+    let (index_output, index_ms) = run_engine_timed([
+        "index",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&index_output);
+    assert_duration_below(
+        "MediaWiki redb index",
+        index_ms,
+        "AETHYME_REDB_MEDIAWIKI_MAX_INDEX_MS",
+        180_000,
+    );
+
+    let (overview_output, overview_ms) =
+        run_engine_timed(["query-overview", "--repo", repo.to_str().unwrap()]);
+    assert_success(&overview_output);
+    assert_duration_below(
+        "MediaWiki query-overview",
+        overview_ms,
+        "AETHYME_REDB_MEDIAWIKI_MAX_QUERY_OVERVIEW_MS",
+        5_000,
+    );
+
+    let (symbol_output, symbol_ms) = run_engine_timed([
+        "symbol",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--query",
+        "doViewUpdates",
+    ]);
+    assert_success(&symbol_output);
+    assert_duration_below(
+        "MediaWiki symbol search",
+        symbol_ms,
+        "AETHYME_REDB_MEDIAWIKI_MAX_SYMBOL_MS",
+        5_000,
+    );
+    let hits: serde_json::Value =
+        serde_json::from_slice(&symbol_output.stdout).expect("symbol JSON parses");
+    assert!(
+        hits.as_array().is_some(),
+        "MediaWiki symbol output should remain a JSON array"
+    );
 }
 
 #[cfg(unix)]
