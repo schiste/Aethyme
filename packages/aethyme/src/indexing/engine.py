@@ -335,7 +335,7 @@ def inspect_repository_structure(repo_path: Path) -> dict[str, Any]:
 
 
 def search_symbol(repo_path: Path, query: str) -> list[dict[str, Any]]:
-    """Return symbol search results from the Rust engine."""
+    """Return exact redb-backed symbol search results from the Rust engine."""
     snapshot = capture_snapshot(repo_path)
     cache_key = f"symbol_{_stable_hash(query)}"
     output = _cached_text(
@@ -353,7 +353,7 @@ def search_symbols(
     limit: int = 20,
     timeout_seconds: float | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Return symbol search results for multiple queries with one map load."""
+    """Return exact redb-backed symbol search results for multiple queries."""
     normalized_queries = []
     seen = set()
     for query in queries:
