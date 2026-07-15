@@ -28,9 +28,15 @@ Usage:
       Adaptive (NOT scaffolding): sniff this repo's manifests and draft
       a gates.toml. Output depends on the repo — review it, then run
       certify.
-  aethyme broker adopt [<path>] [--task <text>] [--json]
+  aethyme broker adopt [<path>] [--task <text>] [--reuse|--replace-stale] [--json]
       Register an existing worktree (attach-first). Defaults to the
-      current directory.
+      current directory. If the worktree already has a session:
+      --reuse points it at a follow-up task (fresh baseline);
+      --replace-stale closes it (state only) and registers fresh;
+      neither flag = error listing your options.
+  aethyme broker close --session <id> [--json]
+      Mark a session finished. State only — never touches the worktree
+      (use cleanup to also remove a spawned session's worktree).
   aethyme broker start-agent --task <text> --cmd <command> [--json]
       Create a worktree + branch and spawn <command> in it (sh -c),
       logging to .aethyme/logs/.
@@ -204,6 +210,8 @@ struct Parsed {
     json: bool,
     force: bool,
     check: bool,
+    reuse: bool,
+    replace_stale: bool,
 }
 
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
@@ -221,6 +229,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         json: false,
         force: false,
         check: false,
+        reuse: false,
+        replace_stale: false,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -237,6 +247,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             }
             "--force" => parsed.force = true,
             "--check" => parsed.check = true,
+            "--reuse" => parsed.reuse = true,
+            "--replace-stale" => parsed.replace_stale = true,
             "--kind" => {
                 parsed.kind = Some(
                     iter.next()
@@ -332,12 +344,23 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             let path = parsed.positional.first().map(PathBuf::from).unwrap_or(
                 std::env::current_dir().map_err(|e| UsageError::Message(e.to_string()))?,
             );
-            let session = broker.adopt(&path, parsed.task.as_deref())?;
+            let mode = match (parsed.reuse, parsed.replace_stale) {
+                (true, true) => {
+                    return Err(UsageError::Message(
+                        "--reuse and --replace-stale are mutually exclusive".into(),
+                    ));
+                }
+                (true, false) => crate::AdoptMode::Reuse,
+                (false, true) => crate::AdoptMode::ReplaceStale,
+                (false, false) => crate::AdoptMode::New,
+            };
+            let session = broker.adopt_with(&path, parsed.task.as_deref(), mode)?;
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&session)?);
             } else {
+                let verb = if parsed.reuse { "Reusing" } else { "Adopted" };
                 println!(
-                    "Adopted session {} — worktree {} on branch {}",
+                    "{verb} session {} — worktree {} on branch {}",
                     session.id, session.worktree_path, session.branch
                 );
             }
@@ -592,6 +615,45 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 .session
                 .ok_or(UsageError::Message("submit requires --session <id>".into()))?;
             let mut broker = open_broker()?;
+            // Preflight (dogfood feedback 2026-07-14): show exactly what
+            // will be submitted before anything runs — and warn about
+            // uncommitted work, which never integrates.
+            if !parsed.json {
+                if let Ok(info) = broker.store().session(session) {
+                    if let Ok(checkout) =
+                        crate::GitRepo::discover(std::path::Path::new(&info.worktree_path))
+                    {
+                        let head = checkout.head_commit().unwrap_or_default();
+                        println!(
+                            "Submitting session {session} — HEAD {}",
+                            &head[..12.min(head.len())]
+                        );
+                        if let Some(base) = info.diff_base.as_deref() {
+                            if let Ok(commits) = checkout.commit_summaries(base, "HEAD", 10) {
+                                if commits.is_empty() {
+                                    println!(
+                                        "  no commits since the session baseline — \
+                                         nothing new to integrate"
+                                    );
+                                }
+                                for line in &commits {
+                                    println!("  {line}");
+                                }
+                            }
+                        }
+                        if let Ok(dirty) = checkout.dirty_paths() {
+                            if !dirty.is_empty() {
+                                println!(
+                                    "  ⚠ {} uncommitted change(s) NOT included \
+                                     (only committed work integrates), e.g. {}",
+                                    dirty.len(),
+                                    dirty.first().map(String::as_str).unwrap_or("")
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             let outcome = broker.submit(session)?;
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
@@ -628,6 +690,27 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     return Err(UsageError::Message(
                         "gates failed on the merged tree".into(),
                     ));
+                }
+                // "What now?" — the next expected human action was
+                // implicit (dogfood feedback 2026-07-14).
+                if outcome.promoted {
+                    let integration = broker
+                        .integration_head()
+                        .map(|(_, commit)| commit[..12.min(commit.len())].to_string())
+                        .unwrap_or_else(|_| "?".into());
+                    println!(
+                        "What now: aethyme/integration is at {integration} and contains this work. \
+                         Your checkout and branches are untouched — keep working, or start \
+                         a follow-up with `aethyme broker adopt --reuse --task \"...\"`, or \
+                         finish with `aethyme broker close --session {}`.",
+                        outcome.entry.session_id,
+                    );
+                } else {
+                    println!(
+                        "What now: entry {} is verified but not promoted (manual mode). \
+                         Promote with `aethyme broker promote --entry {}`.",
+                        outcome.entry.id, outcome.entry.id,
+                    );
                 }
             }
         }
@@ -914,6 +997,21 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             }
             if !report.certified() {
                 return Err(UsageError::Message("certification failed".into()));
+            }
+        }
+        "close" => {
+            let session = parsed
+                .session
+                .ok_or(UsageError::Message("close requires --session <id>".into()))?;
+            let mut broker = open_broker()?;
+            broker.close(session)?;
+            if parsed.json {
+                println!("{}", serde_json::json!({ "closed": session }));
+            } else {
+                println!(
+                    "Session {session} closed (state only — worktree untouched). \
+                     Follow-up task on the same worktree: `aethyme broker adopt --reuse --task \"...\"`."
+                );
             }
         }
         "cleanup" => {

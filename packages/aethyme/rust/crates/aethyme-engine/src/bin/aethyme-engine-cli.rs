@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1295,14 +1296,39 @@ fn index_to_store(
             file_errors,
             map.files.len()
         );
+
+        for class in &map.classes {
+            gs::insert_class(&mut session, class).map_err(|e| e.to_string())?;
+        }
+        eprintln!("  classes: {}", map.classes.len());
+
+        for function in &map.functions {
+            gs::insert_function(&mut session, function).map_err(|e| e.to_string())?;
+        }
+        eprintln!("  functions: {}", map.functions.len());
+
+        for doc in &map.docs {
+            gs::insert_doc(&mut session, doc).map_err(|e| e.to_string())?;
+        }
+        eprintln!("  docs: {}", map.docs.len());
+
+        for config in &map.configs {
+            gs::insert_config(&mut session, config).map_err(|e| e.to_string())?;
+        }
+        eprintln!("  configs: {}", map.configs.len());
         Ok(())
     })?;
 
-    // V1 redb persists file-level adjacency only. Symbol-level edges whose
-    // source or target is `fn:` / `class:` remain available through
-    // RepositoryMap-backed graph navigation, not through redb query surfaces.
-    // With raw structured IDs we just inspect the prefix; redb keys are not
-    // sanitized so what the engine produced is what we filter on.
+    let persisted_symbol_ids: HashSet<&str> = map
+        .classes
+        .iter()
+        .map(|class| class.id.as_str())
+        .chain(map.functions.iter().map(|function| function.id.as_str()))
+        .collect();
+
+    // The redb writer now persists `fn:` and `class:` endpoints, so symbol
+    // adjacency can be materialized. We still skip unresolved `import:`
+    // placeholders until they have a typed node table and read contract.
     let mut edge_errors = 0usize;
     let mut edge_ok = 0usize;
     let mut edge_skipped = 0usize;
@@ -1310,11 +1336,14 @@ fn index_to_store(
         for edge in &map.edges {
             let from = edge.from.as_str();
             let to = edge.to.as_str();
-            if to.starts_with("import:")
-                || from.starts_with("fn:")
-                || from.starts_with("class:")
-                || to.starts_with("fn:")
-                || to.starts_with("class:")
+            let from_is_persisted_symbol = !(from.starts_with("fn:") || from.starts_with("class:"))
+                || persisted_symbol_ids.contains(from);
+            let to_is_persisted_symbol = !(to.starts_with("fn:") || to.starts_with("class:"))
+                || persisted_symbol_ids.contains(to);
+            if from.starts_with("import:")
+                || to.starts_with("import:")
+                || !from_is_persisted_symbol
+                || !to_is_persisted_symbol
             {
                 edge_skipped += 1;
                 continue;
@@ -1335,7 +1364,7 @@ fn index_to_store(
             }
         }
         eprintln!(
-            "  edges: {} ok, {} errors, {} skipped (symbol-level) (of {} total)",
+            "  edges: {} ok, {} errors, {} skipped (unpersisted endpoints) (of {} total)",
             edge_ok,
             edge_errors,
             edge_skipped,

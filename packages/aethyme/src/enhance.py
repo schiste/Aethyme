@@ -197,6 +197,9 @@ this protocol:
 
    This simulates the merge and runs only the checks your diff affects.
    Report the outcome (verified / rejected / conflict) in your summary.
+   Afterwards, finish the session with
+   `"{binary}" broker close --session <id>` (state only), or point it at
+   a follow-up task with `"{binary}" broker adopt --reuse --task "..."`.
 
 4. **If a file named `.aethyme/broker-action-required.md` appears in your
    worktree**, read it immediately: your submission conflicted. It names

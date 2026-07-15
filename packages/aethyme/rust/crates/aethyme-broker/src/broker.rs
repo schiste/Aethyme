@@ -38,6 +38,29 @@ pub enum BrokerOpError {
     GateConfig(#[from] crate::gates::GateConfigError),
     #[error("queue entry {entry} is not verified (status: {status}) — submit/simulate first")]
     NotVerified { entry: i64, status: &'static str },
+    #[error(
+        "session {id} ({status}) already exists for this worktree{task}. Options:\n  \
+         aethyme broker submit --session {id}        submit its committed work\n  \
+         aethyme broker adopt --reuse --task \"...\"   point it at a follow-up task\n  \
+         aethyme broker close --session {id}         mark it finished (state only)\n  \
+         aethyme broker adopt --replace-stale        close it and register fresh"
+    )]
+    SessionExistsForWorktree {
+        id: i64,
+        status: &'static str,
+        task: String,
+    },
+}
+
+/// Policy for `adopt` when the worktree already has a live session.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AdoptMode {
+    /// Fail with guidance (default).
+    New,
+    /// Return the existing session, pointed at a follow-up task.
+    Reuse,
+    /// Close the existing session (state only) and register fresh.
+    ReplaceStale,
 }
 
 /// A session enriched with liveness derived at read time — what
@@ -127,11 +150,57 @@ impl Broker {
     /// Register an existing worktree the user already launched an agent
     /// in. `worktree` may be any path inside it.
     pub fn adopt(&mut self, worktree: &Path, task: Option<&str>) -> Result<Session, BrokerOpError> {
+        self.adopt_with(worktree, task, AdoptMode::New)
+    }
+
+    /// `adopt` with an explicit policy for the "this worktree already has
+    /// a session" case (dogfood feedback 2026-07-14: the bare constraint
+    /// error left no obvious follow-up path).
+    pub fn adopt_with(
+        &mut self,
+        worktree: &Path,
+        task: Option<&str>,
+        mode: AdoptMode,
+    ) -> Result<Session, BrokerOpError> {
         let checkout = GitRepo::discover(worktree)?;
         let branch = checkout.current_branch()?;
         let diff_base = checkout.head_commit().ok();
+        let worktree_path = checkout.root().to_string_lossy().into_owned();
+
+        if let Some(existing) = self.store.session_for_worktree(&worktree_path)? {
+            match mode {
+                AdoptMode::Reuse => {
+                    // Follow-up task on the same worktree: same identity,
+                    // fresh baseline so leases and submit scope reflect
+                    // work from *now*, not the previous task.
+                    return Ok(self.store.reuse_session(
+                        existing.id,
+                        task,
+                        diff_base.as_deref(),
+                    )?);
+                }
+                AdoptMode::ReplaceStale => {
+                    // State-only close (never touches the filesystem),
+                    // then a fresh registration.
+                    self.store
+                        .set_session_status(existing.id, SessionStatus::Cleaned, None)?;
+                }
+                AdoptMode::New => {
+                    return Err(BrokerOpError::SessionExistsForWorktree {
+                        id: existing.id,
+                        status: existing.status.as_str(),
+                        task: existing
+                            .task
+                            .as_deref()
+                            .map(|t| format!(", task: {t:?}"))
+                            .unwrap_or_default(),
+                    });
+                }
+            }
+        }
+
         let session = self.store.register_session(&NewSession {
-            worktree_path: checkout.root().to_string_lossy().into_owned(),
+            worktree_path,
             branch,
             origin: SessionOrigin::Adopted,
             task: task.map(str::to_string),
@@ -141,6 +210,15 @@ impl Broker {
             log_path: None,
         })?;
         Ok(session)
+    }
+
+    /// Mark a session finished without touching its worktree — the right
+    /// verb for adopted sessions, whose checkout the broker never owns
+    /// (`cleanup` removes worktrees and refuses on the main checkout).
+    pub fn close(&mut self, session_id: i64) -> Result<(), BrokerOpError> {
+        self.store
+            .set_session_status(session_id, SessionStatus::Cleaned, None)?;
+        Ok(())
     }
 
     // ── start-agent (spawn convenience) ───────────────────────────────

@@ -182,6 +182,56 @@ impl BrokerStore {
             .ok_or(BrokerError::SessionNotFound(id))?
     }
 
+    /// The non-cleaned session registered for exactly this worktree
+    /// path, if any — what `adopt` consults to give a useful answer
+    /// instead of a bare constraint violation.
+    pub fn session_for_worktree(
+        &self,
+        worktree_path: &str,
+    ) -> Result<Option<Session>, BrokerError> {
+        self.conn
+            .query_row(
+                &format!(
+                    "{SESSION_SELECT} WHERE worktree_path = ?1 AND status != 'cleaned'
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                params![worktree_path],
+                session_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Point an existing session at a follow-up task: new task text (when
+    /// given), fresh diff_base, activity touched. Emits `session.reused`.
+    pub fn reuse_session(
+        &mut self,
+        id: i64,
+        task: Option<&str>,
+        diff_base: Option<&str>,
+    ) -> Result<Session, BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE sessions SET task = COALESCE(?2, task), diff_base = COALESCE(?3, diff_base),
+                                 status = 'active', last_activity_at = ?4, updated_at = ?4
+             WHERE id = ?1 AND status != 'cleaned'",
+            params![id, task, diff_base, now],
+        )?;
+        if changed == 0 {
+            return Err(BrokerError::SessionNotFound(id));
+        }
+        insert_event(
+            &tx,
+            now,
+            crate::events::SESSION_REUSED,
+            Some(id),
+            Some(&crate::events::session_reused_payload(task, diff_base)),
+        )?;
+        tx.commit()?;
+        self.session(id)
+    }
+
     /// All sessions not yet cleaned, oldest first.
     pub fn live_sessions(&self) -> Result<Vec<Session>, BrokerError> {
         let mut stmt = self.conn.prepare(&format!(

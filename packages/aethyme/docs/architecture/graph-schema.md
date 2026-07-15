@@ -357,7 +357,7 @@ The current engine graph store is the Phase-3 redb file at
 live under `.aethyme/cache/`, but committed fragments remain the source of
 truth; redb files are performance/query artifacts.
 
-Supported V1 redb surfaces are intentionally narrower than the fragment
+Supported redb CLI surfaces are intentionally narrower than the fragment
 schema:
 
 - `aethyme-engine-cli index --repo <repo>`: rebuilds the local redb store
@@ -369,44 +369,46 @@ schema:
 - `callers`: uses the current hybrid path: grep for the symbol, then use
   redb adjacency to expand candidate files.
 
-V1 redb is not the full persisted graph backend. It does not make
+The redb store is not the full graph-navigation backend. It does not make
 `.aethyme/graph_store.redb` a committed format, and it does not replace the
-fragments as the durable graph. V2 may broaden redb-backed reads, but should
-still treat fragments as the regeneration source.
+fragments as the durable graph. Broader redb-backed reads must still treat
+fragments as the regeneration source.
 
-V1 redb limitations:
+Current redb storage coverage:
 
-- Symbol-level redb persistence is deliberately incomplete. The schema has
-  tables and secondary indexes for functions/classes and symbol lookup, but
-  the current writer does not fully populate them from `RepositoryMap`.
-- The V1 writer skips adjacency whose source or target is a symbol id such as
-  `fn:` or `class:`. File-level dependency/importer adjacency is the supported
-  redb edge plane.
+- Schema version `2` means `aethyme-engine-cli index` populates typed rows
+  for files, areas, functions, classes, docs, configs, and risks.
+- `SYMBOL_BY_NAME` is populated for function/class simple names using
+  ASCII-lowercased exact-name keys. `FUNCTIONS_BY_PATH` is populated for
+  file-scoped function lookup. `NODES_BY_PATH` is the broader path index for
+  files, functions, classes, docs, and configs.
+- The writer persists `fn:` and `class:` adjacency once the corresponding
+  function/class rows have been written. Unresolved `import:` placeholders
+  are still skipped because there is no persisted import/unresolved-node table
+  in the redb store yet.
 - Most graph navigation still comes from an in-memory `RepositoryMap` rebuilt
   from `.aethyme/graph/` fragments. Commands such as `graph-*`, task views,
   context packs, and `explore` should not be assumed to read from redb just
   because `.aethyme/graph_store.redb` exists.
 
-V2 redb store contract (target, not V1):
+Remaining V2 redb store contract:
 
 - Ownership is unchanged. `.aethyme/graph/` fragments are the source of
   truth; `.aethyme/graph_store.redb` remains a derived, local, disposable
   query artifact rebuilt from those fragments.
-- V2 must persist the full node set used by graph navigation: files, areas,
-  functions, classes, separately modeled methods, docs/configs that affect
-  navigation, and unresolved/import nodes when they participate in lookup or
-  adjacency. Directory/module/container nodes may be materialized when needed
-  for prefix or parent/child navigation, but their ids must still be derived
-  from canonical fragment data.
+- V2 must persist any remaining graph-navigation node kinds: separately
+  modeled methods if they stop being represented as functions,
+  unresolved/import nodes when they participate in lookup or adjacency, and
+  directory/module/container nodes when needed for prefix or parent/child
+  navigation. Their ids must still be derived from canonical fragment data.
 - Each persisted node row must retain the canonical id, kind, path/name,
   language, range, area/container membership, and other typed fields needed
   to derive labels and navigation output. V2 must not introduce stored
   display labels as a substitute for canonical fields.
-- V2 must persist the full edge set used by graph navigation, including
-  symbol-level `fn:` / `class:` / method endpoints. Supported edges include
-  file-level dependency/importer edges plus defines/contains, calls, imports,
-  documents, configures, tests, mocks, risk, entrypoint, and area-membership
-  edges when those relationships feed an existing graph view.
+- V2 must persist the full edge set used by graph navigation. The current
+  writer includes persisted file/function/class/doc/config endpoints, but
+  import/unresolved endpoints and any future node kinds need matching typed
+  rows before their edges are advertised as redb-backed.
 - Both outgoing and incoming adjacency indexes are required for every
   persisted edge kind. A V2 writer must not silently drop symbol-level edges
   and still advertise graph-navigation coverage.

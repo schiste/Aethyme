@@ -44,9 +44,10 @@ One JSON object per line:
 | Kind | session_id | Payload fields | Emitted when |
 |---|---|---|---|
 | `session.registered` | the session | `origin` (adopted\|spawned), `branch`, `worktree_path` | adopt / start-agent |
+| `session.reused` | the session | `task`, `diff_base` (both nullable) | `adopt --reuse` pointed an existing session at a follow-up task (added 2026-07-14) |
 | `session.active` / `.idle` / `.stale` | the session | — | liveness transition persisted (once per transition) |
 | `session.exited` | the session | `exit_code` (when known) | spawned PID died, or explicit transition |
-| `session.cleaned` | the session | — | `cleanup` removed the worktree |
+| `session.cleaned` | the session | — | `cleanup` removed the worktree, `close` marked the session finished (state only), or `adopt --replace-stale` retired the previous session |
 | `lease.claimed` / `lease.released` | claiming session | `path` | explicit lease operations |
 | `lease.overlap` | lower session of the pair | `session_a`, `session_b`, `path` | a NEW overlapping-edit pair is detected (never re-announced) |
 | `gate.pass` / `.fail` / `.error` | submitting session (nullable) | `gate`, `tree` | a gate run concluded against tree `tree` |

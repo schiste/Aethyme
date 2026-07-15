@@ -27,6 +27,8 @@ agent sessions working here concurrently:
 2. Commit early and small; only committed work integrates.
 3. When done, `aethyme broker submit --session <id>` — never merge or push
    yourself, and never touch the `aethyme/integration` branch directly.
+   Then `aethyme broker close --session <id>` to finish, or
+   `aethyme broker adopt --reuse --task "..."` for a follow-up task.
 4. If `.aethyme/broker-action-required.md` appears in your worktree, your
    submission conflicted: it contains the files, the blocking session, and
    the exact rebase steps. Resolve and resubmit.
