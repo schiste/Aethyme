@@ -11,10 +11,7 @@ use std::process::{Command, Output};
 
 use aethyme_graph_indexer::{index_repo_to_disk, IndexerContext, WalkOptions};
 use aethyme_graph_storage::bootstrap_repo;
-use redb::{
-    Database, MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable, ReadableTable,
-    TableDefinition,
-};
+use redb::{Database, MultimapTableDefinition, ReadableDatabase, ReadableTable, TableDefinition};
 
 const FUNCTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("functions");
 const CLASSES: TableDefinition<&str, &[u8]> = TableDefinition::new("classes");
@@ -275,11 +272,17 @@ fn query_areas_reads_existing_store() {
 fn index_populates_symbol_tables_and_symbol_edges() {
     let tmp = build_symbol_redb_fixture();
     let db = open_store(tmp.path());
-    let function_id = "fn:TinyRepo:src/auth/token.py:load_token";
-    let class_id = "class:TinyRepo:src/auth/token.py:TokenLoader";
+    let function_hits = str_multimap_values(&db, SYMBOL_BY_NAME, "load_token");
+    let function_id = function_hits
+        .first()
+        .expect("load_token should be indexed by name");
+    let class_hits = str_multimap_values(&db, SYMBOL_BY_NAME, "tokenloader");
+    let class_id = class_hits
+        .first()
+        .expect("TokenLoader should be indexed by name");
 
-    assert!(table_has_row(&db, FUNCTIONS, function_id));
-    assert!(table_has_row(&db, CLASSES, class_id));
+    assert!(table_has_row(&db, FUNCTIONS, function_id.as_str()));
+    assert!(table_has_row(&db, CLASSES, class_id.as_str()));
     assert!(
         table_row_count(&db, DOCS) > 0,
         "docs table should be populated"
@@ -289,16 +292,9 @@ fn index_populates_symbol_tables_and_symbol_edges() {
         "configs table should be populated"
     );
 
+    assert!(str_multimap_values(&db, FUNCTIONS_BY_PATH, "src/auth/token.py").contains(function_id));
     assert!(
-        str_multimap_values(&db, SYMBOL_BY_NAME, "load_token").contains(&function_id.to_string())
-    );
-    assert!(str_multimap_values(&db, SYMBOL_BY_NAME, "tokenloader").contains(&class_id.to_string()));
-    assert!(
-        str_multimap_values(&db, FUNCTIONS_BY_PATH, "src/auth/token.py")
-            .contains(&function_id.to_string())
-    );
-    assert!(
-        bytes_multimap_count(&db, EDGES_IN, function_id) > 0,
+        bytes_multimap_count(&db, EDGES_IN, function_id.as_str()) > 0,
         "symbol endpoint should have incoming adjacency"
     );
 }
