@@ -366,6 +366,9 @@ schema:
 - `query-overview`: reads repo metadata, top areas, entrypoints, and risks.
 - `deps`: reads outgoing file adjacency.
 - `importers`: reads incoming file adjacency.
+- `symbol` / `symbol-batch`: try exact redb symbol lookup first, then fall
+  back to `RepositoryMap` for fuzzy/path/area-ranked queries redb cannot yet
+  answer.
 - `callers`: uses the current hybrid path: grep for the symbol, then use
   redb adjacency to expand candidate files.
 
@@ -423,6 +426,20 @@ Required V2 read APIs for replacing `RepositoryMap` reads:
 | Adjacency | Implemented as `neighbors(id, direction, kind?)`; existing `edges_from` / `edges_to` remain compatibility wrappers for unfiltered directions. | `children_view`, `parents_view`, `callers_view`, `callees_view`, `docs_view`, `configs_view`, `task_expand_view`, `graph_expand_view`. |
 | Task anchor candidates | Query by task text tokens against symbols, paths, docs/configs, areas, and unresolved/import names, returning typed candidates and ranking signals. Ranking may stay in the graph module, but the store must provide the bounded candidate rows without rebuilding `RepositoryMap`. | `task_anchors_view`, `task_scope_view`, `task_next_view`, context-pack assembly. |
 | Overview/navigation slices | Implemented as `overview_v2(...)` for bounded repo metadata, areas, entrypoints, risks, files, functions, classes, docs, and configs. Higher-level task/navigation slices still need graph-module adapters. | `graph_overview_view`, `task_next_view`, `explore`, context-pack navigation order. |
+
+Bridge decisions as of 2026-07-15:
+
+| Consumer | Decision | Current status |
+|---|---|---|
+| `graph::search::symbol_search` / `symbol` / `symbol-batch` | Hybrid redb-first exact lookup with `RepositoryMap` fallback. | Redb serves exact function/class simple-name queries through `find_symbols`; fuzzy component, path, and area ranking still use `RepositoryMap`. |
+| `deps` / `importers` | Redb-backed equivalent. | CLI reads `neighbors(id, Outgoing/Incoming, None)` and preserves the existing path-list output. |
+| `query-overview` | Redb-backed equivalent with V1 JSON projection. | CLI reads `overview_v2(Default)` but still emits only the stable `repo`, `areas`, `entrypoints`, and `risks` keys. |
+| `callers` | Keep the hybrid grep + redb adjacency path. | Grep finds candidate files containing the symbol; redb `neighbors(..., Incoming, None)` expands importers before line grep. |
+| `anchors` | Keep using `RepositoryMap` for V1. | Anchor ranking depends on fuzzy symbol scoring, file references, areas, configs, ExplainRepo-specific fillers, and task-kind rules that are not yet represented as redb candidate queries. |
+| `task scope` / `task next` | Keep using `RepositoryMap` for V1. | These views compose anchors with scope narrowing, risk selection, and navigation order; move only after redb anchor candidates have parity tests. |
+| `graph expand` / relation views | Keep using `RepositoryMap` for high-level views; bridge low-level adjacency first. | `neighbors` covers raw adjacency, but rendered graph slices still need node labeling, child/parent/doc/config semantics, and parity tests before replacement. |
+| `usage boundary` | Keep using `RepositoryMap` and grep/analyzer logic. | The current analyzer is scope-first and language-specific; redb can provide symbol/path seeds later but should not own the policy yet. |
+| Trait abstraction | Defer. | A trait is useful only once two consumers need the same read contract; today the low-risk commands can call redb directly and higher-level flows still need richer candidate APIs. |
 
 V2 is complete only when the graph module can serve node, relation, task,
 overview, and context-pack navigation paths from read-only redb queries

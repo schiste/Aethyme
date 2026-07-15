@@ -18,11 +18,14 @@ use aethyme_engine::graph::navigation::{
 };
 use aethyme_engine::graph::neighborhood::{dependency_frontier, impact_frontier};
 use aethyme_engine::graph::overview::build_repo_overview;
-use aethyme_engine::graph::search::symbol_search;
+use aethyme_engine::graph::search::{symbol_search, symbol_search_redb, SearchHit};
 use aethyme_engine::graph::usage_boundary::analyze_usage_boundary_scope_first;
 use aethyme_engine::map::RepositoryMap;
 use aethyme_engine::model::task::TaskInput;
 use aethyme_engine::pipeline::{build_context_pack, build_context_pack_with_content};
+use aethyme_engine::store::redb::graph_store::{
+    GraphStore, NeighborDirection, OverviewV2Limits, ReadOnlyGraphStore,
+};
 use aethyme_engine::workspace::{build_workspace_graph, cross_repo_blast_radius};
 
 #[derive(Clone, Copy)]
@@ -118,8 +121,8 @@ fn run() -> Result<(), String> {
         "symbol" => {
             let repo = read_option(&args, "--repo")?;
             let query = read_option(&args, "--query")?;
-            let map = build_map(&repo, no_cache, fragment_mode)?;
-            let hits = symbol_search(&map, &query, 20);
+            let hits =
+                symbol_search_with_redb_fallback(&repo, &query, 20, no_cache, fragment_mode)?;
             println!("{}", aethyme_engine::json::search_hits(&hits));
         }
         "symbol-batch" => {
@@ -132,11 +135,8 @@ fn run() -> Result<(), String> {
                 .ok()
                 .and_then(|raw| raw.parse::<usize>().ok())
                 .unwrap_or(20);
-            let map = build_map(&repo, no_cache, fragment_mode)?;
-            let results = queries
-                .iter()
-                .map(|query| (query.clone(), symbol_search(&map, query, limit)))
-                .collect::<Vec<_>>();
+            let results =
+                symbol_batch_with_redb_fallback(&repo, &queries, limit, no_cache, fragment_mode)?;
             println!("{}", aethyme_engine::json::search_hits_by_query(&results));
         }
         "graph-node" => {
@@ -555,9 +555,7 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let store =
-                aethyme_engine::store::redb::graph_store::GraphStore::open_read_only(&canonical)
-                    .map_err(|e| e.to_string())?;
+            let store = GraphStore::open_read_only(&canonical).map_err(|e| e.to_string())?;
             let areas = store.list_areas(depth).map_err(|e| e.to_string())?;
             println!("{}", serde_json::to_string_pretty(&areas).unwrap());
         }
@@ -567,10 +565,10 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let store =
-                aethyme_engine::store::redb::graph_store::GraphStore::open_read_only(&canonical)
-                    .map_err(|e| e.to_string())?;
-            let edges = store.edges_to(&file).map_err(|e| e.to_string())?;
+            let store = GraphStore::open_read_only(&canonical).map_err(|e| e.to_string())?;
+            let edges = store
+                .neighbors(&file, NeighborDirection::Incoming, None)
+                .map_err(|e| e.to_string())?;
             for edge in &edges {
                 if let Some(path) = file_path_from_id(edge.other.as_str()) {
                     println!("{path}");
@@ -583,10 +581,10 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let store =
-                aethyme_engine::store::redb::graph_store::GraphStore::open_read_only(&canonical)
-                    .map_err(|e| e.to_string())?;
-            let edges = store.edges_from(&file).map_err(|e| e.to_string())?;
+            let store = GraphStore::open_read_only(&canonical).map_err(|e| e.to_string())?;
+            let edges = store
+                .neighbors(&file, NeighborDirection::Outgoing, None)
+                .map_err(|e| e.to_string())?;
             for edge in &edges {
                 if let Some(path) = file_path_from_id(edge.other.as_str()) {
                     println!("{path}");
@@ -599,9 +597,7 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let store =
-                aethyme_engine::store::redb::graph_store::GraphStore::open_read_only(&canonical)
-                    .map_err(|e| e.to_string())?;
+            let store = GraphStore::open_read_only(&canonical).map_err(|e| e.to_string())?;
 
             // Step 1: grep -rl to find files containing the symbol name
             let grep_output = std::process::Command::new("grep")
@@ -632,7 +628,7 @@ fn run() -> Result<(), String> {
                     std::collections::BTreeSet::new();
                 for f in &found_files {
                     search_set.insert(f.clone());
-                    if let Ok(edges) = store.edges_to(f) {
+                    if let Ok(edges) = store.neighbors(f, NeighborDirection::Incoming, None) {
                         for edge in &edges {
                             if let Some(p) = file_path_from_id(edge.other.as_str()) {
                                 search_set.insert(p);
@@ -670,10 +666,10 @@ fn run() -> Result<(), String> {
             let canonical = PathBuf::from(&repo)
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
-            let store =
-                aethyme_engine::store::redb::graph_store::GraphStore::open_read_only(&canonical)
-                    .map_err(|e| e.to_string())?;
-            let overview = store.overview(20, 10, 20).map_err(|e| e.to_string())?;
+            let store = GraphStore::open_read_only(&canonical).map_err(|e| e.to_string())?;
+            let overview = store
+                .overview_v2(OverviewV2Limits::default())
+                .map_err(|e| e.to_string())?;
             // Hand-roll JSON to keep the output stable: native Overview isn't
             // serde::Serialize on the AreaNode/RiskFlag side either, so we
             // build a serde_json::Value here.
@@ -991,6 +987,67 @@ fn build_map(
     fragment_mode: FragmentBuildMode,
 ) -> Result<RepositoryMap, String> {
     build_map_with_profile(repo, no_cache, fragment_mode).map(|(map, _)| map)
+}
+
+fn symbol_search_with_redb_fallback(
+    repo: &str,
+    query: &str,
+    limit: usize,
+    no_cache: bool,
+    fragment_mode: FragmentBuildMode,
+) -> Result<Vec<SearchHit>, String> {
+    if let Some(store) = open_optional_redb_store(repo) {
+        if let Ok(hits) = symbol_search_redb(&store, query, limit) {
+            if redb_symbol_hits_are_decisive(query, limit, &hits) {
+                return Ok(hits);
+            }
+        }
+    }
+
+    let map = build_map(repo, no_cache, fragment_mode)?;
+    Ok(symbol_search(&map, query, limit))
+}
+
+fn symbol_batch_with_redb_fallback(
+    repo: &str,
+    queries: &[String],
+    limit: usize,
+    no_cache: bool,
+    fragment_mode: FragmentBuildMode,
+) -> Result<Vec<(String, Vec<SearchHit>)>, String> {
+    if let Some(store) = open_optional_redb_store(repo) {
+        let mut results = Vec::new();
+        let mut redb_answered_batch = true;
+        for query in queries {
+            match symbol_search_redb(&store, query, limit) {
+                Ok(hits) if redb_symbol_hits_are_decisive(query, limit, &hits) => {
+                    results.push((query.clone(), hits));
+                }
+                _ => {
+                    redb_answered_batch = false;
+                    break;
+                }
+            }
+        }
+        if redb_answered_batch {
+            return Ok(results);
+        }
+    }
+
+    let map = build_map(repo, no_cache, fragment_mode)?;
+    Ok(queries
+        .iter()
+        .map(|query| (query.clone(), symbol_search(&map, query, limit)))
+        .collect())
+}
+
+fn open_optional_redb_store(repo: &str) -> Option<ReadOnlyGraphStore> {
+    let canonical = PathBuf::from(repo).canonicalize().ok()?;
+    GraphStore::open_read_only(&canonical).ok()
+}
+
+fn redb_symbol_hits_are_decisive(query: &str, limit: usize, hits: &[SearchHit]) -> bool {
+    limit == 0 || query.split_whitespace().next().is_none() || !hits.is_empty()
 }
 
 fn build_map_with_profile(
