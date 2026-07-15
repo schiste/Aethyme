@@ -197,3 +197,73 @@ fn doctor_reports_healthy_then_finds_missing_worktree() {
     assert_eq!(report.missing_worktrees, vec![session.id]);
     assert!(!report.healthy());
 }
+
+// ── session lifecycle UX (dogfood feedback 2026-07-14) ─────────────────
+
+#[test]
+fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let first = broker.adopt(tmp.path(), Some("first task")).unwrap();
+
+    // Bare re-adopt fails with guidance naming the session and options.
+    let err = broker.adopt(tmp.path(), Some("second task")).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(err, BrokerOpError::SessionExistsForWorktree { id, .. } if id == first.id),
+        "expected guidance error, got: {msg}"
+    );
+    for needle in [
+        "--reuse",
+        "close --session",
+        "--replace-stale",
+        "first task",
+    ] {
+        assert!(msg.contains(needle), "guidance missing {needle:?}: {msg}");
+    }
+
+    // --reuse keeps the identity, updates the task, refreshes the baseline.
+    std::fs::write(tmp.path().join("f.txt"), "x\n").unwrap();
+    sh(tmp.path(), &["add", "-A"]);
+    sh(tmp.path(), &["commit", "-qm", "advance head"]);
+    let reused = broker
+        .adopt_with(
+            tmp.path(),
+            Some("follow-up task"),
+            aethyme_broker::AdoptMode::Reuse,
+        )
+        .unwrap();
+    assert_eq!(reused.id, first.id);
+    assert_eq!(reused.task.as_deref(), Some("follow-up task"));
+    assert_ne!(reused.diff_base, first.diff_base, "baseline must refresh");
+
+    // close is state-only: session cleaned, worktree untouched.
+    broker.close(first.id).unwrap();
+    let closed = broker.store().session(first.id).unwrap();
+    assert_eq!(closed.status, SessionStatus::Cleaned);
+    assert!(tmp.path().join("README.md").exists());
+
+    // After close, plain adopt works again (no --replace-stale needed).
+    let second = broker.adopt(tmp.path(), Some("third task")).unwrap();
+    assert_ne!(second.id, first.id);
+
+    // --replace-stale swaps a lingering session for a fresh one.
+    let replaced = broker
+        .adopt_with(
+            tmp.path(),
+            Some("fourth task"),
+            aethyme_broker::AdoptMode::ReplaceStale,
+        )
+        .unwrap();
+    assert_ne!(replaced.id, second.id);
+    assert_eq!(
+        broker.store().session(second.id).unwrap().status,
+        SessionStatus::Cleaned
+    );
+
+    // The reuse left an audit trail.
+    let events = broker.store().events_after(0, i64::MAX).unwrap();
+    assert!(events.iter().any(|e| e.kind == "session.reused"));
+}

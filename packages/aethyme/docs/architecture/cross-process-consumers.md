@@ -149,34 +149,32 @@ Supported V1 redb surfaces:
 | `importers` | Read-only | Reads incoming file adjacency from the redb store. |
 | `callers` | Hybrid grep + graph | Greps for the requested symbol, then uses redb adjacency to expand candidate files. It is not a pure redb symbol-query contract in V1. |
 
-Supported V1 limitations:
+Current storage coverage and limitations:
 
-- Symbol-level redb persistence is not complete. The redb schema includes
-  `functions`, `classes`, `functions_by_path`, and `symbol_by_name` tables as
-  schema-ready surfaces, but the current `index` writer does not fully
-  populate them from `RepositoryMap`.
-- The `index` writer skips edges with `fn:` or `class:` endpoints before
-  writing redb adjacency. `deps`, `importers`, and the graph half of
-  `callers` are file-adjacency surfaces, not general symbol-callgraph
-  surfaces.
+- Schema version `2` means the `index` writer populates files, areas,
+  functions, classes, docs, configs, risks, `functions_by_path`, and
+  `symbol_by_name`.
+- The `index` writer persists edges with `fn:` or `class:` endpoints once the
+  corresponding function/class rows exist. Unresolved `import:` endpoints are
+  still skipped because there is no persisted import/unresolved-node table.
 - Most graph navigation is still served by `RepositoryMap` rebuilt from
   `.aethyme/graph/` fragments. The legacy `graph-*`, task, context-pack, and
   `explore` surfaces should not be described as redb-backed until they are
   explicitly moved to `GraphStore::open_read_only`.
 
-V2 target contract:
+Remaining V2 target contract:
 
 - No ownership change: `.aethyme/graph/` fragments remain the durable source
   of truth, while `.aethyme/graph_store.redb` remains derived, local, and
   rebuildable.
-- The V2 writer must persist the full graph-navigation node set: files,
-  areas, functions, classes, separately represented methods, docs/configs
-  used by navigation, unresolved/import nodes when they participate in lookup
-  or edges, and any derived directory/module/container nodes required for
-  prefix or parent/child navigation.
-- The V2 writer must persist the full graph-navigation edge set, including
-  symbol-level endpoints. It must retain incoming and outgoing adjacency for
-  every persisted edge kind.
+- The V2 writer must persist any remaining graph-navigation node kinds:
+  separately represented methods if they stop being represented as functions,
+  unresolved/import nodes when they participate in lookup or edges, and any
+  derived directory/module/container nodes required for prefix or parent/child
+  navigation.
+- The V2 writer must persist the full graph-navigation edge set for every
+  typed node kind it claims to support. It must retain incoming and outgoing
+  adjacency for every persisted edge kind.
 - The V2 read contract must cover `node_by_id`, batch node lookup, symbol
   lookup by name/kind, path-prefix lookup, incoming/outgoing adjacency, task
   anchor candidate queries, and bounded overview/navigation slices.

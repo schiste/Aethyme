@@ -290,6 +290,36 @@ impl GitRepo {
         Ok(files)
     }
 
+    /// One-line summaries (short-sha + subject) of `from..to`, newest
+    /// first, capped at `limit` — the submit preflight's "exactly what
+    /// will be submitted" listing.
+    pub fn commit_summaries(
+        &self,
+        from: &str,
+        to: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, GitError> {
+        let range = format!("{from}..{to}");
+        let n = format!("--max-count={limit}");
+        let out = run_git(
+            &self.root,
+            &["log", "--oneline", "--no-decorate", &n, &range],
+        )?;
+        Ok(out.lines().map(str::to_string).collect())
+    }
+
+    /// Paths with uncommitted or untracked changes — the submit preflight
+    /// warns about these because only committed work integrates.
+    pub fn dirty_paths(&self) -> Result<Vec<String>, GitError> {
+        Ok(run_git(
+            &self.root,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )?
+        .lines()
+        .filter_map(|l| l.get(3..).map(str::to_string))
+        .collect())
+    }
+
     /// True when the checkout has uncommitted changes or untracked files —
     /// the guard `broker cleanup` consults before removing a worktree.
     pub fn is_dirty(&self) -> Result<bool, GitError> {

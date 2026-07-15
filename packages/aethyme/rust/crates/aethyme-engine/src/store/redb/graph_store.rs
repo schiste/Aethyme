@@ -1,20 +1,18 @@
 //! redb-backed graph store for the Aethyme engine.
 //!
 //! This module is the local materialized read model for the committed graph
-//! fragments under `<repo>/.aethyme/graph/`. V1 supports the engine-index
-//! writer, `query-areas`, `query-overview`, `deps`, `importers`, and the graph
-//! adjacency half of the hybrid `callers` path.
+//! fragments under `<repo>/.aethyme/graph/`. The current writer persists
+//! files, areas, functions, classes, docs, configs, risks, and file/symbol
+//! adjacency for `query-areas`, `query-overview`, `deps`, `importers`, and the
+//! graph adjacency half of the hybrid `callers` path.
 //! Most graph navigation still uses an in-memory `RepositoryMap` rebuilt from
 //! fragments rather than this redb store.
 //!
-//! Non-scope for V1: this file is not the durable graph format, does not
-//! mutate fragment files, does not promise in-place redb file migrations, and
-//! is not a daemon-owned live graph. If `.aethyme/graph_store.redb` is missing
-//! or incompatible, rebuild it from fragments with `aethyme-engine-cli index
-//! --repo <repo>`.
-//! V1 also does not fully persist symbol-level graph data: `fn:` / `class:`
-//! edges are skipped by the current writer, and the symbol tables below are
-//! schema-ready but not fully populated by `aethyme-engine-cli index`.
+//! Non-scope for the current redb store: this file is not the durable graph
+//! format, does not mutate fragment files, does not promise in-place redb file
+//! migrations, and is not a daemon-owned live graph. If
+//! `.aethyme/graph_store.redb` is missing or incompatible, rebuild it from
+//! fragments with `aethyme-engine-cli index --repo <repo>`.
 //!
 //! Historical context: this replaced the old SurrealDB-backed `GraphStore`.
 //! `docs/architecture/phase3-redb-graph-store-plan.md` preserves the migration
@@ -30,14 +28,18 @@ use redb::{
 use serde::{Deserialize, Serialize};
 
 use crate::model::area::AreaNode;
+use crate::model::class::ClassNode;
+use crate::model::config::ConfigNode;
+use crate::model::doc::DocNode;
 use crate::model::edge::{Edge, EdgeKind};
 use crate::model::file::FileNode;
+use crate::model::function::FunctionNode;
 use crate::model::intern::InternedStr;
 use crate::model::risk::RiskFlag;
 
 /// Bumped when the on-disk format changes incompatibly. We re-create the file
 /// rather than try to migrate.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// Single-row metadata table: schema version, build timestamps, repo root, ...
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -49,9 +51,10 @@ const META_KEY_SCHEMA_VERSION: &str = "schema_version";
 // `path/` don't have to skip over unrelated kinds. Key = node id (raw &str so
 // scope queries can range over it). Value = bincoded entity record.
 //
-// V1 writer note: FILES and AREAS are populated by the current index command.
-// FUNCTIONS and CLASSES are schema-ready for symbol-level redb work, but the
-// current writer does not bulk-persist `RepositoryMap::functions/classes`.
+// Current writer note: all typed tables below are populated by the index
+// command. A schema-version bump protects query-only callers from older local
+// stores where FUNCTIONS/CLASSES/DOCS/CONFIGS existed but were schema-ready
+// rather than semantically populated.
 
 const FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
 const AREAS: TableDefinition<&str, &[u8]> = TableDefinition::new("areas");
@@ -72,8 +75,9 @@ const EDGES_IN: MultimapTableDefinition<&str, &[u8]> = MultimapTableDefinition::
 // Key = file_path. Value = node id. A range scan from "includes/" to
 // "includes/\xff" yields all symbols under that scope.
 //
-// V1 writer note: NODES_BY_PATH is populated for files. FUNCTIONS_BY_PATH is
-// schema-ready but not fully populated by the current writer.
+// Current writer note: NODES_BY_PATH is the broad path index for files,
+// classes, functions, docs, and configs. FUNCTIONS_BY_PATH remains a narrower
+// hot index for file-scoped symbol lookups.
 
 const FUNCTIONS_BY_PATH: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("functions_by_path");
@@ -83,8 +87,9 @@ const NODES_BY_PATH: MultimapTableDefinition<&str, &str> =
 // ── Symbol search ───────────────────────────────────────────────────────────
 // Key = lowercased name. Value = node id.
 //
-// V1 writer note: schema-ready only. The current writer does not fully
-// populate symbol-name lookup rows from `RepositoryMap`.
+// Current writer note: populated for function and class names. Keys are exact
+// ASCII-lowercased symbol names; ranking/fuzzy expansion belongs in graph
+// search, not in the storage key.
 
 const SYMBOL_BY_NAME: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("symbol_by_name");
@@ -540,9 +545,13 @@ impl ReadOnlyGraphStore {
 // raw redb key (no sanitization), entity → bincoded value, plus the secondary
 // indexes each kind requires. Mirrors the surface of `super::super::write`.
 //
-// V1 coverage note: these primitives can write symbol rows/indexes in tests or
-// future writers, but `aethyme-engine-cli index` currently populates only the
-// area/file/risk subset plus file-level adjacency.
+// These wrappers are intentionally small: each one owns the table/index
+// contract for its node kind so the CLI writer cannot forget a secondary index
+// when adding a new persisted kind.
+
+fn symbol_index_key(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
 
 /// Insert (or overwrite) an area. Key = `area.id` (e.g. `area:Repo:src`).
 pub fn insert_area(session: &mut IndexSession<'_>, area: &AreaNode) -> Result<(), GraphStoreError> {
@@ -555,6 +564,58 @@ pub fn insert_area(session: &mut IndexSession<'_>, area: &AreaNode) -> Result<()
 pub fn insert_file(session: &mut IndexSession<'_>, file: &FileNode) -> Result<(), GraphStoreError> {
     session.insert_node(FILES, &file.id, file)?;
     session.add_path_index(NODES_BY_PATH, &file.path, &file.id)?;
+    Ok(())
+}
+
+/// Insert (or overwrite) a function. Also indexes by file path and
+/// ASCII-lowercased simple name.
+pub fn insert_function(
+    session: &mut IndexSession<'_>,
+    function: &FunctionNode,
+) -> Result<(), GraphStoreError> {
+    session.insert_node(FUNCTIONS, function.id.as_str(), function)?;
+    session.add_path_index(
+        FUNCTIONS_BY_PATH,
+        function.file_path.as_str(),
+        function.id.as_str(),
+    )?;
+    session.add_path_index(
+        NODES_BY_PATH,
+        function.file_path.as_str(),
+        function.id.as_str(),
+    )?;
+    let name_key = symbol_index_key(function.name.as_str());
+    session.add_symbol_index(&name_key, function.id.as_str())?;
+    Ok(())
+}
+
+/// Insert (or overwrite) a class-like symbol. Also indexes by file path and
+/// ASCII-lowercased simple name.
+pub fn insert_class(
+    session: &mut IndexSession<'_>,
+    class: &ClassNode,
+) -> Result<(), GraphStoreError> {
+    session.insert_node(CLASSES, class.id.as_str(), class)?;
+    session.add_path_index(NODES_BY_PATH, class.file_path.as_str(), class.id.as_str())?;
+    let name_key = symbol_index_key(class.name.as_str());
+    session.add_symbol_index(&name_key, class.id.as_str())?;
+    Ok(())
+}
+
+/// Insert (or overwrite) a documentation node and index it by path.
+pub fn insert_doc(session: &mut IndexSession<'_>, doc: &DocNode) -> Result<(), GraphStoreError> {
+    session.insert_node(DOCS, &doc.id, doc)?;
+    session.add_path_index(NODES_BY_PATH, &doc.path, &doc.id)?;
+    Ok(())
+}
+
+/// Insert (or overwrite) a configuration node and index it by path.
+pub fn insert_config(
+    session: &mut IndexSession<'_>,
+    config: &ConfigNode,
+) -> Result<(), GraphStoreError> {
+    session.insert_node(CONFIGS, &config.id, config)?;
+    session.add_path_index(NODES_BY_PATH, &config.path, &config.id)?;
     Ok(())
 }
 
@@ -1205,7 +1266,7 @@ mod tests {
     fn schema_version_is_persisted() {
         let root = tmp_root(function_name!());
         let _ = GraphStore::open(&root).expect("open");
-        // Reopen and confirm the sentinel reads back as v1.
+        // Reopen and confirm the sentinel reads back as the current schema.
         let store = GraphStore::open(&root).expect("reopen");
         let txn = store.db().begin_read().expect("read txn");
         let meta = txn.open_table(META).expect("META");
@@ -1256,6 +1317,17 @@ mod tests {
         let t = txn.open_multimap_table(table).expect("open");
         let iter = t.get(key).expect("get");
         iter.map(|r| r.expect("row").value().to_vec()).collect()
+    }
+
+    fn collect_str_multimap(
+        db: &Database,
+        table: MultimapTableDefinition<&str, &str>,
+        key: &str,
+    ) -> Vec<String> {
+        let txn = db.begin_read().expect("read txn");
+        let t = txn.open_multimap_table(table).expect("open");
+        let iter = t.get(key).expect("get");
+        iter.map(|r| r.expect("row").value().to_string()).collect()
     }
 
     #[test]
@@ -1591,6 +1663,45 @@ mod tests {
         )
     }
 
+    fn sample_class(file: &FileNode, name: &str) -> ClassNode {
+        ClassNode::new(
+            "Repo",
+            InternedStr::from(file.id.clone()),
+            InternedStr::from(file.path.clone()),
+            file.area_id.clone().map(InternedStr::from),
+            InternedStr::from(
+                file.language
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+            ),
+            InternedStr::from(name),
+            7,
+            InternedStr::from(format!("class {name}")),
+        )
+    }
+
+    fn sample_function(
+        file: &FileNode,
+        name: &str,
+        parent_class_id: Option<InternedStr>,
+    ) -> FunctionNode {
+        FunctionNode::new(
+            "Repo",
+            InternedStr::from(file.id.clone()),
+            InternedStr::from(file.path.clone()),
+            file.area_id.clone().map(InternedStr::from),
+            parent_class_id,
+            InternedStr::from(
+                file.language
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+            ),
+            InternedStr::from(name),
+            12,
+            InternedStr::from(format!("def {name}()")),
+        )
+    }
+
     #[test]
     fn typed_insert_area_round_trip() {
         let root = tmp_root(function_name!());
@@ -1635,6 +1746,105 @@ mod tests {
             .map(|r| r.expect("row").value().to_string())
             .collect();
         assert_eq!(hits, vec![id]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn typed_insert_function_populates_symbol_and_path_indexes() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let file = sample_file("Repo", "src/lib.rs", Some("area:Repo:src"));
+        let function = sample_function(&file, "LoadToken", None);
+        let id = function.id.to_string();
+
+        let mut session = store.begin_index().expect("session");
+        insert_function(&mut session, &function).expect("insert_function");
+        session.commit().expect("commit");
+
+        let bytes = read_node_bytes(store.db(), FUNCTIONS, &id).expect("present");
+        let got: FunctionNode = bincode::deserialize(&bytes).expect("decode");
+        assert_eq!(got, function);
+        assert_eq!(
+            collect_str_multimap(store.db(), FUNCTIONS_BY_PATH, "src/lib.rs"),
+            vec![id.clone()]
+        );
+        assert_eq!(
+            collect_str_multimap(store.db(), NODES_BY_PATH, "src/lib.rs"),
+            vec![id.clone()]
+        );
+        assert_eq!(
+            collect_str_multimap(store.db(), SYMBOL_BY_NAME, "loadtoken"),
+            vec![id]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn typed_insert_class_populates_symbol_and_path_indexes() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let file = sample_file("Repo", "src/lib.rs", Some("area:Repo:src"));
+        let class = sample_class(&file, "TokenLoader");
+        let id = class.id.to_string();
+
+        let mut session = store.begin_index().expect("session");
+        insert_class(&mut session, &class).expect("insert_class");
+        session.commit().expect("commit");
+
+        let bytes = read_node_bytes(store.db(), CLASSES, &id).expect("present");
+        let got: ClassNode = bincode::deserialize(&bytes).expect("decode");
+        assert_eq!(got, class);
+        assert_eq!(
+            collect_str_multimap(store.db(), NODES_BY_PATH, "src/lib.rs"),
+            vec![id.clone()]
+        );
+        assert_eq!(
+            collect_str_multimap(store.db(), SYMBOL_BY_NAME, "tokenloader"),
+            vec![id]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn typed_insert_doc_and_config_index_paths() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let doc = DocNode::new(
+            "Repo",
+            "file:Repo:docs/auth.md",
+            "docs/auth.md",
+            "Auth",
+            "markdown",
+            Some("area:Repo:docs".to_string()),
+        );
+        let config = ConfigNode::new(
+            "Repo",
+            "file:Repo:pyproject.toml",
+            "pyproject.toml",
+            "toml",
+            None,
+        );
+
+        let mut session = store.begin_index().expect("session");
+        insert_doc(&mut session, &doc).expect("insert_doc");
+        insert_config(&mut session, &config).expect("insert_config");
+        session.commit().expect("commit");
+
+        let doc_bytes = read_node_bytes(store.db(), DOCS, &doc.id).expect("doc present");
+        let got_doc: DocNode = bincode::deserialize(&doc_bytes).expect("decode doc");
+        assert_eq!(got_doc, doc);
+        let config_bytes =
+            read_node_bytes(store.db(), CONFIGS, &config.id).expect("config present");
+        let got_config: ConfigNode = bincode::deserialize(&config_bytes).expect("decode config");
+        assert_eq!(got_config, config);
+        assert_eq!(
+            collect_str_multimap(store.db(), NODES_BY_PATH, "docs/auth.md"),
+            vec![doc.id.clone()]
+        );
+        assert_eq!(
+            collect_str_multimap(store.db(), NODES_BY_PATH, "pyproject.toml"),
+            vec![config.id.clone()]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

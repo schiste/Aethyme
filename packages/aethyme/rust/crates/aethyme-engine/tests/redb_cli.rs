@@ -11,6 +11,20 @@ use std::process::{Command, Output};
 
 use aethyme_graph_indexer::{index_repo_to_disk, IndexerContext, WalkOptions};
 use aethyme_graph_storage::bootstrap_repo;
+use redb::{
+    Database, MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable, ReadableTable,
+    TableDefinition,
+};
+
+const FUNCTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("functions");
+const CLASSES: TableDefinition<&str, &[u8]> = TableDefinition::new("classes");
+const DOCS: TableDefinition<&str, &[u8]> = TableDefinition::new("docs");
+const CONFIGS: TableDefinition<&str, &[u8]> = TableDefinition::new("configs");
+const EDGES_IN: MultimapTableDefinition<&str, &[u8]> = MultimapTableDefinition::new("edges_in");
+const FUNCTIONS_BY_PATH: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("functions_by_path");
+const SYMBOL_BY_NAME: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("symbol_by_name");
 
 fn engine_bin() -> &'static str {
     env!("CARGO_BIN_EXE_aethyme-engine-cli")
@@ -97,6 +111,89 @@ fn build_redb_fixture() -> tempfile::TempDir {
     tmp
 }
 
+fn build_symbol_redb_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/auth/token.py",
+        b"class TokenLoader:\n    def load(self):\n        return load_token()\n\ndef load_token():\n    return 'token'\n",
+    );
+    write(
+        tmp.path(),
+        "docs/auth.md",
+        b"# Auth\n\nToken loading notes.\n",
+    );
+    write(
+        tmp.path(),
+        "pyproject.toml",
+        b"[project]\nname = \"token-fixture\"\n",
+    );
+
+    let root = tmp.path().canonicalize().unwrap();
+    bootstrap_repo(&root, "test-engine").expect("bootstrap graph layout");
+    let ctx = IndexerContext::new("TinyRepo", root, "test-engine").unwrap();
+    let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
+    assert_eq!(summary.total_files, 3);
+
+    let output = run_engine([
+        "index",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&output);
+    tmp
+}
+
+fn open_store(repo: &Path) -> Database {
+    Database::open(repo.join(".aethyme/graph_store.redb")).expect("open redb store")
+}
+
+fn table_has_row(db: &Database, table: TableDefinition<&str, &[u8]>, key: &str) -> bool {
+    let txn = db.begin_read().expect("read txn");
+    let table = txn.open_table(table).expect("open table");
+    table.get(key).expect("get row").is_some()
+}
+
+fn table_row_count(db: &Database, table: TableDefinition<&str, &[u8]>) -> usize {
+    let txn = db.begin_read().expect("read txn");
+    let table = txn.open_table(table).expect("open table");
+    let mut count = 0;
+    for row in table.iter().expect("iter table") {
+        row.expect("row");
+        count += 1;
+    }
+    count
+}
+
+fn str_multimap_values(
+    db: &Database,
+    table: MultimapTableDefinition<&str, &str>,
+    key: &str,
+) -> Vec<String> {
+    let txn = db.begin_read().expect("read txn");
+    let table = txn.open_multimap_table(table).expect("open multimap");
+    table
+        .get(key)
+        .expect("get values")
+        .map(|row| row.expect("row").value().to_string())
+        .collect()
+}
+
+fn bytes_multimap_count(
+    db: &Database,
+    table: MultimapTableDefinition<&str, &[u8]>,
+    key: &str,
+) -> usize {
+    let txn = db.begin_read().expect("read txn");
+    let table = txn.open_multimap_table(table).expect("open multimap");
+    table
+        .get(key)
+        .expect("get values")
+        .map(|row| row.expect("row"))
+        .count()
+}
+
 fn query_area_prefixes(repo: &Path) -> Vec<String> {
     let output = run_engine([
         "query-areas",
@@ -172,6 +269,38 @@ fn query_areas_reads_existing_store() {
         .map(|area| area["path_prefix"].as_str().expect("path_prefix"))
         .collect();
     assert_eq!(prefixes, vec!["src", "tests"]);
+}
+
+#[test]
+fn index_populates_symbol_tables_and_symbol_edges() {
+    let tmp = build_symbol_redb_fixture();
+    let db = open_store(tmp.path());
+    let function_id = "fn:TinyRepo:src/auth/token.py:load_token";
+    let class_id = "class:TinyRepo:src/auth/token.py:TokenLoader";
+
+    assert!(table_has_row(&db, FUNCTIONS, function_id));
+    assert!(table_has_row(&db, CLASSES, class_id));
+    assert!(
+        table_row_count(&db, DOCS) > 0,
+        "docs table should be populated"
+    );
+    assert!(
+        table_row_count(&db, CONFIGS) > 0,
+        "configs table should be populated"
+    );
+
+    assert!(
+        str_multimap_values(&db, SYMBOL_BY_NAME, "load_token").contains(&function_id.to_string())
+    );
+    assert!(str_multimap_values(&db, SYMBOL_BY_NAME, "tokenloader").contains(&class_id.to_string()));
+    assert!(
+        str_multimap_values(&db, FUNCTIONS_BY_PATH, "src/auth/token.py")
+            .contains(&function_id.to_string())
+    );
+    assert!(
+        bytes_multimap_count(&db, EDGES_IN, function_id) > 0,
+        "symbol endpoint should have incoming adjacency"
+    );
 }
 
 #[cfg(unix)]

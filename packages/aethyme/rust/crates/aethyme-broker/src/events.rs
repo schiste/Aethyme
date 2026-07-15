@@ -16,6 +16,7 @@ use serde_json::json;
 
 // ── kind constants ───────────────────────────────────────────────────
 pub const SESSION_REGISTERED: &str = "session.registered";
+pub const SESSION_REUSED: &str = "session.reused";
 // session.<status> transition kinds are derived from SessionStatus::as_str
 // (active/idle/stale/exited/cleaned) by the store.
 pub const LEASE_CLAIMED: &str = "lease.claimed";
@@ -33,6 +34,10 @@ pub const MERGE_INTEGRATION_REFRESHED: &str = "merge.integration_refreshed";
 
 pub fn session_registered_payload(origin: &str, branch: &str, worktree_path: &str) -> String {
     json!({ "origin": origin, "branch": branch, "worktree_path": worktree_path }).to_string()
+}
+
+pub fn session_reused_payload(task: Option<&str>, diff_base: Option<&str>) -> String {
+    json!({ "task": task, "diff_base": diff_base }).to_string()
 }
 
 pub fn session_exit_payload(exit_code: i64) -> String {
