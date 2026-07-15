@@ -597,8 +597,8 @@ fn redb_performance_smoke_tiny_fixture() {
 }
 
 #[test]
-#[ignore = "requires AETHYME_MEDIAWIKI_REPO; run before enabling V2 redb paths by default"]
-fn mediawiki_scale_redb_smoke_before_v2_default() {
+#[ignore = "requires AETHYME_MEDIAWIKI_REPO; run when broadening V2 redb graph paths"]
+fn mediawiki_scale_redb_smoke_for_v2_paths() {
     let Ok(repo) = env::var("AETHYME_MEDIAWIKI_REPO") else {
         eprintln!("skipping: set AETHYME_MEDIAWIKI_REPO to run MediaWiki-scale redb smoke");
         return;
@@ -742,6 +742,20 @@ fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
     let cases: Vec<Vec<&str>> = vec![
         vec!["query-areas", "--repo", tmp.path().to_str().unwrap()],
         vec!["query-overview", "--repo", tmp.path().to_str().unwrap()],
+        vec![
+            "symbol",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--query",
+            "load_token",
+        ],
+        vec![
+            "symbol-batch",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--query",
+            "load_token",
+        ],
         vec![
             "deps",
             "--repo",

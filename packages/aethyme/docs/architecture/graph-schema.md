@@ -366,9 +366,10 @@ schema:
 - `query-overview`: reads repo metadata, top areas, entrypoints, and risks.
 - `deps`: reads outgoing file adjacency.
 - `importers`: reads incoming file adjacency.
-- `symbol` / `symbol-batch`: try exact redb symbol lookup first, then fall
-  back to `RepositoryMap` for fuzzy/path/area-ranked queries redb cannot yet
-  answer.
+- `symbol` / `symbol-batch`: read exact function/class simple-name lookups
+  from redb. These commands do not build a `RepositoryMap`; fuzzy/path/area
+  ranking belongs to higher-level task and anchor flows until redb candidate
+  APIs own those signals.
 - `callers`: uses the current hybrid path: grep for the symbol, then use
   redb adjacency to expand candidate files.
 
@@ -431,7 +432,7 @@ Bridge decisions as of 2026-07-15:
 
 | Consumer | Decision | Current status |
 |---|---|---|
-| `graph::search::symbol_search` / `symbol` / `symbol-batch` | Hybrid redb-first exact lookup with `RepositoryMap` fallback. | Redb serves exact function/class simple-name queries through `find_symbols`; fuzzy component, path, and area ranking still use `RepositoryMap`. |
+| `symbol` / `symbol-batch` | Redb-backed exact lookup. | CLI opens `.aethyme/graph_store.redb` read-only and serves function/class simple-name queries through `find_symbols`; it fails cleanly when the store is missing. Fuzzy component, path, and area ranking remain meaningful only inside higher-level `RepositoryMap` task/anchor flows for now. |
 | `deps` / `importers` | Redb-backed equivalent. | CLI reads `neighbors(id, Outgoing/Incoming, None)` and preserves the existing path-list output. |
 | `query-overview` | Redb-backed equivalent with V1 JSON projection. | CLI reads `overview_v2(Default)` but still emits only the stable `repo`, `areas`, `entrypoints`, and `risks` keys. |
 | `callers` | Keep the hybrid grep + redb adjacency path. | Grep finds candidate files containing the symbol; redb `neighbors(..., Incoming, None)` expands importers before line grep. |
@@ -458,10 +459,11 @@ V2 correctness and performance gates:
   `AETHYME_REDB_PERF_MAX_INDEX_MS`,
   `AETHYME_REDB_PERF_MAX_QUERY_OVERVIEW_MS`, and
   `AETHYME_REDB_PERF_MAX_SYMBOL_MS`.
-- MediaWiki-scale verification is an opt-in ignored Rust test:
-  `cargo test -p aethyme-engine --test redb_cli mediawiki_scale_redb_smoke_before_v2_default -- --ignored --nocapture`
-  with `AETHYME_MEDIAWIKI_REPO=/path/to/mediawiki`. Run it before enabling
-  any V2 redb-backed path by default. Thresholds are configurable with
+- MediaWiki-scale verification is an explicit ignored Rust test:
+  `cargo test -p aethyme-engine --test redb_cli mediawiki_scale_redb_smoke_for_v2_paths -- --ignored --nocapture`
+  with `AETHYME_MEDIAWIKI_REPO=/path/to/mediawiki`. Run it when broadening
+  redb-backed graph paths beyond the query surfaces listed above. Thresholds
+  are configurable with
   `AETHYME_REDB_MEDIAWIKI_MAX_INDEX_MS`,
   `AETHYME_REDB_MEDIAWIKI_MAX_QUERY_OVERVIEW_MS`, and
   `AETHYME_REDB_MEDIAWIKI_MAX_SYMBOL_MS`.
