@@ -299,6 +299,59 @@ fn index_populates_symbol_tables_and_symbol_edges() {
     );
 }
 
+#[test]
+fn symbol_command_uses_redb_exact_lookup_when_fragments_are_unavailable() {
+    let tmp = build_symbol_redb_fixture();
+    std::fs::remove_dir_all(tmp.path().join(".aethyme/graph")).unwrap();
+
+    let output = run_engine([
+        "symbol",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--query",
+        "load token",
+    ]);
+    assert_success(&output);
+
+    let hits: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("symbol JSON parses");
+    let hits = hits.as_array().expect("hits array");
+    assert!(!hits.is_empty(), "expected redb symbol hit");
+    assert_eq!(hits[0]["name"], "load_token");
+    assert_eq!(hits[0]["kind"], "function");
+    assert!(hits[0]["reason"]
+        .as_str()
+        .expect("reason")
+        .starts_with("redb-exact-symbol-name:"));
+}
+
+#[test]
+fn symbol_batch_uses_redb_exact_lookup_when_fragments_are_unavailable() {
+    let tmp = build_symbol_redb_fixture();
+    std::fs::remove_dir_all(tmp.path().join(".aethyme/graph")).unwrap();
+
+    let output = run_engine([
+        "symbol-batch",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--query",
+        "load_token",
+        "--query",
+        "TokenLoader",
+        "--limit",
+        "5",
+    ]);
+    assert_success(&output);
+
+    let results: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("symbol-batch JSON parses");
+    let load_hits = results["load_token"].as_array().expect("load_token hits");
+    let class_hits = results["TokenLoader"].as_array().expect("TokenLoader hits");
+    assert_eq!(load_hits[0]["name"], "load_token");
+    assert_eq!(class_hits[0]["name"], "TokenLoader");
+    assert_eq!(class_hits[0]["kind"], "class");
+}
+
 #[cfg(unix)]
 #[test]
 fn query_areas_reads_with_read_only_graph_store() {
