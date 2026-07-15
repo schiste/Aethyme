@@ -1,6 +1,6 @@
 # Aethyme Graph Schema
 
-Last Updated: 2026-07-14
+Last Updated: 2026-07-15
 
 Status: **Implemented V1 durable graph contract.** The committed
 source-of-truth graph lives under `.aethyme/graph/` as deterministic
@@ -386,6 +386,47 @@ V1 redb limitations:
   from `.aethyme/graph/` fragments. Commands such as `graph-*`, task views,
   context packs, and `explore` should not be assumed to read from redb just
   because `.aethyme/graph_store.redb` exists.
+
+V2 redb store contract (target, not V1):
+
+- Ownership is unchanged. `.aethyme/graph/` fragments are the source of
+  truth; `.aethyme/graph_store.redb` remains a derived, local, disposable
+  query artifact rebuilt from those fragments.
+- V2 must persist the full node set used by graph navigation: files, areas,
+  functions, classes, separately modeled methods, docs/configs that affect
+  navigation, and unresolved/import nodes when they participate in lookup or
+  adjacency. Directory/module/container nodes may be materialized when needed
+  for prefix or parent/child navigation, but their ids must still be derived
+  from canonical fragment data.
+- Each persisted node row must retain the canonical id, kind, path/name,
+  language, range, area/container membership, and other typed fields needed
+  to derive labels and navigation output. V2 must not introduce stored
+  display labels as a substitute for canonical fields.
+- V2 must persist the full edge set used by graph navigation, including
+  symbol-level `fn:` / `class:` / method endpoints. Supported edges include
+  file-level dependency/importer edges plus defines/contains, calls, imports,
+  documents, configures, tests, mocks, risk, entrypoint, and area-membership
+  edges when those relationships feed an existing graph view.
+- Both outgoing and incoming adjacency indexes are required for every
+  persisted edge kind. A V2 writer must not silently drop symbol-level edges
+  and still advertise graph-navigation coverage.
+
+Required V2 read APIs for replacing `RepositoryMap` reads:
+
+| API family | Required capability | Current graph-module consumer |
+|---|---|---|
+| Node lookup | `node_by_id(id)` and batch lookup for ids already present in navigation order or adjacency results. | `node_view`, relation rendering, risk/doc/config display. |
+| Symbol lookup | Exact and bounded fuzzy/prefix lookup by `name` and optional `kind`, returning canonical ids plus path/range signals. | `task_anchors_view`, symbol query surfaces, graph target resolution. |
+| Path prefix lookup | Bounded lookup by file path or directory prefix, with kind filters for files/functions/classes/docs/configs. | Scope expansion, area views, task-local navigation seeds. |
+| Adjacency | `outgoing(id, kind_filter, limit)` and `incoming(id, kind_filter, limit)` over the full persisted edge set. | `children_view`, `parents_view`, `callers_view`, `callees_view`, `docs_view`, `configs_view`, `task_expand_view`, `graph_expand_view`. |
+| Task anchor candidates | Query by task text tokens against symbols, paths, docs/configs, areas, and unresolved/import names, returning typed candidates and ranking signals. Ranking may stay in the graph module, but the store must provide the bounded candidate rows without rebuilding `RepositoryMap`. | `task_anchors_view`, `task_scope_view`, `task_next_view`, context-pack assembly. |
+| Overview/navigation slices | Bounded repo overview, area tree/top-area slices, entrypoints, representative docs/configs/code files, risk slices, and node-neighborhood slices. | `graph_overview_view`, `task_next_view`, `explore`, context-pack navigation order. |
+
+V2 is complete only when the graph module can serve node, relation, task,
+overview, and context-pack navigation paths from read-only redb queries
+without constructing a full `RepositoryMap`. Parity tests should compare the
+new read-only outputs with the current `RepositoryMap` outputs before a CLI
+surface is described as redb-backed.
 
 ## 6. Update propagation
 

@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-07-14
+Last Updated: 2026-07-15
 
 When code outside the `packages/aethyme/` Python or Rust source tree
 invokes an Aethyme command, it crosses a process boundary. Static
@@ -163,6 +163,27 @@ Supported V1 limitations:
   `.aethyme/graph/` fragments. The legacy `graph-*`, task, context-pack, and
   `explore` surfaces should not be described as redb-backed until they are
   explicitly moved to `GraphStore::open_read_only`.
+
+V2 target contract:
+
+- No ownership change: `.aethyme/graph/` fragments remain the durable source
+  of truth, while `.aethyme/graph_store.redb` remains derived, local, and
+  rebuildable.
+- The V2 writer must persist the full graph-navigation node set: files,
+  areas, functions, classes, separately represented methods, docs/configs
+  used by navigation, unresolved/import nodes when they participate in lookup
+  or edges, and any derived directory/module/container nodes required for
+  prefix or parent/child navigation.
+- The V2 writer must persist the full graph-navigation edge set, including
+  symbol-level endpoints. It must retain incoming and outgoing adjacency for
+  every persisted edge kind.
+- The V2 read contract must cover `node_by_id`, batch node lookup, symbol
+  lookup by name/kind, path-prefix lookup, incoming/outgoing adjacency, task
+  anchor candidate queries, and bounded overview/navigation slices.
+- A CLI surface is not redb-backed merely because V2 tables exist. It is
+  redb-backed only after the implementation reads through
+  `GraphStore::open_read_only` / `ReadOnlyGraphStore` and has parity coverage
+  against the current `RepositoryMap` output.
 
 File-format policy:
 
