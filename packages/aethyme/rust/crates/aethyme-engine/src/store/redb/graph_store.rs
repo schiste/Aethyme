@@ -2657,9 +2657,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn read_only_v2_apis_resolve_nodes_symbols_paths_neighbors_and_overview() {
-        let root = tmp_root(function_name!());
+    struct ReadApiFixture {
+        root: PathBuf,
+        file: FileNode,
+        test_file: FileNode,
+        class: ClassNode,
+        function: FunctionNode,
+        doc: DocNode,
+        config: ConfigNode,
+    }
+
+    impl ReadApiFixture {
+        fn read_only(&self) -> ReadOnlyGraphStore {
+            GraphStore::open_read_only(&self.root).expect("read-only")
+        }
+    }
+
+    impl Drop for ReadApiFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn read_api_fixture(name: &str) -> ReadApiFixture {
+        let root = tmp_root(name);
         let store = GraphStore::open(&root).expect("open");
 
         let area = AreaNode::new("Repo", "src", false);
@@ -2737,80 +2758,135 @@ mod tests {
             .expect("metadata");
         drop(store);
 
-        let readonly = GraphStore::open_read_only(&root).expect("read-only");
+        ReadApiFixture {
+            root,
+            file,
+            test_file,
+            class,
+            function,
+            doc,
+            config,
+        }
+    }
+
+    #[test]
+    fn read_api_get_node_resolves_typed_node_and_missing_id() {
+        let fixture = read_api_fixture(function_name!());
+        let readonly = fixture.read_only();
 
         match readonly
-            .get_node(function.id.as_str())
+            .get_node(fixture.function.id.as_str())
             .expect("function node")
             .expect("present")
         {
-            StoredNode::Function(got) => assert_eq!(got, function),
+            StoredNode::Function(got) => assert_eq!(got, fixture.function),
             other => panic!("expected function node, got {other:?}"),
         }
         assert!(readonly
             .get_node("unknown:Repo:x")
             .expect("unknown")
             .is_none());
+    }
+
+    #[test]
+    fn read_api_find_symbols_is_case_insensitive_and_kind_filterable() {
+        let fixture = read_api_fixture(function_name!());
+        let readonly = fixture.read_only();
 
         let symbols = readonly
             .find_symbols("LoadToken", None)
             .expect("find symbols");
         assert_eq!(symbols.len(), 1);
-        assert_eq!(symbols[0].id, function.id.to_string());
+        assert_eq!(symbols[0].id, fixture.function.id.to_string());
         assert_eq!(symbols[0].kind, StoredNodeKind::Function);
         assert!(readonly
             .find_symbols("LoadToken", Some(StoredNodeKind::Class))
             .expect("class filter")
             .is_empty());
+    }
+
+    #[test]
+    fn read_api_nodes_under_path_returns_typed_path_rows() {
+        let fixture = read_api_fixture(function_name!());
+        let readonly = fixture.read_only();
 
         let nodes = readonly.nodes_under_path("src/").expect("nodes under src");
         let node_ids: BTreeSet<String> = nodes.iter().map(|node| node.id().to_string()).collect();
-        assert!(node_ids.contains(&file.id));
-        assert!(node_ids.contains(function.id.as_str()));
-        assert!(node_ids.contains(class.id.as_str()));
+        assert!(node_ids.contains(&fixture.file.id));
+        assert!(node_ids.contains(fixture.function.id.as_str()));
+        assert!(node_ids.contains(fixture.class.id.as_str()));
+        assert!(!node_ids.contains(&fixture.test_file.id));
+    }
+
+    #[test]
+    fn read_api_functions_under_path_returns_function_rows() {
+        let fixture = read_api_fixture(function_name!());
+        let readonly = fixture.read_only();
 
         let functions = readonly
             .functions_under_path("src/")
             .expect("functions under src");
-        assert_eq!(functions, vec![function.clone()]);
+        assert_eq!(functions, vec![fixture.function.clone()]);
+    }
+
+    #[test]
+    fn read_api_resolve_file_path_is_exact() {
+        let fixture = read_api_fixture(function_name!());
+        let readonly = fixture.read_only();
 
         let resolved = readonly
             .resolve_file_path("src/lib.rs")
             .expect("resolve file")
             .expect("present");
-        assert_eq!(resolved, file);
+        assert_eq!(resolved, fixture.file);
+        assert!(readonly
+            .resolve_file_path("src")
+            .expect("prefix is not exact")
+            .is_none());
         assert!(readonly
             .resolve_file_path("src/missing.rs")
             .expect("missing")
             .is_none());
+    }
+
+    #[test]
+    fn read_api_neighbors_filters_direction_and_kind() {
+        let fixture = read_api_fixture(function_name!());
+        let readonly = fixture.read_only();
 
         let incoming = readonly
             .neighbors(
-                function.id.as_str(),
+                fixture.function.id.as_str(),
                 NeighborDirection::Incoming,
                 Some(EdgeKind::Contains),
             )
             .expect("incoming");
         assert_eq!(incoming.len(), 1);
-        assert_eq!(incoming[0].other.as_str(), file.id.as_str());
+        assert_eq!(incoming[0].other.as_str(), fixture.file.id.as_str());
 
         let outgoing = readonly
             .neighbors(
-                function.id.as_str(),
+                fixture.function.id.as_str(),
                 NeighborDirection::Outgoing,
                 Some(EdgeKind::Configures),
             )
             .expect("outgoing");
         assert_eq!(outgoing.len(), 1);
-        assert_eq!(outgoing[0].other.as_str(), config.id.as_str());
+        assert_eq!(outgoing[0].other.as_str(), fixture.config.id.as_str());
         assert!(readonly
             .neighbors(
-                function.id.as_str(),
+                fixture.function.id.as_str(),
                 NeighborDirection::Outgoing,
                 Some(EdgeKind::Imports),
             )
             .expect("wrong kind")
             .is_empty());
+    }
+
+    #[test]
+    fn read_api_overview_v2_returns_bounded_navigation_slice() {
+        let fixture = read_api_fixture(function_name!());
+        let readonly = fixture.read_only();
 
         let overview = readonly
             .overview_v2(OverviewV2Limits {
@@ -2825,12 +2901,10 @@ mod tests {
         assert_eq!(overview.repo.as_ref().unwrap().file_count, 2);
         assert_eq!(overview.entrypoint_paths, vec!["src/lib.rs".to_string()]);
         assert_eq!(overview.files.len(), 2);
-        assert_eq!(overview.functions, vec![function]);
-        assert_eq!(overview.classes, vec![class]);
-        assert_eq!(overview.docs, vec![doc]);
-        assert_eq!(overview.configs, vec![config]);
-
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(overview.functions, vec![fixture.function.clone()]);
+        assert_eq!(overview.classes, vec![fixture.class.clone()]);
+        assert_eq!(overview.docs, vec![fixture.doc.clone()]);
+        assert_eq!(overview.configs, vec![fixture.config.clone()]);
     }
 
     #[test]
