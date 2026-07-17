@@ -327,6 +327,7 @@ fn build_usage_boundary_response(
             "max_evidence_per_symbol": params.max_evidence_per_symbol,
             "max_answer_items": params.max_answer_items,
         })),
+        observability: None,
     }
 }
 

@@ -1,20 +1,18 @@
 //! Native Rust orchestration for `aethyme explore`.
 //!
-//! Session 1 of the Rust port (see roadmap discussion in commit message of
-//! 49a7beb's parent thread): the simplest happy path that crosses every
-//! layer end-to-end. The scope is deliberately narrow:
+//! V2 data-source contract:
 //!
-//! - Only `task_localization_query` intent
-//! - Only the daemon-routed path (no fallback to subprocess engine here —
-//!   the caller decides whether to fall through to Python on failure)
-//! - Synthesizes `answer[]` items from anchors + in-scope files only
-//! - Stub `verification_steps`, `excluded`, `ambiguous`
-//! - Conservative `trust_policy`: always `needs_verification` because we
-//!   don't yet have the symbol/text/callsite passes that justify
-//!   `answer_candidate`
+//! - `task_localization_query`: graph/navigation reads come from the
+//!   read-only redb store; text and filename evidence are source-text /
+//!   filesystem helpers.
+//! - `behavior_localization_query`: same redb reads with wider explore
+//!   policy defaults for change-oriented requests.
+//! - `usage_boundary_query`: dispatched in `explore/usage_boundary.rs`;
+//!   redb supplies seed discovery while source text supplies evidence.
+//! - Source text and filename passes are intentionally not graph-backed.
 //!
-//! Subsequent sessions add: symbol search (B2 in plan), source-text grep
-//! (B3), full trust policy + verification (B4), behavior_localization (B5).
+//! The production explore path must not construct `RepositoryMap` or depend
+//! on the engine daemon for non-usage-boundary graph/navigation reads.
 //!
 //! Wire shape
 //! ----------
@@ -23,11 +21,15 @@
 //! reads `answer[]` + `safe_to_use_as_answer` + `trust_policy` works
 //! identically against either implementation.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::daemon;
+use crate::graph::navigation::{task_anchors_view_redb, task_next_view_redb, task_scope_view_redb};
+use crate::graph::search::{symbol_search_redb, SearchHit};
+use crate::model::task::TaskInput;
+use crate::store::redb::graph_store::{GraphStore, ReadOnlyGraphStore};
 
 // ── public envelope ─────────────────────────────────────────────────────
 
@@ -68,6 +70,10 @@ pub struct ExploreResponse {
     /// knobs aren't actionable by the agent at compact.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_parameters: Option<serde_json::Value>,
+    /// Runtime read-source status. Emitted only with `detail=full` or
+    /// `--show-observability` so compact answer-json stays stable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observability: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,17 +130,16 @@ pub struct TrustPolicy {
 
 // ── intents ────────────────────────────────────────────────────────────
 
-/// The two task_localization-shaped intents handled by the daemon path.
+/// The two task_localization-shaped intents handled by the redb path.
 ///
 /// `task_localization_query` is the default: bounded answer, compact
 /// detail, conservative defaults. `behavior_localization_query` is for
 /// change-tasks ("what would I edit to make X happen?") — same engine
 /// call, wider params.
 ///
-/// `usage_boundary_query` is dispatched separately because it doesn't
-/// use the daemon — it calls `analyze_usage_boundary_scope_first`
-/// directly via `explore_usage_boundary`. This enum only covers the
-/// daemon-routed intents; the third intent has its own entry point.
+/// `usage_boundary_query` is dispatched separately because it has its
+/// own hybrid analyzer path. This enum only covers the
+/// task-localization-shaped intents; the third intent has its own entry point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
     TaskLocalization,
@@ -446,10 +451,10 @@ pub struct ExploreParams {
     /// authoritative; this caps how many we suggest as "look here".
     pub max_filename_hints: usize,
     /// Number of strongest symbol-search hits to feed into the
-    /// callsite expansion pass. Each hit costs one `callers-of`
-    /// daemon RPC; setting this too high inflates response time on
-    /// queries that match many symbols. 4 is the Python compact
-    /// default and a reasonable cap.
+    /// callsite expansion pass. Each hit can expand incoming redb
+    /// adjacency; setting this too high inflates response time on
+    /// queries that match many symbols. 4 is the Python compact default
+    /// and a reasonable cap.
     pub max_callsite_symbols: usize,
     /// Per-symbol cap on the caller files surfaced as
     /// `call_site_file` answer items. Most agents read the top 3-4;
@@ -607,9 +612,9 @@ impl ExploreParams {
             _ => self.max_filename_hints,
         };
 
-        // Callsite expansion is expensive (one daemon RPC per symbol)
-        // and only meaningful when the agent is actively closing a
-        // loop. Disable below depth=2.
+        // Callsite expansion is deeper than the depth 0/1 contract and
+        // only meaningful when the agent is actively closing a loop.
+        // Disable below depth=2.
         if raw_depth < 2 {
             self.max_callsite_symbols = 0;
             self.max_callsite_results = 0;
@@ -624,9 +629,8 @@ pub enum ExploreError {
     DaemonNotRunning,
     DaemonRpc(String),
     InvalidResponse(String),
-    /// Engine analyzer failure — used by paths that don't go through the
-    /// daemon (e.g. usage_boundary_query, which calls
-    /// `analyze_usage_boundary_scope_first` directly on the filesystem).
+    /// Engine analyzer failure — used by redb/source-text paths that do
+    /// not have a more specific user-error variant.
     EngineAnalyzer(String),
     /// Caller passed insufficient or malformed parameters for the
     /// requested intent. Distinguishes user error from system error so
@@ -649,7 +653,7 @@ impl std::fmt::Display for ExploreError {
 impl std::error::Error for ExploreError {}
 
 mod usage_boundary;
-pub use usage_boundary::{UsageBoundaryParams, explore_usage_boundary};
+pub use usage_boundary::{explore_usage_boundary, UsageBoundaryParams};
 
 // ── orchestration entry point ───────────────────────────────────────────
 
@@ -689,11 +693,6 @@ pub fn explore_with_intent(
     intent_source: IntentSource,
     params: &ExploreParams,
 ) -> Result<ExploreResponse, ExploreError> {
-    let socket = daemon::socket_path_for(repo);
-    if !socket.exists() {
-        return Err(ExploreError::DaemonNotRunning);
-    }
-
     let mut effective_params = params.clone();
     // Order: detail widening first (compact → standard/full caps),
     // then intent overrides (behavior_localization wider than
@@ -706,12 +705,19 @@ pub fn explore_with_intent(
     intent.apply_param_defaults(&mut effective_params);
     let params = &effective_params;
 
-    // 1. Graph-derived view (anchors + scope + next).
-    let view = call_task_localize(&socket, request)?;
+    let canonical_repo = repo
+        .canonicalize()
+        .map_err(|e| ExploreError::EngineAnalyzer(format!("canonicalize repo: {e}")))?;
+    let store = GraphStore::open_read_only(&canonical_repo)
+        .map_err(|e| ExploreError::EngineAnalyzer(e.to_string()))?;
+    let observability = graph_store_observability(&canonical_repo);
 
-    // 2. Symbol-search evidence. On failure (degraded daemon, network
-    //    blip), keep going with the anchors-only path rather than block
-    //    the whole request.
+    // 1. Graph-derived view (anchors + scope + next).
+    let view = task_localize_redb(&store, request)?;
+
+    // 2. Symbol-search evidence. If a local store read fails after the
+    //    task view has succeeded, keep going with anchors/text evidence
+    //    rather than block the whole request.
     let symbol_queries = extract_symbol_queries(request);
     let symbol_queries = if symbol_queries.len() > params.max_symbol_queries {
         symbol_queries[..params.max_symbol_queries].to_vec()
@@ -721,18 +727,18 @@ pub fn explore_with_intent(
     let symbol_matches = if symbol_queries.is_empty() {
         SymbolBatchResults::default()
     } else {
-        match call_symbol_batch(&socket, &symbol_queries, params.max_symbol_results) {
+        match symbol_batch_redb(&store, &symbol_queries, params.max_symbol_results) {
             Ok(r) => r,
             Err(_) => SymbolBatchResults::default(),
         }
     };
 
     // 3. Source-text evidence. Runs ripgrep client-side against the repo
-    //    filesystem; doesn't need the daemon. Tolerates ripgrep absence:
+    //    filesystem; doesn't need redb. Tolerates ripgrep absence:
     //    we degrade to symbol-only without failing the request.
     let text_terms = extract_text_search_terms(request);
     let text_items = text_search::source_text_files(
-        repo,
+        &canonical_repo,
         &text_terms,
         params.max_text_files,
         params.max_text_line_refs,
@@ -745,21 +751,19 @@ pub fn explore_with_intent(
     //    symbols don't (e.g. `suppliers_grader.py` for "find
     //    suppliers grader" — its functions are named
     //    `_default_graders` etc).
-    let filename_items = filename_token_matches(repo, &symbol_queries, params.max_filename_hints);
+    let filename_items =
+        filename_token_matches(&canonical_repo, &symbol_queries, params.max_filename_hints);
 
     // 5. Callsite expansion. For each strong symbol hit, look up
-    //    its callers (via the daemon's callers-of RPC) and emit
-    //    `call_site_file` AnswerItems for the caller files. This is
-    //    the deepest evidence layer: not "this file defines X" but
-    //    "these files actually call X." A file appearing in BOTH
-    //    symbol matches AND someone-else's-callsite is the strongest
-    //    cross-corroboration we produce without running tests.
-    //
-    //    Tolerates daemon failure on this RPC the same way we do for
-    //    symbol-batch — degrade silently, keep the rest of the
-    //    answer.
+    //    its incoming redb `calls` adjacency and emit `call_site_file`
+    //    AnswerItems for the caller files. This is the deepest evidence
+    //    layer: not "this file defines X" but "these files actually call
+    //    X." A file appearing in BOTH symbol matches AND
+    //    someone-else's-callsite is the strongest cross-corroboration we
+    //    produce without running tests. Store read failure here degrades
+    //    silently, matching the old evidence-layer tolerance.
     let callsite_items = compute_callsite_files(
-        &socket,
+        &store,
         &symbol_matches,
         params.max_callsite_symbols,
         params.max_callsite_results,
@@ -776,74 +780,111 @@ pub fn explore_with_intent(
         &filename_items,
         &callsite_items,
         params,
+        observability,
     ))
 }
 
 mod callsite;
 use callsite::compute_callsite_files;
 
-fn call_task_localize(socket: &Path, request: &str) -> Result<serde_json::Value, ExploreError> {
-    let rpc_request = serde_json::json!({
-        "command": "task-localize",
-        "task": request,
-    });
-    let response_text =
-        daemon::send_request(socket, &rpc_request).map_err(ExploreError::DaemonRpc)?;
-    let envelope: serde_json::Value = serde_json::from_str(response_text.trim())
-        .map_err(|e| ExploreError::InvalidResponse(format!("not JSON: {e}")))?;
-    if envelope.get("ok") != Some(&serde_json::Value::Bool(true)) {
-        let msg = envelope
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown daemon error");
-        return Err(ExploreError::DaemonRpc(msg.to_string()));
-    }
-    envelope
-        .get("result")
-        .cloned()
-        .ok_or_else(|| ExploreError::InvalidResponse("missing `result`".into()))
+fn task_localize_redb(
+    store: &ReadOnlyGraphStore,
+    request: &str,
+) -> Result<serde_json::Value, ExploreError> {
+    let task = TaskInput::from_task_text(request);
+    let anchors = task_anchors_view_redb(store, &task)
+        .map_err(|e| ExploreError::EngineAnalyzer(e.to_string()))?;
+    let scope = task_scope_view_redb(store, &task)
+        .map_err(|e| ExploreError::EngineAnalyzer(e.to_string()))?;
+    let next = task_next_view_redb(store, &task)
+        .map_err(|e| ExploreError::EngineAnalyzer(e.to_string()))?;
+    let rendered = crate::json::task_localization_view(&anchors, &scope, &next);
+    serde_json::from_str(&rendered)
+        .map_err(|e| ExploreError::InvalidResponse(format!("redb task-localize JSON: {e}")))
 }
 
-fn call_symbol_batch(
-    socket: &Path,
+fn symbol_batch_redb(
+    store: &ReadOnlyGraphStore,
     queries: &[String],
     limit: usize,
 ) -> Result<SymbolBatchResults, ExploreError> {
-    let rpc_request = serde_json::json!({
-        "command": "symbol-batch",
-        "queries": queries,
-        "limit": limit,
-    });
-    let response_text =
-        daemon::send_request(socket, &rpc_request).map_err(ExploreError::DaemonRpc)?;
-    let envelope: serde_json::Value = serde_json::from_str(response_text.trim())
-        .map_err(|e| ExploreError::InvalidResponse(format!("not JSON: {e}")))?;
-    if envelope.get("ok") != Some(&serde_json::Value::Bool(true)) {
-        let msg = envelope
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown daemon error");
-        return Err(ExploreError::DaemonRpc(msg.to_string()));
-    }
-    let result_obj = envelope
-        .get("result")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| ExploreError::InvalidResponse("missing/object `result`".into()))?;
-
     let mut by_query: std::collections::BTreeMap<String, Vec<SymbolHit>> =
         std::collections::BTreeMap::new();
-    for (query, hits) in result_obj {
-        let arr = match hits.as_array() {
-            Some(a) => a,
-            None => continue,
-        };
-        let parsed: Vec<SymbolHit> = arr.iter().filter_map(SymbolHit::from_value).collect();
+    for query in queries {
+        let parsed = symbol_search_redb(store, query, limit)
+            .map_err(|e| ExploreError::EngineAnalyzer(e.to_string()))?
+            .into_iter()
+            .map(SymbolHit::from_search_hit)
+            .collect();
         by_query.insert(query.clone(), parsed);
     }
     Ok(SymbolBatchResults {
         query_order: queries.to_vec(),
         by_query,
     })
+}
+
+fn graph_store_observability(repo: &Path) -> serde_json::Value {
+    let store_path = GraphStore::final_path(repo);
+    let fragments_path = repo.join(".aethyme").join("graph");
+    let store_modified = modified_unix_secs(&store_path);
+    let newest_fragment = newest_fragment_modified_unix_secs(&fragments_path);
+    let stale = match (store_modified, newest_fragment) {
+        (Some(store), Some(fragment)) => Some(fragment > store),
+        _ => None,
+    };
+    let status = match stale {
+        Some(true) => "stale",
+        Some(false) => "fresh",
+        None if store_path.is_file() => "unknown",
+        None => "missing",
+    };
+
+    serde_json::json!({
+        "graph_store": {
+            "backend": "redb",
+            "status": status,
+            "path": store_path.display().to_string(),
+            "exists": store_path.is_file(),
+            "fragments_path": fragments_path.display().to_string(),
+            "fragments_exist": fragments_path.is_dir(),
+            "stale": stale,
+            "store_modified_unix": store_modified,
+            "newest_fragment_modified_unix": newest_fragment,
+        }
+    })
+}
+
+fn modified_unix_secs(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(system_time_to_unix_secs)
+}
+
+fn newest_fragment_modified_unix_secs(root: &Path) -> Option<u64> {
+    let mut newest = modified_unix_secs(root);
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                newest = newest.max(modified_unix_secs(&path));
+            }
+        }
+    }
+    newest
+}
+
+fn system_time_to_unix_secs(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 #[derive(Debug, Default)]
@@ -864,15 +905,14 @@ pub(super) struct SymbolHit {
 }
 
 impl SymbolHit {
-    fn from_value(v: &serde_json::Value) -> Option<Self> {
-        let obj = v.as_object()?;
-        Some(SymbolHit {
-            name: obj.get("name")?.as_str()?.to_string(),
-            kind: obj.get("kind")?.as_str()?.to_string(),
-            file: obj.get("file")?.as_str()?.to_string(),
-            line: obj.get("line")?.as_u64().unwrap_or(0),
-            score: obj.get("score")?.as_i64().unwrap_or(0),
-        })
+    fn from_search_hit(hit: SearchHit) -> Self {
+        SymbolHit {
+            name: hit.name,
+            kind: hit.kind,
+            file: hit.file,
+            line: hit.line as u64,
+            score: i64::from(hit.score),
+        }
     }
 }
 
@@ -1002,7 +1042,7 @@ pub(crate) fn extract_symbol_queries(request: &str) -> Vec<String> {
 
 // ── response synthesis ──────────────────────────────────────────────────
 
-/// Translate the engine daemon's `task-localize` view into the answer-json
+/// Translate the redb task-localize view into the answer-json
 /// envelope the agent contract expects.
 fn build_response(
     request: &str,
@@ -1014,6 +1054,7 @@ fn build_response(
     filename_items: &[AnswerItem],
     callsite_items: &[AnswerItem],
     params: &ExploreParams,
+    observability: serde_json::Value,
 ) -> ExploreResponse {
     let anchors = view
         .get("anchors")
@@ -1404,7 +1445,7 @@ fn build_response(
         .collect();
 
     // Callsite evidence raises trust further: a file with multi-query
-    // symbol matches AND callers-of evidence is approaching test-suite
+    // symbol matches AND callsite evidence is approaching test-suite
     // territory. We track multi-symbol callsite files separately
     // because that's the strongest dispatch signal we produce.
     let strong_callsite_files: Vec<&str> = callsite_items
@@ -1534,6 +1575,7 @@ fn build_response(
     } else {
         None
     };
+    let observability = if verbose { Some(observability) } else { None };
 
     // At compact, truncate verification_steps to 2 (mirrors Python's
     // _trim_explore_response at cli.py:1752-1755). Agents follow 1-2
@@ -1632,6 +1674,7 @@ fn build_response(
         available_specialized_intents: vec!["behavior_localization_query", "usage_boundary_query"],
         output_adapters,
         resolved_parameters,
+        observability,
     }
 }
 
@@ -2139,6 +2182,7 @@ mod tests {
             &[],
             &[],
             &ExploreParams::default(),
+            test_observability(),
         );
         assert!(!response.answer.is_empty(), "expected at least one answer");
         assert!(
@@ -2213,6 +2257,7 @@ mod tests {
             &[],
             &[],
             &ExploreParams::default(),
+            test_observability(),
         );
 
         let promoted = response
@@ -2318,6 +2363,7 @@ mod tests {
             &[],
             &[],
             &ExploreParams::default(),
+            test_observability(),
         );
 
         // Exactly ONE answer for this file — the text-match one.
@@ -2357,6 +2403,7 @@ mod tests {
                 max_answer_items: 3,
                 ..ExploreParams::default()
             },
+            test_observability(),
         );
         assert_eq!(response.answer.len(), 3);
     }
@@ -2384,6 +2431,7 @@ mod tests {
             &[],
             &[],
             &ExploreParams::default(),
+            test_observability(),
         );
         assert_eq!(response.status, "degraded");
         assert!(response.answer.is_empty());
@@ -2403,6 +2451,7 @@ mod tests {
             &[],
             &[],
             &ExploreParams::default(),
+            test_observability(),
         );
         // Without symbol evidence, anchors+scope alone don't earn
         // `answer_candidate` — the cross-corroboration is missing.
@@ -2427,6 +2476,7 @@ mod tests {
             &[],
             &[],
             &ExploreParams::default(),
+            test_observability(),
         );
         assert!(response.safe_to_use_as_answer);
         assert_eq!(response.trust_policy.trust_policy, "answer_candidate");
@@ -2456,6 +2506,7 @@ mod tests {
             &[],
             &[],
             &ExploreParams::default(),
+            test_observability(),
         );
         // One query matched is weak corroboration — bar to claim
         // `answer_candidate` is multi-term match in the SAME file.
@@ -2468,11 +2519,9 @@ mod tests {
     fn extract_symbol_queries_drops_stop_words_and_short_terms() {
         let queries = extract_symbol_queries("Find the file that handles WatchedItem revisions");
         // "find", "the", "that" are stop words. "Watcheditem" stays.
-        assert!(
-            queries
-                .iter()
-                .any(|q| q.eq_ignore_ascii_case("WatchedItem"))
-        );
+        assert!(queries
+            .iter()
+            .any(|q| q.eq_ignore_ascii_case("WatchedItem")));
         assert!(queries.iter().any(|q| q.eq_ignore_ascii_case("revisions")));
         assert!(!queries.iter().any(|q| q.eq_ignore_ascii_case("the")));
         assert!(!queries.iter().any(|q| q.eq_ignore_ascii_case("find")));
@@ -2647,6 +2696,17 @@ mod tests {
         SymbolBatchResults::default()
     }
 
+    fn test_observability() -> serde_json::Value {
+        serde_json::json!({
+            "graph_store": {
+                "backend": "redb",
+                "status": "fresh",
+                "exists": true,
+                "stale": false,
+            }
+        })
+    }
+
     fn build_minimal_response(detail: Detail, show_observability: bool) -> ExploreResponse {
         let view = empty_view();
         let symbols = empty_symbol_matches();
@@ -2665,6 +2725,7 @@ mod tests {
             &[],
             &[],
             &params,
+            test_observability(),
         )
     }
 
@@ -2723,6 +2784,10 @@ mod tests {
             !obj.contains_key("resolved_parameters"),
             "compact must omit resolved_parameters"
         );
+        assert!(
+            !obj.contains_key("observability"),
+            "compact must omit observability"
+        );
     }
 
     #[test]
@@ -2740,6 +2805,10 @@ mod tests {
             obj.contains_key("resolved_parameters"),
             "Detail::Full must emit resolved_parameters"
         );
+        assert!(
+            obj.contains_key("observability"),
+            "Detail::Full must emit observability"
+        );
     }
 
     #[test]
@@ -2755,6 +2824,10 @@ mod tests {
         assert!(
             obj.contains_key("resolved_parameters"),
             "show_observability=true must emit resolved_parameters"
+        );
+        assert!(
+            obj.contains_key("observability"),
+            "show_observability=true must emit observability"
         );
     }
 
