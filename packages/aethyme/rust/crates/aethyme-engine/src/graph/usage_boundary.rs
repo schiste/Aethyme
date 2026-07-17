@@ -3,6 +3,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+// Phase 5 decision: usage-boundary stays hybrid V2. redb owns bounded seed
+// discovery (public symbols plus candidate source/docs/config files), while
+// query-time source text owns evidence strings. Persisting evidence spans in
+// redb would require explicit freshness/invalidation semantics before it could
+// be trusted for removal decisions.
+
 use crate::graph::facts::classify_exposure;
 use crate::model::analysis::{
     AnswerStatus, DeadCodeAnswer, DeadCodeCandidate, DeadCodeConfidenceSummary, DeadCodeFactCounts,

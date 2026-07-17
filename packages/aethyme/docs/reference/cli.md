@@ -287,6 +287,12 @@ build `RepositoryMap` or mutate the store; run `aethyme-engine-cli index --repo
 `degraded_reasons` includes language/support gaps, use the graph-backed
 `analyze dead-code` / `facts function-usage` commands as the fallback.
 
+Phase 5 decision: usage-boundary is intentionally hybrid V2, not fully
+redb-native. redb owns seed discovery; query-time source/docs/config scanning
+owns evidence strings so caller lines and docs/config references reflect the
+current checkout. A fully redb-native analyzer would need persisted evidence
+rows plus freshness/invalidation rules before replacing this source-text pass.
+
 Optional params:
 - `budget_ms`: time budget for the scope-first analyzer, default `10000`
 - `max_evidence_per_symbol`: maximum evidence strings retained per symbol, default `5`

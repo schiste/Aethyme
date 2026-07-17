@@ -387,8 +387,10 @@ schema:
   the existing JSON shape and do not build a `RepositoryMap`.
 - `analyze-usage-boundary`: reads public PHP symbol seeds and candidate
   source/docs/config files from redb path indexes and adjacency, then scans
-  source text for evidence. It preserves usage-boundary policy in graph
-  modules and does not build a `RepositoryMap`.
+  source/docs/config text for evidence. This hybrid contract is intentional:
+  evidence strings are freshness-sensitive, and query-time text scanning avoids
+  trusting stale redb evidence rows. It preserves usage-boundary policy in
+  graph modules and does not build a `RepositoryMap`.
 - `callers`: uses the current hybrid path: grep for the symbol, then use
   redb adjacency to expand candidate files.
 
@@ -412,14 +414,24 @@ Current redb storage coverage:
 - The writer persists the graph edge set without skipping edges for missing
   unresolved/import endpoint rows. Placeholder endpoints are stored as typed
   unresolved rows before adjacency is written.
-- Task anchors, task scope, task next, task-localize, task-expand, and
-  usage-boundary seed discovery read from redb. Usage-boundary remains hybrid:
-  redb supplies public-symbol and candidate-file seeds, while
-  source/docs/config text still supplies evidence. Context-pack assembly,
-  activation, graph overview, and remaining non-usage-boundary `explore` flows
-  still use graph modules that may build `RepositoryMap`; those surfaces should
-  not be assumed to read from redb just because `.aethyme/graph_store.redb`
-  exists.
+- Graph overview, task/context-pack assembly, activation, task-localize,
+  task-expand, non-usage-boundary `explore`, and usage-boundary seed discovery
+  read from redb. Usage-boundary remains hybrid: redb supplies public-symbol
+  and candidate-file seeds, while source/docs/config text still supplies
+  evidence.
+
+Usage-boundary Phase 5 decision:
+
+- **Accepted V2 contract:** hybrid redb + source text. redb discovers the
+  bounded candidate set; source/docs/config text supplies evidence strings at
+  query time.
+- **Rationale:** evidence spans are freshness-sensitive. A stale persisted
+  evidence row can produce a wrong removal recommendation, while a fresh text
+  scan over redb-discovered files is slower but safer.
+- **Fully redb-native remains future work:** only revisit if the indexer
+  persists usage evidence rows with symbol id, caller file, line/span, evidence
+  kind, and internal/external classification hints, plus explicit
+  freshness/invalidation rules.
 
 Remaining V2 redb store contract:
 
@@ -470,7 +482,7 @@ Bridge decisions as of 2026-07-17:
 | `task-expand` | Redb-backed task expansion. | `task-expand` opens `.aethyme/graph_store.redb` read-only, composes callers/callees, docs/configs, and risks into the existing compact JSON shape, and has binary parity coverage against `RepositoryMap` snapshots. |
 | `graph-node` / rendered relation views | Redb-backed rendered views. | `graph-node`, `graph-children`, `graph-parents`, `graph-callers`, `graph-callees`, `graph-docs`, and `graph-configs` open `.aethyme/graph_store.redb` read-only, adapt redb display/relation rows to the existing JSON structs, and have binary parity snapshots against `RepositoryMap`. |
 | `graph-expand` | Redb-backed composed view. | `graph-expand` opens `.aethyme/graph_store.redb` read-only, composes the redb-backed node, parents, children, callers, callees, docs, configs, and risks views, preserves the existing JSON shape and bounds, and has binary parity, shape, bounded-output, deterministic-ordering, and docs/configs/call-edge fixture gates. |
-| `usage boundary` | Hybrid redb + source text. | `analyze-usage-boundary` and `explore --intent usage_boundary_query` open `.aethyme/graph_store.redb` read-only, discover public PHP symbols and candidate files through redb path indexes/adjacency, then scan source/docs/config text for evidence. It no longer builds `RepositoryMap`, but the analyzer policy and evidence extraction remain in graph modules. |
+| `usage boundary` | Hybrid redb + source text. | `analyze-usage-boundary` and `explore --intent usage_boundary_query` open `.aethyme/graph_store.redb` read-only, discover public PHP symbols and candidate files through redb path indexes/adjacency, then scan source/docs/config text for evidence. This is the accepted Phase 5 contract; fully redb-native evidence would require persisted evidence rows plus freshness/invalidation rules. |
 | Trait abstraction | Defer. | A trait is useful only once two consumers need the same read contract; today the low-risk commands can call redb directly and higher-level flows still need richer candidate APIs. |
 
 V2 correctness and performance gates:
@@ -486,9 +498,10 @@ V2 correctness and performance gates:
   rendered graph parity snapshots, graph-expand JSON shape and bounded
   output, task-expand relation parity, task parity snapshots for ExplainRepo,
   ChangeSymbol, TraceImpact, and config-ownership tasks, usage-boundary
-  internal/external caller plus docs/config reference behavior, deterministic
-  query snapshots after rebuilding from identical fragments, missing-store
-  read-only behavior, and disposable-fast publish boundaries.
+  internal/external caller plus docs/config reference behavior,
+  usage-boundary source-change freshness, deterministic query snapshots after
+  rebuilding from identical fragments, missing-store read-only behavior, and
+  disposable-fast publish boundaries.
 - The default performance smoke is intentionally tiny and bounded by
   environment-overridable thresholds:
   `AETHYME_REDB_PERF_MAX_INDEX_MS`,
@@ -506,14 +519,13 @@ V2 correctness and performance gates:
   `AETHYME_REDB_MEDIAWIKI_MAX_TASK_LOCALIZE_MS` for the Phase 6 task
   navigation smoke.
 
-V2 is complete only when the graph module can serve overview, context-pack,
-remaining `explore` flows, activation, and any remaining task-adjacent
-navigation paths from read-only redb queries without constructing a full
-`RepositoryMap`. Usage-boundary is redb-seeded but still intentionally scans
-source text for evidence; a future fully redb-native analyzer would need its
-own evidence model and parity gates. Parity tests should compare new read-only
-outputs with the current `RepositoryMap` outputs before each additional CLI
-surface is described as redb-backed.
+V2 redb-backed navigation surfaces should be described as complete only after
+they read from `.aethyme/graph_store.redb` without constructing a full
+`RepositoryMap` and have binary gates for shape, determinism, and missing-store
+behavior. Usage-boundary is complete under the hybrid V2 contract above: it is
+redb-seeded, but intentionally scans source/docs/config text for evidence. A
+future fully redb-native analyzer would need its own evidence model and
+freshness gates before replacing that source-text pass.
 
 ## 6. Update propagation
 

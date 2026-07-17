@@ -52,6 +52,11 @@ baselines.
 
 The high-level `explore` answer is `answer[]`, with rejected candidates in
 `excluded[]` and the legacy eval shape at `output_adapters.dead_code_eval_json`.
+The usage-boundary analyzer is intentionally hybrid V2: redb discovers public
+symbols and candidate files, while source/docs/config text is scanned at query
+time for evidence. Do not treat `.aethyme/graph_store.redb` as the authority
+for evidence strings unless a future fully redb-native evidence table also
+defines freshness/invalidation rules.
 
 The direct analyzer answer is `unused_functions[]`. Each item contains
 `function_name`, `defined_in`, `status`, `external_callers`, `internal_callers`,

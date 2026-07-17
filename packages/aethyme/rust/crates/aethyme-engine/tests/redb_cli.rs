@@ -1631,6 +1631,88 @@ fn usage_boundary_uses_redb_seeds_for_callers_and_docs_config_references() {
 }
 
 #[test]
+fn usage_boundary_reads_fresh_source_evidence_after_redb_index() {
+    let tmp = build_usage_boundary_redb_fixture();
+    let store_path = tmp.path().join(".aethyme/graph_store.redb");
+    let store_modified_before = std::fs::metadata(&store_path)
+        .expect("store metadata before query")
+        .modified()
+        .expect("store mtime before query");
+
+    write(
+        tmp.path(),
+        "includes/Api/Controller.php",
+        b"<?php\nclass Controller {\n    public function handle($store) { $store->externalUsed(); }\n    public function newHandle($store) { $store->unusedMethod(); }\n}\n",
+    );
+    write(
+        tmp.path(),
+        "docs/watchlist.md",
+        b"# Watchlist\n\nThe docsOnly hook is configured by operations.\nThe unusedMethod callback was wired after indexing.\n",
+    );
+
+    let output = run_engine([
+        "analyze-usage-boundary",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--scope",
+        "includes/Watchlist",
+        "--include-methods",
+        "--budget-ms",
+        "5000",
+        "--max-evidence-per-symbol",
+        "4",
+    ]);
+    assert_success(&output);
+    let answer: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("usage-boundary JSON parses");
+    let excluded = answer["excluded"].as_array().expect("excluded");
+
+    let now_used = dead_code_item_by_name(excluded, "unusedMethod");
+    assert_eq!(
+        now_used["status"], "Used",
+        "fresh external source text should override the stale pre-index unused classification"
+    );
+    assert!(
+        now_used["evidence"]["external_callers"]
+            .as_array()
+            .expect("external callers")
+            .iter()
+            .any(|item| item
+                .as_str()
+                .is_some_and(|value| value.contains("includes/Api/Controller.php")
+                    && value.contains("unusedMethod"))),
+        "external caller evidence should be read from the mutated source file"
+    );
+
+    let docs_ref = answer["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .chain(excluded.iter())
+        .find(|item| item["function"]["name"] == "unusedMethod")
+        .expect("unusedMethod item");
+    assert!(
+        docs_ref["evidence"]["docs_config_references"]
+            .as_array()
+            .expect("docs refs")
+            .iter()
+            .any(|item| item.as_str().is_some_and(
+                |value| value.contains("docs/watchlist.md") && value.contains("unusedMethod")
+            )),
+        "docs/config evidence should also be read from fresh text"
+    );
+
+    let store_modified_after = std::fs::metadata(&store_path)
+        .expect("store metadata after query")
+        .modified()
+        .expect("store mtime after query");
+    assert_eq!(
+        store_modified_after, store_modified_before,
+        "usage-boundary queries must not mutate the derived redb store"
+    );
+}
+
+#[test]
 fn graph_expand_json_shape_is_stable() {
     let tmp = build_expand_redb_fixture();
 

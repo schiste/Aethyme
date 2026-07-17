@@ -166,7 +166,7 @@ Supported redb surfaces:
 | `task-scope` | Read-only | Builds task scope from redb-backed anchors, path-prefix lookups, symbol rows, area membership, and risk lookup. It preserves the existing JSON shape and does not build `RepositoryMap`. |
 | `task-next` | Read-only | Builds task navigation order from redb-backed anchors, relation views, semantic config/doc path resolution, and bounded overview slices. It preserves the existing JSON shape and does not build `RepositoryMap`. |
 | `task-localize` | Read-only | Composes redb-backed `task-anchors`, `task-scope`, and `task-next` outputs. `--profile` reports redb open / task parse / anchors / scope / next / JSON stages instead of `RepositoryMap` build time. |
-| `analyze-usage-boundary` | Hybrid redb + source text | Reads public PHP symbol seeds and candidate source/docs/config files from redb, then scans source text for evidence. It does not build `RepositoryMap` and fails cleanly when the store is missing. |
+| `analyze-usage-boundary` | Hybrid redb + source text | Reads public PHP symbol seeds and candidate source/docs/config files from redb, then scans source/docs/config text for evidence. This is the accepted V2 contract because evidence strings are freshness-sensitive; a fully redb-native variant would need persisted evidence rows plus freshness/invalidation rules. It does not build `RepositoryMap` and fails cleanly when the store is missing. |
 | `deps` | Read-only | Reads outgoing file adjacency from the redb store. |
 | `importers` | Read-only | Reads incoming file adjacency from the redb store. |
 | `callers` | Hybrid grep + graph | Greps for the requested symbol, then uses redb adjacency to expand candidate files. It is not a pure redb symbol-query contract in V1. |
@@ -253,7 +253,7 @@ Reader/writer split:
 | Read symbols | `symbol`, `symbol-batch` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
 | Read task navigation | `task-anchors`, `task-scope`, `task-next`, `task-localize`, `task-expand` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
 | Read adjacency | `importers`, `deps` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
-| Hybrid usage-boundary | `analyze-usage-boundary`, `explore --intent usage_boundary_query` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` for seeds, source text for evidence |
+| Hybrid usage-boundary | `analyze-usage-boundary`, `explore --intent usage_boundary_query` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` for seeds, source/docs/config text for fresh evidence |
 | Hybrid grep + adjacency | `callers` | Grep first, then `GraphStore::open_read_only` / redb `ReadOnlyDatabase` for candidate expansion |
 | Assert artifact exists | `scripts/eval/setup-playground.sh`, `scripts/eval/verify-playground.sh`, `docs/guides/playground-setup.md` | Filesystem existence check only |
 
