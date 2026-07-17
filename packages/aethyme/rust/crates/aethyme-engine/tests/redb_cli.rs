@@ -284,6 +284,46 @@ fn build_expand_redb_fixture() -> tempfile::TempDir {
     tmp
 }
 
+fn build_usage_boundary_redb_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "includes/Watchlist/Store.php",
+        b"<?php\nclass Store {\n    public function externalUsed() {}\n    public function internalOnly() {}\n    public function unusedMethod() {}\n    public function docsOnly() {}\n    public function configOnly() {}\n}\nclass Manager {\n    private function run($store) { $store->internalOnly(); }\n}\n",
+    );
+    write(
+        tmp.path(),
+        "includes/Api/Controller.php",
+        b"<?php\nclass Controller {\n    public function handle($store) { $store->externalUsed(); }\n}\n",
+    );
+    write(
+        tmp.path(),
+        "docs/watchlist.md",
+        b"# Watchlist\n\nThe docsOnly hook is configured by operations.\n",
+    );
+    write(
+        tmp.path(),
+        "config/watchlist.yaml",
+        b"watchlist:\n  callback: configOnly\n",
+    );
+
+    let root = tmp.path().canonicalize().unwrap();
+    bootstrap_repo(&root, "test-engine").expect("bootstrap graph layout");
+    let ctx = IndexerContext::new("UsageBoundaryRepo", root, "test-engine").unwrap();
+    let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
+    assert_eq!(summary.total_files, 4);
+
+    let output = run_engine([
+        "index",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&output);
+    assert!(tmp.path().join(".aethyme/graph_store.redb").is_file());
+    tmp
+}
+
 fn build_redb_fixture() -> tempfile::TempDir {
     let tmp = build_fragment_fixture();
     let output = run_engine([
@@ -554,6 +594,13 @@ fn hit_name_kinds(hits: &serde_json::Value) -> Vec<(String, String)> {
             )
         })
         .collect()
+}
+
+fn dead_code_item_by_name<'a>(items: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
+    items
+        .iter()
+        .find(|item| item["function"]["name"] == name)
+        .unwrap_or_else(|| panic!("missing dead-code item for {name}"))
 }
 
 fn object_keys(value: &serde_json::Value) -> BTreeSet<&str> {
@@ -920,6 +967,92 @@ fn redb_task_views_match_repository_map_snapshots_for_phase6_task_kinds() {
             "Find the manifest that owns the top-level area",
         ],
     );
+}
+
+#[test]
+fn usage_boundary_uses_redb_seeds_for_callers_and_docs_config_references() {
+    let tmp = build_usage_boundary_redb_fixture();
+    std::fs::remove_dir_all(tmp.path().join(".aethyme/graph")).unwrap();
+
+    let output = run_engine([
+        "analyze-usage-boundary",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--scope",
+        "includes/Watchlist",
+        "--include-methods",
+        "--budget-ms",
+        "5000",
+        "--max-evidence-per-symbol",
+        "4",
+    ]);
+    assert_success(&output);
+    let answer: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("usage-boundary JSON parses");
+
+    assert_eq!(answer["analyzer"], "usage-boundary");
+    assert_eq!(answer["query"]["scope"], "includes/Watchlist");
+    assert_eq!(answer["query"]["include_methods"], true);
+    assert!(
+        answer["observability"]["degraded_reasons"]
+            .as_array()
+            .expect("degraded reasons")
+            .iter()
+            .any(|reason| reason == "redb_seed_discovery"),
+        "usage-boundary should declare the redb seed path"
+    );
+
+    let candidates = answer["candidates"].as_array().expect("candidates");
+    let excluded = answer["excluded"].as_array().expect("excluded");
+
+    let used = dead_code_item_by_name(excluded, "externalUsed");
+    assert_eq!(used["status"], "Used");
+    assert!(
+        used["evidence"]["external_callers"]
+            .as_array()
+            .expect("external callers")
+            .iter()
+            .any(|item| item
+                .as_str()
+                .is_some_and(|value| value.contains("includes/Api/Controller.php"))),
+        "external caller evidence should come from source-text scanning over redb-discovered files"
+    );
+
+    let internal = dead_code_item_by_name(candidates, "internalOnly");
+    assert_eq!(internal["status"], "Ambiguous");
+    assert!(internal["ambiguity"]
+        .as_array()
+        .expect("ambiguity")
+        .contains(&serde_json::json!("exported_but_internal_only")));
+
+    let docs_only = dead_code_item_by_name(candidates, "docsOnly");
+    assert_eq!(docs_only["status"], "Ambiguous");
+    assert!(
+        docs_only["evidence"]["docs_config_references"]
+            .as_array()
+            .expect("docs refs")
+            .iter()
+            .any(|item| item
+                .as_str()
+                .is_some_and(|value| value.contains("docs/watchlist.md"))),
+        "doc reference should be retained"
+    );
+
+    let config_only = dead_code_item_by_name(candidates, "configOnly");
+    assert_eq!(config_only["status"], "Ambiguous");
+    assert!(
+        config_only["evidence"]["docs_config_references"]
+            .as_array()
+            .expect("config refs")
+            .iter()
+            .any(|item| item
+                .as_str()
+                .is_some_and(|value| value.contains("config/watchlist.yaml"))),
+        "config reference should be retained"
+    );
+
+    let unused = dead_code_item_by_name(candidates, "unusedMethod");
+    assert_eq!(unused["status"], "Unused");
 }
 
 #[test]
@@ -1430,6 +1563,14 @@ fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
             tmp.path().to_str().unwrap(),
             "--task",
             "Update load_token flow",
+        ],
+        vec![
+            "analyze-usage-boundary",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--scope",
+            "src",
+            "--include-methods",
         ],
         vec![
             "deps",

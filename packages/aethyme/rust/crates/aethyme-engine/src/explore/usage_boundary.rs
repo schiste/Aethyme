@@ -1,10 +1,10 @@
 //! `usage_boundary_query` intent — the dead-code path.
 //!
 //! Unlike `task_localization_query` and `behavior_localization_query`
-//! (which go through the engine daemon), this intent calls
-//! `analyze_usage_boundary_scope_first` directly. Different shape,
-//! different orchestration; lifting it out of the main `explore.rs`
-//! body keeps the daemon-routed code paths legible.
+//! (which go through the engine daemon), this intent opens the redb graph
+//! store for seed discovery and calls the usage-boundary analyzer directly.
+//! Different shape, different orchestration; lifting it out of the main
+//! `explore.rs` body keeps the daemon-routed code paths legible.
 //!
 //! Public surface re-exported by `explore::*`:
 //! - [`UsageBoundaryParams`]
@@ -12,12 +12,13 @@
 
 use std::path::Path;
 
-use crate::graph::usage_boundary::analyze_usage_boundary_scope_first;
+use crate::graph::usage_boundary::analyze_usage_boundary_scope_first_redb;
 use crate::model::analysis::{AnswerStatus, DeadCodeCandidate};
+use crate::store::redb::graph_store::GraphStore;
 
 use super::{
-    AnswerItem, Confidence, ConfidenceSummary, Evidence, ExploreError, ExploreRequest,
-    ExploreResponse, TrustPolicy, bucket_confidence,
+    bucket_confidence, AnswerItem, Confidence, ConfidenceSummary, Evidence, ExploreError,
+    ExploreRequest, ExploreResponse, TrustPolicy,
 };
 
 /// Parameters for `usage_boundary_query` intent.
@@ -76,10 +77,10 @@ impl Default for UsageBoundaryParams {
 /// nowhere) — i.e. dead-code candidates relative to the rest of the
 /// repo.
 ///
-/// This intent does NOT use the engine daemon. The analyzer walks the
-/// scope filesystem and scans source text for callers across
-/// `search_roots` (or the whole repo). It runs in-process, so the
-/// binary's own startup cost is the only fixed overhead.
+/// This intent does NOT use the engine daemon. The analyzer reads candidate
+/// symbols/files from the local redb graph store, then scans source text for
+/// caller evidence across `search_roots` (or the whole repo). It runs
+/// in-process, so the binary's own startup cost is the only fixed overhead.
 pub fn explore_usage_boundary(
     repo: &Path,
     request: &str,
@@ -90,8 +91,14 @@ pub fn explore_usage_boundary(
             "usage_boundary_query requires --scope (a repo-relative path)".into(),
         ));
     }
-    let answer = analyze_usage_boundary_scope_first(
-        repo,
+    let canonical_repo = repo
+        .canonicalize()
+        .map_err(|error| ExploreError::EngineAnalyzer(format!("resolve repo: {error}")))?;
+    let store = GraphStore::open_read_only(&canonical_repo)
+        .map_err(|error| ExploreError::EngineAnalyzer(error.to_string()))?;
+    let answer = analyze_usage_boundary_scope_first_redb(
+        &canonical_repo,
+        &store,
         &params.scope,
         &params.search_roots,
         params.include_methods,

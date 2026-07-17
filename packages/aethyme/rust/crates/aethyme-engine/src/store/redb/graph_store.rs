@@ -5,9 +5,11 @@
 //! repositories, directories, files, areas, functions, classes, docs, configs,
 //! unresolved/import placeholders, risks, and file/symbol adjacency for
 //! query, symbol, rendered graph, graph-expand, and task
-//! anchors/scope/next/localize CLI views. The hybrid `callers` path still
-//! greps first, then expands candidate files through redb adjacency.
-//! Context-pack assembly, `explore`, activation, and usage-boundary flows
+//! anchors/scope/next/localize CLI views, plus usage-boundary seed discovery.
+//! The hybrid `callers` path still greps first, then expands candidate files
+//! through redb adjacency. Usage-boundary remains hybrid too: redb supplies
+//! symbols and candidate files, while source text supplies evidence. Context
+//! pack assembly, activation, and remaining non-usage-boundary `explore` flows
 //! still use higher-level graph modules that may build `RepositoryMap`.
 //!
 //! Non-scope for the current redb store: this file is not the durable graph

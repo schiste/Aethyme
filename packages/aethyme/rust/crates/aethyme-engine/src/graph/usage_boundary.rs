@@ -3,11 +3,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::graph::facts::classify_exposure;
 use crate::model::analysis::{
     AnswerStatus, DeadCodeAnswer, DeadCodeCandidate, DeadCodeConfidenceSummary, DeadCodeFactCounts,
     DeadCodeGraphCounts, DeadCodeObservability, DeadCodeQuery, DeadCodeSummary, EvidencePacket,
     ExposureKind, FunctionFact,
 };
+use crate::model::class::ClassNode;
+use crate::model::edge::EdgeKind;
+use crate::model::file::{FileNode, FileRole};
+use crate::model::function::FunctionNode;
+use crate::store::redb::graph_store::{NeighborDirection, ReadOnlyGraphStore, StoredNode};
 
 const SOURCE_EXTENSIONS: &[&str] = &["php"];
 const DOC_EXTENSIONS: &[&str] = &["md", "markdown", "rst", "txt"];
@@ -70,6 +76,15 @@ impl ScanBudget {
 enum ScanZone {
     Internal,
     External,
+}
+
+#[derive(Debug, Default)]
+struct UsageBoundarySeedPlan {
+    symbols: Vec<ScopedSymbol>,
+    internal_source_files: Vec<PathBuf>,
+    external_source_files: Vec<PathBuf>,
+    docs_config_files: Vec<PathBuf>,
+    stats: ScanStats,
 }
 
 pub fn analyze_usage_boundary_scope_first(
@@ -207,6 +222,118 @@ pub fn analyze_usage_boundary_scope_first(
         }
     }
 
+    Ok(build_usage_boundary_answer(
+        scope,
+        roots,
+        include_methods,
+        symbols,
+        usage,
+        stats,
+        degraded_reasons,
+    ))
+}
+
+pub fn analyze_usage_boundary_scope_first_redb(
+    repo: &Path,
+    store: &ReadOnlyGraphStore,
+    scope: &str,
+    searched_roots: &[String],
+    include_methods: bool,
+    budget_ms: Option<u64>,
+    max_evidence_per_symbol: usize,
+) -> Result<DeadCodeAnswer, String> {
+    let canonical_repo = repo
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve repo path {}: {error}", repo.display()))?;
+    let scope = normalize_relative_path(scope);
+    if scope.is_empty() {
+        return Err("scope must be a non-empty repository-relative path".to_string());
+    }
+    let scope_path = canonical_repo.join(&scope);
+    if !scope_path.exists() {
+        return Err(format!("scope does not exist: {scope}"));
+    }
+
+    let roots = normalize_roots(searched_roots);
+    let budget = ScanBudget::new(budget_ms);
+    let evidence_limit = max_evidence_per_symbol.max(1);
+    let mut degraded_reasons = vec![
+        "scope_first_strategy".to_string(),
+        "redb_seed_discovery".to_string(),
+        "language_support_limited_to_php_for_scope_first_scan".to_string(),
+    ];
+
+    let seed_plan = collect_redb_usage_seed_plan(
+        &canonical_repo,
+        store,
+        &scope,
+        &roots,
+        include_methods,
+        &budget,
+        &mut degraded_reasons,
+    )?;
+    let mut usage = vec![UsageEvidence::default(); seed_plan.symbols.len()];
+
+    if !seed_plan.symbols.is_empty() && !budget.expired() {
+        scan_source_files(
+            &canonical_repo,
+            &scope,
+            &seed_plan.internal_source_files,
+            &seed_plan.symbols,
+            &mut usage,
+            ScanZone::Internal,
+            evidence_limit,
+            &budget,
+            &mut degraded_reasons,
+        );
+    }
+
+    if !seed_plan.symbols.is_empty() && !budget.expired() {
+        scan_source_files(
+            &canonical_repo,
+            &scope,
+            &seed_plan.external_source_files,
+            &seed_plan.symbols,
+            &mut usage,
+            ScanZone::External,
+            evidence_limit,
+            &budget,
+            &mut degraded_reasons,
+        );
+    }
+
+    if !seed_plan.symbols.is_empty() && !budget.expired() {
+        scan_docs_config_files(
+            &canonical_repo,
+            &seed_plan.docs_config_files,
+            &seed_plan.symbols,
+            &mut usage,
+            evidence_limit,
+            &budget,
+            &mut degraded_reasons,
+        );
+    }
+
+    Ok(build_usage_boundary_answer(
+        scope,
+        roots,
+        include_methods,
+        seed_plan.symbols,
+        usage,
+        seed_plan.stats,
+        degraded_reasons,
+    ))
+}
+
+fn build_usage_boundary_answer(
+    scope: String,
+    roots: Vec<String>,
+    include_methods: bool,
+    symbols: Vec<ScopedSymbol>,
+    usage: Vec<UsageEvidence>,
+    stats: ScanStats,
+    mut degraded_reasons: Vec<String>,
+) -> DeadCodeAnswer {
     let name_counts = symbol_name_counts(&symbols);
     let mut candidates = Vec::new();
     let mut excluded = Vec::new();
@@ -304,7 +431,7 @@ pub fn analyze_usage_boundary_scope_first(
         degraded_reasons,
     };
 
-    Ok(DeadCodeAnswer {
+    DeadCodeAnswer {
         analyzer: "usage-boundary".to_string(),
         version: "1".to_string(),
         query: DeadCodeQuery {
@@ -316,13 +443,427 @@ pub fn analyze_usage_boundary_scope_first(
         excluded,
         summary,
         observability,
-    })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileSet {
     Source,
     DocsConfig,
+}
+
+fn collect_redb_usage_seed_plan(
+    repo: &Path,
+    store: &ReadOnlyGraphStore,
+    scope: &str,
+    roots: &[String],
+    include_methods: bool,
+    budget: &ScanBudget,
+    degraded_reasons: &mut Vec<String>,
+) -> Result<UsageBoundarySeedPlan, String> {
+    let mut source_files = BTreeSet::new();
+    let mut internal_source_files = BTreeSet::new();
+    let mut external_source_files = BTreeSet::new();
+    let mut docs_config_files = BTreeSet::new();
+    let mut class_by_id = BTreeMap::new();
+    let mut seed_ids = BTreeSet::new();
+
+    let scope_prefix = path_index_prefix(repo, scope);
+    let scope_nodes = redb_nodes_under_path(store, &scope_prefix, degraded_reasons)?;
+    for node in &scope_nodes {
+        seed_ids.insert(node.id().to_string());
+        if let StoredNode::Class(class) = node {
+            class_by_id.insert(class.id.to_string(), class.clone());
+        }
+        if let Some(path) = source_scan_path(node) {
+            if is_inside_boundary(&path, scope) {
+                internal_source_files.insert(path.clone());
+                source_files.insert(path);
+            }
+        }
+    }
+
+    let functions = store
+        .functions_under_path(&scope_prefix)
+        .map_err(|error| format!("redb functions_under_path failed for {scope}: {error}"))?;
+    let mut symbols = Vec::new();
+    for function in functions {
+        if budget.expired() {
+            degraded_reasons.push("budget_exceeded_while_extracting_scope_symbols".to_string());
+            break;
+        }
+        if !is_inside_boundary(function.file_path.as_str(), scope)
+            || !is_php_source_path(function.file_path.as_str())
+        {
+            continue;
+        }
+        let Some(exposure_kind) =
+            classify_usage_boundary_exposure(repo, &function, include_methods, degraded_reasons)
+        else {
+            continue;
+        };
+        let parent_class = parent_class_for_function(store, &function, &mut class_by_id)?;
+        let class_kind = parent_class.as_ref().and_then(class_kind);
+        let parent_class_name = parent_class.map(|class| class.name.to_string());
+        seed_ids.insert(function.id.to_string());
+        internal_source_files.insert(function.file_path.to_string());
+        source_files.insert(function.file_path.to_string());
+        symbols.push(ScopedSymbol {
+            fact: FunctionFact {
+                id: function.id.to_string(),
+                name: function.name.to_string(),
+                qualified_name: qualified_name_for_usage_boundary(
+                    &function,
+                    parent_class_name.as_deref(),
+                ),
+                defined_in: function.file_path.to_string(),
+                line: function.line,
+                language: function.language.to_string(),
+                parent_class: parent_class_name,
+                exposure_kind,
+            },
+            class_kind,
+        });
+    }
+    symbols.sort_by(|left, right| {
+        left.fact
+            .defined_in
+            .cmp(&right.fact.defined_in)
+            .then_with(|| left.fact.line.cmp(&right.fact.line))
+            .then_with(|| left.fact.name.cmp(&right.fact.name))
+    });
+
+    collect_adjacency_candidate_paths(
+        store,
+        &seed_ids,
+        scope,
+        roots,
+        &mut source_files,
+        &mut internal_source_files,
+        &mut external_source_files,
+        &mut docs_config_files,
+        degraded_reasons,
+    )?;
+    collect_root_candidate_paths(
+        repo,
+        store,
+        scope,
+        roots,
+        &mut source_files,
+        &mut internal_source_files,
+        &mut external_source_files,
+        &mut docs_config_files,
+        degraded_reasons,
+    )?;
+
+    let mut stats = ScanStats {
+        source_files: source_files.len(),
+        docs: 0,
+        configs: 0,
+    };
+    for path in &docs_config_files {
+        if has_extension(Path::new(path), DOC_EXTENSIONS) {
+            stats.docs += 1;
+        } else {
+            stats.configs += 1;
+        }
+    }
+
+    Ok(UsageBoundarySeedPlan {
+        symbols,
+        internal_source_files: relative_paths_to_full(repo, internal_source_files),
+        external_source_files: relative_paths_to_full(repo, external_source_files),
+        docs_config_files: relative_paths_to_full(repo, docs_config_files),
+        stats,
+    })
+}
+
+fn collect_adjacency_candidate_paths(
+    store: &ReadOnlyGraphStore,
+    seed_ids: &BTreeSet<String>,
+    scope: &str,
+    roots: &[String],
+    source_files: &mut BTreeSet<String>,
+    internal_source_files: &mut BTreeSet<String>,
+    external_source_files: &mut BTreeSet<String>,
+    docs_config_files: &mut BTreeSet<String>,
+    degraded_reasons: &mut Vec<String>,
+) -> Result<(), String> {
+    for seed_id in seed_ids {
+        for direction in [NeighborDirection::Incoming, NeighborDirection::Outgoing] {
+            let edges = store
+                .neighbors(seed_id, direction, None)
+                .map_err(|error| format!("redb neighbors failed for {seed_id}: {error}"))?;
+            for edge in edges {
+                if !matches!(
+                    edge.kind,
+                    EdgeKind::Calls
+                        | EdgeKind::References
+                        | EdgeKind::Imports
+                        | EdgeKind::Documents
+                        | EdgeKind::Configures
+                        | EdgeKind::EntrypointFor
+                ) {
+                    continue;
+                }
+                let Some(node) = store
+                    .get_node(edge.other.as_str())
+                    .map_err(|error| format!("redb get_node failed for {}: {error}", edge.other))?
+                else {
+                    degraded_reasons.push(format!("redb_adjacency_missing_node:{}", edge.other));
+                    continue;
+                };
+                add_candidate_path_from_node(
+                    &node,
+                    scope,
+                    roots,
+                    source_files,
+                    internal_source_files,
+                    external_source_files,
+                    docs_config_files,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_root_candidate_paths(
+    repo: &Path,
+    store: &ReadOnlyGraphStore,
+    scope: &str,
+    roots: &[String],
+    source_files: &mut BTreeSet<String>,
+    internal_source_files: &mut BTreeSet<String>,
+    external_source_files: &mut BTreeSet<String>,
+    docs_config_files: &mut BTreeSet<String>,
+    degraded_reasons: &mut Vec<String>,
+) -> Result<(), String> {
+    for root in redb_root_prefixes(repo, roots, degraded_reasons) {
+        let nodes = redb_nodes_under_path(store, &root, degraded_reasons)?;
+        for node in nodes {
+            add_candidate_path_from_node(
+                &node,
+                scope,
+                roots,
+                source_files,
+                internal_source_files,
+                external_source_files,
+                docs_config_files,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn add_candidate_path_from_node(
+    node: &StoredNode,
+    scope: &str,
+    roots: &[String],
+    source_files: &mut BTreeSet<String>,
+    internal_source_files: &mut BTreeSet<String>,
+    external_source_files: &mut BTreeSet<String>,
+    docs_config_files: &mut BTreeSet<String>,
+) {
+    if let Some(path) = source_scan_path(node) {
+        if is_inside_boundary(&path, scope) {
+            internal_source_files.insert(path.clone());
+            source_files.insert(path);
+        } else if path_is_under_roots(&path, roots) && !is_excluded_relative_path(&path) {
+            external_source_files.insert(path.clone());
+            source_files.insert(path);
+        }
+    }
+    if let Some(path) = docs_config_scan_path(node) {
+        if !is_inside_boundary(&path, scope)
+            && path_is_under_roots(&path, roots)
+            && !is_excluded_relative_path(&path)
+        {
+            docs_config_files.insert(path);
+        }
+    }
+}
+
+fn parent_class_for_function(
+    store: &ReadOnlyGraphStore,
+    function: &FunctionNode,
+    class_by_id: &mut BTreeMap<String, ClassNode>,
+) -> Result<Option<ClassNode>, String> {
+    let Some(class_id) = function.parent_class_id.as_ref() else {
+        return Ok(None);
+    };
+    if let Some(class) = class_by_id.get(class_id.as_str()) {
+        return Ok(Some(class.clone()));
+    }
+    let Some(node) = store
+        .get_node(class_id.as_str())
+        .map_err(|error| format!("redb get_node failed for {class_id}: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let StoredNode::Class(class) = node else {
+        return Ok(None);
+    };
+    class_by_id.insert(class.id.to_string(), class.clone());
+    Ok(Some(class))
+}
+
+fn classify_usage_boundary_exposure(
+    repo: &Path,
+    function: &FunctionNode,
+    include_methods: bool,
+    degraded_reasons: &mut Vec<String>,
+) -> Option<ExposureKind> {
+    if is_ignored_symbol_name(function.name.as_str()) {
+        return None;
+    }
+    if let Some(exposure) = classify_exposure(function, include_methods) {
+        return Some(exposure);
+    }
+    if !include_methods
+        || !function.language.eq_ignore_ascii_case("php")
+        || function.parent_class_id.is_none()
+    {
+        return None;
+    }
+
+    let path = repo.join(function.file_path.as_str());
+    let Ok(content) = fs::read_to_string(&path) else {
+        degraded_reasons.push(format!(
+            "unreadable_source_file_for_visibility:{}",
+            function.file_path
+        ));
+        return None;
+    };
+    let Some(line) = content.lines().nth(function.line.saturating_sub(1)) else {
+        degraded_reasons.push(format!(
+            "missing_source_line_for_visibility:{}:{}",
+            function.file_path, function.line
+        ));
+        return None;
+    };
+    if is_public_php_method(strip_line_comment(line).trim_start()) {
+        Some(ExposureKind::PublicMethod)
+    } else {
+        None
+    }
+}
+
+fn redb_nodes_under_path(
+    store: &ReadOnlyGraphStore,
+    prefix: &str,
+    degraded_reasons: &mut Vec<String>,
+) -> Result<Vec<StoredNode>, String> {
+    let nodes = store
+        .nodes_under_path(prefix)
+        .map_err(|error| format!("redb nodes_under_path failed for {prefix}: {error}"))?;
+    if nodes.is_empty() && !prefix.is_empty() {
+        degraded_reasons.push(format!("redb_path_index_empty:{prefix}"));
+    }
+    Ok(nodes)
+}
+
+fn redb_root_prefixes(
+    repo: &Path,
+    roots: &[String],
+    degraded_reasons: &mut Vec<String>,
+) -> Vec<String> {
+    if roots.is_empty() {
+        return vec![String::new()];
+    }
+    roots
+        .iter()
+        .filter_map(|root| {
+            let path = repo.join(root);
+            if !path.exists() {
+                degraded_reasons.push(format!(
+                    "search_root_missing:{}",
+                    relative_path(repo, &path)
+                ));
+                return None;
+            }
+            Some(path_index_prefix(repo, root))
+        })
+        .collect()
+}
+
+fn path_index_prefix(repo: &Path, relative: &str) -> String {
+    let normalized = normalize_relative_path(relative);
+    if normalized.is_empty() {
+        return normalized;
+    }
+    if repo.join(&normalized).is_dir() {
+        format!("{normalized}/")
+    } else {
+        normalized
+    }
+}
+
+fn source_scan_path(node: &StoredNode) -> Option<String> {
+    match node {
+        StoredNode::File(file) if is_scannable_source_file(file) => Some(file.path.clone()),
+        StoredNode::Function(function) if is_php_source_path(function.file_path.as_str()) => {
+            Some(function.file_path.to_string())
+        }
+        StoredNode::Class(class) if is_php_source_path(class.file_path.as_str()) => {
+            Some(class.file_path.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn docs_config_scan_path(node: &StoredNode) -> Option<String> {
+    match node {
+        StoredNode::Doc(doc) => Some(doc.path.clone()),
+        StoredNode::Config(config) => Some(config.path.clone()),
+        StoredNode::File(file) if matches!(file.role, FileRole::Doc | FileRole::Config) => {
+            Some(file.path.clone())
+        }
+        _ => None,
+    }
+}
+
+fn is_scannable_source_file(file: &FileNode) -> bool {
+    matches!(file.role, FileRole::Source | FileRole::Test) && is_php_source_path(&file.path)
+}
+
+fn is_php_source_path(path: &str) -> bool {
+    has_extension(Path::new(path), SOURCE_EXTENSIONS)
+}
+
+fn path_is_under_roots(path: &str, roots: &[String]) -> bool {
+    roots.is_empty()
+        || roots
+            .iter()
+            .any(|root| path == root || path.starts_with(&format!("{root}/")))
+}
+
+fn relative_paths_to_full(repo: &Path, paths: BTreeSet<String>) -> Vec<PathBuf> {
+    paths.into_iter().map(|path| repo.join(path)).collect()
+}
+
+fn qualified_name_for_usage_boundary(
+    function: &FunctionNode,
+    parent_class_name: Option<&str>,
+) -> String {
+    if let Some(class_name) = parent_class_name {
+        format!("{class_name}::{}", function.name)
+    } else {
+        function.name.to_string()
+    }
+}
+
+fn class_kind(class: &ClassNode) -> Option<String> {
+    let lower = class.signature.trim_start().to_ascii_lowercase();
+    if lower.starts_with("interface ") {
+        Some("interface".to_string())
+    } else if lower.starts_with("trait ") {
+        Some("trait".to_string())
+    } else if lower.starts_with("class ") {
+        Some("class".to_string())
+    } else {
+        None
+    }
 }
 
 fn collect_files(
@@ -724,7 +1265,11 @@ fn php_function_name(line: &str) -> Option<String> {
     while chars.peek().is_some_and(|value| is_identifier_char(*value)) {
         name.push(chars.next().expect("peeked char"));
     }
-    if name.is_empty() { None } else { Some(name) }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 fn is_public_php_method(line: &str) -> bool {
@@ -1042,11 +1587,9 @@ mod tests {
             .find(|candidate| candidate.function.name == "internalOnly")
             .expect("internal only method");
         assert_eq!(internal.status, AnswerStatus::Ambiguous);
-        assert!(
-            internal
-                .ambiguity
-                .contains(&"exported_but_internal_only".to_string())
-        );
+        assert!(internal
+            .ambiguity
+            .contains(&"exported_but_internal_only".to_string()));
 
         let used = answer
             .excluded

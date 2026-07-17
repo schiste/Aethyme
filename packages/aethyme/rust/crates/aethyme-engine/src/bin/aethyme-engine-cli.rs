@@ -18,7 +18,7 @@ use aethyme_engine::graph::navigation::{
 use aethyme_engine::graph::neighborhood::impact_frontier;
 use aethyme_engine::graph::overview::build_repo_overview;
 use aethyme_engine::graph::search::symbol_search_redb;
-use aethyme_engine::graph::usage_boundary::analyze_usage_boundary_scope_first;
+use aethyme_engine::graph::usage_boundary::analyze_usage_boundary_scope_first_redb;
 use aethyme_engine::map::RepositoryMap;
 use aethyme_engine::model::repository::RepositoryNode;
 use aethyme_engine::model::task::TaskInput;
@@ -513,8 +513,13 @@ fn run() -> Result<(), String> {
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(5);
-            let answer = analyze_usage_boundary_scope_first(
-                &PathBuf::from(&repo),
+            let canonical = std::path::PathBuf::from(&repo)
+                .canonicalize()
+                .map_err(|e| format!("failed to resolve repo path {repo}: {e}"))?;
+            let store = GraphStore::open_read_only(&canonical).map_err(|e| e.to_string())?;
+            let answer = analyze_usage_boundary_scope_first_redb(
+                &canonical,
+                &store,
                 &scope,
                 &roots,
                 include_methods,

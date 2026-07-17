@@ -114,7 +114,7 @@ fn normalize_roots(values: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn classify_exposure(
+pub(crate) fn classify_exposure(
     function: &crate::model::function::FunctionNode,
     include_methods: bool,
 ) -> Option<ExposureKind> {
@@ -298,12 +298,10 @@ mod tests {
         // `Imports` edges still provide external usage evidence.
         assert_eq!(usage.internal_callers.len(), 0);
         assert_eq!(usage.external_callers.len(), 1);
-        assert!(
-            !usage
-                .external_callers
-                .iter()
-                .any(|caller| caller.contains("notes.md"))
-        );
+        assert!(!usage
+            .external_callers
+            .iter()
+            .any(|caller| caller.contains("notes.md")));
         assert_eq!(usage.docs_config_references, Vec::<String>::new());
 
         let usage_with_docs = function_usage_fact(&map, &fact, "src/indexing", &[]);
