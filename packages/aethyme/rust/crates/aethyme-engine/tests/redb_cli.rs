@@ -11,6 +11,9 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::time::Instant;
 
+use aethyme_engine::graph::navigation::{
+    callees_view, callers_view, children_view, configs_view, docs_view, node_view, parents_view,
+};
 use aethyme_engine::graph::search::symbol_search;
 use aethyme_engine::map::RepositoryMap;
 use aethyme_graph_indexer::{index_repo_to_disk, IndexerContext, WalkOptions};
@@ -338,6 +341,36 @@ where
     serde_json::from_slice(&output.stdout).expect("JSON parses")
 }
 
+fn graph_cli_json(repo: &Path, command: &str, target: &str) -> serde_json::Value {
+    query_json([
+        command,
+        "--repo",
+        repo.to_str().unwrap(),
+        "--target",
+        target,
+    ])
+}
+
+fn repository_map_graph_json(
+    map: &RepositoryMap,
+    command: &str,
+    target: &str,
+) -> serde_json::Value {
+    let json = match command {
+        "graph-node" => aethyme_engine::json::graph_node_view(
+            &node_view(map, target).expect("RepositoryMap node view"),
+        ),
+        "graph-children" => aethyme_engine::json::graph_relation(&children_view(map, target)),
+        "graph-parents" => aethyme_engine::json::graph_relation(&parents_view(map, target)),
+        "graph-callers" => aethyme_engine::json::graph_relation(&callers_view(map, target)),
+        "graph-callees" => aethyme_engine::json::graph_relation(&callees_view(map, target)),
+        "graph-docs" => aethyme_engine::json::graph_relation(&docs_view(map, target)),
+        "graph-configs" => aethyme_engine::json::graph_relation(&configs_view(map, target)),
+        other => panic!("unsupported graph command: {other}"),
+    };
+    serde_json::from_str(&json).expect("RepositoryMap graph JSON parses")
+}
+
 fn symbol_cli_hits(repo: &Path, query: &str, limit: usize) -> serde_json::Value {
     let limit = limit.to_string();
     query_json([
@@ -660,6 +693,44 @@ fn redb_symbol_search_ordering_is_deterministic() {
     );
 }
 
+fn assert_rendered_graph_command_parity(repo: &Path, targets: &[&str]) {
+    let map = RepositoryMap::build(repo).expect("build RepositoryMap parity oracle");
+    let commands = [
+        "graph-node",
+        "graph-children",
+        "graph-parents",
+        "graph-callers",
+        "graph-callees",
+        "graph-docs",
+        "graph-configs",
+    ];
+
+    for target in targets {
+        for command in commands {
+            let expected = repository_map_graph_json(&map, command, target);
+            let actual = graph_cli_json(repo, command, target);
+            assert_eq!(
+                actual, expected,
+                "{command} should preserve RepositoryMap JSON for target {target:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rendered_graph_commands_match_repository_map_snapshots_on_tiny_fixture() {
+    let tmp = build_redb_fixture();
+
+    assert_rendered_graph_command_parity(tmp.path(), &["load_token", "src/auth/token.py"]);
+}
+
+#[test]
+fn rendered_graph_commands_match_repository_map_snapshots_on_medium_fixture() {
+    let tmp = build_medium_redb_fixture();
+
+    assert_rendered_graph_command_parity(tmp.path(), &["load_token", "src/auth/token.py"]);
+}
+
 #[test]
 fn medium_fixture_indexes_and_queries_symbol_callers_and_callees() {
     let tmp = build_medium_redb_fixture();
@@ -927,6 +998,55 @@ fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
             "--repo",
             tmp.path().to_str().unwrap(),
             "--query",
+            "load_token",
+        ],
+        vec![
+            "graph-node",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--target",
+            "load_token",
+        ],
+        vec![
+            "graph-children",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--target",
+            "load_token",
+        ],
+        vec![
+            "graph-parents",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--target",
+            "load_token",
+        ],
+        vec![
+            "graph-callers",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--target",
+            "load_token",
+        ],
+        vec![
+            "graph-callees",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--target",
+            "load_token",
+        ],
+        vec![
+            "graph-docs",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--target",
+            "load_token",
+        ],
+        vec![
+            "graph-configs",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--target",
             "load_token",
         ],
         vec![
