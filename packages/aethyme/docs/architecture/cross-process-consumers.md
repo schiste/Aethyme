@@ -158,6 +158,7 @@ Supported redb surfaces:
 | `graph-callers` / `graph-callees` | Read-only | Render call relations through redb relation views. They preserve the existing JSON shape and do not build `RepositoryMap`. |
 | `graph-docs` / `graph-configs` | Read-only | Render document/config relations through redb relation views. They preserve the existing JSON shape and do not build `RepositoryMap`. |
 | `graph-expand` | Read-only | Composes the redb-backed node, relation, and risk views into the existing compact expand JSON shape. It preserves the existing bounds and does not build `RepositoryMap`. |
+| `task-expand` | Read-only | Composes redb-backed callers/callees, docs/configs, and risk views into the existing compact task expansion JSON shape. It preserves the existing JSON shape and does not build `RepositoryMap`. |
 | `task-anchors` | Read-only | Resolves task anchors from redb overview rows, path indexes, config/doc rows, and bounded symbol candidates. Ranking policy remains in `graph::anchors`; the command preserves the existing JSON shape and does not build `RepositoryMap`. |
 | `task-scope` | Read-only | Builds task scope from redb-backed anchors, path-prefix lookups, symbol rows, area membership, and risk lookup. It preserves the existing JSON shape and does not build `RepositoryMap`. |
 | `task-next` | Read-only | Builds task navigation order from redb-backed anchors, relation views, semantic config/doc path resolution, and bounded overview slices. It preserves the existing JSON shape and does not build `RepositoryMap`. |
@@ -177,13 +178,14 @@ Current storage coverage and limitations:
 - The `index` writer persists the graph edge set without skipping edges for
   missing unresolved/import endpoint rows. Placeholder endpoints are stored as
   typed unresolved rows before adjacency is written.
-- Task anchors, task scope, task next, task-localize, and usage-boundary
-  seed discovery are served from read-only redb rows. Usage-boundary still
-  scans source/docs/config text for evidence after redb discovers public
-  symbols and candidate files. Context-pack assembly, activation, and
-  remaining non-usage-boundary `explore` flows still use graph modules that
-  may build `RepositoryMap`; those surfaces should not be described as
-  redb-backed until they are explicitly moved to `GraphStore::open_read_only`.
+- Task anchors, task scope, task next, task-localize, task-expand, and
+  usage-boundary seed discovery are served from read-only redb rows.
+  Usage-boundary still scans source/docs/config text for evidence after redb
+  discovers public symbols and candidate files. Context-pack assembly,
+  activation, graph overview, and remaining non-usage-boundary `explore` flows
+  still use graph modules that may build `RepositoryMap`; those surfaces
+  should not be described as redb-backed until they are explicitly moved to
+  `GraphStore::open_read_only`.
 
 Remaining V2 target contract:
 
@@ -246,7 +248,7 @@ Reader/writer split:
 | Optional post-write compaction | `aethyme-engine-cli index --compact --repo <repo>` | Writable `GraphStore::compact` after all write transactions commit |
 | Read areas / overview | `query-areas`, `query-overview` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
 | Read symbols | `symbol`, `symbol-batch` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
-| Read task navigation | `task-anchors`, `task-scope`, `task-next`, `task-localize` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
+| Read task navigation | `task-anchors`, `task-scope`, `task-next`, `task-localize`, `task-expand` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
 | Read adjacency | `importers`, `deps` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
 | Hybrid usage-boundary | `analyze-usage-boundary`, `explore --intent usage_boundary_query` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` for seeds, source text for evidence |
 | Hybrid grep + adjacency | `callers` | Grep first, then `GraphStore::open_read_only` / redb `ReadOnlyDatabase` for candidate expansion |
@@ -284,8 +286,8 @@ Findings:
 | `<repo>/.aethyme/cache/map-*.bin` | Deleted Rust `map_cache.rs` only. `aethyme-graph-storage::cache_dir` also reserves `.aethyme/cache` as a layout helper for future local mirrors, but no external script consumes files in that directory. | 4.7.10 may orphan old `map-*.bin` files. Do not delete or rename the generic `cache_dir` layout helper; it belongs to graph-storage layout, not the removed map-cache implementation. |
 | `ParseStore` and `<repo>/.aethyme/parse_store.redb` | Rust engine internals only before 4.7.11. No Python, shell, eval manifest, or skill consumer found. | Deleted in 4.7.11; the legacy passes that used it were deleted in 4.7.12. The on-disk `parse_store.redb` is now an orphan local cache file. |
 | `<repo>/.aethyme/graph_store.redb` | `scripts/eval/setup-playground.sh`, `scripts/eval/verify-playground.sh`, `docs/guides/playground-setup.md`, `docs/architecture/graph-schema.md`, and `store/redb/graph_store.rs`. | Keep stable. It is the externally asserted redb graph-store artifact and is separate from deleted `ParseStore`. |
-| Engine CLI fragment flags | `aethyme-engine-cli.rs` accepts `--from-fragments` as compatibility spelling and rejects `--no-fragments`; daemon builds require fragments. No external manifest currently passes either flag. | 4.7.12 removed the rollback path. Keep the hard-error message stable enough for operators to diagnose stale scripts. |
-| Engine daemon warm command | `evals/tools/aethyme.toml`, `src/eval/orchestrator.py`, and `tests/local/test_eval_warm_phase.py`. | Daemon start/status names, `engine-daemon.log`, and `listening on` are cross-process contracts. Fragment-only behavior can change underneath, but command/log shape should not change in the 4.7 cutover. |
+| Engine CLI fragment flags | `aethyme-engine-cli.rs` accepts `--from-fragments` as compatibility spelling and rejects `--no-fragments`. No external manifest currently passes either flag. | 4.7.12 removed the rollback path. Keep the hard-error message stable enough for operators to diagnose stale scripts. |
+| Engine daemon redb query server | `aethyme explore` auto-start and any external users of `aethyme-engine-cli daemon start/status/serve`. Removed eval warm-phase files are historical only. | Daemon start/status names, `engine-daemon.log`, and `listening on` are cross-process contracts. The daemon no longer builds or warms `RepositoryMap`; it opens `.aethyme/graph_store.redb` read-only before listening and serves migrated task/symbol/caller RPCs through redb. |
 
 Outstanding risks after 4.7.12:
 

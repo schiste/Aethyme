@@ -301,6 +301,11 @@ Optional params:
 - `aethyme graph configs /path/to/repo <target> --json-output`
 - `aethyme graph overview /path/to/repo --json-output`
 
+`node`, relation, and expansion graph commands read
+`.aethyme/graph_store.redb` through read-only engine APIs. `graph overview`
+still uses the in-memory graph overview path until it receives its own redb
+adapter.
+
 ### Derived Facts
 - `aethyme facts public-functions --repo /path/to/repo --scope src/pkg --json-output`
 - `aethyme facts function-usage --repo /path/to/repo --target my_function --boundary src/pkg --json-output`
@@ -328,6 +333,10 @@ Optional params:
 - `aethyme task next --repo /path/to/repo --task "..." --json-output`
 - `aethyme task expand --repo /path/to/repo --node <target> --json-output`
 - `aethyme task context --repo /path/to/repo --task "..." --json-output`
+
+`task anchors`, `task scope`, `task next`, and `task expand` read the redb
+graph store. `task pack`, `task explain`, and `task context` still build
+context packs through the remaining in-memory path.
 
 ### Local Evaluation
 - `aethyme eval explain-repo --repo /path/to/repo --json-output`
