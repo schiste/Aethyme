@@ -84,13 +84,3 @@ class BaseFixer(ABC):
         )
 
         return fixes
-
-    def get_stats(self) -> dict[str, Any]:
-        """Get statistics for this fixer."""
-        return {
-            "fix_type": self.get_fix_type(),
-            "files_processed": self.files_processed,
-            "fixes_applied": self.fixes_applied,
-            "errors": len(self.errors),
-            "error_messages": self.errors,
-        }

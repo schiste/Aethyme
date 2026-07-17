@@ -133,30 +133,3 @@ class SelectorInserter(BaseFixer):
             except Exception as err:
                 logger.debug("Could not scan file", file=str(file_path), error=str(err))
         return missing
-
-    def get_coverage_report(self) -> dict[str, Any]:
-        total_elements = 0
-        elements_with_selectors = 0
-        for file_path in self.repo_path.rglob("*"):
-            if not self.can_fix(file_path):
-                continue
-            try:
-                with open(file_path, encoding="utf-8") as handle:
-                    content = handle.read()
-                for match in self.JSX_ELEMENT_PATTERN.finditer(content):
-                    element_name = match.group(1)
-                    attributes = match.group(2) or ""
-                    base_element = element_name.split(".")[-1]
-                    if base_element not in self.INTERACTIVE_ELEMENTS:
-                        continue
-                    total_elements += 1
-                    if "data-ui=" in attributes or "data-testid=" in attributes:
-                        elements_with_selectors += 1
-            except Exception:
-                continue
-        coverage = (elements_with_selectors / total_elements * 100) if total_elements else 0
-        return {
-            "total_elements": total_elements,
-            "elements_with_selectors": elements_with_selectors,
-            "coverage_percent": round(coverage, 2),
-        }

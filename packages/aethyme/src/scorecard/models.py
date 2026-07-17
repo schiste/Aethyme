@@ -93,15 +93,3 @@ class ScorecardReport(BaseModel):
         return self.score
 
 
-class ScanSummary(BaseModel):
-    """Summary view of a scan for API responses."""
-    scan_id: str
-    repository_id: str | None
-    timestamp: datetime
-    score: int
-    blocker_count: int
-    warning_count: int
-    info_count: int
-    total_findings: int
-    files_scanned: int
-    scan_time_ms: float

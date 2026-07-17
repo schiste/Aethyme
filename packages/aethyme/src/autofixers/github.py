@@ -323,21 +323,6 @@ class GitHubIntegration:
 
         return "\n".join(lines)
 
-    def get_current_branch(self) -> str:
-        """Get current branch name."""
-        try:
-            result = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=self.repo_path,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            return result.stdout.strip()
-        except subprocess.CalledProcessError as e:
-            logger.error("Failed to get current branch", error=str(e))
-            return ""
-
     def is_clean_working_tree(self) -> bool:
         """Check if working tree is clean."""
         try:
@@ -353,32 +338,3 @@ class GitHubIntegration:
             logger.warning("Failed to inspect working tree status", error=str(exc))
             return False
 
-    def get_remote_info(self) -> dict[str, str] | None:
-        """Get GitHub repository info."""
-        try:
-            result = subprocess.run(
-                ["git", "remote", "get-url", "origin"],
-                cwd=self.repo_path,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-
-            remote_url = result.stdout.strip()
-
-            # Parse GitHub URL
-            # git@github.com:owner/repo.git or https://github.com/owner/repo.git
-            import re
-
-            match = re.search(r'github\.com[:/]([^/]+)/([^/.]+)', remote_url)
-            if match:
-                return {
-                    "owner": match.group(1),
-                    "repo": match.group(2),
-                    "url": remote_url,
-                }
-
-        except subprocess.CalledProcessError as exc:
-            logger.warning("Failed to inspect git remote info", error=str(exc))
-
-        return None
