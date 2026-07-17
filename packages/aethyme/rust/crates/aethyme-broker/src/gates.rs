@@ -354,18 +354,20 @@ pub fn run_affected_with_progress(
         );
         let duration_ms = started.elapsed().as_millis() as i64;
         let (gate_status, exit_code) = match status {
-            Ok(0) => (GateStatus::Pass, Some(0i64)),
-            Ok(code) => (GateStatus::Fail, Some(code as i64)),
+            Ok(Some(0)) => (GateStatus::Pass, Some(0i64)),
+            Ok(Some(code)) => (GateStatus::Fail, Some(code as i64)),
+            // Killed by a signal (cancellation, OOM, operator kill): not a
+            // verdict on the code. Recording a conclusive fail here poisons
+            // the tree-hash cache — if the same tree recurs, the cached
+            // "fail" rejects a submission without ever running the gate
+            // (cached_gate_result only skips cancelled/error rows).
+            Ok(None) => (GateStatus::Cancelled, None),
             Err(_) => (GateStatus::Error, None),
         };
         progress.report(&format!(
             "gate {} {} in {}s",
             gate.name,
-            if gate_status == GateStatus::Pass {
-                "pass"
-            } else {
-                "fail"
-            },
+            gate_status.as_str(),
             started.elapsed().as_secs()
         ));
         store.record_gate_result(&NewGateResult {
@@ -406,7 +408,10 @@ struct GateCommandContext<'a> {
     progress: &'a dyn GateProgressSink,
 }
 
-fn run_gate_command(command: &str, context: GateCommandContext<'_>) -> Result<i32, std::io::Error> {
+fn run_gate_command(
+    command: &str,
+    context: GateCommandContext<'_>,
+) -> Result<Option<i32>, std::io::Error> {
     use std::os::unix::process::CommandExt;
 
     let log = std::fs::File::create(context.log_path)?;
@@ -453,10 +458,9 @@ fn run_gate_command(command: &str, context: GateCommandContext<'_>) -> Result<i3
     if let Some(pidfile) = &pidfile {
         let _ = std::fs::remove_file(pidfile);
     }
-    // Killed-by-signal (cancellation) surfaces as no exit code → treat as
-    // failure exit 143 so the record is conclusive-looking but the
-    // cancelled row written by the canceller is what the cache ignores.
-    Ok(status?.code().unwrap_or(143))
+    // Killed-by-signal surfaces as no exit code; `None` lets the caller
+    // record a non-conclusive `cancelled` row instead of a fake exit code.
+    Ok(status?.code())
 }
 
 #[cfg(test)]

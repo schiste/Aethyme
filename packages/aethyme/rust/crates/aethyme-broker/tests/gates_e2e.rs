@@ -259,8 +259,9 @@ triggers = ["**/*.py"]
     assert_eq!(old.len(), 1);
     assert_eq!(
         old[0].status,
-        GateStatus::Fail,
-        "killed run records the signal exit, cancellation row is separate: {old:?}"
+        GateStatus::Cancelled,
+        "a killed run is not a verdict on the code — it must never record \
+         a conclusive fail: {old:?}"
     );
     assert!(
         !wt.join("slow-finished.txt").exists(),
@@ -272,5 +273,23 @@ triggers = ["**/*.py"]
     assert!(
         events.iter().any(|e| e.kind == "gate.cancelled"),
         "cancellation recorded"
+    );
+
+    // The poisoning scenario: the agent reverts to the v1 content, so the
+    // old tree hash recurs. The killed run's row must NOT satisfy the
+    // cache — a cached fail here would reject a perfectly good
+    // submission without ever running the gate.
+    std::fs::write(wt.join("src/app.py"), "v1\n").unwrap();
+    let v1_tree = aethyme_broker::GitRepo::discover(&wt)
+        .unwrap()
+        .working_tree_hash()
+        .unwrap();
+    assert!(
+        broker
+            .store()
+            .cached_gate_result("slow", &v1_tree)
+            .unwrap()
+            .is_none(),
+        "killed run must not leave a conclusive cached result for its tree"
     );
 }
