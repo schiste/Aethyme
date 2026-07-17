@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use aethyme_engine::graph::navigation::{
     callees_view, callers_view, children_view, configs_view, docs_view, graph_expand_view,
-    node_view, parents_view, task_anchors_view, task_next_view, task_scope_view,
+    node_view, parents_view, task_anchors_view, task_expand_view, task_next_view, task_scope_view,
 };
 use aethyme_engine::graph::search::symbol_search;
 use aethyme_engine::map::RepositoryMap;
@@ -521,6 +521,16 @@ fn task_cli_json(repo: &Path, command: &str, task: &str) -> serde_json::Value {
     query_json([command, "--repo", repo.to_str().unwrap(), "--task", task])
 }
 
+fn task_expand_cli_json(repo: &Path, target: &str) -> serde_json::Value {
+    query_json([
+        "task-expand",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--target",
+        target,
+    ])
+}
+
 fn repository_map_graph_json(
     map: &RepositoryMap,
     command: &str,
@@ -559,6 +569,11 @@ fn repository_map_task_json(map: &RepositoryMap, command: &str, task: &str) -> s
         other => panic!("unsupported task command: {other}"),
     };
     serde_json::from_str(&json).expect("RepositoryMap task JSON parses")
+}
+
+fn repository_map_task_expand_json(map: &RepositoryMap, target: &str) -> serde_json::Value {
+    let json = aethyme_engine::json::task_expand_view(&task_expand_view(map, target));
+    serde_json::from_str(&json).expect("RepositoryMap task-expand JSON parses")
 }
 
 fn symbol_cli_hits(repo: &Path, query: &str, limit: usize) -> serde_json::Value {
@@ -936,6 +951,21 @@ fn rendered_graph_commands_match_repository_map_snapshots_on_medium_fixture() {
     let tmp = build_medium_redb_fixture();
 
     assert_rendered_graph_command_parity(tmp.path(), &["load_token", "src/auth/token.py"]);
+}
+
+#[test]
+fn task_expand_command_matches_repository_map_snapshot_on_relation_fixture() {
+    let tmp = build_expand_redb_fixture();
+    let map = RepositoryMap::build(tmp.path()).expect("build RepositoryMap task-expand oracle");
+
+    for target in ["caller", "callee", "pyproject.toml"] {
+        let expected = repository_map_task_expand_json(&map, target);
+        let actual = task_expand_cli_json(tmp.path(), target);
+        assert_eq!(
+            actual, expected,
+            "task-expand should preserve RepositoryMap JSON for target {target:?}"
+        );
+    }
 }
 
 fn assert_task_command_parity(repo: &Path, tasks: &[&str]) {
@@ -1563,6 +1593,13 @@ fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
             tmp.path().to_str().unwrap(),
             "--task",
             "Update load_token flow",
+        ],
+        vec![
+            "task-expand",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--target",
+            "load_token",
         ],
         vec![
             "analyze-usage-boundary",

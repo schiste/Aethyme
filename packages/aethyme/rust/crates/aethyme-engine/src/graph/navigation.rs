@@ -381,6 +381,25 @@ pub fn task_expand_view(map: &RepositoryMap, target: &str) -> TaskExpandView {
     }
 }
 
+pub fn task_expand_view_redb(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+) -> Result<TaskExpandView, GraphStoreError> {
+    let dependencies = relation_strings(callees_view_redb(store, target)?);
+    let impact = relation_strings(callers_view_redb(store, target)?);
+    let docs = relation_strings(docs_view_redb(store, target)?);
+    let configs = relation_strings(configs_view_redb(store, target)?);
+    let risks = risks_for_redb_target(store, target)?;
+    Ok(TaskExpandView {
+        node: target.to_string(),
+        dependencies,
+        impact,
+        docs,
+        configs,
+        risks,
+    })
+}
+
 pub fn graph_expand_view(map: &RepositoryMap, target: &str) -> Option<GraphExpandView> {
     let target_view = node_view(map, target)?;
     Some(GraphExpandView {
