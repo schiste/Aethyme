@@ -9,7 +9,7 @@
 
 # Local strategy/progress boards (personal working views, kept out of git)
 docs/strategy.html
-docs/strategy-archive-*.html
+docs/strategy-*.html
 docs/legacy.html
 
 node_modules/
