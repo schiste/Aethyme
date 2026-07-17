@@ -10,8 +10,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from src.contracts.run_metadata import RunMetadata, build_run_metadata
-
 from .repository_snapshot import LocalRepositorySnapshot, capture_snapshot
 
 ENGINE_MANIFEST_PATH = Path(__file__).resolve().parents[2] / "rust" / "Cargo.toml"
@@ -39,38 +37,6 @@ def _probe_pyo3_transport() -> tuple[bool, str]:
 
 class EngineError(RuntimeError):
     """Raised when the Rust engine command fails."""
-
-
-def build_engine_run_metadata(
-    snapshot: LocalRepositorySnapshot,
-    *,
-    phase: str,
-    status: str,
-    run_id: str | None = None,
-    command: list[str] | None = None,
-    config: dict[str, object] | None = None,
-    finished_at: str | None = None,
-) -> RunMetadata:
-    """Return versioned metadata for a normal engine invocation."""
-    return build_run_metadata(
-        snapshot,
-        project_root=ENGINE_MANIFEST_PATH.parents[1],
-        phase=phase,
-        status=status,
-        run_id=run_id,
-        engine_binary=_metadata_engine_binary(),
-        command=command,
-        config=config,
-        finished_at=finished_at,
-    )
-
-
-def _metadata_engine_binary() -> Path | None:
-    """Return binary metadata without forcing a subprocess binary for PyO3 runs."""
-    info = engine_runtime_info()
-    if info["resolved_transport"] != "subprocess":
-        return None
-    return ensure_engine_binary()
 
 
 def engine_runtime_info() -> dict[str, Any]:
@@ -346,46 +312,6 @@ def search_symbol(repo_path: Path, query: str) -> list[dict[str, Any]]:
     return json.loads(output)
 
 
-def search_symbols(
-    repo_path: Path,
-    queries: list[str],
-    *,
-    limit: int = 20,
-    timeout_seconds: float | None = None,
-) -> dict[str, list[dict[str, Any]]]:
-    """Return exact redb-backed symbol search results for multiple queries."""
-    normalized_queries = []
-    seen = set()
-    for query in queries:
-        stripped = query.strip()
-        if stripped and stripped not in seen:
-            seen.add(stripped)
-            normalized_queries.append(stripped)
-    if not normalized_queries:
-        return {}
-
-    snapshot = capture_snapshot(repo_path)
-    cache_key = f"symbol_batch_{_stable_hash(json.dumps([normalized_queries, limit]))}"
-    output = _cached_text(
-        snapshot,
-        cache_key,
-        lambda: _run_binary_command_with_timeout(
-            "symbol-batch",
-            "--repo",
-            str(snapshot.repo_path),
-            *[
-                arg
-                for query in normalized_queries
-                for arg in ("--query", query)
-            ],
-            "--limit",
-            str(limit),
-            timeout_seconds=timeout_seconds,
-        ),
-    )
-    return json.loads(output)
-
-
 def _run_binary_command_with_timeout(
     *args: str,
     timeout_seconds: float | None = None,
@@ -555,16 +481,6 @@ def task_next(
     return _task_view(repo_path, "task-next", task, timeout_seconds=timeout_seconds)
 
 
-def task_localize(
-    repo_path: Path,
-    task: str,
-    *,
-    timeout_seconds: float | None = None,
-) -> dict[str, Any]:
-    """Return task anchors, scope, and next steps with one engine map load."""
-    return _task_view(repo_path, "task-localize", task, timeout_seconds=timeout_seconds)
-
-
 def task_expand(
     repo_path: Path,
     target: str,
@@ -668,72 +584,6 @@ def analyze_dead_code(
         ),
     )
     return json.loads(output)
-
-
-def usage_boundary_query(
-    repo_path: Path,
-    scope: str,
-    *,
-    roots: list[str] | None = None,
-    include_methods: bool = False,
-    budget_ms: int = 10_000,
-    max_evidence_per_symbol: int = 5,
-) -> dict[str, Any]:
-    """Return a scope-first usage boundary answer without building the full graph."""
-    snapshot = capture_snapshot(repo_path)
-    roots = roots or []
-    roots_value = ",".join(roots)
-    output = _run_binary_command(
-        "analyze-usage-boundary",
-        "--repo",
-        str(snapshot.repo_path),
-        "--scope",
-        scope,
-        *(["--roots", roots_value] if roots_value else []),
-        *(["--include-methods"] if include_methods else []),
-        "--budget-ms",
-        str(max(0, int(budget_ms))),
-        "--max-evidence-per-symbol",
-        str(max(1, int(max_evidence_per_symbol))),
-    )
-    return json.loads(output)
-
-
-def activate(repo_path: Path, task: str) -> dict[str, Any]:
-    """Return the activation map for a task, showing which graph nodes are relevant."""
-    snapshot = capture_snapshot(repo_path)
-    cache_key = f"activate_{_stable_hash(task)}"
-    output = _cached_text(
-        snapshot,
-        cache_key,
-        lambda: _run_binary_command("activate", "--repo", str(snapshot.repo_path), "--task", task),
-    )
-    return json.loads(output)
-
-
-def activate_from(repo_path: Path, seed: str, hops: int = 3) -> dict[str, Any]:
-    """Return a focused activation wave from a single seed node."""
-    snapshot = capture_snapshot(repo_path)
-    cache_key = f"activate_from_{_stable_hash(seed)}_{hops}"
-    output = _cached_text(
-        snapshot,
-        cache_key,
-        lambda: _run_binary_command(
-            "activate-from", "--repo", str(snapshot.repo_path), "--seed", seed, "--hops", str(hops),
-        ),
-    )
-    return json.loads(output)
-
-
-def explain_task(repo_path: Path, task: str) -> str:
-    """Return a deterministic text explanation from the Rust engine."""
-    snapshot = capture_snapshot(repo_path)
-    cache_key = f"explain_{_stable_hash(task)}"
-    return _cached_text(
-        snapshot,
-        cache_key,
-        lambda: _run_binary_command("explain", "--repo", str(snapshot.repo_path), "--task", task),
-    )
 
 
 def workspace_inspect(repo_paths: list[Path]) -> dict[str, Any]:

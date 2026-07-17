@@ -36,10 +36,6 @@ impl TaskKind {
         matches!(self, Self::ExplainRepo)
     }
 
-    pub fn is_navigation_task(&self) -> bool {
-        matches!(self, Self::NavigateConfigOwnership)
-    }
-
     pub fn is_change_task(&self) -> bool {
         matches!(self, Self::ChangeSymbol | Self::TraceImpact)
     }

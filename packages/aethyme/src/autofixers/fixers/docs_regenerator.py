@@ -14,7 +14,6 @@ class DocsRegenerator(BaseFixer):
     """Regenerates missing or outdated documentation files."""
 
     FOLDER_DOC_NAME = "FOLDER.md"
-    INDEX_NAMES = ["index.md", "README.md"]
 
     def get_fix_type(self) -> str:
         return "docs_regen"
@@ -201,33 +200,3 @@ class DocsRegenerator(BaseFixer):
 
         self.files_processed = len(missing_dirs)
         return created
-
-    def update_existing_folder_docs(self) -> list[dict[str, Any]]:
-        """Update existing FOLDER.md files with fresh content."""
-        updated: list[dict[str, Any]] = []
-
-        for doc_path in self.repo_path.rglob(self.FOLDER_DOC_NAME):
-            try:
-                directory = doc_path.parent
-
-                with open(doc_path, encoding='utf-8') as f:
-                    original_content = f.read()
-
-                new_content = self.generate_folder_doc(directory)
-
-                if new_content != original_content:
-                    updated.append({
-                        "file_path": doc_path,
-                        "original_content": original_content,
-                        "new_content": new_content,
-                        "fix_type": self.get_fix_type(),
-                    })
-
-                    logger.info("Updated FOLDER.md", path=str(doc_path))
-
-            except Exception as e:
-                error_msg = f"Failed to update {doc_path}: {e}"
-                self.errors.append(error_msg)
-                logger.error("FOLDER.md update failed", path=str(doc_path), error=str(e))
-
-        return updated

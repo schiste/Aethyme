@@ -122,10 +122,6 @@ impl GitRepo {
         run_git(&self.root, &["rev-parse", "HEAD"])
     }
 
-    pub fn merge_base(&self, a: &str, b: &str) -> Result<String, GitError> {
-        run_git(&self.root, &["merge-base", a, b])
-    }
-
     /// Resolve a ref (branch name, tag, ...) to a commit, `None` when it
     /// does not exist.
     pub fn resolve_ref(&self, name: &str) -> Option<String> {

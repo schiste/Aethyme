@@ -372,7 +372,7 @@ impl Broker {
         for overlap in &after {
             if !before.contains(overlap) {
                 self.store.append_event(
-                    "lease.overlap",
+                    crate::events::LEASE_OVERLAP,
                     Some(overlap.session_a),
                     Some(&serde_json::to_string(overlap)?),
                 )?;

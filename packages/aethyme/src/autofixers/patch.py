@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import difflib
-import subprocess
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -196,24 +195,3 @@ class PatchGenerator:
     def get_changed_files(self) -> list[Path]:
         return [self.repo_path / patch.file_path for patch in self.patches]
 
-    def rollback(self) -> dict[str, Any]:
-        try:
-            changed_files = self.get_changed_files()
-            if not changed_files:
-                return {"status": "no_changes", "message": "No files to rollback"}
-            for file_path in changed_files:
-                subprocess.run(
-                    ["git", "checkout", "HEAD", "--", str(file_path)],
-                    cwd=self.repo_path,
-                    check=True,
-                    capture_output=True,
-                )
-            logger.info("Rolled back changes", files=len(changed_files))
-            return {
-                "status": "success",
-                "message": f"Rolled back {len(changed_files)} files",
-                "files": [str(file_path) for file_path in changed_files],
-            }
-        except subprocess.CalledProcessError as err:
-            logger.error("Rollback failed", error=str(err))
-            return {"status": "error", "message": f"Rollback failed: {err}"}

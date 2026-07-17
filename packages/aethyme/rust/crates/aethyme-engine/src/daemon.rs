@@ -277,11 +277,6 @@ impl DaemonConfig {
         self
     }
 
-    pub fn with_use_fragments(mut self, use_fragments: bool) -> Self {
-        self.use_fragments = use_fragments;
-        self
-    }
-
     pub fn with_force_fragments(mut self, force_fragments: bool) -> Self {
         self.force_fragments = force_fragments;
         self

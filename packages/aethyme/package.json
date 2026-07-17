@@ -5,15 +5,9 @@
   "description": "Deterministic repository indexing and code intelligence tooling",
   "license": "Apache-2.0",
   "scripts": {
-    "dev:api": "bash scripts/start-api.sh",
-    "index": "python -m src.indexer.cli",
     "test": "pytest tests/ -v",
     "test:coverage": "pytest tests/ --cov=src --cov-report=html",
     "lint": "ruff check src/",
-    "type-check": "pyright src/",
-    "db:migrate": "bash scripts/migrate.sh",
-    "docker:build": "docker-compose -f ops/docker-compose.yml build",
-    "docker:up": "docker-compose -f ops/docker-compose.yml up",
-    "docker:down": "docker-compose -f ops/docker-compose.yml down"
+    "type-check": "pyright src/"
   }
 }

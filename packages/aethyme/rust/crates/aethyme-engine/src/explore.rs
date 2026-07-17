@@ -653,25 +653,6 @@ pub use usage_boundary::{UsageBoundaryParams, explore_usage_boundary};
 
 // ── orchestration entry point ───────────────────────────────────────────
 
-/// Run a `task_localization_query` intent against the engine daemon.
-///
-/// Returns `Err(DaemonNotRunning)` when there's no daemon — the caller
-/// is responsible for falling back (typically to the Python orchestrator).
-/// Other errors indicate the daemon was reachable but the request failed.
-pub fn explore_task_localization(
-    repo: &Path,
-    request: &str,
-    params: &ExploreParams,
-) -> Result<ExploreResponse, ExploreError> {
-    explore_with_intent(
-        repo,
-        request,
-        Intent::TaskLocalization,
-        IntentSource::Default,
-        params,
-    )
-}
-
 /// How the intent was selected. Reported back in the response so
 /// consumers can attribute the choice (an agent that explicitly
 /// requested behavior_localization should know its choice was honored,

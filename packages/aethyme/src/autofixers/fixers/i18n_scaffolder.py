@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 from typing import Any
@@ -112,26 +111,6 @@ class I18nScaffolder(BaseFixer):
         if len(key) > 40:
             key = "_".join(key.split("_")[:4])
         return f"{namespace}.{key}"
-
-    def generate_translation_file(self, output_path: Path, language: str = "en") -> dict[str, str]:
-        translations: dict[str, str] = {}
-        for file_path in self.repo_path.rglob("*"):
-            if not self.can_fix(file_path):
-                continue
-            try:
-                with open(file_path, encoding="utf-8") as handle:
-                    content = handle.read()
-                for match in re.finditer(r"t\([\"']([^\"']+)[\"']\)", content):
-                    key = match.group(1)
-                    translations.setdefault(key, key.split(".")[-1].replace("_", " ").title())
-            except Exception:
-                continue
-
-        if translations:
-            with open(output_path, "w", encoding="utf-8") as handle:
-                json.dump({language: translations}, handle, indent=2, ensure_ascii=False)
-            logger.info("Generated translation file", path=str(output_path), keys=len(translations))
-        return translations
 
     def find_hardcoded_strings(self) -> list[dict[str, Any]]:
         hardcoded: list[dict[str, Any]] = []

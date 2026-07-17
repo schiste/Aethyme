@@ -103,10 +103,6 @@ impl InternedStr {
         &self.0
     }
 
-    pub fn into_arc(self) -> Arc<str> {
-        self.0
-    }
-
     /// Borrow as `&str`. Provided so consumers don't need to write `&*x` or
     /// `x.as_ref()` — and so they don't accidentally hit the unstable
     /// `str::as_str` method via Deref.

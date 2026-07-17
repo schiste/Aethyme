@@ -22,13 +22,6 @@ class FormatFixer(BaseFixer):
         'rust': ['rustfmt'],
     }
 
-    # Linters with auto-fix
-    LINTERS: dict[str, list[str]] = {
-        'python': ['ruff', 'isort'],
-        'javascript': ['eslint'],
-        'typescript': ['eslint'],
-    }
-
     def __init__(self, repo_path: Path, formatter: str | None = None):
         super().__init__(repo_path)
         self.formatter = formatter

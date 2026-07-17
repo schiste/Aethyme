@@ -132,8 +132,6 @@ def test_required_documentation_exists(docs_dir: Path) -> None:
         "reference/cli.md",
         "guides/testing.md",
         "guides/troubleshooting.md",
-        "runbooks/index-failure.md",
-        "runbooks/rollback.md",
     ]
 
     missing_docs: list[str] = []

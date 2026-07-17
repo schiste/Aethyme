@@ -1,30 +1,24 @@
 # Aethyme Tests
 
-The suite is split into unit and integration paths.
+All suites are local-first: no PostgreSQL or external services are required.
 
-## Unit
-- no PostgreSQL required
-- run with `make test-unit`
-- current examples:
-  - `tests/autofixers`
-  - `tests/scorecard`
-  - `tests/indexing`
-  - `tests/docs`
+## Suites
 
-## Integration
-- requires `TEST_DATABASE_URL`
-- run with `make test-integration`
-- current integration directories:
-  - `tests/api`
-  - `tests/auth`
-  - `tests/queries`
+- `tests/local` — end-to-end local workflow, CLI, engine cache, enhance, hygiene checks (run in CI)
+- `tests/indexing` — language/skill indexing behavior
+- `tests/scorecard` — scorecard engine and detectors
+- `tests/autofixers` — fixers, safety, and patch handling
+- `tests/contracts` — cross-process contract and schema stability
+- `tests/docs` — documentation link and example validation
 
-## Full
-- run everything with `make test-full`
+Run everything:
+
+```bash
+pytest tests/local tests/indexing tests/scorecard tests/autofixers tests/contracts tests/docs -q
+```
 
 ## Data Model
-- integration tests rebuild `aethyme_test` from migrations
-- [db_seed.py](support/db_seed.py) seeds canonical org, tenant, repository, node, and edge data
+
 - [repo_builders.py](support/repo_builders.py) creates temporary repositories on demand
 
 Do not add checked-in fake repos or SQL fixture dumps back into the active test path.

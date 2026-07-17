@@ -18,18 +18,18 @@ cd packages/aethyme
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
-docker compose -f docker-compose.dev.yml up -d postgres redis
-export DATABASE_URL='postgresql://aethyme:dev_password_change_me@localhost:5432/aethyme_dev'
-export REDIS_URL='redis://localhost:6379/0'
-bash scripts/migrate.sh
+cargo build --release --manifest-path rust/Cargo.toml
 ```
+
+No database or services are required; the CLI drives the built Rust
+engine binary directly.
 
 ## Run The Core Checks
 
 ```bash
 . .venv/bin/activate
-pytest tests/queries tests/scorecard -q
-python -m src.cli index . --name aethyme
+pytest tests/local tests/scorecard -q
+python -m src.cli repo ingest .
 ```
 
 ## Documentation Rule

@@ -136,11 +136,6 @@ def get_state(ctx: click.Context) -> CLIState:
     return cast(CLIState, ctx.obj)
 
 
-def default_tenant_id() -> str | None:
-    """Tenant resolution retired with the Gen-0 PostgreSQL lineage (2026-07-13)."""
-    return None
-
-
 @click.group(cls=AethymeCLIGroup)
 @click.option(
     "--tenant-id",
@@ -1838,27 +1833,11 @@ def _intent_catalog() -> dict[str, Any]:
     }
 
 
-def _parse_json_object(raw_value: str, *, option_name: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(raw_value)
-    except json.JSONDecodeError as exc:
-        raise click.BadParameter(
-            f"Expected a JSON object: {exc.msg}", param_hint=option_name
-        ) from exc
-    if not isinstance(parsed, dict):
-        raise click.BadParameter("Expected a JSON object.", param_hint=option_name)
-    return parsed
-
-
 @cli.command(name="ai-ready")
 @click.option(
     "--repo",
     type=click.Path(exists=True),
     help="Repository path (defaults to current directory)",
-)
-@click.option(
-    "--org",
-    help="Organization ID for API mode",
 )
 @click.option(
     "--repo-id",
@@ -1885,7 +1864,6 @@ def _parse_json_object(raw_value: str, *, option_name: str) -> dict[str, Any]:
 def ai_ready(
     ctx: click.Context,
     repo: str | None,
-    org: str | None,
     repo_id: str | None,
     format: str,
     output: str | None,

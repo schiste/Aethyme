@@ -20,18 +20,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Resolve paths from target registry
+# Resolve paths from the playground naming convention:
+#   $PLAYGROUND_ROOT/<Name>/<Name> - {Control,Aethyme}
+# (Formerly src.eval.targets, removed with the evaluation stack in 07ddf88.)
 if [[ -n "$TARGET" && -z "$CONTROL_DIR" ]]; then
-    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    AETHYME_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-    PATHS=$(cd "$AETHYME_ROOT" && "$AETHYME_ROOT/.venv/bin/python" -c "
-from src.eval.targets import get_target
-t = get_target('$TARGET')
-print(t.control_path)
-print(t.aethyme_path)
-" 2>/dev/null) || { echo "ERROR: Unknown target '$TARGET'"; exit 1; }
-    CONTROL_DIR=$(echo "$PATHS" | head -1)
-    AETHYME_DIR=$(echo "$PATHS" | tail -1)
+    PLAYGROUND_ROOT="${AETHYME_PLAYGROUND_ROOT:-$HOME/Downloads/Repositories/Playground}"
+    case "$TARGET" in
+        grc)       DISPLAY_NAME="Mockup" ;;      # GRC pair relocated under Mockup/; slug kept for tooling stability
+        mediawiki) DISPLAY_NAME="Mediawiki" ;;
+        *) echo "ERROR: Unknown target '$TARGET' (known: grc, mediawiki)"; exit 1 ;;
+    esac
+    CONTROL_DIR="$PLAYGROUND_ROOT/$DISPLAY_NAME/$DISPLAY_NAME - Control"
+    AETHYME_DIR="$PLAYGROUND_ROOT/$DISPLAY_NAME/$DISPLAY_NAME - Aethyme"
 fi
 
 if [[ -z "$CONTROL_DIR" || -z "$AETHYME_DIR" ]]; then
