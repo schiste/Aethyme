@@ -337,6 +337,12 @@ fn print_checks(checks: &[crate::init::Check]) {
     }
 }
 
+fn duration_label(duration_ms: Option<i64>) -> String {
+    duration_ms
+        .map(|ms| format!("{ms}ms"))
+        .unwrap_or_else(|| "-".into())
+}
+
 fn print_overlap_warnings(overlaps: &[crate::Overlap]) {
     for overlap in overlaps {
         eprintln!(
@@ -638,40 +644,38 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             // Preflight (dogfood feedback 2026-07-14): show exactly what
             // will be submitted before anything runs — and warn about
             // uncommitted work, which never integrates.
-            if !parsed.json {
-                if let Ok(info) = broker.store().session(session) {
-                    if let Ok(checkout) =
-                        crate::GitRepo::discover(std::path::Path::new(&info.worktree_path))
-                    {
-                        let head = checkout.head_commit().unwrap_or_default();
+            if !parsed.json
+                && let Ok(info) = broker.store().session(session)
+                && let Ok(checkout) =
+                    crate::GitRepo::discover(std::path::Path::new(&info.worktree_path))
+            {
+                let head = checkout.head_commit().unwrap_or_default();
+                println!(
+                    "Submitting session {session} — HEAD {}",
+                    &head[..12.min(head.len())]
+                );
+                if let Some(base) = info.diff_base.as_deref()
+                    && let Ok(commits) = checkout.commit_summaries(base, "HEAD", 10)
+                {
+                    if commits.is_empty() {
                         println!(
-                            "Submitting session {session} — HEAD {}",
-                            &head[..12.min(head.len())]
+                            "  no commits since the session baseline — \
+                             nothing new to integrate"
                         );
-                        if let Some(base) = info.diff_base.as_deref() {
-                            if let Ok(commits) = checkout.commit_summaries(base, "HEAD", 10) {
-                                if commits.is_empty() {
-                                    println!(
-                                        "  no commits since the session baseline — \
-                                         nothing new to integrate"
-                                    );
-                                }
-                                for line in &commits {
-                                    println!("  {line}");
-                                }
-                            }
-                        }
-                        if let Ok(dirty) = checkout.dirty_paths() {
-                            if !dirty.is_empty() {
-                                println!(
-                                    "  ⚠ {} uncommitted change(s) NOT included \
-                                     (only committed work integrates), e.g. {}",
-                                    dirty.len(),
-                                    dirty.first().map(String::as_str).unwrap_or("")
-                                );
-                            }
-                        }
                     }
+                    for line in &commits {
+                        println!("  {line}");
+                    }
+                }
+                if let Ok(dirty) = checkout.dirty_paths()
+                    && !dirty.is_empty()
+                {
+                    println!(
+                        "  ⚠ {} uncommitted change(s) NOT included \
+                         (only committed work integrates), e.g. {}",
+                        dirty.len(),
+                        dirty.first().map(String::as_str).unwrap_or("")
+                    );
                 }
             }
             let outcome = broker.submit(session)?;
@@ -688,14 +692,30 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 );
                 return Err(UsageError::Message("submission conflicted".into()));
             } else {
+                let gate_wall_ms: i64 = outcome
+                    .gate_outcomes
+                    .iter()
+                    .filter(|gate| !gate.cached)
+                    .filter_map(|gate| gate.duration_ms)
+                    .sum();
                 for gate in &outcome.gate_outcomes {
-                    println!(
-                        "gate {:<20} {}{}",
-                        gate.gate,
-                        gate.status.as_str(),
-                        if gate.cached { " (cached)" } else { "" }
-                    );
+                    if gate.cached {
+                        println!(
+                            "gate {:<20} {} (cached, saved {})",
+                            gate.gate,
+                            gate.status.as_str(),
+                            duration_label(gate.duration_ms)
+                        );
+                    } else {
+                        println!(
+                            "gate {:<20} {} in {}",
+                            gate.gate,
+                            gate.status.as_str(),
+                            duration_label(gate.duration_ms)
+                        );
+                    }
                 }
+                println!("gate wall time: {}ms", gate_wall_ms);
                 println!(
                     "entry {} → {}{}",
                     outcome.entry.id,
