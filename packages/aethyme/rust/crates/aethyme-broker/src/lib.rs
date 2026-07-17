@@ -26,6 +26,7 @@ mod error;
 pub mod events;
 mod gates;
 mod git;
+pub mod hooks;
 pub mod init;
 mod leases;
 mod merge;
@@ -39,6 +40,7 @@ pub use gates::{
     Gate, GateConfigError, GateProgressSink, GateRunOutcome, load_gates, select_gates,
 };
 pub use git::{GitError, GitRepo, MergeSimulation};
+pub use hooks::{HookReport, HookState, HooksError};
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use merge::{ACTION_REQUIRED_RELPATH, PromoteConfig, SubmitOutcome};
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};

@@ -88,18 +88,26 @@ impl GitRepo {
         &self.root
     }
 
-    /// Root of the **main** checkout, even when `self` is a linked
-    /// worktree. Broker state (`.aethyme/broker.db`) always lives here so
-    /// all worktrees coordinate through one database.
-    pub fn main_root(&self) -> Result<PathBuf, GitError> {
+    /// Absolute path of the repository's **common** git dir — the one
+    /// directory every linked worktree shares. Installed git hooks live
+    /// in `<common>/hooks`, which is what makes them worktree-wide.
+    pub fn git_common_dir(&self) -> Result<PathBuf, GitError> {
         let common = run_git(&self.root, &["rev-parse", "--git-common-dir"])?;
         let mut common_dir = PathBuf::from(common);
         if common_dir.is_relative() {
             common_dir = self.root.join(common_dir);
         }
-        // `<main>/.git` → `<main>`. Canonicalize to strip the `..`
-        // segments git emits from linked worktrees.
-        let common_dir = common_dir.canonicalize().unwrap_or(common_dir);
+        // Canonicalize to strip the `..` segments git emits from linked
+        // worktrees.
+        Ok(common_dir.canonicalize().unwrap_or(common_dir))
+    }
+
+    /// Root of the **main** checkout, even when `self` is a linked
+    /// worktree. Broker state (`.aethyme/broker.db`) always lives here so
+    /// all worktrees coordinate through one database.
+    pub fn main_root(&self) -> Result<PathBuf, GitError> {
+        // `<main>/.git` → `<main>`.
+        let common_dir = self.git_common_dir()?;
         Ok(common_dir
             .parent()
             .map(Path::to_path_buf)
@@ -288,6 +296,38 @@ impl GitRepo {
         files.sort();
         files.dedup();
         Ok(files)
+    }
+
+    /// Paths staged for the next commit (`git diff --cached --name-only`)
+    /// — the selection surface of the derived pre-commit hook. Inherits
+    /// GIT_INDEX_FILE when git set one, so partial commits see exactly
+    /// what will be committed.
+    pub fn staged_files(&self) -> Result<Vec<String>, GitError> {
+        Ok(run_git(&self.root, &["diff", "--cached", "--name-only"])?
+            .lines()
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Files changed by the HEAD commit — what the post-commit conflict
+    /// radar compares against other sessions' leases. `--root` makes the
+    /// initial commit report its files too.
+    pub fn head_changed_files(&self) -> Result<Vec<String>, GitError> {
+        Ok(run_git(
+            &self.root,
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "--root",
+                "HEAD",
+            ],
+        )?
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
     }
 
     /// One-line summaries (short-sha + subject) of `from..to`, newest

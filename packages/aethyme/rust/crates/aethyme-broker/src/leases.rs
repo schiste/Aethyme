@@ -99,7 +99,9 @@ pub struct Overlap {
     pub path: String,
 }
 
-fn paths_overlap(a: &str, b: &str) -> bool {
+/// Whether two lease-style paths overlap. Shared with the post-commit
+/// conflict radar, which compares commit paths against lease paths.
+pub(crate) fn paths_overlap(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
