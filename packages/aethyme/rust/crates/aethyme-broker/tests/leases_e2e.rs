@@ -141,3 +141,48 @@ fn explicit_directory_claim_overlaps_other_sessions_files() {
         "config-ignored prefix keeps implicit leases (and thus overlaps) out"
     );
 }
+
+// ── #41: leases derive from merge-base, self-healing after rebases ─────
+
+#[test]
+fn rebase_onto_integration_does_not_inflate_leases() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    // Session 1 promotes work on file_one — integration now contains it.
+    let wt1 = add_worktree(tmp.path(), "one");
+    let s1 = broker.adopt(&wt1, Some("one")).unwrap();
+    std::fs::write(wt1.join("file_one.txt"), "one\n").unwrap();
+    sh(&wt1, &["add", "-A"]);
+    sh(&wt1, &["commit", "-qm", "one"]);
+    assert!(broker.submit(s1.id).unwrap().promoted);
+
+    // Session 2 rebases onto the integration branch (as the
+    // action-required flow instructs), bringing session 1's promoted
+    // commit into its history, then does its own work on file_two.
+    let wt2 = add_worktree(tmp.path(), "two");
+    let s2 = broker.adopt(&wt2, Some("two")).unwrap();
+    sh(&wt2, &["fetch", ".", "aethyme/integration"]);
+    sh(&wt2, &["rebase", "FETCH_HEAD"]);
+    std::fs::write(wt2.join("file_two.txt"), "two\n").unwrap();
+    sh(&wt2, &["add", "-A"]);
+    sh(&wt2, &["commit", "-qm", "two"]);
+
+    broker.refresh_leases().unwrap();
+    let leases = broker.store().active_leases().unwrap();
+    let s2_paths: Vec<&str> = leases
+        .iter()
+        .filter(|l| l.session_id == s2.id)
+        .map(|l| l.path.as_str())
+        .collect();
+    assert!(
+        s2_paths.contains(&"file_two.txt"),
+        "own work must be leased: {s2_paths:?}"
+    );
+    assert!(
+        !s2_paths.contains(&"file_one.txt"),
+        "promoted work brought in by the rebase must NOT appear as a \
+         phantom lease (#41): {s2_paths:?}"
+    );
+}

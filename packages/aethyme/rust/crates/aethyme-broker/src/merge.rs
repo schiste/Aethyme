@@ -151,6 +151,20 @@ impl Broker {
     /// CURRENT integration head. Rebinds the entry's base if the branch
     /// moved since submission.
     pub fn simulate_and_gate(&mut self, entry_id: i64) -> Result<SubmitOutcome, BrokerOpError> {
+        // #42: remember where the integration branch stood BEFORE the
+        // follows-main refresh. Gate selection must diff against this —
+        // for a main-checkout session the refresh fast-forwards the base
+        // onto the session's own commits, and diffing against the
+        // refreshed base yields an empty set (the observed `gates:[]`
+        // vacuous verify). Diffing against the pre-refresh head selects
+        // gates for the work actually being accepted; for worktree
+        // sessions the two are equal (or the pre-refresh diff is a safe
+        // superset when integration lagged main).
+        let pre_refresh = {
+            let branch = PromoteConfig::load(&self.main_root_path()).branch;
+            self.repo_handle()
+                .resolve_ref(&format!("refs/heads/{branch}"))
+        };
         let (_branch, base) = self.integration_head()?;
         let entry = self
             .store()
@@ -209,7 +223,10 @@ impl Broker {
                 session.task.as_deref().unwrap_or("no task")
             ),
         )?;
-        let changed = self.repo_handle().changed_between(&base, &merge_commit)?;
+        let verify_base = pre_refresh.as_deref().unwrap_or(&base);
+        let changed = self
+            .repo_handle()
+            .changed_between(verify_base, &merge_commit)?;
         // Conflict-only brokering is valid: a repo with no gates.toml gets
         // textual merge simulation and promotion on clean merges, with zero
         // verification — recorded explicitly so nobody mistakes it for a
@@ -270,6 +287,9 @@ impl Broker {
         if all_pass && PromoteConfig::load(&self.main_root_path()).auto {
             self.promote(entry.id)?;
             promoted = true;
+        }
+        if promoted {
+            clear_action_required(Path::new(&session.worktree_path));
         }
         let entry = self.queue_entry(entry.id)?;
         Ok(SubmitOutcome {
@@ -395,6 +415,30 @@ impl Broker {
 /// The agent-facing conflict message (#21): machine- and human-readable,
 /// dropped into the session's worktree. The Aethyme-generated AGENTS.md
 /// can point agents at this path; no vendor-specific injection.
+impl Broker {
+    /// The commit a session's own changes should be measured against:
+    /// `merge-base(session HEAD, integration)`. Unlike the stored
+    /// adoption-time `diff_base`, this self-heals after a conflict-rebase
+    /// (#41): promoted commits brought in by the rebase move into the
+    /// common ancestry instead of inflating the session's apparent diff
+    /// (the phantom-lease symptom). Read-only — never refreshes the
+    /// integration branch.
+    pub fn session_change_base(&mut self, session_checkout: &GitRepo) -> Option<String> {
+        let branch = PromoteConfig::load(&self.main_root_path()).branch;
+        let integration = self
+            .repo_handle()
+            .resolve_ref(&format!("refs/heads/{branch}"))?;
+        session_checkout.merge_base(&integration, "HEAD").ok()
+    }
+}
+
+/// Remove a stale action-required drop once the session's work promotes
+/// (#41 follow-on, reported by agent A4: the file survived success with
+/// outdated blocking info). Best-effort — the worktree may be gone.
+fn clear_action_required(worktree: &Path) {
+    let _ = std::fs::remove_file(worktree.join(ACTION_REQUIRED_RELPATH));
+}
+
 fn write_action_required(
     worktree: &Path,
     entry: &MergeQueueEntry,
@@ -422,6 +466,9 @@ fn write_action_required(
          To resolve, in this worktree:\n\n\
          1. `git fetch . {base}` (the base is a local commit; no network)\n\
          2. `git rebase {base}` and resolve the conflicts above\n\
+            (headless agents: if the rebase pauses, continue with\n\
+            `GIT_EDITOR=true git rebase --continue` — never rely on an\n\
+            interactive editor)\n\
          3. resubmit: `aethyme broker submit --session {session}`\n\n\
          This file is regenerated on each conflicted submission; it is\n\
          gitignored broker state (delete freely).\n",

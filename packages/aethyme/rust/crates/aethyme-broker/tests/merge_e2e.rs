@@ -285,3 +285,94 @@ fn integration_follows_main_but_never_clobbers_unmerged_promotions() {
         "unmerged promotions are never clobbered by a refresh"
     );
 }
+
+// ── #42: main-checkout sessions get real (advisory) verification ────────
+
+#[test]
+fn main_checkout_submission_selects_gates_from_pre_refresh_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    // First submission from the main checkout creates the integration
+    // branch at the session's own head — no earlier verified state exists,
+    // so this one is legitimately vacuous.
+    let session = broker.adopt(tmp.path(), Some("main-root work")).unwrap();
+    std::fs::write(tmp.path().join("src/a.py"), "a = 2\n").unwrap();
+    sh(tmp.path(), &["add", "-A"]);
+    sh(tmp.path(), &["commit", "-qm", "first main change"]);
+    let first = broker.submit(session.id).unwrap();
+    assert!(first.promoted);
+
+    // Second submission: integration now lags main by exactly this new
+    // commit. Pre-#42 the follows-main refresh made base == head and the
+    // entry verified with gates:[] — now the gate must actually run.
+    std::fs::write(tmp.path().join("src/b.py"), "b = 2\n").unwrap();
+    sh(tmp.path(), &["add", "-A"]);
+    sh(tmp.path(), &["commit", "-qm", "second main change"]);
+    let second = broker.submit(session.id).unwrap();
+    assert!(second.promoted);
+    assert!(
+        !second.gate_outcomes.is_empty(),
+        "main-checkout submission must select gates from the pre-refresh \
+         integration head, not verify vacuously (#42)"
+    );
+    assert_eq!(second.gate_outcomes[0].gate, "marker");
+}
+
+// ── #41: action-required drop is cleared once the session promotes ─────
+
+#[test]
+fn action_required_is_cleared_after_successful_promotion() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    // Session 1 promotes a change to src/a.py.
+    let wt1 = agent_worktree(tmp.path(), "one");
+    let s1 = broker.adopt(&wt1, Some("one")).unwrap();
+    std::fs::write(wt1.join("src/a.py"), "a = 111\n").unwrap();
+    sh(&wt1, &["add", "-A"]);
+    sh(&wt1, &["commit", "-qm", "one edits a"]);
+    assert!(broker.submit(s1.id).unwrap().promoted);
+
+    // Session 2 conflicts on the same file → action-required appears.
+    let wt2 = agent_worktree(tmp.path(), "two");
+    let s2 = broker.adopt(&wt2, Some("two")).unwrap();
+    std::fs::write(wt2.join("src/a.py"), "a = 222\n").unwrap();
+    sh(&wt2, &["add", "-A"]);
+    sh(&wt2, &["commit", "-qm", "two edits a"]);
+    let conflicted = broker.submit(s2.id).unwrap();
+    assert!(!conflicted.conflicts.is_empty());
+    let drop_path = wt2.join(aethyme_broker::ACTION_REQUIRED_RELPATH);
+    assert!(drop_path.exists(), "conflict must write the action file");
+
+    // Resolve exactly as the instructions say, resubmit → promoted, and
+    // the stale action file is gone (agent A4's report: it survived with
+    // outdated blocking info).
+    sh(&wt2, &["fetch", ".", &conflicted.entry.base_commit]);
+    let rebase = Command::new("git")
+        .args(["rebase", &conflicted.entry.base_commit])
+        .current_dir(&wt2)
+        .env("GIT_EDITOR", "true")
+        .output()
+        .unwrap();
+    if !rebase.status.success() {
+        // conflict: take ours and continue
+        std::fs::write(wt2.join("src/a.py"), "a = 333\n").unwrap();
+        sh(&wt2, &["add", "-A"]);
+        let cont = Command::new("git")
+            .args(["rebase", "--continue"])
+            .current_dir(&wt2)
+            .env("GIT_EDITOR", "true")
+            .output()
+            .unwrap();
+        assert!(cont.status.success(), "rebase --continue failed");
+    }
+    let resubmit = broker.submit(s2.id).unwrap();
+    assert!(resubmit.promoted, "resubmission after rebase must promote");
+    assert!(
+        !drop_path.exists(),
+        "stale action-required drop must be cleared on promotion (#41)"
+    );
+}
