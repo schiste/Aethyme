@@ -374,6 +374,9 @@ schema:
   `graph-callees`, `graph-docs`, and `graph-configs`: render node/relation
   views from read-only redb display and relation APIs while preserving the
   existing JSON shape. These commands do not build a `RepositoryMap`.
+- `graph-expand`: composes the redb-backed node, relation, and risk views
+  into the existing compact expand JSON shape. It preserves the existing
+  per-relation bounds and does not build a `RepositoryMap`.
 - `callers`: uses the current hybrid path: grep for the symbol, then use
   redb adjacency to expand candidate files.
 
@@ -397,10 +400,10 @@ Current redb storage coverage:
 - The writer persists the graph edge set without skipping edges for missing
   unresolved/import endpoint rows. Placeholder endpoints are stored as typed
   unresolved rows before adjacency is written.
-- Higher-level graph navigation still comes from an in-memory `RepositoryMap`
-  rebuilt from `.aethyme/graph/` fragments. Commands such as `graph-expand`,
-  task views, context packs, and `explore` should not be assumed to read from
-  redb just because `.aethyme/graph_store.redb` exists.
+- Higher-level task views, context packs, and `explore` navigation still
+  come from an in-memory `RepositoryMap` rebuilt from `.aethyme/graph/`
+  fragments. These surfaces should not be assumed to read from redb just
+  because `.aethyme/graph_store.redb` exists.
 
 Remaining V2 redb store contract:
 
@@ -448,7 +451,7 @@ Bridge decisions as of 2026-07-17:
 | `anchors` | Keep using `RepositoryMap` for V1. | Redb now exposes bounded task anchor candidates, but anchor ranking still depends on fuzzy scoring, file references, areas/configs, task-kind rules, and parity tests before replacement. |
 | `task scope` / `task next` | Keep using `RepositoryMap` for V1. | These views compose anchors with scope narrowing, risk selection, and navigation order; move only after redb anchor candidates are wired into graph-module ranking and covered by parity tests. |
 | `graph-node` / rendered relation views | Redb-backed rendered views. | `graph-node`, `graph-children`, `graph-parents`, `graph-callers`, `graph-callees`, `graph-docs`, and `graph-configs` open `.aethyme/graph_store.redb` read-only, adapt redb display/relation rows to the existing JSON structs, and have binary parity snapshots against `RepositoryMap`. |
-| `graph-expand` | Keep using `RepositoryMap` for high-level expansion. | `graph-expand` composes multiple relation groups, risks, and node details; move it after the low-level rendered commands have enough soak and after parity coverage includes risk/annotation behavior. |
+| `graph-expand` | Redb-backed composed view. | `graph-expand` opens `.aethyme/graph_store.redb` read-only, composes the redb-backed node, parents, children, callers, callees, docs, configs, and risks views, preserves the existing JSON shape and bounds, and has binary parity, shape, bounded-output, deterministic-ordering, and docs/configs/call-edge fixture gates. |
 | `usage boundary` | Keep using `RepositoryMap` and grep/analyzer logic. | The current analyzer is scope-first and language-specific; redb can provide symbol/path seeds later but should not own the policy yet. |
 | Trait abstraction | Defer. | A trait is useful only once two consumers need the same read contract; today the low-risk commands can call redb directly and higher-level flows still need richer candidate APIs. |
 
@@ -462,8 +465,10 @@ V2 correctness and performance gates:
 - Binary integration gates live in
   `rust/crates/aethyme-engine/tests/redb_cli.rs` and cover indexing from
   fragments, redb exact symbol query, graph callers/callees query shape,
-  deterministic query snapshots after rebuilding from identical fragments,
-  missing-store read-only behavior, and disposable-fast publish boundaries.
+  rendered graph parity snapshots, graph-expand JSON shape and bounded
+  output, deterministic query snapshots after rebuilding from identical
+  fragments, missing-store read-only behavior, and disposable-fast publish
+  boundaries.
 - The default performance smoke is intentionally tiny and bounded by
   environment-overridable thresholds:
   `AETHYME_REDB_PERF_MAX_INDEX_MS`,
@@ -478,8 +483,8 @@ V2 correctness and performance gates:
   `AETHYME_REDB_MEDIAWIKI_MAX_QUERY_OVERVIEW_MS`, and
   `AETHYME_REDB_MEDIAWIKI_MAX_SYMBOL_MS`.
 
-V2 is complete only when the graph module can serve task, graph-expand,
-overview, and context-pack navigation paths from read-only redb queries
+V2 is complete only when the graph module can serve task, overview,
+context-pack, and `explore` navigation paths from read-only redb queries
 without constructing a full `RepositoryMap`. Parity tests should compare the
 new read-only outputs with the current `RepositoryMap` outputs before each
 additional CLI surface is described as redb-backed.
