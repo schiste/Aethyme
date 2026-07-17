@@ -151,6 +151,87 @@ fn gates_draft_detects_manifests_deterministically() {
 }
 
 #[test]
+fn guided_init_sets_up_a_fresh_repo_and_second_run_is_a_no_op() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+    init_repo(tmp.path());
+
+    // First run: all three phases execute; config + db are scaffolded and
+    // (a manifest exists) a gates draft is written.
+    let report = init::guided_init(tmp.path()).unwrap();
+    assert!(report.certified());
+    assert!(report.changed, "first run creates the missing artifacts");
+    let scaffold = report.scaffold.as_ref().expect("certification passed");
+    for id in [
+        "scaffold.config-toml",
+        "scaffold.gitignore",
+        "scaffold.broker-db",
+    ] {
+        assert_eq!(status_of(scaffold, id), CheckStatus::Created, "{id}");
+    }
+    let gates = report.gates.as_ref().expect("no gates.toml before init");
+    assert_eq!(status_of(gates, "gates.draft"), CheckStatus::Created);
+    assert!(tmp.path().join(".aethyme/config.toml").exists());
+    assert!(tmp.path().join(".aethyme/broker.db").exists());
+    assert!(tmp.path().join(".aethyme/gates.toml").exists());
+
+    // Second run: nothing changes (byte for byte), and the report says so.
+    let first = snapshot(tmp.path());
+    let report = init::guided_init(tmp.path()).unwrap();
+    assert!(report.certified());
+    assert!(!report.changed, "second run must be a no-op");
+    let scaffold = report.scaffold.as_ref().unwrap();
+    for id in [
+        "scaffold.config-toml",
+        "scaffold.gitignore",
+        "scaffold.broker-db",
+    ] {
+        assert_eq!(status_of(scaffold, id), CheckStatus::Pass, "{id}");
+    }
+    assert!(
+        report.gates.is_none(),
+        "drafting is skipped once gates.toml exists"
+    );
+    assert_eq!(snapshot(tmp.path()), first, "re-run is byte-identical");
+}
+
+#[test]
+fn guided_init_without_manifests_drafts_nothing_and_stays_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+
+    let report = init::guided_init(tmp.path()).unwrap();
+    assert!(report.certified());
+    assert!(report.changed, "config + db are still scaffolded");
+    let gates = report.gates.as_ref().expect("gates phase ran");
+    assert_eq!(status_of(gates, "gates.draft"), CheckStatus::Warn);
+    assert!(!tmp.path().join(".aethyme/gates.toml").exists());
+
+    // No gates.toml means the draft phase runs again — and still writes
+    // nothing, so the run as a whole reports no changes.
+    let first = snapshot(tmp.path());
+    let report = init::guided_init(tmp.path()).unwrap();
+    assert!(!report.changed);
+    assert_eq!(
+        status_of(report.gates.as_ref().unwrap(), "gates.draft"),
+        CheckStatus::Warn
+    );
+    assert_eq!(snapshot(tmp.path()), first);
+}
+
+#[test]
+fn guided_init_stops_before_writing_when_certification_fails() {
+    // Not a git repository: certification fails, so init must not write.
+    let tmp = tempfile::tempdir().unwrap();
+    let report = init::guided_init(tmp.path()).unwrap();
+    assert!(!report.certified());
+    assert!(report.scaffold.is_none(), "scaffold never ran");
+    assert!(report.gates.is_none(), "gate drafting never ran");
+    assert!(!report.changed);
+    assert!(!tmp.path().join(".aethyme").exists(), "nothing was written");
+}
+
+#[test]
 fn existing_files_are_never_touched_and_gitignore_appends_preserving_content() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
