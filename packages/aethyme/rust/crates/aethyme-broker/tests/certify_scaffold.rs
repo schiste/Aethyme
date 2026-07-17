@@ -142,6 +142,59 @@ fn certify_is_always_read_only_and_scaffold_rerun_is_byte_identical() {
 }
 
 #[test]
+fn config_schema_key_is_accepted_and_unknown_keys_warn_never_fail() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    let config = tmp.path().join(".aethyme/config.toml");
+    let certify_config = || {
+        let report = init::certify(tmp.path()).unwrap();
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "certify.config")
+            .unwrap()
+            .clone();
+        assert!(report.certified(), "config issues must never fail certify");
+        check
+    };
+
+    // The declared schema (and the full known surface) certifies clean.
+    std::fs::write(
+        &config,
+        "schema = 1\n[promote]\nmode = \"manual\"\nbranch = \"b\"\n[leases]\nignore = [\"x/\"]\n",
+    )
+    .unwrap();
+    let check = certify_config();
+    assert_eq!(check.status, CheckStatus::Pass);
+    assert!(check.detail.contains("schema 1"), "{}", check.detail);
+
+    // Unknown section, unknown key in a known section, and a newer
+    // schema number: WARN with the offenders named — never a failure.
+    std::fs::write(
+        &config,
+        "schema = 2\n[promote]\nmodee = \"auto\"\n[future]\nx = 1\n",
+    )
+    .unwrap();
+    let check = certify_config();
+    assert_eq!(check.status, CheckStatus::Warn);
+    for expected in ["schema = 2", "promote.modee", "future"] {
+        assert!(check.detail.contains(expected), "{}", check.detail);
+    }
+
+    // The runtime consumers tolerate the same file (defaults + declared
+    // values still load).
+    let promote = aethyme_broker::PromoteConfig::load(tmp.path());
+    assert_eq!(promote.branch, "aethyme/integration");
+    assert!(promote.auto);
+
+    // Malformed TOML is still a hard failure (broken, not future, intent).
+    std::fs::write(&config, "[promote\n").unwrap();
+    let report = init::certify(tmp.path()).unwrap();
+    assert!(!report.certified());
+}
+
+#[test]
 fn gates_draft_detects_manifests_deterministically() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
