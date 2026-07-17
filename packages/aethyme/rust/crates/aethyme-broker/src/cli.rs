@@ -62,6 +62,22 @@ Usage:
   aethyme broker gates run --session <id> [--json]
       Run affected gates cheap-first with tree-hash caching; cancels this
       session's obsolete in-flight runs; stops at first failure.
+  aethyme broker hooks install [--json]
+      Explicitly install the two managed git hooks into the shared
+      <git-common-dir>/hooks (all worktrees see them): pre-commit runs
+      the cost<=1 gates whose triggers match the staged files (failure
+      blocks the commit); post-commit warns when the new commit touches
+      files another live session is editing (informational — never
+      blocks). Refuses to touch a hook file it does not own (no aethyme
+      marker); with the marker, only the marker block is replaced. The
+      hook shims embed this binary's absolute path.
+  aethyme broker hooks uninstall [--json]
+      Remove the aethyme marker blocks, deleting a hook file only when
+      nothing but the shim remained. User content is preserved.
+  aethyme broker hooks status [--json]
+      Report installed/absent/foreign per managed hook.
+      (hooks pre-commit / hooks post-commit are the internal entry
+      points the installed shims call — not for direct use.)
   aethyme broker submit --session <id> [--json]
       Submit the session's head commit: simulate the merge onto the local
       integration branch, run affected gates on the merged tree, and
@@ -141,6 +157,11 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "validate",
         "affected",
         "run",
+        "hooks",
+        "install",
+        "uninstall",
+        "pre-commit",
+        "post-commit",
         "submit",
         "queue",
         "promote",
@@ -341,6 +362,22 @@ fn duration_label(duration_ms: Option<i64>) -> String {
     duration_ms
         .map(|ms| format!("{ms}ms"))
         .unwrap_or_else(|| "-".into())
+}
+
+fn render_hook_reports(reports: &[crate::HookReport], json: bool) -> Result<(), UsageError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(reports)?);
+    } else {
+        for report in reports {
+            println!(
+                "{:<12} {:<10} {}",
+                report.hook,
+                report.state.as_str(),
+                report.path
+            );
+        }
+    }
+    Ok(())
 }
 
 fn print_overlap_warnings(overlaps: &[crate::Overlap]) {
@@ -632,6 +669,54 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 other => {
                     return Err(UsageError::Message(format!(
                         "unknown gates action {other:?} — expected draft, validate, affected, or run"
+                    )));
+                }
+            }
+        }
+        "hooks" => {
+            let action =
+                parsed
+                    .positional
+                    .first()
+                    .map(String::as_str)
+                    .ok_or(UsageError::Message(
+                        "hooks requires an action: install, uninstall, or status".into(),
+                    ))?;
+            // Hook management needs only the git repo — never the broker
+            // db, so `hooks install` on a fresh clone creates no state.
+            let cwd = std::env::current_dir()
+                .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
+            match action {
+                "install" => {
+                    let repo = crate::GitRepo::discover(&cwd)?;
+                    let binary = std::env::current_exe().map_err(|err| {
+                        UsageError::Message(format!("cannot resolve the aethyme binary: {err}"))
+                    })?;
+                    let reports = crate::hooks::install(&repo, &binary)?;
+                    render_hook_reports(&reports, parsed.json)?;
+                    if !parsed.json {
+                        println!(
+                            "Hooks are shared by every worktree. Uninstall any time with \
+                             `aethyme broker hooks uninstall`."
+                        );
+                    }
+                }
+                "uninstall" => {
+                    let repo = crate::GitRepo::discover(&cwd)?;
+                    let reports = crate::hooks::uninstall(&repo)?;
+                    render_hook_reports(&reports, parsed.json)?;
+                }
+                "status" => {
+                    let repo = crate::GitRepo::discover(&cwd)?;
+                    let reports = crate::hooks::status(&repo)?;
+                    render_hook_reports(&reports, parsed.json)?;
+                }
+                // Internal entry points the installed shims call.
+                "pre-commit" => crate::hooks::run_pre_commit(&cwd)?,
+                "post-commit" => crate::hooks::run_post_commit(&cwd),
+                other => {
+                    return Err(UsageError::Message(format!(
+                        "unknown hooks action {other:?} — expected install, uninstall, or status"
                     )));
                 }
             }

@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-07-15
+Last Updated: 2026-07-17
 
 When code outside the `packages/aethyme/` Python or Rust source tree
 invokes an Aethyme command, it crosses a process boundary. Static
@@ -82,6 +82,12 @@ consumer. This file exists so that doesn't happen again.
 |---|---|---|
 | `pyproject.toml [project.scripts]` (REMOVED 2026-07-14) | The pip console script `aethyme = "src.cli:main"` was removed — `pip install -e .` no longer installs an `aethyme` executable that shadows the Rust router. `python -m src.cli <cmd>` is the only Python-side invocation. | Out-of-repo scripts calling the *pip* `aethyme` from inside an activated venv now resolve to the Rust router (PATH) or nothing; migrate them to `python -m src.cli`. In-repo audit 2026-07-14 found zero such callers. |
 | Rust router `aethyme` (installed via `cargo install --path rust/crates/aethyme-engine`) | Delegated Python commands resolve the package root via: `$AETHYME_ROOT` env → pointer file `$XDG_CONFIG_HOME/aethyme/root` (default `~/.config/aethyme/root`, managed by `aethyme root set/show`) → upward walk from cwd. Explore auto-start spawns the **sibling** `aethyme-engine-cli` (same install dir) as the daemon-serve process. | If the pointer file goes stale (checkout moved), delegated commands fail with guidance listing all three resolution options. If `aethyme-engine-cli` is not co-installed, explore auto-start falls back to PATH lookup and fails with a spawn error. |
+
+### Installed git hooks (`aethyme broker hooks install`, 2026-07-17)
+
+| Source | Invokes | Failure mode |
+|---|---|---|
+| `<git-common-dir>/hooks/pre-commit` and `post-commit` marker blocks (`# >>> aethyme hooks >>>`), written by `aethyme broker hooks install` into **every repo where an operator opted in** — canonical template: `rust/crates/aethyme-broker/src/hooks.rs:hook_block` | `"<abs-path-to-aethyme-captured-at-install>" broker hooks pre-commit` (blocking, `\|\| exit $?`) and `... broker hooks post-commit` (`\|\| true`) | **Renaming/removing the `broker hooks pre-commit` subcommand blocks ALL commits** in every repo with hooks installed: the shim treats any non-zero exit — including "unknown subcommand" — as a failed gate. `post-commit` degrades silently. A moved/deleted *binary* is handled gracefully by the shims (warn-and-pass / silent skip). Escape hatches: `git commit --no-verify`, `aethyme broker hooks uninstall`, or deleting the marker block by hand. |
 
 ### Rust `aethyme` router ↔ Python daemon (REMOVED 2026-07-13, issue #29)
 

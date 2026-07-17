@@ -15,6 +15,12 @@ path = "src/lib.rs"
 name = "broker-stress-worker"
 path = "src/bin/broker-stress-worker.rs"
 
+[[bin]]
+# Router stand-in used exclusively by the hook end-to-end tests
+# (tests/hooks_e2e.rs). Not a user-facing entrypoint.
+name = "broker-cli-shim"
+path = "src/bin/broker-cli-shim.rs"
+
 [dependencies]
 # Bundled SQLite so the broker has zero system dependencies and one
 # known SQLite version across platforms (macOS/Linux are the v0 targets).
