@@ -1,6 +1,6 @@
 # Aethyme Graph Schema
 
-Last Updated: 2026-07-15
+Last Updated: 2026-07-17
 
 Status: **Implemented V1 durable graph contract.** The committed
 source-of-truth graph lives under `.aethyme/graph/` as deterministic
@@ -377,11 +377,16 @@ schema:
 - `graph-expand`: composes the redb-backed node, relation, and risk views
   into the existing compact expand JSON shape. It preserves the existing
   per-relation bounds and does not build a `RepositoryMap`.
+- `task-anchors`, `task-scope`, `task-next`, and `task-localize`: read task
+  anchors, scope, and navigation order from redb overview rows, path indexes,
+  bounded symbol candidates, relation views, config/doc rows, and risk rows.
+  Task policy and ranking stay in the graph modules. These commands preserve
+  the existing JSON shape and do not build a `RepositoryMap`.
 - `callers`: uses the current hybrid path: grep for the symbol, then use
   redb adjacency to expand candidate files.
 
-The redb store is not the full graph-navigation backend. It does not make
-`.aethyme/graph_store.redb` a committed format, and it does not replace the
+The redb store is not the durable graph format. It does not make
+`.aethyme/graph_store.redb` a committed artifact, and it does not replace
 fragments as the durable graph. Broader redb-backed reads must still treat
 fragments as the regeneration source.
 
@@ -400,10 +405,11 @@ Current redb storage coverage:
 - The writer persists the graph edge set without skipping edges for missing
   unresolved/import endpoint rows. Placeholder endpoints are stored as typed
   unresolved rows before adjacency is written.
-- Higher-level task views, context packs, and `explore` navigation still
-  come from an in-memory `RepositoryMap` rebuilt from `.aethyme/graph/`
-  fragments. These surfaces should not be assumed to read from redb just
-  because `.aethyme/graph_store.redb` exists.
+- Task anchors, task scope, task next, and task-localize read from redb.
+  Context-pack assembly, `explore`, activation, and usage-boundary flows
+  still use graph modules that may build `RepositoryMap`; those surfaces
+  should not be assumed to read from redb just because
+  `.aethyme/graph_store.redb` exists.
 
 Remaining V2 redb store contract:
 
@@ -436,9 +442,9 @@ Required V2 read APIs for replacing `RepositoryMap` reads:
 | Symbol lookup | Implemented as `find_symbols(name, kind?)` for exact lookup and `symbols_matching(query)` / `symbols_matching_with(...)` for bounded exact, case-insensitive, prefix, component, path-component, area, and basename-signal candidates. `symbols_matching*` returns store-ranked candidates; higher-level task flows may still add task-specific ranking above those rows. | `task_anchors_view`, symbol query surfaces, graph target resolution. |
 | Path prefix lookup | Implemented as `nodes_under_path(prefix)`, `functions_under_path(prefix)`, and `resolve_file_path(path)` over redb path indexes. | Scope expansion, area views, task-local navigation seeds. |
 | Adjacency | Implemented as `neighbors(id, direction, kind?)`; existing `edges_from` / `edges_to` remain compatibility wrappers for unfiltered directions. | `children_view`, `parents_view`, `callers_view`, `callees_view`, `docs_view`, `configs_view`, `task_expand_view`, `graph_expand_view`. |
-| Task anchor candidates | Implemented as `task_anchor_candidates(task_tokens, limit)`, returning bounded typed candidates with exact/prefix/component/path/area signals. Ranking may stay in the graph module. | `task_anchors_view`, `task_scope_view`, `task_next_view`, context-pack assembly. |
+| Task anchor candidates | Implemented as `task_anchor_candidates(task_tokens, limit)` and `symbols_matching_with(...)`, returning bounded typed candidates with exact/prefix/component/path/area signals. Ranking stays in the graph module. | `task_anchors_view`, `task_scope_view`, `task_next_view`, context-pack assembly. |
 | Usage-boundary seeds | Implemented as `usage_boundary_candidates(scope, symbol_kind, limit)` over bounded path-index rows. | `usage_boundary_query`, dead-code analysis seed selection. |
-| Overview/navigation slices | Implemented as `overview_v2(...)` for bounded repo metadata, repository, directories, areas, entrypoints, risks, files, functions, classes, docs, configs, and unresolved placeholders. Higher-level task/navigation slices still need graph-module adapters. | `graph_overview_view`, `task_next_view`, `explore`, context-pack navigation order. |
+| Overview/navigation slices | Implemented as `overview_v2(...)` for bounded repo metadata, repository, directories, areas, entrypoints, risks, files, functions, classes, docs, configs, and unresolved placeholders. `task_next_view_redb` now adapts these rows for task navigation; graph overview, `explore`, and context-pack navigation still need redb adapters. | `graph_overview_view`, `task_next_view`, `explore`, context-pack navigation order. |
 
 Bridge decisions as of 2026-07-17:
 
@@ -448,8 +454,9 @@ Bridge decisions as of 2026-07-17:
 | `deps` / `importers` | Redb-backed equivalent. | CLI reads `neighbors(id, Outgoing/Incoming, None)` and preserves the existing path-list output. |
 | `query-overview` | Redb-backed equivalent with V1 JSON projection. | CLI reads `overview_v2(Default)` but still emits only the stable `repo`, `areas`, `entrypoints`, and `risks` keys. |
 | `callers` | Keep the hybrid grep + redb adjacency path. | Grep finds candidate files containing the symbol; redb `neighbors(..., Incoming, None)` expands importers before line grep. |
-| `anchors` | Keep using `RepositoryMap` for V1. | Redb now exposes bounded task anchor candidates, but anchor ranking still depends on fuzzy scoring, file references, areas/configs, task-kind rules, and parity tests before replacement. |
-| `task scope` / `task next` | Keep using `RepositoryMap` for V1. | These views compose anchors with scope narrowing, risk selection, and navigation order; move only after redb anchor candidates are wired into graph-module ranking and covered by parity tests. |
+| `task-anchors` | Redb-backed task anchors. | CLI opens `.aethyme/graph_store.redb` read-only, resolves anchors from overview rows, path indexes, config/doc rows, and bounded symbol candidates, then applies graph-module task ranking. Binary parity snapshots cover ExplainRepo, ChangeSymbol, TraceImpact, and config-ownership tasks. |
+| `task-scope` | Redb-backed task scope. | CLI composes redb-backed anchors with redb path-prefix lookup, symbol rows, area membership, and risk lookup while preserving the existing JSON shape. Binary parity snapshots cover ExplainRepo, ChangeSymbol, TraceImpact, and config-ownership tasks. |
+| `task-next` / `task-localize` | Redb-backed task navigation. | `task-next` reads redb-backed anchors, relation views, semantic config/doc path rows, and bounded overview/navigation slices. `task-localize` composes `task-anchors`, `task-scope`, and `task-next`; `--profile` reports redb stages rather than `RepositoryMap` build time. |
 | `graph-node` / rendered relation views | Redb-backed rendered views. | `graph-node`, `graph-children`, `graph-parents`, `graph-callers`, `graph-callees`, `graph-docs`, and `graph-configs` open `.aethyme/graph_store.redb` read-only, adapt redb display/relation rows to the existing JSON structs, and have binary parity snapshots against `RepositoryMap`. |
 | `graph-expand` | Redb-backed composed view. | `graph-expand` opens `.aethyme/graph_store.redb` read-only, composes the redb-backed node, parents, children, callers, callees, docs, configs, and risks views, preserves the existing JSON shape and bounds, and has binary parity, shape, bounded-output, deterministic-ordering, and docs/configs/call-edge fixture gates. |
 | `usage boundary` | Keep using `RepositoryMap` and grep/analyzer logic. | The current analyzer is scope-first and language-specific; redb can provide symbol/path seeds later but should not own the policy yet. |
@@ -466,9 +473,10 @@ V2 correctness and performance gates:
   `rust/crates/aethyme-engine/tests/redb_cli.rs` and cover indexing from
   fragments, redb exact symbol query, graph callers/callees query shape,
   rendered graph parity snapshots, graph-expand JSON shape and bounded
-  output, deterministic query snapshots after rebuilding from identical
-  fragments, missing-store read-only behavior, and disposable-fast publish
-  boundaries.
+  output, task parity snapshots for ExplainRepo, ChangeSymbol, TraceImpact,
+  and config-ownership tasks, deterministic query snapshots after rebuilding
+  from identical fragments, missing-store read-only behavior, and
+  disposable-fast publish boundaries.
 - The default performance smoke is intentionally tiny and bounded by
   environment-overridable thresholds:
   `AETHYME_REDB_PERF_MAX_INDEX_MS`,
@@ -481,13 +489,17 @@ V2 correctness and performance gates:
   are configurable with
   `AETHYME_REDB_MEDIAWIKI_MAX_INDEX_MS`,
   `AETHYME_REDB_MEDIAWIKI_MAX_QUERY_OVERVIEW_MS`, and
-  `AETHYME_REDB_MEDIAWIKI_MAX_SYMBOL_MS`.
+  `AETHYME_REDB_MEDIAWIKI_MAX_SYMBOL_MS`. The broad recall sanity check uses
+  `AETHYME_REDB_MEDIAWIKI_MAX_BROAD_SYMBOL_MS`, plus
+  `AETHYME_REDB_MEDIAWIKI_MAX_TASK_LOCALIZE_MS` for the Phase 6 task
+  navigation smoke.
 
-V2 is complete only when the graph module can serve task, overview,
-context-pack, and `explore` navigation paths from read-only redb queries
-without constructing a full `RepositoryMap`. Parity tests should compare the
-new read-only outputs with the current `RepositoryMap` outputs before each
-additional CLI surface is described as redb-backed.
+V2 is complete only when the graph module can serve overview, context-pack,
+`explore`, activation, usage-boundary, and any remaining task-adjacent
+navigation paths from read-only redb queries without constructing a full
+`RepositoryMap`. Parity tests should compare new read-only outputs with the
+current `RepositoryMap` outputs before each additional CLI surface is
+described as redb-backed.
 
 ## 6. Update propagation
 
