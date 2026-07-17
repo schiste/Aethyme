@@ -46,6 +46,10 @@ fn main() -> ExitCode {
             print_top_level_help();
             ExitCode::SUCCESS
         }
+        "-V" | "--version" => {
+            print_version();
+            ExitCode::SUCCESS
+        }
         "explore" => run_explore(&args[1..]),
         "root" => run_root_subcommand(&args[1..]),
         // Broker commands are native Rust from birth (issue #31) — never
@@ -67,10 +71,22 @@ fn main() -> ExitCode {
     }
 }
 
+/// Crate version plus `git describe` from build time (empty when the
+/// binary was built outside a git checkout — see build.rs).
+fn print_version() {
+    let describe = env!("AETHYME_GIT_DESCRIBE");
+    if describe.is_empty() {
+        println!("aethyme {}", env!("CARGO_PKG_VERSION"));
+    } else {
+        println!("aethyme {} ({describe})", env!("CARGO_PKG_VERSION"));
+    }
+}
+
 fn print_top_level_help() {
     eprintln!("aethyme — repository navigation, task localization, agent brokering");
     eprintln!();
     eprintln!("Usage: aethyme <subcommand> [args...]");
+    eprintln!("       aethyme --version | -V");
     eprintln!();
     eprintln!("Hot path:");
     eprintln!("  explore --repo <path> --request \"<task>\" [--format answer-json]");
