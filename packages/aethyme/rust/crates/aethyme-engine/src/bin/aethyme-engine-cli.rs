@@ -6,16 +6,18 @@ use std::path::{Path, PathBuf};
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-use aethyme_engine::graph::activation::{hormone_profile, spread_activation, spread_from_seed};
+use aethyme_engine::graph::activation::{
+    hormone_profile, spread_activation_redb, spread_from_seed_redb,
+};
 use aethyme_engine::graph::analyzers::analyze_dead_code;
-use aethyme_engine::graph::anchors::resolve_anchors;
+use aethyme_engine::graph::anchors::resolve_anchors_redb;
 use aethyme_engine::graph::facts::{function_usage_fact, public_function_facts};
 use aethyme_engine::graph::navigation::{
     callees_view_redb, callers_view_redb, children_view_redb, configs_view_redb, docs_view_redb,
     graph_expand_view_redb, graph_overview_view_redb, node_view_redb, parents_view_redb,
     task_anchors_view_redb, task_expand_view_redb, task_next_view_redb, task_scope_view_redb,
 };
-use aethyme_engine::graph::neighborhood::impact_frontier;
+use aethyme_engine::graph::neighborhood::impact_frontier_redb;
 use aethyme_engine::graph::search::symbol_search_redb;
 use aethyme_engine::graph::usage_boundary::analyze_usage_boundary_scope_first_redb;
 use aethyme_engine::map::RepositoryMap;
@@ -269,8 +271,11 @@ fn run() -> Result<(), String> {
         "impact" => {
             let repo = read_option(&args, "--repo")?;
             let target = read_option(&args, "--target")?;
-            let map = build_map(&repo, no_cache, fragment_mode)?;
-            let impact = impact_frontier(&map, &target);
+            let canonical = PathBuf::from(&repo)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let store = GraphStore::open_read_only(&canonical).map_err(|e| e.to_string())?;
+            let impact = impact_frontier_redb(&store, &target).map_err(|e| e.to_string())?;
             println!("{}", aethyme_engine::json::string_list(&impact));
         }
         "pack" | "task-pack" => {
@@ -411,12 +416,17 @@ fn run() -> Result<(), String> {
         "activate" => {
             let repo = read_option(&args, "--repo")?;
             let task_value = read_option(&args, "--task")?;
-            let map = build_map(&repo, no_cache, fragment_mode)?;
+            let canonical = PathBuf::from(&repo)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let store = GraphStore::open_read_only(&canonical).map_err(|e| e.to_string())?;
             let task = TaskInput::from_task_text(&task_value);
             let anchor_limit = if task.kind.is_explain_repo() { 5 } else { 3 };
-            let anchors = resolve_anchors(&map, &task, anchor_limit);
+            let anchors =
+                resolve_anchors_redb(&store, &task, anchor_limit).map_err(|e| e.to_string())?;
             let profile = hormone_profile(&task.kind);
-            let activation = spread_activation(&map, &anchors, &profile);
+            let activation =
+                spread_activation_redb(&store, &anchors, &profile).map_err(|e| e.to_string())?;
             println!("{}", aethyme_engine::json::activation_map(&activation));
         }
         "activate-from" => {
@@ -426,8 +436,12 @@ fn run() -> Result<(), String> {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(3);
-            let map = build_map(&repo, no_cache, fragment_mode)?;
-            let activation = spread_from_seed(&map, &seed, hops);
+            let canonical = PathBuf::from(&repo)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let store = GraphStore::open_read_only(&canonical).map_err(|e| e.to_string())?;
+            let activation =
+                spread_from_seed_redb(&store, &seed, hops).map_err(|e| e.to_string())?;
             println!("{}", aethyme_engine::json::activation_map(&activation));
         }
         "workspace-blast-radius" => {
