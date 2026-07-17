@@ -1,0 +1,74 @@
+name: Release binaries
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: packages/aethyme/rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history + tags so build.rs embeds the tag in
+          # `aethyme --version` via `git describe`.
+          fetch-depth: 0
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p aethyme-engine --bin aethyme --bin aethyme-engine-cli
+
+      - name: Report embedded version
+        run: ./target/release/aethyme --version
+
+      - name: Package archive
+        env:
+          # Tag names may contain shell metacharacters — never inline
+          # github.ref_name into run: commands.
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          tar -C target/release -czf "aethyme-${REF_NAME}-${{ matrix.target }}.tar.gz" \
+            aethyme aethyme-engine-cli
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aethyme-${{ matrix.target }}
+          path: packages/aethyme/rust/aethyme-*-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Attach to GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
