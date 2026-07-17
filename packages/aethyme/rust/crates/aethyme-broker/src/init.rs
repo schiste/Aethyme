@@ -540,11 +540,13 @@ fn draft_gates_toml(main_root: &Path) -> Option<String> {
          # no venv/node_modules); gate outputs must be gitignored.\n",
     );
     let mut found = false;
+    let mut found_test_gate = false;
 
-    // Detector order is fixed and alphabetical by ecosystem: cargo, go,
-    // node, python. Never reorder — determinism contract.
+    // Detector order is fixed: cargo, go, node, python, then Makefile
+    // fallback. Never reorder — determinism contract.
     if manifest_exists(main_root, &["Cargo.toml", "rust/Cargo.toml"]) {
         found = true;
+        found_test_gate = true;
         let manifest = if main_root.join("Cargo.toml").exists() {
             "Cargo.toml"
         } else {
@@ -557,19 +559,28 @@ fn draft_gates_toml(main_root: &Path) -> Option<String> {
     }
     if manifest_exists(main_root, &["go.mod"]) {
         found = true;
+        found_test_gate = true;
         gates.push_str(
-            "\n[[gate]]\nname = \"go-test\"\ncommand = \"go test ./...\"\ncost = 2\ntriggers = [\"**/*.go\", \"go.mod\"]\n",
+            "\n[[gate]]\nname = \"go-test\"\ncommand = \"go test ./...\"\ncost = 2\ntriggers = [\"**/*.go\", \"go.mod\", \"go.sum\"]\n",
         );
     }
     if let Some(scripts) = package_json_scripts(main_root) {
-        for (script, cost) in [("lint", 1), ("test", 2)] {
-            if scripts.contains(&script.to_string()) {
-                found = true;
-                let _ = write!(
-                    gates,
-                    "\n[[gate]]\nname = \"npm-{script}\"\ncommand = \"npm run {script}\"\ncost = {cost}\ntriggers = [\"**/*.js\", \"**/*.jsx\", \"**/*.ts\", \"**/*.tsx\", \"package.json\"]\n"
-                );
-            }
+        if scripts.iter().any(|script| script == "lint") {
+            found = true;
+            let command = node_script_command(main_root, "lint");
+            let _ = write!(
+                gates,
+                "\n[[gate]]\nname = \"js-lint\"\ncommand = \"{command}\"\ncost = 1\ntriggers = [\"**/*.js\", \"**/*.jsx\", \"**/*.ts\", \"**/*.tsx\", \"package.json\"]\n"
+            );
+        }
+        if scripts.iter().any(|script| script == "test") {
+            found = true;
+            found_test_gate = true;
+            let command = node_script_command(main_root, "test");
+            let _ = write!(
+                gates,
+                "\n[[gate]]\nname = \"js-test\"\ncommand = \"{command}\"\ncost = 2\ntriggers = [\"**/*.js\", \"**/*.jsx\", \"**/*.ts\", \"**/*.tsx\", \"package.json\"]\n"
+            );
         }
     }
     if let Ok(pyproject) = std::fs::read_to_string(main_root.join("pyproject.toml")) {
@@ -581,10 +592,17 @@ fn draft_gates_toml(main_root: &Path) -> Option<String> {
         }
         if pyproject.contains("pytest") {
             found = true;
+            found_test_gate = true;
             gates.push_str(
                 "\n[[gate]]\nname = \"pytest\"\ncommand = \"python3 -m pytest -q\"\ncost = 2\ntriggers = [\"**/*.py\", \"pyproject.toml\"]\n",
             );
         }
+    }
+    if !found_test_gate && makefile_has_test_target(main_root) {
+        found = true;
+        gates.push_str(
+            "\n[[gate]]\nname = \"make-test\"\ncommand = \"make test\"\ncost = 2\ntriggers = [\"**\"]\n",
+        );
     }
 
     if !found {
@@ -603,6 +621,45 @@ fn package_json_scripts(main_root: &Path) -> Option<Vec<String>> {
     let mut scripts: Vec<String> = value.get("scripts")?.as_object()?.keys().cloned().collect();
     scripts.sort();
     Some(scripts)
+}
+
+#[derive(Clone, Copy)]
+enum NodeRunner {
+    Pnpm,
+    Yarn,
+    Npm,
+}
+
+fn node_runner(main_root: &Path) -> NodeRunner {
+    if main_root.join("pnpm-lock.yaml").exists() {
+        NodeRunner::Pnpm
+    } else if main_root.join("yarn.lock").exists() {
+        NodeRunner::Yarn
+    } else {
+        NodeRunner::Npm
+    }
+}
+
+fn node_script_command(main_root: &Path, script: &str) -> String {
+    match (node_runner(main_root), script) {
+        (NodeRunner::Pnpm, _) => format!("pnpm {script}"),
+        (NodeRunner::Yarn, _) => format!("yarn {script}"),
+        (NodeRunner::Npm, "test") => "npm test --silent".into(),
+        (NodeRunner::Npm, _) => format!("npm run {script} --silent"),
+    }
+}
+
+fn makefile_has_test_target(main_root: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(main_root.join("Makefile")) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        if line.starts_with('\t') {
+            return false;
+        }
+        let line = line.trim_start();
+        !line.starts_with('#') && line.starts_with("test:")
+    })
 }
 
 // ── document / control helpers ───────────────────────────────────────
