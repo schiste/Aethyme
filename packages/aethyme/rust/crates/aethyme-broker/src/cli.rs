@@ -426,6 +426,13 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     "{verb} session {} — worktree {} on branch {}",
                     session.id, session.worktree_path, session.branch
                 );
+                if std::path::Path::new(&session.worktree_path) == broker.main_root() {
+                    println!(
+                        "note: main-checkout session — verification is advisory here \
+                         (commits land on main before gates run); use a worktree \
+                         session for enforced verification."
+                    );
+                }
             }
         }
         "start-agent" => {
@@ -739,7 +746,10 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     "Submitting session {session} — HEAD {}",
                     &head[..12.min(head.len())]
                 );
-                if let Some(base) = info.diff_base.as_deref()
+                let base = broker
+                    .session_change_base(&checkout)
+                    .or_else(|| info.diff_base.clone());
+                if let Some(base) = base.as_deref()
                     && let Ok(commits) = checkout.commit_summaries(base, "HEAD", 10)
                 {
                     if commits.is_empty() {
@@ -774,6 +784,10 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 eprintln!(
                     "Instructions written to the session worktree at {}",
                     crate::ACTION_REQUIRED_RELPATH
+                );
+                eprintln!(
+                    "Quick start: git fetch . {base} && git rebase {base}   (then resubmit)",
+                    base = outcome.entry.base_commit
                 );
                 return Err(UsageError::Message("submission conflicted".into()));
             } else {
@@ -812,6 +826,14 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     }
                 );
                 if outcome.entry.status.as_str() == "rejected" {
+                    if let Ok(info) = broker.store().session(outcome.entry.session_id)
+                        && std::path::Path::new(&info.worktree_path) == broker.main_root()
+                    {
+                        eprintln!(
+                            "note: this work is already on main (main-checkout session) — \
+                             the broker cannot hold it back. Fix forward on main and resubmit."
+                        );
+                    }
                     return Err(UsageError::Message(
                         "gates failed on the merged tree".into(),
                     ));

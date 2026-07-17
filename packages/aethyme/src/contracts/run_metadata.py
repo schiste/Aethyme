@@ -7,11 +7,19 @@ import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from src import __version__ as AETHYME_VERSION
-from src.indexing.repository_snapshot import LocalRepositorySnapshot
 
 from .versions import RUN_METADATA_SCHEMA_VERSION
+
+if TYPE_CHECKING:
+    # Import only for annotations: a runtime import here recreates the
+    # src.indexing.repository_snapshot -> src.contracts.versions ->
+    # src.contracts (package init) -> run_metadata cycle that broke
+    # collection after the 2026-07-17 dead-module removal shifted import
+    # order (annotations are lazy via `from __future__ import annotations`).
+    from src.indexing.repository_snapshot import LocalRepositorySnapshot
 
 
 def _default_started_at() -> str:

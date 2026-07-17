@@ -357,8 +357,14 @@ impl Broker {
             let Ok(checkout) = GitRepo::discover(Path::new(&session.worktree_path)) else {
                 continue;
             };
-            let base = session.diff_base.as_deref().unwrap_or("HEAD");
-            let Ok(changed) = checkout.changed_files(base) else {
+            // #41: derive the baseline instead of trusting the stored
+            // adoption-time diff_base — after a conflict-rebase the stored
+            // value inflates the diff with everyone else's promoted work.
+            let base = self
+                .session_change_base(&checkout)
+                .or_else(|| session.diff_base.clone())
+                .unwrap_or_else(|| "HEAD".to_string());
+            let Ok(changed) = checkout.changed_files(&base) else {
                 continue;
             };
             let paths: Vec<String> = changed

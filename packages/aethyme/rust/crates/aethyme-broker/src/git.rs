@@ -26,6 +26,34 @@ pub enum GitError {
     NotARepository { path: PathBuf },
 }
 
+/// Extract paths from `git status --porcelain` output, validating each
+/// line against the porcelain XY grammar before trusting it (#43).
+///
+/// PATH shims can decorate git output — the Chau7 CTO shim was observed
+/// printing `ok ✓` where porcelain output belongs, which a naive
+/// `line[3..]` parse reports as a dirty file named `✓` (three of four
+/// agents in the 2026-07-17 batch hit this independently). A status
+/// line is only believed when it matches `XY<space><path>` with X and Y
+/// drawn from git's status-code alphabet. Rename lines keep the target
+/// path (`old -> new` ⇒ `new`).
+fn parse_porcelain_paths(out: &str) -> Vec<String> {
+    const CODES: &[u8] = b" MTADRCU?!";
+    out.lines()
+        .filter_map(|line| {
+            let bytes = line.as_bytes();
+            if bytes.len() < 4
+                || bytes[2] != b' '
+                || !CODES.contains(&bytes[0])
+                || !CODES.contains(&bytes[1])
+            {
+                return None;
+            }
+            let path = &line[3..];
+            Some(path.rsplit(" -> ").next().unwrap_or(path).to_string())
+        })
+        .collect()
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
     run_git_inner(cwd, None, args)
 }
@@ -124,6 +152,15 @@ impl GitRepo {
 
     /// Resolve a ref (branch name, tag, ...) to a commit, `None` when it
     /// does not exist.
+    /// Common ancestor of `a` and `b`. Re-added 2026-07-17: removed as
+    /// dead code the same day #41 made it live (session_change_base
+    /// derives lease baselines from merge-base(HEAD, integration)).
+    pub fn merge_base(&self, a: &str, b: &str) -> Result<String, GitError> {
+        Ok(run_git(&self.root, &["merge-base", a, b])?
+            .trim()
+            .to_string())
+    }
+
     pub fn resolve_ref(&self, name: &str) -> Option<String> {
         run_git(
             &self.root,
@@ -347,13 +384,10 @@ impl GitRepo {
     /// Paths with uncommitted or untracked changes — the submit preflight
     /// warns about these because only committed work integrates.
     pub fn dirty_paths(&self) -> Result<Vec<String>, GitError> {
-        Ok(run_git(
+        Ok(parse_porcelain_paths(&run_git(
             &self.root,
             &["status", "--porcelain", "--untracked-files=all"],
-        )?
-        .lines()
-        .filter_map(|l| l.get(3..).map(str::to_string))
-        .collect())
+        )?))
     }
 
     /// True when the checkout has uncommitted changes or untracked files —
@@ -423,5 +457,33 @@ impl GitRepo {
             .map(PathBuf::from)
             .filter(|path| path.canonicalize().map(|p| p != main).unwrap_or(true))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod porcelain_tests {
+    use super::parse_porcelain_paths;
+
+    #[test]
+    fn valid_lines_yield_paths() {
+        let out = " M src/a.rs\n?? new.txt\nA  staged.rs\n";
+        assert_eq!(
+            parse_porcelain_paths(out),
+            vec!["src/a.rs", "new.txt", "staged.rs"]
+        );
+    }
+
+    #[test]
+    fn shim_decorations_are_discarded() {
+        // The Chau7 CTO shim prints decorations like these where
+        // porcelain output belongs — none may survive as a "path".
+        let out = "ok \u{2713}\n\u{2713}\nok\n";
+        assert!(parse_porcelain_paths(out).is_empty());
+    }
+
+    #[test]
+    fn rename_lines_keep_the_target() {
+        let out = "R  old.rs -> new.rs\n";
+        assert_eq!(parse_porcelain_paths(out), vec!["new.rs"]);
     }
 }
