@@ -457,15 +457,56 @@ impl Broker {
         ))
     }
 
+    /// Run every configured gate against the checkout containing `dir`,
+    /// in cost order with no diff selection (`gates run --all`) — the CI
+    /// entrypoint, making gates.toml the single definition of "verified"
+    /// for CI and broker alike. No session attribution: results are still
+    /// recorded and tree-hash cached, so a broker run on the same tree
+    /// reuses them (and vice versa).
+    pub fn run_all_gates(
+        &mut self,
+        dir: &Path,
+    ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
+        let checkout = GitRepo::discover(dir)?;
+        let gates = self.load_and_sync_gates()?;
+        crate::gates::run_all(&mut self.store, &self.main_root, &checkout, &gates, None)
+    }
+
+    /// Test/non-CLI entrypoint for [`Self::run_all_gates`] with injectable
+    /// progress reporting.
+    pub fn run_all_gates_with_progress(
+        &mut self,
+        dir: &Path,
+        progress: &dyn crate::gates::GateProgressSink,
+    ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
+        let checkout = GitRepo::discover(dir)?;
+        let gates = self.load_and_sync_gates()?;
+        crate::gates::run_all_with_progress(
+            &mut self.store,
+            &self.main_root,
+            &checkout,
+            &gates,
+            None,
+            progress,
+        )
+    }
+
     fn gate_inputs(
         &mut self,
         session_id: i64,
     ) -> Result<(GitRepo, Vec<crate::gates::Gate>, Vec<String>), BrokerOpError> {
         let session = self.store.session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+        let gates = self.load_and_sync_gates()?;
+        let base = session.diff_base.as_deref().unwrap_or("HEAD");
+        let changed = checkout.changed_files(base)?;
+        Ok((checkout, gates, changed))
+    }
+
+    /// Load gates.toml and sync the definition snapshot so recorded
+    /// results stay interpretable after config edits.
+    fn load_and_sync_gates(&mut self) -> Result<Vec<crate::gates::Gate>, BrokerOpError> {
         let gates = crate::gates::load_gates(&self.main_root)?;
-        // Sync the definition snapshot so recorded results stay
-        // interpretable after config edits.
         for gate in &gates {
             self.store.upsert_gate(&crate::types::GateDef {
                 name: gate.name.clone(),
@@ -475,9 +516,7 @@ impl Broker {
                 updated_at: 0,
             })?;
         }
-        let base = session.diff_base.as_deref().unwrap_or("HEAD");
-        let changed = checkout.changed_files(base)?;
-        Ok((checkout, gates, changed))
+        Ok(gates)
     }
 
     // ── status (Phase 6) ──────────────────────────────────────────────

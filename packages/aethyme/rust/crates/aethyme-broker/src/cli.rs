@@ -62,6 +62,12 @@ Usage:
   aethyme broker gates run --session <id> [--json]
       Run affected gates cheap-first with tree-hash caching; cancels this
       session's obsolete in-flight runs; stops at first failure.
+  aethyme broker gates run --all [--json]
+      Run EVERY gate in cost order against the current worktree — no
+      diff selection, no session. Same runner, streaming, and tree-hash
+      result cache as session runs; stops at first failure and exits
+      non-zero if any gate does not pass. The CI entrypoint: gates.toml
+      is the single definition of verified for CI and broker alike.
   aethyme broker hooks install [--json]
       Explicitly install the two managed git hooks into the shared
       <git-common-dir>/hooks (all worktrees see them): pre-commit runs
@@ -240,6 +246,7 @@ struct Parsed {
     check: bool,
     reuse: bool,
     replace_stale: bool,
+    all: bool,
 }
 
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
@@ -259,6 +266,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         check: false,
         reuse: false,
         replace_stale: false,
+        all: false,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -276,6 +284,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--force" => parsed.force = true,
             "--check" => parsed.check = true,
             "--reuse" => parsed.reuse = true,
+            "--all" => parsed.all = true,
             "--replace-stale" => parsed.replace_stale = true,
             "--kind" => {
                 parsed.kind = Some(
@@ -641,9 +650,44 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         }
                     }
                 }
+                "run" if parsed.all => {
+                    if parsed.session.is_some() {
+                        return Err(UsageError::Message(
+                            "gates run takes --session <id> or --all, not both".into(),
+                        ));
+                    }
+                    let cwd = std::env::current_dir()
+                        .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
+                    let mut broker = open_broker()?;
+                    let outcomes = broker.run_all_gates(&cwd)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&outcomes)?);
+                    } else {
+                        for outcome in &outcomes {
+                            println!(
+                                "{:<20} {:<10} {}{}",
+                                outcome.gate,
+                                outcome.status.as_str(),
+                                if outcome.cached { "(cached) " } else { "" },
+                                outcome
+                                    .duration_ms
+                                    .map(|ms| format!("{ms}ms"))
+                                    .unwrap_or_default(),
+                            );
+                        }
+                    }
+                    // Unlike --session runs, --all is the CI entrypoint:
+                    // the exit code must be conclusive in --json mode too.
+                    if outcomes
+                        .iter()
+                        .any(|outcome| outcome.status != crate::GateStatus::Pass)
+                    {
+                        return Err(UsageError::Message("one or more gates did not pass".into()));
+                    }
+                }
                 "run" => {
                     let session = parsed.session.ok_or(UsageError::Message(
-                        "gates run requires --session <id>".into(),
+                        "gates run requires --session <id> (or --all)".into(),
                     ))?;
                     let mut broker = open_broker()?;
                     let outcomes = broker.run_gates(session)?;
