@@ -15,10 +15,14 @@ use aethyme_graph_indexer::{index_repo_to_disk, IndexerContext, WalkOptions};
 use aethyme_graph_storage::bootstrap_repo;
 use redb::{Database, MultimapTableDefinition, ReadableDatabase, ReadableTable, TableDefinition};
 
+const REPOSITORIES: TableDefinition<&str, &[u8]> = TableDefinition::new("repositories");
+const DIRECTORIES: TableDefinition<&str, &[u8]> = TableDefinition::new("directories");
 const FUNCTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("functions");
 const CLASSES: TableDefinition<&str, &[u8]> = TableDefinition::new("classes");
 const DOCS: TableDefinition<&str, &[u8]> = TableDefinition::new("docs");
 const CONFIGS: TableDefinition<&str, &[u8]> = TableDefinition::new("configs");
+const UNRESOLVED: TableDefinition<&str, &[u8]> = TableDefinition::new("unresolved");
+const EDGES_OUT: MultimapTableDefinition<&str, &[u8]> = MultimapTableDefinition::new("edges_out");
 const EDGES_IN: MultimapTableDefinition<&str, &[u8]> = MultimapTableDefinition::new("edges_in");
 const FUNCTIONS_BY_PATH: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("functions_by_path");
@@ -115,6 +119,22 @@ fn build_fragment_fixture() -> tempfile::TempDir {
     let ctx = IndexerContext::new("TinyRepo", root.clone(), "test-engine").unwrap();
     let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
     assert_eq!(summary.total_files, 2);
+    tmp
+}
+
+fn build_unresolved_fragment_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/app.py",
+        b"import missing_sdk\n\n\ndef main():\n    return missing_sdk.run()\n",
+    );
+
+    let root = tmp.path().canonicalize().unwrap();
+    bootstrap_repo(&root, "test-engine").expect("bootstrap graph layout");
+    let ctx = IndexerContext::new("UnresolvedRepo", root.clone(), "test-engine").unwrap();
+    let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
+    assert_eq!(summary.total_files, 1);
     tmp
 }
 
@@ -233,6 +253,16 @@ fn table_row_count(db: &Database, table: TableDefinition<&str, &[u8]>) -> usize 
         count += 1;
     }
     count
+}
+
+fn table_keys(db: &Database, table: TableDefinition<&str, &[u8]>) -> Vec<String> {
+    let txn = db.begin_read().expect("read txn");
+    let table = txn.open_table(table).expect("open table");
+    table
+        .iter()
+        .expect("iter table")
+        .map(|row| row.expect("row").0.value().to_string())
+        .collect()
 }
 
 fn str_multimap_values(
@@ -433,6 +463,44 @@ fn index_populates_symbol_tables_and_symbol_edges() {
         bytes_multimap_count(&db, EDGES_IN, function_id.as_str()) > 0,
         "symbol endpoint should have incoming adjacency"
     );
+}
+
+#[test]
+fn index_persists_complete_node_shape_and_unresolved_edges() {
+    let tmp = build_unresolved_fragment_fixture();
+    let output = run_engine([
+        "index",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("skipped (unpersisted endpoints)"),
+        "edge writer should no longer skip unresolved endpoints: {stderr}"
+    );
+
+    let db = open_store(tmp.path());
+    assert_eq!(table_row_count(&db, REPOSITORIES), 1);
+    assert!(
+        table_row_count(&db, DIRECTORIES) > 0,
+        "directory/container rows should be populated"
+    );
+    let unresolved_ids = table_keys(&db, UNRESOLVED);
+    assert!(
+        !unresolved_ids.is_empty(),
+        "missing import fixture should produce unresolved placeholder rows"
+    );
+
+    for unresolved_id in unresolved_ids {
+        let adjacency = bytes_multimap_count(&db, EDGES_IN, &unresolved_id)
+            + bytes_multimap_count(&db, EDGES_OUT, &unresolved_id);
+        assert!(
+            adjacency > 0,
+            "unresolved node {unresolved_id} should participate in adjacency"
+        );
+    }
 }
 
 #[test]
