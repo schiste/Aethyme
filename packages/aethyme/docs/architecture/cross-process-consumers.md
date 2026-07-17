@@ -161,11 +161,18 @@ Supported redb surfaces:
 | `graph-callers` / `graph-callees` | Read-only | Render call relations through redb relation views. They preserve the existing JSON shape and do not build `RepositoryMap`. |
 | `graph-docs` / `graph-configs` | Read-only | Render document/config relations through redb relation views. They preserve the existing JSON shape and do not build `RepositoryMap`. |
 | `graph-expand` | Read-only | Composes the redb-backed node, relation, and risk views into the existing compact expand JSON shape. It preserves the existing bounds and does not build `RepositoryMap`. |
+| `graph-overview` | Read-only | Renders the existing graph overview JSON shape from redb overview/navigation rows. It preserves the existing JSON shape and does not build `RepositoryMap`. |
 | `task-expand` | Read-only | Composes redb-backed callers/callees, docs/configs, and risk views into the existing compact task expansion JSON shape. It preserves the existing JSON shape and does not build `RepositoryMap`. |
 | `task-anchors` | Read-only | Resolves task anchors from redb overview rows, path indexes, config/doc rows, and bounded symbol candidates. Ranking policy remains in `graph::anchors`; the command preserves the existing JSON shape and does not build `RepositoryMap`. |
 | `task-scope` | Read-only | Builds task scope from redb-backed anchors, path-prefix lookups, symbol rows, area membership, and risk lookup. It preserves the existing JSON shape and does not build `RepositoryMap`. |
 | `task-next` | Read-only | Builds task navigation order from redb-backed anchors, relation views, semantic config/doc path resolution, and bounded overview slices. It preserves the existing JSON shape and does not build `RepositoryMap`. |
 | `task-localize` | Read-only | Composes redb-backed `task-anchors`, `task-scope`, and `task-next` outputs. `--profile` reports redb open / task parse / anchors / scope / next / JSON stages instead of `RepositoryMap` build time. |
+| `pack` / `task-pack` | Read-only + source snippets | Selects context-pack inputs from redb anchors, scope, relation, docs/config, risk, symbol, and path rows, then reads source files only to supply snippets. It does not build `RepositoryMap` in production. |
+| `context` / `task-context` | Read-only + source content | Uses the same redb-selected context-pack inputs as `pack`, then reads source text for bounded content. It does not build `RepositoryMap` in production. |
+| `explain` / `task-explain` | Read-only + source snippets | Renders the redb context-pack summary as text. It does not build `RepositoryMap` in production. |
+| `activate` / `activate-from` / `impact` | Read-only | Expands activation and impact frontiers through redb anchors, adjacency, relations, docs/configs, area, and risk rows. It does not build `RepositoryMap` in production. |
+| `explore` non-usage-boundary intents | Read-only | Native `task_localization_query`, `behavior_localization_query`, and auto-selected explore flows read graph/navigation data from redb and report redb store freshness in observability. They do not build `RepositoryMap` in production. |
+| `explore --intent usage_boundary_query` | Hybrid redb + source text | Uses the usage-boundary analyzer contract below through the shared explore CLI. It does not build `RepositoryMap` and scans source/docs/config text for evidence. |
 | `analyze-usage-boundary` | Hybrid redb + source text | Reads public PHP symbol seeds and candidate source/docs/config files from redb, then scans source/docs/config text for evidence. This is the accepted V2 contract because evidence strings are freshness-sensitive; a fully redb-native variant would need persisted evidence rows plus freshness/invalidation rules. It does not build `RepositoryMap` and fails cleanly when the store is missing. |
 | `deps` | Read-only | Reads outgoing file adjacency from the redb store. |
 | `importers` | Read-only | Reads incoming file adjacency from the redb store. |
@@ -181,14 +188,11 @@ Current storage coverage and limitations:
 - The `index` writer persists the graph edge set without skipping edges for
   missing unresolved/import endpoint rows. Placeholder endpoints are stored as
   typed unresolved rows before adjacency is written.
-- Task anchors, task scope, task next, task-localize, task-expand, and
-  usage-boundary seed discovery are served from read-only redb rows.
-  Usage-boundary still scans source/docs/config text for evidence after redb
-  discovers public symbols and candidate files. Context-pack assembly,
-  activation, graph overview, and remaining non-usage-boundary `explore` flows
-  still use graph modules that may build `RepositoryMap`; those surfaces
-  should not be described as redb-backed until they are explicitly moved to
-  `GraphStore::open_read_only`.
+- Task anchors, task scope, task next, task-localize, task-expand, graph
+  overview, context-pack assembly, activation, impact, non-usage-boundary
+  explore flows, and usage-boundary seed discovery are served from read-only
+  redb rows. Usage-boundary still scans source/docs/config text for evidence
+  after redb discovers public symbols and candidate files.
 
 Remaining V2 target contract:
 
