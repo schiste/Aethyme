@@ -377,6 +377,9 @@ schema:
 - `graph-expand`: composes the redb-backed node, relation, and risk views
   into the existing compact expand JSON shape. It preserves the existing
   per-relation bounds and does not build a `RepositoryMap`.
+- `task-expand`: composes redb-backed callers/callees, docs/configs, and risk
+  views into the existing compact task expansion JSON shape. It does not build
+  a `RepositoryMap`.
 - `task-anchors`, `task-scope`, `task-next`, and `task-localize`: read task
   anchors, scope, and navigation order from redb overview rows, path indexes,
   bounded symbol candidates, relation views, config/doc rows, and risk rows.
@@ -409,13 +412,14 @@ Current redb storage coverage:
 - The writer persists the graph edge set without skipping edges for missing
   unresolved/import endpoint rows. Placeholder endpoints are stored as typed
   unresolved rows before adjacency is written.
-- Task anchors, task scope, task next, task-localize, and usage-boundary
-  seed discovery read from redb. Usage-boundary remains hybrid: redb supplies
-  public-symbol and candidate-file seeds, while source/docs/config text still
-  supplies evidence. Context-pack assembly, activation, and remaining
-  non-usage-boundary `explore` flows still use graph modules that may build
-  `RepositoryMap`; those surfaces should not be assumed to read from redb just
-  because `.aethyme/graph_store.redb` exists.
+- Task anchors, task scope, task next, task-localize, task-expand, and
+  usage-boundary seed discovery read from redb. Usage-boundary remains hybrid:
+  redb supplies public-symbol and candidate-file seeds, while
+  source/docs/config text still supplies evidence. Context-pack assembly,
+  activation, graph overview, and remaining non-usage-boundary `explore` flows
+  still use graph modules that may build `RepositoryMap`; those surfaces should
+  not be assumed to read from redb just because `.aethyme/graph_store.redb`
+  exists.
 
 Remaining V2 redb store contract:
 
@@ -463,6 +467,7 @@ Bridge decisions as of 2026-07-17:
 | `task-anchors` | Redb-backed task anchors. | CLI opens `.aethyme/graph_store.redb` read-only, resolves anchors from overview rows, path indexes, config/doc rows, and bounded symbol candidates, then applies graph-module task ranking. Binary parity snapshots cover ExplainRepo, ChangeSymbol, TraceImpact, and config-ownership tasks. |
 | `task-scope` | Redb-backed task scope. | CLI composes redb-backed anchors with redb path-prefix lookup, symbol rows, area membership, and risk lookup while preserving the existing JSON shape. Binary parity snapshots cover ExplainRepo, ChangeSymbol, TraceImpact, and config-ownership tasks. |
 | `task-next` / `task-localize` | Redb-backed task navigation. | `task-next` reads redb-backed anchors, relation views, semantic config/doc path rows, and bounded overview/navigation slices. `task-localize` composes `task-anchors`, `task-scope`, and `task-next`; `--profile` reports redb stages rather than `RepositoryMap` build time. |
+| `task-expand` | Redb-backed task expansion. | `task-expand` opens `.aethyme/graph_store.redb` read-only, composes callers/callees, docs/configs, and risks into the existing compact JSON shape, and has binary parity coverage against `RepositoryMap` snapshots. |
 | `graph-node` / rendered relation views | Redb-backed rendered views. | `graph-node`, `graph-children`, `graph-parents`, `graph-callers`, `graph-callees`, `graph-docs`, and `graph-configs` open `.aethyme/graph_store.redb` read-only, adapt redb display/relation rows to the existing JSON structs, and have binary parity snapshots against `RepositoryMap`. |
 | `graph-expand` | Redb-backed composed view. | `graph-expand` opens `.aethyme/graph_store.redb` read-only, composes the redb-backed node, parents, children, callers, callees, docs, configs, and risks views, preserves the existing JSON shape and bounds, and has binary parity, shape, bounded-output, deterministic-ordering, and docs/configs/call-edge fixture gates. |
 | `usage boundary` | Hybrid redb + source text. | `analyze-usage-boundary` and `explore --intent usage_boundary_query` open `.aethyme/graph_store.redb` read-only, discover public PHP symbols and candidate files through redb path indexes/adjacency, then scan source/docs/config text for evidence. It no longer builds `RepositoryMap`, but the analyzer policy and evidence extraction remain in graph modules. |
@@ -479,11 +484,11 @@ V2 correctness and performance gates:
   `rust/crates/aethyme-engine/tests/redb_cli.rs` and cover indexing from
   fragments, redb exact symbol query, graph callers/callees query shape,
   rendered graph parity snapshots, graph-expand JSON shape and bounded
-  output, task parity snapshots for ExplainRepo, ChangeSymbol, TraceImpact,
-  and config-ownership tasks, usage-boundary internal/external caller plus
-  docs/config reference behavior, deterministic query snapshots after
-  rebuilding from identical fragments, missing-store read-only behavior, and
-  disposable-fast publish boundaries.
+  output, task-expand relation parity, task parity snapshots for ExplainRepo,
+  ChangeSymbol, TraceImpact, and config-ownership tasks, usage-boundary
+  internal/external caller plus docs/config reference behavior, deterministic
+  query snapshots after rebuilding from identical fragments, missing-store
+  read-only behavior, and disposable-fast publish boundaries.
 - The default performance smoke is intentionally tiny and bounded by
   environment-overridable thresholds:
   `AETHYME_REDB_PERF_MAX_INDEX_MS`,
