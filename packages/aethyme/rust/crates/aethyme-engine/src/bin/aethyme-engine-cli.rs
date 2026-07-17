@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -21,6 +20,7 @@ use aethyme_engine::graph::overview::build_repo_overview;
 use aethyme_engine::graph::search::symbol_search_redb;
 use aethyme_engine::graph::usage_boundary::analyze_usage_boundary_scope_first;
 use aethyme_engine::map::RepositoryMap;
+use aethyme_engine::model::repository::RepositoryNode;
 use aethyme_engine::model::task::TaskInput;
 use aethyme_engine::pipeline::{build_context_pack, build_context_pack_with_content};
 use aethyme_engine::store::redb::graph_store::{GraphStore, NeighborDirection, OverviewV2Limits};
@@ -1277,11 +1277,21 @@ fn index_to_store(
     let mut file_ok = 0usize;
     let mut file_errors = 0usize;
     profiler.stage("redb_node_writes", || -> Result<(), String> {
+        let repo_name = map.snapshot.repo_name();
+        let repository = RepositoryNode::new(&repo_name, &map.snapshot.root);
+        gs::insert_repository(&mut session, &repository).map_err(|e| e.to_string())?;
+        eprintln!("  repositories: 1");
+
         // Areas
         for area in &map.areas {
             gs::insert_area(&mut session, area).map_err(|e| e.to_string())?;
         }
         eprintln!("  areas: {}", map.areas.len());
+
+        for directory in &map.directories {
+            gs::insert_directory(&mut session, directory).map_err(|e| e.to_string())?;
+        }
+        eprintln!("  directories: {}", map.directories.len());
 
         // Files
         for file in &map.files {
@@ -1323,38 +1333,20 @@ fn index_to_store(
             gs::insert_config(&mut session, config).map_err(|e| e.to_string())?;
         }
         eprintln!("  configs: {}", map.configs.len());
+
+        for unresolved in &map.unresolved {
+            gs::insert_unresolved(&mut session, unresolved).map_err(|e| e.to_string())?;
+        }
+        eprintln!("  unresolved: {}", map.unresolved.len());
         Ok(())
     })?;
 
-    let persisted_symbol_ids: HashSet<&str> = map
-        .classes
-        .iter()
-        .map(|class| class.id.as_str())
-        .chain(map.functions.iter().map(|function| function.id.as_str()))
-        .collect();
-
-    // The redb writer now persists `fn:` and `class:` endpoints, so symbol
-    // adjacency can be materialized. We still skip unresolved `import:`
-    // placeholders until they have a typed node table and read contract.
     let mut edge_errors = 0usize;
     let mut edge_ok = 0usize;
-    let mut edge_skipped = 0usize;
     profiler.stage("redb_edge_writes", || -> Result<(), String> {
         for edge in &map.edges {
             let from = edge.from.as_str();
             let to = edge.to.as_str();
-            let from_is_persisted_symbol = !(from.starts_with("fn:") || from.starts_with("class:"))
-                || persisted_symbol_ids.contains(from);
-            let to_is_persisted_symbol = !(to.starts_with("fn:") || to.starts_with("class:"))
-                || persisted_symbol_ids.contains(to);
-            if from.starts_with("import:")
-                || to.starts_with("import:")
-                || !from_is_persisted_symbol
-                || !to_is_persisted_symbol
-            {
-                edge_skipped += 1;
-                continue;
-            }
             if let Err(e) = gs::insert_edge(&mut session, edge) {
                 if edge_errors < 5 {
                     eprintln!(
@@ -1371,10 +1363,9 @@ fn index_to_store(
             }
         }
         eprintln!(
-            "  edges: {} ok, {} errors, {} skipped (unpersisted endpoints) (of {} total)",
+            "  edges: {} ok, {} errors (of {} total)",
             edge_ok,
             edge_errors,
-            edge_skipped,
             map.edges.len()
         );
         Ok(())

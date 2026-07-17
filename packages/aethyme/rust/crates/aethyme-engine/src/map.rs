@@ -15,6 +15,7 @@ use crate::model::graph::{GraphAnnotation, GraphNode, GraphNodeKind, NormalizedG
 use crate::model::intern::InternedStr;
 use crate::model::risk::{RiskArea, RiskFlag, RiskLevel};
 use crate::model::symbol::{Symbol, SymbolKind};
+use crate::model::unresolved::UnresolvedNode;
 use crate::repo::{RepoFile, RepoSnapshot};
 use aethyme_graph_schema::{
     Callable, EdgeKind as SchemaEdgeKind, Node, NonCodeFormat, SourceRange,
@@ -47,6 +48,7 @@ impl MapIndex {
             + map.classes.len()
             + map.docs.len()
             + map.configs.len()
+            + map.unresolved.len()
             + map.areas.len();
         let mut area_id_by_id = HashMap::with_capacity(capacity);
         let mut display_by_id = HashMap::with_capacity(capacity);
@@ -83,6 +85,16 @@ impl MapIndex {
             area_id_by_id.insert(config.id.clone(), config.area_id.clone());
             display_by_id.insert(config.id.clone(), config.path.clone());
         }
+        for unresolved in &map.unresolved {
+            area_id_by_id.insert(
+                unresolved.id.to_string(),
+                unresolved.area_id.as_deref().map(String::from),
+            );
+            display_by_id.insert(
+                unresolved.id.to_string(),
+                format!("{}::{}", unresolved.file_path, unresolved.name),
+            );
+        }
         for area in &map.areas {
             area_id_by_id.insert(area.id.clone(), Some(area.id.clone()));
             display_by_id.insert(area.id.clone(), area.name.clone());
@@ -115,6 +127,8 @@ pub struct RepositoryMap {
     pub functions: Vec<FunctionNode>,
     pub docs: Vec<DocNode>,
     pub configs: Vec<ConfigNode>,
+    #[serde(default)]
+    pub unresolved: Vec<UnresolvedNode>,
     pub symbols: Vec<Symbol>,
     pub edges: Vec<Edge>,
     pub risk_flags: Vec<RiskFlag>,
@@ -143,6 +157,7 @@ impl PartialEq for RepositoryMap {
             && self.functions == other.functions
             && self.docs == other.docs
             && self.configs == other.configs
+            && self.unresolved == other.unresolved
             && self.symbols == other.symbols
             && self.edges == other.edges
             && self.risk_flags == other.risk_flags
@@ -310,6 +325,11 @@ impl RepositoryMap {
         for config in &self.configs {
             if config.id == target || config.path.eq_ignore_ascii_case(target) {
                 push_unique(&mut matches, config.id.clone());
+            }
+        }
+        for unresolved in &self.unresolved {
+            if unresolved.id.as_str() == target || unresolved.name.eq_ignore_ascii_case(target) {
+                push_unique(&mut matches, unresolved.id.to_string());
             }
         }
         for file in &self.files {
@@ -542,6 +562,22 @@ impl RepositoryMap {
         functions.dedup();
 
         let mut symbols = compatibility_symbols(&classes, &functions);
+        let mut unresolved = Vec::new();
+        for fragment in &fragments {
+            let Some(file) = file_index.get(fragment.file_path()) else {
+                continue;
+            };
+            for node in fragment.nodes() {
+                if let Some((schema_id, import_node)) =
+                    unresolved_from_schema_node(node, file, &model_id_by_schema)
+                {
+                    model_id_by_schema.insert(schema_id, import_node.id.to_string());
+                    unresolved.push(import_node);
+                }
+            }
+        }
+        unresolved.sort();
+        unresolved.dedup();
 
         let mut edges = Vec::new();
         let model_repo_id = format!("repo:{repo_name}");
@@ -582,6 +618,7 @@ impl RepositoryMap {
             functions,
             docs,
             configs,
+            unresolved,
             symbols,
             edges,
             risk_flags,
@@ -945,6 +982,39 @@ fn function_node(
         source_range.start_line() as usize,
         InternedStr::from(signature),
     )
+}
+
+fn unresolved_from_schema_node(
+    node: &Node,
+    file: &FileNode,
+    model_id_by_schema: &HashMap<String, String>,
+) -> Option<(String, UnresolvedNode)> {
+    let Node::UnresolvedSymbol(value) = node else {
+        return None;
+    };
+    let schema_id = value.id().as_str().to_string();
+    let referenced_from_id = model_id_by_schema
+        .get(value.referenced_from_id().as_str())
+        .cloned()
+        .unwrap_or_else(|| value.referenced_from_id().as_str().to_string());
+    let expected_kind = value
+        .expected_kind()
+        .map(|kind| InternedStr::from(kind.name()));
+    let unresolved = UnresolvedNode::new(
+        InternedStr::from(schema_id.clone()),
+        InternedStr::from(value.name()),
+        expected_kind,
+        InternedStr::from(referenced_from_id),
+        InternedStr::from(file.id.clone()),
+        InternedStr::from(file.path.clone()),
+        file.area_id.clone().map(InternedStr::from),
+        InternedStr::from(
+            file.language
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+    );
+    Some((schema_id, unresolved))
 }
 
 fn compatibility_symbols(classes: &[ClassNode], functions: &[FunctionNode]) -> Vec<Symbol> {
@@ -1583,20 +1653,18 @@ mod tests {
         let map = RepositoryMap::build(&root).expect("build repository map");
 
         assert!(!map.directories.is_empty());
-        assert!(
-            map.functions
-                .iter()
-                .any(|function| function.name == "validate_token")
-        );
+        assert!(map
+            .functions
+            .iter()
+            .any(|function| function.name == "validate_token"));
         assert!(map.classes.iter().any(|class| class.name == "AuthService"));
         assert!(!map.docs.is_empty());
         assert!(!map.configs.is_empty());
         assert!(!map.graph.nodes.is_empty());
-        assert!(
-            map.risk_flags
-                .iter()
-                .any(|flag| flag.scope == "src/auth/service.py")
-        );
+        assert!(map
+            .risk_flags
+            .iter()
+            .any(|flag| flag.scope == "src/auth/service.py"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1613,12 +1681,10 @@ mod tests {
             RepositoryMap::build_with_profile(&root).expect("build repository map with profile");
 
         assert!(!profile.stages.is_empty());
-        assert!(
-            profile
-                .stages
-                .iter()
-                .any(|stage| stage.name == "populate_from_fragments")
-        );
+        assert!(profile
+            .stages
+            .iter()
+            .any(|stage| stage.name == "populate_from_fragments"));
         assert_eq!(profile.repo_files, map.snapshot.files.len());
         assert_eq!(profile.graph_nodes, map.graph.nodes.len());
         assert!(
