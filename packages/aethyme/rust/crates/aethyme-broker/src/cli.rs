@@ -14,6 +14,12 @@ const USAGE: &str = "\
 aethyme broker — coordinate concurrent AI agent sessions on this repository
 
 Usage:
+  aethyme init [--json]                (also: aethyme broker init)
+      Guided setup: certify (read-only), then scaffold (deterministic,
+      only-if-missing), then gates draft (adaptive, only when no
+      gates.toml exists) — the three commands below in sequence, then a
+      summary of what already existed vs what was created. Idempotent:
+      a second run on the same repo changes nothing and says so.
   aethyme certify [--json]             (also: aethyme broker certify)
       The certification method: deterministic, strictly read-only checks
       (git version, repo, configs valid, gitignore contract, protocol,
@@ -146,6 +152,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "cleanup",
         "certify",
         "scaffold",
+        "init",
     ];
     let label: Vec<&str> = args
         .iter()
@@ -315,6 +322,19 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
 
 fn aethyme_gates_load(main_root: &std::path::Path) -> Result<Vec<crate::Gate>, UsageError> {
     Ok(crate::load_gates(main_root)?)
+}
+
+fn print_checks(checks: &[crate::init::Check]) {
+    for check in checks {
+        let tag = match check.status {
+            crate::init::CheckStatus::Pass => "pass",
+            crate::init::CheckStatus::Created => "created",
+            crate::init::CheckStatus::Warn => "warn",
+            crate::init::CheckStatus::Fail => "FAIL",
+            crate::init::CheckStatus::Skipped => "skip",
+        };
+        println!("{tag:<8} {:<28} {}", check.id, check.detail);
+    }
 }
 
 fn print_overlap_warnings(overlaps: &[crate::Overlap]) {
@@ -961,6 +981,74 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 }
             }
         }
+        "init" => {
+            let cwd = std::env::current_dir()
+                .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
+            let report = crate::init::guided_init(&cwd)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Phase 1/3 — certify (read-only):");
+                print_checks(&report.certify.checks);
+                let Some(scaffold) = &report.scaffold else {
+                    println!();
+                    return Err(UsageError::Message(
+                        "certification failed — fix the FAIL items above, then re-run \
+                         `aethyme init` (nothing was written)"
+                            .into(),
+                    ));
+                };
+                println!();
+                println!("Phase 2/3 — scaffold (deterministic, only-if-missing):");
+                print_checks(&scaffold.checks);
+                println!();
+                println!("Phase 3/3 — gates draft (adaptive):");
+                match &report.gates {
+                    Some(gates) => print_checks(&gates.checks),
+                    None => println!(
+                        "{:<8} {:<28} .aethyme/gates.toml already present — drafting skipped",
+                        "skip", "gates.draft"
+                    ),
+                }
+                println!();
+                let write_checks: Vec<&crate::init::Check> = scaffold
+                    .checks
+                    .iter()
+                    .chain(report.gates.iter().flat_map(|g| g.checks.iter()))
+                    .collect();
+                let existing: Vec<&str> = write_checks
+                    .iter()
+                    .filter(|c| c.status == crate::init::CheckStatus::Pass)
+                    .map(|c| c.id)
+                    .collect();
+                if !existing.is_empty() {
+                    println!("Already existed (untouched): {}", existing.join(", "));
+                }
+                if report.changed {
+                    println!("Created this run:");
+                    for check in write_checks
+                        .iter()
+                        .filter(|c| c.status == crate::init::CheckStatus::Created)
+                    {
+                        println!("  - {} — {}", check.id, check.detail);
+                    }
+                } else {
+                    println!(
+                        "Nothing created — this repository was already set up \
+                         (init is idempotent)."
+                    );
+                }
+                println!(
+                    "Next steps: review any drafts above, re-check anytime with \
+                     `aethyme certify`, register agents with `aethyme broker adopt`; \
+                     optionally `aethyme enhance deploy` installs the agent protocol \
+                     into AGENTS.md/CLAUDE.md."
+                );
+            }
+            if !report.certified() {
+                return Err(UsageError::Message("initialization failed".into()));
+            }
+        }
         "certify" | "scaffold" => {
             let cwd = std::env::current_dir()
                 .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
@@ -972,16 +1060,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                for check in &report.checks {
-                    let tag = match check.status {
-                        crate::init::CheckStatus::Pass => "pass",
-                        crate::init::CheckStatus::Created => "created",
-                        crate::init::CheckStatus::Warn => "warn",
-                        crate::init::CheckStatus::Fail => "FAIL",
-                        crate::init::CheckStatus::Skipped => "skip",
-                    };
-                    println!("{tag:<8} {:<28} {}", check.id, check.detail);
-                }
+                print_checks(&report.checks);
                 println!();
                 if report.certified() {
                     if subcommand == "certify" {

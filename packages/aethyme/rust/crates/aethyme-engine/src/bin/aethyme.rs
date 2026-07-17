@@ -55,6 +55,10 @@ fn main() -> ExitCode {
         // inspection). Strictly read-only; adaptive setup lives in
         // `broker scaffold`.
         "certify" => ExitCode::from(aethyme_broker::cli::run(&args)),
+        // Guided setup — certify + scaffold + gates draft in sequence,
+        // idempotent. Top-level like certify: it is the first command a
+        // new repo runs.
+        "init" => ExitCode::from(aethyme_broker::cli::run(&args)),
         other => {
             // Unknown to the Rust client — pass straight through to Python.
             // This includes commands like `intents`, `enhance`, `eval`, etc.
@@ -73,6 +77,7 @@ fn print_top_level_help() {
     eprintln!("                              in-process engine; auto-starts the engine daemon");
     eprintln!();
     eprintln!("Agent broker:");
+    eprintln!("  init                        guided setup: certify + scaffold + gates draft");
     eprintln!("  certify                     read-only certification checks for this repo");
     eprintln!("  broker adopt|start-agent|agents|cleanup   (see `broker --help`)");
     eprintln!();

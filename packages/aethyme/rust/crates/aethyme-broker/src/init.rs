@@ -245,6 +245,70 @@ pub fn draft_gates(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     })
 }
 
+/// Machine-readable outcome of one guided `aethyme init` run: the three
+/// phases in execution order. `None` phases did not run — see each
+/// field's doc for the (single) reason why.
+#[derive(Debug, serde::Serialize)]
+pub struct GuidedInitReport {
+    /// Phase 1 — read-only certification (always runs).
+    pub certify: InitReport,
+    /// Phase 2 — deterministic scaffolding. `None` when certification
+    /// failed: init stops before writing anything.
+    pub scaffold: Option<InitReport>,
+    /// Phase 3 — adaptive gate drafting. `None` when it was skipped
+    /// because `.aethyme/gates.toml` already existed (never overwritten)
+    /// or because certification failed.
+    pub gates: Option<InitReport>,
+    /// True when this run wrote anything at all; a second invocation on
+    /// the same repository must report `false`.
+    pub changed: bool,
+}
+
+impl GuidedInitReport {
+    pub fn certified(&self) -> bool {
+        self.certify.certified()
+            && self.scaffold.as_ref().is_none_or(InitReport::certified)
+            && self.gates.as_ref().is_none_or(InitReport::certified)
+    }
+}
+
+/// `aethyme init` — one guided pass over the whole setup: certify
+/// (read-only), then scaffold (deterministic, only-if-missing writes),
+/// then gate drafting (adaptive, only when no gates.toml exists yet).
+/// Pure composition of the three phases above — init adds no setup
+/// logic of its own, which is what makes a second run a no-op.
+pub fn guided_init(repo_hint: &Path) -> Result<GuidedInitReport, BrokerOpError> {
+    let certify = certify(repo_hint)?;
+    if !certify.certified() {
+        return Ok(GuidedInitReport {
+            certify,
+            scaffold: None,
+            gates: None,
+            changed: false,
+        });
+    }
+    let repo = crate::GitRepo::discover(repo_hint).map_err(BrokerOpError::Git)?;
+    let main_root = repo.main_root()?;
+    let had_gates = main_root.join(".aethyme/gates.toml").exists();
+    let scaffold = scaffold(repo_hint)?;
+    let gates = if had_gates {
+        None
+    } else {
+        Some(draft_gates(repo_hint)?)
+    };
+    let changed = scaffold
+        .checks
+        .iter()
+        .chain(gates.iter().flat_map(|report| report.checks.iter()))
+        .any(|check| check.status == CheckStatus::Created);
+    Ok(GuidedInitReport {
+        certify,
+        scaffold: Some(scaffold),
+        gates,
+        changed,
+    })
+}
+
 fn check_config_valid(main_root: &Path) -> Check {
     let path = main_root.join(".aethyme/config.toml");
     let Ok(text) = std::fs::read_to_string(&path) else {
