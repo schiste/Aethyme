@@ -1,8 +1,45 @@
 # Aethyme Broker — Event Stream Contract
 
-Version: schema_version **1** (per-row field; see rules below)
+Version: schema_version **1** — **FROZEN** (2026-07-17; per-row field, see
+rules below)
 Source of truth: `rust/crates/aethyme-broker/src/events.rs` (kinds and
 payload constructors) — this document describes what that module defines.
+Enforcement: `rust/crates/aethyme-broker/tests/contract_v1.rs` locks the
+v1 kind list and per-kind payload field names against golden expectations;
+any unversioned change fails CI.
+Stable `--json` command outputs are a separate surface, documented in
+[json-contracts.md](json-contracts.md).
+
+## Change policy (v1 frozen)
+
+Allowed **without** a version bump (additive-only evolution):
+
+- Adding a **new kind** (new dotted `<domain>.<what>` string).
+- Adding a **new payload field** to an existing kind.
+- Adding a new enum-derived kind by adding a variant to
+  `SessionStatus`/`GateStatus`/`MergeStatus` (variants are add-only).
+
+Requires a **schema_version bump** (breaking — never do this silently):
+
+- Renaming or removing a kind, or repurposing its meaning.
+- Renaming or removing a payload field, or changing a field's type or
+  semantics.
+- Changing the envelope row shape (`id`, `schema_version`, `ts`, `kind`,
+  `session_id`, `payload_json`).
+
+### Bump procedure
+
+1. Increment `EVENTS_SCHEMA_VERSION` in
+   `rust/crates/aethyme-broker/src/schema.rs`. New rows carry the new
+   number; existing rows keep theirs — the log is never rewritten, and
+   consumers use the per-row value to pick the right interpretation.
+2. Update the golden expectations in `tests/contract_v1.rs` to the new
+   shape (the failing test is the checklist of what changed).
+3. Update this document: bump the version header, describe the new shape,
+   and keep a short "v(N-1) differences" note so mixed-version logs stay
+   interpretable.
+4. All four artifacts — `schema.rs`, `events.rs`, `contract_v1.rs`, and
+   this file — change in the **same commit**.
 
 ## Consuming the stream
 
@@ -79,5 +116,7 @@ One JSON object per line:
 ## Rules for broker developers
 
 Emit payloads **only** through `src/events.rs` constructors. Adding a
-kind: add the constant + constructor there, a row here, and never touch
-existing fields. This file and that module must change in the same commit.
+kind: add the constant + constructor there, a row here, and a golden
+entry in `tests/contract_v1.rs` — never touch existing fields. This
+file, that module, and the contract test must change in the same commit.
+Breaking changes follow the bump procedure above.
