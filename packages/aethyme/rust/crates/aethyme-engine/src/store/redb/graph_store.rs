@@ -19,7 +19,7 @@
 //! `docs/architecture/phase3-redb-graph-store-plan.md` preserves the migration
 //! rationale; `docs/architecture/graph-schema.md` owns the current contract.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -44,7 +44,7 @@ use crate::model::unresolved::UnresolvedNode;
 
 /// Bumped when the on-disk format changes incompatibly. We re-create the file
 /// rather than try to migrate.
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// Single-row metadata table: schema version, build timestamps, repo root, ...
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -97,11 +97,14 @@ const NODES_BY_PATH: MultimapTableDefinition<&str, &str> =
 // Key = lowercased name. Value = node id.
 //
 // Current writer note: populated for function and class names. Keys are exact
-// ASCII-lowercased symbol names; ranking/fuzzy expansion belongs in graph
-// search, not in the storage key.
+// ASCII-lowercased symbol names plus component tokens extracted from those
+// names; ranking/fuzzy expansion belongs in graph search, not in the storage
+// key.
 
 const SYMBOL_BY_NAME: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("symbol_by_name");
+const SYMBOL_BY_COMPONENT: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("symbol_by_component");
 
 // ── Risk overlays ───────────────────────────────────────────────────────────
 
@@ -562,6 +565,31 @@ fn symbol_index_key(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+fn symbol_components(name: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut current = String::new();
+    let mut previous_was_lower_or_digit = false;
+    for ch in name.chars() {
+        if !ch.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                out.insert(std::mem::take(&mut current));
+            }
+            previous_was_lower_or_digit = false;
+            continue;
+        }
+        if ch.is_ascii_uppercase() && previous_was_lower_or_digit && !current.is_empty() {
+            out.insert(std::mem::take(&mut current));
+        }
+        current.push(ch.to_ascii_lowercase());
+        previous_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+    if !current.is_empty() {
+        out.insert(current);
+    }
+    out.remove("");
+    out
+}
+
 /// Insert (or overwrite) an area. Key = `area.id` (e.g. `area:Repo:src`).
 pub fn insert_area(session: &mut IndexSession<'_>, area: &AreaNode) -> Result<(), GraphStoreError> {
     session.insert_node(AREAS, &area.id, area)
@@ -614,6 +642,9 @@ pub fn insert_function(
     )?;
     let name_key = symbol_index_key(function.name.as_str());
     session.add_symbol_index(&name_key, function.id.as_str())?;
+    for component in symbol_components(function.name.as_str()) {
+        session.add_symbol_component_index(&component, function.id.as_str())?;
+    }
     Ok(())
 }
 
@@ -627,6 +658,9 @@ pub fn insert_class(
     session.add_path_index(NODES_BY_PATH, class.file_path.as_str(), class.id.as_str())?;
     let name_key = symbol_index_key(class.name.as_str());
     session.add_symbol_index(&name_key, class.id.as_str())?;
+    for component in symbol_components(class.name.as_str()) {
+        session.add_symbol_component_index(&component, class.id.as_str())?;
+    }
     Ok(())
 }
 
@@ -775,6 +809,111 @@ pub struct SymbolLookup {
     pub area_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeDisplay {
+    pub id: String,
+    pub kind: StoredNodeKind,
+    pub display: String,
+    pub name: String,
+    pub path: Option<String>,
+    pub language: Option<String>,
+    pub area_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphRelation {
+    Children,
+    Parents,
+    Callers,
+    Callees,
+    Docs,
+    Configs,
+    Imports,
+    Importers,
+    References,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedbRelationItem {
+    pub node: NodeDisplay,
+    pub relation: String,
+    pub edge_kind: EdgeKind,
+    pub confidence: u16,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedbRelationView {
+    pub target: Option<NodeDisplay>,
+    pub relation: GraphRelation,
+    pub items: Vec<RedbRelationItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SymbolMatchSignals {
+    pub exact: bool,
+    pub prefix: bool,
+    pub component: bool,
+    pub path: bool,
+    pub area: bool,
+}
+
+impl SymbolMatchSignals {
+    fn score(&self) -> u8 {
+        self.exact as u8
+            + self.prefix as u8
+            + self.component as u8
+            + self.path as u8
+            + self.area as u8
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.exact |= other.exact;
+        self.prefix |= other.prefix;
+        self.component |= other.component;
+        self.path |= other.path;
+        self.area |= other.area;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolCandidate {
+    pub symbol: SymbolLookup,
+    pub signals: SymbolMatchSignals,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolMatchOptions {
+    pub limit: usize,
+    pub kind: Option<StoredNodeKind>,
+    pub path_prefix: Option<String>,
+    pub area_id: Option<String>,
+}
+
+impl Default for SymbolMatchOptions {
+    fn default() -> Self {
+        Self {
+            limit: 50,
+            kind: None,
+            path_prefix: None,
+            area_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskAnchorCandidate {
+    pub node: NodeDisplay,
+    pub signals: SymbolMatchSignals,
+    pub matched_tokens: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageBoundaryCandidate {
+    pub node: NodeDisplay,
+    pub symbol: Option<SymbolLookup>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NeighborDirection {
     Outgoing,
@@ -910,6 +1049,58 @@ fn get_node_from<D: ReadableDatabase>(
     get_node_in_txn(&txn, id)
 }
 
+fn get_nodes_from<D: ReadableDatabase, S: AsRef<str>>(
+    db: &D,
+    ids: &[S],
+) -> Result<Vec<StoredNode>, GraphStoreError> {
+    let txn = db.begin_read()?;
+    let mut out = Vec::new();
+    for id in ids {
+        if let Some(node) = get_node_in_txn(&txn, id.as_ref())? {
+            out.push(node);
+        }
+    }
+    Ok(out)
+}
+
+fn node_display_from<D: ReadableDatabase>(
+    db: &D,
+    id: &str,
+) -> Result<Option<NodeDisplay>, GraphStoreError> {
+    let txn = db.begin_read()?;
+    display_from_id_in_txn(&txn, id)
+}
+
+fn area_id_from_node(node: &StoredNode) -> Option<String> {
+    match node {
+        StoredNode::Repository(_) => None,
+        StoredNode::Directory(node) => node.area_id.clone(),
+        StoredNode::File(node) => node.area_id.clone(),
+        StoredNode::Area(node) => Some(node.id.clone()),
+        StoredNode::Function(node) => node.area_id.as_ref().map(|id| id.to_string()),
+        StoredNode::Class(node) => node.area_id.as_ref().map(|id| id.to_string()),
+        StoredNode::Doc(node) => node.area_id.clone(),
+        StoredNode::Config(node) => node.area_id.clone(),
+        StoredNode::Unresolved(node) => node.area_id.as_ref().map(|id| id.to_string()),
+    }
+}
+
+fn path_from_node(node: &StoredNode) -> Option<String> {
+    node.path().map(str::to_string)
+}
+
+fn area_for_node_from<D: ReadableDatabase>(
+    db: &D,
+    id_or_path: &str,
+) -> Result<Option<String>, GraphStoreError> {
+    let txn = db.begin_read()?;
+    if let Some(node) = get_node_in_txn(&txn, id_or_path)? {
+        return Ok(area_id_from_node(&node));
+    }
+    drop(txn);
+    Ok(resolve_file_path_from(db, id_or_path)?.and_then(|file| file.area_id))
+}
+
 fn symbol_lookup_from_node(node: StoredNode) -> Option<SymbolLookup> {
     match node {
         StoredNode::Function(function) => Some(SymbolLookup {
@@ -934,6 +1125,99 @@ fn symbol_lookup_from_node(node: StoredNode) -> Option<SymbolLookup> {
         }),
         _ => None,
     }
+}
+
+fn node_display_from_node(node: StoredNode) -> NodeDisplay {
+    match node {
+        StoredNode::Repository(node) => NodeDisplay {
+            id: node.id,
+            kind: StoredNodeKind::Repository,
+            display: node.name.clone(),
+            name: node.name,
+            path: Some(node.root_path),
+            language: None,
+            area_id: None,
+        },
+        StoredNode::Directory(node) => NodeDisplay {
+            id: node.id,
+            kind: StoredNodeKind::Directory,
+            display: node.path.clone(),
+            name: node.name,
+            path: Some(node.path),
+            language: None,
+            area_id: node.area_id,
+        },
+        StoredNode::File(node) => NodeDisplay {
+            id: node.id,
+            kind: StoredNodeKind::File,
+            display: node.path.clone(),
+            name: node.name,
+            path: Some(node.path),
+            language: node.language,
+            area_id: node.area_id,
+        },
+        StoredNode::Area(node) => NodeDisplay {
+            id: node.id,
+            kind: StoredNodeKind::Area,
+            display: node.path_prefix.clone(),
+            name: node.name,
+            path: Some(node.path_prefix),
+            language: None,
+            area_id: None,
+        },
+        StoredNode::Function(node) => NodeDisplay {
+            id: node.id.to_string(),
+            kind: StoredNodeKind::Function,
+            display: node.qualified_name.to_string(),
+            name: node.name.to_string(),
+            path: Some(node.file_path.to_string()),
+            language: Some(node.language.to_string()),
+            area_id: node.area_id.map(|id| id.to_string()),
+        },
+        StoredNode::Class(node) => NodeDisplay {
+            id: node.id.to_string(),
+            kind: StoredNodeKind::Class,
+            display: node.qualified_name.to_string(),
+            name: node.name.to_string(),
+            path: Some(node.file_path.to_string()),
+            language: Some(node.language.to_string()),
+            area_id: node.area_id.map(|id| id.to_string()),
+        },
+        StoredNode::Doc(node) => NodeDisplay {
+            id: node.id,
+            kind: StoredNodeKind::Doc,
+            display: node.path.clone(),
+            name: node.title,
+            path: Some(node.path),
+            language: None,
+            area_id: node.area_id,
+        },
+        StoredNode::Config(node) => NodeDisplay {
+            id: node.id,
+            kind: StoredNodeKind::Config,
+            display: node.path.clone(),
+            name: node.config_type,
+            path: Some(node.path),
+            language: None,
+            area_id: node.area_id,
+        },
+        StoredNode::Unresolved(node) => NodeDisplay {
+            id: node.id.to_string(),
+            kind: StoredNodeKind::Unresolved,
+            display: format!("{}::{}", node.file_path, node.name),
+            name: node.name.to_string(),
+            path: Some(node.file_path.to_string()),
+            language: Some(node.language.to_string()),
+            area_id: node.area_id.map(|id| id.to_string()),
+        },
+    }
+}
+
+fn display_from_id_in_txn(
+    txn: &ReadTransaction,
+    id: &str,
+) -> Result<Option<NodeDisplay>, GraphStoreError> {
+    Ok(get_node_in_txn(txn, id)?.map(node_display_from_node))
 }
 
 fn find_symbols_from<D: ReadableDatabase>(
@@ -992,6 +1276,394 @@ fn find_symbols_from<D: ReadableDatabase>(
     Ok(out)
 }
 
+fn merge_symbol_candidate(
+    candidates: &mut BTreeMap<String, SymbolCandidate>,
+    symbol: SymbolLookup,
+    signals: SymbolMatchSignals,
+) {
+    candidates
+        .entry(symbol.id.clone())
+        .and_modify(|existing| existing.signals.merge(signals))
+        .or_insert(SymbolCandidate { symbol, signals });
+}
+
+fn symbol_candidate_allowed(symbol: &SymbolLookup, options: &SymbolMatchOptions) -> bool {
+    if let Some(kind) = options.kind {
+        if symbol.kind != kind {
+            return false;
+        }
+    }
+    if let Some(prefix) = &options.path_prefix {
+        if !symbol.path.starts_with(prefix) {
+            return false;
+        }
+    }
+    if let Some(area_id) = &options.area_id {
+        if symbol.area_id.as_deref() != Some(area_id.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn add_symbol_candidates_for_ids(
+    txn: &ReadTransaction,
+    ids: BTreeSet<String>,
+    candidates: &mut BTreeMap<String, SymbolCandidate>,
+    signals: SymbolMatchSignals,
+    options: &SymbolMatchOptions,
+) -> Result<(), GraphStoreError> {
+    for id in ids {
+        let Some(node) = get_node_in_txn(txn, &id)? else {
+            continue;
+        };
+        let Some(symbol) = symbol_lookup_from_node(node) else {
+            continue;
+        };
+        if symbol_candidate_allowed(&symbol, options) {
+            merge_symbol_candidate(candidates, symbol, signals);
+        }
+        if candidates.len() >= options.limit.saturating_mul(4).max(options.limit) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn collect_symbol_ids_for_exact_name<D: ReadableDatabase>(
+    db: &D,
+    key: &str,
+) -> Result<BTreeSet<String>, GraphStoreError> {
+    let txn = db.begin_read()?;
+    let t = txn.open_multimap_table(SYMBOL_BY_NAME)?;
+    let mut ids = BTreeSet::new();
+    for row in t.get(key)? {
+        ids.insert(row?.value().to_string());
+    }
+    Ok(ids)
+}
+
+fn collect_symbol_ids_for_name_prefix<D: ReadableDatabase>(
+    db: &D,
+    prefix: &str,
+    limit: usize,
+) -> Result<BTreeSet<String>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(BTreeSet::new());
+    }
+    let txn = db.begin_read()?;
+    let t = txn.open_multimap_table(SYMBOL_BY_NAME)?;
+    let end = prefix_end(prefix);
+    let mut ids = BTreeSet::new();
+    for entry in t.range(prefix..end.as_str())? {
+        let (key, mut values) = entry?;
+        if !key.value().starts_with(prefix) {
+            continue;
+        }
+        while let Some(value) = values.next() {
+            ids.insert(value?.value().to_string());
+            if ids.len() >= limit {
+                return Ok(ids);
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn collect_symbol_ids_for_component<D: ReadableDatabase>(
+    db: &D,
+    component: &str,
+    limit: usize,
+) -> Result<BTreeSet<String>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(BTreeSet::new());
+    }
+    let txn = db.begin_read()?;
+    let t = txn.open_multimap_table(SYMBOL_BY_COMPONENT)?;
+    let mut ids = BTreeSet::new();
+    for row in t.get(component)? {
+        ids.insert(row?.value().to_string());
+        if ids.len() >= limit {
+            break;
+        }
+    }
+    Ok(ids)
+}
+
+fn symbols_matching_from<D: ReadableDatabase>(
+    db: &D,
+    query: &str,
+    options: SymbolMatchOptions,
+) -> Result<Vec<SymbolCandidate>, GraphStoreError> {
+    let normalized = symbol_index_key(query.trim());
+    if normalized.is_empty() || options.limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut candidates = BTreeMap::new();
+    let txn = db.begin_read()?;
+
+    add_symbol_candidates_for_ids(
+        &txn,
+        collect_symbol_ids_for_exact_name(db, &normalized)?,
+        &mut candidates,
+        SymbolMatchSignals {
+            exact: true,
+            ..SymbolMatchSignals::default()
+        },
+        &options,
+    )?;
+    add_symbol_candidates_for_ids(
+        &txn,
+        collect_symbol_ids_for_name_prefix(db, &normalized, options.limit.saturating_mul(2))?,
+        &mut candidates,
+        SymbolMatchSignals {
+            prefix: true,
+            ..SymbolMatchSignals::default()
+        },
+        &options,
+    )?;
+    add_symbol_candidates_for_ids(
+        &txn,
+        collect_symbol_ids_for_component(db, &normalized, options.limit.saturating_mul(2))?,
+        &mut candidates,
+        SymbolMatchSignals {
+            component: true,
+            ..SymbolMatchSignals::default()
+        },
+        &options,
+    )?;
+
+    let path_ids = ids_under_path_limited_from(
+        db,
+        NODES_BY_PATH,
+        query.trim(),
+        options.limit.saturating_mul(3),
+    )?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    add_symbol_candidates_for_ids(
+        &txn,
+        path_ids,
+        &mut candidates,
+        SymbolMatchSignals {
+            path: true,
+            ..SymbolMatchSignals::default()
+        },
+        &options,
+    )?;
+
+    for area in list_areas_from(db, None)? {
+        let area_name = symbol_index_key(&area.name);
+        let area_path = symbol_index_key(&area.path_prefix);
+        if area_name == normalized
+            || area_name.starts_with(&normalized)
+            || area_path == normalized
+            || area_path.starts_with(&normalized)
+            || area.id.eq_ignore_ascii_case(query.trim())
+        {
+            let area_ids = ids_under_path_limited_from(
+                db,
+                NODES_BY_PATH,
+                &area.path_prefix,
+                options.limit.saturating_mul(3),
+            )?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+            add_symbol_candidates_for_ids(
+                &txn,
+                area_ids,
+                &mut candidates,
+                SymbolMatchSignals {
+                    area: true,
+                    ..SymbolMatchSignals::default()
+                },
+                &options,
+            )?;
+        }
+    }
+
+    let mut out = candidates.into_values().collect::<Vec<_>>();
+    out.sort_by(|left, right| {
+        right
+            .signals
+            .score()
+            .cmp(&left.signals.score())
+            .then_with(|| right.signals.exact.cmp(&left.signals.exact))
+            .then_with(|| right.signals.prefix.cmp(&left.signals.prefix))
+            .then_with(|| left.symbol.path.cmp(&right.symbol.path))
+            .then_with(|| left.symbol.line.cmp(&right.symbol.line))
+            .then_with(|| left.symbol.name.cmp(&right.symbol.name))
+            .then_with(|| left.symbol.id.cmp(&right.symbol.id))
+    });
+    out.truncate(options.limit);
+    Ok(out)
+}
+
+fn merge_task_anchor_candidate(
+    candidates: &mut BTreeMap<String, TaskAnchorCandidate>,
+    node: NodeDisplay,
+    token: &str,
+    signals: SymbolMatchSignals,
+) {
+    candidates
+        .entry(node.id.clone())
+        .and_modify(|existing| {
+            existing.signals.merge(signals);
+            if !existing.matched_tokens.iter().any(|value| value == token) {
+                existing.matched_tokens.push(token.to_string());
+                existing.matched_tokens.sort();
+            }
+        })
+        .or_insert_with(|| TaskAnchorCandidate {
+            node,
+            signals,
+            matched_tokens: vec![token.to_string()],
+        });
+}
+
+fn task_anchor_candidates_from<D: ReadableDatabase, S: AsRef<str>>(
+    db: &D,
+    task_tokens: &[S],
+    limit: usize,
+) -> Result<Vec<TaskAnchorCandidate>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut candidates = BTreeMap::new();
+    for token in task_tokens {
+        let token = token.as_ref().trim();
+        if token.len() < 2 {
+            continue;
+        }
+        for symbol in symbols_matching_from(
+            db,
+            token,
+            SymbolMatchOptions {
+                limit,
+                ..SymbolMatchOptions::default()
+            },
+        )? {
+            let node = NodeDisplay {
+                id: symbol.symbol.id.clone(),
+                kind: symbol.symbol.kind,
+                display: format!("{}::{}", symbol.symbol.path, symbol.symbol.name),
+                name: symbol.symbol.name,
+                path: Some(symbol.symbol.path),
+                language: Some(symbol.symbol.language),
+                area_id: symbol.symbol.area_id,
+            };
+            merge_task_anchor_candidate(&mut candidates, node, token, symbol.signals);
+        }
+
+        let path_ids = ids_under_path_limited_from(db, NODES_BY_PATH, token, limit)?;
+        let txn = db.begin_read()?;
+        for id in path_ids {
+            let Some(node) = display_from_id_in_txn(&txn, &id)? else {
+                continue;
+            };
+            merge_task_anchor_candidate(
+                &mut candidates,
+                node,
+                token,
+                SymbolMatchSignals {
+                    path: true,
+                    ..SymbolMatchSignals::default()
+                },
+            );
+        }
+
+        for area in list_areas_from(db, None)? {
+            if area.name.eq_ignore_ascii_case(token)
+                || area.path_prefix.eq_ignore_ascii_case(token)
+                || area.path_prefix.starts_with(token)
+            {
+                merge_task_anchor_candidate(
+                    &mut candidates,
+                    NodeDisplay {
+                        id: area.id.clone(),
+                        kind: StoredNodeKind::Area,
+                        display: area.path_prefix.clone(),
+                        name: area.name.clone(),
+                        path: Some(area.path_prefix.clone()),
+                        language: None,
+                        area_id: Some(area.id),
+                    },
+                    token,
+                    SymbolMatchSignals {
+                        area: true,
+                        ..SymbolMatchSignals::default()
+                    },
+                );
+            }
+        }
+    }
+
+    let mut out = candidates.into_values().collect::<Vec<_>>();
+    out.sort_by(|left, right| {
+        right
+            .matched_tokens
+            .len()
+            .cmp(&left.matched_tokens.len())
+            .then_with(|| right.signals.score().cmp(&left.signals.score()))
+            .then_with(|| left.node.display.cmp(&right.node.display))
+            .then_with(|| left.node.id.cmp(&right.node.id))
+    });
+    out.truncate(limit);
+    Ok(out)
+}
+
+fn usage_boundary_candidates_from<D: ReadableDatabase>(
+    db: &D,
+    scope: &str,
+    symbol_kind: Option<StoredNodeKind>,
+    limit: usize,
+) -> Result<Vec<UsageBoundaryCandidate>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let ids = ids_under_path_limited_from(db, NODES_BY_PATH, scope, limit.saturating_mul(4))?;
+    let txn = db.begin_read()?;
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for id in ids {
+        let Some(node) = get_node_in_txn(&txn, &id)? else {
+            continue;
+        };
+        let kind = node.kind();
+        let include = match symbol_kind {
+            Some(expected) => kind == expected,
+            None => matches!(
+                kind,
+                StoredNodeKind::Function | StoredNodeKind::Class | StoredNodeKind::File
+            ),
+        };
+        if !include {
+            continue;
+        }
+        let symbol = symbol_lookup_from_node(node.clone());
+        let display = node_display_from_node(node);
+        if seen.insert(display.id.clone()) {
+            out.push(UsageBoundaryCandidate {
+                node: display,
+                symbol,
+            });
+        }
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out.sort_by(|left, right| {
+        left.node
+            .path
+            .cmp(&right.node.path)
+            .then_with(|| left.node.kind.cmp(&right.node.kind))
+            .then_with(|| left.node.display.cmp(&right.node.display))
+            .then_with(|| left.node.id.cmp(&right.node.id))
+    });
+    Ok(out)
+}
+
 fn prefix_end(prefix: &str) -> String {
     format!("{prefix}\u{10ffff}")
 }
@@ -1001,6 +1673,18 @@ fn ids_under_path_from<D: ReadableDatabase>(
     table: MultimapTableDefinition<&str, &str>,
     prefix: &str,
 ) -> Result<Vec<String>, GraphStoreError> {
+    ids_under_path_limited_from(db, table, prefix, usize::MAX)
+}
+
+fn ids_under_path_limited_from<D: ReadableDatabase>(
+    db: &D,
+    table: MultimapTableDefinition<&str, &str>,
+    prefix: &str,
+    limit: usize,
+) -> Result<Vec<String>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let txn = db.begin_read()?;
     let t = txn.open_multimap_table(table)?;
     let end = prefix_end(prefix);
@@ -1012,6 +1696,9 @@ fn ids_under_path_from<D: ReadableDatabase>(
         }
         while let Some(value) = values.next() {
             ids.insert(value?.value().to_string());
+            if ids.len() >= limit {
+                return Ok(ids.into_iter().collect());
+            }
         }
     }
     Ok(ids.into_iter().collect())
@@ -1108,6 +1795,248 @@ fn neighbors_from<D: ReadableDatabase>(
             .then_with(|| left.source.cmp(&right.source))
     });
     Ok(rows)
+}
+
+fn edge_kind_label(kind: &EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::Contains => "contains",
+        EdgeKind::BelongsTo => "belongs_to",
+        EdgeKind::Defines => "defines",
+        EdgeKind::Imports => "imports",
+        EdgeKind::Calls => "calls",
+        EdgeKind::References => "references",
+        EdgeKind::Documents => "documents",
+        EdgeKind::Configures => "configures",
+        EdgeKind::EntrypointFor => "entrypoint_for",
+    }
+}
+
+fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection, Vec<EdgeKind>)> {
+    match relation {
+        GraphRelation::Children => vec![(
+            NeighborDirection::Outgoing,
+            vec![EdgeKind::Contains, EdgeKind::Defines],
+        )],
+        GraphRelation::Parents => vec![(
+            NeighborDirection::Incoming,
+            vec![EdgeKind::Contains, EdgeKind::Defines, EdgeKind::BelongsTo],
+        )],
+        GraphRelation::Callers => vec![(NeighborDirection::Incoming, vec![EdgeKind::Calls])],
+        GraphRelation::Callees => vec![(NeighborDirection::Outgoing, vec![EdgeKind::Calls])],
+        GraphRelation::Docs => vec![
+            (NeighborDirection::Outgoing, vec![EdgeKind::Documents]),
+            (NeighborDirection::Incoming, vec![EdgeKind::Documents]),
+        ],
+        GraphRelation::Configs => vec![
+            (
+                NeighborDirection::Outgoing,
+                vec![EdgeKind::Configures, EdgeKind::EntrypointFor],
+            ),
+            (
+                NeighborDirection::Incoming,
+                vec![EdgeKind::Configures, EdgeKind::EntrypointFor],
+            ),
+        ],
+        GraphRelation::Imports => vec![(NeighborDirection::Outgoing, vec![EdgeKind::Imports])],
+        GraphRelation::Importers => vec![(NeighborDirection::Incoming, vec![EdgeKind::Imports])],
+        GraphRelation::References => vec![
+            (NeighborDirection::Outgoing, vec![EdgeKind::References]),
+            (NeighborDirection::Incoming, vec![EdgeKind::References]),
+        ],
+    }
+}
+
+fn relation_items_from<D: ReadableDatabase>(
+    db: &D,
+    id: &str,
+    relation: GraphRelation,
+    kind_filter: Option<StoredNodeKind>,
+) -> Result<Vec<RedbRelationItem>, GraphStoreError> {
+    let mut adjacency = Vec::new();
+    for (direction, kinds) in relation_specs(relation) {
+        for kind in kinds {
+            adjacency.extend(neighbors_from(db, id, direction, Some(kind))?);
+        }
+    }
+    let txn = db.begin_read()?;
+    let mut items = Vec::new();
+    for edge in adjacency {
+        let Some(node) = display_from_id_in_txn(&txn, edge.other.as_str())? else {
+            continue;
+        };
+        if let Some(expected) = kind_filter {
+            if node.kind != expected {
+                continue;
+            }
+        }
+        items.push(RedbRelationItem {
+            relation: edge_kind_label(&edge.kind).to_string(),
+            edge_kind: edge.kind,
+            confidence: edge.confidence,
+            source: edge.source.to_string(),
+            node,
+        });
+    }
+    items.sort_by(|left, right| {
+        left.node
+            .display
+            .cmp(&right.node.display)
+            .then_with(|| left.node.kind.cmp(&right.node.kind))
+            .then_with(|| left.node.id.cmp(&right.node.id))
+            .then_with(|| left.edge_kind.cmp(&right.edge_kind))
+    });
+    items.dedup();
+    Ok(items)
+}
+
+fn relation_view_from<D: ReadableDatabase>(
+    db: &D,
+    id: &str,
+    relation: GraphRelation,
+) -> Result<RedbRelationView, GraphStoreError> {
+    Ok(RedbRelationView {
+        target: node_display_from(db, id)?,
+        relation,
+        items: relation_items_from(db, id, relation, None)?,
+    })
+}
+
+fn children_from<D: ReadableDatabase>(
+    db: &D,
+    id: &str,
+    kind_filter: Option<StoredNodeKind>,
+) -> Result<Vec<NodeDisplay>, GraphStoreError> {
+    Ok(
+        relation_items_from(db, id, GraphRelation::Children, kind_filter)?
+            .into_iter()
+            .map(|item| item.node)
+            .collect(),
+    )
+}
+
+fn parents_from<D: ReadableDatabase>(
+    db: &D,
+    id: &str,
+    kind_filter: Option<StoredNodeKind>,
+) -> Result<Vec<NodeDisplay>, GraphStoreError> {
+    Ok(
+        relation_items_from(db, id, GraphRelation::Parents, kind_filter)?
+            .into_iter()
+            .map(|item| item.node)
+            .collect(),
+    )
+}
+
+fn docs_for_from<D: ReadableDatabase>(db: &D, id: &str) -> Result<Vec<DocNode>, GraphStoreError> {
+    let ids = relation_items_from(db, id, GraphRelation::Docs, Some(StoredNodeKind::Doc))?
+        .into_iter()
+        .map(|item| item.node.id)
+        .collect::<Vec<_>>();
+    let txn = db.begin_read()?;
+    let mut docs = Vec::new();
+    for id in ids {
+        if let Some(doc) = read_table_node::<DocNode>(&txn, DOCS, &id)? {
+            docs.push(doc);
+        }
+    }
+    docs.sort();
+    docs.dedup();
+    Ok(docs)
+}
+
+fn configs_for_from<D: ReadableDatabase>(
+    db: &D,
+    id: &str,
+) -> Result<Vec<ConfigNode>, GraphStoreError> {
+    let ids = relation_items_from(db, id, GraphRelation::Configs, Some(StoredNodeKind::Config))?
+        .into_iter()
+        .map(|item| item.node.id)
+        .collect::<Vec<_>>();
+    let txn = db.begin_read()?;
+    let mut configs = Vec::new();
+    for id in ids {
+        if let Some(config) = read_table_node::<ConfigNode>(&txn, CONFIGS, &id)? {
+            configs.push(config);
+        }
+    }
+    configs.sort();
+    configs.dedup();
+    Ok(configs)
+}
+
+fn risk_key_candidates(path: &str) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return keys;
+    }
+    keys.insert(trimmed.to_string());
+    keys.insert(format!("{trimmed}/"));
+    let mut current = trimmed;
+    while let Some((parent, _)) = current.rsplit_once('/') {
+        keys.insert(parent.to_string());
+        keys.insert(format!("{parent}/"));
+        current = parent;
+    }
+    keys
+}
+
+fn risk_path_from<D: ReadableDatabase>(
+    db: &D,
+    id_or_path: &str,
+) -> Result<String, GraphStoreError> {
+    let txn = db.begin_read()?;
+    if let Some(node) = get_node_in_txn(&txn, id_or_path)? {
+        return Ok(path_from_node(&node).unwrap_or_else(|| id_or_path.to_string()));
+    }
+    Ok(id_or_path.to_string())
+}
+
+fn risks_for_node_or_path_from<D: ReadableDatabase>(
+    db: &D,
+    id_or_path: &str,
+) -> Result<Vec<RiskFlag>, GraphStoreError> {
+    let path = risk_path_from(db, id_or_path)?;
+    let txn = db.begin_read()?;
+    let t = txn.open_multimap_table(RISK_FLAGS)?;
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for key in risk_key_candidates(&path) {
+        for row in t.get(key.as_str())? {
+            let risk: RiskFlag = bincode::deserialize(row?.value())?;
+            if seen.insert((risk.scope.clone(), risk.reason.clone())) {
+                out.push(risk);
+            }
+        }
+    }
+    let prefix = path.trim_matches('/');
+    if !prefix.is_empty() {
+        let end = prefix_end(prefix);
+        for entry in t.range(prefix..end.as_str())? {
+            let (key, mut values) = entry?;
+            if !key.value().starts_with(prefix) {
+                continue;
+            }
+            while let Some(value) = values.next() {
+                let risk: RiskFlag = bincode::deserialize(value?.value())?;
+                if seen.insert((risk.scope.clone(), risk.reason.clone())) {
+                    out.push(risk);
+                }
+            }
+            if out.len() >= 50 {
+                break;
+            }
+        }
+    }
+    out.sort_by(|left, right| {
+        right
+            .level
+            .cmp(&left.level)
+            .then_with(|| left.scope.cmp(&right.scope))
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+    out.truncate(50);
+    Ok(out)
 }
 
 fn repo_metadata_from<D: ReadableDatabase>(
@@ -1457,6 +2386,68 @@ impl GraphStore {
         get_node_from(&self.db, id)
     }
 
+    /// Read typed nodes by canonical id, preserving input order and omitting
+    /// missing ids.
+    pub fn get_nodes<S: AsRef<str>>(&self, ids: &[S]) -> Result<Vec<StoredNode>, GraphStoreError> {
+        get_nodes_from(&self.db, ids)
+    }
+
+    /// Read a display-ready projection for one typed node.
+    pub fn node_display(&self, id: &str) -> Result<Option<NodeDisplay>, GraphStoreError> {
+        node_display_from(&self.db, id)
+    }
+
+    /// Return the area id associated with a node id or exact file path.
+    pub fn area_for_node(&self, id_or_path: &str) -> Result<Option<String>, GraphStoreError> {
+        area_for_node_from(&self.db, id_or_path)
+    }
+
+    /// Return children via outgoing `contains` / `defines` edges.
+    pub fn children(
+        &self,
+        id: &str,
+        kind: Option<StoredNodeKind>,
+    ) -> Result<Vec<NodeDisplay>, GraphStoreError> {
+        children_from(&self.db, id, kind)
+    }
+
+    /// Return parents via incoming `contains` / `defines` / `belongs_to` edges.
+    pub fn parents(
+        &self,
+        id: &str,
+        kind: Option<StoredNodeKind>,
+    ) -> Result<Vec<NodeDisplay>, GraphStoreError> {
+        parents_from(&self.db, id, kind)
+    }
+
+    /// Return a display-ready relation view for rendered graph flows.
+    pub fn relation_view(
+        &self,
+        id: &str,
+        relation: GraphRelation,
+    ) -> Result<RedbRelationView, GraphStoreError> {
+        relation_view_from(&self.db, id, relation)
+    }
+
+    /// Return docs attached to a node through `documents` edges.
+    pub fn docs_for(&self, id: &str) -> Result<Vec<DocNode>, GraphStoreError> {
+        docs_for_from(&self.db, id)
+    }
+
+    /// Return configs attached to a node through `configures` or
+    /// `entrypoint_for` edges.
+    pub fn configs_for(&self, id: &str) -> Result<Vec<ConfigNode>, GraphStoreError> {
+        configs_for_from(&self.db, id)
+    }
+
+    /// Return risk flags attached to a node id, exact path, or path prefix.
+    pub fn risk_for_node_or_path(
+        &self,
+        id_or_path: &str,
+    ) -> Result<Vec<RiskFlag>, GraphStoreError> {
+        risks_for_node_or_path_from(&self.db, id_or_path)
+    }
+
     /// Find function/class symbols by exact simple name, case-insensitive.
     pub fn find_symbols(
         &self,
@@ -1464,6 +2455,40 @@ impl GraphStore {
         kind: Option<StoredNodeKind>,
     ) -> Result<Vec<SymbolLookup>, GraphStoreError> {
         find_symbols_from(&self.db, name, kind)
+    }
+
+    /// Return bounded function/class symbol candidates for exact, prefix,
+    /// component, path, and area signals.
+    pub fn symbols_matching(&self, query: &str) -> Result<Vec<SymbolCandidate>, GraphStoreError> {
+        symbols_matching_from(&self.db, query, SymbolMatchOptions::default())
+    }
+
+    /// Same as `symbols_matching`, with caller-provided bounds and filters.
+    pub fn symbols_matching_with(
+        &self,
+        query: &str,
+        options: SymbolMatchOptions,
+    ) -> Result<Vec<SymbolCandidate>, GraphStoreError> {
+        symbols_matching_from(&self.db, query, options)
+    }
+
+    /// Return bounded typed anchor candidates for tokenized task text.
+    pub fn task_anchor_candidates<S: AsRef<str>>(
+        &self,
+        task_tokens: &[S],
+        limit: usize,
+    ) -> Result<Vec<TaskAnchorCandidate>, GraphStoreError> {
+        task_anchor_candidates_from(&self.db, task_tokens, limit)
+    }
+
+    /// Return bounded symbol/path seeds for usage-boundary flows.
+    pub fn usage_boundary_candidates(
+        &self,
+        scope: &str,
+        symbol_kind: Option<StoredNodeKind>,
+        limit: usize,
+    ) -> Result<Vec<UsageBoundaryCandidate>, GraphStoreError> {
+        usage_boundary_candidates_from(&self.db, scope, symbol_kind, limit)
     }
 
     /// Return all typed nodes whose indexed path starts with `prefix`.
@@ -1539,6 +2564,68 @@ impl ReadOnlyGraphStore {
         get_node_from(&self.db, id)
     }
 
+    /// Read typed nodes by canonical id, preserving input order and omitting
+    /// missing ids.
+    pub fn get_nodes<S: AsRef<str>>(&self, ids: &[S]) -> Result<Vec<StoredNode>, GraphStoreError> {
+        get_nodes_from(&self.db, ids)
+    }
+
+    /// Read a display-ready projection for one typed node.
+    pub fn node_display(&self, id: &str) -> Result<Option<NodeDisplay>, GraphStoreError> {
+        node_display_from(&self.db, id)
+    }
+
+    /// Return the area id associated with a node id or exact file path.
+    pub fn area_for_node(&self, id_or_path: &str) -> Result<Option<String>, GraphStoreError> {
+        area_for_node_from(&self.db, id_or_path)
+    }
+
+    /// Return children via outgoing `contains` / `defines` edges.
+    pub fn children(
+        &self,
+        id: &str,
+        kind: Option<StoredNodeKind>,
+    ) -> Result<Vec<NodeDisplay>, GraphStoreError> {
+        children_from(&self.db, id, kind)
+    }
+
+    /// Return parents via incoming `contains` / `defines` / `belongs_to` edges.
+    pub fn parents(
+        &self,
+        id: &str,
+        kind: Option<StoredNodeKind>,
+    ) -> Result<Vec<NodeDisplay>, GraphStoreError> {
+        parents_from(&self.db, id, kind)
+    }
+
+    /// Return a display-ready relation view for rendered graph flows.
+    pub fn relation_view(
+        &self,
+        id: &str,
+        relation: GraphRelation,
+    ) -> Result<RedbRelationView, GraphStoreError> {
+        relation_view_from(&self.db, id, relation)
+    }
+
+    /// Return docs attached to a node through `documents` edges.
+    pub fn docs_for(&self, id: &str) -> Result<Vec<DocNode>, GraphStoreError> {
+        docs_for_from(&self.db, id)
+    }
+
+    /// Return configs attached to a node through `configures` or
+    /// `entrypoint_for` edges.
+    pub fn configs_for(&self, id: &str) -> Result<Vec<ConfigNode>, GraphStoreError> {
+        configs_for_from(&self.db, id)
+    }
+
+    /// Return risk flags attached to a node id, exact path, or path prefix.
+    pub fn risk_for_node_or_path(
+        &self,
+        id_or_path: &str,
+    ) -> Result<Vec<RiskFlag>, GraphStoreError> {
+        risks_for_node_or_path_from(&self.db, id_or_path)
+    }
+
     /// Find function/class symbols by exact simple name, case-insensitive.
     pub fn find_symbols(
         &self,
@@ -1546,6 +2633,40 @@ impl ReadOnlyGraphStore {
         kind: Option<StoredNodeKind>,
     ) -> Result<Vec<SymbolLookup>, GraphStoreError> {
         find_symbols_from(&self.db, name, kind)
+    }
+
+    /// Return bounded function/class symbol candidates for exact, prefix,
+    /// component, path, and area signals.
+    pub fn symbols_matching(&self, query: &str) -> Result<Vec<SymbolCandidate>, GraphStoreError> {
+        symbols_matching_from(&self.db, query, SymbolMatchOptions::default())
+    }
+
+    /// Same as `symbols_matching`, with caller-provided bounds and filters.
+    pub fn symbols_matching_with(
+        &self,
+        query: &str,
+        options: SymbolMatchOptions,
+    ) -> Result<Vec<SymbolCandidate>, GraphStoreError> {
+        symbols_matching_from(&self.db, query, options)
+    }
+
+    /// Return bounded typed anchor candidates for tokenized task text.
+    pub fn task_anchor_candidates<S: AsRef<str>>(
+        &self,
+        task_tokens: &[S],
+        limit: usize,
+    ) -> Result<Vec<TaskAnchorCandidate>, GraphStoreError> {
+        task_anchor_candidates_from(&self.db, task_tokens, limit)
+    }
+
+    /// Return bounded symbol/path seeds for usage-boundary flows.
+    pub fn usage_boundary_candidates(
+        &self,
+        scope: &str,
+        symbol_kind: Option<StoredNodeKind>,
+        limit: usize,
+    ) -> Result<Vec<UsageBoundaryCandidate>, GraphStoreError> {
+        usage_boundary_candidates_from(&self.db, scope, symbol_kind, limit)
     }
 
     /// Return all typed nodes whose indexed path starts with `prefix`.
@@ -1725,6 +2846,23 @@ impl<'db> IndexSession<'db> {
         Ok(())
     }
 
+    /// Append `node_id` under a lowercased symbol component in
+    /// SYMBOL_BY_COMPONENT. No counter increment — folded into a parent symbol
+    /// insert.
+    pub fn add_symbol_component_index(
+        &mut self,
+        component_lower: &str,
+        node_id: &str,
+    ) -> Result<(), GraphStoreError> {
+        let txn = self
+            .txn
+            .as_ref()
+            .expect("IndexSession invariant: txn present");
+        let mut t = txn.open_multimap_table(SYMBOL_BY_COMPONENT)?;
+        t.insert(component_lower, node_id)?;
+        Ok(())
+    }
+
     /// Append a bincoded risk record under `scope` in RISK_FLAGS.
     pub fn add_risk(&mut self, scope: &str, value: &impl Serialize) -> Result<(), GraphStoreError> {
         let bytes = bincode::serialize(value)?;
@@ -1877,6 +3015,7 @@ fn ensure_schema(db: &Database) -> Result<(), GraphStoreError> {
         let _ = txn.open_multimap_table(FUNCTIONS_BY_PATH)?;
         let _ = txn.open_multimap_table(NODES_BY_PATH)?;
         let _ = txn.open_multimap_table(SYMBOL_BY_NAME)?;
+        let _ = txn.open_multimap_table(SYMBOL_BY_COMPONENT)?;
         let _ = txn.open_multimap_table(RISK_FLAGS)?;
     }
     txn.commit()?;
@@ -1924,6 +3063,7 @@ fn verify_schema_read_only(db: &ReadOnlyDatabase) -> Result<(), GraphStoreError>
         let _ = txn.open_multimap_table(FUNCTIONS_BY_PATH)?;
         let _ = txn.open_multimap_table(NODES_BY_PATH)?;
         let _ = txn.open_multimap_table(SYMBOL_BY_NAME)?;
+        let _ = txn.open_multimap_table(SYMBOL_BY_COMPONENT)?;
         let _ = txn.open_multimap_table(RISK_FLAGS)?;
     }
     Ok(())
@@ -2016,6 +3156,8 @@ mod tests {
             .expect("NODES_BY_PATH");
         txn.open_multimap_table(SYMBOL_BY_NAME)
             .expect("SYMBOL_BY_NAME");
+        txn.open_multimap_table(SYMBOL_BY_COMPONENT)
+            .expect("SYMBOL_BY_COMPONENT");
         txn.open_multimap_table(RISK_FLAGS).expect("RISK_FLAGS");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2380,6 +3522,9 @@ mod tests {
         session
             .add_symbol_index("foo", "fn:Repo:src/lib.rs:foo")
             .expect("name");
+        session
+            .add_symbol_component_index("foo", "fn:Repo:src/lib.rs:foo")
+            .expect("component");
         session.commit().expect("commit");
 
         let txn = store.db().begin_read().expect("read");
@@ -2402,6 +3547,16 @@ mod tests {
             .map(|r| r.expect("row").value().to_string())
             .collect();
         assert_eq!(name_hits, vec!["fn:Repo:src/lib.rs:foo"]);
+
+        let by_component = txn
+            .open_multimap_table(SYMBOL_BY_COMPONENT)
+            .expect("SYMBOL_BY_COMPONENT");
+        let component_hits: Vec<String> = by_component
+            .get("foo")
+            .expect("get")
+            .map(|r| r.expect("row").value().to_string())
+            .collect();
+        assert_eq!(component_hits, vec!["fn:Repo:src/lib.rs:foo"]);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2594,6 +3749,14 @@ mod tests {
             collect_str_multimap(store.db(), SYMBOL_BY_NAME, "loadtoken"),
             vec![id]
         );
+        assert_eq!(
+            collect_str_multimap(store.db(), SYMBOL_BY_COMPONENT, "load"),
+            vec![function.id.to_string()]
+        );
+        assert_eq!(
+            collect_str_multimap(store.db(), SYMBOL_BY_COMPONENT, "token"),
+            vec![function.id.to_string()]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2619,6 +3782,14 @@ mod tests {
         assert_eq!(
             collect_str_multimap(store.db(), SYMBOL_BY_NAME, "tokenloader"),
             vec![id]
+        );
+        assert_eq!(
+            collect_str_multimap(store.db(), SYMBOL_BY_COMPONENT, "token"),
+            vec![class.id.to_string()]
+        );
+        assert_eq!(
+            collect_str_multimap(store.db(), SYMBOL_BY_COMPONENT, "loader"),
+            vec![class.id.to_string()]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2995,6 +4166,17 @@ mod tests {
             &mut session,
             &Edge::new(
                 function.id.as_str(),
+                &doc.id,
+                EdgeKind::Documents,
+                900,
+                "docs",
+            ),
+        )
+        .expect("function documents doc");
+        insert_edge(
+            &mut session,
+            &Edge::new(
+                function.id.as_str(),
                 &config.id,
                 EdgeKind::Configures,
                 900,
@@ -3024,6 +4206,11 @@ mod tests {
             ),
         )
         .expect("entrypoint");
+        insert_risk(
+            &mut session,
+            &RiskFlag::new("src/", RiskArea::SharedCore, RiskLevel::Medium, "core path"),
+        )
+        .expect("risk");
         session.commit().expect("commit");
 
         store
@@ -3095,6 +4282,40 @@ mod tests {
     }
 
     #[test]
+    fn read_api_batch_display_and_area_projection() {
+        let fixture = read_api_fixture(function_name!());
+        let readonly = fixture.read_only();
+        let ids = vec![
+            fixture.repository.id.as_str(),
+            "missing:Repo:x",
+            fixture.function.id.as_str(),
+        ];
+
+        let nodes = readonly.get_nodes(&ids).expect("batch get");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].id(), fixture.repository.id);
+        assert_eq!(nodes[1].id(), fixture.function.id.as_str());
+
+        let display = readonly
+            .node_display(fixture.function.id.as_str())
+            .expect("display")
+            .expect("function display");
+        assert_eq!(display.kind, StoredNodeKind::Function);
+        assert_eq!(display.display, "src/lib.rs::LoadToken");
+        assert_eq!(display.area_id.as_deref(), Some("area:Repo:src"));
+        assert_eq!(
+            readonly
+                .area_for_node(fixture.function.id.as_str())
+                .expect("area"),
+            Some("area:Repo:src".to_string())
+        );
+        assert_eq!(
+            readonly.area_for_node("src/lib.rs").expect("path area"),
+            Some("area:Repo:src".to_string())
+        );
+    }
+
+    #[test]
     fn read_api_find_symbols_is_case_insensitive_and_kind_filterable() {
         let fixture = read_api_fixture(function_name!());
         let readonly = fixture.read_only();
@@ -3113,6 +4334,50 @@ mod tests {
             .find_symbols("missing_call", Some(StoredNodeKind::Unresolved))
             .expect("unresolved filter")
             .is_empty());
+    }
+
+    #[test]
+    fn read_api_symbols_matching_returns_bounded_signal_candidates() {
+        let fixture = read_api_fixture(function_name!());
+        let readonly = fixture.read_only();
+
+        let exact = readonly.symbols_matching("LoadToken").expect("exact");
+        let function_exact = exact
+            .iter()
+            .find(|candidate| candidate.symbol.id == fixture.function.id.to_string())
+            .expect("function exact candidate");
+        assert!(function_exact.signals.exact);
+
+        let prefix = readonly.symbols_matching("Load").expect("prefix");
+        assert!(prefix.iter().any(|candidate| {
+            candidate.symbol.id == fixture.function.id.to_string() && candidate.signals.prefix
+        }));
+
+        let component = readonly.symbols_matching("token").expect("component");
+        assert!(component.iter().any(|candidate| {
+            candidate.symbol.id == fixture.function.id.to_string() && candidate.signals.component
+        }));
+        assert!(component.iter().any(|candidate| {
+            candidate.symbol.id == fixture.class.id.to_string() && candidate.signals.component
+        }));
+
+        let path = readonly
+            .symbols_matching_with(
+                "src/",
+                SymbolMatchOptions {
+                    limit: 10,
+                    ..SymbolMatchOptions::default()
+                },
+            )
+            .expect("path");
+        assert!(path.iter().any(|candidate| {
+            candidate.symbol.id == fixture.function.id.to_string() && candidate.signals.path
+        }));
+
+        let area = readonly.symbols_matching("src").expect("area");
+        assert!(area.iter().any(|candidate| {
+            candidate.symbol.id == fixture.function.id.to_string() && candidate.signals.area
+        }));
     }
 
     #[test]
@@ -3209,6 +4474,78 @@ mod tests {
             )
             .expect("wrong kind")
             .is_empty());
+    }
+
+    #[test]
+    fn read_api_relation_docs_configs_and_risks() {
+        let fixture = read_api_fixture(function_name!());
+        let readonly = fixture.read_only();
+
+        let children = readonly
+            .children(&fixture.file.id, Some(StoredNodeKind::Function))
+            .expect("children");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].id, fixture.function.id.to_string());
+
+        let parents = readonly
+            .parents(fixture.function.id.as_str(), Some(StoredNodeKind::File))
+            .expect("parents");
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].id, fixture.file.id);
+
+        let config_view = readonly
+            .relation_view(fixture.function.id.as_str(), GraphRelation::Configs)
+            .expect("config relation");
+        assert_eq!(
+            config_view.target.as_ref().map(|node| node.id.as_str()),
+            Some(fixture.function.id.as_str())
+        );
+        assert_eq!(config_view.items.len(), 1);
+        assert_eq!(config_view.items[0].node.id, fixture.config.id);
+
+        let docs = readonly
+            .docs_for(fixture.function.id.as_str())
+            .expect("docs");
+        assert_eq!(docs, vec![fixture.doc.clone()]);
+        let configs = readonly
+            .configs_for(fixture.function.id.as_str())
+            .expect("configs");
+        assert_eq!(configs, vec![fixture.config.clone()]);
+
+        let risks = readonly
+            .risk_for_node_or_path(fixture.function.id.as_str())
+            .expect("risks");
+        assert_eq!(risks.len(), 1);
+        assert_eq!(risks[0].scope, "src/");
+    }
+
+    #[test]
+    fn read_api_task_anchor_and_usage_boundary_candidates_are_bounded() {
+        let fixture = read_api_fixture(function_name!());
+        let readonly = fixture.read_only();
+
+        let anchors = readonly
+            .task_anchor_candidates(&["token", "src"], 5)
+            .expect("anchors");
+        let function_anchor = anchors
+            .iter()
+            .find(|candidate| candidate.node.id == fixture.function.id.to_string())
+            .expect("function anchor");
+        assert!(function_anchor
+            .matched_tokens
+            .contains(&"token".to_string()));
+        assert!(function_anchor.matched_tokens.contains(&"src".to_string()));
+        assert!(anchors.len() <= 5);
+
+        let usage = readonly
+            .usage_boundary_candidates("src/", Some(StoredNodeKind::Function), 5)
+            .expect("usage");
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].node.id, fixture.function.id.to_string());
+        assert_eq!(
+            usage[0].symbol.as_ref().map(|symbol| symbol.name.as_str()),
+            Some("LoadToken")
+        );
     }
 
     #[test]
