@@ -283,7 +283,7 @@ fn symbol_candidate_reason(candidate: &SymbolCandidate) -> String {
 /// - Area name: AREA_PER_TOKEN per distinct token matched on area.
 /// - Basename exact: BASENAME_EXACT_BONUS when any token equals the
 ///   filename without extension.
-fn score_symbol(
+pub(crate) fn score_symbol(
     name: &str,
     file_path: &str,
     area_name: Option<&str>,

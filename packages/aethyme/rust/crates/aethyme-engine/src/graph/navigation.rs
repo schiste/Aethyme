@@ -1,15 +1,18 @@
 use crate::context_pack::{Anchor, AnchorKind};
-use crate::graph::anchors::resolve_anchors;
+use crate::graph::anchors::{resolve_anchors, resolve_anchors_redb};
 use crate::graph::guidance::{build_in_scope, build_out_of_scope, navigation_order};
 use crate::graph::overview::build_repo_overview;
 use crate::graph::signals::{evaluate_graph_signals, GraphSignals};
 use crate::map::RepositoryMap;
+use crate::model::area::AreaNode;
 use crate::model::edge::EdgeKind;
-use crate::model::risk::RiskFlag;
+use crate::model::file::FileRole;
+use crate::model::risk::{RiskFlag, RiskLevel};
+use crate::model::scope::{ScopeBoundary, ScopeItem, ScopeKind};
 use crate::model::task::TaskInput;
 use crate::store::redb::graph_store::{
     GraphRelation as RedbGraphRelation, GraphStoreError, NeighborDirection, NodeDisplay,
-    ReadOnlyGraphStore, RedbRelationItem, StoredNode, StoredNodeKind,
+    OverviewV2Limits, ReadOnlyGraphStore, RedbRelationItem, StoredNode, StoredNodeKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +228,17 @@ pub fn task_anchors_view(map: &RepositoryMap, task: &TaskInput) -> TaskAnchorsVi
     }
 }
 
+pub fn task_anchors_view_redb(
+    store: &ReadOnlyGraphStore,
+    task: &TaskInput,
+) -> Result<TaskAnchorsView, GraphStoreError> {
+    let anchors = resolve_anchors_redb(store, task, 5)?;
+    Ok(TaskAnchorsView {
+        task: task.raw.clone(),
+        anchors,
+    })
+}
+
 pub fn task_scope_view(map: &RepositoryMap, task: &TaskInput) -> TaskScopeView {
     let anchors = resolve_anchors(map, task, 5);
     // Memoized on RepositoryMap — first read computes, subsequent reads
@@ -265,6 +279,39 @@ pub fn task_scope_view(map: &RepositoryMap, task: &TaskInput) -> TaskScopeView {
     }
 }
 
+pub fn task_scope_view_redb(
+    store: &ReadOnlyGraphStore,
+    task: &TaskInput,
+) -> Result<TaskScopeView, GraphStoreError> {
+    let anchors = resolve_anchors_redb(store, task, 5)?;
+    let max_files = if task.kind.is_change_task() { 6 } else { 8 };
+    let mut in_scope = build_in_scope_redb(store, &anchors, max_files)?;
+    let out_of_scope = build_out_of_scope_redb(store, &anchors, &task.kind)?;
+    let risks = risks_for_redb_anchors(store, &anchors)?;
+    if task.kind.is_change_task() {
+        extend_change_scope_redb(store, &anchors, &mut in_scope)?;
+        cap_change_scope(&mut in_scope, max_files);
+    }
+
+    Ok(TaskScopeView {
+        task: task.raw.clone(),
+        navigation_order: task_navigation_order_redb(store, task, &anchors)?,
+        in_scope_files: in_scope.files.into_iter().map(|item| item.value).collect(),
+        in_scope_symbols: in_scope
+            .symbols
+            .into_iter()
+            .map(|item| item.value)
+            .collect(),
+        in_scope_areas: in_scope.areas.into_iter().map(|item| item.value).collect(),
+        out_of_scope: out_of_scope
+            .areas
+            .into_iter()
+            .map(|item| item.value)
+            .collect(),
+        risks,
+    })
+}
+
 pub fn task_next_view(map: &RepositoryMap, task: &TaskInput) -> GraphRelationView {
     let anchors = resolve_anchors(map, task, 5);
     let signals = map.signals();
@@ -291,6 +338,31 @@ pub fn task_next_view(map: &RepositoryMap, task: &TaskInput) -> GraphRelationVie
         relation: "next".to_string(),
         items,
     }
+}
+
+pub fn task_next_view_redb(
+    store: &ReadOnlyGraphStore,
+    task: &TaskInput,
+) -> Result<GraphRelationView, GraphStoreError> {
+    let anchors = resolve_anchors_redb(store, task, 5)?;
+    let items = if task.kind.is_explain_repo() {
+        overview_navigation_items_redb(store)?
+    } else if task.kind.is_change_task() {
+        change_task_next_items_redb(store, &anchors)?
+    } else {
+        let mut items = Vec::new();
+        for item in task_navigation_order_redb(store, task, &anchors)? {
+            if let Some(item) = relation_item_for_task_display_redb(store, &item, "next")? {
+                items.push(item);
+            }
+        }
+        items
+    };
+    Ok(GraphRelationView {
+        target: task.raw.clone(),
+        relation: "next".to_string(),
+        items,
+    })
 }
 
 pub fn task_expand_view(map: &RepositoryMap, target: &str) -> TaskExpandView {
@@ -616,6 +688,68 @@ fn relation_item_for_display(
     relation_item(map, &target_id, relation, 1000)
 }
 
+fn relation_item_for_display_redb(
+    store: &ReadOnlyGraphStore,
+    display: &str,
+    relation: &str,
+) -> Result<Option<GraphRelationItem>, GraphStoreError> {
+    let Some(target_id) = resolved_redb_target_id(store, display)? else {
+        return Ok(None);
+    };
+    let Some(node) = store.node_display(&target_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(GraphRelationItem {
+        id: node.id,
+        kind: redb_kind_label(node.kind).to_string(),
+        display: node.path.unwrap_or(node.display),
+        relation: relation.to_string(),
+        confidence: 1000,
+    }))
+}
+
+fn relation_item_for_task_display_redb(
+    store: &ReadOnlyGraphStore,
+    display: &str,
+    relation: &str,
+) -> Result<Option<GraphRelationItem>, GraphStoreError> {
+    let semantic = store.overview_v2(OverviewV2Limits {
+        area_limit: 0,
+        directory_limit: 0,
+        entrypoint_limit: 0,
+        risk_limit: 0,
+        file_limit: 0,
+        function_limit: 0,
+        class_limit: 0,
+        doc_limit: 500,
+        config_limit: 500,
+        unresolved_limit: 0,
+    })?;
+    if let Some(config) = semantic
+        .configs
+        .into_iter()
+        .find(|config| config.path == display)
+    {
+        return Ok(Some(GraphRelationItem {
+            id: config.id,
+            kind: "config".to_string(),
+            display: config.path,
+            relation: relation.to_string(),
+            confidence: 1000,
+        }));
+    }
+    if let Some(doc) = semantic.docs.into_iter().find(|doc| doc.path == display) {
+        return Ok(Some(GraphRelationItem {
+            id: doc.id,
+            kind: "doc".to_string(),
+            display: doc.path,
+            relation: relation.to_string(),
+            confidence: 1000,
+        }));
+    }
+    relation_item_for_display_redb(store, display, relation)
+}
+
 fn relation_strings(view: GraphRelationView) -> Vec<String> {
     view.items.into_iter().map(|item| item.display).collect()
 }
@@ -631,6 +765,286 @@ fn task_navigation_order(map: &RepositoryMap, task: &TaskInput, anchors: &[Ancho
     } else {
         navigation_order(anchors)
     }
+}
+
+fn task_navigation_order_redb(
+    store: &ReadOnlyGraphStore,
+    task: &TaskInput,
+    anchors: &[Anchor],
+) -> Result<Vec<String>, GraphStoreError> {
+    if task.kind.is_change_task() {
+        change_task_order_redb(store, anchors)
+    } else {
+        Ok(navigation_order(anchors))
+    }
+}
+
+fn build_in_scope_redb(
+    store: &ReadOnlyGraphStore,
+    anchors: &[Anchor],
+    max_files: usize,
+) -> Result<ScopeBoundary, GraphStoreError> {
+    let mut boundary = ScopeBoundary::default();
+    let mut files = Vec::new();
+    let primary_areas = primary_area_names_redb(store, anchors)?;
+    let primary_area_set = primary_areas
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for anchor in anchors {
+        match anchor.kind {
+            AnchorKind::File | AnchorKind::Symbol => {
+                let file = match anchor.file.clone() {
+                    Some(file) => Some(file),
+                    None => file_for_redb_symbol(store, &anchor.id)?,
+                };
+                if let Some(file) = file {
+                    if !primary_area_set.is_empty()
+                        && !file_in_primary_areas_redb(store, &file, &primary_area_set)?
+                    {
+                        continue;
+                    }
+                    if !files.iter().any(|f| f == &file) {
+                        files.push(file);
+                    }
+                }
+            }
+            AnchorKind::Folder => {
+                let area_name =
+                    redb_area_display_name(store, &anchor.id)?.unwrap_or_else(|| anchor.id.clone());
+                push_unique_scope_area(&mut boundary, area_name, "primary top-level area");
+            }
+        }
+    }
+
+    for area in &primary_areas {
+        push_unique_scope_area(&mut boundary, area.clone(), "primary top-level area");
+    }
+
+    for file in files.into_iter().take(max_files) {
+        boundary.files.push(ScopeItem::new(
+            file.clone(),
+            ScopeKind::File,
+            "anchor-adjacent file",
+        ));
+        for node in store.nodes_under_path(&file)? {
+            match node {
+                StoredNode::Function(function) => {
+                    let in_primary_area = match function.area_id.as_deref() {
+                        Some(area_id) => redb_area_name_by_id(store, area_id)?
+                            .is_some_and(|area| primary_area_set.contains(&area)),
+                        None => false,
+                    };
+                    if !primary_area_set.is_empty() && !in_primary_area {
+                        continue;
+                    }
+                    if function.file_path.as_str() == file {
+                        boundary.symbols.push(ScopeItem::new(
+                            function.qualified_name.to_string(),
+                            ScopeKind::Symbol,
+                            "function defined in in-scope file",
+                        ));
+                    }
+                }
+                StoredNode::Class(class) => {
+                    let in_primary_area = match class.area_id.as_deref() {
+                        Some(area_id) => redb_area_name_by_id(store, area_id)?
+                            .is_some_and(|area| primary_area_set.contains(&area)),
+                        None => false,
+                    };
+                    if !primary_area_set.is_empty() && !in_primary_area {
+                        continue;
+                    }
+                    if class.file_path.as_str() == file {
+                        boundary.symbols.push(ScopeItem::new(
+                            class.qualified_name.to_string(),
+                            ScopeKind::Symbol,
+                            "class defined in in-scope file",
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    boundary.sort();
+    Ok(boundary)
+}
+
+fn build_out_of_scope_redb(
+    store: &ReadOnlyGraphStore,
+    anchors: &[Anchor],
+    task_kind: &crate::model::task::TaskKind,
+) -> Result<ScopeBoundary, GraphStoreError> {
+    let mut boundary = ScopeBoundary::default();
+    if matches!(task_kind, crate::model::task::TaskKind::ExplainRepo) {
+        return Ok(boundary);
+    }
+
+    let primary_areas = primary_area_names_redb(store, anchors)?;
+    if !primary_areas.is_empty() {
+        for area in store.list_areas(None)? {
+            if !primary_areas.contains(&area.name) {
+                boundary.areas.push(ScopeItem::new(
+                    area.name,
+                    ScopeKind::Area,
+                    "outside the matched primary area",
+                ));
+            }
+        }
+    }
+
+    let anchor_files = anchor_files_redb(store, anchors)?;
+    let overview = store.overview_v2(OverviewV2Limits {
+        risk_limit: 100,
+        ..OverviewV2Limits::default()
+    })?;
+    for risk in overview.risks {
+        if matches!(risk.level, RiskLevel::Low) {
+            continue;
+        }
+        if !anchor_files.iter().any(|file| risk.scope == *file) {
+            boundary.areas.push(ScopeItem::new(
+                risk.scope,
+                ScopeKind::Area,
+                format!("high-risk area: {}", risk.reason),
+            ));
+        }
+    }
+
+    boundary.sort();
+    Ok(boundary)
+}
+
+fn primary_area_names_redb(
+    store: &ReadOnlyGraphStore,
+    anchors: &[Anchor],
+) -> Result<Vec<String>, GraphStoreError> {
+    let folder_areas = anchors
+        .iter()
+        .filter_map(|anchor| match anchor.kind {
+            AnchorKind::Folder => Some(anchor.id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !folder_areas.is_empty() {
+        let mut unique = Vec::new();
+        for area in folder_areas {
+            let name = redb_area_display_name(store, &area)?.unwrap_or(area);
+            if !unique.contains(&name) {
+                unique.push(name);
+            }
+        }
+        return Ok(unique);
+    }
+
+    let mut areas = Vec::new();
+    for anchor in anchors {
+        match anchor.kind {
+            AnchorKind::Folder => {}
+            AnchorKind::File => {
+                let file = anchor.file.as_deref().unwrap_or(&anchor.id);
+                if let Some(area) = file_area_name_redb_nav(store, file)? {
+                    if !areas.contains(&area) {
+                        areas.push(area);
+                    }
+                }
+            }
+            AnchorKind::Symbol => {
+                let file = match anchor.file.clone() {
+                    Some(file) => Some(file),
+                    None => file_for_redb_symbol(store, &anchor.id)?,
+                };
+                if let Some(file) = file {
+                    if let Some(area) = file_area_name_redb_nav(store, &file)? {
+                        if !areas.contains(&area) {
+                            areas.push(area);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(areas)
+}
+
+fn file_in_primary_areas_redb(
+    store: &ReadOnlyGraphStore,
+    file_path: &str,
+    primary_areas: &std::collections::BTreeSet<String>,
+) -> Result<bool, GraphStoreError> {
+    Ok(
+        file_area_name_redb_nav(store, file_path)?
+            .is_some_and(|area| primary_areas.contains(&area)),
+    )
+}
+
+fn redb_area_display_name(
+    store: &ReadOnlyGraphStore,
+    id_or_name: &str,
+) -> Result<Option<String>, GraphStoreError> {
+    for area in store.list_areas(None)? {
+        if area.id == id_or_name || area.name == id_or_name {
+            return Ok(Some(area.name));
+        }
+    }
+    Ok(None)
+}
+
+fn redb_area_name_by_id(
+    store: &ReadOnlyGraphStore,
+    area_id: &str,
+) -> Result<Option<String>, GraphStoreError> {
+    Ok(store.node_display(area_id)?.map(|node| node.name))
+}
+
+fn file_area_name_redb_nav(
+    store: &ReadOnlyGraphStore,
+    file_path: &str,
+) -> Result<Option<String>, GraphStoreError> {
+    let Some(area_id) = store.area_for_node(file_path)? else {
+        return Ok(None);
+    };
+    redb_area_name_by_id(store, &area_id)
+}
+
+fn file_for_redb_symbol(
+    store: &ReadOnlyGraphStore,
+    symbol_id: &str,
+) -> Result<Option<String>, GraphStoreError> {
+    Ok(store.node_display(symbol_id)?.and_then(|node| {
+        if matches!(node.kind, StoredNodeKind::Function | StoredNodeKind::Class) {
+            node.path
+        } else {
+            None
+        }
+    }))
+}
+
+fn push_unique_scope_area(boundary: &mut ScopeBoundary, value: String, reason: &str) {
+    let item = ScopeItem::new(value, ScopeKind::Area, reason);
+    if !boundary.areas.contains(&item) {
+        boundary.areas.push(item);
+    }
+}
+
+fn anchor_files_redb(
+    store: &ReadOnlyGraphStore,
+    anchors: &[Anchor],
+) -> Result<std::collections::BTreeSet<String>, GraphStoreError> {
+    let mut files = std::collections::BTreeSet::new();
+    for anchor in anchors {
+        let file = match anchor.file.clone() {
+            Some(file) => Some(file),
+            None => file_for_redb_symbol(store, &anchor.id)?,
+        };
+        if let Some(file) = file {
+            files.insert(file);
+        }
+    }
+    Ok(files)
 }
 
 fn resolved_target_id(map: &RepositoryMap, target: &str) -> Option<String> {
@@ -707,6 +1121,27 @@ fn risks_for_anchors(map: &RepositoryMap, anchors: &[Anchor]) -> Vec<String> {
         }
     }
     risks
+}
+
+fn risks_for_redb_anchors(
+    store: &ReadOnlyGraphStore,
+    anchors: &[Anchor],
+) -> Result<Vec<String>, GraphStoreError> {
+    let mut risks = Vec::new();
+    for anchor in anchors {
+        if matches!(anchor.kind, AnchorKind::Folder) {
+            continue;
+        }
+        for risk in store.risk_for_node_or_path(&anchor.id)? {
+            let risk = risk_string(&risk);
+            if !risks.contains(&risk) {
+                risks.push(risk);
+            }
+        }
+    }
+    risks.sort();
+    risks.dedup();
+    Ok(risks)
 }
 
 fn risks_for_target(map: &RepositoryMap, target: &str) -> Vec<String> {
@@ -789,6 +1224,539 @@ fn overview_navigation_order(view: &RepoOverviewView) -> Vec<String> {
     order
 }
 
+fn overview_navigation_items_redb(
+    store: &ReadOnlyGraphStore,
+) -> Result<Vec<GraphRelationItem>, GraphStoreError> {
+    let overview = store.overview_v2(OverviewV2Limits {
+        area_limit: 200,
+        directory_limit: 0,
+        entrypoint_limit: 100,
+        risk_limit: 0,
+        file_limit: 2_000,
+        function_limit: 2_000,
+        class_limit: 1_000,
+        doc_limit: 500,
+        config_limit: 500,
+        unresolved_limit: 0,
+    })?;
+
+    let overview_docs = overview
+        .docs
+        .iter()
+        .filter(|doc| matches!(doc.doc_type.as_str(), "readme" | "architecture"))
+        .take(3)
+        .collect::<Vec<_>>();
+
+    let navigation_seed = repo_navigation_seed_redb(&overview);
+    let code_area_limit = 2;
+    let reference_area_limit = 3;
+    let entrypoint_limit = 1;
+    let key_config_limit = 2;
+
+    let mut area_candidates = overview
+        .areas
+        .iter()
+        .filter(|area| !area.inferred && !area.name.starts_with('.'))
+        .map(|area| {
+            let score = area_score_redb(&overview, store, area.id.as_str(), area.name.as_str())?;
+            let profile = area_profile_redb(&overview, store, area.id.as_str())?;
+            Ok((score, profile, area))
+        })
+        .collect::<Result<Vec<_>, GraphStoreError>>()?
+        .into_iter()
+        .filter(|(_, _, area)| {
+            navigation_seed.iter().any(|item| item == &area.name)
+                || overview_docs
+                    .iter()
+                    .any(|doc| doc.path.starts_with(&format!("{}/", area.name)))
+        })
+        .collect::<Vec<_>>();
+    area_candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.code_bearing.cmp(&left.1.code_bearing))
+            .then_with(|| left.2.name.cmp(&right.2.name))
+    });
+
+    let code_areas = select_top_redb_areas(area_candidates.clone(), code_area_limit, true);
+    let reference_areas = select_top_redb_areas(area_candidates, reference_area_limit, false);
+
+    let mut key_configs = overview
+        .configs
+        .iter()
+        .filter(|config| {
+            if code_areas.is_empty() {
+                return config_is_overview_eligible_redb(
+                    config.path.as_str(),
+                    config.config_type.as_str(),
+                );
+            }
+            config_is_overview_eligible_redb(config.path.as_str(), config.config_type.as_str())
+                && config
+                    .area_id
+                    .as_deref()
+                    .map(|area_id| code_areas.iter().any(|area| area_id.ends_with(area)))
+                    .unwrap_or(false)
+        })
+        .map(|config| {
+            let score = config_score_redb(
+                store,
+                config.id.as_str(),
+                config.path.as_str(),
+                config.config_type.as_str(),
+            )?;
+            Ok((score, config.config_type.clone(), config))
+        })
+        .collect::<Result<Vec<_>, GraphStoreError>>()?;
+    key_configs.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.2.path.cmp(&right.2.path))
+    });
+
+    let mut selected_configs = Vec::new();
+    let mut seen_config_families = std::collections::BTreeSet::<String>::new();
+    let mut seen_config_paths = std::collections::BTreeSet::<String>::new();
+    for (_, config_type, config) in key_configs {
+        let family = config_family_key_redb(config_type.as_str(), config.path.as_str());
+        if seen_config_families.contains(&family) || seen_config_paths.contains(&config.path) {
+            continue;
+        }
+        seen_config_families.insert(family);
+        seen_config_paths.insert(config.path.clone());
+        selected_configs.push(config);
+        if selected_configs.len() == key_config_limit {
+            break;
+        }
+    }
+
+    let entrypoints = overview
+        .entrypoint_paths
+        .iter()
+        .filter(|path| is_code_like_path_for_overview(path))
+        .take(entrypoint_limit)
+        .collect::<Vec<_>>();
+
+    let representative_code_files = navigation_seed
+        .iter()
+        .filter(|item| is_code_like_path_for_overview(item))
+        .take(5)
+        .collect::<Vec<_>>();
+    let representative_docs = navigation_seed
+        .iter()
+        .filter(|item| is_doc_like_path_for_overview(item))
+        .take(5)
+        .collect::<Vec<_>>();
+
+    let mut items = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for doc in overview_docs {
+        push_unique_overview_item(&mut items, &mut seen, &doc.id, "doc", &doc.path);
+    }
+    for area_name in code_areas.iter().chain(reference_areas.iter()) {
+        if let Some(area) = overview.areas.iter().find(|area| &area.name == area_name) {
+            push_unique_overview_item(&mut items, &mut seen, &area.id, "area", &area.name);
+        }
+    }
+    for config in selected_configs {
+        push_unique_overview_item(&mut items, &mut seen, &config.id, "config", &config.path);
+    }
+    for path in entrypoints
+        .into_iter()
+        .map(String::as_str)
+        .chain(representative_code_files.into_iter().map(String::as_str))
+        .chain(representative_docs.into_iter().map(String::as_str))
+    {
+        if seen.contains(path) {
+            continue;
+        }
+        if let Some(item) = overview_item_for_path(store, path)? {
+            seen.insert(item.display.clone());
+            items.push(item);
+        }
+    }
+    Ok(items)
+}
+
+fn push_unique_overview_item(
+    items: &mut Vec<GraphRelationItem>,
+    seen: &mut std::collections::BTreeSet<String>,
+    id: &str,
+    kind: &str,
+    display: &str,
+) {
+    if !seen.insert(display.to_string()) {
+        return;
+    }
+    items.push(GraphRelationItem {
+        id: id.to_string(),
+        kind: kind.to_string(),
+        display: display.to_string(),
+        relation: "next".to_string(),
+        confidence: 1000,
+    });
+}
+
+fn overview_item_for_path(
+    store: &ReadOnlyGraphStore,
+    path: &str,
+) -> Result<Option<GraphRelationItem>, GraphStoreError> {
+    for doc in store
+        .overview_v2(OverviewV2Limits {
+            area_limit: 0,
+            directory_limit: 0,
+            entrypoint_limit: 0,
+            risk_limit: 0,
+            file_limit: 0,
+            function_limit: 0,
+            class_limit: 0,
+            doc_limit: 500,
+            config_limit: 0,
+            unresolved_limit: 0,
+        })?
+        .docs
+    {
+        if doc.path == path {
+            return Ok(Some(GraphRelationItem {
+                id: doc.id,
+                kind: "doc".to_string(),
+                display: doc.path,
+                relation: "next".to_string(),
+                confidence: 1000,
+            }));
+        }
+    }
+
+    relation_item_for_display_redb(store, path, "next")
+}
+
+fn repo_navigation_seed_redb(
+    overview: &crate::store::redb::graph_store::OverviewV2,
+) -> Vec<String> {
+    let mut seed = Vec::new();
+    for doc in &overview.docs {
+        if matches!(doc.doc_type.as_str(), "readme" | "architecture") && !seed.contains(&doc.path) {
+            seed.push(doc.path.clone());
+        }
+    }
+    for area in overview.areas.iter().filter(|area| !area.inferred) {
+        if !seed.contains(&area.name) {
+            seed.push(area.name.clone());
+        }
+    }
+    for function in overview
+        .functions
+        .iter()
+        .filter(|function| function.name == "main")
+    {
+        let file_path = function.file_path.to_string();
+        if !seed.contains(&file_path) {
+            seed.push(file_path);
+        }
+    }
+    for config in &overview.configs {
+        if !seed.contains(&config.path) {
+            seed.push(config.path.clone());
+        }
+    }
+    seed
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RedbAreaProfile {
+    code_bearing: bool,
+}
+
+fn area_profile_redb(
+    overview: &crate::store::redb::graph_store::OverviewV2,
+    store: &ReadOnlyGraphStore,
+    area_id: &str,
+) -> Result<RedbAreaProfile, GraphStoreError> {
+    let source_count = overview
+        .files
+        .iter()
+        .filter(|file| file.area_id.as_deref() == Some(area_id))
+        .filter(|file| matches!(file.role, FileRole::Source))
+        .count();
+    let function_count = overview
+        .functions
+        .iter()
+        .filter(|function| function.area_id.as_deref() == Some(area_id))
+        .count();
+    let class_count = overview
+        .classes
+        .iter()
+        .filter(|class| class.area_id.as_deref() == Some(area_id))
+        .count();
+    let mut entrypoint_count = 0;
+    for path in &overview.entrypoint_paths {
+        if store.area_for_node(path)?.as_deref() == Some(area_id) {
+            entrypoint_count += 1;
+        }
+    }
+
+    Ok(RedbAreaProfile {
+        code_bearing: source_count > 0
+            || function_count > 0
+            || class_count > 0
+            || entrypoint_count > 0,
+    })
+}
+
+fn area_score_redb(
+    overview: &crate::store::redb::graph_store::OverviewV2,
+    store: &ReadOnlyGraphStore,
+    area_id: &str,
+    area_name: &str,
+) -> Result<i32, GraphStoreError> {
+    let files = overview
+        .files
+        .iter()
+        .filter(|file| file.area_id.as_deref() == Some(area_id))
+        .collect::<Vec<_>>();
+    let source_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Source))
+        .count() as i32;
+    let config_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Config))
+        .count() as i32;
+    let doc_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Doc))
+        .count() as i32;
+    let asset_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Asset))
+        .count() as i32;
+    let test_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Test))
+        .count() as i32;
+    let unknown_count = files
+        .iter()
+        .filter(|file| {
+            matches!(
+                file.role,
+                FileRole::Unknown | FileRole::Generated | FileRole::Cache | FileRole::Binary
+            )
+        })
+        .count() as i32;
+
+    let function_count = overview
+        .functions
+        .iter()
+        .filter(|function| function.area_id.as_deref() == Some(area_id))
+        .count() as i32;
+    let class_count = overview
+        .classes
+        .iter()
+        .filter(|class| class.area_id.as_deref() == Some(area_id))
+        .count() as i32;
+    let architecture_docs = overview
+        .docs
+        .iter()
+        .filter(|doc| doc.area_id.as_deref() == Some(area_id))
+        .filter(|doc| doc.doc_type == "architecture")
+        .count() as i32;
+    let readme_docs = overview
+        .docs
+        .iter()
+        .filter(|doc| doc.area_id.as_deref() == Some(area_id))
+        .filter(|doc| doc.doc_type == "readme")
+        .count() as i32;
+    let config_score = overview
+        .configs
+        .iter()
+        .filter(|config| config.area_id.as_deref() == Some(area_id))
+        .map(|config| config_weight_redb(config.config_type.as_str()))
+        .sum::<i32>();
+    let mut entrypoint_count = 0;
+    for path in &overview.entrypoint_paths {
+        if store.area_for_node(path)?.as_deref() == Some(area_id) {
+            entrypoint_count += 1;
+        }
+    }
+    let entrypoint_score = entrypoint_count * 16;
+
+    let code_presence_bonus =
+        if source_count > 0 || function_count > 0 || class_count > 0 || config_count > 0 {
+            40
+        } else {
+            0
+        };
+    let doc_score = std::cmp::min(doc_count, 4) * 2 + architecture_docs * 6 + readme_docs * 4;
+    let unknown_penalty = if source_count == 0 && function_count == 0 && class_count == 0 {
+        unknown_count * 2
+    } else {
+        unknown_count
+    };
+    let docs_bonus = overview
+        .docs
+        .iter()
+        .filter(|doc| doc.path.starts_with(&format!("{area_name}/")))
+        .filter(|doc| matches!(doc.doc_type.as_str(), "readme" | "architecture"))
+        .count() as i32
+        * 6;
+
+    Ok(code_presence_bonus
+        + source_count * 10
+        + function_count * 20
+        + class_count * 24
+        + config_score
+        + entrypoint_score
+        + doc_score
+        + asset_count
+        + test_count * 2
+        + docs_bonus
+        - unknown_penalty)
+}
+
+fn select_top_redb_areas(
+    candidates: Vec<(i32, RedbAreaProfile, &AreaNode)>,
+    limit: usize,
+    code_bearing: bool,
+) -> Vec<String> {
+    let matching_count = candidates
+        .iter()
+        .filter(|(_, profile, _)| profile.code_bearing == code_bearing)
+        .count();
+    let prefer_matching = matching_count >= limit;
+
+    let mut selected = Vec::new();
+    if prefer_matching {
+        for (_, profile, area) in &candidates {
+            if profile.code_bearing == code_bearing && !selected.contains(&area.name) {
+                selected.push(area.name.clone());
+                if selected.len() == limit {
+                    return selected;
+                }
+            }
+        }
+    }
+
+    if !code_bearing {
+        return selected;
+    }
+
+    for (_, _, area) in candidates {
+        if !selected.contains(&area.name) {
+            selected.push(area.name.clone());
+            if selected.len() == limit {
+                break;
+            }
+        }
+    }
+    selected
+}
+
+fn config_score_redb(
+    store: &ReadOnlyGraphStore,
+    config_id: &str,
+    config_path: &str,
+    config_type: &str,
+) -> Result<i32, GraphStoreError> {
+    let mut entrypoint_code_targets = 0;
+    let mut entrypoint_area_targets = 0;
+    let mut configures_code_targets = 0;
+    let mut configures_area_targets = 0;
+
+    for relation in store.neighbors(config_id, NeighborDirection::Outgoing, None)? {
+        let target_kind = store
+            .get_node(relation.other.as_str())?
+            .map(|node| node.kind());
+        let target_is_code_artifact = matches!(
+            target_kind,
+            Some(StoredNodeKind::File | StoredNodeKind::Function | StoredNodeKind::Class)
+        );
+        let target_is_area = matches!(target_kind, Some(StoredNodeKind::Area));
+        match relation.kind {
+            EdgeKind::EntrypointFor if target_is_code_artifact => entrypoint_code_targets += 1,
+            EdgeKind::EntrypointFor if target_is_area => entrypoint_area_targets += 1,
+            EdgeKind::Configures if target_is_code_artifact => configures_code_targets += 1,
+            EdgeKind::Configures if target_is_area => configures_area_targets += 1,
+            _ => {}
+        }
+    }
+
+    let relationship_score = entrypoint_code_targets.min(2) * 28
+        + entrypoint_area_targets.min(1) * 6
+        + configures_code_targets.min(3) * 10
+        + configures_area_targets.min(1) * 4;
+    let path_bonus = if config_path.ends_with("Cargo.toml") {
+        18
+    } else if config_path.ends_with("package.json") {
+        14
+    } else if config_path.ends_with("project.godot") {
+        8
+    } else {
+        0
+    };
+
+    Ok(relationship_score + config_weight_redb(config_type) + path_bonus)
+}
+
+fn config_weight_redb(config_type: &str) -> i32 {
+    match config_type {
+        "manifest" => 12,
+        "project" => 10,
+        "runtime" => 8,
+        "toml" => 6,
+        "yaml" => 5,
+        "config" => 4,
+        "json" => 2,
+        _ => 1,
+    }
+}
+
+fn config_family_key_redb(config_type: &str, path: &str) -> String {
+    let basename = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    format!("{config_type}:{basename}")
+}
+
+fn config_is_overview_eligible_redb(path: &str, config_type: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    if lowered.contains("autosave") || lowered.contains("/cache/") || lowered.contains("/tmp/") {
+        return false;
+    }
+
+    match config_type {
+        "manifest" | "project" | "runtime" | "toml" | "yaml" | "config" => true,
+        "json" => {
+            let basename = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
+            basename.contains("config")
+                || basename.contains("settings")
+                || basename.contains("package")
+                || basename.contains("manifest")
+                || basename.contains("project")
+                || basename.contains("schema")
+                || basename.contains("template")
+        }
+        _ => false,
+    }
+}
+
+fn is_code_like_path_for_overview(path: &str) -> bool {
+    path.ends_with(".py")
+        || path.ends_with(".rs")
+        || path.ends_with(".ts")
+        || path.ends_with(".tsx")
+        || path.ends_with(".js")
+        || path.ends_with(".jsx")
+        || path.ends_with(".gd")
+        || path.ends_with(".go")
+}
+
+fn is_doc_like_path_for_overview(path: &str) -> bool {
+    path.ends_with(".md")
+        || path.ends_with(".mdx")
+        || path.contains("documentation/")
+        || path.contains("/docs/")
+}
+
 fn change_task_order(map: &RepositoryMap, anchors: &[Anchor]) -> Vec<String> {
     let mut order = navigation_order(anchors);
     if let Some(primary) = anchors.first() {
@@ -799,6 +1767,24 @@ fn change_task_order(map: &RepositoryMap, anchors: &[Anchor]) -> Vec<String> {
         }
     }
     order
+}
+
+fn change_task_order_redb(
+    store: &ReadOnlyGraphStore,
+    anchors: &[Anchor],
+) -> Result<Vec<String>, GraphStoreError> {
+    let mut order = navigation_order(anchors);
+    if let Some(primary) = anchors.first() {
+        for item in change_neighbor_displays_redb(store, primary)?
+            .into_iter()
+            .take(6)
+        {
+            if !order.contains(&item) {
+                order.push(item);
+            }
+        }
+    }
+    Ok(order)
 }
 
 fn change_task_next_items(map: &RepositoryMap, anchors: &[Anchor]) -> Vec<GraphRelationItem> {
@@ -841,6 +1827,43 @@ fn change_task_next_items(map: &RepositoryMap, anchors: &[Anchor]) -> Vec<GraphR
     items
 }
 
+fn change_task_next_items_redb(
+    store: &ReadOnlyGraphStore,
+    anchors: &[Anchor],
+) -> Result<Vec<GraphRelationItem>, GraphStoreError> {
+    let mut items = Vec::new();
+    for anchor in anchors.iter().take(2) {
+        let display = anchor.file.clone().unwrap_or_else(|| anchor.id.clone());
+        if let Some(item) = relation_item_for_display_redb(store, &display, "next")? {
+            items.push(item);
+        }
+    }
+    if let Some(primary) = anchors.first() {
+        let primary_target = match primary.kind {
+            AnchorKind::Symbol => primary.id.as_str(),
+            _ => primary.file.as_deref().unwrap_or(&primary.id),
+        };
+        for relation in [
+            callers_view_redb(store, primary_target)?,
+            callees_view_redb(store, primary_target)?,
+            docs_view_redb(store, primary_target)?,
+            configs_view_redb(store, primary_target)?,
+        ] {
+            for item in relation.items.into_iter().take(2) {
+                let adjusted_item = if item.kind == "function" {
+                    relation_item_for_display_redb(store, &item.display, "next")?.unwrap_or(item)
+                } else {
+                    item
+                };
+                if !items.iter().any(|existing| existing.id == adjusted_item.id) {
+                    items.push(adjusted_item);
+                }
+            }
+        }
+    }
+    Ok(items)
+}
+
 fn extend_change_scope(
     map: &RepositoryMap,
     anchors: &[Anchor],
@@ -873,6 +1896,44 @@ fn extend_change_scope(
     }
     in_scope.symbols = scoped_change_symbols(map, &in_scope.files);
     in_scope.sort();
+}
+
+fn extend_change_scope_redb(
+    store: &ReadOnlyGraphStore,
+    anchors: &[Anchor],
+    in_scope: &mut ScopeBoundary,
+) -> Result<(), GraphStoreError> {
+    let current_files = in_scope
+        .files
+        .iter()
+        .map(|item| item.value.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut additional = Vec::new();
+    for anchor in anchors.iter().take(2) {
+        for display in change_neighbor_displays_redb(store, anchor)?
+            .into_iter()
+            .take(4)
+        {
+            if display.contains('/')
+                && !display.ends_with(".md")
+                && !display.ends_with(".mdx")
+                && !current_files.contains(&display)
+                && !additional.contains(&display)
+            {
+                additional.push(display);
+            }
+        }
+    }
+    for file in additional.into_iter().take(3) {
+        in_scope.files.push(ScopeItem::new(
+            file,
+            ScopeKind::File,
+            "caller/callee/config neighbor for change task",
+        ));
+    }
+    in_scope.symbols = scoped_change_symbols_redb(store, &in_scope.files)?;
+    in_scope.sort();
+    Ok(())
 }
 
 fn cap_change_scope(in_scope: &mut crate::model::scope::ScopeBoundary, max_files: usize) {
@@ -928,6 +1989,48 @@ fn change_neighbor_displays(map: &RepositoryMap, anchor: &Anchor) -> Vec<String>
     displays
 }
 
+fn change_neighbor_displays_redb(
+    store: &ReadOnlyGraphStore,
+    anchor: &Anchor,
+) -> Result<Vec<String>, GraphStoreError> {
+    let target = match anchor.kind {
+        AnchorKind::Symbol => anchor.id.as_str(),
+        _ => anchor.file.as_deref().unwrap_or(&anchor.id),
+    };
+    let mut displays = Vec::new();
+    for relation in direct_change_relations_redb(store, target)? {
+        for item in relation.items {
+            let display = change_display_for_redb_relation_item(store, item)?;
+            if !displays.contains(&display) {
+                displays.push(display);
+            }
+        }
+    }
+    if anchor.kind == AnchorKind::File {
+        let file = anchor.file.as_deref().unwrap_or(&anchor.id);
+        let file_function_ids = store
+            .functions_under_path(file)?
+            .into_iter()
+            .filter(|function| function.file_path.as_str() == file)
+            .map(|function| function.id.to_string())
+            .collect::<Vec<_>>();
+        for function_id in file_function_ids {
+            for relation in [
+                callers_view_redb(store, &function_id)?,
+                callees_view_redb(store, &function_id)?,
+            ] {
+                for item in relation.items {
+                    let display = change_display_for_redb_relation_item(store, item)?;
+                    if !displays.contains(&display) {
+                        displays.push(display);
+                    }
+                }
+            }
+        }
+    }
+    Ok(displays)
+}
+
 fn direct_change_relations(map: &RepositoryMap, target: &str) -> [GraphRelationView; 4] {
     [
         callers_view(map, target),
@@ -937,6 +2040,18 @@ fn direct_change_relations(map: &RepositoryMap, target: &str) -> [GraphRelationV
     ]
 }
 
+fn direct_change_relations_redb(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+) -> Result<[GraphRelationView; 4], GraphStoreError> {
+    Ok([
+        callers_view_redb(store, target)?,
+        callees_view_redb(store, target)?,
+        docs_view_redb(store, target)?,
+        configs_view_redb(store, target)?,
+    ])
+}
+
 fn change_display_for_relation_item(map: &RepositoryMap, item: GraphRelationItem) -> String {
     if item.kind == "function" {
         if let Some(function) = map.functions.iter().find(|function| function.id == item.id) {
@@ -944,6 +2059,20 @@ fn change_display_for_relation_item(map: &RepositoryMap, item: GraphRelationItem
         }
     }
     item.display
+}
+
+fn change_display_for_redb_relation_item(
+    store: &ReadOnlyGraphStore,
+    item: GraphRelationItem,
+) -> Result<String, GraphStoreError> {
+    if item.kind == "function" {
+        if let Some(node) = store.node_display(&item.id)? {
+            if let Some(path) = node.path {
+                return Ok(path);
+            }
+        }
+    }
+    Ok(item.display)
 }
 
 fn scoped_change_symbols(
@@ -971,6 +2100,37 @@ fn scoped_change_symbols(
         }
     }
     symbols
+}
+
+fn scoped_change_symbols_redb(
+    store: &ReadOnlyGraphStore,
+    files: &[ScopeItem],
+) -> Result<Vec<ScopeItem>, GraphStoreError> {
+    let mut symbols = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for file in files.iter().take(2) {
+        let mut file_symbols = store
+            .nodes_under_path(&file.value)?
+            .into_iter()
+            .filter_map(|node| match node {
+                StoredNode::Function(function) if function.file_path.as_str() == file.value => {
+                    Some(function.qualified_name.to_string())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        file_symbols.sort();
+        for qualified_name in file_symbols.into_iter().take(8) {
+            if seen.insert(qualified_name.clone()) {
+                symbols.push(ScopeItem::new(
+                    qualified_name,
+                    ScopeKind::Symbol,
+                    "symbol defined in in-scope change file",
+                ));
+            }
+        }
+    }
+    Ok(symbols)
 }
 
 fn risk_matches_id(map: &RepositoryMap, scope: &str, target_id: &str) -> bool {

@@ -158,6 +158,10 @@ Supported redb surfaces:
 | `graph-callers` / `graph-callees` | Read-only | Render call relations through redb relation views. They preserve the existing JSON shape and do not build `RepositoryMap`. |
 | `graph-docs` / `graph-configs` | Read-only | Render document/config relations through redb relation views. They preserve the existing JSON shape and do not build `RepositoryMap`. |
 | `graph-expand` | Read-only | Composes the redb-backed node, relation, and risk views into the existing compact expand JSON shape. It preserves the existing bounds and does not build `RepositoryMap`. |
+| `task-anchors` | Read-only | Resolves task anchors from redb overview rows, path indexes, config/doc rows, and bounded symbol candidates. Ranking policy remains in `graph::anchors`; the command preserves the existing JSON shape and does not build `RepositoryMap`. |
+| `task-scope` | Read-only | Builds task scope from redb-backed anchors, path-prefix lookups, symbol rows, area membership, and risk lookup. It preserves the existing JSON shape and does not build `RepositoryMap`. |
+| `task-next` | Read-only | Builds task navigation order from redb-backed anchors, relation views, semantic config/doc path resolution, and bounded overview slices. It preserves the existing JSON shape and does not build `RepositoryMap`. |
+| `task-localize` | Read-only | Composes redb-backed `task-anchors`, `task-scope`, and `task-next` outputs. `--profile` reports redb open / task parse / anchors / scope / next / JSON stages instead of `RepositoryMap` build time. |
 | `deps` | Read-only | Reads outgoing file adjacency from the redb store. |
 | `importers` | Read-only | Reads incoming file adjacency from the redb store. |
 | `callers` | Hybrid grep + graph | Greps for the requested symbol, then uses redb adjacency to expand candidate files. It is not a pure redb symbol-query contract in V1. |
@@ -172,10 +176,11 @@ Current storage coverage and limitations:
 - The `index` writer persists the graph edge set without skipping edges for
   missing unresolved/import endpoint rows. Placeholder endpoints are stored as
   typed unresolved rows before adjacency is written.
-- Higher-level task, context-pack, and `explore` navigation is still served
-  by `RepositoryMap` rebuilt from `.aethyme/graph/` fragments. These
-  surfaces should not be described as redb-backed until they are explicitly
-  moved to `GraphStore::open_read_only`.
+- Task anchors, task scope, task next, and task-localize are served from
+  read-only redb rows. Context-pack assembly, `explore`, activation, and
+  usage-boundary flows still use graph modules that may build
+  `RepositoryMap`; those surfaces should not be described as redb-backed
+  until they are explicitly moved to `GraphStore::open_read_only`.
 
 Remaining V2 target contract:
 
@@ -237,6 +242,7 @@ Reader/writer split:
 | Optional post-write compaction | `aethyme-engine-cli index --compact --repo <repo>` | Writable `GraphStore::compact` after all write transactions commit |
 | Read areas / overview | `query-areas`, `query-overview` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
 | Read symbols | `symbol`, `symbol-batch` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
+| Read task navigation | `task-anchors`, `task-scope`, `task-next`, `task-localize` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
 | Read adjacency | `importers`, `deps` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
 | Hybrid grep + adjacency | `callers` | Grep first, then `GraphStore::open_read_only` / redb `ReadOnlyDatabase` for candidate expansion |
 | Assert artifact exists | `scripts/eval/setup-playground.sh`, `scripts/eval/verify-playground.sh`, `docs/guides/playground-setup.md` | Filesystem existence check only |
