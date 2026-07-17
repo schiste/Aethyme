@@ -4,10 +4,11 @@
 //! fragments under `<repo>/.aethyme/graph/`. The current writer persists
 //! repositories, directories, files, areas, functions, classes, docs, configs,
 //! unresolved/import placeholders, risks, and file/symbol adjacency for
-//! `query-areas`, `query-overview`, `deps`, `importers`, and the graph
-//! adjacency half of the hybrid `callers` path.
-//! Most graph navigation still uses an in-memory `RepositoryMap` rebuilt from
-//! fragments rather than this redb store.
+//! query, symbol, rendered graph, graph-expand, and task
+//! anchors/scope/next/localize CLI views. The hybrid `callers` path still
+//! greps first, then expands candidate files through redb adjacency.
+//! Context-pack assembly, `explore`, activation, and usage-boundary flows
+//! still use higher-level graph modules that may build `RepositoryMap`.
 //!
 //! Non-scope for the current redb store: this file is not the durable graph
 //! format, does not mutate fragment files, does not promise in-place redb file
@@ -1588,6 +1589,33 @@ fn collect_symbol_ids_for_component<D: ReadableDatabase>(
     Ok(ids)
 }
 
+fn collect_symbol_ids_for_component_prefix<D: ReadableDatabase>(
+    db: &D,
+    prefix: &str,
+    limit: usize,
+) -> Result<BTreeSet<String>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(BTreeSet::new());
+    }
+    let txn = db.begin_read()?;
+    let t = txn.open_multimap_table(SYMBOL_BY_COMPONENT)?;
+    let end = prefix_end(prefix);
+    let mut ids = BTreeSet::new();
+    for entry in t.range(prefix..end.as_str())? {
+        let (key, mut values) = entry?;
+        if !key.value().starts_with(prefix) {
+            continue;
+        }
+        while let Some(value) = values.next() {
+            ids.insert(value?.value().to_string());
+            if ids.len() >= limit {
+                return Ok(ids);
+            }
+        }
+    }
+    Ok(ids)
+}
+
 fn collect_symbol_ids_for_path_component<D: ReadableDatabase>(
     db: &D,
     component: &str,
@@ -1606,6 +1634,40 @@ fn collect_symbol_ids_for_path_component<D: ReadableDatabase>(
         }
     }
     Ok(ids)
+}
+
+fn collect_symbol_ids_for_path_component_prefix<D: ReadableDatabase>(
+    db: &D,
+    prefix: &str,
+    limit: usize,
+) -> Result<BTreeSet<String>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(BTreeSet::new());
+    }
+    let txn = db.begin_read()?;
+    let t = txn.open_multimap_table(SYMBOL_BY_PATH_COMPONENT)?;
+    let end = prefix_end(prefix);
+    let mut ids = BTreeSet::new();
+    for entry in t.range(prefix..end.as_str())? {
+        let (key, mut values) = entry?;
+        if !key.value().starts_with(prefix) {
+            continue;
+        }
+        while let Some(value) = values.next() {
+            ids.insert(value?.value().to_string());
+            if ids.len() >= limit {
+                return Ok(ids);
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn stem_prefix(token: &str) -> Option<String> {
+    if token.len() < MIN_STEM_LEN {
+        return None;
+    }
+    Some(token.chars().take(MIN_STEM_LEN).collect())
 }
 
 fn symbols_matching_from<D: ReadableDatabase>(
@@ -1658,6 +1720,22 @@ fn symbols_matching_from<D: ReadableDatabase>(
             },
             &options,
         )?;
+        if let Some(stem) = stem_prefix(token) {
+            add_symbol_candidates_for_ids(
+                &txn,
+                collect_symbol_ids_for_component_prefix(
+                    db,
+                    &stem,
+                    options.limit.saturating_mul(3),
+                )?,
+                &mut candidates,
+                SymbolMatchSignals {
+                    component: true,
+                    ..SymbolMatchSignals::default()
+                },
+                &options,
+            )?;
+        }
         add_symbol_candidates_for_ids(
             &txn,
             collect_symbol_ids_for_path_component(db, token, options.limit.saturating_mul(3))?,
@@ -1668,6 +1746,22 @@ fn symbols_matching_from<D: ReadableDatabase>(
             },
             &options,
         )?;
+        if let Some(stem) = stem_prefix(token) {
+            add_symbol_candidates_for_ids(
+                &txn,
+                collect_symbol_ids_for_path_component_prefix(
+                    db,
+                    &stem,
+                    options.limit.saturating_mul(3),
+                )?,
+                &mut candidates,
+                SymbolMatchSignals {
+                    path: true,
+                    ..SymbolMatchSignals::default()
+                },
+                &options,
+            )?;
+        }
     }
 
     let path_ids =
@@ -4728,6 +4822,39 @@ mod tests {
         assert!(class_only
             .iter()
             .all(|candidate| candidate.symbol.kind == StoredNodeKind::Class));
+    }
+
+    #[test]
+    fn read_api_symbols_matching_collects_stem_component_candidates() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let area = AreaNode::new("Repo", "includes", false);
+        let file = sample_file(
+            "Repo",
+            "includes/Page/WikiPage.php",
+            Some("area:Repo:includes"),
+        );
+        let function = sample_function(&file, "doViewUpdates", None);
+
+        let mut session = store.begin_index().expect("session");
+        insert_area(&mut session, &area).expect("area");
+        insert_file(&mut session, &file).expect("file");
+        insert_function(&mut session, &function).expect("function");
+        session.commit().expect("commit");
+        drop(store);
+
+        let readonly = GraphStore::open_read_only(&root).expect("read-only");
+        let hits = readonly
+            .symbols_matching("viewing page")
+            .expect("stem symbol match");
+        let hit = hits
+            .iter()
+            .find(|candidate| candidate.symbol.id == function.id.to_string())
+            .expect("doViewUpdates should be recalled via the view/viewing stem");
+        assert!(hit.signals.component);
+        assert!(hit.rank > 0);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

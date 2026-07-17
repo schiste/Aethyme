@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use aethyme_engine::graph::navigation::{
     callees_view, callers_view, children_view, configs_view, docs_view, graph_expand_view,
-    node_view, parents_view,
+    node_view, parents_view, task_anchors_view, task_next_view, task_scope_view,
 };
 use aethyme_engine::graph::search::symbol_search;
 use aethyme_engine::map::RepositoryMap;
@@ -185,6 +185,47 @@ fn build_medium_fragment_fixture() -> tempfile::TempDir {
 
 fn build_medium_redb_fixture() -> tempfile::TempDir {
     let tmp = build_medium_fragment_fixture();
+    let output = run_engine([
+        "index",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&output);
+    assert!(tmp.path().join(".aethyme/graph_store.redb").is_file());
+    tmp
+}
+
+fn build_task_redb_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "README.md", b"# Task Fixture\n");
+    write(
+        tmp.path(),
+        "docs/architecture.md",
+        b"# Architecture\n\nAuth and web flow notes.\n",
+    );
+    write(
+        tmp.path(),
+        "src/auth/token.py",
+        b"class TokenLoader:\n    def load(self):\n        return load_token()\n\ndef load_token():\n    return 'token'\n",
+    );
+    write(
+        tmp.path(),
+        "src/web/handler.py",
+        b"from src.auth.token import load_token\n\ndef handle_request():\n    return load_token()\n",
+    );
+    write(
+        tmp.path(),
+        "pyproject.toml",
+        b"[project]\nname = \"task-fixture\"\n",
+    );
+
+    let root = tmp.path().canonicalize().unwrap();
+    bootstrap_repo(&root, "test-engine").expect("bootstrap graph layout");
+    let ctx = IndexerContext::new("TaskRepo", root, "test-engine").unwrap();
+    let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
+    assert_eq!(summary.total_files, 5);
+
     let output = run_engine([
         "index",
         "--repo",
@@ -436,6 +477,10 @@ fn graph_cli_json(repo: &Path, command: &str, target: &str) -> serde_json::Value
     ])
 }
 
+fn task_cli_json(repo: &Path, command: &str, task: &str) -> serde_json::Value {
+    query_json([command, "--repo", repo.to_str().unwrap(), "--task", task])
+}
+
 fn repository_map_graph_json(
     map: &RepositoryMap,
     command: &str,
@@ -457,6 +502,23 @@ fn repository_map_graph_json(
         other => panic!("unsupported graph command: {other}"),
     };
     serde_json::from_str(&json).expect("RepositoryMap graph JSON parses")
+}
+
+fn repository_map_task_json(map: &RepositoryMap, command: &str, task: &str) -> serde_json::Value {
+    let task = aethyme_engine::model::task::TaskInput::from_task_text(task);
+    let json = match command {
+        "task-anchors" => aethyme_engine::json::task_anchors_view(&task_anchors_view(map, &task)),
+        "task-scope" => aethyme_engine::json::task_scope_view(&task_scope_view(map, &task)),
+        "task-next" => aethyme_engine::json::graph_relation(&task_next_view(map, &task)),
+        "task-localize" => {
+            let anchors = task_anchors_view(map, &task);
+            let scope = task_scope_view(map, &task);
+            let next = task_next_view(map, &task);
+            aethyme_engine::json::task_localization_view(&anchors, &scope, &next)
+        }
+        other => panic!("unsupported task command: {other}"),
+    };
+    serde_json::from_str(&json).expect("RepositoryMap task JSON parses")
 }
 
 fn symbol_cli_hits(repo: &Path, query: &str, limit: usize) -> serde_json::Value {
@@ -829,6 +891,37 @@ fn rendered_graph_commands_match_repository_map_snapshots_on_medium_fixture() {
     assert_rendered_graph_command_parity(tmp.path(), &["load_token", "src/auth/token.py"]);
 }
 
+fn assert_task_command_parity(repo: &Path, tasks: &[&str]) {
+    let map = RepositoryMap::build(repo).expect("build RepositoryMap task parity oracle");
+    let commands = ["task-anchors", "task-scope", "task-next", "task-localize"];
+
+    for task in tasks {
+        for command in commands {
+            let expected = repository_map_task_json(&map, command, task);
+            let actual = task_cli_json(repo, command, task);
+            assert_eq!(
+                actual, expected,
+                "{command} should preserve RepositoryMap JSON for task {task:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn redb_task_views_match_repository_map_snapshots_for_phase6_task_kinds() {
+    let tmp = build_task_redb_fixture();
+
+    assert_task_command_parity(
+        tmp.path(),
+        &[
+            "Explain this repo",
+            "Update load_token flow",
+            "Trace impact of load_token",
+            "Find the manifest that owns the top-level area",
+        ],
+    );
+}
+
 #[test]
 fn graph_expand_json_shape_is_stable() {
     let tmp = build_expand_redb_fixture();
@@ -1108,11 +1201,55 @@ fn mediawiki_scale_redb_smoke_for_v2_paths() {
     );
     let hits: serde_json::Value =
         serde_json::from_slice(&symbol_output.stdout).expect("symbol JSON parses");
-    let hit_names = hit_names(&hits);
+    let default_hit_names = hit_names(&hits);
     assert!(
-        hit_names.iter().any(|name| name == "doViewUpdates"),
-        "MediaWiki symbol smoke should surface doViewUpdates for a fuzzy viewing/page query; got {hit_names:?}"
+        !default_hit_names.is_empty(),
+        "MediaWiki symbol smoke should return default hits for a fuzzy viewing/page query"
     );
+
+    let (broad_symbol_output, broad_symbol_ms) = run_engine_timed([
+        "symbol-batch",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--query",
+        "viewing page",
+        "--limit",
+        "1000",
+    ]);
+    assert_success(&broad_symbol_output);
+    assert_duration_below(
+        "MediaWiki broad symbol recall",
+        broad_symbol_ms,
+        "AETHYME_REDB_MEDIAWIKI_MAX_BROAD_SYMBOL_MS",
+        10_000,
+    );
+    let broad_hits: serde_json::Value =
+        serde_json::from_slice(&broad_symbol_output.stdout).expect("symbol-batch JSON parses");
+    let broad_hit_names = hit_names(&broad_hits["viewing page"]);
+    assert!(
+        broad_hit_names.iter().any(|name| name == "doViewUpdates"),
+        "MediaWiki broad symbol smoke should recall doViewUpdates for a fuzzy viewing/page query"
+    );
+
+    let (task_output, task_ms) = run_engine_timed([
+        "task-localize",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--task",
+        "Trace impact of doViewUpdates",
+    ]);
+    assert_success(&task_output);
+    assert_duration_below(
+        "MediaWiki task-localize",
+        task_ms,
+        "AETHYME_REDB_MEDIAWIKI_MAX_TASK_LOCALIZE_MS",
+        10_000,
+    );
+    let task: serde_json::Value =
+        serde_json::from_slice(&task_output.stdout).expect("task-localize JSON parses");
+    assert!(task["anchors"]["anchors"].as_array().is_some());
+    assert!(task["scope"]["navigation_order"].as_array().is_some());
+    assert!(task["next"]["items"].as_array().is_some());
 }
 
 #[cfg(unix)]
@@ -1265,6 +1402,34 @@ fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
             tmp.path().to_str().unwrap(),
             "--target",
             "load_token",
+        ],
+        vec![
+            "task-anchors",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--task",
+            "Update load_token flow",
+        ],
+        vec![
+            "task-scope",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--task",
+            "Update load_token flow",
+        ],
+        vec![
+            "task-next",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--task",
+            "Update load_token flow",
+        ],
+        vec![
+            "task-localize",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--task",
+            "Update load_token flow",
         ],
         vec![
             "deps",

@@ -13,7 +13,7 @@ use aethyme_engine::graph::facts::{function_usage_fact, public_function_facts};
 use aethyme_engine::graph::navigation::{
     callees_view_redb, callers_view_redb, children_view_redb, configs_view_redb, docs_view_redb,
     graph_expand_view_redb, graph_overview_view, node_view_redb, parents_view_redb,
-    task_anchors_view, task_expand_view, task_next_view, task_scope_view,
+    task_anchors_view_redb, task_expand_view, task_next_view_redb, task_scope_view_redb,
 };
 use aethyme_engine::graph::neighborhood::{dependency_frontier, impact_frontier};
 use aethyme_engine::graph::overview::build_repo_overview;
@@ -310,32 +310,47 @@ fn run() -> Result<(), String> {
         }
         "task-anchors" => {
             let repo = read_option(&args, "--repo")?;
-            let map = build_map(&repo, no_cache, fragment_mode)?;
             let task_value = read_option(&args, "--task")?;
+            let canonical = PathBuf::from(&repo)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let store = GraphStore::open_read_only(&canonical).map_err(|e| e.to_string())?;
             let task = TaskInput::from_task_text(&task_value);
             println!(
                 "{}",
-                aethyme_engine::json::task_anchors_view(&task_anchors_view(&map, &task))
+                aethyme_engine::json::task_anchors_view(
+                    &task_anchors_view_redb(&store, &task).map_err(|e| e.to_string())?
+                )
             );
         }
         "task-scope" => {
             let repo = read_option(&args, "--repo")?;
-            let map = build_map(&repo, no_cache, fragment_mode)?;
             let task_value = read_option(&args, "--task")?;
+            let canonical = PathBuf::from(&repo)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let store = GraphStore::open_read_only(&canonical).map_err(|e| e.to_string())?;
             let task = TaskInput::from_task_text(&task_value);
             println!(
                 "{}",
-                aethyme_engine::json::task_scope_view(&task_scope_view(&map, &task))
+                aethyme_engine::json::task_scope_view(
+                    &task_scope_view_redb(&store, &task).map_err(|e| e.to_string())?
+                )
             );
         }
         "task-next" => {
             let repo = read_option(&args, "--repo")?;
-            let map = build_map(&repo, no_cache, fragment_mode)?;
             let task_value = read_option(&args, "--task")?;
+            let canonical = PathBuf::from(&repo)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let store = GraphStore::open_read_only(&canonical).map_err(|e| e.to_string())?;
             let task = TaskInput::from_task_text(&task_value);
             println!(
                 "{}",
-                aethyme_engine::json::graph_relation(&task_next_view(&map, &task))
+                aethyme_engine::json::graph_relation(
+                    &task_next_view_redb(&store, &task).map_err(|e| e.to_string())?
+                )
             );
         }
         "task-localize" => {
@@ -344,27 +359,22 @@ fn run() -> Result<(), String> {
             let profile = has_flag(&args, "--profile");
             let mut profiler = StageProfiler::new("task-localize", profile);
 
-            // Use build_with_profile so we can fold the fragments build
-            // timing into our profiler output. `RepositoryMap::build` only
-            // returned the map, so previously we could only see total
-            // map_build time.
-            let (map, build_profile) = profiler.stage("map_build", || match fragment_mode {
-                FragmentBuildMode::Force => {
-                    RepositoryMap::build_from_fragments(&PathBuf::from(&repo))
-                }
-                FragmentBuildMode::Prefer => RepositoryMap::build_with_fragment_preference(
-                    &PathBuf::from(&repo),
-                    no_cache,
-                    |_| {},
-                ),
+            let canonical = PathBuf::from(&repo)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let store = profiler.stage("redb_open", || {
+                GraphStore::open_read_only(&canonical).map_err(|e| e.to_string())
             })?;
-            if profile {
-                profiler.attach_substages("map_build", &build_profile);
-            }
             let task = profiler.stage_pure("task_parse", || TaskInput::from_task_text(&task_value));
-            let anchors = profiler.stage_pure("anchors", || task_anchors_view(&map, &task));
-            let scope = profiler.stage_pure("scope", || task_scope_view(&map, &task));
-            let next = profiler.stage_pure("next", || task_next_view(&map, &task));
+            let anchors = profiler.stage("anchors", || {
+                task_anchors_view_redb(&store, &task).map_err(|e| e.to_string())
+            })?;
+            let scope = profiler.stage("scope", || {
+                task_scope_view_redb(&store, &task).map_err(|e| e.to_string())
+            })?;
+            let next = profiler.stage("next", || {
+                task_next_view_redb(&store, &task).map_err(|e| e.to_string())
+            })?;
             let rendered = profiler.stage_pure("json_render", || {
                 aethyme_engine::json::task_localization_view(&anchors, &scope, &next)
             });

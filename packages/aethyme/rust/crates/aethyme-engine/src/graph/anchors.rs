@@ -1,9 +1,13 @@
 use crate::context_pack::{Anchor, AnchorKind};
-use crate::graph::search::symbol_search_multi;
+use crate::graph::search::{score_symbol, symbol_search_multi};
 use crate::map::RepositoryMap;
 use crate::model::edge::EdgeKind;
 use crate::model::file::FileRole;
 use crate::model::task::{TaskInput, TaskKind};
+use crate::store::redb::graph_store::{
+    GraphStoreError, NeighborDirection, OverviewV2, OverviewV2Limits, ReadOnlyGraphStore,
+    StoredNodeKind, SymbolMatchOptions,
+};
 
 const STOP_WORDS: &[&str] = &[
     "change",
@@ -256,6 +260,199 @@ pub fn resolve_anchors(map: &RepositoryMap, task: &TaskInput, limit: usize) -> V
     }
 }
 
+pub fn resolve_anchors_redb(
+    store: &ReadOnlyGraphStore,
+    task: &TaskInput,
+    limit: usize,
+) -> Result<Vec<Anchor>, GraphStoreError> {
+    let overview = store.overview_v2(anchor_overview_limits())?;
+    let mut anchors = Vec::new();
+
+    match task.kind {
+        TaskKind::ExplainRepo => {
+            if let Some(readme) = overview
+                .files
+                .iter()
+                .find(|file| file.path.eq_ignore_ascii_case("README.md"))
+                .or_else(|| {
+                    overview.files.iter().find(|file| {
+                        file.path
+                            .rsplit('/')
+                            .next()
+                            .is_some_and(|name| name.eq_ignore_ascii_case("README.md"))
+                    })
+                })
+            {
+                anchors.push(Anchor::new(
+                    AnchorKind::File,
+                    &readme.path,
+                    Some(&readme.path),
+                    "repository readme",
+                ));
+            }
+            anchors.extend(explain_repo_doc_anchors_redb(&overview, 1));
+            anchors.extend(explain_repo_area_anchors_redb(&overview, 2));
+            anchors.extend(explain_repo_entrypoint_anchors_redb(&overview, 1));
+            anchors.extend(explain_repo_config_anchors_redb(&overview, 1));
+        }
+        TaskKind::NavigateConfigOwnership => {
+            let queries = candidate_queries(task);
+            anchors.extend(area_anchors_redb(&overview, &queries, true, 1));
+            anchors.extend(navigation_config_anchors_redb(
+                store, &overview, task, &queries, 1,
+            )?);
+            if anchors.len() < limit {
+                for config in config_anchors_redb(
+                    store,
+                    &overview,
+                    task,
+                    &queries,
+                    limit.saturating_sub(anchors.len()),
+                )? {
+                    if !anchors.contains(&config) {
+                        anchors.push(config);
+                    }
+                    if anchors.len() == limit {
+                        break;
+                    }
+                }
+            }
+        }
+        TaskKind::ChangeSymbol | TaskKind::TraceImpact => {
+            anchors.extend(file_reference_anchors_redb(&overview, task, limit));
+
+            let mut queries = candidate_queries(task);
+            if queries.is_empty() {
+                queries.push(task.normalized.clone());
+            }
+            let prefix = if task.kind == TaskKind::TraceImpact {
+                "impact symbol via "
+            } else {
+                "change symbol via "
+            };
+            for anchor in symbol_anchors_redb(store, &queries, limit, Some(prefix))? {
+                anchors.push(anchor);
+            }
+            if anchors.len() < limit {
+                for query in &queries {
+                    for anchor in code_file_anchors_redb(
+                        &overview,
+                        query,
+                        limit.saturating_sub(anchors.len()),
+                    ) {
+                        if !anchors.contains(&anchor) {
+                            anchors.push(anchor);
+                        }
+                        if anchors.len() == limit {
+                            break;
+                        }
+                    }
+                    if anchors.len() == limit {
+                        break;
+                    }
+                }
+            }
+            if anchors.len() < limit && wants_area_anchor(task) {
+                anchors.extend(area_anchors_redb(
+                    &overview,
+                    &queries,
+                    true,
+                    limit.saturating_sub(anchors.len()),
+                ));
+            }
+        }
+        _ => {
+            anchors.extend(file_reference_anchors_redb(&overview, task, limit));
+
+            let mut queries = candidate_queries(task);
+            if queries.is_empty() {
+                queries.push(task.normalized.clone());
+            }
+
+            for anchor in symbol_anchors_redb(store, &queries, limit, None)? {
+                anchors.push(anchor);
+            }
+
+            if anchors.len() < limit {
+                for query in &queries {
+                    for anchor in code_file_anchors_redb(
+                        &overview,
+                        query,
+                        limit.saturating_sub(anchors.len()),
+                    ) {
+                        if !anchors.contains(&anchor) {
+                            anchors.push(anchor);
+                        }
+                        if anchors.len() == limit {
+                            break;
+                        }
+                    }
+                    if anchors.len() == limit {
+                        break;
+                    }
+                }
+            }
+
+            if anchors.len() < limit {
+                for config in config_anchors_redb(
+                    store,
+                    &overview,
+                    task,
+                    &queries,
+                    limit.saturating_sub(anchors.len()),
+                )? {
+                    if !anchors.contains(&config) {
+                        anchors.push(config);
+                    }
+                    if anchors.len() == limit {
+                        break;
+                    }
+                }
+            }
+
+            if anchors.len() < limit {
+                let wants_area = wants_area_anchor(task);
+                anchors.extend(area_anchors_redb(
+                    &overview,
+                    &queries,
+                    wants_area,
+                    limit.saturating_sub(anchors.len()),
+                ));
+            }
+        }
+    }
+
+    let mut deduped = Vec::new();
+    for anchor in anchors {
+        if !deduped.contains(&anchor) {
+            deduped.push(anchor);
+        }
+        if deduped.len() == limit {
+            break;
+        }
+    }
+    if matches!(task.kind, TaskKind::ExplainRepo) {
+        Ok(deduped)
+    } else {
+        filter_primary_area_anchors_redb(store, deduped, limit)
+    }
+}
+
+fn anchor_overview_limits() -> OverviewV2Limits {
+    OverviewV2Limits {
+        area_limit: 100,
+        directory_limit: 200,
+        entrypoint_limit: 100,
+        risk_limit: 100,
+        file_limit: 2_000,
+        function_limit: 2_000,
+        class_limit: 1_000,
+        doc_limit: 200,
+        config_limit: 200,
+        unresolved_limit: 0,
+    }
+}
+
 fn filter_primary_area_anchors(
     map: &RepositoryMap,
     anchors: Vec<Anchor>,
@@ -292,6 +489,49 @@ fn filter_primary_area_anchors(
         }
     }
     filtered
+}
+
+fn filter_primary_area_anchors_redb(
+    store: &ReadOnlyGraphStore,
+    anchors: Vec<Anchor>,
+    limit: usize,
+) -> Result<Vec<Anchor>, GraphStoreError> {
+    let primary_areas = anchors
+        .iter()
+        .filter_map(|anchor| match anchor.kind {
+            AnchorKind::Folder => Some(anchor.id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if primary_areas.is_empty() {
+        return Ok(anchors);
+    }
+
+    let mut filtered = Vec::new();
+    for anchor in anchors {
+        let keep = match anchor.kind {
+            AnchorKind::Folder => primary_areas.contains(&anchor.id),
+            AnchorKind::File | AnchorKind::Symbol => {
+                let file = match anchor.file.clone() {
+                    Some(file) => Some(file),
+                    None => file_for_symbol_redb(store, &anchor.id)?,
+                };
+                match file {
+                    Some(file) => file_area_name_redb(store, &file)?
+                        .is_some_and(|area| primary_areas.contains(&area)),
+                    None => false,
+                }
+            }
+        };
+        if keep && !filtered.contains(&anchor) {
+            filtered.push(anchor);
+        }
+        if filtered.len() == limit {
+            break;
+        }
+    }
+    Ok(filtered)
 }
 
 /// Extract file-path-like references from task text and resolve them against the graph.
@@ -385,6 +625,93 @@ fn file_reference_anchors(map: &RepositoryMap, task: &TaskInput, limit: usize) -
     anchors.into_iter().map(|(_, anchor)| anchor).collect()
 }
 
+fn file_reference_anchors_redb(
+    overview: &OverviewV2,
+    task: &TaskInput,
+    limit: usize,
+) -> Vec<Anchor> {
+    const EXTENSIONS: &[&str] = &[
+        ".ts", ".tsx", ".js", ".jsx", ".py", ".rs", ".go", ".java", ".rb", ".gd", ".cs", ".cpp",
+        ".c", ".h", ".hpp", ".swift", ".kt",
+    ];
+
+    let mut file_refs: Vec<String> = Vec::new();
+    for token in task.raw.split_whitespace() {
+        let lowered = token.to_ascii_lowercase();
+        let cleaned = lowered.trim_end_matches(|c: char| {
+            c.is_ascii_punctuation() && c != '.' && c != '/' && c != '-' && c != '_'
+        });
+        if EXTENSIONS.iter().any(|ext| cleaned.ends_with(ext)) {
+            let cleaned = cleaned.to_string();
+            if !file_refs.contains(&cleaned) {
+                file_refs.push(cleaned);
+            }
+        }
+    }
+
+    if file_refs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut anchors = Vec::new();
+    let mut seen_areas: Vec<String> = Vec::new();
+
+    for file_ref in &file_refs {
+        let ref_basename = file_ref.rsplit('/').next().unwrap_or(file_ref);
+
+        for file in &overview.files {
+            let file_lower = file.path.to_ascii_lowercase();
+            let file_basename = file_lower.rsplit('/').next().unwrap_or(&file_lower);
+
+            let score = if file_basename == ref_basename {
+                300
+            } else if file_lower.ends_with(file_ref.as_str()) {
+                280
+            } else if file_lower.contains(ref_basename) {
+                200
+            } else {
+                continue;
+            };
+
+            anchors.push((
+                score,
+                Anchor::new(
+                    AnchorKind::File,
+                    &file.path,
+                    Some(&file.path),
+                    format!("file reference from task text ({})", file_ref),
+                ),
+            ));
+
+            if let Some(area_id) = &file.area_id {
+                if !seen_areas.contains(area_id) {
+                    if let Some(area) = overview.areas.iter().find(|area| &area.id == area_id) {
+                        seen_areas.push(area_id.clone());
+                        anchors.push((
+                            score - 10,
+                            Anchor::new(
+                                AnchorKind::Folder,
+                                &area.name,
+                                None::<String>,
+                                format!("area containing referenced file ({})", file_ref),
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    anchors.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+    anchors.truncate(limit);
+    anchors.into_iter().map(|(_, anchor)| anchor).collect()
+}
+
 fn wants_area_anchor(task: &TaskInput) -> bool {
     ["area", "component", "module", "folder", "directory"]
         .iter()
@@ -421,6 +748,19 @@ fn navigation_config_anchors(
     anchors.retain(|anchor| anchor.reason.contains("manifest"));
     anchors.truncate(limit);
     anchors
+}
+
+fn navigation_config_anchors_redb(
+    store: &ReadOnlyGraphStore,
+    overview: &OverviewV2,
+    task: &TaskInput,
+    queries: &[String],
+    limit: usize,
+) -> Result<Vec<Anchor>, GraphStoreError> {
+    let mut anchors = config_anchors_redb(store, overview, task, queries, limit.max(3))?;
+    anchors.retain(|anchor| anchor.reason.contains("manifest"));
+    anchors.truncate(limit);
+    Ok(anchors)
 }
 
 fn config_anchors(
@@ -578,6 +918,168 @@ fn config_anchors(
     anchors.into_iter().map(|(_, anchor)| anchor).collect()
 }
 
+fn config_anchors_redb(
+    store: &ReadOnlyGraphStore,
+    overview: &OverviewV2,
+    task: &TaskInput,
+    queries: &[String],
+    limit: usize,
+) -> Result<Vec<Anchor>, GraphStoreError> {
+    let mut anchors = Vec::new();
+    let wants_manifest = task.normalized.contains("manifest");
+    let wants_project = task.normalized.contains("project");
+    let wants_entrypoint =
+        task.normalized.contains("entrypoint") || task.normalized.contains("main code");
+    let wants_ownership = task.normalized.contains("manage")
+        || task.normalized.contains("managed")
+        || task.normalized.contains("controls")
+        || task.normalized.contains("owner")
+        || task.normalized.contains("owns");
+    let matched_area_ids = overview
+        .areas
+        .iter()
+        .filter(|area| {
+            let area_lower = area.name.to_ascii_lowercase();
+            queries.iter().any(|query| area_lower.contains(query))
+        })
+        .map(|area| area.id.clone())
+        .collect::<Vec<_>>();
+
+    for config in &overview.configs {
+        let path_lower = config.path.to_ascii_lowercase();
+        let area_name = config.area_id.as_deref().and_then(|area_id| {
+            overview
+                .areas
+                .iter()
+                .find(|area| area.id == area_id)
+                .map(|area| area.name.to_ascii_lowercase())
+        });
+        let area_matches = config
+            .area_id
+            .as_ref()
+            .is_some_and(|area_id| matched_area_ids.iter().any(|matched| matched == area_id));
+
+        let mut score = 0;
+        score += 8;
+        if queries.iter().any(|query| path_lower.contains(query)) {
+            score += 6;
+        }
+        if area_name
+            .as_deref()
+            .is_some_and(|name| queries.iter().any(|query| name.contains(query)))
+        {
+            score += 5;
+        }
+        if !matched_area_ids.is_empty() && !area_matches {
+            score = 0;
+        }
+
+        let config_area = config.area_id.as_deref();
+        let mut direct_entrypoint_edges = 0i32;
+        let mut transitive_entrypoint_edges = 0i32;
+        let mut cross_package_bonus = 0i32;
+        for edge in store.neighbors(
+            &config.id,
+            NeighborDirection::Outgoing,
+            Some(EdgeKind::EntrypointFor),
+        )? {
+            let target_area = store.area_for_node(edge.other.as_str())?;
+            let target_in_area = matched_area_ids.is_empty()
+                || target_area
+                    .as_ref()
+                    .is_some_and(|area| matched_area_ids.iter().any(|matched| matched == area));
+            let target_is_code = store
+                .node_display(edge.other.as_str())?
+                .is_some_and(|node| {
+                    matches!(node.kind, StoredNodeKind::File | StoredNodeKind::Function)
+                });
+            if !target_is_code || !target_in_area {
+                continue;
+            }
+            if edge.confidence >= 900 {
+                direct_entrypoint_edges += 1;
+                if config_area.is_some()
+                    && target_area.as_deref().is_some()
+                    && config_area != target_area.as_deref()
+                {
+                    cross_package_bonus += 8;
+                }
+            } else {
+                transitive_entrypoint_edges += 1;
+            }
+        }
+
+        let area_configures = store
+            .neighbors(
+                &config.id,
+                NeighborDirection::Outgoing,
+                Some(EdgeKind::Configures),
+            )?
+            .into_iter()
+            .filter(|edge| {
+                matched_area_ids.is_empty()
+                    || matched_area_ids
+                        .iter()
+                        .any(|matched| matched == edge.other.as_str())
+            })
+            .count() as i32;
+
+        if wants_manifest {
+            score += if config.config_type == "manifest" {
+                12
+            } else {
+                -4
+            };
+        }
+        if wants_project {
+            score += if config.config_type == "project" {
+                8
+            } else {
+                0
+            };
+        }
+        if wants_entrypoint {
+            score += direct_entrypoint_edges * 20;
+            score += transitive_entrypoint_edges.min(3) * 2;
+            score += cross_package_bonus;
+        } else if direct_entrypoint_edges > 0 || transitive_entrypoint_edges > 0 {
+            score += 3;
+        }
+        if wants_ownership {
+            score += area_configures * 4;
+        } else if area_configures > 0 {
+            score += 2;
+        }
+        if matches!(
+            config.config_type.as_str(),
+            "manifest" | "project" | "runtime"
+        ) {
+            score += 2;
+        }
+        if score == 0 {
+            continue;
+        }
+
+        anchors.push((
+            score,
+            Anchor::new(
+                AnchorKind::File,
+                &config.path,
+                Some(&config.path),
+                format!("{} config anchor (score {})", config.config_type, score),
+            ),
+        ));
+    }
+    anchors.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+    anchors.truncate(limit);
+    Ok(anchors.into_iter().map(|(_, anchor)| anchor).collect())
+}
+
 fn file_for_symbol<'a>(map: &'a RepositoryMap, symbol_id: &str) -> Option<&'a str> {
     map.functions
         .iter()
@@ -591,6 +1093,19 @@ fn file_for_symbol<'a>(map: &'a RepositoryMap, symbol_id: &str) -> Option<&'a st
         })
 }
 
+fn file_for_symbol_redb(
+    store: &ReadOnlyGraphStore,
+    symbol_id: &str,
+) -> Result<Option<String>, GraphStoreError> {
+    Ok(store.node_display(symbol_id)?.and_then(|node| {
+        if matches!(node.kind, StoredNodeKind::Function | StoredNodeKind::Class) {
+            node.path
+        } else {
+            None
+        }
+    }))
+}
+
 fn file_area_name(map: &RepositoryMap, file_path: &str) -> Option<String> {
     map.files
         .iter()
@@ -598,6 +1113,16 @@ fn file_area_name(map: &RepositoryMap, file_path: &str) -> Option<String> {
         .and_then(|file| file.area_id.as_deref())
         .and_then(|area_id| map.areas.iter().find(|area| area.id == area_id))
         .map(|area| area.name.clone())
+}
+
+fn file_area_name_redb(
+    store: &ReadOnlyGraphStore,
+    file_path: &str,
+) -> Result<Option<String>, GraphStoreError> {
+    let Some(area_id) = store.area_for_node(file_path)? else {
+        return Ok(None);
+    };
+    Ok(store.node_display(&area_id)?.map(|area| area.name))
 }
 
 fn area_anchors(
@@ -620,6 +1145,45 @@ fn area_anchors(
         // Prefer exact name matches over substring-in-path matches.
         // e.g. area "packages" exactly matching query "packages" should beat
         // area "backend/controls" matching query "controls" via substring.
+        let leaf_name = area_lower.rsplit('/').next().unwrap_or(&area_lower);
+        if queries.iter().any(|query| leaf_name == query.as_str()) {
+            score += 10;
+        }
+        if score == 0 {
+            continue;
+        }
+        anchors.push((
+            score,
+            Anchor::new(AnchorKind::Folder, &area.name, None::<String>, "area match"),
+        ));
+    }
+    anchors.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+    anchors.truncate(limit);
+    anchors.into_iter().map(|(_, anchor)| anchor).collect()
+}
+
+fn area_anchors_redb(
+    overview: &OverviewV2,
+    queries: &[String],
+    wants_area: bool,
+    limit: usize,
+) -> Vec<Anchor> {
+    let mut anchors = Vec::new();
+    for area in &overview.areas {
+        let area_lower = area.name.to_ascii_lowercase();
+        let matching_queries = queries
+            .iter()
+            .filter(|query| area_lower.contains(query.as_str()))
+            .count() as i32;
+        let mut score = matching_queries * 8;
+        if wants_area && matching_queries > 0 {
+            score += 4;
+        }
         let leaf_name = area_lower.rsplit('/').next().unwrap_or(&area_lower);
         if queries.iter().any(|query| leaf_name == query.as_str()) {
             score += 10;
@@ -692,8 +1256,182 @@ fn code_file_anchors(map: &RepositoryMap, query: &str, limit: usize) -> Vec<Anch
     anchors.into_iter().map(|(_, anchor)| anchor).collect()
 }
 
+fn code_file_anchors_redb(overview: &OverviewV2, query: &str, limit: usize) -> Vec<Anchor> {
+    let lowered_query = query.to_ascii_lowercase();
+    let mut anchors = overview
+        .files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Source | FileRole::Test))
+        .filter_map(|file| {
+            let lowered_path = file.path.to_ascii_lowercase();
+            let basename = lowered_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(lowered_path.as_str());
+            let score = if basename == format!("{lowered_query}.py")
+                || basename == format!("{lowered_query}.rs")
+                || basename == format!("{lowered_query}.ts")
+                || basename == format!("{lowered_query}.js")
+                || basename == format!("{lowered_query}.gd")
+            {
+                220
+            } else if basename.starts_with(&lowered_query) {
+                170
+            } else if basename.contains(&lowered_query) {
+                140
+            } else if lowered_path.contains(&lowered_query) {
+                100
+            } else {
+                return None;
+            };
+            Some((
+                score,
+                Anchor::new(
+                    AnchorKind::File,
+                    &file.path,
+                    Some(&file.path),
+                    format!("code file path match ({query})"),
+                ),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    anchors.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+    anchors.truncate(limit);
+    anchors.into_iter().map(|(_, anchor)| anchor).collect()
+}
+
+fn symbol_anchors_redb(
+    store: &ReadOnlyGraphStore,
+    queries: &[String],
+    limit: usize,
+    reason_prefix: Option<&str>,
+) -> Result<Vec<Anchor>, GraphStoreError> {
+    if queries.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let lowered_tokens = queries
+        .iter()
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if lowered_tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let query = queries.join(" ");
+    let candidates = store.symbols_matching_with(
+        &query,
+        SymbolMatchOptions {
+            limit: limit.saturating_mul(8).max(50),
+            ..SymbolMatchOptions::default()
+        },
+    )?;
+    let mut anchors = Vec::new();
+    for candidate in candidates {
+        let area_name = match candidate.symbol.area_id.as_deref() {
+            Some(area_id) => store
+                .node_display(area_id)?
+                .map(|area| area.name.to_ascii_lowercase()),
+            None => None,
+        };
+        let Some((score, matched)) = score_symbol(
+            &candidate.symbol.name,
+            &candidate.symbol.path,
+            area_name.as_deref(),
+            &lowered_tokens,
+        ) else {
+            continue;
+        };
+        let kind = match candidate.symbol.kind {
+            StoredNodeKind::Class => "class",
+            _ => "function",
+        };
+        let anchor = Anchor::new(
+            AnchorKind::Symbol,
+            candidate.symbol.id,
+            Some(candidate.symbol.path.clone()),
+            format!(
+                "{}{}-name-match via {}",
+                reason_prefix.unwrap_or_default(),
+                kind,
+                matched.join("+")
+            ),
+        );
+        anchors.push((
+            score,
+            candidate.symbol.path,
+            candidate.symbol.line,
+            candidate.symbol.name,
+            anchor,
+        ));
+    }
+
+    anchors.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+
+    let mut out = Vec::new();
+    for (_, _, _, _, anchor) in anchors {
+        if !out.contains(&anchor) {
+            out.push(anchor);
+        }
+        if out.len() == limit {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 fn explain_repo_doc_anchors(map: &RepositoryMap, limit: usize) -> Vec<Anchor> {
     let mut docs: Vec<(i32, Anchor)> = map
+        .docs
+        .iter()
+        .filter(|doc| !doc.path.eq_ignore_ascii_case("README.md") && doc.doc_type != "readme")
+        .map(|doc| {
+            let lower = doc.path.to_ascii_lowercase();
+            let mut score = match doc.doc_type.as_str() {
+                "architecture" => 10,
+                "guide" => 6,
+                _ => 4,
+            };
+            if lower.contains("documentation/") || lower.contains("docs/") {
+                score += 2;
+            }
+            (
+                score,
+                Anchor::new(
+                    AnchorKind::File,
+                    &doc.path,
+                    Some(&doc.path),
+                    format!("{} document", doc.doc_type),
+                ),
+            )
+        })
+        .collect();
+    docs.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+    docs.truncate(limit);
+    docs.into_iter().map(|(_, anchor)| anchor).collect()
+}
+
+fn explain_repo_doc_anchors_redb(overview: &OverviewV2, limit: usize) -> Vec<Anchor> {
+    let mut docs: Vec<(i32, Anchor)> = overview
         .docs
         .iter()
         .filter(|doc| !doc.path.eq_ignore_ascii_case("README.md") && doc.doc_type != "readme")
@@ -766,6 +1504,44 @@ fn explain_repo_entrypoint_anchors(map: &RepositoryMap, limit: usize) -> Vec<Anc
     anchors.into_iter().map(|(_, anchor)| anchor).collect()
 }
 
+fn explain_repo_entrypoint_anchors_redb(overview: &OverviewV2, limit: usize) -> Vec<Anchor> {
+    let mut anchors = Vec::new();
+    for function in &overview.functions {
+        let lower = function.file_path.to_ascii_lowercase();
+        let score = if function.name.as_str() == "main" {
+            10
+        } else if lower.ends_with("lib.rs")
+            || lower.ends_with("main.rs")
+            || lower.ends_with("main.py")
+            || lower.ends_with("app.py")
+            || lower.ends_with("cli.py")
+            || lower.ends_with("index.ts")
+            || lower.ends_with("main.ts")
+        {
+            7
+        } else {
+            continue;
+        };
+        anchors.push((
+            score,
+            Anchor::new(
+                AnchorKind::File,
+                function.file_path.to_string(),
+                Some(function.file_path.to_string()),
+                "likely entrypoint",
+            ),
+        ));
+    }
+    anchors.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+    anchors.truncate(limit);
+    anchors.into_iter().map(|(_, anchor)| anchor).collect()
+}
+
 fn explain_repo_area_anchors(map: &RepositoryMap, limit: usize) -> Vec<Anchor> {
     let mut anchors = Vec::new();
     for area in &map.areas {
@@ -811,9 +1587,82 @@ fn explain_repo_area_anchors(map: &RepositoryMap, limit: usize) -> Vec<Anchor> {
     anchors.into_iter().map(|(_, anchor)| anchor).collect()
 }
 
+fn explain_repo_area_anchors_redb(overview: &OverviewV2, limit: usize) -> Vec<Anchor> {
+    let mut anchors = Vec::new();
+    for area in &overview.areas {
+        let mut score = 2;
+        let lower = area.name.to_ascii_lowercase();
+        if lower == "src"
+            || lower == "app"
+            || lower == "packages"
+            || lower == "services"
+            || lower == "tools"
+            || lower.contains("engine")
+        {
+            score += 5;
+        }
+        let files = overview
+            .files
+            .iter()
+            .filter(|file| file.area_id.as_deref() == Some(area.id.as_str()))
+            .count() as i32;
+        let code = overview
+            .functions
+            .iter()
+            .filter(|function| function.area_id.as_deref() == Some(area.id.as_str()))
+            .count() as i32;
+        score += files.min(3) + code.min(3);
+        anchors.push((
+            score,
+            Anchor::new(
+                AnchorKind::Folder,
+                &area.name,
+                None::<String>,
+                "top-level area",
+            ),
+        ));
+    }
+    anchors.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+    anchors.truncate(limit);
+    anchors.into_iter().map(|(_, anchor)| anchor).collect()
+}
+
 fn explain_repo_config_anchors(map: &RepositoryMap, limit: usize) -> Vec<Anchor> {
     let mut anchors = Vec::new();
     for config in &map.configs {
+        let score = match config.config_type.as_str() {
+            "manifest" | "project" => 6,
+            "runtime" => 5,
+            _ => 3,
+        };
+        anchors.push((
+            score,
+            Anchor::new(
+                AnchorKind::File,
+                &config.path,
+                Some(&config.path),
+                format!("{} config", config.config_type),
+            ),
+        ));
+    }
+    anchors.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+    anchors.truncate(limit);
+    anchors.into_iter().map(|(_, anchor)| anchor).collect()
+}
+
+fn explain_repo_config_anchors_redb(overview: &OverviewV2, limit: usize) -> Vec<Anchor> {
+    let mut anchors = Vec::new();
+    for config in &overview.configs {
         let score = match config.config_type.as_str() {
             "manifest" | "project" => 6,
             "runtime" => 5,
@@ -905,11 +1754,9 @@ mod tests {
         let task = TaskInput::from_task_text("Update validate_token flow");
         let anchors = resolve_anchors(&map, &task, 3);
 
-        assert!(
-            anchors
-                .iter()
-                .any(|anchor| anchor.id.contains("validate_token"))
-        );
+        assert!(anchors
+            .iter()
+            .any(|anchor| anchor.id.contains("validate_token")));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -940,11 +1787,9 @@ mod tests {
         assert!(anchors.iter().any(|anchor| anchor.id == "README.md"));
         assert!(anchors.iter().any(|anchor| anchor.id == "documentation"));
         assert!(anchors.iter().any(|anchor| anchor.id == "GameEngine"));
-        assert!(
-            anchors
-                .iter()
-                .any(|anchor| anchor.id.ends_with("technical-architecture.md"))
-        );
+        assert!(anchors
+            .iter()
+            .any(|anchor| anchor.id.ends_with("technical-architecture.md")));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1108,17 +1953,13 @@ mod tests {
             task.kind,
             crate::model::task::TaskKind::NavigateConfigOwnership
         );
-        assert!(
-            anchors
-                .iter()
-                .any(|anchor| anchor.id.ends_with("Cargo.toml"))
-        );
+        assert!(anchors
+            .iter()
+            .any(|anchor| anchor.id.ends_with("Cargo.toml")));
         assert!(anchors.iter().any(|anchor| anchor.id == "GameEngine"));
-        assert!(
-            !anchors
-                .iter()
-                .any(|anchor| anchor.id.contains("Other/project.godot"))
-        );
+        assert!(!anchors
+            .iter()
+            .any(|anchor| anchor.id.contains("Other/project.godot")));
         assert_eq!(
             anchors
                 .iter()
