@@ -11,6 +11,8 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::time::Instant;
 
+use aethyme_engine::graph::search::symbol_search;
+use aethyme_engine::map::RepositoryMap;
 use aethyme_graph_indexer::{index_repo_to_disk, IndexerContext, WalkOptions};
 use aethyme_graph_storage::bootstrap_repo;
 use redb::{Database, MultimapTableDefinition, ReadableDatabase, ReadableTable, TableDefinition};
@@ -28,6 +30,8 @@ const FUNCTIONS_BY_PATH: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("functions_by_path");
 const SYMBOL_BY_NAME: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("symbol_by_name");
+const SYMBOL_BY_PATH_COMPONENT: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("symbol_by_path_component");
 
 fn engine_bin() -> &'static str {
     env!("CARGO_BIN_EXE_aethyme-engine-cli")
@@ -334,6 +338,41 @@ where
     serde_json::from_slice(&output.stdout).expect("JSON parses")
 }
 
+fn symbol_cli_hits(repo: &Path, query: &str, limit: usize) -> serde_json::Value {
+    let limit = limit.to_string();
+    query_json([
+        "symbol-batch",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--query",
+        query,
+        "--limit",
+        limit.as_str(),
+    ])[query]
+        .clone()
+}
+
+fn hit_names(hits: &serde_json::Value) -> Vec<String> {
+    hits.as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["name"].as_str().expect("hit name").to_string())
+        .collect()
+}
+
+fn hit_name_kinds(hits: &serde_json::Value) -> Vec<(String, String)> {
+    hits.as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| {
+            (
+                hit["name"].as_str().expect("hit name").to_string(),
+                hit["kind"].as_str().expect("hit kind").to_string(),
+            )
+        })
+        .collect()
+}
+
 fn stable_redb_query_snapshot(repo: &Path) -> serde_json::Value {
     let mut overview = query_json(["query-overview", "--repo", repo.to_str().unwrap()]);
     if let Some(repo) = overview
@@ -460,6 +499,10 @@ fn index_populates_symbol_tables_and_symbol_edges() {
 
     assert!(str_multimap_values(&db, FUNCTIONS_BY_PATH, "src/auth/token.py").contains(function_id));
     assert!(
+        str_multimap_values(&db, SYMBOL_BY_PATH_COMPONENT, "auth").contains(function_id),
+        "symbol path-component index should support bounded path fuzzy lookup"
+    );
+    assert!(
         bytes_multimap_count(&db, EDGES_IN, function_id.as_str()) > 0,
         "symbol endpoint should have incoming adjacency"
     );
@@ -504,7 +547,7 @@ fn index_persists_complete_node_shape_and_unresolved_edges() {
 }
 
 #[test]
-fn symbol_command_uses_redb_exact_lookup_when_fragments_are_unavailable() {
+fn symbol_command_uses_redb_v2_lookup_when_fragments_are_unavailable() {
     let tmp = build_symbol_redb_fixture();
     std::fs::remove_dir_all(tmp.path().join(".aethyme/graph")).unwrap();
 
@@ -523,14 +566,17 @@ fn symbol_command_uses_redb_exact_lookup_when_fragments_are_unavailable() {
     assert!(!hits.is_empty(), "expected redb symbol hit");
     assert_eq!(hits[0]["name"], "load_token");
     assert_eq!(hits[0]["kind"], "function");
-    assert!(hits[0]["reason"]
-        .as_str()
-        .expect("reason")
-        .starts_with("redb-exact-symbol-name:"));
+    let reason = hits[0]["reason"].as_str().expect("reason");
+    assert!(reason.starts_with("redb-symbol-search:"));
+    assert!(
+        reason.contains("component-name"),
+        "expected component signal in reason, got {reason}"
+    );
+    assert!(hits[0]["score"].as_i64().expect("score") > 0);
 }
 
 #[test]
-fn symbol_batch_uses_redb_exact_lookup_when_fragments_are_unavailable() {
+fn symbol_batch_uses_redb_v2_lookup_when_fragments_are_unavailable() {
     let tmp = build_symbol_redb_fixture();
     std::fs::remove_dir_all(tmp.path().join(".aethyme/graph")).unwrap();
 
@@ -554,6 +600,64 @@ fn symbol_batch_uses_redb_exact_lookup_when_fragments_are_unavailable() {
     assert_eq!(load_hits[0]["name"], "load_token");
     assert_eq!(class_hits[0]["name"], "TokenLoader");
     assert_eq!(class_hits[0]["kind"], "class");
+}
+
+fn assert_redb_symbol_parity_with_repository_map(repo: &Path, queries: &[&str], limit: usize) {
+    let map = RepositoryMap::build(repo).expect("build RepositoryMap parity oracle");
+    for query in queries {
+        let expected = symbol_search(&map, query, limit)
+            .into_iter()
+            .map(|hit| (hit.name, hit.kind))
+            .collect::<Vec<_>>();
+        let actual = hit_name_kinds(&symbol_cli_hits(repo, query, limit));
+        assert_eq!(
+            actual, expected,
+            "redb V2 symbol search should match RepositoryMap fuzzy scorer for query {query:?}"
+        );
+    }
+}
+
+#[test]
+fn redb_symbol_search_matches_repository_map_fuzzy_scorer_on_tiny_fixture() {
+    let tmp = build_redb_fixture();
+
+    assert_redb_symbol_parity_with_repository_map(tmp.path(), &["load token", "auth", "token"], 5);
+}
+
+#[test]
+fn redb_symbol_search_matches_repository_map_fuzzy_scorer_on_medium_fixture() {
+    let tmp = build_medium_redb_fixture();
+
+    assert_redb_symbol_parity_with_repository_map(
+        tmp.path(),
+        &["handle request", "auth", "token"],
+        5,
+    );
+}
+
+#[test]
+fn redb_symbol_search_ordering_is_deterministic() {
+    let tmp = build_medium_redb_fixture();
+
+    let first = symbol_cli_hits(tmp.path(), "token", 10);
+    let second = symbol_cli_hits(tmp.path(), "token", 10);
+    assert_eq!(
+        first, second,
+        "same store/query should produce stable order"
+    );
+
+    let rebuild = run_engine([
+        "index",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&rebuild);
+    let after_rebuild = symbol_cli_hits(tmp.path(), "token", 10);
+    assert_eq!(
+        first, after_rebuild,
+        "same fragments should rebuild to the same symbol ordering"
+    );
 }
 
 #[test]
@@ -712,7 +816,7 @@ fn mediawiki_scale_redb_smoke_for_v2_paths() {
         "--repo",
         repo.to_str().unwrap(),
         "--query",
-        "doViewUpdates",
+        "viewing page",
     ]);
     assert_success(&symbol_output);
     assert_duration_below(
@@ -723,9 +827,10 @@ fn mediawiki_scale_redb_smoke_for_v2_paths() {
     );
     let hits: serde_json::Value =
         serde_json::from_slice(&symbol_output.stdout).expect("symbol JSON parses");
+    let hit_names = hit_names(&hits);
     assert!(
-        hits.as_array().is_some(),
-        "MediaWiki symbol output should remain a JSON array"
+        hit_names.iter().any(|name| name == "doViewUpdates"),
+        "MediaWiki symbol smoke should surface doViewUpdates for a fuzzy viewing/page query; got {hit_names:?}"
     );
 }
 
