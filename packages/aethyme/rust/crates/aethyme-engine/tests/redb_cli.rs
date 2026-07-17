@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Instant;
 
@@ -375,6 +375,78 @@ fn build_usage_boundary_redb_fixture() -> tempfile::TempDir {
     tmp
 }
 
+fn build_final_v2_medium_redb_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "README.md", b"# Final V2 Fixture\n");
+    write(
+        tmp.path(),
+        "docs/architecture.md",
+        b"# Architecture\n\nAuth, web, CLI, and watchlist ownership notes.\n",
+    );
+    write(
+        tmp.path(),
+        "src/auth/token.py",
+        b"class TokenLoader:\n    def load(self):\n        return load_token()\n\ndef load_token():\n    return 'token'\n",
+    );
+    write(
+        tmp.path(),
+        "src/web/handler.py",
+        b"from src.auth.token import load_token\n\ndef handle_request():\n    return load_token()\n",
+    );
+    write(
+        tmp.path(),
+        "src/cli/main.py",
+        b"from src.web.handler import handle_request\n\ndef main():\n    return handle_request()\n",
+    );
+    write(
+        tmp.path(),
+        "src/calls.py",
+        b"def callee():\n    return 'callee'\n\ndef caller():\n    return callee()\n",
+    );
+    write(
+        tmp.path(),
+        "pyproject.toml",
+        b"[project]\nname = \"final-v2-fixture\"\n",
+    );
+    write(
+        tmp.path(),
+        "includes/Watchlist/Store.php",
+        b"<?php\nclass Store {\n    public function externalUsed() {}\n    public function internalOnly() {}\n    public function unusedMethod() {}\n}\nclass Manager {\n    private function run($store) { $store->internalOnly(); }\n}\n",
+    );
+    write(
+        tmp.path(),
+        "includes/Api/Controller.php",
+        b"<?php\nclass Controller {\n    public function handle($store) { $store->externalUsed(); }\n}\n",
+    );
+    write(
+        tmp.path(),
+        "docs/watchlist.md",
+        b"# Watchlist\n\nThe watchlist docs mention externalUsed.\n",
+    );
+    write(
+        tmp.path(),
+        "config/watchlist.yaml",
+        b"watchlist:\n  callback: externalUsed\n",
+    );
+
+    let root = tmp.path().canonicalize().unwrap();
+    bootstrap_repo(&root, "test-engine").expect("bootstrap graph layout");
+    let ctx = IndexerContext::new("FinalV2Repo", root.clone(), "test-engine").unwrap();
+    let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
+    assert_eq!(summary.total_files, 11);
+    add_call_edge_to_fragment(&root, "src/calls.py", "caller", "callee");
+
+    let output = run_engine([
+        "index",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&output);
+    assert!(tmp.path().join(".aethyme/graph_store.redb").is_file());
+    tmp
+}
+
 fn build_redb_fixture() -> tempfile::TempDir {
     let tmp = build_fragment_fixture();
     let output = run_engine([
@@ -627,6 +699,26 @@ fn explore_cli_json(
         args.push("--show-observability".to_string());
     }
     query_json(args)
+}
+
+fn usage_boundary_explore_cli_json(repo: &Path, request: &str, scope: &str) -> serde_json::Value {
+    query_json([
+        "explore",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--request",
+        request,
+        "--format",
+        "answer-json",
+        "--intent",
+        "usage_boundary_query",
+        "--scope",
+        scope,
+        "--budget-ms",
+        "5000",
+        "--max-evidence-per-symbol",
+        "4",
+    ])
 }
 
 fn activate_from_cli_json(repo: &Path, seed: &str, hops: usize) -> serde_json::Value {
@@ -1320,6 +1412,61 @@ fn context_pack_metrics(value: &serde_json::Value) -> (usize, Vec<String>, Vec<S
     (serialized_size, files, symbols, snippet_count)
 }
 
+fn aethyme_repo_root_for_tests() -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .ancestors()
+        .find(|path| path.join("AGENTS.md").is_file() && path.join("packages/aethyme").is_dir())
+        .expect("locate Aethyme repo root")
+        .to_path_buf()
+}
+
+fn assert_external_playground_repo(repo: &Path) -> PathBuf {
+    assert!(
+        repo.is_dir(),
+        "playground repo does not exist: {}",
+        repo.display()
+    );
+    let repo = repo
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("canonicalize playground repo {}: {e}", repo.display()));
+    let aethyme_root = aethyme_repo_root_for_tests()
+        .canonicalize()
+        .expect("canonicalize Aethyme root");
+    assert!(
+        !repo.starts_with(&aethyme_root),
+        "Cardinal Rule 1: playground gates must never point at Aethyme itself ({})",
+        aethyme_root.display()
+    );
+    repo
+}
+
+fn assert_pack_within_token_budget(repo: &Path, map: &RepositoryMap, task: &str, command: &str) {
+    let expected = repository_map_context_pack_json(repo, map, task);
+    let actual = context_pack_cli_json(repo, command, task);
+    let (expected_size, expected_files, expected_symbols, expected_snippets) =
+        context_pack_metrics(&expected);
+    let (actual_size, actual_files, actual_symbols, actual_snippets) =
+        context_pack_metrics(&actual);
+
+    assert_eq!(
+        actual_files, expected_files,
+        "selected files should not drift for task {task:?}"
+    );
+    assert_eq!(
+        actual_symbols, expected_symbols,
+        "selected symbols should not drift for task {task:?}"
+    );
+    assert_eq!(
+        actual_snippets, expected_snippets,
+        "snippet count should not drift for task {task:?}"
+    );
+    assert!(
+        actual_size <= expected_size.saturating_mul(120) / 100 + 512,
+        "redb {command} size regressed for task {task:?}: actual={actual_size}, expected={expected_size}"
+    );
+}
+
 fn assert_context_pack_parity(repo: &Path, tasks: &[&str]) {
     let map = RepositoryMap::build(repo).expect("build RepositoryMap context-pack oracle");
     for task in tasks {
@@ -1372,6 +1519,30 @@ fn redb_context_command_matches_repository_map_snapshot_with_content() {
 }
 
 #[test]
+fn redb_explain_aliases_render_from_redb_context_pack() {
+    let tmp = build_task_redb_fixture();
+
+    let explain = run_engine(["explain", "--repo", tmp.path().to_str().unwrap()]);
+    assert_success(&explain);
+    let explain_text = String::from_utf8_lossy(&explain.stdout);
+    assert!(explain_text.contains("Task: Explain this repo"));
+    assert!(explain_text.contains("Files indexed:"));
+    assert!(explain_text.contains("Docs indexed:"));
+
+    let task_explain = run_engine([
+        "task-explain",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--task",
+        "Trace impact of load_token",
+    ]);
+    assert_success(&task_explain);
+    let task_explain_text = String::from_utf8_lossy(&task_explain.stdout);
+    assert!(task_explain_text.contains("Task: Trace impact of load_token"));
+    assert!(task_explain_text.contains("Functions indexed:"));
+}
+
+#[test]
 fn redb_context_pack_token_regression_gate_on_playground_fixture() {
     let tmp = build_task_redb_fixture();
     let map = RepositoryMap::build(tmp.path()).expect("build RepositoryMap token oracle");
@@ -1382,30 +1553,41 @@ fn redb_context_pack_token_regression_gate_on_playground_fixture() {
         "Trace impact of load_token",
         "Find the manifest that owns the top-level area",
     ] {
-        let expected = repository_map_context_pack_json(tmp.path(), &map, task);
-        let actual = context_pack_cli_json(tmp.path(), "pack", task);
-        let (expected_size, expected_files, expected_symbols, expected_snippets) =
-            context_pack_metrics(&expected);
-        let (actual_size, actual_files, actual_symbols, actual_snippets) =
-            context_pack_metrics(&actual);
-
-        assert_eq!(
-            actual_files, expected_files,
-            "selected files should not drift for task {task:?}"
-        );
-        assert_eq!(
-            actual_symbols, expected_symbols,
-            "selected symbols should not drift for task {task:?}"
-        );
-        assert_eq!(
-            actual_snippets, expected_snippets,
-            "snippet count should not drift for task {task:?}"
-        );
-        assert!(
-            actual_size <= expected_size.saturating_mul(120) / 100 + 512,
-            "redb pack size regressed for task {task:?}: actual={actual_size}, expected={expected_size}"
-        );
+        assert_pack_within_token_budget(tmp.path(), &map, task, "pack");
     }
+}
+
+#[test]
+#[ignore = "requires AETHYME_PLAYGROUND_REPO; never point this at the Aethyme repo"]
+fn playground_context_pack_token_regression_gate_never_self_eval() {
+    let Ok(repo) = env::var("AETHYME_PLAYGROUND_REPO") else {
+        eprintln!("skipping: set AETHYME_PLAYGROUND_REPO to a playground repo");
+        return;
+    };
+    let repo = assert_external_playground_repo(Path::new(&repo));
+
+    let index = run_engine(["index", "--repo", repo.to_str().unwrap()]);
+    assert_success(&index);
+
+    let map = RepositoryMap::build(&repo).expect("build RepositoryMap playground token oracle");
+    for task in [
+        "Explain this repo",
+        "Update the authentication flow",
+        "Trace impact of the main request handler",
+        "Find the manifest that owns the top-level area",
+    ] {
+        assert_pack_within_token_budget(&repo, &map, task, "pack");
+        assert_pack_within_token_budget(&repo, &map, task, "task-pack");
+    }
+
+    let explore = explore_cli_json(
+        &repo,
+        "Find the main request handling flow",
+        "task_localization_query",
+        true,
+    );
+    assert_eq!(explore["schema_version"], "aethyme-explore-v1");
+    assert_eq!(explore["observability"]["graph_store"]["backend"], "redb");
 }
 
 #[test]
@@ -1631,6 +1813,36 @@ fn usage_boundary_uses_redb_seeds_for_callers_and_docs_config_references() {
 }
 
 #[test]
+fn redb_explore_usage_boundary_intent_uses_hybrid_v2_contract() {
+    let tmp = build_usage_boundary_redb_fixture();
+    std::fs::remove_dir_all(tmp.path().join(".aethyme/graph")).unwrap();
+
+    let response = usage_boundary_explore_cli_json(
+        tmp.path(),
+        "Find unused public watchlist methods",
+        "includes/Watchlist",
+    );
+    assert_eq!(response["schema_version"], "aethyme-explore-v1");
+    assert_eq!(response["intent"], "usage_boundary_query");
+    assert_eq!(response["intent_source"], "explicit");
+    assert!(response["answer"]
+        .as_array()
+        .expect("answer array")
+        .iter()
+        .any(|item| item["target"]
+            .as_str()
+            .is_some_and(|target| target.contains("unusedMethod"))));
+    assert!(
+        response["degraded_reasons"]
+            .as_array()
+            .expect("degraded reasons")
+            .iter()
+            .any(|reason| reason == "redb_seed_discovery"),
+        "usage-boundary explore should declare the redb seed path"
+    );
+}
+
+#[test]
 fn usage_boundary_reads_fresh_source_evidence_after_redb_index() {
     let tmp = build_usage_boundary_redb_fixture();
     let store_path = tmp.path().join(".aethyme/graph_store.redb");
@@ -1710,6 +1922,144 @@ fn usage_boundary_reads_fresh_source_evidence_after_redb_index() {
         store_modified_after, store_modified_before,
         "usage-boundary queries must not mutate the derived redb store"
     );
+}
+
+#[test]
+fn final_v2_medium_fixture_integrates_graph_task_context_activation_usage_and_explore() {
+    let tmp = build_final_v2_medium_redb_fixture();
+    let repo = tmp.path();
+
+    let overview = query_json(["query-overview", "--repo", repo.to_str().unwrap()]);
+    assert!(overview["areas"].as_array().expect("areas").len() >= 3);
+
+    let symbol_hits = query_json([
+        "symbol",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--query",
+        "load_token",
+    ]);
+    assert!(
+        !symbol_hits.as_array().expect("symbol hits").is_empty(),
+        "symbol query should return redb matches"
+    );
+
+    let graph_node = graph_cli_json(repo, "graph-node", "load_token");
+    assert_eq!(graph_node["kind"], "function");
+    for command in [
+        "graph-children",
+        "graph-parents",
+        "graph-callers",
+        "graph-callees",
+        "graph-docs",
+        "graph-configs",
+    ] {
+        let relation = graph_cli_json(repo, command, "load_token");
+        assert!(
+            relation["items"].as_array().is_some(),
+            "{command} should render a relation array"
+        );
+    }
+    let callees = graph_cli_json(repo, "graph-callees", "caller");
+    assert!(
+        !callees["items"].as_array().expect("callees").is_empty(),
+        "fixture call edge should be visible through graph-callees"
+    );
+    let graph_overview = graph_overview_cli_json(repo);
+    assert!(graph_overview["signals"].as_object().is_some());
+    let expand = graph_cli_json(repo, "graph-expand", "caller");
+    assert!(
+        !expand["callees"]
+            .as_array()
+            .expect("expand callees")
+            .is_empty(),
+        "graph-expand should compose call relations"
+    );
+
+    let task = "Trace impact of load_token";
+    for command in ["task-anchors", "task-scope", "task-next", "task-localize"] {
+        let task_view = task_cli_json(repo, command, task);
+        assert!(
+            task_view.as_object().is_some(),
+            "{command} should render JSON"
+        );
+    }
+    let task_expand = task_expand_cli_json(repo, "caller");
+    assert!(task_expand["impact"].as_array().is_some());
+
+    let pack = context_pack_cli_json(repo, "pack", task);
+    assert!(pack["snippets"].as_array().is_some());
+    assert_eq!(context_pack_cli_json(repo, "task-pack", task), pack);
+    let context = context_with_content_cli_json(repo, "context", task);
+    assert!(context["snippets"].as_array().is_some());
+    assert_eq!(
+        context_with_content_cli_json(repo, "task-context", task),
+        context
+    );
+
+    let explain = run_engine([
+        "task-explain",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--task",
+        task,
+    ]);
+    assert_success(&explain);
+    assert!(String::from_utf8_lossy(&explain.stdout).contains("Task: Trace impact of load_token"));
+
+    let activation = activation_cli_json(repo, "activate", "--task", task);
+    assert!(
+        !activation["activations"]
+            .as_array()
+            .expect("activation array")
+            .is_empty(),
+        "activate should return redb-backed activations"
+    );
+    let seed_activation = activate_from_cli_json(repo, "src/calls.py::caller", 3);
+    assert!(
+        seed_activation["activations"]
+            .as_array()
+            .expect("seed activation array")
+            .iter()
+            .any(|item| item["id"].as_str().is_some_and(|id| id.contains("callee"))),
+        "activate-from should traverse the fixture call edge"
+    );
+    let impact = query_json([
+        "impact",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--target",
+        "load_token",
+    ]);
+    assert!(impact.as_array().is_some());
+
+    let usage = query_json([
+        "analyze-usage-boundary",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--scope",
+        "includes/Watchlist",
+        "--include-methods",
+        "--budget-ms",
+        "5000",
+    ]);
+    assert_eq!(usage["analyzer"], "usage-boundary");
+    assert!(usage["candidates"].as_array().is_some());
+
+    let explore = explore_cli_json(
+        repo,
+        "Find the load_token flow",
+        "task_localization_query",
+        true,
+    );
+    assert_eq!(explore["schema_version"], "aethyme-explore-v1");
+    assert_eq!(explore["observability"]["graph_store"]["backend"], "redb");
+    let usage_explore = usage_boundary_explore_cli_json(
+        repo,
+        "Find unused watchlist methods",
+        "includes/Watchlist",
+    );
+    assert_eq!(usage_explore["intent"], "usage_boundary_query");
 }
 
 #[test]
@@ -2020,13 +2370,89 @@ fn mediawiki_scale_redb_smoke_for_v2_paths() {
         broad_hit_names.iter().any(|name| name == "doViewUpdates"),
         "MediaWiki broad symbol smoke should recall doViewUpdates for a fuzzy viewing/page query"
     );
+    let broad_hit_items = broad_hits["viewing page"]
+        .as_array()
+        .expect("broad hits array");
+    let mediawiki_target = broad_hit_items
+        .iter()
+        .find(|hit| hit["name"].as_str() == Some("doViewUpdates"))
+        .or_else(|| broad_hit_items.first())
+        .and_then(|hit| hit["id"].as_str().or_else(|| hit["name"].as_str()))
+        .expect("MediaWiki relation target")
+        .to_string();
+
+    let (graph_overview_output, graph_overview_ms) =
+        run_engine_timed(["graph-overview", "--repo", repo.to_str().unwrap()]);
+    assert_success(&graph_overview_output);
+    assert_duration_below(
+        "MediaWiki graph-overview",
+        graph_overview_ms,
+        "AETHYME_REDB_MEDIAWIKI_MAX_GRAPH_OVERVIEW_MS",
+        5_000,
+    );
+
+    let (relation_output, relation_ms) = run_engine_timed([
+        "graph-callees",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--target",
+        mediawiki_target.as_str(),
+    ]);
+    assert_success(&relation_output);
+    assert_duration_below(
+        "MediaWiki graph relation query",
+        relation_ms,
+        "AETHYME_REDB_MEDIAWIKI_MAX_RELATION_MS",
+        5_000,
+    );
+    let relation: serde_json::Value =
+        serde_json::from_slice(&relation_output.stdout).expect("relation JSON parses");
+    assert!(relation["items"].as_array().is_some());
+
+    let (expand_output, expand_ms) = run_engine_timed([
+        "graph-expand",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--target",
+        mediawiki_target.as_str(),
+    ]);
+    assert_success(&expand_output);
+    assert_duration_below(
+        "MediaWiki graph-expand",
+        expand_ms,
+        "AETHYME_REDB_MEDIAWIKI_MAX_GRAPH_EXPAND_MS",
+        10_000,
+    );
+    let expand: serde_json::Value =
+        serde_json::from_slice(&expand_output.stdout).expect("graph-expand JSON parses");
+    assert!(expand["target"].as_object().is_some());
+
+    let task_text = "Trace impact of doViewUpdates";
+    for (command, env_key) in [
+        ("task-anchors", "AETHYME_REDB_MEDIAWIKI_MAX_TASK_ANCHORS_MS"),
+        ("task-scope", "AETHYME_REDB_MEDIAWIKI_MAX_TASK_SCOPE_MS"),
+        ("task-next", "AETHYME_REDB_MEDIAWIKI_MAX_TASK_NEXT_MS"),
+    ] {
+        let (task_output, task_ms) = run_engine_timed([
+            command,
+            "--repo",
+            repo.to_str().unwrap(),
+            "--task",
+            task_text,
+        ]);
+        assert_success(&task_output);
+        assert_duration_below(command, task_ms, env_key, 10_000);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&task_output.stdout).expect("task JSON parses");
+        assert!(parsed.as_object().is_some());
+    }
 
     let (task_output, task_ms) = run_engine_timed([
         "task-localize",
         "--repo",
         repo.to_str().unwrap(),
         "--task",
-        "Trace impact of doViewUpdates",
+        task_text,
     ]);
     assert_success(&task_output);
     assert_duration_below(
@@ -2040,6 +2466,47 @@ fn mediawiki_scale_redb_smoke_for_v2_paths() {
     assert!(task["anchors"]["anchors"].as_array().is_some());
     assert!(task["scope"]["navigation_order"].as_array().is_some());
     assert!(task["next"]["items"].as_array().is_some());
+
+    let (pack_output, pack_ms) = run_engine_timed([
+        "pack",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--task",
+        task_text,
+    ]);
+    assert_success(&pack_output);
+    assert_duration_below(
+        "MediaWiki context pack",
+        pack_ms,
+        "AETHYME_REDB_MEDIAWIKI_MAX_CONTEXT_PACK_MS",
+        20_000,
+    );
+    let pack: serde_json::Value =
+        serde_json::from_slice(&pack_output.stdout).expect("context-pack JSON parses");
+    assert!(pack["snippets"].as_array().is_some());
+
+    let (explore_output, explore_ms) = run_engine_timed([
+        "explore",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--request",
+        "Trace impact of doViewUpdates",
+        "--format",
+        "answer-json",
+        "--intent",
+        "task_localization_query",
+    ]);
+    assert_success(&explore_output);
+    assert_duration_below(
+        "MediaWiki explore",
+        explore_ms,
+        "AETHYME_REDB_MEDIAWIKI_MAX_EXPLORE_MS",
+        20_000,
+    );
+    let explore: serde_json::Value =
+        serde_json::from_slice(&explore_output.stdout).expect("explore JSON parses");
+    assert_eq!(explore["schema_version"], "aethyme-explore-v1");
+    assert!(explore["answer"].as_array().is_some());
 }
 
 #[cfg(unix)]

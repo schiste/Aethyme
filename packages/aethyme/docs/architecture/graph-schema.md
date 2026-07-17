@@ -466,7 +466,7 @@ Required V2 read APIs for replacing `RepositoryMap` reads:
 | Adjacency | Implemented as `neighbors(id, direction, kind?)`; existing `edges_from` / `edges_to` remain compatibility wrappers for unfiltered directions. | `children_view`, `parents_view`, `callers_view`, `callees_view`, `docs_view`, `configs_view`, `task_expand_view`, `graph_expand_view`. |
 | Task anchor candidates | Implemented as `task_anchor_candidates(task_tokens, limit)` and `symbols_matching_with(...)`, returning bounded typed candidates with exact/prefix/component/path/area signals. Ranking stays in the graph module. | `task_anchors_view`, `task_scope_view`, `task_next_view`, context-pack assembly. |
 | Usage-boundary seeds | Implemented through redb path/adjacency APIs: `functions_under_path`, `nodes_under_path`, `neighbors`, plus bounded `usage_boundary_candidates(scope, symbol_kind, limit)` for consumers that need capped seeds. | `usage_boundary_query`, `analyze-usage-boundary`, dead-code analysis seed selection. |
-| Overview/navigation slices | Implemented as `overview_v2(...)` for bounded repo metadata, repository, directories, areas, entrypoints, risks, files, functions, classes, docs, configs, and unresolved placeholders. `task_next_view_redb` now adapts these rows for task navigation; graph overview, `explore`, and context-pack navigation still need redb adapters. | `graph_overview_view`, `task_next_view`, `explore`, context-pack navigation order. |
+| Overview/navigation slices | Implemented as `overview_v2(...)` for bounded repo metadata, repository, directories, areas, entrypoints, risks, files, functions, classes, docs, configs, and unresolved placeholders. `graph_overview_view_redb`, `task_next_view_redb`, native `explore`, and redb context-pack assembly adapt these rows directly. | `graph_overview_view`, `task_next_view`, `explore`, context-pack navigation order. |
 
 Bridge decisions as of 2026-07-17:
 
@@ -475,33 +475,46 @@ Bridge decisions as of 2026-07-17:
 | `symbol` / `symbol-batch` | Redb-backed V2 symbol search. | CLI opens `.aethyme/graph_store.redb` read-only and serves bounded function/class matches through `symbols_matching_with`; it fails cleanly when the store is missing and no longer builds `RepositoryMap` for fuzzy scoring. |
 | `deps` / `importers` | Redb-backed equivalent. | CLI reads `neighbors(id, Outgoing/Incoming, None)` and preserves the existing path-list output. |
 | `query-overview` | Redb-backed equivalent with V1 JSON projection. | CLI reads `overview_v2(Default)` but still emits only the stable `repo`, `areas`, `entrypoints`, and `risks` keys. |
+| `graph-overview` | Redb-backed rendered overview. | CLI opens `.aethyme/graph_store.redb` read-only, renders the existing overview JSON shape from `overview_v2(...)`, and has tiny/medium parity plus deterministic-query gates. |
 | `callers` | Keep the hybrid grep + redb adjacency path. | Grep finds candidate files containing the symbol; redb `neighbors(..., Incoming, None)` expands importers before line grep. |
 | `task-anchors` | Redb-backed task anchors. | CLI opens `.aethyme/graph_store.redb` read-only, resolves anchors from overview rows, path indexes, config/doc rows, and bounded symbol candidates, then applies graph-module task ranking. Binary parity snapshots cover ExplainRepo, ChangeSymbol, TraceImpact, and config-ownership tasks. |
 | `task-scope` | Redb-backed task scope. | CLI composes redb-backed anchors with redb path-prefix lookup, symbol rows, area membership, and risk lookup while preserving the existing JSON shape. Binary parity snapshots cover ExplainRepo, ChangeSymbol, TraceImpact, and config-ownership tasks. |
 | `task-next` / `task-localize` | Redb-backed task navigation. | `task-next` reads redb-backed anchors, relation views, semantic config/doc path rows, and bounded overview/navigation slices. `task-localize` composes `task-anchors`, `task-scope`, and `task-next`; `--profile` reports redb stages rather than `RepositoryMap` build time. |
 | `task-expand` | Redb-backed task expansion. | `task-expand` opens `.aethyme/graph_store.redb` read-only, composes callers/callees, docs/configs, and risks into the existing compact JSON shape, and has binary parity coverage against `RepositoryMap` snapshots. |
+| `pack` / `task-pack` / `context` / `task-context` / `explain` / `task-explain` | Redb-backed context-pack assembly. | CLI opens `.aethyme/graph_store.redb` read-only to select anchors, scope, docs/configs, risks, symbols, relations, and path rows. Source text is read only to supply snippets/content. RepositoryMap remains only as a test oracle for parity and token-regression gates. |
+| `activate` / `activate-from` / `impact` | Redb-backed activation and neighborhood views. | CLI opens `.aethyme/graph_store.redb` read-only and expands from redb anchors, adjacency, docs/configs, call/import relations, area, and risk projections. |
 | `graph-node` / rendered relation views | Redb-backed rendered views. | `graph-node`, `graph-children`, `graph-parents`, `graph-callers`, `graph-callees`, `graph-docs`, and `graph-configs` open `.aethyme/graph_store.redb` read-only, adapt redb display/relation rows to the existing JSON structs, and have binary parity snapshots against `RepositoryMap`. |
 | `graph-expand` | Redb-backed composed view. | `graph-expand` opens `.aethyme/graph_store.redb` read-only, composes the redb-backed node, parents, children, callers, callees, docs, configs, and risks views, preserves the existing JSON shape and bounds, and has binary parity, shape, bounded-output, deterministic-ordering, and docs/configs/call-edge fixture gates. |
+| `explore` non-usage-boundary intents | Redb-backed native explore. | `task_localization_query`, `behavior_localization_query`, and auto-selected native intents read graph/navigation data from `.aethyme/graph_store.redb`; observability reports redb store status/freshness. |
 | `usage boundary` | Hybrid redb + source text. | `analyze-usage-boundary` and `explore --intent usage_boundary_query` open `.aethyme/graph_store.redb` read-only, discover public PHP symbols and candidate files through redb path indexes/adjacency, then scan source/docs/config text for evidence. This is the accepted Phase 5 contract; fully redb-native evidence would require persisted evidence rows plus freshness/invalidation rules. |
-| Trait abstraction | Defer. | A trait is useful only once two consumers need the same read contract; today the low-risk commands can call redb directly and higher-level flows still need richer candidate APIs. |
+| Trait abstraction | Defer. | There is no production dual backend for migrated surfaces. RepositoryMap is kept only where still actively required outside these redb-backed commands, or as an explicit test oracle. |
 
 V2 correctness and performance gates:
 
 - Tiny read-API gates live in
   `rust/crates/aethyme-engine/src/store/redb/graph_store.rs` and cover
-  `get_node`, `find_symbols`, `nodes_under_path`, `functions_under_path`,
-  `resolve_file_path`, `neighbors`, and `overview_v2` on a tiny typed store
+  `get_node`, `get_nodes`, `node_display`, `area_for_node`, `find_symbols`,
+  `symbols_matching`, `symbols_matching_with`, `nodes_under_path`,
+  `functions_under_path`, `resolve_file_path`, `neighbors`, `children`,
+  `parents`, `relation_view`, `docs_for`, `configs_for`,
+  `risk_for_node_or_path`, `task_anchor_candidates`,
+  `usage_boundary_candidates`, and `overview_v2` on a tiny typed store
   fixture.
 - Binary integration gates live in
   `rust/crates/aethyme-engine/tests/redb_cli.rs` and cover indexing from
-  fragments, redb exact symbol query, graph callers/callees query shape,
-  rendered graph parity snapshots, graph-expand JSON shape and bounded
-  output, task-expand relation parity, task parity snapshots for ExplainRepo,
-  ChangeSymbol, TraceImpact, and config-ownership tasks, usage-boundary
-  internal/external caller plus docs/config reference behavior,
-  usage-boundary source-change freshness, deterministic query snapshots after
-  rebuilding from identical fragments, missing-store read-only behavior, and
-  disposable-fast publish boundaries.
+  fragments, redb exact/fuzzy symbol query, graph callers/callees query
+  shape, rendered graph parity snapshots, graph overview parity/shape/
+  determinism, graph-expand JSON shape and bounded output, task-expand
+  relation parity, task parity snapshots for ExplainRepo, ChangeSymbol,
+  TraceImpact, and config-ownership tasks, context-pack/context/explain
+  aliases, activation/activate-from/impact, native explore intents,
+  usage-boundary internal/external caller plus docs/config reference behavior,
+  usage-boundary explore, usage-boundary source-change freshness,
+  deterministic query snapshots after rebuilding from identical fragments,
+  missing-store read-only behavior, disposable-fast publish boundaries, and a
+  medium fixture that runs index, symbol, graph views, graph overview,
+  graph-expand, task views, context pack, activation, usage-boundary, and
+  explore together.
 - The default performance smoke is intentionally tiny and bounded by
   environment-overridable thresholds:
   `AETHYME_REDB_PERF_MAX_INDEX_MS`,
@@ -516,8 +529,23 @@ V2 correctness and performance gates:
   `AETHYME_REDB_MEDIAWIKI_MAX_QUERY_OVERVIEW_MS`, and
   `AETHYME_REDB_MEDIAWIKI_MAX_SYMBOL_MS`. The broad recall sanity check uses
   `AETHYME_REDB_MEDIAWIKI_MAX_BROAD_SYMBOL_MS`, plus
-  `AETHYME_REDB_MEDIAWIKI_MAX_TASK_LOCALIZE_MS` for the Phase 6 task
-  navigation smoke.
+  `AETHYME_REDB_MEDIAWIKI_MAX_GRAPH_OVERVIEW_MS`,
+  `AETHYME_REDB_MEDIAWIKI_MAX_RELATION_MS`,
+  `AETHYME_REDB_MEDIAWIKI_MAX_GRAPH_EXPAND_MS`,
+  `AETHYME_REDB_MEDIAWIKI_MAX_TASK_ANCHORS_MS`,
+  `AETHYME_REDB_MEDIAWIKI_MAX_TASK_SCOPE_MS`,
+  `AETHYME_REDB_MEDIAWIKI_MAX_TASK_NEXT_MS`,
+  `AETHYME_REDB_MEDIAWIKI_MAX_TASK_LOCALIZE_MS`,
+  `AETHYME_REDB_MEDIAWIKI_MAX_CONTEXT_PACK_MS`, and
+  `AETHYME_REDB_MEDIAWIKI_MAX_EXPLORE_MS` for the Phase 6 navigation smoke.
+- Playground eval/token verification is also an explicit ignored Rust test:
+  `cargo test -p aethyme-engine --test redb_cli playground_context_pack_token_regression_gate_never_self_eval -- --ignored --nocapture`
+  with `AETHYME_PLAYGROUND_REPO=/path/to/playground`. The test canonicalizes
+  the supplied repo and fails if it points inside the Aethyme checkout. It
+  compares redb context-pack and task-pack size, selected files, selected
+  symbols, and snippet counts against the RepositoryMap test oracle, then runs
+  a native redb explore smoke. This is the first real consumer-facing token
+  regression gate; it is never an Aethyme self-eval.
 
 V2 redb-backed navigation surfaces should be described as complete only after
 they read from `.aethyme/graph_store.redb` without constructing a full
