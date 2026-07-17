@@ -323,6 +323,26 @@ pub fn graph_expand_view(map: &RepositoryMap, target: &str) -> Option<GraphExpan
     })
 }
 
+pub fn graph_expand_view_redb(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+) -> Result<Option<GraphExpandView>, GraphStoreError> {
+    let Some(target_view) = node_view_redb(store, target)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(GraphExpandView {
+        target: target_view,
+        parents: limited_items(parents_view_redb(store, target)?.items, 5),
+        children: limited_items(children_view_redb(store, target)?.items, 8),
+        callers: limited_items(callers_view_redb(store, target)?.items, 8),
+        callees: limited_items(callees_view_redb(store, target)?.items, 8),
+        docs: limited_items(docs_view_redb(store, target)?.items, 5),
+        configs: limited_items(configs_view_redb(store, target)?.items, 5),
+        risks: risks_for_redb_target(store, target)?,
+    }))
+}
+
 pub fn graph_overview_view(map: &RepositoryMap) -> RepoOverviewView {
     let overview = build_repo_overview(map, &repo_navigation_seed(map));
     RepoOverviewView {
@@ -700,6 +720,23 @@ fn risks_for_target(map: &RepositoryMap, target: &str) -> Vec<String> {
     risks.sort();
     risks.dedup();
     risks
+}
+
+fn risks_for_redb_target(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+) -> Result<Vec<String>, GraphStoreError> {
+    let Some(id) = resolved_redb_target_id(store, target)? else {
+        return Ok(Vec::new());
+    };
+    let mut risks = store
+        .risk_for_node_or_path(&id)?
+        .iter()
+        .map(risk_string)
+        .collect::<Vec<_>>();
+    risks.sort();
+    risks.dedup();
+    Ok(risks)
 }
 
 fn repo_navigation_seed(map: &RepositoryMap) -> Vec<String> {

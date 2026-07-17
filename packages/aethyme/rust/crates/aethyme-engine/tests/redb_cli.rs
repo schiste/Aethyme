@@ -12,12 +12,14 @@ use std::process::{Command, Output};
 use std::time::Instant;
 
 use aethyme_engine::graph::navigation::{
-    callees_view, callers_view, children_view, configs_view, docs_view, node_view, parents_view,
+    callees_view, callers_view, children_view, configs_view, docs_view, graph_expand_view,
+    node_view, parents_view,
 };
 use aethyme_engine::graph::search::symbol_search;
 use aethyme_engine::map::RepositoryMap;
 use aethyme_graph_indexer::{index_repo_to_disk, IndexerContext, WalkOptions};
-use aethyme_graph_storage::bootstrap_repo;
+use aethyme_graph_schema::{Confidence, Edge, EdgeAttributes, EdgeSite, Source};
+use aethyme_graph_storage::{bootstrap_repo, read_fragment, write_fragment, Fragment};
 use redb::{Database, MultimapTableDefinition, ReadableDatabase, ReadableTable, TableDefinition};
 
 const REPOSITORIES: TableDefinition<&str, &[u8]> = TableDefinition::new("repositories");
@@ -194,6 +196,53 @@ fn build_medium_redb_fixture() -> tempfile::TempDir {
     tmp
 }
 
+fn build_expand_redb_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/calls.py",
+        b"def callee():\n    return 'callee'\n\ndef caller():\n    return callee()\n",
+    );
+    write(
+        tmp.path(),
+        "src/wide.py",
+        b"def f00():\n    return 0\n\ndef f01():\n    return 1\n\ndef f02():\n    return 2\n\ndef f03():\n    return 3\n\ndef f04():\n    return 4\n\ndef f05():\n    return 5\n\ndef f06():\n    return 6\n\ndef f07():\n    return 7\n\ndef f08():\n    return 8\n\ndef f09():\n    return 9\n\ndef f10():\n    return 10\n\ndef f11():\n    return 11\n",
+    );
+    for index in 0..12 {
+        write(
+            tmp.path(),
+            &format!("src/dir{index:02}/mod.py"),
+            b"def marker():\n    return True\n",
+        );
+    }
+    write(
+        tmp.path(),
+        "docs/calls.md",
+        b"# Calls\n\nCall graph fixture notes.\n",
+    );
+    write(
+        tmp.path(),
+        "pyproject.toml",
+        b"[project]\nname = \"expand-fixture\"\n",
+    );
+
+    let root = tmp.path().canonicalize().unwrap();
+    bootstrap_repo(&root, "test-engine").expect("bootstrap graph layout");
+    let ctx = IndexerContext::new("ExpandRepo", root.clone(), "test-engine").unwrap();
+    let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
+    assert_eq!(summary.total_files, 16);
+    add_call_edge_to_fragment(&root, "src/calls.py", "caller", "callee");
+
+    let output = run_engine([
+        "index",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&output);
+    tmp
+}
+
 fn build_redb_fixture() -> tempfile::TempDir {
     let tmp = build_fragment_fixture();
     let output = run_engine([
@@ -205,6 +254,42 @@ fn build_redb_fixture() -> tempfile::TempDir {
     assert_success(&output);
     assert!(tmp.path().join(".aethyme/graph_store.redb").is_file());
     tmp
+}
+
+fn add_call_edge_to_fragment(root: &Path, source_path: &str, caller: &str, callee: &str) {
+    let fragment = read_fragment(root, source_path).expect("read fragment");
+    let caller_id = fragment
+        .nodes()
+        .iter()
+        .find(|node| node.name() == Some(caller))
+        .expect("caller node")
+        .id()
+        .clone();
+    let callee_id = fragment
+        .nodes()
+        .iter()
+        .find(|node| node.name() == Some(callee))
+        .expect("callee node")
+        .id()
+        .clone();
+    let mut edges = fragment.edges().to_vec();
+    edges.push(
+        Edge::new(
+            caller_id,
+            callee_id,
+            EdgeAttributes::Calls,
+            Source::Code,
+            Confidence::FULL,
+        )
+        .with_site(EdgeSite {
+            line: 5,
+            is_in_branch: false,
+            is_in_loop: false,
+            kind_tag: "direct".into(),
+        }),
+    );
+    let updated = Fragment::new(source_path, fragment.nodes().to_vec(), edges).expect("fragment");
+    write_fragment(root, source_path, &updated).expect("write fragment");
 }
 
 fn build_symbol_redb_fixture() -> tempfile::TempDir {
@@ -366,6 +451,9 @@ fn repository_map_graph_json(
         "graph-callees" => aethyme_engine::json::graph_relation(&callees_view(map, target)),
         "graph-docs" => aethyme_engine::json::graph_relation(&docs_view(map, target)),
         "graph-configs" => aethyme_engine::json::graph_relation(&configs_view(map, target)),
+        "graph-expand" => aethyme_engine::json::graph_expand_view(
+            &graph_expand_view(map, target).expect("RepositoryMap expand view"),
+        ),
         other => panic!("unsupported graph command: {other}"),
     };
     serde_json::from_str(&json).expect("RepositoryMap graph JSON parses")
@@ -403,6 +491,15 @@ fn hit_name_kinds(hits: &serde_json::Value) -> Vec<(String, String)> {
                 hit["kind"].as_str().expect("hit kind").to_string(),
             )
         })
+        .collect()
+}
+
+fn object_keys(value: &serde_json::Value) -> BTreeSet<&str> {
+    value
+        .as_object()
+        .expect("JSON object")
+        .keys()
+        .map(String::as_str)
         .collect()
 }
 
@@ -703,6 +800,7 @@ fn assert_rendered_graph_command_parity(repo: &Path, targets: &[&str]) {
         "graph-callees",
         "graph-docs",
         "graph-configs",
+        "graph-expand",
     ];
 
     for target in targets {
@@ -729,6 +827,118 @@ fn rendered_graph_commands_match_repository_map_snapshots_on_medium_fixture() {
     let tmp = build_medium_redb_fixture();
 
     assert_rendered_graph_command_parity(tmp.path(), &["load_token", "src/auth/token.py"]);
+}
+
+#[test]
+fn graph_expand_json_shape_is_stable() {
+    let tmp = build_expand_redb_fixture();
+
+    let expand = graph_cli_json(tmp.path(), "graph-expand", "caller");
+    assert_eq!(
+        object_keys(&expand),
+        BTreeSet::from([
+            "callees", "callers", "children", "configs", "docs", "parents", "risks", "target",
+        ])
+    );
+    assert_eq!(
+        object_keys(&expand["target"]),
+        BTreeSet::from([
+            "annotations",
+            "area",
+            "confidence",
+            "id",
+            "kind",
+            "label",
+            "language",
+            "path",
+            "source",
+        ])
+    );
+    assert_eq!(expand["target"]["kind"], "function");
+    assert!(expand["risks"].as_array().is_some());
+
+    let callees = expand["callees"].as_array().expect("callees array");
+    let first = callees.first().expect("call edge callee");
+    assert_eq!(
+        object_keys(first),
+        BTreeSet::from(["confidence", "display", "id", "kind", "relation"])
+    );
+}
+
+#[test]
+fn graph_expand_reads_docs_configs_and_call_edges_from_redb() {
+    let tmp = build_expand_redb_fixture();
+
+    let caller = graph_cli_json(tmp.path(), "graph-expand", "caller");
+    assert!(
+        !caller["callees"]
+            .as_array()
+            .expect("callees array")
+            .is_empty(),
+        "caller should expose a redb-backed callee"
+    );
+
+    let callee = graph_cli_json(tmp.path(), "graph-expand", "callee");
+    assert!(
+        !callee["callers"]
+            .as_array()
+            .expect("callers array")
+            .is_empty(),
+        "callee should expose a redb-backed caller"
+    );
+
+    let doc = graph_cli_json(tmp.path(), "graph-expand", "docs/calls.md");
+    assert!(
+        !doc["docs"].as_array().expect("docs array").is_empty(),
+        "doc target should expose its documents relation"
+    );
+
+    let config = graph_cli_json(tmp.path(), "graph-expand", "pyproject.toml");
+    assert!(
+        !config["configs"]
+            .as_array()
+            .expect("configs array")
+            .is_empty(),
+        "config target should expose its configures relation"
+    );
+}
+
+#[test]
+fn graph_expand_output_is_bounded() {
+    let tmp = build_expand_redb_fixture();
+
+    let children = graph_cli_json(tmp.path(), "graph-children", "src");
+    assert!(
+        children["items"].as_array().expect("children items").len() > 8,
+        "fixture should exceed the expand child cap"
+    );
+
+    let expand = graph_cli_json(tmp.path(), "graph-expand", "src");
+    assert_eq!(expand["children"].as_array().expect("children").len(), 8);
+    assert!(expand["parents"].as_array().expect("parents").len() <= 5);
+    assert!(expand["callers"].as_array().expect("callers").len() <= 8);
+    assert!(expand["callees"].as_array().expect("callees").len() <= 8);
+    assert!(expand["docs"].as_array().expect("docs").len() <= 5);
+    assert!(expand["configs"].as_array().expect("configs").len() <= 5);
+}
+
+#[test]
+fn graph_expand_ordering_is_deterministic() {
+    let tmp = build_expand_redb_fixture();
+
+    let first = graph_cli_json(tmp.path(), "graph-expand", "src");
+    let second = graph_cli_json(tmp.path(), "graph-expand", "src");
+    assert_eq!(first, second);
+
+    let rebuild = run_engine([
+        "index",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&rebuild);
+    let after_rebuild = graph_cli_json(tmp.path(), "graph-expand", "src");
+    assert_eq!(first, after_rebuild);
 }
 
 #[test]
@@ -1044,6 +1254,13 @@ fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
         ],
         vec![
             "graph-configs",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--target",
+            "load_token",
+        ],
+        vec![
+            "graph-expand",
             "--repo",
             tmp.path().to_str().unwrap(),
             "--target",
