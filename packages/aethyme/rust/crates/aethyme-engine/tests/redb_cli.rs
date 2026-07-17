@@ -18,6 +18,7 @@ use aethyme_engine::graph::navigation::{
 };
 use aethyme_engine::graph::search::symbol_search;
 use aethyme_engine::map::RepositoryMap;
+use aethyme_engine::pipeline::{build_context_pack, build_context_pack_with_content};
 use aethyme_graph_indexer::{index_repo_to_disk, IndexerContext, WalkOptions};
 use aethyme_graph_schema::{Confidence, Edge, EdgeAttributes, EdgeSite, Source};
 use aethyme_graph_storage::{bootstrap_repo, read_fragment, write_fragment, Fragment};
@@ -536,6 +537,22 @@ fn task_expand_cli_json(repo: &Path, target: &str) -> serde_json::Value {
     ])
 }
 
+fn context_pack_cli_json(repo: &Path, command: &str, task: &str) -> serde_json::Value {
+    query_json([command, "--repo", repo.to_str().unwrap(), "--task", task])
+}
+
+fn context_with_content_cli_json(repo: &Path, command: &str, task: &str) -> serde_json::Value {
+    query_json([
+        command,
+        "--repo",
+        repo.to_str().unwrap(),
+        "--task",
+        task,
+        "--content-budget",
+        "4096",
+    ])
+}
+
 fn repository_map_graph_json(
     map: &RepositoryMap,
     command: &str,
@@ -584,6 +601,35 @@ fn repository_map_task_json(map: &RepositoryMap, command: &str, task: &str) -> s
 fn repository_map_task_expand_json(map: &RepositoryMap, target: &str) -> serde_json::Value {
     let json = aethyme_engine::json::task_expand_view(&task_expand_view(map, target));
     serde_json::from_str(&json).expect("RepositoryMap task-expand JSON parses")
+}
+
+fn repository_map_context_pack_json(
+    repo: &Path,
+    map: &RepositoryMap,
+    task: &str,
+) -> serde_json::Value {
+    let pack = build_context_pack(
+        repo,
+        map,
+        aethyme_engine::model::task::TaskInput::from_task_text(task),
+    );
+    let json = aethyme_engine::json::context_pack(&pack);
+    serde_json::from_str(&json).expect("RepositoryMap context pack JSON parses")
+}
+
+fn repository_map_context_with_content_json(
+    repo: &Path,
+    map: &RepositoryMap,
+    task: &str,
+) -> serde_json::Value {
+    let pack = build_context_pack_with_content(
+        repo,
+        map,
+        aethyme_engine::model::task::TaskInput::from_task_text(task),
+        4096,
+    );
+    let json = aethyme_engine::json::context_pack(&pack);
+    serde_json::from_str(&json).expect("RepositoryMap context pack with content JSON parses")
 }
 
 fn symbol_cli_hits(repo: &Path, query: &str, limit: usize) -> serde_json::Value {
@@ -1031,6 +1077,137 @@ fn redb_task_views_match_repository_map_snapshots_for_phase6_task_kinds() {
             "Trace impact of load_token",
             "Find the manifest that owns the top-level area",
         ],
+    );
+}
+
+fn context_pack_metrics(value: &serde_json::Value) -> (usize, Vec<String>, Vec<String>, usize) {
+    let serialized_size = value.to_string().len();
+    let files = value["in_scope"]["files"]
+        .as_array()
+        .expect("in_scope files")
+        .iter()
+        .map(|item| item["value"].as_str().expect("file value").to_string())
+        .collect::<Vec<_>>();
+    let symbols = value["in_scope"]["symbols"]
+        .as_array()
+        .expect("in_scope symbols")
+        .iter()
+        .map(|item| item["value"].as_str().expect("symbol value").to_string())
+        .collect::<Vec<_>>();
+    let snippet_count = value["snippets"].as_array().expect("snippets").len();
+    (serialized_size, files, symbols, snippet_count)
+}
+
+fn assert_context_pack_parity(repo: &Path, tasks: &[&str]) {
+    let map = RepositoryMap::build(repo).expect("build RepositoryMap context-pack oracle");
+    for task in tasks {
+        let expected = repository_map_context_pack_json(repo, &map, task);
+        let actual = context_pack_cli_json(repo, "pack", task);
+        assert_eq!(
+            actual, expected,
+            "pack should preserve RepositoryMap JSON for task {task:?}"
+        );
+        assert_eq!(
+            context_pack_cli_json(repo, "task-pack", task),
+            actual,
+            "task-pack should be a redb-backed alias for pack"
+        );
+    }
+}
+
+#[test]
+fn redb_context_pack_matches_repository_map_snapshots_for_phase2_tasks() {
+    let tmp = build_task_redb_fixture();
+
+    assert_context_pack_parity(
+        tmp.path(),
+        &[
+            "Explain this repo",
+            "Update load_token flow",
+            "Trace impact of load_token",
+            "Find the manifest that owns the top-level area",
+        ],
+    );
+}
+
+#[test]
+fn redb_context_command_matches_repository_map_snapshot_with_content() {
+    let tmp = build_task_redb_fixture();
+    let map = RepositoryMap::build(tmp.path()).expect("build RepositoryMap context oracle");
+    let task = "Update load_token flow";
+
+    let expected = repository_map_context_with_content_json(tmp.path(), &map, task);
+    let actual = context_with_content_cli_json(tmp.path(), "context", task);
+    assert_eq!(
+        actual, expected,
+        "context should preserve RepositoryMap JSON with content"
+    );
+    assert_eq!(
+        context_with_content_cli_json(tmp.path(), "task-context", task),
+        actual,
+        "task-context should be a redb-backed alias for context"
+    );
+}
+
+#[test]
+fn redb_context_pack_token_regression_gate_on_playground_fixture() {
+    let tmp = build_task_redb_fixture();
+    let map = RepositoryMap::build(tmp.path()).expect("build RepositoryMap token oracle");
+
+    for task in [
+        "Explain this repo",
+        "Update load_token flow",
+        "Trace impact of load_token",
+        "Find the manifest that owns the top-level area",
+    ] {
+        let expected = repository_map_context_pack_json(tmp.path(), &map, task);
+        let actual = context_pack_cli_json(tmp.path(), "pack", task);
+        let (expected_size, expected_files, expected_symbols, expected_snippets) =
+            context_pack_metrics(&expected);
+        let (actual_size, actual_files, actual_symbols, actual_snippets) =
+            context_pack_metrics(&actual);
+
+        assert_eq!(
+            actual_files, expected_files,
+            "selected files should not drift for task {task:?}"
+        );
+        assert_eq!(
+            actual_symbols, expected_symbols,
+            "selected symbols should not drift for task {task:?}"
+        );
+        assert_eq!(
+            actual_snippets, expected_snippets,
+            "snippet count should not drift for task {task:?}"
+        );
+        assert!(
+            actual_size <= expected_size.saturating_mul(120) / 100 + 512,
+            "redb pack size regressed for task {task:?}: actual={actual_size}, expected={expected_size}"
+        );
+    }
+}
+
+#[test]
+fn redb_context_pack_output_is_deterministic() {
+    let tmp = build_task_redb_fixture();
+    let task = "Trace impact of load_token";
+    let first = context_pack_cli_json(tmp.path(), "pack", task);
+    let second = context_pack_cli_json(tmp.path(), "pack", task);
+    assert_eq!(
+        first, second,
+        "same redb store should produce stable context-pack output"
+    );
+
+    let rebuild = run_engine([
+        "index",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&rebuild);
+    let after_rebuild = context_pack_cli_json(tmp.path(), "pack", task);
+    assert_eq!(
+        first, after_rebuild,
+        "same fragments should rebuild to the same context-pack output"
     );
 }
 
@@ -1710,6 +1887,36 @@ fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
             "--target",
             "load_token",
         ],
+        vec![
+            "pack",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--task",
+            "Update load_token flow",
+        ],
+        vec![
+            "task-pack",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--task",
+            "Update load_token flow",
+        ],
+        vec![
+            "context",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--task",
+            "Update load_token flow",
+        ],
+        vec![
+            "task-context",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--task",
+            "Update load_token flow",
+        ],
+        vec!["explain", "--repo", tmp.path().to_str().unwrap()],
+        vec!["task-explain", "--repo", tmp.path().to_str().unwrap()],
         vec![
             "analyze-usage-boundary",
             "--repo",
