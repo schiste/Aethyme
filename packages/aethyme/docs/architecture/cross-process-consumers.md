@@ -153,6 +153,10 @@ Supported redb surfaces:
 | `query-overview` | Read-only | Reads repo metadata, depth-1 areas, entrypoints, and risks through the redb store. |
 | `symbol` | Read-only | Reads bounded V2 function/class symbol matches from redb through exact-name, case-insensitive, prefix, component, path-component, area, and basename signals. It does not build `RepositoryMap`. |
 | `symbol-batch` | Read-only | Runs the same redb-backed V2 symbol matcher for multiple queries. It does not build `RepositoryMap`. |
+| `graph-node` | Read-only | Renders one node through redb display projections and exact target resolution. It preserves the existing JSON shape and does not build `RepositoryMap`. |
+| `graph-children` / `graph-parents` | Read-only | Render structural relations through redb relation views. They preserve the existing JSON shape and do not build `RepositoryMap`. |
+| `graph-callers` / `graph-callees` | Read-only | Render call relations through redb relation views. They preserve the existing JSON shape and do not build `RepositoryMap`. |
+| `graph-docs` / `graph-configs` | Read-only | Render document/config relations through redb relation views. They preserve the existing JSON shape and do not build `RepositoryMap`. |
 | `deps` | Read-only | Reads outgoing file adjacency from the redb store. |
 | `importers` | Read-only | Reads incoming file adjacency from the redb store. |
 | `callers` | Hybrid grep + graph | Greps for the requested symbol, then uses redb adjacency to expand candidate files. It is not a pure redb symbol-query contract in V1. |
@@ -167,8 +171,8 @@ Current storage coverage and limitations:
 - The `index` writer persists the graph edge set without skipping edges for
   missing unresolved/import endpoint rows. Placeholder endpoints are stored as
   typed unresolved rows before adjacency is written.
-- Most graph navigation is still served by `RepositoryMap` rebuilt from
-  `.aethyme/graph/` fragments. The legacy `graph-*`, task, context-pack, and
+- Higher-level graph navigation is still served by `RepositoryMap` rebuilt
+  from `.aethyme/graph/` fragments. `graph-expand`, task, context-pack, and
   `explore` surfaces should not be described as redb-backed until they are
   explicitly moved to `GraphStore::open_read_only`.
 
