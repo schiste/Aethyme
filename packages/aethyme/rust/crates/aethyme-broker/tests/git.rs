@@ -100,6 +100,25 @@ fn changed_files_covers_committed_staged_unstaged_and_untracked() {
 }
 
 #[test]
+fn dirty_paths_reports_an_unstaged_modification() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let repo = GitRepo::discover(tmp.path()).unwrap();
+    assert!(repo.dirty_paths().unwrap().is_empty());
+
+    // A lone unstaged modification renders as ` M README.md` — with a
+    // LEADING SPACE. Trimming the whole porcelain output before parsing
+    // destroyed that first line's XY column alignment, so the entry was
+    // silently dropped and the submit preflight showed no warning at all.
+    std::fs::write(tmp.path().join("README.md"), "edited\n").unwrap();
+    assert_eq!(repo.dirty_paths().unwrap(), vec!["README.md"]);
+
+    // Mixed with an untracked file, both must survive.
+    std::fs::write(tmp.path().join("new.rs"), "x\n").unwrap();
+    assert_eq!(repo.dirty_paths().unwrap(), vec!["README.md", "new.rs"]);
+}
+
+#[test]
 fn dirty_and_unmerged_guards_for_cleanup() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

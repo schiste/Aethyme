@@ -80,7 +80,12 @@ fn run_git_inner(cwd: &Path, index_file: Option<&str>, args: &[&str]) -> Result<
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    // trim_end ONLY: porcelain status lines carry a significant leading
+    // space (` M path`), and a full trim breaks the first line's XY
+    // column alignment, silently dropping that entry.
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
 }
 
 /// Result of a `git merge-tree --write-tree` simulation.
