@@ -144,25 +144,26 @@ is only a derived local query artifact written by
 not a committed graph format, not the source of truth, and must remain
 derived from committed fragments under `<repo>/.aethyme/graph/`.
 
-Supported V1 redb surfaces:
+Supported redb surfaces:
 
 | Surface | Access | Contract |
 |---|---|---|
 | `index` | Writer | `aethyme-engine-cli index --repo <repo>` rebuilds only the derived redb store from `.aethyme/graph/` fragments. It must not modify fragments. |
 | `query-areas` | Read-only | Reads area rows through `GraphStore::open_read_only` / redb `ReadOnlyDatabase`. |
 | `query-overview` | Read-only | Reads repo metadata, depth-1 areas, entrypoints, and risks through the redb store. |
-| `symbol` | Read-only | Reads exact function/class simple-name matches from `symbol_by_name` through the redb store. It does not build `RepositoryMap`. |
-| `symbol-batch` | Read-only | Reads exact function/class simple-name matches for multiple queries from `symbol_by_name` through the redb store. It does not build `RepositoryMap`. |
+| `symbol` | Read-only | Reads bounded V2 function/class symbol matches from redb through exact-name, case-insensitive, prefix, component, path-component, area, and basename signals. It does not build `RepositoryMap`. |
+| `symbol-batch` | Read-only | Runs the same redb-backed V2 symbol matcher for multiple queries. It does not build `RepositoryMap`. |
 | `deps` | Read-only | Reads outgoing file adjacency from the redb store. |
 | `importers` | Read-only | Reads incoming file adjacency from the redb store. |
 | `callers` | Hybrid grep + graph | Greps for the requested symbol, then uses redb adjacency to expand candidate files. It is not a pure redb symbol-query contract in V1. |
 
 Current storage coverage and limitations:
 
-- Schema version `4` means the `index` writer populates repositories,
+- Schema version `5` means the `index` writer populates repositories,
   directories, files, areas, functions, classes, docs, configs,
   unresolved/import placeholders, risks, `functions_by_path`, and
-  `symbol_by_name` / `symbol_by_component`.
+  `symbol_by_name` / `symbol_by_component` /
+  `symbol_by_path_component`.
 - The `index` writer persists the graph edge set without skipping edges for
   missing unresolved/import endpoint rows. Placeholder endpoints are stored as
   typed unresolved rows before adjacency is written.
