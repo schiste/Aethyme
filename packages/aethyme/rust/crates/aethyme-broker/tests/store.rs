@@ -142,6 +142,69 @@ fn lease_round_trip_expiry_and_activity_filter() {
 }
 
 #[test]
+fn cleaning_a_session_purges_its_lease_rows() {
+    let (_tmp, mut store) = open_temp();
+    let session = sample_session(&mut store);
+
+    store
+        .set_implicit_leases(session.id, &["src/auth.py".into(), "src/main.py".into()])
+        .unwrap();
+    store.claim_lease(session.id, "docs/", None).unwrap();
+    assert_eq!(store.session_leases(session.id).unwrap().len(), 3);
+
+    // Exited is NOT terminal (adopt --reuse can revive it): rows stay.
+    store
+        .set_session_status(session.id, SessionStatus::Exited, Some(0))
+        .unwrap();
+    assert_eq!(store.session_leases(session.id).unwrap().len(), 3);
+
+    // Cleaned IS terminal: rows are purged in the same transaction —
+    // regression for the 722 orphaned rows / ~25 sessions the 2026-07-17
+    // dogfood database accumulated.
+    store
+        .set_session_status(session.id, SessionStatus::Cleaned, None)
+        .unwrap();
+    assert!(store.session_leases(session.id).unwrap().is_empty());
+}
+
+#[test]
+fn retention_sweep_drops_leases_of_already_cleaned_sessions() {
+    let (_tmp, mut store) = open_temp();
+    let kept = sample_session(&mut store);
+    store
+        .set_implicit_leases(kept.id, &["src/live.py".into()])
+        .unwrap();
+
+    let cleaned = store
+        .register_session(&NewSession {
+            worktree_path: "/repo/.aethyme/worktrees/other".into(),
+            branch: "agent/other".into(),
+            origin: SessionOrigin::Adopted,
+            task: None,
+            diff_base: None,
+            pid: None,
+            command: None,
+            log_path: None,
+        })
+        .unwrap();
+    store
+        .set_session_status(cleaned.id, SessionStatus::Cleaned, None)
+        .unwrap();
+    // Plant rows AFTER the clean — set_implicit_leases does not gate on
+    // session status, which is exactly how pre-purge databases (and any
+    // racing refresh) end up with orphaned rows.
+    store
+        .set_implicit_leases(cleaned.id, &["src/old.py".into(), "src/gone.py".into()])
+        .unwrap();
+    assert_eq!(store.session_leases(cleaned.id).unwrap().len(), 2);
+
+    assert_eq!(store.purge_leases_of_cleaned_sessions().unwrap(), 2);
+    assert!(store.session_leases(cleaned.id).unwrap().is_empty());
+    // Live sessions' rows are untouched.
+    assert_eq!(store.session_leases(kept.id).unwrap().len(), 1);
+}
+
+#[test]
 fn gate_result_cache_ignores_cancelled_and_error_runs() {
     let (_tmp, mut store) = open_temp();
     store

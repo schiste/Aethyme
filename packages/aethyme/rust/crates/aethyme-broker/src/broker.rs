@@ -89,6 +89,9 @@ pub struct DoctorReport {
     pub missing_worktrees: Vec<i64>,
     /// Stale gate pidfiles found (and removed) whose process is gone.
     pub orphaned_pidfiles: Vec<String>,
+    /// Lease rows of already-cleaned sessions found (and removed) —
+    /// retention for databases written before leases were purged on clean.
+    pub purged_stale_leases: usize,
 }
 
 impl DoctorReport {
@@ -347,6 +350,9 @@ impl Broker {
                 .collect();
 
         let rules = LeaseIgnoreRules::load(&self.main_root);
+        // The integration tip is the same for every session; resolving it
+        // inside the loop cost one git subprocess per live session.
+        let integration = self.integration_tip();
         for session in self.store.live_sessions()? {
             if !matches!(
                 session.status,
@@ -360,8 +366,9 @@ impl Broker {
             // #41: derive the baseline instead of trusting the stored
             // adoption-time diff_base — after a conflict-rebase the stored
             // value inflates the diff with everyone else's promoted work.
-            let base = self
-                .session_change_base(&checkout)
+            let base = integration
+                .as_ref()
+                .and_then(|tip| checkout.merge_base(tip, "HEAD").ok())
                 .or_else(|| session.diff_base.clone())
                 .unwrap_or_else(|| "HEAD".to_string());
             let Ok(changed) = checkout.changed_files(&base) else {
@@ -577,10 +584,13 @@ impl Broker {
             }
         }
 
+        let purged_stale_leases = self.store.purge_leases_of_cleaned_sessions()?;
+
         Ok(DoctorReport {
             integrity,
             missing_worktrees,
             orphaned_pidfiles,
+            purged_stale_leases,
         })
     }
 

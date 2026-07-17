@@ -424,11 +424,19 @@ impl Broker {
     /// (the phantom-lease symptom). Read-only — never refreshes the
     /// integration branch.
     pub fn session_change_base(&mut self, session_checkout: &GitRepo) -> Option<String> {
-        let branch = PromoteConfig::load(&self.main_root_path()).branch;
-        let integration = self
-            .repo_handle()
-            .resolve_ref(&format!("refs/heads/{branch}"))?;
+        let integration = self.integration_tip()?;
         session_checkout.merge_base(&integration, "HEAD").ok()
+    }
+
+    /// The integration branch's current commit, without creating or
+    /// refreshing the branch (read-only, unlike [`Self::integration_head`]).
+    /// Invariant across sessions — resolve once and reuse when deriving
+    /// change bases in a loop (`refresh_leases` did this per session,
+    /// the dominant redundant git call in `broker status`).
+    pub(crate) fn integration_tip(&self) -> Option<String> {
+        let branch = PromoteConfig::load(&self.main_root_path()).branch;
+        self.repo_handle()
+            .resolve_ref(&format!("refs/heads/{branch}"))
     }
 }
 
