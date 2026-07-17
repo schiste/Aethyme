@@ -166,18 +166,19 @@ def _render_broker_protocol(repo: Path, root: str) -> str:
         or (repo / ".aethyme/config.toml").exists()
     ):
         return ""
-    binary = f"{root}/rust/target/release/aethyme"
     return f"""## Broker Coordination (multi-agent repository)
 
 This repository coordinates concurrent agent sessions through the Aethyme
-broker. Other agents may be working in sibling worktrees right now. Follow
-this protocol:
+broker. Other agents may be working in sibling worktrees right now. The
+`aethyme` binary is installed once with
+`cargo install --path "{root}/rust/crates/aethyme-engine"`
+(check with `aethyme --version`). Follow this protocol:
 
 1. **Before editing**, check current activity and register yourself:
 
    ```bash
-   "{binary}" broker status --json    # who is working on what
-   "{binary}" broker adopt --task "<your task>"   # once, from your worktree
+   aethyme broker status --json    # who is working on what
+   aethyme broker adopt --task "<your task>"   # once, from your worktree
    ```
 
    If `status` shows another session holding leases on the files you plan
@@ -192,14 +193,14 @@ this protocol:
    integration instead of merging anything yourself:
 
    ```bash
-   "{binary}" broker submit --session <your-session-id>
+   aethyme broker submit --session <your-session-id>
    ```
 
    This simulates the merge and runs only the checks your diff affects.
    Report the outcome (verified / rejected / conflict) in your summary.
    Afterwards, finish the session with
-   `"{binary}" broker close --session <id>` (state only), or point it at
-   a follow-up task with `"{binary}" broker adopt --reuse --task "..."`.
+   `aethyme broker close --session <id>` (state only), or point it at
+   a follow-up task with `aethyme broker adopt --reuse --task "..."`.
 
 4. **If a file named `.aethyme/broker-action-required.md` appears in your
    worktree**, read it immediately: your submission conflicted. It names
