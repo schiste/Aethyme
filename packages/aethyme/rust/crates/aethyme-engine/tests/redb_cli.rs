@@ -606,6 +606,29 @@ fn activation_cli_json(repo: &Path, command: &str, key: &str, value: &str) -> se
     query_json([command, "--repo", repo.to_str().unwrap(), key, value])
 }
 
+fn explore_cli_json(
+    repo: &Path,
+    request: &str,
+    intent: &str,
+    show_observability: bool,
+) -> serde_json::Value {
+    let mut args = vec![
+        "explore".to_string(),
+        "--repo".to_string(),
+        repo.to_str().unwrap().to_string(),
+        "--request".to_string(),
+        request.to_string(),
+        "--format".to_string(),
+        "answer-json".to_string(),
+        "--intent".to_string(),
+        intent.to_string(),
+    ];
+    if show_observability {
+        args.push("--show-observability".to_string());
+    }
+    query_json(args)
+}
+
 fn activate_from_cli_json(repo: &Path, seed: &str, hops: usize) -> serde_json::Value {
     let hops = hops.to_string();
     query_json([
@@ -1166,6 +1189,116 @@ fn redb_task_views_match_repository_map_snapshots_for_phase6_task_kinds() {
             "Trace impact of load_token",
             "Find the manifest that owns the top-level area",
         ],
+    );
+}
+
+#[test]
+fn redb_explore_task_localization_runs_without_daemon_or_fragments_and_preserves_shape() {
+    let tmp = build_task_redb_fixture();
+    std::fs::remove_dir_all(tmp.path().join(".aethyme/graph")).unwrap();
+
+    let first = explore_cli_json(
+        tmp.path(),
+        "Find the load_token flow",
+        "task_localization_query",
+        false,
+    );
+    let second = explore_cli_json(
+        tmp.path(),
+        "Find the load_token flow",
+        "task_localization_query",
+        false,
+    );
+    assert_eq!(first, second, "compact explore output should be stable");
+
+    let expected_keys: BTreeSet<&str> = [
+        "schema_version",
+        "mode",
+        "intent",
+        "intent_source",
+        "status",
+        "request",
+        "answer",
+        "navigation_hints",
+        "excluded",
+        "ambiguous",
+        "evidence",
+        "confidence",
+        "safe_to_use_as_answer",
+        "safe_to_use_as_navigation",
+        "trust_policy",
+        "degraded_reasons",
+        "verification_steps",
+        "next_actions",
+        "available_specialized_intents",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(object_keys(&first), expected_keys);
+    assert_eq!(first["schema_version"], "aethyme-explore-v1");
+    assert_eq!(first["intent"], "task_localization_query");
+    assert_eq!(first["intent_source"], "explicit");
+    assert!(first["answer"]
+        .as_array()
+        .expect("answer array")
+        .iter()
+        .any(|item| item["path"] == "src/auth/token.py"
+            || item["target"]
+                .as_str()
+                .is_some_and(|target| target.contains("load_token"))));
+    assert!(
+        first.get("observability").is_none(),
+        "compact explore should omit observability"
+    );
+}
+
+#[test]
+fn redb_explore_behavior_and_auto_intents_use_redb_path() {
+    let tmp = build_task_redb_fixture();
+
+    let explicit = explore_cli_json(
+        tmp.path(),
+        "Implement load_token tracing",
+        "behavior_localization_query",
+        false,
+    );
+    assert_eq!(explicit["intent"], "behavior_localization_query");
+    assert_eq!(explicit["intent_source"], "explicit");
+    assert!(
+        !explicit["answer"]
+            .as_array()
+            .expect("answer array")
+            .is_empty(),
+        "behavior localization should return bounded candidates"
+    );
+
+    let auto = explore_cli_json(tmp.path(), "Implement load_token tracing", "auto", false);
+    assert_eq!(auto["intent"], "behavior_localization_query");
+    assert_eq!(auto["intent_source"], "auto");
+}
+
+#[test]
+fn redb_explore_observability_reports_store_freshness() {
+    let tmp = build_task_redb_fixture();
+
+    let response = explore_cli_json(
+        tmp.path(),
+        "Find the load_token flow",
+        "task_localization_query",
+        true,
+    );
+    let graph_store = &response["observability"]["graph_store"];
+    assert_eq!(graph_store["backend"], "redb");
+    assert_eq!(graph_store["exists"], true);
+    assert_eq!(graph_store["fragments_exist"], true);
+    assert_eq!(graph_store["status"], "fresh");
+    assert_eq!(graph_store["stale"], false);
+    assert!(
+        graph_store["path"]
+            .as_str()
+            .expect("store path")
+            .ends_with(".aethyme/graph_store.redb"),
+        "store path should identify the redb artifact"
     );
 }
 
@@ -2100,6 +2233,17 @@ fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
             tmp.path().to_str().unwrap(),
             "--task",
             "Update load_token flow",
+        ],
+        vec![
+            "explore",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--request",
+            "Update load_token flow",
+            "--format",
+            "answer-json",
+            "--intent",
+            "task_localization_query",
         ],
         vec![
             "task-expand",
