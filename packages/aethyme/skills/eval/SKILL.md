@@ -50,23 +50,12 @@ Creates `<Name> - Control` (vanilla) and `<Name> - Aethyme` (with skill + graph 
 
 ### Run an assessment
 
-```bash
-./scripts/eval/run-eval.sh --eval-type dead-code --target mediawiki --model haiku
-```
-
-End-to-end: verifies playground, starts server, launches 5 conditions via Chau7 MCP, polls until done, prints the scorecard, and writes a full artifact bundle. Results are stored in SQLite at `packages/aethyme-eval-ui/server/evals.db`, visible at http://localhost:5173, and persisted under `packages/aethyme/eval-runs/<timestamp>-<target>-<type>/`.
-
-### Prepare a target
-
-Before any run, persist a lightweight readiness snapshot:
-
-```bash
-curl -X POST http://localhost:8000/api/repositories/prepare \
-  -H "Content-Type: application/json" \
-  -d '{"target":"mediawiki"}'
-```
-
-This checks repo cleanliness, engine presence, index presence, and git state. It must stay lightweight: no prompt generation, no tab launch, no agent work.
+The server-based end-to-end runner (`run-eval.sh`, the eval-ui server,
+and the `src/eval/` orchestrator) was removed with the evaluation stack
+(2026-07-13; stragglers cleaned 2026-07-17). Assessments are currently
+run manually against a verified playground; regression tracking lives in
+the `aethyme-eval` package (`summarize-history`, `compare`,
+`baseline-info`, `playground-command`).
 
 ## Available Assessment Types
 
@@ -195,27 +184,12 @@ See [`docs/guides/eval-protocol.md`](../../docs/guides/eval-protocol.md) "Multi-
 
 ## Adding a New Assessment Scenario
 
-Five files need entries. Follow existing patterns (e.g., `dead-code` or `bug-fix-1`):
-
-### 1. Task text — `packages/aethyme-eval-ui/server/main.py`
-Add to the `EVAL_TASKS` dict (~line 567). This is the prompt the agent receives.
-
-### 2. Reference + schema — `src/eval/schemas.py`
-Create three functions:
-- `mytype_output_schema()` — JSON schema for structured output
-- `mytype_scoring_rubric()` — weights dict (sum to 100) + notes
-- `mytype_reference()` — ground truth data (files, keywords, expected answers)
-
-Plus a `MYTYPE_PATH_KEYS` frozenset for path normalization.
-
-### 3. Scoring — `src/eval/scoring.py`
-Create `score_mytype(candidate, reference, *, cost_usd, repo_path)` returning dict with `scores`, `weighted_score`, `max_score`.
-
-### 4. Orchestrator — `src/eval/orchestrator.py`
-Add to `_EVAL_TYPE_DEFAULTS` dict and the `elif` chain in `_build_prepare_phase()` / `build-inputs` handling.
-
-### 5. CLI — `src/cli.py`
-Add the type to the `click.Choice` list in the `--eval-type` option (~line 771).
+The schema/scoring/orchestrator files this section used to reference
+(`src/eval/schemas.py`, `src/eval/scoring.py`, `src/eval/orchestrator.py`,
+and the eval-ui server) were removed with the evaluation stack
+(2026-07-13). New scenarios currently mean: a task prompt, a manually
+curated ground-truth reference, and manual scoring against the rubric
+patterns preserved in `docs/reports/evals/`.
 
 **Ground truth**: Generate by running commands against the actual repo. Prefer
 current Aethyme facts/analyzer commands for candidate collection, then manually
@@ -289,34 +263,18 @@ On 12K+ file repos like MediaWiki, CTO can increase cost by injecting the full f
 
 ## Architecture
 
+The 8-phase orchestrator, eval-ui server, and Chau7 MCP launch pipeline
+were removed with the evaluation stack (2026-07-13). What remains:
+
 ```
-CLI (src/cli.py)
-  |__ orchestrator.py: generate_run_plan() -> 8-phase JSON plan
-       |__ Phase 1: prepare (check repository readiness contract)
-       |__ Phase 2: build-inputs (generate prompts, schemas, reference)
-       |__ Phase 3: launch (create Chau7 tabs, start backend, send prompts)
-       |__ Phase 4: monitor (poll tab_status until all complete)
-       |__ Phase 5: collect (read session JSONL + tab output for tokens/cost/output)
-       |__ Phase 6: score (quality + usage metrics + recalculated eval score)
-       |__ Phase 7: report (generate markdown + complete-result bundle)
-       |__ Phase 8: cleanup (close tabs)
+Playground lifecycle
+  |__ scripts/eval/setup-playground.sh   -> build a Control/Aethyme pair
+  |__ scripts/eval/verify-playground.sh  -> 15-point readiness check
 
-Server (packages/aethyme-eval-ui/server/main.py)
-  |__ POST /api/repositories/setup -> rebuild playground pair
-  |__ POST /api/repositories/prepare -> persist readiness snapshot
-  |__ POST /api/run -> generates plan, executes in background thread
-  |__ GET /api/run/status -> poll for completion
-  |__ GET /api/results -> query SQLite
-
-Chau7 MCP (server/mcp_client.py)
-  |__ tab_create, tab_exec, tab_send_input, tab_submit_prompt
-  |__ tab_status, tab_output, tab_close
-  |__ Unix socket at ~/.chau7/mcp.sock
-
-Storage
-  |__ SQLite: packages/aethyme-eval-ui/server/evals.db
-  |__ Run artifacts: packages/aethyme/eval-runs/<timestamp>-<target>-<type>/
-  |__ UI: http://localhost:5173 (React + Vite)
+Regression sentinel (packages/aethyme-eval)
+  |__ aethyme-eval summarize-history -> build a baseline from run history
+  |__ aethyme-eval compare           -> compare run results to a baseline
+  |__ Historical run artifacts: packages/aethyme/eval-runs/<timestamp>-...
 ```
 
 ## Key File Locations
@@ -326,14 +284,8 @@ Storage
 | Full protocol | `docs/guides/eval-protocol.md` |
 | Tooling roadmap | `docs/guides/eval-tooling-roadmap.md` |
 | Playground setup guide | `docs/guides/playground-setup.md` |
-| Target registry | `src/eval/targets.py` |
-| Orchestrator | `src/eval/orchestrator.py` |
-| Schemas + references | `src/eval/schemas.py` |
-| Scoring functions | `src/eval/scoring.py` |
-| Server + task text | `packages/aethyme-eval-ui/server/main.py` |
-| MCP client | `packages/aethyme-eval-ui/server/mcp_client.py` |
+| Regression sentinel | `packages/aethyme-eval/src/aethyme_eval/` |
 | Setup script | `scripts/eval/setup-playground.sh` |
 | Verify script | `scripts/eval/verify-playground.sh` |
-| Run script | `scripts/eval/run-eval.sh` |
 | Navigation skill | `skills/aethyme/SKILL.md` |
 | Engine CLI | `rust/crates/aethyme-engine/src/bin/aethyme-engine-cli.rs` |

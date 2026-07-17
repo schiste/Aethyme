@@ -142,31 +142,21 @@ If the Control repo gets contaminated, delete it and re-clone from scratch.
 
 ## Adding a New Eval Target
 
-1. Clone and set up the playground (steps above)
+The `src/eval/targets.py` registry and orchestrator files were removed
+with the evaluation stack (2026-07-13). Targets now resolve by naming
+convention: place the pair at
+`$AETHYME_PLAYGROUND_ROOT/<Name>/<Name> - {Control,Aethyme}` (default
+root: `~/Downloads/Repositories/Playground`) and add the target slug to
+the `case` block in `scripts/eval/verify-playground.sh`.
 
-2. Register in `src/eval/targets.py`:
-```python
-TARGETS["myrepo"] = EvalTarget(
-    name="myrepo",
-    display_name="My Repo",
-    control_path=_PLAYGROUND_ROOT / "MyRepo" / "MyRepo - Control",
-    aethyme_path=_PLAYGROUND_ROOT / "MyRepo" / "MyRepo - Aethyme",
-    description="Language/framework, ~N files",
-)
-```
+1. Clone and set up the playground (steps above)
+2. Add the slug → display-name mapping in `verify-playground.sh`
+3. Validate: `./scripts/eval/verify-playground.sh --target <slug>`
 
 Aethyme itself must not be registered as a benchmark target. The repository
 contains eval references, historical reports, and tooling artifacts that can
 leak answer keys into the target under assessment. Use external repositories as
 benchmark targets and keep Aethyme self-runs as unscored diagnostics only.
-
-3. Add eval scenarios in `src/eval/schemas.py` (reference data) and `src/eval/scoring.py` (scoring function)
-
-4. Register in `src/eval/orchestrator.py` (`_EVAL_TYPE_DEFAULTS` dict)
-
-5. Add task text in `packages/aethyme-eval-ui/server/main.py` (`EVAL_TASKS` dict)
-
-6. Validate: `python -m src.cli eval targets`
 
 ## Troubleshooting
 
