@@ -48,10 +48,6 @@ impl FragmentBuildMode {
             Ok(Self::Prefer)
         }
     }
-
-    fn forces_fragments(self) -> bool {
-        matches!(self, Self::Force)
-    }
 }
 
 fn main() {
@@ -834,28 +830,24 @@ fn parse_daemon_idle_timeout(args: &[String]) -> Result<std::time::Duration, Str
 
 fn daemon_serve_action(
     repo: &Path,
-    no_cache: bool,
-    fragment_mode: FragmentBuildMode,
+    _no_cache: bool,
+    _fragment_mode: FragmentBuildMode,
     args: &[String],
 ) -> Result<(), String> {
     let idle_timeout = parse_daemon_idle_timeout(args)?;
     let config = aethyme_engine::daemon::DaemonConfig::new(repo.to_path_buf())
-        .with_idle_timeout(idle_timeout)
-        .with_no_cache(no_cache)
-        .with_force_fragments(fragment_mode.forces_fragments());
+        .with_idle_timeout(idle_timeout);
     aethyme_engine::daemon::serve_forever(config)
 }
 
 fn daemon_start_action(
     repo: &Path,
-    no_cache: bool,
-    fragment_mode: FragmentBuildMode,
+    _no_cache: bool,
+    _fragment_mode: FragmentBuildMode,
     args: &[String],
 ) -> Result<(), String> {
     let self_path = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let opts = aethyme_engine::daemon::StartOptions {
-        no_cache,
-        force_fragments: fragment_mode.forces_fragments(),
         idle_timeout: read_option(args, "--idle-timeout").ok(),
     };
     match aethyme_engine::daemon::start_detached(repo, &self_path, &opts)? {
@@ -865,7 +857,7 @@ fn daemon_start_action(
         aethyme_engine::daemon::StartOutcome::Spawned(child) => {
             let log_path = aethyme_engine::daemon::logfile_path_for(repo);
             eprintln!(
-                "engine daemon spawned (pid {}, log {})\n  building map will take ~70s on a 12K-file repo",
+                "engine daemon spawned (pid {}, log {})\n  opening redb graph store before listening",
                 child.id(),
                 log_path.display()
             );
@@ -954,11 +946,11 @@ fn legacy_pass_removed_error() -> String {
 ///
 /// Diagnostic for "where does the time actually go?" The profiler reports
 /// stage timings to stderr so command-specific work can be separated from
-/// shared `RepositoryMap` construction. `task-localize --profile` uses it for
-/// navigation latency, while `index --profile` uses it for Redb materialization.
+/// shared setup. `task-localize --profile` uses it for redb-backed navigation
+/// latency, while `index --profile` uses it for Redb materialization.
 ///
 /// Output line example (only when `--profile` is set):
-///   [profile] task-localize: map_build=12480ms task_parse=0ms anchors=210ms \
+///   [profile] task-localize: redb_open=18ms task_parse=0ms anchors=210ms \
 ///             scope=830ms next=305ms json_render=12ms total=13837ms
 enum StageEntry {
     Top {

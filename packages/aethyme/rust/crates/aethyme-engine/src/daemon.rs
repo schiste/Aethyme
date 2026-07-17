@@ -1,23 +1,17 @@
-//! Engine-side daemon: keeps `RepositoryMap` resident across calls.
+//! Engine-side daemon: serves read-only redb graph queries over a socket.
 //!
 //! Why this exists
 //! ---------------
-//! Profiling on MediaWiki (commits 387b8d8, 5537f40, 7d4c3bc, e17ed5a) showed
-//! the 14-second steady-state cost of `aethyme explore` is dominated by
-//! per-call setup that has nothing to do with the user's request:
+//! The daemon used to keep a resident `RepositoryMap` warm to avoid rebuilding
+//! it for every `task-localize`, `symbol-batch`, and caller query. Those
+//! surfaces now read `.aethyme/graph_store.redb` directly. The daemon remains
+//! as stable socket/process plumbing for clients that want a long-lived engine
+//! process, but it no longer constructs or owns the legacy in-memory map.
 //!
-//!   - `RepositoryMap` construction reconstructs the in-memory graph on
-//!     every invocation (~70-130s on cold legacy builds; much lower when
-//!     committed fragments are available).
-//!   - The Python wrapper spawns the engine binary as a subprocess for
-//!     `task-localize`, `task-anchors`, `symbol-batch`, etc. Each spawn
-//!     pays the build cost from scratch.
-//!
-//! This module hosts an in-process daemon that builds the map ONCE on
-//! startup, holds it in memory behind an `RwLock`, and serves queries
-//! over a Unix domain socket. First call pays the full cost; every
-//! subsequent call drops to the algorithmic minimum (5-50ms for typical
-//! task-localize on a 12K-file repo with the map resident).
+//! Startup opens the redb store read-only and performs a tiny overview read so
+//! missing or incompatible stores fail before the socket is advertised. Each
+//! request opens a fresh read-only handle, preserving the same read/write
+//! boundary as the CLI query commands.
 //!
 //! Wire protocol (JSON line-delimited over AF_UNIX)
 //! ------------------------------------------------
@@ -35,17 +29,17 @@
 //!
 //! Concurrency
 //! -----------
-//! Single-threaded request handler for v1. `RepositoryMap` is wrapped in
-//! `Arc<RwLock<...>>` so future thread-pool variants are a drop-in. At
-//! typical agent rates (a few req/s), serial dispatch is fine.
+//! Single-threaded request handler for v1. At typical agent rates (a few
+//! req/s), serial dispatch is fine. Future thread-pool variants should keep
+//! using read-only redb handles and avoid reintroducing map-backed query paths.
 //!
 //! Lifecycle
 //! ---------
-//! - Daemon binds on start, builds map (~70s on MediaWiki), then listens.
+//! - Daemon binds on start after confirming the redb store is readable.
 //! - Idle watcher exits the daemon after `idle_timeout` of inactivity.
 //! - Explicit `shutdown` command terminates the loop and removes the socket.
-//! - Map is NEVER invalidated automatically — caller must restart the
-//!   daemon to pick up filesystem changes. Future work: mtime-based revalidate.
+//! - Store updates are explicit: rerun `aethyme-engine-cli index --repo <repo>`
+//!   after fragment changes.
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -56,10 +50,12 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::graph::navigation::{callers_view, task_anchors_view, task_next_view, task_scope_view};
-use crate::graph::search::symbol_search;
-use crate::map::RepositoryMap;
+use crate::graph::navigation::{
+    callers_view_redb, task_anchors_view_redb, task_next_view_redb, task_scope_view_redb,
+};
+use crate::graph::search::symbol_search_redb;
 use crate::model::task::TaskInput;
+use crate::store::redb::graph_store::{GraphStore, OverviewV2Limits, ReadOnlyGraphStore};
 
 const SOCKET_PREFIX: &str = "engine-";
 const SOCKET_DIR_NAME: &str = "aethyme";
@@ -97,8 +93,6 @@ pub fn logfile_path_for(repo: &Path) -> PathBuf {
 /// Options for [`start_detached`].
 #[derive(Default)]
 pub struct StartOptions {
-    pub no_cache: bool,
-    pub force_fragments: bool,
     pub idle_timeout: Option<String>,
 }
 
@@ -156,12 +150,6 @@ pub fn start_detached(
         .map_err(|e| format!("clone log fd: {e}"))?;
 
     let mut cmd = std::process::Command::new(serve_exe);
-    if opts.no_cache {
-        cmd.arg("--no-cache");
-    }
-    if opts.force_fragments {
-        cmd.arg("--from-fragments");
-    }
     cmd.arg("daemon").arg("serve").arg("--repo").arg(repo);
     if let Some(idle) = &opts.idle_timeout {
         cmd.arg("--idle-timeout").arg(idle);
@@ -201,8 +189,7 @@ pub enum ReadyOutcome {
 
 /// Block until the daemon for `repo` accepts a socket connection, the
 /// watched process dies, or the deadline passes. The socket binds only
-/// after the initial map build, so on large repos this legitimately takes
-/// tens of seconds — callers should surface progress to the user.
+/// after the redb store has been opened and smoke-read.
 pub fn wait_until_ready(
     repo: &Path,
     mut watch: Option<&mut std::process::Child>,
@@ -243,7 +230,6 @@ pub fn log_tail(repo: &Path, lines: usize) -> String {
 /// Server state held across requests.
 struct DaemonState {
     repo: PathBuf,
-    map: RepositoryMap,
     last_activity: Instant,
 }
 
@@ -251,9 +237,6 @@ struct DaemonState {
 pub struct DaemonConfig {
     pub repo: PathBuf,
     pub idle_timeout: Duration,
-    pub no_cache: bool,
-    pub use_fragments: bool,
-    pub force_fragments: bool,
 }
 
 impl DaemonConfig {
@@ -261,9 +244,6 @@ impl DaemonConfig {
         Self {
             repo,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECONDS),
-            no_cache: false,
-            use_fragments: true,
-            force_fragments: false,
         }
     }
 
@@ -272,22 +252,13 @@ impl DaemonConfig {
         self
     }
 
-    pub fn with_no_cache(mut self, no_cache: bool) -> Self {
-        self.no_cache = no_cache;
-        self
-    }
-
-    pub fn with_force_fragments(mut self, force_fragments: bool) -> Self {
-        self.force_fragments = force_fragments;
-        self
-    }
 }
 
 /// Run the daemon for `config.repo` until idle timeout or `shutdown` request.
 ///
 /// Returns when the listen loop exits cleanly (idle, shutdown, or socket
-/// error). Build errors during the initial `RepositoryMap::build` are
-/// returned immediately without ever opening the socket.
+/// error). Redb open/read errors are returned immediately without ever
+/// opening the socket.
 pub fn serve_forever(config: DaemonConfig) -> Result<(), String> {
     let socket_path = socket_path_for(&config.repo);
     if let Some(parent) = socket_path.parent() {
@@ -311,55 +282,30 @@ pub fn serve_forever(config: DaemonConfig) -> Result<(), String> {
     }
 
     eprintln!(
-        "aethyme-engine-daemon: building map for {} ...",
+        "aethyme-engine-daemon: opening redb graph store for {} ...",
         config.repo.display()
     );
-    let build_started = Instant::now();
-    if !config.use_fragments {
-        return Err(
-            "legacy pass pipeline was deleted in 4.7.12; daemon builds require .aethyme/graph fragments"
-                .to_string(),
-        );
-    }
-
-    let (map, build_profile) = if config.force_fragments {
-        RepositoryMap::build_from_fragments(&config.repo)
-            .map_err(|e| format!("build_from_fragments: {e}"))?
-    } else {
-        RepositoryMap::build_with_fragment_preference(&config.repo, config.no_cache, |_| {})
-            .map_err(|e| format!("build_with_fragment_preference: {e}"))?
-    };
-    let build_mode = if build_profile
-        .stages
-        .iter()
-        .any(|stage| stage.name == "populate_from_fragments")
-    {
-        "fragments"
-    } else {
-        "fragments"
-    };
+    let open_started = Instant::now();
+    let store = open_daemon_store(&config.repo)?;
+    let overview = store
+        .overview_v2(OverviewV2Limits::default())
+        .map_err(|e| format!("overview_v2: {e}"))?;
+    let file_count = overview
+        .repo
+        .as_ref()
+        .map(|repo| repo.file_count)
+        .unwrap_or(0);
+    let function_sample_count = overview.functions.len();
+    drop(store);
     eprintln!(
-        "aethyme-engine-daemon: map ready ({} files, {} functions, mode {}, build {:?})",
-        map.files.len(),
-        map.functions.len(),
-        build_mode,
-        build_started.elapsed()
-    );
-
-    // Pre-warm GraphSignals so the first task-localize call doesn't pay
-    // the ~17s parser_visibility O(F·E) sweep. Without this, call 1 is
-    // slow even though calls 2+ are fast — bad UX for any agent that
-    // makes only one or two queries before moving on.
-    let signals_started = Instant::now();
-    let _ = map.signals();
-    eprintln!(
-        "aethyme-engine-daemon: signals warm (took {:?})",
-        signals_started.elapsed()
+        "aethyme-engine-daemon: redb ready ({} files, {} sampled functions, open {:?})",
+        file_count,
+        function_sample_count,
+        open_started.elapsed()
     );
 
     let state = Arc::new(Mutex::new(DaemonState {
         repo: config.repo.clone(),
-        map,
         last_activity: Instant::now(),
     }));
 
@@ -472,17 +418,11 @@ fn handle_request(mut stream: UnixStream, state: &Arc<Mutex<DaemonState>>) -> bo
 
     match command {
         "ping" => {
-            let s = state.lock().expect("daemon state lock poisoned");
-            send_ok_value(
-                &mut stream,
-                serde_json::json!({
-                    "ok": true,
-                    "repo": s.repo.display().to_string(),
-                    "files": s.map.files.len(),
-                    "functions": s.map.functions.len(),
-                    "edges": s.map.edges.len(),
-                }),
-            );
+            let repo = repo_from_state(state);
+            match open_daemon_store(&repo).and_then(|store| daemon_ping_payload(&repo, &store)) {
+                Ok(payload) => send_ok_value(&mut stream, payload),
+                Err(e) => send_error(&mut stream, &e),
+            }
             false
         }
         "shutdown" => {
@@ -491,17 +431,21 @@ fn handle_request(mut stream: UnixStream, state: &Arc<Mutex<DaemonState>>) -> bo
         }
         "task-localize" => {
             let task_text = request.get("task").and_then(|v| v.as_str()).unwrap_or("");
-            let s = state.lock().expect("daemon state lock poisoned");
+            let repo = repo_from_state(state);
             let task = TaskInput::from_task_text(task_text);
-            let anchors = task_anchors_view(&s.map, &task);
-            let scope = task_scope_view(&s.map, &task);
-            let next = task_next_view(&s.map, &task);
-            let view = crate::json::task_localization_view(&anchors, &scope, &next);
-            send_ok_raw(&mut stream, &view);
+            match open_daemon_store(&repo).and_then(|store| {
+                let anchors = task_anchors_view_redb(&store, &task).map_err(|e| e.to_string())?;
+                let scope = task_scope_view_redb(&store, &task).map_err(|e| e.to_string())?;
+                let next = task_next_view_redb(&store, &task).map_err(|e| e.to_string())?;
+                Ok(crate::json::task_localization_view(&anchors, &scope, &next))
+            }) {
+                Ok(view) => send_ok_raw(&mut stream, &view),
+                Err(e) => send_error(&mut stream, &e),
+            }
             false
         }
         "symbol-batch" => {
-            // Run symbol_search against the resident map for each query.
+            // Run the redb-backed V2 matcher for each query.
             // Returns a JSON object keyed by query: {query → [SearchHit, ...]}.
             // Mirrors the `aethyme-engine-cli symbol-batch` shape so the
             // Python wrapper can route through the daemon transparently.
@@ -521,40 +465,43 @@ fn handle_request(mut stream: UnixStream, state: &Arc<Mutex<DaemonState>>) -> bo
                 return false;
             }
 
-            let s = state.lock().expect("daemon state lock poisoned");
-            let mut results: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-            for query in &queries {
-                let hits = symbol_search(&s.map, query, limit);
-                let arr: Vec<serde_json::Value> = hits
-                    .into_iter()
-                    .map(|h| {
-                        serde_json::json!({
-                            "id": h.id,
-                            "name": h.name,
-                            "kind": h.kind,
-                            "file": h.file,
-                            "line": h.line,
-                            "score": h.score,
-                            "reason": h.reason,
+            let repo = repo_from_state(state);
+            match open_daemon_store(&repo).and_then(|store| {
+                let mut results: serde_json::Map<String, serde_json::Value> =
+                    serde_json::Map::new();
+                for query in &queries {
+                    let hits =
+                        symbol_search_redb(&store, query, limit).map_err(|e| e.to_string())?;
+                    let arr: Vec<serde_json::Value> = hits
+                        .into_iter()
+                        .map(|h| {
+                            serde_json::json!({
+                                "id": h.id,
+                                "name": h.name,
+                                "kind": h.kind,
+                                "file": h.file,
+                                "line": h.line,
+                                "score": h.score,
+                                "reason": h.reason,
+                            })
                         })
-                    })
-                    .collect();
-                results.insert(query.clone(), serde_json::Value::Array(arr));
-            }
-            send_ok_value(
-                &mut stream,
-                serde_json::json!({
+                        .collect();
+                    results.insert(query.clone(), serde_json::Value::Array(arr));
+                }
+                Ok(serde_json::json!({
                     "ok": true,
                     "result": serde_json::Value::Object(results),
-                }),
-            );
+                }))
+            }) {
+                Ok(payload) => send_ok_value(&mut stream, payload),
+                Err(e) => send_error(&mut stream, &e),
+            }
             false
         }
         "callers-of" => {
-            // Look up the callers of one or more symbols against the
-            // resident graph. Returns map keyed by symbol id:
+            // Look up callers through redb relation views. Returns map keyed by symbol id:
             // `{symbol_id → [{ "id": ..., "label": ..., "path": ... },
-            // ...]}`. Symbols not found in the graph map to empty
+            // ...]}`. Symbols not found in the graph store map to empty
             // arrays (not errors — common when a symbol-search hit
             // came from a file with no callgraph edges yet).
             let targets: Vec<String> = request
@@ -570,32 +517,35 @@ fn handle_request(mut stream: UnixStream, state: &Arc<Mutex<DaemonState>>) -> bo
                 send_error(&mut stream, "missing or empty `targets` array");
                 return false;
             }
-            let s = state.lock().expect("daemon state lock poisoned");
-            let mut results: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-            for target in &targets {
-                let view = callers_view(&s.map, target);
-                let arr: Vec<serde_json::Value> = view
-                    .items
-                    .into_iter()
-                    .map(|item| {
-                        serde_json::json!({
-                            "id": item.id,
-                            "kind": item.kind,
-                            "display": item.display,
-                            "relation": item.relation,
-                            "confidence": item.confidence,
+            let repo = repo_from_state(state);
+            match open_daemon_store(&repo).and_then(|store| {
+                let mut results: serde_json::Map<String, serde_json::Value> =
+                    serde_json::Map::new();
+                for target in &targets {
+                    let view = callers_view_redb(&store, target).map_err(|e| e.to_string())?;
+                    let arr: Vec<serde_json::Value> = view
+                        .items
+                        .into_iter()
+                        .map(|item| {
+                            serde_json::json!({
+                                "id": item.id,
+                                "kind": item.kind,
+                                "display": item.display,
+                                "relation": item.relation,
+                                "confidence": item.confidence,
+                            })
                         })
-                    })
-                    .collect();
-                results.insert(target.clone(), serde_json::Value::Array(arr));
-            }
-            send_ok_value(
-                &mut stream,
-                serde_json::json!({
+                        .collect();
+                    results.insert(target.clone(), serde_json::Value::Array(arr));
+                }
+                Ok(serde_json::json!({
                     "ok": true,
                     "result": serde_json::Value::Object(results),
-                }),
-            );
+                }))
+            }) {
+                Ok(payload) => send_ok_value(&mut stream, payload),
+                Err(e) => send_error(&mut stream, &e),
+            }
             false
         }
         other => {
@@ -603,6 +553,42 @@ fn handle_request(mut stream: UnixStream, state: &Arc<Mutex<DaemonState>>) -> bo
             false
         }
     }
+}
+
+fn repo_from_state(state: &Arc<Mutex<DaemonState>>) -> PathBuf {
+    let s = state.lock().expect("daemon state lock poisoned");
+    s.repo.clone()
+}
+
+fn open_daemon_store(repo: &Path) -> Result<ReadOnlyGraphStore, String> {
+    GraphStore::open_read_only(repo).map_err(|e| e.to_string())
+}
+
+fn daemon_ping_payload(
+    repo: &Path,
+    store: &ReadOnlyGraphStore,
+) -> Result<serde_json::Value, String> {
+    let overview = store
+        .overview_v2(OverviewV2Limits::default())
+        .map_err(|e| e.to_string())?;
+    let files = overview
+        .repo
+        .as_ref()
+        .map(|repo| repo.file_count)
+        .unwrap_or(0);
+    let functions = store
+        .functions_under_path("")
+        .map_err(|e| e.to_string())?
+        .len();
+    let edges = store.edge_count().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "repo": repo.display().to_string(),
+        "backend": "redb",
+        "files": files,
+        "functions": functions,
+        "edges": edges,
+    }))
 }
 
 #[derive(Serialize)]

@@ -4,7 +4,7 @@
 //! fragments under `<repo>/.aethyme/graph/`. The current writer persists
 //! repositories, directories, files, areas, functions, classes, docs, configs,
 //! unresolved/import placeholders, risks, and file/symbol adjacency for
-//! query, symbol, rendered graph, graph-expand, and task
+//! query, symbol, rendered graph, graph-expand, task-expand, and task
 //! anchors/scope/next/localize CLI views, plus usage-boundary seed discovery.
 //! The hybrid `callers` path still greps first, then expands candidate files
 //! through redb adjacency. Usage-boundary remains hybrid too: redb supplies
@@ -2445,6 +2445,20 @@ fn collect_adjacency<D: ReadableDatabase>(
     Ok(out)
 }
 
+fn edge_count_from<D: ReadableDatabase>(db: &D) -> Result<u64, GraphStoreError> {
+    let txn = db.begin_read()?;
+    let t = txn.open_multimap_table(EDGES_OUT)?;
+    let mut count = 0;
+    for entry in t.iter()? {
+        let (_, mut values) = entry?;
+        while let Some(value) = values.next() {
+            value?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn list_areas_from<D: ReadableDatabase>(
     db: &D,
     depth: Option<u32>,
@@ -3086,6 +3100,10 @@ impl ReadOnlyGraphStore {
     /// Incoming adjacency rows for `entity_id`.
     pub fn edges_to(&self, entity_id: &str) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
         collect_adjacency(&self.db, EDGES_IN, entity_id)
+    }
+
+    pub(crate) fn edge_count(&self) -> Result<u64, GraphStoreError> {
+        edge_count_from(&self.db)
     }
 
     /// One-shot summary for query commands.
