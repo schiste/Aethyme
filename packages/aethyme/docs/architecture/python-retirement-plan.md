@@ -121,9 +121,12 @@ No long-lived dual implementation: per group, the flip is one commit.
    implementation-blind and gates the whole migration unchanged.
 2. *Golden diff:* a script runs the frozen command list against a
    fixture repo + a playground pair on both implementations and diffs
-   canonicalized JSON (timestamps/paths normalized). Byte-parity is the
-   bar for delegation commands; documented-diff parity for quality
-   commands (where pydantic float/ordering quirks may differ).
+   canonicalized output (timestamps/paths normalized). Byte-parity is
+   the bar everywhere — delegation commands and quality commands, JSON
+   and markdown alike (decision #2). Where pydantic float/ordering
+   quirks make Python's bytes awkward to replicate, the Rust side
+   replicates them anyway; cosmetic cleanup is a post-migration change
+   with its own diff review.
 3. Existing pytest suites for scorecard/autofixers translate to Rust
    tests in their phase; until then they keep running against the
    Python side, which still exists for exactly the unported groups.
@@ -258,11 +261,12 @@ Python startup.
   golden harness (run twice, dirty the repo between).
 - *Active collision with redb sessions* — this phase edits
   `aethyme-engine-cli.rs` and navigation code the redb phase-set is
-  actively rewriting (open question #4). Run it **after** the redb
-  set lands, or lease-coordinate per file via the broker.
-- *PyO3 binding orphaned* (open question #3) — Phase 1 removes its
-  only consumer; decide retire-now vs keep-published before, not
-  during.
+  actively rewriting. Per decision #4: run concurrently, lease-
+  coordinated per file via the broker — adopt before editing, watch
+  `broker status` overlaps, negotiate rather than block.
+- *PyO3 binding* — per decision #3, retired **in this phase**: delete
+  `aethyme_py`, the pyo3 transport arm, and `--engine-transport`
+  plumbing in the same commits that remove their `engine.py` consumer.
 
 ## Phase 2 — `aethyme-enhance` (deployment & templating)
 
@@ -364,10 +368,12 @@ the new unified `Finding` model.
    plus synthetic edge-case fixtures (unicode filenames, deep nesting,
    generated-file markers, malformed JSON schemas).
 
-**Exit criteria.** Documented-diff parity on the corpus: identical
-finding sets per detector (file, span, severity), identical scores;
-`--format md` diffs reviewed and accepted (open question #2);
-`tests/scorecard/` retired in favor of the Rust tests.
+**Exit criteria.** Byte parity on the corpus (per decision #2): identical
+finding sets per detector (file, span, severity), identical scores, and
+`--format json` **and** `--format md` outputs byte-identical to the
+Python renderer after volatile-field normalization; two consecutive
+runs and macOS/Linux byte-identical; `tests/scorecard/` retired in
+favor of the Rust tests.
 
 **Risks to manage.**
 - *Regex dialect gap* — Python `re` supports lookaround/backreferences;
@@ -433,9 +439,9 @@ story.
 **Work items.**
 1. Delete `src/` (including the `models/` husk), `pyproject.toml`,
    `requirements-dev.txt`, venv bootstrap docs, `aethyme root`
-   discovery (env → pointer file → upward walk) from the router, the
-   Python-daemon socket namespace remnant in `daemon.rs`, and the PyO3
-   transport if not already retired (open question #3).
+   discovery (env → pointer file → upward walk) from the router, and
+   the Python-daemon socket namespace remnant in `daemon.rs`. (PyO3
+   transport already retired in Phase 1 per decision #3.)
 2. Registry hard-delete ceremony: every row mentioning `python -m
    src.cli`, `engine.py`, or `.venv` — with the PR-body contract
    decision the checker enforces.
@@ -476,10 +482,12 @@ Registry contains zero Python invocations.
 ## Cross-phase risks
 
 - **Concurrent redb sessions** — phases 1–3 touch files the redb
-  phase-set is rewriting. Sequence after it lands or lease-coordinate
-  (open question #4). The broker's merged-tree gates are the backstop,
-  but rebasing a week of migration over a redb rewrite is the expensive
-  path — prefer sequencing.
+  phase-set is rewriting. Per decision #4, run concurrently and
+  coordinate via broker leases: adopt before editing, check
+  `broker status` overlaps on the shared files, keep migration commits
+  small so conflicts stay cheap to resolve. The merged-tree gates are
+  the backstop; a `.aethyme/broker-action-required.md` on submit is the
+  expected resolution path, not an exception.
 - **Gate blind spot: environment-dependent skips** — any parity or
   local test that skips without a built engine reports green while
   verifying nothing (proven live 2026-07-17). Harness and converted
@@ -494,15 +502,23 @@ Registry contains zero Python invocations.
 - **Windows** — out of scope (built-as-if-public says macOS/Linux),
   but single-binary removes the biggest future Windows blocker (venv).
 
-## Open questions for the operator
+## Decisions (operator, 2026-07-17)
 
-1. Crate naming/split: `aethyme-quality` as one crate (recommended — the
-   unification is the point) vs separate scorecard/autofix crates?
-2. Does `ai-ready --format md` output need byte-stability for any
-   downstream consumer, or is documented-diff parity acceptable?
-3. Retire the PyO3 `aethyme_py` binding at Phase 1 (its only consumer is
-   `engine.py`) or keep it published for third-party Python users until
-   Phase 6? No in-repo consumer will remain after Phase 1.
-4. Sequencing against V2 graph work: phases 1–3 touch files the redb
-   sessions are actively changing — coordinate via broker leases, or
-   schedule after the redb phase-set lands?
+Formerly open questions — all resolved; the phases above reflect them.
+
+1. **One crate.** `aethyme-quality` holds both detect and fix sides —
+   the unification is the point.
+2. **Byte stability for `ai-ready --format md`.** Markdown reports are
+   held to the same bar as JSON: byte-identical to the Python output on
+   the parity corpus, and stable across runs/machines. Cost accepted:
+   the Rust renderer replicates Python's exact formatting (whitespace,
+   ordering, number rendering) before any cosmetic improvement.
+3. **Retire PyO3 at Phase 1.** The `aethyme_py` binding and the
+   `--engine-transport` machinery are deleted when their only consumer
+   (`engine.py`) goes; nothing stays published for third parties.
+4. **Coordinate with redb sessions via broker leases**, not by waiting.
+   Migration phases 1–3 may run concurrently with V2 graph work; each
+   migration session adopts through the broker, watches lease overlaps
+   on the shared files (`aethyme-engine-cli.rs`, navigation), and
+   negotiates per-file rather than blocking on the redb set landing.
+   The merged-tree gates remain the backstop.
