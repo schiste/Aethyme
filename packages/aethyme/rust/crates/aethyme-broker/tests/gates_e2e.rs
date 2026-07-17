@@ -75,10 +75,14 @@ fn init_repo(root: &Path) {
     std::fs::write(root.join("src/app.py"), "x = 1\n").unwrap();
     std::fs::write(root.join("docs.md"), "docs\n").unwrap();
     // Gate outputs must be gitignored: the working-tree hash respects
-    // .gitignore, so ignored artifacts don't bust the result cache.
+    // .gitignore, so ignored artifacts don't bust the result cache. The
+    // .aethyme runtime-state lines mirror the scaffold's gitignore block —
+    // without them a run against the MAIN checkout (gates run --all) would
+    // bust its own cache by writing broker.db/logs between runs.
     std::fs::write(
         root.join(".gitignore"),
-        "gate-markers.txt\nslow-finished.txt\n",
+        "gate-markers.txt\nslow-finished.txt\n\
+         .aethyme/broker.db*\n.aethyme/logs/\n.aethyme/run/\n.aethyme/worktrees/\n",
     )
     .unwrap();
     sh(root, &["add", "-A"]);
@@ -273,4 +277,101 @@ triggers = ["**/*.py"]
         events.iter().any(|e| e.kind == "gate.cancelled"),
         "cancellation recorded"
     );
+}
+
+#[test]
+fn run_all_runs_every_gate_in_cost_order_ignoring_diff_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    // Triggers deliberately match NOTHING in the repo: diff selection
+    // would pick zero of these gates, --all must still run them all.
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "expensive"
+command = "echo expensive >> gate-markers.txt"
+cost = 3
+triggers = ["**/*.nomatch"]
+
+[[gate]]
+name = "cheap"
+command = "echo cheap >> gate-markers.txt"
+cost = 1
+triggers = ["**/*.nomatch"]
+
+[[gate]]
+name = "mid"
+command = "echo mid >> gate-markers.txt"
+cost = 2
+triggers = ["**/*.nomatch"]
+"#,
+    );
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    // CI shape: run against the main checkout itself — clean tree, no
+    // worktree, no session ever adopted.
+    let progress = CapturedProgress::default();
+    let outcomes = broker
+        .run_all_gates_with_progress(tmp.path(), &progress)
+        .unwrap();
+    assert_eq!(
+        outcomes.iter().map(|o| o.gate.as_str()).collect::<Vec<_>>(),
+        vec!["cheap", "mid", "expensive"],
+        "every gate runs, cost order, despite zero trigger matches"
+    );
+    assert!(outcomes.iter().all(|o| o.status == GateStatus::Pass));
+    assert!(outcomes.iter().all(|o| !o.cached), "first run executes");
+    let markers = std::fs::read_to_string(tmp.path().join("gate-markers.txt")).unwrap();
+    assert_eq!(markers, "cheap\nmid\nexpensive\n");
+
+    // The existing streaming surface is reused: started/finished lines.
+    let lines = progress.lines();
+    assert!(
+        lines.iter().any(|l| l.starts_with("gate cheap started")),
+        "streaming progress present: {lines:?}"
+    );
+
+    // Same tree again: the tree-hash result cache answers, nothing runs.
+    let outcomes = broker.run_all_gates(tmp.path()).unwrap();
+    assert!(
+        outcomes.iter().all(|o| o.cached),
+        "second run is pure cache"
+    );
+    let markers_after = std::fs::read_to_string(tmp.path().join("gate-markers.txt")).unwrap();
+    assert_eq!(markers, markers_after, "cached rerun executed nothing");
+}
+
+#[test]
+fn run_all_fails_fast_on_first_failing_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "cheap-pass"
+command = "echo cheap >> gate-markers.txt"
+cost = 1
+
+[[gate]]
+name = "mid-fail"
+command = "echo failing >> gate-markers.txt; exit 7"
+cost = 2
+
+[[gate]]
+name = "never-reached"
+command = "echo never >> gate-markers.txt"
+cost = 3
+"#,
+    );
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let outcomes = broker.run_all_gates(tmp.path()).unwrap();
+    assert_eq!(outcomes.len(), 2, "fail-fast stops before never-reached");
+    assert_eq!(outcomes[0].status, GateStatus::Pass);
+    assert_eq!(outcomes[1].gate, "mid-fail");
+    assert_eq!(outcomes[1].status, GateStatus::Fail);
+    assert_eq!(outcomes[1].exit_code, Some(7));
+    let markers = std::fs::read_to_string(tmp.path().join("gate-markers.txt")).unwrap();
+    assert!(!markers.contains("never"));
 }

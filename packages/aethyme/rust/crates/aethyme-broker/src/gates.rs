@@ -289,12 +289,63 @@ pub fn run_affected_with_progress(
     session_id: Option<i64>,
     progress: &dyn GateProgressSink,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    let selections = select_gates(gates, changed);
+    run_selections(store, main_root, checkout, selections, session_id, progress)
+}
+
+/// Run EVERY configured gate cheap-first — no diff selection. This is
+/// the full-tree "verified" definition shared by CI (`gates run --all`)
+/// and the broker: the exact same executor as [`run_affected`], so
+/// streaming progress, the tree-hash result cache, and fail-fast
+/// semantics are identical by construction.
+pub fn run_all(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gates: &[Gate],
+    session_id: Option<i64>,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    let progress = StderrGateProgressSink;
+    run_all_with_progress(store, main_root, checkout, gates, session_id, &progress)
+}
+
+/// Like [`run_all`], with an injectable progress sink.
+pub fn run_all_with_progress(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gates: &[Gate],
+    session_id: Option<i64>,
+    progress: &dyn GateProgressSink,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    // Every gate, already cost-sorted by load_gates; `triggered_by` is
+    // None because nothing was selected by a diff.
+    let selections = gates
+        .iter()
+        .map(|gate| Selection {
+            gate,
+            triggered_by: None,
+        })
+        .collect();
+    run_selections(store, main_root, checkout, selections, session_id, progress)
+}
+
+/// Shared executor for a pre-computed selection: cheap-first order (the
+/// selection preserves `load_gates` sorting), tree-hash caching, one
+/// process group per gate, fail-fast.
+fn run_selections(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    selections: Vec<Selection<'_>>,
+    session_id: Option<i64>,
+    progress: &dyn GateProgressSink,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     let tree = checkout.working_tree_hash()?;
     if let Some(session_id) = session_id {
         cancel_obsolete_runs(store, main_root, session_id, &tree);
     }
 
-    let selections = select_gates(gates, changed);
     let log_dir = main_root.join(".aethyme/logs/gates");
     let _ = std::fs::create_dir_all(&log_dir);
     let run_dir = running_dir(main_root);
