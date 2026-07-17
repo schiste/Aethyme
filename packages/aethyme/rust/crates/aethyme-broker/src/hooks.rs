@@ -132,8 +132,16 @@ pub fn hooks_dir(repo: &GitRepo) -> Result<PathBuf, HooksError> {
 /// on failure but degrades to warn-and-pass when the binary moved —
 /// hooks must never brick commits. The post-commit shim is purely
 /// informational and swallows everything.
+/// POSIX-quote a value for embedding in the generated shims: single
+/// quotes, with embedded single quotes as `'\''`. Every other byte is
+/// inert — `$`, backticks, double quotes, and backslashes in an install
+/// path must never be shell-expanded when the hook runs.
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn hook_block(hook: &str, binary: &Path) -> String {
-    let bin = binary.display();
+    let bin = sh_quote(&binary.display().to_string());
     let invoke = if hook == "pre-commit" {
         "if [ -x \"$AETHYME\" ]; then\n    \
              \"$AETHYME\" broker hooks pre-commit || exit $?\n\
@@ -151,7 +159,7 @@ fn hook_block(hook: &str, binary: &Path) -> String {
     format!(
         "{MARKER_BEGIN}\n\
          # Managed by `aethyme broker hooks install` — edits inside the markers are overwritten.\n\
-         AETHYME=\"{bin}\"\n\
+         AETHYME={bin}\n\
          {invoke}\n\
          {MARKER_END}\n"
     )
@@ -468,6 +476,27 @@ mod tests {
         assert!(replaced.starts_with("#!/bin/sh\necho before\n"));
         assert!(replaced.ends_with("echo after\n"));
         assert_eq!(replaced.matches(MARKER_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn binary_path_is_inert_in_the_generated_shim() {
+        // The path is embedded in a shell script: `$`, backticks, quotes
+        // and backslashes in an install location must never be expanded
+        // or executed when the hook runs. Round-trip through a real sh.
+        let hostile = r#"/tmp/$(touch pwned)/it's "aethyme" `id` \x"#;
+        let quoted = sh_quote(hostile);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf %s {quoted}"))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), hostile);
+
+        let block = hook_block("pre-commit", Path::new(hostile));
+        assert!(
+            block.contains(&format!("AETHYME={quoted}")),
+            "shim embeds the sh-quoted path: {block}"
+        );
     }
 
     #[test]
