@@ -4,13 +4,12 @@
 //! fragments under `<repo>/.aethyme/graph/`. The current writer persists
 //! repositories, directories, files, areas, functions, classes, docs, configs,
 //! unresolved/import placeholders, risks, and file/symbol adjacency for
-//! query, symbol, rendered graph, graph-expand, task-expand, and task
-//! anchors/scope/next/localize CLI views, plus usage-boundary seed discovery.
-//! The hybrid `callers` path still greps first, then expands candidate files
+//! query, symbol, rendered graph, graph-expand, task-expand, task
+//! anchors/scope/next/localize, context-pack, activation, and
+//! non-usage-boundary `explore` views, plus usage-boundary seed discovery. The
+//! hybrid `callers` path still greps first, then expands candidate files
 //! through redb adjacency. Usage-boundary remains hybrid too: redb supplies
-//! symbols and candidate files, while source text supplies evidence. Context
-//! pack assembly, activation, and remaining non-usage-boundary `explore` flows
-//! still use higher-level graph modules that may build `RepositoryMap`.
+//! symbols and candidate files, while source text supplies evidence.
 //!
 //! Non-scope for the current redb store: this file is not the durable graph
 //! format, does not mutate fragment files, does not promise in-place redb file

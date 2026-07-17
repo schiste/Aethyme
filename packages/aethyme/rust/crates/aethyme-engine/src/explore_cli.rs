@@ -5,8 +5,9 @@
 //! parse the same flags and produce the same answer-json. This module owns
 //! that parsing and dispatch so the two front ends cannot drift; the
 //! binaries translate [`ExploreCliOutcome`] into their own exit-code
-//! contracts (`aethyme-engine-cli` keeps exit 2 for "daemon not running";
-//! the router auto-starts the daemon and retries instead).
+//! contracts. The non-usage-boundary native explore path reads redb directly;
+//! the daemon outcome remains only for older callers that still surface that
+//! process-management distinction.
 
 use std::path::PathBuf;
 
@@ -17,8 +18,8 @@ use crate::explore;
 pub enum ExploreCliOutcome {
     /// Answer printed to stdout.
     Done,
-    /// The engine daemon isn't running for this repo. The caller decides:
-    /// exit with the documented code 2, or start the daemon and retry.
+    /// Legacy process-management outcome for callers that still distinguish
+    /// daemon startup from ordinary query failures.
     DaemonNotRunning { repo: PathBuf },
     /// Caller error (bad flags / bad params) — exit-2 semantics.
     BadUsage(String),
@@ -97,8 +98,8 @@ pub fn run(args: &[String]) -> ExploreCliOutcome {
             explore::IntentSource::Auto,
         ),
         "usage_boundary_query" => {
-            // Different orchestrator: doesn't go through the daemon,
-            // calls `analyze_usage_boundary_scope_first` directly.
+            // Different orchestrator: hybrid redb seed discovery plus
+            // source-text evidence scanning.
             return run_usage_boundary(args, &repo_str, &request);
         }
         other => {
@@ -139,8 +140,8 @@ pub fn run(args: &[String]) -> ExploreCliOutcome {
     }
 }
 
-/// Run the `usage_boundary_query` intent path. Doesn't go through the
-/// engine daemon — calls `analyze_usage_boundary_scope_first` directly.
+/// Run the `usage_boundary_query` intent path. This remains hybrid: redb
+/// chooses candidates and source text supplies evidence.
 fn run_usage_boundary(args: &[String], repo_str: &str, request: &str) -> ExploreCliOutcome {
     let scope = match read_option(args, "--scope") {
         Ok(v) => v,
