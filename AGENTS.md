@@ -22,7 +22,7 @@ agent sessions working here concurrently:
 
 1. Before editing, check activity and register your worktree:
    `aethyme broker status --json`, then `aethyme broker adopt --task "<task>"`
-   (install once: `cargo install --path packages/aethyme/rust/crates/aethyme-engine`; fallback binary: `packages/aethyme/rust/target/release/aethyme`).
+   (install once: `cargo install --path packages/aethyme/rust/crates/aethyme-engine`; check with `aethyme --version`).
 2. Commit early and small; only committed work integrates.
 3. When done, `aethyme broker submit --session <id>` — never merge or push
    yourself, and never touch the `aethyme/integration` branch directly.
