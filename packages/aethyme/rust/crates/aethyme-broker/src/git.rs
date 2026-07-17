@@ -152,6 +152,15 @@ impl GitRepo {
 
     /// Resolve a ref (branch name, tag, ...) to a commit, `None` when it
     /// does not exist.
+    /// Common ancestor of `a` and `b`. Re-added 2026-07-17: removed as
+    /// dead code the same day #41 made it live (session_change_base
+    /// derives lease baselines from merge-base(HEAD, integration)).
+    pub fn merge_base(&self, a: &str, b: &str) -> Result<String, GitError> {
+        Ok(run_git(&self.root, &["merge-base", a, b])?
+            .trim()
+            .to_string())
+    }
+
     pub fn resolve_ref(&self, name: &str) -> Option<String> {
         run_git(
             &self.root,
