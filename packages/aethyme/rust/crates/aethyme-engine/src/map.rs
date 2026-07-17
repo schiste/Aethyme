@@ -210,10 +210,6 @@ impl RepositoryMap {
         Self::build_with_profile_and_progress(root, |_| {})
     }
 
-    pub fn build_no_cache(root: &Path) -> Result<(Self, RepositoryBuildProfile), String> {
-        Self::build_internal(root, |_| {}, true)
-    }
-
     pub fn build_with_profile_and_progress<F>(
         root: &Path,
         progress: F,

@@ -122,10 +122,6 @@ impl<P> OverlayFragment<P> {
         &self.payload
     }
 
-    /// Consume the wrapper and return the payload.
-    pub fn into_payload(self) -> P {
-        self.payload
-    }
 }
 
 // ─── Bincode I/O ─────────────────────────────────────────────────────
