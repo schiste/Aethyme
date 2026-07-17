@@ -16,13 +16,12 @@ use aethyme_engine::graph::navigation::{
     task_anchors_view_redb, task_expand_view_redb, task_next_view_redb, task_scope_view_redb,
 };
 use aethyme_engine::graph::neighborhood::impact_frontier;
-use aethyme_engine::graph::overview::build_repo_overview;
 use aethyme_engine::graph::search::symbol_search_redb;
 use aethyme_engine::graph::usage_boundary::analyze_usage_boundary_scope_first_redb;
 use aethyme_engine::map::RepositoryMap;
 use aethyme_engine::model::repository::RepositoryNode;
 use aethyme_engine::model::task::TaskInput;
-use aethyme_engine::pipeline::{build_context_pack, build_context_pack_with_content};
+use aethyme_engine::pipeline::{build_context_pack_redb, build_context_pack_with_content_redb};
 use aethyme_engine::store::redb::graph_store::{GraphStore, NeighborDirection, OverviewV2Limits};
 use aethyme_engine::workspace::{build_workspace_graph, cross_repo_blast_radius};
 
@@ -274,29 +273,34 @@ fn run() -> Result<(), String> {
             let impact = impact_frontier(&map, &target);
             println!("{}", aethyme_engine::json::string_list(&impact));
         }
-        "pack" => {
+        "pack" | "task-pack" => {
             let repo = read_option(&args, "--repo")?;
             let task_value = read_option(&args, "--task")?;
-            let root = PathBuf::from(&repo);
-            let map = build_map(&repo, no_cache, fragment_mode)?;
+            let root = PathBuf::from(&repo)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let store = GraphStore::open_read_only(&root).map_err(|e| e.to_string())?;
             let task = TaskInput::from_task_text(&task_value);
-            let pack = build_context_pack(&root, &map, task);
+            let pack = build_context_pack_redb(&root, &store, task).map_err(|e| e.to_string())?;
             let mut stdout = std::io::stdout().lock();
             aethyme_engine::json::write_context_pack(&mut stdout, &pack)
                 .map_err(|e| e.to_string())?;
             writeln!(stdout).map_err(|e| e.to_string())?;
         }
-        "context" => {
+        "context" | "task-context" => {
             let repo = read_option(&args, "--repo")?;
             let task_value = read_option(&args, "--task")?;
             let content_budget: usize = read_option(&args, "--content-budget")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(80_000);
-            let root = PathBuf::from(&repo);
-            let map = build_map(&repo, no_cache, fragment_mode)?;
+            let root = PathBuf::from(&repo)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let store = GraphStore::open_read_only(&root).map_err(|e| e.to_string())?;
             let task = TaskInput::from_task_text(&task_value);
-            let pack = build_context_pack_with_content(&root, &map, task, content_budget);
+            let pack = build_context_pack_with_content_redb(&root, &store, task, content_budget)
+                .map_err(|e| e.to_string())?;
             let mut stdout = std::io::stdout().lock();
             aethyme_engine::json::write_context_pack(&mut stdout, &pack)
                 .map_err(|e| e.to_string())?;
@@ -385,15 +389,17 @@ fn run() -> Result<(), String> {
             let view = task_expand_view_redb(&store, &target).map_err(|e| e.to_string())?;
             println!("{}", aethyme_engine::json::task_expand_view(&view));
         }
-        "explain" => {
+        "explain" | "task-explain" => {
             let repo = read_option(&args, "--repo")?;
             let task_value =
                 read_option(&args, "--task").unwrap_or_else(|_| "Explain this repo".to_string());
-            let root = PathBuf::from(&repo);
-            let map = build_map(&repo, no_cache, fragment_mode)?;
+            let root = PathBuf::from(&repo)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let store = GraphStore::open_read_only(&root).map_err(|e| e.to_string())?;
             let task = TaskInput::from_task_text(&task_value);
-            let pack = build_context_pack(&root, &map, task);
-            print_explanation(&map, &pack);
+            let pack = build_context_pack_redb(&root, &store, task).map_err(|e| e.to_string())?;
+            print_explanation(&pack);
         }
         "workspace-inspect" => {
             let repos_str = read_option(&args, "--repos")?;
@@ -770,7 +776,7 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 // running, so out-of-repo callers can detect the condition.
 
 fn run_explore_via_shared_cli(args: &[String]) -> Result<(), String> {
-    use aethyme_engine::explore_cli::{run, ExploreCliOutcome};
+    use aethyme_engine::explore_cli::{ExploreCliOutcome, run};
     match run(args) {
         ExploreCliOutcome::Done => Ok(()),
         ExploreCliOutcome::DaemonNotRunning { repo } => {
@@ -1084,20 +1090,20 @@ impl StageProfiler {
     }
 }
 
-fn print_explanation(map: &RepositoryMap, pack: &aethyme_engine::context_pack::ContextPack) {
-    let overview = build_repo_overview(map, &pack.navigation_order);
+fn print_explanation(pack: &aethyme_engine::context_pack::ContextPack) {
+    let overview = &pack.overview;
     println!("Task: {}", pack.task.raw);
-    println!("Languages: {}", map.snapshot.languages.join(", "));
+    println!("Languages: {}", pack.summary.snapshot.languages.join(", "));
     println!(
         "Top-level directories: {}",
-        map.snapshot.top_level_dirs.join(", ")
+        pack.summary.snapshot.top_level_dirs.join(", ")
     );
-    println!("Files indexed: {}", map.snapshot.files.len());
-    println!("Functions indexed: {}", map.functions.len());
-    println!("Classes indexed: {}", map.classes.len());
-    println!("Docs indexed: {}", map.docs.len());
-    println!("Configs indexed: {}", map.configs.len());
-    if let Some(readme) = &map.snapshot.readme_path {
+    println!("Files indexed: {}", pack.summary.files_count);
+    println!("Functions indexed: {}", pack.summary.functions_count);
+    println!("Classes indexed: {}", pack.summary.classes_count);
+    println!("Docs indexed: {}", pack.summary.docs_count);
+    println!("Configs indexed: {}", pack.summary.configs_count);
+    if let Some(readme) = &pack.summary.snapshot.readme_path {
         println!("README: {readme}");
     }
     if !overview.code_areas.is_empty() {
