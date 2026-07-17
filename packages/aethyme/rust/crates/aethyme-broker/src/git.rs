@@ -530,7 +530,8 @@ mod path_line_tests {
 
     #[test]
     fn diff_rendering_artifacts_and_status_decorations_are_discarded() {
-        let out = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n---\nok \u{2713}\n\u{2713}\n\nx\n";
+        let out =
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n---\nok \u{2713}\n\u{2713}\n\nx\n";
         assert_eq!(parse_path_lines(out), vec!["x"]);
     }
 }
