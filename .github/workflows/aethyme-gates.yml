@@ -1,0 +1,46 @@
+name: Aethyme Gates
+
+# Convergence lane: gates.toml is the single definition of "verified" —
+# this workflow runs the exact gates, via the exact runner, that the
+# broker runs before promoting a session (`aethyme broker gates run
+# --all`). The pre-existing test workflows stay in place until this lane
+# has proven equivalent; deleting them is a separate, later decision.
+
+on:
+  pull_request:
+  push:
+    branches: ["main", "master"]
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: Run all gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # gates.toml commands resolve $MAIN/packages/aethyme/.venv from any
+      # worktree, so CI provides the documented package-local venv layout.
+      - name: Install package + dev dependencies (into .venv)
+        working-directory: packages/aethyme
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e ".[dev]"
+
+      - name: Build aethyme binary
+        run: cargo build --release --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme
+
+      - name: Run all gates
+        run: packages/aethyme/rust/target/release/aethyme broker gates run --all
