@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
+use aethyme_broker::Gate;
 use aethyme_broker::init::{self, CheckStatus};
 
 fn sh(cwd: &Path, args: &[&str]) {
@@ -48,6 +49,36 @@ fn status_of(report: &init::InitReport, id: &str) -> CheckStatus {
         .find(|c| c.id == id)
         .unwrap_or_else(|| panic!("missing check {id}"))
         .status
+}
+
+fn draft_created_and_load(root: &Path) -> Vec<Gate> {
+    let report = init::draft_gates(root).unwrap();
+    assert_eq!(status_of(&report, "gates.draft"), CheckStatus::Created);
+    aethyme_broker::load_gates(root).unwrap()
+}
+
+fn assert_gate(gates: &[Gate], name: &str, command: &str, cost: i64, triggers: &[&str]) {
+    let gate = gates
+        .iter()
+        .find(|gate| gate.name == name)
+        .unwrap_or_else(|| panic!("missing gate {name}; got {gates:#?}"));
+    assert_eq!(gate.command, command, "{name} command");
+    assert_eq!(gate.cost, cost, "{name} cost");
+    assert_eq!(
+        gate.triggers,
+        triggers
+            .iter()
+            .map(|trigger| trigger.to_string())
+            .collect::<Vec<_>>(),
+        "{name} triggers"
+    );
+}
+
+fn assert_no_gate(gates: &[Gate], name: &str) {
+    assert!(
+        gates.iter().all(|gate| gate.name != name),
+        "unexpected gate {name}; got {gates:#?}"
+    );
 }
 
 #[test]
@@ -135,16 +166,31 @@ fn gates_draft_detects_manifests_deterministically() {
     let gates = std::fs::read_to_string(tmp.path().join(".aethyme/gates.toml")).unwrap();
     for expected in [
         "name = \"cargo-test\"",
-        "name = \"npm-lint\"",
-        "name = \"npm-test\"",
+        "name = \"js-lint\"",
+        "name = \"js-test\"",
         "name = \"ruff\"",
         "name = \"pytest\"",
     ] {
         assert!(gates.contains(expected), "missing {expected} in:\n{gates}");
     }
+    assert!(gates.contains("REVIEW EVERY GATE"));
     // The draft parses as a valid gate config.
     let loaded = aethyme_broker::load_gates(tmp.path()).unwrap();
     assert_eq!(loaded.len(), 5);
+    assert_gate(
+        &loaded,
+        "js-lint",
+        "npm run lint --silent",
+        1,
+        &["**/*.js", "**/*.jsx", "**/*.ts", "**/*.tsx", "package.json"],
+    );
+    assert_gate(
+        &loaded,
+        "js-test",
+        "npm test --silent",
+        2,
+        &["**/*.js", "**/*.jsx", "**/*.ts", "**/*.tsx", "package.json"],
+    );
     // No timestamps / absolute paths (determinism across machines & time).
     assert!(!gates.contains("202"), "no dates in generated files");
     assert!(!gates.contains(&tmp.path().to_string_lossy().into_owned()));
@@ -229,6 +275,156 @@ fn guided_init_stops_before_writing_when_certification_fails() {
     assert!(report.gates.is_none(), "gate drafting never ran");
     assert!(!report.changed);
     assert!(!tmp.path().join(".aethyme").exists(), "nothing was written");
+}
+
+#[test]
+fn gates_draft_detects_node_package_scripts_and_lockfile_runners() {
+    let pnpm = tempfile::tempdir().unwrap();
+    std::fs::write(
+        pnpm.path().join("package.json"),
+        r#"{"scripts":{"test":"vitest run","lint":"eslint ."}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        pnpm.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .unwrap();
+    init_repo(pnpm.path());
+
+    let gates = draft_created_and_load(pnpm.path());
+    assert_eq!(gates.len(), 2);
+    assert_gate(
+        &gates,
+        "js-lint",
+        "pnpm lint",
+        1,
+        &["**/*.js", "**/*.jsx", "**/*.ts", "**/*.tsx", "package.json"],
+    );
+    assert_gate(
+        &gates,
+        "js-test",
+        "pnpm test",
+        2,
+        &["**/*.js", "**/*.jsx", "**/*.ts", "**/*.tsx", "package.json"],
+    );
+
+    let yarn = tempfile::tempdir().unwrap();
+    std::fs::write(
+        yarn.path().join("package.json"),
+        r#"{"scripts":{"test":"vitest run"}}"#,
+    )
+    .unwrap();
+    std::fs::write(yarn.path().join("yarn.lock"), "# yarn lockfile\n").unwrap();
+    init_repo(yarn.path());
+
+    let gates = draft_created_and_load(yarn.path());
+    assert_eq!(gates.len(), 1);
+    assert_gate(
+        &gates,
+        "js-test",
+        "yarn test",
+        2,
+        &["**/*.js", "**/*.jsx", "**/*.ts", "**/*.tsx", "package.json"],
+    );
+}
+
+#[test]
+fn gates_draft_detects_go_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("go.mod"),
+        "module example.com/x\n\ngo 1.22\n",
+    )
+    .unwrap();
+    init_repo(tmp.path());
+
+    let gates = draft_created_and_load(tmp.path());
+    assert_eq!(gates.len(), 1);
+    assert_gate(
+        &gates,
+        "go-test",
+        "go test ./...",
+        2,
+        &["**/*.go", "go.mod", "go.sum"],
+    );
+}
+
+#[test]
+fn gates_draft_uses_makefile_test_target_as_fallback_only() {
+    let make_only = tempfile::tempdir().unwrap();
+    std::fs::write(
+        make_only.path().join("Makefile"),
+        ".PHONY: test\ntest:\n\ttrue\n",
+    )
+    .unwrap();
+    init_repo(make_only.path());
+
+    let gates = draft_created_and_load(make_only.path());
+    assert_eq!(gates.len(), 1);
+    assert_gate(&gates, "make-test", "make test", 2, &["**"]);
+
+    let node_and_make = tempfile::tempdir().unwrap();
+    std::fs::write(
+        node_and_make.path().join("package.json"),
+        r#"{"scripts":{"test":"vitest run"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        node_and_make.path().join("Makefile"),
+        ".PHONY: test\ntest:\n\ttrue\n",
+    )
+    .unwrap();
+    init_repo(node_and_make.path());
+
+    let gates = draft_created_and_load(node_and_make.path());
+    assert_eq!(gates.len(), 1);
+    assert_gate(
+        &gates,
+        "js-test",
+        "npm test --silent",
+        2,
+        &["**/*.js", "**/*.jsx", "**/*.ts", "**/*.tsx", "package.json"],
+    );
+    assert_no_gate(&gates, "make-test");
+
+    let lint_and_make = tempfile::tempdir().unwrap();
+    std::fs::write(
+        lint_and_make.path().join("package.json"),
+        r#"{"scripts":{"lint":"eslint ."}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        lint_and_make.path().join("Makefile"),
+        ".PHONY: test\ntest:\n\ttrue\n",
+    )
+    .unwrap();
+    init_repo(lint_and_make.path());
+
+    let gates = draft_created_and_load(lint_and_make.path());
+    assert_eq!(gates.len(), 2);
+    assert_gate(
+        &gates,
+        "js-lint",
+        "npm run lint --silent",
+        1,
+        &["**/*.js", "**/*.jsx", "**/*.ts", "**/*.tsx", "package.json"],
+    );
+    assert_gate(&gates, "make-test", "make test", 2, &["**"]);
+}
+
+#[test]
+fn gates_draft_without_manifests_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+
+    let report = init::draft_gates(tmp.path()).unwrap();
+    assert_eq!(status_of(&report, "gates.draft"), CheckStatus::Warn);
+    assert!(!tmp.path().join(".aethyme/gates.toml").exists());
+    assert!(matches!(
+        aethyme_broker::load_gates(tmp.path()),
+        Err(aethyme_broker::GateConfigError::Missing(_))
+    ));
 }
 
 #[test]

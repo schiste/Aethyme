@@ -638,40 +638,38 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             // Preflight (dogfood feedback 2026-07-14): show exactly what
             // will be submitted before anything runs — and warn about
             // uncommitted work, which never integrates.
-            if !parsed.json {
-                if let Ok(info) = broker.store().session(session) {
-                    if let Ok(checkout) =
-                        crate::GitRepo::discover(std::path::Path::new(&info.worktree_path))
-                    {
-                        let head = checkout.head_commit().unwrap_or_default();
+            if !parsed.json
+                && let Ok(info) = broker.store().session(session)
+                && let Ok(checkout) =
+                    crate::GitRepo::discover(std::path::Path::new(&info.worktree_path))
+            {
+                let head = checkout.head_commit().unwrap_or_default();
+                println!(
+                    "Submitting session {session} — HEAD {}",
+                    &head[..12.min(head.len())]
+                );
+                if let Some(base) = info.diff_base.as_deref()
+                    && let Ok(commits) = checkout.commit_summaries(base, "HEAD", 10)
+                {
+                    if commits.is_empty() {
                         println!(
-                            "Submitting session {session} — HEAD {}",
-                            &head[..12.min(head.len())]
+                            "  no commits since the session baseline — \
+                             nothing new to integrate"
                         );
-                        if let Some(base) = info.diff_base.as_deref() {
-                            if let Ok(commits) = checkout.commit_summaries(base, "HEAD", 10) {
-                                if commits.is_empty() {
-                                    println!(
-                                        "  no commits since the session baseline — \
-                                         nothing new to integrate"
-                                    );
-                                }
-                                for line in &commits {
-                                    println!("  {line}");
-                                }
-                            }
-                        }
-                        if let Ok(dirty) = checkout.dirty_paths() {
-                            if !dirty.is_empty() {
-                                println!(
-                                    "  ⚠ {} uncommitted change(s) NOT included \
-                                     (only committed work integrates), e.g. {}",
-                                    dirty.len(),
-                                    dirty.first().map(String::as_str).unwrap_or("")
-                                );
-                            }
-                        }
                     }
+                    for line in &commits {
+                        println!("  {line}");
+                    }
+                }
+                if let Ok(dirty) = checkout.dirty_paths()
+                    && !dirty.is_empty()
+                {
+                    println!(
+                        "  ⚠ {} uncommitted change(s) NOT included \
+                         (only committed work integrates), e.g. {}",
+                        dirty.len(),
+                        dirty.first().map(String::as_str).unwrap_or("")
+                    );
                 }
             }
             let outcome = broker.submit(session)?;
