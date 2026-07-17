@@ -153,10 +153,10 @@ Supported V1 redb surfaces:
 
 Current storage coverage and limitations:
 
-- Schema version `3` means the `index` writer populates repositories,
+- Schema version `4` means the `index` writer populates repositories,
   directories, files, areas, functions, classes, docs, configs,
   unresolved/import placeholders, risks, `functions_by_path`, and
-  `symbol_by_name`.
+  `symbol_by_name` / `symbol_by_component`.
 - The `index` writer persists the graph edge set without skipping edges for
   missing unresolved/import endpoint rows. Placeholder endpoints are stored as
   typed unresolved rows before adjacency is written.
@@ -177,9 +177,11 @@ Remaining V2 target contract:
 - The V2 writer must persist the full graph-navigation edge set for every
   typed node kind it claims to support. It must retain incoming and outgoing
   adjacency for every persisted edge kind.
-- The V2 read contract must cover `node_by_id`, batch node lookup, symbol
-  lookup by name/kind, path-prefix lookup, incoming/outgoing adjacency, task
-  anchor candidate queries, and bounded overview/navigation slices.
+- The V2 read contract now covers typed node lookup, batch node lookup,
+  display projections, area/risk/doc/config lookup, relation views,
+  symbol matching with exact/prefix/component/path/area signals,
+  path-prefix lookup, incoming/outgoing adjacency, task anchor candidate
+  queries, usage-boundary seeds, and bounded overview/navigation slices.
 - A CLI surface is not redb-backed merely because V2 tables exist. It is
   redb-backed only after the implementation reads through
   `GraphStore::open_read_only` / `ReadOnlyGraphStore` and has parity coverage
