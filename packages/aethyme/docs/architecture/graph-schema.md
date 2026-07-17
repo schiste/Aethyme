@@ -380,16 +380,17 @@ fragments as the regeneration source.
 
 Current redb storage coverage:
 
-- Schema version `2` means `aethyme-engine-cli index` populates typed rows
-  for files, areas, functions, classes, docs, configs, and risks.
+- Schema version `3` means `aethyme-engine-cli index` populates typed rows
+  for repositories, directories, files, areas, functions, classes, docs,
+  configs, unresolved/import placeholders, and risks.
 - `SYMBOL_BY_NAME` is populated for function/class simple names using
   ASCII-lowercased exact-name keys. `FUNCTIONS_BY_PATH` is populated for
   file-scoped function lookup. `NODES_BY_PATH` is the broader path index for
-  files, functions, classes, docs, and configs.
-- The writer persists `fn:` and `class:` adjacency once the corresponding
-  function/class rows have been written. Unresolved `import:` placeholders
-  are still skipped because there is no persisted import/unresolved-node table
-  in the redb store yet.
+  directories, files, functions, classes, docs, configs, and
+  unresolved/import placeholders.
+- The writer persists the graph edge set without skipping edges for missing
+  unresolved/import endpoint rows. Placeholder endpoints are stored as typed
+  unresolved rows before adjacency is written.
 - Most graph navigation still comes from an in-memory `RepositoryMap` rebuilt
   from `.aethyme/graph/` fragments. Commands such as `graph-*`, task views,
   context packs, and `explore` should not be assumed to read from redb just
@@ -401,18 +402,18 @@ Remaining V2 redb store contract:
   truth; `.aethyme/graph_store.redb` remains a derived, local, disposable
   query artifact rebuilt from those fragments.
 - V2 must persist any remaining graph-navigation node kinds: separately
-  modeled methods if they stop being represented as functions,
-  unresolved/import nodes when they participate in lookup or adjacency, and
-  directory/module/container nodes when needed for prefix or parent/child
-  navigation. Their ids must still be derived from canonical fragment data.
+  modeled methods if they stop being represented as functions, modules if
+  they are introduced as separate containers, and any future container rows
+  needed for prefix or parent/child navigation. Their ids must still be
+  derived from canonical fragment data.
 - Each persisted node row must retain the canonical id, kind, path/name,
   language, range, area/container membership, and other typed fields needed
   to derive labels and navigation output. V2 must not introduce stored
   display labels as a substitute for canonical fields.
 - V2 must persist the full edge set used by graph navigation. The current
-  writer includes persisted file/function/class/doc/config endpoints, but
-  import/unresolved endpoints and any future node kinds need matching typed
-  rows before their edges are advertised as redb-backed.
+  writer includes persisted repository, directory, file, function, class, doc,
+  config, and unresolved endpoints; any future node kind needs a matching
+  typed row before its edges are advertised as redb-backed.
 - Both outgoing and incoming adjacency indexes are required for every
   persisted edge kind. A V2 writer must not silently drop symbol-level edges
   and still advertise graph-navigation coverage.

@@ -2,9 +2,10 @@
 //!
 //! This module is the local materialized read model for the committed graph
 //! fragments under `<repo>/.aethyme/graph/`. The current writer persists
-//! files, areas, functions, classes, docs, configs, risks, and file/symbol
-//! adjacency for `query-areas`, `query-overview`, `deps`, `importers`, and the
-//! graph adjacency half of the hybrid `callers` path.
+//! repositories, directories, files, areas, functions, classes, docs, configs,
+//! unresolved/import placeholders, risks, and file/symbol adjacency for
+//! `query-areas`, `query-overview`, `deps`, `importers`, and the graph
+//! adjacency half of the hybrid `callers` path.
 //! Most graph navigation still uses an in-memory `RepositoryMap` rebuilt from
 //! fragments rather than this redb store.
 //!
@@ -31,16 +32,19 @@ use serde::{Deserialize, Serialize};
 use crate::model::area::AreaNode;
 use crate::model::class::ClassNode;
 use crate::model::config::ConfigNode;
+use crate::model::directory::DirectoryNode;
 use crate::model::doc::DocNode;
 use crate::model::edge::{Edge, EdgeKind};
 use crate::model::file::FileNode;
 use crate::model::function::FunctionNode;
 use crate::model::intern::InternedStr;
+use crate::model::repository::RepositoryNode;
 use crate::model::risk::RiskFlag;
+use crate::model::unresolved::UnresolvedNode;
 
 /// Bumped when the on-disk format changes incompatibly. We re-create the file
 /// rather than try to migrate.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// Single-row metadata table: schema version, build timestamps, repo root, ...
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -57,12 +61,15 @@ const META_KEY_SCHEMA_VERSION: &str = "schema_version";
 // stores where FUNCTIONS/CLASSES/DOCS/CONFIGS existed but were schema-ready
 // rather than semantically populated.
 
+const REPOSITORIES: TableDefinition<&str, &[u8]> = TableDefinition::new("repositories");
+const DIRECTORIES: TableDefinition<&str, &[u8]> = TableDefinition::new("directories");
 const FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
 const AREAS: TableDefinition<&str, &[u8]> = TableDefinition::new("areas");
 const FUNCTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("functions");
 const CLASSES: TableDefinition<&str, &[u8]> = TableDefinition::new("classes");
 const DOCS: TableDefinition<&str, &[u8]> = TableDefinition::new("docs");
 const CONFIGS: TableDefinition<&str, &[u8]> = TableDefinition::new("configs");
+const UNRESOLVED: TableDefinition<&str, &[u8]> = TableDefinition::new("unresolved");
 
 // ── Adjacency (the wedge for ego/impact/dead-code queries) ──────────────────
 // Both directions are first-class (informed by the `edges_by_target`
@@ -76,9 +83,10 @@ const EDGES_IN: MultimapTableDefinition<&str, &[u8]> = MultimapTableDefinition::
 // Key = file_path. Value = node id. A range scan from "includes/" to
 // "includes/\xff" yields all symbols under that scope.
 //
-// Current writer note: NODES_BY_PATH is the broad path index for files,
-// classes, functions, docs, and configs. FUNCTIONS_BY_PATH remains a narrower
-// hot index for file-scoped symbol lookups.
+// Current writer note: NODES_BY_PATH is the broad path index for directories,
+// files, classes, functions, docs, configs, and unresolved/import
+// placeholders. FUNCTIONS_BY_PATH remains a narrower hot index for file-scoped
+// symbol lookups.
 
 const FUNCTIONS_BY_PATH: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("functions_by_path");
@@ -559,6 +567,25 @@ pub fn insert_area(session: &mut IndexSession<'_>, area: &AreaNode) -> Result<()
     session.insert_node(AREAS, &area.id, area)
 }
 
+/// Insert (or overwrite) the repository container. Key = `repo:<name>`.
+pub fn insert_repository(
+    session: &mut IndexSession<'_>,
+    repository: &RepositoryNode,
+) -> Result<(), GraphStoreError> {
+    session.insert_node(REPOSITORIES, &repository.id, repository)
+}
+
+/// Insert (or overwrite) a directory/container and index it by its relative
+/// path.
+pub fn insert_directory(
+    session: &mut IndexSession<'_>,
+    directory: &DirectoryNode,
+) -> Result<(), GraphStoreError> {
+    session.insert_node(DIRECTORIES, &directory.id, directory)?;
+    session.add_path_index(NODES_BY_PATH, &directory.path, &directory.id)?;
+    Ok(())
+}
+
 /// Insert (or overwrite) a file. Key = `file.id` (e.g. `file:Repo:src/lib.rs`).
 /// Also adds `path → file.id` to NODES_BY_PATH so a path can be resolved to
 /// the structured ID.
@@ -620,6 +647,21 @@ pub fn insert_config(
     Ok(())
 }
 
+/// Insert (or overwrite) an unresolved/import placeholder and index it by the
+/// source file path where the unresolved reference was observed.
+pub fn insert_unresolved(
+    session: &mut IndexSession<'_>,
+    unresolved: &UnresolvedNode,
+) -> Result<(), GraphStoreError> {
+    session.insert_node(UNRESOLVED, unresolved.id.as_str(), unresolved)?;
+    session.add_path_index(
+        NODES_BY_PATH,
+        unresolved.file_path.as_str(),
+        unresolved.id.as_str(),
+    )?;
+    Ok(())
+}
+
 /// Insert one logical edge. Composes into `IndexSession::insert_edge` with
 /// `Edge`'s fields unpacked.
 pub fn insert_edge(session: &mut IndexSession<'_>, edge: &Edge) -> Result<(), GraphStoreError> {
@@ -653,55 +695,70 @@ pub struct Overview {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StoredNodeKind {
+    Repository,
+    Directory,
     File,
     Area,
     Function,
     Class,
     Doc,
     Config,
+    Unresolved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoredNode {
+    Repository(RepositoryNode),
+    Directory(DirectoryNode),
     File(FileNode),
     Area(AreaNode),
     Function(FunctionNode),
     Class(ClassNode),
     Doc(DocNode),
     Config(ConfigNode),
+    Unresolved(UnresolvedNode),
 }
 
 impl StoredNode {
     pub fn id(&self) -> &str {
         match self {
+            Self::Repository(node) => &node.id,
+            Self::Directory(node) => &node.id,
             Self::File(node) => &node.id,
             Self::Area(node) => &node.id,
             Self::Function(node) => node.id.as_str(),
             Self::Class(node) => node.id.as_str(),
             Self::Doc(node) => &node.id,
             Self::Config(node) => &node.id,
+            Self::Unresolved(node) => node.id.as_str(),
         }
     }
 
     pub fn kind(&self) -> StoredNodeKind {
         match self {
+            Self::Repository(_) => StoredNodeKind::Repository,
+            Self::Directory(_) => StoredNodeKind::Directory,
             Self::File(_) => StoredNodeKind::File,
             Self::Area(_) => StoredNodeKind::Area,
             Self::Function(_) => StoredNodeKind::Function,
             Self::Class(_) => StoredNodeKind::Class,
             Self::Doc(_) => StoredNodeKind::Doc,
             Self::Config(_) => StoredNodeKind::Config,
+            Self::Unresolved(_) => StoredNodeKind::Unresolved,
         }
     }
 
     pub fn path(&self) -> Option<&str> {
         match self {
+            Self::Repository(node) => Some(&node.root_path),
+            Self::Directory(node) => Some(&node.path),
             Self::File(node) => Some(&node.path),
             Self::Area(node) => Some(&node.path_prefix),
             Self::Function(node) => Some(node.file_path.as_str()),
             Self::Class(node) => Some(node.file_path.as_str()),
             Self::Doc(node) => Some(&node.path),
             Self::Config(node) => Some(&node.path),
+            Self::Unresolved(node) => Some(node.file_path.as_str()),
         }
     }
 }
@@ -727,6 +784,7 @@ pub enum NeighborDirection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverviewV2Limits {
     pub area_limit: usize,
+    pub directory_limit: usize,
     pub entrypoint_limit: usize,
     pub risk_limit: usize,
     pub file_limit: usize,
@@ -734,12 +792,14 @@ pub struct OverviewV2Limits {
     pub class_limit: usize,
     pub doc_limit: usize,
     pub config_limit: usize,
+    pub unresolved_limit: usize,
 }
 
 impl Default for OverviewV2Limits {
     fn default() -> Self {
         Self {
             area_limit: 20,
+            directory_limit: 20,
             entrypoint_limit: 10,
             risk_limit: 20,
             file_limit: 20,
@@ -747,6 +807,7 @@ impl Default for OverviewV2Limits {
             class_limit: 20,
             doc_limit: 10,
             config_limit: 10,
+            unresolved_limit: 20,
         }
     }
 }
@@ -754,7 +815,9 @@ impl Default for OverviewV2Limits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverviewV2 {
     pub repo: Option<RepoMetadata>,
+    pub repository: Option<RepositoryNode>,
     pub areas: Vec<AreaNode>,
+    pub directories: Vec<DirectoryNode>,
     pub entrypoint_paths: Vec<String>,
     pub risks: Vec<RiskFlag>,
     pub files: Vec<FileNode>,
@@ -762,6 +825,7 @@ pub struct OverviewV2 {
     pub classes: Vec<ClassNode>,
     pub docs: Vec<DocNode>,
     pub configs: Vec<ConfigNode>,
+    pub unresolved: Vec<UnresolvedNode>,
 }
 
 fn area_depth(area: &AreaNode) -> u32 {
@@ -769,7 +833,11 @@ fn area_depth(area: &AreaNode) -> u32 {
 }
 
 fn node_kind_from_id(id: &str) -> Option<StoredNodeKind> {
-    if id.starts_with("file:") {
+    if id.starts_with("repo:") {
+        Some(StoredNodeKind::Repository)
+    } else if id.starts_with("dir:") {
+        Some(StoredNodeKind::Directory)
+    } else if id.starts_with("file:") {
         Some(StoredNodeKind::File)
     } else if id.starts_with("area:") {
         Some(StoredNodeKind::Area)
@@ -781,6 +849,8 @@ fn node_kind_from_id(id: &str) -> Option<StoredNodeKind> {
         Some(StoredNodeKind::Doc)
     } else if id.starts_with("config:") {
         Some(StoredNodeKind::Config)
+    } else if id.starts_with("unresolved_symbol:") || id.starts_with("import:") {
+        Some(StoredNodeKind::Unresolved)
     } else {
         None
     }
@@ -803,6 +873,13 @@ fn get_node_in_txn(txn: &ReadTransaction, id: &str) -> Result<Option<StoredNode>
         return Ok(None);
     };
     match kind {
+        StoredNodeKind::Repository => {
+            Ok(read_table_node::<RepositoryNode>(txn, REPOSITORIES, id)?
+                .map(StoredNode::Repository))
+        }
+        StoredNodeKind::Directory => {
+            Ok(read_table_node::<DirectoryNode>(txn, DIRECTORIES, id)?.map(StoredNode::Directory))
+        }
         StoredNodeKind::File => {
             Ok(read_table_node::<FileNode>(txn, FILES, id)?.map(StoredNode::File))
         }
@@ -818,6 +895,9 @@ fn get_node_in_txn(txn: &ReadTransaction, id: &str) -> Result<Option<StoredNode>
         StoredNodeKind::Doc => Ok(read_table_node::<DocNode>(txn, DOCS, id)?.map(StoredNode::Doc)),
         StoredNodeKind::Config => {
             Ok(read_table_node::<ConfigNode>(txn, CONFIGS, id)?.map(StoredNode::Config))
+        }
+        StoredNodeKind::Unresolved => {
+            Ok(read_table_node::<UnresolvedNode>(txn, UNRESOLVED, id)?.map(StoredNode::Unresolved))
         }
     }
 }
@@ -865,9 +945,12 @@ fn find_symbols_from<D: ReadableDatabase>(
         kind,
         Some(
             StoredNodeKind::File
+                | StoredNodeKind::Repository
+                | StoredNodeKind::Directory
                 | StoredNodeKind::Area
                 | StoredNodeKind::Doc
                 | StoredNodeKind::Config
+                | StoredNodeKind::Unresolved
         )
     ) {
         return Ok(Vec::new());
@@ -1281,6 +1364,67 @@ fn list_configs_from<D: ReadableDatabase>(
     Ok(out)
 }
 
+fn read_repository_from<D: ReadableDatabase>(
+    db: &D,
+) -> Result<Option<RepositoryNode>, GraphStoreError> {
+    let txn = db.begin_read()?;
+    let t = txn.open_table(REPOSITORIES)?;
+    let mut out = Vec::new();
+    for entry in t.iter()? {
+        let (_, value) = entry?;
+        out.push(bincode::deserialize::<RepositoryNode>(value.value())?);
+    }
+    out.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(out.into_iter().next())
+}
+
+fn list_directories_from<D: ReadableDatabase>(
+    db: &D,
+    limit: usize,
+) -> Result<Vec<DirectoryNode>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let txn = db.begin_read()?;
+    let t = txn.open_table(DIRECTORIES)?;
+    let mut out = Vec::new();
+    for entry in t.iter()? {
+        let (_, value) = entry?;
+        out.push(bincode::deserialize::<DirectoryNode>(value.value())?);
+    }
+    out.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    out.truncate(limit);
+    Ok(out)
+}
+
+fn list_unresolved_from<D: ReadableDatabase>(
+    db: &D,
+    limit: usize,
+) -> Result<Vec<UnresolvedNode>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let txn = db.begin_read()?;
+    let t = txn.open_table(UNRESOLVED)?;
+    let mut out = Vec::new();
+    for entry in t.iter()? {
+        let (_, value) = entry?;
+        out.push(bincode::deserialize::<UnresolvedNode>(value.value())?);
+    }
+    out.sort_by(|left, right| {
+        left.file_path
+            .cmp(&right.file_path)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    out.truncate(limit);
+    Ok(out)
+}
+
 fn overview_v2_from<D: ReadableDatabase>(
     db: &D,
     limits: OverviewV2Limits,
@@ -1293,7 +1437,9 @@ fn overview_v2_from<D: ReadableDatabase>(
     )?;
     Ok(OverviewV2 {
         repo: overview.repo,
+        repository: read_repository_from(db)?,
         areas: overview.areas,
+        directories: list_directories_from(db, limits.directory_limit)?,
         entrypoint_paths: overview.entrypoint_paths,
         risks: overview.risks,
         files: list_files_from(db, limits.file_limit)?,
@@ -1301,6 +1447,7 @@ fn overview_v2_from<D: ReadableDatabase>(
         classes: list_classes_from(db, limits.class_limit)?,
         docs: list_docs_from(db, limits.doc_limit)?,
         configs: list_configs_from(db, limits.config_limit)?,
+        unresolved: list_unresolved_from(db, limits.unresolved_limit)?,
     })
 }
 
@@ -1716,12 +1863,15 @@ fn ensure_schema(db: &Database) -> Result<(), GraphStoreError> {
             }
         }
         // Touch every table so they exist on a fresh DB.
+        let _ = txn.open_table(REPOSITORIES)?;
+        let _ = txn.open_table(DIRECTORIES)?;
         let _ = txn.open_table(FILES)?;
         let _ = txn.open_table(AREAS)?;
         let _ = txn.open_table(FUNCTIONS)?;
         let _ = txn.open_table(CLASSES)?;
         let _ = txn.open_table(DOCS)?;
         let _ = txn.open_table(CONFIGS)?;
+        let _ = txn.open_table(UNRESOLVED)?;
         let _ = txn.open_multimap_table(EDGES_OUT)?;
         let _ = txn.open_multimap_table(EDGES_IN)?;
         let _ = txn.open_multimap_table(FUNCTIONS_BY_PATH)?;
@@ -1760,12 +1910,15 @@ fn verify_schema_read_only(db: &ReadOnlyDatabase) -> Result<(), GraphStoreError>
 
         // Query commands expect the same tables as the writable store. Read-only
         // open validates the materialized store instead of creating anything.
+        let _ = txn.open_table(REPOSITORIES)?;
+        let _ = txn.open_table(DIRECTORIES)?;
         let _ = txn.open_table(FILES)?;
         let _ = txn.open_table(AREAS)?;
         let _ = txn.open_table(FUNCTIONS)?;
         let _ = txn.open_table(CLASSES)?;
         let _ = txn.open_table(DOCS)?;
         let _ = txn.open_table(CONFIGS)?;
+        let _ = txn.open_table(UNRESOLVED)?;
         let _ = txn.open_multimap_table(EDGES_OUT)?;
         let _ = txn.open_multimap_table(EDGES_IN)?;
         let _ = txn.open_multimap_table(FUNCTIONS_BY_PATH)?;
@@ -1841,12 +1994,15 @@ mod tests {
         let txn = store.db().begin_read().expect("read txn");
 
         // Single tables: open_table on a missing table is a TableError.
+        txn.open_table(REPOSITORIES).expect("REPOSITORIES");
+        txn.open_table(DIRECTORIES).expect("DIRECTORIES");
         txn.open_table(FILES).expect("FILES");
         txn.open_table(AREAS).expect("AREAS");
         txn.open_table(FUNCTIONS).expect("FUNCTIONS");
         txn.open_table(CLASSES).expect("CLASSES");
         txn.open_table(DOCS).expect("DOCS");
         txn.open_table(CONFIGS).expect("CONFIGS");
+        txn.open_table(UNRESOLVED).expect("UNRESOLVED");
         txn.open_table(META).expect("META");
 
         // Multimap tables.
@@ -2266,6 +2422,10 @@ mod tests {
         )
     }
 
+    fn sample_directory(repo: &str, path: &str, area_id: Option<&str>) -> DirectoryNode {
+        DirectoryNode::new(repo, path, area_id.map(|s| s.to_string()))
+    }
+
     fn sample_class(file: &FileNode, name: &str) -> ClassNode {
         ClassNode::new(
             "Repo",
@@ -2303,6 +2463,61 @@ mod tests {
             12,
             InternedStr::from(format!("def {name}()")),
         )
+    }
+
+    fn sample_unresolved(file: &FileNode, name: &str) -> UnresolvedNode {
+        UnresolvedNode::new(
+            InternedStr::from(format!("unresolved_symbol:Repo:{name}")),
+            InternedStr::from(name),
+            Some(InternedStr::from("function")),
+            InternedStr::from(file.id.clone()),
+            InternedStr::from(file.id.clone()),
+            InternedStr::from(file.path.clone()),
+            file.area_id.clone().map(InternedStr::from),
+            InternedStr::from(
+                file.language
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+            ),
+        )
+    }
+
+    #[test]
+    fn typed_insert_repository_round_trip() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let repository = RepositoryNode::new("Repo", root.to_str().unwrap());
+        let key = repository.id.clone();
+
+        let mut session = store.begin_index().expect("session");
+        insert_repository(&mut session, &repository).expect("insert_repository");
+        session.commit().expect("commit");
+
+        let bytes = read_node_bytes(store.db(), REPOSITORIES, &key).expect("present");
+        let got: RepositoryNode = bincode::deserialize(&bytes).expect("decode");
+        assert_eq!(got, repository);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn typed_insert_directory_indexes_path() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let directory = sample_directory("Repo", "src", Some("area:Repo:src"));
+        let id = directory.id.clone();
+
+        let mut session = store.begin_index().expect("session");
+        insert_directory(&mut session, &directory).expect("insert_directory");
+        session.commit().expect("commit");
+
+        let bytes = read_node_bytes(store.db(), DIRECTORIES, &id).expect("present");
+        let got: DirectoryNode = bincode::deserialize(&bytes).expect("decode");
+        assert_eq!(got, directory);
+        assert_eq!(
+            collect_str_multimap(store.db(), NODES_BY_PATH, "src"),
+            vec![id]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2447,6 +2662,28 @@ mod tests {
         assert_eq!(
             collect_str_multimap(store.db(), NODES_BY_PATH, "pyproject.toml"),
             vec![config.id.clone()]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn typed_insert_unresolved_indexes_source_path() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let file = sample_file("Repo", "src/lib.rs", Some("area:Repo:src"));
+        let unresolved = sample_unresolved(&file, "missing_call");
+        let id = unresolved.id.to_string();
+
+        let mut session = store.begin_index().expect("session");
+        insert_unresolved(&mut session, &unresolved).expect("insert_unresolved");
+        session.commit().expect("commit");
+
+        let bytes = read_node_bytes(store.db(), UNRESOLVED, &id).expect("present");
+        let got: UnresolvedNode = bincode::deserialize(&bytes).expect("decode");
+        assert_eq!(got, unresolved);
+        assert_eq!(
+            collect_str_multimap(store.db(), NODES_BY_PATH, "src/lib.rs"),
+            vec![id]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2659,12 +2896,15 @@ mod tests {
 
     struct ReadApiFixture {
         root: PathBuf,
+        repository: RepositoryNode,
+        directory: DirectoryNode,
         file: FileNode,
         test_file: FileNode,
         class: ClassNode,
         function: FunctionNode,
         doc: DocNode,
         config: ConfigNode,
+        unresolved: UnresolvedNode,
     }
 
     impl ReadApiFixture {
@@ -2683,11 +2923,14 @@ mod tests {
         let root = tmp_root(name);
         let store = GraphStore::open(&root).expect("open");
 
+        let repository = RepositoryNode::new("Repo", root.to_str().unwrap());
         let area = AreaNode::new("Repo", "src", false);
+        let directory = sample_directory("Repo", "src", Some("area:Repo:src"));
         let file = sample_file("Repo", "src/lib.rs", Some("area:Repo:src"));
         let test_file = sample_file("Repo", "tests/test_lib.rs", None);
         let class = sample_class(&file, "TokenLoader");
         let function = sample_function(&file, "LoadToken", Some(class.id.clone()));
+        let unresolved = sample_unresolved(&file, "missing_call");
         let doc = DocNode::new(
             "Repo",
             "file:Repo:docs/auth.md",
@@ -2705,13 +2948,38 @@ mod tests {
         );
 
         let mut session = store.begin_index().expect("session");
+        insert_repository(&mut session, &repository).expect("repository");
         insert_area(&mut session, &area).expect("area");
+        insert_directory(&mut session, &directory).expect("directory");
         insert_file(&mut session, &file).expect("file");
         insert_file(&mut session, &test_file).expect("test file");
         insert_class(&mut session, &class).expect("class");
         insert_function(&mut session, &function).expect("function");
         insert_doc(&mut session, &doc).expect("doc");
         insert_config(&mut session, &config).expect("config");
+        insert_unresolved(&mut session, &unresolved).expect("unresolved");
+        insert_edge(
+            &mut session,
+            &Edge::new(
+                repository.id.as_str(),
+                &area.id,
+                EdgeKind::Contains,
+                1000,
+                "structure",
+            ),
+        )
+        .expect("repo contains area");
+        insert_edge(
+            &mut session,
+            &Edge::new(
+                &area.id,
+                &directory.id,
+                EdgeKind::Contains,
+                1000,
+                "structure",
+            ),
+        )
+        .expect("area contains directory");
         insert_edge(
             &mut session,
             &Edge::new(
@@ -2738,6 +3006,17 @@ mod tests {
             &mut session,
             &Edge::new(
                 &file.id,
+                unresolved.id.as_str(),
+                EdgeKind::Imports,
+                850,
+                "import",
+            ),
+        )
+        .expect("file imports unresolved");
+        insert_edge(
+            &mut session,
+            &Edge::new(
+                &file.id,
                 &area.id,
                 EdgeKind::EntrypointFor,
                 800,
@@ -2760,12 +3039,15 @@ mod tests {
 
         ReadApiFixture {
             root,
+            repository,
+            directory,
             file,
             test_file,
             class,
             function,
             doc,
             config,
+            unresolved,
         }
     }
 
@@ -2775,12 +3057,36 @@ mod tests {
         let readonly = fixture.read_only();
 
         match readonly
+            .get_node(fixture.repository.id.as_str())
+            .expect("repository node")
+            .expect("present")
+        {
+            StoredNode::Repository(got) => assert_eq!(got, fixture.repository),
+            other => panic!("expected repository node, got {other:?}"),
+        }
+        match readonly
+            .get_node(fixture.directory.id.as_str())
+            .expect("directory node")
+            .expect("present")
+        {
+            StoredNode::Directory(got) => assert_eq!(got, fixture.directory),
+            other => panic!("expected directory node, got {other:?}"),
+        }
+        match readonly
             .get_node(fixture.function.id.as_str())
             .expect("function node")
             .expect("present")
         {
             StoredNode::Function(got) => assert_eq!(got, fixture.function),
             other => panic!("expected function node, got {other:?}"),
+        }
+        match readonly
+            .get_node(fixture.unresolved.id.as_str())
+            .expect("unresolved node")
+            .expect("present")
+        {
+            StoredNode::Unresolved(got) => assert_eq!(got, fixture.unresolved),
+            other => panic!("expected unresolved node, got {other:?}"),
         }
         assert!(readonly
             .get_node("unknown:Repo:x")
@@ -2803,6 +3109,10 @@ mod tests {
             .find_symbols("LoadToken", Some(StoredNodeKind::Class))
             .expect("class filter")
             .is_empty());
+        assert!(readonly
+            .find_symbols("missing_call", Some(StoredNodeKind::Unresolved))
+            .expect("unresolved filter")
+            .is_empty());
     }
 
     #[test]
@@ -2815,7 +3125,13 @@ mod tests {
         assert!(node_ids.contains(&fixture.file.id));
         assert!(node_ids.contains(fixture.function.id.as_str()));
         assert!(node_ids.contains(fixture.class.id.as_str()));
+        assert!(node_ids.contains(fixture.unresolved.id.as_str()));
         assert!(!node_ids.contains(&fixture.test_file.id));
+
+        let src_nodes = readonly.nodes_under_path("src").expect("nodes under src");
+        let src_ids: BTreeSet<String> =
+            src_nodes.iter().map(|node| node.id().to_string()).collect();
+        assert!(src_ids.contains(&fixture.directory.id));
     }
 
     #[test]
@@ -2873,6 +3189,18 @@ mod tests {
             .expect("outgoing");
         assert_eq!(outgoing.len(), 1);
         assert_eq!(outgoing[0].other.as_str(), fixture.config.id.as_str());
+        let unresolved_imports = readonly
+            .neighbors(
+                &fixture.file.id,
+                NeighborDirection::Outgoing,
+                Some(EdgeKind::Imports),
+            )
+            .expect("unresolved imports");
+        assert_eq!(unresolved_imports.len(), 1);
+        assert_eq!(
+            unresolved_imports[0].other.as_str(),
+            fixture.unresolved.id.as_str()
+        );
         assert!(readonly
             .neighbors(
                 fixture.function.id.as_str(),
@@ -2890,21 +3218,26 @@ mod tests {
 
         let overview = readonly
             .overview_v2(OverviewV2Limits {
+                directory_limit: 10,
                 file_limit: 10,
                 function_limit: 10,
                 class_limit: 10,
                 doc_limit: 10,
                 config_limit: 10,
+                unresolved_limit: 10,
                 ..OverviewV2Limits::default()
             })
             .expect("overview v2");
         assert_eq!(overview.repo.as_ref().unwrap().file_count, 2);
+        assert_eq!(overview.repository, Some(fixture.repository.clone()));
+        assert_eq!(overview.directories, vec![fixture.directory.clone()]);
         assert_eq!(overview.entrypoint_paths, vec!["src/lib.rs".to_string()]);
         assert_eq!(overview.files.len(), 2);
         assert_eq!(overview.functions, vec![fixture.function.clone()]);
         assert_eq!(overview.classes, vec![fixture.class.clone()]);
         assert_eq!(overview.docs, vec![fixture.doc.clone()]);
         assert_eq!(overview.configs, vec![fixture.config.clone()]);
+        assert_eq!(overview.unresolved, vec![fixture.unresolved.clone()]);
     }
 
     #[test]

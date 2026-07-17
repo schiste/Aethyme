@@ -153,12 +153,13 @@ Supported V1 redb surfaces:
 
 Current storage coverage and limitations:
 
-- Schema version `2` means the `index` writer populates files, areas,
-  functions, classes, docs, configs, risks, `functions_by_path`, and
+- Schema version `3` means the `index` writer populates repositories,
+  directories, files, areas, functions, classes, docs, configs,
+  unresolved/import placeholders, risks, `functions_by_path`, and
   `symbol_by_name`.
-- The `index` writer persists edges with `fn:` or `class:` endpoints once the
-  corresponding function/class rows exist. Unresolved `import:` endpoints are
-  still skipped because there is no persisted import/unresolved-node table.
+- The `index` writer persists the graph edge set without skipping edges for
+  missing unresolved/import endpoint rows. Placeholder endpoints are stored as
+  typed unresolved rows before adjacency is written.
 - Most graph navigation is still served by `RepositoryMap` rebuilt from
   `.aethyme/graph/` fragments. The legacy `graph-*`, task, context-pack, and
   `explore` surfaces should not be described as redb-backed until they are
@@ -171,9 +172,8 @@ Remaining V2 target contract:
   rebuildable.
 - The V2 writer must persist any remaining graph-navigation node kinds:
   separately represented methods if they stop being represented as functions,
-  unresolved/import nodes when they participate in lookup or edges, and any
-  derived directory/module/container nodes required for prefix or parent/child
-  navigation.
+  modules if they are introduced as separate containers, and any future
+  container rows required for prefix or parent/child navigation.
 - The V2 writer must persist the full graph-navigation edge set for every
   typed node kind it claims to support. It must retain incoming and outgoing
   adjacency for every persisted edge kind.

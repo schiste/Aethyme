@@ -32,6 +32,16 @@ triggers = [
 ]
 
 [[gate]]
+# Dogfood catch 2026-07-14: a NEW top-level package matched no trigger, so
+# its submit verified with gates:[] and auto-promoted unchecked. Every
+# package gets its own gate; when adding a package, add its gate in the
+# same change.
+name = "pytest-aethyme-eval"
+command = 'MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && PYTHONPATH=packages/aethyme-eval/src "$MAIN/packages/aethyme/.venv/bin/python" -m pytest -q packages/aethyme-eval/tests'
+cost = 1
+triggers = ["packages/aethyme-eval/**"]
+
+[[gate]]
 name = "cargo-test"
 command = 'CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/aethyme-cargo-target}" cargo test --workspace --quiet --manifest-path packages/aethyme/rust/Cargo.toml'
 cost = 3

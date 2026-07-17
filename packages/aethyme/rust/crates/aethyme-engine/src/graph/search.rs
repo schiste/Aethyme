@@ -263,12 +263,15 @@ fn push_unique_variant(variants: &mut Vec<String>, variant: String) {
 
 fn stored_symbol_kind(kind: StoredNodeKind) -> &'static str {
     match kind {
+        StoredNodeKind::Repository => "repository",
+        StoredNodeKind::Directory => "directory",
         StoredNodeKind::Function => "function",
         StoredNodeKind::Class => "class",
         StoredNodeKind::File => "file",
         StoredNodeKind::Area => "area",
         StoredNodeKind::Doc => "doc",
         StoredNodeKind::Config => "config",
+        StoredNodeKind::Unresolved => "unresolved",
     }
 }
 
