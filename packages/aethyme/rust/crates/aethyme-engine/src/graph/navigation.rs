@@ -2,9 +2,10 @@ use crate::context_pack::{Anchor, AnchorKind};
 use crate::graph::anchors::{resolve_anchors, resolve_anchors_redb};
 use crate::graph::guidance::{build_in_scope, build_out_of_scope, navigation_order};
 use crate::graph::overview::build_repo_overview;
-use crate::graph::signals::{evaluate_graph_signals, GraphSignals};
+use crate::graph::signals::{evaluate_graph_signals, evaluate_graph_signals_redb, GraphSignals};
 use crate::map::RepositoryMap;
 use crate::model::area::AreaNode;
+use crate::model::edge::Edge;
 use crate::model::edge::EdgeKind;
 use crate::model::file::FileRole;
 use crate::model::risk::{RiskFlag, RiskLevel};
@@ -12,7 +13,7 @@ use crate::model::scope::{ScopeBoundary, ScopeItem, ScopeKind};
 use crate::model::task::TaskInput;
 use crate::store::redb::graph_store::{
     GraphRelation as RedbGraphRelation, GraphStoreError, NeighborDirection, NodeDisplay,
-    OverviewV2Limits, ReadOnlyGraphStore, RedbRelationItem, StoredNode, StoredNodeKind,
+    OverviewV2, OverviewV2Limits, ReadOnlyGraphStore, RedbRelationItem, StoredNode, StoredNodeKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,6 +449,124 @@ pub fn graph_overview_view(map: &RepositoryMap) -> RepoOverviewView {
         representative_docs: overview.representative_docs,
         signals: evaluate_graph_signals(map),
     }
+}
+
+pub fn graph_overview_view_redb(
+    store: &ReadOnlyGraphStore,
+) -> Result<RepoOverviewView, GraphStoreError> {
+    let signals = evaluate_graph_signals_redb(store)?;
+    let mut overview = store.overview_v2(overview_view_limits())?;
+    overview.areas = store.list_areas(None)?;
+    let edges = store.all_edges()?;
+    let navigation_seed = repo_navigation_seed_redb(&overview);
+
+    let code_area_limit = if signals.boundary_clarity.score < 55 {
+        2
+    } else {
+        3
+    };
+    let reference_area_limit = if signals.parser_visibility.score < 60 {
+        3
+    } else {
+        2
+    };
+    let entrypoint_limit = if signals.entrypoint_clarity.score >= 70 {
+        3
+    } else {
+        1
+    };
+    let key_config_limit = if signals.config_hygiene.score >= 70 {
+        3
+    } else {
+        2
+    };
+
+    let overview_docs = overview
+        .docs
+        .iter()
+        .filter(|doc| matches!(doc.doc_type.as_str(), "readme" | "architecture"))
+        .map(|doc| doc.path.clone())
+        .take(3)
+        .collect::<Vec<_>>();
+
+    let mut area_candidates = overview
+        .areas
+        .iter()
+        .filter(|area| !area.inferred && !area.name.starts_with('.'))
+        .map(|area| {
+            let score = area_score_redb(&overview, &edges, area.id.as_str(), area.name.as_str());
+            let profile = area_profile_redb(&overview, &edges, area.id.as_str());
+            (score, profile, area)
+        })
+        .filter(|(_, _, area)| {
+            navigation_seed.iter().any(|item| item == &area.name)
+                || overview_docs
+                    .iter()
+                    .any(|path| path.starts_with(&format!("{}/", area.name)))
+        })
+        .collect::<Vec<_>>();
+    area_candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.code_bearing.cmp(&left.1.code_bearing))
+            .then_with(|| left.2.name.cmp(&right.2.name))
+    });
+    let code_areas = select_top_redb_areas(area_candidates.clone(), code_area_limit, true);
+    let reference_areas = select_top_redb_areas(area_candidates, reference_area_limit, false);
+
+    let mut subarea_candidates = overview
+        .areas
+        .iter()
+        .filter(|area| area.inferred)
+        .map(|area| {
+            (
+                subarea_score_redb(&overview, area.id.as_str(), area.name.as_str()),
+                area.name.clone(),
+            )
+        })
+        .filter(|(_, name)| {
+            code_areas
+                .iter()
+                .any(|area| name.starts_with(&format!("{area}/")) || name == area)
+        })
+        .collect::<Vec<_>>();
+    subarea_candidates
+        .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let subareas = subarea_candidates
+        .into_iter()
+        .take(4)
+        .map(|(_, name)| name)
+        .collect::<Vec<_>>();
+
+    let entrypoints = overview_entrypoints_redb(&overview, &edges, entrypoint_limit);
+    let key_configs = overview_key_configs_redb(&overview, store, &code_areas, key_config_limit)?;
+
+    let representative_code_files = navigation_seed
+        .iter()
+        .filter(|item| is_code_like_path_for_overview(item))
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>();
+    let representative_docs = navigation_seed
+        .iter()
+        .filter(|item| is_doc_like_path_for_overview(item))
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    Ok(RepoOverviewView {
+        repo: repo_name_redb(&overview),
+        overview_docs,
+        code_areas,
+        reference_areas,
+        subareas,
+        entrypoints,
+        key_configs,
+        representative_code_files,
+        representative_docs,
+        signals,
+    })
 }
 
 fn relation_view<F>(
@@ -1246,18 +1365,9 @@ fn overview_navigation_order(view: &RepoOverviewView) -> Vec<String> {
 fn overview_navigation_items_redb(
     store: &ReadOnlyGraphStore,
 ) -> Result<Vec<GraphRelationItem>, GraphStoreError> {
-    let overview = store.overview_v2(OverviewV2Limits {
-        area_limit: 200,
-        directory_limit: 0,
-        entrypoint_limit: 100,
-        risk_limit: 0,
-        file_limit: 2_000,
-        function_limit: 2_000,
-        class_limit: 1_000,
-        doc_limit: 500,
-        config_limit: 500,
-        unresolved_limit: 0,
-    })?;
+    let mut overview = store.overview_v2(overview_view_limits())?;
+    overview.areas = store.list_areas(None)?;
+    let edges = store.all_edges()?;
 
     let overview_docs = overview
         .docs
@@ -1277,12 +1387,10 @@ fn overview_navigation_items_redb(
         .iter()
         .filter(|area| !area.inferred && !area.name.starts_with('.'))
         .map(|area| {
-            let score = area_score_redb(&overview, store, area.id.as_str(), area.name.as_str())?;
-            let profile = area_profile_redb(&overview, store, area.id.as_str())?;
-            Ok((score, profile, area))
+            let score = area_score_redb(&overview, &edges, area.id.as_str(), area.name.as_str());
+            let profile = area_profile_redb(&overview, &edges, area.id.as_str());
+            (score, profile, area)
         })
-        .collect::<Result<Vec<_>, GraphStoreError>>()?
-        .into_iter()
         .filter(|(_, _, area)| {
             navigation_seed.iter().any(|item| item == &area.name)
                 || overview_docs
@@ -1351,12 +1459,8 @@ fn overview_navigation_items_redb(
         }
     }
 
-    let entrypoints = overview
-        .entrypoint_paths
-        .iter()
-        .filter(|path| is_code_like_path_for_overview(path))
-        .take(entrypoint_limit)
-        .collect::<Vec<_>>();
+    let entrypoint_paths = overview_entrypoints_redb(&overview, &edges, entrypoint_limit);
+    let entrypoints = entrypoint_paths.iter().collect::<Vec<_>>();
 
     let representative_code_files = navigation_seed
         .iter()
@@ -1451,9 +1555,7 @@ fn overview_item_for_path(
     relation_item_for_display_redb(store, path, "next")
 }
 
-fn repo_navigation_seed_redb(
-    overview: &crate::store::redb::graph_store::OverviewV2,
-) -> Vec<String> {
+fn repo_navigation_seed_redb(overview: &OverviewV2) -> Vec<String> {
     let mut seed = Vec::new();
     for doc in &overview.docs {
         if matches!(doc.doc_type.as_str(), "readme" | "architecture") && !seed.contains(&doc.path) {
@@ -1483,16 +1585,233 @@ fn repo_navigation_seed_redb(
     seed
 }
 
+fn overview_view_limits() -> OverviewV2Limits {
+    OverviewV2Limits {
+        area_limit: usize::MAX,
+        directory_limit: 0,
+        entrypoint_limit: usize::MAX,
+        risk_limit: 0,
+        file_limit: usize::MAX,
+        function_limit: usize::MAX,
+        class_limit: usize::MAX,
+        doc_limit: usize::MAX,
+        config_limit: usize::MAX,
+        unresolved_limit: usize::MAX,
+    }
+}
+
+fn repo_name_redb(overview: &OverviewV2) -> String {
+    overview
+        .repository
+        .as_ref()
+        .map(|repo| repo.name.clone())
+        .or_else(|| {
+            overview.repo.as_ref().and_then(|meta| {
+                std::path::Path::new(&meta.root_path)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .map(ToString::to_string)
+            })
+        })
+        .unwrap_or_else(|| "repo".to_string())
+}
+
+fn overview_entrypoints_redb(
+    overview: &OverviewV2,
+    edges: &[Edge],
+    entrypoint_limit: usize,
+) -> Vec<String> {
+    let mut entrypoints = edges
+        .iter()
+        .filter(|edge| matches!(edge.kind, EdgeKind::EntrypointFor))
+        .filter_map(|edge| {
+            let display = display_for_overview_redb(overview, edge.to.as_str());
+            if is_code_like_path_for_overview(display.as_str()) {
+                Some((edge.confidence, display))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    entrypoints.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+
+    entrypoints
+        .into_iter()
+        .map(|(_, display)| display)
+        .fold(Vec::new(), |mut acc, item| {
+            if !acc.contains(&item) && acc.len() < entrypoint_limit {
+                acc.push(item);
+            }
+            acc
+        })
+}
+
+fn overview_key_configs_redb(
+    overview: &OverviewV2,
+    store: &ReadOnlyGraphStore,
+    code_areas: &[String],
+    key_config_limit: usize,
+) -> Result<Vec<String>, GraphStoreError> {
+    let mut key_configs = overview
+        .configs
+        .iter()
+        .filter(|config| {
+            if code_areas.is_empty() {
+                return config_is_overview_eligible_redb(
+                    config.path.as_str(),
+                    config.config_type.as_str(),
+                );
+            }
+            config_is_overview_eligible_redb(config.path.as_str(), config.config_type.as_str())
+                && config
+                    .area_id
+                    .as_deref()
+                    .map(|area_id| code_areas.iter().any(|area| area_id.ends_with(area)))
+                    .unwrap_or(false)
+        })
+        .map(|config| {
+            let score = config_score_redb(
+                store,
+                config.id.as_str(),
+                config.path.as_str(),
+                config.config_type.as_str(),
+            )?;
+            Ok((score, config.config_type.clone(), config.path.clone()))
+        })
+        .collect::<Result<Vec<_>, GraphStoreError>>()?;
+    key_configs.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(&right.2)));
+
+    let mut key_config_paths = Vec::new();
+    let mut seen_families = std::collections::BTreeSet::<String>::new();
+    let mut seen_paths = std::collections::BTreeSet::<String>::new();
+    for (_, config_type, path) in key_configs {
+        let family = config_family_key_redb(config_type.as_str(), path.as_str());
+        if seen_families.contains(&family) || seen_paths.contains(&path) {
+            continue;
+        }
+        seen_families.insert(family);
+        seen_paths.insert(path.clone());
+        key_config_paths.push(path);
+        if key_config_paths.len() == key_config_limit {
+            break;
+        }
+    }
+    Ok(key_config_paths)
+}
+
+fn display_for_overview_redb(overview: &OverviewV2, value: &str) -> String {
+    overview
+        .files
+        .iter()
+        .find(|file| file.id == value)
+        .map(|file| file.path.clone())
+        .or_else(|| {
+            overview.functions.iter().find_map(|function| {
+                if function.id.as_str() == value {
+                    Some(format!("{}::{}", function.file_path, function.name))
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(|| {
+            overview.classes.iter().find_map(|class| {
+                if class.id.as_str() == value {
+                    Some(format!("{}::{}", class.file_path, class.name))
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(|| {
+            overview
+                .docs
+                .iter()
+                .find(|doc| doc.id == value)
+                .map(|doc| doc.path.clone())
+        })
+        .or_else(|| {
+            overview
+                .configs
+                .iter()
+                .find(|config| config.id == value)
+                .map(|config| config.path.clone())
+        })
+        .or_else(|| {
+            overview.unresolved.iter().find_map(|unresolved| {
+                if unresolved.id.as_str() == value {
+                    Some(format!("{}::{}", unresolved.file_path, unresolved.name))
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(|| {
+            overview
+                .areas
+                .iter()
+                .find(|area| area.id == value)
+                .map(|area| area.name.clone())
+        })
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn area_id_for_overview_redb(overview: &OverviewV2, value: &str) -> Option<String> {
+    overview
+        .files
+        .iter()
+        .find(|file| file.id == value)
+        .and_then(|file| file.area_id.clone())
+        .or_else(|| {
+            overview
+                .functions
+                .iter()
+                .find(|function| function.id.as_str() == value)
+                .and_then(|function| function.area_id.as_ref().map(ToString::to_string))
+        })
+        .or_else(|| {
+            overview
+                .classes
+                .iter()
+                .find(|class| class.id.as_str() == value)
+                .and_then(|class| class.area_id.as_ref().map(ToString::to_string))
+        })
+        .or_else(|| {
+            overview
+                .docs
+                .iter()
+                .find(|doc| doc.id == value)
+                .and_then(|doc| doc.area_id.clone())
+        })
+        .or_else(|| {
+            overview
+                .configs
+                .iter()
+                .find(|config| config.id == value)
+                .and_then(|config| config.area_id.clone())
+        })
+        .or_else(|| {
+            overview
+                .unresolved
+                .iter()
+                .find(|unresolved| unresolved.id.as_str() == value)
+                .and_then(|unresolved| unresolved.area_id.as_ref().map(ToString::to_string))
+        })
+        .or_else(|| {
+            overview
+                .areas
+                .iter()
+                .find(|area| area.id == value)
+                .map(|area| area.id.clone())
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RedbAreaProfile {
     code_bearing: bool,
 }
 
-fn area_profile_redb(
-    overview: &crate::store::redb::graph_store::OverviewV2,
-    store: &ReadOnlyGraphStore,
-    area_id: &str,
-) -> Result<RedbAreaProfile, GraphStoreError> {
+fn area_profile_redb(overview: &OverviewV2, edges: &[Edge], area_id: &str) -> RedbAreaProfile {
     let source_count = overview
         .files
         .iter()
@@ -1509,27 +1828,24 @@ fn area_profile_redb(
         .iter()
         .filter(|class| class.area_id.as_deref() == Some(area_id))
         .count();
-    let mut entrypoint_count = 0;
-    for path in &overview.entrypoint_paths {
-        if store.area_for_node(path)?.as_deref() == Some(area_id) {
-            entrypoint_count += 1;
-        }
-    }
+    let entrypoint_count = edges
+        .iter()
+        .filter(|edge| matches!(edge.kind, EdgeKind::EntrypointFor))
+        .filter(|edge| {
+            area_id_for_overview_redb(overview, edge.from.as_str()).as_deref() == Some(area_id)
+                || area_id_for_overview_redb(overview, edge.to.as_str()).as_deref() == Some(area_id)
+        })
+        .count();
 
-    Ok(RedbAreaProfile {
+    RedbAreaProfile {
         code_bearing: source_count > 0
             || function_count > 0
             || class_count > 0
             || entrypoint_count > 0,
-    })
+    }
 }
 
-fn area_score_redb(
-    overview: &crate::store::redb::graph_store::OverviewV2,
-    store: &ReadOnlyGraphStore,
-    area_id: &str,
-    area_name: &str,
-) -> Result<i32, GraphStoreError> {
+fn area_score_redb(overview: &OverviewV2, edges: &[Edge], area_id: &str, area_name: &str) -> i32 {
     let files = overview
         .files
         .iter()
@@ -1593,12 +1909,14 @@ fn area_score_redb(
         .filter(|config| config.area_id.as_deref() == Some(area_id))
         .map(|config| config_weight_redb(config.config_type.as_str()))
         .sum::<i32>();
-    let mut entrypoint_count = 0;
-    for path in &overview.entrypoint_paths {
-        if store.area_for_node(path)?.as_deref() == Some(area_id) {
-            entrypoint_count += 1;
-        }
-    }
+    let entrypoint_count = edges
+        .iter()
+        .filter(|edge| matches!(edge.kind, EdgeKind::EntrypointFor))
+        .filter(|edge| {
+            area_id_for_overview_redb(overview, edge.from.as_str()).as_deref() == Some(area_id)
+                || area_id_for_overview_redb(overview, edge.to.as_str()).as_deref() == Some(area_id)
+        })
+        .count() as i32;
     let entrypoint_score = entrypoint_count * 16;
 
     let code_presence_bonus =
@@ -1621,7 +1939,7 @@ fn area_score_redb(
         .count() as i32
         * 6;
 
-    Ok(code_presence_bonus
+    code_presence_bonus
         + source_count * 10
         + function_count * 20
         + class_count * 24
@@ -1631,7 +1949,63 @@ fn area_score_redb(
         + asset_count
         + test_count * 2
         + docs_bonus
-        - unknown_penalty)
+        - unknown_penalty
+}
+
+fn subarea_score_redb(overview: &OverviewV2, area_id: &str, area_name: &str) -> i32 {
+    let files = overview
+        .files
+        .iter()
+        .filter(|file| file.path.starts_with(&format!("{area_name}/")))
+        .collect::<Vec<_>>();
+    let source_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Source))
+        .count() as i32;
+    let config_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Config))
+        .count() as i32;
+    let doc_count = files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Doc))
+        .count() as i32;
+    let unknown_count = files
+        .iter()
+        .filter(|file| {
+            matches!(
+                file.role,
+                FileRole::Unknown | FileRole::Generated | FileRole::Cache | FileRole::Binary
+            )
+        })
+        .count() as i32;
+
+    let symbol_score = overview
+        .functions
+        .iter()
+        .filter(|function| function.area_id.as_deref() == Some(area_id))
+        .count() as i32
+        * 12
+        + overview
+            .classes
+            .iter()
+            .filter(|class| class.area_id.as_deref() == Some(area_id))
+            .count() as i32
+            * 14;
+
+    let config_score = overview
+        .configs
+        .iter()
+        .filter(|config| config.path.starts_with(&format!("{area_name}/")))
+        .map(|config| config_weight_redb(config.config_type.as_str()))
+        .sum::<i32>();
+
+    source_count * 8
+        + config_count * 6
+        + symbol_score
+        + config_score
+        + std::cmp::min(doc_count, 3) * 2
+        - unknown_count
 }
 
 fn select_top_redb_areas(

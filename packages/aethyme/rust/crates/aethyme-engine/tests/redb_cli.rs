@@ -13,7 +13,8 @@ use std::time::Instant;
 
 use aethyme_engine::graph::navigation::{
     callees_view, callers_view, children_view, configs_view, docs_view, graph_expand_view,
-    node_view, parents_view, task_anchors_view, task_expand_view, task_next_view, task_scope_view,
+    graph_overview_view, node_view, parents_view, task_anchors_view, task_expand_view,
+    task_next_view, task_scope_view,
 };
 use aethyme_engine::graph::search::symbol_search;
 use aethyme_engine::map::RepositoryMap;
@@ -517,6 +518,10 @@ fn graph_cli_json(repo: &Path, command: &str, target: &str) -> serde_json::Value
     ])
 }
 
+fn graph_overview_cli_json(repo: &Path) -> serde_json::Value {
+    query_json(["graph-overview", "--repo", repo.to_str().unwrap()])
+}
+
 fn task_cli_json(repo: &Path, command: &str, task: &str) -> serde_json::Value {
     query_json([command, "--repo", repo.to_str().unwrap(), "--task", task])
 }
@@ -552,6 +557,11 @@ fn repository_map_graph_json(
         other => panic!("unsupported graph command: {other}"),
     };
     serde_json::from_str(&json).expect("RepositoryMap graph JSON parses")
+}
+
+fn repository_map_graph_overview_json(map: &RepositoryMap) -> serde_json::Value {
+    let json = aethyme_engine::json::repo_overview_view(&graph_overview_view(map));
+    serde_json::from_str(&json).expect("RepositoryMap graph-overview JSON parses")
 }
 
 fn repository_map_task_json(map: &RepositoryMap, command: &str, task: &str) -> serde_json::Value {
@@ -655,6 +665,7 @@ fn stable_redb_query_snapshot(repo: &Path) -> serde_json::Value {
 
     serde_json::json!({
         "overview": overview,
+        "graph_overview": graph_overview_cli_json(repo),
         "areas": query_json([
             "query-areas",
             "--repo",
@@ -951,6 +962,30 @@ fn rendered_graph_commands_match_repository_map_snapshots_on_medium_fixture() {
     let tmp = build_medium_redb_fixture();
 
     assert_rendered_graph_command_parity(tmp.path(), &["load_token", "src/auth/token.py"]);
+}
+
+fn assert_graph_overview_parity(repo: &Path) {
+    let map = RepositoryMap::build(repo).expect("build RepositoryMap graph-overview oracle");
+    let expected = repository_map_graph_overview_json(&map);
+    let actual = graph_overview_cli_json(repo);
+    assert_eq!(
+        actual, expected,
+        "graph-overview should preserve RepositoryMap JSON"
+    );
+}
+
+#[test]
+fn graph_overview_matches_repository_map_snapshot_on_tiny_fixture() {
+    let tmp = build_redb_fixture();
+
+    assert_graph_overview_parity(tmp.path());
+}
+
+#[test]
+fn graph_overview_matches_repository_map_snapshot_on_medium_fixture() {
+    let tmp = build_medium_redb_fixture();
+
+    assert_graph_overview_parity(tmp.path());
 }
 
 #[test]
@@ -1488,6 +1523,79 @@ fn query_overview_json_shape_is_stable() {
 }
 
 #[test]
+fn graph_overview_json_shape_is_stable() {
+    let tmp = build_redb_fixture();
+    let parsed = graph_overview_cli_json(tmp.path());
+
+    assert_eq!(
+        object_keys(&parsed),
+        BTreeSet::from([
+            "code_areas",
+            "entrypoints",
+            "key_configs",
+            "overview_docs",
+            "reference_areas",
+            "repo",
+            "representative_code_files",
+            "representative_docs",
+            "signals",
+            "subareas",
+        ])
+    );
+
+    let signals = parsed["signals"].as_object().expect("signals object");
+    let signal_keys: BTreeSet<&str> = signals.keys().map(String::as_str).collect();
+    assert_eq!(
+        signal_keys,
+        BTreeSet::from([
+            "boundary_clarity",
+            "config_hygiene",
+            "entrypoint_clarity",
+            "hidden_coupling",
+            "parser_visibility",
+        ])
+    );
+    for key in signal_keys {
+        assert_eq!(
+            object_keys(&parsed["signals"][key]),
+            BTreeSet::from(["evidence", "level", "score"])
+        );
+    }
+    assert!(parsed["overview_docs"].as_array().is_some());
+    assert!(parsed["code_areas"].as_array().is_some());
+    assert!(parsed["reference_areas"].as_array().is_some());
+    assert!(parsed["subareas"].as_array().is_some());
+    assert!(parsed["entrypoints"].as_array().is_some());
+    assert!(parsed["key_configs"].as_array().is_some());
+    assert!(parsed["representative_code_files"].as_array().is_some());
+    assert!(parsed["representative_docs"].as_array().is_some());
+}
+
+#[test]
+fn graph_overview_query_output_is_deterministic() {
+    let tmp = build_medium_redb_fixture();
+    let first = graph_overview_cli_json(tmp.path());
+    let second = graph_overview_cli_json(tmp.path());
+    assert_eq!(
+        first, second,
+        "same redb store should produce stable graph-overview output"
+    );
+
+    let rebuild = run_engine([
+        "index",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&rebuild);
+    let after_rebuild = graph_overview_cli_json(tmp.path());
+    assert_eq!(
+        first, after_rebuild,
+        "same fragments should rebuild to the same graph-overview output"
+    );
+}
+
+#[test]
 fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
     let tmp = build_fragment_fixture();
     let store_path = tmp.path().join(".aethyme/graph_store.redb");
@@ -1566,6 +1674,7 @@ fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
             "--target",
             "load_token",
         ],
+        vec!["graph-overview", "--repo", tmp.path().to_str().unwrap()],
         vec![
             "task-anchors",
             "--repo",

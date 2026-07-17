@@ -2459,6 +2459,29 @@ fn edge_count_from<D: ReadableDatabase>(db: &D) -> Result<u64, GraphStoreError> 
     Ok(count)
 }
 
+fn all_edges_from<D: ReadableDatabase>(db: &D) -> Result<Vec<Edge>, GraphStoreError> {
+    let txn = db.begin_read()?;
+    let t = txn.open_multimap_table(EDGES_OUT)?;
+    let mut edges = Vec::new();
+    for entry in t.iter()? {
+        let (key, mut values) = entry?;
+        let from = key.value().to_string();
+        while let Some(value) = values.next() {
+            let row = value?;
+            let rec: AdjacencyRecord = bincode::deserialize(row.value())?;
+            edges.push(Edge::new(
+                from.clone(),
+                rec.other.as_str(),
+                rec.kind,
+                rec.confidence,
+                rec.source.as_str(),
+            ));
+        }
+    }
+    edges.sort();
+    Ok(edges)
+}
+
 fn list_areas_from<D: ReadableDatabase>(
     db: &D,
     depth: Option<u32>,
@@ -3104,6 +3127,11 @@ impl ReadOnlyGraphStore {
 
     pub(crate) fn edge_count(&self) -> Result<u64, GraphStoreError> {
         edge_count_from(&self.db)
+    }
+
+    /// Return all persisted logical edges from the outgoing adjacency table.
+    pub fn all_edges(&self) -> Result<Vec<Edge>, GraphStoreError> {
+        all_edges_from(&self.db)
     }
 
     /// One-shot summary for query commands.
