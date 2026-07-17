@@ -2,11 +2,15 @@ use crate::context_pack::{Anchor, AnchorKind};
 use crate::graph::anchors::resolve_anchors;
 use crate::graph::guidance::{build_in_scope, build_out_of_scope, navigation_order};
 use crate::graph::overview::build_repo_overview;
-use crate::graph::signals::{GraphSignals, evaluate_graph_signals};
+use crate::graph::signals::{evaluate_graph_signals, GraphSignals};
 use crate::map::RepositoryMap;
 use crate::model::edge::EdgeKind;
 use crate::model::risk::RiskFlag;
 use crate::model::task::TaskInput;
+use crate::store::redb::graph_store::{
+    GraphRelation as RedbGraphRelation, GraphStoreError, NeighborDirection, NodeDisplay,
+    ReadOnlyGraphStore, RedbRelationItem, StoredNode, StoredNodeKind,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphNodeView {
@@ -156,6 +160,61 @@ pub fn configs_view(map: &RepositoryMap, target: &str) -> GraphRelationView {
         matches!(kind, EdgeKind::Configures | EdgeKind::EntrypointFor)
             && (from == seed || to == seed)
     })
+}
+
+pub fn node_view_redb(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+) -> Result<Option<GraphNodeView>, GraphStoreError> {
+    let Some(id) = resolved_redb_target_id(store, target)? else {
+        return Ok(None);
+    };
+    let Some(node) = store.node_display(&id)? else {
+        return Ok(None);
+    };
+    Ok(Some(redb_node_view(store, node)?))
+}
+
+pub fn children_view_redb(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+) -> Result<GraphRelationView, GraphStoreError> {
+    relation_view_redb(store, target, RedbGraphRelation::Children, "children")
+}
+
+pub fn parents_view_redb(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+) -> Result<GraphRelationView, GraphStoreError> {
+    relation_view_redb(store, target, RedbGraphRelation::Parents, "parents")
+}
+
+pub fn callers_view_redb(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+) -> Result<GraphRelationView, GraphStoreError> {
+    relation_view_redb(store, target, RedbGraphRelation::Callers, "callers")
+}
+
+pub fn callees_view_redb(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+) -> Result<GraphRelationView, GraphStoreError> {
+    relation_view_redb(store, target, RedbGraphRelation::Callees, "callees")
+}
+
+pub fn docs_view_redb(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+) -> Result<GraphRelationView, GraphStoreError> {
+    relation_view_redb(store, target, RedbGraphRelation::Docs, "docs")
+}
+
+pub fn configs_view_redb(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+) -> Result<GraphRelationView, GraphStoreError> {
+    relation_view_redb(store, target, RedbGraphRelation::Configs, "configs")
 }
 
 pub fn task_anchors_view(map: &RepositoryMap, task: &TaskInput) -> TaskAnchorsView {
@@ -312,6 +371,66 @@ where
     }
 }
 
+fn relation_view_redb(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+    relation: RedbGraphRelation,
+    relation_name: &str,
+) -> Result<GraphRelationView, GraphStoreError> {
+    let Some(id) = resolved_redb_target_id(store, target)? else {
+        return Ok(GraphRelationView {
+            target: target.to_string(),
+            relation: relation_name.to_string(),
+            items: Vec::new(),
+        });
+    };
+
+    let view = store.relation_view(&id, relation)?;
+    let mut items = view
+        .items
+        .into_iter()
+        .map(redb_relation_item)
+        .collect::<Vec<_>>();
+    items.sort();
+    items.dedup();
+    Ok(GraphRelationView {
+        target: target.to_string(),
+        relation: relation_name.to_string(),
+        items,
+    })
+}
+
+fn redb_node_view(
+    store: &ReadOnlyGraphStore,
+    node: NodeDisplay,
+) -> Result<GraphNodeView, GraphStoreError> {
+    let area = redb_area_name(store, &node)?;
+    let (source, confidence) = redb_node_source_confidence(node.kind);
+    let annotations = redb_annotations(store, &node)?;
+    Ok(GraphNodeView {
+        id: node.id,
+        kind: redb_kind_label(node.kind).to_string(),
+        label: node.name,
+        path: node.path,
+        language: node.language,
+        source: source.to_string(),
+        confidence,
+        area,
+        annotations,
+    })
+}
+
+fn redb_relation_item(item: RedbRelationItem) -> GraphRelationItem {
+    let display = item.node.path.clone().unwrap_or(item.node.display);
+    GraphRelationItem {
+        id: item.node.id,
+        kind: redb_kind_label(item.node.kind).to_string(),
+        display,
+        relation: item.relation,
+        confidence: item.confidence,
+    }
+}
+
 fn relation_item(
     map: &RepositoryMap,
     target_id: &str,
@@ -326,6 +445,146 @@ fn relation_item(
         relation: relation.to_string(),
         confidence,
     })
+}
+
+fn resolved_redb_target_id(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+) -> Result<Option<String>, GraphStoreError> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Ok(None);
+    }
+
+    if store.node_display(target)?.is_some() {
+        return Ok(Some(target.to_string()));
+    }
+
+    if let Some(file) = store.resolve_file_path(target)? {
+        return Ok(Some(file.id));
+    }
+
+    for area in store.list_areas(None)? {
+        if area.id == target
+            || area.name.eq_ignore_ascii_case(target)
+            || area.path_prefix.eq_ignore_ascii_case(target)
+        {
+            return Ok(Some(area.id));
+        }
+    }
+
+    for node in store.nodes_under_path(target)? {
+        if node.id() == target
+            || node
+                .path()
+                .map(|path| path.eq_ignore_ascii_case(target))
+                .unwrap_or(false)
+        {
+            return Ok(Some(node.id().to_string()));
+        }
+    }
+
+    if let Some((path, name)) = target.rsplit_once("::") {
+        for symbol in store.find_symbols(name, None)? {
+            if symbol.path.eq_ignore_ascii_case(path)
+                || format!("{}::{}", symbol.path, symbol.name).eq_ignore_ascii_case(target)
+            {
+                return Ok(Some(symbol.id));
+            }
+        }
+    }
+
+    if let Some(symbol) = store.find_symbols(target, None)?.into_iter().next() {
+        return Ok(Some(symbol.id));
+    }
+
+    Ok(None)
+}
+
+fn redb_area_name(
+    store: &ReadOnlyGraphStore,
+    node: &NodeDisplay,
+) -> Result<Option<String>, GraphStoreError> {
+    if node.kind == StoredNodeKind::Area {
+        return Ok(Some(node.name.clone()));
+    }
+
+    let Some(area_id) = node.area_id.as_deref() else {
+        return Ok(None);
+    };
+    Ok(store.node_display(area_id)?.map(|area| area.name))
+}
+
+fn redb_annotations(
+    store: &ReadOnlyGraphStore,
+    node: &NodeDisplay,
+) -> Result<Vec<String>, GraphStoreError> {
+    let mut annotations = Vec::new();
+
+    if node.kind == StoredNodeKind::File {
+        if let Some(path) = node.path.as_deref() {
+            for risk in store.risk_for_node_or_path(&node.id)? {
+                if risk.scope == path {
+                    annotations.push(format!(
+                        "risk: {}",
+                        format!("{:?}", risk.area).to_ascii_lowercase()
+                    ));
+                }
+            }
+        }
+    }
+
+    match store.get_node(&node.id)? {
+        Some(StoredNode::Doc(doc)) => {
+            annotations.push(format!("doc_type: {}", doc.doc_type));
+        }
+        Some(StoredNode::Config(config)) => {
+            annotations.push(format!("config_type: {}", config.config_type));
+        }
+        _ => {}
+    }
+
+    if !store
+        .neighbors(
+            &node.id,
+            NeighborDirection::Outgoing,
+            Some(EdgeKind::EntrypointFor),
+        )?
+        .is_empty()
+    {
+        annotations.push("navigation: entrypoint".to_string());
+    }
+
+    annotations.sort();
+    annotations.dedup();
+    Ok(annotations)
+}
+
+fn redb_node_source_confidence(kind: StoredNodeKind) -> (&'static str, u16) {
+    match kind {
+        StoredNodeKind::Repository
+        | StoredNodeKind::Area
+        | StoredNodeKind::Directory
+        | StoredNodeKind::File => ("structure", 1000),
+        StoredNodeKind::Function | StoredNodeKind::Class => ("code", 1000),
+        StoredNodeKind::Doc => ("docs", 900),
+        StoredNodeKind::Config => ("config", 900),
+        StoredNodeKind::Unresolved => ("unresolved", 500),
+    }
+}
+
+fn redb_kind_label(kind: StoredNodeKind) -> &'static str {
+    match kind {
+        StoredNodeKind::Repository => "repo",
+        StoredNodeKind::Directory => "directory",
+        StoredNodeKind::File => "file",
+        StoredNodeKind::Area => "area",
+        StoredNodeKind::Function => "function",
+        StoredNodeKind::Class => "class",
+        StoredNodeKind::Doc => "doc",
+        StoredNodeKind::Config => "config",
+        StoredNodeKind::Unresolved => "unresolved",
+    }
 }
 
 fn relation_item_for_display(
