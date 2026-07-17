@@ -54,6 +54,42 @@ fn parse_porcelain_paths(out: &str) -> Vec<String> {
         .collect()
 }
 
+/// Extract paths from newline-separated path listings (`git diff
+/// --name-only`, `git diff-tree --name-only`, `git ls-files`), keeping
+/// only lines that can actually be git-emitted paths — the same shim
+/// hazard class as [`parse_porcelain_paths`] (#43). Observed in the
+/// wild: a `--- Changes ---` section header decorating dirty diff
+/// listings, which a naive per-line parse turns into a phantom implicit
+/// lease that EVERY dirty session appears to hold — warning all session
+/// pairs against each other.
+///
+/// Grammar: these listings never contain blank lines or diff-rendering
+/// artifacts (`--- `/`+++ ` file headers, `diff --git`, `@@` hunks),
+/// and git C-quotes any path containing bytes outside printable ASCII
+/// (`core.quotePath` applies to path listings), so an unquoted line
+/// with such bytes (the `ok ✓` decoration class) is not a path either.
+/// Trade-off, same stance as #43: a repo file literally named like a
+/// decoration line is dropped; with quoting disabled by hand, raw
+/// non-ASCII paths are too. Both are vanishingly rare next to the
+/// observed shim corruption.
+fn parse_path_lines(out: &str) -> Vec<String> {
+    out.lines()
+        .filter(|line| {
+            if line.is_empty()
+                || *line == "---"
+                || line.starts_with("--- ")
+                || line.starts_with("+++ ")
+                || line.starts_with("diff --git ")
+                || line.starts_with("@@ ")
+            {
+                return false;
+            }
+            line.starts_with('"') || line.bytes().all(|b| (0x20..0x7f).contains(&b))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
     run_git_inner(cwd, None, args)
 }
@@ -325,12 +361,9 @@ impl GitRepo {
     /// `base`, plus untracked files: the diff surface implicit leases are
     /// derived from.
     pub fn changed_files(&self, base: &str) -> Result<Vec<String>, GitError> {
-        let mut files: Vec<String> = run_git(&self.root, &["diff", "--name-only", base])?
-            .lines()
-            .map(str::to_string)
-            .collect();
+        let mut files = parse_path_lines(&run_git(&self.root, &["diff", "--name-only", base])?);
         let untracked = run_git(&self.root, &["ls-files", "--others", "--exclude-standard"])?;
-        files.extend(untracked.lines().map(str::to_string));
+        files.extend(parse_path_lines(&untracked));
         files.sort();
         files.dedup();
         Ok(files)
@@ -351,7 +384,7 @@ impl GitRepo {
     /// radar compares against other sessions' leases. `--root` makes the
     /// initial commit report its files too.
     pub fn head_changed_files(&self) -> Result<Vec<String>, GitError> {
-        Ok(run_git(
+        Ok(parse_path_lines(&run_git(
             &self.root,
             &[
                 "diff-tree",
@@ -361,11 +394,7 @@ impl GitRepo {
                 "--root",
                 "HEAD",
             ],
-        )?
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
+        )?))
     }
 
     /// One-line summaries (short-sha + subject) of `from..to`, newest
@@ -462,6 +491,40 @@ impl GitRepo {
             .map(PathBuf::from)
             .filter(|path| path.canonicalize().map(|p| p != main).unwrap_or(true))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod path_line_tests {
+    use super::parse_path_lines;
+
+    #[test]
+    fn real_paths_survive_including_spaces_and_quoted_forms() {
+        let out = "src/auth.py\npath with spaces.md\n\"caf\\303\\251.rs\"\nsrc/-leading-dash.rs\n";
+        assert_eq!(
+            parse_path_lines(out),
+            vec![
+                "src/auth.py",
+                "path with spaces.md",
+                "\"caf\\303\\251.rs\"",
+                "src/-leading-dash.rs"
+            ]
+        );
+    }
+
+    #[test]
+    fn shim_section_headers_are_not_paths() {
+        // The observed decoration: a section header prepended to a dirty
+        // diff listing. Parsed naively it became an implicit lease every
+        // dirty session held, warning all session pairs against each other.
+        let out = "--- Changes ---\nsrc/auth.py\n";
+        assert_eq!(parse_path_lines(out), vec!["src/auth.py"]);
+    }
+
+    #[test]
+    fn diff_rendering_artifacts_and_status_decorations_are_discarded() {
+        let out = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n---\nok \u{2713}\n\u{2713}\n\nx\n";
+        assert_eq!(parse_path_lines(out), vec!["x"]);
     }
 }
 
