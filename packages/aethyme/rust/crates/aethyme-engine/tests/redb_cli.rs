@@ -11,11 +11,14 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::time::Instant;
 
+use aethyme_engine::graph::activation::{hormone_profile, spread_activation, spread_from_seed};
+use aethyme_engine::graph::anchors::resolve_anchors;
 use aethyme_engine::graph::navigation::{
     callees_view, callers_view, children_view, configs_view, docs_view, graph_expand_view,
     graph_overview_view, node_view, parents_view, task_anchors_view, task_expand_view,
     task_next_view, task_scope_view,
 };
+use aethyme_engine::graph::neighborhood::impact_frontier;
 use aethyme_engine::graph::search::symbol_search;
 use aethyme_engine::map::RepositoryMap;
 use aethyme_engine::pipeline::{build_context_pack, build_context_pack_with_content};
@@ -286,6 +289,52 @@ fn build_expand_redb_fixture() -> tempfile::TempDir {
     tmp
 }
 
+fn build_activation_redb_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/auth/token.py",
+        b"class TokenLoader:\n    def load(self):\n        return load_token()\n\ndef load_token():\n    return 'token'\n",
+    );
+    write(
+        tmp.path(),
+        "src/web/handler.py",
+        b"from src.auth.token import load_token\n\ndef handle_request():\n    return load_token()\n",
+    );
+    write(
+        tmp.path(),
+        "src/calls.py",
+        b"def callee():\n    return 'callee'\n\ndef caller():\n    return callee()\n",
+    );
+    write(
+        tmp.path(),
+        "docs/auth.md",
+        b"# Auth\n\nToken loading and handler notes.\n",
+    );
+    write(
+        tmp.path(),
+        "pyproject.toml",
+        b"[project]\nname = \"activation-fixture\"\n",
+    );
+
+    let root = tmp.path().canonicalize().unwrap();
+    bootstrap_repo(&root, "test-engine").expect("bootstrap graph layout");
+    let ctx = IndexerContext::new("ActivationRepo", root.clone(), "test-engine").unwrap();
+    let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
+    assert_eq!(summary.total_files, 5);
+    add_call_edge_to_fragment(&root, "src/calls.py", "caller", "callee");
+
+    let output = run_engine([
+        "index",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&output);
+    assert!(tmp.path().join(".aethyme/graph_store.redb").is_file());
+    tmp
+}
+
 fn build_usage_boundary_redb_fixture() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     write(
@@ -553,6 +602,23 @@ fn context_with_content_cli_json(repo: &Path, command: &str, task: &str) -> serd
     ])
 }
 
+fn activation_cli_json(repo: &Path, command: &str, key: &str, value: &str) -> serde_json::Value {
+    query_json([command, "--repo", repo.to_str().unwrap(), key, value])
+}
+
+fn activate_from_cli_json(repo: &Path, seed: &str, hops: usize) -> serde_json::Value {
+    let hops = hops.to_string();
+    query_json([
+        "activate-from",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--seed",
+        seed,
+        "--hops",
+        &hops,
+    ])
+}
+
 fn repository_map_graph_json(
     map: &RepositoryMap,
     command: &str,
@@ -630,6 +696,29 @@ fn repository_map_context_with_content_json(
     );
     let json = aethyme_engine::json::context_pack(&pack);
     serde_json::from_str(&json).expect("RepositoryMap context pack with content JSON parses")
+}
+
+fn repository_map_activation_json(
+    map: &RepositoryMap,
+    task: &str,
+    anchor_limit: usize,
+) -> serde_json::Value {
+    let task = aethyme_engine::model::task::TaskInput::from_task_text(task);
+    let anchors = resolve_anchors(map, &task, anchor_limit);
+    let profile = hormone_profile(&task.kind);
+    let activation = spread_activation(map, &anchors, &profile);
+    let json = aethyme_engine::json::activation_map(&activation);
+    serde_json::from_str(&json).expect("RepositoryMap activation JSON parses")
+}
+
+fn repository_map_activate_from_json(
+    map: &RepositoryMap,
+    seed: &str,
+    hops: usize,
+) -> serde_json::Value {
+    let activation = spread_from_seed(map, seed, hops);
+    let json = aethyme_engine::json::activation_map(&activation);
+    serde_json::from_str(&json).expect("RepositoryMap activate-from JSON parses")
 }
 
 fn symbol_cli_hits(repo: &Path, query: &str, limit: usize) -> serde_json::Value {
@@ -1209,6 +1298,117 @@ fn redb_context_pack_output_is_deterministic() {
         first, after_rebuild,
         "same fragments should rebuild to the same context-pack output"
     );
+}
+
+#[test]
+fn redb_activation_matches_repository_map_snapshot_on_medium_fixture() {
+    let tmp = build_task_redb_fixture();
+    let map = RepositoryMap::build(tmp.path()).expect("build RepositoryMap activation oracle");
+
+    for task in [
+        "Explain this repo",
+        "Update load_token flow",
+        "Trace impact of load_token",
+        "Find the manifest that owns the top-level area",
+    ] {
+        let parsed = aethyme_engine::model::task::TaskInput::from_task_text(task);
+        let anchor_limit = if parsed.kind.is_explain_repo() { 5 } else { 3 };
+        let expected = repository_map_activation_json(&map, task, anchor_limit);
+        let actual = activation_cli_json(tmp.path(), "activate", "--task", task);
+        assert_eq!(
+            actual, expected,
+            "activate should preserve RepositoryMap JSON for task {task:?}"
+        );
+    }
+}
+
+#[test]
+fn redb_activate_from_matches_repository_map_snapshot() {
+    let tmp = build_activation_redb_fixture();
+    let map = RepositoryMap::build(tmp.path()).expect("build RepositoryMap seed oracle");
+    let expected = repository_map_activate_from_json(&map, "src/calls.py::caller", 3);
+    let actual = activate_from_cli_json(tmp.path(), "src/calls.py::caller", 3);
+    assert_eq!(
+        actual, expected,
+        "activate-from should preserve RepositoryMap JSON"
+    );
+}
+
+#[test]
+fn redb_activation_expands_tiny_relation_fixture() {
+    let tmp = build_activation_redb_fixture();
+
+    let call_activation = activate_from_cli_json(tmp.path(), "src/calls.py::caller", 3);
+    let call_ids = call_activation["activations"]
+        .as_array()
+        .expect("activation array")
+        .iter()
+        .map(|item| item["id"].as_str().expect("activation id").to_string())
+        .collect::<Vec<_>>();
+    assert!(call_ids.iter().any(|id| id.contains("caller")));
+    assert!(call_ids.iter().any(|id| id.contains("callee")));
+
+    let repo_activation =
+        activation_cli_json(tmp.path(), "activate", "--task", "Explain this repo");
+    let repo_ids = repo_activation["activations"]
+        .as_array()
+        .expect("activation array")
+        .iter()
+        .map(|item| item["id"].as_str().expect("activation id").to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        repo_ids.iter().any(|id| id.starts_with("doc:")),
+        "docs should be reachable through redb relation expansion"
+    );
+    assert!(
+        repo_ids.iter().any(|id| id.starts_with("config:")),
+        "configs should be reachable through redb relation expansion"
+    );
+
+    let impact = query_json([
+        "impact",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--target",
+        "load_token",
+    ]);
+    let impact_items = impact.as_array().expect("impact array");
+    assert!(
+        impact_items.iter().any(|item| item
+            .as_str()
+            .is_some_and(|value| value.starts_with("file:"))),
+        "import-adjacent impact should include at least one file frontier item"
+    );
+}
+
+#[test]
+fn redb_activation_order_is_deterministic_and_bounded() {
+    let tmp = build_activation_redb_fixture();
+    let first = activate_from_cli_json(tmp.path(), "src/calls.py::caller", 4);
+    let second = activate_from_cli_json(tmp.path(), "src/calls.py::caller", 4);
+    assert_eq!(first, second, "activation order should be deterministic");
+
+    let activations = first["activations"].as_array().expect("activation array");
+    assert!(
+        activations.len() <= 20,
+        "tiny activation fixture should stay bounded, got {} activations",
+        activations.len()
+    );
+}
+
+#[test]
+fn redb_impact_matches_repository_map_snapshot() {
+    let tmp = build_activation_redb_fixture();
+    let map = RepositoryMap::build(tmp.path()).expect("build RepositoryMap impact oracle");
+    let expected = serde_json::to_value(impact_frontier(&map, "load_token")).expect("impact JSON");
+    let actual = query_json([
+        "impact",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--target",
+        "load_token",
+    ]);
+    assert_eq!(actual, expected);
 }
 
 #[test]
@@ -1852,6 +2052,27 @@ fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
             "load_token",
         ],
         vec!["graph-overview", "--repo", tmp.path().to_str().unwrap()],
+        vec![
+            "impact",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--target",
+            "load_token",
+        ],
+        vec![
+            "activate",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--task",
+            "Update load_token flow",
+        ],
+        vec![
+            "activate-from",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--seed",
+            "src/auth/token.py",
+        ],
         vec![
             "task-anchors",
             "--repo",

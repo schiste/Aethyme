@@ -1,10 +1,13 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::context_pack::Anchor;
+use crate::graph::neighborhood::matching_target_ids_redb;
 use crate::map::RepositoryMap;
 use crate::model::edge::EdgeKind;
 use crate::model::task::TaskKind;
-use crate::store::redb::graph_store::{GraphStoreError, ReadOnlyGraphStore};
+use crate::store::redb::graph_store::{
+    GraphRelation, GraphStoreError, NeighborDirection, ReadOnlyGraphStore,
+};
 
 const EDGE_KIND_COUNT: usize = 9;
 
@@ -240,7 +243,6 @@ pub fn spread_activation_redb(
     anchors: &[Anchor],
     profile: &HormoneProfile,
 ) -> Result<ActivationMap, GraphStoreError> {
-    let adj = RedbAdjacencyIndex::build(store)?;
     let mut seed_ids = Vec::new();
     for anchor in anchors {
         for id in resolve_activation_seed_redb(store, &anchor.id)? {
@@ -256,9 +258,7 @@ pub fn spread_activation_redb(
             }
         }
     }
-    Ok(spread_activation_ids(seed_ids, profile, |node_id| {
-        adj.neighbors(node_id)
-    }))
+    spread_activation_ids_redb(store, seed_ids, profile)
 }
 
 pub fn spread_from_seed(map: &RepositoryMap, seed_id: &str, max_hops: usize) -> ActivationMap {
@@ -278,91 +278,38 @@ pub fn spread_from_seed(map: &RepositoryMap, seed_id: &str, max_hops: usize) -> 
     spread_activation(map, &[anchor], &profile)
 }
 
-struct RedbAdjacencyIndex {
-    outgoing: HashMap<String, Vec<(String, EdgeKind)>>,
-    incoming: HashMap<String, Vec<(String, EdgeKind)>>,
-}
-
-impl RedbAdjacencyIndex {
-    fn build(store: &ReadOnlyGraphStore) -> Result<Self, GraphStoreError> {
-        let mut outgoing: HashMap<String, Vec<(String, EdgeKind)>> = HashMap::new();
-        let mut incoming: HashMap<String, Vec<(String, EdgeKind)>> = HashMap::new();
-        for edge in store.all_edges()? {
-            outgoing
-                .entry(edge.from.to_string())
-                .or_default()
-                .push((edge.to.to_string(), edge.kind.clone()));
-            incoming
-                .entry(edge.to.to_string())
-                .or_default()
-                .push((edge.from.to_string(), edge.kind.clone()));
-        }
-        Ok(Self { outgoing, incoming })
-    }
-
-    fn neighbors(&self, node_id: &str) -> Vec<(&str, &EdgeKind)> {
-        let mut result = Vec::new();
-        if let Some(out) = self.outgoing.get(node_id) {
-            for (to, kind) in out {
-                result.push((to.as_str(), kind));
-            }
-        }
-        if let Some(inc) = self.incoming.get(node_id) {
-            for (from, kind) in inc {
-                result.push((from.as_str(), kind));
-            }
-        }
-        result
-    }
+pub fn spread_from_seed_redb(
+    store: &ReadOnlyGraphStore,
+    seed_id: &str,
+    max_hops: usize,
+) -> Result<ActivationMap, GraphStoreError> {
+    let anchor = Anchor::new(
+        crate::context_pack::AnchorKind::File,
+        seed_id,
+        Some(seed_id),
+        "single-seed activation",
+    );
+    let profile = HormoneProfile {
+        weights: [0.5; EDGE_KIND_COUNT],
+        decay: 0.5,
+        threshold: 0.05,
+        max_hops,
+    };
+    spread_activation_redb(store, &[anchor], &profile)
 }
 
 fn resolve_activation_seed_redb(
     store: &ReadOnlyGraphStore,
     value: &str,
 ) -> Result<Vec<String>, GraphStoreError> {
-    let mut seeds = Vec::new();
-    if store.node_display(value)?.is_some() {
-        seeds.push(value.to_string());
-    }
-    if let Some(file) = store.resolve_file_path(value)? {
-        if !seeds.contains(&file.id) {
-            seeds.push(file.id);
-        }
-    }
-    for node in store.nodes_under_path(value)? {
-        if node.id() == value
-            || node
-                .path()
-                .map(|path| path.eq_ignore_ascii_case(value))
-                .unwrap_or(false)
-        {
-            let id = node.id().to_string();
-            if !seeds.contains(&id) {
-                seeds.push(id);
-            }
-        }
-    }
-    for area in store.list_areas(None)? {
-        if area.id == value || area.name.eq_ignore_ascii_case(value) || area.path_prefix == value {
-            if !seeds.contains(&area.id) {
-                seeds.push(area.id);
-            }
-        }
-    }
-    if seeds.is_empty() {
-        seeds.push(value.to_string());
-    }
-    Ok(seeds)
+    matching_target_ids_redb(store, value)
 }
 
-fn spread_activation_ids<'a, F>(
+fn spread_activation_ids_redb(
+    store: &ReadOnlyGraphStore,
     seed_ids: Vec<String>,
     profile: &HormoneProfile,
-    mut neighbors_for: F,
-) -> ActivationMap
-where
-    F: FnMut(&str) -> Vec<(&'a str, &'a EdgeKind)>,
-{
+) -> Result<ActivationMap, GraphStoreError> {
     let seed_count = seed_ids.len();
     let mut best: HashMap<String, (f64, usize, String)> = HashMap::new();
     let mut queue: VecDeque<(String, f64, usize, String)> = VecDeque::new();
@@ -380,8 +327,8 @@ where
             continue;
         }
 
-        for (neighbor, edge_kind) in neighbors_for(&node_id) {
-            let weight = profile.weights[edge_kind_index(edge_kind)];
+        for (neighbor, edge_kind) in activation_neighbors_redb(store, &node_id)? {
+            let weight = profile.weights[edge_kind_index(&edge_kind)];
             let propagated = current_activation * weight * profile.decay;
 
             if propagated < profile.threshold {
@@ -389,23 +336,17 @@ where
             }
 
             let next_depth = depth + 1;
-            let is_new = match best.get(neighbor) {
+            let is_new = match best.get(neighbor.as_str()) {
                 Some((existing, _, _)) => {
                     if propagated > *existing {
-                        best.insert(
-                            neighbor.to_string(),
-                            (propagated, next_depth, source.clone()),
-                        );
+                        best.insert(neighbor.clone(), (propagated, next_depth, source.clone()));
                         true
                     } else {
                         false
                     }
                 }
                 None => {
-                    best.insert(
-                        neighbor.to_string(),
-                        (propagated, next_depth, source.clone()),
-                    );
+                    best.insert(neighbor.clone(), (propagated, next_depth, source.clone()));
                     total_visited += 1;
                     true
                 }
@@ -413,7 +354,7 @@ where
 
             if is_new {
                 max_depth = max_depth.max(next_depth);
-                queue.push_back((neighbor.to_string(), propagated, next_depth, source.clone()));
+                queue.push_back((neighbor, propagated, next_depth, source.clone()));
             }
         }
     }
@@ -435,12 +376,41 @@ where
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    ActivationMap {
+    Ok(ActivationMap {
         activations,
         seed_count,
         total_nodes_visited: total_visited,
         max_depth_reached: max_depth,
+    })
+}
+
+fn activation_neighbors_redb(
+    store: &ReadOnlyGraphStore,
+    node_id: &str,
+) -> Result<Vec<(String, EdgeKind)>, GraphStoreError> {
+    let mut neighbors = Vec::new();
+    for record in store.neighbors(node_id, NeighborDirection::Outgoing, None)? {
+        neighbors.push((record.other.to_string(), record.kind));
     }
+    for record in store.neighbors(node_id, NeighborDirection::Incoming, None)? {
+        neighbors.push((record.other.to_string(), record.kind));
+    }
+    for relation in [
+        GraphRelation::Callers,
+        GraphRelation::Callees,
+        GraphRelation::Docs,
+        GraphRelation::Configs,
+        GraphRelation::Imports,
+        GraphRelation::Importers,
+        GraphRelation::References,
+    ] {
+        for item in store.relation_view(node_id, relation)?.items {
+            neighbors.push((item.node.id, item.edge_kind));
+        }
+    }
+    neighbors.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    neighbors.dedup();
+    Ok(neighbors)
 }
 
 impl ActivationMap {

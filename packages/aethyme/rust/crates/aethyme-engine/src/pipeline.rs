@@ -13,7 +13,10 @@ use crate::graph::navigation::{
     anchor_files_redb, build_in_scope_redb, graph_overview_view_redb, primary_area_names_redb,
     task_navigation_order_redb,
 };
-use crate::graph::neighborhood::{dependency_frontier, impact_frontier};
+use crate::graph::neighborhood::{
+    dependency_frontier, dependency_frontier_redb, display_for_redb_id, impact_frontier,
+    impact_frontier_redb, matching_target_ids_redb,
+};
 use crate::graph::overview::{
     build_repo_overview, overview_dependencies, overview_impact, repo_overview_seed,
 };
@@ -26,7 +29,6 @@ use crate::model::task::TaskInput;
 use crate::snippets::{select_snippets, select_snippets_redb};
 use crate::store::redb::graph_store::{
     GraphStoreError, NeighborDirection, OverviewV2, OverviewV2Limits, ReadOnlyGraphStore,
-    StoredNodeKind,
 };
 
 pub fn build_context_pack(root: &Path, map: &RepositoryMap, task: TaskInput) -> ContextPack {
@@ -538,7 +540,7 @@ fn overview_dependencies_redb(
         .collect::<Vec<_>>();
     let mut edges = Vec::new();
     for focus_item in focus {
-        for source_id in matching_redb_target_ids(store, &focus_item)? {
+        for source_id in matching_target_ids_redb(store, &focus_item)? {
             for edge in store.neighbors(&source_id, NeighborDirection::Outgoing, None)? {
                 if !matches!(
                     edge.kind,
@@ -686,44 +688,6 @@ fn focused_impact_redb(
     Ok(impact)
 }
 
-fn dependency_frontier_redb(
-    store: &ReadOnlyGraphStore,
-    target: &str,
-) -> Result<Vec<String>, GraphStoreError> {
-    let seeds = matching_redb_target_ids(store, target)?;
-    let mut frontier = BTreeSet::new();
-    for edge in store.all_edges()? {
-        if seeds.iter().any(|seed| {
-            seed == edge.from.as_str()
-                || edge.from.as_str().ends_with(seed)
-                || edge.to.as_str().ends_with(seed)
-        }) && !seeds.iter().any(|seed| seed == edge.to.as_str())
-        {
-            frontier.insert(display_for_redb_id(store, edge.to.as_str())?);
-        }
-    }
-    Ok(frontier.into_iter().collect())
-}
-
-fn impact_frontier_redb(
-    store: &ReadOnlyGraphStore,
-    target: &str,
-) -> Result<Vec<String>, GraphStoreError> {
-    let seeds = matching_redb_target_ids(store, target)?;
-    let mut frontier = BTreeSet::new();
-    for edge in store.all_edges()? {
-        if seeds.iter().any(|seed| {
-            seed == edge.to.as_str()
-                || edge.to.as_str().ends_with(seed)
-                || edge.from.as_str().ends_with(seed)
-        }) && !seeds.iter().any(|seed| seed == edge.from.as_str())
-        {
-            frontier.insert(display_for_redb_id(store, edge.from.as_str())?);
-        }
-    }
-    Ok(frontier.into_iter().collect())
-}
-
 fn build_out_of_scope_activated_redb(
     store: &ReadOnlyGraphStore,
     anchors: &[Anchor],
@@ -798,75 +762,6 @@ fn filtered_risk_flags_redb(
         .collect())
 }
 
-fn matching_redb_target_ids(
-    store: &ReadOnlyGraphStore,
-    target: &str,
-) -> Result<Vec<String>, GraphStoreError> {
-    let target = target.trim();
-    let mut ids = Vec::new();
-    if target.is_empty() {
-        return Ok(ids);
-    }
-
-    if store.node_display(target)?.is_some() {
-        push_unique_string(&mut ids, target.to_string());
-    }
-    if let Some(file) = store.resolve_file_path(target)? {
-        push_unique_string(&mut ids, file.id);
-    }
-    for area in store.list_areas(None)? {
-        if area.id == target
-            || area.name.eq_ignore_ascii_case(target)
-            || area.path_prefix.eq_ignore_ascii_case(target)
-        {
-            push_unique_string(&mut ids, area.id);
-        }
-    }
-    for node in store.nodes_under_path(target)? {
-        if node.id() == target
-            || node
-                .path()
-                .map(|path| path.eq_ignore_ascii_case(target))
-                .unwrap_or(false)
-        {
-            push_unique_string(&mut ids, node.id().to_string());
-        }
-    }
-    if let Some((path, name)) = target.rsplit_once("::") {
-        for symbol in store.find_symbols(name, None)? {
-            if symbol.path.eq_ignore_ascii_case(path)
-                || format!("{}::{}", symbol.path, symbol.name).eq_ignore_ascii_case(target)
-            {
-                push_unique_string(&mut ids, symbol.id);
-            }
-        }
-    }
-    if ids.is_empty() {
-        for symbol in store.find_symbols(target, None)? {
-            push_unique_string(&mut ids, symbol.id);
-        }
-    }
-    if ids.is_empty() {
-        ids.push(target.to_string());
-    }
-    Ok(ids)
-}
-
-fn display_for_redb_id(store: &ReadOnlyGraphStore, id: &str) -> Result<String, GraphStoreError> {
-    Ok(match store.node_display(id)? {
-        Some(node)
-            if matches!(
-                node.kind,
-                StoredNodeKind::Directory | StoredNodeKind::Repository
-            ) =>
-        {
-            id.to_string()
-        }
-        Some(node) => node.display,
-        None => id.to_string(),
-    })
-}
-
 fn display_in_primary_area_redb(
     store: &ReadOnlyGraphStore,
     display: &str,
@@ -888,12 +783,6 @@ fn file_area_name_redb(
         return Ok(None);
     };
     Ok(store.node_display(&area_id)?.map(|node| node.name))
-}
-
-fn push_unique_string(values: &mut Vec<String>, value: String) {
-    if !values.contains(&value) {
-        values.push(value);
-    }
 }
 
 fn focused_dependencies(
