@@ -382,6 +382,10 @@ schema:
   bounded symbol candidates, relation views, config/doc rows, and risk rows.
   Task policy and ranking stay in the graph modules. These commands preserve
   the existing JSON shape and do not build a `RepositoryMap`.
+- `analyze-usage-boundary`: reads public PHP symbol seeds and candidate
+  source/docs/config files from redb path indexes and adjacency, then scans
+  source text for evidence. It preserves usage-boundary policy in graph
+  modules and does not build a `RepositoryMap`.
 - `callers`: uses the current hybrid path: grep for the symbol, then use
   redb adjacency to expand candidate files.
 
@@ -405,11 +409,13 @@ Current redb storage coverage:
 - The writer persists the graph edge set without skipping edges for missing
   unresolved/import endpoint rows. Placeholder endpoints are stored as typed
   unresolved rows before adjacency is written.
-- Task anchors, task scope, task next, and task-localize read from redb.
-  Context-pack assembly, `explore`, activation, and usage-boundary flows
-  still use graph modules that may build `RepositoryMap`; those surfaces
-  should not be assumed to read from redb just because
-  `.aethyme/graph_store.redb` exists.
+- Task anchors, task scope, task next, task-localize, and usage-boundary
+  seed discovery read from redb. Usage-boundary remains hybrid: redb supplies
+  public-symbol and candidate-file seeds, while source/docs/config text still
+  supplies evidence. Context-pack assembly, activation, and remaining
+  non-usage-boundary `explore` flows still use graph modules that may build
+  `RepositoryMap`; those surfaces should not be assumed to read from redb just
+  because `.aethyme/graph_store.redb` exists.
 
 Remaining V2 redb store contract:
 
@@ -443,7 +449,7 @@ Required V2 read APIs for replacing `RepositoryMap` reads:
 | Path prefix lookup | Implemented as `nodes_under_path(prefix)`, `functions_under_path(prefix)`, and `resolve_file_path(path)` over redb path indexes. | Scope expansion, area views, task-local navigation seeds. |
 | Adjacency | Implemented as `neighbors(id, direction, kind?)`; existing `edges_from` / `edges_to` remain compatibility wrappers for unfiltered directions. | `children_view`, `parents_view`, `callers_view`, `callees_view`, `docs_view`, `configs_view`, `task_expand_view`, `graph_expand_view`. |
 | Task anchor candidates | Implemented as `task_anchor_candidates(task_tokens, limit)` and `symbols_matching_with(...)`, returning bounded typed candidates with exact/prefix/component/path/area signals. Ranking stays in the graph module. | `task_anchors_view`, `task_scope_view`, `task_next_view`, context-pack assembly. |
-| Usage-boundary seeds | Implemented as `usage_boundary_candidates(scope, symbol_kind, limit)` over bounded path-index rows. | `usage_boundary_query`, dead-code analysis seed selection. |
+| Usage-boundary seeds | Implemented through redb path/adjacency APIs: `functions_under_path`, `nodes_under_path`, `neighbors`, plus bounded `usage_boundary_candidates(scope, symbol_kind, limit)` for consumers that need capped seeds. | `usage_boundary_query`, `analyze-usage-boundary`, dead-code analysis seed selection. |
 | Overview/navigation slices | Implemented as `overview_v2(...)` for bounded repo metadata, repository, directories, areas, entrypoints, risks, files, functions, classes, docs, configs, and unresolved placeholders. `task_next_view_redb` now adapts these rows for task navigation; graph overview, `explore`, and context-pack navigation still need redb adapters. | `graph_overview_view`, `task_next_view`, `explore`, context-pack navigation order. |
 
 Bridge decisions as of 2026-07-17:
@@ -459,7 +465,7 @@ Bridge decisions as of 2026-07-17:
 | `task-next` / `task-localize` | Redb-backed task navigation. | `task-next` reads redb-backed anchors, relation views, semantic config/doc path rows, and bounded overview/navigation slices. `task-localize` composes `task-anchors`, `task-scope`, and `task-next`; `--profile` reports redb stages rather than `RepositoryMap` build time. |
 | `graph-node` / rendered relation views | Redb-backed rendered views. | `graph-node`, `graph-children`, `graph-parents`, `graph-callers`, `graph-callees`, `graph-docs`, and `graph-configs` open `.aethyme/graph_store.redb` read-only, adapt redb display/relation rows to the existing JSON structs, and have binary parity snapshots against `RepositoryMap`. |
 | `graph-expand` | Redb-backed composed view. | `graph-expand` opens `.aethyme/graph_store.redb` read-only, composes the redb-backed node, parents, children, callers, callees, docs, configs, and risks views, preserves the existing JSON shape and bounds, and has binary parity, shape, bounded-output, deterministic-ordering, and docs/configs/call-edge fixture gates. |
-| `usage boundary` | Keep using `RepositoryMap` and grep/analyzer logic. | The current analyzer is scope-first and language-specific; redb can provide symbol/path seeds later but should not own the policy yet. |
+| `usage boundary` | Hybrid redb + source text. | `analyze-usage-boundary` and `explore --intent usage_boundary_query` open `.aethyme/graph_store.redb` read-only, discover public PHP symbols and candidate files through redb path indexes/adjacency, then scan source/docs/config text for evidence. It no longer builds `RepositoryMap`, but the analyzer policy and evidence extraction remain in graph modules. |
 | Trait abstraction | Defer. | A trait is useful only once two consumers need the same read contract; today the low-risk commands can call redb directly and higher-level flows still need richer candidate APIs. |
 
 V2 correctness and performance gates:
@@ -474,8 +480,9 @@ V2 correctness and performance gates:
   fragments, redb exact symbol query, graph callers/callees query shape,
   rendered graph parity snapshots, graph-expand JSON shape and bounded
   output, task parity snapshots for ExplainRepo, ChangeSymbol, TraceImpact,
-  and config-ownership tasks, deterministic query snapshots after rebuilding
-  from identical fragments, missing-store read-only behavior, and
+  and config-ownership tasks, usage-boundary internal/external caller plus
+  docs/config reference behavior, deterministic query snapshots after
+  rebuilding from identical fragments, missing-store read-only behavior, and
   disposable-fast publish boundaries.
 - The default performance smoke is intentionally tiny and bounded by
   environment-overridable thresholds:
@@ -495,11 +502,13 @@ V2 correctness and performance gates:
   navigation smoke.
 
 V2 is complete only when the graph module can serve overview, context-pack,
-`explore`, activation, usage-boundary, and any remaining task-adjacent
+remaining `explore` flows, activation, and any remaining task-adjacent
 navigation paths from read-only redb queries without constructing a full
-`RepositoryMap`. Parity tests should compare new read-only outputs with the
-current `RepositoryMap` outputs before each additional CLI surface is
-described as redb-backed.
+`RepositoryMap`. Usage-boundary is redb-seeded but still intentionally scans
+source text for evidence; a future fully redb-native analyzer would need its
+own evidence model and parity gates. Parity tests should compare new read-only
+outputs with the current `RepositoryMap` outputs before each additional CLI
+surface is described as redb-backed.
 
 ## 6. Update propagation
 

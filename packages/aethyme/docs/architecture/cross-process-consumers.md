@@ -162,6 +162,7 @@ Supported redb surfaces:
 | `task-scope` | Read-only | Builds task scope from redb-backed anchors, path-prefix lookups, symbol rows, area membership, and risk lookup. It preserves the existing JSON shape and does not build `RepositoryMap`. |
 | `task-next` | Read-only | Builds task navigation order from redb-backed anchors, relation views, semantic config/doc path resolution, and bounded overview slices. It preserves the existing JSON shape and does not build `RepositoryMap`. |
 | `task-localize` | Read-only | Composes redb-backed `task-anchors`, `task-scope`, and `task-next` outputs. `--profile` reports redb open / task parse / anchors / scope / next / JSON stages instead of `RepositoryMap` build time. |
+| `analyze-usage-boundary` | Hybrid redb + source text | Reads public PHP symbol seeds and candidate source/docs/config files from redb, then scans source text for evidence. It does not build `RepositoryMap` and fails cleanly when the store is missing. |
 | `deps` | Read-only | Reads outgoing file adjacency from the redb store. |
 | `importers` | Read-only | Reads incoming file adjacency from the redb store. |
 | `callers` | Hybrid grep + graph | Greps for the requested symbol, then uses redb adjacency to expand candidate files. It is not a pure redb symbol-query contract in V1. |
@@ -176,11 +177,13 @@ Current storage coverage and limitations:
 - The `index` writer persists the graph edge set without skipping edges for
   missing unresolved/import endpoint rows. Placeholder endpoints are stored as
   typed unresolved rows before adjacency is written.
-- Task anchors, task scope, task next, and task-localize are served from
-  read-only redb rows. Context-pack assembly, `explore`, activation, and
-  usage-boundary flows still use graph modules that may build
-  `RepositoryMap`; those surfaces should not be described as redb-backed
-  until they are explicitly moved to `GraphStore::open_read_only`.
+- Task anchors, task scope, task next, task-localize, and usage-boundary
+  seed discovery are served from read-only redb rows. Usage-boundary still
+  scans source/docs/config text for evidence after redb discovers public
+  symbols and candidate files. Context-pack assembly, activation, and
+  remaining non-usage-boundary `explore` flows still use graph modules that
+  may build `RepositoryMap`; those surfaces should not be described as
+  redb-backed until they are explicitly moved to `GraphStore::open_read_only`.
 
 Remaining V2 target contract:
 
@@ -198,7 +201,8 @@ Remaining V2 target contract:
   display projections, area/risk/doc/config lookup, relation views,
   symbol matching with exact/prefix/component/path/area signals,
   path-prefix lookup, incoming/outgoing adjacency, task anchor candidate
-  queries, usage-boundary seeds, and bounded overview/navigation slices.
+  queries, usage-boundary seed discovery, and bounded overview/navigation
+  slices.
 - A CLI surface is not redb-backed merely because V2 tables exist. It is
   redb-backed only after the implementation reads through
   `GraphStore::open_read_only` / `ReadOnlyGraphStore` and has parity coverage
@@ -244,6 +248,7 @@ Reader/writer split:
 | Read symbols | `symbol`, `symbol-batch` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
 | Read task navigation | `task-anchors`, `task-scope`, `task-next`, `task-localize` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
 | Read adjacency | `importers`, `deps` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
+| Hybrid usage-boundary | `analyze-usage-boundary`, `explore --intent usage_boundary_query` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` for seeds, source text for evidence |
 | Hybrid grep + adjacency | `callers` | Grep first, then `GraphStore::open_read_only` / redb `ReadOnlyDatabase` for candidate expansion |
 | Assert artifact exists | `scripts/eval/setup-playground.sh`, `scripts/eval/verify-playground.sh`, `docs/guides/playground-setup.md` | Filesystem existence check only |
 

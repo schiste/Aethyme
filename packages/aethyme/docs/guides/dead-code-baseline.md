@@ -31,6 +31,7 @@ Source of truth:
 Preferred analyzer path for collecting candidates:
 ```bash
 # `aethyme explore` is the canonical entry point; routes natively via Rust.
+# Requires `.aethyme/graph_store.redb` from `aethyme-engine-cli index --repo`.
 # `python -m src.cli intents` is still Python (intent catalog discovery).
 cd packages/aethyme
 .venv/bin/python -m src.cli intents --format compact-json

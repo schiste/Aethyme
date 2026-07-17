@@ -280,7 +280,10 @@ analysis and returns:
 
 The current `usage_boundary_query` implementation uses the scope-first
 `analyze-usage-boundary` engine path for PHP public methods/functions. That path
-does not build the full repository graph. For non-PHP scopes, or when
+opens `.aethyme/graph_store.redb` read-only to discover public symbols and
+candidate files, then scans source/docs/config text for evidence. It does not
+build `RepositoryMap` or mutate the store; run `aethyme-engine-cli index --repo
+<repo>` first if the redb artifact is missing. For non-PHP scopes, or when
 `degraded_reasons` includes language/support gaps, use the graph-backed
 `analyze dead-code` / `facts function-usage` commands as the fallback.
 
