@@ -54,6 +54,14 @@ pub enum HooksError {
     )]
     ForeignHook { path: PathBuf },
     #[error(
+        "refusing to install: this repository routes hooks through core.hooksPath = \
+         {configured:?} (a hook manager like husky?), so scripts written to the default \
+         hooks directory would never run. Wire `aethyme broker hooks pre-commit` and \
+         `hooks post-commit` into the scripts there yourself, or unset core.hooksPath \
+         and re-run `aethyme broker hooks install`."
+    )]
+    HooksPathOverride { configured: String },
+    #[error(
         "gate {gate} failed (exit {code}) — commit blocked. Fix and retry, or bypass once \
          with `git commit --no-verify`."
     )]
@@ -222,6 +230,30 @@ fn write_executable(path: &Path, content: &str) -> Result<(), HooksError> {
 pub fn install(repo: &GitRepo, binary: &Path) -> Result<Vec<HookReport>, HooksError> {
     let dir = hooks_dir(repo)?;
     std::fs::create_dir_all(&dir).map_err(io_err(&dir))?;
+
+    // Preflight: a core.hooksPath override (husky and friends) reroutes
+    // hook lookup away from <common>/hooks entirely — installing there
+    // would report success while the hooks silently never run. Allowed
+    // only when the override resolves to the default dir itself.
+    if let Some(configured) = repo.config_get("core.hooksPath") {
+        // Relative core.hooksPath is taken relative to the checkout root
+        // (where git runs hooks from).
+        let resolved = {
+            let path = PathBuf::from(&configured);
+            if path.is_relative() {
+                repo.root().join(path)
+            } else {
+                path
+            }
+        };
+        let same_dir = match (resolved.canonicalize(), dir.canonicalize()) {
+            (Ok(resolved), Ok(dir)) => resolved == dir,
+            _ => false,
+        };
+        if !same_dir {
+            return Err(HooksError::HooksPathOverride { configured });
+        }
+    }
 
     // Preflight: refuse before the first write.
     for hook in MANAGED_HOOKS {

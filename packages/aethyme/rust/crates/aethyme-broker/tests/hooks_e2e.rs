@@ -149,6 +149,35 @@ fn foreign_hook_file_is_refused_untouched() {
 }
 
 #[test]
+fn core_hooks_path_override_refuses_install() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    // A husky-style repo: git resolves hooks ONLY through core.hooksPath,
+    // so anything written to <common>/hooks would silently never run.
+    sh(tmp.path(), &["config", "core.hooksPath", ".husky"]);
+    let repo = GitRepo::discover(tmp.path()).unwrap();
+
+    let err = hooks::install(&repo, Path::new(SHIM)).unwrap_err();
+    assert!(
+        err.to_string().contains("core.hooksPath"),
+        "names the override: {err}"
+    );
+    let dir = hooks::hooks_dir(&repo).unwrap();
+    assert!(
+        !dir.join("pre-commit").exists() && !dir.join("post-commit").exists(),
+        "nothing written where git would ignore it"
+    );
+
+    // Pointing core.hooksPath explicitly AT the default dir is fine.
+    sh(
+        tmp.path(),
+        &["config", "core.hooksPath", dir.to_str().unwrap()],
+    );
+    let reports = hooks::install(&repo, Path::new(SHIM)).unwrap();
+    assert!(reports.iter().all(|r| r.state == HookState::Installed));
+}
+
+#[test]
 fn pre_commit_gate_blocks_failing_commit_and_passes_clean_one() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

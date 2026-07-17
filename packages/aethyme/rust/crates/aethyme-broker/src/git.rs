@@ -202,6 +202,13 @@ impl GitRepo {
             .to_string())
     }
 
+    /// A git config value (`git config --get`), `None` when unset.
+    pub fn config_get(&self, key: &str) -> Option<String> {
+        run_git(&self.root, &["config", "--get", key])
+            .ok()
+            .filter(|value| !value.is_empty())
+    }
+
     pub fn resolve_ref(&self, name: &str) -> Option<String> {
         run_git(
             &self.root,
