@@ -2,7 +2,7 @@ use crate::context_pack::{Anchor, AnchorKind};
 use crate::graph::anchors::{resolve_anchors, resolve_anchors_redb};
 use crate::graph::guidance::{build_in_scope, build_out_of_scope, navigation_order};
 use crate::graph::overview::build_repo_overview;
-use crate::graph::signals::{evaluate_graph_signals, evaluate_graph_signals_redb, GraphSignals};
+use crate::graph::signals::{GraphSignals, evaluate_graph_signals, evaluate_graph_signals_redb};
 use crate::map::RepositoryMap;
 use crate::model::area::AreaNode;
 use crate::model::edge::Edge;
@@ -905,7 +905,7 @@ fn task_navigation_order(map: &RepositoryMap, task: &TaskInput, anchors: &[Ancho
     }
 }
 
-fn task_navigation_order_redb(
+pub(crate) fn task_navigation_order_redb(
     store: &ReadOnlyGraphStore,
     task: &TaskInput,
     anchors: &[Anchor],
@@ -917,7 +917,7 @@ fn task_navigation_order_redb(
     }
 }
 
-fn build_in_scope_redb(
+pub(crate) fn build_in_scope_redb(
     store: &ReadOnlyGraphStore,
     anchors: &[Anchor],
     max_files: usize,
@@ -1056,7 +1056,7 @@ fn build_out_of_scope_redb(
     Ok(boundary)
 }
 
-fn primary_area_names_redb(
+pub(crate) fn primary_area_names_redb(
     store: &ReadOnlyGraphStore,
     anchors: &[Anchor],
 ) -> Result<Vec<String>, GraphStoreError> {
@@ -1148,7 +1148,7 @@ fn file_area_name_redb_nav(
     redb_area_name_by_id(store, &area_id)
 }
 
-fn file_for_redb_symbol(
+pub(crate) fn file_for_redb_symbol(
     store: &ReadOnlyGraphStore,
     symbol_id: &str,
 ) -> Result<Option<String>, GraphStoreError> {
@@ -1168,7 +1168,7 @@ fn push_unique_scope_area(boundary: &mut ScopeBoundary, value: String, reason: &
     }
 }
 
-fn anchor_files_redb(
+pub(crate) fn anchor_files_redb(
     store: &ReadOnlyGraphStore,
     anchors: &[Anchor],
 ) -> Result<std::collections::BTreeSet<String>, GraphStoreError> {
