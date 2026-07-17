@@ -1,24 +1,33 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::Path;
 
 use crate::context_pack::{
     ActivationSummary, Anchor, AnchorKind, Budget, ContextPack, DependencyEdge, FileContent,
-    ImpactItem, Snippet,
+    ImpactItem, RepoOverview, Snippet,
 };
-use crate::graph::activation::{hormone_profile, spread_activation};
-use crate::graph::anchors::resolve_anchors;
+use crate::graph::activation::{hormone_profile, spread_activation, spread_activation_redb};
+use crate::graph::anchors::{resolve_anchors, resolve_anchors_redb};
 use crate::graph::guidance::{build_in_scope, build_out_of_scope_activated, navigation_order};
+use crate::graph::navigation::{
+    anchor_files_redb, build_in_scope_redb, graph_overview_view_redb, primary_area_names_redb,
+    task_navigation_order_redb,
+};
 use crate::graph::neighborhood::{dependency_frontier, impact_frontier};
 use crate::graph::overview::{
     build_repo_overview, overview_dependencies, overview_impact, repo_overview_seed,
 };
-use crate::graph::signals::evaluate_graph_signals;
+use crate::graph::signals::{evaluate_graph_signals, evaluate_graph_signals_redb};
 use crate::map::RepositoryMap;
 use crate::model::edge::EdgeKind;
+use crate::model::risk::{RiskFlag, RiskLevel};
 use crate::model::scope::ScopeBoundary;
 use crate::model::task::TaskInput;
-use crate::snippets::select_snippets;
+use crate::snippets::{select_snippets, select_snippets_redb};
+use crate::store::redb::graph_store::{
+    GraphStoreError, NeighborDirection, OverviewV2, OverviewV2Limits, ReadOnlyGraphStore,
+    StoredNodeKind,
+};
 
 pub fn build_context_pack(root: &Path, map: &RepositoryMap, task: TaskInput) -> ContextPack {
     let anchor_limit = if task.kind.is_explain_repo() { 5 } else { 3 };
@@ -152,6 +161,173 @@ pub fn build_context_pack_with_content(
     pack
 }
 
+#[derive(Debug, Clone)]
+pub struct ContextPackInputs {
+    pub summary: crate::context_pack::PackSummary,
+    pub signals: crate::graph::signals::GraphSignals,
+    pub overview: RepoOverview,
+    pub anchors: Vec<Anchor>,
+    pub in_scope: ScopeBoundary,
+    pub out_of_scope: ScopeBoundary,
+    pub dependencies: Vec<DependencyEdge>,
+    pub impact: Vec<ImpactItem>,
+    pub snippets: Vec<Snippet>,
+    pub risk_flags: Vec<RiskFlag>,
+    pub navigation_order: Vec<String>,
+    pub activation_summary: Option<ActivationSummary>,
+}
+
+impl ContextPackInputs {
+    fn into_context_pack(self, task: TaskInput, budget: Budget) -> ContextPack {
+        let anchor_confidence = if self.anchors.is_empty() {
+            0.0
+        } else if task.kind.is_explain_repo() && self.anchors.len() >= 3 {
+            0.85
+        } else {
+            0.75
+        };
+        let scope_confidence = if self.in_scope.files.is_empty() && self.in_scope.areas.is_empty() {
+            0.0
+        } else if task.kind.is_explain_repo() && !self.in_scope.areas.is_empty() {
+            0.8
+        } else {
+            0.70
+        };
+
+        let mut pack = ContextPack {
+            task,
+            summary: self.summary,
+            signals: self.signals,
+            overview: self.overview,
+            anchors: self.anchors,
+            in_scope: self.in_scope,
+            out_of_scope: self.out_of_scope,
+            dependencies: self.dependencies,
+            impact: self.impact,
+            snippets: self.snippets,
+            file_contents: Vec::new(),
+            risk_flags: self.risk_flags,
+            navigation_order: self.navigation_order,
+            budget,
+            confidence: crate::context_pack::Confidence {
+                anchor_confidence,
+                scope_confidence,
+            },
+            activation_summary: self.activation_summary,
+        };
+        pack.sort();
+        pack
+    }
+}
+
+pub fn build_context_pack_redb(
+    root: &Path,
+    store: &ReadOnlyGraphStore,
+    task: TaskInput,
+) -> Result<ContextPack, GraphStoreError> {
+    let anchor_limit = if task.kind.is_explain_repo() { 5 } else { 3 };
+    let scope_limit = if task.kind.is_explain_repo() { 8 } else { 5 };
+    let budget = Budget {
+        max_anchors: anchor_limit,
+        max_files: scope_limit,
+        ..Default::default()
+    };
+    let inputs = build_context_pack_inputs_redb(root, store, &task, &budget)?;
+    Ok(inputs.into_context_pack(task, budget))
+}
+
+pub fn build_context_pack_with_content_redb(
+    root: &Path,
+    store: &ReadOnlyGraphStore,
+    task: TaskInput,
+    content_budget: usize,
+) -> Result<ContextPack, GraphStoreError> {
+    let mut pack = build_context_pack_redb(root, store, task)?;
+    pack.budget.content_budget = content_budget;
+    pack.file_contents = read_file_contents(
+        root,
+        &pack.anchors,
+        &pack.in_scope,
+        &pack.snippets,
+        &pack.budget,
+    );
+    Ok(pack)
+}
+
+pub fn build_context_pack_inputs_redb(
+    root: &Path,
+    store: &ReadOnlyGraphStore,
+    task: &TaskInput,
+    budget: &Budget,
+) -> Result<ContextPackInputs, GraphStoreError> {
+    let summary_overview = overview_v2_all_redb(store)?;
+    let summary = pack_summary_redb(&summary_overview);
+    let anchors = resolve_anchors_redb(store, task, budget.max_anchors)?;
+    let navigation = task_navigation_order_redb(store, task, &anchors)?;
+    let signals = evaluate_graph_signals_redb(store)?;
+    let overview = if task.kind.is_explain_repo() {
+        let view = graph_overview_view_redb(store)?;
+        RepoOverview {
+            overview_docs: view.overview_docs,
+            code_areas: view.code_areas,
+            reference_areas: view.reference_areas,
+            subareas: view.subareas,
+            entrypoints: view.entrypoints,
+            key_configs: view.key_configs,
+            representative_code_files: view.representative_code_files,
+            representative_docs: view.representative_docs,
+        }
+    } else {
+        Default::default()
+    };
+
+    let primary_areas = primary_area_names_redb(store, &anchors)?;
+    let (mut dependencies, mut impact) = if task.kind.is_explain_repo() {
+        (
+            overview_dependencies_redb(store, &overview)?,
+            overview_impact_redb(&overview),
+        )
+    } else {
+        (
+            focused_dependencies_redb(store, &anchors, &primary_areas)?,
+            focused_impact_redb(store, &anchors, &primary_areas)?,
+        )
+    };
+    dependencies.sort();
+    dependencies.dedup();
+    impact.sort();
+    impact.dedup();
+
+    let profile = hormone_profile(&task.kind);
+    let activation_map = spread_activation_redb(store, &anchors, &profile)?;
+    let activated_set = activation_map.activated_set(0.1);
+    let in_scope = build_in_scope_redb(store, &anchors, budget.max_files)?;
+    let out_of_scope =
+        build_out_of_scope_activated_redb(store, &anchors, &task.kind, &activated_set)?;
+    let risk_flags = filtered_risk_flags_redb(store, &anchors, &activated_set)?;
+    let activation_summary = Some(ActivationSummary {
+        activated_node_count: activation_map.activations.len(),
+        max_depth_reached: activation_map.max_depth_reached,
+        top_activated: activation_map.top_activated(10),
+    });
+    let snippets = select_snippets_redb(root, store, &anchors, budget)?;
+
+    Ok(ContextPackInputs {
+        summary,
+        signals,
+        overview,
+        anchors,
+        in_scope,
+        out_of_scope,
+        dependencies,
+        impact,
+        snippets,
+        risk_flags,
+        navigation_order: navigation,
+        activation_summary,
+    })
+}
+
 fn is_likely_text(path: &Path) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     !matches!(
@@ -274,6 +450,450 @@ fn read_file_contents(
     }
 
     contents
+}
+
+fn overview_v2_all_redb(store: &ReadOnlyGraphStore) -> Result<OverviewV2, GraphStoreError> {
+    let mut overview = store.overview_v2(OverviewV2Limits {
+        area_limit: usize::MAX,
+        directory_limit: usize::MAX,
+        entrypoint_limit: usize::MAX,
+        risk_limit: usize::MAX,
+        file_limit: usize::MAX,
+        function_limit: usize::MAX,
+        class_limit: usize::MAX,
+        doc_limit: usize::MAX,
+        config_limit: usize::MAX,
+        unresolved_limit: usize::MAX,
+    })?;
+    overview.areas = store.list_areas(None)?;
+    Ok(overview)
+}
+
+fn pack_summary_redb(overview: &OverviewV2) -> crate::context_pack::PackSummary {
+    let mut languages = overview
+        .repo
+        .as_ref()
+        .map(|repo| repo.languages.clone())
+        .unwrap_or_default();
+    if languages.is_empty() {
+        languages = overview
+            .files
+            .iter()
+            .filter_map(|file| file.language.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    }
+
+    let top_level_dirs = overview
+        .files
+        .iter()
+        .filter_map(|file| file.path.split_once('/').map(|(dir, _)| dir.to_string()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let readme_path = overview
+        .docs
+        .iter()
+        .find(|doc| doc.doc_type == "readme")
+        .map(|doc| doc.path.clone())
+        .or_else(|| {
+            overview
+                .files
+                .iter()
+                .find(|file| {
+                    file.path
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("README.md"))
+                })
+                .map(|file| file.path.clone())
+        });
+
+    crate::context_pack::PackSummary {
+        snapshot: crate::context_pack::PackSnapshot {
+            languages,
+            top_level_dirs,
+            readme_path,
+        },
+        files_count: overview.files.len(),
+        functions_count: overview.functions.len(),
+        classes_count: overview.classes.len(),
+        docs_count: overview.docs.len(),
+        configs_count: overview.configs.len(),
+    }
+}
+
+fn overview_dependencies_redb(
+    store: &ReadOnlyGraphStore,
+    overview: &RepoOverview,
+) -> Result<Vec<DependencyEdge>, GraphStoreError> {
+    let focus = overview
+        .code_areas
+        .iter()
+        .chain(overview.entrypoints.iter())
+        .chain(overview.representative_code_files.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut edges = Vec::new();
+    for focus_item in focus {
+        for source_id in matching_redb_target_ids(store, &focus_item)? {
+            for edge in store.neighbors(&source_id, NeighborDirection::Outgoing, None)? {
+                if !matches!(
+                    edge.kind,
+                    EdgeKind::Contains
+                        | EdgeKind::Defines
+                        | EdgeKind::EntrypointFor
+                        | EdgeKind::Configures
+                ) {
+                    continue;
+                }
+                let target = display_for_redb_id(store, edge.other.as_str())?;
+                if target.starts_with("doc:") || target.starts_with("repo:") {
+                    continue;
+                }
+                edges.push(DependencyEdge {
+                    from: display_for_redb_id(store, &source_id)?,
+                    to: target,
+                    kind: edge_kind_label(&edge.kind).to_string(),
+                });
+            }
+        }
+    }
+    edges.sort();
+    edges.dedup();
+    edges.truncate(6);
+    Ok(edges)
+}
+
+fn overview_impact_redb(overview: &RepoOverview) -> Vec<ImpactItem> {
+    overview
+        .entrypoints
+        .iter()
+        .take(2)
+        .map(|entry| ImpactItem {
+            symbol: entry.clone(),
+            file: entry.clone(),
+            reason: "entrypoint candidate".to_string(),
+        })
+        .collect()
+}
+
+fn focused_dependencies_redb(
+    store: &ReadOnlyGraphStore,
+    anchors: &[Anchor],
+    primary_areas: &[String],
+) -> Result<Vec<DependencyEdge>, GraphStoreError> {
+    let mut dependencies = Vec::new();
+    for anchor in anchors {
+        let source_id = anchor.id.as_str();
+        for edge in store.neighbors(source_id, NeighborDirection::Outgoing, None)? {
+            if !matches!(
+                edge.kind,
+                EdgeKind::Configures
+                    | EdgeKind::EntrypointFor
+                    | EdgeKind::Imports
+                    | EdgeKind::Calls
+                    | EdgeKind::References
+            ) {
+                continue;
+            }
+            let display = display_for_redb_id(store, edge.other.as_str())?;
+            if !primary_areas.is_empty()
+                && !display_in_primary_area_redb(store, &display, primary_areas)?
+            {
+                continue;
+            }
+            dependencies.push(DependencyEdge {
+                from: display_for_redb_id(store, source_id)?,
+                to: display,
+                kind: edge_kind_label(&edge.kind).to_string(),
+            });
+        }
+        if dependencies.is_empty() {
+            for dependency in dependency_frontier_redb(store, source_id)?
+                .into_iter()
+                .take(3)
+            {
+                if !primary_areas.is_empty()
+                    && !display_in_primary_area_redb(store, &dependency, primary_areas)?
+                {
+                    continue;
+                }
+                dependencies.push(DependencyEdge {
+                    from: display_for_redb_id(store, source_id)?,
+                    to: dependency,
+                    kind: "related".to_string(),
+                });
+            }
+        }
+    }
+    dependencies.sort();
+    dependencies.dedup();
+    dependencies.truncate(6);
+    Ok(dependencies)
+}
+
+fn focused_impact_redb(
+    store: &ReadOnlyGraphStore,
+    anchors: &[Anchor],
+    primary_areas: &[String],
+) -> Result<Vec<ImpactItem>, GraphStoreError> {
+    let mut impact = Vec::new();
+    for anchor in anchors {
+        let target_id = anchor.id.as_str();
+        for edge in store.neighbors(target_id, NeighborDirection::Incoming, None)? {
+            if !matches!(
+                edge.kind,
+                EdgeKind::Configures
+                    | EdgeKind::EntrypointFor
+                    | EdgeKind::Calls
+                    | EdgeKind::References
+            ) {
+                continue;
+            }
+            let display = display_for_redb_id(store, edge.other.as_str())?;
+            if !primary_areas.is_empty()
+                && !display_in_primary_area_redb(store, &display, primary_areas)?
+            {
+                continue;
+            }
+            impact.push(ImpactItem {
+                symbol: display.clone(),
+                file: display,
+                reason: format!("reverse {}", edge_kind_label(&edge.kind)),
+            });
+        }
+        if impact.is_empty() {
+            for item in impact_frontier_redb(store, target_id)?.into_iter().take(3) {
+                if !primary_areas.is_empty()
+                    && !display_in_primary_area_redb(store, &item, primary_areas)?
+                {
+                    continue;
+                }
+                impact.push(ImpactItem {
+                    symbol: item.clone(),
+                    file: item,
+                    reason: "reverse dependency".to_string(),
+                });
+            }
+        }
+    }
+    impact.sort();
+    impact.dedup();
+    impact.truncate(6);
+    Ok(impact)
+}
+
+fn dependency_frontier_redb(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+) -> Result<Vec<String>, GraphStoreError> {
+    let seeds = matching_redb_target_ids(store, target)?;
+    let mut frontier = BTreeSet::new();
+    for edge in store.all_edges()? {
+        if seeds.iter().any(|seed| {
+            seed == edge.from.as_str()
+                || edge.from.as_str().ends_with(seed)
+                || edge.to.as_str().ends_with(seed)
+        }) && !seeds.iter().any(|seed| seed == edge.to.as_str())
+        {
+            frontier.insert(display_for_redb_id(store, edge.to.as_str())?);
+        }
+    }
+    Ok(frontier.into_iter().collect())
+}
+
+fn impact_frontier_redb(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+) -> Result<Vec<String>, GraphStoreError> {
+    let seeds = matching_redb_target_ids(store, target)?;
+    let mut frontier = BTreeSet::new();
+    for edge in store.all_edges()? {
+        if seeds.iter().any(|seed| {
+            seed == edge.to.as_str()
+                || edge.to.as_str().ends_with(seed)
+                || edge.from.as_str().ends_with(seed)
+        }) && !seeds.iter().any(|seed| seed == edge.from.as_str())
+        {
+            frontier.insert(display_for_redb_id(store, edge.from.as_str())?);
+        }
+    }
+    Ok(frontier.into_iter().collect())
+}
+
+fn build_out_of_scope_activated_redb(
+    store: &ReadOnlyGraphStore,
+    anchors: &[Anchor],
+    task_kind: &crate::model::task::TaskKind,
+    activated_set: &HashSet<String>,
+) -> Result<ScopeBoundary, GraphStoreError> {
+    let mut boundary = ScopeBoundary::default();
+    if matches!(task_kind, crate::model::task::TaskKind::ExplainRepo) {
+        return Ok(boundary);
+    }
+
+    let primary_areas = primary_area_names_redb(store, anchors)?;
+    if !primary_areas.is_empty() {
+        let overview = overview_v2_all_redb(store)?;
+        for area in overview.areas {
+            if primary_areas.contains(&area.name) {
+                continue;
+            }
+            let area_has_activation = overview
+                .files
+                .iter()
+                .filter(|file| file.area_id.as_deref() == Some(area.id.as_str()))
+                .any(|file| activated_set.contains(&file.id) || activated_set.contains(&file.path));
+
+            if area_has_activation {
+                boundary.areas.push(crate::model::scope::ScopeItem::new(
+                    area.name,
+                    crate::model::scope::ScopeKind::Area,
+                    "partially activated — exercise caution",
+                ));
+            } else {
+                boundary.areas.push(crate::model::scope::ScopeItem::new(
+                    area.name,
+                    crate::model::scope::ScopeKind::Area,
+                    "outside the matched primary area",
+                ));
+            }
+        }
+    }
+
+    let anchor_files = anchor_files_redb(store, anchors)?;
+    for risk in overview_v2_all_redb(store)?.risks {
+        if matches!(risk.level, RiskLevel::Low) {
+            continue;
+        }
+        if anchor_files.iter().any(|file| risk.scope == *file) {
+            continue;
+        }
+        if activated_set.contains(&risk.scope) {
+            boundary.areas.push(crate::model::scope::ScopeItem::new(
+                risk.scope,
+                crate::model::scope::ScopeKind::Area,
+                format!("high-risk area: {}", risk.reason),
+            ));
+        }
+    }
+
+    boundary.sort();
+    Ok(boundary)
+}
+
+fn filtered_risk_flags_redb(
+    store: &ReadOnlyGraphStore,
+    anchors: &[Anchor],
+    activated_set: &HashSet<String>,
+) -> Result<Vec<RiskFlag>, GraphStoreError> {
+    let anchor_files = anchor_files_redb(store, anchors)?;
+    Ok(overview_v2_all_redb(store)?
+        .risks
+        .into_iter()
+        .filter(|risk| activated_set.contains(&risk.scope) || anchor_files.contains(&risk.scope))
+        .collect())
+}
+
+fn matching_redb_target_ids(
+    store: &ReadOnlyGraphStore,
+    target: &str,
+) -> Result<Vec<String>, GraphStoreError> {
+    let target = target.trim();
+    let mut ids = Vec::new();
+    if target.is_empty() {
+        return Ok(ids);
+    }
+
+    if store.node_display(target)?.is_some() {
+        push_unique_string(&mut ids, target.to_string());
+    }
+    if let Some(file) = store.resolve_file_path(target)? {
+        push_unique_string(&mut ids, file.id);
+    }
+    for area in store.list_areas(None)? {
+        if area.id == target
+            || area.name.eq_ignore_ascii_case(target)
+            || area.path_prefix.eq_ignore_ascii_case(target)
+        {
+            push_unique_string(&mut ids, area.id);
+        }
+    }
+    for node in store.nodes_under_path(target)? {
+        if node.id() == target
+            || node
+                .path()
+                .map(|path| path.eq_ignore_ascii_case(target))
+                .unwrap_or(false)
+        {
+            push_unique_string(&mut ids, node.id().to_string());
+        }
+    }
+    if let Some((path, name)) = target.rsplit_once("::") {
+        for symbol in store.find_symbols(name, None)? {
+            if symbol.path.eq_ignore_ascii_case(path)
+                || format!("{}::{}", symbol.path, symbol.name).eq_ignore_ascii_case(target)
+            {
+                push_unique_string(&mut ids, symbol.id);
+            }
+        }
+    }
+    if ids.is_empty() {
+        for symbol in store.find_symbols(target, None)? {
+            push_unique_string(&mut ids, symbol.id);
+        }
+    }
+    if ids.is_empty() {
+        ids.push(target.to_string());
+    }
+    Ok(ids)
+}
+
+fn display_for_redb_id(store: &ReadOnlyGraphStore, id: &str) -> Result<String, GraphStoreError> {
+    Ok(match store.node_display(id)? {
+        Some(node)
+            if matches!(
+                node.kind,
+                StoredNodeKind::Directory | StoredNodeKind::Repository
+            ) =>
+        {
+            id.to_string()
+        }
+        Some(node) => node.display,
+        None => id.to_string(),
+    })
+}
+
+fn display_in_primary_area_redb(
+    store: &ReadOnlyGraphStore,
+    display: &str,
+    primary_areas: &[String],
+) -> Result<bool, GraphStoreError> {
+    if primary_areas.is_empty() || primary_areas.iter().any(|area| area == display) {
+        return Ok(true);
+    }
+    Ok(file_area_name_redb(store, display)?
+        .map(|area| primary_areas.contains(&area))
+        .unwrap_or(false))
+}
+
+fn file_area_name_redb(
+    store: &ReadOnlyGraphStore,
+    file_path: &str,
+) -> Result<Option<String>, GraphStoreError> {
+    let Some(area_id) = store.area_for_node(file_path)? else {
+        return Ok(None);
+    };
+    Ok(store.node_display(&area_id)?.map(|node| node.name))
+}
+
+fn push_unique_string(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
 }
 
 fn focused_dependencies(

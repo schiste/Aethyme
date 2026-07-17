@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::context_pack::{Anchor, AnchorKind, Budget, Snippet};
 use crate::map::RepositoryMap;
+use crate::store::redb::graph_store::{GraphStoreError, ReadOnlyGraphStore, StoredNode};
 
 pub fn select_snippets(
     root: &Path,
@@ -43,6 +44,45 @@ pub fn select_snippets(
     snippets
 }
 
+pub fn select_snippets_redb(
+    root: &Path,
+    store: &ReadOnlyGraphStore,
+    anchors: &[Anchor],
+    budget: &Budget,
+) -> Result<Vec<Snippet>, GraphStoreError> {
+    let mut snippets = Vec::new();
+    let window = budget.snippet_window;
+
+    for anchor in anchors {
+        let Some(file) = &anchor.file else {
+            continue;
+        };
+        let absolute_path = root.join(file);
+        let contents = fs::read_to_string(&absolute_path).unwrap_or_default();
+        let line_count = contents.lines().count();
+        if line_count == 0 {
+            continue;
+        }
+        let (start_line, end_line, kind) = match anchor.kind {
+            AnchorKind::Symbol => symbol_window_redb(store, &anchor.id, file, line_count, window)?,
+            AnchorKind::File => file_header_window_redb(store, file, line_count, window)?,
+            AnchorKind::Folder => (1, line_count.min(window), "overview".to_string()),
+        };
+        snippets.push(Snippet {
+            file: file.clone(),
+            start_line,
+            end_line,
+            kind,
+        });
+        if snippets.len() >= budget.max_snippets {
+            break;
+        }
+    }
+
+    snippets.sort();
+    Ok(snippets)
+}
+
 fn symbol_window(
     map: &RepositoryMap,
     symbol_id: &str,
@@ -70,6 +110,27 @@ fn symbol_window(
     (start, end, "definition".to_string())
 }
 
+fn symbol_window_redb(
+    store: &ReadOnlyGraphStore,
+    symbol_id: &str,
+    file_path: &str,
+    line_count: usize,
+    window: usize,
+) -> Result<(usize, usize, String), GraphStoreError> {
+    let def_line = match store.get_node(symbol_id)? {
+        Some(StoredNode::Function(function)) => Some(function.line),
+        Some(StoredNode::Class(class)) => Some(class.line),
+        _ => None,
+    };
+
+    let start = match def_line {
+        Some(line) if line >= 1 => line,
+        _ => 1,
+    };
+    let end = find_symbol_end_redb(store, file_path, start, line_count, window)?;
+    Ok((start, end, "definition".to_string()))
+}
+
 fn file_header_window(
     map: &RepositoryMap,
     file_path: &str,
@@ -83,6 +144,23 @@ fn file_header_window(
         _ => line_count.min(window),
     };
     (1, end, "overview".to_string())
+}
+
+fn file_header_window_redb(
+    store: &ReadOnlyGraphStore,
+    file_path: &str,
+    line_count: usize,
+    window: usize,
+) -> Result<(usize, usize, String), GraphStoreError> {
+    let first_def_line = definition_lines_in_file_redb(store, file_path)?
+        .into_iter()
+        .min();
+
+    let end = match first_def_line {
+        Some(line) if line > 1 => (line + 3).min(line_count).min(window),
+        _ => line_count.min(window),
+    };
+    Ok((1, end, "overview".to_string()))
 }
 
 fn find_symbol_end(
@@ -105,6 +183,26 @@ fn find_symbol_end(
     end.max(start_line)
 }
 
+fn find_symbol_end_redb(
+    store: &ReadOnlyGraphStore,
+    file_path: &str,
+    start_line: usize,
+    line_count: usize,
+    window: usize,
+) -> Result<usize, GraphStoreError> {
+    let next_def = definition_lines_in_file_redb(store, file_path)?
+        .into_iter()
+        .filter(|&line| line > start_line)
+        .min();
+
+    let window_end = start_line + window - 1;
+    let mut end = window_end.min(line_count);
+    if let Some(next) = next_def {
+        end = end.min(next.saturating_sub(1));
+    }
+    Ok(end.max(start_line))
+}
+
 fn definition_lines_in_file(map: &RepositoryMap, file_path: &str) -> Vec<usize> {
     let mut lines: Vec<usize> = Vec::new();
     for f in &map.functions {
@@ -118,4 +216,23 @@ fn definition_lines_in_file(map: &RepositoryMap, file_path: &str) -> Vec<usize> 
         }
     }
     lines
+}
+
+fn definition_lines_in_file_redb(
+    store: &ReadOnlyGraphStore,
+    file_path: &str,
+) -> Result<Vec<usize>, GraphStoreError> {
+    let mut lines = Vec::new();
+    for node in store.nodes_under_path(file_path)? {
+        match node {
+            StoredNode::Function(function) if function.file_path.as_str() == file_path => {
+                lines.push(function.line);
+            }
+            StoredNode::Class(class) if class.file_path.as_str() == file_path => {
+                lines.push(class.line);
+            }
+            _ => {}
+        }
+    }
+    Ok(lines)
 }
