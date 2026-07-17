@@ -380,13 +380,14 @@ fragments as the regeneration source.
 
 Current redb storage coverage:
 
-- Schema version `3` means `aethyme-engine-cli index` populates typed rows
+- Schema version `4` means `aethyme-engine-cli index` populates typed rows
   for repositories, directories, files, areas, functions, classes, docs,
   configs, unresolved/import placeholders, and risks.
 - `SYMBOL_BY_NAME` is populated for function/class simple names using
-  ASCII-lowercased exact-name keys. `FUNCTIONS_BY_PATH` is populated for
-  file-scoped function lookup. `NODES_BY_PATH` is the broader path index for
-  directories, files, functions, classes, docs, configs, and
+  ASCII-lowercased exact-name keys. `SYMBOL_BY_COMPONENT` is populated for
+  lowercased function/class name components. `FUNCTIONS_BY_PATH` is populated
+  for file-scoped function lookup. `NODES_BY_PATH` is the broader path index
+  for directories, files, functions, classes, docs, configs, and
   unresolved/import placeholders.
 - The writer persists the graph edge set without skipping edges for missing
   unresolved/import endpoint rows. Placeholder endpoints are stored as typed
@@ -422,24 +423,26 @@ Required V2 read APIs for replacing `RepositoryMap` reads:
 
 | API family | Required capability | Current graph-module consumer |
 |---|---|---|
-| Node lookup | Implemented as `get_node(id)` for typed file/area/function/class/doc/config rows. Batch lookup is still caller-side composition over this primitive. | `node_view`, relation rendering, risk/doc/config display. |
-| Symbol lookup | Implemented as `find_symbols(name, kind?)` over exact ASCII-lowercased function/class names, returning canonical ids plus path/line/signature/language/area signals. Bounded fuzzy/prefix ranking still belongs above the store. | `task_anchors_view`, symbol query surfaces, graph target resolution. |
+| Node lookup | Implemented as `get_node(id)`, `get_nodes(ids)`, `node_display(id)`, and `area_for_node(id/path)` for typed repository/directory/file/area/function/class/doc/config/unresolved rows. | `node_view`, relation rendering, risk/doc/config display. |
+| Relation lookup | Implemented as `children(id, kind?)`, `parents(id, kind?)`, `relation_view(id, relation)`, `docs_for(id)`, `configs_for(id)`, and `risk_for_node_or_path(id/path)`. | `children_view`, `parents_view`, `docs_view`, `configs_view`, `graph_expand_view`, `task_expand_view`. |
+| Symbol lookup | Implemented as `find_symbols(name, kind?)` for exact lookup and `symbols_matching(query)` / `symbols_matching_with(...)` for bounded exact, prefix, component, path, and area-signal candidates. Ranking still belongs above the store. | `task_anchors_view`, symbol query surfaces, graph target resolution. |
 | Path prefix lookup | Implemented as `nodes_under_path(prefix)`, `functions_under_path(prefix)`, and `resolve_file_path(path)` over redb path indexes. | Scope expansion, area views, task-local navigation seeds. |
 | Adjacency | Implemented as `neighbors(id, direction, kind?)`; existing `edges_from` / `edges_to` remain compatibility wrappers for unfiltered directions. | `children_view`, `parents_view`, `callers_view`, `callees_view`, `docs_view`, `configs_view`, `task_expand_view`, `graph_expand_view`. |
-| Task anchor candidates | Query by task text tokens against symbols, paths, docs/configs, areas, and unresolved/import names, returning typed candidates and ranking signals. Ranking may stay in the graph module, but the store must provide the bounded candidate rows without rebuilding `RepositoryMap`. | `task_anchors_view`, `task_scope_view`, `task_next_view`, context-pack assembly. |
-| Overview/navigation slices | Implemented as `overview_v2(...)` for bounded repo metadata, areas, entrypoints, risks, files, functions, classes, docs, and configs. Higher-level task/navigation slices still need graph-module adapters. | `graph_overview_view`, `task_next_view`, `explore`, context-pack navigation order. |
+| Task anchor candidates | Implemented as `task_anchor_candidates(task_tokens, limit)`, returning bounded typed candidates with exact/prefix/component/path/area signals. Ranking may stay in the graph module. | `task_anchors_view`, `task_scope_view`, `task_next_view`, context-pack assembly. |
+| Usage-boundary seeds | Implemented as `usage_boundary_candidates(scope, symbol_kind, limit)` over bounded path-index rows. | `usage_boundary_query`, dead-code analysis seed selection. |
+| Overview/navigation slices | Implemented as `overview_v2(...)` for bounded repo metadata, repository, directories, areas, entrypoints, risks, files, functions, classes, docs, configs, and unresolved placeholders. Higher-level task/navigation slices still need graph-module adapters. | `graph_overview_view`, `task_next_view`, `explore`, context-pack navigation order. |
 
 Bridge decisions as of 2026-07-15:
 
 | Consumer | Decision | Current status |
 |---|---|---|
-| `symbol` / `symbol-batch` | Redb-backed exact lookup. | CLI opens `.aethyme/graph_store.redb` read-only and serves function/class simple-name queries through `find_symbols`; it fails cleanly when the store is missing. Fuzzy component, path, and area ranking remain meaningful only inside higher-level `RepositoryMap` task/anchor flows for now. |
+| `symbol` / `symbol-batch` | Redb-backed exact lookup. | CLI opens `.aethyme/graph_store.redb` read-only and serves function/class simple-name queries through `find_symbols`; it fails cleanly when the store is missing. Broader component/path/area candidate lookup now exists in `symbols_matching`, but the CLI exact surfaces intentionally stay stable. |
 | `deps` / `importers` | Redb-backed equivalent. | CLI reads `neighbors(id, Outgoing/Incoming, None)` and preserves the existing path-list output. |
 | `query-overview` | Redb-backed equivalent with V1 JSON projection. | CLI reads `overview_v2(Default)` but still emits only the stable `repo`, `areas`, `entrypoints`, and `risks` keys. |
 | `callers` | Keep the hybrid grep + redb adjacency path. | Grep finds candidate files containing the symbol; redb `neighbors(..., Incoming, None)` expands importers before line grep. |
-| `anchors` | Keep using `RepositoryMap` for V1. | Anchor ranking depends on fuzzy symbol scoring, file references, areas, configs, ExplainRepo-specific fillers, and task-kind rules that are not yet represented as redb candidate queries. |
-| `task scope` / `task next` | Keep using `RepositoryMap` for V1. | These views compose anchors with scope narrowing, risk selection, and navigation order; move only after redb anchor candidates have parity tests. |
-| `graph expand` / relation views | Keep using `RepositoryMap` for high-level views; bridge low-level adjacency first. | `neighbors` covers raw adjacency, but rendered graph slices still need node labeling, child/parent/doc/config semantics, and parity tests before replacement. |
+| `anchors` | Keep using `RepositoryMap` for V1. | Redb now exposes bounded task anchor candidates, but anchor ranking still depends on fuzzy scoring, file references, areas/configs, task-kind rules, and parity tests before replacement. |
+| `task scope` / `task next` | Keep using `RepositoryMap` for V1. | These views compose anchors with scope narrowing, risk selection, and navigation order; move only after redb anchor candidates are wired into graph-module ranking and covered by parity tests. |
+| `graph expand` / relation views | Keep using `RepositoryMap` for high-level views; bridge low-level relation APIs first. | Redb now exposes display projections and child/parent/doc/config relation views, but rendered graph slices still need graph-module adapters and parity tests before replacement. |
 | `usage boundary` | Keep using `RepositoryMap` and grep/analyzer logic. | The current analyzer is scope-first and language-specific; redb can provide symbol/path seeds later but should not own the policy yet. |
 | Trait abstraction | Defer. | A trait is useful only once two consumers need the same read contract; today the low-risk commands can call redb directly and higher-level flows still need richer candidate APIs. |
 
