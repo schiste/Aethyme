@@ -35,7 +35,9 @@ mod types;
 
 pub use broker::{AdoptMode, AgentView, Broker, BrokerOpError, DoctorReport, StatusView};
 pub use error::BrokerError;
-pub use gates::{Gate, GateConfigError, GateRunOutcome, load_gates, select_gates};
+pub use gates::{
+    Gate, GateConfigError, GateProgressSink, GateRunOutcome, load_gates, select_gates,
+};
 pub use git::{GitError, GitRepo, MergeSimulation};
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use merge::{ACTION_REQUIRED_RELPATH, PromoteConfig, SubmitOutcome};

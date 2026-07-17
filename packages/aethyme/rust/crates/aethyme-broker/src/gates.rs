@@ -17,6 +17,7 @@
 //! validation rather than silently never matching.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
@@ -172,6 +173,29 @@ pub struct GateRunOutcome {
     pub log_path: Option<String>,
 }
 
+/// Sink for human-readable gate progress. Production uses stderr; tests can
+/// inject a collector without changing child stdout/stderr capture.
+pub trait GateProgressSink: Send + Sync {
+    fn report(&self, line: &str);
+}
+
+struct StderrGateProgressSink;
+
+impl GateProgressSink for StderrGateProgressSink {
+    fn report(&self, line: &str) {
+        eprintln!("{line}");
+    }
+}
+
+fn heartbeat_interval() -> Duration {
+    let seconds = std::env::var("AETHYME_GATE_HEARTBEAT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(30);
+    Duration::from_secs(seconds)
+}
+
 /// Directory holding pidfiles for in-flight gate runs, enabling
 /// cross-process cancellation without a daemon. One file per running
 /// gate: `<session>-<gate>.pid` containing `<pgid> <tree_hash>`.
@@ -248,6 +272,23 @@ pub fn run_affected(
     changed: &[String],
     session_id: Option<i64>,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    let progress = StderrGateProgressSink;
+    run_affected_with_progress(
+        store, main_root, checkout, gates, changed, session_id, &progress,
+    )
+}
+
+/// Like [`run_affected`], with an injectable progress sink for tests and
+/// future non-CLI surfaces.
+pub fn run_affected_with_progress(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gates: &[Gate],
+    changed: &[String],
+    session_id: Option<i64>,
+    progress: &dyn GateProgressSink,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     let tree = checkout.working_tree_hash()?;
     if let Some(session_id) = session_id {
         cancel_obsolete_runs(store, main_root, session_id, &tree);
@@ -266,13 +307,18 @@ pub fn run_affected(
         // hit is recorded as an event so saved execution time is
         // measurable (kill-criterion accounting).
         if let Some(hit) = store.cached_gate_result(&gate.name, &tree)? {
+            let saved_ms = hit.duration_ms.unwrap_or(0);
+            progress.report(&format!(
+                "gate {} cached ({}, saved {}ms)",
+                gate.name,
+                hit.status.as_str(),
+                saved_ms
+            ));
             let _ = store.append_event(
                 crate::events::GATE_CACHED,
                 session_id,
                 Some(&crate::events::gate_cached_payload(
-                    &gate.name,
-                    &tree,
-                    hit.duration_ms.unwrap_or(0),
+                    &gate.name, &tree, saved_ms,
                 )),
             );
             let failed = hit.status == GateStatus::Fail;
@@ -291,15 +337,20 @@ pub fn run_affected(
         }
 
         let log_path = log_dir.join(format!("{}-{}.log", gate.name, &tree[..8.min(tree.len())]));
-        let started = std::time::Instant::now();
+        progress.report(&format!("gate {} started (cost {})", gate.name, gate.cost));
+        let started = Instant::now();
         let status = run_gate_command(
             &gate.command,
-            checkout.root(),
-            &log_path,
-            &run_dir,
-            session_id,
-            &gate.name,
-            &tree,
+            GateCommandContext {
+                cwd: checkout.root(),
+                log_path: &log_path,
+                run_dir: &run_dir,
+                session_id,
+                gate_name: &gate.name,
+                tree: &tree,
+                started,
+                progress,
+            },
         );
         let duration_ms = started.elapsed().as_millis() as i64;
         let (gate_status, exit_code) = match status {
@@ -307,6 +358,16 @@ pub fn run_affected(
             Ok(code) => (GateStatus::Fail, Some(code as i64)),
             Err(_) => (GateStatus::Error, None),
         };
+        progress.report(&format!(
+            "gate {} {} in {}s",
+            gate.name,
+            if gate_status == GateStatus::Pass {
+                "pass"
+            } else {
+                "fail"
+            },
+            started.elapsed().as_secs()
+        ));
         store.record_gate_result(&NewGateResult {
             gate_name: gate.name.clone(),
             tree_hash: tree.clone(),
@@ -334,34 +395,61 @@ pub fn run_affected(
 
 /// Spawn one gate command (`sh -c`, own process group, output to log),
 /// maintaining the pidfile for cancellation. Returns the exit code.
-fn run_gate_command(
-    command: &str,
-    cwd: &Path,
-    log_path: &Path,
-    run_dir: &Path,
+struct GateCommandContext<'a> {
+    cwd: &'a Path,
+    log_path: &'a Path,
+    run_dir: &'a Path,
     session_id: Option<i64>,
-    gate_name: &str,
-    tree: &str,
-) -> Result<i32, std::io::Error> {
+    gate_name: &'a str,
+    tree: &'a str,
+    started: Instant,
+    progress: &'a dyn GateProgressSink,
+}
+
+fn run_gate_command(command: &str, context: GateCommandContext<'_>) -> Result<i32, std::io::Error> {
     use std::os::unix::process::CommandExt;
 
-    let log = std::fs::File::create(log_path)?;
+    let log = std::fs::File::create(context.log_path)?;
     let log_err = log.try_clone()?;
     let mut child = std::process::Command::new("sh")
         .arg("-c")
         .arg(command)
-        .current_dir(cwd)
+        .current_dir(context.cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err))
         .process_group(0)
         .spawn()?;
 
-    let pidfile = session_id.map(|sid| run_dir.join(format!("{sid}-{gate_name}.pid")));
+    let pidfile = context.session_id.map(|sid| {
+        context
+            .run_dir
+            .join(format!("{sid}-{}.pid", context.gate_name))
+    });
     if let Some(pidfile) = &pidfile {
-        let _ = std::fs::write(pidfile, format!("{} {tree}", child.id()));
+        let _ = std::fs::write(pidfile, format!("{} {}", child.id(), context.tree));
     }
-    let status = child.wait();
+    let status = std::thread::scope(|scope| {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let interval = heartbeat_interval();
+        scope.spawn(move || {
+            loop {
+                match done_rx.recv_timeout(interval) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        context.progress.report(&format!(
+                            "gate {} running... {}s",
+                            context.gate_name,
+                            context.started.elapsed().as_secs()
+                        ));
+                    }
+                }
+            }
+        });
+        let status = child.wait();
+        let _ = done_tx.send(());
+        status
+    });
     if let Some(pidfile) = &pidfile {
         let _ = std::fs::remove_file(pidfile);
     }

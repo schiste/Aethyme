@@ -2,10 +2,58 @@
 //! processes, tree-hash caching across sessions, cheap-first ordering
 //! with fail-fast, and cancellation of superseded runs.
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Mutex;
 
-use aethyme_broker::{Broker, GateStatus};
+use aethyme_broker::{Broker, GateProgressSink, GateStatus};
+
+#[derive(Default)]
+struct CapturedProgress {
+    lines: Mutex<Vec<String>>,
+}
+
+impl CapturedProgress {
+    fn lines(&self) -> Vec<String> {
+        self.lines.lock().unwrap().clone()
+    }
+}
+
+impl GateProgressSink for CapturedProgress {
+    fn report(&self, line: &str) {
+        self.lines.lock().unwrap().push(line.to_string());
+    }
+}
+
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: this test restores the variable via Drop. Other tests do
+        // not depend on this value, and a shorter heartbeat is harmless.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: restoring process environment at test teardown; see set().
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -132,6 +180,41 @@ triggers = ["**/*.py"]
     assert!(
         outcomes.iter().all(|o| o.cached),
         "identical tree in another session reuses results: {outcomes:?}"
+    );
+}
+
+#[test]
+fn slow_gate_emits_heartbeat_progress() {
+    let _env = EnvGuard::set("AETHYME_GATE_HEARTBEAT_SECS", "1");
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "heartbeat"
+command = "sleep 2"
+triggers = ["**/*.py"]
+"#,
+    );
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = add_worktree(tmp.path(), "heartbeat");
+    let session = broker.adopt(&wt, None).unwrap();
+    std::fs::write(wt.join("src/app.py"), "x = 3\n").unwrap();
+
+    let progress = CapturedProgress::default();
+    let outcomes = broker
+        .run_gates_with_progress(session.id, &progress)
+        .unwrap();
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].status, GateStatus::Pass);
+    let lines = progress.lines();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("gate heartbeat running... ") && line.ends_with('s')),
+        "expected heartbeat progress line, got {lines:?}"
     );
 }
 

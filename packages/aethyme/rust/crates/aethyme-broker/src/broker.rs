@@ -414,6 +414,25 @@ impl Broker {
         )
     }
 
+    /// Test/non-CLI entrypoint for gate runs with injectable progress
+    /// reporting. The default [`Self::run_gates`] sink writes to stderr.
+    pub fn run_gates_with_progress(
+        &mut self,
+        session_id: i64,
+        progress: &dyn crate::gates::GateProgressSink,
+    ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
+        let (checkout, gates, changed) = self.gate_inputs(session_id)?;
+        crate::gates::run_affected_with_progress(
+            &mut self.store,
+            &self.main_root,
+            &checkout,
+            &gates,
+            &changed,
+            Some(session_id),
+            progress,
+        )
+    }
+
     /// Cancel this session's in-flight gate runs whose tree differs from
     /// the worktree's current state (also done automatically at the start
     /// of [`Self::run_gates`]). Returns the cancelled gate names.
