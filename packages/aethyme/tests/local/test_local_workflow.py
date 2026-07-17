@@ -73,6 +73,17 @@ def bootstrap_repo_fragments(root: Path) -> None:
     )
     assert result.returncode == 0, f"aethyme-graph-index failed: {result.stderr}"
 
+    # Graph queries read from the redb store and will not create it
+    # themselves, so demo repos must materialize it from the fragments —
+    # the same contract as setup-playground.sh.
+    index_result = subprocess.run(
+        [str(ensure_engine_binary()), "index", "--repo", str(root), "--from-fragments"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert index_result.returncode == 0, f"engine index failed: {index_result.stderr}"
+
 
 def build_demo_repo(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
