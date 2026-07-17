@@ -90,6 +90,22 @@ fn parse_path_lines(out: &str) -> Vec<String> {
         .collect()
 }
 
+/// Extract paths from NUL-separated (`-z`) git output — the stronger
+/// sibling of [`parse_path_lines`] for the implicit-lease surface. Real
+/// paths never contain NUL or newline, so a chunk with an embedded
+/// newline betrays a shim decoration glued onto a path and is dropped;
+/// unlike the line grammar, an all-printable-ASCII decoration (e.g.
+/// `3 files changed`) cannot slip through as a phantom path, and
+/// non-ASCII paths arrive raw instead of C-quoted. Conservative by
+/// design: a decoration can swallow the one path it was glued to, but
+/// no decoration ever becomes a lease.
+fn parse_nul_paths(out: &str) -> Vec<String> {
+    out.split('\0')
+        .filter(|chunk| !chunk.is_empty() && !chunk.contains('\n'))
+        .map(str::to_string)
+        .collect()
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
     run_git_inner(cwd, None, args)
 }
@@ -366,11 +382,17 @@ impl GitRepo {
 
     /// Tracked-file changes (committed + staged + unstaged) against
     /// `base`, plus untracked files: the diff surface implicit leases are
-    /// derived from.
+    /// derived from. NUL-separated output because shim-decorated
+    /// line output was observed minting leases named `""` and
+    /// `"--- Changes ---"` (2026-07-17 operational data).
     pub fn changed_files(&self, base: &str) -> Result<Vec<String>, GitError> {
-        let mut files = parse_path_lines(&run_git(&self.root, &["diff", "--name-only", base])?);
-        let untracked = run_git(&self.root, &["ls-files", "--others", "--exclude-standard"])?;
-        files.extend(parse_path_lines(&untracked));
+        let mut files =
+            parse_nul_paths(&run_git(&self.root, &["diff", "--name-only", "-z", base])?);
+        let untracked = run_git(
+            &self.root,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+        )?;
+        files.extend(parse_nul_paths(&untracked));
         files.sort();
         files.dedup();
         Ok(files)
@@ -561,5 +583,36 @@ mod porcelain_tests {
     fn rename_lines_keep_the_target() {
         let out = "R  old.rs -> new.rs\n";
         assert_eq!(parse_porcelain_paths(out), vec!["new.rs"]);
+    }
+}
+
+#[cfg(test)]
+mod nul_path_tests {
+    use super::parse_nul_paths;
+
+    #[test]
+    fn nul_separated_paths_round_trip() {
+        let out = "src/a.rs\0dir with space/b.rs\0c.rs\0";
+        assert_eq!(
+            parse_nul_paths(out),
+            vec!["src/a.rs", "dir with space/b.rs", "c.rs"]
+        );
+    }
+
+    #[test]
+    fn shim_decorations_never_become_paths() {
+        // Observed 2026-07-17: a PATH shim wrapped `diff --name-only`
+        // output in a "--- Changes ---" header and blank lines, which the
+        // old line-based parse recorded as leases. In -z output such
+        // decorations carry newlines; every chunk containing one is
+        // rejected rather than risking a phantom path.
+        let out = "--- Changes ---\nsrc/a.rs\0src/b.rs\0src/c.rs\n\u{1f4ca} 3 files\0";
+        assert_eq!(parse_nul_paths(out), vec!["src/b.rs"]);
+    }
+
+    #[test]
+    fn empty_output_yields_no_paths() {
+        assert!(parse_nul_paths("").is_empty());
+        assert!(parse_nul_paths("\0\0").is_empty());
     }
 }
