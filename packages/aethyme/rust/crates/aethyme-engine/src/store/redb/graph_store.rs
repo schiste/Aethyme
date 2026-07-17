@@ -44,7 +44,7 @@ use crate::model::unresolved::UnresolvedNode;
 
 /// Bumped when the on-disk format changes incompatibly. We re-create the file
 /// rather than try to migrate.
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 /// Single-row metadata table: schema version, build timestamps, repo root, ...
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -96,15 +96,18 @@ const NODES_BY_PATH: MultimapTableDefinition<&str, &str> =
 // ── Symbol search ───────────────────────────────────────────────────────────
 // Key = lowercased name. Value = node id.
 //
-// Current writer note: populated for function and class names. Keys are exact
-// ASCII-lowercased symbol names plus component tokens extracted from those
-// names; ranking/fuzzy expansion belongs in graph search, not in the storage
-// key.
+// Current writer note: populated for function and class names. Name keys are
+// ASCII-lowercased simple names, component keys are acronym-aware name tokens,
+// and path-component keys are bounded location tokens extracted from the owning
+// file path. V2 fuzzy ranking is computed at read time over the candidate rows;
+// these tables only provide bounded lookup sets.
 
 const SYMBOL_BY_NAME: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("symbol_by_name");
 const SYMBOL_BY_COMPONENT: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("symbol_by_component");
+const SYMBOL_BY_PATH_COMPONENT: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("symbol_by_path_component");
 
 // ── Risk overlays ───────────────────────────────────────────────────────────
 
@@ -566,27 +569,46 @@ fn symbol_index_key(name: &str) -> String {
 }
 
 fn symbol_components(name: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
+    split_symbol_components(name)
+        .into_iter()
+        .map(|component| component.to_ascii_lowercase())
+        .filter(|component| !component.is_empty())
+        .collect()
+}
+
+fn split_symbol_components(name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
-    let mut previous_was_lower_or_digit = false;
-    for ch in name.chars() {
+    let chars: Vec<char> = name.chars().collect();
+
+    for (idx, ch) in chars.iter().copied().enumerate() {
         if !ch.is_ascii_alphanumeric() {
             if !current.is_empty() {
-                out.insert(std::mem::take(&mut current));
+                out.push(std::mem::take(&mut current));
             }
-            previous_was_lower_or_digit = false;
             continue;
         }
-        if ch.is_ascii_uppercase() && previous_was_lower_or_digit && !current.is_empty() {
-            out.insert(std::mem::take(&mut current));
+
+        if current.is_empty() {
+            current.push(ch);
+            continue;
         }
-        current.push(ch.to_ascii_lowercase());
-        previous_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+
+        let prev = chars[idx - 1];
+        let lc_uc = (prev.is_ascii_lowercase() || prev.is_ascii_digit()) && ch.is_ascii_uppercase();
+        let acronym_break = prev.is_ascii_uppercase()
+            && ch.is_ascii_uppercase()
+            && idx + 1 < chars.len()
+            && chars[idx + 1].is_ascii_lowercase();
+        if lc_uc || acronym_break {
+            out.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
     }
+
     if !current.is_empty() {
-        out.insert(current);
+        out.push(current);
     }
-    out.remove("");
     out
 }
 
@@ -645,6 +667,9 @@ pub fn insert_function(
     for component in symbol_components(function.name.as_str()) {
         session.add_symbol_component_index(&component, function.id.as_str())?;
     }
+    for component in symbol_components(function.file_path.as_str()) {
+        session.add_symbol_path_component_index(&component, function.id.as_str())?;
+    }
     Ok(())
 }
 
@@ -660,6 +685,9 @@ pub fn insert_class(
     session.add_symbol_index(&name_key, class.id.as_str())?;
     for component in symbol_components(class.name.as_str()) {
         session.add_symbol_component_index(&component, class.id.as_str())?;
+    }
+    for component in symbol_components(class.file_path.as_str()) {
+        session.add_symbol_path_component_index(&component, class.id.as_str())?;
     }
     Ok(())
 }
@@ -849,30 +877,43 @@ pub struct RedbRelationView {
     pub items: Vec<RedbRelationItem>,
 }
 
+const MIN_STEM_LEN: usize = 4;
+const NAME_BASE: i32 = 100;
+const NAME_COMPOUND_PER_EXTRA: i32 = 150;
+const PATH_PER_TOKEN: i32 = 60;
+const AREA_PER_TOKEN: i32 = 40;
+const BASENAME_EXACT_BONUS: i32 = 80;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SymbolMatchSignals {
     pub exact: bool,
+    pub case_insensitive: bool,
     pub prefix: bool,
     pub component: bool,
     pub path: bool,
     pub area: bool,
+    pub basename: bool,
 }
 
 impl SymbolMatchSignals {
-    fn score(&self) -> u8 {
+    fn signal_count(&self) -> u8 {
         self.exact as u8
+            + self.case_insensitive as u8
             + self.prefix as u8
             + self.component as u8
             + self.path as u8
             + self.area as u8
+            + self.basename as u8
     }
 
     fn merge(&mut self, other: Self) {
         self.exact |= other.exact;
+        self.case_insensitive |= other.case_insensitive;
         self.prefix |= other.prefix;
         self.component |= other.component;
         self.path |= other.path;
         self.area |= other.area;
+        self.basename |= other.basename;
     }
 }
 
@@ -880,6 +921,7 @@ impl SymbolMatchSignals {
 pub struct SymbolCandidate {
     pub symbol: SymbolLookup,
     pub signals: SymbolMatchSignals,
+    pub rank: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1284,7 +1326,163 @@ fn merge_symbol_candidate(
     candidates
         .entry(symbol.id.clone())
         .and_modify(|existing| existing.signals.merge(signals))
-        .or_insert(SymbolCandidate { symbol, signals });
+        .or_insert(SymbolCandidate {
+            symbol,
+            signals,
+            rank: 0,
+        });
+}
+
+fn symbol_query_tokens(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for component in split_symbol_components(query) {
+        let token = component.to_ascii_lowercase();
+        if !token.is_empty() && !tokens.contains(&token) {
+            tokens.push(token);
+        }
+    }
+    tokens
+}
+
+fn push_unique_string(values: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn symbol_query_exact_variants(query: &str) -> Vec<String> {
+    let trimmed = query.trim();
+    let mut variants = Vec::new();
+    push_unique_string(&mut variants, trimmed.to_string());
+
+    let components = split_symbol_components(trimmed);
+    if !components.is_empty() {
+        push_unique_string(&mut variants, components.join("_"));
+        push_unique_string(&mut variants, components.join(""));
+        for component in components {
+            push_unique_string(&mut variants, component);
+        }
+    }
+    variants
+}
+
+fn symbol_query_index_variants(query: &str, tokens: &[String]) -> Vec<String> {
+    let mut variants = Vec::new();
+    push_unique_string(&mut variants, symbol_index_key(query.trim()));
+    if !tokens.is_empty() {
+        push_unique_string(&mut variants, tokens.join("_"));
+        push_unique_string(&mut variants, tokens.join(""));
+        for token in tokens {
+            push_unique_string(&mut variants, token.clone());
+        }
+    }
+    variants
+}
+
+fn shares_stem(left: &str, right: &str) -> bool {
+    if left.len() < MIN_STEM_LEN || right.len() < MIN_STEM_LEN {
+        return false;
+    }
+    let left_prefix = left.chars().take(MIN_STEM_LEN).collect::<String>();
+    let right_prefix = right.chars().take(MIN_STEM_LEN).collect::<String>();
+    left_prefix.eq_ignore_ascii_case(&right_prefix)
+}
+
+fn basename_without_extension(path: &str) -> String {
+    path.rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn score_symbol_candidate(
+    symbol: &SymbolLookup,
+    query: &str,
+    tokens: &[String],
+    area_name: Option<&str>,
+    mut signals: SymbolMatchSignals,
+) -> (i32, SymbolMatchSignals) {
+    let exact_variants = symbol_query_exact_variants(query);
+    let index_variants = symbol_query_index_variants(query, tokens);
+    let name_lower = symbol.name.to_ascii_lowercase();
+    signals.exact |= exact_variants.iter().any(|variant| symbol.name == *variant);
+    signals.case_insensitive |= index_variants.iter().any(|variant| name_lower == *variant);
+
+    let component_lowers = split_symbol_components(symbol.name.as_str())
+        .into_iter()
+        .map(|component| component.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    let mut name_matched_tokens = Vec::new();
+    for token in tokens {
+        let component_match = component_lowers
+            .iter()
+            .any(|component| component == token || shares_stem(component, token));
+        if component_match {
+            signals.component = true;
+        }
+        if name_lower.starts_with(token)
+            || component_lowers
+                .iter()
+                .any(|component| component.starts_with(token))
+        {
+            signals.prefix = true;
+        }
+        if name_lower == *token || name_lower.contains(token.as_str()) || component_match {
+            if !name_matched_tokens.contains(token) {
+                name_matched_tokens.push(token.clone());
+            }
+        }
+    }
+
+    let name_score = match name_matched_tokens.len() {
+        0 => 0,
+        matched => NAME_BASE + NAME_COMPOUND_PER_EXTRA * (matched as i32 - 1),
+    };
+
+    let path_lower = symbol.path.to_ascii_lowercase();
+    let path_matched = tokens
+        .iter()
+        .filter(|token| token.len() >= MIN_STEM_LEN && path_lower.contains(token.as_str()))
+        .count();
+    if path_matched > 0 {
+        signals.path = true;
+    }
+    let path_score = path_matched as i32 * PATH_PER_TOKEN;
+
+    let area_matched = area_name
+        .map(|area| {
+            tokens
+                .iter()
+                .filter(|token| token.len() >= MIN_STEM_LEN && area.contains(token.as_str()))
+                .count()
+        })
+        .unwrap_or(0);
+    if area_matched > 0 {
+        signals.area = true;
+    }
+    let area_score = area_matched as i32 * AREA_PER_TOKEN;
+
+    let basename_lower = basename_without_extension(symbol.path.as_str());
+    if !basename_lower.is_empty() && tokens.iter().any(|token| *token == basename_lower) {
+        signals.basename = true;
+    }
+    let basename_score = if signals.basename {
+        BASENAME_EXACT_BONUS
+    } else {
+        0
+    };
+
+    let rank = name_score + path_score + area_score + basename_score;
+    let fallback_rank = if rank == 0 {
+        i32::from(signals.signal_count()) * 10
+    } else {
+        0
+    };
+    (rank + fallback_rank, signals)
 }
 
 fn symbol_candidate_allowed(symbol: &SymbolLookup, options: &SymbolMatchOptions) -> bool {
@@ -1390,12 +1588,35 @@ fn collect_symbol_ids_for_component<D: ReadableDatabase>(
     Ok(ids)
 }
 
+fn collect_symbol_ids_for_path_component<D: ReadableDatabase>(
+    db: &D,
+    component: &str,
+    limit: usize,
+) -> Result<BTreeSet<String>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(BTreeSet::new());
+    }
+    let txn = db.begin_read()?;
+    let t = txn.open_multimap_table(SYMBOL_BY_PATH_COMPONENT)?;
+    let mut ids = BTreeSet::new();
+    for row in t.get(component)? {
+        ids.insert(row?.value().to_string());
+        if ids.len() >= limit {
+            break;
+        }
+    }
+    Ok(ids)
+}
+
 fn symbols_matching_from<D: ReadableDatabase>(
     db: &D,
     query: &str,
     options: SymbolMatchOptions,
 ) -> Result<Vec<SymbolCandidate>, GraphStoreError> {
-    let normalized = symbol_index_key(query.trim());
+    let trimmed = query.trim();
+    let normalized = symbol_index_key(trimmed);
+    let tokens = symbol_query_tokens(trimmed);
+    let index_variants = symbol_query_index_variants(trimmed, &tokens);
     if normalized.is_empty() || options.limit == 0 {
         return Ok(Vec::new());
     }
@@ -1403,45 +1624,56 @@ fn symbols_matching_from<D: ReadableDatabase>(
     let mut candidates = BTreeMap::new();
     let txn = db.begin_read()?;
 
-    add_symbol_candidates_for_ids(
-        &txn,
-        collect_symbol_ids_for_exact_name(db, &normalized)?,
-        &mut candidates,
-        SymbolMatchSignals {
-            exact: true,
-            ..SymbolMatchSignals::default()
-        },
-        &options,
-    )?;
-    add_symbol_candidates_for_ids(
-        &txn,
-        collect_symbol_ids_for_name_prefix(db, &normalized, options.limit.saturating_mul(2))?,
-        &mut candidates,
-        SymbolMatchSignals {
-            prefix: true,
-            ..SymbolMatchSignals::default()
-        },
-        &options,
-    )?;
-    add_symbol_candidates_for_ids(
-        &txn,
-        collect_symbol_ids_for_component(db, &normalized, options.limit.saturating_mul(2))?,
-        &mut candidates,
-        SymbolMatchSignals {
-            component: true,
-            ..SymbolMatchSignals::default()
-        },
-        &options,
-    )?;
+    for variant in &index_variants {
+        add_symbol_candidates_for_ids(
+            &txn,
+            collect_symbol_ids_for_exact_name(db, variant)?,
+            &mut candidates,
+            SymbolMatchSignals {
+                case_insensitive: true,
+                ..SymbolMatchSignals::default()
+            },
+            &options,
+        )?;
+        add_symbol_candidates_for_ids(
+            &txn,
+            collect_symbol_ids_for_name_prefix(db, variant, options.limit.saturating_mul(2))?,
+            &mut candidates,
+            SymbolMatchSignals {
+                prefix: true,
+                ..SymbolMatchSignals::default()
+            },
+            &options,
+        )?;
+    }
 
-    let path_ids = ids_under_path_limited_from(
-        db,
-        NODES_BY_PATH,
-        query.trim(),
-        options.limit.saturating_mul(3),
-    )?
-    .into_iter()
-    .collect::<BTreeSet<_>>();
+    for token in &tokens {
+        add_symbol_candidates_for_ids(
+            &txn,
+            collect_symbol_ids_for_component(db, token, options.limit.saturating_mul(2))?,
+            &mut candidates,
+            SymbolMatchSignals {
+                component: true,
+                ..SymbolMatchSignals::default()
+            },
+            &options,
+        )?;
+        add_symbol_candidates_for_ids(
+            &txn,
+            collect_symbol_ids_for_path_component(db, token, options.limit.saturating_mul(3))?,
+            &mut candidates,
+            SymbolMatchSignals {
+                path: true,
+                ..SymbolMatchSignals::default()
+            },
+            &options,
+        )?;
+    }
+
+    let path_ids =
+        ids_under_path_limited_from(db, NODES_BY_PATH, trimmed, options.limit.saturating_mul(3))?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
     add_symbol_candidates_for_ids(
         &txn,
         path_ids,
@@ -1453,15 +1685,21 @@ fn symbols_matching_from<D: ReadableDatabase>(
         &options,
     )?;
 
-    for area in list_areas_from(db, None)? {
+    let areas = list_areas_from(db, None)?;
+    for area in &areas {
         let area_name = symbol_index_key(&area.name);
         let area_path = symbol_index_key(&area.path_prefix);
-        if area_name == normalized
-            || area_name.starts_with(&normalized)
-            || area_path == normalized
-            || area_path.starts_with(&normalized)
-            || area.id.eq_ignore_ascii_case(query.trim())
-        {
+        let area_matches = index_variants.iter().any(|variant| {
+            area_name == *variant
+                || area_name.starts_with(variant)
+                || area_path == *variant
+                || area_path.starts_with(variant)
+                || area_path.contains(variant)
+        }) || tokens.iter().any(|token| {
+            token.len() >= MIN_STEM_LEN && (area_name.contains(token) || area_path.contains(token))
+        }) || area.id.eq_ignore_ascii_case(trimmed);
+
+        if area_matches {
             let area_ids = ids_under_path_limited_from(
                 db,
                 NODES_BY_PATH,
@@ -1483,14 +1721,49 @@ fn symbols_matching_from<D: ReadableDatabase>(
         }
     }
 
+    let area_names = areas
+        .into_iter()
+        .map(|area| (area.id, area.name.to_ascii_lowercase()))
+        .collect::<BTreeMap<_, _>>();
     let mut out = candidates.into_values().collect::<Vec<_>>();
+    for candidate in &mut out {
+        let area_name = candidate
+            .symbol
+            .area_id
+            .as_ref()
+            .and_then(|area_id| area_names.get(area_id).map(String::as_str));
+        let (rank, signals) = score_symbol_candidate(
+            &candidate.symbol,
+            trimmed,
+            &tokens,
+            area_name,
+            candidate.signals,
+        );
+        candidate.rank = rank;
+        candidate.signals = signals;
+    }
     out.sort_by(|left, right| {
         right
-            .signals
-            .score()
-            .cmp(&left.signals.score())
+            .rank
+            .cmp(&left.rank)
             .then_with(|| right.signals.exact.cmp(&left.signals.exact))
+            .then_with(|| {
+                right
+                    .signals
+                    .case_insensitive
+                    .cmp(&left.signals.case_insensitive)
+            })
             .then_with(|| right.signals.prefix.cmp(&left.signals.prefix))
+            .then_with(|| right.signals.component.cmp(&left.signals.component))
+            .then_with(|| right.signals.path.cmp(&left.signals.path))
+            .then_with(|| right.signals.area.cmp(&left.signals.area))
+            .then_with(|| right.signals.basename.cmp(&left.signals.basename))
+            .then_with(|| {
+                right
+                    .signals
+                    .signal_count()
+                    .cmp(&left.signals.signal_count())
+            })
             .then_with(|| left.symbol.path.cmp(&right.symbol.path))
             .then_with(|| left.symbol.line.cmp(&right.symbol.line))
             .then_with(|| left.symbol.name.cmp(&right.symbol.name))
@@ -1605,7 +1878,12 @@ fn task_anchor_candidates_from<D: ReadableDatabase, S: AsRef<str>>(
             .matched_tokens
             .len()
             .cmp(&left.matched_tokens.len())
-            .then_with(|| right.signals.score().cmp(&left.signals.score()))
+            .then_with(|| {
+                right
+                    .signals
+                    .signal_count()
+                    .cmp(&left.signals.signal_count())
+            })
             .then_with(|| left.node.display.cmp(&right.node.display))
             .then_with(|| left.node.id.cmp(&right.node.id))
     });
@@ -2863,6 +3141,23 @@ impl<'db> IndexSession<'db> {
         Ok(())
     }
 
+    /// Append `node_id` under a lowercased file-path component in
+    /// SYMBOL_BY_PATH_COMPONENT. No counter increment — folded into a parent
+    /// symbol insert.
+    pub fn add_symbol_path_component_index(
+        &mut self,
+        component_lower: &str,
+        node_id: &str,
+    ) -> Result<(), GraphStoreError> {
+        let txn = self
+            .txn
+            .as_ref()
+            .expect("IndexSession invariant: txn present");
+        let mut t = txn.open_multimap_table(SYMBOL_BY_PATH_COMPONENT)?;
+        t.insert(component_lower, node_id)?;
+        Ok(())
+    }
+
     /// Append a bincoded risk record under `scope` in RISK_FLAGS.
     pub fn add_risk(&mut self, scope: &str, value: &impl Serialize) -> Result<(), GraphStoreError> {
         let bytes = bincode::serialize(value)?;
@@ -3016,6 +3311,7 @@ fn ensure_schema(db: &Database) -> Result<(), GraphStoreError> {
         let _ = txn.open_multimap_table(NODES_BY_PATH)?;
         let _ = txn.open_multimap_table(SYMBOL_BY_NAME)?;
         let _ = txn.open_multimap_table(SYMBOL_BY_COMPONENT)?;
+        let _ = txn.open_multimap_table(SYMBOL_BY_PATH_COMPONENT)?;
         let _ = txn.open_multimap_table(RISK_FLAGS)?;
     }
     txn.commit()?;
@@ -3064,6 +3360,7 @@ fn verify_schema_read_only(db: &ReadOnlyDatabase) -> Result<(), GraphStoreError>
         let _ = txn.open_multimap_table(NODES_BY_PATH)?;
         let _ = txn.open_multimap_table(SYMBOL_BY_NAME)?;
         let _ = txn.open_multimap_table(SYMBOL_BY_COMPONENT)?;
+        let _ = txn.open_multimap_table(SYMBOL_BY_PATH_COMPONENT)?;
         let _ = txn.open_multimap_table(RISK_FLAGS)?;
     }
     Ok(())
@@ -3525,6 +3822,9 @@ mod tests {
         session
             .add_symbol_component_index("foo", "fn:Repo:src/lib.rs:foo")
             .expect("component");
+        session
+            .add_symbol_path_component_index("lib", "fn:Repo:src/lib.rs:foo")
+            .expect("path component");
         session.commit().expect("commit");
 
         let txn = store.db().begin_read().expect("read");
@@ -3557,6 +3857,16 @@ mod tests {
             .map(|r| r.expect("row").value().to_string())
             .collect();
         assert_eq!(component_hits, vec!["fn:Repo:src/lib.rs:foo"]);
+
+        let by_path_component = txn
+            .open_multimap_table(SYMBOL_BY_PATH_COMPONENT)
+            .expect("SYMBOL_BY_PATH_COMPONENT");
+        let path_component_hits: Vec<String> = by_path_component
+            .get("lib")
+            .expect("get")
+            .map(|r| r.expect("row").value().to_string())
+            .collect();
+        assert_eq!(path_component_hits, vec!["fn:Repo:src/lib.rs:foo"]);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3757,6 +4067,10 @@ mod tests {
             collect_str_multimap(store.db(), SYMBOL_BY_COMPONENT, "token"),
             vec![function.id.to_string()]
         );
+        assert_eq!(
+            collect_str_multimap(store.db(), SYMBOL_BY_PATH_COMPONENT, "lib"),
+            vec![function.id.to_string()]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3789,6 +4103,10 @@ mod tests {
         );
         assert_eq!(
             collect_str_multimap(store.db(), SYMBOL_BY_COMPONENT, "loader"),
+            vec![class.id.to_string()]
+        );
+        assert_eq!(
+            collect_str_multimap(store.db(), SYMBOL_BY_PATH_COMPONENT, "lib"),
             vec![class.id.to_string()]
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -4347,6 +4665,16 @@ mod tests {
             .find(|candidate| candidate.symbol.id == fixture.function.id.to_string())
             .expect("function exact candidate");
         assert!(function_exact.signals.exact);
+        assert!(function_exact.signals.case_insensitive);
+        assert!(function_exact.rank > 0);
+
+        let case_insensitive = readonly.symbols_matching("loadtoken").expect("case");
+        let function_case = case_insensitive
+            .iter()
+            .find(|candidate| candidate.symbol.id == fixture.function.id.to_string())
+            .expect("function case-insensitive candidate");
+        assert!(!function_case.signals.exact);
+        assert!(function_case.signals.case_insensitive);
 
         let prefix = readonly.symbols_matching("Load").expect("prefix");
         assert!(prefix.iter().any(|candidate| {
@@ -4378,6 +4706,28 @@ mod tests {
         assert!(area.iter().any(|candidate| {
             candidate.symbol.id == fixture.function.id.to_string() && candidate.signals.area
         }));
+
+        let basename = readonly.symbols_matching("lib").expect("basename");
+        assert!(basename.iter().any(|candidate| {
+            candidate.symbol.id == fixture.function.id.to_string()
+                && candidate.signals.path
+                && candidate.signals.basename
+        }));
+
+        let class_only = readonly
+            .symbols_matching_with(
+                "token",
+                SymbolMatchOptions {
+                    limit: 10,
+                    kind: Some(StoredNodeKind::Class),
+                    ..SymbolMatchOptions::default()
+                },
+            )
+            .expect("class kind filter");
+        assert!(!class_only.is_empty());
+        assert!(class_only
+            .iter()
+            .all(|candidate| candidate.symbol.kind == StoredNodeKind::Class));
     }
 
     #[test]

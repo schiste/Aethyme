@@ -1,7 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::map::RepositoryMap;
-use crate::store::redb::graph_store::{GraphStoreError, ReadOnlyGraphStore, StoredNodeKind};
+use crate::store::redb::graph_store::{
+    GraphStoreError, ReadOnlyGraphStore, StoredNodeKind, SymbolCandidate, SymbolMatchOptions,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchHit {
@@ -88,10 +90,8 @@ pub fn symbol_search(map: &RepositoryMap, query: &str, limit: usize) -> Vec<Sear
     symbol_search_multi(map, &tokens, limit)
 }
 
-/// Redb-backed exact symbol search. This is intentionally narrower than
-/// `symbol_search_multi`: redb owns exact indexed lookups, while fuzzy ranking
-/// and path/area scoring remain on the `RepositoryMap` fallback until V2 parity
-/// tests cover those signals.
+/// Redb-backed V2 symbol search. The store owns bounded candidate lookup and
+/// multi-signal ranking; this adapter preserves the SearchHit JSON contract.
 pub fn symbol_search_redb(
     store: &ReadOnlyGraphStore,
     query: &str,
@@ -110,42 +110,18 @@ pub fn symbol_search_redb_multi(
     if tokens.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
-
-    let variants = exact_symbol_query_variants(tokens);
-    if variants.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut hits = Vec::new();
-    let mut seen_ids = HashSet::new();
-    for (rank, variant) in variants.iter().enumerate() {
-        let score = 1_000_i32.saturating_sub(rank as i32 * 25);
-        for symbol in store.find_symbols(variant, None)? {
-            if !seen_ids.insert(symbol.id.clone()) {
-                continue;
-            }
-            hits.push(SearchHit {
-                id: symbol.id,
-                name: symbol.name,
-                kind: stored_symbol_kind(symbol.kind).to_string(),
-                file: symbol.path,
-                line: symbol.line,
-                score,
-                reason: format!("redb-exact-symbol-name:{variant}"),
-            });
-        }
-    }
-
-    hits.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.file.cmp(&right.file))
-            .then_with(|| left.line.cmp(&right.line))
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    hits.truncate(limit);
-    Ok(hits)
+    let query = tokens.join(" ");
+    let candidates = store.symbols_matching_with(
+        &query,
+        SymbolMatchOptions {
+            limit,
+            ..SymbolMatchOptions::default()
+        },
+    )?;
+    Ok(candidates
+        .into_iter()
+        .map(symbol_candidate_to_search_hit)
+        .collect())
 }
 
 /// Multi-token symbol search. Use this directly when callers already
@@ -235,32 +211,6 @@ pub fn symbol_search_multi(map: &RepositoryMap, tokens: &[String], limit: usize)
     hits
 }
 
-fn exact_symbol_query_variants(tokens: &[String]) -> Vec<String> {
-    let normalized_tokens: Vec<String> = tokens
-        .iter()
-        .map(|token| token.trim().to_ascii_lowercase())
-        .filter(|token| !token.is_empty())
-        .collect();
-    if normalized_tokens.is_empty() {
-        return Vec::new();
-    }
-
-    let mut variants = Vec::new();
-    push_unique_variant(&mut variants, normalized_tokens.join(" "));
-    push_unique_variant(&mut variants, normalized_tokens.join("_"));
-    push_unique_variant(&mut variants, normalized_tokens.join(""));
-    for token in normalized_tokens {
-        push_unique_variant(&mut variants, token);
-    }
-    variants
-}
-
-fn push_unique_variant(variants: &mut Vec<String>, variant: String) {
-    if !variant.is_empty() && !variants.contains(&variant) {
-        variants.push(variant);
-    }
-}
-
 fn stored_symbol_kind(kind: StoredNodeKind) -> &'static str {
     match kind {
         StoredNodeKind::Repository => "repository",
@@ -273,6 +223,48 @@ fn stored_symbol_kind(kind: StoredNodeKind) -> &'static str {
         StoredNodeKind::Config => "config",
         StoredNodeKind::Unresolved => "unresolved",
     }
+}
+
+fn symbol_candidate_to_search_hit(candidate: SymbolCandidate) -> SearchHit {
+    let reason = symbol_candidate_reason(&candidate);
+    SearchHit {
+        id: candidate.symbol.id,
+        name: candidate.symbol.name,
+        kind: stored_symbol_kind(candidate.symbol.kind).to_string(),
+        file: candidate.symbol.path,
+        line: candidate.symbol.line,
+        score: candidate.rank,
+        reason,
+    }
+}
+
+fn symbol_candidate_reason(candidate: &SymbolCandidate) -> String {
+    let mut signals = Vec::new();
+    if candidate.signals.exact {
+        signals.push("exact-name");
+    }
+    if candidate.signals.case_insensitive {
+        signals.push("case-insensitive-name");
+    }
+    if candidate.signals.prefix {
+        signals.push("prefix-name");
+    }
+    if candidate.signals.component {
+        signals.push("component-name");
+    }
+    if candidate.signals.path {
+        signals.push("path");
+    }
+    if candidate.signals.area {
+        signals.push("area");
+    }
+    if candidate.signals.basename {
+        signals.push("basename");
+    }
+    if signals.is_empty() {
+        signals.push("candidate");
+    }
+    format!("redb-symbol-search:{}", signals.join("+"))
 }
 
 /// Score one symbol against the full token set. Returns `Some((score,
