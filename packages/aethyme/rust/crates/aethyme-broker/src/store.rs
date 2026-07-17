@@ -275,6 +275,14 @@ impl BrokerStore {
         if changed == 0 {
             return Err(BrokerError::SessionNotFound(id));
         }
+        // `cleaned` is terminal (reuse_session excludes it), so the
+        // session's leases can never matter again — drop them in the same
+        // transaction. Without this every cleaned session leaves its last
+        // implicit-lease snapshot behind forever (722 orphaned rows for
+        // ~25 sessions observed in the 2026-07-17 dogfood database).
+        if status == SessionStatus::Cleaned {
+            tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
+        }
         insert_event(
             &tx,
             now,
@@ -389,6 +397,33 @@ impl BrokerStore {
             leases.push(row??);
         }
         Ok(leases)
+    }
+
+    /// Every lease row recorded for one session, regardless of session or
+    /// lease state — introspection for tests and doctor-style audits.
+    pub fn session_leases(&self, session_id: i64) -> Result<Vec<Lease>, BrokerError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{LEASE_SELECT} WHERE session_id = ?1 ORDER BY id"))?;
+        let rows = stmt.query_map([session_id], lease_from_row)?;
+        let mut leases = Vec::new();
+        for row in rows {
+            leases.push(row??);
+        }
+        Ok(leases)
+    }
+
+    /// Retention sweep for databases written before leases were purged on
+    /// clean: drop lease rows whose session is already `cleaned`. Returns
+    /// the number removed. Steady-state this is a no-op because
+    /// [`Self::set_session_status`] now purges in the same transaction.
+    pub fn purge_leases_of_cleaned_sessions(&mut self) -> Result<usize, BrokerError> {
+        let removed = self.conn.execute(
+            "DELETE FROM leases WHERE session_id IN
+                 (SELECT id FROM sessions WHERE status = 'cleaned')",
+            [],
+        )?;
+        Ok(removed)
     }
 
     // ── gates ─────────────────────────────────────────────────────────
