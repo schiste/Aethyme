@@ -1,8 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::map::RepositoryMap;
+use crate::model::area::AreaNode;
+use crate::model::class::ClassNode;
+use crate::model::config::ConfigNode;
+use crate::model::edge::Edge;
 use crate::model::edge::EdgeKind;
-use crate::model::file::FileRole;
+use crate::model::file::{FileNode, FileRole};
+use crate::model::function::FunctionNode;
+use crate::store::redb::graph_store::{GraphStoreError, OverviewV2Limits, ReadOnlyGraphStore};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignalAssessment {
@@ -27,6 +33,123 @@ pub fn evaluate_graph_signals(map: &RepositoryMap) -> GraphSignals {
         config_hygiene: config_hygiene(map),
         hidden_coupling: hidden_coupling(map),
         parser_visibility: parser_visibility(map),
+    }
+}
+
+pub fn evaluate_graph_signals_redb(
+    store: &ReadOnlyGraphStore,
+) -> Result<GraphSignals, GraphStoreError> {
+    let overview = store.overview_v2(signal_overview_limits())?;
+    let ctx = RedbSignalContext {
+        files: overview.files,
+        areas: store.list_areas(None)?,
+        functions: overview.functions,
+        classes: overview.classes,
+        configs: overview.configs,
+        edges: store.all_edges()?,
+    };
+    Ok(GraphSignals {
+        boundary_clarity: boundary_clarity_redb(&ctx),
+        entrypoint_clarity: entrypoint_clarity_redb(&ctx),
+        config_hygiene: config_hygiene_redb(&ctx),
+        hidden_coupling: hidden_coupling_redb(&ctx),
+        parser_visibility: parser_visibility_redb(&ctx),
+    })
+}
+
+fn signal_overview_limits() -> OverviewV2Limits {
+    OverviewV2Limits {
+        area_limit: usize::MAX,
+        directory_limit: 0,
+        entrypoint_limit: usize::MAX,
+        risk_limit: 0,
+        file_limit: usize::MAX,
+        function_limit: usize::MAX,
+        class_limit: usize::MAX,
+        doc_limit: 0,
+        config_limit: usize::MAX,
+        unresolved_limit: 0,
+    }
+}
+
+struct RedbSignalContext {
+    files: Vec<FileNode>,
+    areas: Vec<AreaNode>,
+    functions: Vec<FunctionNode>,
+    classes: Vec<ClassNode>,
+    configs: Vec<ConfigNode>,
+    edges: Vec<Edge>,
+}
+
+impl RedbSignalContext {
+    fn area_id_for_target(&self, value: &str) -> Option<String> {
+        self.files
+            .iter()
+            .find(|file| file.id == value)
+            .and_then(|file| file.area_id.clone())
+            .or_else(|| {
+                self.functions
+                    .iter()
+                    .find(|function| function.id.as_str() == value)
+                    .and_then(|function| function.area_id.as_ref().map(ToString::to_string))
+            })
+            .or_else(|| {
+                self.classes
+                    .iter()
+                    .find(|class| class.id.as_str() == value)
+                    .and_then(|class| class.area_id.as_ref().map(ToString::to_string))
+            })
+            .or_else(|| {
+                self.configs
+                    .iter()
+                    .find(|config| config.id == value)
+                    .and_then(|config| config.area_id.clone())
+            })
+            .or_else(|| {
+                self.areas
+                    .iter()
+                    .find(|area| area.id == value)
+                    .map(|area| area.id.clone())
+            })
+    }
+
+    fn display_for(&self, value: &str) -> String {
+        self.files
+            .iter()
+            .find(|file| file.id == value)
+            .map(|file| file.path.clone())
+            .or_else(|| {
+                self.functions
+                    .iter()
+                    .find(|function| function.id.as_str() == value)
+                    .map(|function| function.name.to_string())
+            })
+            .or_else(|| {
+                self.classes
+                    .iter()
+                    .find(|class| class.id.as_str() == value)
+                    .map(|class| class.name.to_string())
+            })
+            .or_else(|| {
+                self.configs
+                    .iter()
+                    .find(|config| config.id == value)
+                    .map(|config| config.path.clone())
+            })
+            .or_else(|| {
+                self.areas
+                    .iter()
+                    .find(|area| area.id == value)
+                    .map(|area| area.name.clone())
+            })
+            .unwrap_or_else(|| value.to_string())
+    }
+
+    fn config_path(&self, id: &str) -> Option<String> {
+        self.configs
+            .iter()
+            .find(|config| config.id == id)
+            .map(|config| config.path.clone())
     }
 }
 
@@ -87,6 +210,63 @@ fn boundary_clarity(map: &RepositoryMap) -> SignalAssessment {
     }
 }
 
+fn boundary_clarity_redb(ctx: &RedbSignalContext) -> SignalAssessment {
+    let semantic_edges = ctx
+        .edges
+        .iter()
+        .filter(|edge| {
+            matches!(
+                edge.kind,
+                EdgeKind::Imports
+                    | EdgeKind::Calls
+                    | EdgeKind::References
+                    | EdgeKind::Configures
+                    | EdgeKind::Documents
+            )
+        })
+        .collect::<Vec<_>>();
+    let cross_area = semantic_edges
+        .iter()
+        .filter(|edge| {
+            let from = ctx.area_id_for_target(edge.from.as_str());
+            let to = ctx.area_id_for_target(edge.to.as_str());
+            matches!((from, to), (Some(left), Some(right)) if left != right)
+        })
+        .count();
+    let source_files = ctx
+        .files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Source | FileRole::Test))
+        .collect::<Vec<_>>();
+    let assigned_sources = source_files
+        .iter()
+        .filter(|file| file.area_id.is_some())
+        .count();
+    let generic_source_names = source_files
+        .iter()
+        .filter(|file| is_generic_name(file.name.as_str()))
+        .count();
+
+    let semantic_total = semantic_edges.len();
+    let cross_penalty = ratio_scaled(cross_area, semantic_total, 45);
+    let generic_penalty = ratio_scaled(generic_source_names, source_files.len(), 20);
+    let assignment_bonus = ratio_scaled(assigned_sources, source_files.len(), 15);
+    let score = clamp_score(60 + assignment_bonus - cross_penalty - generic_penalty);
+
+    SignalAssessment {
+        score,
+        level: signal_level(score).to_string(),
+        evidence: vec![
+            format!("cross-area semantic edges: {cross_area}/{semantic_total}"),
+            format!(
+                "source files with area assignment: {assigned_sources}/{}",
+                source_files.len()
+            ),
+            format!("generic source file names: {generic_source_names}"),
+        ],
+    }
+}
+
 fn entrypoint_clarity(map: &RepositoryMap) -> SignalAssessment {
     let entrypoint_edges = map
         .edges
@@ -106,6 +286,52 @@ fn entrypoint_clarity(map: &RepositoryMap) -> SignalAssessment {
     for edge in &entrypoint_edges {
         if let Some(config_path) = config_path(map, &edge.from) {
             if let Some(area_id) = map.area_id_for_target(&edge.from) {
+                entrypoints_by_area
+                    .entry(area_id)
+                    .or_default()
+                    .insert(config_path);
+            }
+        }
+    }
+    let ambiguous_areas = entrypoints_by_area
+        .values()
+        .filter(|configs| configs.len() > 1)
+        .count();
+    let score = clamp_score(
+        30 + (entrypoint_edges.len() as i32 * 18) + (configs_with_entrypoints.len() as i32 * 10)
+            - (ambiguous_areas as i32 * 12),
+    );
+
+    SignalAssessment {
+        score,
+        level: signal_level(score).to_string(),
+        evidence: vec![
+            format!("direct code entrypoint edges: {}", entrypoint_edges.len()),
+            format!(
+                "configs with entrypoints: {}",
+                configs_with_entrypoints.len()
+            ),
+            format!("areas with ambiguous entrypoints: {ambiguous_areas}"),
+        ],
+    }
+}
+
+fn entrypoint_clarity_redb(ctx: &RedbSignalContext) -> SignalAssessment {
+    let entrypoint_edges = ctx
+        .edges
+        .iter()
+        .filter(|edge| matches!(edge.kind, EdgeKind::EntrypointFor))
+        .filter(|edge| is_code_path(ctx.display_for(edge.to.as_str()).as_str()))
+        .collect::<Vec<_>>();
+    let configs_with_entrypoints = entrypoint_edges
+        .iter()
+        .filter_map(|edge| ctx.config_path(edge.from.as_str()))
+        .collect::<BTreeSet<_>>();
+
+    let mut entrypoints_by_area = BTreeMap::<String, BTreeSet<String>>::new();
+    for edge in &entrypoint_edges {
+        if let Some(config_path) = ctx.config_path(edge.from.as_str()) {
+            if let Some(area_id) = ctx.area_id_for_target(edge.from.as_str()) {
                 entrypoints_by_area
                     .entry(area_id)
                     .or_default()
@@ -191,6 +417,61 @@ fn config_hygiene(map: &RepositoryMap) -> SignalAssessment {
     }
 }
 
+fn config_hygiene_redb(ctx: &RedbSignalContext) -> SignalAssessment {
+    let operational_configs = ctx
+        .configs
+        .iter()
+        .filter(|config| is_operational_config(config.path.as_str(), config.config_type.as_str()))
+        .collect::<Vec<_>>();
+    let linked_configs = operational_configs
+        .iter()
+        .filter(|config| {
+            config.area_id.is_some()
+                || ctx.edges.iter().any(|edge| {
+                    edge.from.as_str() == config.id
+                        && matches!(edge.kind, EdgeKind::Configures | EdgeKind::EntrypointFor)
+                })
+        })
+        .count();
+
+    let mut families_by_area = BTreeMap::<String, BTreeSet<String>>::new();
+    for config in &operational_configs {
+        let area_key = config.area_id.clone().unwrap_or_else(|| "repo".to_string());
+        families_by_area
+            .entry(area_key)
+            .or_default()
+            .insert(config_family_key(
+                config.config_type.as_str(),
+                config.path.as_str(),
+            ));
+    }
+    let duplicate_families = operational_configs.len().saturating_sub(
+        families_by_area
+            .values()
+            .map(|families| families.len())
+            .sum::<usize>(),
+    );
+    let noisy_configs = ctx.configs.len().saturating_sub(operational_configs.len());
+
+    let linked_bonus = ratio_scaled(linked_configs, operational_configs.len(), 35);
+    let duplicate_penalty = (duplicate_families.min(5) as i32) * 8;
+    let noisy_penalty = (noisy_configs.min(8) as i32) * 3;
+    let score = clamp_score(50 + linked_bonus - duplicate_penalty - noisy_penalty);
+
+    SignalAssessment {
+        score,
+        level: signal_level(score).to_string(),
+        evidence: vec![
+            format!("operational configs: {}", operational_configs.len()),
+            format!(
+                "linked configs: {linked_configs}/{}",
+                operational_configs.len()
+            ),
+            format!("duplicate config families: {duplicate_families}"),
+        ],
+    }
+}
+
 fn hidden_coupling(map: &RepositoryMap) -> SignalAssessment {
     let semantic_edges = map
         .edges
@@ -218,6 +499,62 @@ fn hidden_coupling(map: &RepositoryMap) -> SignalAssessment {
         .filter(|edge| {
             let from = map.area_id_for_target(&edge.from);
             let to = map.area_id_for_target(&edge.to);
+            matches!((from, to), (Some(left), Some(right)) if left != right)
+        })
+        .count();
+
+    let low_penalty = ratio_scaled(low_confidence, semantic_edges.len(), 45);
+    let cross_penalty = ratio_scaled(cross_area, semantic_edges.len(), 20);
+    let high_bonus = ratio_scaled(high_confidence, semantic_edges.len(), 15);
+    let score = clamp_score(65 + high_bonus - low_penalty - cross_penalty);
+
+    SignalAssessment {
+        score,
+        level: signal_level(score).to_string(),
+        evidence: vec![
+            format!(
+                "low-confidence semantic edges: {low_confidence}/{}",
+                semantic_edges.len()
+            ),
+            format!(
+                "high-confidence semantic edges: {high_confidence}/{}",
+                semantic_edges.len()
+            ),
+            format!(
+                "cross-area semantic edges: {cross_area}/{}",
+                semantic_edges.len()
+            ),
+        ],
+    }
+}
+
+fn hidden_coupling_redb(ctx: &RedbSignalContext) -> SignalAssessment {
+    let semantic_edges = ctx
+        .edges
+        .iter()
+        .filter(|edge| {
+            matches!(
+                edge.kind,
+                EdgeKind::Calls
+                    | EdgeKind::References
+                    | EdgeKind::Configures
+                    | EdgeKind::EntrypointFor
+            )
+        })
+        .collect::<Vec<_>>();
+    let low_confidence = semantic_edges
+        .iter()
+        .filter(|edge| edge.confidence < 800)
+        .count();
+    let high_confidence = semantic_edges
+        .iter()
+        .filter(|edge| edge.confidence >= 900)
+        .count();
+    let cross_area = semantic_edges
+        .iter()
+        .filter(|edge| {
+            let from = ctx.area_id_for_target(edge.from.as_str());
+            let to = ctx.area_id_for_target(edge.to.as_str());
             matches!((from, to), (Some(left), Some(right)) if left != right)
         })
         .count();
@@ -295,6 +632,62 @@ fn parser_visibility(map: &RepositoryMap) -> SignalAssessment {
             format!(
                 "total extracted functions/classes: {}",
                 map.functions.len() + map.classes.len()
+            ),
+        ],
+    }
+}
+
+fn parser_visibility_redb(ctx: &RedbSignalContext) -> SignalAssessment {
+    let source_files = ctx
+        .files
+        .iter()
+        .filter(|file| matches!(file.role, FileRole::Source | FileRole::Test))
+        .collect::<Vec<_>>();
+    let supported_sources = source_files
+        .iter()
+        .filter(|file| {
+            file.language
+                .as_deref()
+                .map(is_supported_language)
+                .unwrap_or(false)
+        })
+        .count();
+    let semantic_files = source_files
+        .iter()
+        .filter(|file| {
+            ctx.functions
+                .iter()
+                .any(|function| function.file_id.as_str() == file.id)
+                || ctx
+                    .classes
+                    .iter()
+                    .any(|class| class.file_id.as_str() == file.id)
+                || ctx.edges.iter().any(|edge| {
+                    edge.from.as_str() == file.id
+                        && matches!(edge.kind, EdgeKind::Imports | EdgeKind::Defines)
+                })
+        })
+        .count();
+
+    let support_bonus = ratio_scaled(supported_sources, source_files.len(), 55);
+    let semantic_bonus = ratio_scaled(semantic_files, source_files.len(), 35);
+    let score = clamp_score(10 + support_bonus + semantic_bonus);
+
+    SignalAssessment {
+        score,
+        level: signal_level(score).to_string(),
+        evidence: vec![
+            format!(
+                "supported source files: {supported_sources}/{}",
+                source_files.len()
+            ),
+            format!(
+                "source files with semantic extraction: {semantic_files}/{}",
+                source_files.len()
+            ),
+            format!(
+                "total extracted functions/classes: {}",
+                ctx.functions.len() + ctx.classes.len()
             ),
         ],
     }

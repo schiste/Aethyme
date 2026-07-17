@@ -12,7 +12,7 @@ use aethyme_engine::graph::anchors::resolve_anchors;
 use aethyme_engine::graph::facts::{function_usage_fact, public_function_facts};
 use aethyme_engine::graph::navigation::{
     callees_view_redb, callers_view_redb, children_view_redb, configs_view_redb, docs_view_redb,
-    graph_expand_view_redb, graph_overview_view, node_view_redb, parents_view_redb,
+    graph_expand_view_redb, graph_overview_view_redb, node_view_redb, parents_view_redb,
     task_anchors_view_redb, task_expand_view_redb, task_next_view_redb, task_scope_view_redb,
 };
 use aethyme_engine::graph::neighborhood::impact_frontier;
@@ -256,10 +256,15 @@ fn run() -> Result<(), String> {
         }
         "graph-overview" => {
             let repo = read_option(&args, "--repo")?;
-            let map = build_map(&repo, no_cache, fragment_mode)?;
+            let canonical = PathBuf::from(&repo)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let store = GraphStore::open_read_only(&canonical).map_err(|e| e.to_string())?;
             println!(
                 "{}",
-                aethyme_engine::json::repo_overview_view(&graph_overview_view(&map))
+                aethyme_engine::json::repo_overview_view(
+                    &graph_overview_view_redb(&store).map_err(|e| e.to_string())?
+                )
             );
         }
         "impact" => {
