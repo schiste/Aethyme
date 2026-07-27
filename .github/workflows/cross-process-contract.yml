@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR (full history for diff)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # Need both branches to compute the diff. Default
           # actions/checkout fetches only the head — we need the
