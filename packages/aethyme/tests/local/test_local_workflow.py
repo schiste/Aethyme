@@ -172,6 +172,26 @@ def test_local_graph_navigation_commands(tmp_path: Path) -> None:
     assert overview_payload["signals"]["parser_visibility"]["score"] >= 0
 
 
+def test_local_query_deps_and_impact_commands(tmp_path: Path) -> None:
+    """Coverage for the redb deps/impact contract from the Python side.
+
+    Added 2026-07-27 after `query deps` shipped broken for 12 days
+    (engine flag + output-format change with no Python-side test to
+    notice). Asserts the cross-process contract holds end-to-end, not
+    result richness — the demo repo has no resolved file-to-file
+    adjacency, so empty lists are valid.
+    """
+    require_local_engine_or_skip()
+    repo_path = tmp_path / "demo-repo"
+    build_demo_repo(repo_path)
+
+    deps_result = invoke_aethyme(["query", "deps", str(repo_path), "src/main.py"])
+    assert deps_result.exit_code == 0, deps_result.output
+
+    impact_result = invoke_aethyme(["query", "impact", str(repo_path), "src/auth.py"])
+    assert impact_result.exit_code == 0, impact_result.output
+
+
 def test_local_task_navigation_commands(tmp_path: Path) -> None:
     require_local_engine_or_skip()
     repo_path = tmp_path / "demo-repo"

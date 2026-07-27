@@ -142,10 +142,17 @@ CI workflows and `Makefile`/`package.json` pytest entries shrink per
 phase. Contract decision per phase: `soft-retire` of the Python
 invocation spelling, `hard-delete` only in Phase 6.
 
-**Broker-driven.** Each phase is a broker session; gates on the merged
-tree are the enforcement (the redb-fixture incident of 2026-07-17 shows
-why: environment-dependent skips are a known blind spot — the parity
+**Broker-driven, in worktree sessions.** Each phase is a broker
+*worktree* session, never the shared main checkout (Phase 0 lesson,
+2026-07-27: concurrent sessions' uncommitted edits in the shared tree
+were absorbed into a migration commit, and one migration edit was
+clobbered by a concurrent save). Gates on the merged tree are the
+enforcement (the redb-fixture incident of 2026-07-17 shows why:
+environment-dependent skips are a known blind spot — the parity
 harness must not skip silently when the engine is absent; it fails).
+Since 2026-07-27 the gates include `cross-process-contract`, so every
+entry that removes tracked symbols must carry a
+`Contract decision: <label>` line in a commit message.
 
 ## Phases — overview
 
