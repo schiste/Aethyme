@@ -70,10 +70,7 @@ pub fn function_usage_fact(
                 continue;
             }
         }
-        if !matches!(
-            edge.kind,
-            EdgeKind::Calls | EdgeKind::References | EdgeKind::Imports
-        ) {
+        if !matches!(edge.kind, EdgeKind::Calls | EdgeKind::References) {
             continue;
         }
         let Some(caller_path) = source_code_path_for_id(map, &edge.from) else {
@@ -297,16 +294,9 @@ mod tests {
             usage.internal_callers,
             vec!["src/indexing/service.py::local_user".to_string()]
         );
-        assert_eq!(usage.external_callers.len(), 2);
-        assert!(
-            usage
-                .external_callers
-                .contains(&"src/api/routes.py".to_string())
-        );
-        assert!(
-            usage
-                .external_callers
-                .contains(&"src/api/routes.py::handler".to_string())
+        assert_eq!(
+            usage.external_callers,
+            vec!["src/api/routes.py::handler".to_string()]
         );
         assert!(
             !usage

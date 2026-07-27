@@ -46,10 +46,12 @@
 //!    symbol_part)`. Look up symbol_part in module_part's shard
 //!    first (fast). If exactly one match, resolve.
 //! 3. For `Calls` edges: first reuse exact local import bindings
-//!    (`from util import helper as h; h()`), then module-qualified
-//!    targets (`util.helper()`), then same-module bare calls. Calls
-//!    do not use whole-repo name-only fallback because that can
-//!    confuse callback parameters or locals with unrelated symbols.
+//!    (`from util import helper as h; h()`), then receiver-qualified
+//!    targets whose receiver is itself a resolved local import
+//!    binding (`import util; util.helper()`), then same-module bare
+//!    calls. Calls do not use whole-repo name-only fallback because
+//!    that can confuse callback parameters or locals with unrelated
+//!    symbols.
 //! 4. If no resolution is found OR multiple ambiguous candidates
 //!    exist, leave the edge pointing at the placeholder. The
 //!    placeholder survives.
@@ -564,10 +566,6 @@ impl GlobalSymbolIndex {
             return Some(target);
         }
 
-        if let Some(target) = self.resolve_qualified_call(name) {
-            return Some(target);
-        }
-
         if let Some(target) = self.resolve_local_namespace_call(name, local_import_bindings) {
             return Some(target);
         }
@@ -580,34 +578,21 @@ impl GlobalSymbolIndex {
         None
     }
 
-    fn resolve_qualified_call(&self, name: &str) -> Option<ResolvedRecord> {
-        let (module_part, symbol_part) = name.rsplit_once('.')?;
-        if module_part.is_empty() || symbol_part.is_empty() {
-            return None;
-        }
-        self.unique_call_target(module_part, symbol_part)
-    }
-
     fn resolve_local_namespace_call(
         &self,
         name: &str,
         local_import_bindings: &HashMap<String, Vec<ResolvedRecord>>,
     ) -> Option<ResolvedRecord> {
-        let (root, tail) = name.split_once('.')?;
-        let root_target = unique_import_binding(local_import_bindings, root)?;
-        let (module_suffix, symbol_part) = match tail.rsplit_once('.') {
-            Some((module_suffix, symbol_part)) => (Some(module_suffix), symbol_part),
-            None => (None, tail),
-        };
-        if symbol_part.is_empty() {
+        let (module_part, symbol_part) = name.rsplit_once('.')?;
+        if module_part.is_empty() || symbol_part.is_empty() {
             return None;
         }
-        let module = match module_suffix {
-            Some(module_suffix) if !module_suffix.is_empty() => {
-                format!("{}.{}", root_target.module, module_suffix)
-            }
-            _ => root_target.module.clone(),
-        };
+        let root = module_part.split('.').next()?;
+        let root_target = unique_import_binding(local_import_bindings, root)?;
+        if !is_namespace_target_kind(root_target.kind) {
+            return None;
+        }
+        let module = call_module_from_import_binding(module_part, root, &root_target)?;
         self.unique_call_target(&module, symbol_part)
     }
 
@@ -642,6 +627,37 @@ fn is_call_target_kind(kind: NodeKind) -> bool {
         kind,
         NodeKind::Function | NodeKind::Class | NodeKind::Method
     )
+}
+
+fn is_namespace_target_kind(kind: NodeKind) -> bool {
+    matches!(kind, NodeKind::File | NodeKind::Module | NodeKind::Package)
+}
+
+fn call_module_from_import_binding(
+    module_part: &str,
+    root_binding: &str,
+    root_target: &ResolvedRecord,
+) -> Option<String> {
+    if module_part == root_binding {
+        return Some(root_target.module.clone());
+    }
+
+    let tail = module_part.strip_prefix(root_binding)?.strip_prefix('.')?;
+    if is_same_or_child_module(&root_target.module, root_binding) {
+        if is_same_or_child_module(module_part, &root_target.module) {
+            return Some(module_part.to_string());
+        }
+        return None;
+    }
+
+    Some(format!("{}.{}", root_target.module, tail))
+}
+
+fn is_same_or_child_module(module: &str, ancestor: &str) -> bool {
+    module == ancestor
+        || module
+            .strip_prefix(ancestor)
+            .is_some_and(|suffix| suffix.starts_with('.'))
 }
 
 fn symbol_record_to_resolved(record: &SymbolRecord) -> ResolvedRecord {
