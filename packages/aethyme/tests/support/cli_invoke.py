@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -73,6 +74,13 @@ def invoke_aethyme(args: list[str], cwd: Path | None = None) -> InvokeResult:
     """Run `aethyme <args>` and return exit code + merged output."""
     env = dict(os.environ)
     env["AETHYME_ROOT"] = str(PACKAGE_ROOT)
+    # Checkouts without a package-local .venv (broker merge-sim trees,
+    # fresh worktrees) make the router fall back to bare `python3`,
+    # which lacks the package deps. Prepend the *test interpreter's*
+    # bin dir so that fallback resolves to the venv running this suite;
+    # `python -m src.cli` then imports THIS checkout's src via cwd
+    # precedence. Caught by broker entry 55's merged-tree gate.
+    env["PATH"] = f"{Path(sys.executable).parent}{os.pathsep}{env.get('PATH', '')}"
     completed = subprocess.run(
         [str(aethyme_binary()), *args],
         capture_output=True,
