@@ -10,10 +10,9 @@ from functools import lru_cache
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
 
-from src.cli import cli
 from src.indexing.engine import ENGINE_MANIFEST_PATH, EngineError, ensure_engine_binary
+from tests.support.cli_invoke import invoke_aethyme
 
 
 @lru_cache(maxsize=1)
@@ -130,12 +129,8 @@ def test_local_repo_inspect_and_pack(tmp_path: Path) -> None:
     require_local_engine_or_skip()
     repo_path = tmp_path / "demo-repo"
     build_demo_repo(repo_path)
-    runner = CliRunner()
 
-    inspect_result = runner.invoke(
-        cli,
-        ["repo", "inspect", str(repo_path), "--json-output"],
-    )
+    inspect_result = invoke_aethyme(["repo", "inspect", str(repo_path), "--json-output"])
     assert inspect_result.exit_code == 0, inspect_result.output
     inspect_payload = json.loads(inspect_result.output)
     assert inspect_payload["snapshot"]["readme_path"] == "README.md"
@@ -146,10 +141,7 @@ def test_local_repo_inspect_and_pack(tmp_path: Path) -> None:
     assert inspect_payload["files"]
     assert inspect_payload["graph"]["nodes"]
 
-    pack_result = runner.invoke(
-        cli,
-        ["task", "pack", "--repo", str(repo_path), "--task", "Explain this repo", "--json-output"],
-    )
+    pack_result = invoke_aethyme(["task", "pack", "--repo", str(repo_path), "--task", "Explain this repo", "--json-output"])
     assert pack_result.exit_code == 0, pack_result.output
     pack_payload = json.loads(pack_result.output)
     assert pack_payload["task"]["kind"] == "explain_repo"
@@ -162,28 +154,18 @@ def test_local_graph_navigation_commands(tmp_path: Path) -> None:
     require_local_engine_or_skip()
     repo_path = tmp_path / "demo-repo"
     build_demo_repo(repo_path)
-    runner = CliRunner()
 
-    node_result = runner.invoke(
-        cli,
-        ["graph", "node", str(repo_path), "src/main.py", "--json-output"],
-    )
+    node_result = invoke_aethyme(["graph", "node", str(repo_path), "src/main.py", "--json-output"])
     assert node_result.exit_code == 0, node_result.output
     node_payload = json.loads(node_result.output)
     assert node_payload["kind"] == "file"
 
-    children_result = runner.invoke(
-        cli,
-        ["graph", "children", str(repo_path), "src", "--json-output"],
-    )
+    children_result = invoke_aethyme(["graph", "children", str(repo_path), "src", "--json-output"])
     assert children_result.exit_code == 0, children_result.output
     children_payload = json.loads(children_result.output)
     assert children_payload["items"]
 
-    overview_result = runner.invoke(
-        cli,
-        ["graph", "overview", str(repo_path), "--json-output"],
-    )
+    overview_result = invoke_aethyme(["graph", "overview", str(repo_path), "--json-output"])
     assert overview_result.exit_code == 0, overview_result.output
     overview_payload = json.loads(overview_result.output)
     assert "signals" in overview_payload
@@ -194,20 +176,13 @@ def test_local_task_navigation_commands(tmp_path: Path) -> None:
     require_local_engine_or_skip()
     repo_path = tmp_path / "demo-repo"
     build_demo_repo(repo_path)
-    runner = CliRunner()
 
-    anchors_result = runner.invoke(
-        cli,
-        ["task", "anchors", "--repo", str(repo_path), "--task", "Update validate_token flow", "--json-output"],
-    )
+    anchors_result = invoke_aethyme(["task", "anchors", "--repo", str(repo_path), "--task", "Update validate_token flow", "--json-output"])
     assert anchors_result.exit_code == 0, anchors_result.output
     anchors_payload = json.loads(anchors_result.output)
     assert anchors_payload["anchors"]
 
-    scope_result = runner.invoke(
-        cli,
-        ["task", "scope", "--repo", str(repo_path), "--task", "Update validate_token flow", "--json-output"],
-    )
+    scope_result = invoke_aethyme(["task", "scope", "--repo", str(repo_path), "--task", "Update validate_token flow", "--json-output"])
     assert scope_result.exit_code == 0, scope_result.output
     scope_payload = json.loads(scope_result.output)
     assert scope_payload["in_scope_files"]
@@ -221,10 +196,7 @@ def test_local_task_navigation_commands(tmp_path: Path) -> None:
     #   assert "src/main.py" in scope_payload["in_scope_files"]
     assert any(symbol.startswith("src/auth.py::") for symbol in scope_payload["in_scope_symbols"])
 
-    next_result = runner.invoke(
-        cli,
-        ["task", "next", "--repo", str(repo_path), "--task", "Update validate_token flow", "--json-output"],
-    )
+    next_result = invoke_aethyme(["task", "next", "--repo", str(repo_path), "--task", "Update validate_token flow", "--json-output"])
     assert next_result.exit_code == 0, next_result.output
     next_payload = json.loads(next_result.output)
     assert next_payload["items"]
@@ -233,13 +205,25 @@ def test_local_task_navigation_commands(tmp_path: Path) -> None:
     # Same known gap as above: src/main.py no longer appears in `task next`
     # without cross-file caller edges from the fragment pipeline.
 
-    expand_result = runner.invoke(
-        cli,
-        ["task", "expand", "--repo", str(repo_path), "--node", "src/auth.py", "--json-output"],
-    )
+    expand_result = invoke_aethyme(["task", "expand", "--repo", str(repo_path), "--node", "src/auth.py", "--json-output"])
     assert expand_result.exit_code == 0, expand_result.output
     expand_payload = json.loads(expand_result.output)
     assert "dependencies" in expand_payload
+
+
+# ── Implementation-level tests (in-process by design) ──────────────────
+# The engine-info/transport tests below monkeypatch src.cli internals, so
+# they must run in-process. They test the Python transport machinery,
+# which retires wholesale in python-retirement Phase 1 (decision #3:
+# PyO3/--engine-transport deleted); these tests retire with it.
+
+
+def _invoke_inprocess(args: list[str]):
+    from click.testing import CliRunner
+
+    from src.cli import cli
+
+    return CliRunner().invoke(cli, args)
 
 
 def test_repo_engine_info_command(monkeypatch) -> None:
@@ -259,8 +243,7 @@ def test_repo_engine_info_command(monkeypatch) -> None:
         },
     )
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["repo", "engine-info"])
+    result = _invoke_inprocess(["repo", "engine-info"])
     assert result.exit_code == 0, result.output
     assert "Transport: subprocess" in result.output
     assert "Transport source: env" in result.output
@@ -289,8 +272,7 @@ def test_engine_transport_global_option_sets_runtime_transport(monkeypatch) -> N
 
     monkeypatch.setattr("src.cli.engine_runtime_info", fake_runtime_info)
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["--engine-transport", "pyo3", "repo", "engine-info"])
+    result = _invoke_inprocess(["--engine-transport", "pyo3", "repo", "engine-info"])
     assert result.exit_code == 0, result.output
     assert "Transport: pyo3" in result.output
 
@@ -312,8 +294,7 @@ def test_engine_transport_global_option_accepts_custom_name(monkeypatch) -> None
         },
     )
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["--engine-transport", "CUSTOM-RUNNER", "repo", "engine-info"])
+    result = _invoke_inprocess(["--engine-transport", "CUSTOM-RUNNER", "repo", "engine-info"])
     assert result.exit_code == 0, result.output
     assert "Transport: custom-runner" in result.output
 
@@ -335,8 +316,7 @@ def test_repo_engine_info_check_returns_nonzero_when_not_ready(monkeypatch) -> N
         },
     )
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["repo", "engine-info", "--check"])
+    result = _invoke_inprocess(["repo", "engine-info", "--check"])
     assert result.exit_code != 0
     assert "Engine transport is not ready" in result.output
 
@@ -344,8 +324,7 @@ def test_repo_engine_info_check_returns_nonzero_when_not_ready(monkeypatch) -> N
 def test_engine_transport_global_option_rejects_blank(monkeypatch) -> None:
     monkeypatch.setattr("src.cli.engine_runtime_info", lambda: {"transport": "auto"})
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["--engine-transport", "   ", "repo", "engine-info"])
+    result = _invoke_inprocess(["--engine-transport", "   ", "repo", "engine-info"])
     assert result.exit_code != 0
     assert "Engine transport cannot be empty" in result.output
 

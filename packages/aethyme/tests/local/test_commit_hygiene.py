@@ -3,10 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from click.testing import CliRunner
-
-from src.cli import cli
 from src.indexing.commit_hygiene import default_template, lint_commit_message
+from tests.support.cli_invoke import invoke_aethyme
 
 
 def test_default_template_includes_required_sections_for_fix() -> None:
@@ -75,12 +73,8 @@ Validation:
 
 
 def test_repo_commit_message_template_command() -> None:
-    runner = CliRunner()
-
-    result = runner.invoke(
-        cli,
-        ["repo", "commit-message-template", "--type", "feat", "--scope", "repo-memory"],
-    )
+    result = invoke_aethyme(
+        ["repo", "commit-message-template", "--type", "feat", "--scope", "repo-memory"])
 
     assert result.exit_code == 0, result.output
     assert result.output.startswith("feat(repo-memory): short summary\n")
@@ -88,7 +82,6 @@ def test_repo_commit_message_template_command() -> None:
 
 
 def test_repo_lint_commit_message_command_supports_file_and_json(tmp_path: Path) -> None:
-    runner = CliRunner()
     message_path = tmp_path / "COMMIT_EDITMSG"
     message_path.write_text(
         """docs: clarify onboarding
@@ -105,10 +98,8 @@ Validation:
         encoding="utf-8",
     )
 
-    result = runner.invoke(
-        cli,
-        ["repo", "lint-commit-message", str(message_path), "--json-output"],
-    )
+    result = invoke_aethyme(
+        ["repo", "lint-commit-message", str(message_path), "--json-output"])
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
@@ -118,17 +109,13 @@ Validation:
 
 
 def test_repo_lint_commit_message_command_fails_invalid_message() -> None:
-    runner = CliRunner()
-
-    result = runner.invoke(
-        cli,
+    result = invoke_aethyme(
         [
             "repo",
             "lint-commit-message",
             "--message",
             "fix: short\n\nProblem:\n...\nDecision:\n...\nValidation:\n- tests\n",
-        ],
-    )
+        ])
 
     assert result.exit_code == 1, result.output
     assert "Valid: no" in result.output
