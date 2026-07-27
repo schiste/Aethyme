@@ -60,9 +60,10 @@ consumer. This file exists so that doesn't happen again.
 |---|---|---|
 | `scripts/eval/setup-playground.sh` | `python -m src.cli enhance deploy/verify` | Setup fails if `enhance` Click group is renamed/removed. |
 | `scripts/eval/setup-playground.sh` | `$AETHYME_ROOT/rust/target/release/aethyme-graph-index` followed by `$AETHYME_ROOT/rust/target/release/aethyme-engine-cli index --repo .` | Fresh Playground setup fails if either binary path changes, if fragments are not produced before engine indexing, or if `graph_store.redb` stops being materialized from fragments. |
+| `scripts/eval/setup-playground.sh` | Writes local `.git/info/exclude` rules for `.aethyme/`, `.chau7/`, `.claude/`, `.codex/`, `AGENTS.md`, and `CLAUDE.md`; marks tracked generated artifacts `skip-worktree` if the source repo was already enhanced. | Playground agents can treat generated scaffolding as benchmark source if these local excludes drift or are omitted. |
 | `scripts/eval/setup-playground.sh` | Asserts `<target>/.aethyme/graph/` and `<target>/.aethyme/graph_store.redb` exist after graph-index + engine-index. | False failure if the fragment layout or redb graph-store path changes. |
-| `scripts/eval/verify-playground.sh` | `$AETHYME_ROOT/rust/target/release/aethyme-engine-cli`; checks deployed skill, `.aethyme/graph/`, and `.aethyme/graph_store.redb`. | False failure if binary path, fragment layout, or redb graph-store path changes. |
-| `scripts/eval/verify-playground.sh:131-138` | Greps deployed SKILL.md for command names (`src.cli intents`, `aethyme explore`, `analyze dead-code`, `facts function-usage`) | False positive/negative on health check if SKILL.md template changes wording but verify-playground doesn't update its grep patterns. **Updated 2026-05-08 after the explore hard-delete to expect native `aethyme explore` not `src.cli explore`.** |
+| `scripts/eval/verify-playground.sh` | `$AETHYME_ROOT/rust/target/release/aethyme-engine-cli`; checks deployed root guidance, skill, `.aethyme/graph/`, `.aethyme/graph_store.redb`, and local generated-artifact excludes. | False failure if binary path, fragment layout, redb graph-store path, generated root wording, or ignore contract changes. |
+| `scripts/eval/verify-playground.sh` | Greps deployed root files and SKILL.md for command names (`src.cli intents`, native `aethyme explore`, `analyze dead-code`, `facts function-usage`) and rejects executable `src.cli explore` guidance. | False positive/negative on health check if templates change wording but verify-playground doesn't update its grep patterns. **Updated 2026-07-27 to check generated `AGENTS.md`/`CLAUDE.md` as well as the skill.** |
 | `scripts/docs/generate-docs.sh:38` | Reads `src/cli.py` to extract command help | Doc generation fails if `cli.py` moved/renamed. |
 | `scripts/migrate.sh` (REMOVED 2026-07-13) | Deleted with migrations/, alembic, and the Postgres deps in the final cloud-lineage sweep. | — |
 | `scripts/start-api.sh` (REMOVED 2026-07-13) | Deleted with the Gen-0 PostgreSQL lineage (`src/api`, `src/graph`, tenant CLI commands `index/stats/ego/impact/search`). Any external caller of those entry points was already dead or must migrate to the engine CLI (`query`/`graph` commands). | — |
@@ -259,7 +260,7 @@ Reader/writer split:
 | Read adjacency | `importers`, `deps` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
 | Hybrid usage-boundary | `analyze-usage-boundary`, `explore --intent usage_boundary_query` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` for seeds, source/docs/config text for fresh evidence |
 | Hybrid grep + adjacency | `callers` | Grep first, then `GraphStore::open_read_only` / redb `ReadOnlyDatabase` for candidate expansion |
-| Assert artifact exists | `scripts/eval/setup-playground.sh`, `scripts/eval/verify-playground.sh`, `docs/guides/playground-setup.md` | Filesystem existence check only |
+| Assert artifact exists and is locally ignored in playgrounds | `scripts/eval/setup-playground.sh`, `scripts/eval/verify-playground.sh`, `docs/guides/playground-setup.md` | Filesystem existence check plus `.git/info/exclude` visibility check in playground Aethyme clones |
 
 Read-only open policy:
 
@@ -298,7 +299,7 @@ Findings:
 
 Outstanding risks after 4.7.12:
 
-- The audit only covers in-repo consumers under `packages/aethyme/`; already-deployed playground repos can still contain stale generated skills. Run `scripts/eval/verify-playground.sh` against active playground targets after any template change.
+- The audit only covers in-repo consumers under `packages/aethyme/`; already-deployed playground repos can still contain stale generated skills or missing local excludes. Run `scripts/eval/verify-playground.sh` against active playground targets after any template or playground-hygiene change.
 - Python output caches under `AETHYME_CACHE_DIR` are independent of the removed Rust `map_cache`; deletion of `map_cache.rs` does not clear cached JSON command output.
 - Any out-of-repo scripts that read orphaned `.aethyme/cache/map-*.bin` or `.aethyme/parse_store.redb` files directly, or pass `--no-fragments`, are unsupported and were not found by this repo-local audit.
 - The Rust engine now builds against redb 4.x. Existing `.aethyme/graph_store.redb` files created by the redb 2.x engine should be treated as disposable local materializations and regenerated from `.aethyme/graph/` fragments with `aethyme-engine-cli index --repo <repo>`; the index command reports old redb file formats before deleting/recreating the graph store. Do not rely on an in-place redb file-format migration for deploys.

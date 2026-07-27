@@ -58,6 +58,28 @@ check_warn() { echo "  [WARN] $1"; ((WARNINGS++)); }
 count_git_refs() {
     git for-each-ref --format='%(refname)' refs/heads refs/remotes 2>/dev/null | wc -l | tr -d ' '
 }
+check_ignored_path() {
+    local generated_path="$1"
+    local label="$2"
+    git check-ignore -q -- "$generated_path" \
+        && check_pass "$label ignored for ordinary discovery" \
+        || check_fail "$label is not ignored by .git/info/exclude"
+}
+check_root_guidance() {
+    local file="$1"
+    local label="$2"
+
+    [[ -f "$file" ]] && check_pass "$label present" || { check_fail "Missing $label"; return; }
+    grep -q '{{AETHYME_ROOT}}' "$file" && check_fail "$label has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "$label placeholders resolved"
+    grep -q '"$AETHYME_ROOT/rust/target/release/aethyme" explore' "$file" \
+        && check_pass "$label points Explore at native aethyme binary" \
+        || check_fail "$label missing native Explore quick start"
+    if grep 'src.cli explore' "$file" | grep -Ev 'Do not run|not a valid command|was removed' >/dev/null; then
+        check_fail "$label still contains executable guidance for deleted 'src.cli explore'"
+    else
+        check_pass "$label has no stale executable Python Explore guidance"
+    fi
+}
 
 # ── Control Repo ─────────────────────────────────────────────────────
 
@@ -126,6 +148,8 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
     # Skill deployed
     [[ -f .codex/skills/aethyme/SKILL.md ]] && check_pass "Skill deployed" || check_fail "Missing .codex/skills/aethyme/SKILL.md"
     [[ -d .codex/skills/eval ]] && check_fail "Internal eval skill leaked into playground" || check_pass "No internal eval skill deployed"
+    check_root_guidance "AGENTS.md" "AGENTS.md"
+    check_root_guidance "CLAUDE.md" "CLAUDE.md"
 
     # Skill has no unresolved placeholders
     if [[ -f .codex/skills/aethyme/SKILL.md ]]; then
@@ -156,6 +180,15 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
     # pass/parser fallback is gone.
     [[ -d .aethyme/graph ]] && check_pass "Fragment graph present" || check_fail "Missing .aethyme/graph — run aethyme-graph-index before $ENGINE index --repo ."
     [[ -f .aethyme/graph_store.redb ]] && check_pass "Redb graph store present" || check_fail "Missing .aethyme/graph_store.redb — run: $ENGINE index --repo ."
+    check_ignored_path ".aethyme/graph_store.redb" ".aethyme graph store"
+    check_ignored_path ".aethyme/graph" ".aethyme fragment graph"
+    check_ignored_path ".codex/skills/aethyme/SKILL.md" "Codex Aethyme skill"
+    check_ignored_path ".claude/skills/aethyme/SKILL.md" "Claude Aethyme skill"
+    check_ignored_path "AGENTS.md" "Generated AGENTS.md"
+    check_ignored_path "CLAUDE.md" "Generated CLAUDE.md"
+
+    DIRTY=$(git status --porcelain --untracked-files=all 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$DIRTY" == "0" ]] && check_pass "Generated artifacts hidden from git status" || check_fail "$DIRTY visible working-tree change(s)"
 fi
 
 echo ""

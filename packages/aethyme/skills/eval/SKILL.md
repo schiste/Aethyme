@@ -38,7 +38,12 @@ All scripts are in `scripts/eval/` and auto-detect `AETHYME_ROOT` from their own
   --dest ~/Downloads/Repositories/Playground/Mediawiki
 ```
 
-Creates `<Name> - Control` (vanilla) and `<Name> - Aethyme` (with skill + graph index). Sanitizes git history so agents can't find fix commits via `git log --all`.
+Creates `<Name> - Control` (vanilla) and `<Name> - Aethyme` (with generated
+root guidance, per-product skills, fragment graph, and redb graph store).
+Sanitizes git history so agents can't find fix commits via `git log --all`.
+Installs local `.git/info/exclude` rules so `.aethyme/`, `.chau7/`, `.claude/`,
+`.codex/`, `AGENTS.md`, and `CLAUDE.md` do not appear as ordinary repo
+evidence.
 
 ### Verify a playground
 
@@ -46,7 +51,9 @@ Creates `<Name> - Control` (vanilla) and `<Name> - Aethyme` (with skill + graph 
 ./scripts/eval/verify-playground.sh --target mediawiki
 ```
 
-15-point check: no contamination on Control, skill + graph on Aethyme, same commit, engine exists. **Run this before every assessment.**
+Readiness check: no contamination on Control; current native-Explore guidance,
+skill, graph fragments, redb store, and generated-artifact excludes on Aethyme;
+same commit; engine exists. **Run this before every assessment.**
 
 ### Run an assessment
 
@@ -197,8 +204,8 @@ review the resulting JSON against source when setting the benchmark reference.
 Example for dead-code:
 ```bash
 cd packages/aethyme
-.venv/bin/python -m src.cli explore --repo /path/to/repo --request "Find public methods in includes/Watchlist with no outside callers" --format answer-json
-.venv/bin/python -m src.cli explore --repo /path/to/repo --intent usage_boundary_query --request "Find public methods in includes/Watchlist with no outside callers" --params '{"scope":"includes/Watchlist","symbol_kind":"public_method","boundary":{"type":"outside_directory","path":"includes/Watchlist"},"search_roots":[],"budget_ms":10000,"max_evidence_per_symbol":5}' --format answer-json --show-observability
+rust/target/release/aethyme explore --repo /path/to/repo --request "Find public methods in includes/Watchlist with no outside callers" --format answer-json
+rust/target/release/aethyme explore --repo /path/to/repo --intent usage_boundary_query --request "Find public methods in includes/Watchlist with no outside callers" --params '{"scope":"includes/Watchlist","symbol_kind":"public_method","boundary":{"type":"outside_directory","path":"includes/Watchlist"},"search_roots":[],"budget_ms":10000,"max_evidence_per_symbol":5}' --format answer-json --show-observability
 .venv/bin/python -m src.cli facts public-functions --repo /path/to/repo --scope includes/Watchlist --include-methods --json-output
 .venv/bin/python -m src.cli analyze dead-code --repo /path/to/repo --scope includes/Watchlist --boundary outside-directory --include-methods --format eval-json --show-observability
 .venv/bin/python -m src.cli facts function-usage --repo /path/to/repo --target "<function>" --boundary includes/Watchlist --json-output
@@ -225,6 +232,13 @@ agent conditions.
 ### Control contamination
 Chau7 creates `.chau7/snippets/` when opening a tab in any directory. Delete from Control before each run. `verify-playground.sh` catches this.
 
+### Aethyme artifact contamination
+The Aethyme clone needs `.aethyme/`, `.codex/`, `.claude/`, `AGENTS.md`, and
+`CLAUDE.md` so enhanced agents can run, but those files are not benchmark
+source. `setup-playground.sh` writes local `.git/info/exclude` rules so Git and
+ripgrep ignore them during ordinary discovery; `verify-playground.sh` fails if
+those generated artifacts are visible in `git status` or not ignored.
+
 ### Output capture
 The agent's final text response is hard to capture programmatically. The session JSONL doesn't include it. The terminal scrollback is too small. PTY log has TUI spinner noise. **Telemetry data** (tokens, cost, tools, duration) is reliable. **Quality scores** are approximate until Chau7 provides a `tab_last_response` API.
 
@@ -234,27 +248,19 @@ The task-conditioned prompt can contain navigation context with function/file na
 ### Stale deployed skills
 The Aethyme condition is only meaningful if `.codex/skills/aethyme/SKILL.md`
 advertises current commands. `verify-playground.sh` must pass the skill freshness
-checks before a run. Treat old `$ENGINE unused --repo ...` guidance as stale;
-the current dead-code path starts with `python -m src.cli analyze dead-code
---boundary outside-directory --format eval-json --show-observability`.
-The preferred high-level path for normal requests starts with `python -m src.cli
-explore --request ... --format answer-json --show-observability`; the default
-`task_localization_query` intent returns ranked candidates, evidence, confidence,
-trust policy, navigation hints, next actions, and observability. For degraded
-runs, verify that filename-only matches are not emitted as authoritative
-`answer[]` items. For dead-code or boundary usage requests, use
-`python -m src.cli explore --intent usage_boundary_query --format answer-json
---show-observability`. For PHP scopes, that specialized Explore intent uses the
-scope-first `analyze-usage-boundary` engine path; `facts public-functions` /
-`facts function-usage` remain follow-up verification tools for ambiguous cases
-or non-PHP fallback.
+checks before a run. Treat old `$ENGINE unused --repo ...` guidance as stale.
+Also treat executable `python -m src.cli explore ...` guidance as stale:
+Explore is native now and should start with
+`$AETHYME_ROOT/rust/target/release/aethyme explore --repo ... --request ...
+--format answer-json`. The Python CLI remains valid for non-Explore surfaces
+such as `analyze dead-code`, `facts function-usage`, and `intents`.
 
 ### Aethyme availability vs Aethyme usage
 An Aethyme-enabled repository does not prove that the agent used Aethyme. Every
 run report should inspect the `Aethyme Usage` section:
 - `explore` should usually show whether ambient availability alone was enough.
 - `leverage` should show whether the generic usage card caused real
-  `src.cli explore` / `src.cli intents` calls.
+  native `aethyme explore` / Python `src.cli intents` calls.
 - `task-conditioned` should be interpreted as context-pack value, not as proof
   that high-level Explore commands were used.
 

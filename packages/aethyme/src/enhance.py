@@ -351,7 +351,11 @@ def _render_agents_override_sections(repo: Path) -> str:
         )
     )
     maintainer_markdown = overrides.get("maintainer_markdown")
-    if isinstance(maintainer_markdown, str) and maintainer_markdown.strip():
+    if (
+        isinstance(maintainer_markdown, str)
+        and maintainer_markdown.strip()
+        and not _looks_like_generated_agents_document(maintainer_markdown.strip())
+    ):
         sections.append(f"## Maintainer Notes\n\n{maintainer_markdown.strip()}")
     return "\n\n".join(sections)
 
@@ -388,6 +392,9 @@ def deploy(repo: Path, *, force: bool = False) -> list[DeployAction]:
 
     root = aethyme_root()
     actions: list[DeployAction] = []
+    cleanup_action = _drop_stale_generated_agents_override(repo)
+    if cleanup_action is not None:
+        actions.append(cleanup_action)
     migration_action = _migrate_legacy_agents_content(repo)
     if migration_action is not None:
         actions.append(migration_action)
@@ -514,12 +521,62 @@ def _extract_legacy_agents_content(existing: str) -> str:
         pieces = [before.strip(), after.strip()]
         return "\n\n".join(piece for piece in pieces if piece)
 
+    if _looks_like_generated_agents_document(stripped):
+        return ""
+
     rendered_template = (_TEMPLATE_DIR / "AGENTS.md").read_text(encoding="utf-8").replace(
         PLACEHOLDER, aethyme_root()
     )
     if stripped == rendered_template.strip():
         return ""
     return stripped
+
+
+def _drop_stale_generated_agents_override(repo: Path) -> DeployAction | None:
+    """Remove old generated Aethyme boilerplate from maintainer overrides."""
+    override_path = repo / AGENTS_OVERRIDE_PATH
+    if not override_path.exists():
+        return None
+    overrides = _load_agents_overrides(repo)
+    if overrides.get("_invalid_override"):
+        return None
+    maintainer_markdown = overrides.get("maintainer_markdown")
+    if not (
+        isinstance(maintainer_markdown, str)
+        and _looks_like_generated_agents_document(maintainer_markdown.strip())
+    ):
+        return None
+
+    clean_overrides = {
+        key: value
+        for key, value in overrides.items()
+        if not key.startswith("_") and key != "maintainer_markdown"
+    }
+    if clean_overrides:
+        override_path.write_text(json.dumps(clean_overrides, indent=2) + "\n", encoding="utf-8")
+    else:
+        override_path.unlink()
+
+    target = EnhancementTarget(
+        AGENTS_OVERRIDE_PATH,
+        _TEMPLATE_DIR / "AGENTS.md",
+        "Repo-specific AGENTS override data",
+    )
+    return DeployAction(target, "updated")
+
+
+def _looks_like_generated_agents_document(content: str) -> bool:
+    """Detect legacy generated Aethyme root guidance, including stale variants."""
+    if not content:
+        return False
+    required_markers = (
+        "# Agent Instructions",
+        "This repository is **Aethyme-enhanced**",
+        "## Quick start (any agent)",
+        "## Detailed reference",
+        "## Verifying this enhancement",
+    )
+    return all(marker in content for marker in required_markers)
 
 
 def _ensure_executable(path: Path) -> None:
