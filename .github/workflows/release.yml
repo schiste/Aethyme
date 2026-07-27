@@ -25,7 +25,7 @@ jobs:
         working-directory: packages/aethyme/rust
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           # Full history + tags so build.rs embeds the tag in
           # `aethyme --version` via `git describe`.
@@ -50,7 +50,7 @@ jobs:
             aethyme aethyme-engine-cli
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: aethyme-${{ matrix.target }}
           path: packages/aethyme/rust/aethyme-*-${{ matrix.target }}.tar.gz
@@ -62,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -70,7 +70,7 @@ jobs:
       - name: Create or update release
         # Third-party action with a write-scoped token: pinned to a full
         # commit SHA rather than a movable tag.
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           files: dist/*.tar.gz
           generate_release_notes: true
