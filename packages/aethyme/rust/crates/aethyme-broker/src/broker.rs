@@ -105,9 +105,22 @@ impl DoctorReport {
 pub struct StatusView {
     pub agents: Vec<AgentView>,
     pub overlaps: Vec<crate::leases::Overlap>,
+    pub promoted_conflicts: Vec<PromotedConflict>,
     pub queue: Vec<crate::types::MergeQueueEntry>,
     pub integration_branch: String,
     pub integration_head: String,
+}
+
+/// A live session lease overlapping work that has already promoted to the
+/// local integration branch but has not necessarily reached main. Separate
+/// from live/live lease overlaps: the blocking work may belong to a closed
+/// session whose leases were correctly purged.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+pub struct PromotedConflict {
+    pub session_id: i64,
+    pub path: String,
+    pub session_path: String,
+    pub promoted_path: String,
 }
 
 /// One broker instance per repository: git handle on the main checkout +
@@ -394,6 +407,80 @@ impl Broker {
         Ok(after)
     }
 
+    /// Detect live-session leases that overlap already-promoted work on
+    /// the integration branch. This intentionally does NOT keep leases for
+    /// cleaned sessions alive: closed-session rows remain purged, and the
+    /// promoted branch is its own conflict surface.
+    fn promoted_conflicts(&self) -> Result<Vec<PromotedConflict>, BrokerOpError> {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use crate::leases::{LeaseIgnoreRules, paths_overlap};
+
+        let Some(integration) = self.integration_tip() else {
+            return Ok(Vec::new());
+        };
+        let rules = LeaseIgnoreRules::load(&self.main_root);
+        let mut leases_by_session: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+        for lease in self.store.active_leases()? {
+            if !rules.is_ignored(&lease.path) {
+                leases_by_session
+                    .entry(lease.session_id)
+                    .or_default()
+                    .push(lease.path);
+            }
+        }
+        if leases_by_session.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conflicts = BTreeSet::new();
+        for session in self.store.live_sessions()? {
+            if !matches!(
+                session.status,
+                SessionStatus::Active | SessionStatus::Idle | SessionStatus::Stale
+            ) {
+                continue;
+            }
+            let Some(session_paths) = leases_by_session.get(&session.id) else {
+                continue;
+            };
+            let Ok(checkout) = GitRepo::discover(Path::new(&session.worktree_path)) else {
+                continue;
+            };
+            let Ok(base) = checkout.merge_base(&integration, "HEAD") else {
+                continue;
+            };
+            if base == integration {
+                continue;
+            }
+            let Ok(promoted_paths) = self.repo.changed_between(&base, &integration) else {
+                continue;
+            };
+            for promoted_path in promoted_paths
+                .into_iter()
+                .filter(|path| !rules.is_ignored(path))
+            {
+                for session_path in session_paths {
+                    if !paths_overlap(session_path, &promoted_path) {
+                        continue;
+                    }
+                    let path = if session_path.len() >= promoted_path.len() {
+                        session_path.clone()
+                    } else {
+                        promoted_path.clone()
+                    };
+                    conflicts.insert(PromotedConflict {
+                        session_id: session.id,
+                        path,
+                        session_path: session_path.clone(),
+                        promoted_path: promoted_path.clone(),
+                    });
+                }
+            }
+        }
+        Ok(conflicts.into_iter().collect())
+    }
+
     // ── gates (Phase 4) ───────────────────────────────────────────────
 
     /// Affected-gate selection for a session's current diff, without
@@ -529,15 +616,18 @@ impl Broker {
     // ── status (Phase 6) ──────────────────────────────────────────────
 
     /// The whole picture in one call: refreshed leases + overlaps, agent
-    /// views, the merge queue, and the integration branch head.
+    /// views, promoted/unmerged conflicts, the merge queue, and the
+    /// integration branch head.
     pub fn status(&mut self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
         let overlaps = self.refresh_leases()?;
         let agents = self.agents(now_ms)?;
+        let promoted_conflicts = self.promoted_conflicts()?;
         let queue = self.store.merge_queue()?;
         let (integration_branch, integration_head) = self.integration_head()?;
         Ok(StatusView {
             agents,
             overlaps,
+            promoted_conflicts,
             queue,
             integration_branch,
             integration_head,

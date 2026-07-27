@@ -376,3 +376,32 @@ fn action_required_is_cleared_after_successful_promotion() {
         "stale action-required drop must be cleared on promotion (#41)"
     );
 }
+
+#[test]
+fn status_reports_promoted_unmerged_work_as_separate_conflict_surface() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let wt_promoted = agent_worktree(tmp.path(), "promoted");
+    let promoted = broker.adopt(&wt_promoted, Some("promoted")).unwrap();
+    commit_edit(&wt_promoted, "src/a.py", "a = 20\n");
+    assert!(broker.submit(promoted.id).unwrap().promoted);
+    broker.close(promoted.id).unwrap();
+
+    let wt_live = agent_worktree(tmp.path(), "live");
+    let live = broker.adopt(&wt_live, Some("live")).unwrap();
+    commit_edit(&wt_live, "src/a.py", "a = 30\n");
+
+    let status = broker.status(0).unwrap();
+    assert!(
+        status.overlaps.is_empty(),
+        "closed-session leases stay purged; the promoted branch owns this surface"
+    );
+    assert_eq!(status.promoted_conflicts.len(), 1);
+    let conflict = &status.promoted_conflicts[0];
+    assert_eq!(conflict.session_id, live.id);
+    assert_eq!(conflict.path, "src/a.py");
+    assert_eq!(conflict.session_path, "src/a.py");
+    assert_eq!(conflict.promoted_path, "src/a.py");
+}

@@ -406,6 +406,9 @@ fn run_selections(
         let duration_ms = started.elapsed().as_millis() as i64;
         let (gate_status, exit_code) = match status {
             Ok(Some(0)) => (GateStatus::Pass, Some(0i64)),
+            Ok(Some(code)) if is_cargo_target_dir_infra_error(&gate.command, &log_path) => {
+                (GateStatus::Error, Some(code as i64))
+            }
             Ok(Some(code)) => (GateStatus::Fail, Some(code as i64)),
             // Killed by a signal (cancellation, OOM, operator kill): not a
             // verdict on the code. Recording a conclusive fail here poisons
@@ -444,6 +447,44 @@ fn run_selections(
         }
     }
     Ok(outcomes)
+}
+
+fn is_cargo_target_dir_infra_error(command: &str, log_path: &Path) -> bool {
+    if !command_mentions_cargo(command) {
+        return false;
+    }
+    let Ok(log) = std::fs::read_to_string(log_path) else {
+        return false;
+    };
+    let lower = log.to_ascii_lowercase();
+    let target_context = lower.contains(".fingerprint")
+        || lower.contains("target/debug")
+        || lower.contains("target/release")
+        || lower.contains(".rlib")
+        || lower.contains("build directory");
+    if !target_context {
+        return false;
+    }
+
+    const INFRA_PATTERNS: &[&str] = &[
+        "extern location",
+        "no such file or directory",
+        "failed to lock",
+        "failed to acquire",
+        "failed to rename",
+        "failed to remove",
+        "failed to write",
+        "file exists",
+        "resource busy",
+        "text file busy",
+    ];
+    INFRA_PATTERNS.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn command_mentions_cargo(command: &str) -> bool {
+    command
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+        .any(|part| part == "cargo")
 }
 
 /// Spawn one gate command (`sh -c`, own process group, output to log),

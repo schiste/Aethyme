@@ -188,6 +188,64 @@ triggers = ["**/*.py"]
 }
 
 #[test]
+fn cargo_target_dir_infra_errors_are_not_cached_failures() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "cargo-test"
+command = "echo cargo-run >> gate-markers.txt; printf '%s\n' 'error: extern location for aethyme_broker does not exist: target/debug/deps/libaethyme_broker.rlib' >&2; exit 101 # cargo test"
+triggers = ["**/*.py"]
+"#,
+    );
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = add_worktree(tmp.path(), "cargo-infra");
+    let session = broker.adopt(&wt, None).unwrap();
+    std::fs::write(wt.join("src/app.py"), "x = 4\n").unwrap();
+
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].gate, "cargo-test");
+    assert_eq!(outcomes[0].status, GateStatus::Error);
+    assert_eq!(outcomes[0].exit_code, Some(101));
+    assert!(!outcomes[0].cached);
+
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(
+        outcomes[0].status,
+        GateStatus::Error,
+        "the same infra-shaped cargo failure is still an error"
+    );
+    assert!(
+        !outcomes[0].cached,
+        "error rows must never satisfy the tree-hash gate cache"
+    );
+
+    let markers = std::fs::read_to_string(wt.join("gate-markers.txt")).unwrap();
+    assert_eq!(
+        markers.lines().count(),
+        2,
+        "a second run re-executes instead of reusing a poisoned fail cache"
+    );
+
+    let tree = aethyme_broker::GitRepo::discover(&wt)
+        .unwrap()
+        .working_tree_hash()
+        .unwrap();
+    assert!(
+        broker
+            .store()
+            .cached_gate_result("cargo-test", &tree)
+            .unwrap()
+            .is_none(),
+        "cargo target-dir infrastructure errors are non-conclusive"
+    );
+}
+
+#[test]
 fn slow_gate_emits_heartbeat_progress() {
     let _env = EnvGuard::set("AETHYME_GATE_HEARTBEAT_SECS", "1");
     let tmp = tempfile::tempdir().unwrap();

@@ -336,10 +336,10 @@ impl GitRepo {
     /// Changed files between two commits (for affected-gate selection on
     /// a simulated merged tree).
     pub fn changed_between(&self, from: &str, to: &str) -> Result<Vec<String>, GitError> {
-        Ok(run_git(&self.root, &["diff", "--name-only", from, to])?
-            .lines()
-            .map(str::to_string)
-            .collect())
+        Ok(parse_path_lines(&run_git(
+            &self.root,
+            &["diff", "--name-only", from, to],
+        )?))
     }
 
     /// Create a detached worktree at `dest` checked out at `commit`.
