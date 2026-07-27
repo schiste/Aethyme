@@ -152,20 +152,30 @@ def find_touched_symbols(diff_lines: list[str], tracked: set[str]) -> dict[str, 
 
 
 def parse_contract_decision(pr_body: str) -> str | None:
-    """Find the contract checkbox the PR author marked.
+    """Find the contract decision the author declared.
 
-    The PR template has four labeled checkboxes. We look for
-    `[x]` or `[X]` next to a `**<label>**` form. If none are
-    checked, we treat the contract as undeclared.
+    Two accepted spellings:
+    - PR template checkbox: `- [x] **<label>**` (the GitHub PR path).
+    - Commit-message line: `Contract decision: <label>` (the broker
+      path, where submissions have no PR body and the decision lives
+      in commit messages — added 2026-07-27 when the checker became a
+      broker gate; the 12-day `query deps` break shipped through a
+      broker submission the PR-only checker never saw).
+
+    If neither appears, the contract is undeclared.
     """
-    pattern = re.compile(
+    checkbox = re.compile(
         r"-\s*\[\s*[xX]\s*\]\s*\*\*(none|introduce|soft-retire|hard-delete)\*\*",
         re.IGNORECASE,
     )
-    matches = pattern.findall(pr_body or "")
+    message_line = re.compile(
+        r"^\s*Contract decision:\s*(none|introduce|soft-retire|hard-delete)\b",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    matches = checkbox.findall(pr_body or "") + message_line.findall(pr_body or "")
     if not matches:
         return None
-    # Prefer the most-restrictive label if multiple are checked.
+    # Prefer the most-restrictive label if multiple are declared.
     order = ("hard-delete", "soft-retire", "introduce", "none")
     for tier in order:
         if any(m.lower() == tier for m in matches):

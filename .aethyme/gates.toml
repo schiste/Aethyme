@@ -46,3 +46,17 @@ name = "cargo-test"
 command = 'CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/aethyme-cargo-target}" cargo test --workspace --quiet --manifest-path packages/aethyme/rust/Cargo.toml'
 cost = 3
 triggers = ["**/*.rs", "**/Cargo.toml"]
+
+[[gate]]
+# 2026-07-27: the registry's enforcement previously ran ONLY in the
+# GitHub PR workflow — a path broker submissions never take. That hole
+# shipped the 12-day `query deps` break (d8bbe85 removed tracked
+# symbols; no gate demanded a contract decision). This gate runs the
+# same checker on the entry's diff against the integration branch,
+# feeding the entry's commit messages as the decision source
+# (`Contract decision: <label>` line — checker accepts both this and
+# the PR checkbox syntax). No triggers: tracked symbols can be touched
+# from any file, and the checker exits fast on clean diffs.
+name = "cross-process-contract"
+command = 'MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && BASE="$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)" && BODY="$(mktemp)" && git log --format=%B "$BASE"..HEAD > "$BODY" && "$MAIN/packages/aethyme/.venv/bin/python" scripts/check-cross-process-contract.py --base "$BASE" --pr-body "$BODY"'
+cost = 1
