@@ -36,6 +36,9 @@ part of the contract.
 {
   "agents": [ Session + { "activity_at", "derived_status", "pid_alive" } ],
   "overlaps": [ { "session_a", "session_b", "path" } ],
+  "promoted_conflicts": [
+    { "session_id", "path", "session_path", "promoted_path" }
+  ],
   "queue": [ MergeQueueEntry ],
   "integration_branch": "...",
   "integration_head": "<commit>"

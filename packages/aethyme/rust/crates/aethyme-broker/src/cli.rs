@@ -90,7 +90,9 @@ Usage:
       promote when verified (default; set [promote] mode = 'manual' to
       hold verified entries for explicit promote). Conflicts reject
       before any gate runs and write instructions to
-      <worktree>/.aethyme/broker-action-required.md.
+      <worktree>/.aethyme/broker-action-required.md. V1 submits the
+      whole session head only; --path/--commit scoping is intentionally
+      out of scope while worktree identity is the coordination unit.
   aethyme broker queue [--json]
       Show the merge queue.
   aethyme broker promote --entry <id> [--json]
@@ -98,7 +100,8 @@ Usage:
       entry's merge commit; other in-flight entries are re-simulated.
       Never pushes.
   aethyme broker status [--json]
-      The whole picture: agents, overlaps, merge queue, integration head.
+      The whole picture: agents, overlaps, promoted conflicts, merge
+      queue, integration head.
   aethyme broker events [--since <id>] [--kind <prefix>] [--follow] [--json]
       Show the append-only event log (see docs/events-contract.md).
       --kind filters by prefix (e.g. merge. or lease.overlap); --follow
@@ -394,6 +397,15 @@ fn print_overlap_warnings(overlaps: &[crate::Overlap]) {
         eprintln!(
             "⚠ overlap: sessions {} and {} are both touching {}",
             overlap.session_a, overlap.session_b, overlap.path
+        );
+    }
+}
+
+fn print_promoted_conflict_warnings(conflicts: &[crate::PromotedConflict]) {
+    for conflict in conflicts {
+        eprintln!(
+            "⚠ promoted conflict: session {} is touching {}; integration already changed {}",
+            conflict.session_id, conflict.session_path, conflict.promoted_path
         );
     }
 }
@@ -981,6 +993,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     }
                 }
                 print_overlap_warnings(&status.overlaps);
+                print_promoted_conflict_warnings(&status.promoted_conflicts);
             }
         }
         "events" => {

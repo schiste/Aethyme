@@ -34,7 +34,9 @@ mod schema;
 mod store;
 mod types;
 
-pub use broker::{AdoptMode, AgentView, Broker, BrokerOpError, DoctorReport, StatusView};
+pub use broker::{
+    AdoptMode, AgentView, Broker, BrokerOpError, DoctorReport, PromotedConflict, StatusView,
+};
 pub use error::BrokerError;
 pub use gates::{
     Gate, GateConfigError, GateProgressSink, GateRunOutcome, load_gates, select_gates,
