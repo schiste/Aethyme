@@ -47,6 +47,10 @@ fn engine_bin() -> &'static str {
     env!("CARGO_BIN_EXE_aethyme-engine-cli")
 }
 
+fn aethyme_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_aethyme")
+}
+
 fn write(root: &Path, rel: &str, content: &[u8]) {
     let full = root.join(rel);
     std::fs::create_dir_all(full.parent().unwrap()).unwrap();
@@ -62,6 +66,17 @@ where
         .args(args)
         .output()
         .expect("spawn aethyme-engine-cli")
+}
+
+fn run_aethyme<I, S>(args: I) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Command::new(aethyme_bin())
+        .args(args)
+        .output()
+        .expect("spawn aethyme")
 }
 
 fn run_engine_with_env<I, S>(args: I, env_key: &str, env_value: &str) -> Output
@@ -662,6 +677,20 @@ fn context_pack_cli_json(repo: &Path, command: &str, task: &str) -> serde_json::
     query_json([command, "--repo", repo.to_str().unwrap(), "--task", task])
 }
 
+fn context_pack_cli_json_with_metrics(
+    repo: &Path,
+    command: &str,
+    task: &str,
+) -> (serde_json::Value, ContextPackBudgetMetrics) {
+    let output = run_engine([command, "--repo", repo.to_str().unwrap(), "--task", task]);
+    assert_success(&output);
+    let output_text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("context-pack JSON parses");
+    let metrics = context_pack_budget_metrics(&value, output_text.as_ref());
+    (value, metrics)
+}
+
 fn context_with_content_cli_json(repo: &Path, command: &str, task: &str) -> serde_json::Value {
     query_json([
         command,
@@ -699,6 +728,52 @@ fn explore_cli_json(
         args.push("--show-observability".to_string());
     }
     query_json(args)
+}
+
+fn aethyme_explore_cli_json_with_metrics(
+    repo: &Path,
+    request: &str,
+    intent: &str,
+    show_observability: bool,
+) -> (serde_json::Value, ExploreInvocationMetrics) {
+    let mut args = vec![
+        "explore".to_string(),
+        "--repo".to_string(),
+        repo.to_str().unwrap().to_string(),
+        "--request".to_string(),
+        request.to_string(),
+        "--format".to_string(),
+        "answer-json".to_string(),
+        "--intent".to_string(),
+        intent.to_string(),
+    ];
+    if show_observability {
+        args.push("--show-observability".to_string());
+    }
+    let output = run_aethyme(args);
+    assert_success(&output);
+    let output_text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("aethyme explore JSON parses");
+    let visible_payload = [
+        "answer",
+        "navigation_hints",
+        "verification_steps",
+        "next_actions",
+    ]
+    .into_iter()
+    .filter_map(|key| value.get(key))
+    .map(serde_json::Value::to_string)
+    .collect::<Vec<_>>()
+    .join("\n");
+    let metrics = ExploreInvocationMetrics {
+        command_output_chars: output_text.len(),
+        token_estimate: estimate_tokens_from_chars(output_text.len()),
+        aethyme_explore_invoked: value["schema_version"] == "aethyme-explore-v1"
+            && value["intent"] == intent,
+        aethyme_path_leaked: visible_payload.contains(".aethyme"),
+    };
+    (value, metrics)
 }
 
 fn usage_boundary_explore_cli_json(repo: &Path, request: &str, scope: &str) -> serde_json::Value {
@@ -1394,22 +1469,104 @@ fn redb_explore_observability_reports_store_freshness() {
     );
 }
 
-fn context_pack_metrics(value: &serde_json::Value) -> (usize, Vec<String>, Vec<String>, usize) {
-    let serialized_size = value.to_string().len();
-    let files = value["in_scope"]["files"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextPackBudgetMetrics {
+    command_output_chars: usize,
+    token_estimate: usize,
+    selected_file_count: usize,
+    selected_symbol_count: usize,
+    snippet_count: usize,
+    aethyme_path_leaked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExploreInvocationMetrics {
+    command_output_chars: usize,
+    token_estimate: usize,
+    aethyme_explore_invoked: bool,
+    aethyme_path_leaked: bool,
+}
+
+fn estimate_tokens_from_chars(chars: usize) -> usize {
+    (chars + 3) / 4
+}
+
+fn context_pack_budget_metrics(
+    value: &serde_json::Value,
+    output_text: &str,
+) -> ContextPackBudgetMetrics {
+    let selected_file_count = value["in_scope"]["files"]
         .as_array()
         .expect("in_scope files")
-        .iter()
-        .map(|item| item["value"].as_str().expect("file value").to_string())
-        .collect::<Vec<_>>();
-    let symbols = value["in_scope"]["symbols"]
+        .len();
+    let selected_symbol_count = value["in_scope"]["symbols"]
         .as_array()
         .expect("in_scope symbols")
-        .iter()
-        .map(|item| item["value"].as_str().expect("symbol value").to_string())
-        .collect::<Vec<_>>();
+        .len();
     let snippet_count = value["snippets"].as_array().expect("snippets").len();
-    (serialized_size, files, symbols, snippet_count)
+    ContextPackBudgetMetrics {
+        command_output_chars: output_text.len(),
+        token_estimate: estimate_tokens_from_chars(output_text.len()),
+        selected_file_count,
+        selected_symbol_count,
+        snippet_count,
+        aethyme_path_leaked: output_text.contains(".aethyme"),
+    }
+}
+
+fn repository_map_context_pack_budget_metrics(
+    value: &serde_json::Value,
+) -> ContextPackBudgetMetrics {
+    let output_text = value.to_string();
+    context_pack_budget_metrics(value, &output_text)
+}
+
+#[test]
+fn context_pack_budget_metrics_track_stable_cost_signals() {
+    let value = serde_json::json!({
+        "in_scope": {
+            "files": [{"value": "src/auth/token.py"}, {"value": "src/web/handler.py"}],
+            "symbols": [{"value": "fn:load_token"}]
+        },
+        "snippets": [{"path": "src/auth/token.py"}, {"path": "src/web/handler.py"}]
+    });
+    let output_text = value.to_string();
+
+    let metrics = context_pack_budget_metrics(&value, &output_text);
+
+    assert_eq!(metrics.command_output_chars, output_text.len());
+    assert_eq!(
+        metrics.token_estimate,
+        estimate_tokens_from_chars(output_text.len())
+    );
+    assert_eq!(metrics.selected_file_count, 2);
+    assert_eq!(metrics.selected_symbol_count, 1);
+    assert_eq!(metrics.snippet_count, 2);
+    assert!(!metrics.aethyme_path_leaked);
+
+    let leaked = context_pack_budget_metrics(
+        &value,
+        &format!("{output_text}\ninternal=.aethyme/graph_store.redb"),
+    );
+    assert!(leaked.aethyme_path_leaked);
+}
+
+fn assert_metric_not_above(
+    label: &str,
+    actual: usize,
+    expected: usize,
+    percent_limit: usize,
+    slack: usize,
+    command: &str,
+    task: &str,
+    actual_metrics: &ContextPackBudgetMetrics,
+    expected_metrics: &ContextPackBudgetMetrics,
+) {
+    let limit = expected.saturating_mul(percent_limit) / 100 + slack;
+    assert!(
+        actual <= limit,
+        "{label} regressed for redb {command} task {task:?}: actual={actual}, expected={expected}, limit={limit}, actual_metrics={actual_metrics:?}, expected_metrics={expected_metrics:?}"
+    );
 }
 
 fn aethyme_repo_root_for_tests() -> PathBuf {
@@ -1443,27 +1600,73 @@ fn assert_external_playground_repo(repo: &Path) -> PathBuf {
 
 fn assert_pack_within_token_budget(repo: &Path, map: &RepositoryMap, task: &str, command: &str) {
     let expected = repository_map_context_pack_json(repo, map, task);
-    let actual = context_pack_cli_json(repo, command, task);
-    let (expected_size, expected_files, expected_symbols, expected_snippets) =
-        context_pack_metrics(&expected);
-    let (actual_size, actual_files, actual_symbols, actual_snippets) =
-        context_pack_metrics(&actual);
+    let expected_metrics = repository_map_context_pack_budget_metrics(&expected);
+    let (_actual, actual_metrics) = context_pack_cli_json_with_metrics(repo, command, task);
 
-    assert_eq!(
-        actual_files, expected_files,
-        "selected files should not drift for task {task:?}"
-    );
-    assert_eq!(
-        actual_symbols, expected_symbols,
-        "selected symbols should not drift for task {task:?}"
-    );
-    assert_eq!(
-        actual_snippets, expected_snippets,
-        "snippet count should not drift for task {task:?}"
-    );
+    if expected_metrics.selected_file_count > 0 {
+        assert!(
+            actual_metrics.selected_file_count > 0,
+            "redb {command} selected no files for task {task:?}: actual_metrics={actual_metrics:?}, expected_metrics={expected_metrics:?}"
+        );
+    }
     assert!(
-        actual_size <= expected_size.saturating_mul(120) / 100 + 512,
-        "redb {command} size regressed for task {task:?}: actual={actual_size}, expected={expected_size}"
+        !actual_metrics.aethyme_path_leaked,
+        "redb {command} leaked .aethyme paths into context-pack output for task {task:?}: actual_metrics={actual_metrics:?}"
+    );
+    assert_metric_not_above(
+        "token estimate",
+        actual_metrics.token_estimate,
+        expected_metrics.token_estimate,
+        120,
+        128,
+        command,
+        task,
+        &actual_metrics,
+        &expected_metrics,
+    );
+    assert_metric_not_above(
+        "selected file count",
+        actual_metrics.selected_file_count,
+        expected_metrics.selected_file_count,
+        150,
+        2,
+        command,
+        task,
+        &actual_metrics,
+        &expected_metrics,
+    );
+    assert_metric_not_above(
+        "selected symbol count",
+        actual_metrics.selected_symbol_count,
+        expected_metrics.selected_symbol_count,
+        150,
+        4,
+        command,
+        task,
+        &actual_metrics,
+        &expected_metrics,
+    );
+    assert_metric_not_above(
+        "snippet count",
+        actual_metrics.snippet_count,
+        expected_metrics.snippet_count,
+        150,
+        2,
+        command,
+        task,
+        &actual_metrics,
+        &expected_metrics,
+    );
+    assert_metric_not_above(
+        "command-output chars",
+        actual_metrics.command_output_chars,
+        expected_metrics.command_output_chars,
+        120,
+        512,
+        command,
+        task,
+        &actual_metrics,
+        &expected_metrics,
     );
 }
 
@@ -1580,7 +1783,7 @@ fn playground_context_pack_token_regression_gate_never_self_eval() {
         assert_pack_within_token_budget(&repo, &map, task, "task-pack");
     }
 
-    let explore = explore_cli_json(
+    let (explore, explore_metrics) = aethyme_explore_cli_json_with_metrics(
         &repo,
         "Find the main request handling flow",
         "task_localization_query",
@@ -1588,6 +1791,18 @@ fn playground_context_pack_token_regression_gate_never_self_eval() {
     );
     assert_eq!(explore["schema_version"], "aethyme-explore-v1");
     assert_eq!(explore["observability"]["graph_store"]["backend"], "redb");
+    assert!(
+        explore_metrics.aethyme_explore_invoked,
+        "playground token gate must invoke router-level aethyme explore: {explore_metrics:?}"
+    );
+    assert!(
+        explore_metrics.command_output_chars > 0 && explore_metrics.token_estimate > 0,
+        "explore smoke should record non-empty output metrics: {explore_metrics:?}"
+    );
+    assert!(
+        !explore_metrics.aethyme_path_leaked,
+        "explore answer/navigation payload leaked .aethyme internals: {explore_metrics:?}"
+    );
 }
 
 #[test]

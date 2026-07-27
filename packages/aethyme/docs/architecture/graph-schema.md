@@ -542,10 +542,14 @@ V2 correctness and performance gates:
   `cargo test -p aethyme-engine --test redb_cli playground_context_pack_token_regression_gate_never_self_eval -- --ignored --nocapture`
   with `AETHYME_PLAYGROUND_REPO=/path/to/playground`. The test canonicalizes
   the supplied repo and fails if it points inside the Aethyme checkout. It
-  compares redb context-pack and task-pack size, selected files, selected
-  symbols, and snippet counts against the RepositoryMap test oracle, then runs
-  a native redb explore smoke. This is the first real consumer-facing token
-  regression gate; it is never an Aethyme self-eval.
+  compares redb context-pack and task-pack budget metrics against the
+  RepositoryMap test oracle: token estimate, selected file count, selected
+  symbol count, snippet count, command-output chars, and `.aethyme` path-leak
+  status. It then runs router-level `aethyme explore` and records that Explore
+  was actually invoked. The gate intentionally does not require exact selected
+  file equality, because ranking churn can be acceptable while budget signals
+  stay healthy. This is the first real consumer-facing token regression gate;
+  it is never an Aethyme self-eval.
 
 V2 redb-backed navigation surfaces should be described as complete only after
 they read from `.aethyme/graph_store.redb` without constructing a full
