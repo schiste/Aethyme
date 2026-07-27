@@ -118,6 +118,28 @@ def test_parse_contract_decision_prefers_most_restrictive_when_multiple(cpcc):
     assert cpcc.parse_contract_decision(body) == "hard-delete"
 
 
+def test_parse_contract_decision_accepts_commit_message_line(cpcc):
+    """Broker submissions have no PR body; the decision lives in commit
+    messages as `Contract decision: <label>` (the gate feeds git log
+    output as the body)."""
+    body = "Fix the deps wrapper\n\nContract decision: soft-retire\n\nCo-Authored-By: x"
+    assert cpcc.parse_contract_decision(body) == "soft-retire"
+
+
+def test_parse_contract_decision_commit_line_is_case_insensitive_and_wins_by_tier(cpcc):
+    body = (
+        "commit A\n\ncontract decision: NONE\n\n"
+        "commit B\n\nContract decision: hard-delete\n"
+    )
+    assert cpcc.parse_contract_decision(body) == "hard-delete"
+
+
+def test_parse_contract_decision_ignores_prose_mentions(cpcc):
+    """A sentence merely *discussing* decisions must not count as one."""
+    body = "We should think about the contract decision: maybe later."
+    assert cpcc.parse_contract_decision(body) is None
+
+
 def test_parse_contract_decision_handles_empty_body(cpcc):
     assert cpcc.parse_contract_decision("") is None
     assert cpcc.parse_contract_decision(None) is None  # type: ignore[arg-type]
