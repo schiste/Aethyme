@@ -187,13 +187,7 @@ def test_local_task_navigation_commands(tmp_path: Path) -> None:
     scope_payload = json.loads(scope_result.output)
     assert scope_payload["in_scope_files"]
     assert "src/auth.py" in scope_payload["in_scope_files"]
-    # KNOWN GAP (4.7 fragment cutover): the legacy pass pipeline expanded
-    # scope to caller files (src/main.py imports and calls validate_token),
-    # but the fragment indexer emits only Contains/Imports/Defines edges and
-    # the map does not surface cross-file caller relations from them
-    # (graph callers / query impact / graph-deps all return no cross-file
-    # results for this repo). If caller expansion is restored, reinstate:
-    #   assert "src/main.py" in scope_payload["in_scope_files"]
+    assert "src/main.py" in scope_payload["in_scope_files"]
     assert any(symbol.startswith("src/auth.py::") for symbol in scope_payload["in_scope_symbols"])
 
     next_result = invoke_aethyme(["task", "next", "--repo", str(repo_path), "--task", "Update validate_token flow", "--json-output"])
@@ -202,8 +196,7 @@ def test_local_task_navigation_commands(tmp_path: Path) -> None:
     assert next_payload["items"]
     next_displays = [item["display"] for item in next_payload["items"]]
     assert "src/auth.py" in next_displays
-    # Same known gap as above: src/main.py no longer appears in `task next`
-    # without cross-file caller edges from the fragment pipeline.
+    assert "src/main.py" in next_displays
 
     expand_result = invoke_aethyme(["task", "expand", "--repo", str(repo_path), "--node", "src/auth.py", "--json-output"])
     assert expand_result.exit_code == 0, expand_result.output

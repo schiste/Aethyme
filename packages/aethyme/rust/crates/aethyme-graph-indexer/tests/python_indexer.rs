@@ -482,6 +482,72 @@ fn imports_coexist_with_function_extraction() {
 }
 
 #[test]
+fn function_calls_emit_unresolved_call_edge_with_sites() {
+    let result = index_source("def main():\n    helper()\n    return helper()\n");
+    let kinds: Vec<NodeKind> = result.additional_nodes.iter().map(|n| n.kind()).collect();
+    assert_eq!(
+        kinds.iter().filter(|&&k| k == NodeKind::Function).count(),
+        1
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|&&k| k == NodeKind::UnresolvedSymbol)
+            .count(),
+        1
+    );
+
+    let function_id = result
+        .additional_nodes
+        .iter()
+        .find(|n| n.kind() == NodeKind::Function)
+        .map(|n| n.id().clone())
+        .unwrap();
+    let placeholder_id = result
+        .additional_nodes
+        .iter()
+        .find(|n| n.kind() == NodeKind::UnresolvedSymbol)
+        .map(|n| n.id().clone())
+        .unwrap();
+    let call_edge = result
+        .additional_edges
+        .iter()
+        .find(|e| e.kind() == EdgeKind::Calls)
+        .expect("call edge");
+    assert_eq!(call_edge.src_id(), &function_id);
+    assert_eq!(call_edge.dst_id(), &placeholder_id);
+    assert_eq!(call_edge.sites().len(), 2);
+    assert_eq!(call_edge.sites()[0].line, 2);
+    assert_eq!(call_edge.sites()[1].line, 3);
+
+    let placeholder_json = serde_json::to_string(
+        result
+            .additional_nodes
+            .iter()
+            .find(|n| n.kind() == NodeKind::UnresolvedSymbol)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        placeholder_json.contains("\"name\":\"helper\""),
+        "placeholder: {placeholder_json}"
+    );
+}
+
+#[test]
+fn nested_function_body_calls_are_not_attributed_to_outer_function() {
+    let result = index_source("def outer():\n    def inner():\n        helper()\n    return 1\n");
+    assert_eq!(
+        result
+            .additional_edges
+            .iter()
+            .filter(|e| e.kind() == EdgeKind::Calls)
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn duplicate_imports_are_deduped_via_fragment_layer() {
     // Two identical `import os` lines produce two emitted placeholder
     // nodes with the same NodeId (referenced_from_id + binding name

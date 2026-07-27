@@ -28,8 +28,8 @@ fn ctx(repo_root: &Path) -> IndexerContext {
 #[test]
 fn from_import_resolves_to_target_function() {
     // `from util import helper` in cli.py — util.py defines helper.
-    // After link: the Imports edge in cli.py points at the Function
-    // node in util.py, and the placeholder is removed.
+    // After link: both the Imports edge and the Calls edge in cli.py
+    // point at the Function node in util.py, and placeholders are removed.
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
@@ -40,10 +40,10 @@ fn from_import_resolves_to_target_function() {
     index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
 
     let summary = link_repo(&ctx(tmp.path())).unwrap();
-    assert_eq!(summary.placeholders_seen, 1);
-    assert_eq!(summary.placeholders_resolved, 1);
-    assert_eq!(summary.edges_rewritten, 1);
-    assert_eq!(summary.orphans_removed, 1);
+    assert_eq!(summary.placeholders_seen, 2);
+    assert_eq!(summary.placeholders_resolved, 2);
+    assert_eq!(summary.edges_rewritten, 2);
+    assert_eq!(summary.orphans_removed, 2);
 
     let cli_frag = read_fragment(tmp.path(), "cli.py").unwrap();
     // Placeholder is gone after resolution.
@@ -68,6 +68,84 @@ fn from_import_resolves_to_target_function() {
         .find(|e| e.kind() == EdgeKind::Imports)
         .expect("Imports edge should survive");
     assert_eq!(resolved_edge.dst_id(), &helper_id);
+    let call_edge = cli_frag
+        .edges()
+        .iter()
+        .find(|e| e.kind() == EdgeKind::Calls)
+        .expect("Calls edge should survive");
+    assert_eq!(call_edge.dst_id(), &helper_id);
+    assert_eq!(call_edge.sites().len(), 1);
+}
+
+#[test]
+fn call_edge_resolves_through_import_binding_when_name_is_ambiguous() {
+    // Two modules define `helper`, so a whole-repo name-only call
+    // lookup would be ambiguous. The call is still resolvable because
+    // cli.py has an exact local import binding from util.helper.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "cli.py",
+        b"from util import helper\n\ndef main():\n    return helper()\n",
+    );
+    write(tmp.path(), "util.py", b"def helper():\n    return 1\n");
+    write(tmp.path(), "other.py", b"def helper():\n    return 2\n");
+    index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+
+    let summary = link_repo(&ctx(tmp.path())).unwrap();
+    assert_eq!(summary.placeholders_seen, 2);
+    assert_eq!(summary.placeholders_resolved, 2);
+    assert_eq!(summary.edges_rewritten, 2);
+
+    let cli_frag = read_fragment(tmp.path(), "cli.py").unwrap();
+    let util_frag = read_fragment(tmp.path(), "util.py").unwrap();
+    let helper_id = util_frag
+        .nodes()
+        .iter()
+        .find(|n| n.kind() == NodeKind::Function)
+        .map(|n| n.id().clone())
+        .expect("util helper function");
+    let call_edge = cli_frag
+        .edges()
+        .iter()
+        .find(|e| e.kind() == EdgeKind::Calls)
+        .expect("resolved call edge");
+    assert_eq!(call_edge.dst_id(), &helper_id);
+}
+
+#[test]
+fn same_module_call_resolves_to_function() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "service.py",
+        b"def helper():\n    return 1\n\n\ndef main():\n    return helper()\n",
+    );
+    index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+
+    let summary = link_repo(&ctx(tmp.path())).unwrap();
+    assert_eq!(summary.placeholders_seen, 1);
+    assert_eq!(summary.placeholders_resolved, 1);
+    assert_eq!(summary.edges_rewritten, 1);
+
+    let frag = read_fragment(tmp.path(), "service.py").unwrap();
+    let helper_id = frag
+        .nodes()
+        .iter()
+        .find(|n| {
+            n.kind() == NodeKind::Function
+                && serde_json::to_string(n)
+                    .unwrap()
+                    .contains("\"name\":\"helper\"")
+        })
+        .map(|n| n.id().clone())
+        .expect("helper function");
+    let call_edge = frag
+        .edges()
+        .iter()
+        .find(|e| e.kind() == EdgeKind::Calls)
+        .expect("resolved call edge");
+    assert_eq!(call_edge.dst_id(), &helper_id);
 }
 
 #[test]

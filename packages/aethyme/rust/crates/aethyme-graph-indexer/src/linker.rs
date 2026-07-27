@@ -6,19 +6,19 @@
 //! Phase 4.4 added stage 1 of cross-file edge resolution: each
 //! language indexer emits one `UnresolvedSymbol` placeholder per
 //! imported name, plus an `Imports` edge from the importing file to
-//! the placeholder. The placeholder is a dead-end — nothing reads
-//! it. This module is stage 2: it walks every fragment on disk,
-//! looks up each placeholder by name (and by `import_path` where
-//! available) against the global symbol index, and rewrites the
-//! `Imports` edge target to point at the real concrete node when
-//! a unique resolution exists.
+//! the placeholder. Call-capable indexers can also emit `Calls`
+//! edges to placeholders. The placeholder is a dead-end until this
+//! module walks every fragment on disk, looks up each placeholder
+//! against the global symbol index, and rewrites supported edge
+//! targets to point at real concrete nodes when a unique resolution
+//! exists.
 //!
 //! ## What it is NOT
 //!
 //! - Not a name-binding pass. Python-level semantics like `from a
 //!   import x; x = y; x()` would need full scope analysis. The
-//!   linker only resolves the *import statement*, not the symbol's
-//!   in-file uses.
+//!   linker resolves calls through import bindings and same-module
+//!   symbols only when those facts are unambiguous.
 //! - Not a type-resolution pass. We resolve to whatever the global
 //!   index says exists — the only consumer hint we use is the
 //!   placeholder's `expected_kind` (`Some(Module)` for plain
@@ -34,7 +34,7 @@
 //!
 //! For each placeholder, look at every incoming edge (in the same
 //! fragment — placeholders are local artifacts of the importing
-//! file). For each `Imports` edge:
+//! file). For each supported edge:
 //!
 //! 1. If the edge says `is_namespace=true` (whole-module import):
 //!    look up the import_path as a module — match a SymbolRecord
@@ -45,7 +45,12 @@
 //!    split `import_path` on the last `.` into `(module_part,
 //!    symbol_part)`. Look up symbol_part in module_part's shard
 //!    first (fast). If exactly one match, resolve.
-//! 3. If no resolution is found OR multiple ambiguous candidates
+//! 3. For `Calls` edges: first reuse exact local import bindings
+//!    (`from util import helper as h; h()`), then module-qualified
+//!    targets (`util.helper()`), then same-module bare calls. Calls
+//!    do not use whole-repo name-only fallback because that can
+//!    confuse callback parameters or locals with unrelated symbols.
+//! 4. If no resolution is found OR multiple ambiguous candidates
 //!    exist, leave the edge pointing at the placeholder. The
 //!    placeholder survives.
 //!
@@ -199,6 +204,7 @@ fn link_one_fragment(
     // at the placeholder.
     let mut resolved_placeholders: HashSet<NodeId> = HashSet::new();
     let mut edges_rewritten = 0usize;
+    let local_import_bindings = local_import_bindings(&fragment, &placeholders, global_index);
 
     let new_edges: Vec<Edge> = fragment
         .edges()
@@ -209,16 +215,12 @@ fn link_one_fragment(
                 return edge.clone();
             }
             let placeholder = placeholders[edge.dst_id()];
-            // Only Imports edges are rewritten in this pass. Other
-            // edge kinds pointing at placeholders (none in today's
-            // indexer output) keep the placeholder as their target
-            // — that's a defensive guard for future indexer
-            // additions that may produce e.g. Calls edges to
-            // placeholders.
-            if edge.kind() != EdgeKind::Imports {
-                return edge.clone();
-            }
-            match global_index.resolve_imports_edge(placeholder, edge.attributes()) {
+            match global_index.resolve_edge(
+                source_path,
+                placeholder,
+                edge.attributes(),
+                &local_import_bindings,
+            ) {
                 Some(target) => {
                     edges_rewritten += 1;
                     resolved_placeholders.insert(edge.dst_id().clone());
@@ -293,6 +295,38 @@ struct FragmentResolution {
     edges_rewritten: usize,
     orphans_removed: usize,
     was_rewritten: bool,
+}
+
+fn local_import_bindings(
+    fragment: &Fragment,
+    placeholders: &HashMap<&NodeId, &Node>,
+    global_index: &GlobalSymbolIndex,
+) -> HashMap<String, Vec<ResolvedRecord>> {
+    let mut bindings: HashMap<String, Vec<ResolvedRecord>> = HashMap::new();
+    for edge in fragment.edges() {
+        if edge.kind() != EdgeKind::Imports {
+            continue;
+        }
+        let Some(placeholder) = placeholders.get(edge.dst_id()) else {
+            continue;
+        };
+        let placeholder = *placeholder;
+        let Node::UnresolvedSymbol(p) = placeholder else {
+            continue;
+        };
+        if let Some(target) = global_index.resolve_imports_edge(placeholder, edge.attributes()) {
+            bindings
+                .entry(p.name().to_string())
+                .or_default()
+                .push(target);
+        }
+    }
+
+    for records in bindings.values_mut() {
+        records.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        records.dedup_by(|left, right| left.node_id == right.node_id);
+    }
+    bindings
 }
 
 // ─── Global symbol index ─────────────────────────────────────────────
@@ -412,6 +446,22 @@ impl GlobalSymbolIndex {
         })
     }
 
+    fn resolve_edge(
+        &self,
+        source_path: &str,
+        placeholder: &Node,
+        attrs: &EdgeAttributes,
+        local_import_bindings: &HashMap<String, Vec<ResolvedRecord>>,
+    ) -> Option<ResolvedRecord> {
+        match attrs {
+            EdgeAttributes::Imports { .. } => self.resolve_imports_edge(placeholder, attrs),
+            EdgeAttributes::Calls => {
+                self.resolve_calls_edge(source_path, placeholder, local_import_bindings)
+            }
+            _ => None,
+        }
+    }
+
     /// Try to resolve a placeholder + the import edge that points
     /// at it. Returns the unique matched record on success, None
     /// if the placeholder cannot be resolved unambiguously.
@@ -493,6 +543,105 @@ impl GlobalSymbolIndex {
 
         None
     }
+
+    fn resolve_calls_edge(
+        &self,
+        source_path: &str,
+        placeholder: &Node,
+        local_import_bindings: &HashMap<String, Vec<ResolvedRecord>>,
+    ) -> Option<ResolvedRecord> {
+        let Node::UnresolvedSymbol(p) = placeholder else {
+            return None; // Caller error — fail closed.
+        };
+        let name = p.name();
+        if name.starts_with('.') || name == "*" {
+            return None;
+        }
+
+        if let Some(target) = unique_import_binding(local_import_bindings, name)
+            && is_call_target_kind(target.kind)
+        {
+            return Some(target);
+        }
+
+        if let Some(target) = self.resolve_qualified_call(name) {
+            return Some(target);
+        }
+
+        if let Some(target) = self.resolve_local_namespace_call(name, local_import_bindings) {
+            return Some(target);
+        }
+
+        if !name.contains('.') {
+            let module = synthesize_module_name(source_path);
+            return self.unique_call_target(&module, name);
+        }
+
+        None
+    }
+
+    fn resolve_qualified_call(&self, name: &str) -> Option<ResolvedRecord> {
+        let (module_part, symbol_part) = name.rsplit_once('.')?;
+        if module_part.is_empty() || symbol_part.is_empty() {
+            return None;
+        }
+        self.unique_call_target(module_part, symbol_part)
+    }
+
+    fn resolve_local_namespace_call(
+        &self,
+        name: &str,
+        local_import_bindings: &HashMap<String, Vec<ResolvedRecord>>,
+    ) -> Option<ResolvedRecord> {
+        let (root, tail) = name.split_once('.')?;
+        let root_target = unique_import_binding(local_import_bindings, root)?;
+        let (module_suffix, symbol_part) = match tail.rsplit_once('.') {
+            Some((module_suffix, symbol_part)) => (Some(module_suffix), symbol_part),
+            None => (None, tail),
+        };
+        if symbol_part.is_empty() {
+            return None;
+        }
+        let module = match module_suffix {
+            Some(module_suffix) if !module_suffix.is_empty() => {
+                format!("{}.{}", root_target.module, module_suffix)
+            }
+            _ => root_target.module.clone(),
+        };
+        self.unique_call_target(&module, symbol_part)
+    }
+
+    fn unique_call_target(&self, module: &str, symbol: &str) -> Option<ResolvedRecord> {
+        let hits = self
+            .by_module_and_name
+            .get(&(module.to_string(), symbol.to_string()))?;
+        let callable_hits = hits
+            .iter()
+            .filter(|record| is_call_target_kind(record.kind))
+            .collect::<Vec<_>>();
+        if callable_hits.len() == 1 {
+            return Some(callable_hits[0].clone());
+        }
+        None
+    }
+}
+
+fn unique_import_binding(
+    local_import_bindings: &HashMap<String, Vec<ResolvedRecord>>,
+    binding: &str,
+) -> Option<ResolvedRecord> {
+    let records = local_import_bindings.get(binding)?;
+    if records.len() == 1 {
+        return Some(records[0].clone());
+    }
+    None
+}
+
+fn is_call_target_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Function | NodeKind::Class | NodeKind::Method
+    )
 }
 
 fn symbol_record_to_resolved(record: &SymbolRecord) -> ResolvedRecord {
