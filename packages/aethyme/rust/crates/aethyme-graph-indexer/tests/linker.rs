@@ -149,6 +149,41 @@ fn same_module_call_resolves_to_function() {
 }
 
 #[test]
+fn namespace_import_call_resolves_through_import_binding() {
+    // `util.helper()` is only resolvable because `util` is a local
+    // namespace import binding. The linker must not need a repo-wide
+    // dotted-name fallback for this common case.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "cli.py",
+        b"import util\n\ndef main():\n    return util.helper()\n",
+    );
+    write(tmp.path(), "util.py", b"def helper():\n    return 1\n");
+    index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+
+    let summary = link_repo(&ctx(tmp.path())).unwrap();
+    assert_eq!(summary.placeholders_seen, 2);
+    assert_eq!(summary.placeholders_resolved, 2);
+    assert_eq!(summary.edges_rewritten, 2);
+
+    let cli_frag = read_fragment(tmp.path(), "cli.py").unwrap();
+    let util_frag = read_fragment(tmp.path(), "util.py").unwrap();
+    let helper_id = util_frag
+        .nodes()
+        .iter()
+        .find(|n| n.kind() == NodeKind::Function)
+        .map(|n| n.id().clone())
+        .expect("helper function");
+    let call_edge = cli_frag
+        .edges()
+        .iter()
+        .find(|e| e.kind() == EdgeKind::Calls)
+        .expect("resolved call edge");
+    assert_eq!(call_edge.dst_id(), &helper_id);
+}
+
+#[test]
 fn namespace_import_resolves_to_file_node() {
     // `import util` in cli.py — util.py exists.
     // The placeholder is named `util` (Python binds the top-level
@@ -327,6 +362,40 @@ fn ambiguous_name_only_match_stays_unresolved() {
         .filter(|n| n.kind() == NodeKind::UnresolvedSymbol)
         .count();
     assert_eq!(unresolved, 1);
+}
+
+#[test]
+fn unimported_receiver_call_stays_unresolved() {
+    // The receiver name `util` is a parameter, not an import binding.
+    // Even though this repo has util.py::helper, a type-free linker
+    // must not infer that `util.helper()` points there.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "cli.py",
+        b"def main(util):\n    return util.helper()\n",
+    );
+    write(tmp.path(), "util.py", b"def helper():\n    return 1\n");
+    index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+
+    let summary = link_repo(&ctx(tmp.path())).unwrap();
+    assert_eq!(summary.placeholders_seen, 1);
+    assert_eq!(summary.placeholders_resolved, 0);
+    assert_eq!(summary.edges_rewritten, 0);
+
+    let cli_frag = read_fragment(tmp.path(), "cli.py").unwrap();
+    let placeholder_id = cli_frag
+        .nodes()
+        .iter()
+        .find(|n| n.kind() == NodeKind::UnresolvedSymbol)
+        .map(|n| n.id())
+        .expect("unresolved call placeholder");
+    let call_edge = cli_frag
+        .edges()
+        .iter()
+        .find(|e| e.kind() == EdgeKind::Calls)
+        .expect("call edge should survive");
+    assert_eq!(call_edge.dst_id(), placeholder_id);
 }
 
 #[test]
