@@ -141,4 +141,7 @@ def test_verify_playground_enforces_guidance_and_discovery_hygiene() -> None:
     ):
         assert generated_path in script
 
+    for reference_name in ("explore.md", "graph-task.md", "dead-code.md"):
+        assert reference_name in script
+
     assert "git status --porcelain --untracked-files=all" in script

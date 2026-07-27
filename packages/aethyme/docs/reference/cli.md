@@ -131,6 +131,8 @@ Watchlist seen-marking must remain revision-scoped.
 - `CLAUDE.md`
 - `.claude/skills/aethyme/SKILL.md`
 - `.codex/skills/aethyme/SKILL.md`
+- `.claude/skills/aethyme/references/*.md`
+- `.codex/skills/aethyme/references/*.md`
 - `.claude/hooks/aethyme-load-context.sh`
 - `.aethyme/generated/onboarding.json`
 - `.aethyme/generated/act-starter.json`

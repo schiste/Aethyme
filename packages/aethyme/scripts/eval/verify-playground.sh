@@ -80,6 +80,13 @@ check_root_guidance() {
         check_pass "$label has no stale executable Python Explore guidance"
     fi
 }
+check_reference_file() {
+    local file="$1"
+    local label="$2"
+
+    [[ -f "$file" ]] && check_pass "$label present" || { check_fail "Missing $label"; return; }
+    grep -q '{{AETHYME_ROOT}}' "$file" && check_fail "$label has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "$label placeholders resolved"
+}
 
 # ── Control Repo ─────────────────────────────────────────────────────
 
@@ -151,14 +158,13 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
     check_root_guidance "AGENTS.md" "AGENTS.md"
     check_root_guidance "CLAUDE.md" "CLAUDE.md"
 
-    # Skill has no unresolved placeholders
+    # Skill has no unresolved placeholders and keeps auto-load concise. Detailed
+    # command workflows live in references/ and are checked below.
     if [[ -f .codex/skills/aethyme/SKILL.md ]]; then
         SKILL_FILE=".codex/skills/aethyme/SKILL.md"
         grep -q '{{AETHYME_ROOT}}' "$SKILL_FILE" && check_fail "Skill has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "Skill placeholders resolved"
-        # 2026-05-08: Python explore_command was hard-deleted. The skill's
-        # explore guidance now references the native Rust binary
-        # (`$AETHYME_BIN explore`); the `intents` command stays in Python.
-        grep -q 'src.cli intents' "$SKILL_FILE" && check_pass "Skill includes current intent catalog guidance" || check_fail "Skill missing intents guidance"
+        grep -q 'one bounded Explore call' "$SKILL_FILE" && check_pass "Skill states one bounded Explore-call contract" || check_fail "Skill missing one-call contract"
+        grep -q 'safe_to_use_as_answer' "$SKILL_FILE" && check_pass "Skill tells agents to inspect trust fields" || check_fail "Skill missing trust-field guidance"
         (grep -q '"$AETHYME_BIN" explore' "$SKILL_FILE" || grep -q 'aethyme explore' "$SKILL_FILE") \
             && check_pass "Skill includes current native-explore guidance" \
             || check_fail "Skill missing native explore guidance"
@@ -170,9 +176,30 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
         else
             check_pass "Skill has no stale executable 'src.cli explore' guidance"
         fi
-        grep -q 'analyze dead-code' "$SKILL_FILE" && check_pass "Skill includes current dead-code analyzer" || check_fail "Skill missing analyze dead-code guidance"
-        grep -q 'facts function-usage' "$SKILL_FILE" && check_pass "Skill includes current usage facts command" || check_fail "Skill missing facts function-usage guidance"
+        grep -q 'references/explore.md' "$SKILL_FILE" && check_pass "Skill links Explore reference" || check_fail "Skill missing Explore reference link"
+        grep -q 'references/graph-task.md' "$SKILL_FILE" && check_pass "Skill links graph/task reference" || check_fail "Skill missing graph/task reference link"
+        grep -q 'references/dead-code.md' "$SKILL_FILE" && check_pass "Skill links dead-code reference" || check_fail "Skill missing dead-code reference link"
         grep -q '\$ENGINE unused' "$SKILL_FILE" && check_fail "Skill still advertises stale \$ENGINE unused command" || check_pass "Skill has no stale unused command"
+    fi
+
+    EXPLORE_REF=".codex/skills/aethyme/references/explore.md"
+    GRAPH_REF=".codex/skills/aethyme/references/graph-task.md"
+    DEAD_CODE_REF=".codex/skills/aethyme/references/dead-code.md"
+    check_reference_file "$EXPLORE_REF" "Explore reference"
+    check_reference_file "$GRAPH_REF" "Graph/task reference"
+    check_reference_file "$DEAD_CODE_REF" "Dead-code reference"
+    [[ -f .claude/skills/aethyme/references/explore.md ]] && check_pass "Claude Explore reference present" || check_fail "Missing Claude Explore reference"
+    [[ -f .claude/skills/aethyme/references/graph-task.md ]] && check_pass "Claude graph/task reference present" || check_fail "Missing Claude graph/task reference"
+    [[ -f .claude/skills/aethyme/references/dead-code.md ]] && check_pass "Claude dead-code reference present" || check_fail "Missing Claude dead-code reference"
+    if [[ -f "$EXPLORE_REF" ]]; then
+        grep -q 'src.cli intents' "$EXPLORE_REF" && check_pass "Explore reference includes current intent catalog guidance" || check_fail "Explore reference missing intents guidance"
+    fi
+    if [[ -f "$GRAPH_REF" ]]; then
+        grep -q 'graph callers' "$GRAPH_REF" && check_pass "Graph/task reference includes caller guidance" || check_fail "Graph/task reference missing caller guidance"
+    fi
+    if [[ -f "$DEAD_CODE_REF" ]]; then
+        grep -q 'analyze dead-code' "$DEAD_CODE_REF" && check_pass "Dead-code reference includes current analyzer" || check_fail "Dead-code reference missing analyze dead-code guidance"
+        grep -q 'facts function-usage' "$DEAD_CODE_REF" && check_pass "Dead-code reference includes usage facts command" || check_fail "Dead-code reference missing facts function-usage guidance"
     fi
 
     # Fragment graph + Redb graph store. Since 4.7.12 the engine
