@@ -58,7 +58,7 @@ execution, auth, or team sync is part of the product. Direction doc:
 
 ## Quickstart: first promoted submit in five minutes
 
-Prerequisites: git ≥ 2.38, a Rust toolchain, and any repo to try it on.
+Prerequisites: git ≥ 2.38, a Rust toolchain, ~2 GB free RAM for the one-time compile (the bundled SQLite build is memory-hungry; small VMs/containers may OOM — prebuilt release binaries avoid the compile entirely), and any repo to try it on.
 
 **1. Install the binary** (from a clone of this repository):
 
