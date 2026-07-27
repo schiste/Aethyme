@@ -1,0 +1,34 @@
+# Frozen command list for golden diffing (retirement plan Phase 0).
+# One command per line; {REPO} is substituted with the fixture path.
+# Lines starting with # are ignored. Order is the execution order.
+#
+# Covers every delegated group that migrates in Phases 1-5. Commands
+# whose group has not flipped yet simply exercise the Python path —
+# capture before a flip, compare after.
+
+repo inspect {REPO} --json-output
+repo inspect {REPO} --mode brief --json-output
+query symbol {REPO} issue_token --json-output
+query deps {REPO} src/auth/session.py
+query impact {REPO} src/auth/tokens.py
+graph node {REPO} src/auth/tokens.py --json-output
+graph children {REPO} src --json-output
+graph parents {REPO} src/auth --json-output
+graph callers {REPO} issue_token --json-output
+graph callees {REPO} open_session --json-output
+graph docs {REPO} src/auth/tokens.py --json-output
+graph configs {REPO} src/auth/tokens.py --json-output
+graph expand {REPO} src/auth/tokens.py --json-output
+graph overview {REPO} --json-output
+task anchors --repo {REPO} --task Update-token-issuing --json-output
+task scope --repo {REPO} --task Update-token-issuing --json-output
+task next --repo {REPO} --task Update-token-issuing --json-output
+task expand --repo {REPO} --node src/auth/tokens.py --json-output
+task pack --repo {REPO} --task Explain-this-repo --json-output
+task explain --repo {REPO}
+facts public-functions --repo {REPO} --scope src/auth --json-output
+facts function-usage --repo {REPO} --target fn:medium-fixture:src/auth/tokens.py:issue_token --boundary src/auth --json-output
+analyze dead-code --repo {REPO} --scope src/billing --json-output
+intents --format compact-json
+ai-ready --repo {REPO} --format json --detectors ability-coverage
+ai-ready --repo {REPO} --format md --detectors ability-coverage

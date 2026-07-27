@@ -76,6 +76,55 @@ def build_indexable_core_repo(tmp_path: Path) -> Path:
     return repo_path
 
 
+def build_medium_fixture_repo(dest: Path) -> Path:
+    """Deterministic multi-language fixture for the migration parity corpus.
+
+    Built on demand (never checked in — see CONTRIBUTING's fixture rule)
+    by tests and scripts/migration/golden-diff.sh. Exercises the edge
+    cases the python-retirement plan calls out: multiple languages,
+    unicode filenames, nested areas, docs, configs, and a cross-file
+    call chain.
+    """
+    repo_path = dest / "medium-fixture"
+    _write(repo_path / "README.md", "# Medium Fixture\n\nParity corpus repo.\n")
+    _write(
+        repo_path / "docs" / "architecture.md",
+        "# Architecture\n\nSee [auth](../src/auth/tokens.py) and [routes](../web/routes.ts).\n",
+    )
+    _write(repo_path / "config" / "settings.json", '{\n  "rate_limit": 10,\n  "locale": "fr"\n}\n')
+    _write(repo_path / "config" / "app.yaml", "feature_flags:\n  new_flow: true\n")
+    _write(
+        repo_path / "src" / "auth" / "tokens.py",
+        "def issue_token(user: str) -> str:\n    return f\"tok-{user}\"\n\n\n"
+        "def revoke_token(token: str) -> bool:\n    return token.startswith(\"tok-\")\n",
+    )
+    _write(
+        repo_path / "src" / "auth" / "session.py",
+        "from src.auth.tokens import issue_token\n\n\n"
+        "def open_session(user: str) -> str:\n    return issue_token(user)\n",
+    )
+    _write(
+        repo_path / "src" / "billing" / "invoice.py",
+        "def total(lines: list[int]) -> int:\n    return sum(lines)\n\n\n"
+        "def unused_discount(total_cents: int) -> int:\n    return total_cents // 10\n",
+    )
+    _write(
+        repo_path / "web" / "routes.ts",
+        "import { openSession } from \"./session\";\n\n"
+        "export function loginRoute(user: string): string {\n  return openSession(user);\n}\n",
+    )
+    _write(
+        repo_path / "web" / "session.ts",
+        "export function openSession(user: string): string {\n  return `sess-${user}`;\n}\n",
+    )
+    _write(
+        repo_path / "legacy" / "Départ.php",
+        "<?php\nfunction depart_handler() {\n    return legacy_helper();\n}\n"
+        "function legacy_helper() {\n    return 1;\n}\n",
+    )
+    return repo_path
+
+
 def _write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
