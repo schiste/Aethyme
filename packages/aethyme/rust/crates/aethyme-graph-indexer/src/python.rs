@@ -1,6 +1,7 @@
 //! Python indexer (Phase 3.3). Uses ruff's Python parser to extract
 //! Function, Method, Class, and GlobalVariable nodes plus their
-//! structural edges (Contains / Defines).
+//! structural edges (Contains / Defines) and intra-body call
+//! placeholders.
 //!
 //! Scope of the v1 indexer:
 //!
@@ -9,38 +10,41 @@
 //!   UnresolvedSymbol (import placeholders — Phase 4.4).
 //! - **Extracted edges:** Contains (file → top-level symbol),
 //!   Defines (class → method), Imports (file → UnresolvedSymbol
-//!   per imported name).
-//! - **NOT yet extracted:** call-graph edges (Calls), nested-function
-//!   definitions inside function bodies (we extract only the outermost
-//!   function, plus methods inside classes). These land in later
-//!   commits as the indexer matures.
+//!   per imported name), Calls (function/method → UnresolvedSymbol
+//!   per called target).
+//! - **NOT yet extracted:** nested-function definitions inside
+//!   function bodies (we extract only the outermost function, plus
+//!   methods inside classes). These land in later commits as the
+//!   indexer matures.
 //!
 //! Cross-file resolution model (Phase 4.4): for each `import` or
 //! `from … import …` statement we emit one `UnresolvedSymbol` per
 //! imported name plus a corresponding `Imports` edge from the file
-//! node. The `UnresolvedSymbol` carries the binding name (`np` for
-//! `import numpy as np`); the edge's `import_path` carries the
-//! dotted source path (`numpy`). A future linker pass will look up
-//! each `UnresolvedSymbol` in the global symbol index and rewrite
-//! edge targets to point at concrete nodes (resolved cross-file
-//! edges) — that pass needs no Python-specific code, only the
-//! placeholders this commit emits.
+//! node. For calls inside indexed functions/methods, we emit one
+//! `UnresolvedSymbol` per syntactic callee target plus a `Calls`
+//! edge from the caller. The linker pass looks up placeholders in
+//! the global symbol index and rewrites edge targets to point at
+//! concrete nodes (resolved cross-file edges) — that pass needs no
+//! Python-specific code, only the placeholders this indexer emits.
 //!
 //! The parser-error path returns `LanguageIndexError::Parse` —
 //! callers should log the diagnostic and continue with the
 //! filesystem-only File node for that file (better-than-nothing
 //! degradation).
 
+use std::collections::BTreeMap;
+
 use ruff_python_ast::{
-    ModModule, Stmt, StmtAnnAssign, StmtAssign, StmtClassDef, StmtFunctionDef, StmtImport,
+    Expr, ModModule, Stmt, StmtAnnAssign, StmtAssign, StmtClassDef, StmtFunctionDef, StmtImport,
     StmtImportFrom,
+    visitor::{self, Visitor},
 };
 use ruff_python_parser::parse_module;
 use ruff_text_size::TextRange;
 
 use aethyme_graph_schema::{
-    Callable, Class, Confidence, Edge, EdgeAttributes, Function, GlobalVariable, Method, Node,
-    NodeId, NodeKind, ParameterSignature, Source, SourceRange, UnresolvedSymbol, Visibility,
+    Callable, Class, Confidence, Edge, EdgeAttributes, EdgeSite, Function, GlobalVariable, Method,
+    Node, NodeId, NodeKind, ParameterSignature, Source, SourceRange, UnresolvedSymbol, Visibility,
 };
 
 use crate::context::IndexerContext;
@@ -100,8 +104,17 @@ impl LanguageIndexer for PythonIndexer {
                     edges.push(structural_edge(
                         EdgeAttributes::Contains,
                         file_id.clone(),
-                        function_id,
+                        function_id.clone(),
                     ));
+                    emit_call_placeholders(
+                        repo,
+                        source_path,
+                        &function_id,
+                        &f.body,
+                        &line_index,
+                        &mut nodes,
+                        &mut edges,
+                    )?;
                 }
                 Stmt::ClassDef(c) => {
                     let class = build_class(repo, source_path, c, &line_index)?;
@@ -123,8 +136,17 @@ impl LanguageIndexer for PythonIndexer {
                             edges.push(structural_edge(
                                 EdgeAttributes::Defines,
                                 class_id.clone(),
-                                method_id,
+                                method_id.clone(),
                             ));
+                            emit_call_placeholders(
+                                repo,
+                                source_path,
+                                &method_id,
+                                &m.body,
+                                &line_index,
+                                &mut nodes,
+                                &mut edges,
+                            )?;
                         }
                     }
                 }
@@ -391,6 +413,105 @@ fn visibility_from_name(name: &str) -> Visibility {
 
 fn structural_edge(attributes: EdgeAttributes, src: NodeId, dst: NodeId) -> Edge {
     Edge::new(src, dst, attributes, Source::Structure, Confidence::FULL)
+}
+
+// ─── Calls (V2/#28 foundation) ───────────────────────────────────────
+//
+// Calls mirror the import placeholder pattern: the language indexer
+// records syntactic evidence local to a file, and the generic linker
+// later rewrites the placeholder to a concrete node when there is
+// enough unambiguous repository context.
+
+fn emit_call_placeholders(
+    repo: &str,
+    source_path: &str,
+    caller_id: &NodeId,
+    body: &[Stmt],
+    line_index: &LineIndex,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+) -> Result<(), LanguageIndexError> {
+    let calls = collect_calls(body, line_index);
+    for (target_name, sites) in calls {
+        let placeholder =
+            UnresolvedSymbol::new(repo, source_path, &target_name, None, caller_id.clone())
+                .map_err(|e| LanguageIndexError::NodeConstruction {
+                    message: e.to_string(),
+                })?;
+        let placeholder_id = placeholder.id().clone();
+        nodes.push(Node::UnresolvedSymbol(placeholder));
+        edges.push(
+            Edge::new(
+                caller_id.clone(),
+                placeholder_id,
+                EdgeAttributes::Calls,
+                Source::Code,
+                Confidence::from_milli(850).expect("850 is within confidence range"),
+            )
+            .with_sites(sites),
+        );
+    }
+    Ok(())
+}
+
+fn collect_calls(body: &[Stmt], line_index: &LineIndex) -> BTreeMap<String, Vec<EdgeSite>> {
+    let mut collector = CallCollector {
+        line_index,
+        calls: BTreeMap::new(),
+    };
+    collector.visit_body(body);
+    collector.calls
+}
+
+struct CallCollector<'idx> {
+    line_index: &'idx LineIndex,
+    calls: BTreeMap<String, Vec<EdgeSite>>,
+}
+
+impl<'ast, 'idx> Visitor<'ast> for CallCollector<'idx> {
+    fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+        match stmt {
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+            _ => visitor::walk_stmt(self, stmt),
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        if let Expr::Call(call) = expr
+            && let Some(target_name) = call_target_name(&call.func)
+        {
+            let line = self
+                .line_index
+                .line_at(u32::from(call.range.start()) as usize);
+            self.calls.entry(target_name).or_default().push(EdgeSite {
+                line,
+                is_in_branch: false,
+                is_in_loop: false,
+                kind_tag: "direct".into(),
+            });
+        }
+        visitor::walk_expr(self, expr);
+    }
+}
+
+fn call_target_name(expr: &Expr) -> Option<String> {
+    let name = dotted_expr_name(expr)?;
+    let root = name.split('.').next().unwrap_or(&name);
+    if matches!(root, "self" | "cls" | "super") {
+        return None;
+    }
+    Some(name)
+}
+
+fn dotted_expr_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(n) => Some(n.id.as_str().to_string()),
+        Expr::Attribute(a) => {
+            let prefix = dotted_expr_name(&a.value)?;
+            Some(format!("{prefix}.{}", a.attr.as_str()))
+        }
+        _ => None,
+    }
 }
 
 // ─── Imports (Phase 4.4) ─────────────────────────────────────────────

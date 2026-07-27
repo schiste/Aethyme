@@ -293,15 +293,27 @@ mod tests {
             .expect("exported_helper fact");
         let usage = function_usage_fact(&map, &fact, "src/indexing", &["src".to_string()]);
 
-        // The fragment indexer does not emit Python `Calls` edges yet,
-        // so same-file call sites are not available here. Linked
-        // `Imports` edges still provide external usage evidence.
-        assert_eq!(usage.internal_callers.len(), 0);
-        assert_eq!(usage.external_callers.len(), 1);
-        assert!(!usage
-            .external_callers
-            .iter()
-            .any(|caller| caller.contains("notes.md")));
+        assert_eq!(
+            usage.internal_callers,
+            vec!["src/indexing/service.py::local_user".to_string()]
+        );
+        assert_eq!(usage.external_callers.len(), 2);
+        assert!(
+            usage
+                .external_callers
+                .contains(&"src/api/routes.py".to_string())
+        );
+        assert!(
+            usage
+                .external_callers
+                .contains(&"src/api/routes.py::handler".to_string())
+        );
+        assert!(
+            !usage
+                .external_callers
+                .iter()
+                .any(|caller| caller.contains("notes.md"))
+        );
         assert_eq!(usage.docs_config_references, Vec::<String>::new());
 
         let usage_with_docs = function_usage_fact(&map, &fact, "src/indexing", &[]);

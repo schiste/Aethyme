@@ -164,6 +164,9 @@ pub(crate) fn matching_target_ids_redb(
         }
     }
     for node in store.nodes_under_path(target)? {
+        if node.kind() == StoredNodeKind::Unresolved {
+            continue;
+        }
         if node.id() == target
             || node
                 .path()

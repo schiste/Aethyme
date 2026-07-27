@@ -22,9 +22,8 @@ use aethyme_engine::graph::neighborhood::impact_frontier;
 use aethyme_engine::graph::search::symbol_search;
 use aethyme_engine::map::RepositoryMap;
 use aethyme_engine::pipeline::{build_context_pack, build_context_pack_with_content};
-use aethyme_graph_indexer::{index_repo_to_disk, IndexerContext, WalkOptions};
-use aethyme_graph_schema::{Confidence, Edge, EdgeAttributes, EdgeSite, Source};
-use aethyme_graph_storage::{bootstrap_repo, read_fragment, write_fragment, Fragment};
+use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
+use aethyme_graph_storage::bootstrap_repo;
 use redb::{Database, MultimapTableDefinition, ReadableDatabase, ReadableTable, TableDefinition};
 
 const REPOSITORIES: TableDefinition<&str, &[u8]> = TableDefinition::new("repositories");
@@ -292,7 +291,7 @@ fn build_expand_redb_fixture() -> tempfile::TempDir {
     let ctx = IndexerContext::new("ExpandRepo", root.clone(), "test-engine").unwrap();
     let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
     assert_eq!(summary.total_files, 16);
-    add_call_edge_to_fragment(&root, "src/calls.py", "caller", "callee");
+    link_repo(&ctx).expect("link fragments");
 
     let output = run_engine([
         "index",
@@ -337,7 +336,7 @@ fn build_activation_redb_fixture() -> tempfile::TempDir {
     let ctx = IndexerContext::new("ActivationRepo", root.clone(), "test-engine").unwrap();
     let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
     assert_eq!(summary.total_files, 5);
-    add_call_edge_to_fragment(&root, "src/calls.py", "caller", "callee");
+    link_repo(&ctx).expect("link fragments");
 
     let output = run_engine([
         "index",
@@ -449,7 +448,7 @@ fn build_final_v2_medium_redb_fixture() -> tempfile::TempDir {
     let ctx = IndexerContext::new("FinalV2Repo", root.clone(), "test-engine").unwrap();
     let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
     assert_eq!(summary.total_files, 11);
-    add_call_edge_to_fragment(&root, "src/calls.py", "caller", "callee");
+    link_repo(&ctx).expect("link fragments");
 
     let output = run_engine([
         "index",
@@ -473,42 +472,6 @@ fn build_redb_fixture() -> tempfile::TempDir {
     assert_success(&output);
     assert!(tmp.path().join(".aethyme/graph_store.redb").is_file());
     tmp
-}
-
-fn add_call_edge_to_fragment(root: &Path, source_path: &str, caller: &str, callee: &str) {
-    let fragment = read_fragment(root, source_path).expect("read fragment");
-    let caller_id = fragment
-        .nodes()
-        .iter()
-        .find(|node| node.name() == Some(caller))
-        .expect("caller node")
-        .id()
-        .clone();
-    let callee_id = fragment
-        .nodes()
-        .iter()
-        .find(|node| node.name() == Some(callee))
-        .expect("callee node")
-        .id()
-        .clone();
-    let mut edges = fragment.edges().to_vec();
-    edges.push(
-        Edge::new(
-            caller_id,
-            callee_id,
-            EdgeAttributes::Calls,
-            Source::Code,
-            Confidence::FULL,
-        )
-        .with_site(EdgeSite {
-            line: 5,
-            is_in_branch: false,
-            is_in_loop: false,
-            kind_tag: "direct".into(),
-        }),
-    );
-    let updated = Fragment::new(source_path, fragment.nodes().to_vec(), edges).expect("fragment");
-    write_fragment(root, source_path, &updated).expect("write fragment");
 }
 
 fn build_symbol_redb_fixture() -> tempfile::TempDir {
@@ -1405,14 +1368,16 @@ fn redb_explore_task_localization_runs_without_daemon_or_fragments_and_preserves
     assert_eq!(first["schema_version"], "aethyme-explore-v1");
     assert_eq!(first["intent"], "task_localization_query");
     assert_eq!(first["intent_source"], "explicit");
-    assert!(first["answer"]
-        .as_array()
-        .expect("answer array")
-        .iter()
-        .any(|item| item["path"] == "src/auth/token.py"
-            || item["target"]
-                .as_str()
-                .is_some_and(|target| target.contains("load_token"))));
+    assert!(
+        first["answer"]
+            .as_array()
+            .expect("answer array")
+            .iter()
+            .any(|item| item["path"] == "src/auth/token.py"
+                || item["target"]
+                    .as_str()
+                    .is_some_and(|target| target.contains("load_token")))
+    );
     assert!(
         first.get("observability").is_none(),
         "compact explore should omit observability"
@@ -1992,10 +1957,12 @@ fn usage_boundary_uses_redb_seeds_for_callers_and_docs_config_references() {
 
     let internal = dead_code_item_by_name(candidates, "internalOnly");
     assert_eq!(internal["status"], "Ambiguous");
-    assert!(internal["ambiguity"]
-        .as_array()
-        .expect("ambiguity")
-        .contains(&serde_json::json!("exported_but_internal_only")));
+    assert!(
+        internal["ambiguity"]
+            .as_array()
+            .expect("ambiguity")
+            .contains(&serde_json::json!("exported_but_internal_only"))
+    );
 
     let docs_only = dead_code_item_by_name(candidates, "docsOnly");
     assert_eq!(docs_only["status"], "Ambiguous");
@@ -2040,13 +2007,15 @@ fn redb_explore_usage_boundary_intent_uses_hybrid_v2_contract() {
     assert_eq!(response["schema_version"], "aethyme-explore-v1");
     assert_eq!(response["intent"], "usage_boundary_query");
     assert_eq!(response["intent_source"], "explicit");
-    assert!(response["answer"]
-        .as_array()
-        .expect("answer array")
-        .iter()
-        .any(|item| item["target"]
-            .as_str()
-            .is_some_and(|target| target.contains("unusedMethod"))));
+    assert!(
+        response["answer"]
+            .as_array()
+            .expect("answer array")
+            .iter()
+            .any(|item| item["target"]
+                .as_str()
+                .is_some_and(|target| target.contains("unusedMethod")))
+    );
     assert!(
         response["degraded_reasons"]
             .as_array()
@@ -2774,11 +2743,13 @@ fn query_overview_json_shape_is_stable() {
         ])
     );
     assert_eq!(parsed["repo"]["file_count"], 2);
-    assert!(parsed["repo"]["languages"]
-        .as_array()
-        .expect("languages array")
-        .iter()
-        .any(|lang| lang == "python"));
+    assert!(
+        parsed["repo"]["languages"]
+            .as_array()
+            .expect("languages array")
+            .iter()
+            .any(|lang| lang == "python")
+    );
 
     let areas = parsed["areas"].as_array().expect("areas array");
     assert_eq!(areas.len(), 2);
