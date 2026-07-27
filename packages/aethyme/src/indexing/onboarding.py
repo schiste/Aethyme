@@ -229,7 +229,7 @@ def render_onboarding_skill(artifact: dict[str, Any]) -> str:
         "- Load this skill first when the repository is unfamiliar or the request is broad.",
         f"- Recommended when: {', '.join(summon['recommended_when'])}.",
         f"- Skip when: {', '.join(summon['skip_when'])}.",
-        "- Use `.codex/skills/aethyme/SKILL.md` or `.claude/skills/aethyme/SKILL.md` for the full Aethyme tool runbook after orientation.",
+        "- Use `.codex/skills/aethyme/SKILL.md` or `.claude/skills/aethyme/SKILL.md` for Aethyme's short operating contract after orientation; load its `references/` files only when needed.",
         "",
         "## Repo Identity",
         "",

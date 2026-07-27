@@ -2171,7 +2171,8 @@ def enhance() -> None:
     A repo is "Aethyme-enhanced" when an agent landing in its working
     directory finds AGENTS.md/CLAUDE.md (root-level announcement) plus
     .claude/skills/aethyme/SKILL.md and .codex/skills/aethyme/SKILL.md
-    (per-product detailed runbooks), plus generated repo-onboarding artifacts
+    (per-product short runbooks with optional references), plus generated
+    repo-onboarding artifacts
     under `.aethyme/generated/` and per-product `repo-onboarding` skills.
     Static tool runbooks are derived from canonical templates; onboarding is
     generated deterministically from repository facts.

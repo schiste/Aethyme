@@ -7,15 +7,18 @@ files, all derived from canonical templates under
 
     AGENTS.md                                  # cross-product convention, fully generated
     CLAUDE.md                                  # Claude Code project instructions
-    .claude/skills/aethyme/SKILL.md            # Claude Skills detailed runbook
-    .codex/skills/aethyme/SKILL.md             # Codex skills detailed runbook
+    .claude/skills/aethyme/SKILL.md            # Claude Skills short runbook
+    .codex/skills/aethyme/SKILL.md             # Codex skills short runbook
+    .claude/skills/aethyme/references/*.md     # optional detailed workflows
+    .codex/skills/aethyme/references/*.md      # optional detailed workflows
     .claude/hooks/aethyme-load-context.sh      # Claude Code SessionStart hook
     .claude/settings.local.json                # wires the hook (merge-aware)
 
-The split between AGENTS.md/CLAUDE.md (root-level announcement) and
-SKILL.md (per-product detailed runbook) is intentional: agents that
-auto-load CLAUDE.md/AGENTS.md see the entry-point; agents that load
-their product's skills directory see the full reference.
+The split between AGENTS.md/CLAUDE.md (root-level announcement),
+SKILL.md (per-product short runbook), and references/*.md (optional
+detailed workflows) is intentional: agents that auto-load
+CLAUDE.md/AGENTS.md see the entry-point; agents that load their
+product's skills directory see the bounded operating contract first.
 
 AGENTS.md is now a generated artifact owned by Aethyme. Repo-specific
 human policy is supplied through `.aethyme/overrides/agents.json`, not by
@@ -85,12 +88,42 @@ TARGETS: tuple[EnhancementTarget, ...] = (
     EnhancementTarget(
         ".claude/skills/aethyme/SKILL.md",
         _TEMPLATE_DIR / "SKILL.md",
-        "Claude Skills detailed runbook",
+        "Claude Skills short runbook",
     ),
     EnhancementTarget(
         ".codex/skills/aethyme/SKILL.md",
         _TEMPLATE_DIR / "SKILL.md",
-        "Codex skills detailed runbook",
+        "Codex skills short runbook",
+    ),
+    EnhancementTarget(
+        ".claude/skills/aethyme/references/explore.md",
+        _TEMPLATE_DIR / "references" / "explore.md",
+        "Claude Skills Explore reference",
+    ),
+    EnhancementTarget(
+        ".codex/skills/aethyme/references/explore.md",
+        _TEMPLATE_DIR / "references" / "explore.md",
+        "Codex skills Explore reference",
+    ),
+    EnhancementTarget(
+        ".claude/skills/aethyme/references/graph-task.md",
+        _TEMPLATE_DIR / "references" / "graph-task.md",
+        "Claude Skills graph/task reference",
+    ),
+    EnhancementTarget(
+        ".codex/skills/aethyme/references/graph-task.md",
+        _TEMPLATE_DIR / "references" / "graph-task.md",
+        "Codex skills graph/task reference",
+    ),
+    EnhancementTarget(
+        ".claude/skills/aethyme/references/dead-code.md",
+        _TEMPLATE_DIR / "references" / "dead-code.md",
+        "Claude Skills dead-code reference",
+    ),
+    EnhancementTarget(
+        ".codex/skills/aethyme/references/dead-code.md",
+        _TEMPLATE_DIR / "references" / "dead-code.md",
+        "Codex skills dead-code reference",
     ),
     EnhancementTarget(
         ".claude/hooks/aethyme-load-context.sh",
@@ -351,7 +384,11 @@ def _render_agents_override_sections(repo: Path) -> str:
         )
     )
     maintainer_markdown = overrides.get("maintainer_markdown")
-    if isinstance(maintainer_markdown, str) and maintainer_markdown.strip():
+    if (
+        isinstance(maintainer_markdown, str)
+        and maintainer_markdown.strip()
+        and not _looks_like_generated_agents_document(maintainer_markdown.strip())
+    ):
         sections.append(f"## Maintainer Notes\n\n{maintainer_markdown.strip()}")
     return "\n\n".join(sections)
 
@@ -388,6 +425,9 @@ def deploy(repo: Path, *, force: bool = False) -> list[DeployAction]:
 
     root = aethyme_root()
     actions: list[DeployAction] = []
+    cleanup_action = _drop_stale_generated_agents_override(repo)
+    if cleanup_action is not None:
+        actions.append(cleanup_action)
     migration_action = _migrate_legacy_agents_content(repo)
     if migration_action is not None:
         actions.append(migration_action)
@@ -514,12 +554,62 @@ def _extract_legacy_agents_content(existing: str) -> str:
         pieces = [before.strip(), after.strip()]
         return "\n\n".join(piece for piece in pieces if piece)
 
+    if _looks_like_generated_agents_document(stripped):
+        return ""
+
     rendered_template = (_TEMPLATE_DIR / "AGENTS.md").read_text(encoding="utf-8").replace(
         PLACEHOLDER, aethyme_root()
     )
     if stripped == rendered_template.strip():
         return ""
     return stripped
+
+
+def _drop_stale_generated_agents_override(repo: Path) -> DeployAction | None:
+    """Remove old generated Aethyme boilerplate from maintainer overrides."""
+    override_path = repo / AGENTS_OVERRIDE_PATH
+    if not override_path.exists():
+        return None
+    overrides = _load_agents_overrides(repo)
+    if overrides.get("_invalid_override"):
+        return None
+    maintainer_markdown = overrides.get("maintainer_markdown")
+    if not (
+        isinstance(maintainer_markdown, str)
+        and _looks_like_generated_agents_document(maintainer_markdown.strip())
+    ):
+        return None
+
+    clean_overrides = {
+        key: value
+        for key, value in overrides.items()
+        if not key.startswith("_") and key != "maintainer_markdown"
+    }
+    if clean_overrides:
+        override_path.write_text(json.dumps(clean_overrides, indent=2) + "\n", encoding="utf-8")
+    else:
+        override_path.unlink()
+
+    target = EnhancementTarget(
+        AGENTS_OVERRIDE_PATH,
+        _TEMPLATE_DIR / "AGENTS.md",
+        "Repo-specific AGENTS override data",
+    )
+    return DeployAction(target, "updated")
+
+
+def _looks_like_generated_agents_document(content: str) -> bool:
+    """Detect legacy generated Aethyme root guidance, including stale variants."""
+    if not content:
+        return False
+    required_markers = (
+        "# Agent Instructions",
+        "This repository is **Aethyme-enhanced**",
+        "## Quick start (any agent)",
+        "## Detailed reference",
+        "## Verifying this enhancement",
+    )
+    return all(marker in content for marker in required_markers)
 
 
 def _ensure_executable(path: Path) -> None:

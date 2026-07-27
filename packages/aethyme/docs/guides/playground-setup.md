@@ -1,6 +1,6 @@
 # Playground Setup Guide
 
-Last Updated: 2026-05-08
+Last Updated: 2026-07-27
 
 How to create an eval playground — a pair of repos (Control + Aethyme) from any source repository.
 
@@ -81,10 +81,36 @@ git gc --prune=now
 
 After this, `git log --all` only shows commits reachable from the detached HEAD. Fix commits on newer branches are gone.
 
-### 3. Deploy Aethyme tooling (Aethyme repo only)
+### 3. Hide playground-generated artifacts from ordinary discovery
+
+Playground artifacts are local scaffolding, not benchmark source. Add local
+exclude rules to both clones so Git and ripgrep ignore generated Aethyme,
+Chau7, Claude, and Codex artifacts during ordinary discovery. These rules live
+under `.git/info/exclude`, so they do not modify the source repository.
 
 ```bash
-AETHYME_ROOT=~/Downloads/Repositories/Aethyme/packages/aethyme
+for repo in "$DEST/Mediawiki - Control" "$DEST/Mediawiki - Aethyme"; do
+  cat >> "$repo/.git/info/exclude" <<'EOF'
+
+# AETHYME_PLAYGROUND_GENERATED_ARTIFACTS
+.aethyme/
+.chau7/
+.claude/
+.codex/
+AGENTS.md
+CLAUDE.md
+EOF
+done
+```
+
+If the source repository was already enhanced and any of those files were
+tracked, mark them `skip-worktree` before removing Control-side contamination
+or deploying the Aethyme condition. The setup script handles this for you.
+
+### 4. Deploy Aethyme tooling (Aethyme repo only)
+
+```bash
+AETHYME_ROOT=/path/to/Aethyme/packages/aethyme
 ENGINE="$AETHYME_ROOT/rust/target/release/aethyme-engine-cli"
 GRAPH_INDEXER="$AETHYME_ROOT/rust/target/release/aethyme-graph-index"
 
@@ -97,14 +123,22 @@ $GRAPH_INDEXER \
   --engine-version local
 $ENGINE index --repo .
 
-# Deploy the skill
-mkdir -p .codex/skills/aethyme
-cp "$AETHYME_ROOT/skills/aethyme/SKILL.md" .codex/skills/aethyme/SKILL.md
-# Replace the AETHYME_ROOT placeholder with the actual path
-sed -i '' "s|{{AETHYME_ROOT}}|$AETHYME_ROOT|g" .codex/skills/aethyme/SKILL.md
+# Deploy generated root guidance and per-product skills.
+"$AETHYME_ROOT/.venv/bin/python" -m src.cli enhance deploy --repo "$PWD" --force
 ```
 
-### 4. Verify
+The generated `AGENTS.md` and `CLAUDE.md` quick start must point Explore at
+the native binary:
+
+```bash
+"$AETHYME_ROOT/rust/target/release/aethyme" explore \
+  --repo "$PWD" --request "<your task>" --format answer-json
+```
+
+They may warn that `python -m src.cli explore` was removed, but they must not
+present it as executable guidance.
+
+### 5. Verify
 
 ```bash
 ./scripts/eval/verify-playground.sh --target mediawiki
@@ -118,10 +152,18 @@ ls "$DEST/Mediawiki - Control/.codex" 2>/dev/null && echo "FAIL: .codex exists" 
 ls "$DEST/Mediawiki - Control/.aethyme" 2>/dev/null && echo "FAIL: .aethyme exists" || echo "OK"
 ls "$DEST/Mediawiki - Control/.chau7" 2>/dev/null && echo "FAIL: .chau7 exists" || echo "OK"
 
-# Aethyme: must have skill + fragments + local Redb store
+# Aethyme: must have skill, references, fragments, and local Redb store
 ls "$DEST/Mediawiki - Aethyme/.codex/skills/aethyme/SKILL.md" || echo "FAIL: no skill"
+ls "$DEST/Mediawiki - Aethyme/.codex/skills/aethyme/references/explore.md" || echo "FAIL: no Explore reference"
 ls "$DEST/Mediawiki - Aethyme/.aethyme/graph" || echo "FAIL: no fragment graph"
 ls "$DEST/Mediawiki - Aethyme/.aethyme/graph_store.redb" || echo "FAIL: no Redb graph store"
+cd "$DEST/Mediawiki - Aethyme"
+for path in .aethyme/graph_store.redb .codex/skills/aethyme/SKILL.md AGENTS.md CLAUDE.md; do
+  git check-ignore -q "$path" \
+    && echo "OK: ignored $path" \
+    || echo "FAIL: generated artifact visible: $path"
+done
+git status --porcelain --untracked-files=all
 
 # Both: same commit
 CONTROL_HEAD=$(cd "$DEST/Mediawiki - Control" && git rev-parse HEAD)
@@ -176,5 +218,11 @@ rm -rf "$DEST/Control/.chau7"
 
 **"Aethyme skill shows {{AETHYME_ROOT}}"** — The sed replacement failed. Check the path and re-run:
 ```bash
-sed -i '' "s|{{AETHYME_ROOT}}|$AETHYME_ROOT|g" .codex/skills/aethyme/SKILL.md
+"$AETHYME_ROOT/.venv/bin/python" -m src.cli enhance deploy --repo "$PWD" --force
 ```
+
+**"Generated artifacts appear in git status or rg output"** — The local
+exclude block is missing from `.git/info/exclude`. Re-run
+`setup-playground.sh --force`, or add the
+`AETHYME_PLAYGROUND_GENERATED_ARTIFACTS` block from step 3 and rerun
+`verify-playground.sh`.

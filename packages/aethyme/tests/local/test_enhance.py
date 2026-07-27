@@ -6,10 +6,8 @@ import json
 import os
 from pathlib import Path
 
-from click.testing import CliRunner
-
-from src.cli import cli
 from src.enhance import AGENTS_OVERRIDE_PATH, deploy, is_ok, verify
+from tests.support.cli_invoke import invoke_aethyme
 
 # CWD-independent package root (tests run with cwd=packages/aethyme in CI,
 # but repo-root-relative paths broke when invoked from elsewhere).
@@ -152,13 +150,12 @@ def test_enhance_deploy_migrates_old_full_file_agents_template(tmp_path: Path) -
 def test_init_and_validate_onboarding_overrides_cli(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
-    runner = CliRunner()
 
-    init_result = runner.invoke(cli, ["repo", "init-onboarding-overrides", str(repo_path)])
+    init_result = invoke_aethyme(["repo", "init-onboarding-overrides", str(repo_path)])
     assert init_result.exit_code == 0, init_result.output
     assert (repo_path / ".aethyme" / "overrides" / "onboarding.json").exists()
 
-    validate_result = runner.invoke(cli, ["repo", "validate-onboarding-overrides", str(repo_path)])
+    validate_result = invoke_aethyme(["repo", "validate-onboarding-overrides", str(repo_path)])
     assert validate_result.exit_code == 0, validate_result.output
     assert "Valid override file" in validate_result.output
     telemetry_lines = (repo_path / ".aethyme/generated/experience-telemetry.jsonl").read_text(
@@ -172,13 +169,12 @@ def test_init_and_validate_onboarding_overrides_cli(tmp_path: Path) -> None:
 def test_init_and_validate_agents_overrides_cli(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
-    runner = CliRunner()
 
-    init_result = runner.invoke(cli, ["repo", "init-agents-overrides", str(repo_path)])
+    init_result = invoke_aethyme(["repo", "init-agents-overrides", str(repo_path)])
     assert init_result.exit_code == 0, init_result.output
     assert (repo_path / AGENTS_OVERRIDE_PATH).exists()
 
-    validate_result = runner.invoke(cli, ["repo", "validate-agents-overrides", str(repo_path)])
+    validate_result = invoke_aethyme(["repo", "validate-agents-overrides", str(repo_path)])
     assert validate_result.exit_code == 0, validate_result.output
     assert "Valid override file" in validate_result.output
     telemetry_lines = (repo_path / ".aethyme/generated/experience-telemetry.jsonl").read_text(
@@ -193,9 +189,8 @@ def test_enhance_verify_prints_summary(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
     deploy(repo_path)
-    runner = CliRunner()
 
-    result = runner.invoke(cli, ["enhance", "verify", "--repo", str(repo_path)])
+    result = invoke_aethyme(["enhance", "verify", "--repo", str(repo_path)])
     assert result.exit_code == 0, result.output
     assert "Enhancement summary:" in result.output
     assert "Recommendation: load `repo-onboarding` then run `explore`" in result.output
@@ -219,11 +214,8 @@ def test_repo_experience_telemetry_reports_json_and_text(tmp_path: Path) -> None
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
     deploy(repo_path)
-    runner = CliRunner()
 
-    runner.invoke(
-        cli,
-        [
+    invoke_aethyme([
             "repo",
             "record-wrapper-invocation",
             str(repo_path),
@@ -231,13 +223,9 @@ def test_repo_experience_telemetry_reports_json_and_text(tmp_path: Path) -> None
             "aethyme-explore",
             "--detail",
             "source=test",
-        ],
-    )
+        ])
 
-    json_result = runner.invoke(
-        cli,
-        ["repo", "experience-telemetry", str(repo_path), "--json-output"],
-    )
+    json_result = invoke_aethyme(["repo", "experience-telemetry", str(repo_path), "--json-output"])
     assert json_result.exit_code == 0, json_result.output
     payload = json.loads(json_result.output)
     assert payload["event_count"] >= 2
@@ -246,7 +234,7 @@ def test_repo_experience_telemetry_reports_json_and_text(tmp_path: Path) -> None
     assert payload["kpis"]["wrapper_total"] >= 1
     assert payload["kpis"]["act_has_fast_test"] is True
 
-    text_result = runner.invoke(cli, ["repo", "experience-telemetry", str(repo_path)])
+    text_result = invoke_aethyme(["repo", "experience-telemetry", str(repo_path)])
     assert text_result.exit_code == 0, text_result.output
     assert "Wrapper invocations:" in text_result.output
     assert "KPIs:" in text_result.output
@@ -257,9 +245,8 @@ def test_repo_experience_status_writes_artifacts(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
     deploy(repo_path)
-    runner = CliRunner()
 
-    result = runner.invoke(cli, ["repo", "experience-status", str(repo_path), "--json-output"])
+    result = invoke_aethyme(["repo", "experience-status", str(repo_path), "--json-output"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["schema_version"] == "aethyme-experience-status-v1"
@@ -278,9 +265,8 @@ def test_repo_experience_telemetry_flags_no_wrapper_usage(tmp_path: Path) -> Non
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
     deploy(repo_path)
-    runner = CliRunner()
 
-    result = runner.invoke(cli, ["repo", "experience-telemetry", str(repo_path), "--json-output"])
+    result = invoke_aethyme(["repo", "experience-telemetry", str(repo_path), "--json-output"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     codes = [signal["code"] for signal in payload["kpis"]["signals"]]
@@ -288,12 +274,12 @@ def test_repo_experience_telemetry_flags_no_wrapper_usage(tmp_path: Path) -> Non
     suggestion_codes = [suggestion["code"] for suggestion in payload["kpis"]["suggestions"]]
     assert "load_onboarding_and_use_wrapper" in suggestion_codes
 
-    text_result = runner.invoke(cli, ["repo", "experience-telemetry", str(repo_path)])
+    text_result = invoke_aethyme(["repo", "experience-telemetry", str(repo_path)])
     assert text_result.exit_code == 0, text_result.output
     assert "Suggestions:" in text_result.output
     assert "load_onboarding_and_use_wrapper" in text_result.output
 
-    check_result = runner.invoke(cli, ["repo", "experience-telemetry", str(repo_path), "--check"])
+    check_result = invoke_aethyme(["repo", "experience-telemetry", str(repo_path), "--check"])
     assert check_result.exit_code == 1, check_result.output
 
 
@@ -301,7 +287,6 @@ def test_repo_experience_telemetry_detects_stale_override_artifacts(tmp_path: Pa
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
     deploy(repo_path)
-    runner = CliRunner()
 
     override_path = repo_path / ".aethyme" / "overrides" / "onboarding.json"
     override_path.parent.mkdir(parents=True, exist_ok=True)
@@ -327,10 +312,7 @@ def test_repo_experience_telemetry_detects_stale_override_artifacts(tmp_path: Pa
     newer_mtime = max(onboarding_path.stat().st_mtime, act_path.stat().st_mtime) + 5
     os.utime(override_path, (newer_mtime, newer_mtime))
 
-    result = runner.invoke(
-        cli,
-        ["repo", "experience-telemetry", str(repo_path), "--json-output"],
-    )
+    result = invoke_aethyme(["repo", "experience-telemetry", str(repo_path), "--json-output"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     codes = [signal["code"] for signal in payload["kpis"]["signals"]]
@@ -340,12 +322,12 @@ def test_repo_experience_telemetry_detects_stale_override_artifacts(tmp_path: Pa
     suggestion_codes = [suggestion["code"] for suggestion in payload["kpis"]["suggestions"]]
     assert "regenerate_onboarding_artifacts" in suggestion_codes
 
-    text_result = runner.invoke(cli, ["repo", "experience-telemetry", str(repo_path)])
+    text_result = invoke_aethyme(["repo", "experience-telemetry", str(repo_path)])
     assert text_result.exit_code == 0, text_result.output
     assert "Override freshness:" in text_result.output
     assert "regeneration_required: yes" in text_result.output
 
-    check_result = runner.invoke(cli, ["repo", "experience-telemetry", str(repo_path), "--check"])
+    check_result = invoke_aethyme(["repo", "experience-telemetry", str(repo_path), "--check"])
     assert check_result.exit_code == 1, check_result.output
 
 
@@ -353,9 +335,8 @@ def test_enhance_verify_refreshes_experience_status(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
     deploy(repo_path)
-    runner = CliRunner()
 
-    result = runner.invoke(cli, ["enhance", "verify", "--repo", str(repo_path)])
+    result = invoke_aethyme(["enhance", "verify", "--repo", str(repo_path)])
     assert result.exit_code == 0, result.output
     assert "Experience status:" in result.output
 
@@ -372,7 +353,6 @@ def test_enhance_verify_fails_on_direct_agents_edit(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
     deploy(repo_path)
-    runner = CliRunner()
 
     agents_path = repo_path / "AGENTS.md"
     agents_path.write_text(
@@ -380,7 +360,7 @@ def test_enhance_verify_fails_on_direct_agents_edit(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    result = runner.invoke(cli, ["enhance", "verify", "--repo", str(repo_path)])
+    result = invoke_aethyme(["enhance", "verify", "--repo", str(repo_path)])
     assert result.exit_code == 1, result.output
     assert "AGENTS.md" in result.output
     assert "direct edits unsupported; use .aethyme/overrides/agents.json" in result.output

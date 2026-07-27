@@ -58,6 +58,35 @@ check_warn() { echo "  [WARN] $1"; ((WARNINGS++)); }
 count_git_refs() {
     git for-each-ref --format='%(refname)' refs/heads refs/remotes 2>/dev/null | wc -l | tr -d ' '
 }
+check_ignored_path() {
+    local generated_path="$1"
+    local label="$2"
+    git check-ignore -q -- "$generated_path" \
+        && check_pass "$label ignored for ordinary discovery" \
+        || check_fail "$label is not ignored by .git/info/exclude"
+}
+check_root_guidance() {
+    local file="$1"
+    local label="$2"
+
+    [[ -f "$file" ]] && check_pass "$label present" || { check_fail "Missing $label"; return; }
+    grep -q '{{AETHYME_ROOT}}' "$file" && check_fail "$label has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "$label placeholders resolved"
+    grep -q '"$AETHYME_ROOT/rust/target/release/aethyme" explore' "$file" \
+        && check_pass "$label points Explore at native aethyme binary" \
+        || check_fail "$label missing native Explore quick start"
+    if grep 'src.cli explore' "$file" | grep -Ev 'Do not run|not a valid command|was removed' >/dev/null; then
+        check_fail "$label still contains executable guidance for deleted 'src.cli explore'"
+    else
+        check_pass "$label has no stale executable Python Explore guidance"
+    fi
+}
+check_reference_file() {
+    local file="$1"
+    local label="$2"
+
+    [[ -f "$file" ]] && check_pass "$label present" || { check_fail "Missing $label"; return; }
+    grep -q '{{AETHYME_ROOT}}' "$file" && check_fail "$label has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "$label placeholders resolved"
+}
 
 # ── Control Repo ─────────────────────────────────────────────────────
 
@@ -126,15 +155,16 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
     # Skill deployed
     [[ -f .codex/skills/aethyme/SKILL.md ]] && check_pass "Skill deployed" || check_fail "Missing .codex/skills/aethyme/SKILL.md"
     [[ -d .codex/skills/eval ]] && check_fail "Internal eval skill leaked into playground" || check_pass "No internal eval skill deployed"
+    check_root_guidance "AGENTS.md" "AGENTS.md"
+    check_root_guidance "CLAUDE.md" "CLAUDE.md"
 
-    # Skill has no unresolved placeholders
+    # Skill has no unresolved placeholders and keeps auto-load concise. Detailed
+    # command workflows live in references/ and are checked below.
     if [[ -f .codex/skills/aethyme/SKILL.md ]]; then
         SKILL_FILE=".codex/skills/aethyme/SKILL.md"
         grep -q '{{AETHYME_ROOT}}' "$SKILL_FILE" && check_fail "Skill has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "Skill placeholders resolved"
-        # 2026-05-08: Python explore_command was hard-deleted. The skill's
-        # explore guidance now references the native Rust binary
-        # (`$AETHYME_BIN explore`); the `intents` command stays in Python.
-        grep -q 'src.cli intents' "$SKILL_FILE" && check_pass "Skill includes current intent catalog guidance" || check_fail "Skill missing intents guidance"
+        grep -q 'one bounded Explore call' "$SKILL_FILE" && check_pass "Skill states one bounded Explore-call contract" || check_fail "Skill missing one-call contract"
+        grep -q 'safe_to_use_as_answer' "$SKILL_FILE" && check_pass "Skill tells agents to inspect trust fields" || check_fail "Skill missing trust-field guidance"
         (grep -q '"$AETHYME_BIN" explore' "$SKILL_FILE" || grep -q 'aethyme explore' "$SKILL_FILE") \
             && check_pass "Skill includes current native-explore guidance" \
             || check_fail "Skill missing native explore guidance"
@@ -146,9 +176,30 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
         else
             check_pass "Skill has no stale executable 'src.cli explore' guidance"
         fi
-        grep -q 'analyze dead-code' "$SKILL_FILE" && check_pass "Skill includes current dead-code analyzer" || check_fail "Skill missing analyze dead-code guidance"
-        grep -q 'facts function-usage' "$SKILL_FILE" && check_pass "Skill includes current usage facts command" || check_fail "Skill missing facts function-usage guidance"
+        grep -q 'references/explore.md' "$SKILL_FILE" && check_pass "Skill links Explore reference" || check_fail "Skill missing Explore reference link"
+        grep -q 'references/graph-task.md' "$SKILL_FILE" && check_pass "Skill links graph/task reference" || check_fail "Skill missing graph/task reference link"
+        grep -q 'references/dead-code.md' "$SKILL_FILE" && check_pass "Skill links dead-code reference" || check_fail "Skill missing dead-code reference link"
         grep -q '\$ENGINE unused' "$SKILL_FILE" && check_fail "Skill still advertises stale \$ENGINE unused command" || check_pass "Skill has no stale unused command"
+    fi
+
+    EXPLORE_REF=".codex/skills/aethyme/references/explore.md"
+    GRAPH_REF=".codex/skills/aethyme/references/graph-task.md"
+    DEAD_CODE_REF=".codex/skills/aethyme/references/dead-code.md"
+    check_reference_file "$EXPLORE_REF" "Explore reference"
+    check_reference_file "$GRAPH_REF" "Graph/task reference"
+    check_reference_file "$DEAD_CODE_REF" "Dead-code reference"
+    [[ -f .claude/skills/aethyme/references/explore.md ]] && check_pass "Claude Explore reference present" || check_fail "Missing Claude Explore reference"
+    [[ -f .claude/skills/aethyme/references/graph-task.md ]] && check_pass "Claude graph/task reference present" || check_fail "Missing Claude graph/task reference"
+    [[ -f .claude/skills/aethyme/references/dead-code.md ]] && check_pass "Claude dead-code reference present" || check_fail "Missing Claude dead-code reference"
+    if [[ -f "$EXPLORE_REF" ]]; then
+        grep -q 'src.cli intents' "$EXPLORE_REF" && check_pass "Explore reference includes current intent catalog guidance" || check_fail "Explore reference missing intents guidance"
+    fi
+    if [[ -f "$GRAPH_REF" ]]; then
+        grep -q 'graph callers' "$GRAPH_REF" && check_pass "Graph/task reference includes caller guidance" || check_fail "Graph/task reference missing caller guidance"
+    fi
+    if [[ -f "$DEAD_CODE_REF" ]]; then
+        grep -q 'analyze dead-code' "$DEAD_CODE_REF" && check_pass "Dead-code reference includes current analyzer" || check_fail "Dead-code reference missing analyze dead-code guidance"
+        grep -q 'facts function-usage' "$DEAD_CODE_REF" && check_pass "Dead-code reference includes usage facts command" || check_fail "Dead-code reference missing facts function-usage guidance"
     fi
 
     # Fragment graph + Redb graph store. Since 4.7.12 the engine
@@ -156,6 +207,15 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
     # pass/parser fallback is gone.
     [[ -d .aethyme/graph ]] && check_pass "Fragment graph present" || check_fail "Missing .aethyme/graph — run aethyme-graph-index before $ENGINE index --repo ."
     [[ -f .aethyme/graph_store.redb ]] && check_pass "Redb graph store present" || check_fail "Missing .aethyme/graph_store.redb — run: $ENGINE index --repo ."
+    check_ignored_path ".aethyme/graph_store.redb" ".aethyme graph store"
+    check_ignored_path ".aethyme/graph" ".aethyme fragment graph"
+    check_ignored_path ".codex/skills/aethyme/SKILL.md" "Codex Aethyme skill"
+    check_ignored_path ".claude/skills/aethyme/SKILL.md" "Claude Aethyme skill"
+    check_ignored_path "AGENTS.md" "Generated AGENTS.md"
+    check_ignored_path "CLAUDE.md" "Generated CLAUDE.md"
+
+    DIRTY=$(git status --porcelain --untracked-files=all 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$DIRTY" == "0" ]] && check_pass "Generated artifacts hidden from git status" || check_fail "$DIRTY visible working-tree change(s)"
 fi
 
 echo ""

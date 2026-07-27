@@ -58,9 +58,55 @@ AETHYME_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ENGINE="$AETHYME_ROOT/rust/target/release/aethyme-engine-cli"
 GRAPH_INDEXER="$AETHYME_ROOT/rust/target/release/aethyme-graph-index"
 GRAPH_ENGINE_VERSION="${AETHYME_GRAPH_ENGINE_VERSION:-local}"
+PLAYGROUND_EXCLUDE_MARKER="# AETHYME_PLAYGROUND_GENERATED_ARTIFACTS"
 
 count_git_refs() {
     git for-each-ref --format='%(refname)' refs/heads refs/remotes 2>/dev/null | wc -l | tr -d ' '
+}
+
+write_playground_excludes() {
+    local repo="$1"
+    local exclude_file="$repo/.git/info/exclude"
+
+    mkdir -p "$(dirname "$exclude_file")"
+    if [[ -f "$exclude_file" ]] && grep -q "$PLAYGROUND_EXCLUDE_MARKER" "$exclude_file"; then
+        return
+    fi
+
+    cat >> "$exclude_file" <<'EOF'
+
+# AETHYME_PLAYGROUND_GENERATED_ARTIFACTS
+# Local eval/runtime scaffolding. These files may exist so agent products can
+# load Aethyme, but they are not benchmark source and should not appear in
+# ordinary Git/ripgrep discovery.
+.aethyme/
+.chau7/
+.claude/
+.codex/
+AGENTS.md
+CLAUDE.md
+EOF
+}
+
+hide_tracked_generated_artifacts() {
+    local repo="$1"
+    local generated_path tracked_files
+
+    cd "$repo"
+    for generated_path in .codex .aethyme .chau7 .claude AGENTS.md CLAUDE.md; do
+        tracked_files=("${(@f)$(git ls-files "$generated_path" 2>/dev/null)}")
+        tracked_files=("${(@)tracked_files:#}")
+        if (( ${#tracked_files[@]} > 0 )); then
+            git update-index --skip-worktree -- "${tracked_files[@]}"
+        fi
+    done
+}
+
+generated_artifacts_are_ignored() {
+    local generated_path
+    for generated_path in .aethyme/graph_store.redb .codex/skills/aethyme/SKILL.md .claude/skills/aethyme/SKILL.md AGENTS.md CLAUDE.md; do
+        git check-ignore -q -- "$generated_path" || return 1
+    done
 }
 
 echo "=== Playground Setup ==="
@@ -132,6 +178,7 @@ for REPO in "$CONTROL_DIR" "$AETHYME_DIR"; do
     # Prune unreachable objects
     git reflog expire --expire=now --all
     git gc --prune=now 2>/dev/null
+    write_playground_excludes "$REPO"
     echo "  Cleaned: $(basename "$REPO") — $(count_git_refs) refs, $(git remote | wc -l | tr -d ' ') remotes"
 done
 
@@ -139,14 +186,8 @@ done
 # Aethyme itself (or already enhanced), discoverability files would otherwise leak
 # into the vanilla Control clone and invalidate the playground isolation contract.
 echo ">>> Removing Control-side tooling/runtime contamination..."
+hide_tracked_generated_artifacts "$CONTROL_DIR"
 cd "$CONTROL_DIR"
-for path in .codex .aethyme .chau7 .claude AGENTS.md CLAUDE.md; do
-    tracked_files=("${(@f)$(git ls-files "$path" 2>/dev/null)}")
-    tracked_files=("${(@)tracked_files:#}")
-    if (( ${#tracked_files[@]} > 0 )); then
-        git update-index --skip-worktree -- $tracked_files
-    fi
-done
 /bin/rm -rf .codex .aethyme .chau7 .claude
 /bin/rm -f AGENTS.md CLAUDE.md
 echo "  Removed: .codex .aethyme .chau7 .claude AGENTS.md CLAUDE.md (if present)"
@@ -165,6 +206,8 @@ echo ">>> Materializing Redb graph store..."
 
 echo ">>> Deploying enhancement files..."
 "$AETHYME_ROOT/.venv/bin/python" -m src.cli enhance deploy --repo "$AETHYME_DIR" --force
+hide_tracked_generated_artifacts "$AETHYME_DIR"
+echo "  Aethyme: generated artifacts hidden from git/ripgrep discovery via .git/info/exclude"
 
 # ── Step 4: Verify ───────────────────────────────────────────────────
 
@@ -193,6 +236,11 @@ else
 fi
 [[ -d .aethyme/graph ]] && echo "  Aethyme: fragment graph present" || { echo "  FAIL: Aethyme missing .aethyme/graph"; ((ERRORS++)); }
 [[ -f .aethyme/graph_store.redb ]] && echo "  Aethyme: graph_store.redb present" || { echo "  FAIL: Aethyme missing graph_store.redb"; ((ERRORS++)); }
+DIRTY=$(git status --porcelain --untracked-files=all 2>/dev/null | wc -l | tr -d ' ')
+[[ "$DIRTY" == "0" ]] && echo "  Aethyme: generated artifacts do not appear in git status" || { echo "  FAIL: Aethyme has $DIRTY visible working-tree change(s)"; ((ERRORS++)); }
+generated_artifacts_are_ignored \
+    && echo "  Aethyme: generated artifacts ignored for ordinary discovery" \
+    || { echo "  FAIL: Aethyme generated artifacts are not ignored by .git/info/exclude"; ((ERRORS++)); }
 
 # Same commit
 CONTROL_HEAD=$(cd "$CONTROL_DIR" && git rev-parse HEAD)

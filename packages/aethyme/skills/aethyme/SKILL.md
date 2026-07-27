@@ -7,247 +7,67 @@ description: Use Aethyme's high-level Explore intents, current repository
 
 # Aethyme Navigation
 
+Use this skill when the task needs repository navigation, task localization,
+caller/callee tracing, API/dead-code analysis, graph context, or a compact task
+pack. Do not load every reference by default; start with the short contract
+below and load only the relevant reference if the first result is insufficient.
+
 ## Setup
 
-`aethyme explore` is the canonical entry point — a native Rust binary that
-routes to the engine daemon for sub-second warm latency. Other commands
-(`graph`, `facts`, `task`, `analyze`) still go through the Python CLI.
-
-```
+```bash
 AETHYME_ROOT="{{AETHYME_ROOT}}"
-AETHYME_PY="$AETHYME_ROOT/.venv/bin/python"
 AETHYME_BIN="$AETHYME_ROOT/rust/target/release/aethyme"
+AETHYME_PY="$AETHYME_ROOT/.venv/bin/python"
 REPO="$PWD"
 ```
 
-Important: `python -m src.cli explore` is not a valid command. `explore`
-only runs through the native binary:
+Important: `python -m src.cli explore` is not a valid command. `explore` runs
+only through the native binary.
 
-```bash
-"$AETHYME_BIN" explore --repo "$REPO" --request "<user request>" --format answer-json
-```
+## Default Contract
 
-Use the Python CLI for `graph`, `task`, `intents`, `facts`, and `analyze`.
+1. Make one bounded Explore call before broad manual search:
 
-Command shapes:
+   ```bash
+   "$AETHYME_BIN" explore --repo "$REPO" --request "<user request>" --format answer-json --show-observability --depth 0
+   ```
 
-```bash
-# Explore (native Rust, daemon-routed):
-"$AETHYME_BIN" explore --repo "$REPO" ...
+2. Inspect these fields before trusting the result:
+   `safe_to_use_as_answer`, `trust_policy`, `observability`,
+   `degraded_reasons`, `answer[]`, `navigation_hints[]`, and
+   `verification_steps[]`.
 
-# Everything else (Python CLI):
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli <command> ...)
-```
+3. If `safe_to_use_as_answer=true` and the evidence names concrete files or
+   symbols, verify narrowly by reading those files or grepping those symbols.
+   Do not repeat a broad `rg --files` or repository-wide grep just because the
+   tool returned something.
 
-## Fast Workflows
+4. If `safe_to_use_as_answer=false`, treat `answer[]` and
+   `navigation_hints[]` as an investigation plan. Follow
+   `verification_steps[]`; widen search only after the hints fail.
 
-### Start Here: Explore
+5. Escalate deliberately. Prefer one deeper Explore call over several unrelated
+   commands. Use `--depth 1/2/3` only when the previous result did not provide
+   enough evidence to act.
 
-Prefer the high-level Explore surface before low-level graph navigation.
-Without an explicit intent, Aethyme runs the general-purpose
-`task_localization_query` intent and returns ranked candidate files, symbols,
-areas, compact evidence, confidence, verification steps, trust policy, and
-observability for the user request. This default path uses one bounded
-`task-localize` graph call,
-bounded symbol search, source-text evidence, source call-site expansion,
-filename fallback, and compact expansions. Filename-only fallback is never
-authoritative: it appears in `navigation_hints[]`, not `answer[]`, and is
-marked `navigation_only` with low confidence. The default output detail is
-`compact`; use `--detail standard` or `--detail full` only when additional
-evidence/debug payload is worth the extra tokens. If graph localization exceeds
-the responsiveness budget on a large repo, Aethyme can still return degraded
-source-backed `answer[]` candidates when local text/call-site evidence is
-strong enough, but the trust policy becomes `needs_verification` and
-`safe_to_use_as_answer=false`.
+## Load References Only When Needed
 
-```bash
-"$AETHYME_BIN" explore --repo "$REPO" --request "<user request>" --format answer-json --show-observability
-```
+- `references/explore.md`: depth ladder, intent choice, trust/observability,
+  and bounded retry rules.
+- `references/graph-task.md`: graph views, callers/callees, task scope,
+  context-pack, and prompt-pack commands.
+- `references/dead-code.md`: usage-boundary, dead-code, public API, facts, and
+  ambiguity handling.
 
-Use a specialized intent only when the request clearly matches it. For
-behavior localization, debugging, or "which files implement this workflow"
-questions, use `behavior_localization_query`; it spends more budget on
-source-text ranking and call-site expansion.
+## Non-Explore Commands
 
-```bash
-"$AETHYME_BIN" explore --repo "$REPO" --intent behavior_localization_query --request "<user request>" --format answer-json --show-observability
-```
+Use the Python CLI for non-Explore surfaces such as `graph`, `task`, `intents`,
+`facts`, and `analyze`. The exact commands live in the references above.
 
-For dead-code, boundary usage, or public API caller audits, use
-`usage_boundary_query` with `--scope` (and optionally `--search-root`):
+## When Not To Use Aethyme
 
-```bash
-"$AETHYME_BIN" explore --repo "$REPO" --intent usage_boundary_query --request "<user request>" --scope "<directory>" --search-root src --search-root tests --format answer-json --show-observability
-```
-
-You can still list the intent catalog directly:
-
-```bash
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli intents --request "<user request>" --format compact-json)
-```
-
-Read `trust_policy` and `safe_to_use_as_answer` first. Use `answer[]` as the
-primary result only when `safe_to_use_as_answer` is true. If false, treat
-`answer[]` and `navigation_hints[]` as a ranked investigation plan, not a final
-answer; follow `verification_steps[]` before concluding. Read `excluded[]` to
-understand why candidates or areas were rejected. Read `ambiguous[]` before
-trusting low-confidence candidates. Read
-`output_adapters.dead_code_eval_json` only when the task specifically asks for
-the dead-code evaluation schema.
-
-Always inspect `observability` before trusting the result: command, repo path,
-index freshness, graph/fact counts, output size, confidence summaries, and
-degraded reasons.
-
-If `degraded_reasons` says `task-localize` timed out, read
-`observability.degradation_guidance` before retrying. If
-`degradation_guidance.status` is `recovered`, inspect source-backed
-`answer[].evidence.line_refs` and `verification_steps[]` before broad manual
-search. If `safe_to_use_as_answer` is false, follow `verification_steps[]`,
-`navigation_hints[]`, and `next_actions` as an investigation plan and verify
-with normal repo search before concluding. If a graph/symbol/source-backed
-`answer[]` is present, inspect candidates in order, then verify manually before
-finalizing.
-
-For very large repositories where first-response speed is more important than
-graph coverage, pass `--params '{"graph_query_timeout_ms":500}'`.
-
-### Progressive Disclosure: `--depth`
-
-`explore` accepts a `--depth N` flag (0..=3) that puts you on a four-rung
-ladder of context cost. Lower rungs are cheap and broad; higher rungs are
-expensive and specific. Use this when you want to spend tokens deliberately
-rather than absorb a large bulk response.
-
-Inventory (one line each — call once and you'll see the shape):
-
-- `--depth 0`: paths + names for many candidates. **Discovery.**
-- `--depth 1`: paths + names + signatures for a shorter list. **Triage.**
-- `--depth 2`: + 20-line snippets for the top few. **Read the code.**
-- `--depth 3`: + full content + call-graph closure for one anchor. **Commit.**
-
-**When to use which.** This is the part that matters; the level inventory
-above is just so you recognize the shapes. Two heuristics:
-
-1. **Start at 0 unless you already know the symbol.** If the user said "fix
-   the bug in `WatchedItemStore::handleDelete`", you don't need discovery —
-   skip to `--depth 2` or `--depth 3` on that anchor. If the user said "fix
-   the bug where deleted users still appear in shared resources", you don't
-   yet know which file to read; start at `--depth 0` to triage.
-
-2. **Escalate one rung at a time. Stop when you have enough to act.** Each
-   escalation roughly 2-3× the previous rung's cost. If you're at `--depth 1`
-   with 8 candidates and one of them is clearly right, jump to `--depth 3`
-   on that one anchor — don't pay `--depth 2` first as a formality. Conversely,
-   if `--depth 0` returns 15 candidates and several look plausible, escalate
-   to `--depth 1` on the same query (now you see signatures) before picking
-   a single anchor for `--depth 2`.
-
-**What "escalate" means in practice.** Two shapes:
-
-- **Same query, deeper level.** Same `--request` string, bump `--depth`. Use
-  this when you want to keep the same triage but pay for richer evidence.
-
-  ```bash
-  "$AETHYME_BIN" explore --repo "$REPO" --request "permission share grants" --depth 0
-  # Reads ~15 candidate paths/names. Pick one to escalate.
-  "$AETHYME_BIN" explore --repo "$REPO" --request "permission share grants" --depth 1
-  # Same triage with signatures attached.
-  ```
-
-- **Narrower query, deeper level.** Reformulate the request around a single
-  candidate from the previous rung. Use this when one rung's output already
-  identified the anchor.
-
-  ```bash
-  "$AETHYME_BIN" explore --repo "$REPO" --request "permission share grants" --depth 0
-  # depth 0 surfaces rbac-canonical.ts as the top hit.
-  "$AETHYME_BIN" explore --repo "$REPO" --request "PERMISSION_IMPLICATIONS Action.MANAGE share" --depth 3
-  # Pulled full content + call graph for the specific anchor.
-  ```
-
-**When NOT to escalate.** If `--depth 0` already gives you a single
-unambiguous candidate AND you can verify it with `Read` or `grep` directly,
-do that — don't pay for a second engine call. The depth ladder is for cases
-where the first rung's information genuinely doesn't answer your question.
-
-The legacy `--detail compact|standard|full` flag still works for callers who
-prefer the older budget vocabulary; when both are passed, `--depth` wins.
-
-### Repository Orientation
-```bash
-# Repo-level graph overview
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli graph overview "$REPO" --json-output)
-
-# Task-focused scope and starting anchors
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli task scope --repo "$REPO" --task "<task>" --json-output)
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli task anchors --repo "$REPO" --task "<task>" --json-output)
-```
-
-### Graph Navigation
-```bash
-# Inspect a node and expand nearby graph context
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli graph node "$REPO" "<file-or-symbol>" --json-output)
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli graph expand "$REPO" "<file-or-symbol>" --json-output)
-
-# Caller/callee evidence for a function or method
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli graph callers "$REPO" "<function-or-method>" --json-output)
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli graph callees "$REPO" "<function-or-method>" --json-output)
-```
-
-### Dead Code and API Surface
-
-Use `explore --intent usage_boundary_query` first for boundary usage/dead-code
-questions. It is the lowest-friction path because it returns the final answer,
-excluded candidates, confidence, and observability in one JSON object.
-
-For PHP scopes, this Explore intent uses the scope-first `analyze-usage-boundary`
-engine path and avoids building the full repository graph. If the result has
-`degraded_reasons` for language support or no public symbols in a non-PHP scope,
-fall back to the graph-backed analyzer or facts commands below.
-
-Use the direct analyzer only as a fallback when a task explicitly asks for the
-legacy dead-code shape.
-
-```bash
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli analyze dead-code --repo "$REPO" --scope "<directory>" --boundary outside-directory --format eval-json --show-observability)
-```
-
-Read `unused_functions` first. Each item includes `function_name`, `defined_in`,
-`status`, `external_callers`, `internal_callers`, `evidence`, `confidence`, and
-`reason`. `excluded_functions` explains why candidates were rejected. Read
-`observability` to verify the command, repository path, index freshness,
-graph/fact counts, confidence summary, output size, and degraded reasons.
-
-Interpret status precisely:
-- `Unused`: no internal or external code callers found.
-- `Ambiguous`: no external code callers found, but internal callers or
-  docs/config-only references exist. It matches prompts asking for “no callers
-  outside this directory” but may not be safe to remove.
-- `Used`: at least one caller exists outside the boundary, so exclude it from external-boundary dead-code answers.
-
-For harder cases, derive the public surface and inspect one function's usage
-relative to the boundary.
-
-```bash
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli facts public-functions --repo "$REPO" --scope "<directory>" --json-output)
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli facts function-usage --repo "$REPO" --target "<function>" --boundary "<directory>" --json-output)
-```
-
-Use `--roots "<dir1>,<dir2>"` on `analyze dead-code` or `facts function-usage`
-when the repository is large and the task gives likely search roots.
-
-## When to Use
-
-- **Starting a task:** run `explore --request` first; it composes anchors, scope, compact evidence, and verification steps.
-- **Need a task-ready answer:** run `explore --request`; choose a specialized intent only when the request clearly matches one.
-- **Finding impact:** run `graph callers` or `graph parents` before broad text search.
-- **Dead code / API surface:** run `explore --intent usage_boundary_query`; use `facts function-usage` to verify ambiguous candidates.
-- **Need a compact task pack:** run `task context` or `task pack` before reading many files.
-
-## When NOT to Use
-
-- Don't use Aethyme when a simple `grep` or `find` suffices
-- Don't call multiple commands when one answers your question
-- If a graph/facts command returns decisive evidence, don't repeat the same search manually
-- Don't use eval baselines, prior eval reports, or generated reference artifacts as evidence for benchmark answers
+- A simple file read, exact path lookup, or tiny grep already answers the task.
+- You already have one decisive Aethyme result and only need narrow source
+  verification.
+- The task asks for eval baselines, prior reports, or generated reference
+  artifacts as evidence; those must not be used for benchmark answers.

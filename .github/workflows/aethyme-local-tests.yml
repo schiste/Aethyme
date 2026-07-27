@@ -29,11 +29,20 @@ jobs:
 
       # The documented dev setup uses a package-local .venv (the layout the
       # broker gates and docs assume), so CI provides the same venv layout.
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install package + dev dependencies (into .venv)
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install --upgrade pip
           .venv/bin/python -m pip install -e ".[dev]"
+
+      # tests/local invoke the `aethyme` router binary as a subprocess
+      # (python-retirement Phase 0 seam) — the router must exist in every
+      # lane; only *engine-dependent* tests may skip here.
+      - name: Build Rust router binary
+        run: cargo build --quiet --manifest-path rust/Cargo.toml --bin aethyme
 
       - name: Run local test suite (default lane)
         run: .venv/bin/python -m pytest -q tests/local
@@ -64,8 +73,8 @@ jobs:
           .venv/bin/python -m pip install --upgrade pip
           .venv/bin/python -m pip install -e ".[dev]"
 
-      - name: Build Rust engine binary
-        run: cargo build --quiet --manifest-path rust/Cargo.toml --bin aethyme-engine-cli
+      - name: Build Rust engine + router binaries
+        run: cargo build --quiet --manifest-path rust/Cargo.toml --bin aethyme-engine-cli --bin aethyme
 
       - name: Run strict engine local tests
         run: .venv/bin/python -m pytest -q tests/local

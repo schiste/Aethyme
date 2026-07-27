@@ -46,9 +46,10 @@ Same content lives at both of these per-product skill paths:
 - `.claude/skills/repo-onboarding/SKILL.md` — generated repo-specific orientation
 - `.codex/skills/repo-onboarding/SKILL.md` — generated repo-specific orientation
 
-Read whichever your agent surface auto-loads. The files are identical and
-contain: full intent catalog, output schema, dead-code workflow, scope-first
-analyzer paths, and trust-policy semantics.
+Read whichever your agent surface auto-loads. The Aethyme skill is intentionally
+short: it tells agents to make one bounded Explore call, inspect trust and
+observability, then verify narrowly. Detailed workflows live under the skill's
+`references/` directory and should be loaded only when needed.
 
 ## Commit Hygiene
 
@@ -77,6 +78,5 @@ To confirm the enhancement is intact in this repository:
 "$AETHYME_ROOT/.venv/bin/python" -m src.cli enhance verify --repo "$PWD"
 ```
 
-Returns nonzero if any of `AGENTS.md`, `CLAUDE.md`, `.claude/skills/aethyme/SKILL.md`,
-`.codex/skills/aethyme/SKILL.md`, `.claude/skills/repo-onboarding/SKILL.md`, or
-`.codex/skills/repo-onboarding/SKILL.md` is missing or has unsubstituted placeholders.
+Returns nonzero if any generated root file, Aethyme skill, Aethyme skill
+reference, or repo-onboarding skill is missing or has unsubstituted placeholders.

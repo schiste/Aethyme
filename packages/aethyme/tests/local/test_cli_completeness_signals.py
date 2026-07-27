@@ -1,4 +1,11 @@
-"""CLI/rendering regression tests for completeness and confidence signal surfacing."""
+"""CLI/rendering regression tests for completeness and confidence signal surfacing.
+
+Migration note (python-retirement Phase 0): the monkeypatch-based tests
+here are unit tests of the Python renderers and the Python-side explore
+tombstone — implementation-specific by design, so they stay in-process
+and port/retire with their code in Phase 1. Only the surface-level
+intents test invokes the router subprocess.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +16,7 @@ from click.testing import CliRunner
 
 from src.cli import cli
 from src.rendering.context_pack import render_pack_summary, render_prompt_pack
+from tests.support.cli_invoke import invoke_aethyme
 
 
 def test_removed_python_explore_command_prints_native_recovery_hint() -> None:
@@ -195,8 +203,7 @@ def test_analyze_dead_code_eval_json_is_task_ready(
 
 
 def test_intents_compact_json_lists_default_task_localization_query() -> None:
-    runner = CliRunner()
-    result = runner.invoke(cli, ["intents", "--format", "compact-json"])
+    result = invoke_aethyme(["intents", "--format", "compact-json"])
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)

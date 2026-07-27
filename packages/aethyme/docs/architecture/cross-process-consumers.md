@@ -42,16 +42,17 @@ consumer. This file exists so that doesn't happen again.
 
 | Source | Deployed to | Invokes | Failure mode if entry point removed |
 |---|---|---|---|
-| `skills/aethyme/SKILL.md` | `.claude/skills/aethyme/SKILL.md`, `.codex/skills/aethyme/SKILL.md` | Documents `aethyme explore`, `aethyme query symbol`, `aethyme graph callers/callees`, `analyze dead-code`, `facts function-usage`, `task scope/anchors`, `intents`, `task context/pack` by name | Agent reads stale guidance, runs commands that no longer exist; user sees `Error: No such command 'X'`. Caught by `verify-playground.sh` greps and `scripts/check-cross-process-contract.py` text-consumer validation. |
+| `skills/aethyme/SKILL.md` | `.claude/skills/aethyme/SKILL.md`, `.codex/skills/aethyme/SKILL.md` | Short auto-load card: one bounded native `aethyme explore` call, inspect trust/observability, then verify narrowly. Links detailed workflows under `references/`. | Agent reads stale guidance, runs commands that no longer exist, or bulk-loads detailed workflows. Caught by `verify-playground.sh` greps, `test_skill_progressive_disclosure.py`, and `scripts/check-cross-process-contract.py` text-consumer validation. |
+| `skills/aethyme/references/*.md` | `.claude/skills/aethyme/references/*.md`, `.codex/skills/aethyme/references/*.md` | Detailed optional workflows: Explore depth/intents/trust, graph/task/context commands, and dead-code/facts/analyzer commands. | Enhanced repos receive a short skill with broken reference links or stale detailed commands. Caught by `enhance verify`, `verify-playground.sh`, and reference deployment tests. |
 | `skills/aethyme/AGENTS.md` | fully generated `AGENTS.md` and `CLAUDE.md` (deployed at repo root by `enhance.py`) | Cross-product convention file with quick-start command guidance, compact repo routing from generated onboarding/status artifacts, and commit hygiene policy. Root files are Aethyme-owned generated artifacts; repo-specific human customizations come from `.aethyme/overrides/agents.json`. | Agent reads stale quick start before loading skill details. Caught by `scripts/check-cross-process-contract.py` text-consumer validation and `enhance verify` canonical-match checks. |
 | `skills/aethyme/aethyme-explore` | `.codex/skills/aethyme/aethyme-explore` (executable) | `exec "{{AETHYME_ROOT}}/rust/target/release/aethyme" explore "$@"` | Wrapper produces `Error: No such command 'explore'`. Class-3 failure (silent until invoked). Rebuilt 2026-05-08 to point at native; previously called `python -m src.cli explore` (deleted). |
-| `skills/aethyme/aethyme-load-context.sh` | `.claude/hooks/aethyme-load-context.sh` (executable, wired via `.claude/settings.local.json`) | Reads `AGENTS.md` + `CLAUDE.md` from `$CLAUDE_PROJECT_DIR`; emits SessionStart hook JSON. **Does NOT invoke any Aethyme entry point.** | Hook fails to inject context; agent loses the in-repo discoverability surface. |
+| `skills/aethyme/aethyme-load-context.sh` | `.claude/hooks/aethyme-load-context.sh` (executable, wired via `.claude/settings.local.json`) | Reads `AGENTS.md` + `CLAUDE.md` from `$CLAUDE_PROJECT_DIR`; emits SessionStart hook JSON. **Invokes two Python entry points** (registry corrected 2026-07-17 — the previous "does NOT invoke any entry point" claim predated the telemetry call): (1) `$AETHYME_ROOT/.venv/bin/python -m src.cli repo record-wrapper-invocation` (best-effort, `\|\| true`, relies on the editable install making `src.cli` importable from any cwd); (2) bare `python3` heredoc for JSON escaping of the emitted envelope. | (1) failing is silent by design — telemetry rows go missing with no visible error (fire-and-forget blind spot, see python-retirement-plan Phase 3). (2) failing (no `python3` on PATH) kills context injection entirely. Both flip to native `aethyme` invocations during retirement Phases 2–3. |
 
 ### Deployment plumbing
 
 | Source | Deploys what | Notes |
 |---|---|---|
-| `src/enhance.py:TARGETS` + generated root render | fully generated `AGENTS.md`, `CLAUDE.md`, `.claude/skills/aethyme/SKILL.md`, `.codex/skills/aethyme/SKILL.md`, `.claude/hooks/aethyme-load-context.sh`, `.claude/settings.local.json` (merge-aware) | Single canonical deploy pipeline for in-repo Aethyme discoverability. Substitutes `{{AETHYME_ROOT}}`; repo-specific root customization comes from `.aethyme/overrides/agents.json`; direct edits to `AGENTS.md` / `CLAUDE.md` are unsupported and flagged by `enhance verify`. |
+| `src/enhance.py:TARGETS` + generated root render | fully generated `AGENTS.md`, `CLAUDE.md`, `.claude/skills/aethyme/SKILL.md`, `.codex/skills/aethyme/SKILL.md`, `.claude/skills/aethyme/references/*.md`, `.codex/skills/aethyme/references/*.md`, `.claude/hooks/aethyme-load-context.sh`, `.claude/settings.local.json` (merge-aware) | Single canonical deploy pipeline for in-repo Aethyme discoverability. Substitutes `{{AETHYME_ROOT}}`; repo-specific root customization comes from `.aethyme/overrides/agents.json`; direct edits to `AGENTS.md` / `CLAUDE.md` are unsupported and flagged by `enhance verify`. |
 | `src/indexing/skills.py:deploy_skills` | `.codex/skills/<name>/*` for each runtime skill in `skills/` | Different from `enhance.py` — used by `eval/repos.py` during eval prep. As of 2026-05-08 substitutes `{{AETHYME_ROOT}}` in `.md`, `.sh`, AND the `aethyme-explore` wrapper (no extension). |
 
 ### Shell scripts in `packages/aethyme/scripts/`
@@ -60,9 +61,10 @@ consumer. This file exists so that doesn't happen again.
 |---|---|---|
 | `scripts/eval/setup-playground.sh` | `python -m src.cli enhance deploy/verify` | Setup fails if `enhance` Click group is renamed/removed. |
 | `scripts/eval/setup-playground.sh` | `$AETHYME_ROOT/rust/target/release/aethyme-graph-index` followed by `$AETHYME_ROOT/rust/target/release/aethyme-engine-cli index --repo .` | Fresh Playground setup fails if either binary path changes, if fragments are not produced before engine indexing, or if `graph_store.redb` stops being materialized from fragments. |
+| `scripts/eval/setup-playground.sh` | Writes local `.git/info/exclude` rules for `.aethyme/`, `.chau7/`, `.claude/`, `.codex/`, `AGENTS.md`, and `CLAUDE.md`; marks tracked generated artifacts `skip-worktree` if the source repo was already enhanced. | Playground agents can treat generated scaffolding as benchmark source if these local excludes drift or are omitted. |
 | `scripts/eval/setup-playground.sh` | Asserts `<target>/.aethyme/graph/` and `<target>/.aethyme/graph_store.redb` exist after graph-index + engine-index. | False failure if the fragment layout or redb graph-store path changes. |
-| `scripts/eval/verify-playground.sh` | `$AETHYME_ROOT/rust/target/release/aethyme-engine-cli`; checks deployed skill, `.aethyme/graph/`, and `.aethyme/graph_store.redb`. | False failure if binary path, fragment layout, or redb graph-store path changes. |
-| `scripts/eval/verify-playground.sh:131-138` | Greps deployed SKILL.md for command names (`src.cli intents`, `aethyme explore`, `analyze dead-code`, `facts function-usage`) | False positive/negative on health check if SKILL.md template changes wording but verify-playground doesn't update its grep patterns. **Updated 2026-05-08 after the explore hard-delete to expect native `aethyme explore` not `src.cli explore`.** |
+| `scripts/eval/verify-playground.sh` | `$AETHYME_ROOT/rust/target/release/aethyme-engine-cli`; checks deployed root guidance, skill, `.aethyme/graph/`, `.aethyme/graph_store.redb`, and local generated-artifact excludes. | False failure if binary path, fragment layout, redb graph-store path, generated root wording, or ignore contract changes. |
+| `scripts/eval/verify-playground.sh` | Greps deployed root files, short SKILL.md, and references for command names (`src.cli intents`, native `aethyme explore`, `analyze dead-code`, `facts function-usage`) and rejects executable `src.cli explore` guidance. | False positive/negative on health check if templates change wording but verify-playground doesn't update its grep patterns. **Updated 2026-07-27 to check generated `AGENTS.md`/`CLAUDE.md`, short-skill links, and reference files.** |
 | `scripts/docs/generate-docs.sh:38` | Reads `src/cli.py` to extract command help | Doc generation fails if `cli.py` moved/renamed. |
 | `scripts/migrate.sh` (REMOVED 2026-07-13) | Deleted with migrations/, alembic, and the Postgres deps in the final cloud-lineage sweep. | — |
 | `scripts/start-api.sh` (REMOVED 2026-07-13) | Deleted with the Gen-0 PostgreSQL lineage (`src/api`, `src/graph`, tenant CLI commands `index/stats/ego/impact/search`). Any external caller of those entry points was already dead or must migrate to the engine CLI (`query`/`graph` commands). | — |
@@ -115,9 +117,10 @@ onboarding artifacts.
 
 | Path (under each `<Playground>/<repo> - Aethyme/`) | Source template | Last verified |
 |---|---|---|
-| `.codex/skills/aethyme/SKILL.md` | `skills/aethyme/SKILL.md` | 2026-05-08 (post-redeploy) |
+| `.codex/skills/aethyme/SKILL.md` | `skills/aethyme/SKILL.md` | 2026-07-27 (short-skill redeploy) |
+| `.codex/skills/aethyme/references/*.md` | `skills/aethyme/references/*.md` | 2026-07-27 (short-skill redeploy) |
 | `.codex/skills/aethyme/aethyme-explore` | `skills/aethyme/aethyme-explore` | 2026-05-08 (post-redeploy) |
-| `AGENTS.md`, `CLAUDE.md` | `skills/aethyme/AGENTS.md` | 2026-05-08 |
+| `AGENTS.md`, `CLAUDE.md` | `skills/aethyme/AGENTS.md` | 2026-07-27 |
 
 ### Phase 4+ graph indexer and redb graph store
 
@@ -259,7 +262,7 @@ Reader/writer split:
 | Read adjacency | `importers`, `deps` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` |
 | Hybrid usage-boundary | `analyze-usage-boundary`, `explore --intent usage_boundary_query` | `GraphStore::open_read_only` / redb `ReadOnlyDatabase` for seeds, source/docs/config text for fresh evidence |
 | Hybrid grep + adjacency | `callers` | Grep first, then `GraphStore::open_read_only` / redb `ReadOnlyDatabase` for candidate expansion |
-| Assert artifact exists | `scripts/eval/setup-playground.sh`, `scripts/eval/verify-playground.sh`, `docs/guides/playground-setup.md` | Filesystem existence check only |
+| Assert artifact exists and is locally ignored in playgrounds | `scripts/eval/setup-playground.sh`, `scripts/eval/verify-playground.sh`, `docs/guides/playground-setup.md` | Filesystem existence check plus `.git/info/exclude` visibility check in playground Aethyme clones |
 
 Read-only open policy:
 
@@ -298,7 +301,7 @@ Findings:
 
 Outstanding risks after 4.7.12:
 
-- The audit only covers in-repo consumers under `packages/aethyme/`; already-deployed playground repos can still contain stale generated skills. Run `scripts/eval/verify-playground.sh` against active playground targets after any template change.
+- The audit only covers in-repo consumers under `packages/aethyme/`; already-deployed playground repos can still contain stale generated skills or missing local excludes. Run `scripts/eval/verify-playground.sh` against active playground targets after any template or playground-hygiene change.
 - Python output caches under `AETHYME_CACHE_DIR` are independent of the removed Rust `map_cache`; deletion of `map_cache.rs` does not clear cached JSON command output.
 - Any out-of-repo scripts that read orphaned `.aethyme/cache/map-*.bin` or `.aethyme/parse_store.redb` files directly, or pass `--no-fragments`, are unsupported and were not found by this repo-local audit.
 - The Rust engine now builds against redb 4.x. Existing `.aethyme/graph_store.redb` files created by the redb 2.x engine should be treated as disposable local materializations and regenerated from `.aethyme/graph/` fragments with `aethyme-engine-cli index --repo <repo>`; the index command reports old redb file formats before deleting/recreating the graph store. Do not rely on an in-place redb file-format migration for deploys.
