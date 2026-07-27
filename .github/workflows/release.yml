@@ -5,6 +5,7 @@ on:
     tags: ["v*"]
 
 permissions:
+  actions: read
   contents: write
 
 jobs:
@@ -62,10 +63,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v7
-        with:
-          path: dist
-          merge-multiple: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --dir dist
+          find dist -mindepth 2 -type f -name '*.tar.gz' -exec mv {} dist/ \;
+          find dist -mindepth 1 -type d -empty -delete
+          count="$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')"
+          test "$count" = "3"
 
       - name: Create or update release
         # Third-party action with a write-scoped token: pinned to a full
