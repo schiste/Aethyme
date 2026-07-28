@@ -68,6 +68,12 @@ names/flags/output — golden-verified):
   ingest reports engine snapshot + store state; clear-cache clears the
   legacy cache root. The rest of the repo group still delegates
   (Phases 2-3).
+- `analyze dead-code` (Phase 1 final flip, 2026-07-28; `analyze_cli`
+  module). All three formats ported; the observability
+  `index_freshness`/`engine` blocks are reinterpreted store/binary-
+  backed (the Python originals reported transport-era cache keys and
+  CTO-corruptible git-subprocess state). Eval-facing answer content is
+  byte-identical. engine.py is now a 72-line test bootstrap.
 - RETIRED with PyO3 (decision #3, hard-delete 2026-07-28):
   `--engine-transport`, `AETHYME_ENGINE_TRANSPORT`, the transport
   registration API, and the `aethyme_py` in-process binding.
