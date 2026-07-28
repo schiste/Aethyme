@@ -79,6 +79,7 @@ def main() -> int:
         structured_output, final_output_message = _read_last_message(last_message_file)
         usage = _parse_usage(events_file)
         error_message = _last_error(events_file)
+        command_output_chars = _command_output_chars(events_file)
         artifact_leakage = _detect_artifact_leakage(
             structured_output=structured_output,
             final_output_message=final_output_message or error_message,
@@ -96,7 +97,7 @@ def main() -> int:
             "last_message_file": str(last_message_file),
             "leakage_file": str(temp_root / "leakage.json"),
             "wall_time_seconds": round(wall_time_seconds, 3),
-            "command_output_chars": _command_output_chars(events_file),
+            "command_output_chars": command_output_chars,
             "event_log_chars": len(result.stdout),
             "stderr_chars": len(result.stderr),
             "input_tokens": usage.get("input_tokens"),
@@ -116,6 +117,15 @@ def main() -> int:
             "contract": contract,
             "artifact_leakage": artifact_leakage,
         }
+        payload["regression_metrics"] = _regression_metrics(
+            arm=arm,
+            structured_output=structured_output,
+            usage=usage,
+            command_output_chars=command_output_chars,
+            event_log_chars=len(result.stdout),
+            artifact_leakage=artifact_leakage,
+            events_file=events_file,
+        )
         print(json.dumps(payload))
         if result.stderr:
             sys.stderr.write(result.stderr)
@@ -390,6 +400,92 @@ def _detect_artifact_leakage(
         "leak_count": len(leaks),
         "leaks": leaks[:MAX_REPORTED_LEAKS],
     }
+
+
+def _regression_metrics(
+    *,
+    arm: str,
+    structured_output: dict[str, Any] | None,
+    usage: dict[str, int | None],
+    command_output_chars: int,
+    event_log_chars: int,
+    artifact_leakage: dict[str, Any],
+    events_file: Path,
+) -> dict[str, Any]:
+    token_estimate = _token_estimate(usage, event_log_chars)
+    return {
+        "token_estimate": token_estimate,
+        "selected_file_count": _selected_file_count(structured_output),
+        "snippet_count": _snippet_count(structured_output),
+        "command_output_chars": command_output_chars,
+        "aethyme_path_leaked": bool(artifact_leakage.get("aethyme_path_leaked")),
+        "aethyme_invoked": _aethyme_invoked(events_file),
+        "arm": arm,
+    }
+
+
+def _token_estimate(usage: dict[str, int | None], event_log_chars: int) -> int:
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    if isinstance(input_tokens, int) and isinstance(output_tokens, int):
+        return input_tokens + output_tokens
+    return (event_log_chars + 3) // 4
+
+
+def _selected_file_count(structured_output: dict[str, Any] | None) -> int:
+    return _count_list_field(structured_output, "selected_files")
+
+
+def _snippet_count(structured_output: dict[str, Any] | None) -> int:
+    return _count_list_field(structured_output, "snippets")
+
+
+def _count_list_field(value: Any, field_name: str) -> int:
+    if isinstance(value, dict):
+        total = 0
+        for key, item in value.items():
+            if key == field_name and isinstance(item, list):
+                total += len(item)
+            else:
+                total += _count_list_field(item, field_name)
+        return total
+    if isinstance(value, list):
+        return sum(_count_list_field(item, field_name) for item in value)
+    return 0
+
+
+def _aethyme_invoked(events_file: Path) -> bool:
+    if not events_file.exists():
+        return False
+    for line in events_file.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if _event_contains_aethyme_invocation(event):
+            return True
+    return False
+
+
+def _event_contains_aethyme_invocation(value: Any, *, key: str | None = None) -> bool:
+    if isinstance(value, str):
+        if key in COMMAND_OUTPUT_KEYS or key in {"cmd", "command", "aggregated_output"}:
+            lowered = value.lower()
+            return "aethyme explore" in lowered or "aethyme-engine-cli explore" in lowered
+        return False
+    if isinstance(value, list):
+        joined = " ".join(item for item in value if isinstance(item, str)).lower()
+        if "aethyme" in joined and "explore" in joined:
+            return True
+        return any(_event_contains_aethyme_invocation(item) for item in value)
+    if isinstance(value, dict):
+        return any(
+            _event_contains_aethyme_invocation(item, key=str(item_key))
+            for item_key, item in value.items()
+        )
+    return False
 
 
 def _collect_command_output_path_leaks(events_file: Path) -> list[dict[str, str]]:
