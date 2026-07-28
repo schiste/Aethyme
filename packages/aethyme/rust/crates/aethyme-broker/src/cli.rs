@@ -144,11 +144,13 @@ Usage:
       inside the Aethyme source checkout. --fix-version is explicit and
       source-checkout-only: when the running CLI is behind integration,
       reinstall it from a temporary integration worktree.
-  aethyme broker quick-test [--chau7] [--json]
+  aethyme broker quick-test [--chau7] [--with-gate] [--json]
       Disposable first-run smoke: creates a temporary git repo, runs init,
       adopt, commit, submit, verifies promotion, and removes the repo.
       --chau7 requires a Chau7 runtime marker; outside Chau7 it reports
       that this test is designed to run in Chau7 and skips the smoke.
+      --with-gate installs a passing fixture gate and then proves a
+      failing variant is rejected without promotion.
   aethyme broker verify-loop [--json]   (alias: e2e)
       End-to-end broker verification for operators: snapshot integration,
       run quick-test, run doctor, run broker source tests when this is an
@@ -296,6 +298,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_quick_test_with_gate() {
+        let args = vec!["quick-test".to_string(), "--with-gate".to_string()];
+        let parsed = match super::parse(&args) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("quick-test --with-gate should parse"),
+        };
+
+        assert_eq!(parsed.positional, vec!["quick-test"]);
+        assert!(parsed.with_gate);
+    }
+
+    #[test]
     fn parse_accepts_integration_wait_stable_seconds() {
         let args = vec![
             "integration".to_string(),
@@ -344,6 +358,7 @@ struct Parsed {
     all: bool,
     chau7: bool,
     fix_version: bool,
+    with_gate: bool,
 }
 
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
@@ -367,6 +382,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         all: false,
         chau7: false,
         fix_version: false,
+        with_gate: false,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -387,6 +403,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--all" => parsed.all = true,
             "--chau7" => parsed.chau7 = true,
             "--fix-version" => parsed.fix_version = true,
+            "--with-gate" => parsed.with_gate = true,
             "--replace-stale" => parsed.replace_stale = true,
             "--kind" => {
                 parsed.kind = Some(
@@ -527,6 +544,31 @@ fn render_quick_test_report(report: &crate::QuickTestReport, json: bool) -> Resu
     }
     for step in &report.steps {
         println!("{:<8} {:<20} {}", step.status, step.name, step.detail);
+    }
+    if let Some(gate) = &report.gate_fixture {
+        println!("gate fixture: {}", gate.gate_name);
+        println!("  passing entry: q{}", gate.passing_entry_id);
+        for outcome in &gate.passing_outcomes {
+            println!(
+                "    {} {}{}",
+                outcome.gate,
+                outcome.status.as_str(),
+                if outcome.cached { " (cached)" } else { "" }
+            );
+        }
+        println!(
+            "  failing entry: q{} ({})",
+            gate.failing_entry_id,
+            gate.failing_entry_status.as_str()
+        );
+        for outcome in &gate.failing_outcomes {
+            println!(
+                "    {} {}{}",
+                outcome.gate,
+                outcome.status.as_str(),
+                if outcome.cached { " (cached)" } else { "" }
+            );
+        }
     }
     println!(
         "temporary repo removed: {}",
@@ -1860,7 +1902,12 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             } else {
                 crate::QuickTestMode::Generic
             };
-            let report = crate::run_broker_quick_test(mode)?;
+            let report = crate::run_broker_quick_test_with_options(
+                mode,
+                crate::QuickTestOptions {
+                    with_gate: parsed.with_gate,
+                },
+            )?;
             render_quick_test_report(&report, parsed.json)?;
         }
         "verify-loop" | "e2e" => {
