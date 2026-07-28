@@ -143,6 +143,11 @@ Usage:
       adopt, commit, submit, verifies promotion, and removes the repo.
       --chau7 requires a Chau7 runtime marker; outside Chau7 it reports
       that this test is designed to run in Chau7 and skips the smoke.
+  aethyme broker verify-loop [--json]   (alias: e2e)
+      End-to-end broker verification for operators: snapshot integration,
+      run quick-test, run doctor, run broker source tests when this is an
+      Aethyme source checkout, then fail if integration moved during the
+      run so the result cannot be mistaken for current-tip proof.
   aethyme broker cleanup <session-id> [--force] [--json]
       Remove a session's worktree. Refuses on uncommitted changes or
       unmerged commits unless --force. Usually run only after finish says
@@ -210,6 +215,8 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "metrics",
         "doctor",
         "quick-test",
+        "verify-loop",
+        "e2e",
         "finish",
         "cleanup",
         "certify",
@@ -598,6 +605,76 @@ fn render_finish_report(report: &crate::FinishReport) {
         for command in &report.next_commands {
             println!("    run: {command}");
         }
+    }
+}
+
+fn render_verify_loop_report(report: &crate::VerifyLoopReport) {
+    println!(
+        "Broker verify-loop: {}",
+        if report.ok { "passed" } else { "failed" }
+    );
+    println!(
+        "  integration tested: {} @ {}",
+        report.integration_branch,
+        short_commit(&report.tested_integration_head)
+    );
+    println!(
+        "  integration current: {} @ {}",
+        report.integration_branch,
+        short_commit(&report.current_integration_head)
+    );
+    if report.integration_moved {
+        println!(
+            "  warning: integration moved during verification; tested old tip {}, current tip {}; rerun needed",
+            short_commit(&report.tested_integration_head),
+            short_commit(&report.current_integration_head)
+        );
+    }
+    println!("Steps:");
+    for step in &report.steps {
+        println!(
+            "  {:<22} {:<5} {} ({}ms)",
+            step.name,
+            step.status.as_str(),
+            step.detail,
+            step.duration_ms
+        );
+    }
+    if let Some(quick) = &report.quick_test
+        && let Some(head) = &quick.integration_head
+    {
+        println!("  quick-test temp integration: {}", short_commit(head));
+    }
+    if let Some(doctor) = &report.doctor {
+        println!(
+            "  doctor version: {} — {}",
+            doctor.version.status.as_str(),
+            doctor.version.message
+        );
+    }
+    if report.source_tests.attempted {
+        println!(
+            "  source test command: {}",
+            report.source_tests.command.join(" ")
+        );
+        if report.source_tests.status != crate::VerifyLoopStepStatus::Pass {
+            for line in report
+                .source_tests
+                .stderr_tail
+                .iter()
+                .chain(report.source_tests.stdout_tail.iter())
+                .take(8)
+            {
+                println!("    {line}");
+            }
+        }
+    }
+    if report.ok {
+        println!("Next: none");
+    } else if report.integration_moved {
+        println!("Next: rerun `aethyme broker verify-loop` on the current integration tip.");
+    } else {
+        println!("Next: fix the failed step above, then rerun `aethyme broker verify-loop`.");
     }
 }
 
@@ -1619,6 +1696,20 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             };
             let report = crate::run_broker_quick_test(mode)?;
             render_quick_test_report(&report, parsed.json)?;
+        }
+        "verify-loop" | "e2e" => {
+            let mut broker = open_broker()?;
+            let cwd = std::env::current_dir()
+                .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
+            let report = broker.verify_loop_from(&cwd)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render_verify_loop_report(&report);
+                if !report.ok {
+                    return Err(UsageError::Message("broker verify-loop failed".into()));
+                }
+            }
         }
         "init" => {
             let cwd = std::env::current_dir()

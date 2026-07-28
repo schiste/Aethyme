@@ -34,6 +34,7 @@ mod quick_test;
 mod schema;
 mod store;
 mod types;
+mod verify_loop;
 mod version;
 
 pub use broker::{
@@ -60,6 +61,9 @@ pub use store::BrokerStore;
 pub use types::{
     Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease, LeaseKind, MergeQueueEntry,
     MergeStatus, NewGateResult, NewSession, Session, SessionOrigin, SessionStatus,
+};
+pub use verify_loop::{
+    VerifyLoopCommandReport, VerifyLoopReport, VerifyLoopStep, VerifyLoopStepStatus,
 };
 pub use version::{BinaryBuild, VersionDriftReport, VersionDriftStatus, inspect_version};
 
