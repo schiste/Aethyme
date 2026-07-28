@@ -221,6 +221,27 @@ The runner result JSON is written to stdout and now includes a normalized
 `regression_metrics` block. Redirect each arm's stdout to a result file when
 preparing an A/B pair for the metric gate.
 
+To capture the result files used below:
+
+```bash
+mkdir -p /tmp/aethyme-ab/control /tmp/aethyme-ab/aethyme
+
+env "${COMMON_ENV[@]}" \
+  AETHYME_EVAL_ARM=control \
+  AETHYME_EVAL_REPO="$DEST/Mediawiki - Control" \
+  AETHYME_EVAL_ARTIFACT_DIR=/tmp/aethyme-ab/control \
+  "$AETHYME_ROOT/.venv/bin/python" "$AETHYME_ROOT/scripts/eval/run_codex_eval.py" \
+  > /tmp/aethyme-ab/control/result.json
+
+env "${COMMON_ENV[@]}" \
+  AETHYME_EVAL_ARM=aethyme \
+  AETHYME_EVAL_REPO="$DEST/Mediawiki - Aethyme" \
+  AETHYME_EVAL_TOOL_REPO="$AETHYME_ROOT" \
+  AETHYME_EVAL_ARTIFACT_DIR=/tmp/aethyme-ab/aethyme \
+  "$AETHYME_ROOT/.venv/bin/python" "$AETHYME_ROOT/scripts/eval/run_codex_eval.py" \
+  > /tmp/aethyme-ab/aethyme/result.json
+```
+
 Compare a completed pair with the metric gate:
 
 ```bash
@@ -235,7 +256,10 @@ The gate checks token estimate delta, selected file count delta, snippet count
 delta, command-output char delta, `.aethyme` leakage, Aethyme invocation, and
 reviewer-rubric quality. It intentionally does not require selected-file
 identity equality. Missing reviewer scores fail the gate unless
-`--allow-missing-quality` is passed for an exploratory dry run.
+`--allow-missing-quality` is passed for an exploratory dry run. Missing or
+malformed budget/hygiene metrics fail rather than being treated as zero.
+Aethyme invocation is recognized from command metadata, not from stdout or
+prose mentions of commands.
 
 ## Adding a New Eval Target
 
