@@ -1426,11 +1426,12 @@ fn redb_explore_observability_reports_store_freshness() {
     assert_eq!(graph_store["status"], "fresh");
     assert_eq!(graph_store["stale"], false);
     assert!(
-        graph_store["path"]
-            .as_str()
-            .expect("store path")
-            .ends_with(".aethyme/graph_store.redb"),
-        "store path should identify the redb artifact"
+        graph_store.get("path").is_none(),
+        "observability should report freshness without leaking generated artifact paths"
+    );
+    assert!(
+        graph_store.get("fragments_path").is_none(),
+        "observability should report fragment freshness without leaking generated artifact paths"
     );
 }
 

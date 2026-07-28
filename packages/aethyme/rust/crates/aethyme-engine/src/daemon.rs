@@ -63,21 +63,35 @@ pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 1800; // 30 min
 
 /// Compute the unix socket path for `repo`.
 ///
-/// macOS caps AF_UNIX paths at ~104 bytes, so the socket lives in `$TMPDIR`
-/// keyed by a stable hash of the resolved repo path. The Python daemon's
-/// socket lives at the same prefix with a `daemon-` filename — separate
-/// namespaces so both daemons can coexist.
+/// macOS caps AF_UNIX paths at ~104 bytes, so the default socket lives in
+/// `$TMPDIR/aethyme` keyed by a stable hash of the resolved repo path. Sandboxed
+/// runners can set `AETHYME_ENGINE_SOCKET_DIR` to a writable short path such as
+/// `/tmp/aethyme-engine-sockets`; the client and detached daemon both resolve
+/// this function, so the override stays in sync across process boundaries.
 pub fn socket_path_for(repo: &Path) -> PathBuf {
+    socket_path_in_dir(repo, &socket_dir())
+}
+
+fn socket_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("AETHYME_ENGINE_SOCKET_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        return dir;
+    }
+    let tmp = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    tmp.join(SOCKET_DIR_NAME)
+}
+
+fn socket_path_in_dir(repo: &Path, socket_dir: &Path) -> PathBuf {
     let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
     let mut hasher = Sha256::new();
     hasher.update(canonical.to_string_lossy().as_bytes());
     let digest = hasher.finalize();
     let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    let tmp = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    tmp.join(SOCKET_DIR_NAME)
-        .join(format!("{SOCKET_PREFIX}{hex}.sock"))
+    socket_dir.join(format!("{SOCKET_PREFIX}{hex}.sock"))
 }
 
 /// Compute the pidfile path inside the repo's `.aethyme/` directory.
@@ -251,7 +265,6 @@ impl DaemonConfig {
         self.idle_timeout = timeout;
         self
     }
-
 }
 
 /// Run the daemon for `config.repo` until idle timeout or `shutdown` request.
@@ -671,6 +684,16 @@ mod tests {
         let a = socket_path_for(Path::new("/some/repo"));
         let b = socket_path_for(Path::new("/some/other-repo"));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn socket_path_can_use_explicit_socket_dir() {
+        let dir = Path::new("/tmp/aethyme-codex-engine-sockets");
+        let path = socket_path_in_dir(Path::new("/some/repo"), dir);
+        assert_eq!(path.parent(), Some(dir));
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with(SOCKET_PREFIX));
+        assert!(name.ends_with(".sock"));
     }
 
     #[test]
