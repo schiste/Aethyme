@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Class, Comment, ConfigValue, Directory, DocSection, Docstring, Enum, Expression, Field, File,
     Function, GlobalVariable, Interface, Lambda, Method, Module, NodeId, NodeKind, NonCodeFile,
-    Package, Parameter, Repository, Statement, Struct, Trait, TypeAlias, UnresolvedSymbol,
+    Package, Parameter, Repository, Statement, Struct, SurfaceFlowNode, Trait, TypeAlias,
+    UnresolvedSymbol,
 };
 
 /// A node of any kind. Every variant wraps the corresponding
@@ -58,6 +59,17 @@ pub enum Node {
     Docstring(Docstring),
     // Partial-knowledge
     UnresolvedSymbol(UnresolvedSymbol),
+    // Surface/Flow (tail-appended; alphabetical within the new set)
+    BehaviorTestSurface(SurfaceFlowNode),
+    CliSurface(SurfaceFlowNode),
+    CredentialOperation(SurfaceFlowNode),
+    JobSurface(SurfaceFlowNode),
+    MiddlewareInstallation(SurfaceFlowNode),
+    ProxySurface(SurfaceFlowNode),
+    QueueSurface(SurfaceFlowNode),
+    RouteSurface(SurfaceFlowNode),
+    WebhookSurface(SurfaceFlowNode),
+    WorkerSurface(SurfaceFlowNode),
 }
 
 impl Node {
@@ -91,6 +103,16 @@ impl Node {
             Node::DocSection(_) => NodeKind::DocSection,
             Node::Docstring(_) => NodeKind::Docstring,
             Node::UnresolvedSymbol(_) => NodeKind::UnresolvedSymbol,
+            Node::BehaviorTestSurface(_) => NodeKind::BehaviorTestSurface,
+            Node::CliSurface(_) => NodeKind::CliSurface,
+            Node::CredentialOperation(_) => NodeKind::CredentialOperation,
+            Node::JobSurface(_) => NodeKind::JobSurface,
+            Node::MiddlewareInstallation(_) => NodeKind::MiddlewareInstallation,
+            Node::ProxySurface(_) => NodeKind::ProxySurface,
+            Node::QueueSurface(_) => NodeKind::QueueSurface,
+            Node::RouteSurface(_) => NodeKind::RouteSurface,
+            Node::WebhookSurface(_) => NodeKind::WebhookSurface,
+            Node::WorkerSurface(_) => NodeKind::WorkerSurface,
         }
     }
 
@@ -136,6 +158,17 @@ impl Node {
             Node::ConfigValue(n) => Some(n.config_path()),
             // Partial-knowledge:
             Node::UnresolvedSymbol(n) => Some(n.name()),
+            // Surface/Flow:
+            Node::BehaviorTestSurface(n)
+            | Node::CliSurface(n)
+            | Node::CredentialOperation(n)
+            | Node::JobSurface(n)
+            | Node::MiddlewareInstallation(n)
+            | Node::ProxySurface(n)
+            | Node::QueueSurface(n)
+            | Node::RouteSurface(n)
+            | Node::WebhookSurface(n)
+            | Node::WorkerSurface(n) => Some(n.name()),
         }
     }
 
@@ -171,6 +204,16 @@ impl Node {
             Node::DocSection(n) => n.id(),
             Node::Docstring(n) => n.id(),
             Node::UnresolvedSymbol(n) => n.id(),
+            Node::BehaviorTestSurface(n) => n.id(),
+            Node::CliSurface(n) => n.id(),
+            Node::CredentialOperation(n) => n.id(),
+            Node::JobSurface(n) => n.id(),
+            Node::MiddlewareInstallation(n) => n.id(),
+            Node::ProxySurface(n) => n.id(),
+            Node::QueueSurface(n) => n.id(),
+            Node::RouteSurface(n) => n.id(),
+            Node::WebhookSurface(n) => n.id(),
+            Node::WorkerSurface(n) => n.id(),
         }
     }
 }

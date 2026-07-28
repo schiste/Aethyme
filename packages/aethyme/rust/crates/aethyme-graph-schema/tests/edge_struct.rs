@@ -73,6 +73,14 @@ fn every_edge_attribute_variant_maps_to_a_distinct_kind() {
         EdgeAttributes::References {
             kind_hint: ReferenceKindHint::SeeAlso,
         },
+        EdgeAttributes::Authorizes,
+        EdgeAttributes::Exposes,
+        EdgeAttributes::ForwardsTo,
+        EdgeAttributes::InstallsMiddleware,
+        EdgeAttributes::IssuesCredential,
+        EdgeAttributes::StoresCredential,
+        EdgeAttributes::UsesCredential,
+        EdgeAttributes::ValidatesCredential,
     ];
     let kinds: std::collections::BTreeSet<EdgeKind> = attrs.iter().map(|a| a.kind()).collect();
     let expected: std::collections::BTreeSet<EdgeKind> = ALL_EDGE_KINDS.iter().copied().collect();

@@ -77,11 +77,12 @@ fn canonical_names_are_snake_case() {
 
 #[test]
 fn all_edge_kinds_is_exhaustive() {
-    // 16 edge kinds across 4 categories
-    // (3 structural + 6 behavioral + 2 test + 5 documentation).
+    // 24 edge kinds across 5 categories
+    // (3 structural + 6 behavioral + 2 test + 5 documentation +
+    // 8 surface-flow).
     // Bumping the count is the one-line change required when a new
     // edge kind lands.
-    const EXPECTED_TOTAL: usize = 16;
+    const EXPECTED_TOTAL: usize = 24;
     assert_eq!(
         ALL_EDGE_KINDS.len(),
         EXPECTED_TOTAL,
@@ -194,6 +195,7 @@ fn categories_are_exhaustive_and_well_defined() {
     assert_eq!(counts.get(&EdgeKindCategory::Behavioral), Some(&6));
     assert_eq!(counts.get(&EdgeKindCategory::Test), Some(&2));
     assert_eq!(counts.get(&EdgeKindCategory::Documentation), Some(&5));
+    assert_eq!(counts.get(&EdgeKindCategory::SurfaceFlowEdge), Some(&8));
 
     let total: usize = counts.values().sum();
     assert_eq!(total, ALL_EDGE_KINDS.len());
@@ -223,7 +225,7 @@ fn category_from_name_returns_err_for_unknown_strings() {
 
 #[test]
 fn all_edge_kind_categories_is_exhaustive() {
-    const EXPECTED_TOTAL: usize = 4;
+    const EXPECTED_TOTAL: usize = 5;
     assert_eq!(
         ALL_EDGE_KIND_CATEGORIES.len(),
         EXPECTED_TOTAL,
@@ -262,6 +264,7 @@ fn category_round_trips_through_json() {
         (EdgeKindCategory::Behavioral, "behavioral"),
         (EdgeKindCategory::Test, "test"),
         (EdgeKindCategory::Documentation, "documentation"),
+        (EdgeKindCategory::SurfaceFlowEdge, "surface_flow_edge"),
     ];
     assert_eq!(
         expectations.len(),

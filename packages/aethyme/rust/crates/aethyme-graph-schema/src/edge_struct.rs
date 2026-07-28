@@ -137,6 +137,14 @@ pub enum EdgeAttributes {
     References {
         kind_hint: ReferenceKindHint,
     },
+    Authorizes,
+    Exposes,
+    ForwardsTo,
+    InstallsMiddleware,
+    IssuesCredential,
+    StoresCredential,
+    UsesCredential,
+    ValidatesCredential,
 }
 
 impl EdgeAttributes {
@@ -159,6 +167,14 @@ impl EdgeAttributes {
             EdgeAttributes::Deprecates { .. } => EdgeKind::Deprecates,
             EdgeAttributes::Documents => EdgeKind::Documents,
             EdgeAttributes::References { .. } => EdgeKind::References,
+            EdgeAttributes::Authorizes => EdgeKind::Authorizes,
+            EdgeAttributes::Exposes => EdgeKind::Exposes,
+            EdgeAttributes::ForwardsTo => EdgeKind::ForwardsTo,
+            EdgeAttributes::InstallsMiddleware => EdgeKind::InstallsMiddleware,
+            EdgeAttributes::IssuesCredential => EdgeKind::IssuesCredential,
+            EdgeAttributes::StoresCredential => EdgeKind::StoresCredential,
+            EdgeAttributes::UsesCredential => EdgeKind::UsesCredential,
+            EdgeAttributes::ValidatesCredential => EdgeKind::ValidatesCredential,
         }
     }
 }

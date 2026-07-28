@@ -11,6 +11,7 @@ pub mod callables;
 pub mod containers;
 pub mod non_code;
 pub mod sub_symbols;
+pub mod surface_flow;
 pub mod types;
 pub mod unresolved;
 
@@ -33,6 +34,7 @@ pub use sub_symbols::{
     GlobalVariableConstructionError, Parameter, ParameterConstructionError, Statement,
     StatementConstructionError,
 };
+pub use surface_flow::{SurfaceFlowNode, SurfaceFlowNodeConstructionError, is_surface_flow_kind};
 pub use types::{
     Class, ClassConstructionError, Enum, EnumConstructionError, EnumVariant, Interface,
     InterfaceConstructionError, Struct, StructConstructionError, Trait, TraitConstructionError,

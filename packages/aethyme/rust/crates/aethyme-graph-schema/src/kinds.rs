@@ -1,8 +1,8 @@
 //! The canonical node-kind taxonomy.
 //!
 //! `NodeKind` is the flat enum of every node type the graph admits. There
-//! are 25 variants grouped into six categories (containers, callables,
-//! type-defining, sub-symbol, non-code, partial-knowledge). Each variant
+//! are grouped into seven categories (containers, callables, type-defining,
+//! sub-symbol, non-code, partial-knowledge, surface-flow). Each variant
 //! has a stable snake_case canonical name (used in node IDs, in NDJSON
 //! index shards, and in logs).
 //!
@@ -19,7 +19,8 @@
 //!
 //! 1. Group by category, in this order:
 //!    containers → callables → type-defining → sub-symbol →
-//!    non-code → partial-knowledge.
+//!    non-code → partial-knowledge → surface-flow. Surface-flow was
+//!    tail-appended after the initial set to preserve bincode discriminants.
 //! 2. Within a group, order by the canonical snake_case name's
 //!    alphabetical order. This is enforced by `tests/kinds.rs`.
 //! 3. New variants append to the end of their group, never insert.
@@ -163,6 +164,30 @@ pub enum NodeKind {
     /// "required-when-applicable" invariant across the rest of the
     /// schema.
     UnresolvedSymbol,
+
+    // ─── Surface/Flow (tail-appended; alphabetical within new set) ───
+    /// A behavior test that exercises a live route, proxy, middleware,
+    /// credential operation, or cross-component flow.
+    BehaviorTestSurface,
+    /// A human or automation command entrypoint.
+    CliSurface,
+    /// A credential lifecycle operation: issue, store, use, validate,
+    /// or authorize.
+    CredentialOperation,
+    /// A scheduled/background job entrypoint.
+    JobSurface,
+    /// Configuration or code that installs request/message middleware.
+    MiddlewareInstallation,
+    /// Gateway/proxy logic that forwards to another app boundary.
+    ProxySurface,
+    /// A queue/stream consumer entrypoint.
+    QueueSurface,
+    /// An HTTP route/controller/view entrypoint.
+    RouteSurface,
+    /// An inbound third-party callback surface.
+    WebhookSurface,
+    /// An edge/serverless worker entrypoint.
+    WorkerSurface,
 }
 
 impl NodeKind {
@@ -209,6 +234,17 @@ impl NodeKind {
             NodeKind::Docstring => "docstring",
             // Partial-knowledge
             NodeKind::UnresolvedSymbol => "unresolved_symbol",
+            // Surface/Flow
+            NodeKind::BehaviorTestSurface => "behavior_test_surface",
+            NodeKind::CliSurface => "cli_surface",
+            NodeKind::CredentialOperation => "credential_operation",
+            NodeKind::JobSurface => "job_surface",
+            NodeKind::MiddlewareInstallation => "middleware_installation",
+            NodeKind::ProxySurface => "proxy_surface",
+            NodeKind::QueueSurface => "queue_surface",
+            NodeKind::RouteSurface => "route_surface",
+            NodeKind::WebhookSurface => "webhook_surface",
+            NodeKind::WorkerSurface => "worker_surface",
         }
     }
 
@@ -258,6 +294,17 @@ impl NodeKind {
             "docstring" => NodeKind::Docstring,
             // Partial-knowledge
             "unresolved_symbol" => NodeKind::UnresolvedSymbol,
+            // Surface/Flow
+            "behavior_test_surface" => NodeKind::BehaviorTestSurface,
+            "cli_surface" => NodeKind::CliSurface,
+            "credential_operation" => NodeKind::CredentialOperation,
+            "job_surface" => NodeKind::JobSurface,
+            "middleware_installation" => NodeKind::MiddlewareInstallation,
+            "proxy_surface" => NodeKind::ProxySurface,
+            "queue_surface" => NodeKind::QueueSurface,
+            "route_surface" => NodeKind::RouteSurface,
+            "webhook_surface" => NodeKind::WebhookSurface,
+            "worker_surface" => NodeKind::WorkerSurface,
             _ => return Err(UnknownNodeKind { given: name.into() }),
         })
     }
@@ -295,6 +342,17 @@ impl NodeKind {
             | NodeKind::Docstring => NodeKindCategory::NonCode,
 
             NodeKind::UnresolvedSymbol => NodeKindCategory::PartialKnowledge,
+
+            NodeKind::BehaviorTestSurface
+            | NodeKind::CliSurface
+            | NodeKind::CredentialOperation
+            | NodeKind::JobSurface
+            | NodeKind::MiddlewareInstallation
+            | NodeKind::ProxySurface
+            | NodeKind::QueueSurface
+            | NodeKind::RouteSurface
+            | NodeKind::WebhookSurface
+            | NodeKind::WorkerSurface => NodeKindCategory::SurfaceFlowNode,
         }
     }
 }
@@ -314,6 +372,7 @@ pub enum NodeKindCategory {
     SubSymbol,
     NonCode,
     PartialKnowledge,
+    SurfaceFlowNode,
 }
 
 impl NodeKindCategory {
@@ -328,6 +387,7 @@ impl NodeKindCategory {
             NodeKindCategory::SubSymbol => "sub_symbol",
             NodeKindCategory::NonCode => "non_code",
             NodeKindCategory::PartialKnowledge => "partial_knowledge",
+            NodeKindCategory::SurfaceFlowNode => "surface_flow_node",
         }
     }
 
@@ -342,6 +402,7 @@ impl NodeKindCategory {
             "sub_symbol" => NodeKindCategory::SubSymbol,
             "non_code" => NodeKindCategory::NonCode,
             "partial_knowledge" => NodeKindCategory::PartialKnowledge,
+            "surface_flow_node" => NodeKindCategory::SurfaceFlowNode,
             _ => {
                 return Err(UnknownNodeKindCategory { given: name.into() });
             }
@@ -387,6 +448,17 @@ pub const ALL_NODE_KINDS: &[NodeKind] = &[
     NodeKind::Docstring,
     // Partial-knowledge
     NodeKind::UnresolvedSymbol,
+    // Surface/Flow (tail-appended; alphabetical within the new set)
+    NodeKind::BehaviorTestSurface,
+    NodeKind::CliSurface,
+    NodeKind::CredentialOperation,
+    NodeKind::JobSurface,
+    NodeKind::MiddlewareInstallation,
+    NodeKind::ProxySurface,
+    NodeKind::QueueSurface,
+    NodeKind::RouteSurface,
+    NodeKind::WebhookSurface,
+    NodeKind::WorkerSurface,
 ];
 
 /// Every category in declaration order. Parallel to [`ALL_NODE_KINDS`]:
@@ -400,6 +472,7 @@ pub const ALL_NODE_KIND_CATEGORIES: &[NodeKindCategory] = &[
     NodeKindCategory::SubSymbol,
     NodeKindCategory::NonCode,
     NodeKindCategory::PartialKnowledge,
+    NodeKindCategory::SurfaceFlowNode,
 ];
 
 /// Returned by [`NodeKind::from_name`] when the given string does not

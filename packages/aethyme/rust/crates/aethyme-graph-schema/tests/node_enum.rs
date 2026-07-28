@@ -1,8 +1,10 @@
 //! Integration tests for the unifying `Node` enum.
 
+use std::collections::BTreeMap;
+
 use aethyme_graph_schema::{
     Class, Function, Module, Node, NodeKind, Package, ParameterSignature, Repository, SourceRange,
-    Visibility,
+    SurfaceFlowNode, Visibility,
 };
 
 fn sample_function() -> Function {
@@ -59,6 +61,19 @@ fn kind_method_returns_correct_node_kind_for_every_variant() {
     .unwrap();
     let n: Node = p.into();
     assert_eq!(n.kind(), NodeKind::Package);
+
+    let route = SurfaceFlowNode::new(
+        NodeKind::RouteSurface,
+        "aethyme",
+        "src/routes.py",
+        "GET /api/token",
+        "Django URL route",
+        SourceRange::new(12, 12).unwrap(),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let n = Node::RouteSurface(route);
+    assert_eq!(n.kind(), NodeKind::RouteSurface);
 }
 
 #[test]
@@ -70,6 +85,24 @@ fn id_method_returns_the_inner_node_id() {
     };
     let n: Node = f.into();
     assert_eq!(n.id(), &inner_id);
+}
+
+#[test]
+fn surface_flow_node_variants_expose_the_inner_node_id_and_name() {
+    let surface = SurfaceFlowNode::new(
+        NodeKind::WorkerSurface,
+        "aethyme",
+        "worker.ts",
+        "fetch",
+        "Cloudflare-style fetch handler",
+        SourceRange::new(3, 8).unwrap(),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let inner_id = surface.id().clone();
+    let n = Node::WorkerSurface(surface);
+    assert_eq!(n.id(), &inner_id);
+    assert_eq!(n.name(), Some("fetch"));
 }
 
 #[test]

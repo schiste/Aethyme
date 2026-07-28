@@ -90,6 +90,7 @@ pub use nodes::{
     NonCodeFile, NonCodeFileConstructionError, NonCodeFormat, Package, PackageConstructionError,
     Parameter, ParameterConstructionError, ParameterSignature, Repository,
     RepositoryConstructionError, Statement, StatementConstructionError, Struct,
-    StructConstructionError, Trait, TraitConstructionError, TypeAlias, TypeAliasConstructionError,
-    UnresolvedSymbol, UnresolvedSymbolConstructionError,
+    StructConstructionError, SurfaceFlowNode, SurfaceFlowNodeConstructionError, Trait,
+    TraitConstructionError, TypeAlias, TypeAliasConstructionError, UnresolvedSymbol,
+    UnresolvedSymbolConstructionError, is_surface_flow_kind,
 };

@@ -1,8 +1,8 @@
 //! The canonical edge-kind taxonomy.
 //!
 //! `EdgeKind` is the flat enum of every edge type the graph admits.
-//! There are 16 variants grouped into four categories (structural,
-//! behavioral, test, documentation). Each variant has a stable
+//! Variants are grouped into five categories (structural, behavioral, test,
+//! documentation, surface-flow). Each variant has a stable
 //! snake_case canonical name used in fragment bodies and logs.
 //!
 //! ## Same forever-ordering rule as `NodeKind`
@@ -10,7 +10,7 @@
 //! See `crate::kinds` for the long-form ordering rule. Summary:
 //!
 //! 1. Group by category, in the order:
-//!    structural → behavioral → test → documentation.
+//!    structural → behavioral → test → documentation → surface-flow.
 //! 2. Within a group, alphabetical by snake_case canonical name for
 //!    the initial set. Future additions append to the tail of their
 //!    group (intentionally breaking alphabetical order — that's the
@@ -114,6 +114,25 @@ pub enum EdgeKind {
     /// Edge attribute `kind_hint` distinguishes
     /// `see_also`/`mentions`/`alternative` flavors.
     References,
+
+    // ─── Surface/Flow (tail-appended; alphabetical) ─────────────────
+    /// Surface/middleware/code node → policy/scope/code node.
+    Authorizes,
+    /// Container/config/router → route, worker, proxy, webhook, CLI, job,
+    /// or queue surface.
+    Exposes,
+    /// Proxy/worker surface → route/service surface.
+    ForwardsTo,
+    /// Config/surface → middleware installation or code node.
+    InstallsMiddleware,
+    /// Code/surface node → credential operation/config/model node.
+    IssuesCredential,
+    /// Code/surface node → model/config/storage node.
+    StoresCredential,
+    /// Code/surface node → credential operation/config node.
+    UsesCredential,
+    /// Surface/middleware/code node → credential validation operation/code.
+    ValidatesCredential,
 }
 
 impl EdgeKind {
@@ -142,6 +161,15 @@ impl EdgeKind {
             EdgeKind::Deprecates => "deprecates",
             EdgeKind::Documents => "documents",
             EdgeKind::References => "references",
+            // Surface/Flow
+            EdgeKind::Authorizes => "authorizes",
+            EdgeKind::Exposes => "exposes",
+            EdgeKind::ForwardsTo => "forwards_to",
+            EdgeKind::InstallsMiddleware => "installs_middleware",
+            EdgeKind::IssuesCredential => "issues_credential",
+            EdgeKind::StoresCredential => "stores_credential",
+            EdgeKind::UsesCredential => "uses_credential",
+            EdgeKind::ValidatesCredential => "validates_credential",
         }
     }
 
@@ -170,6 +198,15 @@ impl EdgeKind {
             "deprecates" => EdgeKind::Deprecates,
             "documents" => EdgeKind::Documents,
             "references" => EdgeKind::References,
+            // Surface/Flow
+            "authorizes" => EdgeKind::Authorizes,
+            "exposes" => EdgeKind::Exposes,
+            "forwards_to" => EdgeKind::ForwardsTo,
+            "installs_middleware" => EdgeKind::InstallsMiddleware,
+            "issues_credential" => EdgeKind::IssuesCredential,
+            "stores_credential" => EdgeKind::StoresCredential,
+            "uses_credential" => EdgeKind::UsesCredential,
+            "validates_credential" => EdgeKind::ValidatesCredential,
             _ => return Err(UnknownEdgeKind { given: name.into() }),
         })
     }
@@ -197,6 +234,15 @@ impl EdgeKind {
             | EdgeKind::Deprecates
             | EdgeKind::Documents
             | EdgeKind::References => EdgeKindCategory::Documentation,
+
+            EdgeKind::Authorizes
+            | EdgeKind::Exposes
+            | EdgeKind::ForwardsTo
+            | EdgeKind::InstallsMiddleware
+            | EdgeKind::IssuesCredential
+            | EdgeKind::StoresCredential
+            | EdgeKind::UsesCredential
+            | EdgeKind::ValidatesCredential => EdgeKindCategory::SurfaceFlowEdge,
         }
     }
 }
@@ -212,6 +258,7 @@ pub enum EdgeKindCategory {
     Behavioral,
     Test,
     Documentation,
+    SurfaceFlowEdge,
 }
 
 impl EdgeKindCategory {
@@ -223,6 +270,7 @@ impl EdgeKindCategory {
             EdgeKindCategory::Behavioral => "behavioral",
             EdgeKindCategory::Test => "test",
             EdgeKindCategory::Documentation => "documentation",
+            EdgeKindCategory::SurfaceFlowEdge => "surface_flow_edge",
         }
     }
 
@@ -234,6 +282,7 @@ impl EdgeKindCategory {
             "behavioral" => EdgeKindCategory::Behavioral,
             "test" => EdgeKindCategory::Test,
             "documentation" => EdgeKindCategory::Documentation,
+            "surface_flow_edge" => EdgeKindCategory::SurfaceFlowEdge,
             _ => {
                 return Err(UnknownEdgeKindCategory { given: name.into() });
             }
@@ -264,6 +313,15 @@ pub const ALL_EDGE_KINDS: &[EdgeKind] = &[
     EdgeKind::Deprecates,
     EdgeKind::Documents,
     EdgeKind::References,
+    // Surface/Flow (tail-appended; alphabetical)
+    EdgeKind::Authorizes,
+    EdgeKind::Exposes,
+    EdgeKind::ForwardsTo,
+    EdgeKind::InstallsMiddleware,
+    EdgeKind::IssuesCredential,
+    EdgeKind::StoresCredential,
+    EdgeKind::UsesCredential,
+    EdgeKind::ValidatesCredential,
 ];
 
 /// Every category in declaration order. Parallel to
@@ -273,6 +331,7 @@ pub const ALL_EDGE_KIND_CATEGORIES: &[EdgeKindCategory] = &[
     EdgeKindCategory::Behavioral,
     EdgeKindCategory::Test,
     EdgeKindCategory::Documentation,
+    EdgeKindCategory::SurfaceFlowEdge,
 ];
 
 /// Returned by [`EdgeKind::from_name`] when the given string does not

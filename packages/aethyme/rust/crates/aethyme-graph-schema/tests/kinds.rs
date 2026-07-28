@@ -119,17 +119,18 @@ fn all_node_kinds_is_exhaustive() {
     // to ALL_NODE_KINDS, this test traps the omission.
     //
     // We can't reflect the enum's variant count, so we compare against
-    // an explicit count: 25 variants across 6 categories
+    // an explicit count: 35 variants across 7 categories
     // (6 containers + 3 callables + 6 type-defining + 5 sub-symbol +
-    // 4 non-code + 1 partial-knowledge). The schema doc's prose says
-    // "23" in places due to whether `non_code_file` is double-counted
-    // (it's listed in §3.1 as a container AND in §3.5 as the parent of
-    // non-code symbol kinds); the enum is the authoritative count and
-    // places `non_code_file` once, in the container category.
+    // 4 non-code + 1 partial-knowledge + 10 surface-flow). The schema
+    // doc's prose says "23" in places due to whether `non_code_file`
+    // is double-counted (it's listed in §3.1 as a container AND in
+    // §3.5 as the parent of non-code symbol kinds); the enum is the
+    // authoritative count and places `non_code_file` once, in the
+    // container category.
     //
     // Bumping the count here is the one-line change required when a
     // new kind lands.
-    const EXPECTED_TOTAL: usize = 25;
+    const EXPECTED_TOTAL: usize = 35;
     assert_eq!(
         ALL_NODE_KINDS.len(),
         EXPECTED_TOTAL,
@@ -354,7 +355,8 @@ fn categories_appear_contiguously_in_all_node_kinds() {
 fn categories_are_exhaustive_and_well_defined() {
     // Every kind reports a category, and the category counts match the
     // schema doc's grouping (6 containers, 3 callables, 6 type-defining,
-    // 5 sub-symbol, 4 non-code, 1 partial-knowledge = 25 total).
+    // 5 sub-symbol, 4 non-code, 1 partial-knowledge, 10 surface-flow =
+    // 35 total).
     //
     // BTreeMap (rather than HashMap) keeps test code aligned with the
     // crate-wide determinism discipline.
@@ -369,6 +371,7 @@ fn categories_are_exhaustive_and_well_defined() {
     assert_eq!(counts.get(&NodeKindCategory::SubSymbol), Some(&5));
     assert_eq!(counts.get(&NodeKindCategory::NonCode), Some(&4));
     assert_eq!(counts.get(&NodeKindCategory::PartialKnowledge), Some(&1));
+    assert_eq!(counts.get(&NodeKindCategory::SurfaceFlowNode), Some(&10));
 
     let total: usize = counts.values().sum();
     assert_eq!(total, ALL_NODE_KINDS.len());
@@ -407,10 +410,10 @@ fn category_from_name_returns_err_for_unknown_strings() {
 
 #[test]
 fn all_node_kind_categories_is_exhaustive() {
-    // Mirrors all_node_kinds_is_exhaustive. The expected count of 6 is
+    // Mirrors all_node_kinds_is_exhaustive. The expected count of 7 is
     // the contract; adding a category is itself a contract change per
     // NodeKindCategory's doc comment.
-    const EXPECTED_TOTAL: usize = 6;
+    const EXPECTED_TOTAL: usize = 7;
     assert_eq!(
         ALL_NODE_KIND_CATEGORIES.len(),
         EXPECTED_TOTAL,
@@ -468,6 +471,7 @@ fn category_round_trips_through_json() {
         (NodeKindCategory::SubSymbol, "sub_symbol"),
         (NodeKindCategory::NonCode, "non_code"),
         (NodeKindCategory::PartialKnowledge, "partial_knowledge"),
+        (NodeKindCategory::SurfaceFlowNode, "surface_flow_node"),
     ];
     assert_eq!(
         expectations.len(),
