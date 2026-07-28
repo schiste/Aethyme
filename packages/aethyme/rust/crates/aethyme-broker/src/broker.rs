@@ -1327,6 +1327,17 @@ impl Broker {
             };
             if !dirty.is_empty() {
                 advice.push(dirty_worktree_advice(agent, &dirty));
+                continue;
+            }
+            let Ok(head) = checkout.head_commit() else {
+                continue;
+            };
+            if let Some(entry) = queue.iter().rev().find(|entry| {
+                entry.session_id == agent.session.id
+                    && entry.head_commit == head
+                    && entry.status == MergeStatus::Promoted
+            }) {
+                advice.push(promoted_clean_finish_advice(agent, entry));
             }
         }
 
@@ -1961,6 +1972,28 @@ fn promoted_conflict_advice(
     }
 }
 
+fn promoted_clean_finish_advice(agent: &AgentView, entry: &MergeQueueEntry) -> StatusAdvice {
+    StatusAdvice {
+        id: "session.promoted-clean-finish",
+        severity: StatusAdviceSeverity::Notice,
+        reason: "promoted_clean_finish",
+        summary: format!(
+            "session {} is promoted and clean; run aethyme broker finish --session {}",
+            agent.session.id, agent.session.id
+        ),
+        session_id: Some(agent.session.id),
+        queue_entry_id: Some(entry.id),
+        evidence: vec![
+            format!("qid {} promoted", entry.id),
+            format!("head {}", short_commit(&entry.head_commit)),
+        ],
+        commands: vec![format!(
+            "aethyme broker finish --session {}",
+            agent.session.id
+        )],
+    }
+}
+
 fn integration_movement_advice(
     integration_branch: &str,
     integration_head: &str,
@@ -2348,7 +2381,7 @@ fn slugify(task: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{DoctorRepairStatus, DoctorReport, VersionRepairReport, slugify};
-    use crate::types::{Session, SessionOrigin, SessionStatus};
+    use crate::types::{MergeQueueEntry, Session, SessionOrigin, SessionStatus};
     use crate::version::{BinaryBuild, VersionDriftReport, VersionDriftStatus};
 
     #[test]
@@ -2399,6 +2432,28 @@ mod tests {
                 .commands
                 .contains(&"aethyme broker integration wait-stable --seconds 30".into())
         );
+    }
+
+    #[test]
+    fn promoted_clean_finish_advice_points_to_finish() {
+        let agent = super::AgentView {
+            session: session(69),
+            activity_at: 0,
+            derived_status: SessionStatus::Idle,
+            pid_alive: None,
+        };
+        let entry = queue_entry(104, 69, crate::MergeStatus::Promoted);
+
+        let advice = super::promoted_clean_finish_advice(&agent, &entry);
+
+        assert_eq!(advice.id, "session.promoted-clean-finish");
+        assert_eq!(advice.severity, super::StatusAdviceSeverity::Notice);
+        assert_eq!(advice.queue_entry_id, Some(104));
+        assert_eq!(
+            advice.commands,
+            vec!["aethyme broker finish --session 69".to_string()]
+        );
+        assert!(advice.summary.contains("session 69 is promoted and clean"));
     }
 
     fn doctor_report(
@@ -2472,6 +2527,20 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             last_activity_at: 0,
+        }
+    }
+
+    fn queue_entry(id: i64, session_id: i64, status: crate::MergeStatus) -> MergeQueueEntry {
+        MergeQueueEntry {
+            id,
+            session_id,
+            head_commit: "abcdef1234567890".into(),
+            base_commit: "0123456789abcdef".into(),
+            status,
+            merged_tree: Some("tree".into()),
+            details_json: None,
+            created_at: 0,
+            updated_at: 0,
         }
     }
 }
