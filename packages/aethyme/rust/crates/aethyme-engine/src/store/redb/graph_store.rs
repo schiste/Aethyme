@@ -47,7 +47,7 @@ use crate::model::unresolved::UnresolvedNode;
 
 /// Bumped when the on-disk format changes incompatibly. We re-create the file
 /// rather than try to migrate.
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 /// Single-row metadata table: schema version, build timestamps, repo root, ...
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -2320,6 +2320,8 @@ fn edge_kind_label(kind: &EdgeKind) -> &'static str {
         EdgeKind::StoresCredential => "stores_credential",
         EdgeKind::UsesCredential => "uses_credential",
         EdgeKind::ValidatesCredential => "validates_credential",
+        EdgeKind::RewritesHeader => "rewrites_header",
+        EdgeKind::TestedBy => "tested_by",
     }
 }
 
@@ -2338,6 +2340,8 @@ fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection, Vec<EdgeKi
                 EdgeKind::StoresCredential,
                 EdgeKind::UsesCredential,
                 EdgeKind::ValidatesCredential,
+                EdgeKind::RewritesHeader,
+                EdgeKind::TestedBy,
             ],
         )],
         GraphRelation::Parents => vec![(
@@ -2354,6 +2358,8 @@ fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection, Vec<EdgeKi
                 EdgeKind::StoresCredential,
                 EdgeKind::UsesCredential,
                 EdgeKind::ValidatesCredential,
+                EdgeKind::RewritesHeader,
+                EdgeKind::TestedBy,
             ],
         )],
         GraphRelation::Callers => vec![(NeighborDirection::Incoming, vec![EdgeKind::Calls])],
@@ -2380,7 +2386,13 @@ fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection, Vec<EdgeKi
                 vec![
                     EdgeKind::References,
                     EdgeKind::Authorizes,
+                    EdgeKind::Exposes,
                     EdgeKind::ForwardsTo,
+                    EdgeKind::InstallsMiddleware,
+                    EdgeKind::IssuesCredential,
+                    EdgeKind::RewritesHeader,
+                    EdgeKind::StoresCredential,
+                    EdgeKind::TestedBy,
                     EdgeKind::UsesCredential,
                     EdgeKind::ValidatesCredential,
                 ],
@@ -2390,7 +2402,13 @@ fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection, Vec<EdgeKi
                 vec![
                     EdgeKind::References,
                     EdgeKind::Authorizes,
+                    EdgeKind::Exposes,
                     EdgeKind::ForwardsTo,
+                    EdgeKind::InstallsMiddleware,
+                    EdgeKind::IssuesCredential,
+                    EdgeKind::RewritesHeader,
+                    EdgeKind::StoresCredential,
+                    EdgeKind::TestedBy,
                     EdgeKind::UsesCredential,
                     EdgeKind::ValidatesCredential,
                 ],
@@ -4185,6 +4203,78 @@ mod tests {
                 .len(),
             3
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn surface_flow_edges_round_trip_through_redb() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let area = AreaNode::new("Repo", "src", false);
+        let file = FileNode::new(
+            "Repo",
+            "src/flow.py",
+            Some("python".to_string()),
+            crate::model::file::FileRole::Source,
+            20,
+            300,
+            false,
+            Some(area.id.clone()),
+        );
+        let surface = surface_node(
+            SurfaceKind::CredentialOperation,
+            "src/flow.py",
+            "token flow",
+            5,
+        );
+        let flow_edges = [
+            EdgeKind::Exposes,
+            EdgeKind::ForwardsTo,
+            EdgeKind::RewritesHeader,
+            EdgeKind::InstallsMiddleware,
+            EdgeKind::ValidatesCredential,
+            EdgeKind::Authorizes,
+            EdgeKind::IssuesCredential,
+            EdgeKind::StoresCredential,
+            EdgeKind::UsesCredential,
+            EdgeKind::TestedBy,
+        ];
+
+        let mut session = store.begin_index().expect("session");
+        insert_area(&mut session, &area).expect("area");
+        insert_file(&mut session, &file).expect("file");
+        insert_surface(&mut session, &surface).expect("surface");
+        for kind in &flow_edges {
+            insert_edge(
+                &mut session,
+                &Edge::new(
+                    &file.id,
+                    surface.id.as_str(),
+                    kind.clone(),
+                    850,
+                    "surface-flow",
+                ),
+            )
+            .expect("flow edge");
+        }
+        session.commit().expect("commit");
+        drop(store);
+
+        let readonly = GraphStore::open_read_only(&root).expect("read-only open");
+        let persisted = readonly
+            .neighbors(&file.id, NeighborDirection::Outgoing, None)
+            .expect("outgoing neighbors")
+            .into_iter()
+            .filter(|edge| edge.other == surface.id.as_str())
+            .map(|edge| edge.kind)
+            .collect::<BTreeSet<_>>();
+        for kind in &flow_edges {
+            assert!(
+                persisted.contains(kind),
+                "expected persisted flow edge {kind:?}; got {persisted:?}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

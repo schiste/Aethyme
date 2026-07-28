@@ -626,15 +626,7 @@ fn collect_adjacency_candidate_paths(
                 .neighbors(seed_id, direction, None)
                 .map_err(|error| format!("redb neighbors failed for {seed_id}: {error}"))?;
             for edge in edges {
-                if !matches!(
-                    edge.kind,
-                    EdgeKind::Calls
-                        | EdgeKind::References
-                        | EdgeKind::Imports
-                        | EdgeKind::Documents
-                        | EdgeKind::Configures
-                        | EdgeKind::EntrypointFor
-                ) {
+                if !is_usage_boundary_seed_edge(&edge.kind) {
                     continue;
                 }
                 let Some(node) = store
@@ -657,6 +649,28 @@ fn collect_adjacency_candidate_paths(
         }
     }
     Ok(())
+}
+
+fn is_usage_boundary_seed_edge(kind: &EdgeKind) -> bool {
+    matches!(
+        kind,
+        EdgeKind::Calls
+            | EdgeKind::References
+            | EdgeKind::Imports
+            | EdgeKind::Documents
+            | EdgeKind::Configures
+            | EdgeKind::EntrypointFor
+            | EdgeKind::Authorizes
+            | EdgeKind::Exposes
+            | EdgeKind::ForwardsTo
+            | EdgeKind::InstallsMiddleware
+            | EdgeKind::IssuesCredential
+            | EdgeKind::RewritesHeader
+            | EdgeKind::StoresCredential
+            | EdgeKind::TestedBy
+            | EdgeKind::UsesCredential
+            | EdgeKind::ValidatesCredential
+    )
 }
 
 fn collect_root_candidate_paths(

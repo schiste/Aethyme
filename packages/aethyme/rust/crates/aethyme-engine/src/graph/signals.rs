@@ -154,20 +154,49 @@ impl RedbSignalContext {
     }
 }
 
+fn is_surface_flow_edge(kind: &EdgeKind) -> bool {
+    matches!(
+        kind,
+        EdgeKind::Authorizes
+            | EdgeKind::Exposes
+            | EdgeKind::ForwardsTo
+            | EdgeKind::InstallsMiddleware
+            | EdgeKind::IssuesCredential
+            | EdgeKind::RewritesHeader
+            | EdgeKind::StoresCredential
+            | EdgeKind::TestedBy
+            | EdgeKind::UsesCredential
+            | EdgeKind::ValidatesCredential
+    )
+}
+
+fn is_signal_semantic_edge(kind: &EdgeKind) -> bool {
+    matches!(
+        kind,
+        EdgeKind::Imports
+            | EdgeKind::Calls
+            | EdgeKind::References
+            | EdgeKind::Configures
+            | EdgeKind::Documents
+    ) || is_surface_flow_edge(kind)
+}
+
+fn is_signal_coupling_edge(kind: &EdgeKind) -> bool {
+    matches!(
+        kind,
+        EdgeKind::Calls | EdgeKind::References | EdgeKind::Configures | EdgeKind::EntrypointFor
+    ) || is_surface_flow_edge(kind)
+}
+
+fn is_signal_extraction_edge(kind: &EdgeKind) -> bool {
+    matches!(kind, EdgeKind::Imports | EdgeKind::Defines) || is_surface_flow_edge(kind)
+}
+
 fn boundary_clarity(map: &RepositoryMap) -> SignalAssessment {
     let semantic_edges = map
         .edges
         .iter()
-        .filter(|edge| {
-            matches!(
-                edge.kind,
-                EdgeKind::Imports
-                    | EdgeKind::Calls
-                    | EdgeKind::References
-                    | EdgeKind::Configures
-                    | EdgeKind::Documents
-            )
-        })
+        .filter(|edge| is_signal_semantic_edge(&edge.kind))
         .collect::<Vec<_>>();
     let cross_area = semantic_edges
         .iter()
@@ -215,16 +244,7 @@ fn boundary_clarity_redb(ctx: &RedbSignalContext) -> SignalAssessment {
     let semantic_edges = ctx
         .edges
         .iter()
-        .filter(|edge| {
-            matches!(
-                edge.kind,
-                EdgeKind::Imports
-                    | EdgeKind::Calls
-                    | EdgeKind::References
-                    | EdgeKind::Configures
-                    | EdgeKind::Documents
-            )
-        })
+        .filter(|edge| is_signal_semantic_edge(&edge.kind))
         .collect::<Vec<_>>();
     let cross_area = semantic_edges
         .iter()
@@ -477,15 +497,7 @@ fn hidden_coupling(map: &RepositoryMap) -> SignalAssessment {
     let semantic_edges = map
         .edges
         .iter()
-        .filter(|edge| {
-            matches!(
-                edge.kind,
-                EdgeKind::Calls
-                    | EdgeKind::References
-                    | EdgeKind::Configures
-                    | EdgeKind::EntrypointFor
-            )
-        })
+        .filter(|edge| is_signal_coupling_edge(&edge.kind))
         .collect::<Vec<_>>();
     let low_confidence = semantic_edges
         .iter()
@@ -533,15 +545,7 @@ fn hidden_coupling_redb(ctx: &RedbSignalContext) -> SignalAssessment {
     let semantic_edges = ctx
         .edges
         .iter()
-        .filter(|edge| {
-            matches!(
-                edge.kind,
-                EdgeKind::Calls
-                    | EdgeKind::References
-                    | EdgeKind::Configures
-                    | EdgeKind::EntrypointFor
-            )
-        })
+        .filter(|edge| is_signal_coupling_edge(&edge.kind))
         .collect::<Vec<_>>();
     let low_confidence = semantic_edges
         .iter()
@@ -607,10 +611,10 @@ fn parser_visibility(map: &RepositoryMap) -> SignalAssessment {
                 .iter()
                 .any(|function| function.file_id == file.id)
                 || map.classes.iter().any(|class| class.file_id == file.id)
-                || map.edges.iter().any(|edge| {
-                    edge.from == file.id
-                        && matches!(edge.kind, EdgeKind::Imports | EdgeKind::Defines)
-                })
+                || map
+                    .edges
+                    .iter()
+                    .any(|edge| edge.from == file.id && is_signal_extraction_edge(&edge.kind))
         })
         .count();
 
@@ -664,8 +668,7 @@ fn parser_visibility_redb(ctx: &RedbSignalContext) -> SignalAssessment {
                     .iter()
                     .any(|class| class.file_id.as_str() == file.id)
                 || ctx.edges.iter().any(|edge| {
-                    edge.from.as_str() == file.id
-                        && matches!(edge.kind, EdgeKind::Imports | EdgeKind::Defines)
+                    edge.from.as_str() == file.id && is_signal_extraction_edge(&edge.kind)
                 })
         })
         .count();

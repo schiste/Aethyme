@@ -134,10 +134,11 @@ const CREDENTIAL_SEMANTIC_TERMS: &[&str] = &[
     "validates_credential",
     "authorizes",
     "issues_credential",
+    "rewrites_header",
     "stores_credential",
     "uses_credential",
 ];
-const LIVE_TEST_SEMANTIC_TERMS: &[&str] = &["behavior_test_surface"];
+const LIVE_TEST_SEMANTIC_TERMS: &[&str] = &["behavior_test_surface", "tested_by"];
 const SURFACE_FLOW_SEMANTIC_TERMS: &[&str] = &[
     "route_surface",
     "worker_surface",
@@ -154,7 +155,9 @@ const SURFACE_FLOW_SEMANTIC_TERMS: &[&str] = &[
     "validates_credential",
     "authorizes",
     "issues_credential",
+    "rewrites_header",
     "stores_credential",
+    "tested_by",
     "uses_credential",
 ];
 
@@ -3776,9 +3779,11 @@ mod tests {
     fn extract_symbol_queries_drops_stop_words_and_short_terms() {
         let queries = extract_symbol_queries("Find the file that handles WatchedItem revisions");
         // "find", "the", "that" are stop words. "Watcheditem" stays.
-        assert!(queries
-            .iter()
-            .any(|q| q.eq_ignore_ascii_case("WatchedItem")));
+        assert!(
+            queries
+                .iter()
+                .any(|q| q.eq_ignore_ascii_case("WatchedItem"))
+        );
         assert!(queries.iter().any(|q| q.eq_ignore_ascii_case("revisions")));
         assert!(!queries.iter().any(|q| q.eq_ignore_ascii_case("the")));
         assert!(!queries.iter().any(|q| q.eq_ignore_ascii_case("find")));

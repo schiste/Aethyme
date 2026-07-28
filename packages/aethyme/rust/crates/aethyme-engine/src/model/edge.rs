@@ -19,6 +19,8 @@ pub enum EdgeKind {
     StoresCredential,
     UsesCredential,
     ValidatesCredential,
+    RewritesHeader,
+    TestedBy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]

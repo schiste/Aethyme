@@ -1275,6 +1275,8 @@ fn schema_edge_kind_to_model(kind: SchemaEdgeKind) -> EdgeKind {
         SchemaEdgeKind::StoresCredential => EdgeKind::StoresCredential,
         SchemaEdgeKind::UsesCredential => EdgeKind::UsesCredential,
         SchemaEdgeKind::ValidatesCredential => EdgeKind::ValidatesCredential,
+        SchemaEdgeKind::RewritesHeader => EdgeKind::RewritesHeader,
+        SchemaEdgeKind::TestedBy => EdgeKind::TestedBy,
         SchemaEdgeKind::References
         | SchemaEdgeKind::Decides
         | SchemaEdgeKind::Deprecates
