@@ -115,7 +115,7 @@ pub enum EdgeKind {
     /// `see_also`/`mentions`/`alternative` flavors.
     References,
 
-    // ─── Surface/Flow (tail-appended; alphabetical) ─────────────────
+    // ─── Surface/Flow (tail-appended; initial set alphabetical) ─────
     /// Surface/middleware/code node → policy/scope/code node.
     Authorizes,
     /// Container/config/router → route, worker, proxy, webhook, CLI, job,
@@ -133,6 +133,10 @@ pub enum EdgeKind {
     UsesCredential,
     /// Surface/middleware/code node → credential validation operation/code.
     ValidatesCredential,
+    /// Code/surface/config node → header mutation behavior.
+    RewritesHeader,
+    /// Code/config/surface node → behavior test exercising it.
+    TestedBy,
 }
 
 impl EdgeKind {
@@ -170,6 +174,8 @@ impl EdgeKind {
             EdgeKind::StoresCredential => "stores_credential",
             EdgeKind::UsesCredential => "uses_credential",
             EdgeKind::ValidatesCredential => "validates_credential",
+            EdgeKind::RewritesHeader => "rewrites_header",
+            EdgeKind::TestedBy => "tested_by",
         }
     }
 
@@ -207,6 +213,8 @@ impl EdgeKind {
             "stores_credential" => EdgeKind::StoresCredential,
             "uses_credential" => EdgeKind::UsesCredential,
             "validates_credential" => EdgeKind::ValidatesCredential,
+            "rewrites_header" => EdgeKind::RewritesHeader,
+            "tested_by" => EdgeKind::TestedBy,
             _ => return Err(UnknownEdgeKind { given: name.into() }),
         })
     }
@@ -242,7 +250,9 @@ impl EdgeKind {
             | EdgeKind::IssuesCredential
             | EdgeKind::StoresCredential
             | EdgeKind::UsesCredential
-            | EdgeKind::ValidatesCredential => EdgeKindCategory::SurfaceFlowEdge,
+            | EdgeKind::ValidatesCredential
+            | EdgeKind::RewritesHeader
+            | EdgeKind::TestedBy => EdgeKindCategory::SurfaceFlowEdge,
         }
     }
 }
@@ -313,7 +323,7 @@ pub const ALL_EDGE_KINDS: &[EdgeKind] = &[
     EdgeKind::Deprecates,
     EdgeKind::Documents,
     EdgeKind::References,
-    // Surface/Flow (tail-appended; alphabetical)
+    // Surface/Flow (tail-appended; first eight are the initial alphabetical set)
     EdgeKind::Authorizes,
     EdgeKind::Exposes,
     EdgeKind::ForwardsTo,
@@ -322,6 +332,8 @@ pub const ALL_EDGE_KINDS: &[EdgeKind] = &[
     EdgeKind::StoresCredential,
     EdgeKind::UsesCredential,
     EdgeKind::ValidatesCredential,
+    EdgeKind::RewritesHeader,
+    EdgeKind::TestedBy,
 ];
 
 /// Every category in declaration order. Parallel to

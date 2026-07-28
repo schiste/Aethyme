@@ -145,6 +145,8 @@ pub enum EdgeAttributes {
     StoresCredential,
     UsesCredential,
     ValidatesCredential,
+    RewritesHeader,
+    TestedBy,
 }
 
 impl EdgeAttributes {
@@ -175,6 +177,8 @@ impl EdgeAttributes {
             EdgeAttributes::StoresCredential => EdgeKind::StoresCredential,
             EdgeAttributes::UsesCredential => EdgeKind::UsesCredential,
             EdgeAttributes::ValidatesCredential => EdgeKind::ValidatesCredential,
+            EdgeAttributes::RewritesHeader => EdgeKind::RewritesHeader,
+            EdgeAttributes::TestedBy => EdgeKind::TestedBy,
         }
     }
 }

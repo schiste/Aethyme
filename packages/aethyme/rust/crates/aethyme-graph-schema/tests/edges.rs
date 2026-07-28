@@ -77,12 +77,12 @@ fn canonical_names_are_snake_case() {
 
 #[test]
 fn all_edge_kinds_is_exhaustive() {
-    // 24 edge kinds across 5 categories
+    // 26 edge kinds across 5 categories
     // (3 structural + 6 behavioral + 2 test + 5 documentation +
-    // 8 surface-flow).
+    // 10 surface-flow).
     // Bumping the count is the one-line change required when a new
     // edge kind lands.
-    const EXPECTED_TOTAL: usize = 24;
+    const EXPECTED_TOTAL: usize = 26;
     assert_eq!(
         ALL_EDGE_KINDS.len(),
         EXPECTED_TOTAL,
@@ -140,6 +140,52 @@ fn json_form_matches_canonical_name() {
 
 #[test]
 fn variants_are_alphabetical_within_each_category() {
+    const INITIAL_KINDS: &[&str] = &[
+        // Structural (3)
+        "contains",
+        "defines",
+        "imports",
+        // Behavioral (6)
+        "calls",
+        "implements",
+        "inherits",
+        "reads",
+        "uses",
+        "writes",
+        // Test (2)
+        "mocks",
+        "tests",
+        // Documentation (5)
+        "configures",
+        "decides",
+        "deprecates",
+        "documents",
+        "references",
+        // Surface/Flow initial set (8)
+        "authorizes",
+        "exposes",
+        "forwards_to",
+        "installs_middleware",
+        "issues_credential",
+        "stores_credential",
+        "uses_credential",
+        "validates_credential",
+    ];
+
+    let positions: BTreeMap<&str, usize> = ALL_EDGE_KINDS
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (k.name(), i))
+        .collect();
+    for &name in INITIAL_KINDS {
+        assert!(
+            positions.contains_key(name),
+            "initial-set edge kind {name:?} is missing from ALL_EDGE_KINDS; \
+             initial kinds are closed and may not be removed"
+        );
+    }
+    let initial_set: BTreeSet<&str> = INITIAL_KINDS.iter().copied().collect();
+
     let mut group_start = 0;
     while group_start < ALL_EDGE_KINDS.len() {
         let head_category = ALL_EDGE_KINDS[group_start].category();
@@ -150,14 +196,30 @@ fn variants_are_alphabetical_within_each_category() {
             group_end += 1;
         }
 
-        for i in group_start..group_end.saturating_sub(1) {
+        let mut prefix_end = group_start;
+        while prefix_end < group_end && initial_set.contains(ALL_EDGE_KINDS[prefix_end].name()) {
+            prefix_end += 1;
+        }
+
+        for i in group_start..prefix_end.saturating_sub(1) {
             let a = ALL_EDGE_KINDS[i].name();
             let b = ALL_EDGE_KINDS[i + 1].name();
             assert!(
                 a < b,
-                "ALL_EDGE_KINDS not alphabetical within {head_category:?}: \
+                "ALL_EDGE_KINDS not alphabetical within initial-set \
+                 prefix of {head_category:?}: \
                  {a:?} appears before {b:?} (positions {i} and {})",
                 i + 1,
+            );
+        }
+
+        for i in prefix_end..group_end {
+            let name = ALL_EDGE_KINDS[i].name();
+            assert!(
+                !initial_set.contains(name),
+                "initial-set edge kind {name:?} appears after a tail-appended \
+                 variant in {head_category:?} (position {i}); initial \
+                 kinds must occupy the leading prefix of their group"
             );
         }
 
@@ -195,7 +257,7 @@ fn categories_are_exhaustive_and_well_defined() {
     assert_eq!(counts.get(&EdgeKindCategory::Behavioral), Some(&6));
     assert_eq!(counts.get(&EdgeKindCategory::Test), Some(&2));
     assert_eq!(counts.get(&EdgeKindCategory::Documentation), Some(&5));
-    assert_eq!(counts.get(&EdgeKindCategory::SurfaceFlowEdge), Some(&8));
+    assert_eq!(counts.get(&EdgeKindCategory::SurfaceFlowEdge), Some(&10));
 
     let total: usize = counts.values().sum();
     assert_eq!(total, ALL_EDGE_KINDS.len());

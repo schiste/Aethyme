@@ -81,6 +81,8 @@ fn every_edge_attribute_variant_maps_to_a_distinct_kind() {
         EdgeAttributes::StoresCredential,
         EdgeAttributes::UsesCredential,
         EdgeAttributes::ValidatesCredential,
+        EdgeAttributes::RewritesHeader,
+        EdgeAttributes::TestedBy,
     ];
     let kinds: std::collections::BTreeSet<EdgeKind> = attrs.iter().map(|a| a.kind()).collect();
     let expected: std::collections::BTreeSet<EdgeKind> = ALL_EDGE_KINDS.iter().copied().collect();
