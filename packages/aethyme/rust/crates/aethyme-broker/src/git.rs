@@ -453,6 +453,22 @@ impl GitRepo {
         )?))
     }
 
+    /// Fetch a local commit object into this worktree's repository. Used
+    /// by broker repair to apply the same no-network path written into
+    /// `.aethyme/broker-action-required.md`.
+    pub fn fetch_local_commit(&self, commit: &str) -> Result<(), GitError> {
+        run_git(&self.root, &["fetch", ".", commit])?;
+        Ok(())
+    }
+
+    /// Rebase this checkout onto `base`. If git stops for conflicts, the
+    /// caller receives the stderr and the worktree is intentionally left
+    /// in the paused rebase state for manual resolution.
+    pub fn rebase_onto(&self, base: &str) -> Result<(), GitError> {
+        run_git(&self.root, &["rebase", base])?;
+        Ok(())
+    }
+
     /// True when the checkout has uncommitted changes or untracked files —
     /// the guard `broker cleanup` consults before removing a worktree.
     pub fn is_dirty(&self) -> Result<bool, GitError> {

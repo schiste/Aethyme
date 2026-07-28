@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::{Broker, MergeStatus, StatusAdviceSeverity};
+use aethyme_broker::{Broker, MergeStatus, RepairAction, RepairSource, StatusAdviceSeverity};
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -26,7 +26,11 @@ fn init_repo(root: &Path) {
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/a.py"), "a = 1\n").unwrap();
     std::fs::write(root.join("src/b.py"), "b = 1\n").unwrap();
-    std::fs::write(root.join(".gitignore"), "gate-ran.txt\n").unwrap();
+    std::fs::write(
+        root.join(".gitignore"),
+        "gate-ran.txt\n.aethyme/broker-action-required.md\n",
+    )
+    .unwrap();
     std::fs::create_dir_all(root.join(".aethyme")).unwrap();
     std::fs::write(
         root.join(".aethyme/gates.toml"),
@@ -203,6 +207,12 @@ fn conflicting_submission_rejected_pre_gate_with_instruction_drop() {
             .iter()
             .any(|command| command.contains("broker-action-required.md")),
         "{advice:?}"
+    );
+
+    let err = broker.repair(b.id).unwrap_err().to_string();
+    assert!(
+        err.contains("repair paused during rebase"),
+        "repair should apply the documented rebase path and stop for true content conflicts: {err}"
     );
 }
 
@@ -467,8 +477,57 @@ fn status_reports_promoted_unmerged_work_as_separate_conflict_surface() {
         advice
             .commands
             .iter()
-            .any(|command| command.contains("rebase aethyme/integration")),
+            .any(|command| command == &format!("aethyme broker repair --session {}", live.id)),
         "{advice:?}"
+    );
+}
+
+#[test]
+fn repair_rebases_promoted_conflict_and_reports_affected_gates() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    std::fs::write(tmp.path().join("src/a.py"), "a = 1\nmiddle = 1\nb = 1\n").unwrap();
+    sh(tmp.path(), &["add", "-A"]);
+    sh(tmp.path(), &["commit", "-qm", "make separate lines"]);
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let wt_promoted = agent_worktree(tmp.path(), "promoted-repair");
+    let promoted = broker.adopt(&wt_promoted, Some("promoted")).unwrap();
+    commit_edit(&wt_promoted, "src/a.py", "a = 20\nmiddle = 1\nb = 1\n");
+    assert!(broker.submit(promoted.id).unwrap().promoted);
+    broker.close(promoted.id).unwrap();
+
+    let wt_live = agent_worktree(tmp.path(), "live-repair");
+    let live = broker.adopt(&wt_live, Some("live")).unwrap();
+    commit_edit(&wt_live, "src/a.py", "a = 1\nmiddle = 1\nb = 30\n");
+
+    let before = broker.status(0).unwrap();
+    assert_eq!(before.promoted_conflicts.len(), 1);
+
+    let report = broker.repair(live.id).unwrap();
+    assert_eq!(report.source, RepairSource::PromotedConflict);
+    assert_eq!(report.action, RepairAction::Rebased);
+    assert!(report.leases_refreshed);
+    assert_eq!(
+        report.next_command,
+        format!("aethyme broker submit --session {}", live.id)
+    );
+    assert!(
+        report
+            .affected_gates
+            .iter()
+            .any(|gate| gate.gate == "marker"),
+        "{report:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt_live.join("src/a.py")).unwrap(),
+        "a = 20\nmiddle = 1\nb = 30\n"
+    );
+
+    let after = broker.status(0).unwrap();
+    assert!(
+        after.promoted_conflicts.is_empty(),
+        "repair should refresh leases against the rebased worktree"
     );
 }
 
