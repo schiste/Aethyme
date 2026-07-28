@@ -122,6 +122,14 @@ the wrong home for operational state. The broker consults the graph
 "this change's impact frontier includes X" — and must degrade gracefully when
 the graph is cold or stale.
 
+Semantic gate selection follows that same split. Path triggers in
+`.aethyme/gates.toml` remain the enforced selection surface for session submit
+and `broker gates run`; CI still runs the full gates definition via
+`broker gates run --all`. Caller-edge or impact-frontier data may only appear
+as advisory operator guidance until the #28 caller-edge pipeline has proven
+graph quality in real repos. The `broker gates semantic --session <id>`
+command is the intentionally separate read surface for that future signal.
+
 ## v0 scope
 
 Aethyme v0 local broker should eventually provide:

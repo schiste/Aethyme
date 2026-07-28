@@ -59,6 +59,10 @@ Usage:
       Parse and validate .aethyme/gates.toml.
   aethyme broker gates affected --session <id> [--json]
       Show which gates the session's diff selects and why.
+  aethyme broker gates semantic --session <id> [--json]
+      Advisory semantic gate-selection report: shows enforced path-triggered
+      gates plus caller-edge suggestion status. Never changes what submit,
+      CI, or gates run execute.
   aethyme broker gates run --session <id> [--json]
       Run affected gates cheap-first with tree-hash caching; cancels this
       session's obsolete in-flight runs; stops at first failure.
@@ -181,6 +185,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "draft",
         "validate",
         "affected",
+        "semantic",
         "run",
         "hooks",
         "install",
@@ -525,6 +530,48 @@ fn render_repair_report(report: &crate::RepairReport) {
     println!("  next: {}", report.next_command);
 }
 
+fn render_semantic_gate_advice(report: &crate::SemanticGateAdvice) {
+    println!("Semantic gate selection: advisory only");
+    println!("  session: {}", report.session_id);
+    println!("  enforced by this command: no");
+    if report.changed_files.is_empty() {
+        println!("  changed files: none");
+    } else {
+        println!("  changed files: {}", capped_join(&report.changed_files, 8));
+    }
+    println!(
+        "  semantic source: {} ({})",
+        report.semantic.provider,
+        report.semantic.status.as_str()
+    );
+    println!("    {}", report.semantic.reason);
+
+    if report.path_selected_gates.is_empty() {
+        println!("  path-selected gates: none");
+    } else {
+        println!("  path-selected gates:");
+        for gate in &report.path_selected_gates {
+            match &gate.triggered_by {
+                Some(path) => println!("    - {} (triggered by {})", gate.gate, path),
+                None => println!("    - {} (always runs)", gate.gate),
+            }
+        }
+    }
+
+    if report.semantic_suggested_gates.is_empty() {
+        println!("  semantic suggestions: none");
+    } else {
+        println!("  semantic suggestions:");
+        for gate in &report.semantic_suggested_gates {
+            match &gate.triggered_by {
+                Some(path) => println!("    - {} (via {})", gate.gate, path),
+                None => println!("    - {} ({})", gate.gate, gate.reason),
+            }
+        }
+    }
+    println!("  next: {}", report.next_action);
+}
+
 fn short_commit(commit: &str) -> &str {
     &commit[..12.min(commit.len())]
 }
@@ -836,7 +883,8 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     .first()
                     .map(String::as_str)
                     .ok_or(UsageError::Message(
-                        "gates requires an action: validate, affected, or run".into(),
+                        "gates requires an action: draft, validate, affected, semantic, or run"
+                            .into(),
                     ))?;
             match action {
                 "draft" => {
@@ -913,6 +961,18 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         }
                     }
                 }
+                "semantic" => {
+                    let session = parsed.session.ok_or(UsageError::Message(
+                        "gates semantic requires --session <id>".into(),
+                    ))?;
+                    let mut broker = open_broker()?;
+                    let report = broker.semantic_gate_advice(session)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        render_semantic_gate_advice(&report);
+                    }
+                }
                 "run" if parsed.all => {
                     if parsed.session.is_some() {
                         return Err(UsageError::Message(
@@ -982,7 +1042,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 }
                 other => {
                     return Err(UsageError::Message(format!(
-                        "unknown gates action {other:?} — expected draft, validate, affected, or run"
+                        "unknown gates action {other:?} — expected draft, validate, affected, semantic, or run"
                     )));
                 }
             }

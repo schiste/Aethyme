@@ -7,7 +7,9 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
 
-use aethyme_broker::{Broker, GateFailureClass, GateProgressSink, GateStatus};
+use aethyme_broker::{
+    Broker, GateFailureClass, GateProgressSink, GateStatus, SemanticGateSourceStatus,
+};
 
 #[derive(Default)]
 struct CapturedProgress {
@@ -115,6 +117,71 @@ fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
         ],
     );
     path
+}
+
+#[test]
+fn semantic_gate_advice_is_advisory_and_preserves_path_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "always-check"
+command = "true"
+cost = 0
+
+[[gate]]
+name = "python-check"
+command = "true"
+cost = 1
+triggers = ["**/*.py"]
+
+[[gate]]
+name = "docs-check"
+command = "true"
+cost = 1
+triggers = ["docs/**"]
+"#,
+    );
+    commit_all(tmp.path(), "add gates");
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = add_worktree(tmp.path(), "semantic");
+    let session = broker.adopt(&wt, None).unwrap();
+    std::fs::write(wt.join("src/app.py"), "x = 42\n").unwrap();
+
+    let report = broker.semantic_gate_advice(session.id).unwrap();
+    assert_eq!(report.session_id, session.id);
+    assert_eq!(report.mode, "advisory");
+    assert!(!report.enforced);
+    assert_eq!(report.changed_files, vec!["src/app.py".to_string()]);
+    assert_eq!(report.path_selected_gates.len(), 2);
+    assert_eq!(report.path_selected_gates[0].gate, "always-check");
+    assert_eq!(report.path_selected_gates[0].triggered_by, None);
+    assert_eq!(report.path_selected_gates[0].reason, "always runs");
+    assert_eq!(report.path_selected_gates[1].gate, "python-check");
+    assert_eq!(
+        report.path_selected_gates[1].triggered_by.as_deref(),
+        Some("src/app.py")
+    );
+    assert_eq!(report.path_selected_gates[1].reason, "path trigger");
+    assert!(report.semantic_suggested_gates.is_empty());
+    assert_eq!(report.semantic.provider, "caller_edges");
+    assert_eq!(
+        report.semantic.status,
+        SemanticGateSourceStatus::Unavailable
+    );
+    assert!(report.semantic.reason.contains("path-triggered gates"));
+    assert!(report.next_action.contains("gates run"));
+
+    assert_eq!(
+        broker.affected_gates(session.id).unwrap(),
+        vec![
+            ("always-check".to_string(), None),
+            ("python-check".to_string(), Some("src/app.py".to_string()))
+        ]
+    );
 }
 
 #[test]
