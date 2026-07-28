@@ -166,13 +166,13 @@ fn v1_constructor_payload_field_names_are_frozen() {
         "lease.claimed / lease.released",
     );
     assert_keys(
-        &events::gate_result_payload("g", "t"),
-        &["gate", "tree"],
+        &events::gate_result_payload("g", "t", None),
+        &["failure_class", "gate", "tree"],
         "gate.pass / gate.fail / gate.cancelled / gate.error",
     );
     assert_keys(
-        &events::gate_cached_payload("g", "t", 1),
-        &["gate", "saved_ms", "tree"],
+        &events::gate_cached_payload("g", "t", 1, GateStatus::Pass, None),
+        &["cached_status", "failure_class", "gate", "saved_ms", "tree"],
         "gate.cached",
     );
     assert_keys(
@@ -334,7 +334,7 @@ fn merge_lifecycle_payload_field_names_are_frozen_on_the_wire() {
         for gate in gates {
             assert_keys(
                 &gate.to_string(),
-                &["cached", "gate", "status"],
+                &["cached", "failure_class", "gate", "status"],
                 &format!("{kind} gates[] element"),
             );
         }

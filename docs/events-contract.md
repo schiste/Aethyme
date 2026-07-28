@@ -87,9 +87,9 @@ One JSON object per line:
 | `session.cleaned` | the session | — | `cleanup` removed the worktree, `close` marked the session finished (state only), or `adopt --replace-stale` retired the previous session |
 | `lease.claimed` / `lease.released` | claiming session | `path` | explicit lease operations |
 | `lease.overlap` | lower session of the pair | `session_a`, `session_b`, `path` | a NEW overlapping-edit pair is detected (never re-announced) |
-| `gate.pass` / `.fail` / `.error` | submitting session (nullable) | `gate`, `tree` | a gate run concluded against tree `tree` |
-| `gate.cancelled` | the session | `gate`, `tree` | a superseded in-flight run was killed |
-| `gate.cached` | requesting session (nullable) | `gate`, `tree`, `saved_ms` | a cache hit avoided executing a gate (`saved_ms` = the cached run's duration) |
+| `gate.pass` / `.fail` / `.error` | submitting session (nullable) | `gate`, `tree`, `failure_class` | a gate run concluded against tree `tree`; `failure_class` is nullable and classifies non-pass outcomes (`test_failure`, `environment`, `resource_contention`, `timeout`, `unknown`) |
+| `gate.cancelled` | the session | `gate`, `tree`, `failure_class` | a superseded in-flight run was killed (`failure_class` is null) |
+| `gate.cached` | requesting session (nullable) | `gate`, `tree`, `saved_ms`, `cached_status`, `failure_class` | a cache hit avoided executing a gate (`saved_ms` = the cached run's duration; cached failed outcomes report `cached_prior_fail`) |
 | `merge.submitted` | the session | `head` | head commit entered the queue (idempotent: once per head) |
 | `merge.simulating` | the session | — | merge-tree simulation started |
 | `merge.conflict` | the session | `conflicts[]`, `blocking_sessions[]`, `base` | simulation found textual conflicts (rejected pre-gate) |

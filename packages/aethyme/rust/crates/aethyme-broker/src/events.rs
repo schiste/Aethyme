@@ -48,14 +48,36 @@ pub fn lease_path_payload(path: &str) -> String {
     json!({ "path": path }).to_string()
 }
 
-pub fn gate_result_payload(gate: &str, tree: &str) -> String {
-    json!({ "gate": gate, "tree": tree }).to_string()
+pub fn gate_result_payload(
+    gate: &str,
+    tree: &str,
+    failure_class: Option<crate::types::GateFailureClass>,
+) -> String {
+    json!({
+        "gate": gate,
+        "tree": tree,
+        "failure_class": failure_class.map(|class| class.as_str()),
+    })
+    .to_string()
 }
 
 /// `saved_ms` is the cached run's recorded duration — the execution time
 /// this cache hit avoided.
-pub fn gate_cached_payload(gate: &str, tree: &str, saved_ms: i64) -> String {
-    json!({ "gate": gate, "tree": tree, "saved_ms": saved_ms }).to_string()
+pub fn gate_cached_payload(
+    gate: &str,
+    tree: &str,
+    saved_ms: i64,
+    cached_status: crate::types::GateStatus,
+    failure_class: Option<crate::types::GateFailureClass>,
+) -> String {
+    json!({
+        "gate": gate,
+        "tree": tree,
+        "saved_ms": saved_ms,
+        "cached_status": cached_status.as_str(),
+        "failure_class": failure_class.map(|class| class.as_str()),
+    })
+    .to_string()
 }
 
 pub fn merge_submitted_payload(head: &str) -> String {

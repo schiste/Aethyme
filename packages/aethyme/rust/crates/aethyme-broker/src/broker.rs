@@ -1139,15 +1139,22 @@ fn dirty_worktree_advice(agent: &AgentView, dirty: &[String]) -> StatusAdvice {
 struct GateFailure {
     name: String,
     status: String,
+    failure_class: Option<String>,
     cached: bool,
 }
 
 impl GateFailure {
     fn evidence(&self) -> String {
+        let class = self
+            .failure_class
+            .as_deref()
+            .map(|class| format!("/{class}"))
+            .unwrap_or_default();
         format!(
-            "gate {} status {}{}",
+            "gate {} status {}{}{}",
             self.name,
             self.status,
+            class,
             if self.cached { " (cached)" } else { "" }
         )
     }
@@ -1174,6 +1181,10 @@ fn gate_failures(details_json: Option<&str>) -> Vec<GateFailure> {
             Some(GateFailure {
                 name: name.to_string(),
                 status: status.to_string(),
+                failure_class: gate
+                    .get("failure_class")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
                 cached: gate
                     .get("cached")
                     .and_then(serde_json::Value::as_bool)

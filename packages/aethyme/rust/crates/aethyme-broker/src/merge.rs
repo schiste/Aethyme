@@ -264,7 +264,10 @@ impl Broker {
             "merge_commit": merge_commit,
             "base": base,
             "gates": gate_outcomes.iter().map(|o| serde_json::json!({
-                "gate": o.gate, "status": o.status, "cached": o.cached,
+                "gate": o.gate,
+                "status": o.status,
+                "failure_class": o.failure_class,
+                "cached": o.cached,
             })).collect::<Vec<_>>(),
         });
         if all_pass {

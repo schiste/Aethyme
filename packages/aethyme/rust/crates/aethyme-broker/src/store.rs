@@ -15,8 +15,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::error::BrokerError;
 use crate::schema::{self, EVENTS_SCHEMA_VERSION};
 use crate::types::{
-    Event, GateDef, GateResult, GateStatus, Lease, LeaseKind, MergeQueueEntry, MergeStatus,
-    NewGateResult, NewSession, Session, SessionOrigin, SessionStatus,
+    Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease, LeaseKind, MergeQueueEntry,
+    MergeStatus, NewGateResult, NewSession, Session, SessionOrigin, SessionStatus,
 };
 
 /// Milliseconds a writer waits on a locked database before erroring.
@@ -470,13 +470,14 @@ impl BrokerStore {
         let now = now_ms();
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO gate_results (gate_name, tree_hash, status, exit_code,
+            "INSERT INTO gate_results (gate_name, tree_hash, status, failure_class, exit_code,
                                        duration_ms, log_path, session_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 result.gate_name,
                 result.tree_hash,
                 result.status.as_str(),
+                result.failure_class.map(|class| class.as_str()),
                 result.exit_code,
                 result.duration_ms,
                 result.log_path,
@@ -493,14 +494,17 @@ impl BrokerStore {
             Some(&crate::events::gate_result_payload(
                 &result.gate_name,
                 &result.tree_hash,
+                result.failure_class,
             )),
         )?;
         tx.commit()?;
         Ok(id)
     }
 
-    /// Cache lookup: the most recent *conclusive* (pass/fail) result for
-    /// this gate against this exact tree. Cancelled/error runs never
+    /// Cache lookup: the most recent *conclusive* result for this gate
+    /// against this exact tree. Passes are conclusive; failures are only
+    /// conclusive when classified as real test failures. Cancelled,
+    /// error, infra-classified, and legacy unclassified fail rows never
     /// satisfy the cache.
     pub fn cached_gate_result(
         &self,
@@ -513,7 +517,10 @@ impl BrokerStore {
                 &format!(
                     "{GATE_RESULT_SELECT}
                      WHERE gate_name = ?1 AND tree_hash = ?2
-                       AND status IN ('pass', 'fail')
+                       AND (
+                            status = 'pass'
+                            OR (status = 'fail' AND failure_class = 'test_failure')
+                       )
                      ORDER BY id DESC LIMIT 1"
                 ),
                 params![gate_name, tree_hash],
@@ -706,8 +713,8 @@ const SESSION_SELECT: &str = "SELECT id, worktree_path, branch, origin, status, 
 const LEASE_SELECT: &str =
     "SELECT id, session_id, path, kind, created_at, expires_at, released_at FROM leases";
 
-const GATE_RESULT_SELECT: &str = "SELECT id, gate_name, tree_hash, status, exit_code, \
-     duration_ms, log_path, session_id, created_at FROM gate_results";
+const GATE_RESULT_SELECT: &str = "SELECT id, gate_name, tree_hash, status, failure_class, \
+     exit_code, duration_ms, log_path, session_id, created_at FROM gate_results";
 
 const MERGE_SELECT: &str = "SELECT id, session_id, head_commit, base_commit, status, \
      merged_tree, details_json, created_at, updated_at FROM merge_queue";
@@ -754,17 +761,22 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> RowResult<Lease> {
 
 fn gate_result_from_row(row: &rusqlite::Row<'_>) -> RowResult<GateResult> {
     let status: String = row.get(3)?;
+    let failure_class: Option<String> = row.get(4)?;
     Ok((|| {
         Ok(GateResult {
             id: row.get(0)?,
             gate_name: row.get(1)?,
             tree_hash: row.get(2)?,
             status: GateStatus::parse(&status)?,
-            exit_code: row.get(4)?,
-            duration_ms: row.get(5)?,
-            log_path: row.get(6)?,
-            session_id: row.get(7)?,
-            created_at: row.get(8)?,
+            failure_class: failure_class
+                .as_deref()
+                .map(GateFailureClass::parse)
+                .transpose()?,
+            exit_code: row.get(5)?,
+            duration_ms: row.get(6)?,
+            log_path: row.get(7)?,
+            session_id: row.get(8)?,
+            created_at: row.get(9)?,
         })
     })())
 }
