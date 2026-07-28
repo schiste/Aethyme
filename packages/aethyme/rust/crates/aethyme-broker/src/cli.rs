@@ -558,7 +558,11 @@ fn render_integration_status(
     let main_relation = if report.head == report.main_head {
         "current with integration".to_string()
     } else if report.main_is_ancestor {
-        format!("{} commit(s) behind integration", report.commits_ahead_main)
+        format!(
+            "{} {} behind integration",
+            report.commits_ahead_main,
+            plural(report.commits_ahead_main as usize, "commit", "commits")
+        )
     } else {
         "diverged from integration".into()
     };
