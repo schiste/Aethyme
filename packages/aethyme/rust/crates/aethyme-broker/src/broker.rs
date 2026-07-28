@@ -29,6 +29,16 @@ pub enum BrokerOpError {
     Store(#[from] BrokerError),
     #[error("refusing to clean session {id}: {reason} (use --force to discard)")]
     DirtyWorktree { id: i64, reason: String },
+    #[error(
+        "repair paused during rebase for session {id} onto {base}: {message}\n\
+         Resolve conflicts in the session worktree, then run \
+         `GIT_EDITOR=true git rebase --continue` and resubmit."
+    )]
+    RepairRebaseFailed {
+        id: i64,
+        base: String,
+        message: String,
+    },
     #[error("failed to spawn agent command {command:?}: {source}")]
     Spawn {
         command: String,
@@ -112,6 +122,60 @@ pub struct StatusView {
     pub queue: Vec<crate::types::MergeQueueEntry>,
     pub integration_branch: String,
     pub integration_head: String,
+}
+
+/// Result of `broker repair --session`: a conservative recovery action
+/// plus the refreshed gate-selection surface.
+#[derive(Debug, serde::Serialize)]
+pub struct RepairReport {
+    pub session_id: i64,
+    pub worktree_path: String,
+    pub source: RepairSource,
+    pub action: RepairAction,
+    pub base: Option<String>,
+    pub leases_refreshed: bool,
+    pub affected_gates: Vec<RepairGateSelection>,
+    pub next_command: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairSource {
+    LatestSubmitConflict,
+    PromotedConflict,
+    None,
+}
+
+impl RepairSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LatestSubmitConflict => "latest submit conflict",
+            Self::PromotedConflict => "promoted conflict",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairAction {
+    Rebased,
+    None,
+}
+
+impl RepairAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rebased => "rebased",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RepairGateSelection {
+    pub gate: String,
+    pub triggered_by: Option<String>,
 }
 
 /// Operator guidance derived from `broker status` facts. This is
@@ -519,6 +583,92 @@ impl Broker {
         Ok(conflicts.into_iter().collect())
     }
 
+    // ── repair (one-command recovery) ─────────────────────────────────
+
+    /// Recover a blocked session by applying the documented local rebase
+    /// path when there is an actionable conflict, then refresh leases and
+    /// return the affected gate selection. Does not submit or promote.
+    pub fn repair(&mut self, session_id: i64) -> Result<RepairReport, BrokerOpError> {
+        let session = self.store.session(session_id)?;
+        let worktree_path = session.worktree_path.clone();
+        let checkout = GitRepo::discover(Path::new(&worktree_path))?;
+        let (source, base) = self.repair_target(session_id)?;
+        let action = if let Some(base) = base.as_deref() {
+            let dirty = checkout.dirty_paths()?;
+            if !dirty.is_empty() {
+                return Err(BrokerOpError::DirtyWorktree {
+                    id: session_id,
+                    reason: format!(
+                        "worktree has uncommitted changes; commit or stash before repair, e.g. {}",
+                        dirty.first().map(String::as_str).unwrap_or("-")
+                    ),
+                });
+            }
+            checkout.fetch_local_commit(base)?;
+            checkout
+                .rebase_onto(base)
+                .map_err(|err| BrokerOpError::RepairRebaseFailed {
+                    id: session_id,
+                    base: base.to_string(),
+                    message: err.to_string(),
+                })?;
+            let _ = std::fs::remove_file(
+                Path::new(&worktree_path).join(crate::ACTION_REQUIRED_RELPATH),
+            );
+            RepairAction::Rebased
+        } else {
+            RepairAction::None
+        };
+
+        self.refresh_leases()?;
+        let affected_gates = self
+            .affected_gates(session_id)?
+            .into_iter()
+            .map(|(gate, triggered_by)| RepairGateSelection { gate, triggered_by })
+            .collect();
+        Ok(RepairReport {
+            session_id,
+            worktree_path,
+            source,
+            action,
+            base,
+            leases_refreshed: true,
+            affected_gates,
+            next_command: format!("aethyme broker submit --session {session_id}"),
+        })
+    }
+
+    fn repair_target(
+        &mut self,
+        session_id: i64,
+    ) -> Result<(RepairSource, Option<String>), BrokerOpError> {
+        let latest = self
+            .store
+            .merge_queue()?
+            .into_iter()
+            .filter(|entry| entry.session_id == session_id)
+            .last();
+        if let Some(entry) = latest
+            && entry.status == MergeStatus::Conflict
+        {
+            let base = details_string_value(entry.details_json.as_deref(), "base")
+                .unwrap_or(entry.base_commit);
+            return Ok((RepairSource::LatestSubmitConflict, Some(base)));
+        }
+
+        self.refresh_leases()?;
+        if self
+            .promoted_conflicts()?
+            .iter()
+            .any(|conflict| conflict.session_id == session_id)
+        {
+            let (_branch, head) = self.integration_head()?;
+            return Ok((RepairSource::PromotedConflict, Some(head)));
+        }
+
+        Ok((RepairSource::None, None))
+    }
+
     // ── gates (Phase 4) ───────────────────────────────────────────────
 
     /// Affected-gate selection for a session's current diff, without
@@ -630,8 +780,11 @@ impl Broker {
         let session = self.store.session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let gates = self.load_and_sync_gates()?;
-        let base = session.diff_base.as_deref().unwrap_or("HEAD");
-        let changed = checkout.changed_files(base)?;
+        let base = self
+            .session_change_base(&checkout)
+            .or(session.diff_base)
+            .unwrap_or_else(|| "HEAD".to_string());
+        let changed = checkout.changed_files(&base)?;
         Ok((checkout, gates, changed))
     }
 
@@ -904,16 +1057,16 @@ fn conflict_submit_advice(agent: &AgentView, entry: &MergeQueueEntry) -> StatusA
         queue_entry_id: Some(entry.id),
         evidence,
         commands: vec![
-            format!("cat {}/{}", worktree, crate::ACTION_REQUIRED_RELPATH),
-            format!("git -C {worktree} rebase {}", entry.base_commit),
+            format!("aethyme broker repair --session {}", agent.session.id),
             format!("aethyme broker submit --session {}", agent.session.id),
+            format!("cat {}/{}", worktree, crate::ACTION_REQUIRED_RELPATH),
         ],
     }
 }
 
 fn promoted_conflict_advice(
     session_id: i64,
-    worktree_path: &str,
+    _worktree_path: &str,
     integration_branch: &str,
     conflicts: &[&PromotedConflict],
 ) -> StatusAdvice {
@@ -936,10 +1089,7 @@ fn promoted_conflict_advice(
     }
 
     let mut commands = Vec::new();
-    if !worktree_path.is_empty() {
-        let worktree = shell_quote(worktree_path);
-        commands.push(format!("git -C {worktree} rebase {integration_branch}"));
-    }
+    commands.push(format!("aethyme broker repair --session {session_id}"));
     commands.push(format!("aethyme broker submit --session {session_id}"));
 
     StatusAdvice {
@@ -1040,6 +1190,12 @@ fn details_string_array(details_json: Option<&str>, key: &str) -> Vec<String> {
         .flatten()
         .filter_map(|value| value.as_str().map(str::to_string))
         .collect()
+}
+
+fn details_string_value(details_json: Option<&str>, key: &str) -> Option<String> {
+    let details_json = details_json?;
+    let details = serde_json::from_str::<serde_json::Value>(details_json).ok()?;
+    details.get(key)?.as_str().map(str::to_string)
 }
 
 fn details_i64_array(details_json: Option<&str>, key: &str) -> Vec<i64> {

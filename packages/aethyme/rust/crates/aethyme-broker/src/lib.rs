@@ -36,8 +36,9 @@ mod store;
 mod types;
 
 pub use broker::{
-    AdoptMode, AgentView, Broker, BrokerOpError, DoctorReport, PromotedConflict, StatusAdvice,
-    StatusAdviceSeverity, StatusView,
+    AdoptMode, AgentView, Broker, BrokerOpError, DoctorReport, PromotedConflict, RepairAction,
+    RepairGateSelection, RepairReport, RepairSource, StatusAdvice, StatusAdviceSeverity,
+    StatusView,
 };
 pub use error::BrokerError;
 pub use gates::{

@@ -93,6 +93,12 @@ Usage:
       <worktree>/.aethyme/broker-action-required.md. V1 submits the
       whole session head only; --path/--commit scoping is intentionally
       out of scope while worktree identity is the coordination unit.
+  aethyme broker repair --session <id> [--json]
+      One-command recovery for a blocked session: apply the documented
+      local rebase path for the latest submit conflict, or rebase onto
+      promoted integration work when status reports that conflict surface.
+      Then refresh leases and show affected gates. Never submits or
+      promotes; run submit when the report is clean.
   aethyme broker queue [--json]
       Show the merge queue.
   aethyme broker promote --entry <id> [--json]
@@ -177,6 +183,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "pre-commit",
         "post-commit",
         "submit",
+        "repair",
         "queue",
         "promote",
         "status",
@@ -472,6 +479,34 @@ fn render_status_advice(advice: &[crate::StatusAdvice]) {
             println!("     run: {command}");
         }
     }
+}
+
+fn render_repair_report(report: &crate::RepairReport) {
+    println!(
+        "Repair session {}: {}",
+        report.session_id,
+        report.action.as_str()
+    );
+    println!("  source: {}", report.source.as_str());
+    if let Some(base) = &report.base {
+        println!("  base: {}", &base[..12.min(base.len())]);
+    }
+    println!(
+        "  leases refreshed: {}",
+        if report.leases_refreshed { "yes" } else { "no" }
+    );
+    if report.affected_gates.is_empty() {
+        println!("  affected gates: none");
+    } else {
+        println!("  affected gates:");
+        for gate in &report.affected_gates {
+            match &gate.triggered_by {
+                Some(path) => println!("    - {} (triggered by {})", gate.gate, path),
+                None => println!("    - {} (always runs)", gate.gate),
+            }
+        }
+    }
+    println!("  next: {}", report.next_command);
 }
 
 fn open_broker() -> Result<Broker, UsageError> {
@@ -981,6 +1016,18 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         outcome.entry.id, outcome.entry.id,
                     );
                 }
+            }
+        }
+        "repair" => {
+            let session = parsed
+                .session
+                .ok_or(UsageError::Message("repair requires --session <id>".into()))?;
+            let mut broker = open_broker()?;
+            let report = broker.repair(session)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render_repair_report(&report);
             }
         }
         "queue" => {
