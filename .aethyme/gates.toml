@@ -57,6 +57,12 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
 # (`Contract decision: <label>` line — checker accepts both this and
 # the PR checkbox syntax). No triggers: tracked symbols can be touched
 # from any file, and the checker exits fast on clean diffs.
+# CHAU7_CTO_OPTIM_ACTIVE=1 bypasses Chau7's CTO git wrapper
+# (~/.chau7/cto_bin/git), which compresses `git log`/`git status`
+# output for token savings in agent tabs. Discovered 2026-07-28 when
+# it truncated commit bodies to subject lines and this gate rejected a
+# correctly-labeled entry: any gate that PARSES git output must force
+# the real binary or it reads CTO fiction.
 name = "cross-process-contract"
-command = 'MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && BASE="$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)" && BODY="$(mktemp)" && git log --format=%B "$BASE"..HEAD > "$BODY" && "$MAIN/packages/aethyme/.venv/bin/python" scripts/check-cross-process-contract.py --base "$BASE" --pr-body "$BODY"'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && BASE="$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)" && BODY="$(mktemp)" && git log --format=%B "$BASE"..HEAD > "$BODY" && "$MAIN/packages/aethyme/.venv/bin/python" scripts/check-cross-process-contract.py --base "$BASE" --pr-body "$BODY"'
 cost = 1
