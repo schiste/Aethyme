@@ -44,6 +44,13 @@ unresolved, explore daemon-down) and 127 (spawn failure).
 
 Native (non-delegated) router surface — `explore`, `broker`, `certify`,
 `root` — is out of scope here; it is already Rust.
+
+Flipped native during the retirement (removed from the Click tree, same
+names/flags/output — golden-verified):
+- `query symbol|deps|impact` (Phase 1, 2026-07-28; engine
+  `query_cli` module). Known divergence: Click-style global options
+  before the group (`aethyme --json query ...`) are no longer accepted;
+  no in-repo consumer used that spelling.
 """
 
 
