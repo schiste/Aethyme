@@ -300,18 +300,6 @@ def inspect_repository_structure(repo_path: Path) -> dict[str, Any]:
     return json.loads(output)
 
 
-def search_symbol(repo_path: Path, query: str) -> list[dict[str, Any]]:
-    """Return exact redb-backed symbol search results from the Rust engine."""
-    snapshot = capture_snapshot(repo_path)
-    cache_key = f"symbol_{_stable_hash(query)}"
-    output = _cached_text(
-        snapshot,
-        cache_key,
-        lambda: _run_binary_command("symbol", "--repo", str(snapshot.repo_path), "--query", query),
-    )
-    return json.loads(output)
-
-
 def _run_binary_command_with_timeout(
     *args: str,
     timeout_seconds: float | None = None,
@@ -396,35 +384,6 @@ def graph_overview(repo_path: Path) -> dict[str, Any]:
         snapshot,
         "graph_overview",
         lambda: _run_binary_command("graph-overview", "--repo", str(snapshot.repo_path)),
-    )
-    return json.loads(output)
-
-
-def dependency_frontier(repo_path: Path, target: str) -> list[str]:
-    """Return dependency frontier values for a file."""
-    snapshot = capture_snapshot(repo_path)
-    # The redb `deps` surface reads outgoing FILE adjacency, takes
-    # --file, and emits newline-separated paths (not JSON) — see the
-    # redb V1 contract table. Caught by the golden harness 2026-07-27:
-    # the redb cutover landed without this caller updating — the exact
-    # failure mode the consumers registry predicts for engine.py.
-    cache_key = f"deps_{_stable_hash(target)}"
-    output = _cached_text(
-        snapshot,
-        cache_key,
-        lambda: _run_binary_command("deps", "--repo", str(snapshot.repo_path), "--file", target),
-    )
-    return [line for line in output.splitlines() if line.strip()]
-
-
-def impact_frontier(repo_path: Path, target: str) -> list[str]:
-    """Return impact frontier values for a symbol or file."""
-    snapshot = capture_snapshot(repo_path)
-    cache_key = f"impact_{_stable_hash(target)}"
-    output = _cached_text(
-        snapshot,
-        cache_key,
-        lambda: _run_binary_command("impact", "--repo", str(snapshot.repo_path), "--target", target),
     )
     return json.loads(output)
 

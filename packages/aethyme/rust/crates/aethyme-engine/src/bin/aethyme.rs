@@ -51,6 +51,16 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "explore" => run_explore(&args[1..]),
+        // Native since python-retirement Phase 1 (the Python `query`
+        // group is deleted). Errors keep Click's `Error: {msg}` shape
+        // and exit 1 so scripted consumers see the same surface.
+        "query" => match aethyme_engine::query_cli::run(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("Error: {message}");
+                ExitCode::from(1)
+            }
+        },
         "root" => run_root_subcommand(&args[1..]),
         // Broker commands are native Rust from birth (issue #31) — never
         // delegated to Python.

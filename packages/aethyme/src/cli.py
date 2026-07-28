@@ -30,7 +30,6 @@ from src.indexing.engine import (
     inspect_repository,
     inspect_repository_brief,
     inspect_repository_structure,
-    search_symbol,
     task_anchors,
     task_expand,
     task_next,
@@ -38,12 +37,6 @@ from src.indexing.engine import (
 )
 from src.indexing.engine import (
     analyze_dead_code as analyze_dead_code_answer,
-)
-from src.indexing.engine import (
-    dependency_frontier as rust_dependency_frontier,
-)
-from src.indexing.engine import (
-    impact_frontier as rust_impact_frontier,
 )
 from src.indexing.repository_snapshot import capture_snapshot
 from src.rendering.context_pack import render_explain_repo_text, render_pack_summary
@@ -757,67 +750,8 @@ def repo_engine_info(json_output: bool, check_ready: bool) -> None:
 
 
 @cli.group()
-def query() -> None:
-    """Query the local Rust-backed navigation engine."""
-
-
-@cli.group()
 def graph() -> None:
     """Navigate graph entities and relations directly."""
-
-
-@query.command("symbol")
-@click.argument(
-    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
-)
-@click.argument("symbol_query")
-@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-def query_symbol(repo_path: Path, symbol_query: str, json_output: bool) -> None:
-    """Look up symbols in the local repository map."""
-    try:
-        results = search_symbol(repo_path, symbol_query)
-    except EngineError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-    if json_output:
-        click.echo(json.dumps(results, indent=2))
-        return
-
-    for result in results:
-        click.echo(
-            f"- {result['name']} ({result['kind']}) at {result['file']}:{result['line']} "
-            f"[score={result['score']}]"
-        )
-
-
-@query.command("deps")
-@click.argument(
-    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
-)
-@click.argument("target")
-def query_deps(repo_path: Path, target: str) -> None:
-    """Show dependency frontier for a target symbol or file."""
-    try:
-        results = rust_dependency_frontier(repo_path, target)
-    except EngineError as exc:
-        raise click.ClickException(str(exc)) from exc
-    for result in results:
-        click.echo(f"- {result}")
-
-
-@query.command("impact")
-@click.argument(
-    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
-)
-@click.argument("target")
-def query_impact(repo_path: Path, target: str) -> None:
-    """Show reverse dependency frontier for a target symbol or file."""
-    try:
-        results = rust_impact_frontier(repo_path, target)
-    except EngineError as exc:
-        raise click.ClickException(str(exc)) from exc
-    for result in results:
-        click.echo(f"- {result}")
 
 
 @graph.command("node")

@@ -18,6 +18,13 @@ unresolved, explore daemon-down) and 127 (spawn failure).
 Native (non-delegated) router surface — `explore`, `broker`, `certify`,
 `root` — is out of scope here; it is already Rust.
 
+Flipped native during the retirement (removed from the Click tree, same
+names/flags/output — golden-verified):
+- `query symbol|deps|impact` (Phase 1, 2026-07-28; engine
+  `query_cli` module). Known divergence: Click-style global options
+  before the group (`aethyme --json query ...`) are no longer accepted;
+  no in-repo consumer used that spelling.
+
 ## Global options
 
 - `--tenant-id` (env AETHYME_TENANT_ID)
@@ -50,10 +57,6 @@ Native (non-delegated) router surface — `explore`, `broker`, `certify`,
 | `graph overview` | command | `repo_path` (arg, required); `--json-output` (flag) |
 | `graph parents` | command | `repo_path` (arg, required); `target` (arg, required); `--json-output` (flag) |
 | `intents` | command | `--request` (default ''); `--format` (choice, default 'compact-json') |
-| `query` | group | — |
-| `query deps` | command | `repo_path` (arg, required); `target` (arg, required) |
-| `query impact` | command | `repo_path` (arg, required); `target` (arg, required) |
-| `query symbol` | command | `repo_path` (arg, required); `symbol_query` (arg, required); `--json-output` (flag) |
 | `repo` | group | — |
 | `repo clear-cache` | command | `repo_path` (arg, required) |
 | `repo commit-message-template` | command | `--type` (choice, default 'fix'); `--scope` (default 'scope') |
