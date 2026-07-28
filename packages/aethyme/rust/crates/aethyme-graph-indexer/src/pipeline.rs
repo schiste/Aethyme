@@ -23,10 +23,11 @@ use aethyme_graph_storage::{
 
 use crate::context::IndexerContext;
 use crate::filesystem::{FilesystemIndexerError, IndexedFile, WalkOptions, walk_source_tree};
-use crate::language::{LanguageIndexError, LanguageRegistry};
+use crate::language::{LanguageIndexError, LanguageIndexResult, LanguageRegistry};
 use crate::php::PhpIndexer;
 use crate::python::PythonIndexer;
 use crate::rust_lang::RustIndexer;
+use crate::surface_flow;
 use crate::typescript::TypeScriptIndexer;
 
 /// One indexed file's full storage footprint.
@@ -183,23 +184,46 @@ pub fn index_repo_to_disk_with(
         .files
         .par_iter()
         .map(|indexed| -> Result<(PathBuf, BTreeMap<NodeKind, usize>, BuiltFragment), IndexRepoError> {
-            let lang_output = match registry.get(&indexed.language) {
-                Some(indexer) => {
-                    let abs = ctx.repo_root().join(&*indexed.source_path);
-                    let content = std::fs::read_to_string(&abs).map_err(|e| {
+            let language_indexer = registry.get(&indexed.language);
+            let needs_content = language_indexer.is_some() || surface_flow::should_scan(indexed);
+            let content = if needs_content {
+                let abs = ctx.repo_root().join(&*indexed.source_path);
+                Some(std::fs::read_to_string(&abs).map_err(|e| {
                         IndexRepoError::ReadSource {
                             source_path: indexed.source_path.clone(),
                             message: e.to_string(),
                         }
-                    })?;
-                    Some(
-                        indexer
-                            .index_file(ctx, indexed, &content)
-                            .map_err(IndexRepoError::Language)?,
-                    )
-                }
-                None => None,
+                })?)
+            } else {
+                None
             };
+
+            let mut combined = LanguageIndexResult::default();
+            if let Some(indexer) = language_indexer {
+                let content = content
+                    .as_deref()
+                    .expect("language-indexed files are read above");
+                let output = indexer
+                    .index_file(ctx, indexed, content)
+                    .map_err(IndexRepoError::Language)?;
+                combined.additional_nodes.extend(output.additional_nodes);
+                combined.additional_edges.extend(output.additional_edges);
+            }
+            if surface_flow::should_scan(indexed) {
+                let content = content
+                    .as_deref()
+                    .expect("surface-flow-scanned files are read above");
+                let output =
+                    surface_flow::index_file(ctx, indexed, content).map_err(IndexRepoError::Language)?;
+                combined.additional_nodes.extend(output.additional_nodes);
+                combined.additional_edges.extend(output.additional_edges);
+            };
+            let lang_output =
+                if combined.additional_nodes.is_empty() && combined.additional_edges.is_empty() {
+                    None
+                } else {
+                    Some(combined)
+                };
 
             let built = build_fragment(indexed, lang_output)
                 .map_err(IndexRepoError::Build)?;

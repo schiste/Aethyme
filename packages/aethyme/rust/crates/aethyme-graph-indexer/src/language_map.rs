@@ -108,7 +108,7 @@ fn non_code_format_from_extension(extension: &str) -> Option<NonCodeFormat> {
     match extension {
         "md" | "markdown" => Some(NonCodeFormat::Markdown),
         "yaml" | "yml" => Some(NonCodeFormat::Yaml),
-        "json" => Some(NonCodeFormat::Json),
+        "json" | "jsonc" => Some(NonCodeFormat::Json),
         "toml" => Some(NonCodeFormat::Toml),
         "txt" => Some(NonCodeFormat::Plain),
         // The Other(...) escape hatch for recognized-but-not-typed

@@ -27,6 +27,7 @@ pub mod php;
 pub mod pipeline;
 pub mod python;
 pub mod rust_lang;
+pub mod surface_flow;
 pub mod typescript;
 
 pub use context::IndexerContext;
