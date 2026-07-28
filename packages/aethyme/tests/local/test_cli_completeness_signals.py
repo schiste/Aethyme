@@ -29,36 +29,6 @@ def test_removed_python_explore_command_prints_native_recovery_hint() -> None:
     assert "The Python CLI still handles graph, task, intents, facts, and analyze." in result.output
 
 
-def test_graph_node_non_json_surfaces_completeness_signals(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    repo_path = tmp_path / "demo"
-    repo_path.mkdir(parents=True)
-
-    monkeypatch.setattr(
-        "src.cli.graph_node",
-        lambda _repo, _target: {
-            "id": "fn:demo:main",
-            "kind": "function",
-            "label": "main",
-            "confidence": 920,
-            "truncated": True,
-            "reason": "result cap reached",
-            "caps": {"max_items": 50},
-        },
-    )
-
-    runner = CliRunner()
-    result = runner.invoke(cli, ["graph", "node", str(repo_path), "main"])
-
-    assert result.exit_code == 0, result.output
-    assert "Confidence: 920" in result.output
-    assert "Truncated: yes" in result.output
-    assert "Truncation reason: result cap reached" in result.output
-    assert 'Caps: {"max_items": 50}' in result.output
-
-
 def test_task_scope_non_json_renders_reason_fields(
     monkeypatch,
     tmp_path: Path,

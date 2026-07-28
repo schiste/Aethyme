@@ -54,6 +54,13 @@ fn main() -> ExitCode {
         // Native since python-retirement Phase 1 (the Python `query`
         // group is deleted). Errors keep Click's `Error: {msg}` shape
         // and exit 1 so scripted consumers see the same surface.
+        "graph" => match aethyme_engine::graph_cli::run(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("Error: {message}");
+                ExitCode::from(1)
+            }
+        },
         "query" => match aethyme_engine::query_cli::run(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {

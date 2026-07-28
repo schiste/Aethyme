@@ -330,64 +330,6 @@ def _run_binary_command_with_timeout(
     return result.stdout.strip()
 
 
-def graph_node(repo_path: Path, target: str) -> dict[str, Any]:
-    """Return a graph node view for a resolved target."""
-    snapshot = capture_snapshot(repo_path)
-    cache_key = f"graph_node_{_stable_hash(target)}"
-    output = _cached_text(
-        snapshot,
-        cache_key,
-        lambda: _run_binary_command("graph-node", "--repo", str(snapshot.repo_path), "--target", target),
-    )
-    return json.loads(output)
-
-
-def graph_children(repo_path: Path, target: str) -> dict[str, Any]:
-    """Return structural children for a target."""
-    return _graph_relation(repo_path, "graph-children", target)
-
-
-def graph_parents(repo_path: Path, target: str) -> dict[str, Any]:
-    """Return structural parents for a target."""
-    return _graph_relation(repo_path, "graph-parents", target)
-
-
-def graph_callers(repo_path: Path, target: str) -> dict[str, Any]:
-    """Return caller relations for a target."""
-    return _graph_relation(repo_path, "graph-callers", target)
-
-
-def graph_callees(repo_path: Path, target: str) -> dict[str, Any]:
-    """Return callee relations for a target."""
-    return _graph_relation(repo_path, "graph-callees", target)
-
-
-def graph_docs(repo_path: Path, target: str) -> dict[str, Any]:
-    """Return documentation relations for a target."""
-    return _graph_relation(repo_path, "graph-docs", target)
-
-
-def graph_configs(repo_path: Path, target: str) -> dict[str, Any]:
-    """Return config relations for a target."""
-    return _graph_relation(repo_path, "graph-configs", target)
-
-
-def graph_expand(repo_path: Path, target: str) -> dict[str, Any]:
-    """Return a compact graph slice for iterative navigation."""
-    return _graph_relation(repo_path, "graph-expand", target)
-
-
-def graph_overview(repo_path: Path) -> dict[str, Any]:
-    """Return a repo-level navigation overview derived from the graph."""
-    snapshot = capture_snapshot(repo_path)
-    output = _cached_text(
-        snapshot,
-        "graph_overview",
-        lambda: _run_binary_command("graph-overview", "--repo", str(snapshot.repo_path)),
-    )
-    return json.loads(output)
-
-
 def build_task_pack(repo_path: Path, task: str) -> dict[str, Any]:
     """Return a deterministic task-context pack."""
     snapshot = capture_snapshot(repo_path)
