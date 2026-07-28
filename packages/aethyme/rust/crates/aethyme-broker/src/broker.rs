@@ -220,6 +220,54 @@ pub struct RepairGateSelection {
     pub triggered_by: Option<String>,
 }
 
+/// Advisory semantic gate-selection report. Path-triggered gate
+/// selection remains the only enforced broker behavior; this report is
+/// a read surface for graph/caller-edge hints once that provider is
+/// proven.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SemanticGateAdvice {
+    pub session_id: i64,
+    pub mode: String,
+    pub enforced: bool,
+    pub changed_files: Vec<String>,
+    pub path_selected_gates: Vec<SemanticGateSelection>,
+    pub semantic_suggested_gates: Vec<SemanticGateSelection>,
+    pub semantic: SemanticGateSource,
+    pub next_action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SemanticGateSelection {
+    pub gate: String,
+    pub triggered_by: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SemanticGateSource {
+    pub provider: String,
+    pub status: SemanticGateSourceStatus,
+    pub reason: String,
+    pub graph_store_path: String,
+    pub graph_fragments_path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticGateSourceStatus {
+    Unavailable,
+    ProviderPending,
+}
+
+impl SemanticGateSourceStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::ProviderPending => "provider_pending",
+        }
+    }
+}
+
 /// Operator guidance derived from `broker status` facts. This is
 /// deliberately local and deterministic: no model-generated prose, no
 /// hidden lookups, and no state mutation.
@@ -724,6 +772,69 @@ impl Broker {
             .into_iter()
             .map(|s| (s.gate.name.clone(), s.triggered_by))
             .collect())
+    }
+
+    /// Advisory semantic gate-selection surface. The returned semantic
+    /// suggestions are not used by [`Self::run_gates`], submit, or CI.
+    pub fn semantic_gate_advice(
+        &mut self,
+        session_id: i64,
+    ) -> Result<SemanticGateAdvice, BrokerOpError> {
+        let (_, gates, changed) = self.gate_inputs(session_id)?;
+        let path_selected_gates = crate::gates::select_gates(&gates, &changed)
+            .into_iter()
+            .map(|selection| {
+                let triggered_by = selection.triggered_by;
+                let reason = if triggered_by.is_some() {
+                    "path trigger"
+                } else {
+                    "always runs"
+                };
+                SemanticGateSelection {
+                    gate: selection.gate.name.clone(),
+                    triggered_by,
+                    reason: reason.into(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let graph_store = self.main_root.join(".aethyme/graph_store.redb");
+        let semantic = if graph_store.exists() {
+            SemanticGateSource {
+                provider: "caller_edges".into(),
+                status: SemanticGateSourceStatus::ProviderPending,
+                reason: "graph store is present, but broker semantic gate selection is not wired to caller edges yet".into(),
+                graph_store_path: ".aethyme/graph_store.redb".into(),
+                graph_fragments_path: ".aethyme/graph/".into(),
+            }
+        } else {
+            SemanticGateSource {
+                provider: "caller_edges".into(),
+                status: SemanticGateSourceStatus::Unavailable,
+                reason: "no .aethyme/graph_store.redb found; path-triggered gates remain the only enforced selection".into(),
+                graph_store_path: ".aethyme/graph_store.redb".into(),
+                graph_fragments_path: ".aethyme/graph/".into(),
+            }
+        };
+
+        let next_action = if path_selected_gates.is_empty() {
+            "No path-triggered gates are selected; semantic suggestions are advisory and currently do not add enforced gates.".into()
+        } else {
+            format!(
+                "Run `aethyme broker gates run --session {session_id}` to execute the enforced path-triggered gates; treat semantic suggestions as hints only."
+            )
+        };
+
+        Ok(SemanticGateAdvice {
+            session_id,
+            mode: "advisory".into(),
+            enforced: false,
+            changed_files: changed,
+            path_selected_gates,
+            semantic_suggested_gates: Vec::new(),
+            semantic,
+            next_action,
+        })
     }
 
     /// Run the affected gates for a session's worktree: cheap-first,
