@@ -12,13 +12,13 @@
 
 use std::path::Path;
 
-use crate::graph::usage_boundary::analyze_usage_boundary_scope_first_redb;
+use crate::graph::usage_boundary::analyze_usage_boundary_scope_first_redb_with_request;
 use crate::model::analysis::{AnswerStatus, DeadCodeCandidate};
 use crate::store::redb::graph_store::GraphStore;
 
 use super::{
-    bucket_confidence, AnswerItem, Confidence, ConfidenceSummary, Evidence, ExploreError,
-    ExploreRequest, ExploreResponse, TrustPolicy,
+    AnswerItem, Confidence, ConfidenceSummary, Evidence, ExploreError, ExploreRequest,
+    ExploreResponse, TrustPolicy, bucket_confidence,
 };
 
 /// Parameters for `usage_boundary_query` intent.
@@ -96,12 +96,13 @@ pub fn explore_usage_boundary(
         .map_err(|error| ExploreError::EngineAnalyzer(format!("resolve repo: {error}")))?;
     let store = GraphStore::open_read_only(&canonical_repo)
         .map_err(|error| ExploreError::EngineAnalyzer(error.to_string()))?;
-    let answer = analyze_usage_boundary_scope_first_redb(
+    let answer = analyze_usage_boundary_scope_first_redb_with_request(
         &canonical_repo,
         &store,
         &params.scope,
         &params.search_roots,
         params.include_methods,
+        Some(request),
         Some(params.budget_ms),
         params.max_evidence_per_symbol,
     )

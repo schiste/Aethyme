@@ -248,6 +248,28 @@ pub fn analyze_usage_boundary_scope_first_redb(
     budget_ms: Option<u64>,
     max_evidence_per_symbol: usize,
 ) -> Result<DeadCodeAnswer, String> {
+    analyze_usage_boundary_scope_first_redb_with_request(
+        repo,
+        store,
+        scope,
+        searched_roots,
+        include_methods,
+        None,
+        budget_ms,
+        max_evidence_per_symbol,
+    )
+}
+
+pub fn analyze_usage_boundary_scope_first_redb_with_request(
+    repo: &Path,
+    store: &ReadOnlyGraphStore,
+    scope: &str,
+    searched_roots: &[String],
+    include_methods: bool,
+    request: Option<&str>,
+    budget_ms: Option<u64>,
+    max_evidence_per_symbol: usize,
+) -> Result<DeadCodeAnswer, String> {
     let canonical_repo = repo
         .canonicalize()
         .map_err(|error| format!("failed to resolve repo path {}: {error}", repo.display()))?;
@@ -275,6 +297,7 @@ pub fn analyze_usage_boundary_scope_first_redb(
         &scope,
         &roots,
         include_methods,
+        request,
         &budget,
         &mut degraded_reasons,
     )?;
@@ -464,6 +487,7 @@ fn collect_redb_usage_seed_plan(
     scope: &str,
     roots: &[String],
     include_methods: bool,
+    request: Option<&str>,
     budget: &ScanBudget,
     degraded_reasons: &mut Vec<String>,
 ) -> Result<UsageBoundarySeedPlan, String> {
@@ -531,13 +555,7 @@ fn collect_redb_usage_seed_plan(
             class_kind,
         });
     }
-    symbols.sort_by(|left, right| {
-        left.fact
-            .defined_in
-            .cmp(&right.fact.defined_in)
-            .then_with(|| left.fact.line.cmp(&right.fact.line))
-            .then_with(|| left.fact.name.cmp(&right.fact.name))
-    });
+    sort_usage_boundary_symbols(&mut symbols, request);
 
     collect_adjacency_candidate_paths(
         store,
@@ -575,11 +593,18 @@ fn collect_redb_usage_seed_plan(
         }
     }
 
+    let mut internal_source_files = relative_paths_to_full(repo, internal_source_files);
+    let mut external_source_files = relative_paths_to_full(repo, external_source_files);
+    let mut docs_config_files = relative_paths_to_full(repo, docs_config_files);
+    rank_usage_boundary_scan_files(repo, &mut internal_source_files, request);
+    rank_usage_boundary_scan_files(repo, &mut external_source_files, request);
+    rank_usage_boundary_scan_files(repo, &mut docs_config_files, request);
+
     Ok(UsageBoundarySeedPlan {
         symbols,
-        internal_source_files: relative_paths_to_full(repo, internal_source_files),
-        external_source_files: relative_paths_to_full(repo, external_source_files),
-        docs_config_files: relative_paths_to_full(repo, docs_config_files),
+        internal_source_files,
+        external_source_files,
+        docs_config_files,
         stats,
     })
 }
@@ -846,6 +871,204 @@ fn path_is_under_roots(path: &str, roots: &[String]) -> bool {
 
 fn relative_paths_to_full(repo: &Path, paths: BTreeSet<String>) -> Vec<PathBuf> {
     paths.into_iter().map(|path| repo.join(path)).collect()
+}
+
+fn sort_usage_boundary_symbols(symbols: &mut [ScopedSymbol], request: Option<&str>) {
+    symbols.sort_by(|left, right| {
+        let left_score = usage_boundary_auth_seed_score(
+            left.fact.defined_in.as_str(),
+            Some(left.fact.name.as_str()),
+            request,
+        );
+        let right_score = usage_boundary_auth_seed_score(
+            right.fact.defined_in.as_str(),
+            Some(right.fact.name.as_str()),
+            request,
+        );
+        right_score
+            .cmp(&left_score)
+            .then_with(|| left.fact.defined_in.cmp(&right.fact.defined_in))
+            .then_with(|| left.fact.line.cmp(&right.fact.line))
+            .then_with(|| left.fact.name.cmp(&right.fact.name))
+    });
+}
+
+fn rank_usage_boundary_scan_files(repo: &Path, files: &mut [PathBuf], request: Option<&str>) {
+    files.sort_by(|left, right| {
+        let left_relative = relative_path(repo, left);
+        let right_relative = relative_path(repo, right);
+        let left_score = usage_boundary_auth_seed_score(&left_relative, None, request);
+        let right_score = usage_boundary_auth_seed_score(&right_relative, None, request);
+        right_score
+            .cmp(&left_score)
+            .then_with(|| left_relative.cmp(&right_relative))
+            .then_with(|| left.cmp(right))
+    });
+}
+
+fn usage_boundary_auth_seed_score(
+    relative_path: &str,
+    symbol_name: Option<&str>,
+    request: Option<&str>,
+) -> i32 {
+    if !usage_boundary_auth_focus(request) {
+        return 0;
+    }
+
+    let lower_path = relative_path.to_ascii_lowercase();
+    let basename = lower_path.rsplit('/').next().unwrap_or(&lower_path);
+    let lower_symbol = symbol_name.unwrap_or("").to_ascii_lowercase();
+    let combined = format!("{lower_path} {lower_symbol}");
+    let mut score = 0;
+
+    if contains_any_usage_boundary(
+        &combined,
+        &["api_keys", "api-key", "api_key", "apikey", "api key"],
+    ) {
+        score += 110;
+    }
+    if contains_any_usage_boundary(
+        &combined,
+        &[
+            "/auth",
+            "/accounts/",
+            "authentication",
+            "authenticate",
+            "authorization",
+            "bearer",
+            "credential",
+            "jwt",
+            "oauth",
+            "oidc",
+            "session",
+            "token",
+        ],
+    ) {
+        score += 35;
+    }
+    if contains_any_usage_boundary(
+        &combined,
+        &[
+            "middleware",
+            "request_auth",
+            "request_authentication",
+            "authenticate_request",
+            "verify_request",
+        ],
+    ) {
+        score += 90;
+    }
+    if basename == "urls.py"
+        || basename.contains("routes")
+        || basename.contains("router")
+        || basename.contains("controller")
+        || basename.contains("views")
+        || lower_path.contains("/api/")
+    {
+        score += 55;
+    }
+    if contains_any_usage_boundary(
+        &combined,
+        &[
+            "create_key",
+            "generate_api_key",
+            "issue",
+            "create_token",
+            "generate_token",
+            "mint",
+            "validate",
+            "verify",
+            "check_token",
+            "verify_id_token",
+        ],
+    ) {
+        score += 45;
+    }
+
+    if usage_boundary_is_outbound_provider_helper(&combined) {
+        if usage_boundary_request_targets_outbound_provider_helper(request, &combined) {
+            score += 280;
+        } else {
+            score -= 90;
+        }
+    }
+
+    score
+}
+
+fn usage_boundary_auth_focus(request: Option<&str>) -> bool {
+    let Some(request) = request else {
+        return false;
+    };
+    let lower = request.to_ascii_lowercase();
+    contains_any_usage_boundary(
+        &lower,
+        &[
+            "api key",
+            "api-key",
+            "api_key",
+            "apikey",
+            "authentication",
+            "authorization",
+            "bearer",
+            "credential",
+            "jwt",
+            "oauth",
+            "oidc",
+            "session",
+            "token",
+        ],
+    ) || lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| token == "auth")
+}
+
+fn usage_boundary_is_outbound_provider_helper(lower: &str) -> bool {
+    contains_any_usage_boundary(
+        lower,
+        &[
+            "/adapters/",
+            "/integrations/",
+            "/sdk",
+            "auth0_management",
+            "client.",
+            "management",
+            "provider",
+        ],
+    ) && !contains_any_usage_boundary(lower, &["middleware", "urls.py", "api_keys"])
+}
+
+fn usage_boundary_request_targets_outbound_provider_helper(
+    request: Option<&str>,
+    candidate_lower: &str,
+) -> bool {
+    let Some(request) = request else {
+        return false;
+    };
+    let lower = request.to_ascii_lowercase();
+    if lower.contains("auth0") {
+        return candidate_lower.contains("auth0");
+    }
+    if lower.contains("provider management")
+        || lower.contains("provider-management")
+        || lower.contains("external provider")
+    {
+        return contains_any_usage_boundary(
+            candidate_lower,
+            &["provider", "management", "/integrations/", "/adapters/"],
+        );
+    }
+    if lower.contains("management token")
+        || lower.contains("management api")
+        || lower.contains("oauth management")
+    {
+        return contains_any_usage_boundary(candidate_lower, &["management", "provider", "oauth"]);
+    }
+    false
+}
+
+fn contains_any_usage_boundary(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn qualified_name_for_usage_boundary(
@@ -1538,8 +1761,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::graph::usage_boundary::analyze_usage_boundary_scope_first;
     use crate::model::analysis::AnswerStatus;
+
+    use super::{analyze_usage_boundary_scope_first, usage_boundary_auth_seed_score};
 
     fn temp_repo(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -1547,6 +1771,73 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("aethyme_engine_{name}_{nonce}"))
+    }
+
+    #[test]
+    fn auth_usage_boundary_seed_score_prefers_inbound_request_surfaces() {
+        let request = Some("trace token issuing and validation behavior");
+        let inbound = usage_boundary_auth_seed_score(
+            "backend/api_keys/middleware.py",
+            Some("authenticate_api_key"),
+            request,
+        );
+        let outbound = usage_boundary_auth_seed_score(
+            "backend/accounts/auth0_management.py",
+            Some("get_management_token"),
+            request,
+        );
+
+        assert!(
+            inbound > outbound,
+            "broad token tasks should scan inbound request auth before provider helpers"
+        );
+    }
+
+    #[test]
+    fn auth_usage_boundary_seed_score_keeps_named_provider_helpers() {
+        let broad = usage_boundary_auth_seed_score(
+            "backend/accounts/auth0_management.py",
+            Some("get_management_token"),
+            Some("trace token issuing and validation behavior"),
+        );
+        let named = usage_boundary_auth_seed_score(
+            "backend/accounts/auth0_management.py",
+            Some("get_management_token"),
+            Some("trace Auth0 management token behavior"),
+        );
+        let inbound = usage_boundary_auth_seed_score(
+            "backend/api_keys/middleware.py",
+            Some("authenticate_api_key"),
+            Some("trace Auth0 management token behavior"),
+        );
+
+        assert!(
+            named > broad,
+            "explicit provider-management tasks should not suppress the named helper"
+        );
+        assert!(
+            named > inbound,
+            "the named provider-management helper should outrank generic inbound auth for that task"
+        );
+    }
+
+    #[test]
+    fn auth_usage_boundary_seed_score_does_not_promote_unmatched_integrations() {
+        let auth0 = usage_boundary_auth_seed_score(
+            "backend/accounts/auth0_management.py",
+            Some("get_management_token"),
+            Some("trace Auth0 management token behavior"),
+        );
+        let integration = usage_boundary_auth_seed_score(
+            "backend/integrations/api_views.py",
+            Some("decrypt_token"),
+            Some("trace Auth0 management token behavior"),
+        );
+
+        assert!(
+            auth0 > integration,
+            "Auth0-specific tasks should not boost unrelated integration token helpers"
+        );
     }
 
     #[test]
