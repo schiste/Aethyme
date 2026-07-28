@@ -2,6 +2,7 @@
 members = [
     "crates/aethyme-broker",
     "crates/aethyme-engine",
+    "crates/aethyme-enhance",
     "crates/aethyme-graph-indexer",
     "crates/aethyme-graph-schema",
     "crates/aethyme-graph-storage",
