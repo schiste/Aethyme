@@ -41,8 +41,14 @@ Usage:
       --replace-stale closes it (state only) and registers fresh;
       neither flag = error listing your options.
   aethyme broker close --session <id> [--json]
-      Mark a session finished. State only — never touches the worktree
-      (use cleanup to also remove a spawned session's worktree).
+      Low-level state-only close. Never touches the worktree and does
+      not check whether commits were submitted. Prefer finish for normal
+      lifecycle use.
+  aethyme broker finish --session <id> [--json]
+      Higher-level lifecycle close: closes only when the session has no
+      dirty WIP and no committed work waiting for submit/promotion. If it
+      is not safe, prints the next command; suggests cleanup only when
+      cleanup would pass without --force.
   aethyme broker start-agent --task <text> --cmd <command> [--json]
       Create a worktree + branch and spawn <command> in it (sh -c),
       logging to .aethyme/logs/.
@@ -139,7 +145,8 @@ Usage:
       that this test is designed to run in Chau7 and skips the smoke.
   aethyme broker cleanup <session-id> [--force] [--json]
       Remove a session's worktree. Refuses on uncommitted changes or
-      unmerged commits unless --force.
+      unmerged commits unless --force. Usually run only after finish says
+      cleanup is safe.
 
 Overlaps warn — they never block (v0 policy).
 ";
@@ -203,6 +210,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "metrics",
         "doctor",
         "quick-test",
+        "finish",
         "cleanup",
         "certify",
         "scaffold",
@@ -553,6 +561,44 @@ fn render_repair_report(report: &crate::RepairReport) {
         }
     }
     println!("  next: {}", report.next_command);
+}
+
+fn render_finish_report(report: &crate::FinishReport) {
+    println!(
+        "Finish session {}: {}",
+        report.session_id,
+        report.status.as_str()
+    );
+    println!("  {}", report.summary);
+    println!("  worktree: {}", report.worktree_path);
+    if let Some(entry_id) = report.latest_queue_entry_id {
+        let status = report
+            .latest_queue_status
+            .map(|status| status.as_str())
+            .unwrap_or("unknown");
+        println!("  latest queue: qid {entry_id} ({status})");
+    }
+    if !report.dirty_paths.is_empty() {
+        println!("  dirty paths: {}", capped_join(&report.dirty_paths, 8));
+    }
+    if report.unsubmitted_commits > 0 {
+        println!("  unsubmitted commits: {}", report.unsubmitted_commits);
+    }
+    println!(
+        "  cleanup safe: {}",
+        if report.cleanup_safe { "yes" } else { "no" }
+    );
+    for warning in &report.warnings {
+        println!("  warning: {warning}");
+    }
+    if report.next_commands.is_empty() {
+        println!("  next: none");
+    } else {
+        println!("  next:");
+        for command in &report.next_commands {
+            println!("    run: {command}");
+        }
+    }
 }
 
 fn render_semantic_gate_advice(report: &crate::SemanticGateAdvice) {
@@ -1241,7 +1287,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         "What now: aethyme/integration is at {integration} and contains this work. \
                          Your checkout and branches are untouched — keep working, or start \
                          a follow-up with `aethyme broker adopt --reuse --task \"...\"`, or \
-                         finish with `aethyme broker close --session {}`.",
+                         finish safely with `aethyme broker finish --session {}`.",
                         outcome.entry.session_id,
                     );
                 } else {
@@ -1666,6 +1712,21 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 return Err(UsageError::Message("certification failed".into()));
             }
         }
+        "finish" => {
+            let session = parsed
+                .session
+                .ok_or(UsageError::Message("finish requires --session <id>".into()))?;
+            let mut broker = open_broker()?;
+            let report = broker.finish(session)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render_finish_report(&report);
+                if report.status == crate::FinishStatus::Blocked {
+                    return Err(UsageError::Message("session is not ready to finish".into()));
+                }
+            }
+        }
         "close" => {
             let session = parsed
                 .session
@@ -1677,7 +1738,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             } else {
                 println!(
                     "Session {session} closed (state only — worktree untouched). \
-                     Follow-up task on the same worktree: `aethyme broker adopt --reuse --task \"...\"`."
+                     Next task on the same worktree: `aethyme broker adopt --task \"...\"`."
                 );
             }
         }

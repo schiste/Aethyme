@@ -180,6 +180,49 @@ pub struct RepairReport {
     pub next_command: String,
 }
 
+/// Outcome class for `broker finish --session`: a human lifecycle helper
+/// that only mutates state when the session is safe to close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishStatus {
+    Blocked,
+    Closed,
+    AlreadyClosed,
+}
+
+impl FinishStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Closed => "closed",
+            Self::AlreadyClosed => "already_closed",
+        }
+    }
+}
+
+impl serde::Serialize for FinishStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Report from `broker finish --session`: close when safe, otherwise
+/// explain exactly what must happen first.
+#[derive(Debug, serde::Serialize)]
+pub struct FinishReport {
+    pub session_id: i64,
+    pub worktree_path: String,
+    pub status: FinishStatus,
+    pub closed: bool,
+    pub dirty_paths: Vec<String>,
+    pub unsubmitted_commits: u64,
+    pub latest_queue_entry_id: Option<i64>,
+    pub latest_queue_status: Option<MergeStatus>,
+    pub cleanup_safe: bool,
+    pub summary: String,
+    pub warnings: Vec<String>,
+    pub next_commands: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepairSource {
@@ -1186,6 +1229,209 @@ impl Broker {
         })
     }
 
+    // ── finish ────────────────────────────────────────────────────────
+
+    /// Finish a session at the operator level: close it when there is no
+    /// dirty work and no committed work waiting for submit/promotion;
+    /// otherwise return actionable guidance without mutating state.
+    pub fn finish(&mut self, session_id: i64) -> Result<FinishReport, BrokerOpError> {
+        let session = self.store.session(session_id)?;
+        let worktree_path = PathBuf::from(&session.worktree_path);
+        let mut report = FinishReport {
+            session_id,
+            worktree_path: session.worktree_path.clone(),
+            status: FinishStatus::Blocked,
+            closed: false,
+            dirty_paths: Vec::new(),
+            unsubmitted_commits: 0,
+            latest_queue_entry_id: None,
+            latest_queue_status: None,
+            cleanup_safe: false,
+            summary: format!("session {session_id} is not finished yet"),
+            warnings: Vec::new(),
+            next_commands: Vec::new(),
+        };
+
+        if !worktree_path.exists() {
+            if session.status == SessionStatus::Cleaned {
+                report.status = FinishStatus::AlreadyClosed;
+                report.summary = format!("session {session_id} is already closed");
+            } else {
+                self.close(session_id)?;
+                report.status = FinishStatus::Closed;
+                report.closed = true;
+                report.summary =
+                    format!("session {session_id} closed in broker state; worktree is missing");
+            }
+            report
+                .warnings
+                .push("worktree path does not exist; cleanup is not applicable".into());
+            return Ok(report);
+        }
+
+        let checkout = GitRepo::discover(&worktree_path)?;
+        let head = checkout.head_commit()?;
+        report.dirty_paths = checkout.dirty_paths()?;
+
+        let queue = self.store.merge_queue()?;
+        let latest_for_head = queue
+            .iter()
+            .rev()
+            .find(|entry| entry.session_id == session_id && entry.head_commit == head);
+        let latest_for_session = queue
+            .iter()
+            .rev()
+            .find(|entry| entry.session_id == session_id);
+        let visible_entry = latest_for_head.or(latest_for_session);
+        if let Some(entry) = visible_entry {
+            report.latest_queue_entry_id = Some(entry.id);
+            report.latest_queue_status = Some(entry.status);
+        }
+
+        let base = self
+            .session_change_base(&checkout)
+            .or_else(|| session.diff_base.clone())
+            .unwrap_or_else(|| "HEAD".to_string());
+        report.unsubmitted_commits = checkout.commit_count_between(&base, "HEAD")?;
+
+        if session.status == SessionStatus::Cleaned {
+            report.status = FinishStatus::AlreadyClosed;
+            report.summary = format!("session {session_id} is already closed");
+            report.cleanup_safe = self.finish_cleanup_safe(&worktree_path, &report.dirty_paths)?;
+            if report.cleanup_safe {
+                report
+                    .next_commands
+                    .push(format!("aethyme broker cleanup {session_id}"));
+            } else if !report.dirty_paths.is_empty() {
+                report.warnings.push(format!(
+                    "worktree still has {} uncommitted or untracked {}; cleanup is not safe",
+                    report.dirty_paths.len(),
+                    plural_word(report.dirty_paths.len(), "path", "paths")
+                ));
+            }
+            return Ok(report);
+        }
+
+        if !report.dirty_paths.is_empty() {
+            report.warnings.push(format!(
+                "worktree has {} uncommitted or untracked {}; commit or stash before finish",
+                report.dirty_paths.len(),
+                plural_word(report.dirty_paths.len(), "path", "paths")
+            ));
+            report
+                .next_commands
+                .push(format!("git -C {} status --short", session.worktree_path));
+            report
+                .next_commands
+                .push(format!("git -C {} add ...", session.worktree_path));
+            report
+                .next_commands
+                .push(format!("git -C {} commit", session.worktree_path));
+            report
+                .next_commands
+                .push(format!("git -C {} stash push", session.worktree_path));
+            return Ok(report);
+        }
+
+        if let Some(entry) = latest_for_head {
+            match entry.status {
+                MergeStatus::Promoted => {}
+                MergeStatus::Verified => {
+                    report.warnings.push(format!(
+                        "queue entry {} is verified but not promoted; promote it before finish",
+                        entry.id
+                    ));
+                    report
+                        .next_commands
+                        .push(format!("aethyme broker promote --entry {}", entry.id));
+                    report
+                        .next_commands
+                        .push(format!("aethyme broker finish --session {session_id}"));
+                    return Ok(report);
+                }
+                MergeStatus::Conflict => {
+                    report.warnings.push(format!(
+                        "latest submit qid {} conflicted; repair and resubmit before finish",
+                        entry.id
+                    ));
+                    report
+                        .next_commands
+                        .push(format!("aethyme broker repair --session {session_id}"));
+                    report
+                        .next_commands
+                        .push(format!("aethyme broker submit --session {session_id}"));
+                    return Ok(report);
+                }
+                MergeStatus::Rejected => {
+                    report.warnings.push(format!(
+                        "latest submit qid {} was rejected; commit a fix and resubmit before finish",
+                        entry.id
+                    ));
+                    report
+                        .next_commands
+                        .push(format!("aethyme broker submit --session {session_id}"));
+                    return Ok(report);
+                }
+                MergeStatus::Submitted | MergeStatus::Simulating => {
+                    report.warnings.push(format!(
+                        "queue entry {} is still {}; wait for it before finish",
+                        entry.id,
+                        entry.status.as_str()
+                    ));
+                    report.next_commands.push("aethyme broker queue".into());
+                    return Ok(report);
+                }
+                MergeStatus::Superseded => {}
+            }
+        }
+
+        if report.unsubmitted_commits > 0 {
+            report.warnings.push(format!(
+                "HEAD has {} committed {} not yet represented in promoted integration; submit before finish",
+                report.unsubmitted_commits,
+                plural_word(report.unsubmitted_commits as usize, "change", "changes")
+            ));
+            report
+                .next_commands
+                .push(format!("aethyme broker submit --session {session_id}"));
+            return Ok(report);
+        }
+
+        self.close(session_id)?;
+        report.status = FinishStatus::Closed;
+        report.closed = true;
+        report.summary = format!("session {session_id} closed; worktree untouched");
+        report.cleanup_safe = self.finish_cleanup_safe(&worktree_path, &report.dirty_paths)?;
+        if report.cleanup_safe {
+            report
+                .next_commands
+                .push(format!("aethyme broker cleanup {session_id}"));
+        } else if worktree_path.as_path() != self.main_root.as_path() {
+            report.warnings.push(
+                "cleanup not suggested yet; cleanup only removes worktrees with no dirty paths \
+                 and no commits beyond main"
+                    .into(),
+            );
+        }
+        Ok(report)
+    }
+
+    fn finish_cleanup_safe(
+        &self,
+        worktree_path: &Path,
+        dirty_paths: &[String],
+    ) -> Result<bool, BrokerOpError> {
+        if worktree_path == self.main_root.as_path()
+            || !worktree_path.exists()
+            || !dirty_paths.is_empty()
+        {
+            return Ok(false);
+        }
+        let checkout = GitRepo::discover(worktree_path)?;
+        let main_head = self.repo.head_commit()?;
+        Ok(checkout.unmerged_commit_count(&main_head)? == 0)
+    }
+
     // ── cleanup ───────────────────────────────────────────────────────
 
     /// Remove a session's worktree and mark it cleaned. Refuses when the
@@ -1222,6 +1468,10 @@ impl Broker {
             .set_session_status(session_id, SessionStatus::Cleaned, None)?;
         Ok(())
     }
+}
+
+fn plural_word(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 { singular } else { plural }
 }
 
 fn rejected_submit_advice(agent: &AgentView, entry: &MergeQueueEntry) -> StatusAdvice {

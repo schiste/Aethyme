@@ -157,7 +157,7 @@ Submitting session 1 — HEAD 6613f5ccb1a0
   6613f5c feat: add farewell function
 gate wall time: 0ms
 entry 1 → promoted (auto-promoted)
-What now: aethyme/integration is at 69d395da1c7c and contains this work. Your checkout and branches are untouched — keep working, or start a follow-up with `aethyme broker adopt --reuse --task "..."`, or finish with `aethyme broker close --session 1`.
+What now: aethyme/integration is at 69d395da1c7c and contains this work. Your checkout and branches are untouched — keep working, or start a follow-up with `aethyme broker adopt --reuse --task "..."`, or finish safely with `aethyme broker finish --session 1`.
 ```
 
 **7. What now?** Your promoted work is on the local `aethyme/integration`
