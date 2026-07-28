@@ -37,6 +37,10 @@ The remaining live eval surface is the playground A/B runner under
 - `.aethyme` path leakage in selected files, snippets, command output, or the
   final answer is a hard regression. The bundled runner writes `leakage.json`
   and exits non-zero when the leak gate trips.
+- The regression gate compares stable budget and hygiene metrics, not selected
+  file identity: token estimate delta, selected file count delta, snippet count
+  delta, command-output char delta, `.aethyme` leakage, Aethyme invocation, and
+  reviewer-rubric final answer quality.
 
 Set `AETHYME_EVAL_ARM=control` or `AETHYME_EVAL_ARM=aethyme` explicitly when
 using `scripts/eval/run_codex_eval.py`. For reproducible archives, set

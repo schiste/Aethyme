@@ -217,6 +217,26 @@ to Codex. The Aethyme arm adds only `AETHYME_EVAL_TOOL_REPO` as the tool
 surface. Any `.aethyme` path in selected files, snippets, command output, or
 the final answer fails the run before the result can be interpreted.
 
+The runner result JSON is written to stdout and now includes a normalized
+`regression_metrics` block. Redirect each arm's stdout to a result file when
+preparing an A/B pair for the metric gate.
+
+Compare a completed pair with the metric gate:
+
+```bash
+"$AETHYME_ROOT/.venv/bin/python" "$AETHYME_ROOT/scripts/eval/check_regression_gate.py" \
+  --control /tmp/aethyme-ab/control/result.json \
+  --aethyme /tmp/aethyme-ab/aethyme/result.json \
+  --control-quality 4 \
+  --aethyme-quality 4
+```
+
+The gate checks token estimate delta, selected file count delta, snippet count
+delta, command-output char delta, `.aethyme` leakage, Aethyme invocation, and
+reviewer-rubric quality. It intentionally does not require selected-file
+identity equality. Missing reviewer scores fail the gate unless
+`--allow-missing-quality` is passed for an exploratory dry run.
+
 ## Adding a New Eval Target
 
 The `src/eval/targets.py` registry and orchestrator files were removed
