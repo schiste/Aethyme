@@ -357,7 +357,7 @@ Current behavior:
 - with `--control-cmd`, `--explore-cmd`, and `--leverage-cmd`, it executes real runs through the evaluation runner contract
 - `--baseline-cmd` and `--aethyme-cmd` remain accepted as legacy aliases for compatibility
 - external runners receive the prompt, navigation context, output schema, and Aethyme tool paths through `AETHYME_EVAL_*` env vars
-- the bundled Codex wrapper requires `AETHYME_EVAL_ARM=control|aethyme`, runs `codex exec --ignore-user-config --json`, preserves `events.jsonl` / `stderr.log` / `last-message.json`, and reports wall time, token usage, command-output chars, event-log chars, and stderr chars
+- the bundled Codex wrapper requires `AETHYME_EVAL_ARM=control|aethyme`, runs `codex exec --ignore-user-config --json`, preserves `events.jsonl` / `stderr.log` / `last-message.json` / `leakage.json`, reports wall time, token usage, command-output chars, event-log chars, and stderr chars, and fails the run if `.aethyme` paths leak into selected files, snippets, command output, or the final answer
 - every run writes a local markdown report under `packages/aethyme/docs/reports/evals/`
 - the repository tracks only a curated subset of eval reports there; the rest are generated local artifacts
 - JSON output includes the generated `report_path`

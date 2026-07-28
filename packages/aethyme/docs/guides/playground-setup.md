@@ -210,11 +210,12 @@ env "${COMMON_ENV[@]}" \
 
 The wrapper runs both arms with `codex exec --ignore-user-config --json`,
 preserves `events.jsonl`, `stderr.log`, `last-message.json`, `command.json`,
-and `contract.json`, and emits wall time, input/output tokens,
+`contract.json`, and `leakage.json`, and emits wall time, input/output tokens,
 command-output chars, event-log chars, and stderr chars. The Control arm strips
 `AETHYME*`/`AETHYMEBENCH*` environment variables and does not add the tool repo
 to Codex. The Aethyme arm adds only `AETHYME_EVAL_TOOL_REPO` as the tool
-surface.
+surface. Any `.aethyme` path in selected files, snippets, command output, or
+the final answer fails the run before the result can be interpreted.
 
 ## Adding a New Eval Target
 
