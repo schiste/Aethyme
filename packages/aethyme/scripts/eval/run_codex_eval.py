@@ -22,6 +22,8 @@ GENERATED_ARTIFACTS = (
     "CLAUDE.md",
 )
 COMMAND_OUTPUT_KEYS = {"output", "stdout", "stderr"}
+PATH_LEAK_MARKERS = (".aethyme",)
+MAX_REPORTED_LEAKS = 20
 
 
 def main() -> int:
@@ -72,12 +74,22 @@ def main() -> int:
         structured_output, final_output_message = _read_last_message(last_message_file)
         usage = _parse_usage(events_file)
         error_message = _last_error(events_file)
+        artifact_leakage = _detect_artifact_leakage(
+            structured_output=structured_output,
+            final_output_message=final_output_message or error_message,
+            events_file=events_file,
+        )
+        (temp_root / "leakage.json").write_text(
+            json.dumps(artifact_leakage, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         payload = {
             "arm": arm,
             "artifact_dir": str(temp_root),
             "event_log_file": str(events_file),
             "stderr_file": str(stderr_file),
             "last_message_file": str(last_message_file),
+            "leakage_file": str(temp_root / "leakage.json"),
             "wall_time_seconds": round(wall_time_seconds, 3),
             "command_output_chars": _command_output_chars(events_file),
             "event_log_chars": len(result.stdout),
@@ -97,12 +109,19 @@ def main() -> int:
                 "tool_repo": str(tool_repo) if arm == "aethyme" else None,
             },
             "contract": contract,
+            "artifact_leakage": artifact_leakage,
         }
         print(json.dumps(payload))
         if result.stderr:
             sys.stderr.write(result.stderr)
         if result.returncode != 0 and error_message:
             sys.stderr.write(f"\nCodex error: {error_message}\n")
+        if artifact_leakage["aethyme_path_leaked"]:
+            sys.stderr.write(
+                "\nGenerated artifact leakage detected: .aethyme path appeared in "
+                "structured output, command output, or final answer.\n"
+            )
+            return 3
         return result.returncode
     except ContractError as exc:
         print(json.dumps({"error": str(exc), "contract_failed": True, "arm": arm}))
@@ -339,6 +358,120 @@ def _command_output_chars(events_file: Path) -> int:
             continue
         total += _sum_command_outputs(event)
     return total
+
+
+def _detect_artifact_leakage(
+    *,
+    structured_output: dict[str, Any] | None,
+    final_output_message: str | None,
+    events_file: Path,
+) -> dict[str, Any]:
+    leaks: list[dict[str, str]] = []
+    if structured_output is not None:
+        leaks.extend(_collect_path_leaks(structured_output, "structured_output"))
+    if final_output_message:
+        leaks.extend(_collect_path_leaks(final_output_message, "final_output_message"))
+    leaks.extend(_collect_command_output_path_leaks(events_file))
+
+    return {
+        "aethyme_path_leaked": bool(leaks),
+        "markers": list(PATH_LEAK_MARKERS),
+        "checked_surfaces": [
+            "structured_output",
+            "final_output_message",
+            "command_output",
+        ],
+        "leak_count": len(leaks),
+        "leaks": leaks[:MAX_REPORTED_LEAKS],
+    }
+
+
+def _collect_command_output_path_leaks(events_file: Path) -> list[dict[str, str]]:
+    leaks: list[dict[str, str]] = []
+    if not events_file.exists():
+        return leaks
+    for line_number, line in enumerate(
+        events_file.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        leaks.extend(_collect_command_output_path_leaks_from_value(event, f"event[{line_number}]"))
+    return leaks
+
+
+def _collect_command_output_path_leaks_from_value(
+    value: Any,
+    path: str,
+    *,
+    key: str | None = None,
+) -> list[dict[str, str]]:
+    if isinstance(value, str):
+        if key in COMMAND_OUTPUT_KEYS:
+            return _collect_path_leaks(value, "command_output", path=path)
+        return []
+    if isinstance(value, list):
+        leaks: list[dict[str, str]] = []
+        for index, item in enumerate(value):
+            leaks.extend(_collect_command_output_path_leaks_from_value(item, f"{path}[{index}]"))
+        return leaks
+    if isinstance(value, dict):
+        leaks: list[dict[str, str]] = []
+        for item_key, item in value.items():
+            item_key_text = str(item_key)
+            leaks.extend(
+                _collect_command_output_path_leaks_from_value(
+                    item,
+                    f"{path}.{item_key_text}",
+                    key=item_key_text,
+                )
+            )
+        return leaks
+    return []
+
+
+def _collect_path_leaks(value: Any, source: str, *, path: str = "$") -> list[dict[str, str]]:
+    if isinstance(value, str):
+        marker = _matched_path_leak_marker(value)
+        if marker is None:
+            return []
+        return [
+            {
+                "source": source,
+                "path": path,
+                "marker": marker,
+                "excerpt": _leak_excerpt(value, marker),
+            }
+        ]
+    if isinstance(value, list):
+        leaks: list[dict[str, str]] = []
+        for index, item in enumerate(value):
+            leaks.extend(_collect_path_leaks(item, source, path=f"{path}[{index}]"))
+        return leaks
+    if isinstance(value, dict):
+        leaks: list[dict[str, str]] = []
+        for item_key, item in value.items():
+            leaks.extend(_collect_path_leaks(item, source, path=f"{path}.{item_key}"))
+        return leaks
+    return []
+
+
+def _matched_path_leak_marker(value: str) -> str | None:
+    return next((marker for marker in PATH_LEAK_MARKERS if marker in value), None)
+
+
+def _leak_excerpt(value: str, marker: str) -> str:
+    index = value.find(marker)
+    if index < 0:
+        return value[:120]
+    start = max(0, index - 40)
+    end = min(len(value), index + len(marker) + 80)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(value) else ""
+    return f"{prefix}{value[start:end]}{suffix}"
 
 
 def _sum_command_outputs(value: Any, *, key: str | None = None) -> int:

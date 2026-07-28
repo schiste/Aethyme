@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 from pathlib import Path
 from types import ModuleType
 
@@ -143,3 +144,107 @@ def test_command_output_metric_reads_event_output_fields(tmp_path: Path) -> None
     )
 
     assert runner._command_output_chars(events_file) == 6
+
+
+def test_leakage_gate_checks_selected_files_snippets_command_output_and_final_answer(
+    tmp_path: Path,
+) -> None:
+    runner = _load_runner()
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "stdout": "read .aethyme/graph_store.redb",
+                    "message": ".aethyme here is not command output",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    leakage = runner._detect_artifact_leakage(
+        structured_output={
+            "selected_files": ["src/auth/token.py", ".aethyme/graph/auth.bin"],
+            "snippets": [{"path": "src/web.py"}, {"path": ".aethyme/generated/context.json"}],
+        },
+        final_output_message="The answer mentions .aethyme/graph.",
+        events_file=events_file,
+    )
+
+    assert leakage["aethyme_path_leaked"] is True
+    sources = {leak["source"] for leak in leakage["leaks"]}
+    assert sources == {"structured_output", "final_output_message", "command_output"}
+    paths = {leak["path"] for leak in leakage["leaks"]}
+    assert "$.selected_files[1]" in paths
+    assert "$.snippets[1].path" in paths
+    assert "event[1].item.stdout" in paths
+    assert all(".aethyme" in leak["excerpt"] for leak in leakage["leaks"])
+
+
+def test_leakage_gate_ignores_non_output_event_metadata(tmp_path: Path) -> None:
+    runner = _load_runner()
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "message": "internal metadata mentions .aethyme but was not stdout",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    leakage = runner._detect_artifact_leakage(
+        structured_output={"selected_files": ["src/auth/token.py"], "snippets": []},
+        final_output_message="No generated path leaked.",
+        events_file=events_file,
+    )
+
+    assert leakage["aethyme_path_leaked"] is False
+    assert leakage["leaks"] == []
+
+
+def test_main_fails_when_command_output_leaks_aethyme_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner = _load_runner()
+    playground_root = tmp_path / "Playground"
+    repo_path = playground_root / "Demo" / "Demo - Control"
+    repo_path.mkdir(parents=True)
+    artifact_dir = tmp_path / "artifacts"
+
+    monkeypatch.setenv("AETHYME_PLAYGROUND_ROOTS", str(playground_root))
+    monkeypatch.setenv("AETHYME_EVAL_ARM", "control")
+    monkeypatch.setenv("AETHYME_EVAL_REPO", str(repo_path))
+    monkeypatch.setenv("AETHYME_EVAL_ARTIFACT_DIR", str(artifact_dir))
+    monkeypatch.setenv("AETHYME_EVAL_OUTPUT_SCHEMA", '{"type":"object"}')
+    monkeypatch.setenv("AETHYME_EVAL_PROMPT", "inspect auth flow")
+
+    def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        last_message_path = Path(command[command.index("--output-last-message") + 1])
+        last_message_path.write_text(json.dumps({"answer": "clean final answer"}), encoding="utf-8")
+        stdout = (
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"stdout": "read .aethyme/graph_store.redb"},
+                }
+            )
+            + "\n"
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+
+    assert runner.main() == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["artifact_leakage"]["aethyme_path_leaked"] is True
+    assert Path(payload["leakage_file"]).is_file()

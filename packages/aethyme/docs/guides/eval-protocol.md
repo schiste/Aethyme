@@ -34,6 +34,9 @@ The remaining live eval surface is the playground A/B runner under
 - Runs preserve `events.jsonl`, `stderr.log`, `last-message.json`,
   `command.json`, and `contract.json`, and emit wall time, token usage,
   command-output chars, event-log chars, and stderr chars in the runner JSON.
+- `.aethyme` path leakage in selected files, snippets, command output, or the
+  final answer is a hard regression. The bundled runner writes `leakage.json`
+  and exits non-zero when the leak gate trips.
 
 Set `AETHYME_EVAL_ARM=control` or `AETHYME_EVAL_ARM=aethyme` explicitly when
 using `scripts/eval/run_codex_eval.py`. For reproducible archives, set
