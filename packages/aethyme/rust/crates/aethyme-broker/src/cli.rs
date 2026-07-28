@@ -117,6 +117,11 @@ Usage:
   aethyme broker doctor [--json]
       Health checks: database integrity, sessions whose worktree is
       gone, and orphaned gate pidfiles.
+  aethyme broker quick-test [--chau7] [--json]
+      Disposable first-run smoke: creates a temporary git repo, runs init,
+      adopt, commit, submit, verifies promotion, and removes the repo.
+      --chau7 requires a Chau7 runtime marker; outside Chau7 it reports
+      that this test is designed to run in Chau7 and skips the smoke.
   aethyme broker cleanup <session-id> [--force] [--json]
       Remove a session's worktree. Refuses on uncommitted changes or
       unmerged commits unless --force.
@@ -179,6 +184,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "prune",
         "metrics",
         "doctor",
+        "quick-test",
         "cleanup",
         "certify",
         "scaffold",
@@ -250,6 +256,7 @@ struct Parsed {
     reuse: bool,
     replace_stale: bool,
     all: bool,
+    chau7: bool,
 }
 
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
@@ -270,6 +277,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         reuse: false,
         replace_stale: false,
         all: false,
+        chau7: false,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -288,6 +296,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--check" => parsed.check = true,
             "--reuse" => parsed.reuse = true,
             "--all" => parsed.all = true,
+            "--chau7" => parsed.chau7 = true,
             "--replace-stale" => parsed.replace_stale = true,
             "--kind" => {
                 parsed.kind = Some(
@@ -388,6 +397,39 @@ fn render_hook_reports(reports: &[crate::HookReport], json: bool) -> Result<(), 
                 report.path
             );
         }
+    }
+    Ok(())
+}
+
+fn render_quick_test_report(report: &crate::QuickTestReport, json: bool) -> Result<(), UsageError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    if report.skipped {
+        println!("{}", report.message);
+        return Ok(());
+    }
+    println!("{}", report.message);
+    if report.chau7.detected {
+        println!(
+            "Chau7 runtime markers detected: {}",
+            report.chau7.markers.join(", ")
+        );
+    }
+    for step in &report.steps {
+        println!("{:<8} {:<20} {}", step.status, step.name, step.detail);
+    }
+    println!(
+        "temporary repo removed: {}",
+        if report.temp_repo_removed {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    if let Some(head) = &report.integration_head {
+        println!("integration head: {}", &head[..12.min(head.len())]);
     }
     Ok(())
 }
@@ -1164,6 +1206,15 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     return Err(UsageError::Message("doctor found problems".into()));
                 }
             }
+        }
+        "quick-test" => {
+            let mode = if parsed.chau7 {
+                crate::QuickTestMode::Chau7
+            } else {
+                crate::QuickTestMode::Generic
+            };
+            let report = crate::run_broker_quick_test(mode)?;
+            render_quick_test_report(&report, parsed.json)?;
         }
         "init" => {
             let cwd = std::env::current_dir()

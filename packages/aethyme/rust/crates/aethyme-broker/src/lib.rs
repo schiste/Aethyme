@@ -30,6 +30,7 @@ pub mod hooks;
 pub mod init;
 mod leases;
 mod merge;
+mod quick_test;
 mod schema;
 mod store;
 mod types;
@@ -45,6 +46,10 @@ pub use git::{GitError, GitRepo, MergeSimulation};
 pub use hooks::{HookReport, HookState, HooksError};
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use merge::{ACTION_REQUIRED_RELPATH, PromoteConfig, SubmitOutcome};
+pub use quick_test::{
+    Chau7Probe, QuickTestError, QuickTestMode, QuickTestReport, QuickTestStep,
+    run_broker_quick_test,
+};
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use store::BrokerStore;
 pub use types::{
