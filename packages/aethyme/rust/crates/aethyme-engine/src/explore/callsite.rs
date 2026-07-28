@@ -8,7 +8,7 @@
 use crate::model::edge::EdgeKind;
 use crate::store::redb::graph_store::{NeighborDirection, ReadOnlyGraphStore};
 
-use super::{AnswerItem, ExploreError, SymbolBatchResults};
+use super::{AnswerItem, ExploreError, SymbolBatchResults, ranking};
 
 /// Pick the strongest symbol hits, look up callers via redb, and emit one
 /// `call_site_file` AnswerItem per distinct caller file.
@@ -24,6 +24,7 @@ use super::{AnswerItem, ExploreError, SymbolBatchResults};
 pub(super) fn compute_callsite_files(
     store: &ReadOnlyGraphStore,
     symbol_matches: &SymbolBatchResults,
+    request: &str,
     max_symbols: usize,
     max_results: usize,
 ) -> Result<Vec<AnswerItem>, ExploreError> {
@@ -36,11 +37,12 @@ pub(super) fn compute_callsite_files(
         return Ok(Vec::new());
     }
 
-    // file_path -> (Set<symbol_name>, hit_count, sample_callers)
+    // file_path -> (Set<symbol_name>, hit_count, production_hit_count, sample_callers)
     let mut by_file: std::collections::BTreeMap<
         String,
         (
             std::collections::BTreeSet<String>,
+            usize,
             usize,
             Vec<serde_json::Value>,
         ),
@@ -78,11 +80,14 @@ pub(super) fn compute_callsite_files(
                 }
                 let entry = by_file
                     .entry(file_path.clone())
-                    .or_insert_with(|| (std::collections::BTreeSet::new(), 0, Vec::new()));
+                    .or_insert_with(|| (std::collections::BTreeSet::new(), 0, 0, Vec::new()));
                 entry.0.insert(symbol.clone());
                 entry.1 += 1;
-                if entry.2.len() < 5 {
-                    entry.2.push(serde_json::json!({
+                if !ranking::is_test_path(&file_path) {
+                    entry.2 += 1;
+                }
+                if entry.3.len() < 5 {
+                    entry.3.push(serde_json::json!({
                         "symbol": symbol,
                         "caller_id": caller_id,
                         "display": {
@@ -101,14 +106,30 @@ pub(super) fn compute_callsite_files(
         String,
         std::collections::BTreeSet<String>,
         usize,
+        usize,
         Vec<serde_json::Value>,
     )> = by_file
         .into_iter()
-        .map(|(path, (syms, hits, samples))| (path, syms, hits, samples))
+        .map(|(path, (syms, hits, production_hits, samples))| {
+            (path, syms, hits, production_hits, samples)
+        })
         .collect();
+    let auth_focus = ranking::auth_token_focus_from_request(request);
     ranked.sort_by(|a, b| {
-        b.1.len()
-            .cmp(&a.1.len())
+        let a_symbols = a.1.iter().cloned().collect::<Vec<_>>();
+        let b_symbols = b.1.iter().cloned().collect::<Vec<_>>();
+        let a_surface = ranking::auth_token_surface_signals(&a.0, &a_symbols, request);
+        let b_surface = ranking::auth_token_surface_signals(&b.0, &b_symbols, request);
+        let auth_ordering = if auth_focus {
+            b_surface
+                .score
+                .cmp(&a_surface.score)
+                .then_with(|| b.3.cmp(&a.3))
+        } else {
+            std::cmp::Ordering::Equal
+        };
+        auth_ordering
+            .then_with(|| b.1.len().cmp(&a.1.len()))
             .then_with(|| b.2.cmp(&a.2))
             .then_with(|| a.0.cmp(&b.0))
     });
@@ -116,34 +137,63 @@ pub(super) fn compute_callsite_files(
 
     let result: Vec<AnswerItem> = ranked
         .into_iter()
-        .map(|(path, symbols, hit_count, samples)| {
-            let symbol_count = symbols.len();
-            let multi = symbol_count >= 2;
-            let confidence = if multi { 0.86 } else { 0.74 };
-            let reason = if multi {
-                "Multiple candidate symbols are called from this file; \
+        .map(
+            |(path, symbols, hit_count, production_hit_count, samples)| {
+                let symbol_count = symbols.len();
+                let multi = symbol_count >= 2;
+                let symbols_for_ranking = symbols.iter().cloned().collect::<Vec<_>>();
+                let signals =
+                    ranking::auth_token_surface_signals(&path, &symbols_for_ranking, request);
+                let surface_confidence_bonus = if signals.score >= 100 {
+                    0.03
+                } else if production_hit_count > 0 {
+                    0.02
+                } else {
+                    0.0
+                };
+                let confidence: f64 = if multi { 0.86 } else { 0.74 };
+                let confidence = (((confidence + surface_confidence_bonus).min(0.9_f64)) * 100.0)
+                    .round()
+                    / 100.0;
+                let reason = if multi {
+                    "Multiple candidate symbols are called from this file; \
                  likely a usage entry point or dispatch hub."
-            } else {
-                "This file calls one of the candidate symbols; verify \
+                } else {
+                    "This file calls one of the candidate symbols; verify \
                  whether it's the primary caller or one of many."
-            };
-            let symbols_list: Vec<&String> = symbols.iter().collect();
-            AnswerItem {
-                kind: "call_site_file".into(),
-                target: path.clone(),
-                path: Some(path),
-                status: "candidate".into(),
-                confidence,
-                reason: reason.into(),
-                role: "callsite".into(),
-                evidence: serde_json::json!({
+                };
+                let symbols_list: Vec<&String> = symbols.iter().collect();
+                let mut evidence = serde_json::json!({
                     "source": "redb.calls",
                     "symbols": symbols_list,
                     "hit_count": hit_count,
+                    "production_hit_count": production_hit_count,
                     "samples": samples,
-                }),
-            }
-        })
+                });
+                if signals.score != 0 {
+                    if let Some(obj) = evidence.as_object_mut() {
+                        obj.insert(
+                            "ranking_bonus".to_string(),
+                            serde_json::json!(signals.score),
+                        );
+                        obj.insert(
+                            "ranking_signals".to_string(),
+                            serde_json::json!(signals.labels),
+                        );
+                    }
+                }
+                AnswerItem {
+                    kind: "call_site_file".into(),
+                    target: path.clone(),
+                    path: Some(path),
+                    status: "candidate".into(),
+                    confidence,
+                    reason: reason.into(),
+                    role: "callsite".into(),
+                    evidence,
+                }
+            },
+        )
         .collect();
 
     debug_assert!(

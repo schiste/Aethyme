@@ -765,6 +765,7 @@ pub fn explore_with_intent(
     let callsite_items = compute_callsite_files(
         &store,
         &symbol_matches,
+        request,
         params.max_callsite_symbols,
         params.max_callsite_results,
     )
@@ -916,6 +917,8 @@ impl SymbolHit {
 
 mod filename_match;
 use filename_match::filename_token_matches;
+
+mod ranking;
 
 mod text_search;
 pub(crate) use text_search::extract_text_search_terms;
@@ -1218,7 +1221,7 @@ fn build_response(
     // The reservation is conservative: only ≥2 slots, only when symbol
     // has multi-query hits. Single-query symbol matches stay weakly
     // ranked.
-    let symbol_items = build_symbol_file_items(symbol_matches, params.max_symbol_files);
+    let symbol_items = build_symbol_file_items(symbol_matches, params.max_symbol_files, request);
     let multi_query_symbol_count = symbol_items
         .iter()
         .filter(|item| {
@@ -1862,13 +1865,18 @@ fn build_verification_steps(
 ///
 /// These are the same numbers Python uses; preserving them keeps the
 /// trust-policy heuristics consistent across implementations.
-fn build_symbol_file_items(symbol_matches: &SymbolBatchResults, cap: usize) -> Vec<AnswerItem> {
+fn build_symbol_file_items(
+    symbol_matches: &SymbolBatchResults,
+    cap: usize,
+    request: &str,
+) -> Vec<AnswerItem> {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
 
     #[derive(Default)]
     struct PerFile {
         queries: BTreeSet<String>,
+        symbol_names: BTreeSet<String>,
         symbols: Vec<serde_json::Value>,
         score: i64,
     }
@@ -1886,6 +1894,7 @@ fn build_symbol_file_items(symbol_matches: &SymbolBatchResults, cap: usize) -> V
             }
             let entry = by_file.entry(hit.file.clone()).or_default();
             entry.queries.insert(query.clone());
+            entry.symbol_names.insert(hit.name.clone());
             entry.symbols.push(serde_json::json!({
                 "name": hit.name,
                 "kind": hit.kind,
@@ -1898,11 +1907,26 @@ fn build_symbol_file_items(symbol_matches: &SymbolBatchResults, cap: usize) -> V
 
     let mut ranked: Vec<(String, PerFile)> = by_file.into_iter().collect();
     ranked.sort_by(|(la, a), (lb, b)| {
-        // Primary: more distinct queries. Secondary: total score.
-        // Tertiary: filename alphabetical for stability.
-        b.queries
-            .len()
-            .cmp(&a.queries.len())
+        // Auth/token requests get one extra generic surface signal:
+        // inbound request-path and credential issue/auth surfaces outrank
+        // incidental token helpers. Non-auth requests return score 0 here,
+        // preserving the historical query/score/path ordering.
+        let a_surface = ranking::auth_token_surface_signals(
+            la,
+            &a.symbol_names.iter().cloned().collect::<Vec<_>>(),
+            request,
+        );
+        let b_surface = ranking::auth_token_surface_signals(
+            lb,
+            &b.symbol_names.iter().cloned().collect::<Vec<_>>(),
+            request,
+        );
+        // Primary: auth surface score when relevant. Secondary: more
+        // distinct queries. Tertiary: total score. Final: stable path order.
+        b_surface
+            .score
+            .cmp(&a_surface.score)
+            .then_with(|| b.queries.len().cmp(&a.queries.len()))
             .then_with(|| b.score.cmp(&a.score))
             .then_with(|| la.cmp(lb))
     });
@@ -1911,13 +1935,45 @@ fn build_symbol_file_items(symbol_matches: &SymbolBatchResults, cap: usize) -> V
     for (file_path, summary) in ranked.into_iter().take(cap) {
         let matched_queries: Vec<String> = summary.queries.iter().cloned().collect();
         let multi = matched_queries.len() > 1;
-        let confidence = if multi { 0.88 } else { 0.76 };
+        let signals = ranking::auth_token_surface_signals(
+            &file_path,
+            &summary.symbol_names.iter().cloned().collect::<Vec<_>>(),
+            request,
+        );
+        let surface_confidence_bonus = if signals.score >= 120 {
+            0.04
+        } else if signals.score >= 70 {
+            0.02
+        } else {
+            0.0
+        };
+        let confidence: f64 = if multi { 0.88 } else { 0.76 };
+        let confidence =
+            (((confidence + surface_confidence_bonus).min(0.92_f64)) * 100.0).round() / 100.0;
         let reason = if multi {
             "Multiple request terms matched symbols in this file."
         } else {
             "A request term matched a symbol in this file."
         };
         let symbols_preview: Vec<serde_json::Value> = summary.symbols.into_iter().take(5).collect();
+        let mut evidence = serde_json::json!({
+            "source": "query-symbol",
+            "matched_queries": matched_queries,
+            "symbols": symbols_preview,
+            "combined_score": summary.score,
+        });
+        if signals.score != 0 {
+            if let Some(obj) = evidence.as_object_mut() {
+                obj.insert(
+                    "ranking_bonus".to_string(),
+                    serde_json::json!(signals.score),
+                );
+                obj.insert(
+                    "ranking_signals".to_string(),
+                    serde_json::json!(signals.labels),
+                );
+            }
+        }
         items.push(AnswerItem {
             kind: "symbol_search_file".into(),
             target: file_path.clone(),
@@ -1926,12 +1982,7 @@ fn build_symbol_file_items(symbol_matches: &SymbolBatchResults, cap: usize) -> V
             confidence,
             reason: reason.into(),
             role: "candidate".into(),
-            evidence: serde_json::json!({
-                "source": "query-symbol",
-                "matched_queries": matched_queries,
-                "symbols": symbols_preview,
-                "combined_score": summary.score,
-            }),
+            evidence,
         });
     }
     items
@@ -2488,6 +2539,89 @@ mod tests {
         assert!(
             symbol_match_position.is_some(),
             "symbol_search_file should be present in answer[]"
+        );
+    }
+
+    #[test]
+    fn build_response_auth_token_ranking_prefers_credential_boundary_over_incidental_token_view() {
+        let mut by_query = std::collections::BTreeMap::new();
+        by_query.insert(
+            "token".to_string(),
+            vec![
+                SymbolHit {
+                    name: "_issue_profile_integrity_token".into(),
+                    kind: "function".into(),
+                    file: "backend/accounts/platform_users_views.py".into(),
+                    line: 18,
+                    score: 900,
+                },
+                SymbolHit {
+                    name: "generate_api_key".into(),
+                    kind: "function".into(),
+                    file: "backend/api_keys/models.py".into(),
+                    line: 12,
+                    score: 40,
+                },
+            ],
+        );
+        by_query.insert(
+            "authenticate".to_string(),
+            vec![
+                SymbolHit {
+                    name: "authenticate_api_key".into(),
+                    kind: "function".into(),
+                    file: "backend/api_keys/models.py".into(),
+                    line: 36,
+                    score: 40,
+                },
+                SymbolHit {
+                    name: "authenticate_profile_token".into(),
+                    kind: "function".into(),
+                    file: "backend/accounts/platform_users_views.py".into(),
+                    line: 42,
+                    score: 40,
+                },
+            ],
+        );
+        let symbols = SymbolBatchResults {
+            query_order: vec!["token".to_string(), "authenticate".to_string()],
+            by_query,
+        };
+
+        let response = build_response(
+            "trace token issuing and authentication behavior",
+            Intent::TaskLocalization,
+            IntentSource::Default,
+            &sample_view(),
+            &symbols,
+            &[],
+            &[],
+            &[],
+            &ExploreParams::default(),
+            test_observability(),
+        );
+
+        let first_symbol_file = response
+            .answer
+            .iter()
+            .find(|item| item.kind == "symbol_search_file")
+            .expect("symbol evidence should be included in answer[]");
+        assert_eq!(
+            first_symbol_file.path.as_deref(),
+            Some("backend/api_keys/models.py"),
+            "credential boundary should outrank incidental high-scoring token view"
+        );
+        let signals = first_symbol_file
+            .evidence
+            .get("ranking_signals")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            signals
+                .iter()
+                .any(|signal| signal.as_str() == Some("issue_auth_credential_pair")),
+            "expected credential-pair ranking evidence, got {signals:?}"
         );
     }
 
