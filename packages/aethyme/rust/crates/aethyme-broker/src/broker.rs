@@ -111,6 +111,9 @@ pub struct DoctorReport {
     /// Lease rows of already-cleaned sessions found (and removed) —
     /// retention for databases written before leases were purged on clean.
     pub purged_stale_leases: usize,
+    /// Present when live sessions can still submit and move integration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_movement: Option<IntegrationMovementNotice>,
 }
 
 impl DoctorReport {
@@ -175,6 +178,39 @@ pub struct StatusView {
     pub queue: Vec<crate::types::MergeQueueEntry>,
     pub integration_branch: String,
     pub integration_head: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IntegrationLiveSession {
+    pub id: i64,
+    pub status: SessionStatus,
+    pub branch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+}
+
+/// Advisory context when integration may move after this command exits.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IntegrationMovementNotice {
+    pub branch: String,
+    pub head: String,
+    pub live_sessions: Vec<IntegrationLiveSession>,
+    pub message: String,
+    pub commands: Vec<String>,
+}
+
+/// Result of `broker integration wait-stable`.
+#[derive(Debug, serde::Serialize)]
+pub struct IntegrationStabilityReport {
+    pub branch: String,
+    pub start_head: String,
+    pub end_head: String,
+    pub stable: bool,
+    pub requested_seconds: u64,
+    pub observed_ms: i64,
+    pub live_sessions: Vec<IntegrationLiveSession>,
+    pub message: String,
+    pub commands: Vec<String>,
 }
 
 /// Focused view of the local integration branch as a pending layer above
@@ -1139,6 +1175,71 @@ impl Broker {
         })
     }
 
+    /// Sample the integration branch, wait for the requested window, then
+    /// sample again so long-running checks can prove which integration tip
+    /// they were run against.
+    pub fn wait_integration_stable(
+        &mut self,
+        seconds: u64,
+    ) -> Result<IntegrationStabilityReport, BrokerOpError> {
+        let started = now_ms();
+        let (branch, start_head) = self.integration_head()?;
+        if seconds > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(seconds));
+        }
+        let (_, end_head) = self.integration_head()?;
+        let observed_ms = now_ms().saturating_sub(started);
+        let live_sessions = integration_live_sessions(self.store.live_sessions()?);
+        let stable = start_head == end_head;
+        let message = if stable {
+            let mut message = format!(
+                "{} stayed at {} for {}s",
+                branch,
+                short_commit(&end_head),
+                seconds
+            );
+            if !live_sessions.is_empty() {
+                message.push_str(&format!(
+                    "; {} live {} may still submit later",
+                    live_sessions.len(),
+                    plural_word(live_sessions.len(), "session", "sessions")
+                ));
+            }
+            message
+        } else {
+            format!(
+                "{} moved from {} to {} during the {}s window; rerun needed before treating checks as current-tip proof",
+                branch,
+                short_commit(&start_head),
+                short_commit(&end_head),
+                seconds
+            )
+        };
+        let mut commands = Vec::new();
+        if stable {
+            if !live_sessions.is_empty() {
+                commands.push("aethyme broker agents".into());
+            }
+        } else {
+            commands.push(format!(
+                "aethyme broker integration wait-stable --seconds {seconds}"
+            ));
+            commands.push("aethyme broker status".into());
+        }
+
+        Ok(IntegrationStabilityReport {
+            branch,
+            start_head,
+            end_head,
+            stable,
+            requested_seconds: seconds,
+            observed_ms,
+            live_sessions,
+            message,
+            commands,
+        })
+    }
+
     /// The whole picture in one call: refreshed leases + overlaps, agent
     /// views, promoted/unmerged conflicts, the merge queue, and the
     /// integration branch head.
@@ -1148,7 +1249,13 @@ impl Broker {
         let promoted_conflicts = self.promoted_conflicts()?;
         let queue = self.store.merge_queue()?;
         let (integration_branch, integration_head) = self.integration_head()?;
-        let advice = self.status_advice(&agents, &promoted_conflicts, &queue, &integration_branch);
+        let advice = self.status_advice(
+            &agents,
+            &promoted_conflicts,
+            &queue,
+            &integration_branch,
+            &integration_head,
+        );
         Ok(StatusView {
             advice,
             agents,
@@ -1166,6 +1273,7 @@ impl Broker {
         promoted_conflicts: &[PromotedConflict],
         queue: &[MergeQueueEntry],
         integration_branch: &str,
+        integration_head: &str,
     ) -> Vec<StatusAdvice> {
         use std::collections::BTreeMap;
 
@@ -1222,6 +1330,14 @@ impl Broker {
             }
         }
 
+        if !agents.is_empty() {
+            advice.push(integration_movement_advice(
+                integration_branch,
+                integration_head,
+                agents,
+            ));
+        }
+
         advice
     }
 
@@ -1246,8 +1362,9 @@ impl Broker {
     fn doctor_inner(&mut self, fix_version: bool) -> Result<DoctorReport, BrokerOpError> {
         let integrity = self.store.integrity_check()?;
 
+        let live_sessions = self.store.live_sessions()?;
         let mut missing_worktrees = Vec::new();
-        for session in self.store.live_sessions()? {
+        for session in &live_sessions {
             if matches!(
                 session.status,
                 SessionStatus::Active | SessionStatus::Idle | SessionStatus::Stale
@@ -1280,6 +1397,8 @@ impl Broker {
         let purged_stale_leases = self.store.purge_leases_of_cleaned_sessions()?;
         let version = crate::version::inspect_version(&self.main_root);
         let version_repair = fix_version.then(|| self.repair_local_cli_version(&version));
+        let integration_movement =
+            self.integration_movement_notice_from_sessions(&live_sessions)?;
 
         Ok(DoctorReport {
             integrity,
@@ -1288,7 +1407,33 @@ impl Broker {
             missing_worktrees,
             orphaned_pidfiles,
             purged_stale_leases,
+            integration_movement,
         })
+    }
+
+    fn integration_movement_notice_from_sessions(
+        &mut self,
+        sessions: &[Session],
+    ) -> Result<Option<IntegrationMovementNotice>, BrokerOpError> {
+        if sessions.is_empty() {
+            return Ok(None);
+        }
+        let (branch, head) = self.integration_head()?;
+        let live_sessions = integration_live_sessions(sessions.to_vec());
+        Ok(Some(IntegrationMovementNotice {
+            branch: branch.clone(),
+            head,
+            message: format!(
+                "{} live {} may submit and move {branch}; wait for a stable window before treating long checks as current-tip proof",
+                live_sessions.len(),
+                plural_word(live_sessions.len(), "session", "sessions")
+            ),
+            live_sessions,
+            commands: vec![
+                "aethyme broker integration wait-stable --seconds 30".into(),
+                "aethyme broker status".into(),
+            ],
+        }))
     }
 
     fn repair_local_cli_version(&mut self, version: &VersionDriftReport) -> VersionRepairReport {
@@ -1816,6 +1961,56 @@ fn promoted_conflict_advice(
     }
 }
 
+fn integration_movement_advice(
+    integration_branch: &str,
+    integration_head: &str,
+    agents: &[AgentView],
+) -> StatusAdvice {
+    let count = agents.len();
+    let summary = format!(
+        "{} live {} may submit and move {integration_branch}; wait for a stable integration window before treating long checks as current-tip proof",
+        count,
+        plural_word(count, "session", "sessions")
+    );
+    let mut evidence: Vec<String> = agents
+        .iter()
+        .take(5)
+        .map(|agent| {
+            format!(
+                "session {} {} {}",
+                agent.session.id,
+                agent.derived_status.as_str(),
+                agent.session.branch
+            )
+        })
+        .collect();
+    if count > evidence.len() {
+        evidence.push(format!(
+            "and {} more {}",
+            count - evidence.len(),
+            plural_word(count - evidence.len(), "session", "sessions")
+        ));
+    }
+    evidence.push(format!(
+        "integration head {}",
+        short_commit(integration_head)
+    ));
+
+    StatusAdvice {
+        id: "integration.may-move",
+        severity: StatusAdviceSeverity::Notice,
+        reason: "live_sessions_can_submit",
+        summary,
+        session_id: None,
+        queue_entry_id: None,
+        evidence,
+        commands: vec![
+            "aethyme broker integration wait-stable --seconds 30".into(),
+            "aethyme broker agents".into(),
+        ],
+    }
+}
+
 fn integration_next_action(
     branch: &str,
     main_is_ancestor: bool,
@@ -1886,6 +2081,18 @@ fn integration_next_action(
         summary: "no promoted work pending outside main".into(),
         commands: Vec::new(),
     }
+}
+
+fn integration_live_sessions(sessions: Vec<Session>) -> Vec<IntegrationLiveSession> {
+    sessions
+        .into_iter()
+        .map(|session| IntegrationLiveSession {
+            id: session.id,
+            status: session.status,
+            branch: session.branch,
+            task: session.task,
+        })
+        .collect()
 }
 
 fn dirty_worktree_advice(agent: &AgentView, dirty: &[String]) -> StatusAdvice {
@@ -2141,6 +2348,7 @@ fn slugify(task: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{DoctorRepairStatus, DoctorReport, VersionRepairReport, slugify};
+    use crate::types::{Session, SessionOrigin, SessionStatus};
     use crate::version::{BinaryBuild, VersionDriftReport, VersionDriftStatus};
 
     #[test]
@@ -2172,6 +2380,27 @@ mod tests {
         assert!(!report.healthy());
     }
 
+    #[test]
+    fn integration_movement_advice_points_to_wait_stable() {
+        let agent = super::AgentView {
+            session: session(56),
+            activity_at: 0,
+            derived_status: SessionStatus::Active,
+            pid_alive: None,
+        };
+
+        let advice =
+            super::integration_movement_advice("aethyme/integration", "abcdef1234567890", &[agent]);
+
+        assert_eq!(advice.id, "integration.may-move");
+        assert_eq!(advice.severity, super::StatusAdviceSeverity::Notice);
+        assert!(
+            advice
+                .commands
+                .contains(&"aethyme broker integration wait-stable --seconds 30".into())
+        );
+    }
+
     fn doctor_report(
         status: VersionDriftStatus,
         version_repair: Option<VersionRepairReport>,
@@ -2197,6 +2426,7 @@ mod tests {
             missing_worktrees: Vec::new(),
             orphaned_pidfiles: Vec::new(),
             purged_stale_leases: 0,
+            integration_movement: None,
         }
     }
 
@@ -2223,6 +2453,25 @@ mod tests {
             message: "test repair".into(),
             stdout_tail: Vec::new(),
             stderr_tail: Vec::new(),
+        }
+    }
+
+    fn session(id: i64) -> Session {
+        Session {
+            id,
+            worktree_path: format!("/tmp/session-{id}"),
+            branch: format!("agent/session-{id}"),
+            origin: SessionOrigin::Adopted,
+            status: SessionStatus::Active,
+            task: Some("test".into()),
+            diff_base: Some("HEAD".into()),
+            pid: None,
+            command: None,
+            log_path: None,
+            exit_code: None,
+            created_at: 0,
+            updated_at: 0,
+            last_activity_at: 0,
         }
     }
 }

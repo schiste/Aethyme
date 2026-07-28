@@ -119,6 +119,10 @@ Usage:
       Focused promoted-but-unmerged view: the local integration branch as
       a pending layer above main, with promoted entries, files changed,
       live sessions conflicting with that layer, and the next action.
+  aethyme broker integration wait-stable [--seconds <n>] [--json]
+      Sample integration, wait for a quiet window (default: 30s), then
+      sample again. Fails if integration moved, printing the old and new
+      tips so long checks are not mistaken for current-tip proof.
   aethyme broker status [--json]
       The whole picture: agents, overlaps, promoted conflicts, merge
       queue, integration head.
@@ -290,6 +294,23 @@ mod tests {
         assert_eq!(parsed.positional, vec!["doctor"]);
         assert!(parsed.fix_version);
     }
+
+    #[test]
+    fn parse_accepts_integration_wait_stable_seconds() {
+        let args = vec![
+            "integration".to_string(),
+            "wait-stable".to_string(),
+            "--seconds".to_string(),
+            "30".to_string(),
+        ];
+        let parsed = match super::parse(&args) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("integration wait-stable --seconds should parse"),
+        };
+
+        assert_eq!(parsed.positional, vec!["integration", "wait-stable"]);
+        assert_eq!(parsed.seconds, Some(30));
+    }
 }
 
 enum UsageError {
@@ -313,6 +334,7 @@ struct Parsed {
     since: Option<i64>,
     kind: Option<String>,
     keep_days: Option<i64>,
+    seconds: Option<u64>,
     follow: bool,
     json: bool,
     force: bool,
@@ -335,6 +357,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         since: None,
         kind: None,
         keep_days: None,
+        seconds: None,
         follow: false,
         json: false,
         force: false,
@@ -380,6 +403,14 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                     Some(value.parse().map_err(|_| {
                         UsageError::Message("--keep-days must be an integer".into())
                     })?);
+            }
+            "--seconds" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--seconds requires a value".into()))?;
+                parsed.seconds = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--seconds must be a non-negative integer".into())
+                })?);
             }
             "--task" => {
                 parsed.task = Some(
@@ -867,6 +898,57 @@ fn render_integration_status(
     println!("Next action: {}", report.next_action.summary);
     for command in &report.next_action.commands {
         println!("  run: {command}");
+    }
+    Ok(())
+}
+
+fn render_integration_stability(
+    report: &crate::IntegrationStabilityReport,
+    json: bool,
+) -> Result<(), UsageError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    println!(
+        "Integration: {} {} -> {}",
+        report.branch,
+        short_commit(&report.start_head),
+        short_commit(&report.end_head)
+    );
+    println!(
+        "Window:      {}s (observed {}ms)",
+        report.requested_seconds, report.observed_ms
+    );
+    println!(
+        "Result:      {}",
+        if report.stable { "stable" } else { "moved" }
+    );
+    println!("{}", report.message);
+    if report.live_sessions.is_empty() {
+        println!("Live sessions: none");
+    } else {
+        println!("Live sessions:");
+        for session in report.live_sessions.iter().take(10) {
+            println!(
+                "  session {} {} {} {}",
+                session.id,
+                session.status.as_str(),
+                session.branch,
+                session.task.as_deref().unwrap_or("-")
+            );
+        }
+        if report.live_sessions.len() > 10 {
+            println!(
+                "  and {} more {}",
+                report.live_sessions.len() - 10,
+                plural(report.live_sessions.len() - 10, "session", "sessions")
+            );
+        }
+    }
+    for command in &report.commands {
+        println!("run: {command}");
     }
     Ok(())
 }
@@ -1444,7 +1526,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     .first()
                     .map(String::as_str)
                     .ok_or(UsageError::Message(
-                        "integration requires an action: status".into(),
+                        "integration requires an action: status or wait-stable".into(),
                     ))?;
             match action {
                 "status" => {
@@ -1452,9 +1534,20 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     let report = broker.integration_status(now_ms())?;
                     render_integration_status(&report, parsed.json)?;
                 }
+                "wait-stable" => {
+                    let seconds = parsed.seconds.unwrap_or(30);
+                    let mut broker = open_broker()?;
+                    let report = broker.wait_integration_stable(seconds)?;
+                    render_integration_stability(&report, parsed.json)?;
+                    if !report.stable {
+                        return Err(UsageError::Message(
+                            "integration moved during wait-stable window".into(),
+                        ));
+                    }
+                }
                 other => {
                     return Err(UsageError::Message(format!(
-                        "unknown integration action {other:?} — expected status"
+                        "unknown integration action {other:?} — expected status or wait-stable"
                     )));
                 }
             }
@@ -1687,6 +1780,32 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         "  integration: {} {integration}",
                         report.version.integration_branch
                     );
+                }
+                if let Some(movement) = &report.integration_movement {
+                    println!("integration movement: {}", movement.message);
+                    println!(
+                        "  head: {} @ {}",
+                        movement.branch,
+                        short_commit(&movement.head)
+                    );
+                    for session in movement.live_sessions.iter().take(5) {
+                        println!(
+                            "  live session {} {} {}",
+                            session.id,
+                            session.status.as_str(),
+                            session.branch
+                        );
+                    }
+                    if movement.live_sessions.len() > 5 {
+                        println!(
+                            "  and {} more live {}",
+                            movement.live_sessions.len() - 5,
+                            plural(movement.live_sessions.len() - 5, "session", "sessions")
+                        );
+                    }
+                    for command in &movement.commands {
+                        println!("  run: {command}");
+                    }
                 }
                 if let Some(repair) = &report.version_repair {
                     println!(

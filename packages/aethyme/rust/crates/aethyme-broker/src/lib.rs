@@ -39,10 +39,11 @@ mod version;
 
 pub use broker::{
     AdoptMode, AgentView, Broker, BrokerOpError, DoctorRepairStatus, DoctorReport, FinishReport,
-    FinishStatus, IntegrationNextAction, IntegrationStatusView, PromotedConflict,
-    PromotedIntegrationEntry, RepairAction, RepairGateSelection, RepairReport, RepairSource,
-    SemanticGateAdvice, SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus,
-    StatusAdvice, StatusAdviceSeverity, StatusView, VersionRepairReport,
+    FinishStatus, IntegrationLiveSession, IntegrationMovementNotice, IntegrationNextAction,
+    IntegrationStabilityReport, IntegrationStatusView, PromotedConflict, PromotedIntegrationEntry,
+    RepairAction, RepairGateSelection, RepairReport, RepairSource, SemanticGateAdvice,
+    SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus, StatusAdvice,
+    StatusAdviceSeverity, StatusView, VersionRepairReport,
 };
 pub use error::BrokerError;
 pub use gates::{
