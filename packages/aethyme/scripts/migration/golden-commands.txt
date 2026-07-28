@@ -25,6 +25,8 @@ task scope --repo {REPO} --task Update-token-issuing --json-output
 task next --repo {REPO} --task Update-token-issuing --json-output
 task expand --repo {REPO} --node src/auth/tokens.py --json-output
 task pack --repo {REPO} --task Explain-this-repo --json-output
+task context --repo {REPO} --task Explain-this-repo --content-budget 4000 --json-output
+task context --repo {REPO} --task Explain-this-repo
 task explain --repo {REPO}
 facts public-functions --repo {REPO} --scope src/auth --json-output
 facts function-usage --repo {REPO} --target fn:medium-fixture:src/auth/tokens.py:issue_token --boundary src/auth --json-output
