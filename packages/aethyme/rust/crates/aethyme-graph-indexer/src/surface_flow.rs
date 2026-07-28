@@ -9,7 +9,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aethyme_graph_schema::{
-    Confidence, Edge, EdgeAttributes, Node, NodeId, NodeKind, Source, SourceRange, SurfaceFlowNode,
+    Confidence, Edge, EdgeAttributes, EdgeKind, Node, NodeId, NodeKind, Source, SourceRange,
+    SurfaceFlowNode,
 };
 
 use crate::context::IndexerContext;
@@ -66,6 +67,7 @@ struct SurfaceBuilder<'a> {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
     seen_nodes: BTreeSet<String>,
+    seen_edges: BTreeSet<(String, String, EdgeKind)>,
 }
 
 impl<'a> SurfaceBuilder<'a> {
@@ -77,6 +79,7 @@ impl<'a> SurfaceBuilder<'a> {
             nodes: Vec::new(),
             edges: Vec::new(),
             seen_nodes: BTreeSet::new(),
+            seen_edges: BTreeSet::new(),
         }
     }
 
@@ -84,6 +87,18 @@ impl<'a> SurfaceBuilder<'a> {
         &mut self,
         kind: NodeKind,
         edge_attrs: EdgeAttributes,
+        raw_name: &str,
+        detail: &str,
+        line: u32,
+        metadata: &[(&str, String)],
+    ) -> Result<(), LanguageIndexError> {
+        self.push_with_edges(kind, &[edge_attrs], raw_name, detail, line, metadata)
+    }
+
+    fn push_with_edges(
+        &mut self,
+        kind: NodeKind,
+        edge_attrs: &[EdgeAttributes],
         raw_name: &str,
         detail: &str,
         line: u32,
@@ -115,18 +130,32 @@ impl<'a> SurfaceBuilder<'a> {
             message: e.to_string(),
         })?;
         let id = surface.id().clone();
-        if !self.seen_nodes.insert(id.as_str().to_string()) {
-            return Ok(());
+        if self.seen_nodes.insert(id.as_str().to_string()) {
+            self.nodes.push(node_for_kind(kind, surface));
         }
-        self.nodes.push(node_for_kind(kind, surface));
+        for attrs in edge_attrs {
+            self.push_file_edge(id.clone(), attrs.clone());
+        }
+        Ok(())
+    }
+
+    fn push_file_edge(&mut self, to: NodeId, attrs: EdgeAttributes) {
+        let edge_kind = attrs.kind();
+        let key = (
+            self.file_id.as_str().to_string(),
+            to.as_str().to_string(),
+            edge_kind,
+        );
+        if !self.seen_edges.insert(key) {
+            return;
+        }
         self.edges.push(Edge::new(
             self.file_id.clone(),
-            id,
-            edge_attrs,
+            to,
+            attrs,
             Source::Derived,
             Confidence::from_milli(850).expect("surface-flow confidence is in range"),
         ));
-        Ok(())
     }
 
     fn finish(self) -> LanguageIndexResult {
@@ -261,6 +290,8 @@ fn extract_python_django(
                 &[("framework", "python".to_string())],
             )?;
         }
+
+        extract_credential_lifecycle_line(builder, trimmed, &lower, line_no, "python")?;
     }
 
     Ok(())
@@ -343,23 +374,31 @@ fn extract_js_ts(
             || lower.contains("new headers")
         {
             let credentialish = contains_credential_term(&lower);
-            builder.push(
-                if credentialish {
-                    NodeKind::CredentialOperation
-                } else {
-                    NodeKind::MiddlewareInstallation
-                },
-                if credentialish {
-                    EdgeAttributes::UsesCredential
-                } else {
-                    EdgeAttributes::InstallsMiddleware
-                },
-                header_mutation_name(trimmed),
-                "JS/TS request or response header mutation",
-                line_no,
-                &[("runtime", "javascript".to_string())],
-            )?;
+            if credentialish {
+                builder.push_with_edges(
+                    NodeKind::CredentialOperation,
+                    &[
+                        EdgeAttributes::RewritesHeader,
+                        EdgeAttributes::UsesCredential,
+                    ],
+                    header_mutation_name(trimmed),
+                    "JS/TS request or response header mutation",
+                    line_no,
+                    &[("runtime", "javascript".to_string())],
+                )?;
+            } else {
+                builder.push(
+                    NodeKind::MiddlewareInstallation,
+                    EdgeAttributes::RewritesHeader,
+                    header_mutation_name(trimmed),
+                    "JS/TS request or response header mutation",
+                    line_no,
+                    &[("runtime", "javascript".to_string())],
+                )?;
+            }
         }
+
+        extract_credential_lifecycle_line(builder, trimmed, &lower, line_no, "javascript")?;
     }
 
     Ok(())
@@ -433,9 +472,12 @@ fn extract_behavior_tests(
             || lower.starts_with("test(")
             || lower.starts_with("describe(")
         {
-            builder.push(
+            builder.push_with_edges(
                 NodeKind::BehaviorTestSurface,
-                EdgeAttributes::ValidatesCredential,
+                &[
+                    EdgeAttributes::TestedBy,
+                    EdgeAttributes::ValidatesCredential,
+                ],
                 &test_name(trimmed),
                 "Route/auth behavior test",
                 line_no,
@@ -446,13 +488,49 @@ fn extract_behavior_tests(
     }
 
     if !emitted {
-        builder.push(
+        builder.push_with_edges(
             NodeKind::BehaviorTestSurface,
-            EdgeAttributes::ValidatesCredential,
+            &[
+                EdgeAttributes::TestedBy,
+                EdgeAttributes::ValidatesCredential,
+            ],
             "auth behavior coverage",
             "Route/auth behavior test",
             1,
             &[("test_path", builder.indexed.source_path.to_string())],
+        )?;
+    }
+    Ok(())
+}
+
+fn extract_credential_lifecycle_line(
+    builder: &mut SurfaceBuilder<'_>,
+    trimmed: &str,
+    lower: &str,
+    line_no: u32,
+    runtime: &str,
+) -> Result<(), LanguageIndexError> {
+    if !contains_credential_term(lower) {
+        return Ok(());
+    }
+    if looks_like_credential_issue(lower) {
+        builder.push(
+            NodeKind::CredentialOperation,
+            EdgeAttributes::IssuesCredential,
+            &credential_lifecycle_name("issue", trimmed),
+            "Credential issue operation",
+            line_no,
+            &[("runtime", runtime.to_string())],
+        )?;
+    }
+    if looks_like_credential_store(lower) {
+        builder.push(
+            NodeKind::CredentialOperation,
+            EdgeAttributes::StoresCredential,
+            &credential_lifecycle_name("store", trimmed),
+            "Credential store operation",
+            line_no,
+            &[("runtime", runtime.to_string())],
         )?;
     }
     Ok(())
@@ -502,6 +580,50 @@ fn contains_credential_term(lower: &str) -> bool {
         || lower.contains("cookie")
         || lower.contains("credential")
         || lower.contains("secret")
+}
+
+fn looks_like_credential_issue(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "issue",
+            "mint",
+            "generate",
+            "create",
+            "sign",
+            "jwt.encode",
+            "encode_jwt",
+            "new_api_key",
+        ],
+    )
+}
+
+fn looks_like_credential_store(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "store",
+            "save",
+            "persist",
+            "set_cookie",
+            "cookies.set",
+            "session[",
+            "localstorage.setitem",
+            "securestorage",
+        ],
+    )
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+fn credential_lifecycle_name(action: &str, line: &str) -> String {
+    if let Some(value) = first_quoted_value(line) {
+        format!("{action}:{value}")
+    } else {
+        format!("{action}:{}", compact_name(line))
+    }
 }
 
 fn looks_like_proxy_config_line(lower: &str) -> bool {

@@ -73,6 +73,8 @@ REST_FRAMEWORK = {
 export default {
   async fetch(request, env) {
     const headers = new Headers(request.headers)
+    const issued = jwt.sign({ sub: "u1" }, env.JWT_SECRET)
+    await tokenStore.save(issued)
     headers.set("Authorization", `Bearer ${env.API_TOKEN}`)
     return fetch("https://api.example.com/token", { headers })
   }
@@ -180,4 +182,32 @@ def test_token_route_requires_bearer(client):
 
     let test_nodes = node_kinds(tmp.path(), "backend/tests/test_auth_flow.py");
     assert!(test_nodes.contains(&NodeKind::BehaviorTestSurface));
+
+    let all_edges = [
+        "backend/urls.py",
+        "backend/settings.py",
+        "edge/worker.mjs",
+        "netlify.toml",
+        "backend/tests/test_auth_flow.py",
+    ]
+    .into_iter()
+    .flat_map(|rel| edge_kinds(tmp.path(), rel))
+    .collect::<Vec<_>>();
+    for expected in [
+        EdgeKind::Exposes,
+        EdgeKind::ForwardsTo,
+        EdgeKind::RewritesHeader,
+        EdgeKind::InstallsMiddleware,
+        EdgeKind::ValidatesCredential,
+        EdgeKind::Authorizes,
+        EdgeKind::IssuesCredential,
+        EdgeKind::StoresCredential,
+        EdgeKind::UsesCredential,
+        EdgeKind::TestedBy,
+    ] {
+        assert!(
+            all_edges.contains(&expected),
+            "expected persisted Surface/Flow edge {expected:?}; got {all_edges:?}"
+        );
+    }
 }
