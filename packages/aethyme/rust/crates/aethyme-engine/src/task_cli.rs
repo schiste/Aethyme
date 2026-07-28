@@ -500,6 +500,48 @@ mod tests {
     use super::compact_json_python_style;
 
     #[test]
+    fn scope_render_surfaces_reason_fields() {
+        // Ported from test_task_scope_non_json_renders_reason_fields when
+        // the task group went native (Phase 1).
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{"task":"Update auth flow",
+                "in_scope_files":[{"value":"src/auth.py","reason":"anchor file"}],
+                "in_scope_areas":[{"value":"src","reason":"contains anchor"}],
+                "out_of_scope":[{"value":"docs","reason":"non-runtime"}],
+                "risks":["auth regression"]}"#,
+        )
+        .unwrap();
+        let rendered = super::render_scope(&payload);
+        assert!(rendered.contains("- src/auth.py (anchor file)"), "{rendered}");
+        assert!(rendered.contains("- src (contains anchor)"), "{rendered}");
+        assert!(rendered.contains("- docs (non-runtime)"), "{rendered}");
+        assert!(rendered.contains("- auth regression"), "{rendered}");
+    }
+
+    #[test]
+    fn pack_summary_surfaces_confidence_caps_truncation() {
+        // Ported from test_render_pack_summary_includes_confidence_caps_
+        // and_truncation (rendering/context_pack.py deleted in Phase 1).
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{"task":{"raw":"Explain this repo"},
+                "confidence":{"anchor_confidence":0.91,"scope_confidence":0.73},
+                "budget":{"max_anchors":3,"max_files":5},
+                "file_contents":[{"path":"src/big.py","end_line":120,"total_lines":300}]}"#,
+        )
+        .unwrap();
+        let rendered = super::render_pack_summary(&payload);
+        assert!(
+            rendered.contains("Confidence: anchor=0.91, scope=0.73"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Caps: max_anchors=3, max_files=5"), "{rendered}");
+        assert!(
+            rendered.contains("- src/big.py (120/300 lines)"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn python_compact_separators() {
         assert_eq!(
             compact_json_python_style(r#"{"a":1,"b":["x,y","z:w"],"c":{}}"#),
