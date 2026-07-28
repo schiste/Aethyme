@@ -61,6 +61,16 @@ names/flags/output — golden-verified):
   `context --json-output` keeps Python's compact-with-spaces dump; the
   Click renderer helpers and rendering/context_pack.py are deleted —
   their logic lives in task_cli with ported unit tests.
+- `facts public-functions|function-usage`, `intents`, and `repo
+  ingest|inspect|clear-cache|warm|engine-info` (Phase 1 closeout,
+  2026-07-28; `facts_cli`/`repo_cli` modules). Reinterpretations:
+  engine-info reports binary/store/daemon/ready (transports are gone);
+  ingest reports engine snapshot + store state; clear-cache clears the
+  legacy cache root. The rest of the repo group still delegates
+  (Phases 2-3).
+- RETIRED with PyO3 (decision #3, hard-delete 2026-07-28):
+  `--engine-transport`, `AETHYME_ENGINE_TRANSPORT`, the transport
+  registration API, and the `aethyme_py` in-process binding.
 """
 
 

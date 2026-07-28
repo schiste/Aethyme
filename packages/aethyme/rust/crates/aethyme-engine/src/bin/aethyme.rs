@@ -61,6 +61,30 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        "facts" => match aethyme_engine::facts_cli::run_facts(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("Error: {message}");
+                ExitCode::from(1)
+            }
+        },
+        "intents" => match aethyme_engine::facts_cli::run_intents(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("Error: {message}");
+                ExitCode::from(1)
+            }
+        },
+        // Partially flipped: engine-facing basics answer natively, the
+        // deployment/telemetry subcommands still delegate (Phases 2-3).
+        "repo" => match aethyme_engine::repo_cli::run(&args[1..]) {
+            aethyme_engine::repo_cli::Outcome::Handled(Ok(())) => ExitCode::SUCCESS,
+            aethyme_engine::repo_cli::Outcome::Handled(Err(message)) => {
+                eprintln!("Error: {message}");
+                ExitCode::from(1)
+            }
+            aethyme_engine::repo_cli::Outcome::Delegate => delegate_to_python("repo", &args[1..]),
+        },
         "task" => match aethyme_engine::task_cli::run(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {

@@ -34,13 +34,22 @@ names/flags/output — golden-verified):
   `context --json-output` keeps Python's compact-with-spaces dump; the
   Click renderer helpers and rendering/context_pack.py are deleted —
   their logic lives in task_cli with ported unit tests.
+- `facts public-functions|function-usage`, `intents`, and `repo
+  ingest|inspect|clear-cache|warm|engine-info` (Phase 1 closeout,
+  2026-07-28; `facts_cli`/`repo_cli` modules). Reinterpretations:
+  engine-info reports binary/store/daemon/ready (transports are gone);
+  ingest reports engine snapshot + store state; clear-cache clears the
+  legacy cache root. The rest of the repo group still delegates
+  (Phases 2-3).
+- RETIRED with PyO3 (decision #3, hard-delete 2026-07-28):
+  `--engine-transport`, `AETHYME_ENGINE_TRANSPORT`, the transport
+  registration API, and the `aethyme_py` in-process binding.
 
 ## Global options
 
 - `--tenant-id` (env AETHYME_TENANT_ID)
 - `--json` (flag)
 - `--verbose/-v` (flag)
-- `--engine-transport` (env AETHYME_ENGINE_TRANSPORT)
 
 ## Commands
 
@@ -53,27 +62,18 @@ names/flags/output — golden-verified):
 | `enhance` | group | — |
 | `enhance deploy` | command | `--repo` (directory, required); `--force` (flag) |
 | `enhance verify` | command | `--repo` (directory, required) |
-| `facts` | group | — |
-| `facts function-usage` | command | `--repo` (directory, required); `--target` (required); `--boundary` (required); `--roots` (default ''); `--json-output` (flag) |
-| `facts public-functions` | command | `--repo` (directory, required); `--scope` (required); `--include-methods` (flag); `--json-output` (flag) |
-| `intents` | command | `--request` (default ''); `--format` (choice, default 'compact-json') |
 | `repo` | group | — |
-| `repo clear-cache` | command | `repo_path` (arg, required) |
 | `repo commit-message-template` | command | `--type` (choice, default 'fix'); `--scope` (default 'scope') |
 | `repo compile-skills` | command | `repo_path` (arg, required); `--skill` (choice) |
 | `repo deploy-skills` | command | `repo_path` (arg, required); `--force` (flag); `--remove` (flag) |
-| `repo engine-info` | command | `--json-output` (flag); `--check` (flag) |
 | `repo experience-status` | command | `repo_path` (arg, required); `--json-output` (flag) |
 | `repo experience-telemetry` | command | `repo_path` (arg, required); `--json-output` (flag); `--check` (flag) |
-| `repo ingest` | command | `repo_path` (arg, required) |
 | `repo init-agents-overrides` | command | `repo_path` (arg, required); `--force` (flag) |
 | `repo init-onboarding-overrides` | command | `repo_path` (arg, required); `--force` (flag) |
-| `repo inspect` | command | `repo_path` (arg, required); `--json-output` (flag); `--mode` (choice, default 'full') |
 | `repo lint-commit-message` | command | `message_path` (arg); `--message`; `--json-output` (flag) |
 | `repo record-wrapper-invocation` | command | `repo_path` (arg, required); `--wrapper` (required); `--detail` |
 | `repo validate-agents-overrides` | command | `repo_path` (arg, required) |
 | `repo validate-onboarding-overrides` | command | `repo_path` (arg, required) |
-| `repo warm` | command | `repo_path` (arg, required) |
 
 ## Environment variables (non-option)
 

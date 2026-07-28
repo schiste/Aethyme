@@ -1,5 +1,4 @@
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any, TypeAlias, TypedDict, cast
@@ -12,13 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.indexing.engine import (
     EngineError,
-    clear_repository_cache,
-    derived_function_usage,
-    derived_public_functions,
     engine_runtime_info,
-    inspect_repository,
-    inspect_repository_brief,
-    inspect_repository_structure,
 )
 from src.indexing.engine import (
     analyze_dead_code as analyze_dead_code_answer,
@@ -131,22 +124,12 @@ def get_state(ctx: click.Context) -> CLIState:
     is_flag=True,
     help="Verbose output",
 )
-@click.option(
-    "--engine-transport",
-    type=str,
-    envvar="AETHYME_ENGINE_TRANSPORT",
-    help=(
-        "Engine transport backend. Built-ins: auto, subprocess, pyo3. "
-        "Custom registered transport names are also accepted."
-    ),
-)
 @click.pass_context
 def cli(
     ctx: click.Context,
     tenant_id: str | None,
     output_json_flag: bool,
     verbose: bool,
-    engine_transport: str | None,
 ) -> None:
     """Aethyme - Graph-based code intelligence system.
 
@@ -162,43 +145,6 @@ def cli(
     state["tenant_id"] = tenant_id
     state["json"] = output_json_flag
     state["verbose"] = verbose
-    if engine_transport:
-        normalized_transport = engine_transport.strip().lower()
-        if not normalized_transport:
-            raise click.BadParameter(
-                "Engine transport cannot be empty.", param_hint="--engine-transport"
-            )
-        os.environ["AETHYME_ENGINE_TRANSPORT"] = normalized_transport
-        state["engine_transport"] = normalized_transport
-
-
-@cli.command("intents")
-@click.option(
-    "--request",
-    "request_text",
-    default="",
-    help=(
-        "Optional user request to echo in the catalog. Intent selection remains "
-        "the caller/LLM's responsibility."
-    ),
-)
-@click.option(
-    "--format",
-    "output_format",
-    type=click.Choice(["compact-json"]),
-    default="compact-json",
-    show_default=True,
-    help="Output format for the intent catalog.",
-)
-def intents_command(request_text: str, output_format: str) -> None:
-    """List high-level Aethyme modes and supported intents."""
-    if output_format != "compact-json":
-        raise click.ClickException(f"Unsupported intents format: {output_format}")
-    catalog = _intent_catalog()
-    if request_text:
-        catalog["request"] = {"raw": request_text}
-        catalog["selection_status"] = "default_available_choose_specialized_when_clear"
-    click.echo(json.dumps(catalog, indent=2))
 
 
 
@@ -206,91 +152,6 @@ def intents_command(request_text: str, output_format: str) -> None:
 @cli.group()
 def repo() -> None:
     """Local repository intake and inspection workflows."""
-
-
-@repo.command("ingest")
-@click.argument(
-    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
-)
-def repo_ingest(repo_path: Path) -> None:
-    """Capture local repository metadata for a local-first workflow."""
-    snapshot = capture_snapshot(repo_path)
-    click.echo(f"Repository: {snapshot.repo_name}")
-    click.echo(f"Path: {snapshot.repo_path}")
-    click.echo(f"Commit: {snapshot.commit or 'working-tree'}")
-    click.echo(f"Files: {snapshot.file_count}")
-    click.echo(f"Snapshot key: {snapshot.cache_key}")
-
-
-@repo.command("inspect")
-@click.argument(
-    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
-)
-@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-@click.option(
-    "--mode",
-    "mode",
-    type=click.Choice(["brief", "structure", "full"]),
-    default="full",
-    help="Inspect depth: brief (areas+signals), structure (adds files/configs/docs), full (everything)",
-)
-def repo_inspect(repo_path: Path, json_output: bool, mode: str) -> None:
-    """Inspect the local repository map produced by the Rust engine."""
-    try:
-        if mode == "brief":
-            result = inspect_repository_brief(repo_path)
-        elif mode == "structure":
-            result = inspect_repository_structure(repo_path)
-        else:
-            result = inspect_repository(repo_path)
-    except EngineError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-    if json_output:
-        click.echo(json.dumps(result, indent=2))
-        return
-
-    snapshot = result["snapshot"]
-    click.echo(f"Root: {snapshot['root']}")
-    click.echo(f"Languages: {', '.join(snapshot['languages'])}")
-    click.echo(f"Top-level directories: {', '.join(snapshot['top_level_dirs'])}")
-    file_count = snapshot.get("file_count") or len(snapshot.get("files", []))
-    click.echo(f"Files: {file_count}")
-    if mode == "full":
-        click.echo(f"Symbols: {len(result.get('symbols', []))}")
-        click.echo(f"Edges: {len(result.get('edges', []))}")
-    if result.get("entrypoints"):
-        click.echo(f"Entrypoints: {', '.join(result['entrypoints'])}")
-    if result.get("key_configs"):
-        click.echo(f"Key configs: {', '.join(result['key_configs'])}")
-    if result.get("signals"):
-        click.echo("Signals:")
-        for name, signal in result["signals"].items():
-            click.echo(
-                f"- {name.replace('_', ' ')}: {signal['score']} ({signal['level']})"
-            )
-
-
-@repo.command("clear-cache")
-@click.argument(
-    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
-)
-def repo_clear_cache(repo_path: Path) -> None:
-    """Clear cached local engine artifacts for the current repository snapshot."""
-    clear_repository_cache(repo_path)
-    click.echo(f"Cleared cache for {repo_path}")
-
-
-@repo.command("warm")
-@click.argument(
-    "repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path)
-)
-def repo_warm(repo_path: Path) -> None:
-    """Pre-build the repository map cache for fast subsequent commands."""
-    from src.indexing.engine import warm_repository
-
-    warm_repository(repo_path)
-    click.echo(f"Map cache warmed for {repo_path}")
 
 
 @repo.command("deploy-skills")
@@ -696,131 +557,9 @@ def repo_lint_commit_message(
         raise SystemExit(1)
 
 
-@repo.command("engine-info")
-@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-@click.option(
-    "--check",
-    "check_ready",
-    is_flag=True,
-    help="Exit non-zero if selected transport is not ready.",
-)
-def repo_engine_info(json_output: bool, check_ready: bool) -> None:
-    """Show configured engine transport/runtime information."""
-    info = engine_runtime_info()
-    if json_output:
-        click.echo(json.dumps(info, indent=2))
-        if check_ready and (
-            not info["transport_supported"] or not info["transport_ready"]
-        ):
-            raise click.ClickException("Engine transport is not ready.")
-        return
-
-    click.echo(f"Transport: {info['transport']}")
-    if info.get("transport_source"):
-        click.echo(f"Transport source: {info['transport_source']}")
-    if info.get("resolved_transport") is not None:
-        click.echo(f"Resolved transport: {info['resolved_transport']}")
-    click.echo(f"Supported: {'yes' if info['transport_supported'] else 'no'}")
-    click.echo(f"Ready: {'yes' if info['transport_ready'] else 'no'}")
-    click.echo(f"Transport detail: {info['transport_detail']}")
-    click.echo(f"Binary path: {info['binary_path']}")
-    click.echo(f"Binary exists: {'yes' if info['binary_exists'] else 'no'}")
-    click.echo(f"Supported transports: {', '.join(info['supported_transports'])}")
-    runnable = info.get("runnable_transports")
-    if isinstance(runnable, list) and runnable:
-        click.echo(f"Runnable transports: {', '.join(runnable)}")
-    if check_ready and (not info["transport_supported"] or not info["transport_ready"]):
-        raise click.ClickException("Engine transport is not ready.")
-
-
-@cli.group()
-def facts() -> None:
-    """Derived repository facts built on top of the graph."""
-
-
 @cli.group()
 def analyze() -> None:
     """Deterministic analyzers that answer recurring repository questions."""
-
-
-@facts.command("public-functions")
-@click.option(
-    "--repo",
-    "repo_path",
-    required=True,
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-)
-@click.option("--scope", "scope", required=True, help="Directory scope prefix")
-@click.option(
-    "--include-methods",
-    "include_methods",
-    is_flag=True,
-    help="Include public methods as well as top-level functions",
-)
-@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-def facts_public_functions_command(
-    repo_path: Path, scope: str, include_methods: bool, json_output: bool
-) -> None:
-    """List derived public/exported function facts for a scope."""
-    try:
-        result = derived_public_functions(
-            repo_path, scope, include_methods=include_methods
-        )
-    except EngineError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-    if json_output:
-        click.echo(json.dumps(result, indent=2))
-        return
-
-    for item in result:
-        click.echo(f"- {item['defined_in']}::{item['name']} [{item['exposure_kind']}]")
-
-
-@facts.command("function-usage")
-@click.option(
-    "--repo",
-    "repo_path",
-    required=True,
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-)
-@click.option(
-    "--target", "target", required=True, help="Function id, name, or qualified name"
-)
-@click.option(
-    "--boundary",
-    "boundary",
-    required=True,
-    help="Boundary prefix for internal vs external callers",
-)
-@click.option("--roots", "roots", default="", help="Comma-separated search roots")
-@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-def facts_function_usage_command(
-    repo_path: Path, target: str, boundary: str, roots: str, json_output: bool
-) -> None:
-    """Show derived usage facts for one function relative to a boundary."""
-    roots_list = [item.strip() for item in roots.split(",") if item.strip()]
-    try:
-        result = derived_function_usage(
-            repo_path, target, boundary=boundary, roots=roots_list
-        )
-    except EngineError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-    if json_output:
-        click.echo(json.dumps(result, indent=2))
-        return
-
-    click.echo(f"Function: {result['function']['qualified_name']}")
-    click.echo(f"Boundary: {result['boundary']}")
-    if result["internal_callers"]:
-        click.echo("Internal callers:")
-        for item in result["internal_callers"]:
-            click.echo(f"- {item}")
-    if result["external_callers"]:
-        click.echo("External callers:")
-        for item in result["external_callers"]:
-            click.echo(f"- {item}")
 
 
 @analyze.command("dead-code")
@@ -1043,258 +782,6 @@ def _set_output_size(payload: dict[str, Any], observability: dict[str, Any]) -> 
         if observability.get("output_size_bytes") == output_size:
             return
         observability["output_size_bytes"] = output_size
-
-
-def _intent_catalog() -> dict[str, Any]:
-    return {
-        "schema_version": "aethyme-intents-v1",
-        "selection_contract": {
-            "who_selects": "caller_or_llm_for_specialized_intents",
-            "aethyme_role": (
-                "Run the default general-purpose localization intent when no "
-                "intent is selected; validate explicit intents and parameters, "
-                "then run deterministic repository analysis."
-            ),
-            "caller_role": (
-                "Use the default Explore path for normal requests. Choose a "
-                "specialized intent from the catalog only when the user request "
-                "clearly matches it, then provide that intent's structured "
-                "parameters."
-            ),
-            "default_intent": "task_localization_query",
-            "no_hidden_task_specific_routing": True,
-        },
-        "canonical_flow": [
-            "Run `aethyme explore --repo <repo> --request <task> --format answer-json` first; default detail is compact.",
-            "Read `trust_policy` and use `answer[]` only when `safe_to_use_as_answer` is true.",
-            "If trust_policy is `needs_verification`, follow `verification_steps[]` before using answer[] as final evidence.",
-            "If only `navigation_hints[]` are available, treat them as manual investigation steps, not candidate answers.",
-            "For a specialized intent, rerun `aethyme explore --repo <repo> --intent <intent> --request <task> --params '<json>' --format answer-json --show-observability`.",
-            "Read answer[] first only after the trust policy, verification_steps[] second, excluded[] third, ambiguous[]/navigation_hints[]/next_actions fourth, observability last.",
-        ],
-        "modes": [
-            {
-                "mode": "explore",
-                "purpose": "Return repository facts, evidence, and task-ready answers without editing files.",
-                "command": "aethyme explore",
-                "intents": [
-                    {
-                        "intent": "task_localization_query",
-                        "summary": (
-                            "Localize any normal repository question into ranked "
-                            "candidate files, symbols, areas, evidence, and next "
-                            "navigation steps."
-                        ),
-                        "best_for": [
-                            "bug diagnosis",
-                            "feature localization",
-                            "impact analysis",
-                            "architecture questions",
-                            "where should I look first",
-                            "general repository exploration",
-                        ],
-                        "required_params": [],
-                        "optional_params": [
-                            "max_anchors",
-                            "max_files",
-                            "max_symbols",
-                            "max_areas",
-                            "max_next_items",
-                            "max_answer_items",
-                            "max_expansions",
-                            "detail",
-                            "include_expansions",
-                            "max_symbol_queries",
-                            "max_symbol_results",
-                            "max_text_files",
-                            "max_text_line_refs",
-                            "max_callsite_symbols",
-                            "max_callsite_results",
-                            "symbol_query_timeout_ms",
-                            "graph_query_timeout_ms",
-                            "skip_symbols_after_graph_timeout",
-                        ],
-                        "param_defaults": {
-                            "detail": "compact",
-                            "max_anchors": 3,
-                            "max_files": 5,
-                            "max_symbols": 5,
-                            "max_areas": 3,
-                            "max_next_items": 5,
-                            "max_answer_items": 12,
-                            "max_expansions": 1,
-                            "include_expansions": True,
-                            "max_symbol_queries": 5,
-                            "max_symbol_results": 4,
-                            "max_text_files": 5,
-                            "max_text_line_refs": 2,
-                            "max_callsite_symbols": 4,
-                            "max_callsite_results": 4,
-                            "symbol_query_timeout_ms": 1000,
-                            "graph_query_timeout_ms": 1000,
-                            "skip_symbols_after_graph_timeout": False,
-                        },
-                        "default_for_explore": True,
-                        "answer_schema": {
-                            "kind": "anchor | in_scope_file | in_scope_symbol | in_scope_area | next_step",
-                            "target": "symbol id, file path, area, or display label",
-                            "path": "repo-relative path when known",
-                            "status": "candidate",
-                            "evidence": "object",
-                            "confidence": "number",
-                            "reason": "string",
-                        },
-                        "verification_step_schema": {
-                            "action": "read_source_window | search_symbol_in_candidate | read_candidate_file",
-                            "target": "symbol or path",
-                            "path": "repo-relative path when known",
-                            "command": "shell command for cheap manual verification",
-                            "reason": "why this verification step matters",
-                        },
-                        "navigation_hint_schema": {
-                            "kind": "filesystem_file | graph_next_action | investigation_plan",
-                            "status": "navigation_hint",
-                            "trust_policy": "navigation_only",
-                            "confidence": "low number; filename-only evidence cannot be authoritative",
-                        },
-                        "trust_contract": {
-                            "safe_to_use_as_answer": "boolean",
-                            "safe_to_use_as_navigation": "boolean",
-                            # Native (Rust) explore emits compound levels that
-                            # describe WHICH evidence sources corroborated, e.g.
-                            # `graph+symbol+text+callsite` (triple corroborated),
-                            # `graph+symbol+callsite` (strong callsite),
-                            # `graph+callsite-weak`, `graph+text`, `graph+symbol`,
-                            # `graph+symbol-weak`, `graph` (anchors only). Single-
-                            # word legacy forms (`graph`/`symbol`/`text`) still
-                            # appear at the lowest tiers and on degraded paths.
-                            "evidence_level": "compound: graph[+symbol[-weak]][+text[-weak]][+callsite[-weak]] | none",
-                            "verification_required": "boolean",
-                            "trust_policy": "answer_candidate | needs_verification | navigation_only | failed",
-                        },
-                        "observability": [
-                            "command name",
-                            "repo path",
-                            "index freshness",
-                            "internal analyzers called",
-                            "graph/fact count",
-                            "output size",
-                            "confidence summary",
-                            "evidence level",
-                            "trust policy",
-                            "failure/degraded reason",
-                        ],
-                    },
-                    {
-                        "intent": "behavior_localization_query",
-                        "summary": (
-                            "Localize behavioral bugs and feature flows by combining "
-                            "graph/symbol results with source-text evidence and "
-                            "call-site expansion."
-                        ),
-                        "best_for": [
-                            "bug reports with observable behavior",
-                            "trace this feature or side effect",
-                            "what code path updates this state",
-                            "which callers of this API need inspection",
-                        ],
-                        "required_params": [],
-                        "optional_params": [
-                            "max_text_files",
-                            "max_text_line_refs",
-                            "max_callsite_symbols",
-                            "max_callsite_results",
-                            "graph_query_timeout_ms",
-                            "symbol_query_timeout_ms",
-                        ],
-                        "param_defaults": {
-                            "max_text_files": 10,
-                            "max_text_line_refs": 4,
-                            "max_callsite_symbols": 8,
-                            "max_callsite_results": 8,
-                            "graph_query_timeout_ms": 1000,
-                            "symbol_query_timeout_ms": 1000,
-                            "skip_symbols_after_graph_timeout": False,
-                        },
-                        "answer_schema": {
-                            "kind": "source_text_file | call_site_file | symbol_search_file | anchor",
-                            "path": "repo-relative path",
-                            "role": "entrypoint | state_change | caller | docs | source_candidate",
-                            "evidence": "line_refs, matched_terms, top_symbols, call-site chains, or callers",
-                            "confidence": "number",
-                            "reason": "string",
-                        },
-                        "observability": [
-                            "source text candidate count",
-                            "callsite candidate count",
-                            "degradation guidance",
-                            "trust policy",
-                        ],
-                    },
-                    {
-                        "intent": "usage_boundary_query",
-                        "summary": (
-                            "Find public symbols in a scope and classify whether callers "
-                            "exist outside a boundary."
-                        ),
-                        "best_for": [
-                            "dead-code checks",
-                            "public API usage audits",
-                            "is this symbol used outside this package",
-                        ],
-                        "required_params": ["scope"],
-                        "optional_params": [
-                            "symbol_kind",
-                            "boundary",
-                            "search_roots",
-                            "include_methods",
-                            "budget_ms",
-                            "max_evidence_per_symbol",
-                        ],
-                        "param_defaults": {
-                            "symbol_kind": "public_top_level_function",
-                            "boundary": {"type": "outside_directory", "path": "<scope>"},
-                            "search_roots": [],
-                            "include_methods": False,
-                            "budget_ms": 10000,
-                            "max_evidence_per_symbol": 5,
-                        },
-                        "answer_schema": {
-                            "function_name": "string",
-                            "defined_in": "repo-relative path",
-                            "status": "Unused | Ambiguous | Used",
-                            "external_callers": ["string"],
-                            "internal_callers": ["string"],
-                            "evidence": "object",
-                            "confidence": "number",
-                            "reason": "string",
-                        },
-                        "observability": [
-                            "command name",
-                            "repo path",
-                            "index freshness",
-                            "graph/fact count",
-                            "output size",
-                            "confidence summary",
-                            "failure/degraded reason",
-                        ],
-                    }
-                ],
-            },
-            {
-                "mode": "act",
-                "purpose": "Reserved for future deterministic change-planning and safe edit workflows.",
-                "command": None,
-                "intents": [],
-            },
-            {
-                "mode": "learn",
-                "purpose": "Reserved for future feedback capture, eval traces, and repository memory updates.",
-                "command": None,
-                "intents": [],
-            },
-        ],
-    }
 
 
 @cli.command(name="ai-ready")
