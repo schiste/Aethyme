@@ -19,6 +19,7 @@ SQLite in `.aethyme/`, on macOS and Linux.
 | **Clearance to land** | `submit` → simulate → gates → promote | A submission is merge-simulated against the integration branch *before* anything runs. Conflicts are rejected in milliseconds with written recovery steps; clean merges get your checks run on the merged tree — the only place semantic conflicts are detectable — then promote. |
 | **Regulations** | `.aethyme/gates.toml` | Quality rules are repo policy, not broker policy. You declare gates (command, cost tier, path triggers); the broker selects the affected ones, runs cheap-first, caches by tree hash, and cancels obsolete runs. A repo with no gates is a valid conflict-only deployment. |
 | **Certification** | `aethyme init` / `aethyme certify` | `certify` is a read-only inspection (git version, repo state, config validity, gitignore contract, database integrity) you can run in CI or cron. `init` runs certify, then scaffolds only what's missing, then drafts gates from your manifests. Idempotent: a second run changes nothing and says so. |
+| **Preflight smoke** | `aethyme broker quick-test` | Creates a disposable repo, runs init → adopt → commit → submit, verifies promotion, then removes the repo. Use it after install/init to prove the local broker loop before adopting real work. |
 | **Charts** | the graph engine | A deterministic Rust repo-intelligence engine (indexing, graph navigation, impact frontiers, task-context packs). Today it serves queries on its own; feeding impact hints to the tower is planned, deliberately deferred. |
 | **The flight recorder** | `aethyme broker events` | Every mutation appends to a versioned event log ([`docs/events-contract.md`](docs/events-contract.md)) — the integration contract for any future surface (TUI, editor plugin). |
 
@@ -56,9 +57,12 @@ engine remains a separate supporting service.
 execution, auth, or team sync is part of the product. Direction doc:
 [`docs/aethyme-local-agent-broker.md`](docs/aethyme-local-agent-broker.md).
 
-## Quickstart: first promoted submit in five minutes
+## Quickstart: install -> init -> quick-test -> adopt -> submit
 
 Prerequisites: git ≥ 2.38, a Rust toolchain, ~2 GB free RAM for the one-time compile (the bundled SQLite build is memory-hungry; small VMs/containers may OOM — prebuilt release binaries avoid the compile entirely), and any repo to try it on.
+
+First-time flow: install -> `aethyme init` -> `aethyme broker quick-test` ->
+`aethyme broker adopt` -> `aethyme broker submit --session <id>`.
 
 **1. Install the binary** (from a clone of this repository):
 
@@ -79,7 +83,7 @@ pass     certify.git-version          git 2.55.0 (≥ 2.38 required for merge si
 pass     certify.git-repo             inside a git repository
 pass     certify.head-commit          repository has at least one commit
 pass     certify.binary-path          the running aethyme is the one on PATH
-warn     certify.gates                no gates.toml — broker runs conflict-only (no verification); `aethyme broker scaffold` can draft one
+warn     certify.gates                no gates.toml — broker runs conflict-only (no verification); `aethyme broker gates draft` can draft one
 ...
 
 Phase 2/3 — scaffold (deterministic, only-if-missing):
@@ -89,6 +93,9 @@ created  scaffold.broker-db           integrity: ok
 
 Phase 3/3 — gates draft (adaptive):
 warn     gates.draft                  no manifests recognized — define .aethyme/gates.toml yourself; until then the broker runs conflict-only (no verification)
+
+First-time flow: install -> `aethyme init` -> `aethyme broker quick-test` -> `aethyme broker adopt` -> `aethyme broker submit --session <id>`.
+Next steps: review any drafts above, re-check anytime with `aethyme certify`, then run the disposable smoke before adopting real sessions; optionally `aethyme enhance deploy` installs the agent protocol into AGENTS.md/CLAUDE.md.
 ```
 
 (On a repo with a `Cargo.toml`, `go.mod`, `package.json` scripts, or a
@@ -100,7 +107,26 @@ git add .gitignore .aethyme/config.toml
 git commit -m "chore: adopt aethyme broker (scaffold)"
 ```
 
-**3. Register a session** — here the current checkout; agents normally each
+**3. Run the disposable broker smoke** — this creates and removes a temporary
+repo; it does not touch your target repo:
+
+```bash
+aethyme broker quick-test
+```
+
+```text
+broker quick test passed
+pass     create-temp-repo     /tmp/aethyme-broker-quick-test-...
+pass     git-bootstrap        initial commit on main
+pass     aethyme-init         scaffold committed
+pass     broker-adopt         session 1
+pass     smoke-commit         committed one broker-owned change
+pass     broker-submit        entry 1 promoted
+temporary repo removed: yes
+integration head: 69d395da1c7c
+```
+
+**4. Register a session** — here the current checkout; agents normally each
 get their own worktree:
 
 ```bash
@@ -112,7 +138,7 @@ Adopted session 1 — worktree /private/tmp/demo-app on branch main
 note: main-checkout session — verification is advisory here (commits land on main before gates run); use a worktree session for enforced verification.
 ```
 
-**4. Do the work and commit it.** Only committed work integrates:
+**5. Do the work and commit it.** Only committed work integrates:
 
 ```bash
 # ...edit src/app.py...
@@ -120,7 +146,7 @@ git add src/app.py
 git commit -m "feat: add farewell function"
 ```
 
-**5. Submit — simulate, gate, land:**
+**6. Submit — simulate, gate, land:**
 
 ```bash
 aethyme broker submit --session 1
@@ -134,7 +160,7 @@ entry 1 → promoted (auto-promoted)
 What now: aethyme/integration is at 69d395da1c7c and contains this work. Your checkout and branches are untouched — keep working, or start a follow-up with `aethyme broker adopt --reuse --task "..."`, or finish with `aethyme broker close --session 1`.
 ```
 
-**6. What now?** Your promoted work is on the local `aethyme/integration`
+**7. What now?** Your promoted work is on the local `aethyme/integration`
 branch (`git log aethyme/integration`); merge or push it through your normal
 review flow whenever you choose. `aethyme broker status` shows the whole
 picture:

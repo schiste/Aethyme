@@ -246,6 +246,23 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn init_next_steps_names_quick_test_before_adopt_and_submit() {
+        let message = super::init_next_steps_message();
+        let init = message.find("aethyme init").unwrap();
+        let quick_test = message.find("aethyme broker quick-test").unwrap();
+        let adopt = message.find("aethyme broker adopt").unwrap();
+        let submit = message
+            .find("aethyme broker submit --session <id>")
+            .unwrap();
+        assert!(init < quick_test);
+        assert!(quick_test < adopt);
+        assert!(adopt < submit);
+    }
+}
+
 enum UsageError {
     Help,
     Message(String),
@@ -460,6 +477,14 @@ fn render_quick_test_report(report: &crate::QuickTestReport, json: bool) -> Resu
         println!("integration head: {}", &head[..12.min(head.len())]);
     }
     Ok(())
+}
+
+fn init_next_steps_message() -> &'static str {
+    "First-time flow: install -> `aethyme init` -> `aethyme broker quick-test` -> \
+     `aethyme broker adopt` -> `aethyme broker submit --session <id>`.\n\
+     Next steps: review any drafts above, re-check anytime with `aethyme certify`, \
+     then run the disposable smoke before adopting real sessions; optionally \
+     `aethyme enhance deploy` installs the agent protocol into AGENTS.md/CLAUDE.md."
 }
 
 fn print_overlap_warnings(overlaps: &[crate::Overlap]) {
@@ -1606,12 +1631,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                          (init is idempotent)."
                     );
                 }
-                println!(
-                    "Next steps: review any drafts above, re-check anytime with \
-                     `aethyme certify`, register agents with `aethyme broker adopt`; \
-                     optionally `aethyme enhance deploy` installs the agent protocol \
-                     into AGENTS.md/CLAUDE.md."
-                );
+                println!("{}", init_next_steps_message());
             }
             if !report.certified() {
                 return Err(UsageError::Message("initialization failed".into()));

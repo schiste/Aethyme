@@ -117,7 +117,7 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
             id: "certify.gates",
             status: CheckStatus::Warn,
             detail: "no gates.toml — broker runs conflict-only (no verification); \
-                     `aethyme broker scaffold` can draft one"
+                     `aethyme broker gates draft` can draft one"
                 .into(),
         }
     });
