@@ -130,6 +130,42 @@ pub struct StatusView {
     pub integration_head: String,
 }
 
+/// Focused view of the local integration branch as a pending layer above
+/// the main checkout.
+#[derive(Debug, serde::Serialize)]
+pub struct IntegrationStatusView {
+    pub branch: String,
+    pub head: String,
+    pub main_head: String,
+    pub main_is_ancestor: bool,
+    pub commits_ahead_main: u64,
+    pub changed_files: Vec<String>,
+    pub promoted_entries: Vec<PromotedIntegrationEntry>,
+    pub conflicts: Vec<PromotedConflict>,
+    pub next_action: IntegrationNextAction,
+}
+
+/// A promoted queue entry whose merge commit is still reachable from
+/// integration and not yet reachable from main.
+#[derive(Debug, serde::Serialize)]
+pub struct PromotedIntegrationEntry {
+    pub queue_entry_id: i64,
+    pub session_id: i64,
+    pub branch: Option<String>,
+    pub task: Option<String>,
+    pub base_commit: String,
+    pub head_commit: String,
+    pub merge_commit: String,
+    pub files: Vec<String>,
+}
+
+/// Deterministic operator guidance for the focused integration view.
+#[derive(Debug, serde::Serialize)]
+pub struct IntegrationNextAction {
+    pub summary: String,
+    pub commands: Vec<String>,
+}
+
 /// Result of `broker repair --session`: a conservative recovery action
 /// plus the refreshed gate-selection surface.
 #[derive(Debug, serde::Serialize)]
@@ -818,6 +854,90 @@ impl Broker {
 
     // ── status (Phase 6) ──────────────────────────────────────────────
 
+    /// Focused status for promoted-but-unmerged work: the integration
+    /// branch as a pending layer above the main checkout, plus live
+    /// sessions whose leases overlap that layer.
+    pub fn integration_status(
+        &mut self,
+        now_ms: i64,
+    ) -> Result<IntegrationStatusView, BrokerOpError> {
+        self.refresh_leases()?;
+        self.agents(now_ms)?;
+
+        let (branch, head) = self.integration_head()?;
+        let main_head = self.repo.head_commit()?;
+        let main_is_ancestor = self.repo.is_ancestor(&main_head, &head);
+        let commits_ahead_main = self.repo.commit_count_between(&main_head, &head)?;
+        let changed_files = if head == main_head {
+            Vec::new()
+        } else {
+            self.repo.changed_between(&main_head, &head)?
+        };
+
+        let mut promoted_entries = Vec::new();
+        for entry in self.store.merge_queue()? {
+            if entry.status != MergeStatus::Promoted {
+                continue;
+            }
+            let Some(merge_commit) = details_string_value(entry.details_json.as_deref(), "commit")
+            else {
+                continue;
+            };
+            if !self.repo.is_ancestor(&merge_commit, &head)
+                || self.repo.is_ancestor(&merge_commit, &main_head)
+            {
+                continue;
+            }
+            let session = self.store.session(entry.session_id).ok();
+            let files = self
+                .repo
+                .changed_between(&entry.base_commit, &entry.head_commit)
+                .unwrap_or_default();
+            promoted_entries.push(PromotedIntegrationEntry {
+                queue_entry_id: entry.id,
+                session_id: entry.session_id,
+                branch: session.as_ref().map(|session| session.branch.clone()),
+                task: session.and_then(|session| session.task),
+                base_commit: entry.base_commit,
+                head_commit: entry.head_commit,
+                merge_commit,
+                files,
+            });
+        }
+
+        let conflicts = if changed_files.is_empty() {
+            Vec::new()
+        } else {
+            self.promoted_conflicts()?
+                .into_iter()
+                .filter(|conflict| {
+                    changed_files
+                        .iter()
+                        .any(|path| crate::leases::paths_overlap(path, &conflict.promoted_path))
+                })
+                .collect()
+        };
+        let next_action = integration_next_action(
+            &branch,
+            main_is_ancestor,
+            &promoted_entries,
+            &changed_files,
+            &conflicts,
+        );
+
+        Ok(IntegrationStatusView {
+            branch,
+            head,
+            main_head,
+            main_is_ancestor,
+            commits_ahead_main,
+            changed_files,
+            promoted_entries,
+            conflicts,
+            next_action,
+        })
+    }
+
     /// The whole picture in one call: refreshed leases + overlaps, agent
     /// views, promoted/unmerged conflicts, the merge queue, and the
     /// integration branch head.
@@ -1114,6 +1234,71 @@ fn promoted_conflict_advice(
         queue_entry_id: None,
         evidence,
         commands,
+    }
+}
+
+fn integration_next_action(
+    branch: &str,
+    main_is_ancestor: bool,
+    promoted_entries: &[PromotedIntegrationEntry],
+    changed_files: &[String],
+    conflicts: &[PromotedConflict],
+) -> IntegrationNextAction {
+    use std::collections::BTreeSet;
+
+    let conflict_sessions: BTreeSet<i64> = conflicts
+        .iter()
+        .map(|conflict| conflict.session_id)
+        .collect();
+    if !conflict_sessions.is_empty() {
+        let commands = conflict_sessions
+            .iter()
+            .take(5)
+            .map(|session_id| format!("aethyme broker repair --session {session_id}"))
+            .collect();
+        return IntegrationNextAction {
+            summary: format!(
+                "{} session(s) overlap the pending integration layer; repair or rebase them before submit",
+                conflict_sessions.len()
+            ),
+            commands,
+        };
+    }
+
+    if !promoted_entries.is_empty() {
+        if main_is_ancestor {
+            return IntegrationNextAction {
+                summary: format!(
+                    "{} promoted entry(s) are pending; fast-forward main from {branch} when ready",
+                    promoted_entries.len()
+                ),
+                commands: vec![
+                    format!("git merge --ff-only {branch}"),
+                    "aethyme broker integration status".into(),
+                ],
+            };
+        }
+        return IntegrationNextAction {
+            summary: format!(
+                "{} promoted entry(s) are pending, but main and {branch} have diverged; inspect before merging",
+                promoted_entries.len()
+            ),
+            commands: vec![format!("git log --oneline --left-right HEAD...{branch}")],
+        };
+    }
+
+    if !changed_files.is_empty() {
+        return IntegrationNextAction {
+            summary: format!(
+                "{branch} differs from main, but no promoted queue entries describe the pending commits; inspect branch history"
+            ),
+            commands: vec![format!("git log --oneline --left-right HEAD...{branch}")],
+        };
+    }
+
+    IntegrationNextAction {
+        summary: "no promoted work pending outside main".into(),
+        commands: Vec::new(),
     }
 }
 

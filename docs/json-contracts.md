@@ -4,12 +4,13 @@ Version: **1** — **FROZEN** (2026-07-17). Companion to
 [events-contract.md](events-contract.md), which covers the event stream
 itself; this file covers command outputs.
 
-Four command outputs are **stable v1 surfaces**. Scripts and integrations
+Five command outputs are **stable v1 surfaces**. Scripts and integrations
 may depend on their field names:
 
 | Surface | Command | Shape (source of truth) |
 |---|---|---|
 | Status | `aethyme broker status --json` | `StatusView` (`src/broker.rs`) |
+| Integration status | `aethyme broker integration status --json` | `IntegrationStatusView` (`src/broker.rs`) |
 | Events | `aethyme broker events --json` | `Event` rows (`src/types.rs`), NDJSON |
 | Metrics | `aethyme broker metrics --json` | inline object (`src/cli.rs`) |
 | Submit outcome | `aethyme broker submit --json` | `SubmitOutcome` (`src/merge.rs`) |
@@ -53,6 +54,40 @@ part of the contract.
 `MergeQueueEntry` fields: `id`, `session_id`, `head_commit`,
 `base_commit`, `status`, `merged_tree`, `details_json`, `created_at`,
 `updated_at`.
+
+### `integration status --json`
+
+```
+{
+  "branch": "aethyme/integration",
+  "head": "<commit>",
+  "main_head": "<commit>",
+  "main_is_ancestor": true|false,
+  "commits_ahead_main": n,
+  "changed_files": [ "path", ... ],
+  "promoted_entries": [
+    {
+      "queue_entry_id": n,
+      "session_id": n,
+      "branch": "...",
+      "task": "...",
+      "base_commit": "<commit>",
+      "head_commit": "<commit>",
+      "merge_commit": "<commit>",
+      "files": [ "path", ... ]
+    }
+  ],
+  "conflicts": [
+    { "session_id", "path", "session_path", "promoted_path" }
+  ],
+  "next_action": { "summary": "...", "commands": [ "..." ] }
+}
+```
+
+This is the focused promoted-but-unmerged view: only work present on the
+local integration branch and absent from the main checkout is considered
+pending. `conflicts` are scoped to that pending layer, not every change
+between an old live session and current main.
 
 ### `events --json`
 

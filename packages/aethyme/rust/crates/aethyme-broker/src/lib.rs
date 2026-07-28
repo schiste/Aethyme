@@ -37,7 +37,8 @@ mod types;
 mod version;
 
 pub use broker::{
-    AdoptMode, AgentView, Broker, BrokerOpError, DoctorReport, PromotedConflict, RepairAction,
+    AdoptMode, AgentView, Broker, BrokerOpError, DoctorReport, IntegrationNextAction,
+    IntegrationStatusView, PromotedConflict, PromotedIntegrationEntry, RepairAction,
     RepairGateSelection, RepairReport, RepairSource, StatusAdvice, StatusAdviceSeverity,
     StatusView,
 };
