@@ -756,7 +756,8 @@ impl Broker {
         dir: &Path,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let checkout = GitRepo::discover(dir)?;
-        let gates = self.load_and_sync_gates()?;
+        let config_root = checkout.root().to_path_buf();
+        let gates = self.load_and_sync_gates_from(&config_root)?;
         crate::gates::run_all(&mut self.store, &self.main_root, &checkout, &gates, None)
     }
 
@@ -768,7 +769,8 @@ impl Broker {
         progress: &dyn crate::gates::GateProgressSink,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let checkout = GitRepo::discover(dir)?;
-        let gates = self.load_and_sync_gates()?;
+        let config_root = checkout.root().to_path_buf();
+        let gates = self.load_and_sync_gates_from(&config_root)?;
         crate::gates::run_all_with_progress(
             &mut self.store,
             &self.main_root,
@@ -785,7 +787,8 @@ impl Broker {
     ) -> Result<(GitRepo, Vec<crate::gates::Gate>, Vec<String>), BrokerOpError> {
         let session = self.store.session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
-        let gates = self.load_and_sync_gates()?;
+        let config_root = checkout.root().to_path_buf();
+        let gates = self.load_and_sync_gates_from(&config_root)?;
         let base = self
             .session_change_base(&checkout)
             .or(session.diff_base)
@@ -796,8 +799,11 @@ impl Broker {
 
     /// Load gates.toml and sync the definition snapshot so recorded
     /// results stay interpretable after config edits.
-    fn load_and_sync_gates(&mut self) -> Result<Vec<crate::gates::Gate>, BrokerOpError> {
-        let gates = crate::gates::load_gates(&self.main_root)?;
+    pub(crate) fn load_and_sync_gates_from(
+        &mut self,
+        config_root: &Path,
+    ) -> Result<Vec<crate::gates::Gate>, BrokerOpError> {
+        let gates = crate::gates::load_gates(config_root)?;
         for gate in &gates {
             self.store.upsert_gate(&crate::types::GateDef {
                 name: gate.name.clone(),

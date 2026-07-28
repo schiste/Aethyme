@@ -220,15 +220,17 @@ fn conflicting_submission_rejected_pre_gate_with_instruction_drop() {
 fn failing_gate_on_merged_tree_rejects_and_auto_mode_promotes() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    // Failing gate config.
-    std::fs::write(
-        tmp.path().join(".aethyme/gates.toml"),
-        "[[gate]]\nname = \"fail\"\ncommand = \"exit 7\"\ntriggers = [\"**/*.py\"]\n",
-    )
-    .unwrap();
     let mut broker = Broker::open(tmp.path()).unwrap();
     let wt = agent_worktree(tmp.path(), "x");
     let session = broker.adopt(&wt, None).unwrap();
+    // Failing gate config is committed in the session worktree so the
+    // simulated merged tree, not the broker's main checkout, defines the
+    // verification policy.
+    std::fs::write(
+        wt.join(".aethyme/gates.toml"),
+        "[[gate]]\nname = \"fail\"\ncommand = \"exit 7\"\ntriggers = [\"**/*.py\"]\n",
+    )
+    .unwrap();
     commit_edit(&wt, "src/a.py", "a = 3\n");
 
     let outcome = broker.submit(session.id).unwrap();
@@ -265,7 +267,7 @@ fn failing_gate_on_merged_tree_rejects_and_auto_mode_promotes() {
     // Flip to a passing gate: with the DEFAULT config (no config.toml),
     // verified promotes immediately — auto is the default (2026-07-13).
     std::fs::write(
-        tmp.path().join(".aethyme/gates.toml"),
+        wt.join(".aethyme/gates.toml"),
         "[[gate]]\nname = \"ok\"\ncommand = \"true\"\ntriggers = [\"**/*.py\"]\n",
     )
     .unwrap();
@@ -279,12 +281,13 @@ fn failing_gate_on_merged_tree_rejects_and_auto_mode_promotes() {
 fn repo_without_gates_is_a_pure_conflict_manager() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    // Remove the gate config entirely: conflict-only mode.
-    std::fs::remove_file(tmp.path().join(".aethyme/gates.toml")).unwrap();
     let mut broker = Broker::open(tmp.path()).unwrap();
 
     let wt = agent_worktree(tmp.path(), "solo");
     let session = broker.adopt(&wt, None).unwrap();
+    // Remove the gate config in the submitted tree: conflict-only mode is
+    // committed repository state, not an untracked local checkout setting.
+    std::fs::remove_file(wt.join(".aethyme/gates.toml")).unwrap();
     commit_edit(&wt, "src/a.py", "a = 9\n");
 
     // Clean merge, zero gates configured -> promoted with no verification,

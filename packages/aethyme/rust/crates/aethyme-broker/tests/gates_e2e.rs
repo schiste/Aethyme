@@ -94,6 +94,11 @@ fn write_gates(root: &Path, body: &str) {
     std::fs::write(root.join(".aethyme/gates.toml"), body).unwrap();
 }
 
+fn commit_all(root: &Path, message: &str) {
+    sh(root, &["add", "-A"]);
+    sh(root, &["commit", "-qm", message]);
+}
+
 fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
     let path = root.join(".aethyme/worktrees").join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -138,6 +143,7 @@ cost = 3
 triggers = ["**/*.py"]
 "#,
     );
+    commit_all(tmp.path(), "add gates");
     let mut broker = Broker::open(tmp.path()).unwrap();
 
     // Docs-only session: zero gates selected (#16 acceptance).
@@ -214,6 +220,7 @@ cache = false
 triggers = ["**/*.py"]
 "#,
     );
+    commit_all(tmp.path(), "add gates");
     let gates = aethyme_broker::load_gates(tmp.path()).unwrap();
     assert!(!gates[0].cache);
     let mut broker = Broker::open(tmp.path()).unwrap();
@@ -237,6 +244,53 @@ triggers = ["**/*.py"]
 }
 
 #[test]
+fn session_gate_runs_use_the_session_worktree_gate_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "config-source"
+command = "echo main-run >> gate-markers.txt"
+triggers = ["**/*.py"]
+"#,
+    );
+    commit_all(tmp.path(), "add main gates");
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = add_worktree(tmp.path(), "worktree-gates");
+    let session = broker.adopt(&wt, None).unwrap();
+    write_gates(
+        &wt,
+        r#"
+[[gate]]
+name = "config-source"
+command = "echo worktree-run >> gate-markers.txt"
+cache = false
+triggers = ["**/*.py"]
+"#,
+    );
+    std::fs::write(wt.join("src/app.py"), "x = 4\n").unwrap();
+
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert!(!outcomes[0].cached);
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert!(
+        !outcomes[0].cached,
+        "cache=false from the session worktree must control reruns"
+    );
+
+    let markers = std::fs::read_to_string(wt.join("gate-markers.txt")).unwrap();
+    assert_eq!(
+        markers.lines().collect::<Vec<_>>(),
+        vec!["worktree-run", "worktree-run"]
+    );
+}
+
+#[test]
 fn cargo_target_dir_infra_errors_are_not_cached_failures() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
@@ -249,6 +303,7 @@ command = "echo cargo-run >> gate-markers.txt; printf '%s\n' 'error: extern loca
 triggers = ["**/*.py"]
 "#,
     );
+    commit_all(tmp.path(), "add gates");
     let mut broker = Broker::open(tmp.path()).unwrap();
     let wt = add_worktree(tmp.path(), "cargo-infra");
     let session = broker.adopt(&wt, None).unwrap();
@@ -322,6 +377,7 @@ cost = 2
 triggers = ["**/*.py"]
 "#,
     );
+    commit_all(tmp.path(), "add gates");
     let mut broker = Broker::open(tmp.path()).unwrap();
     let wt = add_worktree(tmp.path(), "env-timeout");
     let session = broker.adopt(&wt, None).unwrap();
@@ -347,7 +403,7 @@ triggers = ["**/*.py"]
     );
 
     write_gates(
-        tmp.path(),
+        &wt,
         r#"
 [[gate]]
 name = "timeout"
@@ -389,6 +445,7 @@ command = "sleep 2"
 triggers = ["**/*.py"]
 "#,
     );
+    commit_all(tmp.path(), "add gates");
     let mut broker = Broker::open(tmp.path()).unwrap();
     let wt = add_worktree(tmp.path(), "heartbeat");
     let session = broker.adopt(&wt, None).unwrap();
@@ -423,6 +480,7 @@ command = "sleep 30; echo done >> slow-finished.txt"
 triggers = ["**/*.py"]
 "#,
     );
+    commit_all(tmp.path(), "add gates");
     let mut broker = Broker::open(tmp.path()).unwrap();
     let wt = add_worktree(tmp.path(), "slow");
     let session = broker.adopt(&wt, None).unwrap();
