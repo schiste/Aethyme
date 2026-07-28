@@ -452,6 +452,28 @@ fn print_promoted_conflict_warnings(conflicts: &[crate::PromotedConflict]) {
     }
 }
 
+fn render_status_advice(advice: &[crate::StatusAdvice]) {
+    println!("Next actions:");
+    if advice.is_empty() {
+        println!("  none");
+        return;
+    }
+    for (index, item) in advice.iter().enumerate() {
+        println!(
+            "  {}. {:<7} {}",
+            index + 1,
+            item.severity.as_str().to_uppercase(),
+            item.summary
+        );
+        if !item.evidence.is_empty() {
+            println!("     evidence: {}", item.evidence.join("; "));
+        }
+        for command in &item.commands {
+            println!("     run: {command}");
+        }
+    }
+}
+
 fn open_broker() -> Result<Broker, UsageError> {
     let cwd = std::env::current_dir()
         .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
@@ -658,6 +680,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                                 serde_json::json!({
                                     "name": g.name, "command": g.command,
                                     "cost": g.cost, "triggers": g.triggers,
+                                    "cache": g.cache,
                                 })
                             })
                             .collect();
@@ -666,7 +689,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         println!("gates.toml OK — {} gate(s), cheap-first:", gates.len());
                         for gate in gates {
                             println!(
-                                "  [{}] {} — {} (triggers: {})",
+                                "  [{}] {} — {} (triggers: {}{})",
                                 gate.cost,
                                 gate.name,
                                 gate.command,
@@ -674,7 +697,8 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                                     "always".to_string()
                                 } else {
                                     gate.triggers.join(", ")
-                                }
+                                },
+                                if gate.cache { "" } else { "; cache: off" }
                             );
                         }
                     }
@@ -1002,6 +1026,8 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     status.integration_branch,
                     &status.integration_head[..12.min(status.integration_head.len())]
                 );
+                println!();
+                render_status_advice(&status.advice);
                 println!();
                 if status.agents.is_empty() {
                     println!("No live sessions.");
