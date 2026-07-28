@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,14 @@ DEFAULT_TOKEN_DELTA_RATIO = 0.20
 DEFAULT_SELECTED_FILE_DELTA_RATIO = 0.50
 DEFAULT_SNIPPET_DELTA_RATIO = 0.50
 DEFAULT_COMMAND_OUTPUT_DELTA_RATIO = 0.25
+COMMAND_FIELD_KEYS = {"cmd", "command"}
+REQUIRED_INT_METRICS = (
+    "token_estimate",
+    "selected_file_count",
+    "snippet_count",
+    "command_output_chars",
+)
+REQUIRED_BOOL_METRICS = ("aethyme_path_leaked", "aethyme_invoked")
 
 
 def main() -> int:
@@ -58,6 +67,8 @@ def compare_runs(
     control_metrics = _metrics(control)
     aethyme_metrics = _metrics(aethyme)
     checks = [
+        *_metric_contract_checks("control", control_metrics),
+        *_metric_contract_checks("aethyme", aethyme_metrics),
         _boolean_check(
             "control_did_not_invoke_aethyme",
             not bool(control_metrics.get("aethyme_invoked")),
@@ -175,7 +186,7 @@ def _metrics(payload: dict[str, Any]) -> dict[str, Any]:
         "token_estimate": _token_estimate(payload),
         "selected_file_count": _count_list_field(structured_output, "selected_files"),
         "snippet_count": _count_list_field(structured_output, "snippets"),
-        "command_output_chars": _int_or_zero(payload.get("command_output_chars")),
+        "command_output_chars": payload.get("command_output_chars"),
         "aethyme_path_leaked": bool(
             payload.get("artifact_leakage", {}).get("aethyme_path_leaked")
         ),
@@ -183,12 +194,15 @@ def _metrics(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _token_estimate(payload: dict[str, Any]) -> int:
+def _token_estimate(payload: dict[str, Any]) -> int | None:
     input_tokens = payload.get("input_tokens")
     output_tokens = payload.get("output_tokens")
-    if isinstance(input_tokens, int) and isinstance(output_tokens, int):
+    if type(input_tokens) is int and type(output_tokens) is int:
         return input_tokens + output_tokens
-    return (max(_int_or_zero(payload.get("event_log_chars")), 0) + 3) // 4
+    event_log_chars = payload.get("event_log_chars")
+    if type(event_log_chars) is int:
+        return (max(event_log_chars, 0) + 3) // 4
+    return None
 
 
 def _count_list_field(value: Any, field_name: str) -> int:
@@ -210,7 +224,34 @@ def _metric_int(metrics: dict[str, Any], key: str) -> int:
 
 
 def _int_or_zero(value: Any) -> int:
-    return value if isinstance(value, int) else 0
+    return value if type(value) is int else 0
+
+
+def _metric_contract_checks(label: str, metrics: dict[str, Any]) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+    for key in REQUIRED_INT_METRICS:
+        value = metrics.get(key)
+        passed = type(value) is int and value >= 0
+        checks.append(
+            {
+                "name": f"{label}_metric_{key}_valid",
+                "passed": passed,
+                "value": value,
+                "failure": None if passed else f"{label} metric {key} must be a non-negative int",
+            }
+        )
+    for key in REQUIRED_BOOL_METRICS:
+        value = metrics.get(key)
+        passed = type(value) is bool
+        checks.append(
+            {
+                "name": f"{label}_metric_{key}_valid",
+                "passed": passed,
+                "value": value,
+                "failure": None if passed else f"{label} metric {key} must be a bool",
+            }
+        )
+    return checks
 
 
 def _aethyme_invoked(payload: dict[str, Any]) -> bool:
@@ -234,14 +275,12 @@ def _aethyme_invoked(payload: dict[str, Any]) -> bool:
 
 def _event_contains_aethyme_invocation(value: Any, *, key: str | None = None) -> bool:
     if isinstance(value, str):
-        if key in {"aggregated_output", "cmd", "command", "output", "stdout", "stderr"}:
-            lowered = value.lower()
-            return "aethyme explore" in lowered or "aethyme-engine-cli explore" in lowered
+        if key in COMMAND_FIELD_KEYS:
+            return _command_tokens_invoke_aethyme_explore(_split_command_text(value))
         return False
     if isinstance(value, list):
-        joined = " ".join(item for item in value if isinstance(item, str)).lower()
-        if "aethyme" in joined and "explore" in joined:
-            return True
+        if key in COMMAND_FIELD_KEYS:
+            return _command_tokens_invoke_aethyme_explore(value)
         return any(_event_contains_aethyme_invocation(item) for item in value)
     if isinstance(value, dict):
         return any(
@@ -249,6 +288,26 @@ def _event_contains_aethyme_invocation(value: Any, *, key: str | None = None) ->
             for item_key, item in value.items()
         )
     return False
+
+
+def _split_command_text(value: str) -> list[str]:
+    try:
+        return shlex.split(value)
+    except ValueError:
+        return value.split()
+
+
+def _command_tokens_invoke_aethyme_explore(value: list[Any]) -> bool:
+    tokens = [item for item in value if isinstance(item, str)]
+    if not tokens:
+        return False
+    has_aethyme_binary = any(_is_aethyme_binary(token) for token in tokens)
+    has_explore_subcommand = any(token.lower() == "explore" for token in tokens)
+    return has_aethyme_binary and has_explore_subcommand
+
+
+def _is_aethyme_binary(token: str) -> bool:
+    return Path(token).name.lower() in {"aethyme", "aethyme-engine-cli"}
 
 
 def _boolean_check(name: str, passed: bool, failure: str) -> dict[str, Any]:

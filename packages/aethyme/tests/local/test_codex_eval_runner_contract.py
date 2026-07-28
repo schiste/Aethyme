@@ -251,6 +251,26 @@ def test_runner_emits_stable_regression_metrics(
     }
 
 
+def test_runner_invocation_detection_ignores_non_command_text_and_output(tmp_path: Path) -> None:
+    runner = _load_runner()
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "stdout": "The answer says to run aethyme explore later.",
+                    "message": ["aethyme", "explore"],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert runner._aethyme_invoked(events_file) is False
+
+
 def test_leakage_gate_checks_selected_files_snippets_command_output_and_final_answer(
     tmp_path: Path,
 ) -> None:
@@ -450,6 +470,77 @@ def test_regression_gate_can_infer_invocation_from_legacy_event_log(tmp_path: Pa
 
     assert report["passed"] is True
     assert report["aethyme_metrics"]["aethyme_invoked"] is True
+
+
+def test_regression_gate_does_not_infer_invocation_from_text_mentions(tmp_path: Path) -> None:
+    gate = _load_gate()
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "stdout": "No command was run; aethyme explore is only mentioned.",
+                    "message": ["aethyme", "explore"],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    control = {
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "command_output_chars": 100,
+        "artifact_leakage": {"aethyme_path_leaked": False},
+        "reviewer_quality_score": 4.0,
+    }
+    aethyme = {
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "command_output_chars": 100,
+        "artifact_leakage": {"aethyme_path_leaked": False},
+        "event_log_file": str(events_file),
+        "reviewer_quality_score": 4.0,
+    }
+
+    report = gate.compare_runs(control, aethyme)
+
+    assert report["passed"] is False
+    assert report["aethyme_metrics"]["aethyme_invoked"] is False
+    failures = {check["name"] for check in report["checks"] if not check["passed"]}
+    assert failures == {"aethyme_invoked"}
+
+
+def test_regression_gate_fails_missing_required_metrics() -> None:
+    gate = _load_gate()
+    control = {
+        "regression_metrics": {
+            "selected_file_count": 2,
+            "snippet_count": 1,
+            "command_output_chars": 1_000,
+            "aethyme_path_leaked": False,
+            "aethyme_invoked": False,
+        },
+        "reviewer_quality_score": 4.0,
+    }
+    aethyme = {
+        "regression_metrics": {
+            "selected_file_count": 2,
+            "snippet_count": 1,
+            "command_output_chars": 1_000,
+            "aethyme_path_leaked": False,
+            "aethyme_invoked": True,
+        },
+        "reviewer_quality_score": 4.0,
+    }
+
+    report = gate.compare_runs(control, aethyme)
+
+    assert report["passed"] is False
+    failures = {check["name"] for check in report["checks"] if not check["passed"]}
+    assert "control_metric_token_estimate_valid" in failures
+    assert "aethyme_metric_token_estimate_valid" in failures
 
 
 def test_regression_gate_fails_hygiene_invocation_and_quality_regressions() -> None:

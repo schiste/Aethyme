@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,7 @@ GENERATED_ARTIFACTS = (
     "CLAUDE.md",
 )
 COMMAND_OUTPUT_KEYS = {"aggregated_output", "output", "stdout", "stderr"}
+COMMAND_FIELD_KEYS = {"cmd", "command"}
 PATH_LEAK_MARKERS = (".aethyme",)
 MAX_REPORTED_LEAKS = 20
 CODEX_EVAL_ENGINE_SOCKET_DIR = Path("/tmp/aethyme-codex-engine-sockets")
@@ -471,14 +473,12 @@ def _aethyme_invoked(events_file: Path) -> bool:
 
 def _event_contains_aethyme_invocation(value: Any, *, key: str | None = None) -> bool:
     if isinstance(value, str):
-        if key in COMMAND_OUTPUT_KEYS or key in {"cmd", "command", "aggregated_output"}:
-            lowered = value.lower()
-            return "aethyme explore" in lowered or "aethyme-engine-cli explore" in lowered
+        if key in COMMAND_FIELD_KEYS:
+            return _command_tokens_invoke_aethyme_explore(_split_command_text(value))
         return False
     if isinstance(value, list):
-        joined = " ".join(item for item in value if isinstance(item, str)).lower()
-        if "aethyme" in joined and "explore" in joined:
-            return True
+        if key in COMMAND_FIELD_KEYS:
+            return _command_tokens_invoke_aethyme_explore(value)
         return any(_event_contains_aethyme_invocation(item) for item in value)
     if isinstance(value, dict):
         return any(
@@ -486,6 +486,26 @@ def _event_contains_aethyme_invocation(value: Any, *, key: str | None = None) ->
             for item_key, item in value.items()
         )
     return False
+
+
+def _split_command_text(value: str) -> list[str]:
+    try:
+        return shlex.split(value)
+    except ValueError:
+        return value.split()
+
+
+def _command_tokens_invoke_aethyme_explore(value: list[Any]) -> bool:
+    tokens = [item for item in value if isinstance(item, str)]
+    if not tokens:
+        return False
+    has_aethyme_binary = any(_is_aethyme_binary(token) for token in tokens)
+    has_explore_subcommand = any(token.lower() == "explore" for token in tokens)
+    return has_aethyme_binary and has_explore_subcommand
+
+
+def _is_aethyme_binary(token: str) -> bool:
+    return Path(token).name.lower() in {"aethyme", "aethyme-engine-cli"}
 
 
 def _collect_command_output_path_leaks(events_file: Path) -> list[dict[str, str]]:
