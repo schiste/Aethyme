@@ -94,10 +94,16 @@ Python-invocation rows.
    remaining map-based surfaces follow the redb workstream's existing
    trajectory (facts/analyze redb-backing), which removes the cost
    instead of hiding it. `/tmp/aethyme-cache` and its `clear-cache`
-   reinterpretation are legacy stubs that die in Phase 6. At playground
-   scale (12.5K files) map builds are seconds-scale, so redb-backing
-   facts/analyze before heavy playground use is the follow-up, tracked
-   with the redb owners.
+   reinterpretation are legacy stubs that die in Phase 6.
+   **Scale check (2026-07-28, 4,851-file synthetic repo, 9,450 resolved
+   edges):** redb reads stay near-flat (25–31ms; task anchors 85ms);
+   fragment-based map builds are cheap even here (facts 106ms, inspect
+   130ms) — but `analyze dead-code` is **4.4s**, and the cost is the
+   analyzer's per-function caller scans, not map building. So the one
+   place the old Python cache is genuinely missed is repeated identical
+   analyze runs at playground scale — an eval-harness pattern, not an
+   operator pattern. The structural fix is redb-backing the analyzer
+   (with the redb owners), not resurrecting a cache for one command.
 6. **Typed errors + exit-code contract.** Click's ad-hoc `SystemExit(1)`
    becomes the documented exit-code table the router already started
    (explore's exit-2-daemon-down convention).
