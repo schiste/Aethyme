@@ -303,11 +303,33 @@ def _command_tokens_invoke_aethyme_explore(value: list[Any]) -> bool:
         return False
     has_aethyme_binary = any(_is_aethyme_binary(token) for token in tokens)
     has_explore_subcommand = any(token.lower() == "explore" for token in tokens)
+    shell_invocation = any(
+        _command_tokens_invoke_aethyme_explore(_split_command_text(payload))
+        for payload in _shell_command_payloads(tokens)
+    )
+    if shell_invocation:
+        return True
     return has_aethyme_binary and has_explore_subcommand
 
 
 def _is_aethyme_binary(token: str) -> bool:
     return Path(token).name.lower() in {"aethyme", "aethyme-engine-cli"}
+
+
+def _shell_command_payloads(tokens: list[str]) -> list[str]:
+    payloads: list[str] = []
+    for index, token in enumerate(tokens[:-1]):
+        if _looks_like_shell_c_flag(token) and index > 0 and _is_shell_binary(tokens[index - 1]):
+            payloads.append(tokens[index + 1])
+    return payloads
+
+
+def _looks_like_shell_c_flag(token: str) -> bool:
+    return token.startswith("-") and "c" in token[1:]
+
+
+def _is_shell_binary(token: str) -> bool:
+    return Path(token).name.lower() in {"bash", "dash", "ksh", "sh", "zsh"}
 
 
 def _boolean_check(name: str, passed: bool, failure: str) -> dict[str, Any]:
