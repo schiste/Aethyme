@@ -505,6 +505,16 @@ impl GitRepo {
         Ok(count.parse().unwrap_or(0))
     }
 
+    /// Commits reachable from `to` but not from `from`. Used by status
+    /// surfaces that compare named refs instead of this checkout's HEAD.
+    pub fn commit_count_between(&self, from: &str, to: &str) -> Result<u64, GitError> {
+        let count = run_git(
+            &self.root,
+            &["rev-list", "--count", &format!("{from}..{to}")],
+        )?;
+        Ok(count.parse().unwrap_or(0))
+    }
+
     /// Create a linked worktree at `dest` on new branch `branch` starting
     /// from `base`, returning a handle on it.
     pub fn worktree_add(&self, dest: &Path, branch: &str, base: &str) -> Result<GitRepo, GitError> {

@@ -105,6 +105,10 @@ Usage:
       Manual-mode only: advance the local integration branch to a verified
       entry's merge commit; other in-flight entries are re-simulated.
       Never pushes.
+  aethyme broker integration status [--json]
+      Focused promoted-but-unmerged view: the local integration branch as
+      a pending layer above main, with promoted entries, files changed,
+      live sessions conflicting with that layer, and the next action.
   aethyme broker status [--json]
       The whole picture: agents, overlaps, promoted conflicts, merge
       queue, integration head.
@@ -187,6 +191,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "repair",
         "queue",
         "promote",
+        "integration",
         "status",
         "events",
         "prune",
@@ -518,6 +523,136 @@ fn render_repair_report(report: &crate::RepairReport) {
         }
     }
     println!("  next: {}", report.next_command);
+}
+
+fn short_commit(commit: &str) -> &str {
+    &commit[..12.min(commit.len())]
+}
+
+fn capped_join(values: &[String], limit: usize) -> String {
+    let mut shown: Vec<String> = values.iter().take(limit).cloned().collect();
+    if values.len() > shown.len() {
+        shown.push(format!("and {} more", values.len() - shown.len()));
+    }
+    shown.join(", ")
+}
+
+fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
+}
+
+fn render_integration_status(
+    report: &crate::IntegrationStatusView,
+    json: bool,
+) -> Result<(), UsageError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    println!(
+        "Integration: {} @ {}",
+        report.branch,
+        short_commit(&report.head)
+    );
+    let main_relation = if report.head == report.main_head {
+        "current with integration".to_string()
+    } else if report.main_is_ancestor {
+        format!("{} commit(s) behind integration", report.commits_ahead_main)
+    } else {
+        "diverged from integration".into()
+    };
+    println!(
+        "Main:        {} ({main_relation})",
+        short_commit(&report.main_head)
+    );
+    println!();
+
+    if report.promoted_entries.is_empty() && report.changed_files.is_empty() {
+        println!("Pending layer: none");
+    } else {
+        println!(
+            "Pending layer: {} promoted {}, {} {} changed, {} {} ahead of main",
+            report.promoted_entries.len(),
+            plural(report.promoted_entries.len(), "entry", "entries"),
+            report.changed_files.len(),
+            plural(report.changed_files.len(), "file", "files"),
+            report.commits_ahead_main,
+            plural(report.commits_ahead_main as usize, "commit", "commits"),
+        );
+    }
+
+    if report.promoted_entries.is_empty() {
+        println!("Promoted entries: none");
+    } else {
+        println!("Promoted entries:");
+        for entry in report.promoted_entries.iter().take(10) {
+            let label = entry
+                .task
+                .as_deref()
+                .or(entry.branch.as_deref())
+                .unwrap_or("-");
+            println!(
+                "  q{} session {} {} -> {}  {}",
+                entry.queue_entry_id,
+                entry.session_id,
+                short_commit(&entry.head_commit),
+                short_commit(&entry.merge_commit),
+                label
+            );
+            if !entry.files.is_empty() {
+                println!("    files: {}", capped_join(&entry.files, 5));
+            }
+        }
+        if report.promoted_entries.len() > 10 {
+            println!(
+                "  and {} more promoted {}",
+                report.promoted_entries.len() - 10,
+                plural(report.promoted_entries.len() - 10, "entry", "entries")
+            );
+        }
+    }
+
+    if report.changed_files.is_empty() {
+        println!("Changed files: none");
+    } else {
+        println!("Changed files:");
+        for path in report.changed_files.iter().take(12) {
+            println!("  - {path}");
+        }
+        if report.changed_files.len() > 12 {
+            println!(
+                "  and {} more {}",
+                report.changed_files.len() - 12,
+                plural(report.changed_files.len() - 12, "file", "files")
+            );
+        }
+    }
+
+    if report.conflicts.is_empty() {
+        println!("Conflicts with pending layer: none");
+    } else {
+        println!("Conflicts with pending layer:");
+        for conflict in report.conflicts.iter().take(12) {
+            println!(
+                "  session {}: {} (session {}, integration {})",
+                conflict.session_id, conflict.path, conflict.session_path, conflict.promoted_path
+            );
+        }
+        if report.conflicts.len() > 12 {
+            println!(
+                "  and {} more {}",
+                report.conflicts.len() - 12,
+                plural(report.conflicts.len() - 12, "conflict", "conflicts")
+            );
+        }
+    }
+
+    println!("Next action: {}", report.next_action.summary);
+    for command in &report.next_action.commands {
+        println!("  run: {command}");
+    }
+    Ok(())
 }
 
 fn open_broker() -> Result<Broker, UsageError> {
@@ -1071,6 +1206,28 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 println!("{{\"promoted\":{entry}}}");
             } else {
                 println!("Promoted entry {entry} to the local integration branch.");
+            }
+        }
+        "integration" => {
+            let action =
+                parsed
+                    .positional
+                    .first()
+                    .map(String::as_str)
+                    .ok_or(UsageError::Message(
+                        "integration requires an action: status".into(),
+                    ))?;
+            match action {
+                "status" => {
+                    let mut broker = open_broker()?;
+                    let report = broker.integration_status(now_ms())?;
+                    render_integration_status(&report, parsed.json)?;
+                }
+                other => {
+                    return Err(UsageError::Message(format!(
+                        "unknown integration action {other:?} — expected status"
+                    )));
+                }
             }
         }
         "status" => {

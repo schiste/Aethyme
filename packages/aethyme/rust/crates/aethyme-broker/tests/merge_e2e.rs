@@ -486,6 +486,71 @@ fn status_reports_promoted_unmerged_work_as_separate_conflict_surface() {
 }
 
 #[test]
+fn integration_status_reports_pending_layer_entries_files_and_conflicts() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let wt_promoted = agent_worktree(tmp.path(), "pending-promoted");
+    let promoted = broker.adopt(&wt_promoted, Some("promoted layer")).unwrap();
+    commit_edit(&wt_promoted, "src/a.py", "a = 20\n");
+    let promoted_out = broker.submit(promoted.id).unwrap();
+    assert!(promoted_out.promoted);
+    broker.close(promoted.id).unwrap();
+
+    let wt_live = agent_worktree(tmp.path(), "pending-live");
+    let live = broker.adopt(&wt_live, Some("live overlap")).unwrap();
+    commit_edit(&wt_live, "src/a.py", "a = 30\n");
+
+    let report = broker.integration_status(0).unwrap();
+    assert_eq!(report.branch, "aethyme/integration");
+    assert_eq!(report.head, resolve(tmp.path(), "aethyme/integration"));
+    assert_eq!(report.main_head, resolve(tmp.path(), "main"));
+    assert!(report.main_is_ancestor);
+    assert!(report.commits_ahead_main > 0);
+    assert_eq!(report.changed_files, vec!["src/a.py".to_string()]);
+
+    assert_eq!(report.promoted_entries.len(), 1);
+    let entry = &report.promoted_entries[0];
+    assert_eq!(entry.queue_entry_id, promoted_out.entry.id);
+    assert_eq!(entry.session_id, promoted.id);
+    assert_eq!(entry.task.as_deref(), Some("promoted layer"));
+    assert_eq!(entry.files, vec!["src/a.py".to_string()]);
+
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(report.conflicts[0].session_id, live.id);
+    assert_eq!(report.conflicts[0].path, "src/a.py");
+    assert!(
+        report
+            .next_action
+            .summary
+            .contains("pending integration layer")
+    );
+    assert!(
+        report
+            .next_action
+            .commands
+            .iter()
+            .any(|command| command == &format!("aethyme broker repair --session {}", live.id)),
+        "{report:?}"
+    );
+
+    sh(tmp.path(), &["merge", "--ff-only", "aethyme/integration"]);
+    let report = broker.integration_status(0).unwrap();
+    assert!(report.changed_files.is_empty());
+    assert!(report.promoted_entries.is_empty());
+    assert!(
+        report.conflicts.is_empty(),
+        "once integration is merged to main, this focused command should not \
+         label old-main drift as promoted-but-unmerged work"
+    );
+    assert_eq!(
+        report.next_action.summary,
+        "no promoted work pending outside main"
+    );
+}
+
+#[test]
 fn repair_rebases_promoted_conflict_and_reports_affected_gates() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
