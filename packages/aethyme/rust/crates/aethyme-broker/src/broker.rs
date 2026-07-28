@@ -1251,6 +1251,9 @@ fn integration_next_action(
         .map(|conflict| conflict.session_id)
         .collect();
     if !conflict_sessions.is_empty() {
+        let count = conflict_sessions.len();
+        let noun = if count == 1 { "session" } else { "sessions" };
+        let verb = if count == 1 { "overlaps" } else { "overlap" };
         let commands = conflict_sessions
             .iter()
             .take(5)
@@ -1258,19 +1261,24 @@ fn integration_next_action(
             .collect();
         return IntegrationNextAction {
             summary: format!(
-                "{} session(s) overlap the pending integration layer; repair or rebase them before submit",
-                conflict_sessions.len()
+                "{count} {noun} {verb} the pending integration layer; repair or rebase before submit"
             ),
             commands,
         };
     }
 
     if !promoted_entries.is_empty() {
+        let count = promoted_entries.len();
+        let noun = if count == 1 {
+            "promoted entry"
+        } else {
+            "promoted entries"
+        };
+        let verb = if count == 1 { "is" } else { "are" };
         if main_is_ancestor {
             return IntegrationNextAction {
                 summary: format!(
-                    "{} promoted entry(s) are pending; fast-forward main from {branch} when ready",
-                    promoted_entries.len()
+                    "{count} {noun} {verb} pending; fast-forward main from {branch} when ready"
                 ),
                 commands: vec![
                     format!("git merge --ff-only {branch}"),
@@ -1280,8 +1288,7 @@ fn integration_next_action(
         }
         return IntegrationNextAction {
             summary: format!(
-                "{} promoted entry(s) are pending, but main and {branch} have diverged; inspect before merging",
-                promoted_entries.len()
+                "{count} {noun} {verb} pending, but main and {branch} have diverged; inspect before merging"
             ),
             commands: vec![format!("git log --oneline --left-right HEAD...{branch}")],
         };
