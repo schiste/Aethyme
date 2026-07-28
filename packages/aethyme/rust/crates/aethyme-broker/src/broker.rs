@@ -11,7 +11,9 @@ use std::process::{Command, Stdio};
 use crate::error::BrokerError;
 use crate::git::{GitError, GitRepo};
 use crate::store::BrokerStore;
-use crate::types::{NewSession, Session, SessionOrigin, SessionStatus};
+use crate::types::{
+    MergeQueueEntry, MergeStatus, NewSession, Session, SessionOrigin, SessionStatus,
+};
 
 /// Idle/stale thresholds for activity-derived liveness (issue #9).
 /// Configurable via `.aethyme/config.toml` in a later phase; constants
@@ -103,12 +105,48 @@ impl DoctorReport {
 /// Everything `broker status` renders, in one serializable shape.
 #[derive(Debug, serde::Serialize)]
 pub struct StatusView {
+    pub advice: Vec<StatusAdvice>,
     pub agents: Vec<AgentView>,
     pub overlaps: Vec<crate::leases::Overlap>,
     pub promoted_conflicts: Vec<PromotedConflict>,
     pub queue: Vec<crate::types::MergeQueueEntry>,
     pub integration_branch: String,
     pub integration_head: String,
+}
+
+/// Operator guidance derived from `broker status` facts. This is
+/// deliberately local and deterministic: no model-generated prose, no
+/// hidden lookups, and no state mutation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatusAdvice {
+    pub id: &'static str,
+    pub severity: StatusAdviceSeverity,
+    pub reason: &'static str,
+    pub summary: String,
+    pub session_id: Option<i64>,
+    pub queue_entry_id: Option<i64>,
+    pub evidence: Vec<String>,
+    pub commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StatusAdviceSeverity {
+    Blocked,
+    Warning,
+    Notice,
+    Info,
+}
+
+impl StatusAdviceSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Warning => "warning",
+            Self::Notice => "notice",
+            Self::Info => "info",
+        }
+    }
 }
 
 /// A live session lease overlapping work that has already promoted to the
@@ -624,7 +662,9 @@ impl Broker {
         let promoted_conflicts = self.promoted_conflicts()?;
         let queue = self.store.merge_queue()?;
         let (integration_branch, integration_head) = self.integration_head()?;
+        let advice = self.status_advice(&agents, &promoted_conflicts, &queue, &integration_branch);
         Ok(StatusView {
+            advice,
             agents,
             overlaps,
             promoted_conflicts,
@@ -632,6 +672,71 @@ impl Broker {
             integration_branch,
             integration_head,
         })
+    }
+
+    fn status_advice(
+        &self,
+        agents: &[AgentView],
+        promoted_conflicts: &[PromotedConflict],
+        queue: &[MergeQueueEntry],
+        integration_branch: &str,
+    ) -> Vec<StatusAdvice> {
+        use std::collections::BTreeMap;
+
+        let mut advice = Vec::new();
+        let mut latest_queue_by_session = BTreeMap::new();
+        for entry in queue {
+            latest_queue_by_session.insert(entry.session_id, entry);
+        }
+        let agents_by_id: BTreeMap<i64, &AgentView> = agents
+            .iter()
+            .map(|agent| (agent.session.id, agent))
+            .collect();
+
+        for agent in agents {
+            let Some(entry) = latest_queue_by_session.get(&agent.session.id) else {
+                continue;
+            };
+            match entry.status {
+                MergeStatus::Rejected => advice.push(rejected_submit_advice(agent, entry)),
+                MergeStatus::Conflict => advice.push(conflict_submit_advice(agent, entry)),
+                _ => {}
+            }
+        }
+
+        let mut promoted_by_session: BTreeMap<i64, Vec<&PromotedConflict>> = BTreeMap::new();
+        for conflict in promoted_conflicts {
+            promoted_by_session
+                .entry(conflict.session_id)
+                .or_default()
+                .push(conflict);
+        }
+        for (session_id, conflicts) in promoted_by_session {
+            let worktree = agents_by_id
+                .get(&session_id)
+                .map(|agent| agent.session.worktree_path.as_str())
+                .unwrap_or("");
+            advice.push(promoted_conflict_advice(
+                session_id,
+                worktree,
+                integration_branch,
+                &conflicts,
+            ));
+        }
+
+        for agent in agents {
+            let Ok(checkout) = GitRepo::discover(Path::new(&agent.session.worktree_path)) else {
+                continue;
+            };
+            let Ok(dirty) = checkout.dirty_paths() else {
+                continue;
+            };
+            if !dirty.is_empty() {
+                advice.push(dirty_worktree_advice(agent, &dirty));
+            }
+        }
+
+        advice
     }
 
     // ── doctor (operational health) ───────────────────────────────────
@@ -719,6 +824,272 @@ impl Broker {
         self.store
             .set_session_status(session_id, SessionStatus::Cleaned, None)?;
         Ok(())
+    }
+}
+
+fn rejected_submit_advice(agent: &AgentView, entry: &MergeQueueEntry) -> StatusAdvice {
+    let failures = gate_failures(entry.details_json.as_deref());
+    let gate_names: Vec<String> = failures
+        .iter()
+        .map(|failure| failure.name.clone())
+        .collect();
+    let summary = if gate_names.is_empty() {
+        format!(
+            "session {} latest submit qid {} was rejected; inspect the gate details, commit a fix, then resubmit",
+            agent.session.id, entry.id
+        )
+    } else {
+        format!(
+            "session {} latest submit qid {} was rejected by {}; commit a fix, then resubmit",
+            agent.session.id,
+            entry.id,
+            gate_names.join(", ")
+        )
+    };
+
+    let mut evidence = queue_evidence(entry);
+    if failures.is_empty() {
+        evidence.push("gate details unavailable or did not include a failing gate".into());
+    } else {
+        evidence.extend(failures.iter().map(GateFailure::evidence));
+    }
+
+    let worktree = shell_quote(&agent.session.worktree_path);
+    StatusAdvice {
+        id: "session.latest-submit-rejected",
+        severity: StatusAdviceSeverity::Blocked,
+        reason: "submit_rejected",
+        summary,
+        session_id: Some(agent.session.id),
+        queue_entry_id: Some(entry.id),
+        evidence,
+        commands: vec![
+            format!("git -C {worktree} status --short"),
+            format!("aethyme broker gates run --session {}", agent.session.id),
+            format!("aethyme broker submit --session {}", agent.session.id),
+        ],
+    }
+}
+
+fn conflict_submit_advice(agent: &AgentView, entry: &MergeQueueEntry) -> StatusAdvice {
+    let conflicts = details_string_array(entry.details_json.as_deref(), "conflicts");
+    let blockers = details_i64_array(entry.details_json.as_deref(), "blocking_sessions");
+    let conflict_count = conflicts.len();
+    let summary = if conflict_count == 0 {
+        format!(
+            "session {} latest submit qid {} conflicted; read the action-required file, rebase, then resubmit",
+            agent.session.id, entry.id
+        )
+    } else {
+        format!(
+            "session {} latest submit qid {} conflicted on {} path(s); rebase, resolve, then resubmit",
+            agent.session.id, entry.id, conflict_count
+        )
+    };
+
+    let mut evidence = queue_evidence(entry);
+    evidence.extend(path_evidence("conflict", &conflicts));
+    if !blockers.is_empty() {
+        let labels: Vec<String> = blockers.iter().map(i64::to_string).collect();
+        evidence.push(format!("blocking sessions {}", labels.join(", ")));
+    }
+
+    let worktree = shell_quote(&agent.session.worktree_path);
+    StatusAdvice {
+        id: "session.latest-submit-conflict",
+        severity: StatusAdviceSeverity::Blocked,
+        reason: "submit_conflict",
+        summary,
+        session_id: Some(agent.session.id),
+        queue_entry_id: Some(entry.id),
+        evidence,
+        commands: vec![
+            format!("cat {}/{}", worktree, crate::ACTION_REQUIRED_RELPATH),
+            format!("git -C {worktree} rebase {}", entry.base_commit),
+            format!("aethyme broker submit --session {}", agent.session.id),
+        ],
+    }
+}
+
+fn promoted_conflict_advice(
+    session_id: i64,
+    worktree_path: &str,
+    integration_branch: &str,
+    conflicts: &[&PromotedConflict],
+) -> StatusAdvice {
+    let count = conflicts.len();
+    let summary = format!(
+        "session {session_id} overlaps promoted integration work on {count} path(s); rebase onto {integration_branch} before submit"
+    );
+    let mut evidence: Vec<String> = conflicts
+        .iter()
+        .take(5)
+        .map(|conflict| {
+            format!(
+                "path {} (session {}, integration {})",
+                conflict.path, conflict.session_path, conflict.promoted_path
+            )
+        })
+        .collect();
+    if count > evidence.len() {
+        evidence.push(format!("and {} more path(s)", count - evidence.len()));
+    }
+
+    let mut commands = Vec::new();
+    if !worktree_path.is_empty() {
+        let worktree = shell_quote(worktree_path);
+        commands.push(format!("git -C {worktree} rebase {integration_branch}"));
+    }
+    commands.push(format!("aethyme broker submit --session {session_id}"));
+
+    StatusAdvice {
+        id: "session.promoted-conflict",
+        severity: StatusAdviceSeverity::Blocked,
+        reason: "promoted_conflict",
+        summary,
+        session_id: Some(session_id),
+        queue_entry_id: None,
+        evidence,
+        commands,
+    }
+}
+
+fn dirty_worktree_advice(agent: &AgentView, dirty: &[String]) -> StatusAdvice {
+    let summary = format!(
+        "session {} has {} uncommitted change(s); commit or stash before submit because only committed work integrates",
+        agent.session.id,
+        dirty.len()
+    );
+    let worktree = shell_quote(&agent.session.worktree_path);
+    StatusAdvice {
+        id: "session.dirty-worktree",
+        severity: StatusAdviceSeverity::Warning,
+        reason: "dirty_worktree",
+        summary,
+        session_id: Some(agent.session.id),
+        queue_entry_id: None,
+        evidence: path_evidence("dirty", dirty),
+        commands: vec![
+            format!("git -C {worktree} status --short"),
+            format!("git -C {worktree} add ..."),
+            format!("git -C {worktree} commit"),
+            format!("git -C {worktree} stash push"),
+        ],
+    }
+}
+
+#[derive(Debug)]
+struct GateFailure {
+    name: String,
+    status: String,
+    cached: bool,
+}
+
+impl GateFailure {
+    fn evidence(&self) -> String {
+        format!(
+            "gate {} status {}{}",
+            self.name,
+            self.status,
+            if self.cached { " (cached)" } else { "" }
+        )
+    }
+}
+
+fn gate_failures(details_json: Option<&str>) -> Vec<GateFailure> {
+    let Some(details_json) = details_json else {
+        return Vec::new();
+    };
+    let Ok(details) = serde_json::from_str::<serde_json::Value>(details_json) else {
+        return Vec::new();
+    };
+    let Some(gates) = details.get("gates").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    gates
+        .iter()
+        .filter_map(|gate| {
+            let name = gate.get("gate")?.as_str()?;
+            let status = gate.get("status")?.as_str()?;
+            if status == "pass" {
+                return None;
+            }
+            Some(GateFailure {
+                name: name.to_string(),
+                status: status.to_string(),
+                cached: gate
+                    .get("cached")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+fn details_string_array(details_json: Option<&str>, key: &str) -> Vec<String> {
+    let Some(details_json) = details_json else {
+        return Vec::new();
+    };
+    let Ok(details) = serde_json::from_str::<serde_json::Value>(details_json) else {
+        return Vec::new();
+    };
+    details
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect()
+}
+
+fn details_i64_array(details_json: Option<&str>, key: &str) -> Vec<i64> {
+    let Some(details_json) = details_json else {
+        return Vec::new();
+    };
+    let Ok(details) = serde_json::from_str::<serde_json::Value>(details_json) else {
+        return Vec::new();
+    };
+    details
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_i64)
+        .collect()
+}
+
+fn queue_evidence(entry: &MergeQueueEntry) -> Vec<String> {
+    vec![
+        format!("head {}", short_commit(&entry.head_commit)),
+        format!("base {}", short_commit(&entry.base_commit)),
+    ]
+}
+
+fn path_evidence(label: &str, paths: &[String]) -> Vec<String> {
+    let mut evidence: Vec<String> = paths
+        .iter()
+        .take(5)
+        .map(|path| format!("{label} {path}"))
+        .collect();
+    if paths.len() > evidence.len() {
+        evidence.push(format!("and {} more path(s)", paths.len() - evidence.len()));
+    }
+    evidence
+}
+
+fn short_commit(commit: &str) -> &str {
+    &commit[..12.min(commit.len())]
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b':' | b'@')
+        })
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 }
 

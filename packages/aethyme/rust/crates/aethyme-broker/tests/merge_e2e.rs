@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::{Broker, MergeStatus};
+use aethyme_broker::{Broker, MergeStatus, StatusAdviceSeverity};
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -182,6 +182,28 @@ fn conflicting_submission_rejected_pre_gate_with_instruction_drop() {
     assert!(note.contains("src/a.py"));
     assert!(note.contains(&format!("session {}", b.id)) || note.contains("Blocking session"));
     assert!(note.contains("rebase"));
+
+    let status = broker.status(0).unwrap();
+    let advice = status
+        .advice
+        .iter()
+        .find(|item| item.id == "session.latest-submit-conflict")
+        .expect("latest conflict should produce status advice");
+    assert_eq!(advice.severity, StatusAdviceSeverity::Blocked);
+    assert_eq!(advice.session_id, Some(b.id));
+    assert_eq!(advice.queue_entry_id, Some(out_b.entry.id));
+    assert!(advice.summary.contains("conflicted"));
+    assert!(
+        advice.evidence.iter().any(|line| line.contains("src/a.py")),
+        "{advice:?}"
+    );
+    assert!(
+        advice
+            .commands
+            .iter()
+            .any(|command| command.contains("broker-action-required.md")),
+        "{advice:?}"
+    );
 }
 
 #[test]
@@ -204,6 +226,30 @@ fn failing_gate_on_merged_tree_rejects_and_auto_mode_promotes() {
     assert!(
         broker.promote(outcome.entry.id).is_err(),
         "rejected entries cannot be promoted"
+    );
+    let status = broker.status(0).unwrap();
+    let advice = status
+        .advice
+        .iter()
+        .find(|item| item.id == "session.latest-submit-rejected")
+        .expect("latest rejected submit should produce status advice");
+    assert_eq!(advice.severity, StatusAdviceSeverity::Blocked);
+    assert_eq!(advice.session_id, Some(session.id));
+    assert_eq!(advice.queue_entry_id, Some(outcome.entry.id));
+    assert!(advice.summary.contains("fail"));
+    assert!(
+        advice
+            .evidence
+            .iter()
+            .any(|line| line.contains("gate fail status fail")),
+        "{advice:?}"
+    );
+    assert!(
+        advice
+            .commands
+            .iter()
+            .any(|command| command == &format!("aethyme broker submit --session {}", session.id)),
+        "{advice:?}"
     );
 
     // Flip to a passing gate: with the DEFAULT config (no config.toml),
@@ -404,4 +450,56 @@ fn status_reports_promoted_unmerged_work_as_separate_conflict_surface() {
     assert_eq!(conflict.path, "src/a.py");
     assert_eq!(conflict.session_path, "src/a.py");
     assert_eq!(conflict.promoted_path, "src/a.py");
+
+    let advice = status
+        .advice
+        .iter()
+        .find(|item| item.id == "session.promoted-conflict")
+        .expect("promoted conflict should produce status advice");
+    assert_eq!(advice.severity, StatusAdviceSeverity::Blocked);
+    assert_eq!(advice.session_id, Some(live.id));
+    assert!(advice.summary.contains("rebase onto aethyme/integration"));
+    assert!(
+        advice.evidence.iter().any(|line| line.contains("src/a.py")),
+        "{advice:?}"
+    );
+    assert!(
+        advice
+            .commands
+            .iter()
+            .any(|command| command.contains("rebase aethyme/integration")),
+        "{advice:?}"
+    );
+}
+
+#[test]
+fn status_advice_warns_about_dirty_worktree_wip() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let wt = agent_worktree(tmp.path(), "dirty");
+    let session = broker.adopt(&wt, Some("dirty wip")).unwrap();
+    std::fs::write(wt.join("src/a.py"), "a = 99\n").unwrap();
+
+    let status = broker.status(0).unwrap();
+    let advice = status
+        .advice
+        .iter()
+        .find(|item| item.id == "session.dirty-worktree")
+        .expect("dirty worktree should produce status advice");
+    assert_eq!(advice.severity, StatusAdviceSeverity::Warning);
+    assert_eq!(advice.session_id, Some(session.id));
+    assert!(advice.summary.contains("uncommitted change"));
+    assert!(
+        advice.evidence.iter().any(|line| line.contains("src/a.py")),
+        "{advice:?}"
+    );
+    assert!(
+        advice
+            .commands
+            .iter()
+            .any(|command| command.contains("status --short")),
+        "{advice:?}"
+    );
 }
