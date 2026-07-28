@@ -29,6 +29,11 @@ names/flags/output — golden-verified):
   global-option divergence. The `_render_relation` /
   `_emit_completeness_signals` Click helpers remain in cli.py for the
   task group until it flips.
+- `task pack|context|anchors|scope|next|expand|explain` (Phase 1,
+  2026-07-28; engine `task_cli` module). Same global-option divergence.
+  `context --json-output` keeps Python's compact-with-spaces dump; the
+  Click renderer helpers and rendering/context_pack.py are deleted —
+  their logic lives in task_cli with ported unit tests.
 
 ## Global options
 
@@ -69,14 +74,6 @@ names/flags/output — golden-verified):
 | `repo validate-agents-overrides` | command | `repo_path` (arg, required) |
 | `repo validate-onboarding-overrides` | command | `repo_path` (arg, required) |
 | `repo warm` | command | `repo_path` (arg, required) |
-| `task` | group | — |
-| `task anchors` | command | `--repo` (directory, required); `--task` (required); `--json-output` (flag) |
-| `task context` | command | `--repo` (directory, required); `--task` (required); `--content-budget` (integer, default 80000); `--json-output` (flag) |
-| `task expand` | command | `--repo` (directory, required); `--node` (required); `--json-output` (flag) |
-| `task explain` | command | `--repo` (directory, required); `--task` (default 'Explain this repo') |
-| `task next` | command | `--repo` (directory, required); `--task` (required); `--json-output` (flag) |
-| `task pack` | command | `--repo` (directory, required); `--task` (required); `--json-output` (flag) |
-| `task scope` | command | `--repo` (directory, required); `--task` (required); `--json-output` (flag) |
 
 ## Environment variables (non-option)
 

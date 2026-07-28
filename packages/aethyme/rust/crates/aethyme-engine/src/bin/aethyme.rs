@@ -61,6 +61,13 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        "task" => match aethyme_engine::task_cli::run(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("Error: {message}");
+                ExitCode::from(1)
+            }
+        },
         "query" => match aethyme_engine::query_cli::run(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {

@@ -12,8 +12,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.indexing.engine import (
     EngineError,
-    build_task_context,
-    build_task_pack,
     clear_repository_cache,
     derived_function_usage,
     derived_public_functions,
@@ -21,16 +19,11 @@ from src.indexing.engine import (
     inspect_repository,
     inspect_repository_brief,
     inspect_repository_structure,
-    task_anchors,
-    task_expand,
-    task_next,
-    task_scope,
 )
 from src.indexing.engine import (
     analyze_dead_code as analyze_dead_code_answer,
 )
 from src.indexing.repository_snapshot import capture_snapshot
-from src.rendering.context_pack import render_explain_repo_text, render_pack_summary
 
 # Configure logging
 structlog.configure(
@@ -740,50 +733,6 @@ def repo_engine_info(json_output: bool, check_ready: bool) -> None:
         raise click.ClickException("Engine transport is not ready.")
 
 
-def _render_relation(result: dict[str, Any], json_output: bool) -> None:
-    if json_output:
-        click.echo(json.dumps(result, indent=2))
-        return
-    click.echo(f"Target: {result['target']}")
-    click.echo(f"Relation: {result['relation']}")
-    for item in result["items"]:
-        click.echo(
-            f"- {item['display']} ({item['kind']}, {item['relation']}, conf={item['confidence']})"
-        )
-    _emit_completeness_signals(result)
-
-
-def _emit_completeness_signals(payload: dict[str, Any]) -> None:
-    """Surface truncation/cap/confidence signals when available."""
-    if isinstance(payload.get("truncated"), bool):
-        truncated = payload["truncated"]
-        click.echo(f"Truncated: {'yes' if truncated else 'no'}")
-        if truncated and payload.get("reason"):
-            click.echo(f"Truncation reason: {payload['reason']}")
-
-    confidence = payload.get("confidence")
-    if isinstance(confidence, (int, float)):
-        click.echo(f"Confidence: {confidence}")
-    elif isinstance(confidence, dict):
-        anchor_conf = confidence.get("anchor_confidence")
-        scope_conf = confidence.get("scope_confidence")
-        if anchor_conf is not None or scope_conf is not None:
-            click.echo(
-                "Confidence:"
-                f" anchor={anchor_conf if anchor_conf is not None else 'n/a'}"
-                f", scope={scope_conf if scope_conf is not None else 'n/a'}"
-            )
-
-    caps = payload.get("caps")
-    if isinstance(caps, dict) and caps:
-        click.echo(f"Caps: {json.dumps(caps)}")
-
-
-@cli.group()
-def task() -> None:
-    """Task-context workflows over the local repository engine."""
-
-
 @cli.group()
 def facts() -> None:
     """Derived repository facts built on top of the graph."""
@@ -792,214 +741,6 @@ def facts() -> None:
 @cli.group()
 def analyze() -> None:
     """Deterministic analyzers that answer recurring repository questions."""
-
-
-@task.command("pack")
-@click.option(
-    "--repo",
-    "repo_path",
-    required=True,
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-)
-@click.option("--task", "task_text", required=True, help="Task description")
-@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-def task_pack(repo_path: Path, task_text: str, json_output: bool) -> None:
-    """Build a deterministic task-context pack."""
-    try:
-        pack = build_task_pack(repo_path, task_text)
-    except EngineError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-    if json_output:
-        click.echo(json.dumps(pack, indent=2))
-        return
-
-    click.echo(render_pack_summary(pack))
-
-
-@task.command("context")
-@click.option(
-    "--repo",
-    "repo_path",
-    required=True,
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-)
-@click.option("--task", "task_text", required=True, help="Task description")
-@click.option(
-    "--content-budget",
-    "content_budget",
-    default=80000,
-    type=int,
-    help="Max bytes of file content",
-)
-@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-def task_context_command(
-    repo_path: Path, task_text: str, content_budget: int, json_output: bool
-) -> None:
-    """Build task context pack with file contents (single-call navigation)."""
-    try:
-        result = build_task_context(repo_path, task_text, content_budget)
-    except EngineError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-    if json_output:
-        click.echo(json.dumps(result))
-        return
-
-    click.echo(render_pack_summary(result))
-
-
-@task.command("anchors")
-@click.option(
-    "--repo",
-    "repo_path",
-    required=True,
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-)
-@click.option("--task", "task_text", required=True, help="Task description")
-@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-def task_anchors_command(repo_path: Path, task_text: str, json_output: bool) -> None:
-    """Resolve initial graph anchors for a task."""
-    try:
-        result = task_anchors(repo_path, task_text)
-    except EngineError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-    if json_output:
-        click.echo(json.dumps(result, indent=2))
-        return
-
-    click.echo(f"Task: {result['task']}")
-    for anchor in result["anchors"]:
-        click.echo(f"- {anchor['id']} ({anchor['kind']}): {anchor['reason']}")
-
-
-@task.command("scope")
-@click.option(
-    "--repo",
-    "repo_path",
-    required=True,
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-)
-@click.option("--task", "task_text", required=True, help="Task description")
-@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-def task_scope_command(repo_path: Path, task_text: str, json_output: bool) -> None:
-    """Show in-scope and out-of-scope graph regions for a task."""
-    try:
-        result = task_scope(repo_path, task_text)
-    except EngineError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-    if json_output:
-        click.echo(json.dumps(result, indent=2))
-        return
-
-    click.echo(f"Task: {result['task']}")
-    if result["in_scope_files"]:
-        click.echo("In-scope files:")
-        for item in result["in_scope_files"]:
-            if isinstance(item, dict):
-                reason = item.get("reason")
-                suffix = f" ({reason})" if reason else ""
-                click.echo(f"- {item.get('value', item)}{suffix}")
-            else:
-                click.echo(f"- {item}")
-    if result["in_scope_areas"]:
-        click.echo("In-scope areas:")
-        for item in result["in_scope_areas"]:
-            if isinstance(item, dict):
-                reason = item.get("reason")
-                suffix = f" ({reason})" if reason else ""
-                click.echo(f"- {item.get('value', item)}{suffix}")
-            else:
-                click.echo(f"- {item}")
-    if result["out_of_scope"]:
-        click.echo("Out of scope:")
-        for item in result["out_of_scope"]:
-            if isinstance(item, dict):
-                reason = item.get("reason")
-                suffix = f" ({reason})" if reason else ""
-                click.echo(f"- {item.get('value', item)}{suffix}")
-            else:
-                click.echo(f"- {item}")
-    if result["risks"]:
-        click.echo("Risks:")
-        for item in result["risks"]:
-            click.echo(f"- {item}")
-    _emit_completeness_signals(result)
-
-
-@task.command("next")
-@click.option(
-    "--repo",
-    "repo_path",
-    required=True,
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-)
-@click.option("--task", "task_text", required=True, help="Task description")
-@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-def task_next_command(repo_path: Path, task_text: str, json_output: bool) -> None:
-    """Show the next recommended navigation steps for a task."""
-    try:
-        _render_relation(task_next(repo_path, task_text), json_output)
-    except EngineError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-
-@task.command("expand")
-@click.option(
-    "--repo",
-    "repo_path",
-    required=True,
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-)
-@click.option("--node", "node_target", required=True, help="Node id or display target")
-@click.option("--json-output", "json_output", is_flag=True, help="Emit raw JSON")
-def task_expand_command(repo_path: Path, node_target: str, json_output: bool) -> None:
-    """Expand a graph node into related navigation context."""
-    try:
-        result = task_expand(repo_path, node_target)
-    except EngineError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-    if json_output:
-        click.echo(json.dumps(result, indent=2))
-        return
-
-    click.echo(f"Node: {result['node']}")
-    for section in ("dependencies", "impact", "docs", "configs", "risks"):
-        items = result.get(section, [])
-        if not items:
-            continue
-        click.echo(f"{section.capitalize()}:")
-        for item in items:
-            click.echo(f"- {item}")
-    _emit_completeness_signals(result)
-
-
-@task.command("explain")
-@click.option(
-    "--repo",
-    "repo_path",
-    required=True,
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-)
-@click.option(
-    "--task",
-    "task_text",
-    default="Explain this repo",
-    show_default=True,
-    help="Task description",
-)
-def task_explain(repo_path: Path, task_text: str) -> None:
-    """Explain the repository using the deterministic Rust engine."""
-    try:
-        inspect = inspect_repository(repo_path)
-        pack = build_task_pack(repo_path, task_text)
-        explanation = render_explain_repo_text(inspect, pack)
-    except EngineError as exc:
-        raise click.ClickException(str(exc)) from exc
-    click.echo(explanation)
 
 
 @facts.command("public-functions")

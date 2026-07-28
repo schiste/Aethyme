@@ -11,6 +11,7 @@ pub mod map;
 pub mod model;
 pub mod pipeline;
 pub mod query_cli;
+pub mod task_cli;
 pub mod repo;
 pub mod snippets;
 pub mod store;

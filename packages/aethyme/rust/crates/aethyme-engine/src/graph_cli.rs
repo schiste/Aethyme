@@ -169,7 +169,7 @@ fn render_node(payload: &Value) -> String {
     out
 }
 
-fn render_relation(payload: &Value) -> String {
+pub(crate) fn render_relation(payload: &Value) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "Target: {}",
@@ -300,7 +300,7 @@ fn render_overview(payload: &Value, raw_json: &str) -> String {
     out
 }
 
-fn emit_completeness_signals(payload: &Value, out: &mut String) {
+pub(crate) fn emit_completeness_signals(payload: &Value, out: &mut String) {
     if let Some(truncated) = payload.get("truncated").and_then(Value::as_bool) {
         out.push_str(&format!(
             "Truncated: {}",
@@ -350,7 +350,7 @@ fn emit_completeness_signals(payload: &Value, out: &mut String) {
     }
 }
 
-fn render_number(value: &Value) -> String {
+pub(crate) fn render_number(value: &Value) -> String {
     // Match Python's str() for ints and floats appearing in JSON.
     if let Some(i) = value.as_i64() {
         return i.to_string();

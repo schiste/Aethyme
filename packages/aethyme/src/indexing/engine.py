@@ -330,87 +330,6 @@ def _run_binary_command_with_timeout(
     return result.stdout.strip()
 
 
-def build_task_pack(repo_path: Path, task: str) -> dict[str, Any]:
-    """Return a deterministic task-context pack."""
-    snapshot = capture_snapshot(repo_path)
-    cache_key = f"pack_{_stable_hash(task)}"
-    output = _cached_text(
-        snapshot,
-        cache_key,
-        lambda: _run_binary_command("pack", "--repo", str(snapshot.repo_path), "--task", task),
-    )
-    return json.loads(output)
-
-
-def build_task_context(repo_path: Path, task: str, content_budget: int = 80_000) -> dict[str, Any]:
-    """Return a task-context pack including file contents."""
-    snapshot = capture_snapshot(repo_path)
-    cache_key = f"context_{_stable_hash(task)}_{content_budget}"
-    output = _cached_text(
-        snapshot,
-        cache_key,
-        lambda: _run_binary_command(
-            "context", "--repo", str(snapshot.repo_path),
-            "--task", task, "--content-budget", str(content_budget),
-        ),
-    )
-    return json.loads(output)
-
-
-def task_anchors(
-    repo_path: Path,
-    task: str,
-    *,
-    timeout_seconds: float | None = None,
-) -> dict[str, Any]:
-    """Return task anchors derived from the graph."""
-    return _task_view(repo_path, "task-anchors", task, timeout_seconds=timeout_seconds)
-
-
-def task_scope(
-    repo_path: Path,
-    task: str,
-    *,
-    timeout_seconds: float | None = None,
-) -> dict[str, Any]:
-    """Return task scope derived from the graph."""
-    return _task_view(repo_path, "task-scope", task, timeout_seconds=timeout_seconds)
-
-
-def task_next(
-    repo_path: Path,
-    task: str,
-    *,
-    timeout_seconds: float | None = None,
-) -> dict[str, Any]:
-    """Return the next navigation steps for a task."""
-    return _task_view(repo_path, "task-next", task, timeout_seconds=timeout_seconds)
-
-
-def task_expand(
-    repo_path: Path,
-    target: str,
-    *,
-    timeout_seconds: float | None = None,
-) -> dict[str, Any]:
-    """Expand a graph node into related navigation context."""
-    snapshot = capture_snapshot(repo_path)
-    cache_key = f"task_expand_{_stable_hash(target)}"
-    output = _cached_text(
-        snapshot,
-        cache_key,
-        lambda: _run_binary_command_with_timeout(
-            "task-expand",
-            "--repo",
-            str(snapshot.repo_path),
-            "--target",
-            target,
-            timeout_seconds=timeout_seconds,
-        ),
-    )
-    return json.loads(output)
-
-
 def derived_public_functions(
     repo_path: Path,
     scope: str,
@@ -538,29 +457,5 @@ def _graph_relation(repo_path: Path, command: str, target: str) -> dict[str, Any
         snapshot,
         cache_key,
         lambda: _run_binary_command(command, "--repo", str(snapshot.repo_path), "--target", target),
-    )
-    return json.loads(output)
-
-
-def _task_view(
-    repo_path: Path,
-    command: str,
-    task: str,
-    *,
-    timeout_seconds: float | None = None,
-) -> dict[str, Any]:
-    snapshot = capture_snapshot(repo_path)
-    cache_key = f"{command}_{_stable_hash(task)}"
-    output = _cached_text(
-        snapshot,
-        cache_key,
-        lambda: _run_binary_command_with_timeout(
-            command,
-            "--repo",
-            str(snapshot.repo_path),
-            "--task",
-            task,
-            timeout_seconds=timeout_seconds,
-        ),
     )
     return json.loads(output)
