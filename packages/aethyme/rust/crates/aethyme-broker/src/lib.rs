@@ -34,6 +34,7 @@ mod quick_test;
 mod schema;
 mod store;
 mod types;
+mod version;
 
 pub use broker::{
     AdoptMode, AgentView, Broker, BrokerOpError, DoctorReport, PromotedConflict, RepairAction,
@@ -58,6 +59,7 @@ pub use types::{
     Event, GateDef, GateResult, GateStatus, Lease, LeaseKind, MergeQueueEntry, MergeStatus,
     NewGateResult, NewSession, Session, SessionOrigin, SessionStatus,
 };
+pub use version::{BinaryBuild, VersionDriftReport, VersionDriftStatus, inspect_version};
 
 /// Repo-relative location of the broker database.
 pub const BROKER_DB_RELPATH: &str = ".aethyme/broker.db";

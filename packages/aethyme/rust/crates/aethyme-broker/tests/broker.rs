@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::{Broker, BrokerOpError, SessionOrigin, SessionStatus};
+use aethyme_broker::{Broker, BrokerOpError, SessionOrigin, SessionStatus, VersionDriftStatus};
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -176,6 +176,7 @@ fn doctor_reports_healthy_then_finds_missing_worktree() {
 
     let report = broker.doctor().unwrap();
     assert_eq!(report.integrity, "ok");
+    assert_eq!(report.version.status, VersionDriftStatus::NotAethymeSource);
     assert!(report.healthy());
 
     // A session whose worktree vanishes out-of-band is a finding.

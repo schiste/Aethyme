@@ -122,7 +122,8 @@ Usage:
       any gate ran, overlaps warned.
   aethyme broker doctor [--json]
       Health checks: database integrity, sessions whose worktree is
-      gone, and orphaned gate pidfiles.
+      gone, orphaned gate pidfiles, and stale local CLI builds when run
+      inside the Aethyme source checkout.
   aethyme broker quick-test [--chau7] [--json]
       Disposable first-run smoke: creates a temporary git repo, runs init,
       adopt, commit, submit, verifies promotion, and removes the repo.
@@ -1259,6 +1260,34 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!("integrity: {}", report.integrity);
+                println!(
+                    "version: {} — {}",
+                    report.version.status.as_str(),
+                    report.version.message
+                );
+                if let Some(describe) = &report.version.binary.describe {
+                    println!(
+                        "  binary: aethyme {} ({describe})",
+                        report.version.binary.version
+                    );
+                } else {
+                    println!("  binary: aethyme {}", report.version.binary.version);
+                }
+                if let Some(path) = &report.version.binary.path {
+                    println!("  path: {path}");
+                }
+                if report.version.repo_is_aethyme_source {
+                    let integration = report
+                        .version
+                        .integration_describe
+                        .as_deref()
+                        .or(report.version.integration_head.as_deref())
+                        .unwrap_or("unknown");
+                    println!(
+                        "  integration: {} {integration}",
+                        report.version.integration_branch
+                    );
+                }
                 if report.missing_worktrees.is_empty() {
                     println!("worktrees: all live session worktrees exist");
                 } else {

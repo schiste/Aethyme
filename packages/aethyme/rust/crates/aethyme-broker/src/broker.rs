@@ -14,6 +14,7 @@ use crate::store::BrokerStore;
 use crate::types::{
     MergeQueueEntry, MergeStatus, NewSession, Session, SessionOrigin, SessionStatus,
 };
+use crate::version::VersionDriftReport;
 
 /// Idle/stale thresholds for activity-derived liveness (issue #9).
 /// Configurable via `.aethyme/config.toml` in a later phase; constants
@@ -97,6 +98,9 @@ pub struct AgentView {
 pub struct DoctorReport {
     /// SQLite PRAGMA integrity_check result ("ok" when healthy).
     pub integrity: String,
+    /// Running CLI build compared with this checkout's integration head
+    /// when the checkout is Aethyme itself.
+    pub version: VersionDriftReport,
     /// Live sessions whose worktree path no longer exists on disk.
     pub missing_worktrees: Vec<i64>,
     /// Stale gate pidfiles found (and removed) whose process is gone.
@@ -108,7 +112,9 @@ pub struct DoctorReport {
 
 impl DoctorReport {
     pub fn healthy(&self) -> bool {
-        self.integrity == "ok" && self.missing_worktrees.is_empty()
+        self.integrity == "ok"
+            && self.missing_worktrees.is_empty()
+            && !self.version.status.is_drift()
     }
 }
 
@@ -936,6 +942,7 @@ impl Broker {
 
         Ok(DoctorReport {
             integrity,
+            version: crate::version::inspect_version(&self.main_root),
             missing_worktrees,
             orphaned_pidfiles,
             purged_stale_leases,
