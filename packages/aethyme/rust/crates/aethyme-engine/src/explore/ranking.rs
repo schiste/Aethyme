@@ -35,7 +35,8 @@ pub(super) fn auth_token_surface_signals(
     if !auth_token_focus_from_request(request) {
         return SurfaceSignals::default();
     }
-    surface_signals(path, symbol_names)
+    let lower_request = request.to_ascii_lowercase();
+    surface_signals(path, symbol_names, Some(lower_request.as_str()))
 }
 
 pub(super) fn auth_token_surface_signals_for_terms(
@@ -46,7 +47,12 @@ pub(super) fn auth_token_surface_signals_for_terms(
     if !auth_token_focus_from_terms(terms) {
         return SurfaceSignals::default();
     }
-    surface_signals(path, symbol_names)
+    let joined_terms = terms
+        .iter()
+        .map(|term| term.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    surface_signals(path, symbol_names, Some(joined_terms.as_str()))
 }
 
 pub(super) fn is_test_path(path: &str) -> bool {
@@ -91,7 +97,11 @@ fn contains_token(haystack: &str, needle: &str) -> bool {
         .any(|token| token == needle)
 }
 
-fn surface_signals(path: &str, symbol_names: &[String]) -> SurfaceSignals {
+fn surface_signals(
+    path: &str,
+    symbol_names: &[String],
+    request_lower: Option<&str>,
+) -> SurfaceSignals {
     let lower_path = path.to_ascii_lowercase();
     let basename = lower_path.rsplit('/').next().unwrap_or(&lower_path);
     let runtime_surface = is_runtime_surface_path(&lower_path);
@@ -100,6 +110,7 @@ fn surface_signals(path: &str, symbol_names: &[String]) -> SurfaceSignals {
         .map(|name| name.to_ascii_lowercase())
         .collect::<Vec<_>>()
         .join(" ");
+    let combined = format!("{lower_path} {symbols}");
     let mut signals = SurfaceSignals::default();
     let auth_path = lower_path.contains("/auth")
         || lower_path.contains("/accounts/")
@@ -235,23 +246,56 @@ fn surface_signals(path: &str, symbol_names: &[String]) -> SurfaceSignals {
         add(&mut signals, 30, "live_auth_behavior_test");
     }
 
-    if contains_any(
-        &lower_path,
-        &[
-            "/adapters/",
-            "/integrations/",
-            "/sdk",
-            "auth0_management",
-            "client.",
-            "management",
-            "provider",
-        ],
-    ) && !contains_any(&lower_path, &["middleware", "urls.py", "api_keys"])
-    {
-        add(&mut signals, -35, "outbound_provider_helper");
+    let outbound_provider_helper =
+        contains_any(
+            &lower_path,
+            &[
+                "/adapters/",
+                "/integrations/",
+                "/sdk",
+                "auth0_management",
+                "client.",
+                "management",
+                "provider",
+            ],
+        ) && !contains_any(&lower_path, &["middleware", "urls.py", "api_keys"]);
+    if outbound_provider_helper {
+        if request_targets_outbound_provider_helper(request_lower, &combined) {
+            add(&mut signals, 280, "named_provider_management_helper");
+        } else {
+            add(&mut signals, -35, "outbound_provider_helper");
+        }
     }
 
     signals
+}
+
+fn request_targets_outbound_provider_helper(
+    request_lower: Option<&str>,
+    candidate_lower: &str,
+) -> bool {
+    let Some(request_lower) = request_lower else {
+        return false;
+    };
+    if request_lower.contains("auth0") {
+        return candidate_lower.contains("auth0");
+    }
+    if request_lower.contains("provider management")
+        || request_lower.contains("provider-management")
+        || request_lower.contains("external provider")
+    {
+        return contains_any(
+            candidate_lower,
+            &["provider", "management", "/integrations/", "/adapters/"],
+        );
+    }
+    if request_lower.contains("management token")
+        || request_lower.contains("management api")
+        || request_lower.contains("oauth management")
+    {
+        return contains_any(candidate_lower, &["management", "provider", "oauth"]);
+    }
+    false
 }
 
 fn is_runtime_surface_path(lower_path: &str) -> bool {
@@ -341,6 +385,42 @@ mod tests {
         assert!(middleware.labels.contains(&"middleware_request_path"));
         assert!(middleware.labels.contains(&"api_boundary"));
         assert!(outbound.labels.contains(&"outbound_provider_helper"));
+    }
+
+    #[test]
+    fn outbound_provider_helper_not_penalized_when_request_names_it() {
+        let signals = auth_token_surface_signals(
+            "backend/accounts/auth0_management.py",
+            &["get_management_token".into()],
+            "trace Auth0 management token behavior",
+        );
+
+        assert!(
+            !signals.labels.contains(&"outbound_provider_helper"),
+            "explicit provider-management tasks should not suppress the named helper"
+        );
+        assert!(
+            signals.labels.contains(&"named_provider_management_helper"),
+            "explicit provider-management tasks should promote the named helper"
+        );
+    }
+
+    #[test]
+    fn auth0_request_does_not_promote_unmatched_integration_helpers() {
+        let signals = auth_token_surface_signals(
+            "backend/integrations/api_views.py",
+            &["decrypt_token".into()],
+            "trace Auth0 management token behavior",
+        );
+
+        assert!(
+            !signals.labels.contains(&"named_provider_management_helper"),
+            "Auth0-specific requests should not promote unrelated integration helpers"
+        );
+        assert!(
+            signals.labels.contains(&"outbound_provider_helper"),
+            "unmatched integration helpers remain secondary for Auth0-specific tasks"
+        );
     }
 
     #[test]

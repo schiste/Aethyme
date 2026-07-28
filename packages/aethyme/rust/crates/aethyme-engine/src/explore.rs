@@ -1043,6 +1043,241 @@ pub(crate) fn extract_symbol_queries(request: &str) -> Vec<String> {
 
 // ── response synthesis ──────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
+struct TokenSubsystemSummary {
+    id: &'static str,
+    label: &'static str,
+    score: i32,
+    paths: std::collections::BTreeSet<String>,
+    signals: std::collections::BTreeSet<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TokenSubsystemMatch {
+    id: &'static str,
+    label: &'static str,
+    base_score: i32,
+    signal: &'static str,
+}
+
+fn token_subsystem_summaries(
+    request: &str,
+    item_groups: &[&[AnswerItem]],
+) -> Vec<TokenSubsystemSummary> {
+    if !ranking::auth_token_focus_from_request(request) {
+        return Vec::new();
+    }
+
+    let mut by_id: std::collections::BTreeMap<&'static str, TokenSubsystemSummary> =
+        std::collections::BTreeMap::new();
+    for group in item_groups {
+        for item in *group {
+            let text = token_subsystem_item_text(item);
+            for matched in token_subsystem_matches(&text) {
+                let entry = by_id
+                    .entry(matched.id)
+                    .or_insert_with(|| TokenSubsystemSummary {
+                        id: matched.id,
+                        label: matched.label,
+                        score: 0,
+                        paths: std::collections::BTreeSet::new(),
+                        signals: std::collections::BTreeSet::new(),
+                    });
+                entry.score = entry
+                    .score
+                    .max(matched.base_score + token_subsystem_item_score(item));
+                entry.signals.insert(matched.signal);
+                if let Some(path) = item.path.as_deref().filter(|path| !path.is_empty()) {
+                    entry.paths.insert(path.to_string());
+                } else if !item.target.is_empty() {
+                    entry.paths.insert(item.target.clone());
+                }
+            }
+        }
+    }
+
+    let mut summaries: Vec<TokenSubsystemSummary> =
+        by_id.into_iter().map(|(_, summary)| summary).collect();
+    summaries.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.label.cmp(right.label))
+    });
+    summaries
+}
+
+fn token_subsystem_item_score(item: &AnswerItem) -> i32 {
+    let raw_bonus = item
+        .evidence
+        .get("ranking_bonus")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+    let ranking_bonus = raw_bonus.max(-200).min(200) as i32;
+    let confidence = (item.confidence * 100.0).round() as i32;
+    let kind_bonus = match item.kind.as_str() {
+        "source_text_file" => 12,
+        "symbol_search_file" => 10,
+        "call_site_file" => 8,
+        _ => 0,
+    };
+    confidence + ranking_bonus + kind_bonus
+}
+
+fn token_subsystem_item_text(item: &AnswerItem) -> String {
+    let mut chunks = Vec::new();
+    chunks.push(item.kind.clone());
+    chunks.push(item.target.clone());
+    chunks.push(item.reason.clone());
+    if let Some(path) = item.path.as_deref() {
+        chunks.push(path.to_string());
+    }
+    collect_json_strings(&item.evidence, &mut chunks, 24);
+    chunks.join(" ").to_ascii_lowercase()
+}
+
+fn collect_json_strings(value: &serde_json::Value, output: &mut Vec<String>, limit: usize) {
+    if output.len() >= limit {
+        return;
+    }
+    match value {
+        serde_json::Value::String(text) => output.push(text.clone()),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_strings(value, output, limit);
+                if output.len() >= limit {
+                    break;
+                }
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_json_strings(value, output, limit);
+                if output.len() >= limit {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn token_subsystem_matches(lower: &str) -> Vec<TokenSubsystemMatch> {
+    let mut matches = Vec::new();
+    if contains_any_text(
+        lower,
+        &["api keys", "api-key", "api_key", "api_keys", "apikey"],
+    ) {
+        matches.push(TokenSubsystemMatch {
+            id: "api_keys",
+            label: "API keys",
+            base_score: 120,
+            signal: "api_key_surface",
+        });
+    }
+    if contains_any_text(
+        lower,
+        &["oidc", "openid", "id token", "id_token", "idtoken"],
+    ) {
+        matches.push(TokenSubsystemMatch {
+            id: "oidc",
+            label: "OIDC",
+            base_score: 95,
+            signal: "oidc_surface",
+        });
+    }
+    if lower.contains("jws")
+        || lower.contains("audit_jws")
+        || (lower.contains("audit")
+            && contains_any_text(lower, &["jwt", "signature", "signing", "signed"]))
+    {
+        matches.push(TokenSubsystemMatch {
+            id: "audit_jws",
+            label: "audit JWS",
+            base_score: 90,
+            signal: "audit_jws_surface",
+        });
+    }
+    if lower.contains("auth0_management")
+        || (lower.contains("auth0") && lower.contains("management"))
+        || lower.contains("management_token")
+        || lower.contains("management token")
+    {
+        matches.push(TokenSubsystemMatch {
+            id: "auth0_management",
+            label: "Auth0 management",
+            base_score: 80,
+            signal: "auth0_management_surface",
+        });
+    }
+    if lower.contains("profile_integrity")
+        || lower.contains("profile-integrity")
+        || (lower.contains("profile") && lower.contains("integrity"))
+    {
+        matches.push(TokenSubsystemMatch {
+            id: "profile_integrity",
+            label: "profile-integrity",
+            base_score: 70,
+            signal: "profile_integrity_surface",
+        });
+    }
+    if lower.contains("domain_verification")
+        || lower.contains("domain verification")
+        || lower.contains("domain-verification")
+        || (lower.contains("domain") && contains_any_text(lower, &["verify", "verification"]))
+    {
+        matches.push(TokenSubsystemMatch {
+            id: "domain_verification",
+            label: "domain verification",
+            base_score: 65,
+            signal: "domain_verification_surface",
+        });
+    }
+    matches
+}
+
+fn request_names_specific_token_subsystem(request: &str) -> bool {
+    let lower = request.to_ascii_lowercase();
+    !token_subsystem_matches(&lower).is_empty()
+}
+
+fn token_subsystem_ambiguity_value(summaries: &[TokenSubsystemSummary]) -> serde_json::Value {
+    let subsystems: Vec<serde_json::Value> = summaries
+        .iter()
+        .enumerate()
+        .map(|(index, summary)| {
+            serde_json::json!({
+                "rank": index + 1,
+                "id": summary.id,
+                "label": summary.label,
+                "score": summary.score,
+                "paths": summary.paths.iter().take(4).cloned().collect::<Vec<_>>(),
+                "signals": summary.signals.iter().copied().collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "kind": "token_subsystem_ambiguity",
+        "status": "needs_verification",
+        "reason": "Multiple token/auth subsystems matched this request; verify the top 2 before committing to one subsystem.",
+        "verify_top_n": 2,
+        "subsystems": subsystems,
+    })
+}
+
+fn top_token_subsystem_labels(summaries: &[TokenSubsystemSummary], limit: usize) -> String {
+    summaries
+        .iter()
+        .take(limit)
+        .map(|summary| summary.label)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn contains_any_text(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
 /// Translate the redb task-localize view into the answer-json
 /// envelope the agent contract expects.
 fn build_response(
@@ -1249,6 +1484,13 @@ fn build_response(
     }
 
     for item in &symbol_items {
+        if let Some(existing) = answers
+            .iter_mut()
+            .find(|a| a.path.as_deref() == item.path.as_deref())
+        {
+            merge_symbol_search_evidence(existing, item);
+            continue;
+        }
         if answers.len() >= params.max_answer_items {
             break;
         }
@@ -1395,6 +1637,21 @@ fn build_response(
     // `max_answer_items` exactly.
     answers.truncate(params.max_answer_items);
 
+    let token_summary_groups: [&[AnswerItem]; 4] = [
+        answers.as_slice(),
+        symbol_items.as_slice(),
+        text_items,
+        callsite_items,
+    ];
+    let token_subsystems = token_subsystem_summaries(request, &token_summary_groups);
+    let token_subsystem_ambiguous =
+        token_subsystems.len() >= 2 && !request_names_specific_token_subsystem(request);
+    let ambiguous = if token_subsystem_ambiguous {
+        vec![token_subsystem_ambiguity_value(&token_subsystems)]
+    } else {
+        Vec::new()
+    };
+
     let answer_count = answers.len();
     let navigation_hint_count = nav_hints.len();
 
@@ -1463,7 +1720,7 @@ fn build_response(
     let triple_corroborated: bool = !strong_callsite_files.is_empty()
         && (!cross_corroborated.is_empty() || !multi_query_symbol_files.is_empty());
 
-    let policy_kind = if answers.is_empty() && nav_hints.is_empty() {
+    let mut policy_kind = if answers.is_empty() && nav_hints.is_empty() {
         "failed"
     } else if !cross_corroborated.is_empty() || !multi_query_symbol_files.is_empty() {
         "answer_candidate"
@@ -1473,6 +1730,9 @@ fn build_response(
     } else {
         "needs_verification"
     };
+    if token_subsystem_ambiguous && policy_kind == "answer_candidate" {
+        policy_kind = "needs_verification";
+    }
     let evidence_level = if triple_corroborated {
         "graph+symbol+text+callsite"
     } else if !cross_corroborated.is_empty() {
@@ -1494,6 +1754,11 @@ fn build_response(
     };
     let safe_to_use_as_answer = matches!(policy_kind, "answer_candidate");
     let trust_reason = match policy_kind {
+        _ if token_subsystem_ambiguous => format!(
+            "Multiple token/auth subsystems matched ({}); verify the top 2 \
+             before relying on one implementation.",
+            top_token_subsystem_labels(&token_subsystems, 6)
+        ),
         "answer_candidate" if !cross_corroborated.is_empty() => format!(
             "Symbol search and source-text both matched {} candidate file(s); \
              cross-corroborated evidence treated as authoritative.",
@@ -1539,6 +1804,15 @@ fn build_response(
             "Refine the request — graph navigation found no anchors.".into(),
             "Try a more specific keyword from the codebase domain.".into(),
         ]
+    } else if token_subsystem_ambiguous {
+        vec![
+            "Verify the top 2 token/auth subsystems in ambiguous[] before \
+             committing to one implementation."
+                .into(),
+            "Then read the top answer[] item and confirm it matches the \
+             intended inbound or provider-management path."
+                .into(),
+        ]
     } else {
         vec![
             "Read the top answer[] item to verify it matches the task.".into(),
@@ -1552,8 +1826,17 @@ fn build_response(
     // into the response struct.
     let safe_to_use_as_answer = trust_policy.safe_to_use_as_answer;
     let safe_to_use_as_navigation = trust_policy.safe_to_use_as_navigation;
-    let verification_steps =
-        build_verification_steps(&answers, &nav_hints, &trust_policy, text_items);
+    let verification_steps = build_verification_steps(
+        &answers,
+        &nav_hints,
+        &trust_policy,
+        text_items,
+        if token_subsystem_ambiguous {
+            token_subsystems.as_slice()
+        } else {
+            &[]
+        },
+    );
 
     // Build output_adapters and resolved_parameters only when the
     // caller has asked for verbose shaping. Mirrors Python's
@@ -1648,7 +1931,7 @@ fn build_response(
         answer: answers,
         navigation_hints: nav_hints,
         excluded: Vec::new(),
-        ambiguous: Vec::new(),
+        ambiguous,
         evidence: Evidence {
             answer_count,
             navigation_hint_count,
@@ -1736,6 +2019,30 @@ fn build_output_adapters(
     })
 }
 
+fn merge_symbol_search_evidence(existing: &mut AnswerItem, symbol_item: &AnswerItem) {
+    let mut merged = serde_json::Map::new();
+    for key in [
+        "matched_queries",
+        "symbols",
+        "combined_score",
+        "ranking_bonus",
+        "ranking_signals",
+    ] {
+        if let Some(value) = symbol_item.evidence.get(key).cloned() {
+            merged.insert(key.to_string(), value);
+        }
+    }
+    if merged.is_empty() {
+        return;
+    }
+    if let Some(obj) = existing.evidence.as_object_mut() {
+        obj.insert(
+            "also_symbol_search".to_string(),
+            serde_json::Value::Object(merged),
+        );
+    }
+}
+
 /// Tailor the verification steps to the evidence we actually produced.
 ///
 /// Mirrors the philosophy of Python's
@@ -1745,18 +2052,34 @@ fn build_output_adapters(
 /// specific line ref or symbol gives the agent a concrete thing to do.
 ///
 /// Step priority (we emit at most 4):
-///   1. If text evidence with line_refs → read the cited line(s)
-///   2. If symbol evidence → grep callers/dispatch sites of the symbol
-///   3. If failed/no answers → suggest broadening the request or running
+///   1. If token/auth ambiguity exists → verify the top 2 subsystems
+///   2. If text evidence with line_refs → read the cited line(s)
+///   3. If symbol evidence → grep callers/dispatch sites of the symbol
+///   4. If failed/no answers → suggest broadening the request or running
 ///      Python explore for richer evidence
-///   4. Generic "open top answer and confirm" as a final fallback
+///   5. Generic "open top answer and confirm" as a final fallback
 fn build_verification_steps(
     answers: &[AnswerItem],
     nav_hints: &[AnswerItem],
     trust_policy: &TrustPolicy,
     text_items: &[AnswerItem],
+    token_subsystems: &[TokenSubsystemSummary],
 ) -> Vec<serde_json::Value> {
     let mut steps: Vec<serde_json::Value> = Vec::new();
+
+    if token_subsystems.len() >= 2 {
+        steps.push(serde_json::json!({
+            "step": format!(
+                "Token/auth is ambiguous: Aethyme found multiple subsystems \
+                 ({}). Verify the top 2 before committing to one subsystem.",
+                top_token_subsystem_labels(token_subsystems, 6)
+            ),
+            "rationale": "Broad token requests can match API keys, OIDC, audit \
+                          JWS, provider-management, profile-integrity, and \
+                          domain-verification code. Checking the top two \
+                          prevents anchoring on the first plausible token hit.",
+        }));
+    }
 
     // Step 1: cite a specific line ref the agent can read.
     if let Some(top_text) = text_items.first() {
@@ -1786,13 +2109,19 @@ fn build_verification_steps(
     // top), suggest checking the symbol's call sites.
     let symbol_file = answers
         .iter()
-        .find(|a| a.kind == "symbol_search_file")
+        .find(|a| a.evidence.get("also_symbol_search").is_some())
+        .or_else(|| answers.iter().find(|a| a.kind == "symbol_search_file"))
         .or_else(|| nav_hints.iter().find(|h| h.kind == "anchor_symbol"));
     if let Some(item) = symbol_file {
         let path = item.path.as_deref().unwrap_or(item.target.as_str());
         let matched: Option<Vec<String>> = item
             .evidence
             .get("matched_queries")
+            .or_else(|| {
+                item.evidence
+                    .get("also_symbol_search")
+                    .and_then(|value| value.get("matched_queries"))
+            })
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
@@ -2622,6 +2951,286 @@ mod tests {
                 .iter()
                 .any(|signal| signal.as_str() == Some("issue_auth_credential_pair")),
             "expected credential-pair ranking evidence, got {signals:?}"
+        );
+    }
+
+    #[test]
+    fn build_response_auth_token_ambiguity_lists_ranked_subsystems_and_verifies_top_two() {
+        let mut by_query = std::collections::BTreeMap::new();
+        by_query.insert(
+            "token".to_string(),
+            vec![
+                SymbolHit {
+                    name: "generate_api_key".into(),
+                    kind: "function".into(),
+                    file: "backend/api_keys/models.py".into(),
+                    line: 12,
+                    score: 40,
+                },
+                SymbolHit {
+                    name: "verify_oidc_token".into(),
+                    kind: "function".into(),
+                    file: "backend/accounts/oidc_validator.py".into(),
+                    line: 28,
+                    score: 80,
+                },
+                SymbolHit {
+                    name: "verify_audit_jws".into(),
+                    kind: "function".into(),
+                    file: "backend/audit/jws.py".into(),
+                    line: 32,
+                    score: 70,
+                },
+                SymbolHit {
+                    name: "get_management_token".into(),
+                    kind: "function".into(),
+                    file: "backend/accounts/auth0_management.py".into(),
+                    line: 17,
+                    score: 900,
+                },
+                SymbolHit {
+                    name: "_issue_profile_integrity_token".into(),
+                    kind: "function".into(),
+                    file: "backend/accounts/platform_users_views.py".into(),
+                    line: 18,
+                    score: 850,
+                },
+                SymbolHit {
+                    name: "issue_domain_verification_token".into(),
+                    kind: "function".into(),
+                    file: "backend/domains/domain_verification.py".into(),
+                    line: 22,
+                    score: 60,
+                },
+            ],
+        );
+        by_query.insert(
+            "authenticate".to_string(),
+            vec![SymbolHit {
+                name: "authenticate_api_key".into(),
+                kind: "function".into(),
+                file: "backend/api_keys/models.py".into(),
+                line: 36,
+                score: 40,
+            }],
+        );
+        let symbols = SymbolBatchResults {
+            query_order: vec!["token".to_string(), "authenticate".to_string()],
+            by_query,
+        };
+
+        let response = build_response(
+            "trace token issuing and authentication behavior",
+            Intent::TaskLocalization,
+            IntentSource::Default,
+            &sample_view(),
+            &symbols,
+            &[],
+            &[],
+            &[],
+            &ExploreParams::default(),
+            test_observability(),
+        );
+
+        assert!(
+            !response.safe_to_use_as_answer,
+            "broad token subsystem ambiguity should require verification"
+        );
+        assert_eq!(response.trust_policy.trust_policy, "needs_verification");
+
+        let ambiguity = response
+            .ambiguous
+            .iter()
+            .find(|item| {
+                item.get("kind").and_then(|value| value.as_str())
+                    == Some("token_subsystem_ambiguity")
+            })
+            .expect("broad token request should emit subsystem ambiguity");
+        assert_eq!(
+            ambiguity
+                .get("verify_top_n")
+                .and_then(|value| value.as_u64()),
+            Some(2)
+        );
+        let subsystems = ambiguity
+            .get("subsystems")
+            .and_then(|value| value.as_array())
+            .expect("subsystems should be an array");
+        let labels: Vec<&str> = subsystems
+            .iter()
+            .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+            .collect();
+        for expected in [
+            "API keys",
+            "OIDC",
+            "audit JWS",
+            "Auth0 management",
+            "profile-integrity",
+            "domain verification",
+        ] {
+            assert!(
+                labels.contains(&expected),
+                "expected subsystem {expected:?} in {labels:?}"
+            );
+        }
+        assert_eq!(
+            labels.first().copied(),
+            Some("API keys"),
+            "inbound credential boundary should rank ahead of provider helpers"
+        );
+        let first_step = response
+            .verification_steps
+            .first()
+            .and_then(|value| value.get("step"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        assert!(
+            first_step.contains("top 2"),
+            "first verification step should ask for top-2 subsystem verification: {first_step}"
+        );
+    }
+
+    #[test]
+    fn build_response_specific_token_subsystem_request_stays_decisive() {
+        let mut by_query = std::collections::BTreeMap::new();
+        by_query.insert(
+            "token".to_string(),
+            vec![
+                SymbolHit {
+                    name: "get_management_token".into(),
+                    kind: "function".into(),
+                    file: "backend/accounts/auth0_management.py".into(),
+                    line: 17,
+                    score: 900,
+                },
+                SymbolHit {
+                    name: "generate_api_key".into(),
+                    kind: "function".into(),
+                    file: "backend/api_keys/models.py".into(),
+                    line: 12,
+                    score: 40,
+                },
+            ],
+        );
+        by_query.insert(
+            "management".to_string(),
+            vec![SymbolHit {
+                name: "get_management_token".into(),
+                kind: "function".into(),
+                file: "backend/accounts/auth0_management.py".into(),
+                line: 17,
+                score: 900,
+            }],
+        );
+        let symbols = SymbolBatchResults {
+            query_order: vec!["token".to_string(), "management".to_string()],
+            by_query,
+        };
+
+        let response = build_response(
+            "trace Auth0 management token behavior",
+            Intent::TaskLocalization,
+            IntentSource::Default,
+            &sample_view(),
+            &symbols,
+            &[],
+            &[],
+            &[],
+            &ExploreParams::default(),
+            test_observability(),
+        );
+
+        assert!(
+            response.ambiguous.is_empty(),
+            "a request that names the subsystem should not be downgraded by broad-token ambiguity"
+        );
+        assert!(response.safe_to_use_as_answer);
+        let first_symbol_file = response
+            .answer
+            .iter()
+            .find(|item| item.kind == "symbol_search_file")
+            .expect("symbol evidence should be present");
+        assert_eq!(
+            first_symbol_file.path.as_deref(),
+            Some("backend/accounts/auth0_management.py")
+        );
+    }
+
+    #[test]
+    fn build_response_verification_prefers_symbol_evidence_merged_into_top_text_answer() {
+        let text_match = AnswerItem {
+            kind: "source_text_file".into(),
+            target: "backend/accounts/auth0_management.py".into(),
+            path: Some("backend/accounts/auth0_management.py".into()),
+            status: "candidate".into(),
+            confidence: 0.87,
+            reason: "text evidence".into(),
+            role: "candidate".into(),
+            evidence: serde_json::json!({
+                "source": "source-text-search",
+                "matched_terms": ["auth0", "management", "token"],
+                "line_refs": [{"line": 114, "text": "management token", "matched_terms": ["auth0", "management", "token"]}],
+            }),
+        };
+        let mut by_query = std::collections::BTreeMap::new();
+        by_query.insert(
+            "Auth0".to_string(),
+            vec![
+                SymbolHit {
+                    name: "get_management_token".into(),
+                    kind: "function".into(),
+                    file: "backend/accounts/auth0_management.py".into(),
+                    line: 83,
+                    score: 160,
+                },
+                SymbolHit {
+                    name: "record_auth0_idp_assets".into(),
+                    kind: "function".into(),
+                    file: "backend/accounts/idp_assets.py".into(),
+                    line: 56,
+                    score: 100,
+                },
+            ],
+        );
+        let symbols = SymbolBatchResults {
+            query_order: vec!["Auth0".to_string()],
+            by_query,
+        };
+
+        let response = build_response(
+            "Trace Auth0 management token behavior.",
+            Intent::TaskLocalization,
+            IntentSource::Default,
+            &sample_view(),
+            &symbols,
+            &[text_match],
+            &[],
+            &[],
+            &ExploreParams::default(),
+            test_observability(),
+        );
+
+        let top = response
+            .answer
+            .first()
+            .expect("expected text answer to survive");
+        assert_eq!(
+            top.path.as_deref(),
+            Some("backend/accounts/auth0_management.py")
+        );
+        assert!(
+            top.evidence.get("also_symbol_search").is_some(),
+            "same-path symbol evidence should merge into the top text answer"
+        );
+        let symbol_step = response
+            .verification_steps
+            .iter()
+            .filter_map(|value| value.get("step").and_then(|step| step.as_str()))
+            .find(|step| step.contains("callers of the symbol"))
+            .unwrap_or("");
+        assert!(
+            symbol_step.contains("backend/accounts/auth0_management.py"),
+            "symbol verification should follow the merged top answer, got {symbol_step}"
         );
     }
 
