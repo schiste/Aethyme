@@ -5,7 +5,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::{Broker, BrokerOpError, SessionOrigin, SessionStatus, VersionDriftStatus};
+use aethyme_broker::{
+    Broker, BrokerOpError, FinishStatus, SessionOrigin, SessionStatus, VersionDriftStatus,
+};
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -267,4 +269,98 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
     // The reuse left an audit trail.
     let events = broker.store().events_after(0, i64::MAX).unwrap();
     assert!(events.iter().any(|e| e.kind == "session.reused"));
+}
+
+#[test]
+fn finish_blocks_dirty_then_unsubmitted_commits() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let wt = tmp.path().join("finish-wt");
+    sh(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "agent/finish",
+            wt.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&wt, Some("finish task")).unwrap();
+
+    std::fs::write(wt.join("wip.txt"), "dirty\n").unwrap();
+    let dirty = broker.finish(session.id).unwrap();
+    assert_eq!(dirty.status, FinishStatus::Blocked);
+    assert!(!dirty.closed);
+    assert_eq!(dirty.dirty_paths, vec!["wip.txt"]);
+    assert!(
+        dirty
+            .next_commands
+            .iter()
+            .any(|command| command.contains("status --short"))
+    );
+    assert_ne!(
+        broker.store().session(session.id).unwrap().status,
+        SessionStatus::Cleaned
+    );
+
+    sh(&wt, &["add", "-A"]);
+    sh(&wt, &["commit", "-qm", "finish wip"]);
+    let unsubmitted = broker.finish(session.id).unwrap();
+    assert_eq!(unsubmitted.status, FinishStatus::Blocked);
+    assert_eq!(unsubmitted.unsubmitted_commits, 1);
+    assert_eq!(
+        unsubmitted.next_commands,
+        vec![format!("aethyme broker submit --session {}", session.id)]
+    );
+    assert_ne!(
+        broker.store().session(session.id).unwrap().status,
+        SessionStatus::Cleaned
+    );
+}
+
+#[test]
+fn finish_closes_promoted_session_and_suggests_cleanup_only_when_main_contains_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let wt = tmp.path().join("promoted-finish-wt");
+    sh(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "agent/promoted-finish",
+            wt.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&wt, Some("promoted finish task")).unwrap();
+
+    std::fs::write(wt.join("done.txt"), "done\n").unwrap();
+    sh(&wt, &["add", "-A"]);
+    sh(&wt, &["commit", "-qm", "done"]);
+    assert!(broker.submit(session.id).unwrap().promoted);
+
+    let closed = broker.finish(session.id).unwrap();
+    assert_eq!(closed.status, FinishStatus::Closed);
+    assert!(closed.closed);
+    assert!(!closed.cleanup_safe);
+    assert!(closed.next_commands.is_empty());
+    assert_eq!(
+        broker.store().session(session.id).unwrap().status,
+        SessionStatus::Cleaned
+    );
+
+    sh(tmp.path(), &["merge", "--ff-only", "aethyme/integration"]);
+    let already = broker.finish(session.id).unwrap();
+    assert_eq!(already.status, FinishStatus::AlreadyClosed);
+    assert!(already.cleanup_safe);
+    assert_eq!(
+        already.next_commands,
+        vec![format!("aethyme broker cleanup {}", session.id)]
+    );
 }
