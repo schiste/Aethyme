@@ -1,12 +1,14 @@
 # Aethyme Graph Schema
 
-Last Updated: 2026-07-17
+Last Updated: 2026-07-28
 
-Status: **Implemented V1 durable graph contract.** The committed
-source-of-truth graph lives under `.aethyme/graph/` as deterministic
-fragments and index shards. The engine redb file at
-`.aethyme/graph_store.redb` is a derived local query artifact, rebuilt from
-those fragments by `aethyme-engine-cli index --repo <repo>`.
+Status: **Implemented V1 durable graph contract with Surface/Flow Graph V1
+contract defined.** The committed source-of-truth graph lives under
+`.aethyme/graph/` as deterministic fragments and index shards. The engine
+redb file at `.aethyme/graph_store.redb` is a derived local query artifact,
+rebuilt from those fragments by `aethyme-engine-cli index --repo <repo>`.
+Surface/Flow Graph records are part of the same fragment contract; redb may
+index them for fast queries, but redb never becomes their durable source.
 
 No schema versioning means every fragment-shape decision here is treated as
 forever; push back hard before changing any field or enum that has landed in
@@ -26,6 +28,8 @@ violate one of them, that's the trip wire.
 | **Required-per-kind, never permissive optional** | When a fact is genuinely unavailable, emit a different kind (e.g. `UnresolvedSymbol`) rather than relax the field. |
 | **Index time is one-time; query time must be fast** | Materialize derived facts at index time. The query path never recomputes what the indexer could have stored. |
 | **Fragments are the source of truth** | Per-file fragments, overlay fragments, and per-module index shards live under `.aethyme/graph/` in git. The current engine redb graph store lives at `.aethyme/graph_store.redb`; it is derived from fragments and regenerated locally. |
+| **Surface/Flow is explicit** | Entrypoints, middleware/config installation, forwarding, auth/authorization, credential operations, and behavior tests are first-class graph facts. A backend symbol hit alone is not enough to claim request-flow coverage. |
+| **Coverage is separate from freshness** | A fresh redb store only proves it is newer than fragments. Surface/Flow coverage must also say which expected surface families were present in source and whether matching graph fragments/index rows exist. |
 | **Determinism is paramount** | Same source → byte-identical fragments on every machine, OS, parser version. Non-determinism is a bug, not a quirk. |
 | **Neutral surface, language extensions** | Node kinds and edge kinds are language-neutral. Language-specific data lives under `extensions.<lang>` namespaces. |
 
@@ -155,6 +159,36 @@ This is the layer that supports the documentation-as-graph vision.
 |---|---|---|
 | `unresolved_symbol` | `name`, `expected_kind?`, `referenced_from_id` | Used when we see a reference (call, import) to a symbol we cannot locate. Prevents relaxing required fields on real kinds. |
 
+### 3.7 Surface/Flow Graph kinds
+
+Surface/Flow Graph is the behavior-navigation layer on top of the structural
+repo graph. It models where work enters the system, how requests/messages are
+transformed, where credentials are issued or validated, and which tests prove
+the live behavior. These facts are durable graph records under
+`.aethyme/graph/`, not query-only heuristics.
+
+The layer is generic. It must not special-case a product, eval fixture, or one
+folder name. Language/framework adapters emit the same neutral node kinds with
+language-specific details in `extensions.<lang_or_framework>`.
+
+| Kind | Required | Notes |
+|---|---|---|
+| `route_surface` | `path`, `route_pattern`, `methods[]`, `handler_node_id?`, `framework`, `start_line`, `end_line` | HTTP route/controller/view entrypoint. Django URL routes, Express routers, Rails routes, ASP.NET endpoints, and similar adapters map here. |
+| `worker_surface` | `path`, `runtime`, `handler_node_id?`, `trigger`, `start_line`, `end_line` | Edge/serverless worker entrypoint such as Cloudflare Workers, Vercel/Netlify middleware, Lambda handlers, or fetch/event handlers. |
+| `proxy_surface` | `path`, `source_origin?`, `target_origin?`, `rewrites_headers[]`, `preserves_headers[]`, `start_line`, `end_line` | Gateway/proxy logic that forwards to another app boundary. Header mutation belongs here because it can decide what backend auth ever sees. |
+| `webhook_surface` | `path`, `provider?`, `route_pattern?`, `handler_node_id?`, `verification_kind?`, `start_line`, `end_line` | Inbound third-party callback surface. Verification may be HMAC, shared token, JWS/JWT, mTLS, or provider SDK validation. |
+| `cli_surface` | `path`, `command_name`, `handler_node_id?`, `start_line`, `end_line` | Human/automation command entrypoint. Includes shell-exposed commands and framework CLI commands. |
+| `job_surface` | `path`, `scheduler?`, `job_name`, `handler_node_id?`, `start_line`, `end_line` | Scheduled/background job entrypoint. |
+| `queue_surface` | `path`, `queue_name?`, `message_type?`, `handler_node_id?`, `start_line`, `end_line` | Consumer/subscriber entrypoint for queued or streamed messages. |
+| `middleware_installation` | `path`, `middleware_node_id?`, `installed_by_node_id?`, `order?`, `scope?`, `start_line`, `end_line` | Configuration or code that installs request/message middleware. For Django this includes `settings.MIDDLEWARE`; for JS/TS this includes app/router middleware registration. |
+| `credential_operation` | `path`, `operation` (`issues`/`stores`/`uses`/`validates`/`authorizes`), `credential_kind`, `target_node_id?`, `start_line`, `end_line` | Credential lifecycle operation. `validates` and `authorizes` are distinct: validation establishes identity; authorization checks permission/scope/policy. |
+| `behavior_test_surface` | `path`, `test_name`, `test_kind` (`unit`/`integration`/`e2e`/`contract`), `target_surface_id?`, `start_line`, `end_line` | Test node that proves a live route, proxy, middleware, credential operation, or cross-component flow. Existing `function` test nodes may coexist; this node carries behavior-surface semantics. |
+
+Surface/Flow node IDs use the same canonical ID rule as other nodes. The
+identity tuple is `(repo, file_path, stable_surface_name, kind_name)`, where
+`stable_surface_name` is the route pattern, command name, job name, queue name,
+or a deterministic adapter label when no framework name exists.
+
 ## 4. Edge kinds
 
 Edges carry their own attributes. Storage is one-way forward; a reverse
@@ -208,7 +242,30 @@ cross-language binding is resolvable.
 |---|---|
 | `calls`, `imports`, `uses` | `language_boundary: true`, `binding_kind` (`pyo3`/`napi`/`wasm-bindgen`/`ffi`/`unknown`) |
 
-### 4.6 Edge attributes — common fields
+### 4.6 Surface/Flow edges
+
+Surface/Flow edges connect system boundaries to implementation and tests. They
+are the long-term fix for tasks where the right answer crosses components:
+edge worker → backend route → middleware → validator → authorization → audit or
+test evidence.
+
+| Kind | Direction | Common attributes | Notes |
+|---|---|---|---|
+| `exposes` | container/config → surface | `environment?`, `route_pattern?`, `method?` | A deployment/config/router exposes a route, worker, proxy, webhook, CLI, job, or queue surface. |
+| `forwards_to` | proxy/worker surface → route/service surface | `target_hint`, `preserves_headers[]`, `drops_headers[]`, `rewrites_headers[]` | Cross-boundary forwarding. This is required for ingress flows where auth headers are preserved, stripped, rewritten, or minted before backend validation. |
+| `installs_middleware` | config/surface → middleware_installation/code node | `order?`, `scope?`, `conditional?` | Connects settings/router/app config to middleware that participates in the live request/message path. |
+| `validates_credential` | surface/middleware/code node → credential_operation/code node | `credential_kind`, `source` (`header`/`cookie`/`query`/`body`/`message`/`env`/`unknown`) | Identity validation. A bearer parser, HMAC verifier, API-key hash lookup, OIDC callback verifier, or JWS validator maps here. |
+| `authorizes` | surface/middleware/code node → policy/scope/code node | `policy_kind?`, `scope?`, `fallback?` | Permission/scope/RBAC/policy checks after identity validation. |
+| `issues_credential` | code/surface node → credential_operation/config/model node | `credential_kind`, `lifetime?` | Credential minting or issuance path. |
+| `stores_credential` | code/surface node → model/config/storage node | `credential_kind`, `storage_kind?`, `hashed?` | Credential persistence, cache, or secret storage. |
+| `uses_credential` | code/surface node → credential_operation/config node | `credential_kind`, `direction` (`inbound`/`outbound`/`internal`) | Credential use that is not itself validation or issuance. Outbound provider-management helpers should rank separately from inbound auth paths. |
+| `tests` | behavior_test_surface/function → surface/flow/code node | `test_kind`, `scenario?`, `assertion_count?` | Existing test edge kind extends to Surface/Flow targets. Integration/e2e tests of live auth/proxy behavior should target the surface or flow node they exercise. |
+
+Every Surface/Flow edge keeps the same edge identity and common fields as other
+edges. Adapters must emit unresolved placeholder nodes rather than dropping an
+edge whose endpoint is not yet resolvable.
+
+### 4.7 Edge attributes — common fields
 
 | Field | Type | Always present |
 |---|---|---|
@@ -558,6 +615,92 @@ behavior. Usage-boundary is complete under the hybrid V2 contract above: it is
 redb-seeded, but intentionally scans source/docs/config text for evidence. A
 future fully redb-native analyzer would need its own evidence model and
 freshness gates before replacing that source-text pass.
+
+### 5.9 Surface/Flow coverage observability
+
+Freshness and coverage are separate contracts.
+
+`observability.graph_store.status = "fresh"` means the redb file is not older
+than the newest committed fragment. It does **not** mean every relevant
+boundary surface was indexed. Explore and future graph/task commands that emit
+observability must expose Surface/Flow coverage under:
+
+```json
+{
+  "observability": {
+    "graph_store": {
+      "backend": "redb",
+      "status": "fresh",
+      "exists": true,
+      "fragments_exist": true
+    },
+    "surface_flow_graph": {
+      "schema_version": 1,
+      "status": "partial",
+      "source_of_truth": ".aethyme/graph/",
+      "derived_query_artifact": ".aethyme/graph_store.redb",
+      "coverage": {
+        "backend": {
+          "source_present": true,
+          "indexed": true,
+          "status": "covered"
+        },
+        "edge_proxy": {
+          "source_present": true,
+          "indexed": false,
+          "path_indexed": true,
+          "semantic_required": true,
+          "semantic_indexed": false,
+          "status": "source_present_not_indexed",
+          "path_indexed_hints": ["gcp-run-proxy/src/worker.mjs.bin"],
+          "semantic_path_hints": [],
+          "unindexed_source_path_hints": ["gcp-run-proxy/src/worker.mjs"]
+        }
+      },
+      "missing_expected_surfaces": [
+        {
+          "surface_type": "edge_proxy",
+          "reason": "source paths and path fragments exist for this Surface/Flow family, but explicit semantic Surface/Flow node/edge evidence is missing"
+        }
+      ]
+    }
+  }
+}
+```
+
+V1 coverage reporting is intentionally conservative. It compares bounded
+source-path signals against `.aethyme/graph/` evidence and reports families
+such as `backend`, `edge_proxy`, `route`, `middleware`, `webhook`, `cli`,
+`job_queue`, `credential`, and `live_behavior_test`. For Surface/Flow families,
+ordinary file/path fragments are not enough: `indexed` means an explicit
+Surface/Flow semantic node or edge term was found. Path-only evidence is
+reported separately as `path_indexed` so agents can see that the source file was
+noticed but the behavior layer is still missing.
+
+Statuses:
+
+| Status | Meaning |
+|---|---|
+| `covered` | Source paths and the required graph evidence both contain this family. For backend structure that can be path/index evidence; for Surface/Flow families it must be semantic node/edge evidence. |
+| `partially_indexed` | Some source paths for this family have matching required graph evidence, but other source paths do not. Agents must verify the unindexed source hints before treating graph output as complete. |
+| `source_present_not_indexed` | Source paths suggest the surface exists, but committed graph fragments/index shards do not expose the required evidence. This must be visible to agents; they should widen verification instead of trusting a narrow graph answer. |
+| `indexed_without_source_hint` | Required graph evidence exists, but the bounded source-path scan did not see a matching source path. This can happen for overlays, generated fragments, or path-pattern gaps. |
+| `not_detected` | Neither the bounded source-path scan nor fragment/index scan saw that surface family. |
+
+Aggregate `surface_flow_graph.status` is:
+
+| Status | Meaning |
+|---|---|
+| `unknown` | `.aethyme/graph/` does not exist, so coverage cannot be assessed. |
+| `partial` | At least one source-present surface family is missing from graph fragments/index shards. |
+| `covered` | At least one surface family is present in both source and graph, and none of the detected source-present families are missing. |
+| `no_surface_signals` | The bounded scans found no known Surface/Flow path signals. |
+
+This V1 report is not a substitute for full Surface/Flow indexing. It exists so
+the system can state gaps honestly before the dedicated route/proxy/middleware
+adapters land. Once adapters persist the node/edge kinds in §3.7/§4.6, the
+same observability envelope should derive coverage from typed fragment/redb
+rows rather than path heuristics.
 
 ## 6. Update propagation
 
