@@ -54,8 +54,9 @@ pub use hooks::{HookReport, HookState, HooksError};
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use merge::{ACTION_REQUIRED_RELPATH, PromoteConfig, SubmitOutcome};
 pub use quick_test::{
-    Chau7Probe, QuickTestError, QuickTestMode, QuickTestReport, QuickTestStep,
-    run_broker_quick_test,
+    Chau7Probe, QuickTestError, QuickTestGateOutcome, QuickTestGateReport, QuickTestMode,
+    QuickTestOptions, QuickTestReport, QuickTestStep, run_broker_quick_test,
+    run_broker_quick_test_with_options,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use store::BrokerStore;
