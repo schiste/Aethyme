@@ -18,45 +18,6 @@ def build_demo_repo(root: Path) -> None:
     (root / "src" / "main.py").write_text("def main():\n    return 1\n", encoding="utf-8")
 
 
-def test_engine_inspect_uses_snapshot_cache(monkeypatch, tmp_path: Path) -> None:
-    repo_path = tmp_path / "repo"
-    build_demo_repo(repo_path)
-    cache_root = tmp_path / "cache"
-    cache_root.mkdir()
-    fake_binary = tmp_path / "aethyme-engine-cli"
-    fake_binary.write_text("", encoding="utf-8")
-
-    calls: list[tuple[str, ...]] = []
-
-    monkeypatch.setattr(engine_module, "CACHE_ROOT", cache_root)
-    monkeypatch.setattr(engine_module, "ensure_engine_binary", lambda: fake_binary)
-
-    def fake_run(*args: str) -> str:
-        calls.append(args)
-        return json.dumps(
-            {
-                "snapshot": {
-                    "root": str(repo_path),
-                    "languages": ["python"],
-                    "top_level_dirs": ["src"],
-                    "readme_path": "README.md",
-                    "files": [{"path": "README.md", "language": None, "line_count": 1, "size_bytes": 12}],
-                },
-                "symbols": [],
-                "edges": [],
-                "risk_flags": [],
-            }
-        )
-
-    monkeypatch.setattr(engine_module, "_run_binary_command", fake_run)
-
-    first = engine_module.inspect_repository(repo_path)
-    second = engine_module.inspect_repository(repo_path)
-
-    assert first == second
-    assert len(calls) == 1
-
-
 def test_engine_command_rejects_unknown_transport(monkeypatch) -> None:
     monkeypatch.setenv("AETHYME_ENGINE_TRANSPORT", "unknown")
 

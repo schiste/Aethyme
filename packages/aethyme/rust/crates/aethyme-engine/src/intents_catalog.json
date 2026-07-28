@@ -1,0 +1,230 @@
+{
+  "schema_version": "aethyme-intents-v1",
+  "selection_contract": {
+    "who_selects": "caller_or_llm_for_specialized_intents",
+    "aethyme_role": "Run the default general-purpose localization intent when no intent is selected; validate explicit intents and parameters, then run deterministic repository analysis.",
+    "caller_role": "Use the default Explore path for normal requests. Choose a specialized intent from the catalog only when the user request clearly matches it, then provide that intent's structured parameters.",
+    "default_intent": "task_localization_query",
+    "no_hidden_task_specific_routing": true
+  },
+  "canonical_flow": [
+    "Run `aethyme explore --repo <repo> --request <task> --format answer-json` first; default detail is compact.",
+    "Read `trust_policy` and use `answer[]` only when `safe_to_use_as_answer` is true.",
+    "If trust_policy is `needs_verification`, follow `verification_steps[]` before using answer[] as final evidence.",
+    "If only `navigation_hints[]` are available, treat them as manual investigation steps, not candidate answers.",
+    "For a specialized intent, rerun `aethyme explore --repo <repo> --intent <intent> --request <task> --params '<json>' --format answer-json --show-observability`.",
+    "Read answer[] first only after the trust policy, verification_steps[] second, excluded[] third, ambiguous[]/navigation_hints[]/next_actions fourth, observability last."
+  ],
+  "modes": [
+    {
+      "mode": "explore",
+      "purpose": "Return repository facts, evidence, and task-ready answers without editing files.",
+      "command": "aethyme explore",
+      "intents": [
+        {
+          "intent": "task_localization_query",
+          "summary": "Localize any normal repository question into ranked candidate files, symbols, areas, evidence, and next navigation steps.",
+          "best_for": [
+            "bug diagnosis",
+            "feature localization",
+            "impact analysis",
+            "architecture questions",
+            "where should I look first",
+            "general repository exploration"
+          ],
+          "required_params": [],
+          "optional_params": [
+            "max_anchors",
+            "max_files",
+            "max_symbols",
+            "max_areas",
+            "max_next_items",
+            "max_answer_items",
+            "max_expansions",
+            "detail",
+            "include_expansions",
+            "max_symbol_queries",
+            "max_symbol_results",
+            "max_text_files",
+            "max_text_line_refs",
+            "max_callsite_symbols",
+            "max_callsite_results",
+            "symbol_query_timeout_ms",
+            "graph_query_timeout_ms",
+            "skip_symbols_after_graph_timeout"
+          ],
+          "param_defaults": {
+            "detail": "compact",
+            "max_anchors": 3,
+            "max_files": 5,
+            "max_symbols": 5,
+            "max_areas": 3,
+            "max_next_items": 5,
+            "max_answer_items": 12,
+            "max_expansions": 1,
+            "include_expansions": true,
+            "max_symbol_queries": 5,
+            "max_symbol_results": 4,
+            "max_text_files": 5,
+            "max_text_line_refs": 2,
+            "max_callsite_symbols": 4,
+            "max_callsite_results": 4,
+            "symbol_query_timeout_ms": 1000,
+            "graph_query_timeout_ms": 1000,
+            "skip_symbols_after_graph_timeout": false
+          },
+          "default_for_explore": true,
+          "answer_schema": {
+            "kind": "anchor | in_scope_file | in_scope_symbol | in_scope_area | next_step",
+            "target": "symbol id, file path, area, or display label",
+            "path": "repo-relative path when known",
+            "status": "candidate",
+            "evidence": "object",
+            "confidence": "number",
+            "reason": "string"
+          },
+          "verification_step_schema": {
+            "action": "read_source_window | search_symbol_in_candidate | read_candidate_file",
+            "target": "symbol or path",
+            "path": "repo-relative path when known",
+            "command": "shell command for cheap manual verification",
+            "reason": "why this verification step matters"
+          },
+          "navigation_hint_schema": {
+            "kind": "filesystem_file | graph_next_action | investigation_plan",
+            "status": "navigation_hint",
+            "trust_policy": "navigation_only",
+            "confidence": "low number; filename-only evidence cannot be authoritative"
+          },
+          "trust_contract": {
+            "safe_to_use_as_answer": "boolean",
+            "safe_to_use_as_navigation": "boolean",
+            "evidence_level": "compound: graph[+symbol[-weak]][+text[-weak]][+callsite[-weak]] | none",
+            "verification_required": "boolean",
+            "trust_policy": "answer_candidate | needs_verification | navigation_only | failed"
+          },
+          "observability": [
+            "command name",
+            "repo path",
+            "index freshness",
+            "internal analyzers called",
+            "graph/fact count",
+            "output size",
+            "confidence summary",
+            "evidence level",
+            "trust policy",
+            "failure/degraded reason"
+          ]
+        },
+        {
+          "intent": "behavior_localization_query",
+          "summary": "Localize behavioral bugs and feature flows by combining graph/symbol results with source-text evidence and call-site expansion.",
+          "best_for": [
+            "bug reports with observable behavior",
+            "trace this feature or side effect",
+            "what code path updates this state",
+            "which callers of this API need inspection"
+          ],
+          "required_params": [],
+          "optional_params": [
+            "max_text_files",
+            "max_text_line_refs",
+            "max_callsite_symbols",
+            "max_callsite_results",
+            "graph_query_timeout_ms",
+            "symbol_query_timeout_ms"
+          ],
+          "param_defaults": {
+            "max_text_files": 10,
+            "max_text_line_refs": 4,
+            "max_callsite_symbols": 8,
+            "max_callsite_results": 8,
+            "graph_query_timeout_ms": 1000,
+            "symbol_query_timeout_ms": 1000,
+            "skip_symbols_after_graph_timeout": false
+          },
+          "answer_schema": {
+            "kind": "source_text_file | call_site_file | symbol_search_file | anchor",
+            "path": "repo-relative path",
+            "role": "entrypoint | state_change | caller | docs | source_candidate",
+            "evidence": "line_refs, matched_terms, top_symbols, call-site chains, or callers",
+            "confidence": "number",
+            "reason": "string"
+          },
+          "observability": [
+            "source text candidate count",
+            "callsite candidate count",
+            "degradation guidance",
+            "trust policy"
+          ]
+        },
+        {
+          "intent": "usage_boundary_query",
+          "summary": "Find public symbols in a scope and classify whether callers exist outside a boundary.",
+          "best_for": [
+            "dead-code checks",
+            "public API usage audits",
+            "is this symbol used outside this package"
+          ],
+          "required_params": [
+            "scope"
+          ],
+          "optional_params": [
+            "symbol_kind",
+            "boundary",
+            "search_roots",
+            "include_methods",
+            "budget_ms",
+            "max_evidence_per_symbol"
+          ],
+          "param_defaults": {
+            "symbol_kind": "public_top_level_function",
+            "boundary": {
+              "type": "outside_directory",
+              "path": "<scope>"
+            },
+            "search_roots": [],
+            "include_methods": false,
+            "budget_ms": 10000,
+            "max_evidence_per_symbol": 5
+          },
+          "answer_schema": {
+            "function_name": "string",
+            "defined_in": "repo-relative path",
+            "status": "Unused | Ambiguous | Used",
+            "external_callers": [
+              "string"
+            ],
+            "internal_callers": [
+              "string"
+            ],
+            "evidence": "object",
+            "confidence": "number",
+            "reason": "string"
+          },
+          "observability": [
+            "command name",
+            "repo path",
+            "index freshness",
+            "graph/fact count",
+            "output size",
+            "confidence summary",
+            "failure/degraded reason"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "act",
+      "purpose": "Reserved for future deterministic change-planning and safe edit workflows.",
+      "command": null,
+      "intents": []
+    },
+    {
+      "mode": "learn",
+      "purpose": "Reserved for future feedback capture, eval traces, and repository memory updates.",
+      "command": null,
+      "intents": []
+    }
+  ]
+}

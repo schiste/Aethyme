@@ -388,10 +388,8 @@ pub fn pretty_json(compact: &str) -> String {
     let mut depth: usize = 0;
     let mut in_string = false;
     let mut escaped = false;
-    let bytes = compact.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
+    let mut chars = compact.chars().peekable();
+    while let Some(c) = chars.next() {
         if in_string {
             out.push(c);
             if escaped {
@@ -401,7 +399,6 @@ pub fn pretty_json(compact: &str) -> String {
             } else if c == '"' {
                 in_string = false;
             }
-            i += 1;
             continue;
         }
         match c {
@@ -412,10 +409,10 @@ pub fn pretty_json(compact: &str) -> String {
             '{' | '[' => {
                 let close = if c == '{' { '}' } else { ']' };
                 // Empty containers stay inline, matching json.dumps.
-                if i + 1 < bytes.len() && bytes[i + 1] as char == close {
+                if chars.peek() == Some(&close) {
                     out.push(c);
                     out.push(close);
-                    i += 2;
+                    chars.next();
                     continue;
                 }
                 depth += 1;
@@ -440,14 +437,13 @@ pub fn pretty_json(compact: &str) -> String {
             }
             _ => out.push(c),
         }
-        i += 1;
     }
     out
 }
 
 /// Return the keys of the object stored under `field` in `raw` compact
 /// JSON, in emission order.
-fn object_key_order(raw: &str, field: &str) -> Vec<String> {
+pub(crate) fn object_key_order(raw: &str, field: &str) -> Vec<String> {
     let marker = format!("\"{field}\":{{");
     let Some(start) = raw.find(&marker) else {
         return Vec::new();
@@ -533,6 +529,16 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("Caps: {\"max_items\": 50}"), "{rendered}");
+    }
+
+    #[test]
+    fn pretty_json_preserves_multibyte_utf8() {
+        // Caught by the unicode fixture file (Départ.php): the original
+        // byte-cast tokenizer emitted mojibake for non-ASCII content.
+        assert_eq!(
+            pretty_json(r#"{"path":"legacy/Départ.php"}"#),
+            "{\n  \"path\": \"legacy/Départ.php\"\n}"
+        );
     }
 
     #[test]

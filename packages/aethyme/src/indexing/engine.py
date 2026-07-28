@@ -267,39 +267,6 @@ def _cached_text(snapshot: LocalRepositorySnapshot, name: str, producer: Callabl
     return _store_cached_text(cache_path, payload)
 
 
-def inspect_repository(repo_path: Path) -> dict[str, Any]:
-    """Return the repository map emitted by the Rust engine."""
-    snapshot = capture_snapshot(repo_path)
-    output = _cached_text(
-        snapshot,
-        "inspect",
-        lambda: _run_binary_command("inspect", "--repo", str(snapshot.repo_path)),
-    )
-    return json.loads(output)
-
-
-def inspect_repository_brief(repo_path: Path) -> dict[str, Any]:
-    """Return a compact repository overview (areas, signals, entrypoints, key configs)."""
-    snapshot = capture_snapshot(repo_path)
-    output = _cached_text(
-        snapshot,
-        "inspect_brief",
-        lambda: _run_binary_command("inspect", "--repo", str(snapshot.repo_path), "--mode", "brief"),
-    )
-    return json.loads(output)
-
-
-def inspect_repository_structure(repo_path: Path) -> dict[str, Any]:
-    """Return a structural repository view (areas, files, configs, docs — no edges/graph)."""
-    snapshot = capture_snapshot(repo_path)
-    output = _cached_text(
-        snapshot,
-        "inspect_structure",
-        lambda: _run_binary_command("inspect", "--repo", str(snapshot.repo_path), "--mode", "structure"),
-    )
-    return json.loads(output)
-
-
 def _run_binary_command_with_timeout(
     *args: str,
     timeout_seconds: float | None = None,
@@ -328,59 +295,6 @@ def _run_binary_command_with_timeout(
     if result.returncode != 0:
         raise EngineError(result.stderr.strip() or result.stdout.strip() or "Rust engine failed")
     return result.stdout.strip()
-
-
-def derived_public_functions(
-    repo_path: Path,
-    scope: str,
-    *,
-    include_methods: bool = False,
-) -> list[dict[str, Any]]:
-    """Return derived public or exported function facts within a scope."""
-    snapshot = capture_snapshot(repo_path)
-    cache_key = f"facts_public_functions_{_stable_hash(f'{scope}:{include_methods}')}"
-    output = _cached_text(
-        snapshot,
-        cache_key,
-        lambda: _run_binary_command(
-            "facts-public-functions",
-            "--repo",
-            str(snapshot.repo_path),
-            "--scope",
-            scope,
-            *(["--include-methods"] if include_methods else []),
-        ),
-    )
-    return json.loads(output)
-
-
-def derived_function_usage(
-    repo_path: Path,
-    target: str,
-    *,
-    boundary: str,
-    roots: list[str] | None = None,
-) -> dict[str, Any]:
-    """Return deterministic usage facts for one function relative to a boundary."""
-    snapshot = capture_snapshot(repo_path)
-    roots = roots or []
-    roots_value = ",".join(roots)
-    cache_key = f"facts_function_usage_{_stable_hash(f'{target}:{boundary}:{roots_value}')}"
-    output = _cached_text(
-        snapshot,
-        cache_key,
-        lambda: _run_binary_command(
-            "facts-function-usage",
-            "--repo",
-            str(snapshot.repo_path),
-            "--target",
-            target,
-            "--boundary",
-            boundary,
-            *(["--roots", roots_value] if roots_value else []),
-        ),
-    )
-    return json.loads(output)
 
 
 def analyze_dead_code(
@@ -430,20 +344,6 @@ def workspace_blast_radius(
         "--file", file_path,
     )
     return json.loads(output)
-
-
-def warm_repository(repo_path: Path) -> None:
-    """Pre-build the repository map cache by invoking the warm command."""
-    _run_binary_command("warm", "--repo", str(repo_path))
-
-
-def clear_repository_cache(repo_path: Path) -> None:
-    """Remove cached engine artifacts for the current repository snapshot."""
-    snapshot = capture_snapshot(repo_path)
-    cache_dir = _cache_directory(snapshot)
-    for child in cache_dir.iterdir():
-        if child.is_file():
-            child.unlink()
 
 
 def _stable_hash(value: str) -> str:
