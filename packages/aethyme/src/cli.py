@@ -1,5 +1,4 @@
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any, TypeAlias, TypedDict, cast
@@ -125,22 +124,12 @@ def get_state(ctx: click.Context) -> CLIState:
     is_flag=True,
     help="Verbose output",
 )
-@click.option(
-    "--engine-transport",
-    type=str,
-    envvar="AETHYME_ENGINE_TRANSPORT",
-    help=(
-        "Engine transport backend. Built-ins: auto, subprocess, pyo3. "
-        "Custom registered transport names are also accepted."
-    ),
-)
 @click.pass_context
 def cli(
     ctx: click.Context,
     tenant_id: str | None,
     output_json_flag: bool,
     verbose: bool,
-    engine_transport: str | None,
 ) -> None:
     """Aethyme - Graph-based code intelligence system.
 
@@ -156,14 +145,6 @@ def cli(
     state["tenant_id"] = tenant_id
     state["json"] = output_json_flag
     state["verbose"] = verbose
-    if engine_transport:
-        normalized_transport = engine_transport.strip().lower()
-        if not normalized_transport:
-            raise click.BadParameter(
-                "Engine transport cannot be empty.", param_hint="--engine-transport"
-            )
-        os.environ["AETHYME_ENGINE_TRANSPORT"] = normalized_transport
-        state["engine_transport"] = normalized_transport
 
 
 
