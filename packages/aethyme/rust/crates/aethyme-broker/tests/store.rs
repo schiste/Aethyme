@@ -3,8 +3,8 @@
 //! issue #5: migrations from empty and from v1).
 
 use aethyme_broker::{
-    BrokerError, BrokerStore, GateDef, GateStatus, LeaseKind, MergeStatus, NewGateResult,
-    NewSession, SessionOrigin, SessionStatus,
+    BrokerError, BrokerStore, GateDef, GateFailureClass, GateStatus, LeaseKind, MergeStatus,
+    NewGateResult, NewSession, SessionOrigin, SessionStatus,
 };
 
 fn open_temp() -> (tempfile::TempDir, BrokerStore) {
@@ -230,6 +230,7 @@ fn gate_result_cache_ignores_cancelled_and_error_runs() {
             gate_name: "pytest".into(),
             tree_hash: "tree-a".into(),
             status: GateStatus::Cancelled,
+            failure_class: None,
             exit_code: None,
             duration_ms: None,
             log_path: None,
@@ -249,6 +250,7 @@ fn gate_result_cache_ignores_cancelled_and_error_runs() {
             gate_name: "pytest".into(),
             tree_hash: "tree-a".into(),
             status: GateStatus::Pass,
+            failure_class: None,
             exit_code: Some(0),
             duration_ms: Some(1200),
             log_path: None,
@@ -260,6 +262,46 @@ fn gate_result_cache_ignores_cancelled_and_error_runs() {
         .unwrap()
         .unwrap();
     assert_eq!(hit.status, GateStatus::Pass);
+    assert_eq!(hit.failure_class, None);
+
+    store
+        .record_gate_result(&NewGateResult {
+            gate_name: "pytest".into(),
+            tree_hash: "tree-c".into(),
+            status: GateStatus::Fail,
+            failure_class: None,
+            exit_code: Some(1),
+            duration_ms: Some(100),
+            log_path: None,
+            session_id: None,
+        })
+        .unwrap();
+    assert!(
+        store
+            .cached_gate_result("pytest", "tree-c")
+            .unwrap()
+            .is_none(),
+        "legacy/unclassified fail rows must not satisfy the cache"
+    );
+
+    store
+        .record_gate_result(&NewGateResult {
+            gate_name: "pytest".into(),
+            tree_hash: "tree-c".into(),
+            status: GateStatus::Fail,
+            failure_class: Some(GateFailureClass::TestFailure),
+            exit_code: Some(1),
+            duration_ms: Some(100),
+            log_path: None,
+            session_id: None,
+        })
+        .unwrap();
+    let hit = store
+        .cached_gate_result("pytest", "tree-c")
+        .unwrap()
+        .unwrap();
+    assert_eq!(hit.status, GateStatus::Fail);
+    assert_eq!(hit.failure_class, Some(GateFailureClass::TestFailure));
 
     // Different tree = different cache slot.
     assert!(

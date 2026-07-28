@@ -66,6 +66,15 @@ text_enum!(GateStatus, "gate_results.status", {
     Error => "error",
 });
 
+text_enum!(GateFailureClass, "gate_results.failure_class", {
+    TestFailure => "test_failure",
+    Environment => "environment",
+    ResourceContention => "resource_contention",
+    Timeout => "timeout",
+    CachedPriorFail => "cached_prior_fail",
+    Unknown => "unknown",
+});
+
 text_enum!(MergeStatus, "merge_queue.status", {
     Submitted => "submitted",
     Simulating => "simulating",
@@ -143,6 +152,7 @@ pub struct NewGateResult {
     pub gate_name: String,
     pub tree_hash: String,
     pub status: GateStatus,
+    pub failure_class: Option<GateFailureClass>,
     pub exit_code: Option<i64>,
     pub duration_ms: Option<i64>,
     pub log_path: Option<String>,
@@ -156,6 +166,7 @@ pub struct GateResult {
     /// Git tree hash the gate ran against — the cache key.
     pub tree_hash: String,
     pub status: GateStatus,
+    pub failure_class: Option<GateFailureClass>,
     pub exit_code: Option<i64>,
     pub duration_ms: Option<i64>,
     pub log_path: Option<String>,

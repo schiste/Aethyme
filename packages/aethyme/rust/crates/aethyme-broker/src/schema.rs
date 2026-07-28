@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -113,7 +113,20 @@ CREATE TABLE events (
 CREATE INDEX events_by_kind ON events (kind, id);
 ";
 
-const MIGRATIONS: &[&str] = &[MIGRATION_V1];
+const MIGRATION_V2: &str = "
+ALTER TABLE gate_results
+ADD COLUMN failure_class TEXT
+    CHECK (failure_class IS NULL OR failure_class IN (
+        'test_failure',
+        'environment',
+        'resource_contention',
+        'timeout',
+        'cached_prior_fail',
+        'unknown'
+    ));
+";
+
+const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2];
 
 fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
     let version = conn

@@ -56,8 +56,8 @@ pub use quick_test::{
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use store::BrokerStore;
 pub use types::{
-    Event, GateDef, GateResult, GateStatus, Lease, LeaseKind, MergeQueueEntry, MergeStatus,
-    NewGateResult, NewSession, Session, SessionOrigin, SessionStatus,
+    Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease, LeaseKind, MergeQueueEntry,
+    MergeStatus, NewGateResult, NewSession, Session, SessionOrigin, SessionStatus,
 };
 pub use version::{BinaryBuild, VersionDriftReport, VersionDriftStatus, inspect_version};
 

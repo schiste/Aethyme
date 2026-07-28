@@ -393,6 +393,16 @@ fn duration_label(duration_ms: Option<i64>) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
+fn gate_status_label(
+    status: crate::GateStatus,
+    failure_class: Option<crate::GateFailureClass>,
+) -> String {
+    match failure_class {
+        Some(class) => format!("{}/{}", status.as_str(), class.as_str()),
+        None => status.as_str().to_string(),
+    }
+}
+
 fn render_hook_reports(reports: &[crate::HookReport], json: bool) -> Result<(), UsageError> {
     if json {
         println!("{}", serde_json::to_string_pretty(reports)?);
@@ -781,7 +791,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                             println!(
                                 "{:<20} {:<10} {}{}",
                                 outcome.gate,
-                                outcome.status.as_str(),
+                                gate_status_label(outcome.status, outcome.failure_class),
                                 if outcome.cached { "(cached) " } else { "" },
                                 outcome
                                     .duration_ms
@@ -815,7 +825,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                             println!(
                                 "{:<20} {:<10} {}{}",
                                 outcome.gate,
-                                outcome.status.as_str(),
+                                gate_status_label(outcome.status, outcome.failure_class),
                                 if outcome.cached { "(cached) " } else { "" },
                                 outcome
                                     .duration_ms
@@ -960,14 +970,14 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         println!(
                             "gate {:<20} {} (cached, saved {})",
                             gate.gate,
-                            gate.status.as_str(),
+                            gate_status_label(gate.status, gate.failure_class),
                             duration_label(gate.duration_ms)
                         );
                     } else {
                         println!(
                             "gate {:<20} {} in {}",
                             gate.gate,
-                            gate.status.as_str(),
+                            gate_status_label(gate.status, gate.failure_class),
                             duration_label(gate.duration_ms)
                         );
                     }

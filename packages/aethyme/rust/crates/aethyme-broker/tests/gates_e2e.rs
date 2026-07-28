@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
 
-use aethyme_broker::{Broker, GateProgressSink, GateStatus};
+use aethyme_broker::{Broker, GateFailureClass, GateProgressSink, GateStatus};
 
 #[derive(Default)]
 struct CapturedProgress {
@@ -94,6 +94,11 @@ fn write_gates(root: &Path, body: &str) {
     std::fs::write(root.join(".aethyme/gates.toml"), body).unwrap();
 }
 
+fn commit_all(root: &Path, message: &str) {
+    sh(root, &["add", "-A"]);
+    sh(root, &["commit", "-qm", message]);
+}
+
 fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
     let path = root.join(".aethyme/worktrees").join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -138,6 +143,7 @@ cost = 3
 triggers = ["**/*.py"]
 "#,
     );
+    commit_all(tmp.path(), "add gates");
     let mut broker = Broker::open(tmp.path()).unwrap();
 
     // Docs-only session: zero gates selected (#16 acceptance).
@@ -163,6 +169,10 @@ triggers = ["**/*.py"]
     assert!(!outcomes[0].cached);
     assert_eq!(outcomes[1].gate, "expensive-fail");
     assert_eq!(outcomes[1].status, GateStatus::Fail);
+    assert_eq!(
+        outcomes[1].failure_class,
+        Some(GateFailureClass::TestFailure)
+    );
     assert_eq!(outcomes[1].exit_code, Some(3));
     let markers = std::fs::read_to_string(wt_py.join("gate-markers.txt")).unwrap();
     assert!(!markers.contains("never"));
@@ -172,6 +182,11 @@ triggers = ["**/*.py"]
     // working-tree hash — the real-world contract for gate outputs.)
     let outcomes = broker.run_gates(py.id).unwrap();
     assert!(outcomes.iter().all(|o| o.cached), "all cache hits");
+    assert_eq!(outcomes[0].failure_class, None);
+    assert_eq!(
+        outcomes[1].failure_class,
+        Some(GateFailureClass::CachedPriorFail)
+    );
     let markers_after = std::fs::read_to_string(wt_py.join("gate-markers.txt")).unwrap();
     assert_eq!(markers, markers_after, "cached rerun executed nothing");
 
@@ -184,6 +199,10 @@ triggers = ["**/*.py"]
     assert!(
         outcomes.iter().all(|o| o.cached),
         "identical tree in another session reuses results: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes[1].failure_class,
+        Some(GateFailureClass::CachedPriorFail)
     );
 }
 
@@ -201,6 +220,7 @@ cache = false
 triggers = ["**/*.py"]
 "#,
     );
+    commit_all(tmp.path(), "add gates");
     let gates = aethyme_broker::load_gates(tmp.path()).unwrap();
     assert!(!gates[0].cache);
     let mut broker = Broker::open(tmp.path()).unwrap();
@@ -224,6 +244,53 @@ triggers = ["**/*.py"]
 }
 
 #[test]
+fn session_gate_runs_use_the_session_worktree_gate_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "config-source"
+command = "echo main-run >> gate-markers.txt"
+triggers = ["**/*.py"]
+"#,
+    );
+    commit_all(tmp.path(), "add main gates");
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = add_worktree(tmp.path(), "worktree-gates");
+    let session = broker.adopt(&wt, None).unwrap();
+    write_gates(
+        &wt,
+        r#"
+[[gate]]
+name = "config-source"
+command = "echo worktree-run >> gate-markers.txt"
+cache = false
+triggers = ["**/*.py"]
+"#,
+    );
+    std::fs::write(wt.join("src/app.py"), "x = 4\n").unwrap();
+
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert!(!outcomes[0].cached);
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert!(
+        !outcomes[0].cached,
+        "cache=false from the session worktree must control reruns"
+    );
+
+    let markers = std::fs::read_to_string(wt.join("gate-markers.txt")).unwrap();
+    assert_eq!(
+        markers.lines().collect::<Vec<_>>(),
+        vec!["worktree-run", "worktree-run"]
+    );
+}
+
+#[test]
 fn cargo_target_dir_infra_errors_are_not_cached_failures() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
@@ -236,6 +303,7 @@ command = "echo cargo-run >> gate-markers.txt; printf '%s\n' 'error: extern loca
 triggers = ["**/*.py"]
 "#,
     );
+    commit_all(tmp.path(), "add gates");
     let mut broker = Broker::open(tmp.path()).unwrap();
     let wt = add_worktree(tmp.path(), "cargo-infra");
     let session = broker.adopt(&wt, None).unwrap();
@@ -245,6 +313,10 @@ triggers = ["**/*.py"]
     assert_eq!(outcomes.len(), 1);
     assert_eq!(outcomes[0].gate, "cargo-test");
     assert_eq!(outcomes[0].status, GateStatus::Error);
+    assert_eq!(
+        outcomes[0].failure_class,
+        Some(GateFailureClass::ResourceContention)
+    );
     assert_eq!(outcomes[0].exit_code, Some(101));
     assert!(!outcomes[0].cached);
 
@@ -254,6 +326,10 @@ triggers = ["**/*.py"]
         outcomes[0].status,
         GateStatus::Error,
         "the same infra-shaped cargo failure is still an error"
+    );
+    assert_eq!(
+        outcomes[0].failure_class,
+        Some(GateFailureClass::ResourceContention)
     );
     assert!(
         !outcomes[0].cached,
@@ -282,6 +358,80 @@ triggers = ["**/*.py"]
 }
 
 #[test]
+fn environment_and_timeout_failures_are_classified_and_not_cached() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "missing-tool"
+command = "echo env-run >> gate-markers.txt; definitely_missing_aethyme_gate_tool_123"
+cost = 1
+triggers = ["**/*.py"]
+
+[[gate]]
+name = "timeout"
+command = "echo timeout-run >> gate-markers.txt; printf '%s\n' 'command timed out' >&2; exit 124"
+cost = 2
+triggers = ["**/*.py"]
+"#,
+    );
+    commit_all(tmp.path(), "add gates");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = add_worktree(tmp.path(), "env-timeout");
+    let session = broker.adopt(&wt, None).unwrap();
+    std::fs::write(wt.join("src/app.py"), "x = 5\n").unwrap();
+
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes.len(), 1, "environment error fail-fasts");
+    assert_eq!(outcomes[0].status, GateStatus::Error);
+    assert_eq!(
+        outcomes[0].failure_class,
+        Some(GateFailureClass::Environment)
+    );
+    assert_eq!(outcomes[0].exit_code, Some(127));
+
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert!(!outcomes[0].cached);
+    let markers = std::fs::read_to_string(wt.join("gate-markers.txt")).unwrap();
+    assert_eq!(
+        markers.lines().filter(|line| *line == "env-run").count(),
+        2,
+        "environment failures must rerun instead of poisoning the cache"
+    );
+
+    write_gates(
+        &wt,
+        r#"
+[[gate]]
+name = "timeout"
+command = "echo timeout-run >> gate-markers.txt; printf '%s\n' 'command timed out' >&2; exit 124"
+triggers = ["**/*.py"]
+"#,
+    );
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].status, GateStatus::Error);
+    assert_eq!(outcomes[0].failure_class, Some(GateFailureClass::Timeout));
+    assert_eq!(outcomes[0].exit_code, Some(124));
+
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert!(!outcomes[0].cached);
+    let markers = std::fs::read_to_string(wt.join("gate-markers.txt")).unwrap();
+    assert_eq!(
+        markers
+            .lines()
+            .filter(|line| *line == "timeout-run")
+            .count(),
+        2,
+        "timeout failures must rerun instead of poisoning the cache"
+    );
+}
+
+#[test]
 fn slow_gate_emits_heartbeat_progress() {
     let _env = EnvGuard::set("AETHYME_GATE_HEARTBEAT_SECS", "1");
     let tmp = tempfile::tempdir().unwrap();
@@ -295,6 +445,7 @@ command = "sleep 2"
 triggers = ["**/*.py"]
 "#,
     );
+    commit_all(tmp.path(), "add gates");
     let mut broker = Broker::open(tmp.path()).unwrap();
     let wt = add_worktree(tmp.path(), "heartbeat");
     let session = broker.adopt(&wt, None).unwrap();
@@ -329,6 +480,7 @@ command = "sleep 30; echo done >> slow-finished.txt"
 triggers = ["**/*.py"]
 "#,
     );
+    commit_all(tmp.path(), "add gates");
     let mut broker = Broker::open(tmp.path()).unwrap();
     let wt = add_worktree(tmp.path(), "slow");
     let session = broker.adopt(&wt, None).unwrap();

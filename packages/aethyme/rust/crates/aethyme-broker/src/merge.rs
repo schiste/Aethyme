@@ -227,16 +227,6 @@ impl Broker {
         let changed = self
             .repo_handle()
             .changed_between(verify_base, &merge_commit)?;
-        // Conflict-only brokering is valid: a repo with no gates.toml gets
-        // textual merge simulation and promotion on clean merges, with zero
-        // verification — recorded explicitly so nobody mistakes it for a
-        // passing check run. A *malformed* gates.toml stays a hard error
-        // (broken intent, not absent intent).
-        let gates = match crate::gates::load_gates(&self.main_root_path()) {
-            Ok(gates) => gates,
-            Err(crate::gates::GateConfigError::Missing(_)) => Vec::new(),
-            Err(err) => return Err(err.into()),
-        };
         let tmp_dir = self
             .main_root_path()
             .join(".aethyme/run/merge-sim")
@@ -245,6 +235,19 @@ impl Broker {
         let sim_worktree = self
             .repo_handle()
             .worktree_add_detached(&tmp_dir, &merge_commit)?;
+        // Conflict-only brokering is valid: a repo with no gates.toml gets
+        // textual merge simulation and promotion on clean merges, with zero
+        // verification — recorded explicitly so nobody mistakes it for a
+        // passing check run. A *malformed* gates.toml in the merged tree
+        // stays a hard error (broken intent, not absent intent).
+        let gates = match self.load_and_sync_gates_from(sim_worktree.root()) {
+            Ok(gates) => gates,
+            Err(BrokerOpError::GateConfig(crate::gates::GateConfigError::Missing(_))) => Vec::new(),
+            Err(err) => {
+                let _ = self.repo_handle().worktree_remove(&tmp_dir, true);
+                return Err(err);
+            }
+        };
         let main_root = self.main_root_path();
         let gate_outcomes = crate::gates::run_affected(
             self.store(),
@@ -264,7 +267,10 @@ impl Broker {
             "merge_commit": merge_commit,
             "base": base,
             "gates": gate_outcomes.iter().map(|o| serde_json::json!({
-                "gate": o.gate, "status": o.status, "cached": o.cached,
+                "gate": o.gate,
+                "status": o.status,
+                "failure_class": o.failure_class,
+                "cached": o.cached,
             })).collect::<Vec<_>>(),
         });
         if all_pass {

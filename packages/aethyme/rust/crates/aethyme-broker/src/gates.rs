@@ -24,7 +24,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use crate::git::GitRepo;
 use crate::store::BrokerStore;
-use crate::types::{GateStatus, NewGateResult};
+use crate::types::{GateFailureClass, GateStatus, NewGateResult};
 
 pub const GATES_CONFIG_RELPATH: &str = ".aethyme/gates.toml";
 
@@ -171,6 +171,7 @@ pub fn select_gates<'g>(gates: &'g [Gate], changed: &[String]) -> Vec<Selection<
 pub struct GateRunOutcome {
     pub gate: String,
     pub status: GateStatus,
+    pub failure_class: Option<GateFailureClass>,
     pub cached: bool,
     pub exit_code: Option<i64>,
     pub duration_ms: Option<i64>,
@@ -254,6 +255,7 @@ pub fn cancel_obsolete_runs(
             gate_name: gate_name.to_string(),
             tree_hash: tree.to_string(),
             status: GateStatus::Cancelled,
+            failure_class: None,
             exit_code: None,
             duration_ms: None,
             log_path: None,
@@ -377,13 +379,18 @@ fn run_selections(
                 crate::events::GATE_CACHED,
                 session_id,
                 Some(&crate::events::gate_cached_payload(
-                    &gate.name, &tree, saved_ms,
+                    &gate.name,
+                    &tree,
+                    saved_ms,
+                    hit.status,
+                    cached_failure_class(hit.status),
                 )),
             );
             let failed = hit.status == GateStatus::Fail;
             outcomes.push(GateRunOutcome {
                 gate: gate.name.clone(),
                 status: hit.status,
+                failure_class: cached_failure_class(hit.status),
                 cached: true,
                 exit_code: hit.exit_code,
                 duration_ms: hit.duration_ms,
@@ -412,20 +419,8 @@ fn run_selections(
             },
         );
         let duration_ms = started.elapsed().as_millis() as i64;
-        let (gate_status, exit_code) = match status {
-            Ok(Some(0)) => (GateStatus::Pass, Some(0i64)),
-            Ok(Some(code)) if is_cargo_target_dir_infra_error(&gate.command, &log_path) => {
-                (GateStatus::Error, Some(code as i64))
-            }
-            Ok(Some(code)) => (GateStatus::Fail, Some(code as i64)),
-            // Killed by a signal (cancellation, OOM, operator kill): not a
-            // verdict on the code. Recording a conclusive fail here poisons
-            // the tree-hash cache — if the same tree recurs, the cached
-            // "fail" rejects a submission without ever running the gate
-            // (cached_gate_result only skips cancelled/error rows).
-            Ok(None) => (GateStatus::Cancelled, None),
-            Err(_) => (GateStatus::Error, None),
-        };
+        let (gate_status, failure_class, exit_code) =
+            classify_gate_result(&gate.command, &log_path, status);
         progress.report(&format!(
             "gate {} {} in {}s",
             gate.name,
@@ -436,6 +431,7 @@ fn run_selections(
             gate_name: gate.name.clone(),
             tree_hash: tree.clone(),
             status: gate_status,
+            failure_class,
             exit_code,
             duration_ms: Some(duration_ms),
             log_path: Some(log_path.to_string_lossy().into_owned()),
@@ -445,6 +441,7 @@ fn run_selections(
         outcomes.push(GateRunOutcome {
             gate: gate.name.clone(),
             status: gate_status,
+            failure_class,
             cached: false,
             exit_code,
             duration_ms: Some(duration_ms),
@@ -457,9 +454,75 @@ fn run_selections(
     Ok(outcomes)
 }
 
-fn is_cargo_target_dir_infra_error(command: &str, log_path: &Path) -> bool {
-    if !command_mentions_cargo(command) {
+fn classify_gate_result(
+    command: &str,
+    log_path: &Path,
+    status: Result<Option<i32>, std::io::Error>,
+) -> (GateStatus, Option<GateFailureClass>, Option<i64>) {
+    match status {
+        Ok(Some(0)) => (GateStatus::Pass, None, Some(0)),
+        Ok(Some(code)) if is_timeout_error(code, log_path) => (
+            GateStatus::Error,
+            Some(GateFailureClass::Timeout),
+            Some(code as i64),
+        ),
+        Ok(Some(code)) if is_resource_contention_error(command, log_path) => (
+            GateStatus::Error,
+            Some(GateFailureClass::ResourceContention),
+            Some(code as i64),
+        ),
+        Ok(Some(code)) if is_environment_error(code, log_path) => (
+            GateStatus::Error,
+            Some(GateFailureClass::Environment),
+            Some(code as i64),
+        ),
+        Ok(Some(code)) => (
+            GateStatus::Fail,
+            Some(GateFailureClass::TestFailure),
+            Some(code as i64),
+        ),
+        // Killed by a signal (cancellation, OOM, operator kill): not a
+        // verdict on the code. Recording a conclusive fail here poisons
+        // the tree-hash cache — if the same tree recurs, the cached
+        // "fail" rejects a submission without ever running the gate.
+        Ok(None) => (GateStatus::Cancelled, None, None),
+        Err(_) => (GateStatus::Error, Some(GateFailureClass::Environment), None),
+    }
+}
+
+fn cached_failure_class(status: GateStatus) -> Option<GateFailureClass> {
+    match status {
+        GateStatus::Fail => Some(GateFailureClass::CachedPriorFail),
+        _ => None,
+    }
+}
+
+fn is_timeout_error(exit_code: i32, log_path: &Path) -> bool {
+    if exit_code == 124 {
+        return true;
+    }
+    let Ok(log) = std::fs::read_to_string(log_path) else {
         return false;
+    };
+    let lower = log.to_ascii_lowercase();
+    lower.contains("timed out")
+        || lower.contains("timeout exceeded")
+        || lower.contains("command timed out")
+}
+
+fn is_resource_contention_error(command: &str, log_path: &Path) -> bool {
+    if !command_mentions_cargo(command) {
+        return log_contains_any(
+            log_path,
+            &[
+                "database is locked",
+                "resource busy",
+                "resource temporarily unavailable",
+                "text file busy",
+                "too many open files",
+                "no space left on device",
+            ],
+        );
     }
     let Ok(log) = std::fs::read_to_string(log_path) else {
         return false;
@@ -487,6 +550,31 @@ fn is_cargo_target_dir_infra_error(command: &str, log_path: &Path) -> bool {
         "text file busy",
     ];
     INFRA_PATTERNS.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn is_environment_error(exit_code: i32, log_path: &Path) -> bool {
+    if exit_code == 126 || exit_code == 127 {
+        return true;
+    }
+    log_contains_any(
+        log_path,
+        &[
+            ": command not found",
+            "command not found",
+            "not found on path",
+            "executable file not found",
+            "permission denied",
+            "cannot execute",
+        ],
+    )
+}
+
+fn log_contains_any(log_path: &Path, patterns: &[&str]) -> bool {
+    let Ok(log) = std::fs::read_to_string(log_path) else {
+        return false;
+    };
+    let lower = log.to_ascii_lowercase();
+    patterns.iter().any(|pattern| lower.contains(pattern))
 }
 
 fn command_mentions_cargo(command: &str) -> bool {

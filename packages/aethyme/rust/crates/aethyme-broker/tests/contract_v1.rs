@@ -166,13 +166,13 @@ fn v1_constructor_payload_field_names_are_frozen() {
         "lease.claimed / lease.released",
     );
     assert_keys(
-        &events::gate_result_payload("g", "t"),
-        &["gate", "tree"],
+        &events::gate_result_payload("g", "t", None),
+        &["failure_class", "gate", "tree"],
         "gate.pass / gate.fail / gate.cancelled / gate.error",
     );
     assert_keys(
-        &events::gate_cached_payload("g", "t", 1),
-        &["gate", "saved_ms", "tree"],
+        &events::gate_cached_payload("g", "t", 1, GateStatus::Pass, None),
+        &["cached_status", "failure_class", "gate", "saved_ms", "tree"],
         "gate.cached",
     );
     assert_keys(
@@ -286,14 +286,15 @@ fn merge_lifecycle_payload_field_names_are_frozen_on_the_wire() {
     let out = broker.submit(b.id).unwrap();
     assert_eq!(out.entry.status, MergeStatus::Conflict);
 
-    // Rejected: session C's clean merge fails the (now failing) gate.
+    // Rejected: session C's clean merge fails the gate policy carried by
+    // its submitted tree.
+    let wt_c = agent_worktree(tmp.path(), "c");
+    let c = broker.adopt(&wt_c, Some("c")).unwrap();
     std::fs::write(
-        tmp.path().join(".aethyme/gates.toml"),
+        wt_c.join(".aethyme/gates.toml"),
         "[[gate]]\nname = \"no\"\ncommand = \"exit 7\"\ntriggers = [\"**/*.py\"]\n",
     )
     .unwrap();
-    let wt_c = agent_worktree(tmp.path(), "c");
-    let c = broker.adopt(&wt_c, Some("c")).unwrap();
     commit_edit(&wt_c, "src/b.py", "b = 2\n");
     let out = broker.submit(c.id).unwrap();
     assert_eq!(out.entry.status, MergeStatus::Rejected);
@@ -334,7 +335,7 @@ fn merge_lifecycle_payload_field_names_are_frozen_on_the_wire() {
         for gate in gates {
             assert_keys(
                 &gate.to_string(),
-                &["cached", "gate", "status"],
+                &["cached", "failure_class", "gate", "status"],
                 &format!("{kind} gates[] element"),
             );
         }
