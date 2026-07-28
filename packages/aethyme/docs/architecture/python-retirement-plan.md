@@ -80,11 +80,24 @@ Python-invocation rows.
    `AETHYME_ENGINE_TRANSPORT`, `AETHYME_REQUIRE_LOCAL_ENGINE`, …)
    consolidate into `.aethyme/config.toml` + a documented env override
    table. Transport vars die outright.
-5. **Move the output cache into the engine.** The snapshot-keyed cache in
-   `/tmp/aethyme-cache` is engine-adjacent logic stranded in Python.
-   Native commands hit the engine library directly; caching (where still
-   needed post-redb — redb reads are already fast) becomes an engine
-   concern with one implementation.
+5. **Move the output cache into the engine.** ~~The snapshot-keyed cache
+   in `/tmp/aethyme-cache` is engine-adjacent logic stranded in Python.~~
+   **RESOLVED 2026-07-28 — no engine cache.** Measured post-flip on the
+   medium fixture (10 files) and the Aethyme worktree (388 source
+   files), 3-run averages, release build: redb-backed commands (query/
+   graph/task) are ~19–23ms flat regardless of repo size — pure process
+   startup; a cache cannot help. Map-building commands (facts, analyze,
+   repo inspect) scale with repo size (20ms → 54–66ms at 388 files) and
+   are the only class the old Python output cache amortized. Decision:
+   the redb store IS the cache — a materialized, explicitly-refreshed
+   artifact. Rather than cache around per-invocation map builds, the
+   remaining map-based surfaces follow the redb workstream's existing
+   trajectory (facts/analyze redb-backing), which removes the cost
+   instead of hiding it. `/tmp/aethyme-cache` and its `clear-cache`
+   reinterpretation are legacy stubs that die in Phase 6. At playground
+   scale (12.5K files) map builds are seconds-scale, so redb-backing
+   facts/analyze before heavy playground use is the follow-up, tracked
+   with the redb owners.
 6. **Typed errors + exit-code contract.** Click's ad-hoc `SystemExit(1)`
    becomes the documented exit-code table the router already started
    (explore's exit-2-daemon-down convention).

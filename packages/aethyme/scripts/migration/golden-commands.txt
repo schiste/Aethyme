@@ -31,6 +31,8 @@ task explain --repo {REPO}
 facts public-functions --repo {REPO} --scope src/auth --json-output
 facts function-usage --repo {REPO} --target fn:medium-fixture:src/auth/tokens.py:issue_token --boundary src/auth --json-output
 analyze dead-code --repo {REPO} --scope src/billing --json-output
+analyze dead-code --repo {REPO} --scope src/billing --format eval-json --show-observability
+analyze dead-code --repo {REPO} --scope src/billing
 intents --format compact-json
 ai-ready --repo {REPO} --format json --detectors ability-coverage
 ai-ready --repo {REPO} --format md --detectors ability-coverage

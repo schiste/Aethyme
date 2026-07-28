@@ -61,6 +61,13 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        "analyze" => match aethyme_engine::analyze_cli::run(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("Error: {message}");
+                ExitCode::from(1)
+            }
+        },
         "facts" => match aethyme_engine::facts_cli::run_facts(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {

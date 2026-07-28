@@ -5,6 +5,7 @@ pub mod deps;
 pub mod explore;
 pub mod explore_cli;
 pub mod graph;
+pub mod analyze_cli;
 pub mod facts_cli;
 pub mod graph_cli;
 pub mod json;
