@@ -1,6 +1,6 @@
 # Playground Setup Guide
 
-Last Updated: 2026-07-27
+Last Updated: 2026-07-28
 
 How to create an eval playground — a pair of repos (Control + Aethyme) from any source repository.
 
@@ -181,6 +181,40 @@ The Control repo is the scientific baseline. After initial setup:
 4. **Check before each eval run** — Chau7 creates `.chau7/snippets/` when tabs are opened in a directory. Delete it if present.
 
 If the Control repo gets contaminated, delete it and re-clone from scratch.
+
+## Clean Codex A/B Runs
+
+Use the bundled Codex wrapper only after `verify-playground.sh` passes for the
+pair. The wrapper requires an explicit arm so the Control condition cannot
+accidentally inherit the Aethyme tool surface:
+
+```bash
+COMMON_ENV=(
+  AETHYME_EVAL_PROMPT="Inspect the auth/token flow without modifying files."
+  AETHYME_EVAL_OUTPUT_SCHEMA_FILE=/path/to/schema.json
+)
+
+env "${COMMON_ENV[@]}" \
+  AETHYME_EVAL_ARM=control \
+  AETHYME_EVAL_REPO="$DEST/Mediawiki - Control" \
+  AETHYME_EVAL_ARTIFACT_DIR=/tmp/aethyme-ab/control \
+  "$AETHYME_ROOT/.venv/bin/python" "$AETHYME_ROOT/scripts/eval/run_codex_eval.py"
+
+env "${COMMON_ENV[@]}" \
+  AETHYME_EVAL_ARM=aethyme \
+  AETHYME_EVAL_REPO="$DEST/Mediawiki - Aethyme" \
+  AETHYME_EVAL_TOOL_REPO="$AETHYME_ROOT" \
+  AETHYME_EVAL_ARTIFACT_DIR=/tmp/aethyme-ab/aethyme \
+  "$AETHYME_ROOT/.venv/bin/python" "$AETHYME_ROOT/scripts/eval/run_codex_eval.py"
+```
+
+The wrapper runs both arms with `codex exec --ignore-user-config --json`,
+preserves `events.jsonl`, `stderr.log`, `last-message.json`, `command.json`,
+and `contract.json`, and emits wall time, input/output tokens,
+command-output chars, event-log chars, and stderr chars. The Control arm strips
+`AETHYME*`/`AETHYMEBENCH*` environment variables and does not add the tool repo
+to Codex. The Aethyme arm adds only `AETHYME_EVAL_TOOL_REPO` as the tool
+surface.
 
 ## Adding a New Eval Target
 

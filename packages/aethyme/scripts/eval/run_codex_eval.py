@@ -9,71 +9,266 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
+
+GENERATED_ARTIFACTS = (
+    ".codex",
+    ".aethyme",
+    ".chau7",
+    ".claude",
+    "AGENTS.md",
+    "CLAUDE.md",
+)
+COMMAND_OUTPUT_KEYS = {"output", "stdout", "stderr"}
 
 
 def main() -> int:
     prompt = os.environ.get("AETHYME_EVAL_PROMPT", "")
     repo_path = Path(os.environ["AETHYME_EVAL_REPO"]).expanduser().resolve()
     schema_file, schema_cleanup_dir = _resolve_schema_file()
-    tool_repo = Path(os.environ.get("AETHYME_EVAL_TOOL_REPO", Path(__file__).resolve().parents[2])).resolve()
+    tool_repo = Path(
+        os.environ.get("AETHYME_EVAL_TOOL_REPO", Path(__file__).resolve().parents[2])
+    ).resolve()
+    arm = os.environ.get("AETHYME_EVAL_ARM", "")
 
     try:
-        with tempfile.TemporaryDirectory(prefix="aethyme-codex-eval-") as temp_dir:
-            temp_root = Path(temp_dir)
-            events_file = temp_root / "events.jsonl"
-            last_message_file = temp_root / "last-message.json"
+        arm = _resolve_eval_arm()
+        contract = _enforce_eval_contract(repo_path, tool_repo, arm)
+        temp_root = _resolve_artifact_dir(arm)
+        events_file = temp_root / "events.jsonl"
+        stderr_file = temp_root / "stderr.log"
+        last_message_file = temp_root / "last-message.json"
+        command = _build_codex_command(
+            repo_path=repo_path,
+            tool_repo=tool_repo,
+            arm=arm,
+            schema_file=schema_file,
+            last_message_file=last_message_file,
+            prompt=prompt,
+        )
 
-            command = [
-                "codex",
-                "exec",
-                "--skip-git-repo-check",
-                "--sandbox",
-                "workspace-write",
-                "--color",
-                "never",
-                "--json",
-                "--output-schema",
-                str(schema_file),
-                "--output-last-message",
-                str(last_message_file),
-                "--add-dir",
-                str(tool_repo),
-                "--add-dir",
-                "/tmp",
-                "-C",
-                str(repo_path),
-                prompt,
-            ]
-            result = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                env=os.environ.copy(),
-            )
-            events_file.write_text(result.stdout, encoding="utf-8")
-            structured_output, final_output_message = _read_last_message(last_message_file)
-            usage = _parse_usage(events_file)
-            error_message = _last_error(events_file)
-            payload = {
-                "input_tokens": usage.get("input_tokens"),
-                "output_tokens": usage.get("output_tokens"),
-                "retries": usage.get("retries"),
-                "review_burden": None,
-                "final_output_message": final_output_message or error_message,
-                "structured_output": structured_output,
-            }
-            print(json.dumps(payload))
-            if result.stderr:
-                sys.stderr.write(result.stderr)
-            if result.returncode != 0 and error_message:
-                sys.stderr.write(f"\nCodex error: {error_message}\n")
-            return result.returncode
+        started_at = time.monotonic()
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=_codex_env(arm, tool_repo),
+        )
+        wall_time_seconds = time.monotonic() - started_at
+
+        events_file.write_text(result.stdout, encoding="utf-8")
+        stderr_file.write_text(result.stderr, encoding="utf-8")
+        (temp_root / "command.json").write_text(
+            json.dumps(_redact_prompt(command), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        (temp_root / "contract.json").write_text(
+            json.dumps(contract, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        structured_output, final_output_message = _read_last_message(last_message_file)
+        usage = _parse_usage(events_file)
+        error_message = _last_error(events_file)
+        payload = {
+            "arm": arm,
+            "artifact_dir": str(temp_root),
+            "event_log_file": str(events_file),
+            "stderr_file": str(stderr_file),
+            "last_message_file": str(last_message_file),
+            "wall_time_seconds": round(wall_time_seconds, 3),
+            "command_output_chars": _command_output_chars(events_file),
+            "event_log_chars": len(result.stdout),
+            "stderr_chars": len(result.stderr),
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "retries": usage.get("retries"),
+            "review_burden": None,
+            "final_output_message": final_output_message or error_message,
+            "structured_output": structured_output,
+            "runner_settings": {
+                "codex_exec": True,
+                "ignore_user_config": True,
+                "sandbox": "workspace-write",
+                "json_events": True,
+                "added_tool_repo": arm == "aethyme",
+                "tool_repo": str(tool_repo) if arm == "aethyme" else None,
+            },
+            "contract": contract,
+        }
+        print(json.dumps(payload))
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+        if result.returncode != 0 and error_message:
+            sys.stderr.write(f"\nCodex error: {error_message}\n")
+        return result.returncode
+    except ContractError as exc:
+        print(json.dumps({"error": str(exc), "contract_failed": True, "arm": arm}))
+        return 2
     finally:
         if schema_cleanup_dir is not None:
             shutil.rmtree(schema_cleanup_dir, ignore_errors=True)
+
+
+class ContractError(RuntimeError):
+    """The playground A/B contract was violated before Codex was launched."""
+
+
+def _resolve_eval_arm() -> str:
+    arm = os.environ.get("AETHYME_EVAL_ARM")
+    if arm not in {"control", "aethyme"}:
+        raise ContractError("AETHYME_EVAL_ARM must be 'control' or 'aethyme'")
+    return arm
+
+
+def _build_codex_command(
+    *,
+    repo_path: Path,
+    tool_repo: Path,
+    arm: str,
+    schema_file: Path,
+    last_message_file: Path,
+    prompt: str,
+) -> list[str]:
+    command = [
+        "codex",
+        "exec",
+        "--ignore-user-config",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "workspace-write",
+        "--color",
+        "never",
+        "--json",
+        "--output-schema",
+        str(schema_file),
+        "--output-last-message",
+        str(last_message_file),
+        "--add-dir",
+        "/tmp",
+    ]
+    if arm == "aethyme":
+        command.extend(["--add-dir", str(tool_repo)])
+    command.extend(["-C", str(repo_path), prompt])
+    return command
+
+
+def _codex_env(arm: str, tool_repo: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    if arm == "control":
+        for key in list(env):
+            if key.startswith(("AETHYME", "AETHYMEBENCH")):
+                env.pop(key, None)
+        return env
+    env["AETHYME_ROOT"] = str(tool_repo)
+    return env
+
+
+def _resolve_artifact_dir(arm: str) -> Path:
+    root = os.environ.get("AETHYME_EVAL_ARTIFACT_DIR")
+    if root:
+        artifact_dir = Path(root).expanduser().resolve()
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        return artifact_dir
+    return Path(tempfile.mkdtemp(prefix=f"aethyme-codex-{arm}-eval-")).resolve()
+
+
+def _enforce_eval_contract(repo_path: Path, tool_repo: Path, arm: str) -> dict[str, Any]:
+    _assert_playground_repo(repo_path, tool_repo)
+    contract: dict[str, Any] = {
+        "playground_repo": True,
+        "aethyme_self_eval": False,
+        "arm": arm,
+        "repo_path": str(repo_path),
+    }
+    if arm == "control":
+        _assert_control_repo_clean(repo_path)
+        contract.update(
+            {
+                "control_no_generated_artifacts": True,
+                "control_tool_repo_added": False,
+            }
+        )
+    else:
+        _assert_aethyme_repo_surface(repo_path)
+        contract.update(
+            {
+                "aethyme_intended_surface_present": True,
+                "aethyme_internal_eval_skill_absent": True,
+            }
+        )
+    return contract
+
+
+def _assert_playground_repo(repo_path: Path, tool_repo: Path) -> None:
+    package_root = Path(__file__).resolve().parents[2]
+    monorepo_root = package_root.parents[1]
+    if _is_relative_to(repo_path, monorepo_root) or _is_relative_to(repo_path, tool_repo):
+        raise ContractError("Eval target must be a Playground repo, never Aethyme itself")
+
+    roots = _playground_roots()
+    if not any(_is_relative_to(repo_path, root) for root in roots):
+        formatted = ", ".join(str(root) for root in roots)
+        raise ContractError(f"Eval target must live under a Playground root ({formatted})")
+
+
+def _playground_roots() -> tuple[Path, ...]:
+    raw_roots = os.environ.get("AETHYME_PLAYGROUND_ROOTS")
+    if raw_roots:
+        roots = [
+            Path(value).expanduser().resolve() for value in raw_roots.split(os.pathsep) if value
+        ]
+    else:
+        home = Path.home()
+        roots = [
+            home / "Repositories" / "Playground",
+            home / "Downloads" / "Repositories" / "Playground",
+        ]
+        if os.environ.get("AETHYME_PLAYGROUND_ROOT"):
+            roots.insert(0, Path(os.environ["AETHYME_PLAYGROUND_ROOT"]).expanduser().resolve())
+    return tuple(dict.fromkeys(root.resolve() for root in roots))
+
+
+def _assert_control_repo_clean(repo_path: Path) -> None:
+    leaked = [path for path in GENERATED_ARTIFACTS if (repo_path / path).exists()]
+    if leaked:
+        raise ContractError(f"Control repo contains generated/tool artifacts: {', '.join(leaked)}")
+
+
+def _assert_aethyme_repo_surface(repo_path: Path) -> None:
+    required = (
+        ".codex/skills/aethyme/SKILL.md",
+        ".codex/skills/aethyme/references/explore.md",
+        ".aethyme/graph",
+        ".aethyme/graph_store.redb",
+        "AGENTS.md",
+        "CLAUDE.md",
+    )
+    missing = [path for path in required if not (repo_path / path).exists()]
+    if missing:
+        raise ContractError(
+            f"Aethyme arm missing intended enhancement surface: {', '.join(missing)}"
+        )
+    if (repo_path / ".codex/skills/eval").exists():
+        raise ContractError("Aethyme arm contains internal eval skill leakage")
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _redact_prompt(command: list[str]) -> list[str]:
+    if not command:
+        return command
+    redacted = list(command)
+    redacted[-1] = "<prompt>"
+    return redacted
 
 
 def _resolve_schema_file() -> tuple[Path, Path | None]:
@@ -129,6 +324,33 @@ def _parse_usage(events_file: Path) -> dict[str, int | None]:
             turn_failures += 1
     usage["retries"] = turn_failures if turn_failures else 0
     return usage
+
+
+def _command_output_chars(events_file: Path) -> int:
+    total = 0
+    if not events_file.exists():
+        return total
+    for line in events_file.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        total += _sum_command_outputs(event)
+    return total
+
+
+def _sum_command_outputs(value: Any, *, key: str | None = None) -> int:
+    if isinstance(value, str):
+        return len(value) if key in COMMAND_OUTPUT_KEYS else 0
+    if isinstance(value, list):
+        return sum(_sum_command_outputs(item) for item in value)
+    if isinstance(value, dict):
+        return sum(
+            _sum_command_outputs(item, key=str(item_key)) for item_key, item in value.items()
+        )
+    return 0
 
 
 def _last_error(events_file: Path) -> str | None:
