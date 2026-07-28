@@ -56,6 +56,11 @@ names/flags/output — golden-verified):
   global-option divergence. The `_render_relation` /
   `_emit_completeness_signals` Click helpers remain in cli.py for the
   task group until it flips.
+- `task pack|context|anchors|scope|next|expand|explain` (Phase 1,
+  2026-07-28; engine `task_cli` module). Same global-option divergence.
+  `context --json-output` keeps Python's compact-with-spaces dump; the
+  Click renderer helpers and rendering/context_pack.py are deleted —
+  their logic lives in task_cli with ported unit tests.
 """
 
 
