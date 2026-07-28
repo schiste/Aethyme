@@ -12,6 +12,7 @@ pub mod intern;
 pub mod repository;
 pub mod risk;
 pub mod scope;
+pub mod surface;
 pub mod symbol;
 pub mod task;
 pub mod unresolved;

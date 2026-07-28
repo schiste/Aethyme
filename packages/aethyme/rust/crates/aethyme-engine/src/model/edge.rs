@@ -11,6 +11,14 @@ pub enum EdgeKind {
     Documents,
     Configures,
     EntrypointFor,
+    Authorizes,
+    Exposes,
+    ForwardsTo,
+    InstallsMiddleware,
+    IssuesCredential,
+    StoresCredential,
+    UsesCredential,
+    ValidatesCredential,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]

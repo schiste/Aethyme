@@ -221,6 +221,16 @@ fn stored_symbol_kind(kind: StoredNodeKind) -> &'static str {
         StoredNodeKind::Area => "area",
         StoredNodeKind::Doc => "doc",
         StoredNodeKind::Config => "config",
+        StoredNodeKind::BehaviorTestSurface => "behavior_test_surface",
+        StoredNodeKind::CliSurface => "cli_surface",
+        StoredNodeKind::CredentialOperation => "credential_operation",
+        StoredNodeKind::JobSurface => "job_surface",
+        StoredNodeKind::MiddlewareInstallation => "middleware_installation",
+        StoredNodeKind::ProxySurface => "proxy_surface",
+        StoredNodeKind::QueueSurface => "queue_surface",
+        StoredNodeKind::RouteSurface => "route_surface",
+        StoredNodeKind::WebhookSurface => "webhook_surface",
+        StoredNodeKind::WorkerSurface => "worker_surface",
         StoredNodeKind::Unresolved => "unresolved",
     }
 }

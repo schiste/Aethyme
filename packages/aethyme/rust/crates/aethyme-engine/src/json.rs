@@ -257,6 +257,14 @@ fn edge_kind(kind: &EdgeKind) -> &'static str {
         EdgeKind::Documents => "documents",
         EdgeKind::Configures => "configures",
         EdgeKind::EntrypointFor => "entrypoint_for",
+        EdgeKind::Authorizes => "authorizes",
+        EdgeKind::Exposes => "exposes",
+        EdgeKind::ForwardsTo => "forwards_to",
+        EdgeKind::InstallsMiddleware => "installs_middleware",
+        EdgeKind::IssuesCredential => "issues_credential",
+        EdgeKind::StoresCredential => "stores_credential",
+        EdgeKind::UsesCredential => "uses_credential",
+        EdgeKind::ValidatesCredential => "validates_credential",
     }
 }
 
@@ -306,6 +314,16 @@ fn graph_node_kind(kind: &GraphNodeKind) -> &'static str {
         GraphNodeKind::Function => "function",
         GraphNodeKind::Doc => "doc",
         GraphNodeKind::Config => "config",
+        GraphNodeKind::BehaviorTestSurface => "behavior_test_surface",
+        GraphNodeKind::CliSurface => "cli_surface",
+        GraphNodeKind::CredentialOperation => "credential_operation",
+        GraphNodeKind::JobSurface => "job_surface",
+        GraphNodeKind::MiddlewareInstallation => "middleware_installation",
+        GraphNodeKind::ProxySurface => "proxy_surface",
+        GraphNodeKind::QueueSurface => "queue_surface",
+        GraphNodeKind::RouteSurface => "route_surface",
+        GraphNodeKind::WebhookSurface => "webhook_surface",
+        GraphNodeKind::WorkerSurface => "worker_surface",
     }
 }
 
@@ -1429,6 +1447,20 @@ mod tests {
         assert_eq!(edge_kind(&EdgeKind::Documents), "documents");
         assert_eq!(edge_kind(&EdgeKind::Configures), "configures");
         assert_eq!(edge_kind(&EdgeKind::EntrypointFor), "entrypoint_for");
+        assert_eq!(edge_kind(&EdgeKind::Authorizes), "authorizes");
+        assert_eq!(edge_kind(&EdgeKind::Exposes), "exposes");
+        assert_eq!(edge_kind(&EdgeKind::ForwardsTo), "forwards_to");
+        assert_eq!(
+            edge_kind(&EdgeKind::InstallsMiddleware),
+            "installs_middleware"
+        );
+        assert_eq!(edge_kind(&EdgeKind::IssuesCredential), "issues_credential");
+        assert_eq!(edge_kind(&EdgeKind::StoresCredential), "stores_credential");
+        assert_eq!(edge_kind(&EdgeKind::UsesCredential), "uses_credential");
+        assert_eq!(
+            edge_kind(&EdgeKind::ValidatesCredential),
+            "validates_credential"
+        );
     }
 
     #[test]
@@ -1474,6 +1506,40 @@ mod tests {
         assert_eq!(graph_node_kind(&GraphNodeKind::Function), "function");
         assert_eq!(graph_node_kind(&GraphNodeKind::Doc), "doc");
         assert_eq!(graph_node_kind(&GraphNodeKind::Config), "config");
+        assert_eq!(
+            graph_node_kind(&GraphNodeKind::BehaviorTestSurface),
+            "behavior_test_surface"
+        );
+        assert_eq!(graph_node_kind(&GraphNodeKind::CliSurface), "cli_surface");
+        assert_eq!(
+            graph_node_kind(&GraphNodeKind::CredentialOperation),
+            "credential_operation"
+        );
+        assert_eq!(graph_node_kind(&GraphNodeKind::JobSurface), "job_surface");
+        assert_eq!(
+            graph_node_kind(&GraphNodeKind::MiddlewareInstallation),
+            "middleware_installation"
+        );
+        assert_eq!(
+            graph_node_kind(&GraphNodeKind::ProxySurface),
+            "proxy_surface"
+        );
+        assert_eq!(
+            graph_node_kind(&GraphNodeKind::QueueSurface),
+            "queue_surface"
+        );
+        assert_eq!(
+            graph_node_kind(&GraphNodeKind::RouteSurface),
+            "route_surface"
+        );
+        assert_eq!(
+            graph_node_kind(&GraphNodeKind::WebhookSurface),
+            "webhook_surface"
+        );
+        assert_eq!(
+            graph_node_kind(&GraphNodeKind::WorkerSurface),
+            "worker_surface"
+        );
     }
 
     // ── search_hits ──────────────────────────────────────────────

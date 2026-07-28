@@ -68,6 +68,7 @@ fn signal_overview_limits() -> OverviewV2Limits {
         class_limit: usize::MAX,
         doc_limit: 0,
         config_limit: usize::MAX,
+        surface_limit: usize::MAX,
         unresolved_limit: 0,
     }
 }

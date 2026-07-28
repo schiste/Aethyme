@@ -107,6 +107,7 @@ pub(crate) fn matching_target_ids_redb(
         class_limit: usize::MAX,
         doc_limit: usize::MAX,
         config_limit: usize::MAX,
+        surface_limit: usize::MAX,
         unresolved_limit: usize::MAX,
     })?;
     for directory in overview.directories {

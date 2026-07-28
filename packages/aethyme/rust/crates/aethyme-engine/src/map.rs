@@ -14,6 +14,7 @@ use crate::model::function::FunctionNode;
 use crate::model::graph::{GraphAnnotation, GraphNode, GraphNodeKind, NormalizedGraph};
 use crate::model::intern::InternedStr;
 use crate::model::risk::{RiskArea, RiskFlag, RiskLevel};
+use crate::model::surface::{SurfaceKind, SurfaceNode};
 use crate::model::symbol::{Symbol, SymbolKind};
 use crate::model::unresolved::UnresolvedNode;
 use crate::repo::{RepoFile, RepoSnapshot};
@@ -46,6 +47,7 @@ impl MapIndex {
         let capacity = map.files.len()
             + map.functions.len()
             + map.classes.len()
+            + map.surfaces.len()
             + map.docs.len()
             + map.configs.len()
             + map.unresolved.len()
@@ -76,6 +78,13 @@ impl MapIndex {
                 class.id.to_string(),
                 format!("{}::{}", class.file_path, class.name),
             );
+        }
+        for surface in &map.surfaces {
+            area_id_by_id.insert(
+                surface.id.to_string(),
+                surface.area_id.as_deref().map(String::from),
+            );
+            display_by_id.insert(surface.id.to_string(), surface.display());
         }
         for doc in &map.docs {
             area_id_by_id.insert(doc.id.clone(), doc.area_id.clone());
@@ -125,6 +134,8 @@ pub struct RepositoryMap {
     pub files: Vec<FileNode>,
     pub classes: Vec<ClassNode>,
     pub functions: Vec<FunctionNode>,
+    #[serde(default)]
+    pub surfaces: Vec<SurfaceNode>,
     pub docs: Vec<DocNode>,
     pub configs: Vec<ConfigNode>,
     #[serde(default)]
@@ -155,6 +166,7 @@ impl PartialEq for RepositoryMap {
             && self.files == other.files
             && self.classes == other.classes
             && self.functions == other.functions
+            && self.surfaces == other.surfaces
             && self.docs == other.docs
             && self.configs == other.configs
             && self.unresolved == other.unresolved
@@ -308,6 +320,15 @@ impl RepositoryMap {
                 || function.qualified_name.eq_ignore_ascii_case(target)
             {
                 push_unique(&mut matches, function.id.to_string());
+            }
+        }
+        for surface in &self.surfaces {
+            if surface.id == target
+                || surface.name.eq_ignore_ascii_case(target)
+                || surface.detail.eq_ignore_ascii_case(target)
+                || surface.display().eq_ignore_ascii_case(target)
+            {
+                push_unique(&mut matches, surface.id.to_string());
             }
         }
         for doc in &self.docs {
@@ -557,6 +578,21 @@ impl RepositoryMap {
         functions.sort();
         functions.dedup();
 
+        let mut surfaces = Vec::new();
+        for fragment in &fragments {
+            let Some(file) = file_index.get(fragment.file_path()) else {
+                continue;
+            };
+            for node in fragment.nodes() {
+                if let Some((schema_id, surface)) = surface_from_schema_node(node, file) {
+                    model_id_by_schema.insert(schema_id, surface.id.to_string());
+                    surfaces.push(surface);
+                }
+            }
+        }
+        surfaces.sort();
+        surfaces.dedup();
+
         let mut symbols = compatibility_symbols(&classes, &functions);
         let mut unresolved = Vec::new();
         for fragment in &fragments {
@@ -612,6 +648,7 @@ impl RepositoryMap {
             files,
             classes,
             functions,
+            surfaces,
             docs,
             configs,
             unresolved,
@@ -980,6 +1017,47 @@ fn function_node(
     )
 }
 
+fn surface_from_schema_node(node: &Node, file: &FileNode) -> Option<(String, SurfaceNode)> {
+    let (kind, value) = match node {
+        Node::BehaviorTestSurface(value) => (SurfaceKind::BehaviorTestSurface, value),
+        Node::CliSurface(value) => (SurfaceKind::CliSurface, value),
+        Node::CredentialOperation(value) => (SurfaceKind::CredentialOperation, value),
+        Node::JobSurface(value) => (SurfaceKind::JobSurface, value),
+        Node::MiddlewareInstallation(value) => (SurfaceKind::MiddlewareInstallation, value),
+        Node::ProxySurface(value) => (SurfaceKind::ProxySurface, value),
+        Node::QueueSurface(value) => (SurfaceKind::QueueSurface, value),
+        Node::RouteSurface(value) => (SurfaceKind::RouteSurface, value),
+        Node::WebhookSurface(value) => (SurfaceKind::WebhookSurface, value),
+        Node::WorkerSurface(value) => (SurfaceKind::WorkerSurface, value),
+        _ => return None,
+    };
+    let schema_id = value.id().as_str().to_string();
+    let metadata = value
+        .metadata()
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    Some((
+        schema_id.clone(),
+        SurfaceNode {
+            id: InternedStr::from(schema_id),
+            kind,
+            name: InternedStr::from(value.name()),
+            file_id: InternedStr::from(file.id.clone()),
+            file_path: InternedStr::from(file.path.clone()),
+            area_id: file.area_id.clone().map(InternedStr::from),
+            language: InternedStr::from(
+                file.language
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+            ),
+            line: value.source_range().start_line() as usize,
+            detail: InternedStr::from(value.detail()),
+            metadata,
+        },
+    ))
+}
+
 fn unresolved_from_schema_node(
     node: &Node,
     file: &FileNode,
@@ -1189,6 +1267,14 @@ fn schema_edge_kind_to_model(kind: SchemaEdgeKind) -> EdgeKind {
         SchemaEdgeKind::Calls => EdgeKind::Calls,
         SchemaEdgeKind::Configures => EdgeKind::Configures,
         SchemaEdgeKind::Documents => EdgeKind::Documents,
+        SchemaEdgeKind::Authorizes => EdgeKind::Authorizes,
+        SchemaEdgeKind::Exposes => EdgeKind::Exposes,
+        SchemaEdgeKind::ForwardsTo => EdgeKind::ForwardsTo,
+        SchemaEdgeKind::InstallsMiddleware => EdgeKind::InstallsMiddleware,
+        SchemaEdgeKind::IssuesCredential => EdgeKind::IssuesCredential,
+        SchemaEdgeKind::StoresCredential => EdgeKind::StoresCredential,
+        SchemaEdgeKind::UsesCredential => EdgeKind::UsesCredential,
+        SchemaEdgeKind::ValidatesCredential => EdgeKind::ValidatesCredential,
         SchemaEdgeKind::References
         | SchemaEdgeKind::Decides
         | SchemaEdgeKind::Deprecates
@@ -1575,6 +1661,20 @@ fn build_graph_with_profile(map: &RepositoryMap) -> (NormalizedGraph, GraphBuild
             metadata: std::collections::BTreeMap::new(),
         });
     }
+    for surface in &map.surfaces {
+        let mut metadata = surface.metadata.clone();
+        metadata.insert("surface_kind".to_string(), surface.kind.label().to_string());
+        nodes.push(GraphNode {
+            id: surface.id.to_string(),
+            kind: graph_node_kind_from_surface(surface.kind),
+            label: surface.name.to_string(),
+            path: Some(surface.file_path.to_string()),
+            language: Some(surface.language.to_string()),
+            confidence: 850,
+            source: "surface-flow".to_string(),
+            metadata,
+        });
+    }
     for doc in &map.docs {
         let mut metadata = std::collections::BTreeMap::new();
         metadata.insert("doc_type".to_string(), doc.doc_type.clone());
@@ -1626,6 +1726,21 @@ fn build_graph_with_profile(map: &RepositoryMap) -> (NormalizedGraph, GraphBuild
     )
 }
 
+fn graph_node_kind_from_surface(kind: SurfaceKind) -> GraphNodeKind {
+    match kind {
+        SurfaceKind::BehaviorTestSurface => GraphNodeKind::BehaviorTestSurface,
+        SurfaceKind::CliSurface => GraphNodeKind::CliSurface,
+        SurfaceKind::CredentialOperation => GraphNodeKind::CredentialOperation,
+        SurfaceKind::JobSurface => GraphNodeKind::JobSurface,
+        SurfaceKind::MiddlewareInstallation => GraphNodeKind::MiddlewareInstallation,
+        SurfaceKind::ProxySurface => GraphNodeKind::ProxySurface,
+        SurfaceKind::QueueSurface => GraphNodeKind::QueueSurface,
+        SurfaceKind::RouteSurface => GraphNodeKind::RouteSurface,
+        SurfaceKind::WebhookSurface => GraphNodeKind::WebhookSurface,
+        SurfaceKind::WorkerSurface => GraphNodeKind::WorkerSurface,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1649,18 +1764,20 @@ mod tests {
         let map = RepositoryMap::build(&root).expect("build repository map");
 
         assert!(!map.directories.is_empty());
-        assert!(map
-            .functions
-            .iter()
-            .any(|function| function.name == "validate_token"));
+        assert!(
+            map.functions
+                .iter()
+                .any(|function| function.name == "validate_token")
+        );
         assert!(map.classes.iter().any(|class| class.name == "AuthService"));
         assert!(!map.docs.is_empty());
         assert!(!map.configs.is_empty());
         assert!(!map.graph.nodes.is_empty());
-        assert!(map
-            .risk_flags
-            .iter()
-            .any(|flag| flag.scope == "src/auth/service.py"));
+        assert!(
+            map.risk_flags
+                .iter()
+                .any(|flag| flag.scope == "src/auth/service.py")
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1677,10 +1794,12 @@ mod tests {
             RepositoryMap::build_with_profile(&root).expect("build repository map with profile");
 
         assert!(!profile.stages.is_empty());
-        assert!(profile
-            .stages
-            .iter()
-            .any(|stage| stage.name == "populate_from_fragments"));
+        assert!(
+            profile
+                .stages
+                .iter()
+                .any(|stage| stage.name == "populate_from_fragments")
+        );
         assert_eq!(profile.repo_files, map.snapshot.files.len());
         assert_eq!(profile.graph_nodes, map.graph.nodes.len());
         assert!(

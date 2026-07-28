@@ -45,6 +45,13 @@ fn edge_kind_index(kind: &EdgeKind) -> usize {
         EdgeKind::Documents => 6,
         EdgeKind::Configures => 7,
         EdgeKind::EntrypointFor => 8,
+        EdgeKind::Authorizes
+        | EdgeKind::ForwardsTo
+        | EdgeKind::IssuesCredential
+        | EdgeKind::StoresCredential
+        | EdgeKind::UsesCredential
+        | EdgeKind::ValidatesCredential => 5,
+        EdgeKind::Exposes | EdgeKind::InstallsMiddleware => 8,
     }
 }
 

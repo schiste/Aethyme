@@ -909,6 +909,13 @@ fn hit_name_kinds(hits: &serde_json::Value) -> Vec<(String, String)> {
         .collect()
 }
 
+fn legacy_symbol_hit_name_kinds(hits: &serde_json::Value) -> Vec<(String, String)> {
+    hit_name_kinds(hits)
+        .into_iter()
+        .filter(|(_, kind)| matches!(kind.as_str(), "function" | "class"))
+        .collect()
+}
+
 fn dead_code_item_by_name<'a>(items: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
     items
         .iter()
@@ -1162,10 +1169,10 @@ fn assert_redb_symbol_parity_with_repository_map(repo: &Path, queries: &[&str], 
             .into_iter()
             .map(|hit| (hit.name, hit.kind))
             .collect::<Vec<_>>();
-        let actual = hit_name_kinds(&symbol_cli_hits(repo, query, limit));
+        let actual = legacy_symbol_hit_name_kinds(&symbol_cli_hits(repo, query, limit));
         assert_eq!(
             actual, expected,
-            "redb V2 symbol search should match RepositoryMap fuzzy scorer for query {query:?}"
+            "redb V2 function/class symbol search should match RepositoryMap fuzzy scorer for query {query:?}"
         );
     }
 }
@@ -1175,6 +1182,14 @@ fn redb_symbol_search_matches_repository_map_fuzzy_scorer_on_tiny_fixture() {
     let tmp = build_redb_fixture();
 
     assert_redb_symbol_parity_with_repository_map(tmp.path(), &["load token", "auth", "token"], 5);
+
+    let surface_hits = hit_name_kinds(&symbol_cli_hits(tmp.path(), "load token", 5));
+    assert!(
+        surface_hits
+            .iter()
+            .any(|(_, kind)| kind == "behavior_test_surface"),
+        "unfiltered V2 search should include Surface/Flow hits; got {surface_hits:?}"
+    );
 }
 
 #[test]

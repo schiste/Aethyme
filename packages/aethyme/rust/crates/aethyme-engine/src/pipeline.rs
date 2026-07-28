@@ -465,6 +465,7 @@ fn overview_v2_all_redb(store: &ReadOnlyGraphStore) -> Result<OverviewV2, GraphS
         class_limit: usize::MAX,
         doc_limit: usize::MAX,
         config_limit: usize::MAX,
+        surface_limit: usize::MAX,
         unresolved_limit: usize::MAX,
     })?;
     overview.areas = store.list_areas(None)?;
@@ -950,6 +951,14 @@ fn edge_kind_label(kind: &EdgeKind) -> &'static str {
         EdgeKind::Documents => "documents",
         EdgeKind::Configures => "configures",
         EdgeKind::EntrypointFor => "entrypoint_for",
+        EdgeKind::Authorizes => "authorizes",
+        EdgeKind::Exposes => "exposes",
+        EdgeKind::ForwardsTo => "forwards_to",
+        EdgeKind::InstallsMiddleware => "installs_middleware",
+        EdgeKind::IssuesCredential => "issues_credential",
+        EdgeKind::StoresCredential => "stores_credential",
+        EdgeKind::UsesCredential => "uses_credential",
+        EdgeKind::ValidatesCredential => "validates_credential",
     }
 }
 

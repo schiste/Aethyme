@@ -3,8 +3,8 @@
 //! This module is the local materialized read model for the committed graph
 //! fragments under `<repo>/.aethyme/graph/`. The current writer persists
 //! repositories, directories, files, areas, functions, classes, docs, configs,
-//! unresolved/import placeholders, risks, and file/symbol adjacency for
-//! query, symbol, rendered graph, graph-expand, task-expand, task
+//! surface/flow facts, unresolved/import placeholders, risks, and file/symbol
+//! adjacency for query, symbol, rendered graph, graph-expand, task-expand, task
 //! anchors/scope/next/localize, context-pack, activation, and
 //! non-usage-boundary `explore` views, plus usage-boundary seed discovery. The
 //! hybrid `callers` path still greps first, then expands candidate files
@@ -42,11 +42,12 @@ use crate::model::function::FunctionNode;
 use crate::model::intern::InternedStr;
 use crate::model::repository::RepositoryNode;
 use crate::model::risk::RiskFlag;
+use crate::model::surface::{SurfaceKind, SurfaceNode};
 use crate::model::unresolved::UnresolvedNode;
 
 /// Bumped when the on-disk format changes incompatibly. We re-create the file
 /// rather than try to migrate.
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 /// Single-row metadata table: schema version, build timestamps, repo root, ...
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -71,6 +72,7 @@ const FUNCTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("functions"
 const CLASSES: TableDefinition<&str, &[u8]> = TableDefinition::new("classes");
 const DOCS: TableDefinition<&str, &[u8]> = TableDefinition::new("docs");
 const CONFIGS: TableDefinition<&str, &[u8]> = TableDefinition::new("configs");
+const SURFACES: TableDefinition<&str, &[u8]> = TableDefinition::new("surfaces");
 const UNRESOLVED: TableDefinition<&str, &[u8]> = TableDefinition::new("unresolved");
 
 // ── Adjacency (the wedge for ego/impact/dead-code queries) ──────────────────
@@ -711,6 +713,33 @@ pub fn insert_config(
     Ok(())
 }
 
+/// Insert (or overwrite) a Surface/Flow node. Also indexes by owning file path
+/// and simple name so task anchors can find routes, middleware, workers, and
+/// credential operations without scanning the full store.
+pub fn insert_surface(
+    session: &mut IndexSession<'_>,
+    surface: &SurfaceNode,
+) -> Result<(), GraphStoreError> {
+    session.insert_node(SURFACES, surface.id.as_str(), surface)?;
+    session.add_path_index(
+        NODES_BY_PATH,
+        surface.file_path.as_str(),
+        surface.id.as_str(),
+    )?;
+    let name_key = symbol_index_key(surface.name.as_str());
+    session.add_symbol_index(&name_key, surface.id.as_str())?;
+    for component in symbol_components(surface.name.as_str()) {
+        session.add_symbol_component_index(&component, surface.id.as_str())?;
+    }
+    for component in symbol_components(surface.detail.as_str()) {
+        session.add_symbol_component_index(&component, surface.id.as_str())?;
+    }
+    for component in symbol_components(surface.file_path.as_str()) {
+        session.add_symbol_path_component_index(&component, surface.id.as_str())?;
+    }
+    Ok(())
+}
+
 /// Insert (or overwrite) an unresolved/import placeholder and index it by the
 /// source file path where the unresolved reference was observed.
 pub fn insert_unresolved(
@@ -767,6 +796,16 @@ pub enum StoredNodeKind {
     Class,
     Doc,
     Config,
+    BehaviorTestSurface,
+    CliSurface,
+    CredentialOperation,
+    JobSurface,
+    MiddlewareInstallation,
+    ProxySurface,
+    QueueSurface,
+    RouteSurface,
+    WebhookSurface,
+    WorkerSurface,
     Unresolved,
 }
 
@@ -780,6 +819,7 @@ pub enum StoredNode {
     Class(ClassNode),
     Doc(DocNode),
     Config(ConfigNode),
+    Surface(SurfaceNode),
     Unresolved(UnresolvedNode),
 }
 
@@ -794,6 +834,7 @@ impl StoredNode {
             Self::Class(node) => node.id.as_str(),
             Self::Doc(node) => &node.id,
             Self::Config(node) => &node.id,
+            Self::Surface(node) => node.id.as_str(),
             Self::Unresolved(node) => node.id.as_str(),
         }
     }
@@ -808,6 +849,7 @@ impl StoredNode {
             Self::Class(_) => StoredNodeKind::Class,
             Self::Doc(_) => StoredNodeKind::Doc,
             Self::Config(_) => StoredNodeKind::Config,
+            Self::Surface(node) => stored_kind_from_surface_kind(node.kind),
             Self::Unresolved(_) => StoredNodeKind::Unresolved,
         }
     }
@@ -822,9 +864,41 @@ impl StoredNode {
             Self::Class(node) => Some(node.file_path.as_str()),
             Self::Doc(node) => Some(&node.path),
             Self::Config(node) => Some(&node.path),
+            Self::Surface(node) => Some(node.file_path.as_str()),
             Self::Unresolved(node) => Some(node.file_path.as_str()),
         }
     }
+}
+
+fn stored_kind_from_surface_kind(kind: SurfaceKind) -> StoredNodeKind {
+    match kind {
+        SurfaceKind::BehaviorTestSurface => StoredNodeKind::BehaviorTestSurface,
+        SurfaceKind::CliSurface => StoredNodeKind::CliSurface,
+        SurfaceKind::CredentialOperation => StoredNodeKind::CredentialOperation,
+        SurfaceKind::JobSurface => StoredNodeKind::JobSurface,
+        SurfaceKind::MiddlewareInstallation => StoredNodeKind::MiddlewareInstallation,
+        SurfaceKind::ProxySurface => StoredNodeKind::ProxySurface,
+        SurfaceKind::QueueSurface => StoredNodeKind::QueueSurface,
+        SurfaceKind::RouteSurface => StoredNodeKind::RouteSurface,
+        SurfaceKind::WebhookSurface => StoredNodeKind::WebhookSurface,
+        SurfaceKind::WorkerSurface => StoredNodeKind::WorkerSurface,
+    }
+}
+
+fn is_surface_stored_kind(kind: StoredNodeKind) -> bool {
+    matches!(
+        kind,
+        StoredNodeKind::BehaviorTestSurface
+            | StoredNodeKind::CliSurface
+            | StoredNodeKind::CredentialOperation
+            | StoredNodeKind::JobSurface
+            | StoredNodeKind::MiddlewareInstallation
+            | StoredNodeKind::ProxySurface
+            | StoredNodeKind::QueueSurface
+            | StoredNodeKind::RouteSurface
+            | StoredNodeKind::WebhookSurface
+            | StoredNodeKind::WorkerSurface
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -975,6 +1049,7 @@ pub struct OverviewV2Limits {
     pub class_limit: usize,
     pub doc_limit: usize,
     pub config_limit: usize,
+    pub surface_limit: usize,
     pub unresolved_limit: usize,
 }
 
@@ -990,6 +1065,7 @@ impl Default for OverviewV2Limits {
             class_limit: 20,
             doc_limit: 10,
             config_limit: 10,
+            surface_limit: 20,
             unresolved_limit: 20,
         }
     }
@@ -1008,6 +1084,7 @@ pub struct OverviewV2 {
     pub classes: Vec<ClassNode>,
     pub docs: Vec<DocNode>,
     pub configs: Vec<ConfigNode>,
+    pub surfaces: Vec<SurfaceNode>,
     pub unresolved: Vec<UnresolvedNode>,
 }
 
@@ -1032,6 +1109,26 @@ fn node_kind_from_id(id: &str) -> Option<StoredNodeKind> {
         Some(StoredNodeKind::Doc)
     } else if id.starts_with("config:") {
         Some(StoredNodeKind::Config)
+    } else if id.starts_with("behavior_test_surface:") {
+        Some(StoredNodeKind::BehaviorTestSurface)
+    } else if id.starts_with("cli_surface:") {
+        Some(StoredNodeKind::CliSurface)
+    } else if id.starts_with("credential_operation:") {
+        Some(StoredNodeKind::CredentialOperation)
+    } else if id.starts_with("job_surface:") {
+        Some(StoredNodeKind::JobSurface)
+    } else if id.starts_with("middleware_installation:") {
+        Some(StoredNodeKind::MiddlewareInstallation)
+    } else if id.starts_with("proxy_surface:") {
+        Some(StoredNodeKind::ProxySurface)
+    } else if id.starts_with("queue_surface:") {
+        Some(StoredNodeKind::QueueSurface)
+    } else if id.starts_with("route_surface:") {
+        Some(StoredNodeKind::RouteSurface)
+    } else if id.starts_with("webhook_surface:") {
+        Some(StoredNodeKind::WebhookSurface)
+    } else if id.starts_with("worker_surface:") {
+        Some(StoredNodeKind::WorkerSurface)
     } else if id.starts_with("unresolved_symbol:") || id.starts_with("import:") {
         Some(StoredNodeKind::Unresolved)
     } else {
@@ -1079,6 +1176,18 @@ fn get_node_in_txn(txn: &ReadTransaction, id: &str) -> Result<Option<StoredNode>
         StoredNodeKind::Config => {
             Ok(read_table_node::<ConfigNode>(txn, CONFIGS, id)?.map(StoredNode::Config))
         }
+        StoredNodeKind::BehaviorTestSurface
+        | StoredNodeKind::CliSurface
+        | StoredNodeKind::CredentialOperation
+        | StoredNodeKind::JobSurface
+        | StoredNodeKind::MiddlewareInstallation
+        | StoredNodeKind::ProxySurface
+        | StoredNodeKind::QueueSurface
+        | StoredNodeKind::RouteSurface
+        | StoredNodeKind::WebhookSurface
+        | StoredNodeKind::WorkerSurface => {
+            Ok(read_table_node::<SurfaceNode>(txn, SURFACES, id)?.map(StoredNode::Surface))
+        }
         StoredNodeKind::Unresolved => {
             Ok(read_table_node::<UnresolvedNode>(txn, UNRESOLVED, id)?.map(StoredNode::Unresolved))
         }
@@ -1125,6 +1234,7 @@ fn area_id_from_node(node: &StoredNode) -> Option<String> {
         StoredNode::Class(node) => node.area_id.as_ref().map(|id| id.to_string()),
         StoredNode::Doc(node) => node.area_id.clone(),
         StoredNode::Config(node) => node.area_id.clone(),
+        StoredNode::Surface(node) => node.area_id.as_ref().map(|id| id.to_string()),
         StoredNode::Unresolved(node) => node.area_id.as_ref().map(|id| id.to_string()),
     }
 }
@@ -1166,6 +1276,16 @@ fn symbol_lookup_from_node(node: StoredNode) -> Option<SymbolLookup> {
             signature: class.signature.to_string(),
             language: class.language.to_string(),
             area_id: class.area_id.map(|id| id.to_string()),
+        }),
+        StoredNode::Surface(surface) => Some(SymbolLookup {
+            id: surface.id.to_string(),
+            kind: stored_kind_from_surface_kind(surface.kind),
+            name: surface.name.to_string(),
+            path: surface.file_path.to_string(),
+            line: surface.line,
+            signature: surface.detail.to_string(),
+            language: surface.language.to_string(),
+            area_id: surface.area_id.map(|id| id.to_string()),
         }),
         _ => None,
     }
@@ -1244,6 +1364,15 @@ fn node_display_from_node(node: StoredNode) -> NodeDisplay {
             path: Some(node.path),
             language: None,
             area_id: node.area_id,
+        },
+        StoredNode::Surface(node) => NodeDisplay {
+            id: node.id.to_string(),
+            kind: stored_kind_from_surface_kind(node.kind),
+            display: node.display(),
+            name: node.name.to_string(),
+            path: Some(node.file_path.to_string()),
+            language: Some(node.language.to_string()),
+            area_id: node.area_id.map(|id| id.to_string()),
         },
         StoredNode::Unresolved(node) => NodeDisplay {
             id: node.id.to_string(),
@@ -2006,10 +2135,12 @@ fn usage_boundary_candidates_from<D: ReadableDatabase>(
         let kind = node.kind();
         let include = match symbol_kind {
             Some(expected) => kind == expected,
-            None => matches!(
-                kind,
-                StoredNodeKind::Function | StoredNodeKind::Class | StoredNodeKind::File
-            ),
+            None => {
+                matches!(
+                    kind,
+                    StoredNodeKind::Function | StoredNodeKind::Class | StoredNodeKind::File
+                ) || is_surface_stored_kind(kind)
+            }
         };
         if !include {
             continue;
@@ -2181,6 +2312,14 @@ fn edge_kind_label(kind: &EdgeKind) -> &'static str {
         EdgeKind::Documents => "documents",
         EdgeKind::Configures => "configures",
         EdgeKind::EntrypointFor => "entrypoint_for",
+        EdgeKind::Authorizes => "authorizes",
+        EdgeKind::Exposes => "exposes",
+        EdgeKind::ForwardsTo => "forwards_to",
+        EdgeKind::InstallsMiddleware => "installs_middleware",
+        EdgeKind::IssuesCredential => "issues_credential",
+        EdgeKind::StoresCredential => "stores_credential",
+        EdgeKind::UsesCredential => "uses_credential",
+        EdgeKind::ValidatesCredential => "validates_credential",
     }
 }
 
@@ -2188,11 +2327,34 @@ fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection, Vec<EdgeKi
     match relation {
         GraphRelation::Children => vec![(
             NeighborDirection::Outgoing,
-            vec![EdgeKind::Contains, EdgeKind::Defines],
+            vec![
+                EdgeKind::Contains,
+                EdgeKind::Defines,
+                EdgeKind::Authorizes,
+                EdgeKind::Exposes,
+                EdgeKind::ForwardsTo,
+                EdgeKind::InstallsMiddleware,
+                EdgeKind::IssuesCredential,
+                EdgeKind::StoresCredential,
+                EdgeKind::UsesCredential,
+                EdgeKind::ValidatesCredential,
+            ],
         )],
         GraphRelation::Parents => vec![(
             NeighborDirection::Incoming,
-            vec![EdgeKind::Contains, EdgeKind::Defines, EdgeKind::BelongsTo],
+            vec![
+                EdgeKind::Contains,
+                EdgeKind::Defines,
+                EdgeKind::BelongsTo,
+                EdgeKind::Authorizes,
+                EdgeKind::Exposes,
+                EdgeKind::ForwardsTo,
+                EdgeKind::InstallsMiddleware,
+                EdgeKind::IssuesCredential,
+                EdgeKind::StoresCredential,
+                EdgeKind::UsesCredential,
+                EdgeKind::ValidatesCredential,
+            ],
         )],
         GraphRelation::Callers => vec![(NeighborDirection::Incoming, vec![EdgeKind::Calls])],
         GraphRelation::Callees => vec![(NeighborDirection::Outgoing, vec![EdgeKind::Calls])],
@@ -2213,8 +2375,26 @@ fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection, Vec<EdgeKi
         GraphRelation::Imports => vec![(NeighborDirection::Outgoing, vec![EdgeKind::Imports])],
         GraphRelation::Importers => vec![(NeighborDirection::Incoming, vec![EdgeKind::Imports])],
         GraphRelation::References => vec![
-            (NeighborDirection::Outgoing, vec![EdgeKind::References]),
-            (NeighborDirection::Incoming, vec![EdgeKind::References]),
+            (
+                NeighborDirection::Outgoing,
+                vec![
+                    EdgeKind::References,
+                    EdgeKind::Authorizes,
+                    EdgeKind::ForwardsTo,
+                    EdgeKind::UsesCredential,
+                    EdgeKind::ValidatesCredential,
+                ],
+            ),
+            (
+                NeighborDirection::Incoming,
+                vec![
+                    EdgeKind::References,
+                    EdgeKind::Authorizes,
+                    EdgeKind::ForwardsTo,
+                    EdgeKind::UsesCredential,
+                    EdgeKind::ValidatesCredential,
+                ],
+            ),
         ],
     }
 }
@@ -2703,6 +2883,32 @@ fn list_configs_from<D: ReadableDatabase>(
     Ok(out)
 }
 
+fn list_surfaces_from<D: ReadableDatabase>(
+    db: &D,
+    limit: usize,
+) -> Result<Vec<SurfaceNode>, GraphStoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let txn = db.begin_read()?;
+    let t = txn.open_table(SURFACES)?;
+    let mut out = Vec::new();
+    for entry in t.iter()? {
+        let (_, value) = entry?;
+        out.push(bincode::deserialize::<SurfaceNode>(value.value())?);
+    }
+    out.sort_by(|left, right| {
+        left.file_path
+            .cmp(&right.file_path)
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    out.truncate(limit);
+    Ok(out)
+}
+
 fn read_repository_from<D: ReadableDatabase>(
     db: &D,
 ) -> Result<Option<RepositoryNode>, GraphStoreError> {
@@ -2786,6 +2992,7 @@ fn overview_v2_from<D: ReadableDatabase>(
         classes: list_classes_from(db, limits.class_limit)?,
         docs: list_docs_from(db, limits.doc_limit)?,
         configs: list_configs_from(db, limits.config_limit)?,
+        surfaces: list_surfaces_from(db, limits.surface_limit)?,
         unresolved: list_unresolved_from(db, limits.unresolved_limit)?,
     })
 }
@@ -3445,6 +3652,7 @@ fn ensure_schema(db: &Database) -> Result<(), GraphStoreError> {
         let _ = txn.open_table(CLASSES)?;
         let _ = txn.open_table(DOCS)?;
         let _ = txn.open_table(CONFIGS)?;
+        let _ = txn.open_table(SURFACES)?;
         let _ = txn.open_table(UNRESOLVED)?;
         let _ = txn.open_multimap_table(EDGES_OUT)?;
         let _ = txn.open_multimap_table(EDGES_IN)?;
@@ -3494,6 +3702,7 @@ fn verify_schema_read_only(db: &ReadOnlyDatabase) -> Result<(), GraphStoreError>
         let _ = txn.open_table(CLASSES)?;
         let _ = txn.open_table(DOCS)?;
         let _ = txn.open_table(CONFIGS)?;
+        let _ = txn.open_table(SURFACES)?;
         let _ = txn.open_table(UNRESOLVED)?;
         let _ = txn.open_multimap_table(EDGES_OUT)?;
         let _ = txn.open_multimap_table(EDGES_IN)?;
@@ -3509,6 +3718,8 @@ fn verify_schema_read_only(db: &ReadOnlyDatabase) -> Result<(), GraphStoreError>
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use redb::{ReadableDatabase, ReadableTableMetadata};
     use serde::Deserialize;
@@ -3580,6 +3791,7 @@ mod tests {
         txn.open_table(CLASSES).expect("CLASSES");
         txn.open_table(DOCS).expect("DOCS");
         txn.open_table(CONFIGS).expect("CONFIGS");
+        txn.open_table(SURFACES).expect("SURFACES");
         txn.open_table(UNRESOLVED).expect("UNRESOLVED");
         txn.open_table(META).expect("META");
 
@@ -3791,6 +4003,187 @@ mod tests {
                 .other
                 .as_str(),
             file_a.id
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn surface_node(kind: SurfaceKind, path: &str, name: &str, line: usize) -> SurfaceNode {
+        let schema_id = aethyme_graph_schema::NodeId::new(
+            match kind {
+                SurfaceKind::BehaviorTestSurface => {
+                    aethyme_graph_schema::NodeKind::BehaviorTestSurface
+                }
+                SurfaceKind::CliSurface => aethyme_graph_schema::NodeKind::CliSurface,
+                SurfaceKind::CredentialOperation => {
+                    aethyme_graph_schema::NodeKind::CredentialOperation
+                }
+                SurfaceKind::JobSurface => aethyme_graph_schema::NodeKind::JobSurface,
+                SurfaceKind::MiddlewareInstallation => {
+                    aethyme_graph_schema::NodeKind::MiddlewareInstallation
+                }
+                SurfaceKind::ProxySurface => aethyme_graph_schema::NodeKind::ProxySurface,
+                SurfaceKind::QueueSurface => aethyme_graph_schema::NodeKind::QueueSurface,
+                SurfaceKind::RouteSurface => aethyme_graph_schema::NodeKind::RouteSurface,
+                SurfaceKind::WebhookSurface => aethyme_graph_schema::NodeKind::WebhookSurface,
+                SurfaceKind::WorkerSurface => aethyme_graph_schema::NodeKind::WorkerSurface,
+            },
+            "Repo",
+            path,
+            name,
+        )
+        .expect("schema id");
+        SurfaceNode {
+            id: InternedStr::from(schema_id.as_str()),
+            kind,
+            name: InternedStr::from(name),
+            file_id: InternedStr::from(format!("file:Repo:{path}")),
+            file_path: InternedStr::from(path),
+            area_id: Some(InternedStr::from("area:Repo:src")),
+            language: InternedStr::from("python"),
+            line,
+            detail: InternedStr::from(kind.label()),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn surface_nodes_are_persisted_and_queryable() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let area = AreaNode::new("Repo", "src", false);
+        let file = FileNode::new(
+            "Repo",
+            "src/routes.py",
+            Some("python".to_string()),
+            crate::model::file::FileRole::Source,
+            20,
+            300,
+            false,
+            Some(area.id.clone()),
+        );
+        let route = surface_node(
+            SurfaceKind::RouteSurface,
+            "src/routes.py",
+            "GET /api/token",
+            3,
+        );
+        let middleware = surface_node(
+            SurfaceKind::MiddlewareInstallation,
+            "src/routes.py",
+            "TokenAuthMiddleware",
+            7,
+        );
+        let proxy = surface_node(
+            SurfaceKind::ProxySurface,
+            "src/routes.py",
+            "https://api.example.com",
+            12,
+        );
+
+        let mut session = store.begin_index().expect("session");
+        insert_area(&mut session, &area).expect("area");
+        insert_file(&mut session, &file).expect("file");
+        for surface in [&route, &middleware, &proxy] {
+            insert_surface(&mut session, surface).expect("surface");
+        }
+        insert_edge(
+            &mut session,
+            &Edge::new(
+                &file.id,
+                route.id.as_str(),
+                EdgeKind::Exposes,
+                850,
+                "surface-flow",
+            ),
+        )
+        .expect("route edge");
+        insert_edge(
+            &mut session,
+            &Edge::new(
+                &file.id,
+                middleware.id.as_str(),
+                EdgeKind::InstallsMiddleware,
+                850,
+                "surface-flow",
+            ),
+        )
+        .expect("middleware edge");
+        insert_edge(
+            &mut session,
+            &Edge::new(
+                &file.id,
+                proxy.id.as_str(),
+                EdgeKind::ForwardsTo,
+                850,
+                "surface-flow",
+            ),
+        )
+        .expect("proxy edge");
+        session.commit().expect("commit");
+        drop(store);
+
+        let readonly = GraphStore::open_read_only(&root).expect("read-only open");
+        assert_eq!(
+            readonly
+                .node_display(route.id.as_str())
+                .expect("display")
+                .unwrap()
+                .kind,
+            StoredNodeKind::RouteSurface
+        );
+        assert!(matches!(
+            readonly.get_node(middleware.id.as_str()).expect("node"),
+            Some(StoredNode::Surface(node)) if node.kind == SurfaceKind::MiddlewareInstallation
+        ));
+        let nodes = readonly.nodes_under_path("src/").expect("nodes under path");
+        assert!(
+            nodes
+                .iter()
+                .filter(|node| matches!(node, StoredNode::Surface(_)))
+                .count()
+                >= 3
+        );
+        let symbols = readonly
+            .find_symbols("GET /api/token", Some(StoredNodeKind::RouteSurface))
+            .expect("symbol lookup");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].id, route.id.as_str());
+        let children = readonly.children(&file.id, None).expect("children");
+        assert!(
+            children
+                .iter()
+                .any(|node| node.kind == StoredNodeKind::RouteSurface)
+        );
+        assert!(
+            children
+                .iter()
+                .any(|node| node.kind == StoredNodeKind::MiddlewareInstallation)
+        );
+        assert!(
+            children
+                .iter()
+                .any(|node| node.kind == StoredNodeKind::ProxySurface)
+        );
+        assert_eq!(
+            readonly
+                .overview_v2(OverviewV2Limits {
+                    area_limit: 0,
+                    directory_limit: 0,
+                    entrypoint_limit: 0,
+                    risk_limit: 0,
+                    file_limit: 0,
+                    function_limit: 0,
+                    class_limit: 0,
+                    doc_limit: 0,
+                    config_limit: 0,
+                    surface_limit: 10,
+                    unresolved_limit: 0,
+                })
+                .expect("overview")
+                .surfaces
+                .len(),
+            3
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -4734,10 +5127,12 @@ mod tests {
             StoredNode::Unresolved(got) => assert_eq!(got, fixture.unresolved),
             other => panic!("expected unresolved node, got {other:?}"),
         }
-        assert!(readonly
-            .get_node("unknown:Repo:x")
-            .expect("unknown")
-            .is_none());
+        assert!(
+            readonly
+                .get_node("unknown:Repo:x")
+                .expect("unknown")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4785,14 +5180,18 @@ mod tests {
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].id, fixture.function.id.to_string());
         assert_eq!(symbols[0].kind, StoredNodeKind::Function);
-        assert!(readonly
-            .find_symbols("LoadToken", Some(StoredNodeKind::Class))
-            .expect("class filter")
-            .is_empty());
-        assert!(readonly
-            .find_symbols("missing_call", Some(StoredNodeKind::Unresolved))
-            .expect("unresolved filter")
-            .is_empty());
+        assert!(
+            readonly
+                .find_symbols("LoadToken", Some(StoredNodeKind::Class))
+                .expect("class filter")
+                .is_empty()
+        );
+        assert!(
+            readonly
+                .find_symbols("missing_call", Some(StoredNodeKind::Unresolved))
+                .expect("unresolved filter")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4866,9 +5265,11 @@ mod tests {
             )
             .expect("class kind filter");
         assert!(!class_only.is_empty());
-        assert!(class_only
-            .iter()
-            .all(|candidate| candidate.symbol.kind == StoredNodeKind::Class));
+        assert!(
+            class_only
+                .iter()
+                .all(|candidate| candidate.symbol.kind == StoredNodeKind::Class)
+        );
     }
 
     #[test]
@@ -4944,14 +5345,18 @@ mod tests {
             .expect("resolve file")
             .expect("present");
         assert_eq!(resolved, fixture.file);
-        assert!(readonly
-            .resolve_file_path("src")
-            .expect("prefix is not exact")
-            .is_none());
-        assert!(readonly
-            .resolve_file_path("src/missing.rs")
-            .expect("missing")
-            .is_none());
+        assert!(
+            readonly
+                .resolve_file_path("src")
+                .expect("prefix is not exact")
+                .is_none()
+        );
+        assert!(
+            readonly
+                .resolve_file_path("src/missing.rs")
+                .expect("missing")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4990,14 +5395,16 @@ mod tests {
             unresolved_imports[0].other.as_str(),
             fixture.unresolved.id.as_str()
         );
-        assert!(readonly
-            .neighbors(
-                fixture.function.id.as_str(),
-                NeighborDirection::Outgoing,
-                Some(EdgeKind::Imports),
-            )
-            .expect("wrong kind")
-            .is_empty());
+        assert!(
+            readonly
+                .neighbors(
+                    fixture.function.id.as_str(),
+                    NeighborDirection::Outgoing,
+                    Some(EdgeKind::Imports),
+                )
+                .expect("wrong kind")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5055,9 +5462,11 @@ mod tests {
             .iter()
             .find(|candidate| candidate.node.id == fixture.function.id.to_string())
             .expect("function anchor");
-        assert!(function_anchor
-            .matched_tokens
-            .contains(&"token".to_string()));
+        assert!(
+            function_anchor
+                .matched_tokens
+                .contains(&"token".to_string())
+        );
         assert!(function_anchor.matched_tokens.contains(&"src".to_string()));
         assert!(anchors.len() <= 5);
 

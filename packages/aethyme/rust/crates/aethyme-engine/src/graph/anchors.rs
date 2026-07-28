@@ -449,6 +449,7 @@ fn anchor_overview_limits() -> OverviewV2Limits {
         class_limit: 1_000,
         doc_limit: 200,
         config_limit: 200,
+        surface_limit: 1_000,
         unresolved_limit: 0,
     }
 }
@@ -1754,9 +1755,11 @@ mod tests {
         let task = TaskInput::from_task_text("Update validate_token flow");
         let anchors = resolve_anchors(&map, &task, 3);
 
-        assert!(anchors
-            .iter()
-            .any(|anchor| anchor.id.contains("validate_token")));
+        assert!(
+            anchors
+                .iter()
+                .any(|anchor| anchor.id.contains("validate_token"))
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1787,9 +1790,11 @@ mod tests {
         assert!(anchors.iter().any(|anchor| anchor.id == "README.md"));
         assert!(anchors.iter().any(|anchor| anchor.id == "documentation"));
         assert!(anchors.iter().any(|anchor| anchor.id == "GameEngine"));
-        assert!(anchors
-            .iter()
-            .any(|anchor| anchor.id.ends_with("technical-architecture.md")));
+        assert!(
+            anchors
+                .iter()
+                .any(|anchor| anchor.id.ends_with("technical-architecture.md"))
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1953,13 +1958,17 @@ mod tests {
             task.kind,
             crate::model::task::TaskKind::NavigateConfigOwnership
         );
-        assert!(anchors
-            .iter()
-            .any(|anchor| anchor.id.ends_with("Cargo.toml")));
+        assert!(
+            anchors
+                .iter()
+                .any(|anchor| anchor.id.ends_with("Cargo.toml"))
+        );
         assert!(anchors.iter().any(|anchor| anchor.id == "GameEngine"));
-        assert!(!anchors
-            .iter()
-            .any(|anchor| anchor.id.contains("Other/project.godot")));
+        assert!(
+            !anchors
+                .iter()
+                .any(|anchor| anchor.id.contains("Other/project.godot"))
+        );
         assert_eq!(
             anchors
                 .iter()

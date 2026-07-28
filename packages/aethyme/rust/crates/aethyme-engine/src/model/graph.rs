@@ -12,6 +12,16 @@ pub enum GraphNodeKind {
     Function,
     Doc,
     Config,
+    BehaviorTestSurface,
+    CliSurface,
+    CredentialOperation,
+    JobSurface,
+    MiddlewareInstallation,
+    ProxySurface,
+    QueueSurface,
+    RouteSurface,
+    WebhookSurface,
+    WorkerSurface,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]

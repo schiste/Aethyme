@@ -1272,6 +1272,11 @@ fn index_to_store(
         }
         eprintln!("  functions: {}", map.functions.len());
 
+        for surface in &map.surfaces {
+            gs::insert_surface(&mut session, surface).map_err(|e| e.to_string())?;
+        }
+        eprintln!("  surfaces: {}", map.surfaces.len());
+
         for doc in &map.docs {
             gs::insert_doc(&mut session, doc).map_err(|e| e.to_string())?;
         }

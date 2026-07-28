@@ -799,6 +799,16 @@ fn redb_node_source_confidence(kind: StoredNodeKind) -> (&'static str, u16) {
         StoredNodeKind::Function | StoredNodeKind::Class => ("code", 1000),
         StoredNodeKind::Doc => ("docs", 900),
         StoredNodeKind::Config => ("config", 900),
+        StoredNodeKind::BehaviorTestSurface
+        | StoredNodeKind::CliSurface
+        | StoredNodeKind::CredentialOperation
+        | StoredNodeKind::JobSurface
+        | StoredNodeKind::MiddlewareInstallation
+        | StoredNodeKind::ProxySurface
+        | StoredNodeKind::QueueSurface
+        | StoredNodeKind::RouteSurface
+        | StoredNodeKind::WebhookSurface
+        | StoredNodeKind::WorkerSurface => ("surface-flow", 850),
         StoredNodeKind::Unresolved => ("unresolved", 500),
     }
 }
@@ -813,6 +823,16 @@ fn redb_kind_label(kind: StoredNodeKind) -> &'static str {
         StoredNodeKind::Class => "class",
         StoredNodeKind::Doc => "doc",
         StoredNodeKind::Config => "config",
+        StoredNodeKind::BehaviorTestSurface => "behavior_test_surface",
+        StoredNodeKind::CliSurface => "cli_surface",
+        StoredNodeKind::CredentialOperation => "credential_operation",
+        StoredNodeKind::JobSurface => "job_surface",
+        StoredNodeKind::MiddlewareInstallation => "middleware_installation",
+        StoredNodeKind::ProxySurface => "proxy_surface",
+        StoredNodeKind::QueueSurface => "queue_surface",
+        StoredNodeKind::RouteSurface => "route_surface",
+        StoredNodeKind::WebhookSurface => "webhook_surface",
+        StoredNodeKind::WorkerSurface => "worker_surface",
         StoredNodeKind::Unresolved => "unresolved",
     }
 }
@@ -861,6 +881,7 @@ fn relation_item_for_task_display_redb(
         class_limit: 0,
         doc_limit: 500,
         config_limit: 500,
+        surface_limit: 0,
         unresolved_limit: 0,
     })?;
     if let Some(config) = semantic
@@ -1231,6 +1252,16 @@ fn graph_kind(node: &crate::model::graph::GraphNode) -> String {
         crate::model::graph::GraphNodeKind::Function => "function",
         crate::model::graph::GraphNodeKind::Doc => "doc",
         crate::model::graph::GraphNodeKind::Config => "config",
+        crate::model::graph::GraphNodeKind::BehaviorTestSurface => "behavior_test_surface",
+        crate::model::graph::GraphNodeKind::CliSurface => "cli_surface",
+        crate::model::graph::GraphNodeKind::CredentialOperation => "credential_operation",
+        crate::model::graph::GraphNodeKind::JobSurface => "job_surface",
+        crate::model::graph::GraphNodeKind::MiddlewareInstallation => "middleware_installation",
+        crate::model::graph::GraphNodeKind::ProxySurface => "proxy_surface",
+        crate::model::graph::GraphNodeKind::QueueSurface => "queue_surface",
+        crate::model::graph::GraphNodeKind::RouteSurface => "route_surface",
+        crate::model::graph::GraphNodeKind::WebhookSurface => "webhook_surface",
+        crate::model::graph::GraphNodeKind::WorkerSurface => "worker_surface",
     }
     .to_string()
 }
@@ -1246,6 +1277,14 @@ fn edge_kind_label(kind: &EdgeKind) -> &'static str {
         EdgeKind::Documents => "documents",
         EdgeKind::Configures => "configures",
         EdgeKind::EntrypointFor => "entrypoint_for",
+        EdgeKind::Authorizes => "authorizes",
+        EdgeKind::Exposes => "exposes",
+        EdgeKind::ForwardsTo => "forwards_to",
+        EdgeKind::InstallsMiddleware => "installs_middleware",
+        EdgeKind::IssuesCredential => "issues_credential",
+        EdgeKind::StoresCredential => "stores_credential",
+        EdgeKind::UsesCredential => "uses_credential",
+        EdgeKind::ValidatesCredential => "validates_credential",
     }
 }
 
@@ -1537,6 +1576,7 @@ fn overview_item_for_path(
             class_limit: 0,
             doc_limit: 500,
             config_limit: 0,
+            surface_limit: 0,
             unresolved_limit: 0,
         })?
         .docs
@@ -1596,6 +1636,7 @@ fn overview_view_limits() -> OverviewV2Limits {
         class_limit: usize::MAX,
         doc_limit: usize::MAX,
         config_limit: usize::MAX,
+        surface_limit: usize::MAX,
         unresolved_limit: usize::MAX,
     }
 }
