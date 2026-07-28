@@ -51,6 +51,11 @@ names/flags/output — golden-verified):
   `query_cli` module). Known divergence: Click-style global options
   before the group (`aethyme --json query ...`) are no longer accepted;
   no in-repo consumer used that spelling.
+- `graph node|children|parents|callers|callees|docs|configs|expand|
+  overview` (Phase 1, 2026-07-28; engine `graph_cli` module). Same
+  global-option divergence. The `_render_relation` /
+  `_emit_completeness_signals` Click helpers remain in cli.py for the
+  task group until it flips.
 """
 
 

@@ -64,8 +64,8 @@ fn run_symbol(rest: &[String]) -> Result<(), String> {
     if json_output {
         // Python re-emitted the engine JSON via json.dumps(..., indent=2);
         // round-trip through serde_json::Value for the same 2-space shape.
-        let value: serde_json::Value = serde_json::from_str(&crate::json::search_hits(&hits))
-            .map_err(|e| e.to_string())?;
+        let value: serde_json::Value =
+            serde_json::from_str(&crate::json::search_hits(&hits)).map_err(|e| e.to_string())?;
         println!(
             "{}",
             serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?

@@ -24,6 +24,11 @@ names/flags/output — golden-verified):
   `query_cli` module). Known divergence: Click-style global options
   before the group (`aethyme --json query ...`) are no longer accepted;
   no in-repo consumer used that spelling.
+- `graph node|children|parents|callers|callees|docs|configs|expand|
+  overview` (Phase 1, 2026-07-28; engine `graph_cli` module). Same
+  global-option divergence. The `_render_relation` /
+  `_emit_completeness_signals` Click helpers remain in cli.py for the
+  task group until it flips.
 
 ## Global options
 
@@ -46,16 +51,6 @@ names/flags/output — golden-verified):
 | `facts` | group | — |
 | `facts function-usage` | command | `--repo` (directory, required); `--target` (required); `--boundary` (required); `--roots` (default ''); `--json-output` (flag) |
 | `facts public-functions` | command | `--repo` (directory, required); `--scope` (required); `--include-methods` (flag); `--json-output` (flag) |
-| `graph` | group | — |
-| `graph callees` | command | `repo_path` (arg, required); `target` (arg, required); `--json-output` (flag) |
-| `graph callers` | command | `repo_path` (arg, required); `target` (arg, required); `--json-output` (flag) |
-| `graph children` | command | `repo_path` (arg, required); `target` (arg, required); `--json-output` (flag) |
-| `graph configs` | command | `repo_path` (arg, required); `target` (arg, required); `--json-output` (flag) |
-| `graph docs` | command | `repo_path` (arg, required); `target` (arg, required); `--json-output` (flag) |
-| `graph expand` | command | `repo_path` (arg, required); `target` (arg, required); `--json-output` (flag) |
-| `graph node` | command | `repo_path` (arg, required); `target` (arg, required); `--json-output` (flag) |
-| `graph overview` | command | `repo_path` (arg, required); `--json-output` (flag) |
-| `graph parents` | command | `repo_path` (arg, required); `target` (arg, required); `--json-output` (flag) |
 | `intents` | command | `--request` (default ''); `--format` (choice, default 'compact-json') |
 | `repo` | group | — |
 | `repo clear-cache` | command | `repo_path` (arg, required) |
