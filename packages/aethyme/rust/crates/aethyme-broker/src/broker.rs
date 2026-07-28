@@ -14,7 +14,7 @@ use crate::store::BrokerStore;
 use crate::types::{
     MergeQueueEntry, MergeStatus, NewSession, Session, SessionOrigin, SessionStatus,
 };
-use crate::version::VersionDriftReport;
+use crate::version::{VersionDriftReport, VersionDriftStatus};
 
 /// Idle/stale thresholds for activity-derived liveness (issue #9).
 /// Configurable via `.aethyme/config.toml` in a later phase; constants
@@ -101,6 +101,9 @@ pub struct DoctorReport {
     /// Running CLI build compared with this checkout's integration head
     /// when the checkout is Aethyme itself.
     pub version: VersionDriftReport,
+    /// Present only when `doctor --fix-version` was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_repair: Option<VersionRepairReport>,
     /// Live sessions whose worktree path no longer exists on disk.
     pub missing_worktrees: Vec<i64>,
     /// Stale gate pidfiles found (and removed) whose process is gone.
@@ -112,9 +115,53 @@ pub struct DoctorReport {
 
 impl DoctorReport {
     pub fn healthy(&self) -> bool {
-        self.integrity == "ok"
-            && self.missing_worktrees.is_empty()
-            && !self.version.status.is_drift()
+        let version_ok = !self.version.status.is_drift()
+            || self
+                .version_repair
+                .as_ref()
+                .is_some_and(VersionRepairReport::repaired);
+        self.integrity == "ok" && self.missing_worktrees.is_empty() && version_ok
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorRepairStatus {
+    NotNeeded,
+    Skipped,
+    Pass,
+    Fail,
+}
+
+impl DoctorRepairStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotNeeded => "not needed",
+            Self::Skipped => "skipped",
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+/// Result of the explicit local CLI repair path.
+#[derive(Debug, serde::Serialize)]
+pub struct VersionRepairReport {
+    pub status: DoctorRepairStatus,
+    pub attempted: bool,
+    pub command: Vec<String>,
+    pub install_source: Option<String>,
+    pub integration_head: Option<String>,
+    pub exit_code: Option<i32>,
+    pub duration_ms: i64,
+    pub message: String,
+    pub stdout_tail: Vec<String>,
+    pub stderr_tail: Vec<String>,
+}
+
+impl VersionRepairReport {
+    pub fn repaired(&self) -> bool {
+        self.status == DoctorRepairStatus::Pass
     }
 }
 
@@ -1185,6 +1232,18 @@ impl Broker {
     /// orphaned gate pidfiles (whose process group is gone) — the latter
     /// are removed as part of the check.
     pub fn doctor(&mut self) -> Result<DoctorReport, BrokerOpError> {
+        self.doctor_inner(false)
+    }
+
+    /// Same health checks as [`Self::doctor`], plus an explicit local CLI
+    /// reinstall when the running binary is behind this checkout's
+    /// integration branch. The repair installs from a detached worktree at
+    /// integration, not from the operator's possibly dirty checkout.
+    pub fn doctor_with_version_fix(&mut self) -> Result<DoctorReport, BrokerOpError> {
+        self.doctor_inner(true)
+    }
+
+    fn doctor_inner(&mut self, fix_version: bool) -> Result<DoctorReport, BrokerOpError> {
         let integrity = self.store.integrity_check()?;
 
         let mut missing_worktrees = Vec::new();
@@ -1219,14 +1278,173 @@ impl Broker {
         }
 
         let purged_stale_leases = self.store.purge_leases_of_cleaned_sessions()?;
+        let version = crate::version::inspect_version(&self.main_root);
+        let version_repair = fix_version.then(|| self.repair_local_cli_version(&version));
 
         Ok(DoctorReport {
             integrity,
-            version: crate::version::inspect_version(&self.main_root),
+            version,
+            version_repair,
             missing_worktrees,
             orphaned_pidfiles,
             purged_stale_leases,
         })
+    }
+
+    fn repair_local_cli_version(&mut self, version: &VersionDriftReport) -> VersionRepairReport {
+        match version.status {
+            VersionDriftStatus::Current | VersionDriftStatus::AheadOfIntegration => {
+                return VersionRepairReport {
+                    status: DoctorRepairStatus::NotNeeded,
+                    attempted: false,
+                    command: local_cli_install_command(None),
+                    install_source: None,
+                    integration_head: version.integration_head.clone(),
+                    exit_code: None,
+                    duration_ms: 0,
+                    message: format!(
+                        "no local CLI repair needed for version status {}",
+                        version.status.as_str()
+                    ),
+                    stdout_tail: Vec::new(),
+                    stderr_tail: Vec::new(),
+                };
+            }
+            VersionDriftStatus::NotAethymeSource | VersionDriftStatus::Unknown => {
+                return VersionRepairReport {
+                    status: DoctorRepairStatus::Skipped,
+                    attempted: false,
+                    command: local_cli_install_command(None),
+                    install_source: None,
+                    integration_head: version.integration_head.clone(),
+                    exit_code: None,
+                    duration_ms: 0,
+                    message: format!(
+                        "local CLI repair is available only for comparable Aethyme source checkouts; version status is {}",
+                        version.status.as_str()
+                    ),
+                    stdout_tail: Vec::new(),
+                    stderr_tail: Vec::new(),
+                };
+            }
+            VersionDriftStatus::BehindIntegration
+            | VersionDriftStatus::ReleaseBehindIntegration => {}
+        }
+
+        let Some(integration_head) = version.integration_head.as_deref() else {
+            return VersionRepairReport {
+                status: DoctorRepairStatus::Skipped,
+                attempted: false,
+                command: local_cli_install_command(None),
+                install_source: None,
+                integration_head: None,
+                exit_code: None,
+                duration_ms: 0,
+                message: "integration head is unavailable; cannot choose a repair source".into(),
+                stdout_tail: Vec::new(),
+                stderr_tail: Vec::new(),
+            };
+        };
+        if !version.repo_is_aethyme_source {
+            return VersionRepairReport {
+                status: DoctorRepairStatus::Skipped,
+                attempted: false,
+                command: local_cli_install_command(None),
+                install_source: None,
+                integration_head: Some(integration_head.to_string()),
+                exit_code: None,
+                duration_ms: 0,
+                message: "not an Aethyme source checkout; refusing to reinstall local CLI".into(),
+                stdout_tail: Vec::new(),
+                stderr_tail: Vec::new(),
+            };
+        }
+
+        let temp_root = self
+            .main_root
+            .join(".aethyme/run/version-repair")
+            .join(format!(
+                "install-{}-{}-{}",
+                short_commit(integration_head),
+                std::process::id(),
+                now_ms()
+            ));
+        let engine_path = temp_root.join("packages/aethyme/rust/crates/aethyme-engine");
+        let command = local_cli_install_command(Some(&engine_path));
+        let start = now_ms();
+        let worktree = self
+            .repo
+            .worktree_add_detached(&temp_root, integration_head);
+        if let Err(err) = worktree {
+            return VersionRepairReport {
+                status: DoctorRepairStatus::Fail,
+                attempted: true,
+                command,
+                install_source: Some(temp_root.to_string_lossy().into_owned()),
+                integration_head: Some(integration_head.to_string()),
+                exit_code: None,
+                duration_ms: now_ms().saturating_sub(start),
+                message: format!("failed to create temporary integration worktree: {err}"),
+                stdout_tail: Vec::new(),
+                stderr_tail: Vec::new(),
+            };
+        }
+
+        let output = Command::new("cargo")
+            .args(&command[1..])
+            .current_dir(&temp_root)
+            .output();
+        let duration_ms = now_ms().saturating_sub(start);
+        let _ = self.repo.worktree_remove(&temp_root, true);
+
+        match output {
+            Ok(output) => {
+                let stdout_tail = tail_lines(&String::from_utf8_lossy(&output.stdout), 12);
+                let stderr_tail = tail_lines(&String::from_utf8_lossy(&output.stderr), 12);
+                let status = if output.status.success() {
+                    DoctorRepairStatus::Pass
+                } else {
+                    DoctorRepairStatus::Fail
+                };
+                let message = if output.status.success() {
+                    format!(
+                        "installed local CLI from {} {}; rerun doctor to observe the repaired binary",
+                        version.integration_branch,
+                        short_commit(integration_head)
+                    )
+                } else {
+                    format!(
+                        "cargo install failed while repairing local CLI from {} {}",
+                        version.integration_branch,
+                        short_commit(integration_head)
+                    )
+                };
+                VersionRepairReport {
+                    status,
+                    attempted: true,
+                    command,
+                    install_source: Some(temp_root.to_string_lossy().into_owned()),
+                    integration_head: Some(integration_head.to_string()),
+                    exit_code: output.status.code(),
+                    duration_ms,
+                    message,
+                    stdout_tail,
+                    stderr_tail,
+                }
+            }
+            Err(err) => VersionRepairReport {
+                status: DoctorRepairStatus::Fail,
+                attempted: true,
+                command,
+                install_source: Some(temp_root.to_string_lossy().into_owned()),
+                integration_head: Some(integration_head.to_string()),
+                exit_code: None,
+                duration_ms,
+                message: format!("failed to run cargo install: {err}"),
+                stdout_tail: Vec::new(),
+                stderr_tail: Vec::new(),
+            },
+        }
     }
 
     // ── finish ────────────────────────────────────────────────────────
@@ -1814,6 +2032,42 @@ fn short_commit(commit: &str) -> &str {
     &commit[..12.min(commit.len())]
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn tail_lines(text: &str, limit: usize) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if lines.len() > limit {
+        lines = lines.split_off(lines.len() - limit);
+    }
+    lines
+}
+
+fn local_cli_install_command(path: Option<&Path>) -> Vec<String> {
+    let install_path = path
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            "<integration-worktree>/packages/aethyme/rust/crates/aethyme-engine".into()
+        });
+    vec![
+        "cargo".into(),
+        "install".into(),
+        "--path".into(),
+        install_path,
+        "--force".into(),
+        "--locked".into(),
+    ]
+}
+
 fn shell_quote(value: &str) -> String {
     if !value.is_empty()
         && value.bytes().all(|byte| {
@@ -1886,7 +2140,8 @@ fn slugify(task: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::slugify;
+    use super::{DoctorRepairStatus, DoctorReport, VersionRepairReport, slugify};
+    use crate::version::{BinaryBuild, VersionDriftReport, VersionDriftStatus};
 
     #[test]
     fn slugify_is_safe_for_branches_and_paths() {
@@ -1895,5 +2150,79 @@ mod tests {
         assert_eq!(slugify("émojis 🎉 stripped"), "mojis-stripped");
         assert_eq!(slugify(""), "task");
         assert!(slugify(&"x".repeat(100)).len() <= 40);
+    }
+
+    #[test]
+    fn doctor_healthy_accepts_successful_explicit_version_repair() {
+        let report = doctor_report(
+            VersionDriftStatus::BehindIntegration,
+            Some(repair_report(DoctorRepairStatus::Pass)),
+        );
+
+        assert!(report.healthy());
+    }
+
+    #[test]
+    fn doctor_healthy_rejects_failed_explicit_version_repair() {
+        let report = doctor_report(
+            VersionDriftStatus::BehindIntegration,
+            Some(repair_report(DoctorRepairStatus::Fail)),
+        );
+
+        assert!(!report.healthy());
+    }
+
+    fn doctor_report(
+        status: VersionDriftStatus,
+        version_repair: Option<VersionRepairReport>,
+    ) -> DoctorReport {
+        DoctorReport {
+            integrity: "ok".into(),
+            version: VersionDriftReport {
+                binary: BinaryBuild {
+                    version: "0.1.1".into(),
+                    describe: Some("v0.1.1".into()),
+                    commit: Some("aaaaaaaaaaaa".into()),
+                    path: Some("/tmp/aethyme".into()),
+                },
+                repo_is_aethyme_source: true,
+                integration_branch: "aethyme/integration".into(),
+                integration_head: Some("bbbbbbbbbbbb".into()),
+                integration_describe: Some("v0.1.1-1-gbbbbbbbbbbbb".into()),
+                release_tag: Some("v0.1.1".into()),
+                status,
+                message: "test report".into(),
+            },
+            version_repair,
+            missing_worktrees: Vec::new(),
+            orphaned_pidfiles: Vec::new(),
+            purged_stale_leases: 0,
+        }
+    }
+
+    fn repair_report(status: DoctorRepairStatus) -> VersionRepairReport {
+        VersionRepairReport {
+            status,
+            attempted: true,
+            command: vec![
+                "cargo".into(),
+                "install".into(),
+                "--path".into(),
+                "/tmp/source".into(),
+                "--force".into(),
+                "--locked".into(),
+            ],
+            install_source: Some("/tmp/source".into()),
+            integration_head: Some("bbbbbbbbbbbb".into()),
+            exit_code: Some(if status == DoctorRepairStatus::Pass {
+                0
+            } else {
+                1
+            }),
+            duration_ms: 1,
+            message: "test repair".into(),
+            stdout_tail: Vec::new(),
+            stderr_tail: Vec::new(),
+        }
     }
 }
