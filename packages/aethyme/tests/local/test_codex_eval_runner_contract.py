@@ -271,6 +271,29 @@ def test_runner_invocation_detection_ignores_non_command_text_and_output(tmp_pat
     assert runner._aethyme_invoked(events_file) is False
 
 
+def test_runner_invocation_detection_handles_shell_wrapped_command(tmp_path: Path) -> None:
+    runner = _load_runner()
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text(
+        json.dumps(
+            {
+                "type": "item.started",
+                "item": {
+                    "command": (
+                        "/bin/zsh -lc "
+                        "'/tmp/aethyme/rust/target/release/aethyme explore "
+                        "--repo \"$PWD\" --format answer-json'"
+                    )
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert runner._aethyme_invoked(events_file) is True
+
+
 def test_leakage_gate_checks_selected_files_snippets_command_output_and_final_answer(
     tmp_path: Path,
 ) -> None:
@@ -445,6 +468,47 @@ def test_regression_gate_can_infer_invocation_from_legacy_event_log(tmp_path: Pa
             {
                 "type": "item.completed",
                 "item": {"cmd": ["aethyme", "explore", "--task", "auth"]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    control = {
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "command_output_chars": 100,
+        "artifact_leakage": {"aethyme_path_leaked": False},
+        "reviewer_quality_score": 4.0,
+    }
+    aethyme = {
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "command_output_chars": 100,
+        "artifact_leakage": {"aethyme_path_leaked": False},
+        "event_log_file": str(events_file),
+        "reviewer_quality_score": 4.0,
+    }
+
+    report = gate.compare_runs(control, aethyme)
+
+    assert report["passed"] is True
+    assert report["aethyme_metrics"]["aethyme_invoked"] is True
+
+
+def test_regression_gate_can_infer_shell_wrapped_aethyme_invocation(tmp_path: Path) -> None:
+    gate = _load_gate()
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text(
+        json.dumps(
+            {
+                "type": "item.started",
+                "item": {
+                    "command": (
+                        "/bin/zsh -lc "
+                        "'/tmp/aethyme/rust/target/release/aethyme explore "
+                        "--repo \"$PWD\" --show-observability'"
+                    )
+                },
             }
         )
         + "\n",
