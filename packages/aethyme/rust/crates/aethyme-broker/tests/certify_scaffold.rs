@@ -91,6 +91,10 @@ fn certify_is_always_read_only_and_scaffold_rerun_is_byte_identical() {
     let before = snapshot(tmp.path());
     let report = init::certify(tmp.path()).unwrap();
     assert!(report.certified(), "missing config is warn, not fail");
+    assert_eq!(
+        status_of(&report, "certify.binary-version"),
+        CheckStatus::Pass
+    );
     assert_eq!(status_of(&report, "certify.gates"), CheckStatus::Warn);
     assert_eq!(status_of(&report, "certify.config"), CheckStatus::Warn);
     assert_eq!(snapshot(tmp.path()), before, "certify wrote nothing");

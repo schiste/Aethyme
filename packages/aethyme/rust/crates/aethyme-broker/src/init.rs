@@ -107,6 +107,7 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
         }
     };
     checks.push(check_binary_shadowing());
+    checks.push(check_binary_version(&main_root));
 
     // Document requirements: presence + validity, never generation.
     checks.push(if main_root.join(".aethyme/gates.toml").exists() {
@@ -474,6 +475,23 @@ fn check_binary_shadowing() -> Check {
                 on_path.display()
             ),
         },
+    }
+}
+
+fn check_binary_version(main_root: &Path) -> Check {
+    let report = crate::version::inspect_version(main_root);
+    let status = match report.status {
+        crate::VersionDriftStatus::BehindIntegration
+        | crate::VersionDriftStatus::ReleaseBehindIntegration
+        | crate::VersionDriftStatus::Unknown => CheckStatus::Warn,
+        crate::VersionDriftStatus::Current
+        | crate::VersionDriftStatus::AheadOfIntegration
+        | crate::VersionDriftStatus::NotAethymeSource => CheckStatus::Pass,
+    };
+    Check {
+        id: "certify.binary-version",
+        status,
+        detail: report.message,
     }
 }
 

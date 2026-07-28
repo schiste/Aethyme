@@ -238,6 +238,22 @@ impl GitRepo {
         .ok()
     }
 
+    /// Human-readable description of `rev` using the repository's tags
+    /// when available, falling back to an abbreviated commit.
+    pub fn describe_ref(&self, rev: &str) -> Option<String> {
+        run_git(&self.root, &["describe", "--tags", "--always", rev])
+            .ok()
+            .filter(|value| !value.is_empty())
+    }
+
+    /// Nearest reachable release tag for `rev`, if the repository has
+    /// one. Used only for operator-facing version drift classification.
+    pub fn nearest_tag(&self, rev: &str) -> Option<String> {
+        run_git(&self.root, &["describe", "--tags", "--abbrev=0", rev])
+            .ok()
+            .filter(|value| !value.is_empty())
+    }
+
     /// True when `ancestor` is reachable from `descendant`
     /// (`git merge-base --is-ancestor`).
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
