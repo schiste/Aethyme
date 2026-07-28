@@ -63,6 +63,9 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
 # it truncated commit bodies to subject lines and this gate rejected a
 # correctly-labeled entry: any gate that PARSES git output must force
 # the real binary or it reads CTO fiction.
+# The gate also reads commit bodies, so tree-hash caching is unsound:
+# amending only `Contract decision: ...` keeps the tree unchanged.
 name = "cross-process-contract"
 command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && BASE="$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)" && BODY="$(mktemp)" && git log --format=%B "$BASE"..HEAD > "$BODY" && "$MAIN/packages/aethyme/.venv/bin/python" scripts/check-cross-process-contract.py --base "$BASE" --pr-body "$BODY"'
 cost = 1
+cache = false

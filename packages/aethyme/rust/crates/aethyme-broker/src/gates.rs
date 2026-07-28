@@ -10,6 +10,7 @@
 //! command = "cargo test --workspace"
 //! cost = 2                     # ascending = cheaper first (default 0)
 //! triggers = ["**/*.rs", "Cargo.toml"]   # empty/missing = always runs
+//! cache = true                 # false for gates that read commit metadata
 //! ```
 //!
 //! Selection policy is deliberately over-selecting: a gate with no
@@ -48,6 +49,7 @@ pub struct Gate {
     pub command: String,
     pub cost: i64,
     pub triggers: Vec<String>,
+    pub cache: bool,
     matcher: Option<GlobSet>,
 }
 
@@ -89,6 +91,7 @@ pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
             })?
             .to_string();
         let cost = entry.get("cost").and_then(|v| v.as_integer()).unwrap_or(0);
+        let cache = entry.get("cache").and_then(|v| v.as_bool()).unwrap_or(true);
         let triggers: Vec<String> = entry
             .get("triggers")
             .and_then(|v| v.as_array())
@@ -121,6 +124,7 @@ pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
             command,
             cost,
             triggers,
+            cache,
             matcher,
         });
     }
@@ -356,8 +360,12 @@ fn run_selections(
         let gate = selection.gate;
         // Cache: conclusive result for this exact tree, any session. The
         // hit is recorded as an event so saved execution time is
-        // measurable (kill-criterion accounting).
-        if let Some(hit) = store.cached_gate_result(&gate.name, &tree)? {
+        // measurable (kill-criterion accounting). Gates that inspect
+        // commit metadata must opt out: the tree can stay identical while
+        // commit bodies change.
+        if gate.cache
+            && let Some(hit) = store.cached_gate_result(&gate.name, &tree)?
+        {
             let saved_ms = hit.duration_ms.unwrap_or(0);
             progress.report(&format!(
                 "gate {} cached ({}, saved {}ms)",

@@ -188,6 +188,42 @@ triggers = ["**/*.py"]
 }
 
 #[test]
+fn cache_false_gate_reruns_for_the_same_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "metadata-sensitive"
+command = "echo run >> gate-markers.txt"
+cache = false
+triggers = ["**/*.py"]
+"#,
+    );
+    let gates = aethyme_broker::load_gates(tmp.path()).unwrap();
+    assert!(!gates[0].cache);
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let wt = add_worktree(tmp.path(), "no-cache");
+    let session = broker.adopt(&wt, None).unwrap();
+    std::fs::write(wt.join("src/app.py"), "x = 3\n").unwrap();
+
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert!(!outcomes[0].cached, "first run executes");
+
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert!(
+        !outcomes[0].cached,
+        "cache=false gate must not reuse same-tree results"
+    );
+    let markers = std::fs::read_to_string(wt.join("gate-markers.txt")).unwrap();
+    assert_eq!(markers.lines().count(), 2, "gate command ran twice");
+}
+
+#[test]
 fn cargo_target_dir_infra_errors_are_not_cached_failures() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

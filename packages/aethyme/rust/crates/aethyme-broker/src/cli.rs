@@ -680,6 +680,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                                 serde_json::json!({
                                     "name": g.name, "command": g.command,
                                     "cost": g.cost, "triggers": g.triggers,
+                                    "cache": g.cache,
                                 })
                             })
                             .collect();
@@ -688,7 +689,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         println!("gates.toml OK — {} gate(s), cheap-first:", gates.len());
                         for gate in gates {
                             println!(
-                                "  [{}] {} — {} (triggers: {})",
+                                "  [{}] {} — {} (triggers: {}{})",
                                 gate.cost,
                                 gate.name,
                                 gate.command,
@@ -696,7 +697,8 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                                     "always".to_string()
                                 } else {
                                     gate.triggers.join(", ")
-                                }
+                                },
+                                if gate.cache { "" } else { "; cache: off" }
                             );
                         }
                     }
