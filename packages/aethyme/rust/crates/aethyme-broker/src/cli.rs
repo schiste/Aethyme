@@ -134,10 +134,12 @@ Usage:
       latency (names + numbers only, never task text or paths), gate
       executions vs cache hits with time saved, conflicts caught before
       any gate ran, overlaps warned.
-  aethyme broker doctor [--json]
+  aethyme broker doctor [--fix-version] [--json]
       Health checks: database integrity, sessions whose worktree is
       gone, orphaned gate pidfiles, and stale local CLI builds when run
-      inside the Aethyme source checkout.
+      inside the Aethyme source checkout. --fix-version is explicit and
+      source-checkout-only: when the running CLI is behind integration,
+      reinstall it from a temporary integration worktree.
   aethyme broker quick-test [--chau7] [--json]
       Disposable first-run smoke: creates a temporary git repo, runs init,
       adopt, commit, submit, verifies promotion, and removes the repo.
@@ -276,6 +278,18 @@ mod tests {
         assert!(quick_test < adopt);
         assert!(adopt < submit);
     }
+
+    #[test]
+    fn parse_accepts_explicit_doctor_version_fix() {
+        let args = vec!["doctor".to_string(), "--fix-version".to_string()];
+        let parsed = match super::parse(&args) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("doctor --fix-version should parse"),
+        };
+
+        assert_eq!(parsed.positional, vec!["doctor"]);
+        assert!(parsed.fix_version);
+    }
 }
 
 enum UsageError {
@@ -307,6 +321,7 @@ struct Parsed {
     replace_stale: bool,
     all: bool,
     chau7: bool,
+    fix_version: bool,
 }
 
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
@@ -328,6 +343,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         replace_stale: false,
         all: false,
         chau7: false,
+        fix_version: false,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -347,6 +363,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--reuse" => parsed.reuse = true,
             "--all" => parsed.all = true,
             "--chau7" => parsed.chau7 = true,
+            "--fix-version" => parsed.fix_version = true,
             "--replace-stale" => parsed.replace_stale = true,
             "--kind" => {
                 parsed.kind = Some(
@@ -1634,7 +1651,11 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
         }
         "doctor" => {
             let mut broker = open_broker()?;
-            let report = broker.doctor()?;
+            let report = if parsed.fix_version {
+                broker.doctor_with_version_fix()?
+            } else {
+                broker.doctor()?
+            };
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -1666,6 +1687,32 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         "  integration: {} {integration}",
                         report.version.integration_branch
                     );
+                }
+                if let Some(repair) = &report.version_repair {
+                    println!(
+                        "version repair: {} — {}",
+                        repair.status.as_str(),
+                        repair.message
+                    );
+                    if repair.attempted {
+                        println!("  command: {}", repair.command.join(" "));
+                        println!("  duration: {}ms", repair.duration_ms);
+                        if let Some(code) = repair.exit_code {
+                            println!("  exit: {code}");
+                        }
+                    }
+                    if !repair.stdout_tail.is_empty() {
+                        println!("  stdout tail:");
+                        for line in &repair.stdout_tail {
+                            println!("    {line}");
+                        }
+                    }
+                    if !repair.stderr_tail.is_empty() {
+                        println!("  stderr tail:");
+                        for line in &repair.stderr_tail {
+                            println!("    {line}");
+                        }
+                    }
                 }
                 if report.missing_worktrees.is_empty() {
                     println!("worktrees: all live session worktrees exist");
