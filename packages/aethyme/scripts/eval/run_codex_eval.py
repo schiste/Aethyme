@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,9 +22,13 @@ GENERATED_ARTIFACTS = (
     "AGENTS.md",
     "CLAUDE.md",
 )
-COMMAND_OUTPUT_KEYS = {"output", "stdout", "stderr"}
+COMMAND_OUTPUT_KEYS = {"aggregated_output", "output", "stdout", "stderr"}
 PATH_LEAK_MARKERS = (".aethyme",)
 MAX_REPORTED_LEAKS = 20
+CODEX_EVAL_ENGINE_SOCKET_DIR = Path("/tmp/aethyme-codex-engine-sockets")
+_PATH_LEAK_PATTERNS = {
+    ".aethyme": re.compile(r"(?:^|[\s'\"`({\[<:=!,/])(?:\./)?\.aethyme(?:/|$)")
+}
 
 
 def main() -> int:
@@ -182,6 +187,7 @@ def _codex_env(arm: str, tool_repo: Path) -> dict[str, str]:
                 env.pop(key, None)
         return env
     env["AETHYME_ROOT"] = str(tool_repo)
+    env["AETHYME_ENGINE_SOCKET_DIR"] = str(CODEX_EVAL_ENGINE_SOCKET_DIR)
     return env
 
 
@@ -460,7 +466,14 @@ def _collect_path_leaks(value: Any, source: str, *, path: str = "$") -> list[dic
 
 
 def _matched_path_leak_marker(value: str) -> str | None:
-    return next((marker for marker in PATH_LEAK_MARKERS if marker in value), None)
+    return next(
+        (
+            marker
+            for marker in PATH_LEAK_MARKERS
+            if _PATH_LEAK_PATTERNS[marker].search(value)
+        ),
+        None,
+    )
 
 
 def _leak_excerpt(value: str, marker: str) -> str:

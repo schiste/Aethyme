@@ -67,14 +67,26 @@ def test_aethyme_command_adds_only_the_tool_repo_surface() -> None:
 def test_control_environment_removes_aethyme_leakage(monkeypatch: pytest.MonkeyPatch) -> None:
     runner = _load_runner()
     monkeypatch.setenv("AETHYME_ROOT", "/leaky/tool/root")
+    monkeypatch.setenv("AETHYME_ENGINE_SOCKET_DIR", "/leaky/socket/root")
     monkeypatch.setenv("AETHYMEBENCH_SELF_TOOL", "/leaky/manifest.toml")
     monkeypatch.setenv("AETHYME_EVAL_REPO", "/tmp/Playground/Demo/Demo - Control")
 
     env = runner._codex_env("control", Path("/tmp/Aethyme/packages/aethyme"))
 
     assert "AETHYME_ROOT" not in env
+    assert "AETHYME_ENGINE_SOCKET_DIR" not in env
     assert "AETHYMEBENCH_SELF_TOOL" not in env
     assert "AETHYME_EVAL_REPO" not in env
+
+
+def test_aethyme_environment_sets_short_socket_dir() -> None:
+    runner = _load_runner()
+    tool_repo = Path("/tmp/Aethyme/packages/aethyme")
+
+    env = runner._codex_env("aethyme", tool_repo)
+
+    assert env["AETHYME_ROOT"] == str(tool_repo)
+    assert env["AETHYME_ENGINE_SOCKET_DIR"] == "/tmp/aethyme-codex-engine-sockets"
 
 
 def test_control_contract_rejects_generated_artifact_leakage(
@@ -132,6 +144,7 @@ def test_command_output_metric_reads_event_output_fields(tmp_path: Path) -> None
             {
                 "type": "item.completed",
                 "item": {
+                    "aggregated_output": "xyz",
                     "stdout": "abc",
                     "stderr": "de",
                     "output": "f",
@@ -143,7 +156,7 @@ def test_command_output_metric_reads_event_output_fields(tmp_path: Path) -> None
         encoding="utf-8",
     )
 
-    assert runner._command_output_chars(events_file) == 6
+    assert runner._command_output_chars(events_file) == 9
 
 
 def test_leakage_gate_checks_selected_files_snippets_command_output_and_final_answer(
@@ -203,6 +216,34 @@ def test_leakage_gate_ignores_non_output_event_metadata(tmp_path: Path) -> None:
     leakage = runner._detect_artifact_leakage(
         structured_output={"selected_files": ["src/auth/token.py"], "snippets": []},
         final_output_message="No generated path leaked.",
+        events_file=events_file,
+    )
+
+    assert leakage["aethyme_path_leaked"] is False
+    assert leakage["leaks"] == []
+
+
+def test_leakage_gate_ignores_aethyme_product_domains(tmp_path: Path) -> None:
+    runner = _load_runner()
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "aggregated_output": "external client calls https://mordor.aethyme.com/api",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    leakage = runner._detect_artifact_leakage(
+        structured_output={
+            "evidence": ["external client calls https://mordor.aethyme.com/api"],
+        },
+        final_output_message="Boundary includes https://mordor.aethyme.com/api.",
         events_file=events_file,
     )
 
