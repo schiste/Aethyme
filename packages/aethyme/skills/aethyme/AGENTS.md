@@ -66,8 +66,8 @@ Use typed commit messages.
 Useful commands:
 
 ```bash
-"$AETHYME_ROOT/.venv/bin/python" -m src.cli repo commit-message-template --type fix --scope <scope>
-"$AETHYME_ROOT/.venv/bin/python" -m src.cli repo lint-commit-message .git/COMMIT_EDITMSG
+aethyme repo commit-message-template --type fix --scope <scope>
+aethyme repo lint-commit-message .git/COMMIT_EDITMSG
 ```
 
 ## Verifying this enhancement
@@ -75,7 +75,7 @@ Useful commands:
 To confirm the enhancement is intact in this repository:
 
 ```bash
-"$AETHYME_ROOT/.venv/bin/python" -m src.cli enhance verify --repo "$PWD"
+aethyme enhance verify --repo "$PWD"
 ```
 
 Returns nonzero if any generated root file, Aethyme skill, Aethyme skill

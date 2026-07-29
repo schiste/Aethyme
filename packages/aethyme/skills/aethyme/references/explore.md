@@ -80,7 +80,7 @@ boundary usage questions:
 List the intent catalog only when you need to choose among intents:
 
 ```bash
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli intents --request "<user request>" --format compact-json)
+aethyme intents --request "<user request>" --format compact-json
 ```
 
 ## Retry Rules

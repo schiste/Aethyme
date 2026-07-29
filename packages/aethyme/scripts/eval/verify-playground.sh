@@ -74,10 +74,13 @@ check_root_guidance() {
     grep -q '"$AETHYME_ROOT/rust/target/release/aethyme" explore' "$file" \
         && check_pass "$label points Explore at native aethyme binary" \
         || check_fail "$label missing native Explore quick start"
-    if grep 'src.cli explore' "$file" | grep -Ev 'Do not run|not a valid command|was removed' >/dev/null; then
-        check_fail "$label still contains executable guidance for deleted 'src.cli explore'"
+    # 2026-07-30 (python-retirement Phase 2): the delegated command groups
+    # went native and deployed templates now spell every command `aethyme ...`.
+    # ANY executable `-m src.cli` line is stale, not just explore.
+    if grep -- '-m src.cli' "$file" | grep -Ev 'Do not run|not a valid command|was removed|retired' >/dev/null; then
+        check_fail "$label still contains executable 'python -m src.cli' guidance (templates spell commands 'aethyme ...' since the Phase 2 flip; redeploy)"
     else
-        check_pass "$label has no stale executable Python Explore guidance"
+        check_pass "$label has no stale executable Python CLI guidance"
     fi
 }
 check_reference_file() {
@@ -86,6 +89,13 @@ check_reference_file() {
 
     [[ -f "$file" ]] && check_pass "$label present" || { check_fail "Missing $label"; return; }
     grep -q '{{AETHYME_ROOT}}' "$file" && check_fail "$label has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "$label placeholders resolved"
+    # Same Phase 2 staleness rule as AGENTS/SKILL files: reference
+    # workflows spell commands `aethyme ...`, never `python -m src.cli`.
+    if grep -- '-m src.cli' "$file" | grep -Ev 'Do not run|not a valid command|was removed|retired' >/dev/null; then
+        check_fail "$label still contains executable 'python -m src.cli' guidance (redeploy with current template)"
+    else
+        check_pass "$label has no stale executable Python CLI guidance"
+    fi
 }
 
 # ── Control Repo ─────────────────────────────────────────────────────
@@ -168,13 +178,13 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
         (grep -q '"$AETHYME_BIN" explore' "$SKILL_FILE" || grep -q 'aethyme explore' "$SKILL_FILE") \
             && check_pass "Skill includes current native-explore guidance" \
             || check_fail "Skill missing native explore guidance"
-        # The post-2026-05-08 SKILL.md should NOT mention `src.cli explore` —
-        # that's the deleted Python entry point. Flip the check: if it's
-        # there, the skill is stale.
-        if grep 'src.cli explore' "$SKILL_FILE" | grep -Ev 'Do not run|not a valid command|was removed' >/dev/null; then
-            check_fail "Skill still contains executable guidance for deleted 'src.cli explore' (Python explore_command was hard-deleted 2026-05-08; redeploy with current template)"
+        # The post-2026-05-08 SKILL.md should NOT mention `src.cli explore`,
+        # and since the Phase 2 flip (2026-07-30) no deployed markdown should
+        # carry ANY executable `-m src.cli` line — commands spell `aethyme ...`.
+        if grep -- '-m src.cli' "$SKILL_FILE" | grep -Ev 'Do not run|not a valid command|was removed|retired' >/dev/null; then
+            check_fail "Skill still contains executable 'python -m src.cli' guidance (deleted/delegated Python entry points; redeploy with current template)"
         else
-            check_pass "Skill has no stale executable 'src.cli explore' guidance"
+            check_pass "Skill has no stale executable Python CLI guidance"
         fi
         grep -q 'references/explore.md' "$SKILL_FILE" && check_pass "Skill links Explore reference" || check_fail "Skill missing Explore reference link"
         grep -q 'references/graph-task.md' "$SKILL_FILE" && check_pass "Skill links graph/task reference" || check_fail "Skill missing graph/task reference link"
@@ -192,7 +202,7 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
     [[ -f .claude/skills/aethyme/references/graph-task.md ]] && check_pass "Claude graph/task reference present" || check_fail "Missing Claude graph/task reference"
     [[ -f .claude/skills/aethyme/references/dead-code.md ]] && check_pass "Claude dead-code reference present" || check_fail "Missing Claude dead-code reference"
     if [[ -f "$EXPLORE_REF" ]]; then
-        grep -q 'src.cli intents' "$EXPLORE_REF" && check_pass "Explore reference includes current intent catalog guidance" || check_fail "Explore reference missing intents guidance"
+        grep -q 'aethyme intents' "$EXPLORE_REF" && check_pass "Explore reference includes current intent catalog guidance" || check_fail "Explore reference missing intents guidance"
     fi
     if [[ -f "$GRAPH_REF" ]]; then
         grep -q 'graph callers' "$GRAPH_REF" && check_pass "Graph/task reference includes caller guidance" || check_fail "Graph/task reference missing caller guidance"

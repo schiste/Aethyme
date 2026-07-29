@@ -720,11 +720,11 @@ def _navigation_recipes(aethyme_root: Path) -> list[dict[str, str]]:
         },
         {
             "purpose": "Quick deterministic repo summary",
-            "command": f"(cd \"{aethyme_root}\" && .venv/bin/python -m src.cli repo inspect \"$PWD\" --mode brief --json-output)",
+            "command": "aethyme repo inspect \"$PWD\" --mode brief --json-output",
         },
         {
             "purpose": "Trace likely impact before editing",
-            "command": f"(cd \"{aethyme_root}\" && .venv/bin/python -m src.cli graph callers \"$PWD\" \"<symbol-or-file>\" --json-output)",
+            "command": "aethyme graph callers \"$PWD\" \"<symbol-or-file>\" --json-output",
         },
     ]
 

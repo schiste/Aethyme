@@ -17,12 +17,12 @@ below and load only the relevant reference if the first result is insufficient.
 ```bash
 AETHYME_ROOT="{{AETHYME_ROOT}}"
 AETHYME_BIN="$AETHYME_ROOT/rust/target/release/aethyme"
-AETHYME_PY="$AETHYME_ROOT/.venv/bin/python"
 REPO="$PWD"
 ```
 
-Important: `python -m src.cli explore` is not a valid command. `explore` runs
-only through the native binary.
+Important: `python -m src.cli ...` commands are retired. Graph, task, facts,
+intents, analyze, and enhance all run through the `aethyme` binary; `explore`
+runs only through the native binary.
 
 ## Default Contract
 

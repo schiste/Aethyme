@@ -206,9 +206,9 @@ Example for dead-code:
 cd packages/aethyme
 rust/target/release/aethyme explore --repo /path/to/repo --request "Find public methods in includes/Watchlist with no outside callers" --format answer-json
 rust/target/release/aethyme explore --repo /path/to/repo --intent usage_boundary_query --request "Find public methods in includes/Watchlist with no outside callers" --params '{"scope":"includes/Watchlist","symbol_kind":"public_method","boundary":{"type":"outside_directory","path":"includes/Watchlist"},"search_roots":[],"budget_ms":10000,"max_evidence_per_symbol":5}' --format answer-json --show-observability
-.venv/bin/python -m src.cli facts public-functions --repo /path/to/repo --scope includes/Watchlist --include-methods --json-output
-.venv/bin/python -m src.cli analyze dead-code --repo /path/to/repo --scope includes/Watchlist --boundary outside-directory --include-methods --format eval-json --show-observability
-.venv/bin/python -m src.cli facts function-usage --repo /path/to/repo --target "<function>" --boundary includes/Watchlist --json-output
+aethyme facts public-functions --repo /path/to/repo --scope includes/Watchlist --include-methods --json-output
+aethyme analyze dead-code --repo /path/to/repo --scope includes/Watchlist --boundary outside-directory --include-methods --format eval-json --show-observability
+aethyme facts function-usage --repo /path/to/repo --target "<function>" --boundary includes/Watchlist --json-output
 ```
 
 For `explore --request`, inspect `degraded_reasons`. The default path is
@@ -249,18 +249,20 @@ The task-conditioned prompt can contain navigation context with function/file na
 The Aethyme condition is only meaningful if `.codex/skills/aethyme/SKILL.md`
 advertises current commands. `verify-playground.sh` must pass the skill freshness
 checks before a run. Treat old `$ENGINE unused --repo ...` guidance as stale.
-Also treat executable `python -m src.cli explore ...` guidance as stale:
-Explore is native now and should start with
+Also treat any executable `python -m src.cli ...` guidance as stale: the
+delegated command groups (`query`, `graph`, `task`, `facts`, `intents`,
+`analyze`, most of `repo`) went native during the python-retirement and were
+removed from the Click tree — `python -m src.cli facts ...` now fails. Use
+bare `aethyme ...` from PATH. Explore starts with
 `$AETHYME_ROOT/rust/target/release/aethyme explore --repo ... --request ...
---format answer-json`. The Python CLI remains valid for non-Explore surfaces
-such as `analyze dead-code`, `facts function-usage`, and `intents`.
+--format answer-json`.
 
 ### Aethyme availability vs Aethyme usage
 An Aethyme-enabled repository does not prove that the agent used Aethyme. Every
 run report should inspect the `Aethyme Usage` section:
 - `explore` should usually show whether ambient availability alone was enough.
 - `leverage` should show whether the generic usage card caused real
-  native `aethyme explore` / Python `src.cli intents` calls.
+  native `aethyme explore` / `aethyme intents` calls.
 - `task-conditioned` should be interpreted as context-pack value, not as proof
   that high-level Explore commands were used.
 

@@ -18,7 +18,7 @@ Use overview only when the user asks for repo orientation or the initial
 Explore answer is too broad:
 
 ```bash
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli graph overview "$REPO" --json-output)
+aethyme graph overview "$REPO" --json-output
 ```
 
 ## Graph Navigation
@@ -26,15 +26,15 @@ Explore answer is too broad:
 Inspect a node and nearby graph context:
 
 ```bash
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli graph node "$REPO" "<file-or-symbol>" --json-output)
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli graph expand "$REPO" "<file-or-symbol>" --json-output)
+aethyme graph node "$REPO" "<file-or-symbol>" --json-output
+aethyme graph expand "$REPO" "<file-or-symbol>" --json-output
 ```
 
 Caller/callee evidence:
 
 ```bash
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli graph callers "$REPO" "<function-or-method>" --json-output)
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli graph callees "$REPO" "<function-or-method>" --json-output)
+aethyme graph callers "$REPO" "<function-or-method>" --json-output
+aethyme graph callees "$REPO" "<function-or-method>" --json-output
 ```
 
 Use relation commands to narrow a known node. Do not run every relation command
@@ -47,9 +47,9 @@ scope?", or "what should I inspect next?" and the initial Explore answer is not
 enough.
 
 ```bash
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli task anchors --repo "$REPO" --task "<task>" --json-output)
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli task scope --repo "$REPO" --task "<task>" --json-output)
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli task next --repo "$REPO" --task "<task>" --json-output)
+aethyme task anchors --repo "$REPO" --task "<task>" --json-output
+aethyme task scope --repo "$REPO" --task "<task>" --json-output
+aethyme task next --repo "$REPO" --task "<task>" --json-output
 ```
 
 Read reasons and risks before expanding scope. A file with a clear reason beats
@@ -61,8 +61,8 @@ Use a pack when you need a compact prompt-ready bundle instead of reading many
 files manually.
 
 ```bash
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli task context --repo "$REPO" --task "<task>" --json-output)
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli task pack --repo "$REPO" --task "<task>" --json-output)
+aethyme task context --repo "$REPO" --task "<task>" --json-output
+aethyme task pack --repo "$REPO" --task "<task>" --json-output
 ```
 
 Inspect selected files, selected symbols, snippets, and token estimates. If a

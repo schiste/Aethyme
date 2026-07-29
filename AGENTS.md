@@ -25,7 +25,7 @@ agent sessions working here concurrently:
    `aethyme broker status --json`, then `aethyme broker start --task "<task>"`
    and `cd` into the reported worktree. If you are already in a dedicated
    worktree, use `aethyme broker adopt --task "<task>"` instead.
-   (install once: `cargo install --path packages/aethyme/rust/crates/aethyme-engine`; check with `aethyme --version`).
+   (install once: `cargo install --path packages/aethyme/rust/crates/aethyme-cli` and `cargo install --path packages/aethyme/rust/crates/aethyme-engine` — the router plus its engine-daemon sibling binary; check with `aethyme --version`).
 2. If you know you will touch a shared file before it appears in your diff,
    claim it explicitly: `aethyme broker leases claim <path> --session <id>`.
    Use a trailing `/` for directory leases, and release with

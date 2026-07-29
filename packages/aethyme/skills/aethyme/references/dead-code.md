@@ -31,7 +31,7 @@ Use the direct analyzer when the user explicitly asks for the legacy dead-code
 shape or when Explore asks you to verify with the analyzer:
 
 ```bash
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli analyze dead-code --repo "$REPO" --scope "<directory>" --boundary outside-directory --format eval-json --show-observability)
+aethyme analyze dead-code --repo "$REPO" --scope "<directory>" --boundary outside-directory --format eval-json --show-observability
 ```
 
 Use `--roots "<dir1>,<dir2>"` when the repository is large and the task gives
@@ -42,8 +42,8 @@ likely search roots.
 For harder cases, derive public surface first, then inspect one target's usage:
 
 ```bash
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli facts public-functions --repo "$REPO" --scope "<directory>" --json-output)
-(cd "$AETHYME_ROOT" && "$AETHYME_PY" -m src.cli facts function-usage --repo "$REPO" --target "<function>" --boundary "<directory>" --json-output)
+aethyme facts public-functions --repo "$REPO" --scope "<directory>" --json-output
+aethyme facts function-usage --repo "$REPO" --target "<function>" --boundary "<directory>" --json-output
 ```
 
 ## Status Interpretation

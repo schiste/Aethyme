@@ -1224,7 +1224,7 @@ fn navigation_recipes(aethyme_root: &Path) -> Value {
             (
                 "command",
                 Value::str(format!(
-                    "(cd \"{root}\" && .venv/bin/python -m src.cli repo inspect \"$PWD\" --mode brief --json-output)"
+                    "aethyme repo inspect \"$PWD\" --mode brief --json-output"
                 )),
             ),
         ]),
@@ -1233,7 +1233,7 @@ fn navigation_recipes(aethyme_root: &Path) -> Value {
             (
                 "command",
                 Value::str(format!(
-                    "(cd \"{root}\" && .venv/bin/python -m src.cli graph callers \"$PWD\" \"<symbol-or-file>\" --json-output)"
+                    "aethyme graph callers \"$PWD\" \"<symbol-or-file>\" --json-output"
                 )),
             ),
         ]),
