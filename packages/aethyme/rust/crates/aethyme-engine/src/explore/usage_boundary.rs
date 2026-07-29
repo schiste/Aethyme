@@ -270,6 +270,7 @@ fn build_usage_boundary_response(
         navigation_hints: Vec::new(),
         excluded,
         ambiguous,
+        subsystems: Vec::new(),
         evidence: Evidence {
             answer_count,
             navigation_hint_count: 0,
