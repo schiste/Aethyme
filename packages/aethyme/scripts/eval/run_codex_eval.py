@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -25,11 +26,37 @@ GENERATED_ARTIFACTS = (
 )
 COMMAND_OUTPUT_KEYS = {"aggregated_output", "output", "stdout", "stderr"}
 COMMAND_FIELD_KEYS = {"cmd", "command"}
-PATH_LEAK_MARKERS = (".aethyme",)
+REQUIRED_PLAYGROUND_FIXTURES = {
+    "django_backend_auth": "Django backend-only auth",
+    "edge_proxy_backend_auth": "edge proxy + backend auth",
+    "oidc_session_auth": "OIDC + session auth",
+    "webhook_secret_auth": "webhook secret auth",
+    "queue_job_behavior": "queue/job behavior",
+    "config_owned_middleware_behavior": "config-owned middleware behavior",
+    "frontend_backend_route_behavior": "frontend-to-backend route behavior",
+}
+GENERATED_ARTIFACT_LEAK_MARKERS = (
+    ".aethyme",
+    ".chau7",
+    ".codex",
+    ".claude",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "graph_store.redb",
+)
+PATH_LEAK_MARKERS = GENERATED_ARTIFACT_LEAK_MARKERS
 MAX_REPORTED_LEAKS = 20
 CODEX_EVAL_ENGINE_SOCKET_DIR = Path("/tmp/aethyme-codex-engine-sockets")
+_PATH_PREFIX = r"(?:^|[\s'\"`({\[<:=!,/])(?:\./)?"
+_PATH_SUFFIX = r"(?:/|$|[\s'\"`)}\]>:;,.])"
 _PATH_LEAK_PATTERNS = {
-    ".aethyme": re.compile(r"(?:^|[\s'\"`({\[<:=!,/])(?:\./)?\.aethyme(?:/|$)")
+    ".aethyme": re.compile(_PATH_PREFIX + r"\.aethyme" + _PATH_SUFFIX),
+    ".chau7": re.compile(_PATH_PREFIX + r"\.chau7" + _PATH_SUFFIX),
+    ".codex": re.compile(_PATH_PREFIX + r"\.codex" + _PATH_SUFFIX),
+    ".claude": re.compile(_PATH_PREFIX + r"\.claude" + _PATH_SUFFIX),
+    "AGENTS.md": re.compile(_PATH_PREFIX + r"AGENTS\.md" + _PATH_SUFFIX),
+    "CLAUDE.md": re.compile(_PATH_PREFIX + r"CLAUDE\.md" + _PATH_SUFFIX),
+    "graph_store.redb": re.compile(_PATH_PREFIX + r"graph_store\.redb" + _PATH_SUFFIX),
 }
 
 
@@ -44,7 +71,15 @@ def main() -> int:
 
     try:
         arm = _resolve_eval_arm()
-        contract = _enforce_eval_contract(repo_path, tool_repo, arm)
+        fixture_id = _resolve_fixture_id()
+        task_class = _resolve_task_class()
+        contract = _enforce_eval_contract(
+            repo_path,
+            tool_repo,
+            arm,
+            fixture_id=fixture_id,
+            task_class=task_class,
+        )
         temp_root = _resolve_artifact_dir(arm)
         events_file = temp_root / "events.jsonl"
         stderr_file = temp_root / "stderr.log"
@@ -93,6 +128,8 @@ def main() -> int:
         )
         payload = {
             "arm": arm,
+            "fixture_id": fixture_id,
+            "task_class": task_class,
             "artifact_dir": str(temp_root),
             "event_log_file": str(events_file),
             "stderr_file": str(stderr_file),
@@ -107,6 +144,10 @@ def main() -> int:
             "retries": usage.get("retries"),
             "review_burden": None,
             "final_output_message": final_output_message or error_message,
+            "output_fingerprint": _output_fingerprint(
+                structured_output,
+                final_output_message or error_message,
+            ),
             "structured_output": structured_output,
             "runner_settings": {
                 "codex_exec": True,
@@ -127,15 +168,16 @@ def main() -> int:
             event_log_chars=len(result.stdout),
             artifact_leakage=artifact_leakage,
             events_file=events_file,
+            final_output_message=final_output_message or error_message,
         )
         print(json.dumps(payload))
         if result.stderr:
             sys.stderr.write(result.stderr)
         if result.returncode != 0 and error_message:
             sys.stderr.write(f"\nCodex error: {error_message}\n")
-        if artifact_leakage["aethyme_path_leaked"]:
+        if artifact_leakage["generated_artifact_leaked"]:
             sys.stderr.write(
-                "\nGenerated artifact leakage detected: .aethyme path appeared in "
+                "\nGenerated artifact leakage detected: Aethyme scaffolding appeared in "
                 "structured output, command output, or final answer.\n"
             )
             return 3
@@ -157,6 +199,31 @@ def _resolve_eval_arm() -> str:
     if arm not in {"control", "aethyme"}:
         raise ContractError("AETHYME_EVAL_ARM must be 'control' or 'aethyme'")
     return arm
+
+
+def _resolve_fixture_id() -> str | None:
+    raw_fixture = os.environ.get("AETHYME_EVAL_FIXTURE_ID") or os.environ.get(
+        "AETHYME_EVAL_FIXTURE"
+    )
+    if not raw_fixture:
+        return None
+    fixture_id = _normalize_fixture_id(raw_fixture)
+    if fixture_id not in REQUIRED_PLAYGROUND_FIXTURES:
+        known = ", ".join(sorted(REQUIRED_PLAYGROUND_FIXTURES))
+        raise ContractError(f"Unknown playground eval fixture '{raw_fixture}' (known: {known})")
+    return fixture_id
+
+
+def _resolve_task_class() -> str | None:
+    raw_task_class = os.environ.get("AETHYME_EVAL_TASK_CLASS")
+    if raw_task_class is None:
+        return None
+    task_class = raw_task_class.strip()
+    return task_class or None
+
+
+def _normalize_fixture_id(value: str) -> str:
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", value.lower())).strip("_")
 
 
 def _build_codex_command(
@@ -212,7 +279,14 @@ def _resolve_artifact_dir(arm: str) -> Path:
     return Path(tempfile.mkdtemp(prefix=f"aethyme-codex-{arm}-eval-")).resolve()
 
 
-def _enforce_eval_contract(repo_path: Path, tool_repo: Path, arm: str) -> dict[str, Any]:
+def _enforce_eval_contract(
+    repo_path: Path,
+    tool_repo: Path,
+    arm: str,
+    *,
+    fixture_id: str | None = None,
+    task_class: str | None = None,
+) -> dict[str, Any]:
     _assert_playground_repo(repo_path, tool_repo)
     contract: dict[str, Any] = {
         "playground_repo": True,
@@ -220,6 +294,11 @@ def _enforce_eval_contract(repo_path: Path, tool_repo: Path, arm: str) -> dict[s
         "arm": arm,
         "repo_path": str(repo_path),
     }
+    if fixture_id is not None:
+        contract["fixture_id"] = fixture_id
+        contract["fixture_name"] = REQUIRED_PLAYGROUND_FIXTURES[fixture_id]
+    if task_class is not None:
+        contract["task_class"] = task_class
     if arm == "control":
         _assert_control_repo_clean(repo_path)
         contract.update(
@@ -392,8 +471,9 @@ def _detect_artifact_leakage(
     leaks.extend(_collect_command_output_path_leaks(events_file))
 
     return {
+        "generated_artifact_leaked": bool(leaks),
         "aethyme_path_leaked": bool(leaks),
-        "markers": list(PATH_LEAK_MARKERS),
+        "markers": list(GENERATED_ARTIFACT_LEAK_MARKERS),
         "checked_surfaces": [
             "structured_output",
             "final_output_message",
@@ -408,6 +488,7 @@ def _regression_metrics(
     *,
     arm: str,
     structured_output: dict[str, Any] | None,
+    final_output_message: str | None,
     usage: dict[str, int | None],
     command_output_chars: int,
     event_log_chars: int,
@@ -420,10 +501,26 @@ def _regression_metrics(
         "selected_file_count": _selected_file_count(structured_output),
         "snippet_count": _snippet_count(structured_output),
         "command_output_chars": command_output_chars,
+        "generated_artifact_leaked": bool(artifact_leakage.get("generated_artifact_leaked")),
         "aethyme_path_leaked": bool(artifact_leakage.get("aethyme_path_leaked")),
         "aethyme_invoked": _aethyme_invoked(events_file),
+        "output_fingerprint": _output_fingerprint(structured_output, final_output_message),
         "arm": arm,
     }
+
+
+def _output_fingerprint(
+    structured_output: dict[str, Any] | None,
+    final_output_message: str | None,
+) -> str:
+    surface: Any = structured_output if structured_output is not None else final_output_message or ""
+    encoded = json.dumps(
+        surface,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _token_estimate(usage: dict[str, int | None], event_log_chars: int) -> int:
@@ -579,9 +676,6 @@ def _collect_command_output_path_leaks_from_value(
 
 def _collect_path_leaks(value: Any, source: str, *, path: str = "$") -> list[dict[str, str]]:
     if isinstance(value, str):
-        marker = _matched_path_leak_marker(value)
-        if marker is None:
-            return []
         return [
             {
                 "source": source,
@@ -589,6 +683,7 @@ def _collect_path_leaks(value: Any, source: str, *, path: str = "$") -> list[dic
                 "marker": marker,
                 "excerpt": _leak_excerpt(value, marker),
             }
+            for marker in _matched_path_leak_markers(value)
         ]
     if isinstance(value, list):
         leaks: list[dict[str, str]] = []
@@ -603,15 +698,12 @@ def _collect_path_leaks(value: Any, source: str, *, path: str = "$") -> list[dic
     return []
 
 
-def _matched_path_leak_marker(value: str) -> str | None:
-    return next(
-        (
-            marker
-            for marker in PATH_LEAK_MARKERS
-            if _PATH_LEAK_PATTERNS[marker].search(value)
-        ),
-        None,
-    )
+def _matched_path_leak_markers(value: str) -> list[str]:
+    return [
+        marker
+        for marker in PATH_LEAK_MARKERS
+        if _PATH_LEAK_PATTERNS[marker].search(value)
+    ]
 
 
 def _leak_excerpt(value: str, marker: str) -> str:
