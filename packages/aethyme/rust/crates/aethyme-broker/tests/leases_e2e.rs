@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::Broker;
+use aethyme_broker::{Broker, BrokerOpError};
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -140,6 +140,120 @@ fn explicit_directory_claim_overlaps_other_sessions_files() {
         overlaps.is_empty(),
         "config-ignored prefix keeps implicit leases (and thus overlaps) out"
     );
+}
+
+#[test]
+fn explicit_claim_blocks_paths_owned_by_another_live_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let wt_a = add_worktree(tmp.path(), "a");
+    let wt_b = add_worktree(tmp.path(), "b");
+    let session_a = broker.adopt(&wt_a, None).unwrap();
+    let _session_b = broker.adopt(&wt_b, None).unwrap();
+
+    std::fs::write(wt_b.join("src/auth.py"), "owned elsewhere\n").unwrap();
+    let err = broker.claim_lease(session_a.id, "src/", None).unwrap_err();
+
+    assert!(matches!(
+        err,
+        BrokerOpError::LeaseClaimConflict {
+            blocker_count: 1,
+            ..
+        }
+    ));
+    assert!(err.to_string().contains("overlaps 1 active lease"));
+}
+
+#[test]
+fn guarded_exec_requires_explicit_lease_for_new_dirty_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let wt = add_worktree(tmp.path(), "guarded");
+    let session = broker.adopt(&wt, None).unwrap();
+    broker.claim_lease(session.id, "src/auth.py", None).unwrap();
+
+    let allowed = broker
+        .guarded_exec(
+            session.id,
+            &[
+                "sh".into(),
+                "-c".into(),
+                "printf owned > src/auth.py".into(),
+            ],
+        )
+        .unwrap();
+    assert!(allowed.ok, "{allowed:?}");
+    assert_eq!(allowed.touched_paths, vec!["src/auth.py"]);
+
+    let blocked = broker
+        .guarded_exec(
+            session.id,
+            &[
+                "sh".into(),
+                "-c".into(),
+                "printf outside > src/other.py".into(),
+            ],
+        )
+        .unwrap();
+    assert!(!blocked.ok, "{blocked:?}");
+    assert_eq!(blocked.outside_lease_paths, vec!["src/other.py"]);
+}
+
+#[test]
+fn submit_blocks_paths_explicitly_owned_by_another_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let wt_a = add_worktree(tmp.path(), "owner");
+    let wt_b = add_worktree(tmp.path(), "intruder");
+    let session_a = broker.adopt(&wt_a, None).unwrap();
+    let session_b = broker.adopt(&wt_b, None).unwrap();
+    broker
+        .claim_lease(session_a.id, "src/auth.py", None)
+        .unwrap();
+
+    std::fs::write(wt_b.join("src/auth.py"), "intruder\n").unwrap();
+    sh(&wt_b, &["add", "-A"]);
+    sh(&wt_b, &["commit", "-qm", "intruder"]);
+
+    let err = broker.submit(session_b.id).unwrap_err();
+    let BrokerOpError::OwnershipViolation { report, .. } = err else {
+        panic!("expected ownership violation");
+    };
+    assert_eq!(report.conflicting_leases.len(), 1);
+    assert_eq!(report.conflicting_leases[0].session_id, session_a.id);
+    assert_eq!(report.conflicting_leases[0].path, "src/auth.py");
+}
+
+#[test]
+fn adoption_time_foreign_file_blocks_submit_until_explicitly_claimed() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let wt = add_worktree(tmp.path(), "foreign");
+    std::fs::write(wt.join("foreign.txt"), "preexisting\n").unwrap();
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&wt, None).unwrap();
+    assert_eq!(
+        broker.store().session_foreign_files(session.id).unwrap(),
+        vec!["foreign.txt"]
+    );
+
+    sh(&wt, &["add", "foreign.txt"]);
+    sh(&wt, &["commit", "-qm", "commit foreign"]);
+    let err = broker.submit(session.id).unwrap_err();
+    let BrokerOpError::OwnershipViolation { report, .. } = err else {
+        panic!("expected ownership violation");
+    };
+    assert_eq!(report.foreign_paths, vec!["foreign.txt"]);
+
+    broker.claim_lease(session.id, "foreign.txt", None).unwrap();
+    assert!(broker.submit(session.id).unwrap().promoted);
 }
 
 // ── #41: leases derive from merge-base, self-healing after rebases ─────

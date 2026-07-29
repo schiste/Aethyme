@@ -12,7 +12,7 @@ use crate::error::BrokerError;
 use crate::git::{GitError, GitRepo};
 use crate::store::BrokerStore;
 use crate::types::{
-    MergeQueueEntry, MergeStatus, NewSession, Session, SessionOrigin, SessionStatus,
+    LeaseKind, MergeQueueEntry, MergeStatus, NewSession, Session, SessionOrigin, SessionStatus,
 };
 use crate::version::{VersionDriftReport, VersionDriftStatus};
 
@@ -45,6 +45,22 @@ pub enum BrokerOpError {
         command: String,
         source: std::io::Error,
     },
+    #[error(
+        "lease claim for {path} by session {session_id} overlaps {blocker_count} active lease(s) held by other sessions"
+    )]
+    LeaseClaimConflict {
+        session_id: i64,
+        path: String,
+        blocker_count: usize,
+        blockers: Vec<LeaseBlocker>,
+    },
+    #[error("{summary}")]
+    OwnershipViolation {
+        summary: String,
+        report: Box<OwnershipAuditReport>,
+    },
+    #[error("guarded exec requires a command after --")]
+    MissingExecCommand,
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -222,6 +238,80 @@ pub struct IntegrationMovementNotice {
     pub live_sessions: Vec<IntegrationLiveSession>,
     pub message: String,
     pub commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LeaseBlocker {
+    pub session_id: i64,
+    pub path: String,
+    pub kind: LeaseKind,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LeaseClaimReport {
+    pub session_id: i64,
+    pub path: String,
+    pub accepted: bool,
+    pub blockers: Vec<LeaseBlocker>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OwnershipAuditReport {
+    pub session_id: i64,
+    pub base_commit: String,
+    pub head_commit: String,
+    pub changed_paths: Vec<String>,
+    pub missing_lease_paths: Vec<String>,
+    pub conflicting_leases: Vec<LeaseBlocker>,
+    pub foreign_paths: Vec<String>,
+    pub ok: bool,
+}
+
+impl OwnershipAuditReport {
+    pub fn failure_summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.missing_lease_paths.is_empty() {
+            parts.push(format!(
+                "{} path(s) without a session lease",
+                self.missing_lease_paths.len()
+            ));
+        }
+        if !self.conflicting_leases.is_empty() {
+            parts.push(format!(
+                "{} overlapping lease(s) held by other sessions",
+                self.conflicting_leases.len()
+            ));
+        }
+        if !self.foreign_paths.is_empty() {
+            parts.push(format!(
+                "{} adoption-time foreign path(s)",
+                self.foreign_paths.len()
+            ));
+        }
+        if parts.is_empty() {
+            format!("ownership audit failed for session {}", self.session_id)
+        } else {
+            format!(
+                "ownership audit failed for session {}: {}",
+                self.session_id,
+                parts.join(", ")
+            )
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GuardedExecReport {
+    pub session_id: i64,
+    pub command: Vec<String>,
+    pub exit_code: Option<i32>,
+    pub command_success: bool,
+    pub before_dirty_paths: Vec<String>,
+    pub after_dirty_paths: Vec<String>,
+    pub touched_paths: Vec<String>,
+    pub outside_lease_paths: Vec<String>,
+    pub foreign_paths: Vec<String>,
+    pub ok: bool,
 }
 
 /// Result of `broker integration wait-stable`.
@@ -525,6 +615,7 @@ impl Broker {
         let branch = checkout.current_branch()?;
         let diff_base = checkout.head_commit().ok();
         let worktree_path = checkout.root().to_string_lossy().into_owned();
+        let foreign_files = checkout.untracked_paths()?;
 
         if let Some(existing) = self.store.session_for_worktree(&worktree_path)? {
             match mode {
@@ -532,11 +623,12 @@ impl Broker {
                     // Follow-up task on the same worktree: same identity,
                     // fresh baseline so leases and submit scope reflect
                     // work from *now*, not the previous task.
-                    return Ok(self.store.reuse_session(
-                        existing.id,
-                        task,
-                        diff_base.as_deref(),
-                    )?);
+                    let session =
+                        self.store
+                            .reuse_session(existing.id, task, diff_base.as_deref())?;
+                    self.store
+                        .set_session_foreign_files(session.id, &foreign_files)?;
+                    return Ok(session);
                 }
                 AdoptMode::ReplaceStale => {
                     // State-only close (never touches the filesystem),
@@ -568,6 +660,8 @@ impl Broker {
             command: None,
             log_path: None,
         })?;
+        self.store
+            .set_session_foreign_files(session.id, &foreign_files)?;
         Ok(session)
     }
 
@@ -582,16 +676,32 @@ impl Broker {
 
     // ── start-agent (spawn convenience) ───────────────────────────────
 
+    /// Create a broker-owned worktree + branch for `task` without
+    /// spawning a process. This is the preferred entrypoint for agents
+    /// already running in an existing shell: the caller can `cd` into the
+    /// returned path and continue with an isolated index and checkout.
+    pub fn start_worktree(&mut self, task: &str) -> Result<Session, BrokerOpError> {
+        let (_slug, branch, base, worktree) = self.create_session_worktree(task)?;
+        let session = self.store.register_session(&NewSession {
+            worktree_path: worktree.root().to_string_lossy().into_owned(),
+            branch,
+            origin: SessionOrigin::Spawned,
+            task: Some(task.to_string()),
+            diff_base: Some(base),
+            pid: None,
+            command: None,
+            log_path: None,
+        })?;
+        self.store.set_session_foreign_files(session.id, &[])?;
+        Ok(session)
+    }
+
     /// Create a worktree + branch for `task` and spawn `command` in it via
     /// `sh -c` with stdout/stderr teed to a log file. Returns the session;
     /// the child runs detached (the broker never owns the process beyond
     /// recording its PID).
     pub fn start_agent(&mut self, task: &str, command: &str) -> Result<Session, BrokerOpError> {
-        let slug = slugify(task);
-        let worktree_path = self.main_root.join(".aethyme/worktrees").join(&slug);
-        let branch = format!("agent/{slug}");
-        let base = self.repo.head_commit()?;
-        let worktree = self.repo.worktree_add(&worktree_path, &branch, &base)?;
+        let (slug, branch, base, worktree) = self.create_session_worktree(task)?;
 
         let log_dir = self.main_root.join(".aethyme/logs");
         std::fs::create_dir_all(&log_dir).map_err(|source| BrokerError::Io {
@@ -631,7 +741,37 @@ impl Broker {
             command: Some(command.to_string()),
             log_path: Some(log_path.to_string_lossy().into_owned()),
         })?;
+        self.store.set_session_foreign_files(session.id, &[])?;
         Ok(session)
+    }
+
+    fn create_session_worktree(
+        &mut self,
+        task: &str,
+    ) -> Result<(String, String, String, GitRepo), BrokerOpError> {
+        let slug = self.next_worktree_slug(task);
+        let worktree_path = self.main_root.join(".aethyme/worktrees").join(&slug);
+        let branch = format!("agent/{slug}");
+        let base = self.repo.head_commit()?;
+        let worktree = self.repo.worktree_add(&worktree_path, &branch, &base)?;
+        Ok((slug, branch, base, worktree))
+    }
+
+    fn next_worktree_slug(&self, task: &str) -> String {
+        let base = slugify(task);
+        for attempt in 0..1000 {
+            let slug = if attempt == 0 {
+                base.clone()
+            } else {
+                format!("{base}-{}", attempt + 1)
+            };
+            let branch = format!("refs/heads/agent/{slug}");
+            let worktree_path = self.main_root.join(".aethyme/worktrees").join(&slug);
+            if !worktree_path.exists() && self.repo.resolve_ref(&branch).is_none() {
+                return slug;
+            }
+        }
+        format!("{base}-{}", now_ms())
     }
 
     // ── agents (liveness) ─────────────────────────────────────────────
@@ -748,6 +888,245 @@ impl Broker {
             }
         }
         Ok(after)
+    }
+
+    /// Claim an explicit write lease after checking active ownership from
+    /// other live sessions. Implicit leases remain advisory conflict
+    /// telemetry; explicit leases are the boundary used by guarded exec.
+    pub fn claim_lease(
+        &mut self,
+        session_id: i64,
+        path: &str,
+        ttl_ms: Option<i64>,
+    ) -> Result<LeaseClaimReport, BrokerOpError> {
+        self.store.session(session_id)?;
+        self.refresh_leases()?;
+        let blockers = self.lease_blockers(session_id, path, false)?;
+        if !blockers.is_empty() {
+            return Err(BrokerOpError::LeaseClaimConflict {
+                session_id,
+                path: path.to_string(),
+                blocker_count: blockers.len(),
+                blockers,
+            });
+        }
+        self.store.claim_lease(session_id, path, ttl_ms)?;
+        Ok(LeaseClaimReport {
+            session_id,
+            path: path.to_string(),
+            accepted: true,
+            blockers: Vec::new(),
+        })
+    }
+
+    /// Preflight a session's committed diff before submit. Every
+    /// non-ignored changed path must be owned by this session, must not
+    /// overlap another live session's lease, and must not be an
+    /// adoption-time foreign untracked path unless explicitly claimed.
+    pub fn audit_submit_ownership(
+        &mut self,
+        session_id: i64,
+    ) -> Result<OwnershipAuditReport, BrokerOpError> {
+        let session = self.store.session(session_id)?;
+        let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+        let head = checkout.head_commit()?;
+        let base = self
+            .session_change_base(&checkout)
+            .or(session.diff_base)
+            .unwrap_or_else(|| "HEAD".to_string());
+        self.audit_ownership_for_paths(session_id, &base, &head, true)
+    }
+
+    fn audit_ownership_for_paths(
+        &mut self,
+        session_id: i64,
+        base: &str,
+        head: &str,
+        allow_implicit: bool,
+    ) -> Result<OwnershipAuditReport, BrokerOpError> {
+        self.refresh_leases()?;
+        let changed = self.repo.changed_between(base, head)?;
+        self.audit_paths(session_id, base, head, changed, allow_implicit)
+    }
+
+    fn audit_paths(
+        &mut self,
+        session_id: i64,
+        base: &str,
+        head: &str,
+        mut changed: Vec<String>,
+        allow_implicit: bool,
+    ) -> Result<OwnershipAuditReport, BrokerOpError> {
+        use crate::leases::{LeaseIgnoreRules, paths_overlap};
+
+        changed.sort();
+        changed.dedup();
+        let rules = LeaseIgnoreRules::load(&self.main_root);
+        let leases = self.store.active_leases()?;
+        let foreign = self.store.session_foreign_files(session_id)?;
+        let mut missing_lease_paths = Vec::new();
+        let mut conflicting_leases = Vec::new();
+        let mut foreign_paths = Vec::new();
+
+        for path in changed.iter().filter(|path| !rules.is_ignored(path)) {
+            let owns = leases.iter().any(|lease| {
+                lease.session_id == session_id
+                    && (allow_implicit || lease.kind == LeaseKind::Explicit)
+                    && paths_overlap(&lease.path, path)
+            });
+            if !owns {
+                missing_lease_paths.push(path.clone());
+            }
+
+            for blocker in leases
+                .iter()
+                .filter(|lease| lease.session_id != session_id)
+                .filter(|lease| lease.kind == LeaseKind::Explicit)
+                .filter(|lease| paths_overlap(&lease.path, path))
+            {
+                conflicting_leases.push(LeaseBlocker {
+                    session_id: blocker.session_id,
+                    path: blocker.path.clone(),
+                    kind: blocker.kind,
+                });
+            }
+
+            let explicitly_claimed = leases.iter().any(|lease| {
+                lease.session_id == session_id
+                    && lease.kind == LeaseKind::Explicit
+                    && paths_overlap(&lease.path, path)
+            });
+            if !explicitly_claimed
+                && foreign
+                    .iter()
+                    .any(|foreign_path| paths_overlap(foreign_path, path))
+            {
+                foreign_paths.push(path.clone());
+            }
+        }
+
+        conflicting_leases.sort_by(|a, b| {
+            (a.session_id, a.path.as_str(), a.kind.as_str()).cmp(&(
+                b.session_id,
+                b.path.as_str(),
+                b.kind.as_str(),
+            ))
+        });
+        conflicting_leases
+            .dedup_by(|a, b| a.session_id == b.session_id && a.path == b.path && a.kind == b.kind);
+        missing_lease_paths.sort();
+        missing_lease_paths.dedup();
+        foreign_paths.sort();
+        foreign_paths.dedup();
+        let ok = missing_lease_paths.is_empty()
+            && conflicting_leases.is_empty()
+            && foreign_paths.is_empty();
+        Ok(OwnershipAuditReport {
+            session_id,
+            base_commit: base.to_string(),
+            head_commit: head.to_string(),
+            changed_paths: changed,
+            missing_lease_paths,
+            conflicting_leases,
+            foreign_paths,
+            ok,
+        })
+    }
+
+    fn lease_blockers(
+        &self,
+        session_id: i64,
+        path: &str,
+        explicit_only: bool,
+    ) -> Result<Vec<LeaseBlocker>, BrokerOpError> {
+        use crate::leases::paths_overlap;
+
+        let mut blockers: Vec<LeaseBlocker> = self
+            .store
+            .active_leases()?
+            .into_iter()
+            .filter(|lease| lease.session_id != session_id)
+            .filter(|lease| !explicit_only || lease.kind == LeaseKind::Explicit)
+            .filter(|lease| paths_overlap(&lease.path, path))
+            .map(|lease| LeaseBlocker {
+                session_id: lease.session_id,
+                path: lease.path,
+                kind: lease.kind,
+            })
+            .collect();
+        blockers.sort_by(|a, b| {
+            (a.session_id, a.path.as_str(), a.kind.as_str()).cmp(&(
+                b.session_id,
+                b.path.as_str(),
+                b.kind.as_str(),
+            ))
+        });
+        blockers
+            .dedup_by(|a, b| a.session_id == b.session_id && a.path == b.path && a.kind == b.kind);
+        Ok(blockers)
+    }
+
+    /// Run a command inside a session worktree and fail the guard when it
+    /// leaves new dirty paths outside explicit leases. The command's own
+    /// exit status is preserved in the report; guard failure is separate
+    /// so callers can distinguish test failure from ownership failure.
+    pub fn guarded_exec(
+        &mut self,
+        session_id: i64,
+        command: &[String],
+    ) -> Result<GuardedExecReport, BrokerOpError> {
+        if command.is_empty() {
+            return Err(BrokerOpError::MissingExecCommand);
+        }
+        let session = self.store.session(session_id)?;
+        self.refresh_leases()?;
+        let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+        let mut before_dirty = checkout.dirty_paths()?;
+        before_dirty.sort();
+        before_dirty.dedup();
+
+        let status = Command::new(&command[0])
+            .args(&command[1..])
+            .current_dir(&session.worktree_path)
+            .env("AETHYME_BROKER_SESSION_ID", session_id.to_string())
+            .env("AETHYME_GATE_WORKER_ID", format!("s{session_id}-exec"))
+            .env("AETHYME_TEST_DB_SUFFIX", format!("s{session_id}-exec"))
+            .status()
+            .map_err(|source| BrokerOpError::Spawn {
+                command: command.join(" "),
+                source,
+            })?;
+
+        let mut after_dirty = checkout.dirty_paths()?;
+        after_dirty.sort();
+        after_dirty.dedup();
+        let before_set: std::collections::BTreeSet<String> = before_dirty.iter().cloned().collect();
+        let touched: Vec<String> = after_dirty
+            .iter()
+            .filter(|path| !before_set.contains(*path))
+            .cloned()
+            .collect();
+        let audit = self.audit_paths(
+            session_id,
+            "GUARDED_EXEC_BEFORE",
+            "GUARDED_EXEC_AFTER",
+            touched.clone(),
+            false,
+        )?;
+        let command_success = status.success();
+        let ok = command_success && audit.ok;
+        Ok(GuardedExecReport {
+            session_id,
+            command: command.to_vec(),
+            exit_code: status.code(),
+            command_success,
+            before_dirty_paths: before_dirty,
+            after_dirty_paths: after_dirty,
+            touched_paths: touched,
+            outside_lease_paths: audit.missing_lease_paths,
+            foreign_paths: audit.foreign_paths,
+            ok,
+        })
     }
 
     /// Detect live-session leases that overlap already-promoted work on

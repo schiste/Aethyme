@@ -116,6 +116,13 @@ impl Broker {
         let session = self.store().session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let head = checkout.head_commit()?;
+        let ownership = self.audit_submit_ownership(session_id)?;
+        if !ownership.ok {
+            return Err(BrokerOpError::OwnershipViolation {
+                summary: ownership.failure_summary(),
+                report: Box::new(ownership),
+            });
+        }
         let (_branch, base) = self.integration_head()?;
 
         let entry = self.store().submit(session_id, &head, &base)?;

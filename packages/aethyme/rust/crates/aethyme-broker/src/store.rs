@@ -282,6 +282,10 @@ impl BrokerStore {
         // ~25 sessions observed in the 2026-07-17 dogfood database).
         if status == SessionStatus::Cleaned {
             tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
+            tx.execute(
+                "DELETE FROM session_foreign_files WHERE session_id = ?1",
+                [id],
+            )?;
         }
         insert_event(
             &tx,
@@ -294,6 +298,49 @@ impl BrokerStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Replace the adoption-time foreign-file snapshot for a session.
+    /// These are files that were already untracked when the session began,
+    /// so later submit/exec checks can distinguish "mine" from inherited
+    /// worktree clutter.
+    pub fn set_session_foreign_files(
+        &mut self,
+        session_id: i64,
+        paths: &[String],
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM session_foreign_files WHERE session_id = ?1",
+            [session_id],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO session_foreign_files (session_id, path, created_at)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for path in paths {
+                stmt.execute(params![session_id, path, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Adoption-time untracked paths recorded for one session.
+    pub fn session_foreign_files(&self, session_id: i64) -> Result<Vec<String>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path FROM session_foreign_files
+             WHERE session_id = ?1
+             ORDER BY path",
+        )?;
+        let rows = stmt.query_map([session_id], |row| row.get::<_, String>(0))?;
+        let mut paths = Vec::new();
+        for row in rows {
+            paths.push(row?);
+        }
+        Ok(paths)
     }
 
     // ── leases ────────────────────────────────────────────────────────

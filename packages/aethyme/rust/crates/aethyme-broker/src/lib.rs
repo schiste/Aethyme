@@ -39,8 +39,9 @@ mod version;
 
 pub use broker::{
     AdoptMode, AgentView, Broker, BrokerOpError, DoctorRepairStatus, DoctorReport, FinishReport,
-    FinishStatus, IntegrationLiveSession, IntegrationMovementNotice, IntegrationNextAction,
-    IntegrationStabilityReport, IntegrationStatusView, PromotedConflict, PromotedIntegrationEntry,
+    FinishStatus, GuardedExecReport, IntegrationLiveSession, IntegrationMovementNotice,
+    IntegrationNextAction, IntegrationStabilityReport, IntegrationStatusView, LeaseBlocker,
+    LeaseClaimReport, OwnershipAuditReport, PromotedConflict, PromotedIntegrationEntry,
     RepairAction, RepairGateSelection, RepairReport, RepairSource, SemanticGateAdvice,
     SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus, StatusAdvice,
     StatusAdviceSeverity, StatusIntegrationRelation, StatusSummary, StatusView,

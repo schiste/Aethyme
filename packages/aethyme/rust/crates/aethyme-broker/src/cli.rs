@@ -49,6 +49,10 @@ Usage:
       dirty WIP and no committed work waiting for submit/promotion. If it
       is not safe, prints the next command; suggests cleanup only when
       cleanup would pass without --force.
+  aethyme broker start --task <text> [--json]
+      Create a broker-managed worktree + branch and register a session,
+      but do not spawn a process. Prefer this over adopting the main
+      checkout for agent work; it isolates the git index and worktree.
   aethyme broker start-agent --task <text> --cmd <command> [--json]
       Create a worktree + branch and spawn <command> in it (sh -c),
       logging to .aethyme/logs/.
@@ -61,6 +65,10 @@ Usage:
       Explicitly claim a path (end it with / for a directory claim).
   aethyme broker leases release <path> --session <id> [--json]
       Release an explicit claim.
+  aethyme broker exec --session <id> -- <command> [--json]
+      Run a command in the session worktree, then fail if it leaves new
+      dirty paths outside explicit leases or in adoption-time foreign
+      files. Exports AETHYME_TEST_DB_SUFFIX=s<id>-exec.
   aethyme broker gates validate [--json]
       Parse and validate .aethyme/gates.toml.
   aethyme broker gates affected --session <id> [--json]
@@ -196,7 +204,9 @@ pub fn run(args: &[String]) -> u8 {
 fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
     const KNOWN: &[&str] = &[
         "adopt",
+        "start",
         "start-agent",
+        "exec",
         "agents",
         "leases",
         "claim",
@@ -272,17 +282,17 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn init_next_steps_names_quick_test_before_adopt_and_submit() {
+    fn init_next_steps_names_quick_test_before_start_and_submit() {
         let message = super::init_next_steps_message();
         let init = message.find("aethyme init").unwrap();
         let quick_test = message.find("aethyme broker quick-test").unwrap();
-        let adopt = message.find("aethyme broker adopt").unwrap();
+        let start = message.find("aethyme broker start").unwrap();
         let submit = message
             .find("aethyme broker submit --session <id>")
             .unwrap();
         assert!(init < quick_test);
-        assert!(quick_test < adopt);
-        assert!(adopt < submit);
+        assert!(quick_test < start);
+        assert!(start < submit);
     }
 
     #[test]
@@ -325,6 +335,27 @@ mod tests {
         assert_eq!(parsed.positional, vec!["integration", "wait-stable"]);
         assert_eq!(parsed.seconds, Some(30));
     }
+
+    #[test]
+    fn parse_accepts_guarded_exec_command_after_separator() {
+        let args = vec![
+            "exec".to_string(),
+            "--session".to_string(),
+            "7".to_string(),
+            "--".to_string(),
+            "cargo".to_string(),
+            "fmt".to_string(),
+            "--check".to_string(),
+        ];
+        let parsed = match super::parse(&args) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("exec with -- separator should parse"),
+        };
+
+        assert_eq!(parsed.positional, vec!["exec"]);
+        assert_eq!(parsed.session, Some(7));
+        assert_eq!(parsed.exec_command, vec!["cargo", "fmt", "--check"]);
+    }
 }
 
 enum UsageError {
@@ -359,6 +390,7 @@ struct Parsed {
     chau7: bool,
     fix_version: bool,
     with_gate: bool,
+    exec_command: Vec<String>,
 }
 
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
@@ -383,10 +415,15 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         chau7: false,
         fix_version: false,
         with_gate: false,
+        exec_command: Vec::new(),
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--" => {
+                parsed.exec_command = iter.cloned().collect();
+                break;
+            }
             "--json" => parsed.json = true,
             "--follow" => parsed.follow = true,
             "--since" => {
@@ -586,9 +623,9 @@ fn render_quick_test_report(report: &crate::QuickTestReport, json: bool) -> Resu
 
 fn init_next_steps_message() -> &'static str {
     "First-time flow: install -> `aethyme init` -> `aethyme broker quick-test` -> \
-     `aethyme broker adopt` -> `aethyme broker submit --session <id>`.\n\
+     `aethyme broker start --task \"...\"` -> `aethyme broker submit --session <id>`.\n\
      Next steps: review any drafts above, re-check anytime with `aethyme certify`, \
-     then run the disposable smoke before adopting real sessions; optionally \
+     then run the disposable smoke before starting real sessions; optionally \
      `aethyme enhance deploy` installs the agent protocol into AGENTS.md/CLAUDE.md."
 }
 
@@ -1041,6 +1078,22 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 }
             }
         }
+        "start" => {
+            let task = parsed
+                .task
+                .ok_or(UsageError::Message("start requires --task".into()))?;
+            let mut broker = open_broker()?;
+            let session = broker.start_worktree(&task)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&session)?);
+            } else {
+                println!(
+                    "Started session {} — worktree {} on branch {}",
+                    session.id, session.worktree_path, session.branch
+                );
+                println!("Next: cd {}", session.worktree_path);
+            }
+        }
         "start-agent" => {
             let task = parsed
                 .task
@@ -1076,7 +1129,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     }))?
                 );
             } else if views.is_empty() {
-                println!("No live sessions. Register one with `aethyme broker adopt`.");
+                println!("No live sessions. Start one with `aethyme broker start --task \"...\"`.");
             } else {
                 println!(
                     "{:<4} {:<8} {:<8} {:<24} TASK",
@@ -1132,13 +1185,10 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     let session = parsed
                         .session
                         .ok_or(UsageError::Message("claim requires --session <id>".into()))?;
-                    let lease = broker.store().claim_lease(
-                        session,
-                        path,
-                        parsed.ttl_seconds.map(|s| s * 1000),
-                    )?;
+                    let report =
+                        broker.claim_lease(session, path, parsed.ttl_seconds.map(|s| s * 1000))?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&lease)?);
+                        println!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
                         println!("Session {session} claimed {path}.");
                     }
@@ -1163,6 +1213,52 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         "unknown leases action {other:?} — expected claim or release"
                     )));
                 }
+            }
+        }
+        "exec" => {
+            let session = parsed
+                .session
+                .ok_or(UsageError::Message("exec requires --session <id>".into()))?;
+            let mut broker = open_broker()?;
+            let report = broker.guarded_exec(session, &parsed.exec_command)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "exec session {}: command {}{}",
+                    session,
+                    if report.command_success {
+                        "passed"
+                    } else {
+                        "failed"
+                    },
+                    report
+                        .exit_code
+                        .map(|code| format!(" ({code})"))
+                        .unwrap_or_default()
+                );
+                if report.touched_paths.is_empty() {
+                    println!("  touched paths: none");
+                } else {
+                    println!("  touched paths: {}", capped_join(&report.touched_paths, 8));
+                }
+                if !report.outside_lease_paths.is_empty() {
+                    println!(
+                        "  outside explicit leases: {}",
+                        capped_join(&report.outside_lease_paths, 8)
+                    );
+                }
+                if !report.foreign_paths.is_empty() {
+                    println!(
+                        "  adoption-time foreign paths: {}",
+                        capped_join(&report.foreign_paths, 8)
+                    );
+                }
+            }
+            if !report.ok {
+                return Err(UsageError::Message(
+                    "guarded exec failed ownership or command checks".into(),
+                ));
             }
         }
         "gates" => {

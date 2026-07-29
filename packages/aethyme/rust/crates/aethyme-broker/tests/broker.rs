@@ -98,6 +98,29 @@ fn adopted_hand_made_worktree_and_spawned_session_are_indistinguishable() {
 }
 
 #[test]
+fn start_worktree_creates_broker_managed_session_without_process() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let session = broker.start_worktree("isolated edits").unwrap();
+    let wt = std::path::PathBuf::from(&session.worktree_path);
+
+    assert_eq!(session.origin, SessionOrigin::Spawned);
+    assert!(session.pid.is_none());
+    assert_eq!(session.branch, "agent/isolated-edits");
+    assert!(wt.exists());
+    assert!(wt.ends_with(".aethyme/worktrees/isolated-edits"));
+    assert!(
+        broker
+            .store()
+            .session_foreign_files(session.id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn dead_spawned_pid_reconciles_to_exited_and_activity_drives_idle() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

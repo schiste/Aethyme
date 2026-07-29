@@ -8,6 +8,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_PRIVATE_INDEX_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Errors from git operations. `Git` carries the failing subcommand and
 /// stderr so callers can surface actionable messages verbatim.
@@ -37,6 +40,13 @@ pub enum GitError {
 /// drawn from git's status-code alphabet. Rename lines keep the target
 /// path (`old -> new` ⇒ `new`).
 fn parse_porcelain_paths(out: &str) -> Vec<String> {
+    parse_porcelain_entries(out)
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect()
+}
+
+fn parse_porcelain_entries(out: &str) -> Vec<([u8; 2], String)> {
     const CODES: &[u8] = b" MTADRCU?!";
     out.lines()
         .filter_map(|line| {
@@ -49,7 +59,10 @@ fn parse_porcelain_paths(out: &str) -> Vec<String> {
                 return None;
             }
             let path = &line[3..];
-            Some(path.rsplit(" -> ").next().unwrap_or(path).to_string())
+            Some((
+                [bytes[0], bytes[1]],
+                path.rsplit(" -> ").next().unwrap_or(path).to_string(),
+            ))
         })
         .collect()
 }
@@ -385,14 +398,30 @@ impl GitRepo {
     /// never touched; identical content in different worktrees hashes
     /// identically, which is what makes cross-agent gate dedup work.
     pub fn working_tree_hash(&self) -> Result<String, GitError> {
-        let tmp = self.root.join(".git-broker-index.tmp");
+        let index_dir = self.git_common_dir()?.join("aethyme-broker/indexes");
+        std::fs::create_dir_all(&index_dir).map_err(|source| GitError::Spawn {
+            args: format!("create_dir_all {}", index_dir.display()),
+            source,
+        })?;
+        let tmp = index_dir.join(format!(
+            "index-{}-{}.tmp",
+            std::process::id(),
+            NEXT_PRIVATE_INDEX_ID.fetch_add(1, Ordering::Relaxed)
+        ));
         let tmp_str = tmp.to_string_lossy().into_owned();
+        let lock = tmp.with_file_name(format!(
+            "{}.lock",
+            tmp.file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default()
+        ));
         let result = (|| {
             run_git_with_index(&self.root, &tmp_str, &["read-tree", "HEAD"])?;
             run_git_with_index(&self.root, &tmp_str, &["add", "-A", "."])?;
             run_git_with_index(&self.root, &tmp_str, &["write-tree"])
         })();
         let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(lock);
         result
     }
 
@@ -467,6 +496,20 @@ impl GitRepo {
             &self.root,
             &["status", "--porcelain", "--untracked-files=all"],
         )?))
+    }
+
+    /// Untracked paths from porcelain status. Used for the adoption-time
+    /// foreign-file snapshot; keeping the status grammar here prevents
+    /// output decoration from becoming "foreign" broker state.
+    pub fn untracked_paths(&self) -> Result<Vec<String>, GitError> {
+        Ok(parse_porcelain_entries(&run_git(
+            &self.root,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )?)
+        .into_iter()
+        .filter(|(xy, _path)| *xy == [b'?', b'?'])
+        .map(|(_xy, path)| path)
+        .collect())
     }
 
     /// Fetch a local commit object into this worktree's repository. Used

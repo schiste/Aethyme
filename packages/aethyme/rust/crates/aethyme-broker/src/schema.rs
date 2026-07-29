@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -126,7 +126,20 @@ ADD COLUMN failure_class TEXT
     ));
 ";
 
-const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2];
+const MIGRATION_V3: &str = "
+CREATE TABLE session_foreign_files (
+    id          INTEGER PRIMARY KEY,
+    session_id  INTEGER NOT NULL REFERENCES sessions (id),
+    path        TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    UNIQUE (session_id, path)
+);
+
+CREATE INDEX session_foreign_files_by_session
+    ON session_foreign_files (session_id, path);
+";
+
+const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3];
 
 fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
     let version = conn

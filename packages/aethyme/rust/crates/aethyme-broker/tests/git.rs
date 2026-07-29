@@ -100,6 +100,32 @@ fn changed_files_covers_committed_staged_unstaged_and_untracked() {
 }
 
 #[test]
+fn working_tree_hash_uses_worktree_invisible_private_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let repo = GitRepo::discover(tmp.path()).unwrap();
+
+    std::fs::write(tmp.path().join("untracked.rs"), "x\n").unwrap();
+    let first = repo.working_tree_hash().unwrap();
+    let second = repo.working_tree_hash().unwrap();
+
+    assert_eq!(first, second, "same working state should hash identically");
+    assert!(
+        !tmp.path().join(".git-broker-index.tmp").exists(),
+        "legacy fixed temp index must not be created in the worktree"
+    );
+    let index_dir = repo
+        .git_common_dir()
+        .unwrap()
+        .join("aethyme-broker/indexes");
+    assert!(
+        std::fs::read_dir(index_dir).unwrap().next().is_none(),
+        "private index files should be removed after hashing"
+    );
+    assert_eq!(repo.dirty_paths().unwrap(), vec!["untracked.rs"]);
+}
+
+#[test]
 fn dirty_paths_reports_an_unstaged_modification() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
