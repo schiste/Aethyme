@@ -513,6 +513,16 @@ fn extract_credential_lifecycle_line(
     if !contains_credential_term(lower) {
         return Ok(());
     }
+    if looks_like_credential_validation(lower) {
+        builder.push(
+            NodeKind::CredentialOperation,
+            EdgeAttributes::ValidatesCredential,
+            &credential_lifecycle_name("validate", trimmed),
+            "Credential validation operation",
+            line_no,
+            &[("runtime", runtime.to_string())],
+        )?;
+    }
     if looks_like_credential_issue(lower) {
         builder.push(
             NodeKind::CredentialOperation,
@@ -565,6 +575,7 @@ fn is_auth_decorator(lower: &str) -> bool {
         || lower.contains("permission_required")
         || lower.contains("authentication_classes")
         || lower.contains("permission_classes")
+        || lower.contains("require_scope")
         || lower.contains("csrf")
         || lower.contains("api_view")
 }
@@ -576,10 +587,26 @@ fn contains_credential_term(lower: &str) -> bool {
         || lower.contains("api_key")
         || lower.contains("apikey")
         || lower.contains("jwt")
+        || lower.contains("jws")
         || lower.contains("oidc")
         || lower.contains("cookie")
         || lower.contains("credential")
         || lower.contains("secret")
+}
+
+fn looks_like_credential_validation(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "authenticate",
+            "authorize",
+            "permission",
+            "require_scope",
+            "scope",
+            "validate",
+            "verify",
+        ],
+    )
 }
 
 fn looks_like_credential_issue(lower: &str) -> bool {
