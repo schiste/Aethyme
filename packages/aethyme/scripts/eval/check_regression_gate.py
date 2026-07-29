@@ -55,15 +55,19 @@ AUTH_FIXTURE_REQUIRED_LANES = {
     "django_backend_auth": {"backend_validator"},
     "edge_proxy_backend_auth": {"backend_validator", "ingress_proxy"},
 }
-REQUIRED_PLAYGROUND_FIXTURES = {
-    "django_backend_auth": "Django backend-only auth",
-    "edge_proxy_backend_auth": "edge proxy + backend auth",
-    "oidc_session_auth": "OIDC + session auth",
-    "webhook_secret_auth": "webhook secret auth",
-    "queue_job_behavior": "queue/job behavior",
-    "config_owned_middleware_behavior": "config-owned middleware behavior",
-    "frontend_backend_route_behavior": "frontend-to-backend route behavior",
-}
+PLAYGROUND_FIXTURE_CADENCE = (
+    ("edge_proxy_backend_auth", "edge proxy + backend auth"),
+    ("django_backend_auth", "Django backend-only auth"),
+    ("oidc_session_auth", "OIDC + session auth"),
+    ("webhook_secret_auth", "webhook secret auth"),
+    ("config_owned_middleware_behavior", "config-owned middleware behavior"),
+    ("frontend_backend_route_behavior", "frontend-to-backend route behavior"),
+    ("queue_job_behavior", "queue/job behavior"),
+)
+REQUIRED_PLAYGROUND_FIXTURES = dict(PLAYGROUND_FIXTURE_CADENCE)
+REQUIRED_PLAYGROUND_FIXTURE_ORDER = tuple(
+    fixture_id for fixture_id, _label in PLAYGROUND_FIXTURE_CADENCE
+)
 REQUIRED_INT_METRICS = (
     "token_estimate",
     "selected_file_count",
@@ -314,6 +318,7 @@ def compare_runs(
             "selected_file_contents_compared": False,
             "selected_file_count_compared": True,
             "required_playground_fixtures": REQUIRED_PLAYGROUND_FIXTURES,
+            "playground_fixture_cadence": list(REQUIRED_PLAYGROUND_FIXTURE_ORDER),
             "strict_playground_contract": require_playground_contract,
             "determinism_requires_repeat_result": require_determinism,
             "coverage_report_required": require_coverage_report,
@@ -355,7 +360,10 @@ def compare_suite(
 ) -> dict[str, Any]:
     entries = _suite_entries(suite)
     fixture_ids = [_normalize_fixture_id(str(entry.get("fixture_id", ""))) for entry in entries]
-    fixture_checks = _required_fixture_checks(fixture_ids)
+    fixture_checks = [
+        *_required_fixture_checks(fixture_ids),
+        _fixture_cadence_order_check(fixture_ids),
+    ]
     run_reports: list[dict[str, Any]] = []
 
     for index, entry in enumerate(entries):
@@ -412,7 +420,9 @@ def compare_suite(
         "checks": checks,
         "runs": run_reports,
         "required_fixtures": REQUIRED_PLAYGROUND_FIXTURES,
+        "fixture_cadence": list(REQUIRED_PLAYGROUND_FIXTURE_ORDER),
         "present_fixtures": sorted({fixture_id for fixture_id in fixture_ids if fixture_id}),
+        "present_fixtures_in_suite_order": [fixture_id for fixture_id in fixture_ids if fixture_id],
     }
 
 
@@ -567,6 +577,27 @@ def _required_fixture_checks(fixture_ids: list[str]) -> list[dict[str, Any]]:
         }
     )
     return checks
+
+
+def _fixture_cadence_order_check(fixture_ids: list[str]) -> dict[str, Any]:
+    known_order = [
+        fixture_id for fixture_id in fixture_ids if fixture_id in REQUIRED_PLAYGROUND_FIXTURES
+    ]
+    positions = {
+        fixture_id: index for index, fixture_id in enumerate(REQUIRED_PLAYGROUND_FIXTURE_ORDER)
+    }
+    expected_for_present = sorted(known_order, key=lambda fixture_id: positions[fixture_id])
+    passed = known_order == expected_for_present
+    return {
+        "name": "fixture_cadence_order",
+        "passed": passed,
+        "expected_order": list(REQUIRED_PLAYGROUND_FIXTURE_ORDER),
+        "expected_order_for_present_fixtures": expected_for_present,
+        "actual_order": known_order,
+        "failure": None
+        if passed
+        else "fixture suite order does not match canonical playground evaluation cadence",
+    }
 
 
 def _float_or_none(value: Any, fallback: float | None) -> float | None:

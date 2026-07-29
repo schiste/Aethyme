@@ -26,15 +26,19 @@ GENERATED_ARTIFACTS = (
 )
 COMMAND_OUTPUT_KEYS = {"aggregated_output", "output", "stdout", "stderr"}
 COMMAND_FIELD_KEYS = {"cmd", "command"}
-REQUIRED_PLAYGROUND_FIXTURES = {
-    "django_backend_auth": "Django backend-only auth",
-    "edge_proxy_backend_auth": "edge proxy + backend auth",
-    "oidc_session_auth": "OIDC + session auth",
-    "webhook_secret_auth": "webhook secret auth",
-    "queue_job_behavior": "queue/job behavior",
-    "config_owned_middleware_behavior": "config-owned middleware behavior",
-    "frontend_backend_route_behavior": "frontend-to-backend route behavior",
-}
+PLAYGROUND_FIXTURE_CADENCE = (
+    ("edge_proxy_backend_auth", "edge proxy + backend auth"),
+    ("django_backend_auth", "Django backend-only auth"),
+    ("oidc_session_auth", "OIDC + session auth"),
+    ("webhook_secret_auth", "webhook secret auth"),
+    ("config_owned_middleware_behavior", "config-owned middleware behavior"),
+    ("frontend_backend_route_behavior", "frontend-to-backend route behavior"),
+    ("queue_job_behavior", "queue/job behavior"),
+)
+REQUIRED_PLAYGROUND_FIXTURES = dict(PLAYGROUND_FIXTURE_CADENCE)
+REQUIRED_PLAYGROUND_FIXTURE_ORDER = tuple(
+    fixture_id for fixture_id, _label in PLAYGROUND_FIXTURE_CADENCE
+)
 GENERATED_ARTIFACT_LEAK_MARKERS = (
     ".aethyme",
     ".chau7",
@@ -209,7 +213,7 @@ def _resolve_fixture_id() -> str | None:
         return None
     fixture_id = _normalize_fixture_id(raw_fixture)
     if fixture_id not in REQUIRED_PLAYGROUND_FIXTURES:
-        known = ", ".join(sorted(REQUIRED_PLAYGROUND_FIXTURES))
+        known = ", ".join(REQUIRED_PLAYGROUND_FIXTURE_ORDER)
         raise ContractError(f"Unknown playground eval fixture '{raw_fixture}' (known: {known})")
     return fixture_id
 
