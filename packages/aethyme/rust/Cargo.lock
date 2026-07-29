@@ -36,6 +36,7 @@ name = "aethyme-engine"
 version = "0.1.1"
 dependencies = [
  "aethyme-broker",
+ "aethyme-enhance",
  "aethyme-graph-indexer",
  "aethyme-graph-schema",
  "aethyme-graph-storage",
@@ -58,6 +59,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
