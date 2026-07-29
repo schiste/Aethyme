@@ -1164,8 +1164,27 @@ def test_regression_gate_suite_requires_all_surface_flow_fixture_families() -> N
 
     passing = gate.compare_suite({"runs": complete_runs})
     assert passing["passed"] is True
+    expected_cadence = list(gate.REQUIRED_PLAYGROUND_FIXTURE_ORDER)
+    assert passing["fixture_cadence"] == expected_cadence
+    assert passing["present_fixtures_in_suite_order"] == expected_cadence
 
     missing_fixture = gate.compare_suite({"runs": complete_runs[:-1]})
     assert missing_fixture["passed"] is False
     failures = {check["name"] for check in missing_fixture["checks"] if not check["passed"]}
-    assert "required_fixture_frontend_backend_route_behavior_present" in failures
+    assert "required_fixture_queue_job_behavior_present" in failures
+
+    out_of_order_runs = list(complete_runs)
+    out_of_order_runs[0], out_of_order_runs[1] = (
+        out_of_order_runs[1],
+        out_of_order_runs[0],
+    )
+    out_of_order = gate.compare_suite({"runs": out_of_order_runs})
+    assert out_of_order["passed"] is False
+    order_check = next(
+        check for check in out_of_order["checks"] if check["name"] == "fixture_cadence_order"
+    )
+    assert order_check["actual_order"][:2] == [
+        "django_backend_auth",
+        "edge_proxy_backend_auth",
+    ]
+    assert order_check["expected_order_for_present_fixtures"] == expected_cadence

@@ -48,21 +48,22 @@ The remaining live eval surface is the playground A/B runner under
 ### Required V2 Surface/Flow Fixtures
 
 A V2 evaluation suite is not valid unless it covers all of these Playground
-fixture families:
+fixture families in this cadence:
 
 | Fixture id | Required behavior family |
 |---|---|
-| `django_backend_auth` | Django backend-only auth |
 | `edge_proxy_backend_auth` | edge proxy + backend auth |
+| `django_backend_auth` | Django backend-only auth |
 | `oidc_session_auth` | OIDC + session auth |
 | `webhook_secret_auth` | webhook secret auth |
-| `queue_job_behavior` | queue/job behavior |
 | `config_owned_middleware_behavior` | config-owned middleware behavior |
 | `frontend_backend_route_behavior` | frontend-to-backend route behavior |
+| `queue_job_behavior` | queue/job behavior |
 
 Each suite row must compare Control and Aethyme runner JSON for the same
-fixture id. The strict regression gate requires repeat result JSON for both
-arms so it can compare deterministic output fingerprints. For fixtures with
+fixture id, and suite rows must follow the cadence above. The strict
+regression gate requires repeat result JSON for both arms so it can compare
+deterministic output fingerprints. For fixtures with
 known incomplete graph coverage, declare `expected_missing_coverage`; the gate
 fails unless Aethyme observability reports those missing Surface/Flow families
 instead of hiding them behind a generic freshness status.

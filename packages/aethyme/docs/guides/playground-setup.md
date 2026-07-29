@@ -298,9 +298,10 @@ as part of the same gate:
 ```
 
 The manifest is valid only when it includes all required fixture ids from
-`docs/guides/eval-protocol.md`: Django backend auth, edge proxy + backend auth,
-OIDC + session auth, webhook secret auth, queue/job behavior, config-owned
-middleware behavior, and frontend-to-backend route behavior.
+`docs/guides/eval-protocol.md` in cadence order: edge proxy + backend auth,
+Django backend auth, OIDC + session auth, webhook secret auth, config-owned
+middleware behavior, frontend-to-backend route behavior, and queue/job
+behavior. The regression gate fails manifests that drift from this order.
 
 ## Adding a New Eval Target
 
