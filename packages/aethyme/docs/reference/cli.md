@@ -296,6 +296,7 @@ It does not yet claim actual agent adoption or downstream answer quality.
 - `aethyme explore --repo /path/to/repo --request "Find public functions with no outside callers" --format answer-json`
 - `aethyme intents --request "Find public functions with no outside callers" --format compact-json`
 - `aethyme explore --repo /path/to/repo --intent behavior_localization_query --request "Find the files responsible for this behavior" --format answer-json --show-observability`
+- `aethyme explore --repo /path/to/repo --intent behavior_localization_query --request "Find the files responsible for this behavior" --format answer-json --show-observability --detail full`
 - `aethyme explore --repo /path/to/repo --intent usage_boundary_query --request "Find public functions with no outside callers" --params '{"scope":"src/pkg","symbol_kind":"public_top_level_function","boundary":{"type":"outside_directory","path":"src/pkg"},"search_roots":["src","tests"],"budget_ms":10000,"max_evidence_per_symbol":5}' --format answer-json --show-observability`
 
 `intents` returns the finite mode/intent catalog. The public product model is
@@ -313,19 +314,27 @@ call-site expansion, filename fallback, and compact `task-expand` output into:
 - `excluded[]`: out-of-scope areas or candidates
 - `ambiguous[]`: low-confidence or missing-anchor cases
 - `subsystems[]`: ranked subsystem lanes for ambiguous Surface/Flow tasks, including role, confidence, concrete `token_subsystems`, top verification targets, paths, signals, and missing-coverage warnings; broad auth/token requests use this to separate ingress/proxy, backend validation, and provider/OIDC/audit-style token systems before trusting a flat file ranking
-- `output_adapters.task_localization_json`: compact candidate file/symbol lists and expansion commands
+- `output_chars_estimate` / `truncated`: command-output budget metadata for agent loops
+- `output_adapters.task_localization_json`: compact candidate file/symbol lists and expansion commands, emitted only with `--detail full`
 - `confidence`: answer-only, excluded-only, and analyzed confidence summaries
 - `safe_to_use_as_answer` / `trust_policy`: whether `answer[]` is authoritative enough to guide an answer, or only safe as navigation
-- `observability`: graph freshness, graph completeness by Surface/Flow type, indexed languages/frameworks, missing expected surfaces, ranking explainability, answer-safety mode, and readiness fields. Freshness alone is not enough: agents should require the graph to be fresh, complete enough for the request, and explainable before treating `answer[]` as answer-safe.
+- `observability`: with `--show-observability`, compact graph-store freshness, Surface/Flow coverage, missing expected surfaces, ranking explainability, answer-safety mode, and readiness fields. Freshness alone is not enough: agents should require the graph to be fresh, complete enough for the request, and explainable before treating `answer[]` as answer-safe. Use `--detail full --show-observability` only when debugging the full observability envelope.
 
 For task/behavior localization, Explore observability includes:
 - `graph_freshness`: redb backend status, `fresh`, `stale`, fragment/store timestamps, and path-free artifact role labels (`source_of_truth=graph_fragments`, `derived_query_artifact=redb_graph_store`)
-- `graph_completeness_by_surface_type`: per-surface coverage for backend, edge/proxy, routes, middleware, webhooks, CLIs, jobs/queues, credential flows, and live behavior tests
+- `surface_flow_graph.coverage`: per-surface coverage for backend, edge/proxy, routes, middleware, webhooks, CLIs, jobs/queues, credential flows, and live behavior tests
 - `indexed_languages` / `indexed_frameworks`: language/framework signals inferred from indexed graph fragments, not from source files alone
-- `missing_expected_surfaces`: source-present surfaces that graph fragments did not fully index
+- `surface_flow_graph.missing_expected_surfaces`: source-present surfaces that graph fragments did not fully index
 - `ranking_explainability`: `degraded_ranking_reasons`, `top_signals_used`, `top_signals_absent`, and whether subsystem ambiguity was detected
 - `answer_safety`: evidence-only safety, observability-adjusted safety, navigation-only mode, trust policy, and reason
 - `readiness`: booleans for `fresh_enough`, `complete_enough`, `surface_flow_complete`, `explainable`, `answer_safe_after_observability`, and `navigation_only_after_observability`
+
+Compact agent-mode observability is the default for `--show-observability`.
+It caps `answer[]`, `navigation_hints[]`, subsystem targets/signals, ranking
+signals, evidence arrays, and Surface/Flow path hints so an initial Explore
+call stays in the 12k-20k character budget. Indexed language/framework detail
+and full path-hint coverage remain available through
+`--detail full --show-observability`.
 
 Default `task_localization_query` responsiveness behavior:
 - `graph_query_timeout_ms`: default `1000`

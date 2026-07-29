@@ -264,7 +264,7 @@ fn build_usage_boundary_response(
         excluded_count,
     );
 
-    ExploreResponse {
+    let response = ExploreResponse {
         schema_version: "aethyme-explore-v1",
         mode: "explore",
         intent: "usage_boundary_query",
@@ -315,6 +315,8 @@ fn build_usage_boundary_response(
             "task_localization_query",
             "behavior_localization_query",
         ],
+        output_chars_estimate: 0,
+        truncated: false,
         // Dead-code eval scoring reads `output_adapters.dead_code_eval_json.unused_functions`
         // directly — this adapter is the SCORER input, not just verbose
         // diagnostics. Always emit (no detail gate) for usage_boundary;
@@ -344,7 +346,8 @@ fn build_usage_boundary_response(
             "max_answer_items": params.max_answer_items,
         })),
         observability: Some(observability),
-    }
+    };
+    super::response_with_output_estimate(response)
 }
 
 fn usage_boundary_observability(
