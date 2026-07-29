@@ -70,7 +70,7 @@ Primary commands:
 
 - `aethyme explore --repo /path/to/repo --request "<task>" --format answer-json`
   (single Rust entrypoint since 2026-07-14 (#31): install with
-  `cargo install --path rust/crates/aethyme-engine`; the pip console script
+  `cargo install --path rust/crates/aethyme-cli` (plus `rust/crates/aethyme-engine` for the daemon sibling binary); the pip console script
   was removed so nothing shadows the router. Explore runs in-process and
   auto-starts the engine daemon. Delegated Python commands resolve the
   package via `aethyme root show` — env var, pointer file, or upward walk.)
