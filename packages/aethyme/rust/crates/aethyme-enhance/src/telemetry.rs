@@ -1,10 +1,30 @@
-//! Repo-local experience telemetry — byte-parity port of the parts of
-//! `src/indexing/experience_telemetry.py` that `enhance deploy`/`verify`
-//! invoke (event append, summaries, status artifacts). The standalone
-//! telemetry CLI commands stay Python until Phase 3.
+//! Repo-local experience telemetry — byte-parity port of
+//! `src/indexing/experience_telemetry.py` (event append, summaries,
+//! wrapper-invocation recording, status artifacts). Since the Phase 3
+//! flip the standalone telemetry CLI commands dispatch here too.
 //!
 //! Parity-first: events carry real wall-clock timestamps and the exact
 //! Python `json.dumps` (compact, `", "` separators) line shape.
+//!
+//! ## On-disk format & versioning (Phase 3 decision, 2026-07-29)
+//!
+//! The ledger is JSONL: one event object per line, appended, never
+//! rewritten. Every row's **first key** is
+//! `"schema_version": "aethyme-experience-telemetry-v1"` — written by
+//! the Python implementation since v1 and preserved verbatim by this
+//! port. That per-row field IS the version mechanism:
+//!
+//! - real repos already have files full of such rows, and this reader
+//!   parses them unchanged (readers key off `event_type`/`payload` and
+//!   tolerate unknown fields and unknown event types);
+//! - a first-line file header was rejected because it would break the
+//!   "every line is an event" contract both readers rely on, breaks
+//!   append-only concurrency (two writers would race to write the
+//!   header), and would not survive log truncation/rotation;
+//! - future format changes bump the per-row `schema_version`; readers
+//!   detect rows they do not understand by that field. The transition
+//!   Python reader ignored the field entirely, so v1 rows written by
+//!   either implementation remain mutually readable.
 
 use std::path::Path;
 
@@ -191,6 +211,24 @@ pub fn detailed_report(repo_path: &Path) -> Result<Value, String> {
     report.set("freshness", freshness);
     report.set("kpis", kpis);
     Ok(report)
+}
+
+/// Record that an Aethyme-provided wrapper or hook was invoked.
+/// Mirrors Python `record_wrapper_invocation`: `details` is attached
+/// only when truthy (a non-empty object).
+pub fn record_wrapper_invocation(
+    repo_path: &Path,
+    wrapper_name: &str,
+    details: Option<Value>,
+) -> Result<(), String> {
+    let mut payload = Value::object();
+    payload.set("wrapper_name", Value::str(wrapper_name));
+    if let Some(details) = details {
+        if details.truthy() {
+            payload.set("details", details);
+        }
+    }
+    append_event(repo_path, "wrapper.invocation", payload)
 }
 
 /// Compact payload from generated onboarding and Act artifacts.
@@ -878,6 +916,76 @@ mod tests {
         assert_eq!(
             summary.get("last_event_type").and_then(Value::as_str),
             Some("enhance.deploy")
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn record_wrapper_invocation_shapes_payload_like_python() {
+        let repo = fixture_repo("wrapper");
+        // With details.
+        let mut details = Value::object();
+        details.set("source", Value::str("wrapper"));
+        record_wrapper_invocation(&repo, "aethyme-explore", Some(details)).unwrap();
+        // Empty details map → Python's `parsed_details or None` drops it.
+        record_wrapper_invocation(&repo, "aethyme-sessionstart-hook", Some(Value::object()))
+            .unwrap();
+        let text = std::fs::read_to_string(repo.join(TELEMETRY_LOG_PATH)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains(
+            "\"payload\": {\"wrapper_name\": \"aethyme-explore\", \"details\": {\"source\": \"wrapper\"}}"
+        ));
+        assert!(lines[1].contains("\"payload\": {\"wrapper_name\": \"aethyme-sessionstart-hook\"}"));
+
+        let report = detailed_report(&repo).unwrap();
+        let invocations = report.get("wrapper_invocations").unwrap();
+        assert_eq!(invocations.get("aethyme-explore"), Some(&Value::Int(1)));
+        assert_eq!(
+            invocations.get("aethyme-sessionstart-hook"),
+            Some(&Value::Int(1))
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn reader_parses_rows_written_by_the_python_implementation() {
+        // Verbatim rows captured from a real dogfood-repo ledger written
+        // by `src/indexing/experience_telemetry.py` (v1 format), plus the
+        // tolerated degradations: blank lines, invalid JSON, a missing
+        // event_type, and an unknown future schema_version row.
+        let repo = fixture_repo("compat");
+        let log_path = repo.join(TELEMETRY_LOG_PATH);
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &log_path,
+            concat!(
+                "{\"schema_version\": \"aethyme-experience-telemetry-v1\", \"event_type\": \"enhance.deploy\", \"timestamp\": \"2026-07-20T09:15:02+00:00\", \"repo_path\": \"/tmp/demo\", \"payload\": {\"force\": true, \"actions\": 12}}\n",
+                "\n",
+                "{\"schema_version\": \"aethyme-experience-telemetry-v1\", \"event_type\": \"wrapper.invocation\", \"timestamp\": \"2026-07-20T09:16:40+00:00\", \"repo_path\": \"/tmp/demo\", \"payload\": {\"wrapper_name\": \"aethyme-explore\", \"details\": {\"source\": \"wrapper\"}}}\n",
+                "not json at all\n",
+                "{\"timestamp\": \"2026-07-20T09:17:00+00:00\", \"payload\": {}}\n",
+                "{\"schema_version\": \"aethyme-experience-telemetry-v9\", \"event_type\": \"future.event\", \"payload\": {\"x\": 1}}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_events(&repo).unwrap();
+        assert_eq!(summary.get("event_count"), Some(&Value::Int(5)));
+        let by_type = summary.get("by_type").unwrap();
+        assert_eq!(by_type.get("enhance.deploy"), Some(&Value::Int(1)));
+        assert_eq!(by_type.get("wrapper.invocation"), Some(&Value::Int(1)));
+        assert_eq!(by_type.get("invalid_json"), Some(&Value::Int(1)));
+        assert_eq!(by_type.get("unknown"), Some(&Value::Int(1)));
+        assert_eq!(by_type.get("future.event"), Some(&Value::Int(1)));
+
+        let report = detailed_report(&repo).unwrap();
+        assert_eq!(
+            report
+                .get("wrapper_invocations")
+                .unwrap()
+                .get("aethyme-explore"),
+            Some(&Value::Int(1))
         );
         std::fs::remove_dir_all(&repo).unwrap();
     }
