@@ -12,6 +12,9 @@
 #   whole workspace on every submit.
 # - Gate outputs must be gitignored or they change the working-tree hash
 #   and bust the result cache.
+# - Gate commands receive AETHYME_GATE_WORKER_ID and AETHYME_TEST_DB_SUFFIX.
+#   Any gate that uses a test database or external namespace must suffix it
+#   with that value; fixed shared test DB names are unsafe under broker load.
 # - Every command exports CHAU7_CTO_OPTIM_ACTIVE=1: Chau7's CTO git
 #   wrapper compresses git output in agent tabs (chau7#77), and gates —
 #   or the tests they run — that parse git output would read fiction.

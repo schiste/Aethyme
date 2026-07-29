@@ -1,6 +1,6 @@
 # Testing Guide
 
-Last Updated: 2026-05-09
+Last Updated: 2026-07-29
 
 ## Test Tiers
 
@@ -10,7 +10,7 @@ Does not require PostgreSQL.
 ```bash
 cd packages/aethyme
 . .venv/bin/activate
-make test-unit
+python -m pytest tests/local tests/scorecard -q
 ```
 
 ### Integration
@@ -19,9 +19,14 @@ Requires PostgreSQL and uses `TEST_DATABASE_URL`.
 ```bash
 cd packages/aethyme
 . .venv/bin/activate
-export TEST_DATABASE_URL='postgresql://aethyme:dev_password_change_me@localhost:5432/aethyme_test'
+WORKER_ID="${AETHYME_TEST_DB_SUFFIX:-${AETHYME_GATE_WORKER_ID:-${USER:-local}_$$}}"
+export TEST_DATABASE_URL="postgresql://aethyme:dev_password_change_me@localhost:5432/aethyme_test_${WORKER_ID}"
 make test-integration
 ```
+
+In broker gates, prefer deriving the database name from
+`AETHYME_TEST_DB_SUFFIX`; the gate runner sets it to a session/process-scoped
+value before launching the command.
 
 ### Full
 Runs unit and integration coverage together.
@@ -29,7 +34,8 @@ Runs unit and integration coverage together.
 ```bash
 cd packages/aethyme
 . .venv/bin/activate
-export TEST_DATABASE_URL='postgresql://aethyme:dev_password_change_me@localhost:5432/aethyme_test'
+WORKER_ID="${AETHYME_TEST_DB_SUFFIX:-${AETHYME_GATE_WORKER_ID:-${USER:-local}_$$}}"
+export TEST_DATABASE_URL="postgresql://aethyme:dev_password_change_me@localhost:5432/aethyme_test_${WORKER_ID}"
 make test-full
 ```
 
@@ -57,7 +63,7 @@ Three layers, run independently:
 
 ```bash
 # Style + import hygiene (local, per-file)
-.venv/bin/python -m ruff check src/ tests/
+python -m ruff check src/ tests/
 
 # Type-checking
 .venv/bin/python -m pyright src/

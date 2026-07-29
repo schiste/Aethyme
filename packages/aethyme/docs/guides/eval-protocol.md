@@ -72,6 +72,13 @@ using `scripts/eval/run_codex_eval.py`. For reproducible archives, set
 `AETHYME_EVAL_ARTIFACT_DIR` to a run-specific directory outside the target
 repository.
 
+For multi-agent playground load, isolate every worker's mutable state. Do not
+share a test database name across workers; suffix it with a worker/session id
+or, inside broker gates, `$AETHYME_TEST_DB_SUFFIX`. If workers are expected to
+touch the same files, use broker leases or separate worktrees before starting
+the run so git indexes, test DBs, and generated artifacts do not become the
+measured variable.
+
 Sources are recoverable at git ref `16cfa5e`
 (`packages/aethyme/src/eval/`, `packages/aethyme/evals/`,
 `packages/aethyme-eval-ui/`). Frozen baseline reports remain at

@@ -53,7 +53,7 @@ make_repo() {
 {
   "project_context": "Fixture project for enhance parity.",
   "conventions": ["Use tabs never", "Prefer small commits"],
-  "commands": {"test": "pytest -q"},
+  "commands": {"test": "python -m pytest -q"},
   "warnings": ["Do not touch generated files"]
 }
 EOF

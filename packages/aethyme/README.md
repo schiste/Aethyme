@@ -115,7 +115,7 @@ at [`docs/architecture/eval-mining-notes.md`](docs/architecture/eval-mining-note
 - Default local test runs skip engine-backed integration tests if the Rust engine cannot be built in the current environment.
 - Set `AETHYME_REQUIRE_LOCAL_ENGINE=1` to enforce strict mode (tests fail instead of skip when engine build/runtime is unavailable).
 - Strict lane example:
-  - `AETHYME_REQUIRE_LOCAL_ENGINE=1 pytest packages/aethyme/tests/local/test_local_workflow.py -q`
+  - `AETHYME_REQUIRE_LOCAL_ENGINE=1 python -m pytest packages/aethyme/tests/local/test_local_workflow.py -q`
 - CI runs both lanes in `.github/workflows/aethyme-local-tests.yml`.
 
 This local path is the shortest route to proving:

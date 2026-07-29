@@ -4,7 +4,7 @@
 
 PYTHON := python3
 PIP := $(PYTHON) -m pip
-PYTEST := .venv/bin/pytest
+PYTEST := $(PYTHON) -m pytest
 
 ## help: Show this help message
 help:

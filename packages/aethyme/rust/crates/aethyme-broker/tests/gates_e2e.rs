@@ -274,6 +274,33 @@ triggers = ["**/*.py"]
 }
 
 #[test]
+fn gate_commands_receive_worker_suffix_and_owner_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "env-check"
+command = 'test -n "$AETHYME_GATE_WORKER_ID" && test "$AETHYME_TEST_DB_SUFFIX" = "$AETHYME_GATE_WORKER_ID" && case "$AETHYME_GATE_OWNER_PATHS" in *src/app.py*) exit 0 ;; *) exit 9 ;; esac'
+triggers = ["**/*.py"]
+"#,
+    );
+    commit_all(tmp.path(), "add gates");
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = add_worktree(tmp.path(), "env");
+    let session = broker.adopt(&wt, None).unwrap();
+    std::fs::write(wt.join("src/app.py"), "x = 2\n").unwrap();
+
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].gate, "env-check");
+    assert_eq!(outcomes[0].status, GateStatus::Pass);
+    assert!(outcomes[0].log_path.as_deref().unwrap().contains("-s"));
+}
+
+#[test]
 fn cache_false_gate_reruns_for_the_same_tree() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

@@ -26,7 +26,7 @@ cargo build --quiet --bin aethyme-engine-cli
 
 ```bash
 cd packages/aethyme
-.venv/bin/pytest -q tests/local
+.venv/bin/python -m pytest -q tests/local
 cd rust
 cargo test --workspace
 ```

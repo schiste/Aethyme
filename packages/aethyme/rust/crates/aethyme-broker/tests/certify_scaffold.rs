@@ -248,6 +248,10 @@ fn gates_draft_detects_manifests_deterministically() {
         2,
         &["**/*.js", "**/*.jsx", "**/*.ts", "**/*.tsx", "package.json"],
     );
+    let pytest = loaded.iter().find(|gate| gate.name == "pytest").unwrap();
+    assert!(pytest.command.starts_with("python3 -c "));
+    assert!(pytest.command.contains("pytest.console_main()"));
+    assert!(!pytest.command.contains("-m pytest"));
     // No timestamps / absolute paths (determinism across machines & time).
     assert!(!gates.contains("202"), "no dates in generated files");
     assert!(!gates.contains(&tmp.path().to_string_lossy().into_owned()));

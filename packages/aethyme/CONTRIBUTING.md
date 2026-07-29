@@ -28,7 +28,7 @@ engine binary directly.
 
 ```bash
 . .venv/bin/activate
-pytest tests/local tests/scorecard -q
+python -m pytest tests/local tests/scorecard -q
 python -m src.cli repo ingest .
 ```
 

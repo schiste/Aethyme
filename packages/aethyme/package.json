@@ -5,8 +5,8 @@
   "description": "Deterministic repository indexing and code intelligence tooling",
   "license": "Apache-2.0",
   "scripts": {
-    "test": "pytest tests/ -v",
-    "test:coverage": "pytest tests/ --cov=src --cov-report=html",
+    "test": "python3 -m pytest tests/ -v",
+    "test:coverage": "python3 -m pytest tests/ --cov=src --cov-report=html",
     "lint": "ruff check src/",
     "type-check": "pyright src/"
   }

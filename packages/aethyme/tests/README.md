@@ -14,7 +14,7 @@ All suites are local-first: no PostgreSQL or external services are required.
 Run everything:
 
 ```bash
-pytest tests/local tests/indexing tests/scorecard tests/autofixers tests/contracts tests/docs -q
+python -m pytest tests/local tests/indexing tests/scorecard tests/autofixers tests/contracts tests/docs -q
 ```
 
 ## Data Model

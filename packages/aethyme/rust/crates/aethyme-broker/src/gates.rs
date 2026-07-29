@@ -139,6 +139,8 @@ pub struct Selection<'g> {
     #[serde(serialize_with = "gate_name")]
     pub gate: &'g Gate,
     pub triggered_by: Option<String>,
+    #[serde(skip)]
+    owner_paths: Vec<String>,
 }
 
 fn gate_name<S: serde::Serializer>(gate: &&Gate, s: S) -> Result<S::Ok, S::Error> {
@@ -153,13 +155,20 @@ pub fn select_gates<'g>(gates: &'g [Gate], changed: &[String]) -> Vec<Selection<
             selections.push(Selection {
                 gate,
                 triggered_by: None,
+                owner_paths: Vec::new(),
             });
             continue;
         }
-        if let Some(hit) = changed.iter().find(|path| gate.matches(path)) {
+        let owner_paths = changed
+            .iter()
+            .filter(|path| gate.matches(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(hit) = owner_paths.first() {
             selections.push(Selection {
                 gate,
                 triggered_by: Some(hit.clone()),
+                owner_paths,
             });
         }
     }
@@ -331,9 +340,131 @@ pub fn run_all_with_progress(
         .map(|gate| Selection {
             gate,
             triggered_by: None,
+            owner_paths: Vec::new(),
         })
         .collect();
     run_selections(store, main_root, checkout, selections, session_id, progress)
+}
+
+struct GateOwnerLocks {
+    _files: Vec<std::fs::File>,
+}
+
+impl GateOwnerLocks {
+    fn acquire(
+        owner_dir: &Path,
+        gate_name: &str,
+        owner_paths: &[String],
+        progress: &dyn GateProgressSink,
+    ) -> Result<Self, std::io::Error> {
+        use std::os::fd::AsRawFd;
+
+        std::fs::create_dir_all(owner_dir)?;
+        let mut paths = gate_owner_lock_paths(owner_dir, gate_name, owner_paths);
+        paths.sort();
+        paths.dedup();
+        if !paths.is_empty() {
+            progress.report(&format!(
+                "gate {gate_name} waiting for {} owner lock(s)",
+                paths.len()
+            ));
+        }
+
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            files.push(file);
+        }
+        Ok(Self { _files: files })
+    }
+}
+
+fn gate_owner_lock_paths(
+    owner_dir: &Path,
+    gate_name: &str,
+    owner_paths: &[String],
+) -> Vec<PathBuf> {
+    gate_owner_scope(owner_paths)
+        .into_iter()
+        .map(|scope| {
+            let name = format!(
+                "{}-{}-{:016x}.lock",
+                lock_segment(gate_name),
+                lock_segment(&scope),
+                stable_hash(gate_name, &scope)
+            );
+            owner_dir.join(name)
+        })
+        .collect()
+}
+
+fn gate_owner_scope(owner_paths: &[String]) -> Vec<String> {
+    if owner_paths.is_empty() {
+        return vec!["all".into()];
+    }
+    let mut scope = owner_paths.to_vec();
+    scope.sort();
+    scope.dedup();
+    scope
+}
+
+fn lock_segment(value: &str) -> String {
+    let mut segment = String::new();
+    let mut last_was_dash = false;
+    for ch in value.chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else if !last_was_dash {
+            Some('-')
+        } else {
+            None
+        };
+        if let Some(ch) = next {
+            segment.push(ch);
+            last_was_dash = ch == '-';
+        }
+        if segment.len() >= 48 {
+            break;
+        }
+    }
+    let trimmed = segment.trim_matches('-');
+    if trimmed.is_empty() {
+        "scope".into()
+    } else {
+        trimmed.into()
+    }
+}
+
+fn stable_hash(gate_name: &str, scope: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in gate_name
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain([0])
+        .chain(scope.as_bytes().iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn gate_worker_id(session_id: Option<i64>, gate_name: &str) -> String {
+    let owner = match session_id {
+        Some(session_id) => format!("s{session_id}"),
+        None => format!("p{}", std::process::id()),
+    };
+    format!("{}-{}", owner, lock_segment(gate_name))
 }
 
 /// Shared executor for a pre-computed selection: cheap-first order (the
@@ -360,6 +491,7 @@ fn run_selections(
     let mut outcomes = Vec::new();
     for selection in selections {
         let gate = selection.gate;
+        let worker_id = gate_worker_id(session_id, &gate.name);
         // Cache: conclusive result for this exact tree, any session. The
         // hit is recorded as an event so saved execution time is
         // measurable (kill-criterion accounting). Gates that inspect
@@ -402,7 +534,19 @@ fn run_selections(
             continue;
         }
 
-        let log_path = log_dir.join(format!("{}-{}.log", gate.name, &tree[..8.min(tree.len())]));
+        let owner_dir = run_dir.join("owners");
+        let owner_locks =
+            GateOwnerLocks::acquire(&owner_dir, &gate.name, &selection.owner_paths, progress)
+                .map_err(|source| crate::BrokerError::Io {
+                    path: owner_dir,
+                    source,
+                })?;
+        let log_path = log_dir.join(format!(
+            "{}-{}-{}.log",
+            gate.name,
+            &tree[..8.min(tree.len())],
+            worker_id
+        ));
         progress.report(&format!("gate {} started (cost {})", gate.name, gate.cost));
         let started = Instant::now();
         let status = run_gate_command(
@@ -414,10 +558,13 @@ fn run_selections(
                 session_id,
                 gate_name: &gate.name,
                 tree: &tree,
+                worker_id: &worker_id,
+                owner_paths: &selection.owner_paths,
                 started,
                 progress,
             },
         );
+        drop(owner_locks);
         let duration_ms = started.elapsed().as_millis() as i64;
         let (gate_status, failure_class, exit_code) =
             classify_gate_result(&gate.command, &log_path, status);
@@ -592,6 +739,8 @@ struct GateCommandContext<'a> {
     session_id: Option<i64>,
     gate_name: &'a str,
     tree: &'a str,
+    worker_id: &'a str,
+    owner_paths: &'a [String],
     started: Instant,
     progress: &'a dyn GateProgressSink,
 }
@@ -608,6 +757,9 @@ fn run_gate_command(
         .arg("-c")
         .arg(command)
         .current_dir(context.cwd)
+        .env("AETHYME_GATE_WORKER_ID", context.worker_id)
+        .env("AETHYME_TEST_DB_SUFFIX", context.worker_id)
+        .env("AETHYME_GATE_OWNER_PATHS", context.owner_paths.join(":"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err))
@@ -722,10 +874,21 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
         assert!(select_gates(&gates, &["docs/guide.md".into()]).is_empty());
 
         // Python diff → pytest only, and --why knows which file.
-        let selections = select_gates(&gates, &["src/auth.py".into(), "README.md".into()]);
+        let selections = select_gates(
+            &gates,
+            &[
+                "src/auth.py".into(),
+                "tests/test_auth.py".into(),
+                "README.md".into(),
+            ],
+        );
         assert_eq!(selections.len(), 1);
         assert_eq!(selections[0].gate.name, "pytest");
         assert_eq!(selections[0].triggered_by.as_deref(), Some("src/auth.py"));
+        assert_eq!(
+            selections[0].owner_paths,
+            vec!["src/auth.py".to_string(), "tests/test_auth.py".to_string()]
+        );
 
         // Nested Cargo.toml matches the rooted-glob form.
         let selections = select_gates(&gates, &["crates/x/Cargo.toml".into()]);

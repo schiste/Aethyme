@@ -29,6 +29,8 @@ use std::path::Path;
 
 use crate::broker::{Broker, BrokerOpError};
 
+const PYTEST_SAFE_COMMAND: &str = "python3 -c \"import os, sys; sys.path = [p for p in sys.path if p not in ('', os.getcwd())]; import pytest; raise SystemExit(pytest.console_main())\" -q";
+
 /// Machine-readable outcome of one certification check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -678,8 +680,10 @@ fn draft_gates_toml(main_root: &Path) -> Option<String> {
         if pyproject.contains("pytest") {
             found = true;
             found_test_gate = true;
-            gates.push_str(
-                "\n[[gate]]\nname = \"pytest\"\ncommand = \"python3 -m pytest -q\"\ncost = 2\ntriggers = [\"**/*.py\", \"pyproject.toml\"]\n",
+            let command = toml_basic_string(PYTEST_SAFE_COMMAND);
+            let _ = write!(
+                gates,
+                "\n[[gate]]\nname = \"pytest\"\ncommand = \"{command}\"\ncost = 2\ntriggers = [\"**/*.py\", \"pyproject.toml\"]\n",
             );
         }
     }
@@ -694,6 +698,10 @@ fn draft_gates_toml(main_root: &Path) -> Option<String> {
         return None;
     }
     Some(gates)
+}
+
+fn toml_basic_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn manifest_exists(main_root: &Path, candidates: &[&str]) -> bool {
