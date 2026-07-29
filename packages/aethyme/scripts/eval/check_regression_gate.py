@@ -17,8 +17,44 @@ DEFAULT_SELECTED_FILE_DELTA_RATIO = 0.50
 DEFAULT_SNIPPET_DELTA_RATIO = 0.50
 DEFAULT_COMMAND_OUTPUT_DELTA_RATIO = 0.25
 DEFAULT_MAX_COMMAND_OUTPUT_CHARS = 64_000
+DEFAULT_MAX_SINGLE_COMMAND_OUTPUT_CHARS = 20_000
+DEFAULT_MAX_EXPLORE_OUTPUT_CHARS = 20_000
+DEFAULT_MAX_CUMULATIVE_REPLAY_ESTIMATE = 50_000
 COMMAND_FIELD_KEYS = {"cmd", "command"}
 COMMAND_OUTPUT_KEYS = {"aggregated_output", "output", "stdout", "stderr"}
+AUTH_TOKEN_FIXTURE_IDS = {
+    "django_backend_auth",
+    "edge_proxy_backend_auth",
+    "oidc_session_auth",
+    "webhook_secret_auth",
+    "config_owned_middleware_behavior",
+    "frontend_backend_route_behavior",
+}
+AUTH_TOKEN_TASK_KEYWORDS = (
+    "api key",
+    "api_key",
+    "apikey",
+    "auth",
+    "authorization",
+    "bearer",
+    "credential",
+    "jwt",
+    "jws",
+    "oauth",
+    "oidc",
+    "session",
+    "token",
+    "webhook",
+)
+AUTH_SURFACE_LANE_ROLES = {
+    "backend_validator",
+    "ingress_proxy",
+    "provider_or_secondary_token",
+}
+AUTH_FIXTURE_REQUIRED_LANES = {
+    "django_backend_auth": {"backend_validator"},
+    "edge_proxy_backend_auth": {"backend_validator", "ingress_proxy"},
+}
 REQUIRED_PLAYGROUND_FIXTURES = {
     "django_backend_auth": "Django backend-only auth",
     "edge_proxy_backend_auth": "edge proxy + backend auth",
@@ -33,8 +69,17 @@ REQUIRED_INT_METRICS = (
     "selected_file_count",
     "snippet_count",
     "command_output_chars",
+    "max_single_command_output_chars",
+    "explore_output_chars",
+    "cumulative_replay_token_estimate",
 )
-REQUIRED_BOOL_METRICS = ("generated_artifact_leaked", "aethyme_path_leaked", "aethyme_invoked")
+REQUIRED_BOOL_METRICS = (
+    "generated_artifact_leaked",
+    "aethyme_path_leaked",
+    "aethyme_invoked",
+    "broad_rg_after_successful_explore",
+    "successful_explore_detected",
+)
 NONDETERMINISTIC_OUTPUT_FIELDS = {
     "artifact_dir",
     "artifact_leakage",
@@ -75,12 +120,17 @@ def main() -> int:
             command_output_delta_ratio=args.max_command_output_delta_ratio,
             command_output_slack=args.command_output_slack,
             max_command_output_chars=args.max_command_output_chars,
+            max_single_command_output_chars=args.max_single_command_output_chars,
+            max_explore_output_chars=args.max_explore_output_chars,
+            max_cumulative_replay_estimate=args.max_cumulative_replay_estimate,
             control_quality=args.control_quality,
             aethyme_quality=args.aethyme_quality,
             allow_missing_quality=args.allow_missing_quality,
             require_playground_contract=not args.allow_missing_playground_contract,
             require_determinism=not args.allow_missing_determinism,
             require_coverage_report=not args.allow_missing_coverage_report,
+            require_event_sequence=not args.allow_missing_event_sequence,
+            require_auth_surface_lanes=not args.allow_missing_auth_surface_lanes,
         )
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if report["passed"] else 1
@@ -111,10 +161,15 @@ def main() -> int:
         command_output_delta_ratio=args.max_command_output_delta_ratio,
         command_output_slack=args.command_output_slack,
         max_command_output_chars=args.max_command_output_chars,
+        max_single_command_output_chars=args.max_single_command_output_chars,
+        max_explore_output_chars=args.max_explore_output_chars,
+        max_cumulative_replay_estimate=args.max_cumulative_replay_estimate,
         allow_missing_quality=args.allow_missing_quality,
         require_playground_contract=not args.allow_missing_playground_contract,
         require_determinism=not args.allow_missing_determinism,
         require_coverage_report=not args.allow_missing_coverage_report,
+        require_event_sequence=not args.allow_missing_event_sequence,
+        require_auth_surface_lanes=not args.allow_missing_auth_surface_lanes,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["passed"] else 1
@@ -139,10 +194,15 @@ def compare_runs(
     command_output_delta_ratio: float = DEFAULT_COMMAND_OUTPUT_DELTA_RATIO,
     command_output_slack: int = 1024,
     max_command_output_chars: int | None = None,
+    max_single_command_output_chars: int | None = DEFAULT_MAX_SINGLE_COMMAND_OUTPUT_CHARS,
+    max_explore_output_chars: int | None = DEFAULT_MAX_EXPLORE_OUTPUT_CHARS,
+    max_cumulative_replay_estimate: int | None = DEFAULT_MAX_CUMULATIVE_REPLAY_ESTIMATE,
     allow_missing_quality: bool = False,
     require_playground_contract: bool = False,
     require_determinism: bool = False,
     require_coverage_report: bool = False,
+    require_event_sequence: bool = False,
+    require_auth_surface_lanes: bool = True,
 ) -> dict[str, Any]:
     control_metrics = _metrics(control)
     aethyme_metrics = _metrics(aethyme)
@@ -175,6 +235,28 @@ def compare_runs(
             "Aethyme arm leaked generated Aethyme scaffolding.",
         ),
         *_command_output_bound_checks(control_metrics, aethyme_metrics, max_command_output_chars),
+        *_single_command_output_bound_checks(
+            control_metrics,
+            aethyme_metrics,
+            max_single_command_output_chars,
+        ),
+        _explore_output_bound_check(aethyme_metrics, max_explore_output_chars),
+        *_cumulative_replay_bound_checks(
+            control_metrics,
+            aethyme_metrics,
+            max_cumulative_replay_estimate,
+        ),
+        _first_aethyme_before_broad_search_check(
+            aethyme_metrics,
+            require=require_event_sequence,
+        ),
+        _broad_rg_after_successful_explore_warning(aethyme_metrics),
+        _surface_flow_lanes_check(
+            aethyme,
+            aethyme_metrics,
+            fixture_id=resolved_fixture_id,
+            require=require_auth_surface_lanes,
+        ),
         _delta_check(
             "token_estimate_delta",
             _metric_int(aethyme_metrics, "token_estimate"),
@@ -236,6 +318,11 @@ def compare_runs(
             "determinism_requires_repeat_result": require_determinism,
             "coverage_report_required": require_coverage_report,
             "max_command_output_chars": max_command_output_chars,
+            "max_single_command_output_chars": max_single_command_output_chars,
+            "max_explore_output_chars": max_explore_output_chars,
+            "max_cumulative_replay_estimate": max_cumulative_replay_estimate,
+            "event_sequence_required": require_event_sequence,
+            "auth_surface_lanes_required": require_auth_surface_lanes,
             "quality_source": "reviewer rubric or supplied quality_score field",
         },
     }
@@ -256,10 +343,15 @@ def compare_suite(
     command_output_delta_ratio: float = DEFAULT_COMMAND_OUTPUT_DELTA_RATIO,
     command_output_slack: int = 1024,
     max_command_output_chars: int | None = DEFAULT_MAX_COMMAND_OUTPUT_CHARS,
+    max_single_command_output_chars: int | None = DEFAULT_MAX_SINGLE_COMMAND_OUTPUT_CHARS,
+    max_explore_output_chars: int | None = DEFAULT_MAX_EXPLORE_OUTPUT_CHARS,
+    max_cumulative_replay_estimate: int | None = DEFAULT_MAX_CUMULATIVE_REPLAY_ESTIMATE,
     allow_missing_quality: bool = False,
     require_playground_contract: bool = True,
     require_determinism: bool = True,
     require_coverage_report: bool = True,
+    require_event_sequence: bool = True,
+    require_auth_surface_lanes: bool = True,
 ) -> dict[str, Any]:
     entries = _suite_entries(suite)
     fixture_ids = [_normalize_fixture_id(str(entry.get("fixture_id", ""))) for entry in entries]
@@ -291,10 +383,15 @@ def compare_suite(
             command_output_delta_ratio=command_output_delta_ratio,
             command_output_slack=command_output_slack,
             max_command_output_chars=max_command_output_chars,
+            max_single_command_output_chars=max_single_command_output_chars,
+            max_explore_output_chars=max_explore_output_chars,
+            max_cumulative_replay_estimate=max_cumulative_replay_estimate,
             allow_missing_quality=allow_missing_quality,
             require_playground_contract=require_playground_contract,
             require_determinism=require_determinism,
             require_coverage_report=require_coverage_report,
+            require_event_sequence=require_event_sequence,
+            require_auth_surface_lanes=require_auth_surface_lanes,
         )
         report["suite_index"] = index
         run_reports.append(report)
@@ -355,7 +452,27 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_COMMAND_OUTPUT_DELTA_RATIO,
     )
     parser.add_argument("--command-output-slack", type=int, default=1024)
-    parser.add_argument("--max-command-output-chars", type=int, default=DEFAULT_MAX_COMMAND_OUTPUT_CHARS)
+    parser.add_argument(
+        "--max-command-output-chars", type=int, default=DEFAULT_MAX_COMMAND_OUTPUT_CHARS
+    )
+    parser.add_argument(
+        "--max-single-command-output-chars",
+        type=int,
+        default=DEFAULT_MAX_SINGLE_COMMAND_OUTPUT_CHARS,
+        help="Absolute cap for any one command's emitted stdout/stderr/aggregated output.",
+    )
+    parser.add_argument(
+        "--max-explore-output-chars",
+        type=int,
+        default=DEFAULT_MAX_EXPLORE_OUTPUT_CHARS,
+        help="Absolute cap for captured output from Aethyme Explore commands.",
+    )
+    parser.add_argument(
+        "--max-cumulative-replay-estimate",
+        type=int,
+        default=DEFAULT_MAX_CUMULATIVE_REPLAY_ESTIMATE,
+        help="Estimated token cap for replaying captured eval artifacts.",
+    )
     parser.add_argument(
         "--allow-missing-quality",
         action="store_true",
@@ -375,6 +492,16 @@ def _parse_args() -> argparse.Namespace:
         "--allow-missing-coverage-report",
         action="store_true",
         help="Allow Aethyme results that omit Surface/Flow coverage observability.",
+    )
+    parser.add_argument(
+        "--allow-missing-event-sequence",
+        action="store_true",
+        help="Allow results without event-log evidence for Aethyme-before-broad-search checks.",
+    )
+    parser.add_argument(
+        "--allow-missing-auth-surface-lanes",
+        action="store_true",
+        help="Allow auth/token tasks that omit Surface/Flow subsystem lanes.",
     )
     return parser.parse_args()
 
@@ -467,6 +594,7 @@ def _metrics(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalized_metrics(metrics: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    event_analysis = _event_log_analysis(payload)
     artifact_leakage = payload.get("artifact_leakage")
     generated_leak = metrics.get("generated_artifact_leaked")
     if type(generated_leak) is not bool and isinstance(artifact_leakage, dict):
@@ -478,6 +606,36 @@ def _normalized_metrics(metrics: dict[str, Any], payload: dict[str, Any]) -> dic
     if type(generated_leak) is bool:
         metrics["generated_artifact_leaked"] = generated_leak
         metrics.setdefault("aethyme_path_leaked", generated_leak)
+    metrics.setdefault(
+        "max_single_command_output_chars",
+        event_analysis.get("max_single_command_output_chars"),
+    )
+    metrics.setdefault("explore_output_chars", event_analysis.get("explore_output_chars"))
+    metrics.setdefault(
+        "cumulative_replay_token_estimate",
+        _cumulative_replay_estimate(payload, metrics, event_analysis),
+    )
+    metrics.setdefault(
+        "first_aethyme_call_before_broad_search",
+        event_analysis.get("first_aethyme_call_before_broad_search"),
+    )
+    metrics.setdefault(
+        "broad_rg_after_successful_explore",
+        event_analysis.get("broad_rg_after_successful_explore"),
+    )
+    metrics.setdefault(
+        "successful_explore_detected",
+        event_analysis.get("successful_explore_detected"),
+    )
+    metrics.setdefault("first_aethyme_command_index", event_analysis.get("first_aethyme_index"))
+    metrics.setdefault(
+        "first_broad_search_command_index", event_analysis.get("first_broad_search_index")
+    )
+    metrics.setdefault(
+        "post_explore_broad_rg_commands",
+        event_analysis.get("post_explore_broad_rg_commands", []),
+    )
+    metrics.setdefault("surface_flow_lane_roles", sorted(_surface_flow_lane_roles(payload)))
     metrics.setdefault("output_fingerprint", _output_fingerprint(payload))
     return metrics
 
@@ -547,6 +705,360 @@ def _metric_contract_checks(label: str, metrics: dict[str, Any]) -> list[dict[st
             }
         )
     return checks
+
+
+def _event_log_analysis(payload: dict[str, Any]) -> dict[str, Any]:
+    path = _event_log_path(payload)
+    if path is None:
+        command_output_chars = _int_or_zero(payload.get("command_output_chars"))
+        return {
+            "event_log_available": False,
+            "max_single_command_output_chars": command_output_chars,
+            "explore_output_chars": 0,
+            "first_aethyme_index": None,
+            "first_broad_search_index": None,
+            "first_aethyme_call_before_broad_search": None,
+            "successful_explore_detected": False,
+            "broad_rg_after_successful_explore": False,
+            "post_explore_broad_rg_commands": [],
+        }
+
+    max_single_output = 0
+    explore_output_chars = 0
+    first_aethyme_index: int | None = None
+    first_broad_search_index: int | None = None
+    first_successful_explore_index: int | None = None
+    post_explore_broad_rg_commands: list[str] = []
+
+    for command_index, event in enumerate(_event_log_events(path)):
+        outputs = _command_output_strings(event)
+        output_lengths = [len(output) for output in outputs]
+        event_output_chars = sum(output_lengths)
+        max_single_output = max(max_single_output, event_output_chars, *output_lengths)
+
+        commands = _event_command_token_lists(event)
+        has_aethyme_explore = any(
+            _command_tokens_invoke_aethyme_explore(command) for command in commands
+        )
+        has_broad_search = any(_command_tokens_are_broad_search(command) for command in commands)
+        has_broad_rg = any(_command_tokens_are_broad_rg(command) for command in commands)
+
+        if has_aethyme_explore:
+            if first_aethyme_index is None:
+                first_aethyme_index = command_index
+            explore_output_chars += event_output_chars
+            if first_successful_explore_index is None and _event_looks_like_successful_explore(
+                event, outputs
+            ):
+                first_successful_explore_index = command_index
+
+        if has_broad_search and first_broad_search_index is None:
+            first_broad_search_index = command_index
+
+        if (
+            has_broad_rg
+            and first_successful_explore_index is not None
+            and command_index > first_successful_explore_index
+        ):
+            post_explore_broad_rg_commands.extend(_command_summaries(commands))
+
+    first_before_broad: bool | None
+    if first_aethyme_index is None:
+        first_before_broad = None
+    elif first_broad_search_index is None:
+        first_before_broad = True
+    else:
+        first_before_broad = first_aethyme_index < first_broad_search_index
+
+    return {
+        "event_log_available": True,
+        "max_single_command_output_chars": max_single_output,
+        "explore_output_chars": explore_output_chars,
+        "first_aethyme_index": first_aethyme_index,
+        "first_broad_search_index": first_broad_search_index,
+        "first_aethyme_call_before_broad_search": first_before_broad,
+        "successful_explore_detected": first_successful_explore_index is not None,
+        "broad_rg_after_successful_explore": bool(post_explore_broad_rg_commands),
+        "post_explore_broad_rg_commands": post_explore_broad_rg_commands[:5],
+    }
+
+
+def _event_log_path(payload: dict[str, Any]) -> Path | None:
+    event_log_file = payload.get("event_log_file")
+    if not isinstance(event_log_file, str):
+        return None
+    path = Path(event_log_file)
+    return path if path.is_file() else None
+
+
+def _event_log_events(path: Path) -> list[Any]:
+    events: list[Any] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
+def _event_command_token_lists(value: Any, *, key: str | None = None) -> list[list[Any]]:
+    if isinstance(value, str):
+        return [_split_command_text(value)] if key in COMMAND_FIELD_KEYS else []
+    if isinstance(value, list):
+        if key in COMMAND_FIELD_KEYS and any(isinstance(item, str) for item in value):
+            return [value]
+        commands: list[list[Any]] = []
+        for item in value:
+            commands.extend(_event_command_token_lists(item))
+        return commands
+    if isinstance(value, dict):
+        commands: list[list[Any]] = []
+        for item_key, item in value.items():
+            commands.extend(_event_command_token_lists(item, key=str(item_key)))
+        return commands
+    return []
+
+
+def _event_looks_like_successful_explore(event: Any, outputs: list[str]) -> bool:
+    if _event_has_failed_exit_status(event):
+        return False
+    return bool(outputs) or _event_type_name(event).endswith(".completed")
+
+
+def _event_has_failed_exit_status(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if key_text in {"exit_code", "exitcode", "returncode", "status_code"}:
+                if isinstance(item, int) and item != 0:
+                    return True
+                if isinstance(item, str) and item not in {"0", "success", "ok", "passed"}:
+                    return True
+            if key_text in {"success", "ok", "passed"} and item is False:
+                return True
+            if _event_has_failed_exit_status(item):
+                return True
+    elif isinstance(value, list):
+        return any(_event_has_failed_exit_status(item) for item in value)
+    return False
+
+
+def _event_type_name(value: Any) -> str:
+    if isinstance(value, dict) and isinstance(value.get("type"), str):
+        return value["type"]
+    return ""
+
+
+def _command_tokens_are_broad_search(value: list[Any]) -> bool:
+    tokens = [item for item in value if isinstance(item, str)]
+    if not tokens:
+        return False
+    if any(
+        _command_tokens_are_broad_search(_split_command_text(payload))
+        for payload in _shell_command_payloads(tokens)
+    ):
+        return True
+    return any(_command_tail_is_broad_search(tokens, index) for index in _command_indices(tokens))
+
+
+def _command_tokens_are_broad_rg(value: list[Any]) -> bool:
+    tokens = [item for item in value if isinstance(item, str)]
+    if not tokens:
+        return False
+    if any(
+        _command_tokens_are_broad_rg(_split_command_text(payload))
+        for payload in _shell_command_payloads(tokens)
+    ):
+        return True
+    return any(
+        Path(tokens[index]).name.lower() in {"rg", "ripgrep"}
+        and _rg_command_is_broad(tokens[index:])
+        for index in _command_indices(tokens)
+    )
+
+
+def _command_indices(tokens: list[str]) -> list[int]:
+    if not tokens:
+        return []
+    first_name = Path(tokens[0]).name.lower()
+    if first_name == "env":
+        for index, token in enumerate(tokens[1:], start=1):
+            if token.startswith("-") or _looks_like_env_assignment(token):
+                continue
+            return [index]
+    return [0]
+
+
+def _looks_like_env_assignment(token: str) -> bool:
+    name, separator, _value = token.partition("=")
+    return bool(separator and name and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name))
+
+
+def _command_tail_is_broad_search(tokens: list[str], index: int) -> bool:
+    name = Path(tokens[index]).name.lower()
+    tail = tokens[index:]
+    if name in {"rg", "ripgrep"}:
+        return _rg_command_is_broad(tail)
+    if name == "grep":
+        return _grep_command_is_broad(tail)
+    if name == "find":
+        return _find_command_is_broad(tail)
+    if name == "git" and index + 1 < len(tokens) and tokens[index + 1] == "grep":
+        return _grep_command_is_broad(tokens[index + 1 :])
+    return False
+
+
+def _rg_command_is_broad(tokens: list[str]) -> bool:
+    operands = _search_command_operands(tokens[1:])
+    if any(token == "--files" for token in tokens[1:]):
+        path_operands = operands
+    else:
+        path_operands = operands[1:] if operands else []
+    if not path_operands:
+        return True
+    return any(_search_path_is_broad(path) for path in path_operands)
+
+
+def _grep_command_is_broad(tokens: list[str]) -> bool:
+    recursive = any(token in {"-R", "-r", "--recursive"} for token in tokens[1:])
+    if not recursive:
+        return False
+    operands = _search_command_operands(tokens[1:])
+    path_operands = operands[1:] if operands else []
+    if not path_operands:
+        return True
+    return any(_search_path_is_broad(path) for path in path_operands)
+
+
+def _find_command_is_broad(tokens: list[str]) -> bool:
+    operands = _search_command_operands(tokens[1:])
+    if not operands:
+        return True
+    return any(_search_path_is_broad(path) for path in operands[:2])
+
+
+def _search_command_operands(tokens: list[str]) -> list[str]:
+    operands: list[str] = []
+    skip_next = False
+    flags_with_value = {
+        "-A",
+        "-B",
+        "-C",
+        "-e",
+        "-g",
+        "-m",
+        "-t",
+        "-T",
+        "--after-context",
+        "--before-context",
+        "--context",
+        "--glob",
+        "--ignore-file",
+        "--max-count",
+        "--regexp",
+        "--sort",
+        "--type",
+        "--type-not",
+    }
+    for index, token in enumerate(tokens):
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--":
+            operands.extend(tokens[index + 1 :])
+            break
+        if token in flags_with_value:
+            skip_next = True
+            continue
+        if any(token.startswith(f"{flag}=") for flag in flags_with_value if flag.startswith("--")):
+            continue
+        if token.startswith("-"):
+            continue
+        operands.append(token)
+    return operands
+
+
+def _search_path_is_broad(path: str) -> bool:
+    normalized = path.strip().strip("'\"").rstrip("/")
+    if not normalized:
+        return False
+    lower = normalized.lower()
+    if lower in {"", ".", "./", "$pwd", "${pwd}", "$repo", "$repo_path"}:
+        return True
+    if any(char in normalized for char in "*?[]"):
+        return True
+    if lower in {
+        "app",
+        "apps",
+        "backend",
+        "client",
+        "frontend",
+        "lib",
+        "package",
+        "packages",
+        "server",
+        "src",
+        "test",
+        "tests",
+        "web",
+    }:
+        return True
+    return Path(normalized).suffix == "" and "/" in normalized
+
+
+def _command_summaries(commands: list[list[Any]]) -> list[str]:
+    return [_command_summary(command) for command in commands if command]
+
+
+def _command_summary(command: list[Any]) -> str:
+    text = " ".join(shlex.quote(str(token)) for token in command)
+    return text[:240]
+
+
+def _cumulative_replay_estimate(
+    payload: dict[str, Any],
+    metrics: dict[str, Any],
+    event_analysis: dict[str, Any],
+) -> int:
+    existing = metrics.get("cumulative_replay_token_estimate")
+    if isinstance(existing, int) and existing >= 0:
+        return existing
+
+    event_log_chars = _payload_or_file_chars(payload, "event_log_chars", "event_log_file")
+    stderr_chars = _payload_or_file_chars(payload, "stderr_chars", "stderr_file")
+    if event_log_chars == 0:
+        event_log_chars = _metric_int(metrics, "command_output_chars")
+
+    answer_chars = 0
+    final_output = payload.get("final_output_message")
+    if isinstance(final_output, str):
+        answer_chars += len(final_output)
+    structured_output = payload.get("structured_output")
+    if structured_output is not None:
+        answer_chars += len(json.dumps(structured_output, sort_keys=True, ensure_ascii=True))
+
+    total_chars = event_log_chars + stderr_chars + answer_chars
+    if total_chars == 0:
+        return _metric_int(metrics, "token_estimate")
+    return (total_chars + 3) // 4
+
+
+def _payload_or_file_chars(payload: dict[str, Any], count_key: str, file_key: str) -> int:
+    count = payload.get(count_key)
+    if isinstance(count, int) and count >= 0:
+        return count
+    path_value = payload.get(file_key)
+    if not isinstance(path_value, str):
+        return 0
+    path = Path(path_value)
+    if not path.is_file():
+        return 0
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def _aethyme_invoked(payload: dict[str, Any]) -> bool:
@@ -853,6 +1365,138 @@ def _command_output_bound_check(
     }
 
 
+def _single_command_output_bound_checks(
+    control_metrics: dict[str, Any],
+    aethyme_metrics: dict[str, Any],
+    max_single_command_output_chars: int | None,
+) -> list[dict[str, Any]]:
+    if max_single_command_output_chars is None:
+        return []
+    return [
+        _single_command_output_bound_check(
+            "control",
+            control_metrics,
+            max_single_command_output_chars,
+        ),
+        _single_command_output_bound_check(
+            "aethyme",
+            aethyme_metrics,
+            max_single_command_output_chars,
+        ),
+    ]
+
+
+def _single_command_output_bound_check(
+    label: str,
+    metrics: dict[str, Any],
+    max_single_command_output_chars: int,
+) -> dict[str, Any]:
+    actual = _metric_int(metrics, "max_single_command_output_chars")
+    passed = actual <= max_single_command_output_chars
+    return {
+        "name": f"{label}_single_command_output_bounded",
+        "passed": passed,
+        "actual": actual,
+        "limit": max_single_command_output_chars,
+        "failure": None if passed else f"{label} single command output exceeded cap",
+    }
+
+
+def _explore_output_bound_check(
+    aethyme_metrics: dict[str, Any],
+    max_explore_output_chars: int | None,
+) -> dict[str, Any]:
+    if max_explore_output_chars is None:
+        return {
+            "name": "aethyme_explore_output_bounded",
+            "passed": True,
+            "skipped": True,
+            "failure": None,
+        }
+    actual = _metric_int(aethyme_metrics, "explore_output_chars")
+    passed = actual <= max_explore_output_chars
+    return {
+        "name": "aethyme_explore_output_bounded",
+        "passed": passed,
+        "actual": actual,
+        "limit": max_explore_output_chars,
+        "failure": None if passed else "Aethyme Explore output exceeded cap",
+    }
+
+
+def _cumulative_replay_bound_checks(
+    control_metrics: dict[str, Any],
+    aethyme_metrics: dict[str, Any],
+    max_cumulative_replay_estimate: int | None,
+) -> list[dict[str, Any]]:
+    if max_cumulative_replay_estimate is None:
+        return []
+    return [
+        _cumulative_replay_bound_check(
+            "control",
+            control_metrics,
+            max_cumulative_replay_estimate,
+        ),
+        _cumulative_replay_bound_check(
+            "aethyme",
+            aethyme_metrics,
+            max_cumulative_replay_estimate,
+        ),
+    ]
+
+
+def _cumulative_replay_bound_check(
+    label: str,
+    metrics: dict[str, Any],
+    max_cumulative_replay_estimate: int,
+) -> dict[str, Any]:
+    actual = _metric_int(metrics, "cumulative_replay_token_estimate")
+    passed = actual <= max_cumulative_replay_estimate
+    return {
+        "name": f"{label}_cumulative_replay_estimate_bounded",
+        "passed": passed,
+        "actual": actual,
+        "limit": max_cumulative_replay_estimate,
+        "failure": None if passed else f"{label} replay estimate exceeded cap",
+    }
+
+
+def _first_aethyme_before_broad_search_check(
+    aethyme_metrics: dict[str, Any],
+    *,
+    require: bool,
+) -> dict[str, Any]:
+    value = aethyme_metrics.get("first_aethyme_call_before_broad_search")
+    if not isinstance(value, bool):
+        return {
+            "name": "aethyme_first_call_before_broad_search",
+            "passed": not require,
+            "skipped": not require,
+            "value": value,
+            "failure": None
+            if not require
+            else "missing event-log evidence for Aethyme/broad-search ordering",
+        }
+    return {
+        "name": "aethyme_first_call_before_broad_search",
+        "passed": value,
+        "first_aethyme_command_index": aethyme_metrics.get("first_aethyme_command_index"),
+        "first_broad_search_command_index": aethyme_metrics.get("first_broad_search_command_index"),
+        "failure": None if value else "first broad search happened before Aethyme Explore",
+    }
+
+
+def _broad_rg_after_successful_explore_warning(aethyme_metrics: dict[str, Any]) -> dict[str, Any]:
+    warned = bool(aethyme_metrics.get("broad_rg_after_successful_explore"))
+    return {
+        "name": "broad_rg_after_successful_explore",
+        "passed": True,
+        "warning": warned,
+        "commands": aethyme_metrics.get("post_explore_broad_rg_commands", []),
+        "failure": None,
+    }
+
+
 def _determinism_checks(
     control: dict[str, Any],
     aethyme: dict[str, Any],
@@ -915,9 +1559,7 @@ def _deterministic_output_surface(payload: dict[str, Any]) -> Any:
     if payload.get("final_output_message") is not None:
         return payload.get("final_output_message")
     return {
-        key: value
-        for key, value in payload.items()
-        if key not in NONDETERMINISTIC_OUTPUT_FIELDS
+        key: value for key, value in payload.items() if key not in NONDETERMINISTIC_OUTPUT_FIELDS
     }
 
 
@@ -947,6 +1589,131 @@ def _coverage_report_check(
             return assessment
         best = assessment
     return best
+
+
+def _surface_flow_lanes_check(
+    aethyme: dict[str, Any],
+    aethyme_metrics: dict[str, Any],
+    *,
+    fixture_id: str | None,
+    require: bool,
+) -> dict[str, Any]:
+    if not require or not _is_auth_token_task(aethyme, fixture_id):
+        return {
+            "name": "auth_token_surface_flow_lanes_present",
+            "passed": True,
+            "skipped": True,
+            "fixture_id": fixture_id,
+            "failure": None,
+        }
+
+    roles = _surface_flow_lane_roles_from_metrics(aethyme_metrics)
+    if not roles:
+        roles = _surface_flow_lane_roles(aethyme)
+    required_roles = _required_auth_surface_lane_roles(fixture_id)
+    if required_roles:
+        missing_roles = sorted(required_roles - roles)
+        passed = not missing_roles
+        failure = None if passed else f"missing required Surface/Flow lanes: {missing_roles}"
+    else:
+        matching_roles = sorted(roles & AUTH_SURFACE_LANE_ROLES)
+        passed = bool(matching_roles)
+        failure = None if passed else "auth/token task did not expose Surface/Flow subsystem lanes"
+        missing_roles = []
+
+    return {
+        "name": "auth_token_surface_flow_lanes_present",
+        "passed": passed,
+        "fixture_id": fixture_id,
+        "roles": sorted(roles),
+        "required_roles": sorted(required_roles),
+        "missing_roles": missing_roles,
+        "failure": failure,
+    }
+
+
+def _is_auth_token_task(payload: dict[str, Any], fixture_id: str | None) -> bool:
+    if fixture_id in AUTH_TOKEN_FIXTURE_IDS:
+        return True
+    for value in _payload_task_descriptors(payload):
+        lower = value.lower()
+        if any(keyword in lower for keyword in AUTH_TOKEN_TASK_KEYWORDS):
+            return True
+    return False
+
+
+def _payload_task_descriptors(payload: dict[str, Any]) -> list[str]:
+    descriptors: list[str] = []
+    for key in ("fixture_id", "fixture", "task_class", "request", "prompt"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            descriptors.append(value)
+    contract = payload.get("contract")
+    if isinstance(contract, dict):
+        for key in ("fixture_id", "fixture", "task_class", "request", "prompt"):
+            value = contract.get(key)
+            if isinstance(value, str):
+                descriptors.append(value)
+    fixture = payload.get("fixture")
+    if isinstance(fixture, dict):
+        for key in ("id", "fixture_id", "task_class", "request", "prompt"):
+            value = fixture.get(key)
+            if isinstance(value, str):
+                descriptors.append(value)
+    return descriptors
+
+
+def _required_auth_surface_lane_roles(fixture_id: str | None) -> set[str]:
+    if fixture_id is None:
+        return set()
+    return set(AUTH_FIXTURE_REQUIRED_LANES.get(fixture_id, set()))
+
+
+def _surface_flow_lane_roles_from_metrics(metrics: dict[str, Any]) -> set[str]:
+    value = metrics.get("surface_flow_lane_roles")
+    if not isinstance(value, list):
+        return set()
+    return {_normalize_fixture_id(item) for item in value if isinstance(item, str)}
+
+
+def _surface_flow_lane_roles(payload: dict[str, Any]) -> set[str]:
+    roles: set[str] = set()
+    _collect_surface_flow_lane_roles(payload.get("structured_output"), roles)
+    _collect_surface_flow_lane_roles(payload.get("final_output_message"), roles)
+    event_log_file = payload.get("event_log_file")
+    if isinstance(event_log_file, str) and Path(event_log_file).is_file():
+        for line in Path(event_log_file).read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            for output_text in _command_output_strings(event):
+                for decoded in _decoded_json_values(output_text):
+                    _collect_surface_flow_lane_roles(decoded, roles)
+    return roles
+
+
+def _collect_surface_flow_lane_roles(value: Any, roles: set[str]) -> None:
+    if isinstance(value, str):
+        for decoded in _decoded_json_values(value):
+            _collect_surface_flow_lane_roles(decoded, roles)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_surface_flow_lane_roles(item, roles)
+        return
+    if not isinstance(value, dict):
+        return
+
+    subsystems = value.get("subsystems")
+    if isinstance(subsystems, list):
+        for subsystem in subsystems:
+            if isinstance(subsystem, dict) and isinstance(subsystem.get("role"), str):
+                roles.add(_normalize_fixture_id(subsystem["role"]))
+    for item in value.values():
+        _collect_surface_flow_lane_roles(item, roles)
 
 
 def _assess_coverage_candidate(
