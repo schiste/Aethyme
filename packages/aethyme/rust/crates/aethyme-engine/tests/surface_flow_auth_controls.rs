@@ -228,6 +228,24 @@ def verify_audit_jws(audit_jws):
     return audit_jws.split(".")
 "#,
         );
+        write(
+            tmp.path(),
+            "backend/accounts/auth0_management.py",
+            br#"
+def get_auth0_management_token(client):
+    return client.oauth_token("auth0-management")
+"#,
+        );
+        write(
+            tmp.path(),
+            "backend/accounts/webhook_tokens.py",
+            br#"
+def verify_webhook_token(signature, payload, secret):
+    if not signature.startswith("whsec_"):
+        raise PermissionError("invalid webhook token signature")
+    return hmac_compare(signature, payload, secret)
+"#,
+        );
     }
 
     if options.behavior_tests && options.proxy {
@@ -338,14 +356,13 @@ fn verification_steps_text(response: &serde_json::Value) -> String {
         .join("\n")
 }
 
-fn target_text(subsystem: &serde_json::Value) -> String {
+fn top_target_text(subsystem: &serde_json::Value) -> String {
     subsystem["top_verification_targets"]
         .as_array()
         .expect("top verification targets")
-        .iter()
+        .first()
         .map(serde_json::Value::to_string)
-        .collect::<Vec<_>>()
-        .join("\n")
+        .unwrap_or_default()
 }
 
 fn has_behavior_test_warning(response: &serde_json::Value) -> bool {
@@ -419,13 +436,23 @@ fn auth_surface_positive_contract_is_ranked_bounded_and_deterministic() {
         vec!["ingress_proxy".to_string(), "backend_validator".to_string()]
     );
     let ingress = subsystem_by_role(&first, "ingress_proxy").expect("ingress/proxy subsystem");
-    assert!(target_text(ingress).contains("gcp-run-proxy"));
+    let ingress_top = top_target_text(ingress);
+    assert!(
+        ingress_top.contains("gcp-run-proxy"),
+        "ingress/proxy top target should point at gcp-run-proxy: {ingress_top}"
+    );
     let backend = subsystem_by_role(&first, "backend_validator").expect("backend subsystem");
-    assert!(target_text(backend).contains("backend/api_keys"));
+    let backend_top = top_target_text(backend);
+    assert!(
+        backend_top.contains("backend/api_keys"),
+        "backend validator top target should point at backend/api_keys: {backend_top}"
+    );
 
     let ambiguity = first["ambiguous"].to_string();
     assert!(ambiguity.contains("OIDC"));
     assert!(ambiguity.contains("audit JWS"));
+    assert!(ambiguity.contains("Auth0 management"));
+    assert!(ambiguity.contains("webhook tokens"));
 
     let steps = verification_steps_text(&first);
     assert!(steps.contains("There are multiple token systems"));
@@ -449,6 +476,19 @@ fn auth_surface_without_proxy_does_not_emit_proxy_crossing_hint() {
     );
     let output = response.to_string();
     assert!(!output.contains("gcp-run-proxy"));
+    if let Some(ingress) = subsystem_by_role(&response, "ingress_proxy") {
+        let confidence = ingress["confidence"].as_f64().unwrap_or(1.0);
+        assert!(
+            confidence <= 0.68,
+            "route-only ingress must have reduced confidence, got {confidence}: {ingress}"
+        );
+        assert!(
+            ingress["missing_coverage_warnings"]
+                .to_string()
+                .contains("backend route-only"),
+            "route-only ingress should warn that no edge/proxy surface matched: {ingress}"
+        );
+    }
     assert!(
         !verification_steps_text(&response).contains("Verify proxy classification first"),
         "proxy-specific verification should require actual proxy evidence"
@@ -536,4 +576,6 @@ fn auth_surface_decoys_only_surfaces_uncertainty_without_ingress_or_backend() {
     let token_subsystems = provider["token_subsystems"].to_string();
     assert!(token_subsystems.contains("OIDC"));
     assert!(token_subsystems.contains("audit JWS"));
+    assert!(token_subsystems.contains("Auth0 management"));
+    assert!(token_subsystems.contains("webhook tokens"));
 }
