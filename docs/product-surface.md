@@ -36,7 +36,9 @@ Use this as the daily operator loop when agents work concurrently.
 
 ```bash
 aethyme broker status
-aethyme broker adopt --task "Describe the task"
+aethyme broker start --task "Describe the task"
+aethyme broker leases claim <path> --session <id>
+aethyme broker exec --session <id> -- <command>
 # edit and commit in the session worktree
 aethyme broker submit --session <id>
 aethyme broker repair --session <id>
@@ -46,8 +48,9 @@ aethyme broker integration status
 
 What this provides:
 
-- session registration by worktree and task
-- dirty-worktree and overlap visibility
+- broker-created worktrees, with `adopt` available for existing worktrees
+- dirty-worktree visibility, explicit leases, and overlap warnings
+- guarded command execution for broad rewrites
 - merge simulation before promotion
 - repo-owned gates on the merged tree
 - promoted-but-unmerged integration visibility
@@ -79,7 +82,9 @@ These commands are the public product path and should stay easy to explain:
 - `aethyme init`
 - `aethyme certify`
 - `aethyme broker status`
+- `aethyme broker start`
 - `aethyme broker adopt`
+- `aethyme broker exec`
 - `aethyme broker submit`
 - `aethyme broker repair`
 - `aethyme broker finish`

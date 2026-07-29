@@ -35,13 +35,15 @@ contracts, so any future delivery surface is a client, not a rewrite.
    diffs, regardless of whether Claude Code, Codex, Aider, or a shell
    script is driving it. Multi-vendor operation is a v0 requirement, not a
    later adapter story.
-2. **Attach-first, from day one.** Real usage starts inside an agent tool
-   the user already launched. Session identity is the (worktree, branch)
-   pair — `broker adopt` registers an existing worktree; `broker
-   start-agent` is a convenience spawner layered on the same model. PID is
-   optional metadata captured when the broker did the spawning; liveness
-   derives from diff/file activity, with process state as a bonus signal.
-   No design may assume the broker owns the agent process.
+2. **Worktree-first, attach-capable.** Session identity is the
+   (worktree, branch) pair. The normal entry point is now `broker start`,
+   which creates an isolated worktree + branch and registers the session;
+   `broker adopt` remains the attach path for a worktree the user or agent
+   tool already created. `broker start-agent` is a convenience spawner
+   layered on the same model. PID is optional metadata captured when the
+   broker did the spawning; liveness derives from diff/file activity, with
+   process state as a bonus signal. No design may assume the broker owns the
+   agent process.
 3. **API-first.** The broker core is a Rust library crate with a typed
    public API; the CLI is a thin client of it, every command has a
    `--json` form, and the append-only events schema is a versioned
@@ -135,11 +137,13 @@ command is the intentionally separate read surface for that future signal.
 Aethyme v0 local broker should eventually provide:
 
 - one isolated git worktree per agent/task
-- an agent session registry keyed on (worktree, branch): `broker adopt`
-  registers an existing worktree (attach-first); `broker start-agent`
-  creates worktree + spawns a command template as a convenience; task,
-  logs, status, and exit state are recorded where known
+- an agent session registry keyed on (worktree, branch): `broker start`
+  creates the default isolated worktree; `broker adopt` registers an
+  existing worktree; `broker start-agent` creates worktree + spawns a
+  command template as a convenience; task, logs, status, and exit state are
+  recorded where known
 - changed-file tracking per session
+- explicit path leases and guarded command execution for write ownership
 - overlapping-edit detection across live sessions
 - a simple gate runner (configured gates, run on changed files, results
   cached)
@@ -223,12 +227,12 @@ and are labeled as experiments.
 
 1. **Phase 1 — local state model**: SQLite schema (sessions, leases, gates,
    gate_results, merge_queue, events) behind a typed store layer.
-2. **Phase 2 — worktree & session broker**: `adopt` (attach-first session
-   registration on existing worktrees), `start-agent` (worktree + spawn
-   convenience), `agents`, `cleanup`; worktree lifecycle; activity-based
-   liveness with PID as optional metadata.
+2. **Phase 2 — worktree & session broker**: `start` (broker-created
+   worktree), `adopt` (registration on existing worktrees), `start-agent`
+   (worktree + spawn convenience), `agents`, `cleanup`; worktree lifecycle;
+   activity-based liveness with PID as optional metadata.
 3. **Phase 3 — leases & conflict detection**: diff-derived implicit leases,
-   overlap warnings, TTL expiry.
+   explicit path claims, guarded exec, overlap warnings, TTL expiry.
 4. **Phase 4 — affected gate runner**: `gates.toml`, glob-triggered
    selection, cheap-first ordering, tree-hash result cache.
 5. **Phase 5 — merge simulation & promotion queue**: `git merge-tree`

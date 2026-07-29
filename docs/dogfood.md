@@ -29,9 +29,18 @@ Gates and broker config are committed (`.aethyme/gates.toml`,
 ## The daily loop
 
 ```bash
-# Starting an agent on a task, in a worktree you (or your agent tool)
-# already created — the normal, attach-first path:
+# Starting an agent on a task — normal path:
+aethyme broker start --task "short task description"
+cd <reported-worktree>
+
+# If you or your agent tool already created a dedicated worktree:
 cd <worktree> && aethyme broker adopt --task "short task description"
+
+# Before planned shared edits:
+aethyme broker leases claim <path> --session <id>
+
+# For broad rewrite tools:
+aethyme broker exec --session <id> -- <command>
 
 # Or let the broker create worktree + branch + spawn in one step:
 aethyme broker start-agent --task "port X" --cmd "claude -p '...'"

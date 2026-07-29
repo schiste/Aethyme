@@ -21,7 +21,9 @@ product surface.
 - `aethyme init`
 - `aethyme certify`
 - `aethyme broker status`
+- `aethyme broker start`
 - `aethyme broker adopt`
+- `aethyme broker exec`
 - `aethyme broker submit`
 - `aethyme broker repair`
 - `aethyme broker finish`
@@ -59,7 +61,9 @@ The broker is the stable product front door for multi-agent coordination:
 - `aethyme init`
 - `aethyme certify`
 - `aethyme broker status [--json]`
+- `aethyme broker start --task "..." [--json]`
 - `aethyme broker adopt [<path>] --task "..." [--reuse] [--json]`
+- `aethyme broker exec --session <id> -- <command> [--json]`
 - `aethyme broker submit --session <id> [--json]`
 - `aethyme broker repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`

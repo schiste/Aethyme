@@ -47,8 +47,12 @@ def test_agents_document_includes_broker_protocol_only_when_configured(
     agents_text = (repo_path / "AGENTS.md").read_text(encoding="utf-8")
     assert "## Broker Coordination" in agents_text
     assert "broker status --json" in agents_text
+    assert "broker start --task" in agents_text
     assert "broker adopt" in agents_text
+    assert "broker leases claim" in agents_text
+    assert "broker exec --session" in agents_text
     assert "broker submit" in agents_text
+    assert "AETHYME_TEST_DB_SUFFIX" in agents_text
     assert ".aethyme/broker-action-required.md" in agents_text
     assert "aethyme/integration" in agents_text
     # CLAUDE.md renders from the same generated document.

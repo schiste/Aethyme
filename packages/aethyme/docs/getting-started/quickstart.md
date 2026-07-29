@@ -6,7 +6,7 @@ This page covers the lower-level graph-engine path. For the current public
 product quickstart, use the broker-first flow in
 [`../../../../README.md`](../../../../README.md) and the product map in
 [`../../../../docs/product-surface.md`](../../../../docs/product-surface.md):
-install -> `aethyme init` -> `aethyme broker quick-test` -> adopt -> submit.
+install -> `aethyme init` -> `aethyme broker quick-test` -> start -> submit.
 
 ## 1. Install
 
@@ -55,7 +55,7 @@ At this stage:
 
 ```bash
 . .venv/bin/activate
-pytest tests/local tests/indexing tests/scorecard tests/autofixers tests/contracts tests/docs -q
+python -m pytest tests/local tests/indexing tests/scorecard tests/autofixers tests/contracts tests/docs -q
 ```
 
 See `tests/README.md` for the suite layout.

@@ -19,17 +19,18 @@ SQLite in `.aethyme/`, on macOS and Linux.
 | **Clearance to land** | `submit` → simulate → gates → promote | A submission is merge-simulated against the integration branch *before* anything runs. Conflicts are rejected in milliseconds with written recovery steps; clean merges get your checks run on the merged tree — the only place semantic conflicts are detectable — then promote. |
 | **Regulations** | `.aethyme/gates.toml` | Quality rules are repo policy, not broker policy. You declare gates (command, cost tier, path triggers); the broker selects the affected ones, runs cheap-first, caches by tree hash, and cancels obsolete runs. A repo with no gates is a valid conflict-only deployment. |
 | **Certification** | `aethyme init` / `aethyme certify` | `certify` is a read-only inspection (git version, repo state, config validity, gitignore contract, database integrity) you can run in CI or cron. `init` runs certify, then scaffolds only what's missing, then drafts gates from your manifests. Idempotent: a second run changes nothing and says so. |
-| **Preflight smoke** | `aethyme broker quick-test` | Creates a disposable repo, runs init → adopt → commit → submit, verifies promotion, then removes the repo. Use it after install/init to prove the local broker loop before adopting real work. |
+| **Preflight smoke** | `aethyme broker quick-test` | Creates a disposable repo, runs init → adopt → commit → submit, verifies promotion, then removes the repo. Use it after install/init to prove the local broker loop before starting real work. |
 | **Verification loop** | `aethyme broker verify-loop` | Operator E2E: snapshots the integration head, runs quick-test, runs doctor, runs broker source tests when invoked inside the Aethyme checkout, and fails if integration moved before the result could prove the current tip. Alias: `aethyme broker e2e`. |
 | **Charts** | the graph engine | A deterministic Rust repo-intelligence engine (indexing, graph navigation, impact frontiers, task-context packs). Today it serves queries on its own; feeding impact hints to the tower is planned, deliberately deferred. |
 | **The flight recorder** | `aethyme broker events` | Every mutation appends to a versioned event log ([`docs/events-contract.md`](docs/events-contract.md)) — the integration contract for any future surface (TUI, editor plugin). |
 
 Two design commitments underneath all of it:
 
-- **Attach-first.** A session is an existing worktree you register
-  (`broker adopt`), not a process the broker owns. Agents from different
-  vendors coordinate because sessions are vendor-agnostic worktrees, not
-  because of per-vendor adapters.
+- **Worktree-first.** The normal path is `broker start --task`, which creates
+  an isolated worktree + branch and registers the session. `broker adopt`
+  remains the attach path for an existing dedicated worktree. Agents from
+  different vendors coordinate because sessions are vendor-agnostic
+  worktrees, not because of per-vendor adapters.
 - **API-first.** The broker core is a typed Rust library; the CLI is a thin
   client and every command has a `--json` form. The promotion lands on a
   *local* integration branch only — the broker never pushes, never opens
@@ -43,8 +44,9 @@ broker directions for repo cleanliness and token budgets, see
 ## Current state — honest version
 
 **v0 (MVP) is built and proven in dogfood.** Sessions, diff-derived leases
-with overlap warnings, the affected gate runner with tree-hash caching,
-merge simulation, auto-promotion, conflict hand-back
+with overlap warnings, explicit write leases, guarded command execution, the
+affected gate runner with tree-hash caching, merge simulation, auto-promotion,
+conflict hand-back
 (`.aethyme/broker-action-required.md`), the append-only event log, managed
 git hooks, `init`/`certify`, and cost/benefit `metrics` all work today.
 Aethyme's own development runs through the broker — multi-agent batches on
@@ -55,20 +57,20 @@ merged tree caught it). Friction and cost accounting are logged in
 
 **V1 is in progress.** The dogfood week is hardening the loop; known edges:
 design ceiling of 15 concurrent sessions (stress-tested at 20), macOS/Linux
-only, overlap warnings never block (v0 policy), and graph-aware broker
-features (impact-hint advisories) are deferred. The deterministic graph
+only, implicit overlap warnings are advisory while explicit leases block, and
+graph-aware broker features (impact-hint advisories) are deferred. The deterministic graph
 engine remains a separate supporting service.
 
 **Removed.** Earlier cloud/SaaS work was deleted in 2026-07; no cloud
 execution, auth, or team sync is part of the product. Direction doc:
 [`docs/aethyme-local-agent-broker.md`](docs/aethyme-local-agent-broker.md).
 
-## Quickstart: install -> init -> quick-test -> adopt -> submit
+## Quickstart: install -> init -> quick-test -> start -> submit
 
 Prerequisites: git ≥ 2.38, a Rust toolchain, ~2 GB free RAM for the one-time compile (the bundled SQLite build is memory-hungry; small VMs/containers may OOM — prebuilt release binaries avoid the compile entirely), and any repo to try it on.
 
 First-time flow: install -> `aethyme init` -> `aethyme broker quick-test` ->
-`aethyme broker adopt` -> `aethyme broker submit --session <id>`.
+`aethyme broker start --task "..."` -> `aethyme broker submit --session <id>`.
 
 **1. Install the binary** (from a clone of this repository):
 
@@ -100,8 +102,8 @@ created  scaffold.broker-db           integrity: ok
 Phase 3/3 — gates draft (adaptive):
 warn     gates.draft                  no manifests recognized — define .aethyme/gates.toml yourself; until then the broker runs conflict-only (no verification)
 
-First-time flow: install -> `aethyme init` -> `aethyme broker quick-test` -> `aethyme broker adopt` -> `aethyme broker submit --session <id>`.
-Next steps: review any drafts above, re-check anytime with `aethyme certify`, then run the disposable smoke before adopting real sessions; optionally `aethyme enhance deploy` installs the agent protocol into AGENTS.md/CLAUDE.md.
+First-time flow: install -> `aethyme init` -> `aethyme broker quick-test` -> `aethyme broker start --task "..."` -> `aethyme broker submit --session <id>`.
+Next steps: review any drafts above, re-check anytime with `aethyme certify`, then run the disposable smoke before starting real sessions; optionally `aethyme enhance deploy` installs the agent protocol into AGENTS.md/CLAUDE.md.
 ```
 
 (On a repo with a `Cargo.toml`, `go.mod`, `package.json` scripts, or a
@@ -132,22 +134,27 @@ temporary repo removed: yes
 integration head: 69d395da1c7c
 ```
 
-**4. Register a session** — here the current checkout; agents normally each
-get their own worktree:
+**4. Start a broker-managed session** — this creates an isolated worktree and
+branch for the task:
 
 ```bash
-aethyme broker adopt --task "Add a farewell function"
+aethyme broker start --task "Add a farewell function"
 ```
 
 ```text
-Adopted session 1 — worktree /private/tmp/demo-app on branch main
-note: main-checkout session — verification is advisory here (commits land on main before gates run); use a worktree session for enforced verification.
+Started session 1 — worktree /private/tmp/demo-app/.aethyme/worktrees/add-a-farewell-function on branch agent/add-a-farewell-function
+Next: cd /private/tmp/demo-app/.aethyme/worktrees/add-a-farewell-function
 ```
+
+`broker adopt --task "..."` is still available when you have already created
+a dedicated worktree yourself.
 
 **5. Do the work and commit it.** Only committed work integrates:
 
 ```bash
-# ...edit src/app.py...
+aethyme broker leases claim src/app.py --session 1
+# ...edit src/app.py, or run broad tools through:
+# aethyme broker exec --session 1 -- <command>
 git add src/app.py
 git commit -m "feat: add farewell function"
 ```
@@ -211,7 +218,7 @@ longer guide at
 ```bash
 cd packages/aethyme
 python3 -m venv .venv && . .venv/bin/activate && pip install -e '.[dev]'
-.venv/bin/pytest -q tests/local
+python -m pytest -q tests/local
 cd rust && cargo test --workspace
 ```
 

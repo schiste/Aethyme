@@ -20,14 +20,28 @@ See [`packages/aethyme/docs/guides/eval-protocol.md`](packages/aethyme/docs/guid
 This repository dogfoods the Aethyme broker. If you are one of several
 agent sessions working here concurrently:
 
-1. Before editing, check activity and register your worktree:
-   `aethyme broker status --json`, then `aethyme broker adopt --task "<task>"`
+1. Broker entry point, before editing: check activity, create an isolated
+   broker worktree, and work from that checkout:
+   `aethyme broker status --json`, then `aethyme broker start --task "<task>"`
+   and `cd` into the reported worktree. If you are already in a dedicated
+   worktree, use `aethyme broker adopt --task "<task>"` instead.
    (install once: `cargo install --path packages/aethyme/rust/crates/aethyme-engine`; check with `aethyme --version`).
-2. Commit early and small; only committed work integrates.
-3. When done, `aethyme broker submit --session <id>` — never merge or push
+2. If you know you will touch a shared file before it appears in your diff,
+   claim it explicitly: `aethyme broker leases claim <path> --session <id>`.
+   Use a trailing `/` for directory leases, and release with
+   `aethyme broker leases release <path> --session <id>` when done.
+3. Run broad rewrite tools through the guard:
+   `aethyme broker exec --session <id> -- <command>`. The guard fails if
+   the command leaves dirty paths outside your explicit leases or in files
+   that were untracked before your session began.
+4. Commit early and small; only committed work integrates.
+5. Gates run with path-scoped owner locks. Gate commands that need external
+   state must use per-worker names, e.g. suffix test databases with
+   `$AETHYME_TEST_DB_SUFFIX` instead of sharing one fixed DB.
+6. When done, `aethyme broker submit --session <id>` — never merge or push
    yourself, and never touch the `aethyme/integration` branch directly.
    Then `aethyme broker close --session <id>` to finish, or
    `aethyme broker adopt --reuse --task "..."` for a follow-up task.
-4. If `.aethyme/broker-action-required.md` appears in your worktree, your
+7. If `.aethyme/broker-action-required.md` appears in your worktree, your
    submission conflicted: it contains the files, the blocking session, and
    the exact rebase steps. Resolve and resubmit.

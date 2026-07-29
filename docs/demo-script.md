@@ -83,9 +83,11 @@ gates.toml OK — 1 gate(s), cheap-first:
 
 ## Scene 2 — two agents, two worktrees
 
-Attach-first: the worktrees are ordinary `git worktree` checkouts; `adopt`
-registers them as sessions. (In real use each agent runs `adopt` itself —
-the point of the broker is that any vendor's agent can.)
+This scene uses hand-made worktrees to show the attach path: the worktrees
+are ordinary `git worktree` checkouts, and `adopt` registers them as
+sessions. In normal agent use, `aethyme broker start --task "..."` creates
+and registers the isolated worktree in one step; `adopt` remains the path
+when a vendor tool already made the checkout.
 
 ```bash
 git worktree add -q -b agent/alpha .aethyme/worktrees/alpha main
