@@ -202,7 +202,7 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
     [[ -f .claude/skills/aethyme/references/graph-task.md ]] && check_pass "Claude graph/task reference present" || check_fail "Missing Claude graph/task reference"
     [[ -f .claude/skills/aethyme/references/dead-code.md ]] && check_pass "Claude dead-code reference present" || check_fail "Missing Claude dead-code reference"
     if [[ -f "$EXPLORE_REF" ]]; then
-        grep -q 'src.cli intents' "$EXPLORE_REF" && check_pass "Explore reference includes current intent catalog guidance" || check_fail "Explore reference missing intents guidance"
+        grep -q 'aethyme intents' "$EXPLORE_REF" && check_pass "Explore reference includes current intent catalog guidance" || check_fail "Explore reference missing intents guidance"
     fi
     if [[ -f "$GRAPH_REF" ]]; then
         grep -q 'graph callers' "$GRAPH_REF" && check_pass "Graph/task reference includes caller guidance" || check_fail "Graph/task reference missing caller guidance"
