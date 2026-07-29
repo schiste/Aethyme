@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from src.enhance import AGENTS_OVERRIDE_PATH, deploy
+from src.enhance import AGENTS_OVERRIDE_PATH
+from tests.support.cli_invoke import invoke_aethyme
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS_DIR = _PACKAGE_ROOT / "scripts" / "eval"
@@ -61,7 +62,8 @@ def test_enhance_deploy_root_guidance_uses_native_explore(tmp_path: Path) -> Non
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
 
-    deploy(repo_path)
+    result = invoke_aethyme(["enhance", "deploy", "--repo", str(repo_path)])
+    assert result.exit_code == 0, result.output
 
     _assert_native_root_guidance(repo_path)
 
@@ -76,7 +78,8 @@ def test_enhance_deploy_does_not_migrate_legacy_generated_agents_as_maintainer(
         encoding="utf-8",
     )
 
-    deploy(repo_path)
+    result = invoke_aethyme(["enhance", "deploy", "--repo", str(repo_path)])
+    assert result.exit_code == 0, result.output
 
     agents_text = (repo_path / "AGENTS.md").read_text(encoding="utf-8")
     assert "## Maintainer Notes" not in agents_text
@@ -94,7 +97,8 @@ def test_enhance_deploy_cleans_stale_generated_agents_override(tmp_path: Path) -
         encoding="utf-8",
     )
 
-    deploy(repo_path)
+    result = invoke_aethyme(["enhance", "deploy", "--repo", str(repo_path)])
+    assert result.exit_code == 0, result.output
 
     agents_text = (repo_path / "AGENTS.md").read_text(encoding="utf-8")
     assert "## Maintainer Notes" not in agents_text

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.enhance import deploy
+from tests.support.cli_invoke import invoke_aethyme
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL_PATH = REPO_ROOT / "skills" / "aethyme" / "SKILL.md"
@@ -33,7 +33,7 @@ DEAD_CODE_REF_PATH = REPO_ROOT / "skills" / "aethyme" / "references" / "dead-cod
 
 def test_skill_md_exists():
     assert SKILL_PATH.exists(), (
-        f"{SKILL_PATH} must exist — deployed by `enhance.py` to "
+        f"{SKILL_PATH} must exist — deployed by `aethyme enhance deploy` to "
         ".codex/skills/aethyme/SKILL.md in target repos"
     )
 
@@ -68,7 +68,8 @@ def test_enhance_deploys_aethyme_skill_references(tmp_path: Path) -> None:
     (repo / "src").mkdir()
     (repo / "src" / "main.ts").write_text("console.log('demo')\n", encoding="utf-8")
 
-    deploy(repo)
+    result = invoke_aethyme(["enhance", "deploy", "--repo", str(repo)])
+    assert result.exit_code == 0, result.output
 
     for product in (".codex", ".claude"):
         for name in ("explore.md", "graph-task.md", "dead-code.md"):
