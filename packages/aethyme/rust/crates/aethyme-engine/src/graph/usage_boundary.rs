@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 // Phase 5 decision: usage-boundary stays hybrid V2. redb owns bounded seed
 // discovery (public symbols plus candidate source/docs/config files), while
-// query-time source text owns evidence strings. Persisting evidence spans in
-// redb would require explicit freshness/invalidation semantics before it could
-// be trusted for removal decisions.
+// query-time source text owns caller and docs/config evidence strings.
+// Persisting evidence spans in redb would require explicit freshness/
+// invalidation semantics before it could be trusted for removal decisions.
 
 use crate::graph::facts::classify_exposure;
 use crate::model::analysis::{
@@ -528,7 +528,7 @@ fn collect_redb_usage_seed_plan(
             continue;
         }
         let Some(exposure_kind) =
-            classify_usage_boundary_exposure(repo, &function, include_methods, degraded_reasons)
+            classify_usage_boundary_exposure(&function, include_methods, degraded_reasons)
         else {
             continue;
         };
@@ -754,7 +754,6 @@ fn parent_class_for_function(
 }
 
 fn classify_usage_boundary_exposure(
-    repo: &Path,
     function: &FunctionNode,
     include_methods: bool,
     degraded_reasons: &mut Vec<String>,
@@ -765,33 +764,18 @@ fn classify_usage_boundary_exposure(
     if let Some(exposure) = classify_exposure(function, include_methods) {
         return Some(exposure);
     }
-    if !include_methods
-        || !function.language.eq_ignore_ascii_case("php")
-        || function.parent_class_id.is_none()
-    {
-        return None;
-    }
 
-    let path = repo.join(function.file_path.as_str());
-    let Ok(content) = fs::read_to_string(&path) else {
+    if include_methods
+        && function.language.eq_ignore_ascii_case("php")
+        && function.parent_class_id.is_some()
+        && function.signature.trim().is_empty()
+    {
         degraded_reasons.push(format!(
-            "unreadable_source_file_for_visibility:{}",
-            function.file_path
-        ));
-        return None;
-    };
-    let Some(line) = content.lines().nth(function.line.saturating_sub(1)) else {
-        degraded_reasons.push(format!(
-            "missing_source_line_for_visibility:{}:{}",
+            "redb_missing_function_signature_for_visibility:{}:{}",
             function.file_path, function.line
         ));
-        return None;
-    };
-    if is_public_php_method(strip_line_comment(line).trim_start()) {
-        Some(ExposureKind::PublicMethod)
-    } else {
-        None
     }
+    None
 }
 
 fn redb_nodes_under_path(

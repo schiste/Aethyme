@@ -116,6 +116,21 @@ fn static_method_marks_is_static_true() {
     assert!(json.contains("\"is_static\":true"));
 }
 
+#[test]
+fn method_signature_carries_visibility_for_redb_exposure() {
+    let result = index_source("<?php\nclass Foo {\n    public function helper(): void {}\n}\n");
+    let method = result
+        .additional_nodes
+        .iter()
+        .find(|n| n.kind() == NodeKind::Method)
+        .unwrap();
+    let json = serde_json::to_string(method).unwrap();
+    assert!(
+        json.contains("\"signature\":\"public function helper("),
+        "expected visibility in method signature, got: {json}"
+    );
+}
+
 // ─── Constants ──────────────────────────────────────────────────────
 
 #[test]

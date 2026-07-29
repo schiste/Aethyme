@@ -346,10 +346,10 @@ fn build_method(
         return Ok(None);
     };
     let parameters = parameter_signatures(node, content);
-    let signature = synthesize_function_signature(&name, &parameters);
     let source_range = node_range(node, line_index)?;
     let visibility = php_method_visibility(node, content);
     let is_static = php_method_is_static(node, content);
+    let signature = synthesize_method_signature(&name, &parameters, visibility, is_static);
     // PHP methods are virtual by default unless declared `final`.
     let is_virtual = !node_text(node, content).contains("final ");
     Method::new(
@@ -461,6 +461,20 @@ fn synthesize_function_signature(name: &str, parameters: &[ParameterSignature]) 
         .collect::<Vec<_>>()
         .join(", ");
     format!("function {name}({params_str})")
+}
+
+fn synthesize_method_signature(
+    name: &str,
+    parameters: &[ParameterSignature],
+    visibility: Visibility,
+    is_static: bool,
+) -> String {
+    let base = synthesize_function_signature(name, parameters);
+    if is_static {
+        format!("{} static {base}", visibility.name())
+    } else {
+        format!("{} {base}", visibility.name())
+    }
 }
 
 fn php_method_visibility(node: Node<'_>, content: &str) -> Visibility {

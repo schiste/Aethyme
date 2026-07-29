@@ -1,10 +1,9 @@
 //! `usage_boundary_query` intent — the dead-code path.
 //!
-//! Unlike `task_localization_query` and `behavior_localization_query`
-//! (which go through the engine daemon), this intent opens the redb graph
-//! store for seed discovery and calls the usage-boundary analyzer directly.
-//! Different shape, different orchestration; lifting it out of the main
-//! `explore.rs` body keeps the daemon-routed code paths legible.
+//! Like the other V2 explore intents, this intent opens the redb graph store
+//! for bounded graph/navigation discovery. It then calls the usage-boundary
+//! analyzer directly because the response shape is dead-code specific and
+//! because source-text caller evidence remains query-time data.
 //!
 //! Public surface re-exported by `explore::*`:
 //! - [`UsageBoundaryParams`]
@@ -77,10 +76,10 @@ impl Default for UsageBoundaryParams {
 /// nowhere) — i.e. dead-code candidates relative to the rest of the
 /// repo.
 ///
-/// This intent does NOT use the engine daemon. The analyzer reads candidate
-/// symbols/files from the local redb graph store, then scans source text for
-/// caller evidence across `search_roots` (or the whole repo). It runs
-/// in-process, so the binary's own startup cost is the only fixed overhead.
+/// The analyzer reads candidate symbols/files from the local redb graph store,
+/// then scans source text for caller evidence across `search_roots` (or the
+/// whole repo). It runs in-process, so the binary's own startup cost is the
+/// only fixed overhead.
 pub fn explore_usage_boundary(
     repo: &Path,
     request: &str,
