@@ -32,7 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::graph::navigation::{task_anchors_view_redb, task_next_view_redb, task_scope_view_redb};
-use crate::graph::search::{symbol_search_redb, SearchHit};
+use crate::graph::search::{SearchHit, symbol_search_redb};
 use crate::model::edge::EdgeKind;
 use crate::model::task::TaskInput;
 #[cfg(test)]
@@ -883,7 +883,7 @@ impl std::fmt::Display for ExploreError {
 impl std::error::Error for ExploreError {}
 
 mod usage_boundary;
-pub use usage_boundary::{explore_usage_boundary, UsageBoundaryParams};
+pub use usage_boundary::{UsageBoundaryParams, explore_usage_boundary};
 
 // ── orchestration entry point ───────────────────────────────────────────
 
@@ -2308,6 +2308,9 @@ fn add_surface_flow_candidate_subsystems(
         for token in &candidate.matched_tokens {
             builder.add_signal(format!("matched_token:{token}"));
         }
+        for matched in token_subsystem_matches(&text) {
+            builder.add_signal(matched.signal);
+        }
         builder.add_target(ExploreSubsystemTarget {
             kind: target_kind.to_string(),
             target: node_target_label(&candidate.node),
@@ -2347,6 +2350,9 @@ fn add_surface_path_subsystems(
         }
         for token in &path.matched_tokens {
             builder.add_signal(format!("matched_token:{token}"));
+        }
+        for matched in token_subsystem_matches(&text) {
+            builder.add_signal(matched.signal);
         }
         builder.add_target(ExploreSubsystemTarget {
             kind: "surface_path".into(),
@@ -2686,10 +2692,53 @@ fn subsystem_lane_ambiguity_value(subsystems: &[ExploreSubsystem]) -> serde_json
                 "role": subsystem.role,
                 "confidence": subsystem.confidence,
                 "paths": subsystem.paths,
+                "token_subsystems": subsystem_token_subsystem_labels(subsystem),
+                "signals": subsystem.signals,
+                "top_verification_targets": subsystem.top_verification_targets,
                 "missing_coverage_warnings": subsystem.missing_coverage_warnings,
             }))
             .collect::<Vec<_>>(),
     })
+}
+
+fn subsystem_token_subsystem_labels(subsystem: &ExploreSubsystem) -> Vec<&'static str> {
+    let mut labels = std::collections::BTreeSet::new();
+    for signal in &subsystem.signals {
+        match signal.as_str() {
+            "api_key_surface" | "token_subsystem:api_keys" => {
+                labels.insert("API keys");
+            }
+            "oidc_surface" | "token_subsystem:oidc" => {
+                labels.insert("OIDC");
+            }
+            "audit_jws_surface" | "token_subsystem:audit_jws" => {
+                labels.insert("audit JWS");
+            }
+            "auth0_management_surface" | "token_subsystem:auth0_management" => {
+                labels.insert("Auth0 management");
+            }
+            "profile_integrity_surface" | "token_subsystem:profile_integrity" => {
+                labels.insert("profile-integrity");
+            }
+            "domain_verification_surface" | "token_subsystem:domain_verification" => {
+                labels.insert("domain verification");
+            }
+            _ => {}
+        }
+    }
+    for target in &subsystem.top_verification_targets {
+        let text = format!(
+            "{} {} {}",
+            target.target,
+            target.path.as_deref().unwrap_or(""),
+            target.reason
+        )
+        .to_ascii_lowercase();
+        for matched in token_subsystem_matches(&text) {
+            labels.insert(matched.label);
+        }
+    }
+    labels.into_iter().collect()
 }
 
 fn edge_kind_label_for_explore(kind: &EdgeKind) -> &'static str {
@@ -5543,9 +5592,11 @@ mod tests {
     fn extract_symbol_queries_drops_stop_words_and_short_terms() {
         let queries = extract_symbol_queries("Find the file that handles WatchedItem revisions");
         // "find", "the", "that" are stop words. "Watcheditem" stays.
-        assert!(queries
-            .iter()
-            .any(|q| q.eq_ignore_ascii_case("WatchedItem")));
+        assert!(
+            queries
+                .iter()
+                .any(|q| q.eq_ignore_ascii_case("WatchedItem"))
+        );
         assert!(queries.iter().any(|q| q.eq_ignore_ascii_case("revisions")));
         assert!(!queries.iter().any(|q| q.eq_ignore_ascii_case("the")));
         assert!(!queries.iter().any(|q| q.eq_ignore_ascii_case("find")));
