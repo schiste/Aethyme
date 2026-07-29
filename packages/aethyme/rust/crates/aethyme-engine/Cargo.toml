@@ -14,14 +14,6 @@ name = "aethyme-engine-cli"
 path = "src/bin/aethyme-engine-cli.rs"
 
 [dependencies]
-# Broker CLI dispatch: the `aethyme` router binary exposes `aethyme broker ...`
-# by calling aethyme_broker::cli (bin-only usage; engine library code must not
-# depend on broker state).
-# Enhance dispatch (python-retirement Phase 2): bin-only usage by the
-# `aethyme` router (`enhance deploy|verify` behind AETHYME_ENHANCE_NATIVE=1).
-# Cargo has no per-bin dependencies, so this is a normal dependency; the
-# planned aethyme-cli crate move (Phase 1 target architecture) relocates
-# it out of the engine.
 rayon = "1.10"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }

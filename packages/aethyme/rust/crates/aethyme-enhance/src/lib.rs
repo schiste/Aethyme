@@ -11,9 +11,8 @@
 //! change, with byte-identical rendered output verified by
 //! `scripts/migration/enhance-golden.sh`.
 //!
-//! The router dispatches `enhance deploy|verify` here only when
-//! `AETHYME_ENHANCE_NATIVE=1`; the Python side stays fully intact and
-//! keeps answering by default until the flip.
+//! The router dispatches `enhance deploy|verify` here unconditionally
+//! (Phase 2 flip, 2026-07-29); the Python `enhance` group is deleted.
 
 pub mod agents;
 pub mod cli;

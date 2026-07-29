@@ -1,10 +1,8 @@
 //! Native `aethyme enhance` front end. Stdout is byte-compatible with
-//! the Click commands it replaces (`enhance_deploy_command` /
-//! `enhance_verify_command` in `src/cli.py`), verified by the extended
-//! `scripts/migration/enhance-golden.sh` stdout comparison.
-//!
-//! Dispatch is env-gated in the router (`AETHYME_ENHANCE_NATIVE=1`);
-//! without the gate the Python implementation keeps answering.
+//! the deleted Click commands it replaced (`enhance_deploy_command` /
+//! `enhance_verify_command`, `src/cli.py` before the Phase 2 flip),
+//! verified by the `scripts/migration/enhance-golden.sh` stdout
+//! comparison. The router dispatches here unconditionally.
 
 use std::path::{Path, PathBuf};
 

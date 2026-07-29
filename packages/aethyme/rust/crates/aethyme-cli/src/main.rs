@@ -118,29 +118,22 @@ fn main() -> ExitCode {
         // idempotent. Top-level like certify: it is the first command a
         // new repo runs.
         "init" => ExitCode::from(aethyme_broker::cli::run(&args)),
-        // Enhance (python-retirement Phase 2): native dispatch is
-        // env-gated — opt in with AETHYME_ENHANCE_NATIVE=1 while the
-        // parity harness gates the flip. Everything else (including
-        // `enhance --help` and unknown subcommands) still delegates so
-        // the Python surface stays authoritative until then.
+        // Native since python-retirement Phase 2 (the Python `enhance`
+        // group is deleted). deploy/verify answer natively; unknown
+        // subcommands (and `--help`) get a native error like the other
+        // native groups — there is no Python surface to delegate to.
+        // The package root is still resolved: rendered templates embed
+        // `{{AETHYME_ROOT}}` substitutions pointing at the checkout.
         "enhance" => {
-            let native = env::var("AETHYME_ENHANCE_NATIVE")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-            let subcommand = args.get(1).map(String::as_str);
-            if native && matches!(subcommand, Some("deploy") | Some("verify")) {
-                let Some((aethyme_root, _source)) = resolve_aethyme_root() else {
-                    eprintln!(
-                        "aethyme: cannot locate the Aethyme package root for the \
-                         'enhance' command."
-                    );
-                    print_root_guidance();
-                    return ExitCode::from(2);
-                };
-                ExitCode::from(aethyme_enhance::cli::run(&aethyme_root, &args[1..]))
-            } else {
-                delegate_to_python("enhance", &args[1..])
-            }
+            let Some((aethyme_root, _source)) = resolve_aethyme_root() else {
+                eprintln!(
+                    "aethyme: cannot locate the Aethyme package root for the \
+                     'enhance' command."
+                );
+                print_root_guidance();
+                return ExitCode::from(2);
+            };
+            ExitCode::from(aethyme_enhance::cli::run(&aethyme_root, &args[1..]))
         }
         other => {
             // Unknown to the Rust client — pass straight through to Python.
@@ -182,7 +175,7 @@ fn print_top_level_help() {
     );
     eprintln!();
     eprintln!("Everything else delegates to the Python CLI:");
-    eprintln!("  intents, enhance, analyze, task, graph, ...");
+    eprintln!("  ai-ready, autofix, repo (onboarding/telemetry subcommands), ...");
 }
 
 // ── explore ─────────────────────────────────────────────────────────────────
