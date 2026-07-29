@@ -15,9 +15,11 @@
 //! `AETHYME_ENHANCE_NATIVE=1`; the Python side stays fully intact and
 //! keeps answering by default until the flip.
 
+pub mod agents;
 pub mod onboarding;
 pub mod pyjson;
 pub mod render;
+pub mod telemetry;
 pub mod templates;
 pub mod timeutil;
 pub mod util;
