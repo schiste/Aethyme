@@ -1327,13 +1327,23 @@ fn symbol_anchors_redb(
     }
 
     let query = queries.join(" ");
-    let candidates = store.symbols_matching_with(
+    let mut candidates = store.symbols_matching_with(
         &query,
         SymbolMatchOptions {
             limit: limit.saturating_mul(8).max(50),
             ..SymbolMatchOptions::default()
         },
     )?;
+    // Change anchors are code symbols (functions/classes), mirroring
+    // symbol_anchors on the RepositoryMap side. Surface/Flow annotation
+    // nodes also satisfy the store's symbol lookup but have no call
+    // adjacency, so anchoring on them starves task-next of neighbors.
+    candidates.retain(|candidate| {
+        matches!(
+            candidate.symbol.kind,
+            StoredNodeKind::Function | StoredNodeKind::Class
+        )
+    });
     let mut anchors = Vec::new();
     for candidate in candidates {
         let area_name = match candidate.symbol.area_id.as_deref() {
