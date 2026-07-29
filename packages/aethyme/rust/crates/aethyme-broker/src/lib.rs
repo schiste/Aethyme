@@ -43,7 +43,8 @@ pub use broker::{
     IntegrationStabilityReport, IntegrationStatusView, PromotedConflict, PromotedIntegrationEntry,
     RepairAction, RepairGateSelection, RepairReport, RepairSource, SemanticGateAdvice,
     SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus, StatusAdvice,
-    StatusAdviceSeverity, StatusView, VersionRepairReport,
+    StatusAdviceSeverity, StatusIntegrationRelation, StatusSummary, StatusView,
+    VersionRepairReport,
 };
 pub use error::BrokerError;
 pub use gates::{

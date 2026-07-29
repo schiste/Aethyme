@@ -1605,6 +1605,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     status.integration_branch,
                     &status.integration_head[..12.min(status.integration_head.len())]
                 );
+                println!("Summary: {}", status.summary.message);
                 println!();
                 render_status_advice(&status.advice);
                 println!();
