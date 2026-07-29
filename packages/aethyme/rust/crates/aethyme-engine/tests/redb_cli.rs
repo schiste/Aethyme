@@ -1367,6 +1367,7 @@ fn redb_explore_task_localization_runs_without_daemon_or_fragments_and_preserves
         "navigation_hints",
         "excluded",
         "ambiguous",
+        "subsystems",
         "evidence",
         "confidence",
         "safe_to_use_as_answer",

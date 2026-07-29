@@ -245,6 +245,7 @@ call-site expansion, filename fallback, and compact `task-expand` output into:
 - `navigation_hints[]`: low-confidence investigation hints, including filename-only fallback candidates and suggested searches
 - `excluded[]`: out-of-scope areas or candidates
 - `ambiguous[]`: low-confidence or missing-anchor cases
+- `subsystems[]`: ranked subsystem lanes for ambiguous Surface/Flow tasks, including role, confidence, top verification targets, paths, signals, and missing-coverage warnings; broad auth/token requests use this to separate ingress/proxy, backend validation, and provider/OIDC/audit-style token systems before trusting a flat file ranking
 - `output_adapters.task_localization_json`: compact candidate file/symbol lists and expansion commands
 - `confidence`: answer-only, excluded-only, and analyzed confidence summaries
 - `safe_to_use_as_answer` / `trust_policy`: whether `answer[]` is authoritative enough to guide an answer, or only safe as navigation
