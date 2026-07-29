@@ -46,6 +46,25 @@ const SURFACE_FLOW_COVERAGE_SCHEMA_VERSION: u8 = 1;
 const SURFACE_FLOW_MAX_FRAGMENT_BYTES: u64 = 8_192;
 const SURFACE_FLOW_MAX_PATH_HINTS: usize = 8;
 const SURFACE_FLOW_MAX_SCANNED_PATHS: usize = 20_000;
+const AGENT_OUTPUT_MAX_ANSWER_ITEMS: usize = 4;
+const AGENT_OUTPUT_MAX_NAVIGATION_HINTS: usize = 0;
+const AGENT_OUTPUT_MAX_SUBSYSTEMS: usize = 3;
+const AGENT_OUTPUT_MAX_SUBSYSTEM_PATHS: usize = 2;
+const AGENT_OUTPUT_MAX_SUBSYSTEM_TARGETS: usize = 2;
+const AGENT_OUTPUT_MAX_SUBSYSTEM_SIGNALS: usize = 3;
+const AGENT_OUTPUT_MAX_TARGET_REASON_CHARS: usize = 140;
+const AGENT_OUTPUT_MAX_WARNINGS: usize = 3;
+const AGENT_OUTPUT_MAX_DEGRADED_REASONS: usize = 6;
+const AGENT_OUTPUT_MAX_NEXT_ACTIONS: usize = 3;
+const AGENT_OUTPUT_MAX_VERIFICATION_STEPS: usize = 2;
+const AGENT_OUTPUT_MAX_EVIDENCE_ARRAY_ITEMS: usize = 4;
+const AGENT_OUTPUT_MAX_RANKING_SIGNALS: usize = 4;
+const AGENT_OUTPUT_MAX_MATCHED_TERMS: usize = 6;
+const AGENT_OUTPUT_MAX_MATCHED_QUERIES: usize = 4;
+const AGENT_OUTPUT_MAX_SYMBOLS: usize = 3;
+const AGENT_OUTPUT_MAX_LINE_REFS: usize = 2;
+const AGENT_OUTPUT_MAX_AMBIGUITY_ARRAY_ITEMS: usize = 4;
+const AGENT_OUTPUT_MAX_MISSING_SURFACES: usize = 8;
 const SURFACE_FLOW_IGNORED_DIRS: &[&str] = &[
     ".aethyme",
     ".git",
@@ -262,24 +281,34 @@ pub struct ExploreResponse {
     pub verification_steps: Vec<serde_json::Value>,
     pub next_actions: Vec<String>,
     pub available_specialized_intents: Vec<&'static str>,
+    /// Approximate serialized JSON size after output-profile shaping.
+    ///
+    /// The value is computed from the response itself just before returning
+    /// to the CLI. It is intentionally character-oriented rather than
+    /// tokenizer-specific so shell callers can compare it directly to
+    /// command-output budgets.
+    pub output_chars_estimate: usize,
+    /// True when the response was capped by the agent-facing output budget.
+    ///
+    /// The ranking/indexing passes still see the full internal evidence; this
+    /// flag only describes what was omitted from the serialized envelope.
+    pub truncated: bool,
     /// Downstream-friendly repackaging of the response. Mirrors Python's
     /// `output_adapters.task_localization_json` / `dead_code_eval_json`
     /// at `cli.py:2088-2118` and `cli.py:4700`.
     ///
-    /// Gated by `detail==Full` OR `show_observability` to mirror
-    /// `_trim_explore_response` at `cli.py:1735-1739` — at compact and
-    /// standard the canonical `answer[]` is what consumers read; the
-    /// adapter is redundant repackaging that costs tokens.
+    /// Gated by `detail==Full`. Agent-mode `--show-observability` emits
+    /// compact trust/coverage fields, but adapters are redundant
+    /// repackaging that costs tokens on the first Explore call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_adapters: Option<serde_json::Value>,
     /// Echo of the effective `ExploreParams` after intent + detail
-    /// widening. Mirrors Python's `resolved_parameters`. Same gate as
-    /// `output_adapters` (full or show-observability) — internal tuning
-    /// knobs aren't actionable by the agent at compact.
+    /// widening. Same gate as `output_adapters`: internal tuning knobs
+    /// are not actionable by the agent at compact.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_parameters: Option<serde_json::Value>,
-    /// Runtime read-source status. Emitted only with `detail=full` or
-    /// `--show-observability` so compact answer-json stays stable.
+    /// Runtime read-source status. `--show-observability` emits a compact
+    /// agent summary; `--detail full` emits the verbose debugging envelope.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observability: Option<serde_json::Value>,
 }
@@ -573,14 +602,12 @@ pub struct DisclosureLevel {
     /// truncates the answer list when JSON output approaches this
     /// threshold. Approximate — token counts vary by tokenizer.
     ///
-    /// **Status (v1, 2026-05-09):** the value is declared here and
-    /// surfaced via `apply_disclosure_level`, but the response
-    /// builder does NOT yet enforce it. depth=0 currently emits
-    /// ~10 KB (13 items × ~800B per item baseline) rather than the
-    /// nominal ~600. The budget will be enforced when the answer-
-    /// item shape is trimmed at low depths (drop the nested
-    /// evidence wrapper for path-only items). Until then the cap
-    /// reads as documentation, not behavior. Tracked for follow-up.
+    /// **Status (v1, 2026-07-29):** the response builder enforces
+    /// this at the representation layer by capping agent-facing
+    /// answer, navigation, subsystem, evidence, and observability
+    /// arrays. It is still a soft cap because JSON overhead and
+    /// request-specific strings vary, but depth=0 no longer emits
+    /// the full debugging observability envelope.
     pub max_response_tokens: usize,
 }
 
@@ -692,11 +719,10 @@ pub struct ExploreParams {
     /// emitting all callers (which can be hundreds for popular
     /// functions) inflates the response unnecessarily.
     pub max_callsite_results: usize,
-    /// When true, emit a richer observability envelope. Mirrors Python's
-    /// `--show-observability` flag at `cli.py:396-401`. Compact form
-    /// (default) keeps the response small; full form includes graph
-    /// counts, fact counts, confidence summary, and degraded reasons
-    /// for downstream introspection.
+    /// When true, emit agent-facing observability. Compact/standard output
+    /// includes trust, freshness, Surface/Flow coverage, warnings, and ranking
+    /// summaries; `--detail full --show-observability` emits the verbose
+    /// debugging envelope.
     pub show_observability: bool,
 }
 
@@ -3247,7 +3273,7 @@ fn build_response_with_surface_flow(
         callsite_items,
     ];
     let token_subsystems = token_subsystem_summaries(request, &token_summary_groups);
-    let subsystems = explore_subsystem_rankings(request, &token_subsystems, surface_flow);
+    let mut subsystems = explore_subsystem_rankings(request, &token_subsystems, surface_flow);
     let token_subsystem_ambiguous =
         token_subsystems.len() >= 2 && !request_names_specific_token_subsystem(request);
     let subsystem_lane_ambiguous = subsystems.len() >= 2
@@ -3260,6 +3286,17 @@ fn build_response_with_surface_flow(
     }
     if subsystem_lane_ambiguous {
         ambiguous.push(subsystem_lane_ambiguity_value(&subsystems));
+    }
+
+    let mut output_budget = OutputBudgetReport::default();
+    if agent_output_profile(params) {
+        apply_agent_output_budget(
+            &mut answers,
+            &mut nav_hints,
+            &mut ambiguous,
+            &mut subsystems,
+            &mut output_budget,
+        );
     }
 
     let answer_count = answers.len();
@@ -3408,7 +3445,7 @@ fn build_response_with_surface_flow(
         trust_policy: policy_kind,
         reason: trust_reason,
     };
-    let degraded_reasons = explore_degraded_ranking_reasons(
+    let mut degraded_reasons = explore_degraded_ranking_reasons(
         request,
         &trust_policy,
         &answers,
@@ -3428,7 +3465,7 @@ fn build_response_with_surface_flow(
         "complete"
     };
 
-    let next_actions = if answers.is_empty() && nav_hints.is_empty() {
+    let mut next_actions = if answers.is_empty() && nav_hints.is_empty() {
         vec![
             "Refine the request — graph navigation found no anchors.".into(),
             "Try a more specific keyword from the codebase domain.".into(),
@@ -3460,7 +3497,7 @@ fn build_response_with_surface_flow(
     // into the response struct.
     let safe_to_use_as_answer = trust_policy.safe_to_use_as_answer;
     let safe_to_use_as_navigation = trust_policy.safe_to_use_as_navigation;
-    let verification_steps = build_verification_steps(
+    let mut verification_steps = build_verification_steps(
         &answers,
         &nav_hints,
         &trust_policy,
@@ -3478,11 +3515,25 @@ fn build_response_with_surface_flow(
     );
 
     // Build output_adapters and resolved_parameters only when the
-    // caller has asked for verbose shaping. Mirrors Python's
-    // _trim_explore_response gate at cli.py:1732-1743. At compact the
-    // canonical answer[] is sufficient; the repackaging is redundant.
-    let verbose = matches!(params.detail, Detail::Full) || params.show_observability;
-    let output_adapters = if verbose {
+    // caller has asked for the explicit full profile. `--show-observability`
+    // in compact/standard now emits a compact trust/coverage block instead
+    // of the full debug envelope; agents need safety, lanes, and warnings on
+    // the first call, not adapters and long path-hint arrays.
+    let full_profile = matches!(params.detail, Detail::Full);
+
+    // At the agent-facing profile, truncate tail arrays to keep the first
+    // Explore call under the command-output budget. Full detail remains the
+    // deliberate escape hatch for exhaustive debugging.
+    if agent_output_profile(params) {
+        apply_agent_tail_budget(
+            &mut degraded_reasons,
+            &mut verification_steps,
+            &mut next_actions,
+            &mut output_budget,
+        );
+    }
+
+    let output_adapters = if full_profile {
         Some(build_output_adapters(
             &answers,
             &nav_hints,
@@ -3493,13 +3544,28 @@ fn build_response_with_surface_flow(
     } else {
         None
     };
-    let resolved_parameters = if verbose {
+    let resolved_parameters = if full_profile {
         Some(params.to_json())
     } else {
         None
     };
-    let observability = if verbose {
+    let observability = if full_profile {
         Some(enrich_explore_observability(
+            observability,
+            request,
+            &trust_policy,
+            &degraded_reasons,
+            &answers,
+            &nav_hints,
+            &symbol_items,
+            text_items,
+            callsite_items,
+            &subsystems,
+            surface_flow,
+            subsystem_ambiguous,
+        ))
+    } else if params.show_observability {
+        Some(compact_explore_observability(
             observability,
             request,
             &trust_policy,
@@ -3516,16 +3582,6 @@ fn build_response_with_surface_flow(
     } else {
         None
     };
-
-    // At compact, truncate verification_steps to 2 (mirrors Python's
-    // _trim_explore_response at cli.py:1752-1755). Agents follow 1-2
-    // before deciding; emitting all 5+ inflates response by ~30%.
-    let verification_steps =
-        if matches!(params.detail, Detail::Compact) && !params.show_observability {
-            verification_steps.into_iter().take(2).collect()
-        } else {
-            verification_steps
-        };
 
     // Post-conditions for `answers[]`. These are debug-only; they
     // document the response contract that a downstream agent or scoring
@@ -3574,7 +3630,7 @@ fn build_response_with_surface_flow(
         answers.iter().map(|i| i.kind.as_str()).collect::<Vec<_>>()
     );
 
-    ExploreResponse {
+    let response = ExploreResponse {
         schema_version: "aethyme-explore-v1",
         mode: "explore",
         intent: intent.as_str(),
@@ -3613,10 +3669,13 @@ fn build_response_with_surface_flow(
         verification_steps,
         next_actions,
         available_specialized_intents: vec!["behavior_localization_query", "usage_boundary_query"],
+        output_chars_estimate: 0,
+        truncated: output_budget.truncated,
         output_adapters,
         resolved_parameters,
         observability,
-    }
+    };
+    response_with_output_estimate(response)
 }
 
 fn enrich_explore_observability(
@@ -3701,6 +3760,181 @@ fn enrich_explore_observability(
     }
 
     observability
+}
+
+fn compact_explore_observability(
+    observability: serde_json::Value,
+    request: &str,
+    trust_policy: &TrustPolicy,
+    degraded_reasons: &[String],
+    answers: &[AnswerItem],
+    nav_hints: &[AnswerItem],
+    symbol_items: &[AnswerItem],
+    text_items: &[AnswerItem],
+    callsite_items: &[AnswerItem],
+    subsystems: &[ExploreSubsystem],
+    surface_flow: &SurfaceFlowExploreEvidence,
+    subsystem_ambiguous: bool,
+) -> serde_json::Value {
+    let enriched = enrich_explore_observability(
+        observability,
+        request,
+        trust_policy,
+        degraded_reasons,
+        answers,
+        nav_hints,
+        symbol_items,
+        text_items,
+        callsite_items,
+        subsystems,
+        surface_flow,
+        subsystem_ambiguous,
+    );
+    let mut compact = serde_json::Map::new();
+    if let Some(value) = enriched.get("graph_store").cloned() {
+        compact.insert("graph_store".into(), value);
+    }
+    if let Some(value) = enriched.get("surface_flow_graph") {
+        compact.insert(
+            "surface_flow_graph".into(),
+            compact_surface_flow_graph(value),
+        );
+    }
+    if let Some(value) = enriched.get("answer_safety").cloned() {
+        compact.insert("answer_safety".into(), value);
+    }
+    if let Some(value) = enriched.get("readiness").cloned() {
+        compact.insert("readiness".into(), value);
+    }
+    if let Some(value) = enriched.get("ranking_explainability") {
+        compact.insert(
+            "ranking_explainability".into(),
+            compact_ranking_explainability(value),
+        );
+    }
+    compact.insert("output_profile".into(), serde_json::json!("agent_compact"));
+    compact.insert(
+        "full_observability_hint".into(),
+        serde_json::json!("rerun with --detail full --show-observability"),
+    );
+    serde_json::Value::Object(compact)
+}
+
+fn compact_surface_flow_graph(value: &serde_json::Value) -> serde_json::Value {
+    let mut compact = serde_json::Map::new();
+    for key in [
+        "schema_version",
+        "status",
+        "source_of_truth",
+        "derived_query_artifact",
+        "source_path_count_scanned",
+        "indexed_path_count_scanned",
+        "semantic_fragment_hit_count",
+        "source_scan_truncated",
+        "indexed_scan_truncated",
+        "indexed_languages",
+        "indexed_frameworks",
+        "surface_type_count",
+        "source_present_surface_count",
+        "covered_surface_count",
+    ] {
+        if let Some(child) = value.get(key).cloned() {
+            compact.insert(key.to_string(), child);
+        }
+    }
+    if let Some(coverage) = value.get("coverage") {
+        compact.insert("coverage".into(), compact_surface_flow_coverage(coverage));
+    }
+    if let Some(missing) = value.get("missing_expected_surfaces") {
+        compact.insert(
+            "missing_expected_surfaces".into(),
+            compact_missing_expected_surfaces(missing),
+        );
+    }
+    serde_json::Value::Object(compact)
+}
+
+fn compact_surface_flow_coverage(value: &serde_json::Value) -> serde_json::Value {
+    let mut compact = serde_json::Map::new();
+    if let Some(entries) = value.as_object() {
+        for (surface_type, entry) in entries {
+            let mut surface = serde_json::Map::new();
+            for key in ["label", "source_present", "indexed", "status"] {
+                if let Some(child) = entry.get(key).cloned() {
+                    surface.insert(key.to_string(), child);
+                }
+            }
+            compact.insert(surface_type.clone(), serde_json::Value::Object(surface));
+        }
+    }
+    serde_json::Value::Object(compact)
+}
+
+fn compact_missing_expected_surfaces(value: &serde_json::Value) -> serde_json::Value {
+    let Some(items) = value.as_array() else {
+        return serde_json::json!([]);
+    };
+    serde_json::Value::Array(
+        items
+            .iter()
+            .take(AGENT_OUTPUT_MAX_MISSING_SURFACES)
+            .map(|item| {
+                let mut surface = serde_json::Map::new();
+                for key in ["surface_type", "label"] {
+                    if let Some(child) = item.get(key).cloned() {
+                        surface.insert(key.to_string(), child);
+                    }
+                }
+                serde_json::Value::Object(surface)
+            })
+            .collect(),
+    )
+}
+
+fn compact_ranking_explainability(value: &serde_json::Value) -> serde_json::Value {
+    let mut compact = serde_json::Map::new();
+    for key in ["subsystem_ambiguous", "degraded_ranking_reasons"] {
+        if let Some(child) = value.get(key).cloned() {
+            compact.insert(key.to_string(), child);
+        }
+    }
+    if let Some(items) = value
+        .get("top_signals_used")
+        .and_then(|value| value.as_array())
+    {
+        compact.insert(
+            "top_signals_used".into(),
+            compact_signal_items(items, &["signal", "count"]),
+        );
+    }
+    if let Some(items) = value
+        .get("top_signals_absent")
+        .and_then(|value| value.as_array())
+    {
+        compact.insert(
+            "top_signals_absent".into(),
+            compact_signal_items(items, &["signal"]),
+        );
+    }
+    serde_json::Value::Object(compact)
+}
+
+fn compact_signal_items(items: &[serde_json::Value], keys: &[&str]) -> serde_json::Value {
+    serde_json::Value::Array(
+        items
+            .iter()
+            .take(AGENT_OUTPUT_MAX_SYMBOLS)
+            .map(|item| {
+                let mut compact = serde_json::Map::new();
+                for key in keys {
+                    if let Some(child) = item.get(*key).cloned() {
+                        compact.insert((*key).to_string(), child);
+                    }
+                }
+                serde_json::Value::Object(compact)
+            })
+            .collect(),
+    )
 }
 
 fn explore_top_signals_used(
@@ -4169,6 +4403,191 @@ fn push_unique_reason(reasons: &mut Vec<String>, reason: impl Into<String>) {
     if !reasons.iter().any(|existing| existing == &reason) {
         reasons.push(reason);
     }
+}
+
+#[derive(Debug, Default)]
+struct OutputBudgetReport {
+    truncated: bool,
+}
+
+fn agent_output_profile(params: &ExploreParams) -> bool {
+    !matches!(params.detail, Detail::Full) && (params.show_observability || params.depth.is_some())
+}
+
+fn cap_vec<T>(items: &mut Vec<T>, max: usize, report: &mut OutputBudgetReport) {
+    if items.len() > max {
+        items.truncate(max);
+        report.truncated = true;
+    }
+}
+
+fn apply_agent_output_budget(
+    answers: &mut Vec<AnswerItem>,
+    nav_hints: &mut Vec<AnswerItem>,
+    ambiguous: &mut [serde_json::Value],
+    subsystems: &mut Vec<ExploreSubsystem>,
+    report: &mut OutputBudgetReport,
+) {
+    cap_vec(answers, AGENT_OUTPUT_MAX_ANSWER_ITEMS, report);
+    cap_vec(nav_hints, AGENT_OUTPUT_MAX_NAVIGATION_HINTS, report);
+    cap_vec(subsystems, AGENT_OUTPUT_MAX_SUBSYSTEMS, report);
+
+    for item in answers.iter_mut().chain(nav_hints.iter_mut()) {
+        budget_answer_item(item, report);
+    }
+    for value in ambiguous {
+        budget_ambiguity_value(value, report);
+    }
+    for subsystem in subsystems {
+        cap_vec(
+            &mut subsystem.paths,
+            AGENT_OUTPUT_MAX_SUBSYSTEM_PATHS,
+            report,
+        );
+        cap_vec(
+            &mut subsystem.top_verification_targets,
+            AGENT_OUTPUT_MAX_SUBSYSTEM_TARGETS,
+            report,
+        );
+        for target in &mut subsystem.top_verification_targets {
+            shorten_string(
+                &mut target.reason,
+                AGENT_OUTPUT_MAX_TARGET_REASON_CHARS,
+                report,
+            );
+        }
+        cap_vec(
+            &mut subsystem.signals,
+            AGENT_OUTPUT_MAX_SUBSYSTEM_SIGNALS,
+            report,
+        );
+        cap_vec(
+            &mut subsystem.missing_coverage_warnings,
+            AGENT_OUTPUT_MAX_WARNINGS,
+            report,
+        );
+    }
+}
+
+fn apply_agent_tail_budget(
+    degraded_reasons: &mut Vec<String>,
+    verification_steps: &mut Vec<serde_json::Value>,
+    next_actions: &mut Vec<String>,
+    report: &mut OutputBudgetReport,
+) {
+    cap_vec(degraded_reasons, AGENT_OUTPUT_MAX_DEGRADED_REASONS, report);
+    cap_vec(
+        verification_steps,
+        AGENT_OUTPUT_MAX_VERIFICATION_STEPS,
+        report,
+    );
+    cap_vec(next_actions, AGENT_OUTPUT_MAX_NEXT_ACTIONS, report);
+}
+
+fn budget_answer_item(item: &mut AnswerItem, report: &mut OutputBudgetReport) {
+    budget_evidence_value(&mut item.evidence, None, report);
+}
+
+fn shorten_string(value: &mut String, max_chars: usize, report: &mut OutputBudgetReport) {
+    if value.chars().count() <= max_chars {
+        return;
+    }
+    let shortened = value.chars().take(max_chars).collect::<String>();
+    *value = format!("{shortened}...");
+    report.truncated = true;
+}
+
+fn budget_evidence_value(
+    value: &mut serde_json::Value,
+    key: Option<&str>,
+    report: &mut OutputBudgetReport,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            let max = match key {
+                Some("ranking_signals") => AGENT_OUTPUT_MAX_RANKING_SIGNALS,
+                Some("matched_terms") => AGENT_OUTPUT_MAX_MATCHED_TERMS,
+                Some("matched_queries") => AGENT_OUTPUT_MAX_MATCHED_QUERIES,
+                Some("symbols") => AGENT_OUTPUT_MAX_SYMBOLS,
+                Some("line_refs") => AGENT_OUTPUT_MAX_LINE_REFS,
+                _ => AGENT_OUTPUT_MAX_EVIDENCE_ARRAY_ITEMS,
+            };
+            cap_vec(items, max, report);
+            for item in items {
+                budget_evidence_value(item, None, report);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (child_key, child_value) in map {
+                budget_evidence_value(child_value, Some(child_key.as_str()), report);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn budget_ambiguity_value(value: &mut serde_json::Value, report: &mut OutputBudgetReport) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let Some(subsystems) = obj
+        .get_mut("subsystems")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return;
+    };
+    cap_vec(subsystems, AGENT_OUTPUT_MAX_AMBIGUITY_ARRAY_ITEMS, report);
+    for subsystem in subsystems {
+        let Some(subsystem_obj) = subsystem.as_object_mut() else {
+            continue;
+        };
+        let keep: std::collections::BTreeSet<&str> = [
+            "id",
+            "label",
+            "rank",
+            "role",
+            "score",
+            "confidence",
+            "token_subsystems",
+            "missing_coverage_warnings",
+        ]
+        .into_iter()
+        .collect();
+        let keys_to_remove = subsystem_obj
+            .keys()
+            .filter(|key| !keep.contains(key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !keys_to_remove.is_empty() {
+            report.truncated = true;
+        }
+        for key in keys_to_remove {
+            subsystem_obj.remove(&key);
+        }
+        if let Some(token_subsystems) = subsystem_obj
+            .get_mut("token_subsystems")
+            .and_then(|value| value.as_array_mut())
+        {
+            cap_vec(
+                token_subsystems,
+                AGENT_OUTPUT_MAX_AMBIGUITY_ARRAY_ITEMS,
+                report,
+            );
+        }
+        if let Some(warnings) = subsystem_obj
+            .get_mut("missing_coverage_warnings")
+            .and_then(|value| value.as_array_mut())
+        {
+            cap_vec(warnings, AGENT_OUTPUT_MAX_WARNINGS, report);
+        }
+    }
+}
+
+pub(super) fn response_with_output_estimate(mut response: ExploreResponse) -> ExploreResponse {
+    response.output_chars_estimate = serde_json::to_string_pretty(&response)
+        .map(|json| json.len())
+        .unwrap_or(0);
+    response
 }
 
 /// Build the `output_adapters.task_localization_json` structure that
@@ -5648,11 +6067,9 @@ mod tests {
     fn extract_symbol_queries_drops_stop_words_and_short_terms() {
         let queries = extract_symbol_queries("Find the file that handles WatchedItem revisions");
         // "find", "the", "that" are stop words. "Watcheditem" stays.
-        assert!(
-            queries
-                .iter()
-                .any(|q| q.eq_ignore_ascii_case("WatchedItem"))
-        );
+        assert!(queries
+            .iter()
+            .any(|q| q.eq_ignore_ascii_case("WatchedItem")));
         assert!(queries.iter().any(|q| q.eq_ignore_ascii_case("revisions")));
         assert!(!queries.iter().any(|q| q.eq_ignore_ascii_case("the")));
         assert!(!queries.iter().any(|q| q.eq_ignore_ascii_case("find")));
@@ -5795,7 +6212,7 @@ mod tests {
     //   (a) Required top-level keys are always present (any agent can
     //       rely on `answer[]`, `trust_policy`, etc. existing).
     //   (b) Optional keys (`output_adapters`, `resolved_parameters`)
-    //       gate correctly on `Detail::Full` / `show_observability`.
+    //       gate correctly on `Detail::Full`.
     //   (c) Nested types — e.g. `evidence.answer_count` is a number,
     //       `trust_policy.trust_policy` is one of the documented
     //       enum values.
@@ -5884,6 +6301,8 @@ mod tests {
         "verification_steps",
         "next_actions",
         "available_specialized_intents",
+        "output_chars_estimate",
+        "truncated",
     ];
 
     #[test]
@@ -5920,6 +6339,10 @@ mod tests {
             !obj.contains_key("observability"),
             "compact must omit observability"
         );
+        assert!(
+            response.output_chars_estimate > 0,
+            "compact response should report an output char estimate"
+        );
     }
 
     #[test]
@@ -5944,22 +6367,27 @@ mod tests {
     }
 
     #[test]
-    fn response_show_observability_overrides_detail() {
-        // `--show-observability` forces verbose shaping even at compact.
+    fn response_show_observability_uses_agent_compact_profile() {
+        // `--show-observability` at compact emits the agent-facing trust
+        // summary, not the full debug envelope.
         let response = build_minimal_response(Detail::Compact, true);
         let json = serde_json::to_value(&response).unwrap();
         let obj = json.as_object().unwrap();
         assert!(
-            obj.contains_key("output_adapters"),
-            "show_observability=true must emit output_adapters"
+            !obj.contains_key("output_adapters"),
+            "agent compact observability must not emit output_adapters"
         );
         assert!(
-            obj.contains_key("resolved_parameters"),
-            "show_observability=true must emit resolved_parameters"
+            !obj.contains_key("resolved_parameters"),
+            "agent compact observability must not emit resolved_parameters"
         );
         assert!(
             obj.contains_key("observability"),
-            "show_observability=true must emit observability"
+            "show_observability=true must emit compact observability"
+        );
+        assert_eq!(
+            obj["observability"]["output_profile"], "agent_compact",
+            "compact observability should identify its profile"
         );
     }
 

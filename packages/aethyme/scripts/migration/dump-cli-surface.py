@@ -27,7 +27,7 @@ from src.cli import cli  # noqa: E402
 
 HEADER = """# CLI Surface v1 (frozen 2026-07-17)
 
-Last Updated: 2026-07-17
+Last Updated: 2026-07-29
 
 The contract every python-retirement phase must hold: command names,
 flags, env-var bindings, and defaults of the delegated (Python) surface.
@@ -77,6 +77,15 @@ names/flags/output — golden-verified):
 - RETIRED with PyO3 (decision #3, hard-delete 2026-07-28):
   `--engine-transport`, `AETHYME_ENGINE_TRANSPORT`, the transport
   registration API, and the `aethyme_py` in-process binding.
+- `enhance deploy|verify` (Phase 2 flip, 2026-07-29; `aethyme-enhance`
+  crate, templates embedded at build time). Deployed artifacts and
+  stdout are byte-identical to the Python implementation, verified by
+  `scripts/migration/enhance-golden.sh` against the last Python-side
+  goldens. The temporary `AETHYME_ENHANCE_NATIVE` opt-in gate is gone;
+  the router dispatches natively unconditionally. Unknown enhance
+  subcommands and `--help` now produce the native
+  `Error: unsupported enhance subcommand: ...` (exit 2) instead of
+  Click group help.
 """
 
 

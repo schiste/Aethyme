@@ -36,7 +36,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binaries
-        run: cargo build --release --locked -p aethyme-engine --bin aethyme --bin aethyme-engine-cli
+        run: cargo build --release --locked -p aethyme-cli --bin aethyme -p aethyme-engine --bin aethyme-engine-cli
 
       - name: Report embedded version
         run: ./target/release/aethyme --version

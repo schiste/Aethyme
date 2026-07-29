@@ -72,22 +72,52 @@ broker. Other agents may be working in sibling worktrees right now. The
 `cargo install --path "{root}/rust/crates/aethyme-engine"`
 (check with `aethyme --version`). Follow this protocol:
 
-1. **Before editing**, check current activity and register yourself:
+1. **Broker entry point, before editing**: check current activity, create an
+   isolated broker worktree, and work from that checkout:
 
    ```bash
    aethyme broker status --json    # who is working on what
-   aethyme broker adopt --task "<your task>"   # once, from your worktree
+   aethyme broker start --task "<your task>"   # creates a worktree + session
    ```
 
+   `cd` into the reported worktree before editing. If you are already in a
+   dedicated worktree, use `aethyme broker adopt --task "<your task>"` instead.
    If `status` shows another session holding leases on the files you plan
    to change, prefer working elsewhere first or say so in your report —
    overlapping edits will conflict at merge time.
 
-2. **While working**: commit early and small. Only committed work can be
+2. **Lease known shared files before the diff exists**. If you know you will
+   edit a file or directory other agents may touch, claim it explicitly:
+
+   ```bash
+   aethyme broker leases claim <path> --session <your-session-id>
+   aethyme broker leases release <path> --session <your-session-id>
+   ```
+
+   Use a trailing `/` for directory leases. Implicit leases refresh from
+   changed files, but explicit leases are clearer for planned shared edits.
+
+3. **Guard broad rewrite commands**. For formatters, code generators, or any
+   command likely to touch many files, run through the broker guard:
+
+   ```bash
+   aethyme broker exec --session <your-session-id> -- <command>
+   ```
+
+   The guard fails if the command leaves dirty paths outside your explicit
+   leases or in files that were untracked before your session began.
+
+4. **While working**: commit early and small. Only committed work can be
    verified and integrated. Never switch branches inside someone else's
    worktree; never edit files outside your own worktree.
 
-3. **When your task is complete**, submit your head commit for verified
+5. **Gate resources are per worker**. Broker gate runs take path-scoped owner
+   locks and export `AETHYME_GATE_WORKER_ID` plus `AETHYME_TEST_DB_SUFFIX`.
+   Gate commands that need a test database, cache namespace, or similar
+   external state should suffix it with that value instead of sharing one
+   fixed name.
+
+6. **When your task is complete**, submit your head commit for verified
    integration instead of merging anything yourself:
 
    ```bash
@@ -100,12 +130,12 @@ broker. Other agents may be working in sibling worktrees right now. The
    `aethyme broker close --session <id>` (state only), or point it at
    a follow-up task with `aethyme broker adopt --reuse --task "..."`.
 
-4. **If a file named `.aethyme/broker-action-required.md` appears in your
+7. **If a file named `.aethyme/broker-action-required.md` appears in your
    worktree**, read it immediately: your submission conflicted. It names
    the conflicting files, the blocking session, and the exact rebase
    steps. Resolve, commit, and resubmit.
 
-5. **Never** push, merge to the default branch, or touch the
+8. **Never** push, merge to the default branch, or touch the
    `aethyme/integration` branch directly — integration and shipping are
    handled through the broker and the human operator."#
     )

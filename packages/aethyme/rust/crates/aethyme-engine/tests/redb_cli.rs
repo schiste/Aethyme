@@ -4,6 +4,7 @@
 //! `aethyme-engine-cli` as a subprocess. That keeps the repos tiny while still
 //! pinning the CLI contract that scripts and playground setup consume.
 
+mod common;
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
@@ -46,9 +47,7 @@ fn engine_bin() -> &'static str {
     env!("CARGO_BIN_EXE_aethyme-engine-cli")
 }
 
-fn aethyme_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_aethyme")
-}
+use common::aethyme_bin;
 
 fn write(root: &Path, rel: &str, content: &[u8]) {
     let full = root.join(rel);
@@ -1547,6 +1546,8 @@ fn redb_explore_task_localization_runs_without_daemon_or_fragments_and_preserves
         "verification_steps",
         "next_actions",
         "available_specialized_intents",
+        "output_chars_estimate",
+        "truncated",
     ]
     .into_iter()
     .collect();
@@ -1567,6 +1568,14 @@ fn redb_explore_task_localization_runs_without_daemon_or_fragments_and_preserves
     assert!(
         first.get("observability").is_none(),
         "compact explore should omit observability"
+    );
+    assert!(
+        first["output_chars_estimate"].as_u64().unwrap_or(0) > 0,
+        "compact explore should report output size"
+    );
+    assert!(
+        first["truncated"].is_boolean(),
+        "compact explore should report whether output was truncated"
     );
 }
 
@@ -1635,6 +1644,18 @@ fn redb_explore_auth_surface_fixture_ranks_proxy_backend_and_names_decoys() {
     assert_eq!(response["schema_version"], "aethyme-explore-v1");
     assert_eq!(response["intent"], "task_localization_query");
     assert_eq!(response["observability"]["graph_store"]["backend"], "redb");
+    assert_eq!(
+        response["observability"]["output_profile"], "agent_compact",
+        "--show-observability should default to compact agent observability"
+    );
+    assert!(
+        response.get("output_adapters").is_none(),
+        "compact agent observability should not emit verbose adapters"
+    );
+    assert!(
+        response.get("resolved_parameters").is_none(),
+        "compact agent observability should not emit resolved params"
+    );
     assert!(
         metrics.aethyme_explore_invoked,
         "fixture should exercise router-level aethyme explore: {metrics:?}"

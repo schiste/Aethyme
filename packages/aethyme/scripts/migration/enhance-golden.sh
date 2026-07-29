@@ -67,14 +67,14 @@ for condition in bare overrides; do
     make_repo "$REPO" "$with"
 
     echo ">>> enhance deploy ($condition)..."
-    # AETHYME_ENHANCE_NATIVE passes through explicitly: with it set to 1
-    # in the harness environment, the router answers natively (the Phase 2
-    # port); unset/empty keeps the Python implementation answering.
-    AETHYME_ROOT="$PACKAGE_ROOT" AETHYME_ENHANCE_NATIVE="${AETHYME_ENHANCE_NATIVE:-}" \
+    # The AETHYME_ENHANCE_NATIVE gate is gone (Phase 2 flip, 2026-07-29):
+    # the router dispatches enhance natively unconditionally, so the
+    # harness now always exercises the single native path.
+    AETHYME_ROOT="$PACKAGE_ROOT" \
         "$AETHYME_BIN" enhance deploy --repo "$REPO" --force \
         > "$WORK_DIR/deploy-$condition.out" 2>&1 \
         || { echo "FATAL: enhance deploy failed ($condition)"; cat "$WORK_DIR/deploy-$condition.out"; exit 1; }
-    AETHYME_ROOT="$PACKAGE_ROOT" AETHYME_ENHANCE_NATIVE="${AETHYME_ENHANCE_NATIVE:-}" \
+    AETHYME_ROOT="$PACKAGE_ROOT" \
         "$AETHYME_BIN" enhance verify --repo "$REPO" \
         > "$WORK_DIR/verify-$condition.out" 2>&1 \
         || { echo "FATAL: enhance verify failed ($condition)"; cat "$WORK_DIR/verify-$condition.out"; exit 1; }

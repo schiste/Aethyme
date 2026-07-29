@@ -6,12 +6,36 @@ import json
 import os
 from pathlib import Path
 
-from src.enhance import AGENTS_OVERRIDE_PATH, deploy, is_ok, verify
+from src.enhance import AGENTS_OVERRIDE_PATH
 from tests.support.cli_invoke import invoke_aethyme
 
 # CWD-independent package root (tests run with cwd=packages/aethyme in CI,
 # but repo-root-relative paths broke when invoked from elsewhere).
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _deploy(repo_path: Path, *, force: bool = False) -> str:
+    """Run `aethyme enhance deploy` (implementation-blind) and return stdout.
+
+    The Python `deploy()` function is gone (Phase 2 flip); the CLI surface
+    is the contract now. Output lines are `  {action:9}  {relative_path}`,
+    golden-verified byte-stable by enhance-golden.sh.
+    """
+    args = ["enhance", "deploy", "--repo", str(repo_path)]
+    if force:
+        args.append("--force")
+    result = invoke_aethyme(args)
+    assert result.exit_code == 0, result.output
+    return result.output
+
+
+def _deployed_paths(deploy_output: str) -> set[str]:
+    """Relative paths from deploy action lines (the old DeployAction list)."""
+    return {
+        line[13:]  # "  " + action padded to 9 + "  "
+        for line in deploy_output.splitlines()
+        if line.startswith("  ") and not line.startswith("Enhanced:")
+    }
 
 
 def _build_repo(root: Path) -> None:
@@ -32,7 +56,7 @@ def test_agents_document_includes_broker_protocol_only_when_configured(
     _build_repo(repo_path)
 
     # No broker config → no broker section, no failing instructions.
-    deploy(repo_path)
+    _deploy(repo_path)
     agents_text = (repo_path / "AGENTS.md").read_text(encoding="utf-8")
     assert "Broker Coordination" not in agents_text
 
@@ -43,7 +67,7 @@ def test_agents_document_includes_broker_protocol_only_when_configured(
     (repo_path / ".aethyme/gates.toml").write_text(
         '[[gate]]\nname = "ok"\ncommand = "true"\n', encoding="utf-8"
     )
-    deploy(repo_path, force=True)
+    _deploy(repo_path, force=True)
     agents_text = (repo_path / "AGENTS.md").read_text(encoding="utf-8")
     assert "## Broker Coordination" in agents_text
     assert "broker status --json" in agents_text
@@ -64,8 +88,8 @@ def test_enhance_deploy_writes_generated_onboarding(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
 
-    actions = deploy(repo_path)
-    written = {action.target.relative_path for action in actions}
+    output = _deploy(repo_path)
+    written = _deployed_paths(output)
 
     assert ".codex/skills/aethyme/SKILL.md" in written
     assert "AGENTS.md" in written
@@ -86,8 +110,9 @@ def test_enhance_deploy_writes_generated_onboarding(tmp_path: Path) -> None:
     assert act_artifact["starter_checklists"]["debugging"]
     assert any(json.loads(line)["event_type"] == "enhance.deploy" for line in telemetry_lines)
 
-    results = verify(repo_path)
-    assert is_ok(results)
+    verify_result = invoke_aethyme(["enhance", "verify", "--repo", str(repo_path)])
+    assert verify_result.exit_code == 0, verify_result.output
+    assert "All discoverability files present and substituted." in verify_result.output
 
     wrapper_text = (repo_path / ".claude" / "hooks" / "aethyme-load-context.sh").read_text(
         encoding="utf-8"
@@ -115,7 +140,7 @@ def test_enhance_deploy_migrates_human_agents_content_into_override(tmp_path: Pa
         encoding="utf-8",
     )
 
-    deploy(repo_path)
+    _deploy(repo_path)
     first_text = (repo_path / "AGENTS.md").read_text(encoding="utf-8")
     override_payload = json.loads((repo_path / AGENTS_OVERRIDE_PATH).read_text(encoding="utf-8"))
     assert override_payload["maintainer_markdown"] == (
@@ -125,7 +150,7 @@ def test_enhance_deploy_migrates_human_agents_content_into_override(tmp_path: Pa
     assert "# Maintainer Rules" in first_text
     assert "Run focused tests before broad suites." in first_text
 
-    deploy(repo_path, force=True)
+    _deploy(repo_path, force=True)
     second_text = (repo_path / "AGENTS.md").read_text(encoding="utf-8")
     assert "<!-- AETHYME:BEGIN generated -->" not in second_text
     assert "# Maintainer Rules" in second_text
@@ -144,7 +169,7 @@ def test_enhance_deploy_migrates_old_full_file_agents_template(tmp_path: Path) -
     )
     (repo_path / "AGENTS.md").write_text(rendered, encoding="utf-8")
 
-    deploy(repo_path)
+    _deploy(repo_path)
     agents_text = (repo_path / "AGENTS.md").read_text(encoding="utf-8")
     assert agents_text.startswith("# Agent Instructions")
     assert agents_text.count("# Agent Instructions") == 1
@@ -192,7 +217,7 @@ def test_init_and_validate_agents_overrides_cli(tmp_path: Path) -> None:
 def test_enhance_verify_prints_summary(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
-    deploy(repo_path)
+    _deploy(repo_path)
 
     result = invoke_aethyme(["enhance", "verify", "--repo", str(repo_path)])
     assert result.exit_code == 0, result.output
@@ -217,7 +242,7 @@ def test_static_wrapper_template_records_invocation_signal() -> None:
 def test_repo_experience_telemetry_reports_json_and_text(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
-    deploy(repo_path)
+    _deploy(repo_path)
 
     invoke_aethyme([
             "repo",
@@ -248,7 +273,7 @@ def test_repo_experience_telemetry_reports_json_and_text(tmp_path: Path) -> None
 def test_repo_experience_status_writes_artifacts(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
-    deploy(repo_path)
+    _deploy(repo_path)
 
     result = invoke_aethyme(["repo", "experience-status", str(repo_path), "--json-output"])
     assert result.exit_code == 0, result.output
@@ -268,7 +293,7 @@ def test_repo_experience_status_writes_artifacts(tmp_path: Path) -> None:
 def test_repo_experience_telemetry_flags_no_wrapper_usage(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
-    deploy(repo_path)
+    _deploy(repo_path)
 
     result = invoke_aethyme(["repo", "experience-telemetry", str(repo_path), "--json-output"])
     assert result.exit_code == 0, result.output
@@ -290,7 +315,7 @@ def test_repo_experience_telemetry_flags_no_wrapper_usage(tmp_path: Path) -> Non
 def test_repo_experience_telemetry_detects_stale_override_artifacts(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
-    deploy(repo_path)
+    _deploy(repo_path)
 
     override_path = repo_path / ".aethyme" / "overrides" / "onboarding.json"
     override_path.parent.mkdir(parents=True, exist_ok=True)
@@ -338,7 +363,7 @@ def test_repo_experience_telemetry_detects_stale_override_artifacts(tmp_path: Pa
 def test_enhance_verify_refreshes_experience_status(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
-    deploy(repo_path)
+    _deploy(repo_path)
 
     result = invoke_aethyme(["enhance", "verify", "--repo", str(repo_path)])
     assert result.exit_code == 0, result.output
@@ -356,7 +381,7 @@ def test_enhance_verify_refreshes_experience_status(tmp_path: Path) -> None:
 def test_enhance_verify_fails_on_direct_agents_edit(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
-    deploy(repo_path)
+    _deploy(repo_path)
 
     agents_path = repo_path / "AGENTS.md"
     agents_path.write_text(
