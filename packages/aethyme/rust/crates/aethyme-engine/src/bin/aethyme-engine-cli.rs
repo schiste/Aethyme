@@ -78,6 +78,7 @@ fn run() -> Result<(), String> {
     match command.as_str() {
         "daemon" => return run_daemon_subcommand(&args, no_cache, fragment_mode),
         "explore" => return run_explore_via_shared_cli(&args),
+        "verify-targets" => return run_verify_targets_via_shared_cli(&args),
         "inspect" => {
             let repo = read_option(&args, "--repo")?;
             let mode = read_option(&args, "--mode").unwrap_or_else(|_| "full".to_string());
@@ -763,6 +764,18 @@ fn run() -> Result<(), String> {
         other => return Err(format!("unsupported command: {other}")),
     }
     Ok(())
+}
+
+fn run_verify_targets_via_shared_cli(args: &[String]) -> Result<(), String> {
+    use aethyme_engine::verify_targets_cli::{VerifyTargetsCliOutcome, run};
+    match run(args) {
+        VerifyTargetsCliOutcome::Done => Ok(()),
+        VerifyTargetsCliOutcome::BadUsage(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+        VerifyTargetsCliOutcome::Failed(message) => Err(message),
+    }
 }
 
 fn read_option(args: &[String], flag: &str) -> Result<String, String> {

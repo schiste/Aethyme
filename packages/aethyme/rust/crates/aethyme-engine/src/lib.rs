@@ -18,4 +18,5 @@ pub mod task_cli;
 pub mod repo;
 pub mod snippets;
 pub mod store;
+pub mod verify_targets_cli;
 pub mod workspace;
