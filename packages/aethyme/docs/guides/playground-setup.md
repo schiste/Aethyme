@@ -191,6 +191,8 @@ accidentally inherit the Aethyme tool surface:
 ```bash
 COMMON_ENV=(
   AETHYME_EVAL_PROMPT="Inspect the auth/token flow without modifying files."
+  AETHYME_EVAL_FIXTURE_ID=edge_proxy_backend_auth
+  AETHYME_EVAL_TASK_CLASS=auth_token_behavior
   AETHYME_EVAL_OUTPUT_SCHEMA_FILE=/path/to/schema.json
 )
 
@@ -214,8 +216,10 @@ preserves `events.jsonl`, `stderr.log`, `last-message.json`, `command.json`,
 command-output chars, event-log chars, and stderr chars. The Control arm strips
 `AETHYME*`/`AETHYMEBENCH*` environment variables and does not add the tool repo
 to Codex. The Aethyme arm adds only `AETHYME_EVAL_TOOL_REPO` as the tool
-surface. Any `.aethyme` path in selected files, snippets, command output, or
-the final answer fails the run before the result can be interpreted.
+surface. Any generated artifact path (`.aethyme/`, `.chau7/`, `.codex/`,
+`.claude/`, generated `AGENTS.md`, generated `CLAUDE.md`, or
+`graph_store.redb`) in selected files, snippets, command output, or the final
+answer fails the run before the result can be interpreted.
 
 The runner result JSON is written to stdout and now includes a normalized
 `regression_metrics` block. Redirect each arm's stdout to a result file when
@@ -247,19 +251,52 @@ Compare a completed pair with the metric gate:
 ```bash
 "$AETHYME_ROOT/.venv/bin/python" "$AETHYME_ROOT/scripts/eval/check_regression_gate.py" \
   --control /tmp/aethyme-ab/control/result.json \
+  --control-repeat /tmp/aethyme-ab/control-repeat/result.json \
   --aethyme /tmp/aethyme-ab/aethyme/result.json \
+  --aethyme-repeat /tmp/aethyme-ab/aethyme-repeat/result.json \
+  --fixture edge_proxy_backend_auth \
+  --expected-missing-coverage edge_proxy \
   --control-quality 4 \
   --aethyme-quality 4
 ```
 
 The gate checks token estimate delta, selected file count delta, snippet count
-delta, command-output char delta, `.aethyme` leakage, Aethyme invocation, and
-reviewer-rubric quality. It intentionally does not require selected-file
-identity equality. Missing reviewer scores fail the gate unless
-`--allow-missing-quality` is passed for an exploratory dry run. Missing or
-malformed budget/hygiene metrics fail rather than being treated as zero.
-Aethyme invocation is recognized from command metadata, not from stdout or
-prose mentions of commands.
+delta, command-output char delta plus an absolute command-output cap,
+generated-artifact leakage, Aethyme invocation, deterministic repeat output,
+Surface/Flow coverage reporting, and reviewer-rubric quality. It intentionally
+does not require selected-file identity equality. Missing reviewer scores fail
+the gate unless `--allow-missing-quality` is passed for an exploratory dry run.
+Missing repeat results or missing Surface/Flow coverage fail the strict gate;
+use `--allow-missing-determinism` or `--allow-missing-coverage-report` only for
+dry runs that will not be interpreted as V2 evidence. Missing or malformed
+budget/hygiene metrics fail rather than being treated as zero. Aethyme
+invocation is recognized from command metadata, not from stdout or prose
+mentions of commands.
+
+For the full V2 suite, use a manifest so the fixture-family coverage is checked
+as part of the same gate:
+
+```json
+{
+  "runs": [
+    {
+      "fixture_id": "edge_proxy_backend_auth",
+      "control": "edge-proxy/control/result.json",
+      "control_repeat": "edge-proxy/control-repeat/result.json",
+      "aethyme": "edge-proxy/aethyme/result.json",
+      "aethyme_repeat": "edge-proxy/aethyme-repeat/result.json",
+      "expected_missing_coverage": ["edge_proxy"],
+      "control_quality": 4,
+      "aethyme_quality": 4
+    }
+  ]
+}
+```
+
+The manifest is valid only when it includes all required fixture ids from
+`docs/guides/eval-protocol.md`: Django backend auth, edge proxy + backend auth,
+OIDC + session auth, webhook secret auth, queue/job behavior, config-owned
+middleware behavior, and frontend-to-backend route behavior.
 
 ## Adding a New Eval Target
 

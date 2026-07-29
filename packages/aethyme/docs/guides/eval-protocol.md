@@ -1,6 +1,6 @@
 # Eval Protocol (removed)
 
-Last Updated: 2026-07-28
+Last Updated: 2026-07-29
 
 The evaluation harness (`src/eval/`, `evals/tools/*.toml`, the
 `aethyme eval` / `aethyme methodology` CLI groups, and
@@ -34,13 +34,38 @@ The remaining live eval surface is the playground A/B runner under
 - Runs preserve `events.jsonl`, `stderr.log`, `last-message.json`,
   `command.json`, and `contract.json`, and emit wall time, token usage,
   command-output chars, event-log chars, and stderr chars in the runner JSON.
-- `.aethyme` path leakage in selected files, snippets, command output, or the
-  final answer is a hard regression. The bundled runner writes `leakage.json`
-  and exits non-zero when the leak gate trips.
+- Generated artifact leakage in selected files, snippets, command output, or
+  the final answer is a hard regression. The bundled runner checks `.aethyme/`,
+  `.chau7/`, `.codex/`, `.claude/`, generated `AGENTS.md`, generated
+  `CLAUDE.md`, and `graph_store.redb`; it writes `leakage.json` and exits
+  non-zero when the leak gate trips.
 - The regression gate compares stable budget and hygiene metrics, not selected
   file identity: token estimate delta, selected file count delta, snippet count
-  delta, command-output char delta, `.aethyme` leakage, Aethyme invocation, and
+  delta, command-output char delta, generated-artifact leakage, Aethyme
+  invocation, deterministic repeat output, Surface/Flow coverage reporting, and
   reviewer-rubric final answer quality.
+
+### Required V2 Surface/Flow Fixtures
+
+A V2 evaluation suite is not valid unless it covers all of these Playground
+fixture families:
+
+| Fixture id | Required behavior family |
+|---|---|
+| `django_backend_auth` | Django backend-only auth |
+| `edge_proxy_backend_auth` | edge proxy + backend auth |
+| `oidc_session_auth` | OIDC + session auth |
+| `webhook_secret_auth` | webhook secret auth |
+| `queue_job_behavior` | queue/job behavior |
+| `config_owned_middleware_behavior` | config-owned middleware behavior |
+| `frontend_backend_route_behavior` | frontend-to-backend route behavior |
+
+Each suite row must compare Control and Aethyme runner JSON for the same
+fixture id. The strict regression gate requires repeat result JSON for both
+arms so it can compare deterministic output fingerprints. For fixtures with
+known incomplete graph coverage, declare `expected_missing_coverage`; the gate
+fails unless Aethyme observability reports those missing Surface/Flow families
+instead of hiding them behind a generic freshness status.
 
 Set `AETHYME_EVAL_ARM=control` or `AETHYME_EVAL_ARM=aethyme` explicitly when
 using `scripts/eval/run_codex_eval.py`. For reproducible archives, set

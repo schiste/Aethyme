@@ -33,6 +33,73 @@ def _load_gate() -> ModuleType:
     return module
 
 
+def _surface_flow_observability(missing: list[str] | None = None) -> dict[str, object]:
+    missing = missing or []
+    coverage: dict[str, object] = {"backend": {"status": "covered"}}
+    for surface_type in missing:
+        coverage[surface_type] = {"status": "source_present_not_indexed"}
+    return {
+        "observability": {
+            "surface_flow_graph": {
+                "status": "partial" if missing else "covered",
+                "coverage": coverage,
+                "missing_expected_surfaces": [
+                    {"surface_type": surface_type, "reason": "fixture expects a visible gap"}
+                    for surface_type in missing
+                ],
+            },
+            "graph_completeness_by_surface_type": coverage,
+            "missing_expected_surfaces": [
+                {"surface_type": surface_type, "reason": "fixture expects a visible gap"}
+                for surface_type in missing
+            ],
+        }
+    }
+
+
+def _strict_gate_payload(
+    *,
+    arm: str,
+    fixture_id: str = "edge_proxy_backend_auth",
+    repo_path: str | None = None,
+    token_estimate: int = 1_000,
+    command_output_chars: int = 1_000,
+    aethyme_invoked: bool | None = None,
+    generated_artifact_leaked: bool = False,
+    quality: float = 4.0,
+    missing_coverage: list[str] | None = None,
+    answer: str = "stable answer",
+) -> dict[str, object]:
+    invoked = arm == "aethyme" if aethyme_invoked is None else aethyme_invoked
+    return {
+        "arm": arm,
+        "fixture_id": fixture_id,
+        "contract": {
+            "playground_repo": True,
+            "aethyme_self_eval": False,
+            "arm": arm,
+            "repo_path": repo_path or f"/tmp/Playground/Demo/Demo - {arm.title()}",
+            "fixture_id": fixture_id,
+        },
+        "regression_metrics": {
+            "token_estimate": token_estimate,
+            "selected_file_count": 2,
+            "snippet_count": 1,
+            "command_output_chars": command_output_chars,
+            "generated_artifact_leaked": generated_artifact_leaked,
+            "aethyme_path_leaked": generated_artifact_leaked,
+            "aethyme_invoked": invoked,
+        },
+        "structured_output": {
+            "selected_files": ["src/auth.py", "src/routes.py"],
+            "snippets": [{"path": "src/auth.py"}],
+            "answer": answer,
+            **_surface_flow_observability(missing_coverage or []),
+        },
+        "reviewer_quality_score": quality,
+    }
+
+
 def test_control_command_uses_clean_codex_runner_without_tool_repo() -> None:
     runner = _load_runner()
     repo_path = Path("/tmp/Playground/Demo/Demo - Control")
@@ -240,15 +307,16 @@ def test_runner_emits_stable_regression_metrics(
     assert runner.main() == 0
     payload = json.loads(capsys.readouterr().out)
     metrics = payload["regression_metrics"]
-    assert metrics == {
-        "token_estimate": 125,
-        "selected_file_count": 2,
-        "snippet_count": 1,
-        "command_output_chars": len(command_output),
-        "aethyme_path_leaked": False,
-        "aethyme_invoked": True,
-        "arm": "aethyme",
-    }
+    assert metrics["token_estimate"] == 125
+    assert metrics["selected_file_count"] == 2
+    assert metrics["snippet_count"] == 1
+    assert metrics["command_output_chars"] == len(command_output)
+    assert metrics["generated_artifact_leaked"] is False
+    assert metrics["aethyme_path_leaked"] is False
+    assert metrics["aethyme_invoked"] is True
+    assert metrics["arm"] == "aethyme"
+    assert isinstance(metrics["output_fingerprint"], str)
+    assert len(metrics["output_fingerprint"]) == 64
 
 
 def test_runner_invocation_detection_ignores_non_command_text_and_output(tmp_path: Path) -> None:
@@ -330,6 +398,45 @@ def test_leakage_gate_checks_selected_files_snippets_command_output_and_final_an
     assert "$.snippets[1].path" in paths
     assert "event[1].item.stdout" in paths
     assert all(".aethyme" in leak["excerpt"] for leak in leakage["leaks"])
+
+
+def test_leakage_gate_detects_generated_scaffolding_beyond_aethyme_paths(
+    tmp_path: Path,
+) -> None:
+    runner = _load_runner()
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "stdout": "opened .codex/skills/aethyme/SKILL.md and graph_store.redb",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    leakage = runner._detect_artifact_leakage(
+        structured_output={
+            "selected_files": ["AGENTS.md", ".chau7/snippets/current.json"],
+            "snippets": [{"path": ".claude/skills/aethyme/SKILL.md"}],
+        },
+        final_output_message="The answer should not mention CLAUDE.md.",
+        events_file=events_file,
+    )
+
+    assert leakage["generated_artifact_leaked"] is True
+    markers = {leak["marker"] for leak in leakage["leaks"]}
+    assert {
+        ".codex",
+        "graph_store.redb",
+        "AGENTS.md",
+        ".chau7",
+        ".claude",
+        "CLAUDE.md",
+    }.issubset(markers)
 
 
 def test_leakage_gate_ignores_non_output_event_metadata(tmp_path: Path) -> None:
@@ -637,7 +744,7 @@ def test_regression_gate_fails_hygiene_invocation_and_quality_regressions() -> N
     assert report["passed"] is False
     failures = {check["name"] for check in report["checks"] if not check["passed"]}
     assert "aethyme_invoked" in failures
-    assert "aethyme_no_aethyme_path_leak" in failures
+    assert "aethyme_no_generated_artifact_leak" in failures
     assert "final_answer_quality_not_worse" in failures
 
 
@@ -677,3 +784,149 @@ def test_regression_gate_fails_budget_delta_without_file_equality() -> None:
     assert report["passed"] is False
     failures = {check["name"] for check in report["checks"] if not check["passed"]}
     assert failures == {"token_estimate_delta"}
+
+
+def test_strict_regression_gate_accepts_repeat_and_reported_missing_coverage() -> None:
+    gate = _load_gate()
+    control = _strict_gate_payload(arm="control", missing_coverage=[])
+    aethyme = _strict_gate_payload(arm="aethyme", missing_coverage=["edge_proxy"])
+
+    report = gate.compare_runs(
+        control,
+        aethyme,
+        control_repeat=control,
+        aethyme_repeat=aethyme,
+        fixture_id="edge-proxy + backend auth",
+        expected_missing_coverage=["edge_proxy"],
+        max_command_output_chars=2_000,
+        require_playground_contract=True,
+        require_determinism=True,
+        require_coverage_report=True,
+    )
+
+    assert report["passed"] is True
+    passed = {check["name"] for check in report["checks"] if check["passed"]}
+    assert "control_output_deterministic" in passed
+    assert "aethyme_output_deterministic" in passed
+    assert "surface_flow_coverage_reported" in passed
+    assert report["fixture_id"] == "edge_proxy_backend_auth"
+
+
+def test_strict_regression_gate_fails_missing_repeat_bounded_output_and_self_eval() -> None:
+    gate = _load_gate()
+    control = _strict_gate_payload(
+        arm="control",
+        repo_path=str(_PACKAGE_ROOT),
+        command_output_chars=3_000,
+    )
+    aethyme = _strict_gate_payload(arm="aethyme", command_output_chars=3_000)
+
+    report = gate.compare_runs(
+        control,
+        aethyme,
+        max_command_output_chars=2_000,
+        require_playground_contract=True,
+        require_determinism=True,
+        require_coverage_report=True,
+    )
+
+    assert report["passed"] is False
+    failures = {check["name"] for check in report["checks"] if not check["passed"]}
+    assert "control_repo_path_not_aethyme_checkout" in failures
+    assert "control_command_output_bounded" in failures
+    assert "aethyme_command_output_bounded" in failures
+    assert "control_output_deterministic" in failures
+    assert "aethyme_output_deterministic" in failures
+
+
+def test_regression_gate_fails_when_missing_coverage_is_hidden() -> None:
+    gate = _load_gate()
+    control = _strict_gate_payload(arm="control")
+    aethyme = _strict_gate_payload(arm="aethyme", missing_coverage=[])
+    aethyme["structured_output"] = {
+        "observability": {
+            "surface_flow_graph": {
+                "status": "partial",
+                "coverage": {"edge_proxy": {"status": "source_present_not_indexed"}},
+                "missing_expected_surfaces": [],
+            }
+        }
+    }
+
+    report = gate.compare_runs(
+        control,
+        aethyme,
+        control_repeat=control,
+        aethyme_repeat=aethyme,
+        expected_missing_coverage=["edge_proxy"],
+        require_determinism=True,
+        require_coverage_report=True,
+    )
+
+    assert report["passed"] is False
+    failures = {check["name"] for check in report["checks"] if not check["passed"]}
+    assert "surface_flow_coverage_reported" in failures
+    coverage_check = next(
+        check for check in report["checks"] if check["name"] == "surface_flow_coverage_reported"
+    )
+    assert coverage_check["hidden_missing_coverage"] == ["edge_proxy"]
+
+
+def test_regression_gate_reads_coverage_from_aethyme_command_output(tmp_path: Path) -> None:
+    gate = _load_gate()
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "stdout": json.dumps(_surface_flow_observability(["webhook"])),
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    control = _strict_gate_payload(arm="control")
+    aethyme = _strict_gate_payload(arm="aethyme", missing_coverage=[])
+    aethyme["structured_output"] = {"answer": "checked command output"}
+    aethyme["event_log_file"] = str(events_file)
+
+    report = gate.compare_runs(
+        control,
+        aethyme,
+        control_repeat=control,
+        aethyme_repeat=aethyme,
+        expected_missing_coverage=["webhook"],
+        require_determinism=True,
+        require_coverage_report=True,
+    )
+
+    assert report["passed"] is True
+
+
+def test_regression_gate_suite_requires_all_surface_flow_fixture_families() -> None:
+    gate = _load_gate()
+    complete_runs = []
+    for fixture_id in gate.REQUIRED_PLAYGROUND_FIXTURES:
+        control = _strict_gate_payload(arm="control", fixture_id=fixture_id)
+        aethyme = _strict_gate_payload(arm="aethyme", fixture_id=fixture_id)
+        complete_runs.append(
+            {
+                "fixture_id": fixture_id,
+                "control": control,
+                "aethyme": aethyme,
+                "control_repeat": control,
+                "aethyme_repeat": aethyme,
+                "control_quality": 4,
+                "aethyme_quality": 4,
+            }
+        )
+
+    passing = gate.compare_suite({"runs": complete_runs})
+    assert passing["passed"] is True
+
+    missing_fixture = gate.compare_suite({"runs": complete_runs[:-1]})
+    assert missing_fixture["passed"] is False
+    failures = {check["name"] for check in missing_fixture["checks"] if not check["passed"]}
+    assert "required_fixture_frontend_backend_route_behavior_present" in failures

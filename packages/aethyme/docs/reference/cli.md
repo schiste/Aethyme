@@ -352,22 +352,25 @@ adapter.
 - `aethyme task expand --repo /path/to/repo --node <target> --json-output`
 - `aethyme task context --repo /path/to/repo --task "..." --json-output`
 
-`task anchors`, `task scope`, `task next`, and `task expand` read the redb
-graph store. `task pack`, `task explain`, and `task context` still build
-context packs through the remaining in-memory path.
+`task anchors`, `task scope`, `task next`, `task expand`, `task pack`,
+`task explain`, and `task context` read the redb graph store. Source text is
+still read from the filesystem when context packs need snippets/content, but
+candidate selection and graph navigation come from `.aethyme/graph_store.redb`.
 
 ### Local Evaluation
 - `aethyme eval explain-repo --repo /path/to/repo --json-output`
 - `aethyme eval explain-repo --repo /path/to/repo --control-cmd "<cmd>" --explore-cmd "<cmd>" --leverage-cmd "<cmd>"`
 - `aethyme eval navigation-ctf --repo /path/to/repo --json-output`
 - Example Codex wrapper command: `packages/aethyme/.venv/bin/python packages/aethyme/scripts/eval/run_codex_eval.py`
+- Example regression gate command: `packages/aethyme/.venv/bin/python packages/aethyme/scripts/eval/check_regression_gate.py --suite /path/to/suite.json`
 
 Current behavior:
 - with no commands, this builds the control artifacts and comparison report only
 - with `--control-cmd`, `--explore-cmd`, and `--leverage-cmd`, it executes real runs through the evaluation runner contract
 - `--baseline-cmd` and `--aethyme-cmd` remain accepted as legacy aliases for compatibility
 - external runners receive the prompt, navigation context, output schema, and Aethyme tool paths through `AETHYME_EVAL_*` env vars
-- the bundled Codex wrapper requires `AETHYME_EVAL_ARM=control|aethyme`, runs `codex exec --ignore-user-config --json`, preserves `events.jsonl` / `stderr.log` / `last-message.json` / `leakage.json`, reports wall time, token usage, command-output chars, event-log chars, and stderr chars, and fails the run if `.aethyme` paths leak into selected files, snippets, command output, or the final answer
+- the bundled Codex wrapper requires `AETHYME_EVAL_ARM=control|aethyme`, runs `codex exec --ignore-user-config --json`, preserves `events.jsonl` / `stderr.log` / `last-message.json` / `leakage.json`, reports wall time, token usage, command-output chars, event-log chars, stderr chars, fixture metadata, and output fingerprints, and fails the run if generated Aethyme artifacts leak into selected files, snippets, command output, or the final answer
+- the strict regression gate rejects Aethyme self-evals, incomplete required fixture suites, generated-artifact leakage, missing repeat-output determinism, unbounded command output, token-budget regressions, worse reviewer quality, and hidden Surface/Flow coverage gaps
 - every run writes a local markdown report under `packages/aethyme/docs/reports/evals/`
 - the repository tracks only a curated subset of eval reports there; the rest are generated local artifacts
 - JSON output includes the generated `report_path`
