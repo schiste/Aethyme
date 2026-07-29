@@ -118,9 +118,33 @@ fn main() -> ExitCode {
         // idempotent. Top-level like certify: it is the first command a
         // new repo runs.
         "init" => ExitCode::from(aethyme_broker::cli::run(&args)),
+        // Enhance (python-retirement Phase 2): native dispatch is
+        // env-gated — opt in with AETHYME_ENHANCE_NATIVE=1 while the
+        // parity harness gates the flip. Everything else (including
+        // `enhance --help` and unknown subcommands) still delegates so
+        // the Python surface stays authoritative until then.
+        "enhance" => {
+            let native = env::var("AETHYME_ENHANCE_NATIVE")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            let subcommand = args.get(1).map(String::as_str);
+            if native && matches!(subcommand, Some("deploy") | Some("verify")) {
+                let Some((aethyme_root, _source)) = resolve_aethyme_root() else {
+                    eprintln!(
+                        "aethyme: cannot locate the Aethyme package root for the \
+                         'enhance' command."
+                    );
+                    print_root_guidance();
+                    return ExitCode::from(2);
+                };
+                ExitCode::from(aethyme_enhance::cli::run(&aethyme_root, &args[1..]))
+            } else {
+                delegate_to_python("enhance", &args[1..])
+            }
+        }
         other => {
             // Unknown to the Rust client — pass straight through to Python.
-            // This includes commands like `intents`, `enhance`, `eval`, etc.
+            // This includes commands like `intents`, `eval`, etc.
             delegate_to_python(other, &args[1..])
         }
     }

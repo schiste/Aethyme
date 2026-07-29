@@ -16,6 +16,7 @@
 //! keeps answering by default until the flip.
 
 pub mod agents;
+pub mod cli;
 pub mod deploy;
 pub mod onboarding;
 pub mod pyjson;
