@@ -20,18 +20,46 @@ entrypoints, or where to begin.
 
 ```bash
 AETHYME_ROOT="{{AETHYME_ROOT}}"
+AETHYME_JSON="$(mktemp -t aethyme-explore.XXXXXX.json)"
 "$AETHYME_ROOT/rust/target/release/aethyme" explore \
-    --repo "$PWD" --request "<your task>" --format answer-json
+    --repo "$PWD" --request "<your task>" \
+    --format answer-json --show-observability --depth 0 > "$AETHYME_JSON"
+"$AETHYME_ROOT/.venv/bin/python" - "$AETHYME_JSON" <<'PY'
+import json, sys; d = json.load(open(sys.argv[1], encoding="utf-8"))
+targets = []; lanes = d.get("subsystems", [])[:3]
+subsystems = [{k: lane.get(k) for k in ("rank", "id", "label", "role", "confidence", "token_subsystems", "missing_coverage_warnings")} for lane in lanes]
+for lane in lanes:
+    for target in lane.get("top_verification_targets", [])[:2]:
+        if isinstance(target, dict):
+            row = dict(target); row.setdefault("subsystem", lane.get("role") or lane.get("id"))
+            targets.append(row)
+print(json.dumps({
+    "safe_to_use_as_answer": d.get("safe_to_use_as_answer"),
+    "trust_policy": d.get("trust_policy"),
+    "subsystems": subsystems,
+    "top_verification_targets": targets[:6],
+    "verification_steps": d.get("verification_steps", [])[:3],
+    "observability": {"readiness": d.get("observability", {}).get("readiness")},
+}, indent=2))
+PY
+"$AETHYME_ROOT/rust/target/release/aethyme" verify-targets \
+    --repo "$PWD" --from "$AETHYME_JSON" \
+    --max-targets 2 --max-lines 80
 ```
 
 Do not run `python -m src.cli explore`; the Python `explore` subcommand was
-removed. Use the native binary above for Explore, and use the Python CLI for
+removed. Use the native binary above for Explore and the `aethyme` binary for
 `graph`, `task`, `intents`, `facts`, and `analyze`.
 
-Read `trust_policy` and `safe_to_use_as_answer` first. Use `answer[]` as the
-primary result only when `safe_to_use_as_answer` is true. Otherwise treat
-`answer[]` and `navigation_hints[]` as a ranked investigation plan and
-follow `verification_steps[]` before concluding.
+Inspect only the printed projection first: `safe_to_use_as_answer`,
+`trust_policy`, `subsystems`, `top_verification_targets`,
+`verification_steps`, and `observability.readiness`. Keep the full JSON temp
+file for audit/debug, not for dumping into the conversation.
+
+Verify from the bounded source spans first. Read full target files only if
+those spans are insufficient: at most 2-3 files, about 80-120 relevant lines
+each. Do not run broad `rg`, `rg --files`, or repository-wide grep unless the
+top targets fail.
 
 The default detail is `compact`. Use `--detail standard` or `--detail full`
 only when the task needs more evidence payload — they trade tokens for
@@ -48,7 +76,7 @@ Same content lives at both of these per-product skill paths:
 
 Read whichever your agent surface auto-loads. The Aethyme skill is intentionally
 short: it tells agents to make one bounded Explore call, inspect trust and
-observability, then verify narrowly. Detailed workflows live under the skill's
+observability, then verify bounded spans. Detailed workflows live under the skill's
 `references/` directory and should be loaded only when needed.
 
 ## Commit Hygiene

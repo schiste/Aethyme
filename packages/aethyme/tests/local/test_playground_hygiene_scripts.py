@@ -135,6 +135,11 @@ def test_verify_playground_enforces_guidance_and_discovery_hygiene() -> None:
     # Phase 2 template flip (2026-07-30): the staleness check widened from
     # 'src.cli explore' to any executable `-m src.cli` line.
     assert "executable 'python -m src.cli' guidance" in script
+    assert "mktemp -t aethyme-explore" in script
+    assert "top_verification_targets" in script
+    assert "observability.readiness" in script
+    assert "verify-targets" in script
+    assert "navigation_hints\\[\\]" in script
 
     assert "check_ignored_path" in script
     for generated_path in (

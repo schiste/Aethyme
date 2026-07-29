@@ -74,6 +74,21 @@ check_root_guidance() {
     grep -q '"$AETHYME_ROOT/rust/target/release/aethyme" explore' "$file" \
         && check_pass "$label points Explore at native aethyme binary" \
         || check_fail "$label missing native Explore quick start"
+    grep -q 'mktemp -t aethyme-explore' "$file" \
+        && check_pass "$label writes full Explore JSON to temp" \
+        || check_fail "$label missing temp-file Explore capture"
+    grep -q 'top_verification_targets' "$file" \
+        && check_pass "$label prints compact verification-target projection" \
+        || check_fail "$label missing compact verification-target projection"
+    grep -q 'observability.readiness' "$file" \
+        && check_pass "$label inspects compact readiness" \
+        || check_fail "$label missing readiness-only observability guidance"
+    grep -q 'verify-targets' "$file" \
+        && check_pass "$label uses bounded verify-targets source spans" \
+        || check_fail "$label missing bounded verify-targets source spans"
+    grep -q 'navigation_hints\[\]' "$file" \
+        && check_fail "$label still tells agents to inspect navigation_hints[]" \
+        || check_pass "$label does not inspect navigation_hints[] by default"
     # 2026-07-30 (python-retirement Phase 2): the delegated command groups
     # went native and deployed templates now spell every command `aethyme ...`.
     # ANY executable `-m src.cli` line is stale, not just explore.
@@ -175,6 +190,13 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
         grep -q '{{AETHYME_ROOT}}' "$SKILL_FILE" && check_fail "Skill has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "Skill placeholders resolved"
         grep -q 'one bounded Explore call' "$SKILL_FILE" && check_pass "Skill states one bounded Explore-call contract" || check_fail "Skill missing one-call contract"
         grep -q 'safe_to_use_as_answer' "$SKILL_FILE" && check_pass "Skill tells agents to inspect trust fields" || check_fail "Skill missing trust-field guidance"
+        grep -q 'mktemp -t aethyme-explore' "$SKILL_FILE" && check_pass "Skill writes full Explore JSON to temp" || check_fail "Skill missing temp-file Explore capture"
+        grep -q 'top_verification_targets' "$SKILL_FILE" && check_pass "Skill prints compact verification-target projection" || check_fail "Skill missing compact verification-target projection"
+        grep -q 'observability.readiness' "$SKILL_FILE" && check_pass "Skill inspects compact readiness" || check_fail "Skill missing readiness-only observability guidance"
+        grep -q 'verify-targets' "$SKILL_FILE" && check_pass "Skill uses bounded verify-targets source spans" || check_fail "Skill missing bounded verify-targets source spans"
+        grep -q '80-120' "$SKILL_FILE" && check_pass "Skill caps narrow source reads" || check_fail "Skill missing narrow source-read cap"
+        grep -q 'broad `rg`' "$SKILL_FILE" && check_pass "Skill blocks broad rg until top targets fail" || check_fail "Skill missing broad-rg guard"
+        grep -q 'navigation_hints\[\]' "$SKILL_FILE" && check_fail "Skill still tells agents to inspect navigation_hints[]" || check_pass "Skill does not inspect navigation_hints[] by default"
         (grep -q '"$AETHYME_BIN" explore' "$SKILL_FILE" || grep -q 'aethyme explore' "$SKILL_FILE") \
             && check_pass "Skill includes current native-explore guidance" \
             || check_fail "Skill missing native explore guidance"
