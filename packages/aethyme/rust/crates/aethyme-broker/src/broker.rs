@@ -171,6 +171,7 @@ impl VersionRepairReport {
 /// Everything `broker status` renders, in one serializable shape.
 #[derive(Debug, serde::Serialize)]
 pub struct StatusView {
+    pub summary: StatusSummary,
     pub advice: Vec<StatusAdvice>,
     pub agents: Vec<AgentView>,
     pub overlaps: Vec<crate::leases::Overlap>,
@@ -178,6 +179,30 @@ pub struct StatusView {
     pub queue: Vec<crate::types::MergeQueueEntry>,
     pub integration_branch: String,
     pub integration_head: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatusSummary {
+    pub message: String,
+    pub live_sessions: usize,
+    pub active_sessions: usize,
+    pub idle_sessions: usize,
+    pub stale_sessions: usize,
+    pub dirty_sessions: usize,
+    pub overlap_count: usize,
+    pub promoted_conflict_count: usize,
+    pub integration_relation: StatusIntegrationRelation,
+    pub integration_ahead_main_commits: u64,
+    pub may_move_integration: bool,
+    pub commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusIntegrationRelation {
+    CurrentWithMain,
+    AheadOfMain,
+    DivergedFromMain,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1249,6 +1274,29 @@ impl Broker {
         let promoted_conflicts = self.promoted_conflicts()?;
         let queue = self.store.merge_queue()?;
         let (integration_branch, integration_head) = self.integration_head()?;
+        let main_head = self.repo.head_commit()?;
+        let (integration_relation, integration_ahead_main_commits) =
+            if integration_head == main_head {
+                (StatusIntegrationRelation::CurrentWithMain, 0)
+            } else if self.repo.is_ancestor(&main_head, &integration_head) {
+                (
+                    StatusIntegrationRelation::AheadOfMain,
+                    self.repo
+                        .commit_count_between(&main_head, &integration_head)?,
+                )
+            } else {
+                (StatusIntegrationRelation::DivergedFromMain, 0)
+            };
+        let dirty_sessions = dirty_session_count(&agents);
+        let summary = status_summary(
+            &agents,
+            overlaps.len(),
+            promoted_conflicts.len(),
+            dirty_sessions,
+            &integration_branch,
+            integration_relation,
+            integration_ahead_main_commits,
+        );
         let advice = self.status_advice(
             &agents,
             &promoted_conflicts,
@@ -1257,6 +1305,7 @@ impl Broker {
             &integration_head,
         );
         Ok(StatusView {
+            summary,
             advice,
             agents,
             overlaps,
@@ -1994,6 +2043,182 @@ fn promoted_clean_finish_advice(agent: &AgentView, entry: &MergeQueueEntry) -> S
     }
 }
 
+fn dirty_session_count(agents: &[AgentView]) -> usize {
+    agents
+        .iter()
+        .filter(|agent| {
+            let Ok(checkout) = GitRepo::discover(Path::new(&agent.session.worktree_path)) else {
+                return false;
+            };
+            checkout
+                .dirty_paths()
+                .map(|dirty| !dirty.is_empty())
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+fn status_summary(
+    agents: &[AgentView],
+    overlap_count: usize,
+    promoted_conflict_count: usize,
+    dirty_sessions: usize,
+    integration_branch: &str,
+    integration_relation: StatusIntegrationRelation,
+    integration_ahead_main_commits: u64,
+) -> StatusSummary {
+    let live_sessions = agents.len();
+    let active_sessions = agents
+        .iter()
+        .filter(|agent| agent.derived_status == SessionStatus::Active)
+        .count();
+    let idle_sessions = agents
+        .iter()
+        .filter(|agent| agent.derived_status == SessionStatus::Idle)
+        .count();
+    let stale_sessions = agents
+        .iter()
+        .filter(|agent| agent.derived_status == SessionStatus::Stale)
+        .count();
+    let may_move_integration = live_sessions > 0;
+
+    let sessions = session_summary_phrase(
+        live_sessions,
+        active_sessions,
+        idle_sessions,
+        stale_sessions,
+    );
+    let overlaps = overlap_summary_phrase(overlap_count, promoted_conflict_count);
+    let integration = integration_summary_phrase(
+        integration_branch,
+        integration_relation,
+        integration_ahead_main_commits,
+    );
+    let mut notes = Vec::new();
+    if dirty_sessions > 0 {
+        notes.push(format!(
+            "{} dirty {} need commit/stash before submit",
+            dirty_sessions,
+            plural_word(dirty_sessions, "session", "sessions")
+        ));
+    }
+    notes.push(if active_sessions > 0 {
+        "active session may promote new integration work".to_string()
+    } else if live_sessions > 0 {
+        "live session may promote new integration work".to_string()
+    } else {
+        "no active submitters".to_string()
+    });
+
+    let mut commands = Vec::new();
+    if may_move_integration {
+        commands.push("aethyme broker integration wait-stable --seconds 30".into());
+    }
+    if integration_relation != StatusIntegrationRelation::CurrentWithMain {
+        commands.push("aethyme broker integration status".into());
+    }
+
+    StatusSummary {
+        message: format!(
+            "{sessions}; {overlaps}; {integration}; {}",
+            notes.join("; ")
+        ),
+        live_sessions,
+        active_sessions,
+        idle_sessions,
+        stale_sessions,
+        dirty_sessions,
+        overlap_count,
+        promoted_conflict_count,
+        integration_relation,
+        integration_ahead_main_commits,
+        may_move_integration,
+        commands,
+    }
+}
+
+fn session_summary_phrase(
+    live_sessions: usize,
+    active_sessions: usize,
+    idle_sessions: usize,
+    stale_sessions: usize,
+) -> String {
+    if live_sessions == 0 {
+        return "no live sessions".into();
+    }
+    if live_sessions == 1 {
+        if active_sessions == 1 {
+            return "1 active session".into();
+        }
+        if idle_sessions == 1 {
+            return "1 idle session".into();
+        }
+        if stale_sessions == 1 {
+            return "1 stale session".into();
+        }
+        return "1 live session".into();
+    }
+
+    let mut parts = Vec::new();
+    if active_sessions > 0 {
+        parts.push(format!("{active_sessions} active"));
+    }
+    if idle_sessions > 0 {
+        parts.push(format!("{idle_sessions} idle"));
+    }
+    if stale_sessions > 0 {
+        parts.push(format!("{stale_sessions} stale"));
+    }
+    if parts.is_empty() {
+        format!("{live_sessions} live sessions")
+    } else {
+        format!("{live_sessions} live sessions ({})", parts.join(", "))
+    }
+}
+
+fn overlap_summary_phrase(overlap_count: usize, promoted_conflict_count: usize) -> String {
+    match (overlap_count, promoted_conflict_count) {
+        (0, 0) => "no overlaps".into(),
+        (overlaps, 0) => format!(
+            "{} live {}",
+            overlaps,
+            plural_word(overlaps, "overlap", "overlaps")
+        ),
+        (0, promoted) => format!(
+            "{} promoted {}",
+            promoted,
+            plural_word(promoted, "conflict", "conflicts")
+        ),
+        (overlaps, promoted) => format!(
+            "{} live {}, {} promoted {}",
+            overlaps,
+            plural_word(overlaps, "overlap", "overlaps"),
+            promoted,
+            plural_word(promoted, "conflict", "conflicts")
+        ),
+    }
+}
+
+fn integration_summary_phrase(
+    integration_branch: &str,
+    integration_relation: StatusIntegrationRelation,
+    commits_ahead_main: u64,
+) -> String {
+    match integration_relation {
+        StatusIntegrationRelation::CurrentWithMain => {
+            format!("{integration_branch} current with main")
+        }
+        StatusIntegrationRelation::AheadOfMain => format!(
+            "{integration_branch} ahead of main by {} {}",
+            commits_ahead_main,
+            plural_word(commits_ahead_main as usize, "commit", "commits")
+        ),
+        StatusIntegrationRelation::DivergedFromMain => {
+            format!("{integration_branch} diverged from main")
+        }
+    }
+}
+
 fn integration_movement_advice(
     integration_branch: &str,
     integration_head: &str,
@@ -2454,6 +2679,60 @@ mod tests {
             vec!["aethyme broker finish --session 69".to_string()]
         );
         assert!(advice.summary.contains("session 69 is promoted and clean"));
+    }
+
+    #[test]
+    fn status_summary_explains_single_active_session_risk() {
+        let agent = super::AgentView {
+            session: session(70),
+            activity_at: 0,
+            derived_status: SessionStatus::Active,
+            pid_alive: None,
+        };
+
+        let summary = super::status_summary(
+            &[agent],
+            0,
+            0,
+            0,
+            "aethyme/integration",
+            super::StatusIntegrationRelation::CurrentWithMain,
+            0,
+        );
+
+        assert_eq!(summary.live_sessions, 1);
+        assert_eq!(summary.active_sessions, 1);
+        assert!(summary.may_move_integration);
+        assert_eq!(
+            summary.message,
+            "1 active session; no overlaps; aethyme/integration current with main; active session may promote new integration work"
+        );
+        assert_eq!(
+            summary.commands,
+            vec!["aethyme broker integration wait-stable --seconds 30"]
+        );
+    }
+
+    #[test]
+    fn status_summary_explains_no_active_submitters() {
+        let summary = super::status_summary(
+            &[],
+            0,
+            0,
+            0,
+            "aethyme/integration",
+            super::StatusIntegrationRelation::CurrentWithMain,
+            0,
+        );
+
+        assert_eq!(summary.live_sessions, 0);
+        assert_eq!(summary.active_sessions, 0);
+        assert!(!summary.may_move_integration);
+        assert_eq!(
+            summary.message,
+            "no live sessions; no overlaps; aethyme/integration current with main; no active submitters"
+        );
+        assert!(summary.commands.is_empty());
     }
 
     fn doctor_report(
