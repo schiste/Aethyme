@@ -67,10 +67,15 @@ for condition in bare overrides; do
     make_repo "$REPO" "$with"
 
     echo ">>> enhance deploy ($condition)..."
-    AETHYME_ROOT="$PACKAGE_ROOT" "$AETHYME_BIN" enhance deploy --repo "$REPO" --force \
+    # AETHYME_ENHANCE_NATIVE passes through explicitly: with it set to 1
+    # in the harness environment, the router answers natively (the Phase 2
+    # port); unset/empty keeps the Python implementation answering.
+    AETHYME_ROOT="$PACKAGE_ROOT" AETHYME_ENHANCE_NATIVE="${AETHYME_ENHANCE_NATIVE:-}" \
+        "$AETHYME_BIN" enhance deploy --repo "$REPO" --force \
         > "$WORK_DIR/deploy-$condition.out" 2>&1 \
         || { echo "FATAL: enhance deploy failed ($condition)"; cat "$WORK_DIR/deploy-$condition.out"; exit 1; }
-    AETHYME_ROOT="$PACKAGE_ROOT" "$AETHYME_BIN" enhance verify --repo "$REPO" \
+    AETHYME_ROOT="$PACKAGE_ROOT" AETHYME_ENHANCE_NATIVE="${AETHYME_ENHANCE_NATIVE:-}" \
+        "$AETHYME_BIN" enhance verify --repo "$REPO" \
         > "$WORK_DIR/verify-$condition.out" 2>&1 \
         || { echo "FATAL: enhance verify failed ($condition)"; cat "$WORK_DIR/verify-$condition.out"; exit 1; }
 
@@ -114,6 +119,32 @@ for condition in bare overrides; do
             fi
         fi
     done < <(find "$REPO" -type f -print0)
+
+    # Stdout parity: deploy/verify command output is part of the frozen
+    # surface too. Same volatile normalization as the artifacts.
+    STDOUT_DEST="$GOLDEN_DIR/stdout"
+    mkdir -p "$STDOUT_DEST"
+    for stream in deploy verify; do
+        norm="$WORK_DIR/norm-stdout"
+        sed -E -e "s|$PACKAGE_ROOT|{AETHYME_ROOT}|g" \
+            -e "s|/private$REPO|{REPO}|g" \
+            -e "s|$REPO|{REPO}|g" \
+            -e "s/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\+00:00/{TIMESTAMP}/g" \
+            "$WORK_DIR/$stream-$condition.out" > "$norm"
+        if [[ "$MODE" == "capture" ]]; then
+            cp "$norm" "$STDOUT_DEST/$condition-$stream.out"
+            echo "  captured stdout/$condition-$stream.out"
+        elif [[ ! -f "$STDOUT_DEST/$condition-$stream.out" ]]; then
+            echo "FAIL [stdout/$condition-$stream.out]: stdout not in goldens" >&2
+            FAILED=$((FAILED + 1))
+        elif ! cmp -s "$STDOUT_DEST/$condition-$stream.out" "$norm"; then
+            echo "FAIL [stdout/$condition-$stream.out]: stdout drifted" >&2
+            diff "$STDOUT_DEST/$condition-$stream.out" "$norm" | head -10 >&2
+            FAILED=$((FAILED + 1))
+        else
+            echo "  parity  stdout/$condition-$stream.out"
+        fi
+    done
 
     # In compare mode, also catch artifacts that STOPPED being deployed.
     if [[ "$MODE" == "compare" && -d "$DEST" ]]; then
