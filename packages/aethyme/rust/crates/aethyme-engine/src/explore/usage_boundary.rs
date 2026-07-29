@@ -17,8 +17,8 @@ use crate::model::analysis::{AnswerStatus, DeadCodeCandidate};
 use crate::store::redb::graph_store::GraphStore;
 
 use super::{
-    AnswerItem, Confidence, ConfidenceSummary, Evidence, ExploreError, ExploreRequest,
-    ExploreResponse, TrustPolicy, bucket_confidence,
+    bucket_confidence, graph_store_observability, AnswerItem, Confidence, ConfidenceSummary,
+    Evidence, ExploreError, ExploreRequest, ExploreResponse, TrustPolicy,
 };
 
 /// Parameters for `usage_boundary_query` intent.
@@ -108,7 +108,13 @@ pub fn explore_usage_boundary(
     )
     .map_err(ExploreError::EngineAnalyzer)?;
 
-    Ok(build_usage_boundary_response(request, params, answer))
+    let observability = graph_store_observability(&canonical_repo);
+    Ok(build_usage_boundary_response(
+        request,
+        params,
+        answer,
+        observability,
+    ))
 }
 
 /// Convert a `DeadCodeAnswer` into the answer-json envelope shape the
@@ -118,6 +124,7 @@ fn build_usage_boundary_response(
     request: &str,
     params: &UsageBoundaryParams,
     answer: crate::model::analysis::DeadCodeAnswer,
+    observability: serde_json::Value,
 ) -> ExploreResponse {
     // Split candidates by status: Unused/Ambiguous → answer[],
     // Used → excluded[]. The agent acts on `answer[]` items only.
@@ -249,6 +256,14 @@ fn build_usage_boundary_response(
     ];
 
     let degraded_reasons: Vec<String> = answer.observability.degraded_reasons.clone();
+    let observability = usage_boundary_observability(
+        observability,
+        &trust_policy,
+        &degraded_reasons,
+        &answer.observability,
+        answer_count,
+        excluded_count,
+    );
 
     ExploreResponse {
         schema_version: "aethyme-explore-v1",
@@ -329,8 +344,157 @@ fn build_usage_boundary_response(
             "max_evidence_per_symbol": params.max_evidence_per_symbol,
             "max_answer_items": params.max_answer_items,
         })),
-        observability: None,
+        observability: Some(observability),
     }
+}
+
+fn usage_boundary_observability(
+    mut observability: serde_json::Value,
+    trust_policy: &TrustPolicy,
+    degraded_reasons: &[String],
+    analyzer_observability: &crate::model::analysis::DeadCodeObservability,
+    answer_count: usize,
+    excluded_count: usize,
+) -> serde_json::Value {
+    let graph_status = observability
+        .get("graph_freshness")
+        .or_else(|| observability.get("graph_store"))
+        .and_then(|value| value.get("status"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let surface_flow_status = observability
+        .get("surface_flow_graph")
+        .and_then(|value| value.get("status"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let fresh_enough = graph_status == "fresh";
+    let complete_enough = fresh_enough
+        && !degraded_reasons.iter().any(|reason| {
+            reason.contains("budget_exceeded")
+                || reason.contains("redb_")
+                || reason.contains("search_root_missing")
+        });
+    let explainable = answer_count > 0
+        || excluded_count > 0
+        || analyzer_observability.fact_counts.public_functions > 0;
+    let answer_safe_after_observability =
+        trust_policy.safe_to_use_as_answer && complete_enough && explainable;
+    let navigation_only_after_observability =
+        trust_policy.safe_to_use_as_navigation && !answer_safe_after_observability;
+    let mode = if answer_safe_after_observability {
+        "answer_safe"
+    } else if navigation_only_after_observability {
+        "navigation_only"
+    } else {
+        "failed"
+    };
+
+    let mut top_signals_used = vec![
+        serde_json::json!({"signal": "usage_boundary_analyzer", "count": 1}),
+        serde_json::json!({"signal": "redb_seed_discovery", "count": analyzer_observability.fact_counts.public_functions}),
+        serde_json::json!({"signal": "source_text_usage_scan", "count": analyzer_observability.fact_counts.usage_facts}),
+    ];
+    if analyzer_observability.fact_counts.docs_config_references > 0 {
+        top_signals_used.push(serde_json::json!({
+            "signal": "docs_config_references",
+            "count": analyzer_observability.fact_counts.docs_config_references,
+        }));
+    }
+    if analyzer_observability.fact_counts.external_callers > 0 {
+        top_signals_used.push(serde_json::json!({
+            "signal": "external_caller_evidence",
+            "count": analyzer_observability.fact_counts.external_callers,
+        }));
+    }
+    if analyzer_observability.fact_counts.internal_callers > 0 {
+        top_signals_used.push(serde_json::json!({
+            "signal": "internal_caller_evidence",
+            "count": analyzer_observability.fact_counts.internal_callers,
+        }));
+    }
+
+    let mut top_signals_absent = Vec::new();
+    if !fresh_enough {
+        top_signals_absent.push(serde_json::json!({
+            "signal": "fresh_graph_store",
+            "reason": "The redb graph store is missing, stale, or freshness could not be proven.",
+        }));
+    }
+    if analyzer_observability.fact_counts.external_callers == 0 {
+        top_signals_absent.push(serde_json::json!({
+            "signal": "external_caller_evidence",
+            "reason": "No external caller evidence was found for the analyzed scope.",
+        }));
+    }
+    if analyzer_observability.fact_counts.docs_config_references == 0 {
+        top_signals_absent.push(serde_json::json!({
+            "signal": "docs_config_references",
+            "reason": "No docs/config references were found for the analyzed symbols.",
+        }));
+    }
+    if degraded_reasons
+        .iter()
+        .any(|reason| reason.contains("budget_exceeded"))
+    {
+        top_signals_absent.push(serde_json::json!({
+            "signal": "complete_usage_scan",
+            "reason": "The usage-boundary analyzer reported a budget-exceeded degradation.",
+        }));
+    }
+
+    if let Some(obj) = observability.as_object_mut() {
+        obj.insert(
+            "usage_boundary_analyzer".into(),
+            serde_json::json!({
+                "graph_counts": analyzer_observability.graph_counts,
+                "fact_counts": analyzer_observability.fact_counts,
+                "confidence_summary": analyzer_observability.confidence_summary,
+                "degraded_reasons": degraded_reasons,
+            }),
+        );
+        obj.insert(
+            "ranking_explainability".into(),
+            serde_json::json!({
+                "degraded_ranking_reasons": degraded_reasons,
+                "top_signals_used": top_signals_used,
+                "top_signals_absent": top_signals_absent,
+                "subsystem_ambiguous": false,
+            }),
+        );
+        obj.insert(
+            "answer_safety".into(),
+            serde_json::json!({
+                "mode": mode,
+                "answer_safe_by_evidence": trust_policy.safe_to_use_as_answer,
+                "answer_safe_after_observability": answer_safe_after_observability,
+                "navigation_only_after_observability": navigation_only_after_observability,
+                "trust_policy": trust_policy.trust_policy,
+                "evidence_level": trust_policy.evidence_level,
+                "reason": trust_policy.reason,
+            }),
+        );
+        obj.insert(
+            "readiness".into(),
+            serde_json::json!({
+                "status": mode,
+                "fresh_enough": fresh_enough,
+                "complete_enough": complete_enough,
+                "surface_flow_relevant": false,
+                "surface_flow_complete": true,
+                "explainable": explainable,
+                "answer_safe_by_evidence": trust_policy.safe_to_use_as_answer,
+                "answer_safe_after_observability": answer_safe_after_observability,
+                "navigation_only_after_observability": navigation_only_after_observability,
+                "graph_freshness_status": graph_status,
+                "surface_flow_graph_status": surface_flow_status,
+                "degraded_reasons": degraded_reasons,
+            }),
+        );
+    }
+
+    observability
 }
 
 fn candidate_to_answer_item(c: &DeadCodeCandidate) -> AnswerItem {
@@ -379,4 +543,127 @@ fn candidate_to_value(c: &DeadCodeCandidate) -> serde_json::Value {
         "internal_callers": c.evidence.internal_callers,
         "external_callers": c.evidence.external_callers,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::analysis::{
+        DeadCodeAnswer, DeadCodeConfidenceSummary, DeadCodeFactCounts, DeadCodeGraphCounts,
+        DeadCodeObservability, DeadCodeQuery, DeadCodeSummary, EvidencePacket, ExposureKind,
+        FunctionFact,
+    };
+
+    #[test]
+    fn usage_boundary_response_emits_enterprise_observability() {
+        let function = FunctionFact {
+            id: "fn:demo:unused".into(),
+            name: "unused_widget".into(),
+            qualified_name: "Demo::unused_widget".into(),
+            defined_in: "src/demo.php".into(),
+            line: 7,
+            language: "php".into(),
+            parent_class: None,
+            exposure_kind: ExposureKind::ExportedTopLevel,
+        };
+        let answer = DeadCodeAnswer {
+            analyzer: "usage-boundary".into(),
+            version: "test".into(),
+            query: DeadCodeQuery {
+                scope: "src".into(),
+                searched_roots: vec!["src".into(), "tests".into()],
+                include_methods: true,
+            },
+            candidates: vec![DeadCodeCandidate {
+                function,
+                status: AnswerStatus::Unused,
+                confidence: 0.93,
+                evidence: EvidencePacket {
+                    searched_roots: vec!["src".into(), "tests".into()],
+                    internal_callers: Vec::new(),
+                    external_callers: Vec::new(),
+                    docs_config_references: Vec::new(),
+                },
+                ambiguity: Vec::new(),
+                rationale: "No callers found.".into(),
+            }],
+            excluded: Vec::new(),
+            summary: DeadCodeSummary {
+                total_candidates: 1,
+                unused: 1,
+                ambiguous: 0,
+                used: 0,
+            },
+            observability: DeadCodeObservability {
+                graph_counts: DeadCodeGraphCounts {
+                    functions: 1,
+                    docs: 0,
+                    configs: 0,
+                    edges: 0,
+                },
+                fact_counts: DeadCodeFactCounts {
+                    public_functions: 1,
+                    usage_facts: 1,
+                    internal_callers: 0,
+                    external_callers: 0,
+                    docs_config_references: 0,
+                },
+                confidence_summary: DeadCodeConfidenceSummary {
+                    high: 1,
+                    medium: 0,
+                    low: 0,
+                    min: Some(0.93),
+                    max: Some(0.93),
+                },
+                degraded_reasons: Vec::new(),
+            },
+        };
+
+        let response = build_usage_boundary_response(
+            "find unused functions",
+            &UsageBoundaryParams {
+                scope: "src".into(),
+                ..UsageBoundaryParams::default()
+            },
+            answer,
+            serde_json::json!({
+                "graph_freshness": {"status": "fresh", "fresh": true},
+                "graph_store": {"status": "fresh"},
+                "surface_flow_graph": {"status": "no_surface_signals"},
+                "missing_expected_surfaces": [],
+            }),
+        );
+
+        let observability = response
+            .observability
+            .as_ref()
+            .expect("usage boundary emits observability");
+        assert_eq!(
+            observability
+                .get("answer_safety")
+                .and_then(|value| value.get("mode"))
+                .and_then(|value| value.as_str()),
+            Some("answer_safe")
+        );
+        assert_eq!(
+            observability
+                .get("usage_boundary_analyzer")
+                .and_then(|value| value.get("fact_counts"))
+                .and_then(|value| value.get("public_functions"))
+                .and_then(|value| value.as_u64()),
+            Some(1)
+        );
+        let used_signals = observability
+            .get("ranking_explainability")
+            .and_then(|value| value.get("top_signals_used"))
+            .and_then(|value| value.as_array())
+            .expect("used signals");
+        assert!(
+            used_signals.iter().any(|value| {
+                value.get("signal").and_then(|signal| signal.as_str())
+                    == Some("redb_seed_discovery")
+            }),
+            "expected redb seed signal in {used_signals:?}"
+        );
+    }
 }

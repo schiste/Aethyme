@@ -1162,17 +1162,52 @@ fn graph_store_observability(repo: &Path) -> serde_json::Value {
         None => "missing",
     };
 
+    let graph_store = serde_json::json!({
+        "backend": "redb",
+        "status": status,
+        "exists": store_path.is_file(),
+        "fragments_exist": fragments_path.is_dir(),
+        "stale": stale,
+        "store_modified_unix": store_modified,
+        "newest_fragment_modified_unix": newest_fragment,
+    });
+    let surface_flow_graph = surface_flow_coverage(repo, &fragments_path);
+    let completeness = surface_flow_graph
+        .get("coverage")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let indexed_languages = surface_flow_graph
+        .get("indexed_languages")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let indexed_frameworks = surface_flow_graph
+        .get("indexed_frameworks")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let missing_expected_surfaces = surface_flow_graph
+        .get("missing_expected_surfaces")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+
     serde_json::json!({
-        "graph_store": {
+        "graph_store": graph_store,
+        "graph_freshness": {
             "backend": "redb",
             "status": status,
+            "fresh": status == "fresh",
             "exists": store_path.is_file(),
             "fragments_exist": fragments_path.is_dir(),
             "stale": stale,
             "store_modified_unix": store_modified,
             "newest_fragment_modified_unix": newest_fragment,
+            "source_of_truth": ".aethyme/graph/",
+            "derived_query_artifact": ".aethyme/graph_store.redb",
         },
-        "surface_flow_graph": surface_flow_coverage(repo, &fragments_path),
+        "surface_flow_graph": surface_flow_graph,
+        "graph_completeness_by_surface_type": completeness,
+        "indexed_languages": indexed_languages,
+        "indexed_frameworks": indexed_frameworks,
+        "missing_expected_surfaces": missing_expected_surfaces,
     })
 }
 
@@ -1180,6 +1215,8 @@ fn surface_flow_coverage(repo: &Path, fragments_path: &Path) -> serde_json::Valu
     let source_paths = collect_surface_flow_paths(repo, false);
     let indexed_paths = collect_surface_flow_paths(fragments_path, true);
     let semantic_hits = collect_surface_flow_semantic_hits(fragments_path, &indexed_paths);
+    let indexed_languages = indexed_languages_from_graph_paths(&indexed_paths);
+    let indexed_frameworks = indexed_frameworks_from_graph_paths(&indexed_paths, &semantic_hits);
     let source_truncated = source_paths.len() >= SURFACE_FLOW_MAX_SCANNED_PATHS;
     let indexed_truncated = indexed_paths.len() >= SURFACE_FLOW_MAX_SCANNED_PATHS;
     let mut coverage = serde_json::Map::new();
@@ -1293,6 +1330,8 @@ fn surface_flow_coverage(repo: &Path, fragments_path: &Path) -> serde_json::Valu
         "semantic_fragment_hit_count": semantic_hits.len(),
         "source_scan_truncated": source_truncated,
         "indexed_scan_truncated": indexed_truncated,
+        "indexed_languages": indexed_languages,
+        "indexed_frameworks": indexed_frameworks,
         "surface_type_count": SURFACE_COVERAGE_SPECS.len(),
         "source_present_surface_count": source_present_count,
         "covered_surface_count": covered_count,
@@ -1472,6 +1511,116 @@ fn strip_known_source_extension(path: &str) -> Option<String> {
     SOURCE_EXTENSIONS
         .iter()
         .find_map(|extension| path.strip_suffix(extension).map(str::to_string))
+}
+
+fn indexed_languages_from_graph_paths(paths: &[String]) -> Vec<String> {
+    let mut languages = std::collections::BTreeSet::new();
+    for path in paths {
+        let logical = surface_logical_path(path);
+        let extension = Path::new(&logical)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("");
+        if let Some(language) = language_for_extension(extension) {
+            languages.insert(language);
+        }
+    }
+    languages.into_iter().map(str::to_string).collect()
+}
+
+fn language_for_extension(extension: &str) -> Option<&'static str> {
+    match extension {
+        "cs" => Some("csharp"),
+        "go" => Some("go"),
+        "java" => Some("java"),
+        "js" | "jsx" | "mjs" => Some("javascript"),
+        "php" => Some("php"),
+        "py" => Some("python"),
+        "rb" => Some("ruby"),
+        "rs" => Some("rust"),
+        "swift" => Some("swift"),
+        "ts" | "tsx" => Some("typescript"),
+        _ => None,
+    }
+}
+
+fn indexed_frameworks_from_graph_paths(
+    paths: &[String],
+    semantic_hits: &[SurfaceSemanticHit],
+) -> Vec<String> {
+    let mut match_text = paths
+        .iter()
+        .map(|path| surface_path_match_text(path))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for hit in semantic_hits {
+        match_text.push('\n');
+        match_text.push_str(&surface_path_match_text(&hit.path));
+        match_text.push('\n');
+        match_text.push_str(&hit.terms.join("\n"));
+    }
+
+    let mut frameworks = std::collections::BTreeSet::new();
+    if contains_any_text(
+        &match_text,
+        &["manage.py", "settings.py", "urls.py", "django"],
+    ) {
+        frameworks.insert("django");
+    }
+    if contains_any_text(
+        &match_text,
+        &[
+            "rest_framework",
+            "viewset",
+            "serializers.py",
+            "api_views.py",
+        ],
+    ) {
+        frameworks.insert("django-rest-framework");
+    }
+    if contains_any_text(&match_text, &["fastapi", "apirouter"]) {
+        frameworks.insert("fastapi");
+    }
+    if contains_any_text(&match_text, &["flask", "blueprint"]) {
+        frameworks.insert("flask");
+    }
+    if contains_any_text(&match_text, &["next.config", "app/api/", "pages/api/"]) {
+        frameworks.insert("nextjs");
+    }
+    if contains_any_text(
+        &match_text,
+        &["functions/_middleware", "middleware.ts", "middleware.js"],
+    ) {
+        frameworks.insert("edge-middleware");
+    }
+    if contains_any_text(
+        &match_text,
+        &[
+            "cloudflare",
+            "wrangler",
+            "worker.js",
+            "worker.mjs",
+            "worker.ts",
+        ],
+    ) {
+        frameworks.insert("cloudflare-workers");
+    }
+    if contains_any_text(&match_text, &["gcp-run-proxy", "proxy_surface"]) {
+        frameworks.insert("edge-proxy");
+    }
+    if contains_any_text(&match_text, &["vercel.json", "vercel/"]) {
+        frameworks.insert("vercel");
+    }
+    if contains_any_text(&match_text, &["netlify.toml", "netlify/functions"]) {
+        frameworks.insert("netlify");
+    }
+    if contains_any_text(&match_text, &["config/routes.rb", "rails"]) {
+        frameworks.insert("rails");
+    }
+    if contains_any_text(&match_text, &["axum", "actix_web", "rocket"]) {
+        frameworks.insert("rust-web");
+    }
+    frameworks.into_iter().map(str::to_string).collect()
 }
 
 fn surface_hint_priority(path: &str) -> u8 {
@@ -3144,7 +3293,7 @@ fn build_response_with_surface_flow(
               authoritative answer. Verify before acting."
             .to_string(),
     };
-    let trust_policy = TrustPolicy {
+    let mut trust_policy = TrustPolicy {
         safe_to_use_as_answer,
         safe_to_use_as_navigation: !answers.is_empty() || !nav_hints.is_empty(),
         evidence_level: evidence_level.to_string(),
@@ -3154,6 +3303,19 @@ fn build_response_with_surface_flow(
         trust_policy: policy_kind,
         reason: trust_reason,
     };
+    let degraded_reasons = explore_degraded_ranking_reasons(
+        request,
+        &trust_policy,
+        &answers,
+        &nav_hints,
+        &symbol_items,
+        text_items,
+        callsite_items,
+        surface_flow,
+        subsystem_ambiguous,
+        &observability,
+    );
+    trust_policy.degraded = !degraded_reasons.is_empty();
 
     let status = if answers.is_empty() && nav_hints.is_empty() {
         "degraded"
@@ -3231,7 +3393,24 @@ fn build_response_with_surface_flow(
     } else {
         None
     };
-    let observability = if verbose { Some(observability) } else { None };
+    let observability = if verbose {
+        Some(enrich_explore_observability(
+            observability,
+            request,
+            &trust_policy,
+            &degraded_reasons,
+            &answers,
+            &nav_hints,
+            &symbol_items,
+            text_items,
+            callsite_items,
+            &subsystems,
+            surface_flow,
+            subsystem_ambiguous,
+        ))
+    } else {
+        None
+    };
 
     // At compact, truncate verification_steps to 2 (mirrors Python's
     // _trim_explore_response at cli.py:1752-1755). Agents follow 1-2
@@ -3325,13 +3504,565 @@ fn build_response_with_surface_flow(
         safe_to_use_as_answer,
         safe_to_use_as_navigation,
         trust_policy,
-        degraded_reasons: Vec::new(),
+        degraded_reasons,
         verification_steps,
         next_actions,
         available_specialized_intents: vec!["behavior_localization_query", "usage_boundary_query"],
         output_adapters,
         resolved_parameters,
         observability,
+    }
+}
+
+fn enrich_explore_observability(
+    mut observability: serde_json::Value,
+    request: &str,
+    trust_policy: &TrustPolicy,
+    degraded_reasons: &[String],
+    answers: &[AnswerItem],
+    nav_hints: &[AnswerItem],
+    symbol_items: &[AnswerItem],
+    text_items: &[AnswerItem],
+    callsite_items: &[AnswerItem],
+    subsystems: &[ExploreSubsystem],
+    surface_flow: &SurfaceFlowExploreEvidence,
+    subsystem_ambiguous: bool,
+) -> serde_json::Value {
+    let top_signals_used = explore_top_signals_used(
+        answers,
+        nav_hints,
+        symbol_items,
+        text_items,
+        callsite_items,
+        subsystems,
+        surface_flow,
+    );
+    let top_signals_absent = explore_top_signals_absent(
+        request,
+        symbol_items,
+        text_items,
+        callsite_items,
+        subsystems,
+        surface_flow,
+        &observability,
+    );
+    let readiness = explore_observability_readiness(
+        request,
+        trust_policy,
+        &top_signals_used,
+        degraded_reasons,
+        surface_flow,
+        &observability,
+    );
+    let answer_safe_after_observability = readiness
+        .get("answer_safe_after_observability")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let navigation_only_after_observability = readiness
+        .get("navigation_only_after_observability")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let mode = if answer_safe_after_observability {
+        "answer_safe"
+    } else if navigation_only_after_observability {
+        "navigation_only"
+    } else {
+        "failed"
+    };
+
+    if let Some(obj) = observability.as_object_mut() {
+        obj.insert(
+            "ranking_explainability".into(),
+            serde_json::json!({
+                "degraded_ranking_reasons": degraded_reasons,
+                "top_signals_used": top_signals_used,
+                "top_signals_absent": top_signals_absent,
+                "subsystem_ambiguous": subsystem_ambiguous,
+            }),
+        );
+        obj.insert(
+            "answer_safety".into(),
+            serde_json::json!({
+                "mode": mode,
+                "answer_safe_by_evidence": trust_policy.safe_to_use_as_answer,
+                "answer_safe_after_observability": answer_safe_after_observability,
+                "navigation_only_after_observability": navigation_only_after_observability,
+                "trust_policy": trust_policy.trust_policy,
+                "evidence_level": trust_policy.evidence_level,
+                "reason": trust_policy.reason,
+            }),
+        );
+        obj.insert("readiness".into(), readiness);
+    }
+
+    observability
+}
+
+fn explore_top_signals_used(
+    answers: &[AnswerItem],
+    nav_hints: &[AnswerItem],
+    symbol_items: &[AnswerItem],
+    text_items: &[AnswerItem],
+    callsite_items: &[AnswerItem],
+    subsystems: &[ExploreSubsystem],
+    surface_flow: &SurfaceFlowExploreEvidence,
+) -> Vec<serde_json::Value> {
+    let mut counts = std::collections::BTreeMap::new();
+    if !answers.is_empty() {
+        add_signal_count(&mut counts, "ranked_answer_candidates");
+    }
+    if !nav_hints.is_empty() {
+        add_signal_count(&mut counts, "navigation_hints");
+    }
+    for item in answers
+        .iter()
+        .chain(nav_hints.iter())
+        .chain(symbol_items.iter())
+        .chain(text_items.iter())
+        .chain(callsite_items.iter())
+    {
+        collect_answer_item_signals(item, &mut counts);
+    }
+    if !subsystems.is_empty() {
+        add_signal_count(&mut counts, "subsystem_lane_ranking");
+    }
+    for subsystem in subsystems {
+        add_signal_count(&mut counts, format!("subsystem:{}", subsystem.role));
+        for signal in &subsystem.signals {
+            add_signal_count(&mut counts, format!("subsystem_signal:{signal}"));
+        }
+    }
+    if !surface_flow.entrypoints.is_empty() {
+        add_signal_count(&mut counts, "surface_flow_entrypoints");
+    }
+    if !surface_flow.surface_paths.is_empty() {
+        add_signal_count(&mut counts, "surface_flow_paths");
+    }
+    if !surface_flow.credential_flows.is_empty() {
+        add_signal_count(&mut counts, "surface_flow_credential_flows");
+    }
+    if !surface_flow.tests.is_empty() {
+        add_signal_count(&mut counts, "surface_flow_behavior_tests");
+    }
+    signal_count_values(counts, 14)
+}
+
+fn collect_answer_item_signals(
+    item: &AnswerItem,
+    counts: &mut std::collections::BTreeMap<String, usize>,
+) {
+    match item.kind.as_str() {
+        "anchor" | "anchor_area" => add_signal_count(counts, "graph_anchor"),
+        "in_scope_file" | "in_scope_area" => add_signal_count(counts, "graph_scope"),
+        "source_text_file" => add_signal_count(counts, "source_text_match"),
+        "symbol_search_file" | "symbol_search" => add_signal_count(counts, "symbol_search_match"),
+        "call_site_file" => add_signal_count(counts, "callsite_adjacency"),
+        "filesystem_file" => add_signal_count(counts, "filesystem_filename_match"),
+        _ => {}
+    }
+    collect_evidence_signals(&item.evidence, counts);
+}
+
+fn collect_evidence_signals(
+    evidence: &serde_json::Value,
+    counts: &mut std::collections::BTreeMap<String, usize>,
+) {
+    if let Some(source) = evidence.get("source").and_then(|value| value.as_str()) {
+        match source {
+            "source-text-search" => add_signal_count(counts, "source_text_match"),
+            "task-localize.anchors" => add_signal_count(counts, "graph_anchor"),
+            "task-localize.scope" => add_signal_count(counts, "graph_scope"),
+            other => add_signal_count(counts, format!("evidence_source:{other}")),
+        }
+    }
+    if evidence
+        .get("line_refs")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| !items.is_empty())
+    {
+        add_signal_count(counts, "source_line_refs");
+    }
+    if evidence
+        .get("matched_terms")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| items.len() >= 2)
+    {
+        add_signal_count(counts, "multi_term_source_text");
+    }
+    if evidence
+        .get("matched_queries")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| !items.is_empty())
+    {
+        add_signal_count(counts, "symbol_name_match");
+    }
+    if evidence
+        .get("matched_queries")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| items.len() >= 2)
+    {
+        add_signal_count(counts, "multi_query_symbol_match");
+    }
+    if evidence
+        .get("symbols")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| !items.is_empty())
+    {
+        add_signal_count(counts, "callsite_or_symbol_rows");
+    }
+    if let Some(signals) = evidence
+        .get("ranking_signals")
+        .and_then(|value| value.as_array())
+    {
+        for signal in signals.iter().filter_map(|value| value.as_str()) {
+            add_signal_count(counts, format!("ranking_signal:{signal}"));
+        }
+    }
+    if let Some(symbol_evidence) = evidence.get("also_symbol_search") {
+        collect_evidence_signals(symbol_evidence, counts);
+    }
+}
+
+fn explore_top_signals_absent(
+    request: &str,
+    symbol_items: &[AnswerItem],
+    text_items: &[AnswerItem],
+    callsite_items: &[AnswerItem],
+    subsystems: &[ExploreSubsystem],
+    surface_flow: &SurfaceFlowExploreEvidence,
+    observability: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let mut absent = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    if graph_freshness_status(observability) != Some("fresh") {
+        push_absent_signal(
+            &mut absent,
+            &mut seen,
+            "fresh_graph_store",
+            "The redb graph store is missing, stale, or freshness could not be proven.",
+        );
+    }
+    if surface_flow_relevant_for_request(request, surface_flow)
+        && !surface_flow_complete_for_request(observability)
+    {
+        push_absent_signal(
+            &mut absent,
+            &mut seen,
+            "complete_surface_flow_coverage",
+            "The request depends on ingress/middleware/credential surfaces, but coverage is partial or unknown.",
+        );
+    }
+    if symbol_items.is_empty() {
+        push_absent_signal(
+            &mut absent,
+            &mut seen,
+            "symbol_search_match",
+            "No redb symbol candidates matched the bounded query set.",
+        );
+    } else if !has_multi_query_symbol_file(symbol_items) {
+        push_absent_signal(
+            &mut absent,
+            &mut seen,
+            "multi_query_symbol_match",
+            "Symbol evidence matched only single request terms per file.",
+        );
+    }
+    if text_items.is_empty() {
+        push_absent_signal(
+            &mut absent,
+            &mut seen,
+            "source_text_match",
+            "No bounded source-text candidate matched enough request terms.",
+        );
+    }
+    if !has_symbol_text_corroboration(symbol_items, text_items) {
+        push_absent_signal(
+            &mut absent,
+            &mut seen,
+            "symbol_text_corroboration",
+            "No candidate file was confirmed by both multi-query symbol search and multi-term source text.",
+        );
+    }
+    if callsite_items.is_empty() {
+        push_absent_signal(
+            &mut absent,
+            &mut seen,
+            "callsite_adjacency",
+            "No caller/callee expansion evidence was emitted for the ranked symbols.",
+        );
+    }
+    let auth_focus = ranking::auth_token_focus_from_request(request);
+    if auth_focus && surface_flow.entrypoints.is_empty() {
+        push_absent_signal(
+            &mut absent,
+            &mut seen,
+            "surface_flow_entrypoints",
+            "No indexed route/proxy/worker entrypoint candidate matched this auth or token task.",
+        );
+    }
+    if auth_focus && surface_flow.credential_flows.is_empty() {
+        push_absent_signal(
+            &mut absent,
+            &mut seen,
+            "surface_flow_credential_flows",
+            "No persisted credential issue/store/use/validation edge matched this task.",
+        );
+    }
+    if auth_focus && surface_flow.tests.is_empty() {
+        push_absent_signal(
+            &mut absent,
+            &mut seen,
+            "linked_behavior_tests",
+            "No indexed integration or behavior test was linked to the matching surface.",
+        );
+    }
+    if auth_focus && subsystems.len() < 2 {
+        push_absent_signal(
+            &mut absent,
+            &mut seen,
+            "multi_lane_subsystem_ranking",
+            "Explore did not have enough Surface/Flow evidence to rank competing subsystem lanes.",
+        );
+    }
+    absent.into_iter().take(14).collect()
+}
+
+fn explore_degraded_ranking_reasons(
+    request: &str,
+    trust_policy: &TrustPolicy,
+    answers: &[AnswerItem],
+    nav_hints: &[AnswerItem],
+    symbol_items: &[AnswerItem],
+    text_items: &[AnswerItem],
+    callsite_items: &[AnswerItem],
+    surface_flow: &SurfaceFlowExploreEvidence,
+    subsystem_ambiguous: bool,
+    observability: &serde_json::Value,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if answers.is_empty() && nav_hints.is_empty() {
+        push_unique_reason(&mut reasons, "no_ranked_candidates");
+    } else if !trust_policy.safe_to_use_as_answer {
+        push_unique_reason(
+            &mut reasons,
+            "navigation_only_without_authoritative_evidence",
+        );
+    }
+    if subsystem_ambiguous {
+        push_unique_reason(&mut reasons, "ambiguous_token_or_surface_subsystems");
+    }
+    if !trust_policy.safe_to_use_as_answer
+        && !has_symbol_text_corroboration(symbol_items, text_items)
+    {
+        push_unique_reason(&mut reasons, "missing_symbol_text_corroboration");
+    }
+    if !trust_policy.safe_to_use_as_answer && symbol_items.is_empty() {
+        push_unique_reason(&mut reasons, "missing_symbol_search_evidence");
+    }
+    if !trust_policy.safe_to_use_as_answer && text_items.is_empty() {
+        push_unique_reason(&mut reasons, "missing_source_text_evidence");
+    }
+    if !trust_policy.safe_to_use_as_answer && callsite_items.is_empty() {
+        push_unique_reason(&mut reasons, "missing_callsite_evidence");
+    }
+    if ranking::auth_token_focus_from_request(request) {
+        if surface_flow.entrypoints.is_empty() {
+            push_unique_reason(&mut reasons, "missing_ingress_surface_flow_candidates");
+        }
+        if surface_flow.credential_flows.is_empty() {
+            push_unique_reason(&mut reasons, "missing_credential_flow_edges");
+        }
+    }
+    if !surface_flow.coverage_missing.is_empty() {
+        push_unique_reason(&mut reasons, "surface_flow_task_coverage_missing");
+    }
+    match graph_freshness_status(observability) {
+        Some("fresh") => {}
+        Some(status) => push_unique_reason(&mut reasons, format!("graph_store_{status}")),
+        None => push_unique_reason(&mut reasons, "graph_store_status_unknown"),
+    }
+    if surface_flow_relevant_for_request(request, surface_flow)
+        && !surface_flow_complete_for_request(observability)
+    {
+        push_unique_reason(&mut reasons, "surface_flow_coverage_not_complete_enough");
+    }
+    reasons
+}
+
+fn explore_observability_readiness(
+    request: &str,
+    trust_policy: &TrustPolicy,
+    top_signals_used: &[serde_json::Value],
+    degraded_reasons: &[String],
+    surface_flow: &SurfaceFlowExploreEvidence,
+    observability: &serde_json::Value,
+) -> serde_json::Value {
+    let graph_status = graph_freshness_status(observability).unwrap_or("unknown");
+    let graph_fresh = graph_status == "fresh";
+    let surface_status = surface_flow_status(observability).unwrap_or("unknown");
+    let surface_relevant = surface_flow_relevant_for_request(request, surface_flow);
+    let surface_complete = surface_flow_complete_for_request(observability);
+    let complete_enough = if surface_relevant {
+        surface_complete
+    } else {
+        graph_status != "missing"
+    };
+    let explainable = !top_signals_used.is_empty();
+    let answer_safe_after_observability =
+        trust_policy.safe_to_use_as_answer && graph_fresh && complete_enough && explainable;
+    let navigation_only_after_observability =
+        trust_policy.safe_to_use_as_navigation && !answer_safe_after_observability;
+    let status = if answer_safe_after_observability {
+        "answer_safe"
+    } else if navigation_only_after_observability {
+        "navigation_only"
+    } else {
+        "degraded"
+    };
+
+    serde_json::json!({
+        "status": status,
+        "fresh_enough": graph_fresh,
+        "complete_enough": complete_enough,
+        "surface_flow_relevant": surface_relevant,
+        "surface_flow_complete": surface_complete,
+        "explainable": explainable,
+        "answer_safe_by_evidence": trust_policy.safe_to_use_as_answer,
+        "answer_safe_after_observability": answer_safe_after_observability,
+        "navigation_only_after_observability": navigation_only_after_observability,
+        "graph_freshness_status": graph_status,
+        "surface_flow_graph_status": surface_status,
+        "degraded_reasons": degraded_reasons,
+    })
+}
+
+fn surface_flow_relevant_for_request(
+    request: &str,
+    surface_flow: &SurfaceFlowExploreEvidence,
+) -> bool {
+    ranking::auth_token_focus_from_request(request)
+        || !surface_flow.entrypoints.is_empty()
+        || !surface_flow.surface_paths.is_empty()
+        || !surface_flow.credential_flows.is_empty()
+        || contains_any_text(
+            &request.to_ascii_lowercase(),
+            &[
+                "credential",
+                "entrypoint",
+                "middleware",
+                "proxy",
+                "route",
+                "surface",
+                "webhook",
+                "worker",
+            ],
+        )
+}
+
+fn surface_flow_complete_for_request(observability: &serde_json::Value) -> bool {
+    let missing_count = observability
+        .get("missing_expected_surfaces")
+        .and_then(|value| value.as_array())
+        .map(Vec::len)
+        .unwrap_or(0);
+    matches!(
+        surface_flow_status(observability),
+        Some("covered") | Some("no_surface_signals")
+    ) && missing_count == 0
+}
+
+fn graph_freshness_status(observability: &serde_json::Value) -> Option<&str> {
+    observability
+        .get("graph_freshness")
+        .or_else(|| observability.get("graph_store"))
+        .and_then(|value| value.get("status"))
+        .and_then(|value| value.as_str())
+}
+
+fn surface_flow_status(observability: &serde_json::Value) -> Option<&str> {
+    observability
+        .get("surface_flow_graph")
+        .and_then(|value| value.get("status"))
+        .and_then(|value| value.as_str())
+}
+
+fn has_multi_query_symbol_file(symbol_items: &[AnswerItem]) -> bool {
+    symbol_items.iter().any(|item| {
+        item.evidence
+            .get("matched_queries")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| items.len() >= 2)
+    })
+}
+
+fn has_symbol_text_corroboration(symbol_items: &[AnswerItem], text_items: &[AnswerItem]) -> bool {
+    let symbol_paths: std::collections::BTreeSet<&str> = symbol_items
+        .iter()
+        .filter(|item| {
+            item.evidence
+                .get("matched_queries")
+                .and_then(|value| value.as_array())
+                .is_some_and(|items| items.len() >= 2)
+        })
+        .filter_map(|item| item.path.as_deref())
+        .collect();
+    text_items
+        .iter()
+        .filter(|item| {
+            item.evidence
+                .get("matched_terms")
+                .and_then(|value| value.as_array())
+                .is_some_and(|items| items.len() >= 2)
+        })
+        .filter_map(|item| item.path.as_deref())
+        .any(|path| symbol_paths.contains(path))
+}
+
+fn add_signal_count(
+    counts: &mut std::collections::BTreeMap<String, usize>,
+    signal: impl Into<String>,
+) {
+    let signal = signal.into();
+    if !signal.trim().is_empty() {
+        *counts.entry(signal).or_insert(0) += 1;
+    }
+}
+
+fn signal_count_values(
+    counts: std::collections::BTreeMap<String, usize>,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
+    ranked.sort_by(|(left_signal, left_count), (right_signal, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_signal.cmp(right_signal))
+    });
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(signal, count)| serde_json::json!({"signal": signal, "count": count}))
+        .collect()
+}
+
+fn push_absent_signal(
+    absent: &mut Vec<serde_json::Value>,
+    seen: &mut std::collections::BTreeSet<String>,
+    signal: &str,
+    reason: &str,
+) {
+    if seen.insert(signal.to_string()) {
+        absent.push(serde_json::json!({
+            "signal": signal,
+            "reason": reason,
+        }));
+    }
+}
+
+fn push_unique_reason(reasons: &mut Vec<String>, reason: impl Into<String>) {
+    let reason = reason.into();
+    if !reasons.iter().any(|existing| existing == &reason) {
+        reasons.push(reason);
     }
 }
 
@@ -5143,9 +5874,33 @@ mod tests {
             ".aethyme/graph/_index/backend.api_keys.middleware.ndjson",
             r#"{"module":"backend.api_keys.middleware","symbol":"APIKeyAuthenticationMiddleware","kind":"class","node_id":"class:demo:abc","file":"backend/api_keys/middleware.py"}"#,
         );
+        write_test_file(
+            tmp.path(),
+            ".aethyme/graph/backend/api_keys/middleware.py.bin",
+            "middleware_installation validates_credential\n",
+        );
+        write_test_file(
+            tmp.path(),
+            ".aethyme/graph/backend/api_keys/urls.py.bin",
+            "route_surface exposes\n",
+        );
         write_test_file(tmp.path(), ".aethyme/graph_store.redb", "placeholder");
 
         let observability = graph_store_observability(tmp.path());
+        assert_eq!(
+            observability
+                .get("graph_freshness")
+                .and_then(|value| value.get("status"))
+                .and_then(|value| value.as_str()),
+            Some("fresh")
+        );
+        assert_eq!(
+            observability
+                .get("graph_freshness")
+                .and_then(|value| value.get("fresh"))
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
         let surface_flow = observability
             .get("surface_flow_graph")
             .and_then(|value| value.as_object())
@@ -5193,6 +5948,39 @@ mod tests {
         assert!(missing.iter().any(|item| {
             item.get("surface_type").and_then(|value| value.as_str()) == Some("edge_proxy")
         }));
+        let top_level_missing = observability
+            .get("missing_expected_surfaces")
+            .and_then(|value| value.as_array())
+            .expect("top-level missing surface list");
+        assert_eq!(top_level_missing.len(), missing.len());
+        assert_eq!(
+            observability
+                .get("graph_completeness_by_surface_type")
+                .and_then(|value| value.get("edge_proxy"))
+                .and_then(|value| value.get("status"))
+                .and_then(|value| value.as_str()),
+            Some("source_present_not_indexed")
+        );
+        let languages = observability
+            .get("indexed_languages")
+            .and_then(|value| value.as_array())
+            .expect("indexed languages");
+        assert!(
+            languages
+                .iter()
+                .any(|value| value.as_str() == Some("python")),
+            "expected python indexed language in {languages:?}"
+        );
+        let frameworks = observability
+            .get("indexed_frameworks")
+            .and_then(|value| value.as_array())
+            .expect("indexed frameworks");
+        assert!(
+            frameworks
+                .iter()
+                .any(|value| value.as_str() == Some("django")),
+            "expected django indexed framework in {frameworks:?}"
+        );
     }
 
     #[test]
@@ -5258,6 +6046,120 @@ mod tests {
                 .as_str()
                 .is_some_and(|path| path.starts_with("gcp-run-proxy/"))
         }));
+        let languages = observability
+            .get("indexed_languages")
+            .and_then(|value| value.as_array())
+            .expect("indexed languages");
+        assert!(
+            languages
+                .iter()
+                .any(|value| value.as_str() == Some("typescript")),
+            "expected typescript indexed language in {languages:?}"
+        );
+        let frameworks = observability
+            .get("indexed_frameworks")
+            .and_then(|value| value.as_array())
+            .expect("indexed frameworks");
+        assert!(
+            frameworks
+                .iter()
+                .any(|value| value.as_str() == Some("edge-middleware")),
+            "expected edge-middleware indexed framework in {frameworks:?}"
+        );
+    }
+
+    #[test]
+    fn full_response_observability_reports_safety_and_ranking_signals() {
+        let text_match = AnswerItem {
+            kind: "source_text_file".into(),
+            target: "includes/Watchlist/WatchedItemStore.php".into(),
+            path: Some("includes/Watchlist/WatchedItemStore.php".into()),
+            status: "candidate".into(),
+            confidence: 0.87,
+            reason: "source text evidence".into(),
+            role: "candidate".into(),
+            evidence: serde_json::json!({
+                "source": "source-text-search",
+                "matched_terms": ["watchlist", "revision"],
+                "line_refs": [{"line": 12, "text": "watchlist revision", "matched_terms": ["watchlist", "revision"]}],
+            }),
+        };
+        let symbols = symbols_for(
+            "includes/Watchlist/WatchedItemStore.php",
+            &[("watchlist", 200), ("revision", 300)],
+        );
+        let params = ExploreParams {
+            detail: Detail::Full,
+            ..ExploreParams::default()
+        };
+
+        let response = build_response(
+            "find watchlist revision handlers",
+            Intent::TaskLocalization,
+            IntentSource::Default,
+            &sample_view(),
+            &symbols,
+            &[text_match],
+            &[],
+            &[],
+            &params,
+            test_observability(),
+        );
+
+        let observability = response
+            .observability
+            .as_ref()
+            .expect("full detail emits observability");
+        assert_eq!(
+            observability
+                .get("answer_safety")
+                .and_then(|value| value.get("mode"))
+                .and_then(|value| value.as_str()),
+            Some("answer_safe")
+        );
+        assert_eq!(
+            observability
+                .get("readiness")
+                .and_then(|value| value.get("fresh_enough"))
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            observability
+                .get("readiness")
+                .and_then(|value| value.get("complete_enough"))
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        let signals = observability
+            .get("ranking_explainability")
+            .and_then(|value| value.get("top_signals_used"))
+            .and_then(|value| value.as_array())
+            .expect("used signals");
+        assert!(
+            signals.iter().any(|value| {
+                value.get("signal").and_then(|signal| signal.as_str())
+                    == Some("multi_query_symbol_match")
+            }),
+            "expected multi-query symbol signal in {signals:?}"
+        );
+        assert!(
+            signals.iter().any(|value| {
+                value.get("signal").and_then(|signal| signal.as_str()) == Some("source_line_refs")
+            }),
+            "expected source line-ref signal in {signals:?}"
+        );
+        let absent = observability
+            .get("ranking_explainability")
+            .and_then(|value| value.get("top_signals_absent"))
+            .and_then(|value| value.as_array())
+            .expect("absent signals");
+        assert!(
+            absent.iter().any(|value| {
+                value.get("signal").and_then(|signal| signal.as_str()) == Some("callsite_adjacency")
+            }),
+            "expected missing callsite signal in {absent:?}"
+        );
     }
 
     #[test]
