@@ -35,6 +35,11 @@ Two design commitments underneath all of it:
   *local* integration branch only — the broker never pushes, never opens
   PRs; your GitHub flow stays human and unchanged.
 
+For the current public product map, including the three canonical user
+journeys, command tiers, confidence commands, JSON stability, and the next
+broker directions for repo cleanliness and token budgets, see
+[`docs/product-surface.md`](docs/product-surface.md).
+
 ## Current state — honest version
 
 **v0 (MVP) is built and proven in dogfood.** Sessions, diff-derived leases

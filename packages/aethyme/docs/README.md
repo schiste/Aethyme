@@ -1,11 +1,15 @@
 # Aethyme Core Docs
 
-Last Updated: 2026-03-06
+Last Updated: 2026-07-29
 
 This directory documents the code that is active in `packages/aethyme`.
+The public product surface is broker-first and is documented canonically in
+[`../../../docs/product-surface.md`](../../../docs/product-surface.md). Use that
+page before reaching for lower-level graph, eval, or architecture references.
 
 ## Canonical Docs
 
+- [`../../../docs/product-surface.md`](../../../docs/product-surface.md)
 - [`../../../docs/project-plan.md`](../../../docs/project-plan.md)
 - [`../README.md`](../README.md)
 - [`vision.md`](vision.md)
@@ -23,11 +27,12 @@ This directory documents the code that is active in `packages/aethyme`.
 
 ## First Local Proof
 
-For the current local-first proof path, start with:
+For the current local-first product proof path, start with:
 
-1. [`getting-started/quickstart.md`](getting-started/quickstart.md)
+1. [`../../../docs/product-surface.md`](../../../docs/product-surface.md)
 2. [`reference/cli.md`](reference/cli.md)
-3. [`agent-navigation-spec.md`](agent-navigation-spec.md)
+3. [`getting-started/quickstart.md`](getting-started/quickstart.md) for the
+   graph-engine path only
 
 ## Scope Rule
 

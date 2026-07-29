@@ -8,6 +8,73 @@ Last Updated: 2026-07-29
 - `--json`
 - `--verbose`
 
+## Product-Surface Tiers
+
+The public product map is
+[`../../../../docs/product-surface.md`](../../../../docs/product-surface.md).
+This reference includes stable front-door commands, advanced public tools, and
+internal or historical commands; do not treat every listed command as equal
+product surface.
+
+### Stable Front Door
+
+- `aethyme init`
+- `aethyme certify`
+- `aethyme broker status`
+- `aethyme broker adopt`
+- `aethyme broker submit`
+- `aethyme broker repair`
+- `aethyme broker finish`
+- `aethyme broker integration status`
+- `aethyme broker quick-test`
+- `aethyme broker verify-loop`
+- `aethyme explore`
+
+### Advanced Public Tools
+
+- `aethyme broker gates ...`
+- `aethyme broker events`
+- `aethyme broker metrics`
+- `aethyme broker doctor`
+- `aethyme broker leases ...`
+- `aethyme broker cleanup`
+- `aethyme graph ...`
+- `aethyme facts ...`
+- `aethyme task ...`
+- `aethyme analyze dead-code`
+- `aethyme enhance deploy`
+- `aethyme enhance verify`
+- `aethyme repo experience-*`
+
+### Internal Or Historical
+
+Local eval harnesses, benchmark/report generators, storage implementation
+details, SaaS-era material, and compatibility-only commands may be documented
+for maintainers but should not lead user onboarding.
+
+## Broker Commands
+
+The broker is the stable product front door for multi-agent coordination:
+
+- `aethyme init`
+- `aethyme certify`
+- `aethyme broker status [--json]`
+- `aethyme broker adopt [<path>] --task "..." [--reuse] [--json]`
+- `aethyme broker submit --session <id> [--json]`
+- `aethyme broker repair --session <id> [--json]`
+- `aethyme broker finish --session <id> [--json]`
+- `aethyme broker integration status [--json]`
+- `aethyme broker quick-test [--with-gate] [--json]`
+- `aethyme broker verify-loop [--json]`
+
+`quick-test` is the disposable install smoke. `verify-loop` is the stronger
+operator E2E: it reports the integration commit tested and flags movement during
+the run, so callers know whether the result proves the current integration tip.
+
+Frozen broker JSON contracts are limited to the commands listed in
+[`../../../../docs/json-contracts.md`](../../../../docs/json-contracts.md).
+Other `--json` outputs are useful but provisional.
+
 ## Core Commands
 
 ### Indexing

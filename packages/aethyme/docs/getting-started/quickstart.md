@@ -1,6 +1,12 @@
-# Aethyme Quick Start
+# Aethyme Graph Engine Quick Start
 
-Last Updated: 2026-07-17
+Last Updated: 2026-07-29
+
+This page covers the lower-level graph-engine path. For the current public
+product quickstart, use the broker-first flow in
+[`../../../../README.md`](../../../../README.md) and the product map in
+[`../../../../docs/product-surface.md`](../../../../docs/product-surface.md):
+install -> `aethyme init` -> `aethyme broker quick-test` -> adopt -> submit.
 
 ## 1. Install
 
