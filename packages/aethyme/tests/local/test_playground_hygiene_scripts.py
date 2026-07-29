@@ -132,7 +132,9 @@ def test_verify_playground_enforces_guidance_and_discovery_hygiene() -> None:
 
     assert "check_root_guidance" in script
     assert '"$AETHYME_ROOT/rust/target/release/aethyme" explore' in script
-    assert "executable guidance for deleted 'src.cli explore'" in script
+    # Phase 2 template flip (2026-07-30): the staleness check widened from
+    # 'src.cli explore' to any executable `-m src.cli` line.
+    assert "executable 'python -m src.cli' guidance" in script
 
     assert "check_ignored_path" in script
     for generated_path in (

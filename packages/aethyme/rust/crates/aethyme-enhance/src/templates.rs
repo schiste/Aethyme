@@ -6,8 +6,10 @@
 //! `cargo install`ed binary deploys without a source checkout, while the
 //! rendered bytes stay identical to Python reading the same files
 //! (verified by `scripts/migration/enhance-golden.sh`). Template CONTENT
-//! is frozen this session — the `python -m src.cli` → `aethyme` spelling
-//! flip is a separate change with its own protocol.
+//! flipped to `aethyme ...` spellings on 2026-07-30 (Class 3 change,
+//! in lockstep with verify-playground.sh greps and the consumer
+//! registry); the wrapper scripts' `record-wrapper-invocation` calls
+//! stay Python until the Phase 3 hook flip.
 
 pub const AGENTS_MD: &str = include_str!("../../../../skills/aethyme/AGENTS.md");
 pub const SKILL_MD: &str = include_str!("../../../../skills/aethyme/SKILL.md");
