@@ -12,16 +12,20 @@
 #   whole workspace on every submit.
 # - Gate outputs must be gitignored or they change the working-tree hash
 #   and bust the result cache.
+# - Every command exports CHAU7_CTO_OPTIM_ACTIVE=1: Chau7's CTO git
+#   wrapper compresses git output in agent tabs (chau7#77), and gates —
+#   or the tests they run — that parse git output would read fiction.
+#   Blanket insurance until the wrapper passes through non-TTY output.
 
 [[gate]]
 name = "ruff"
-command = 'MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && cd packages/aethyme && "$MAIN/packages/aethyme/.venv/bin/python" -m ruff check .'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && cd packages/aethyme && "$MAIN/packages/aethyme/.venv/bin/python" -m ruff check .'
 cost = 1
 triggers = ["packages/aethyme/**/*.py"]
 
 [[gate]]
 name = "pytest-local"
-command = 'MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && cd packages/aethyme && "$MAIN/packages/aethyme/.venv/bin/python" -m pytest -q tests/local'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && cd packages/aethyme && "$MAIN/packages/aethyme/.venv/bin/python" -m pytest -q tests/local'
 cost = 2
 triggers = [
     "packages/aethyme/src/**",
@@ -37,13 +41,13 @@ triggers = [
 # package gets its own gate; when adding a package, add its gate in the
 # same change.
 name = "pytest-aethyme-eval"
-command = 'MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && PYTHONPATH=packages/aethyme-eval/src "$MAIN/packages/aethyme/.venv/bin/python" -m pytest -q packages/aethyme-eval/tests'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && PYTHONPATH=packages/aethyme-eval/src "$MAIN/packages/aethyme/.venv/bin/python" -m pytest -q packages/aethyme-eval/tests'
 cost = 1
 triggers = ["packages/aethyme-eval/**"]
 
 [[gate]]
 name = "cargo-test"
-command = 'CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/aethyme-cargo-target}" cargo test --workspace --quiet --manifest-path packages/aethyme/rust/Cargo.toml'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/aethyme-cargo-target}" cargo test --workspace --quiet --manifest-path packages/aethyme/rust/Cargo.toml'
 cost = 3
 triggers = ["**/*.rs", "**/Cargo.toml"]
 
