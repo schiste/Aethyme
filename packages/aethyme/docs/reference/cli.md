@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-05-14
+Last Updated: 2026-07-29
 
 ## Global Options
 
@@ -249,7 +249,16 @@ call-site expansion, filename fallback, and compact `task-expand` output into:
 - `output_adapters.task_localization_json`: compact candidate file/symbol lists and expansion commands
 - `confidence`: answer-only, excluded-only, and analyzed confidence summaries
 - `safe_to_use_as_answer` / `trust_policy`: whether `answer[]` is authoritative enough to guide an answer, or only safe as navigation
-- `observability`: command, repo path, index freshness, internal analyzers, graph/fact counts, output size, confidence summary, evidence level, trust policy, and degraded/failure reasons
+- `observability`: graph freshness, graph completeness by Surface/Flow type, indexed languages/frameworks, missing expected surfaces, ranking explainability, answer-safety mode, and readiness fields. Freshness alone is not enough: agents should require the graph to be fresh, complete enough for the request, and explainable before treating `answer[]` as answer-safe.
+
+For task/behavior localization, Explore observability includes:
+- `graph_freshness`: redb backend status, `fresh`, `stale`, fragment/store timestamps, `.aethyme/graph/` source-of-truth path, and `.aethyme/graph_store.redb` derived artifact path
+- `graph_completeness_by_surface_type`: per-surface coverage for backend, edge/proxy, routes, middleware, webhooks, CLIs, jobs/queues, credential flows, and live behavior tests
+- `indexed_languages` / `indexed_frameworks`: language/framework signals inferred from indexed graph fragments, not from source files alone
+- `missing_expected_surfaces`: source-present surfaces that graph fragments did not fully index
+- `ranking_explainability`: `degraded_ranking_reasons`, `top_signals_used`, `top_signals_absent`, and whether subsystem ambiguity was detected
+- `answer_safety`: evidence-only safety, observability-adjusted safety, navigation-only mode, trust policy, and reason
+- `readiness`: booleans for `fresh_enough`, `complete_enough`, `surface_flow_complete`, `explainable`, `answer_safe_after_observability`, and `navigation_only_after_observability`
 
 Default `task_localization_query` responsiveness behavior:
 - `graph_query_timeout_ms`: default `1000`
@@ -279,7 +288,7 @@ analysis and returns:
 - `excluded[]`: candidates rejected by evidence
 - `output_adapters.dead_code_eval_json`: compatibility shape for the dead-code eval
 - `confidence`: answer-only, excluded-only, and analyzed confidence summaries
-- `observability`: command, repo path, index freshness, graph/fact counts, output size, confidence summary, and degraded/failure reasons
+- `observability`: the same enterprise envelope used by the default Explore path, plus `usage_boundary_analyzer` graph/fact counts, confidence summary, and analyzer degraded reasons. Usage-boundary remains a hybrid contract: redb discovers seeds/candidate files, while source text supplies caller/docs/config evidence.
 
 The current `usage_boundary_query` implementation uses the scope-first
 `analyze-usage-boundary` engine path for PHP public methods/functions. That path

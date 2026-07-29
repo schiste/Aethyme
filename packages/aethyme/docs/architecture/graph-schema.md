@@ -628,6 +628,15 @@ observability must expose Surface/Flow coverage under:
 ```json
 {
   "observability": {
+    "graph_freshness": {
+      "backend": "redb",
+      "status": "fresh",
+      "fresh": true,
+      "exists": true,
+      "fragments_exist": true,
+      "source_of_truth": ".aethyme/graph/",
+      "derived_query_artifact": ".aethyme/graph_store.redb"
+    },
     "graph_store": {
       "backend": "redb",
       "status": "fresh",
@@ -663,6 +672,43 @@ observability must expose Surface/Flow coverage under:
           "reason": "source paths and path fragments exist for this Surface/Flow family, but explicit semantic Surface/Flow node/edge evidence is missing"
         }
       ]
+    },
+    "graph_completeness_by_surface_type": {
+      "backend": {"status": "covered"},
+      "edge_proxy": {"status": "source_present_not_indexed"}
+    },
+    "indexed_languages": ["python", "typescript"],
+    "indexed_frameworks": ["django", "edge-middleware"],
+    "missing_expected_surfaces": [
+      {"surface_type": "edge_proxy"}
+    ],
+    "ranking_explainability": {
+      "degraded_ranking_reasons": ["surface_flow_coverage_not_complete_enough"],
+      "top_signals_used": [
+        {"signal": "multi_query_symbol_match", "count": 2}
+      ],
+      "top_signals_absent": [
+        {
+          "signal": "complete_surface_flow_coverage",
+          "reason": "The request depends on ingress/middleware/credential surfaces, but coverage is partial or unknown."
+        }
+      ],
+      "subsystem_ambiguous": true
+    },
+    "answer_safety": {
+      "mode": "navigation_only",
+      "answer_safe_by_evidence": true,
+      "answer_safe_after_observability": false,
+      "navigation_only_after_observability": true,
+      "trust_policy": "answer_candidate",
+      "evidence_level": "graph+symbol+text"
+    },
+    "readiness": {
+      "status": "navigation_only",
+      "fresh_enough": true,
+      "complete_enough": false,
+      "surface_flow_complete": false,
+      "explainable": true
     }
   }
 }
@@ -695,6 +741,20 @@ Aggregate `surface_flow_graph.status` is:
 | `partial` | At least one source-present surface family is missing from graph fragments/index shards. |
 | `covered` | At least one surface family is present in both source and graph, and none of the detected source-present families are missing. |
 | `no_surface_signals` | The bounded scans found no known Surface/Flow path signals. |
+
+Enterprise-grade Explore observability deliberately reports both the legacy
+`graph_store` object and the newer task-ready projections:
+`graph_freshness`, `graph_completeness_by_surface_type`,
+`indexed_languages`, `indexed_frameworks`, `missing_expected_surfaces`,
+`ranking_explainability`, `answer_safety`, and `readiness`. Consumers should
+prefer `answer_safety.answer_safe_after_observability` over evidence-only trust
+when deciding whether to answer from Explore output. A strong symbol/text match
+can still be downgraded to navigation-only when Surface/Flow coverage is
+incomplete for a route, middleware, proxy, worker, credential, or token task.
+`usage_boundary_query` uses the same high-level envelope and additionally emits
+`usage_boundary_analyzer`; for that hybrid flow, redb freshness and analyzer
+degraded reasons decide readiness while source text remains the evidence source
+for caller/docs/config references.
 
 This V1 report is not a substitute for full Surface/Flow indexing. It exists so
 the system can state gaps honestly before the dedicated route/proxy/middleware
