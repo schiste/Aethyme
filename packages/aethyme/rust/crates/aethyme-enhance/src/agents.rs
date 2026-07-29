@@ -69,8 +69,10 @@ fn render_broker_protocol(repo: &Path, root: &str) -> String {
 This repository coordinates concurrent agent sessions through the Aethyme
 broker. Other agents may be working in sibling worktrees right now. The
 `aethyme` binary is installed once with
-`cargo install --path "{root}/rust/crates/aethyme-engine"`
-(check with `aethyme --version`). Follow this protocol:
+`cargo install --path "{root}/rust/crates/aethyme-cli"` (plus
+`cargo install --path "{root}/rust/crates/aethyme-engine"` for the
+engine-daemon sibling binary; check with `aethyme --version`).
+Follow this protocol:
 
 1. **Broker entry point, before editing**: check current activity, create an
    isolated broker worktree, and work from that checkout:
