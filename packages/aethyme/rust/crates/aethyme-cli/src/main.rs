@@ -51,6 +51,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "explore" => run_explore(&args[1..]),
+        "verify-targets" => run_verify_targets(&args[1..]),
         // Native since python-retirement Phase 1 (the Python `query`
         // group is deleted). Errors keep Click's `Error: {msg}` shape
         // and exit 1 so scripted consumers see the same surface.
@@ -163,6 +164,10 @@ fn print_top_level_help() {
     eprintln!("Hot path:");
     eprintln!("  explore --repo <path> --request \"<task>\" [--format answer-json]");
     eprintln!("                              in-process engine; auto-starts the engine daemon");
+    eprintln!(
+        "  verify-targets --repo <path> --from explore.json [--max-targets 2 --max-lines 80]"
+    );
+    eprintln!("                              bounded source spans for Explore targets");
     eprintln!();
     eprintln!("Agent broker:");
     eprintln!("  init                        guided setup: certify + scaffold + gates draft");
@@ -226,6 +231,21 @@ fn run_explore(args: &[String]) -> ExitCode {
                     ExitCode::from(1)
                 }
             }
+        }
+    }
+}
+
+fn run_verify_targets(args: &[String]) -> ExitCode {
+    use aethyme_engine::verify_targets_cli::{VerifyTargetsCliOutcome, run};
+    match run(args) {
+        VerifyTargetsCliOutcome::Done => ExitCode::SUCCESS,
+        VerifyTargetsCliOutcome::BadUsage(message) => {
+            eprintln!("{message}");
+            ExitCode::from(2)
+        }
+        VerifyTargetsCliOutcome::Failed(message) => {
+            eprintln!("{message}");
+            ExitCode::from(1)
         }
     }
 }

@@ -926,6 +926,27 @@ fn aethyme_explore_cli_json_with_metrics(
     (value, metrics)
 }
 
+fn aethyme_verify_targets_cli_json(
+    repo: &Path,
+    explore_json: &Path,
+    max_targets: usize,
+    max_lines: usize,
+) -> serde_json::Value {
+    let output = run_aethyme([
+        "verify-targets",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--from",
+        explore_json.to_str().unwrap(),
+        "--max-targets",
+        &max_targets.to_string(),
+        "--max-lines",
+        &max_lines.to_string(),
+    ]);
+    assert_success(&output);
+    serde_json::from_slice(&output.stdout).expect("verify-targets JSON parses")
+}
+
 fn usage_boundary_explore_cli_json(repo: &Path, request: &str, scope: &str) -> serde_json::Value {
     query_json([
         "explore",
@@ -1769,6 +1790,54 @@ fn redb_explore_auth_surface_fixture_ranks_proxy_backend_and_names_decoys() {
         verification_steps.contains("Verify proxy classification first, then backend validation"),
         "verification should force proxy/backend verification order: {verification_steps}"
     );
+}
+
+#[test]
+fn verify_targets_extracts_bounded_spans_from_explore_json() {
+    let tmp = build_surface_flow_auth_redb_fixture();
+
+    let (explore, _) = aethyme_explore_cli_json_with_metrics(
+        tmp.path(),
+        "Trace token authentication behavior for publishable API keys",
+        "task_localization_query",
+        true,
+    );
+    let explore_path = tmp.path().join("explore.json");
+    std::fs::write(&explore_path, serde_json::to_vec_pretty(&explore).unwrap()).unwrap();
+
+    let verified = aethyme_verify_targets_cli_json(tmp.path(), &explore_path, 2, 80);
+    assert_eq!(verified["schema_version"], "aethyme-verify-targets-v1");
+    assert_eq!(verified["limits"]["max_targets"], 2);
+    assert_eq!(verified["limits"]["max_lines"], 80);
+    assert!(verified["total_line_count"].as_u64().unwrap() <= 80);
+    assert!(
+        !verified.to_string().contains(".aethyme"),
+        "verification output must not leak generated graph artifacts: {verified}"
+    );
+
+    let targets = verified["targets"].as_array().expect("targets array");
+    assert_eq!(targets.len(), 2, "expected exactly two bounded targets");
+    assert_eq!(targets[0]["status"], "verified_span");
+    assert_eq!(targets[1]["status"], "verified_span");
+    assert!(
+        targets[0]["path"]
+            .as_str()
+            .is_some_and(|path| path.contains("gcp-run-proxy")),
+        "first target should verify the ingress/proxy lane: {targets:?}"
+    );
+    assert!(
+        targets[1]["path"]
+            .as_str()
+            .is_some_and(|path| path.contains("backend/api_keys")),
+        "second target should verify the backend validator lane: {targets:?}"
+    );
+
+    let first_lines = targets[0]["lines"].to_string();
+    assert!(first_lines.contains("Authorization"));
+    assert!(first_lines.contains("Bearer"));
+    let second_lines = targets[1]["lines"].to_string();
+    assert!(second_lines.contains("validate_publishable_key"));
+    assert!(second_lines.contains("pk_"));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
