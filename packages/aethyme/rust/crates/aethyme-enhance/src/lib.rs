@@ -16,9 +16,11 @@
 //! keeps answering by default until the flip.
 
 pub mod agents;
+pub mod deploy;
 pub mod onboarding;
 pub mod pyjson;
 pub mod render;
+pub mod skills;
 pub mod telemetry;
 pub mod templates;
 pub mod timeutil;
