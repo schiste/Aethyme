@@ -2035,6 +2035,16 @@ fn token_subsystem_matches(lower: &str) -> Vec<TokenSubsystemMatch> {
             signal: "auth0_management_surface",
         });
     }
+    if lower.contains("webhook")
+        && contains_any_text(lower, &["token", "secret", "signature", "hmac"])
+    {
+        matches.push(TokenSubsystemMatch {
+            id: "webhook_tokens",
+            label: "webhook tokens",
+            base_score: 75,
+            signal: "webhook_token_surface",
+        });
+    }
     if lower.contains("profile_integrity")
         || lower.contains("profile-integrity")
         || (lower.contains("profile") && lower.contains("integrity"))
@@ -2071,7 +2081,12 @@ fn request_names_provider_or_secondary_token_subsystem(request: &str) -> bool {
     token_subsystem_matches(&lower).iter().any(|matched| {
         matches!(
             matched.id,
-            "oidc" | "audit_jws" | "auth0_management" | "profile_integrity" | "domain_verification"
+            "oidc"
+                | "audit_jws"
+                | "auth0_management"
+                | "webhook_tokens"
+                | "profile_integrity"
+                | "domain_verification"
         )
     })
 }
@@ -2179,9 +2194,166 @@ fn explore_subsystem_identity(id: &'static str) -> (&'static str, &'static str, 
     match id {
         "ingress_proxy" => ("ingress/proxy", "ingress_proxy", 0),
         "backend_validator" => ("backend API-key validator", "backend_validator", 1),
-        "provider_oidc_audit" => ("provider/OIDC/audit", "provider_or_secondary_token", 2),
+        "provider_oidc_audit" => (
+            "provider/OIDC/audit/webhook",
+            "provider_or_secondary_token",
+            2,
+        ),
         _ => ("related subsystem", "related", 9),
     }
+}
+
+fn subsystem_target_search_text(target: &ExploreSubsystemTarget) -> String {
+    format!(
+        "{} {} {} {}",
+        target.kind,
+        target.target,
+        target.path.as_deref().unwrap_or(""),
+        target.reason
+    )
+    .to_ascii_lowercase()
+}
+
+fn target_path_component_count(target: &ExploreSubsystemTarget) -> usize {
+    target
+        .path
+        .as_deref()
+        .unwrap_or(target.target.as_str())
+        .trim_matches('/')
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .count()
+}
+
+fn broad_subsystem_path_penalty(target: &ExploreSubsystemTarget) -> i32 {
+    if target.kind != "subsystem_path" {
+        return 0;
+    }
+    let lower = target
+        .path
+        .as_deref()
+        .unwrap_or(target.target.as_str())
+        .to_ascii_lowercase();
+    if target_path_component_count(target) <= 1
+        || matches!(
+            lower.as_str(),
+            "api" | "backend" | "server" | "services" | "src"
+        )
+    {
+        -220
+    } else {
+        0
+    }
+}
+
+fn subsystem_target_priority(subsystem_id: &str, target: &ExploreSubsystemTarget) -> i32 {
+    let text = subsystem_target_search_text(target);
+    let mut priority = match target.kind.as_str() {
+        "entrypoint" => 320,
+        "credential_flow" => 300,
+        "surface_path" => 240,
+        "token_subsystem" => 160,
+        "behavior_test" => 80,
+        "subsystem_path" => 60,
+        _ => 100,
+    } + broad_subsystem_path_penalty(target);
+
+    match subsystem_id {
+        "ingress_proxy" => {
+            if text.contains("gcp-run-proxy") {
+                priority += 520;
+            }
+            if path_looks_ingress_proxy(&text) {
+                priority += 220;
+            }
+            if contains_any_text(
+                &text,
+                &[
+                    "forwards_to",
+                    "rewrites_header",
+                    "entrypoint_for",
+                    "exposes",
+                ],
+            ) {
+                priority += 140;
+            }
+            if target.kind == "behavior_test" {
+                priority -= 80;
+            }
+        }
+        "backend_validator" => {
+            if contains_any_text(&text, &["backend/api_keys", "backend.api_keys"]) {
+                priority += 520;
+            }
+            if contains_any_text(
+                &text,
+                &[
+                    "validates_credential",
+                    "authorizes",
+                    "publishablekey",
+                    "validate_publishable_key",
+                    "authenticate_api_key",
+                ],
+            ) {
+                priority += 180;
+            }
+            if target.kind == "behavior_test" {
+                priority -= 70;
+            }
+        }
+        "provider_oidc_audit" => {
+            if !token_subsystem_matches(&text).is_empty() {
+                priority += 160;
+            }
+            if contains_any_text(
+                &text,
+                &[
+                    "oidc",
+                    "audit_jws",
+                    "auth0_management",
+                    "webhook_token",
+                    "profile_integrity",
+                    "domain_verification",
+                ],
+            ) {
+                priority += 120;
+            }
+        }
+        _ => {}
+    }
+
+    priority
+}
+
+fn text_has_edge_proxy_evidence(text: &str) -> bool {
+    path_looks_ingress_proxy(text)
+        || contains_any_text(
+            text,
+            &[
+                "proxy_surface",
+                "worker_surface",
+                "forwards_to",
+                "rewrites_header",
+            ],
+        )
+}
+
+fn ingress_lane_lacks_edge_proxy_evidence(builder: &ExploreSubsystemBuilder) -> bool {
+    builder.id == "ingress_proxy"
+        && !builder
+            .paths
+            .iter()
+            .any(|path| text_has_edge_proxy_evidence(&path.to_ascii_lowercase()))
+        && !builder.signals.iter().any(|signal| {
+            matches!(
+                signal.as_str(),
+                "forwards_to" | "rewrites_header" | "proxy_surface" | "worker_surface"
+            )
+        })
+        && !builder
+            .targets
+            .iter()
+            .any(|target| text_has_edge_proxy_evidence(&subsystem_target_search_text(target)))
 }
 
 fn explore_subsystem_rankings(
@@ -2207,6 +2379,7 @@ fn explore_subsystem_rankings(
             "oidc"
             | "audit_jws"
             | "auth0_management"
+            | "webhook_tokens"
             | "profile_integrity"
             | "domain_verification" => "provider_oidc_audit",
             _ => continue,
@@ -2280,11 +2453,22 @@ fn explore_subsystem_rankings(
         .into_iter()
         .enumerate()
         .map(|(index, mut builder)| {
+            let subsystem_id = builder.id;
+            let route_only_ingress = ingress_lane_lacks_edge_proxy_evidence(&builder);
+            if route_only_ingress {
+                builder.add_warning(
+                    "No indexed edge/proxy surface matched this task; ingress evidence is backend route-only.",
+                );
+            }
             builder.targets.sort_by(|left, right| {
-                right
-                    .confidence
-                    .partial_cmp(&left.confidence)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                subsystem_target_priority(subsystem_id, right)
+                    .cmp(&subsystem_target_priority(subsystem_id, left))
+                    .then_with(|| {
+                        right
+                            .confidence
+                            .partial_cmp(&left.confidence)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .then_with(|| left.target.cmp(&right.target))
                     .then_with(|| left.path.cmp(&right.path))
             });
@@ -2292,12 +2476,16 @@ fn explore_subsystem_rankings(
             let signals = builder.signals.iter().take(10).cloned().collect::<Vec<_>>();
             let token_subsystems =
                 token_subsystem_labels_from_signals_targets(&signals, &top_verification_targets);
+            let mut confidence = confidence_from_subsystem_score(builder.score);
+            if route_only_ingress {
+                confidence = confidence.min(0.68);
+            }
             ExploreSubsystem {
                 rank: index + 1,
                 id: builder.id.to_string(),
                 label: builder.label.to_string(),
                 role: builder.role.to_string(),
-                confidence: confidence_from_subsystem_score(builder.score),
+                confidence,
                 paths: builder.paths.iter().take(6).cloned().collect(),
                 token_subsystems,
                 top_verification_targets,
@@ -2556,7 +2744,12 @@ fn classify_surface_subsystems(
     let provider_or_secondary = token_subsystem_matches(lower_text).iter().any(|matched| {
         matches!(
             matched.id,
-            "oidc" | "audit_jws" | "auth0_management" | "profile_integrity" | "domain_verification"
+            "oidc"
+                | "audit_jws"
+                | "auth0_management"
+                | "webhook_tokens"
+                | "profile_integrity"
+                | "domain_verification"
         )
     }) || contains_any_text(
         lower_text,
@@ -2596,7 +2789,7 @@ fn classify_surface_subsystems(
                 "worker.",
                 "workers/",
                 "route_surface",
-                "webhook",
+                "webhook_surface",
                 "middleware.ts",
                 "middleware.js",
             ],
@@ -2798,6 +2991,9 @@ fn token_subsystem_labels_from_signals_targets(
             }
             "auth0_management_surface" | "token_subsystem:auth0_management" => {
                 labels.insert("Auth0 management");
+            }
+            "webhook_token_surface" | "token_subsystem:webhook_tokens" => {
+                labels.insert("webhook tokens");
             }
             "profile_integrity_surface" | "token_subsystem:profile_integrity" => {
                 labels.insert("profile-integrity");
@@ -5639,6 +5835,13 @@ mod tests {
                     score: 900,
                 },
                 SymbolHit {
+                    name: "verify_webhook_token_signature".into(),
+                    kind: "function".into(),
+                    file: "backend/accounts/webhook_tokens.py".into(),
+                    line: 44,
+                    score: 780,
+                },
+                SymbolHit {
                     name: "_issue_profile_integrity_token".into(),
                     kind: "function".into(),
                     file: "backend/accounts/platform_users_views.py".into(),
@@ -5715,6 +5918,7 @@ mod tests {
             "OIDC",
             "audit JWS",
             "Auth0 management",
+            "webhook tokens",
             "profile-integrity",
             "domain verification",
         ] {

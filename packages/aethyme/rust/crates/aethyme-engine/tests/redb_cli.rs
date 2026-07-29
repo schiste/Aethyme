@@ -382,6 +382,24 @@ def verify_audit_jws(audit_jws):
     );
     write(
         tmp.path(),
+        "backend/accounts/auth0_management.py",
+        br#"
+def get_auth0_management_token(client):
+    return client.oauth_token("auth0-management")
+"#,
+    );
+    write(
+        tmp.path(),
+        "backend/accounts/webhook_tokens.py",
+        br#"
+def verify_webhook_token(signature, payload, secret):
+    if not signature.startswith("whsec_"):
+        raise PermissionError("invalid webhook token signature")
+    return hmac_compare(signature, payload, secret)
+"#,
+    );
+    write(
+        tmp.path(),
         "tests/test_proxy_worker.mjs",
         br#"
 test("proxy preserves publishable key Authorization", async () => {
@@ -412,7 +430,7 @@ def test_project_route_requires_projects_read_scope(client):
     bootstrap_repo(&root, "test-engine").expect("bootstrap graph layout");
     let ctx = IndexerContext::new("SurfaceFlowAuthRepo", root, "test-engine").unwrap();
     let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
-    assert_eq!(summary.total_files, 9);
+    assert_eq!(summary.total_files, 11);
 
     let output = run_engine([
         "index",
@@ -906,6 +924,27 @@ fn aethyme_explore_cli_json_with_metrics(
         aethyme_path_leaked: visible_payload.contains(".aethyme"),
     };
     (value, metrics)
+}
+
+fn aethyme_verify_targets_cli_json(
+    repo: &Path,
+    explore_json: &Path,
+    max_targets: usize,
+    max_lines: usize,
+) -> serde_json::Value {
+    let output = run_aethyme([
+        "verify-targets",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--from",
+        explore_json.to_str().unwrap(),
+        "--max-targets",
+        &max_targets.to_string(),
+        "--max-lines",
+        &max_lines.to_string(),
+    ]);
+    assert_success(&output);
+    serde_json::from_slice(&output.stdout).expect("verify-targets JSON parses")
 }
 
 fn usage_boundary_explore_cli_json(repo: &Path, request: &str, scope: &str) -> serde_json::Value {
@@ -1680,32 +1719,42 @@ fn redb_explore_auth_surface_fixture_ranks_proxy_backend_and_names_decoys() {
         .iter()
         .find(|subsystem| subsystem["role"] == "ingress_proxy")
         .expect("ingress/proxy subsystem");
-    let ingress_targets = ingress_proxy["top_verification_targets"]
+    let ingress_target_values = ingress_proxy["top_verification_targets"]
         .as_array()
-        .expect("ingress targets")
+        .expect("ingress targets");
+    let ingress_top = ingress_target_values
+        .first()
+        .map(serde_json::Value::to_string)
+        .unwrap_or_default();
+    let ingress_targets = ingress_target_values
         .iter()
         .map(serde_json::Value::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        ingress_targets.contains("gcp-run-proxy"),
-        "ingress top verification targets should point at the worker/proxy: {ingress_targets}"
+        ingress_top.contains("gcp-run-proxy"),
+        "ingress first verification target should point at the worker/proxy: top={ingress_top}, all={ingress_targets}"
     );
 
     let backend_validator = subsystems
         .iter()
         .find(|subsystem| subsystem["role"] == "backend_validator")
         .expect("backend validator subsystem");
-    let backend_targets = backend_validator["top_verification_targets"]
+    let backend_target_values = backend_validator["top_verification_targets"]
         .as_array()
-        .expect("backend targets")
+        .expect("backend targets");
+    let backend_top = backend_target_values
+        .first()
+        .map(serde_json::Value::to_string)
+        .unwrap_or_default();
+    let backend_targets = backend_target_values
         .iter()
         .map(serde_json::Value::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        backend_targets.contains("backend/api_keys"),
-        "backend top verification targets should point at API-key validation code: {backend_targets}"
+        backend_top.contains("backend/api_keys"),
+        "backend first verification target should point at API-key validation code: top={backend_top}, all={backend_targets}"
     );
 
     let ambiguity = response["ambiguous"].to_string();
@@ -1716,6 +1765,14 @@ fn redb_explore_auth_surface_fixture_ranks_proxy_backend_and_names_decoys() {
     assert!(
         ambiguity.contains("audit JWS"),
         "token ambiguity should explicitly name the audit JWS decoy subsystem: {ambiguity}"
+    );
+    assert!(
+        ambiguity.contains("Auth0 management"),
+        "token ambiguity should explicitly name the Auth0 management decoy subsystem: {ambiguity}"
+    );
+    assert!(
+        ambiguity.contains("webhook tokens"),
+        "token ambiguity should explicitly name the webhook token decoy subsystem: {ambiguity}"
     );
 
     let verification_steps = response["verification_steps"]
@@ -1733,6 +1790,54 @@ fn redb_explore_auth_surface_fixture_ranks_proxy_backend_and_names_decoys() {
         verification_steps.contains("Verify proxy classification first, then backend validation"),
         "verification should force proxy/backend verification order: {verification_steps}"
     );
+}
+
+#[test]
+fn verify_targets_extracts_bounded_spans_from_explore_json() {
+    let tmp = build_surface_flow_auth_redb_fixture();
+
+    let (explore, _) = aethyme_explore_cli_json_with_metrics(
+        tmp.path(),
+        "Trace token authentication behavior for publishable API keys",
+        "task_localization_query",
+        true,
+    );
+    let explore_path = tmp.path().join("explore.json");
+    std::fs::write(&explore_path, serde_json::to_vec_pretty(&explore).unwrap()).unwrap();
+
+    let verified = aethyme_verify_targets_cli_json(tmp.path(), &explore_path, 2, 80);
+    assert_eq!(verified["schema_version"], "aethyme-verify-targets-v1");
+    assert_eq!(verified["limits"]["max_targets"], 2);
+    assert_eq!(verified["limits"]["max_lines"], 80);
+    assert!(verified["total_line_count"].as_u64().unwrap() <= 80);
+    assert!(
+        !verified.to_string().contains(".aethyme"),
+        "verification output must not leak generated graph artifacts: {verified}"
+    );
+
+    let targets = verified["targets"].as_array().expect("targets array");
+    assert_eq!(targets.len(), 2, "expected exactly two bounded targets");
+    assert_eq!(targets[0]["status"], "verified_span");
+    assert_eq!(targets[1]["status"], "verified_span");
+    assert!(
+        targets[0]["path"]
+            .as_str()
+            .is_some_and(|path| path.contains("gcp-run-proxy")),
+        "first target should verify the ingress/proxy lane: {targets:?}"
+    );
+    assert!(
+        targets[1]["path"]
+            .as_str()
+            .is_some_and(|path| path.contains("backend/api_keys")),
+        "second target should verify the backend validator lane: {targets:?}"
+    );
+
+    let first_lines = targets[0]["lines"].to_string();
+    assert!(first_lines.contains("Authorization"));
+    assert!(first_lines.contains("Bearer"));
+    let second_lines = targets[1]["lines"].to_string();
+    assert!(second_lines.contains("validate_publishable_key"));
+    assert!(second_lines.contains("pk_"));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
