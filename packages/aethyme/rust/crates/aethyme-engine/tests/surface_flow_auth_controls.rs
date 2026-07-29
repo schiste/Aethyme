@@ -4,6 +4,7 @@
 //! Aethyme itself. They exercise the production CLI path from source
 //! fragments through redb into `aethyme explore`.
 
+mod common;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -16,9 +17,7 @@ fn engine_bin() -> &'static str {
     env!("CARGO_BIN_EXE_aethyme-engine-cli")
 }
 
-fn aethyme_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_aethyme")
-}
+use common::aethyme_bin;
 
 fn write(root: &Path, rel: &str, content: &[u8]) {
     let full = root.join(rel);
