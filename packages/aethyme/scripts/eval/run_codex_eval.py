@@ -253,13 +253,24 @@ def _build_codex_command(
         str(schema_file),
         "--output-last-message",
         str(last_message_file),
-        "--add-dir",
-        "/tmp",
     ]
+    for extra_dir in _codex_artifact_dirs(schema_file, last_message_file):
+        command.extend(["--add-dir", str(extra_dir)])
     if arm == "aethyme":
         command.extend(["--add-dir", str(tool_repo)])
     command.extend(["-C", str(repo_path), prompt])
     return command
+
+
+def _codex_artifact_dirs(schema_file: Path, last_message_file: Path) -> tuple[Path, ...]:
+    return tuple(
+        dict.fromkeys(
+            (
+                schema_file.expanduser().resolve().parent,
+                last_message_file.expanduser().resolve().parent,
+            )
+        )
+    )
 
 
 def _codex_env(arm: str, tool_repo: Path) -> dict[str, str]:
@@ -517,7 +528,9 @@ def _output_fingerprint(
     structured_output: dict[str, Any] | None,
     final_output_message: str | None,
 ) -> str:
-    surface: Any = structured_output if structured_output is not None else final_output_message or ""
+    surface: Any = (
+        structured_output if structured_output is not None else final_output_message or ""
+    )
     encoded = json.dumps(
         surface,
         sort_keys=True,
@@ -612,6 +625,9 @@ def _command_tokens_invoke_aethyme_explore(value: list[Any]) -> bool:
 
 
 def _is_aethyme_binary(token: str) -> bool:
+    normalized = token.strip("\"'")
+    if normalized in {"$AETHYME_BIN", "${AETHYME_BIN}"}:
+        return True
     return Path(token).name.lower() in {"aethyme", "aethyme-engine-cli"}
 
 
@@ -703,11 +719,7 @@ def _collect_path_leaks(value: Any, source: str, *, path: str = "$") -> list[dic
 
 
 def _matched_path_leak_markers(value: str) -> list[str]:
-    return [
-        marker
-        for marker in PATH_LEAK_MARKERS
-        if _PATH_LEAK_PATTERNS[marker].search(value)
-    ]
+    return [marker for marker in PATH_LEAK_MARKERS if _PATH_LEAK_PATTERNS[marker].search(value)]
 
 
 def _leak_excerpt(value: str, marker: str) -> str:

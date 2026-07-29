@@ -1151,6 +1151,9 @@ def _command_tokens_invoke_aethyme_explore(value: list[Any]) -> bool:
 
 
 def _is_aethyme_binary(token: str) -> bool:
+    normalized = token.strip("\"'")
+    if normalized in {"$AETHYME_BIN", "${AETHYME_BIN}"}:
+        return True
     return Path(token).name.lower() in {"aethyme", "aethyme-engine-cli"}
 
 

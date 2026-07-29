@@ -184,19 +184,25 @@ def test_control_command_uses_clean_codex_runner_without_tool_repo() -> None:
     runner = _load_runner()
     repo_path = Path("/tmp/Playground/Demo/Demo - Control")
     tool_repo = Path("/tmp/Aethyme/packages/aethyme")
+    schema_file = Path("/private/tmp/aethyme-eval/schema/schema.json")
+    last_message_file = Path("/private/tmp/aethyme-eval/artifacts/control/last-message.json")
 
     command = runner._build_codex_command(
         repo_path=repo_path,
         tool_repo=tool_repo,
         arm="control",
-        schema_file=Path("/tmp/schema.json"),
-        last_message_file=Path("/tmp/last-message.json"),
+        schema_file=schema_file,
+        last_message_file=last_message_file,
         prompt="inspect auth flow",
     )
 
     assert "--ignore-user-config" in command
     assert "--json" in command
-    assert command.count("--add-dir") == 1
+    assert command.count("--add-dir") == 2
+    add_dirs = _command_add_dirs(command)
+    assert str(schema_file.parent) in add_dirs
+    assert str(last_message_file.parent) in add_dirs
+    assert "/tmp" not in add_dirs
     assert str(tool_repo) not in command
     assert command[-3:] == ["-C", str(repo_path), "inspect auth flow"]
 
@@ -205,20 +211,40 @@ def test_aethyme_command_adds_only_the_tool_repo_surface() -> None:
     runner = _load_runner()
     repo_path = Path("/tmp/Playground/Demo/Demo - Aethyme")
     tool_repo = Path("/tmp/Aethyme/packages/aethyme")
+    schema_file = Path("/private/tmp/aethyme-eval/schema/schema.json")
+    last_message_file = Path("/private/tmp/aethyme-eval/artifacts/aethyme/last-message.json")
 
     command = runner._build_codex_command(
         repo_path=repo_path,
         tool_repo=tool_repo,
         arm="aethyme",
-        schema_file=Path("/tmp/schema.json"),
-        last_message_file=Path("/tmp/last-message.json"),
+        schema_file=schema_file,
+        last_message_file=last_message_file,
         prompt="inspect auth flow",
     )
 
     assert "--ignore-user-config" in command
-    assert command.count("--add-dir") == 2
+    assert command.count("--add-dir") == 3
+    add_dirs = _command_add_dirs(command)
+    assert str(schema_file.parent) in add_dirs
+    assert str(last_message_file.parent) in add_dirs
+    assert "/tmp" not in add_dirs
     assert str(tool_repo) in command
     assert command[-3:] == ["-C", str(repo_path), "inspect auth flow"]
+
+
+def test_codex_artifact_dirs_are_deduplicated() -> None:
+    runner = _load_runner()
+    artifact_dir = Path("/private/tmp/aethyme-eval/artifacts/run")
+
+    assert runner._codex_artifact_dirs(
+        artifact_dir / "schema.json",
+        artifact_dir / "last-message.json",
+    ) == (artifact_dir,)
+
+
+def _command_add_dirs(command: list[str]) -> list[str]:
+    return [command[index + 1] for index, item in enumerate(command[:-1]) if item == "--add-dir"]
 
 
 def test_control_environment_removes_aethyme_leakage(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -431,6 +457,29 @@ def test_runner_invocation_detection_handles_shell_wrapped_command(tmp_path: Pat
                         "/bin/zsh -lc "
                         "'/tmp/aethyme/rust/target/release/aethyme explore "
                         '--repo "$PWD" --format answer-json\''
+                    )
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert runner._aethyme_invoked(events_file) is True
+
+
+def test_runner_invocation_detection_handles_shell_variable_binary(tmp_path: Path) -> None:
+    runner = _load_runner()
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "command": (
+                        "/bin/zsh -lc "
+                        "'AETHYME_BIN=/tool/rust/target/release/aethyme; "
+                        '"$AETHYME_BIN" explore --repo "$PWD" --format answer-json\''
                     )
                 },
             }
@@ -815,6 +864,46 @@ def test_regression_gate_requires_first_aethyme_call_before_broad_search(
     assert report["passed"] is False
     failures = {check["name"] for check in report["checks"] if not check["passed"]}
     assert "aethyme_first_call_before_broad_search" in failures
+
+
+def test_regression_gate_detects_shell_variable_aethyme_invocation(
+    tmp_path: Path,
+) -> None:
+    gate = _load_gate()
+    events_file = tmp_path / "events.jsonl"
+    _write_events(
+        events_file,
+        [
+            {
+                "type": "item.completed",
+                "item": {
+                    "command": (
+                        "/bin/zsh -lc "
+                        "'AETHYME_BIN=/tool/rust/target/release/aethyme; "
+                        '"$AETHYME_BIN" explore --repo "$PWD" --format answer-json\''
+                    ),
+                    "stdout": _explore_output_with_lanes(),
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {"cmd": ["rg", "auth"], "stdout": "src/auth.py\n"},
+            },
+        ],
+    )
+    control = _event_gate_payload(arm="control")
+    aethyme = _event_gate_payload(arm="aethyme", event_log_file=events_file)
+
+    report = gate.compare_runs(
+        control,
+        aethyme,
+        command_output_delta_ratio=10.0,
+        require_event_sequence=True,
+    )
+
+    assert report["passed"] is True
+    assert report["aethyme_metrics"]["aethyme_invoked"] is True
+    assert report["aethyme_metrics"]["first_aethyme_call_before_broad_search"] is True
 
 
 def test_regression_gate_warns_on_broad_rg_after_successful_explore(
