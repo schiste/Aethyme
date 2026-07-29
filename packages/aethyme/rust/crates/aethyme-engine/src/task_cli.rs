@@ -6,8 +6,8 @@
 //! which Python emitted compact-with-spaces (`json.dumps(result)` —
 //! `", "` / `": "` separators): [`compact_json_python_style`] replicates
 //! that. `next` shares the relation renderer with the graph group;
-//! `explain` composes the full-inspect JSON + pack exactly as the Python
-//! `render_explain_repo_text` did.
+//! `explain` renders from the redb-built context pack so task flows do not
+//! rebuild an in-memory `RepositoryMap`.
 //!
 //! Golden-verified byte parity against the Python renderers.
 
@@ -352,19 +352,14 @@ fn render_pack_summary(pack: &Value) -> String {
 }
 
 fn render_explain(repo: &Path, task_text: &str) -> Result<String, String> {
-    // Python composed engine `inspect` (full map JSON) + `pack`, then
-    // rendered render_explain_repo_text from both payloads.
-    let map = crate::map::RepositoryMap::build_with_fragment_preference(repo, false, |_| {})
-        .map_err(|e| e.to_string())?
-        .0;
-    let mut inspect_raw = Vec::new();
-    crate::json::write_repository_map(&mut inspect_raw, &map).map_err(|e| e.to_string())?;
-    let inspect: Value =
-        serde_json::from_slice(&inspect_raw).map_err(|e| e.to_string())?;
     let pack: Value =
         serde_json::from_str(&pack_json(repo, task_text)?).map_err(|e| e.to_string())?;
+    Ok(render_explain_from_pack(&pack))
+}
 
-    let snapshot = &inspect["snapshot"];
+fn render_explain_from_pack(pack: &Value) -> String {
+    let summary = &pack["summary"];
+    let snapshot = &summary["snapshot"];
     let languages = snapshot
         .get("languages")
         .and_then(Value::as_array)
@@ -388,17 +383,11 @@ fn render_explain(repo: &Path, task_text: &str) -> Result<String, String> {
                 .join(", ")
         })
         .unwrap_or_default();
-    let count = |count_key: &str, list_key: &str| -> i64 {
-        inspect
+    let count = |count_key: &str| -> i64 {
+        summary
             .get(count_key)
             .and_then(Value::as_i64)
-            .unwrap_or_else(|| {
-                inspect
-                    .get(list_key)
-                    .and_then(Value::as_array)
-                    .map(|a| a.len() as i64)
-                    .unwrap_or(0)
-            })
+            .unwrap_or(0)
     };
     let mut lines = vec![
         format!(
@@ -407,11 +396,11 @@ fn render_explain(repo: &Path, task_text: &str) -> Result<String, String> {
         ),
         format!("Languages: {languages}"),
         format!("Top-level directories: {top_level_dirs}"),
-        format!("Files indexed: {}", count("files_count", "files")),
-        format!("Functions indexed: {}", count("functions_count", "functions")),
-        format!("Classes indexed: {}", count("classes_count", "classes")),
-        format!("Docs indexed: {}", count("docs_count", "docs")),
-        format!("Configs indexed: {}", count("configs_count", "configs")),
+        format!("Files indexed: {}", count("files_count")),
+        format!("Functions indexed: {}", count("functions_count")),
+        format!("Classes indexed: {}", count("classes_count")),
+        format!("Docs indexed: {}", count("docs_count")),
+        format!("Configs indexed: {}", count("configs_count")),
     ];
 
     let overview = &pack["overview"];
@@ -460,7 +449,7 @@ fn render_explain(repo: &Path, task_text: &str) -> Result<String, String> {
             }
         }
     }
-    Ok(lines.join("\n"))
+    lines.join("\n")
 }
 
 /// Python's `json.dumps(obj)` default: compact but with `", "` and
@@ -539,6 +528,48 @@ mod tests {
             rendered.contains("- src/big.py (120/300 lines)"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn explain_renderer_uses_context_pack_summary() {
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{"task":{"raw":"Explain this repo"},
+                "summary":{
+                    "snapshot":{"languages":["rust"],"top_level_dirs":["src"],"readme_path":"README.md"},
+                    "files_count":2,
+                    "functions_count":3,
+                    "classes_count":1,
+                    "docs_count":1,
+                    "configs_count":1
+                },
+                "overview":{
+                    "overview_docs":["README.md"],
+                    "code_areas":["src"],
+                    "reference_areas":["docs"],
+                    "subareas":["src/graph"],
+                    "entrypoints":["src/bin/aethyme.rs"],
+                    "key_configs":["Cargo.toml"],
+                    "representative_code_files":["src/lib.rs"],
+                    "representative_docs":["README.md"]
+                },
+                "navigation_order":["src/lib.rs"],
+                "risk_flags":[],
+                "confidence":{"anchor_confidence":0.85,"scope_confidence":0.8},
+                "budget":{"max_anchors":5,"max_files":8}}"#,
+        )
+        .unwrap();
+        let rendered = super::render_explain_from_pack(&payload);
+
+        assert!(rendered.contains("Task: Explain this repo"), "{rendered}");
+        assert!(rendered.contains("Languages: rust"), "{rendered}");
+        assert!(
+            rendered.contains("Top-level directories: src"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Files indexed: 2"), "{rendered}");
+        assert!(rendered.contains("Functions indexed: 3"), "{rendered}");
+        assert!(rendered.contains("README: README.md"), "{rendered}");
+        assert!(rendered.contains("- src/lib.rs"), "{rendered}");
     }
 
     #[test]
