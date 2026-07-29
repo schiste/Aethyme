@@ -32,7 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::graph::navigation::{task_anchors_view_redb, task_next_view_redb, task_scope_view_redb};
-use crate::graph::search::{SearchHit, symbol_search_redb};
+use crate::graph::search::{symbol_search_redb, SearchHit};
 use crate::model::edge::EdgeKind;
 use crate::model::task::TaskInput;
 #[cfg(test)]
@@ -310,6 +310,7 @@ pub struct ExploreSubsystem {
     pub role: String,
     pub confidence: f64,
     pub paths: Vec<String>,
+    pub token_subsystems: Vec<&'static str>,
     pub top_verification_targets: Vec<ExploreSubsystemTarget>,
     pub signals: Vec<String>,
     pub missing_coverage_warnings: Vec<String>,
@@ -883,7 +884,7 @@ impl std::fmt::Display for ExploreError {
 impl std::error::Error for ExploreError {}
 
 mod usage_boundary;
-pub use usage_boundary::{UsageBoundaryParams, explore_usage_boundary};
+pub use usage_boundary::{explore_usage_boundary, UsageBoundaryParams};
 
 // ── orchestration entry point ───────────────────────────────────────────
 
@@ -1200,8 +1201,8 @@ fn graph_store_observability(repo: &Path) -> serde_json::Value {
             "stale": stale,
             "store_modified_unix": store_modified,
             "newest_fragment_modified_unix": newest_fragment,
-            "source_of_truth": ".aethyme/graph/",
-            "derived_query_artifact": ".aethyme/graph_store.redb",
+            "source_of_truth": "graph_fragments",
+            "derived_query_artifact": "redb_graph_store",
         },
         "surface_flow_graph": surface_flow_graph,
         "graph_completeness_by_surface_type": completeness,
@@ -1323,8 +1324,8 @@ fn surface_flow_coverage(repo: &Path, fragments_path: &Path) -> serde_json::Valu
     serde_json::json!({
         "schema_version": SURFACE_FLOW_COVERAGE_SCHEMA_VERSION,
         "status": status,
-        "source_of_truth": ".aethyme/graph/",
-        "derived_query_artifact": ".aethyme/graph_store.redb",
+        "source_of_truth": "graph_fragments",
+        "derived_query_artifact": "redb_graph_store",
         "source_path_count_scanned": source_paths.len(),
         "indexed_path_count_scanned": indexed_paths.len(),
         "semantic_fragment_hit_count": semantic_hits.len(),
@@ -2175,7 +2176,8 @@ fn explore_subsystem_rankings(
 
     for summary in token_subsystems {
         let subsystem_id = match summary.id {
-            "api_keys" => "backend_validator",
+            "api_keys" if !summary_paths_are_only_ingress_proxy(summary) => "backend_validator",
+            "api_keys" => continue,
             "oidc"
             | "audit_jws"
             | "auth0_management"
@@ -2260,6 +2262,10 @@ fn explore_subsystem_rankings(
                     .then_with(|| left.target.cmp(&right.target))
                     .then_with(|| left.path.cmp(&right.path))
             });
+            let top_verification_targets = builder.targets.into_iter().take(3).collect::<Vec<_>>();
+            let signals = builder.signals.iter().take(10).cloned().collect::<Vec<_>>();
+            let token_subsystems =
+                token_subsystem_labels_from_signals_targets(&signals, &top_verification_targets);
             ExploreSubsystem {
                 rank: index + 1,
                 id: builder.id.to_string(),
@@ -2267,13 +2273,38 @@ fn explore_subsystem_rankings(
                 role: builder.role.to_string(),
                 confidence: confidence_from_subsystem_score(builder.score),
                 paths: builder.paths.iter().take(6).cloned().collect(),
-                top_verification_targets: builder.targets.into_iter().take(3).collect(),
-                signals: builder.signals.iter().take(10).cloned().collect(),
+                token_subsystems,
+                top_verification_targets,
+                signals,
                 missing_coverage_warnings: builder.warnings.iter().take(4).cloned().collect(),
             }
         })
         .take(4)
         .collect()
+}
+
+fn summary_paths_are_only_ingress_proxy(summary: &TokenSubsystemSummary) -> bool {
+    !summary.paths.is_empty()
+        && summary
+            .paths
+            .iter()
+            .all(|path| path_looks_ingress_proxy(path))
+}
+
+fn path_looks_ingress_proxy(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    contains_any_text(
+        &lower,
+        &[
+            "gcp-run-proxy",
+            "proxy/",
+            "proxy.",
+            "worker.",
+            "workers/",
+            "edge/",
+            "gateway/",
+        ],
+    )
 }
 
 fn add_surface_flow_candidate_subsystems(
@@ -2290,7 +2321,7 @@ fn add_surface_flow_candidate_subsystems(
         candidate.node.name.as_str(),
         candidate.node.path.as_deref(),
         &candidate.relation_kinds,
-        &candidate.matched_tokens,
+        &[],
     );
     for subsystem_id in
         classify_surface_subsystems(candidate.node.kind, &text, &candidate.relation_kinds)
@@ -2337,7 +2368,7 @@ fn add_surface_path_subsystems(
         path.path.as_str(),
         Some(path.path.as_str()),
         &path.relation_kinds,
-        &path.matched_tokens,
+        &[],
     );
     for subsystem_id in classify_surface_subsystems(node_kind, &text, &path.relation_kinds) {
         let builder = builders
@@ -2379,7 +2410,10 @@ fn add_redb_subsystem_candidate(
     )
     .to_ascii_lowercase();
     let relation_kinds = Vec::new();
-    let mut matched = classify_surface_subsystems(StoredNodeKind::File, &text, &relation_kinds);
+    let mut matched = classify_surface_subsystems(StoredNodeKind::File, &text, &relation_kinds)
+        .into_iter()
+        .filter(|id| *id != "backend_validator")
+        .collect::<Vec<_>>();
     for node in &subsystem.nodes {
         let node_text = surface_candidate_text(
             node.kind,
@@ -2388,7 +2422,7 @@ fn add_redb_subsystem_candidate(
             node.name.as_str(),
             node.path.as_deref(),
             &relation_kinds,
-            &subsystem.matched_tokens,
+            &[],
         );
         for id in classify_surface_subsystems(node.kind, &node_text, &relation_kinds) {
             if !matched.contains(&id) {
@@ -2555,30 +2589,46 @@ fn classify_surface_subsystems(
                 | EdgeKind::ValidatesCredential
         )
     });
-    let backend_text = contains_any_text(
+    let backend_text = contains_any_text(lower_text, &["backend/", "backend.", "server/", "api/"]);
+    let backend_validation_text = api_key
+        || contains_any_text(
+            lower_text,
+            &[
+                "bearer",
+                "credential",
+                "pk_",
+                "authenticate",
+                "authentication",
+                "authorize",
+                "permission",
+                "validate",
+                "validator",
+            ],
+        );
+    let ingress_proxy_text = path_looks_ingress_proxy(lower_text);
+    let backend_implementation_text = contains_any_text(
         lower_text,
         &[
-            "backend/",
-            "server/",
-            "api/",
-            "middleware",
-            "authenticate",
-            "authentication",
-            "authorize",
-            "permission",
-            "validate",
-            "validator",
+            "backend/api_keys",
+            "backend.api_keys",
+            "/api_keys",
+            "api_keys/",
         ],
     );
-    if api_key
-        || (!provider_or_secondary
-            && (credential_relation
-                || matches!(
-                    kind,
-                    StoredNodeKind::CredentialOperation
-                        | StoredNodeKind::MiddlewareInstallation
-                        | StoredNodeKind::RouteSurface
-                ) && backend_text))
+    let backend_candidate_kind = matches!(
+        kind,
+        StoredNodeKind::File
+            | StoredNodeKind::Function
+            | StoredNodeKind::Class
+            | StoredNodeKind::CredentialOperation
+            | StoredNodeKind::MiddlewareInstallation
+            | StoredNodeKind::RouteSurface
+    );
+    if !provider_or_secondary
+        && backend_text
+        && backend_validation_text
+        && (!ingress_proxy_text || backend_implementation_text)
+        && (api_key || credential_relation || backend_candidate_kind)
     {
         out.push("backend_validator");
     }
@@ -2650,11 +2700,15 @@ fn subsystem_crossing_hint(subsystems: &[ExploreSubsystem]) -> Option<String> {
     let ingress = subsystems
         .iter()
         .find(|subsystem| subsystem.role == "ingress_proxy")
-        .and_then(|subsystem| preferred_path(&subsystem.paths, &["gcp-run-proxy", "proxy"]));
+        .and_then(|subsystem| {
+            preferred_matching_path(&subsystem.paths, &["gcp-run-proxy", "proxy"])
+        });
     let backend = subsystems
         .iter()
         .find(|subsystem| subsystem.role == "backend_validator")
-        .and_then(|subsystem| preferred_path(&subsystem.paths, &["backend/api_keys", "api_keys"]));
+        .and_then(|subsystem| {
+            preferred_matching_path(&subsystem.paths, &["backend/api_keys", "api_keys"])
+        });
     match (ingress, backend) {
         (Some(ingress), Some(backend)) => Some(format!(
             "The likely inbound API-key path crosses {ingress} and {backend}. Verify proxy classification first, then backend validation."
@@ -2663,7 +2717,7 @@ fn subsystem_crossing_hint(subsystems: &[ExploreSubsystem]) -> Option<String> {
     }
 }
 
-fn preferred_path(paths: &[String], preferred_needles: &[&str]) -> Option<String> {
+fn preferred_matching_path(paths: &[String], preferred_needles: &[&str]) -> Option<String> {
     paths
         .iter()
         .find(|path| {
@@ -2673,7 +2727,6 @@ fn preferred_path(paths: &[String], preferred_needles: &[&str]) -> Option<String
                 .any(|needle| lower.contains(needle))
         })
         .cloned()
-        .or_else(|| paths.first().cloned())
 }
 
 fn subsystem_lane_ambiguity_value(subsystems: &[ExploreSubsystem]) -> serde_json::Value {
@@ -2692,7 +2745,7 @@ fn subsystem_lane_ambiguity_value(subsystems: &[ExploreSubsystem]) -> serde_json
                 "role": subsystem.role,
                 "confidence": subsystem.confidence,
                 "paths": subsystem.paths,
-                "token_subsystems": subsystem_token_subsystem_labels(subsystem),
+                "token_subsystems": subsystem.token_subsystems,
                 "signals": subsystem.signals,
                 "top_verification_targets": subsystem.top_verification_targets,
                 "missing_coverage_warnings": subsystem.missing_coverage_warnings,
@@ -2701,9 +2754,12 @@ fn subsystem_lane_ambiguity_value(subsystems: &[ExploreSubsystem]) -> serde_json
     })
 }
 
-fn subsystem_token_subsystem_labels(subsystem: &ExploreSubsystem) -> Vec<&'static str> {
+fn token_subsystem_labels_from_signals_targets(
+    signals: &[String],
+    targets: &[ExploreSubsystemTarget],
+) -> Vec<&'static str> {
     let mut labels = std::collections::BTreeSet::new();
-    for signal in &subsystem.signals {
+    for signal in signals {
         match signal.as_str() {
             "api_key_surface" | "token_subsystem:api_keys" => {
                 labels.insert("API keys");
@@ -2726,7 +2782,7 @@ fn subsystem_token_subsystem_labels(subsystem: &ExploreSubsystem) -> Vec<&'stati
             _ => {}
         }
     }
-    for target in &subsystem.top_verification_targets {
+    for target in targets {
         let text = format!(
             "{} {} {}",
             target.target,

@@ -3375,6 +3375,32 @@ fn tests_for_surface_or_symbol_from<D: ReadableDatabase>(
     Ok(out)
 }
 
+fn behavior_tests_for_task_from<D: ReadableDatabase, S: AsRef<str>>(
+    db: &D,
+    tokens: &[S],
+) -> Result<Vec<NodeDisplay>, GraphStoreError> {
+    let candidates = surface_flow_candidates_from(
+        db,
+        tokens,
+        |kind| kind == StoredNodeKind::BehaviorTestSurface,
+        &[EdgeKind::TestedBy, EdgeKind::ValidatesCredential],
+        generic_surface_term,
+        FLOW_QUERY_LIMIT,
+    )?;
+    let mut tests = BTreeMap::new();
+    for candidate in candidates {
+        tests.insert(candidate.node.id.clone(), candidate.node);
+    }
+    let mut out = tests.into_values().collect::<Vec<_>>();
+    out.sort_by(|left, right| {
+        left.display
+            .cmp(&right.display)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    out.truncate(FLOW_QUERY_LIMIT);
+    Ok(out)
+}
+
 fn subsystem_path_for_node<D: ReadableDatabase>(
     db: &D,
     node: &NodeDisplay,
@@ -3530,6 +3556,9 @@ fn coverage_for_task_class_from<D: ReadableDatabase>(
         for test in tests_for_surface_or_symbol_from(db, id)? {
             tests.insert(test.id.clone(), test);
         }
+    }
+    for test in behavior_tests_for_task_from(db, &tokens)? {
+        tests.insert(test.id.clone(), test);
     }
     let tests = tests.into_values().collect::<Vec<_>>();
 
