@@ -76,6 +76,15 @@ Python-invocation rows.
    byte-identical given identical inputs (same discipline as
    certify/scaffold, which tests already enforce). Golden-file tests on
    rendered AGENTS.md/skills replace the current partial checks.
+   **RESOLVED 2026-07-30 — deterministic except `generated_at`, by
+   design.** The onboarding artifact's `freshness` block carries the
+   deterministic staleness signals (`snapshot_key`, `commit`,
+   `repo_dirty`); `generated_at` is the human-facing wall-clock stamp
+   and stays `now_iso_utc()` — replacing it with e.g. the commit
+   timestamp would lie on dirty repos and add nothing the snapshot key
+   doesn't already provide. Parity/golden tooling scrubs the timestamp
+   (enhance-golden.sh already does); everything else renders
+   byte-identical given identical inputs.
 4. **One config surface.** Scattered env vars (`AETHYME_CACHE_DIR`,
    `AETHYME_ENGINE_TRANSPORT`, `AETHYME_REQUIRE_LOCAL_ENGINE`, …)
    consolidate into `.aethyme/config.toml` + a documented env override
