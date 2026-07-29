@@ -388,16 +388,24 @@ fn auth_surface_positive_contract_is_ranked_bounded_and_deterministic() {
     assert_eq!(first["schema_version"], "aethyme-explore-v1");
     assert_eq!(first["observability"]["graph_store"]["backend"], "redb");
     assert_eq!(first["observability"]["graph_store"]["status"], "fresh");
+    assert_eq!(
+        first["observability"]["output_profile"], "agent_compact",
+        "default show-observability should use the compact agent profile"
+    );
+    assert!(
+        first["output_chars_estimate"].as_u64().unwrap_or(0) > 0,
+        "output size estimate should be populated"
+    );
     assert!(
         first_metrics.duration_ms > 0 && second_metrics.duration_ms > 0,
         "wall-time capture should be populated: first={first_metrics:?}, second={second_metrics:?}"
     );
     assert!(
-        first_metrics.command_output_chars < 80_000,
+        first_metrics.command_output_chars < 20_000,
         "output should stay bounded: {first_metrics:?}"
     );
     assert!(
-        first_metrics.token_estimate < 20_000,
+        first_metrics.token_estimate < 5_000,
         "token estimate should stay bounded: {first_metrics:?}"
     );
     assert!(
