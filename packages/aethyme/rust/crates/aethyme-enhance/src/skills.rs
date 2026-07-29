@@ -15,6 +15,13 @@ use crate::templates::AETHYME_SKILL_FILES;
 
 const DEFAULT_RUNTIME_SKILLS: &[&str] = &["aethyme"];
 
+/// Skill names `remove_skills` sweeps. The Python original removed every
+/// target directory matching a `skills/` source-template name — at
+/// deletion time that set was `{aethyme, eval}` (the internal eval skill
+/// is never deployed by current tooling but may exist in repos enhanced
+/// by older versions). Sorted order preserved.
+const REMOVABLE_SKILLS: &[&str] = &["aethyme", "eval"];
+
 fn should_substitute(relative_path: &str) -> bool {
     // Python: markdown docs, shell scripts, and the extensionless
     // `aethyme-explore` wrapper.
@@ -86,7 +93,7 @@ pub fn remove_skills(target_repo: &Path) -> Result<Vec<String>, String> {
     if !dest_base.is_dir() {
         return Ok(removed);
     }
-    for skill_name in DEFAULT_RUNTIME_SKILLS {
+    for skill_name in REMOVABLE_SKILLS {
         let dest_dir = dest_base.join(skill_name);
         if dest_dir.exists() {
             std::fs::remove_dir_all(&dest_dir)
@@ -139,6 +146,20 @@ mod tests {
 
         assert_eq!(remove_skills(&repo).unwrap(), vec!["aethyme".to_string()]);
         assert!(!repo.join(".codex/skills/aethyme").exists());
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn remove_sweeps_legacy_eval_skill_too() {
+        let repo = fixture_repo("remove-eval");
+        deploy_skills(&repo, "/opt/ae", false).unwrap();
+        std::fs::create_dir_all(repo.join(".codex/skills/eval")).unwrap();
+        std::fs::write(repo.join(".codex/skills/eval/SKILL.md"), "old\n").unwrap();
+        assert_eq!(
+            remove_skills(&repo).unwrap(),
+            vec!["aethyme".to_string(), "eval".to_string()]
+        );
+        assert!(!repo.join(".codex/skills/eval").exists());
         std::fs::remove_dir_all(&repo).unwrap();
     }
 }
