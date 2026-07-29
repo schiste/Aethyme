@@ -634,8 +634,8 @@ observability must expose Surface/Flow coverage under:
       "fresh": true,
       "exists": true,
       "fragments_exist": true,
-      "source_of_truth": ".aethyme/graph/",
-      "derived_query_artifact": ".aethyme/graph_store.redb"
+      "source_of_truth": "graph_fragments",
+      "derived_query_artifact": "redb_graph_store"
     },
     "graph_store": {
       "backend": "redb",
@@ -646,8 +646,8 @@ observability must expose Surface/Flow coverage under:
     "surface_flow_graph": {
       "schema_version": 1,
       "status": "partial",
-      "source_of_truth": ".aethyme/graph/",
-      "derived_query_artifact": ".aethyme/graph_store.redb",
+      "source_of_truth": "graph_fragments",
+      "derived_query_artifact": "redb_graph_store",
       "coverage": {
         "backend": {
           "source_present": true,

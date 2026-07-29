@@ -312,14 +312,14 @@ call-site expansion, filename fallback, and compact `task-expand` output into:
 - `navigation_hints[]`: low-confidence investigation hints, including filename-only fallback candidates and suggested searches
 - `excluded[]`: out-of-scope areas or candidates
 - `ambiguous[]`: low-confidence or missing-anchor cases
-- `subsystems[]`: ranked subsystem lanes for ambiguous Surface/Flow tasks, including role, confidence, top verification targets, paths, signals, and missing-coverage warnings; broad auth/token requests use this to separate ingress/proxy, backend validation, and provider/OIDC/audit-style token systems before trusting a flat file ranking
+- `subsystems[]`: ranked subsystem lanes for ambiguous Surface/Flow tasks, including role, confidence, concrete `token_subsystems`, top verification targets, paths, signals, and missing-coverage warnings; broad auth/token requests use this to separate ingress/proxy, backend validation, and provider/OIDC/audit-style token systems before trusting a flat file ranking
 - `output_adapters.task_localization_json`: compact candidate file/symbol lists and expansion commands
 - `confidence`: answer-only, excluded-only, and analyzed confidence summaries
 - `safe_to_use_as_answer` / `trust_policy`: whether `answer[]` is authoritative enough to guide an answer, or only safe as navigation
 - `observability`: graph freshness, graph completeness by Surface/Flow type, indexed languages/frameworks, missing expected surfaces, ranking explainability, answer-safety mode, and readiness fields. Freshness alone is not enough: agents should require the graph to be fresh, complete enough for the request, and explainable before treating `answer[]` as answer-safe.
 
 For task/behavior localization, Explore observability includes:
-- `graph_freshness`: redb backend status, `fresh`, `stale`, fragment/store timestamps, `.aethyme/graph/` source-of-truth path, and `.aethyme/graph_store.redb` derived artifact path
+- `graph_freshness`: redb backend status, `fresh`, `stale`, fragment/store timestamps, and path-free artifact role labels (`source_of_truth=graph_fragments`, `derived_query_artifact=redb_graph_store`)
 - `graph_completeness_by_surface_type`: per-surface coverage for backend, edge/proxy, routes, middleware, webhooks, CLIs, jobs/queues, credential flows, and live behavior tests
 - `indexed_languages` / `indexed_frameworks`: language/framework signals inferred from indexed graph fragments, not from source files alone
 - `missing_expected_surfaces`: source-present surfaces that graph fragments did not fully index
