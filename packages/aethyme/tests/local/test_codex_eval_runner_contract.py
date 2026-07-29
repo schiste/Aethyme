@@ -57,6 +57,24 @@ def _surface_flow_observability(missing: list[str] | None = None) -> dict[str, o
     }
 
 
+def _surface_flow_subsystems(fixture_id: str) -> list[dict[str, object]]:
+    if fixture_id == "edge_proxy_backend_auth":
+        return [
+            {"role": "ingress_proxy", "top_verification_targets": ["gcp-run-proxy"]},
+            {"role": "backend_validator", "top_verification_targets": ["backend/api_keys"]},
+        ]
+    if fixture_id == "django_backend_auth":
+        return [{"role": "backend_validator", "top_verification_targets": ["backend/auth"]}]
+    if fixture_id in {"oidc_session_auth", "webhook_secret_auth"}:
+        return [
+            {
+                "role": "provider_or_secondary_token",
+                "top_verification_targets": ["backend/providers"],
+            }
+        ]
+    return [{"role": "ingress_proxy", "top_verification_targets": ["src/routes"]}]
+
+
 def _strict_gate_payload(
     *,
     arm: str,
@@ -71,6 +89,15 @@ def _strict_gate_payload(
     answer: str = "stable answer",
 ) -> dict[str, object]:
     invoked = arm == "aethyme" if aethyme_invoked is None else aethyme_invoked
+    structured_output: dict[str, object] = {
+        "selected_files": ["src/auth.py", "src/routes.py"],
+        "snippets": [{"path": "src/auth.py"}],
+        "answer": answer,
+        **_surface_flow_observability(missing_coverage or []),
+    }
+    if arm == "aethyme":
+        structured_output["subsystems"] = _surface_flow_subsystems(fixture_id)
+
     return {
         "arm": arm,
         "fixture_id": fixture_id,
@@ -86,18 +113,71 @@ def _strict_gate_payload(
             "selected_file_count": 2,
             "snippet_count": 1,
             "command_output_chars": command_output_chars,
+            "max_single_command_output_chars": command_output_chars,
+            "explore_output_chars": command_output_chars if arm == "aethyme" else 0,
+            "cumulative_replay_token_estimate": token_estimate,
             "generated_artifact_leaked": generated_artifact_leaked,
             "aethyme_path_leaked": generated_artifact_leaked,
             "aethyme_invoked": invoked,
+            "first_aethyme_call_before_broad_search": True if arm == "aethyme" else None,
+            "broad_rg_after_successful_explore": False,
+            "successful_explore_detected": arm == "aethyme",
+        },
+        "structured_output": structured_output,
+        "reviewer_quality_score": quality,
+    }
+
+
+def _event_gate_payload(
+    *,
+    arm: str,
+    event_log_file: Path | None = None,
+    fixture_id: str = "edge_proxy_backend_auth",
+    command_output_chars: int = 1_000,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "arm": arm,
+        "fixture_id": fixture_id,
+        "contract": {
+            "playground_repo": True,
+            "aethyme_self_eval": False,
+            "arm": arm,
+            "repo_path": f"/tmp/Playground/Demo/Demo - {arm.title()}",
+            "fixture_id": fixture_id,
+        },
+        "input_tokens": 800,
+        "output_tokens": 200,
+        "command_output_chars": command_output_chars,
+        "artifact_leakage": {
+            "generated_artifact_leaked": False,
+            "aethyme_path_leaked": False,
         },
         "structured_output": {
             "selected_files": ["src/auth.py", "src/routes.py"],
             "snippets": [{"path": "src/auth.py"}],
-            "answer": answer,
-            **_surface_flow_observability(missing_coverage or []),
+            "answer": "stable answer",
         },
-        "reviewer_quality_score": quality,
+        "reviewer_quality_score": 4.0,
     }
+    if event_log_file is not None:
+        payload["event_log_file"] = str(event_log_file)
+    return payload
+
+
+def _write_events(path: Path, events: list[dict[str, object]]) -> None:
+    path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+
+def _explore_output_with_lanes() -> str:
+    return json.dumps(
+        {
+            "subsystems": _surface_flow_subsystems("edge_proxy_backend_auth"),
+            "observability": _surface_flow_observability()["observability"],
+        }
+    )
 
 
 def test_control_command_uses_clean_codex_runner_without_tool_repo() -> None:
@@ -350,7 +430,7 @@ def test_runner_invocation_detection_handles_shell_wrapped_command(tmp_path: Pat
                     "command": (
                         "/bin/zsh -lc "
                         "'/tmp/aethyme/rust/target/release/aethyme explore "
-                        "--repo \"$PWD\" --format answer-json'"
+                        '--repo "$PWD" --format answer-json\''
                     )
                 },
             }
@@ -613,7 +693,7 @@ def test_regression_gate_can_infer_shell_wrapped_aethyme_invocation(tmp_path: Pa
                     "command": (
                         "/bin/zsh -lc "
                         "'/tmp/aethyme/rust/target/release/aethyme explore "
-                        "--repo \"$PWD\" --show-observability'"
+                        '--repo "$PWD" --show-observability\''
                     )
                 },
             }
@@ -641,6 +721,139 @@ def test_regression_gate_can_infer_shell_wrapped_aethyme_invocation(tmp_path: Pa
 
     assert report["passed"] is True
     assert report["aethyme_metrics"]["aethyme_invoked"] is True
+
+
+def test_regression_gate_enforces_single_command_and_explore_output_caps(
+    tmp_path: Path,
+) -> None:
+    gate = _load_gate()
+    events_file = tmp_path / "events.jsonl"
+    explore_output = _explore_output_with_lanes()
+    _write_events(
+        events_file,
+        [
+            {
+                "type": "item.completed",
+                "item": {
+                    "cmd": ["aethyme", "explore", "--request", "auth token"],
+                    "stdout": explore_output,
+                },
+            }
+        ],
+    )
+    control = _event_gate_payload(arm="control", command_output_chars=100)
+    aethyme = _event_gate_payload(
+        arm="aethyme",
+        event_log_file=events_file,
+        command_output_chars=len(explore_output),
+    )
+
+    report = gate.compare_runs(
+        control,
+        aethyme,
+        command_output_delta_ratio=10.0,
+        max_command_output_chars=10_000,
+        max_single_command_output_chars=40,
+        max_explore_output_chars=40,
+    )
+
+    assert report["passed"] is False
+    failures = {check["name"] for check in report["checks"] if not check["passed"]}
+    assert "aethyme_single_command_output_bounded" in failures
+    assert "aethyme_explore_output_bounded" in failures
+
+
+def test_regression_gate_enforces_cumulative_replay_estimate_cap() -> None:
+    gate = _load_gate()
+    control = _strict_gate_payload(arm="control", token_estimate=400)
+    aethyme = _strict_gate_payload(arm="aethyme")
+    aethyme["regression_metrics"]["cumulative_replay_token_estimate"] = 900
+
+    report = gate.compare_runs(
+        control,
+        aethyme,
+        token_delta_ratio=10.0,
+        max_cumulative_replay_estimate=500,
+    )
+
+    assert report["passed"] is False
+    failures = {check["name"] for check in report["checks"] if not check["passed"]}
+    assert failures == {"aethyme_cumulative_replay_estimate_bounded"}
+
+
+def test_regression_gate_requires_first_aethyme_call_before_broad_search(
+    tmp_path: Path,
+) -> None:
+    gate = _load_gate()
+    events_file = tmp_path / "events.jsonl"
+    _write_events(
+        events_file,
+        [
+            {
+                "type": "item.completed",
+                "item": {"cmd": ["rg", "auth"], "stdout": "src/auth.py\n"},
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "cmd": ["aethyme", "explore", "--request", "auth token"],
+                    "stdout": _explore_output_with_lanes(),
+                },
+            },
+        ],
+    )
+    control = _event_gate_payload(arm="control")
+    aethyme = _event_gate_payload(arm="aethyme", event_log_file=events_file)
+
+    report = gate.compare_runs(
+        control,
+        aethyme,
+        command_output_delta_ratio=10.0,
+        require_event_sequence=True,
+    )
+
+    assert report["passed"] is False
+    failures = {check["name"] for check in report["checks"] if not check["passed"]}
+    assert "aethyme_first_call_before_broad_search" in failures
+
+
+def test_regression_gate_warns_on_broad_rg_after_successful_explore(
+    tmp_path: Path,
+) -> None:
+    gate = _load_gate()
+    events_file = tmp_path / "events.jsonl"
+    _write_events(
+        events_file,
+        [
+            {
+                "type": "item.completed",
+                "item": {
+                    "cmd": ["aethyme", "explore", "--request", "auth token"],
+                    "stdout": _explore_output_with_lanes(),
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {"cmd": ["rg", "auth"], "stdout": "src/auth.py\n"},
+            },
+        ],
+    )
+    control = _event_gate_payload(arm="control")
+    aethyme = _event_gate_payload(arm="aethyme", event_log_file=events_file)
+
+    report = gate.compare_runs(
+        control,
+        aethyme,
+        command_output_delta_ratio=10.0,
+        require_event_sequence=True,
+    )
+
+    assert report["passed"] is True
+    warning = next(
+        check for check in report["checks"] if check["name"] == "broad_rg_after_successful_explore"
+    )
+    assert warning["warning"] is True
+    assert warning["commands"] == ["rg auth"]
 
 
 def test_regression_gate_does_not_infer_invocation_from_text_mentions(tmp_path: Path) -> None:
@@ -872,15 +1085,41 @@ def test_regression_gate_fails_when_missing_coverage_is_hidden() -> None:
     assert coverage_check["hidden_missing_coverage"] == ["edge_proxy"]
 
 
+def test_regression_gate_requires_surface_flow_lanes_for_auth_token_tasks() -> None:
+    gate = _load_gate()
+    control = _strict_gate_payload(arm="control")
+    aethyme = _strict_gate_payload(arm="aethyme")
+    aethyme["structured_output"].pop("subsystems")
+
+    report = gate.compare_runs(
+        control,
+        aethyme,
+        fixture_id="edge_proxy_backend_auth",
+        require_auth_surface_lanes=True,
+    )
+
+    assert report["passed"] is False
+    lane_check = next(
+        check
+        for check in report["checks"]
+        if check["name"] == "auth_token_surface_flow_lanes_present"
+    )
+    assert lane_check["missing_roles"] == ["backend_validator", "ingress_proxy"]
+
+
 def test_regression_gate_reads_coverage_from_aethyme_command_output(tmp_path: Path) -> None:
     gate = _load_gate()
     events_file = tmp_path / "events.jsonl"
+    explore_output = {
+        **_surface_flow_observability(["webhook"]),
+        "subsystems": _surface_flow_subsystems("edge_proxy_backend_auth"),
+    }
     events_file.write_text(
         json.dumps(
             {
                 "type": "item.completed",
                 "item": {
-                    "stdout": json.dumps(_surface_flow_observability(["webhook"])),
+                    "stdout": json.dumps(explore_output),
                 },
             }
         )

@@ -261,17 +261,21 @@ Compare a completed pair with the metric gate:
 ```
 
 The gate checks token estimate delta, selected file count delta, snippet count
-delta, command-output char delta plus an absolute command-output cap,
-generated-artifact leakage, Aethyme invocation, deterministic repeat output,
-Surface/Flow coverage reporting, and reviewer-rubric quality. It intentionally
-does not require selected-file identity equality. Missing reviewer scores fail
-the gate unless `--allow-missing-quality` is passed for an exploratory dry run.
-Missing repeat results or missing Surface/Flow coverage fail the strict gate;
-use `--allow-missing-determinism` or `--allow-missing-coverage-report` only for
-dry runs that will not be interpreted as V2 evidence. Missing or malformed
-budget/hygiene metrics fail rather than being treated as zero. Aethyme
-invocation is recognized from command metadata, not from stdout or prose
-mentions of commands.
+delta, command-output char delta plus total/per-command command-output caps,
+Explore output size, cumulative replay-token estimate, generated-artifact
+leakage, Aethyme invocation, first Aethyme call before broad repo search,
+deterministic repeat output, Surface/Flow coverage reporting, auth/token
+Surface/Flow lane presence, and reviewer-rubric quality. It intentionally does
+not require selected-file identity equality. A broad `rg` after successful
+Explore is reported as a warning because it usually explains overspend, but it
+does not by itself fail an otherwise interpretable A/B result. Missing reviewer
+scores fail the gate unless `--allow-missing-quality` is passed for an
+exploratory dry run. Missing repeat results, missing Surface/Flow coverage,
+missing event sequencing, or missing auth/token subsystem lanes fail the strict
+gate; use the corresponding `--allow-missing-*` option only for dry runs that
+will not be interpreted as V2 evidence. Missing or malformed budget/hygiene
+metrics fail rather than being treated as zero. Aethyme invocation is recognized
+from command metadata, not from stdout or prose mentions of commands.
 
 For the full V2 suite, use a manifest so the fixture-family coverage is checked
 as part of the same gate:
