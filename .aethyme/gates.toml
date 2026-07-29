@@ -36,6 +36,11 @@ triggers = [
     "packages/aethyme/skills/**",
     "packages/aethyme/evals/**",
     "packages/aethyme/pyproject.toml",
+    # 2026-07-29: tests/local is implementation-blind since the
+    # retirement flips — it drives the aethyme binary, so RUST changes
+    # can break it. A rust-only entry previously skipped this gate and
+    # shipped a task-next regression (Surface/Flow anchors) unguarded.
+    "packages/aethyme/rust/**",
 ]
 
 [[gate]]
