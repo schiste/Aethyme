@@ -108,6 +108,12 @@ check_root_guidance() {
     grep -q 'verify-targets' "$file" \
         && check_pass "$label uses bounded verify-targets source spans" \
         || check_fail "$label missing bounded verify-targets source spans"
+    grep -q '120 output lines / 20k chars' "$file" \
+        && check_pass "$label caps manual source output" \
+        || check_fail "$label missing manual source-output cap"
+    grep -q 'multi-file `sed`' "$file" \
+        && check_pass "$label blocks multi-file source dumps" \
+        || check_fail "$label missing multi-file source-dump guard"
     grep -q 'navigation_hints\[\]' "$file" \
         && check_fail "$label still tells agents to inspect navigation_hints[]" \
         || check_pass "$label does not inspect navigation_hints[] by default"
@@ -219,7 +225,8 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
         grep -q 'top_verification_targets' "$SKILL_FILE" && check_pass "Skill prints compact verification-target projection" || check_fail "Skill missing compact verification-target projection"
         grep -q 'observability.readiness' "$SKILL_FILE" && check_pass "Skill inspects compact readiness" || check_fail "Skill missing readiness-only observability guidance"
         grep -q 'verify-targets' "$SKILL_FILE" && check_pass "Skill uses bounded verify-targets source spans" || check_fail "Skill missing bounded verify-targets source spans"
-        grep -q '80-120' "$SKILL_FILE" && check_pass "Skill caps narrow source reads" || check_fail "Skill missing narrow source-read cap"
+        grep -q '120 output lines / 20k chars' "$SKILL_FILE" && check_pass "Skill caps manual source output" || check_fail "Skill missing manual source-output cap"
+        grep -q 'multi-file `sed`' "$SKILL_FILE" && check_pass "Skill blocks multi-file source dumps" || check_fail "Skill missing multi-file source-dump guard"
         grep -q 'broad `rg`' "$SKILL_FILE" && check_pass "Skill blocks broad rg until top targets fail" || check_fail "Skill missing broad-rg guard"
         grep -q 'navigation_hints\[\]' "$SKILL_FILE" && check_fail "Skill still tells agents to inspect navigation_hints[]" || check_pass "Skill does not inspect navigation_hints[] by default"
         (grep -q '"$AETHYME_BIN" explore' "$SKILL_FILE" || grep -q 'aethyme explore' "$SKILL_FILE") \
