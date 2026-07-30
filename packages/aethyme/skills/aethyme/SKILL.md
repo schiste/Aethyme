@@ -7,46 +7,68 @@ description: Use Aethyme's high-level Explore intents, current repository
 
 # Aethyme Navigation
 
-Use this skill when the task needs repository navigation, task localization,
-caller/callee tracing, API/dead-code analysis, graph context, or a compact task
-pack. Do not load every reference by default; start with the short contract
-below and load only the relevant reference if the first result is insufficient.
+Use this skill for repository navigation, task localization, caller tracing,
+dead-code analysis, graph context, or compact task packs. Start with this
+contract; load a reference only if the first result is insufficient.
 
 ## Setup
 
 ```bash
 AETHYME_ROOT="{{AETHYME_ROOT}}"
 AETHYME_BIN="$AETHYME_ROOT/rust/target/release/aethyme"
+AETHYME_PY="$AETHYME_ROOT/.venv/bin/python"
 REPO="$PWD"
 ```
 
-Important: `python -m src.cli ...` commands are retired. Graph, task, facts,
-intents, analyze, and enhance all run through the `aethyme` binary; `explore`
-runs only through the native binary.
+Important: `python -m src.cli ...` commands are retired. Use the `aethyme`
+binary for graph, task, facts, intents, analyze, enhance, and Explore.
 
 ## Default Contract
 
-1. Make one bounded Explore call before broad manual search:
+1. Make one bounded Explore call before broad manual search. Save the full JSON
+   to a temp file and print only the compact projection:
 
-   ```bash
-   "$AETHYME_BIN" explore --repo "$REPO" --request "<user request>" --format answer-json --show-observability --depth 0
-   ```
+```bash
+AETHYME_JSON="$(mktemp -t aethyme-explore.XXXXXX.json)"
+"$AETHYME_BIN" explore --repo "$REPO" --request "<user request>" --format answer-json --show-observability --depth 0 > "$AETHYME_JSON"
+"$AETHYME_PY" - "$AETHYME_JSON" <<'PY'
+import json, sys; d = json.load(open(sys.argv[1], encoding="utf-8"))
+targets = []; lanes = d.get("subsystems", [])[:3]
+subsystems = [{k: lane.get(k) for k in ("rank", "id", "label", "role", "confidence", "token_subsystems", "missing_coverage_warnings")} for lane in lanes]
+for lane in lanes:
+    for target in lane.get("top_verification_targets", [])[:2]:
+        if isinstance(target, dict):
+            row = dict(target); row.setdefault("subsystem", lane.get("role") or lane.get("id"))
+            targets.append(row)
+print(json.dumps({
+    "safe_to_use_as_answer": d.get("safe_to_use_as_answer"),
+    "trust_policy": d.get("trust_policy"),
+    "subsystems": subsystems,
+    "top_verification_targets": targets[:6],
+    "verification_steps": d.get("verification_steps", [])[:3],
+    "observability": {"readiness": d.get("observability", {}).get("readiness")},
+}, indent=2))
+PY
+```
 
-2. Inspect these fields before trusting the result:
-   `safe_to_use_as_answer`, `trust_policy`, `observability`,
-   `degraded_reasons`, `answer[]`, `navigation_hints[]`, and
-   `verification_steps[]`.
+2. Inspect only: `safe_to_use_as_answer`, `trust_policy`, `subsystems`,
+   `top_verification_targets`, `verification_steps`, and
+   `observability.readiness`.
 
-3. If `safe_to_use_as_answer=true` and the evidence names concrete files or
-   symbols, verify narrowly by reading those files or grepping those symbols.
-   Do not repeat a broad `rg --files` or repository-wide grep just because the
-   tool returned something.
+3. Verify with bounded source spans before manual reads:
 
-4. If `safe_to_use_as_answer=false`, treat `answer[]` and
-   `navigation_hints[]` as an investigation plan. Follow
-   `verification_steps[]`; widen search only after the hints fail.
+```bash
+"$AETHYME_BIN" verify-targets --repo "$REPO" --from "$AETHYME_JSON" --max-targets 2 --max-lines 80
+```
 
-5. Escalate deliberately. Prefer one deeper Explore call over several unrelated
+4. Use the returned spans first. Read full target files only if those spans are
+   insufficient: at most 2-3 files, about 80-120 relevant lines each.
+
+5. If `safe_to_use_as_answer=false`, follow `verification_steps` and the top
+   subsystem lanes as an investigation plan. Do not run broad `rg`, `rg
+   --files`, or repository-wide grep unless the top targets fail.
+
+6. Escalate deliberately. Prefer one deeper Explore call over several unrelated
    commands. Use `--depth 1/2/3` only when the previous result did not provide
    enough evidence to act.
 
@@ -58,11 +80,6 @@ runs only through the native binary.
   context-pack, and prompt-pack commands.
 - `references/dead-code.md`: usage-boundary, dead-code, public API, facts, and
   ambiguity handling.
-
-## Non-Explore Commands
-
-Use the Python CLI for non-Explore surfaces such as `graph`, `task`, `intents`,
-`facts`, and `analyze`. The exact commands live in the references above.
 
 ## When Not To Use Aethyme
 

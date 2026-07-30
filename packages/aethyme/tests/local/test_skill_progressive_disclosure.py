@@ -26,6 +26,7 @@ from tests.support.cli_invoke import invoke_aethyme
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL_PATH = REPO_ROOT / "skills" / "aethyme" / "SKILL.md"
+AGENTS_PATH = REPO_ROOT / "skills" / "aethyme" / "AGENTS.md"
 EXPLORE_REF_PATH = REPO_ROOT / "skills" / "aethyme" / "references" / "explore.md"
 GRAPH_REF_PATH = REPO_ROOT / "skills" / "aethyme" / "references" / "graph-task.md"
 DEAD_CODE_REF_PATH = REPO_ROOT / "skills" / "aethyme" / "references" / "dead-code.md"
@@ -46,11 +47,27 @@ def test_skill_md_is_concise_auto_load_card():
         "workflows into references/*.md"
     )
     assert "one bounded Explore call" in text
+    assert "mktemp -t aethyme-explore" in text
     assert "safe_to_use_as_answer" in text
-    assert "observability" in text
+    assert "top_verification_targets" in text
+    assert "observability.readiness" in text
+    assert "verify-targets" in text
+    assert "80-120" in text
+    assert "broad `rg`" in text
+    assert "navigation_hints[]" not in text
     assert "references/explore.md" in text
     assert "references/graph-task.md" in text
     assert "references/dead-code.md" in text
+
+
+def test_generated_agents_template_uses_projection_contract():
+    text = AGENTS_PATH.read_text()
+    assert "mktemp -t aethyme-explore" in text
+    assert "top_verification_targets" in text
+    assert "observability.readiness" in text
+    assert "verify-targets" in text
+    assert "80-120" in text
+    assert "navigation_hints[]" not in text
 
 
 def test_reference_files_exist():
