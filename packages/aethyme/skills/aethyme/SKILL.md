@@ -61,12 +61,14 @@ PY
 "$AETHYME_BIN" verify-targets --repo "$REPO" --from "$AETHYME_JSON" --max-targets 2 --max-lines 80
 ```
 
-4. Use the returned spans first. Read full target files only if those spans are
-   insufficient: at most 2-3 files, about 80-120 relevant lines each.
+4. Use the returned spans first. If still unverified, read one missing line range
+   at a time. Keep each manual command under about 120 output lines / 20k chars
+   and the whole post-Explore source verification under about 200 lines.
 
 5. If `safe_to_use_as_answer=false`, follow `verification_steps` and the top
    subsystem lanes as an investigation plan. Do not run broad `rg`, `rg
-   --files`, or repository-wide grep unless the top targets fail.
+   --files`, repository-wide grep, multi-file `sed`, or `rg -C` context dumps
+   unless the top targets fail.
 
 6. Escalate deliberately. Prefer one deeper Explore call over several unrelated
    commands. Use `--depth 1/2/3` only when the previous result did not provide
@@ -74,12 +76,9 @@ PY
 
 ## Load References Only When Needed
 
-- `references/explore.md`: depth ladder, intent choice, trust/observability,
-  and bounded retry rules.
-- `references/graph-task.md`: graph views, callers/callees, task scope,
-  context-pack, and prompt-pack commands.
-- `references/dead-code.md`: usage-boundary, dead-code, public API, facts, and
-  ambiguity handling.
+- `references/explore.md`: depth, intent, trust/observability, retry rules.
+- `references/graph-task.md`: graph views, task scope, context/prompt packs.
+- `references/dead-code.md`: usage-boundary, public API, facts, ambiguity.
 
 ## When Not To Use Aethyme
 

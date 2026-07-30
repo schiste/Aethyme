@@ -47,9 +47,11 @@ for audit/debug or a later `--detail full` comparison; do not dump it into the
 conversation by default.
 
 Verify from the bounded source spans first. Read full target files only if
-those spans are insufficient: at most 2-3 files, about 80-120 relevant lines
-each. Do not run broad `rg`, `rg --files`, or repository-wide grep unless the
-top targets fail.
+those spans are insufficient. Read only the missing line range from one target
+at a time, keep each manual verification command under about 120 output lines /
+20k chars, and keep the whole post-Explore source verification under about 200
+lines. Do not run broad `rg`, `rg --files`, repository-wide grep, multi-file
+`sed`, or `rg -C` context dumps unless the top targets fail.
 
 ## Progressive Disclosure: `--depth`
 

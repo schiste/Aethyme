@@ -1196,6 +1196,83 @@ def test_regression_gate_requires_surface_flow_lanes_for_auth_token_tasks() -> N
     assert lane_check["missing_roles"] == ["backend_validator", "ingress_proxy"]
 
 
+def test_regression_gate_accepts_user_facing_surface_flow_role_aliases() -> None:
+    gate = _load_gate()
+    control = _strict_gate_payload(arm="control")
+    aethyme = _strict_gate_payload(arm="aethyme")
+    aethyme["structured_output"]["subsystems"] = [
+        {
+            "role": "edge credential transport",
+            "top_verification_targets": ["gcp-run-proxy/src/worker.mjs"],
+        },
+        {
+            "role": "authoritative pk validator",
+            "top_verification_targets": ["backend/api_keys/middleware.py"],
+        },
+    ]
+
+    report = gate.compare_runs(
+        control,
+        aethyme,
+        fixture_id="edge_proxy_backend_auth",
+        require_auth_surface_lanes=True,
+    )
+
+    assert report["passed"] is True
+    lane_check = next(
+        check
+        for check in report["checks"]
+        if check["name"] == "auth_token_surface_flow_lanes_present"
+    )
+    assert set(lane_check["roles"]) >= {"backend_validator", "ingress_proxy"}
+
+
+def test_regression_gate_merges_surface_flow_lanes_from_pretty_command_output(
+    tmp_path: Path,
+) -> None:
+    gate = _load_gate()
+    events_file = tmp_path / "events.jsonl"
+    explore_output = {
+        "subsystems": _surface_flow_subsystems("edge_proxy_backend_auth"),
+    }
+    events_file.write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "aggregated_output": "projection follows:\n"
+                    + json.dumps(explore_output, indent=2)
+                    + "\nsource verification follows",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    control = _strict_gate_payload(arm="control")
+    aethyme = _strict_gate_payload(arm="aethyme")
+    aethyme["structured_output"]["subsystems"] = [
+        {"role": "edge credential transport", "top_verification_targets": ["proxy"]},
+    ]
+    aethyme["regression_metrics"]["surface_flow_lane_roles"] = ["edge credential transport"]
+    aethyme["event_log_file"] = str(events_file)
+
+    report = gate.compare_runs(
+        control,
+        aethyme,
+        fixture_id="edge_proxy_backend_auth",
+        require_auth_surface_lanes=True,
+    )
+
+    assert report["passed"] is True
+    lane_check = next(
+        check
+        for check in report["checks"]
+        if check["name"] == "auth_token_surface_flow_lanes_present"
+    )
+    assert set(lane_check["roles"]) >= {"backend_validator", "ingress_proxy"}
+
+
 def test_regression_gate_reads_coverage_from_aethyme_command_output(tmp_path: Path) -> None:
     gate = _load_gate()
     events_file = tmp_path / "events.jsonl"
