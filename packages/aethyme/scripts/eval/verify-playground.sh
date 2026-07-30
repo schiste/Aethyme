@@ -61,9 +61,31 @@ count_git_refs() {
 check_ignored_path() {
     local generated_path="$1"
     local label="$2"
-    git check-ignore -q -- "$generated_path" \
+    git check-ignore --no-index -q -- "$generated_path" \
         && check_pass "$label ignored for ordinary discovery" \
         || check_fail "$label is not ignored by .git/info/exclude"
+}
+visible_agent_guidance_files() {
+    local mode="${1:-all}"
+
+    if [[ "$mode" == "allow-root" ]]; then
+        find . \( -path ./.git -o -path ./.codex -o -path ./.claude -o -path ./.aethyme -o -path ./.chau7 \) -prune \
+            -o \( -path ./AGENTS.md -o -path ./CLAUDE.md \) -prune \
+            -o \( -name AGENTS.md -o -name CLAUDE.md \) -type f -print
+    else
+        find . \( -path ./.git -o -path ./.codex -o -path ./.claude -o -path ./.aethyme -o -path ./.chau7 \) -prune \
+            -o \( -name AGENTS.md -o -name CLAUDE.md \) -type f -print
+    fi
+}
+check_no_agent_guidance_files() {
+    local mode="$1"
+    local label="$2"
+    local visible
+
+    visible="$(visible_agent_guidance_files "$mode")"
+    [[ -z "$visible" ]] \
+        && check_pass "$label hidden from working-tree discovery" \
+        || check_fail "$label still visible: ${visible//$'\n'/, }"
 }
 check_root_guidance() {
     local file="$1"
@@ -152,6 +174,8 @@ if [[ -d "$CONTROL_DIR/.git" ]]; then
     # No uncommitted changes
     DIRTY=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
     [[ "$DIRTY" == "0" ]] && check_pass "Clean working tree" || check_warn "$DIRTY uncommitted change(s)"
+
+    check_no_agent_guidance_files "all" "Control agent guidance files"
 fi
 
 echo ""
@@ -182,6 +206,7 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
     [[ -d .codex/skills/eval ]] && check_fail "Internal eval skill leaked into playground" || check_pass "No internal eval skill deployed"
     check_root_guidance "AGENTS.md" "AGENTS.md"
     check_root_guidance "CLAUDE.md" "CLAUDE.md"
+    check_no_agent_guidance_files "allow-root" "Source-side agent guidance files"
 
     # Skill has no unresolved placeholders and keeps auto-load concise. Detailed
     # command workflows live in references/ and are checked below.
@@ -264,6 +289,8 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
     check_ignored_path ".claude/skills/aethyme/SKILL.md" "Claude Aethyme skill"
     check_ignored_path "AGENTS.md" "Generated AGENTS.md"
     check_ignored_path "CLAUDE.md" "Generated CLAUDE.md"
+    check_ignored_path "docs/AGENTS.md" "Nested AGENTS.md"
+    check_ignored_path "docs/CLAUDE.md" "Nested CLAUDE.md"
 
     DIRTY=$(git status --porcelain --untracked-files=all 2>/dev/null | wc -l | tr -d ' ')
     [[ "$DIRTY" == "0" ]] && check_pass "Generated artifacts hidden from git status" || check_fail "$DIRTY visible working-tree change(s)"
