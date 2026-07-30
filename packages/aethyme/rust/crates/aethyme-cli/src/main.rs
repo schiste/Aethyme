@@ -145,6 +145,14 @@ fn main() -> ExitCode {
         // native groups — there is no Python surface to delegate to.
         // The package root is still resolved: rendered templates embed
         // `{{AETHYME_ROOT}}` substitutions pointing at the checkout.
+        // Native since python-retirement Phase 4 (the Python `ai-ready`
+        // command and src/scorecard/ are deleted). The 8 detectors,
+        // integer scoring, and json/md renderers live in the
+        // aethyme-quality crate; stdout and report bytes are parity-
+        // verified against the last Python implementation. Usage errors
+        // keep Click's `Error: {message}` line without the usage block
+        // (Phase 2 precedent).
+        "ai-ready" => ExitCode::from(aethyme_quality::ai_ready_cli::run(&args[1..])),
         "enhance" => {
             let Some((aethyme_root, _source)) = resolve_aethyme_root() else {
                 eprintln!(
@@ -200,7 +208,7 @@ fn print_top_level_help() {
     );
     eprintln!();
     eprintln!("Everything else delegates to the Python CLI:");
-    eprintln!("  ai-ready, autofix, ...");
+    eprintln!("  autofix, ...");
 }
 
 // ── explore ─────────────────────────────────────────────────────────────────

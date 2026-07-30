@@ -12,6 +12,7 @@
 //! purpose (see per-detector comments); improvements — graph-backed
 //! detection, smarter heuristics — are V2 material, not this port.
 
+pub mod ai_ready_cli;
 pub mod detectors;
 pub mod engine;
 pub mod format;

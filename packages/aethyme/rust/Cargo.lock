@@ -38,6 +38,7 @@ dependencies = [
  "aethyme-broker",
  "aethyme-engine",
  "aethyme-enhance",
+ "aethyme-quality",
  "libc",
 ]
 
