@@ -1,11 +1,11 @@
 //! Native `aethyme repo` basics (python-retirement Phase 1 closeout).
 //!
-//! Only the engine-facing basics flip here: `ingest`, `inspect`,
+//! Only the engine-facing basics live here: `ingest`, `inspect`,
 //! `clear-cache`, `warm`, and `engine-info`. The rest of the repo group
 //! (skills deploy/compile, onboarding/agents overrides, commit hygiene,
-//! telemetry, record-wrapper-invocation) is Phase 2–3 material and
-//! still delegates to Python — [`run`] returns [`Outcome::Delegate`]
-//! for those so the router falls through.
+//! telemetry, record-wrapper-invocation) is native too since the
+//! Phase 3 flip — [`run`] returns [`Outcome::Delegate`] for those and
+//! the router falls through to `aethyme_enhance::repo_cli`.
 //!
 //! Sanctioned reinterpretations (recorded in cli-surface-v1.md): the
 //! transport/cache era ended, so `engine-info` now reports binary/

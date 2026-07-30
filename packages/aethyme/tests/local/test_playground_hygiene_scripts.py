@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from src.enhance import AGENTS_OVERRIDE_PATH
 from tests.support.cli_invoke import invoke_aethyme
+
+# Frozen contract path (was src.enhance.AGENTS_OVERRIDE_PATH; the Python
+# module is deleted — the aethyme-enhance crate owns the constant now).
+AGENTS_OVERRIDE_PATH = ".aethyme/overrides/agents.json"
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS_DIR = _PACKAGE_ROOT / "scripts" / "eval"

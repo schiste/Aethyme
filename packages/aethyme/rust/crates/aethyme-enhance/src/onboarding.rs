@@ -1,8 +1,7 @@
 //! Deterministic repo-onboarding skill generation — byte-parity port of
-//! the parts of `src/indexing/onboarding.py` that `enhance deploy`/
-//! `verify` invoke (artifact building, skill rendering, override
-//! application, freshness, recommendation). The onboarding CLI helpers
-//! (init/validate overrides) stay Python until Phase 3.
+//! `src/indexing/onboarding.py` (artifact building, skill rendering,
+//! override init/validate, freshness, recommendation). The onboarding
+//! CLI helpers dispatch here via `repo_cli` since the Phase 3 flip.
 //!
 //! All JSON is built as ordered [`Value`]s so `json.dumps(..., indent=2)`
 //! byte shapes survive the port, including override-injected content.
@@ -1754,6 +1753,121 @@ fn apply_overrides(artifact: &mut Value, overrides: &Value) -> Result<(), String
     Ok(())
 }
 
+/// `override_template`: the starter onboarding override for maintainers.
+pub fn override_template() -> Value {
+    obj(vec![
+        ("repo", obj(vec![("kind", Value::str("service"))])),
+        (
+            "commands",
+            Value::Array(vec![obj(vec![
+                ("kind", Value::str("test")),
+                ("command", Value::str("./scripts/test-fast.sh")),
+                ("source", Value::str("manual-override")),
+                ("confidence", Value::str("high")),
+            ])]),
+        ),
+        (
+            "notes",
+            str_list(&[
+                "Use sandbox credentials from 1Password.",
+                "Do not edit generated files under src/gen directly.",
+            ]),
+        ),
+        (
+            "summon",
+            obj(vec![
+                (
+                    "recommended_when",
+                    str_list(&["first touch", "broad task"]),
+                ),
+                ("skip_when", str_list(&["single known file"])),
+            ]),
+        ),
+    ])
+}
+
+/// Python `json.JSONDecodeError.msg` analogue: the pyjson error without
+/// its `: char N` position suffix (Python's `.msg` excludes position).
+pub fn json_error_msg(error: &str) -> String {
+    match error.rfind(": char ") {
+        Some(pos) if error[pos + 7..].chars().all(|c| c.is_ascii_digit()) => {
+            error[..pos].to_string()
+        }
+        _ => error.to_string(),
+    }
+}
+
+/// `validate_overrides`: validation status for the onboarding override
+/// file — the exact Python result dict shape.
+pub fn validate_overrides(repo_path: &Path) -> Value {
+    let repo_path = resolve_path(repo_path);
+    let override_path = repo_path.join(ONBOARDING_OVERRIDE_PATH);
+    if !override_path.exists() {
+        return obj(vec![
+            ("ok", Value::Bool(true)),
+            ("exists", Value::Bool(false)),
+            ("path", Value::str(ONBOARDING_OVERRIDE_PATH)),
+            ("errors", Value::Array(vec![])),
+        ]);
+    }
+    let text = std::fs::read_to_string(&override_path).unwrap_or_default();
+    let payload = match pyjson::loads(&text) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return obj(vec![
+                ("ok", Value::Bool(false)),
+                ("exists", Value::Bool(true)),
+                ("path", Value::str(ONBOARDING_OVERRIDE_PATH)),
+                (
+                    "errors",
+                    Value::Array(vec![Value::str(format!(
+                        "invalid JSON: {}",
+                        json_error_msg(&error)
+                    ))]),
+                ),
+            ]);
+        }
+    };
+    if !payload.is_object() {
+        return obj(vec![
+            ("ok", Value::Bool(false)),
+            ("exists", Value::Bool(true)),
+            ("path", Value::str(ONBOARDING_OVERRIDE_PATH)),
+            (
+                "errors",
+                Value::Array(vec![Value::str("override root must be a JSON object")]),
+            ),
+        ]);
+    }
+    let mut errors: Vec<Value> = Vec::new();
+    if let Some(notes) = payload.get("notes") {
+        let valid = match notes {
+            Value::Null => true,
+            Value::Array(items) => items.iter().all(|item| matches!(item, Value::Str(_))),
+            _ => false,
+        };
+        if !valid {
+            errors.push(Value::str("notes must be a list of strings"));
+        }
+    }
+    if let Some(commands) = payload.get("commands") {
+        if !matches!(commands, Value::Null | Value::Array(_)) {
+            errors.push(Value::str("commands must be a list"));
+        }
+    }
+    if let Some(summon) = payload.get("summon") {
+        if !matches!(summon, Value::Null | Value::Object(_)) {
+            errors.push(Value::str("summon must be an object"));
+        }
+    }
+    obj(vec![
+        ("ok", Value::Bool(errors.is_empty())),
+        ("exists", Value::Bool(true)),
+        ("path", Value::str(ONBOARDING_OVERRIDE_PATH)),
+        ("errors", Value::Array(errors)),
+    ])
+}
+
 fn summon_policy() -> Value {
     obj(vec![
         (
@@ -2161,6 +2275,69 @@ mod tests {
             Some("./t.sh")
         );
 
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn override_template_matches_python_dumps_shape() {
+        let json = pyjson::dumps_indent2(&override_template());
+        assert!(json.starts_with("{\n  \"repo\": {\n    \"kind\": \"service\"\n  },"));
+        assert!(json.contains("\"command\": \"./scripts/test-fast.sh\""));
+        assert!(json.contains("\"Use sandbox credentials from 1Password.\""));
+        assert!(json.contains("\"skip_when\": [\n      \"single known file\"\n    ]"));
+    }
+
+    #[test]
+    fn validate_overrides_matches_python_results() {
+        let repo = fixture_repo("validate-ovr");
+        // Missing file: ok, exists false.
+        let result = validate_overrides(&repo);
+        assert_eq!(result.get("ok"), Some(&Value::Bool(true)));
+        assert_eq!(result.get("exists"), Some(&Value::Bool(false)));
+
+        // Invalid JSON → exc.msg without position.
+        write(&repo.join(ONBOARDING_OVERRIDE_PATH), "not json");
+        let result = validate_overrides(&repo);
+        assert_eq!(result.get("ok"), Some(&Value::Bool(false)));
+        let errors = result.get("errors").unwrap().as_array().unwrap();
+        assert_eq!(errors[0].as_str(), Some("invalid JSON: Expecting value"));
+
+        // Non-object root.
+        write(&repo.join(ONBOARDING_OVERRIDE_PATH), "[1, 2]");
+        let result = validate_overrides(&repo);
+        let errors = result.get("errors").unwrap().as_array().unwrap();
+        assert_eq!(errors[0].as_str(), Some("override root must be a JSON object"));
+
+        // Field-level errors; JSON null values are tolerated (Python's
+        // `is not None` guard).
+        write(
+            &repo.join(ONBOARDING_OVERRIDE_PATH),
+            r#"{"notes": ["ok", 3], "commands": {}, "summon": [], "extra": null}"#,
+        );
+        let result = validate_overrides(&repo);
+        let errors: Vec<_> = result
+            .get("errors")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            errors,
+            vec![
+                "notes must be a list of strings",
+                "commands must be a list",
+                "summon must be an object",
+            ]
+        );
+
+        write(
+            &repo.join(ONBOARDING_OVERRIDE_PATH),
+            r#"{"notes": null, "commands": null, "summon": null}"#,
+        );
+        let result = validate_overrides(&repo);
+        assert_eq!(result.get("ok"), Some(&Value::Bool(true)));
         std::fs::remove_dir_all(&repo).unwrap();
     }
 

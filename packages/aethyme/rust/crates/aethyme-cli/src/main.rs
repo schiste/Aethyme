@@ -83,15 +83,35 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        // Partially flipped: engine-facing basics answer natively, the
-        // deployment/telemetry subcommands still delegate (Phases 2-3).
+        // Fully native since python-retirement Phase 3: the engine-facing
+        // basics answer in aethyme_engine::repo_cli, the UX subcommands
+        // (skills, overrides, telemetry, commit hygiene) in
+        // aethyme_enhance::repo_cli. The Python repo group is deleted;
+        // unknown subcommands (and `--help`) get the native error shape
+        // like the other native groups.
         "repo" => match aethyme_engine::repo_cli::run(&args[1..]) {
             aethyme_engine::repo_cli::Outcome::Handled(Ok(())) => ExitCode::SUCCESS,
             aethyme_engine::repo_cli::Outcome::Handled(Err(message)) => {
                 eprintln!("Error: {message}");
                 ExitCode::from(1)
             }
-            aethyme_engine::repo_cli::Outcome::Delegate => delegate_to_python("repo", &args[1..]),
+            aethyme_engine::repo_cli::Outcome::Delegate => {
+                // The UX slice resolves the package root lazily: only
+                // deploy-skills/compile-skills need it (template
+                // substitution); the hook-facing telemetry commands must
+                // work in repos with no Aethyme checkout reachable.
+                let resolve = || resolve_aethyme_root().map(|(path, _source)| path);
+                match aethyme_enhance::repo_cli::run(&args[1..], &resolve) {
+                    aethyme_enhance::repo_cli::Outcome::Handled(code) => ExitCode::from(code),
+                    aethyme_enhance::repo_cli::Outcome::Delegate => {
+                        eprintln!(
+                            "Error: unsupported repo subcommand: {}",
+                            args.get(1).map(String::as_str).unwrap_or("<none>")
+                        );
+                        ExitCode::from(2)
+                    }
+                }
+            }
         },
         "task" => match aethyme_engine::task_cli::run(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
@@ -180,7 +200,7 @@ fn print_top_level_help() {
     );
     eprintln!();
     eprintln!("Everything else delegates to the Python CLI:");
-    eprintln!("  ai-ready, autofix, repo (onboarding/telemetry subcommands), ...");
+    eprintln!("  ai-ready, autofix, ...");
 }
 
 // ── explore ─────────────────────────────────────────────────────────────────

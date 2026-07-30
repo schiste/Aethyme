@@ -36,6 +36,126 @@ pub fn load_agents_overrides(repo: &Path) -> Value {
     payload
 }
 
+fn obj(pairs: Vec<(&str, Value)>) -> Value {
+    Value::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+}
+
+/// `agents_override_template`: starter agents override for repo-specific
+/// root instructions.
+pub fn agents_override_template() -> Value {
+    let str_list = |items: &[&str]| -> Value {
+        Value::Array(items.iter().map(|s| Value::str(*s)).collect())
+    };
+    obj(vec![
+        (
+            "repo_summary",
+            Value::str("One-paragraph repo-specific summary for agents."),
+        ),
+        (
+            "hard_constraints",
+            str_list(&["Never bypass tenant isolation or authorization checks."]),
+        ),
+        (
+            "validation_rules",
+            str_list(&["Run the smallest relevant test set before broader suites."]),
+        ),
+        (
+            "commit_hygiene_notes",
+            str_list(&[
+                "Document domain invariants in the Memory section for substantive commits.",
+            ]),
+        ),
+        (
+            "summon_policy_notes",
+            str_list(&["Load repo-onboarding first for broad or unfamiliar tasks."]),
+        ),
+        (
+            "maintainer_markdown",
+            Value::str("## Domain Notes\n\nAdd compact repo-specific guidance here."),
+        ),
+    ])
+}
+
+/// `validate_agents_overrides`: validation status for the agents override
+/// file — the exact Python result dict shape.
+pub fn validate_agents_overrides(repo: &Path) -> Value {
+    let repo = crate::util::resolve_path(repo);
+    let override_path = repo.join(AGENTS_OVERRIDE_PATH);
+    if !override_path.exists() {
+        return obj(vec![
+            ("ok", Value::Bool(true)),
+            ("exists", Value::Bool(false)),
+            ("path", Value::str(AGENTS_OVERRIDE_PATH)),
+            ("errors", Value::Array(vec![])),
+        ]);
+    }
+    let text = std::fs::read_to_string(&override_path).unwrap_or_default();
+    let payload = match pyjson::loads(&text) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return obj(vec![
+                ("ok", Value::Bool(false)),
+                ("exists", Value::Bool(true)),
+                ("path", Value::str(AGENTS_OVERRIDE_PATH)),
+                (
+                    "errors",
+                    Value::Array(vec![Value::str(format!(
+                        "invalid JSON: {}",
+                        crate::onboarding::json_error_msg(&error)
+                    ))]),
+                ),
+            ]);
+        }
+    };
+    if !payload.is_object() {
+        return obj(vec![
+            ("ok", Value::Bool(false)),
+            ("exists", Value::Bool(true)),
+            ("path", Value::str(AGENTS_OVERRIDE_PATH)),
+            (
+                "errors",
+                Value::Array(vec![Value::str("override root must be a JSON object")]),
+            ),
+        ]);
+    }
+    let mut errors: Vec<Value> = Vec::new();
+    // Python: `"repo_summary" in payload and not isinstance(..., str)` —
+    // key presence (even null) with a non-string value is an error.
+    if let Some(value) = payload.get("repo_summary") {
+        if !matches!(value, Value::Str(_)) {
+            errors.push(Value::str("repo_summary must be a string"));
+        }
+    }
+    for key in [
+        "hard_constraints",
+        "validation_rules",
+        "commit_hygiene_notes",
+        "summon_policy_notes",
+    ] {
+        if let Some(value) = payload.get(key) {
+            let valid = match value {
+                Value::Null => true,
+                Value::Array(items) => items.iter().all(|item| matches!(item, Value::Str(_))),
+                _ => false,
+            };
+            if !valid {
+                errors.push(Value::str(format!("{key} must be a list of strings")));
+            }
+        }
+    }
+    if let Some(value) = payload.get("maintainer_markdown") {
+        if !matches!(value, Value::Str(_)) {
+            errors.push(Value::str("maintainer_markdown must be a string"));
+        }
+    }
+    obj(vec![
+        ("ok", Value::Bool(errors.is_empty())),
+        ("exists", Value::Bool(true)),
+        ("path", Value::str(AGENTS_OVERRIDE_PATH)),
+        ("errors", Value::Array(errors)),
+    ])
+}
+
 /// `_render_agents_document`: template + routing + broker protocol +
 /// override sections, normalized to a single trailing newline.
 pub fn render_agents_document(root: &str, repo: Option<&Path>) -> Result<String, String> {
@@ -387,6 +507,54 @@ mod tests {
         let doc = render_agents_document("/opt/ae", Some(&repo)).unwrap();
         assert!(doc.contains("## Aethyme Override Status"));
         assert!(doc.contains("is invalid JSON"));
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn agents_override_template_matches_python_dumps_shape() {
+        let json = pyjson::dumps_indent2(&agents_override_template());
+        assert!(json.starts_with(
+            "{\n  \"repo_summary\": \"One-paragraph repo-specific summary for agents.\","
+        ));
+        assert!(json.contains("\"maintainer_markdown\": \"## Domain Notes\\n\\nAdd compact repo-specific guidance here.\""));
+    }
+
+    #[test]
+    fn validate_agents_overrides_matches_python_results() {
+        let repo = fixture_repo("validate");
+        let result = validate_agents_overrides(&repo);
+        assert_eq!(result.get("ok"), Some(&Value::Bool(true)));
+        assert_eq!(result.get("exists"), Some(&Value::Bool(false)));
+
+        std::fs::create_dir_all(repo.join(".aethyme/overrides")).unwrap();
+        std::fs::write(repo.join(AGENTS_OVERRIDE_PATH), "{broken").unwrap();
+        let result = validate_agents_overrides(&repo);
+        assert_eq!(result.get("ok"), Some(&Value::Bool(false)));
+
+        // Null repo_summary/maintainer_markdown error (key present, not a
+        // string); null list keys are tolerated (`is not None` guard).
+        std::fs::write(
+            repo.join(AGENTS_OVERRIDE_PATH),
+            r#"{"repo_summary": null, "hard_constraints": null, "validation_rules": ["ok", 5], "maintainer_markdown": 3}"#,
+        )
+        .unwrap();
+        let result = validate_agents_overrides(&repo);
+        let errors: Vec<_> = result
+            .get("errors")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            errors,
+            vec![
+                "repo_summary must be a string",
+                "validation_rules must be a list of strings",
+                "maintainer_markdown must be a string",
+            ]
+        );
         std::fs::remove_dir_all(&repo).unwrap();
     }
 
