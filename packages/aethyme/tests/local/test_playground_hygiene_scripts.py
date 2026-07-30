@@ -122,12 +122,16 @@ def test_setup_playground_installs_local_generated_artifact_excludes() -> None:
         ".codex/",
         "AGENTS.md",
         "CLAUDE.md",
+        "**/AGENTS.md",
+        "**/CLAUDE.md",
     ):
         assert pattern in script
 
     assert "hide_tracked_generated_artifacts" in script
+    assert "remove_agent_guidance_files" in script
     assert "git update-index --skip-worktree" in script
     assert "generated_artifacts_are_ignored" in script
+    assert "git check-ignore --no-index" in script
 
 
 def test_verify_playground_enforces_guidance_and_discovery_hygiene() -> None:
@@ -145,6 +149,8 @@ def test_verify_playground_enforces_guidance_and_discovery_hygiene() -> None:
     assert "navigation_hints\\[\\]" in script
 
     assert "check_ignored_path" in script
+    assert "check_no_agent_guidance_files" in script
+    assert "visible_agent_guidance_files" in script
     for generated_path in (
         ".aethyme/graph_store.redb",
         ".aethyme/graph",
@@ -152,6 +158,8 @@ def test_verify_playground_enforces_guidance_and_discovery_hygiene() -> None:
         ".claude/skills/aethyme/SKILL.md",
         "AGENTS.md",
         "CLAUDE.md",
+        "docs/AGENTS.md",
+        "docs/CLAUDE.md",
     ):
         assert generated_path in script
 
