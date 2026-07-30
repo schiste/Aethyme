@@ -1,8 +1,7 @@
 //! Deterministic repo-onboarding skill generation — byte-parity port of
-//! the parts of `src/indexing/onboarding.py` that `enhance deploy`/
-//! `verify` invoke (artifact building, skill rendering, override
-//! application, freshness, recommendation). The onboarding CLI helpers
-//! (init/validate overrides) stay Python until Phase 3.
+//! `src/indexing/onboarding.py` (artifact building, skill rendering,
+//! override init/validate, freshness, recommendation). The onboarding
+//! CLI helpers dispatch here via `repo_cli` since the Phase 3 flip.
 //!
 //! All JSON is built as ordered [`Value`]s so `json.dumps(..., indent=2)`
 //! byte shapes survive the port, including override-injected content.

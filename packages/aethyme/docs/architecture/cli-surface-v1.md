@@ -59,6 +59,24 @@ names/flags/output — golden-verified):
   subcommands and `--help` now produce the native
   `Error: unsupported enhance subcommand: ...` (exit 2) instead of
   Click group help.
+- `repo deploy-skills|compile-skills|init-onboarding-overrides|
+  validate-onboarding-overrides|init-agents-overrides|
+  validate-agents-overrides|record-wrapper-invocation|
+  experience-telemetry|experience-status|commit-message-template|
+  lint-commit-message` (Phase 3 flip, 2026-07-29;
+  `aethyme_enhance::repo_cli`). Stdout, written artifacts, telemetry
+  ledger rows, and exit codes byte-identical to Python (parity harness
+  over all 11 commands + a multi-command sequence; commit-hygiene
+  additionally verified over a 200-commit corpus of this repo's git
+  history in both text and JSON modes, zero diffs). The whole `repo`
+  group is now native: unknown repo subcommands and `--help` produce
+  `Error: unsupported repo subcommand: ...` (exit 2) instead of Click
+  group help; usage errors keep Click's `Error: {message}` line but
+  drop the preceding usage block (Phase 2 precedent). Sanctioned
+  addition (plan Phase 3 risk item): the hidden
+  `record-wrapper-invocation` logs argument-parse failures to the
+  repo-local ledger as `wrapper.invocation-error` events instead of
+  dying silently behind the deployed hooks' `|| true`.
 
 ## Global options
 

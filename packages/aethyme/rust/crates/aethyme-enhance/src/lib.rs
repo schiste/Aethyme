@@ -21,6 +21,7 @@ pub mod hygiene;
 pub mod onboarding;
 pub mod pyjson;
 pub mod render;
+pub mod repo_cli;
 pub mod skills;
 pub mod telemetry;
 pub mod templates;

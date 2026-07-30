@@ -5,8 +5,8 @@
 //! packaging change), substituting `{{AETHYME_ROOT}}` in markdown and
 //! shell files exactly as before. Executable bits are set explicitly for
 //! the shell wrappers (the Python `copytree` inherited them from the
-//! checkout). Library-only this session: `repo deploy-skills` /
-//! `compile-skills` still delegate to Python until Phase 3.
+//! checkout). `repo deploy-skills` / `compile-skills` dispatch here via
+//! `repo_cli` since the Phase 3 flip.
 
 use std::path::Path;
 
