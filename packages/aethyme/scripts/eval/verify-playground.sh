@@ -222,7 +222,9 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
         grep -q 'aethyme repo record-wrapper-invocation' "$wrapper" \
             && check_pass "$wrapper records telemetry via native router" \
             || check_fail "$wrapper missing native record-wrapper-invocation call (redeploy with current template)"
-        if grep -- '-m src.cli' "$wrapper" >/dev/null; then
+        # Ignore comment lines: the current templates carry provenance
+        # comments mentioning the retired Python spelling.
+        if grep -- '-m src.cli' "$wrapper" | grep -v '^[[:space:]]*#' >/dev/null; then
             check_fail "$wrapper still invokes 'python -m src.cli' (Phase 3 hook flip; redeploy with current template)"
         else
             check_pass "$wrapper has no stale Python CLI invocation"
