@@ -146,6 +146,8 @@ def test_verify_playground_enforces_guidance_and_discovery_hygiene() -> None:
     assert "top_verification_targets" in script
     assert "observability.readiness" in script
     assert "verify-targets" in script
+    assert "120 output lines / 20k chars" in script
+    assert "multi-file `sed`" in script
     assert "navigation_hints\\[\\]" in script
 
     assert "check_ignored_path" in script
