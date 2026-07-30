@@ -85,6 +85,8 @@ write_playground_excludes() {
 .codex/
 AGENTS.md
 CLAUDE.md
+**/AGENTS.md
+**/CLAUDE.md
 EOF
 }
 
@@ -93,7 +95,7 @@ hide_tracked_generated_artifacts() {
     local generated_path tracked_files
 
     cd "$repo"
-    for generated_path in .codex .aethyme .chau7 .claude AGENTS.md CLAUDE.md; do
+    for generated_path in .codex .aethyme .chau7 .claude AGENTS.md CLAUDE.md ':(glob)**/AGENTS.md' ':(glob)**/CLAUDE.md'; do
         tracked_files=("${(@f)$(git ls-files "$generated_path" 2>/dev/null)}")
         tracked_files=("${(@)tracked_files:#}")
         if (( ${#tracked_files[@]} > 0 )); then
@@ -102,10 +104,21 @@ hide_tracked_generated_artifacts() {
     done
 }
 
+remove_agent_guidance_files() {
+    local repo="$1"
+    local guidance_path
+
+    cd "$repo"
+    setopt local_options null_glob
+    for guidance_path in AGENTS.md CLAUDE.md **/AGENTS.md **/CLAUDE.md; do
+        [[ -f "$guidance_path" ]] && /bin/rm -f -- "$guidance_path"
+    done
+}
+
 generated_artifacts_are_ignored() {
     local generated_path
-    for generated_path in .aethyme/graph_store.redb .codex/skills/aethyme/SKILL.md .claude/skills/aethyme/SKILL.md AGENTS.md CLAUDE.md; do
-        git check-ignore -q -- "$generated_path" || return 1
+    for generated_path in .aethyme/graph_store.redb .codex/skills/aethyme/SKILL.md .claude/skills/aethyme/SKILL.md AGENTS.md CLAUDE.md docs/AGENTS.md docs/CLAUDE.md; do
+        git check-ignore --no-index -q -- "$generated_path" || return 1
     done
 }
 
@@ -195,10 +208,14 @@ done
 # into the vanilla Control clone and invalidate the playground isolation contract.
 echo ">>> Removing Control-side tooling/runtime contamination..."
 hide_tracked_generated_artifacts "$CONTROL_DIR"
+remove_agent_guidance_files "$CONTROL_DIR"
 cd "$CONTROL_DIR"
 /bin/rm -rf .codex .aethyme .chau7 .claude
-/bin/rm -f AGENTS.md CLAUDE.md
-echo "  Removed: .codex .aethyme .chau7 .claude AGENTS.md CLAUDE.md (if present)"
+echo "  Removed: .codex .aethyme .chau7 .claude and agent guidance files (if present)"
+
+echo ">>> Removing source-side agent guidance from Aethyme arm before indexing..."
+hide_tracked_generated_artifacts "$AETHYME_DIR"
+remove_agent_guidance_files "$AETHYME_DIR"
 
 # ── Step 3: Deploy Aethyme tooling ───────────────────────────────────
 
