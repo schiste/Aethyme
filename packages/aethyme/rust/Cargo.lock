@@ -38,6 +38,7 @@ dependencies = [
  "aethyme-broker",
  "aethyme-engine",
  "aethyme-enhance",
+ "aethyme-quality",
  "libc",
 ]
 
@@ -124,6 +125,14 @@ dependencies = [
  "aethyme-graph-storage",
  "serde",
  "tempfile",
+]
+
+[[package]]
+name = "aethyme-quality"
+version = "0.1.0"
+dependencies = [
+ "aethyme-enhance",
+ "regex",
 ]
 
 [[package]]

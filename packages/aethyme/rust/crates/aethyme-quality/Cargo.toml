@@ -1,0 +1,17 @@
+[package]
+name = "aethyme-quality"
+version = "0.1.0"
+edition = "2024"
+description = "AI-readiness scorecard, detect side: the 8 detectors, the integer 100-point scoring engine, and json/md report rendering. Retirement-plan Phase 4 port of src/scorecard/; findings, scores, and rendered reports are byte-parity with the Python implementation (parity corpus verified, volatile fields normalized)."
+
+[dependencies]
+# pyjson: CPython-exact JSON emission (insertion order, ensure_ascii,
+# repr float rendering) — the sanctioned serializer for parity output.
+aethyme-enhance = { path = "../aethyme-enhance" }
+regex = "1"
+
+[[bin]]
+# Migration parity tooling only (drives the scratch corpus harness);
+# not part of the frozen CLI surface. Retires with the harness in Phase 6.
+name = "quality-probe"
+path = "src/bin/quality_probe.rs"

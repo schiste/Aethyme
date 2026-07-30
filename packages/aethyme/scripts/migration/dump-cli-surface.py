@@ -27,7 +27,7 @@ from src.cli import cli  # noqa: E402
 
 HEADER = """# CLI Surface v1 (frozen 2026-07-17)
 
-Last Updated: 2026-07-29
+Last Updated: 2026-07-30
 
 The contract every python-retirement phase must hold: command names,
 flags, env-var bindings, and defaults of the delegated (Python) surface.
@@ -104,6 +104,22 @@ names/flags/output — golden-verified):
   `record-wrapper-invocation` logs argument-parse failures to the
   repo-local ledger as `wrapper.invocation-error` events instead of
   dying silently behind the deployed hooks' `|| true`.
+- `ai-ready` (Phase 4 flip, 2026-07-30; `aethyme-quality` crate: the 8
+  detectors, integer 100-point scoring, json/md renderers). Stdout,
+  written report files, and exit codes byte-identical to Python on the
+  parity corpus (this repo, Mediawiki playground, synthetic edge
+  fixtures; volatile scan_id/timestamp/duration fields normalized),
+  including finding ORDER (the walk replicates CPython's glob
+  stack/wildcard hybrid traversal). Same flags incl. the
+  `AETHYME_TENANT_ID` env binding. Divergences per the Phase 2
+  precedent: usage errors keep Click's `Error: {message}` line (exact
+  Click 8.3 wording) without the usage block; `--help` prints the same
+  option help with the `aethyme ai-ready` spelling; the TTY progress
+  bar renders as its piped one-line label form. The Python command,
+  `src/scorecard/`, and `tests/scorecard/` are hard-deleted in the
+  companion commit (autofix never imported them);
+  `record_scan_metrics` (in-process Prometheus, a no-op since the
+  Phase 0 dependency purge) is retired with no replacement.
 """
 
 

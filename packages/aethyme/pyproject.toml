@@ -18,7 +18,6 @@ classifiers = [
     "Topic :: Software Development",
 ]
 dependencies = [
-    "pydantic>=2.5.0",
     "click>=8.1.0",
     "structlog>=24.1.0",
 ]

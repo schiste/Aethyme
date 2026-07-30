@@ -8,5 +8,6 @@ members = [
     "crates/aethyme-graph-schema",
     "crates/aethyme-graph-storage",
     "crates/aethyme-producers",
+    "crates/aethyme-quality",
 ]
 resolver = "2"
