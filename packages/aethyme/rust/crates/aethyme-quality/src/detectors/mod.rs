@@ -51,6 +51,7 @@
 
 pub mod data_ui_coverage;
 pub mod folder_docs;
+pub mod relative_links;
 
 use std::path::Path;
 
@@ -77,5 +78,6 @@ pub fn all_detectors() -> Vec<Box<dyn Detector>> {
     vec![
         Box::new(data_ui_coverage::DataUiCoverageDetector),
         Box::new(folder_docs::FolderDocsDetector),
+        Box::new(relative_links::RelativeLinksDetector),
     ]
 }
