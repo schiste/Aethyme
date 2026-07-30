@@ -10,15 +10,17 @@
 # Replaced the soft-retired Python `python -m src.cli explore` wrapper
 # on 2026-05-08 (task #59 — Python explore hard-deleted).
 #
-# `{{AETHYME_ROOT}}` is replaced by `deploy_skills` in
-# packages/aethyme/src/indexing/skills.py with the local package path.
+# `{{AETHYME_ROOT}}` is replaced by the aethyme-enhance crate's
+# `deploy_skills` (embedded templates) with the local package path.
 set -euo pipefail
 
 AETHYME_ROOT="{{AETHYME_ROOT}}"
 REPO="${PWD}"
 
-if [[ -x "$AETHYME_ROOT/.venv/bin/python" && -d "$REPO" ]]; then
-    "$AETHYME_ROOT/.venv/bin/python" -m src.cli repo record-wrapper-invocation \
+# Best-effort telemetry via the native router (Phase 3 hook flip,
+# 2026-07-30; previously `$AETHYME_ROOT/.venv/bin/python -m src.cli`).
+if command -v aethyme >/dev/null 2>&1 && [[ -d "$REPO" ]]; then
+    aethyme repo record-wrapper-invocation \
         "$REPO" \
         --wrapper aethyme-explore \
         --detail source=wrapper \

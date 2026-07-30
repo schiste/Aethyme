@@ -44,8 +44,12 @@ if [[ -z "$context" ]]; then
     exit 0
 fi
 
-if [[ -x "$AETHYME_ROOT/.venv/bin/python" && -d "$cwd" ]]; then
-    "$AETHYME_ROOT/.venv/bin/python" -m src.cli repo record-wrapper-invocation \
+# Best-effort telemetry via the native router (Phase 3 hook flip,
+# 2026-07-30; previously `$AETHYME_ROOT/.venv/bin/python -m src.cli`).
+# The native command also ledgers its own arg-parse failures, so this
+# fire-and-forget call no longer fails invisibly.
+if command -v aethyme >/dev/null 2>&1 && [[ -d "$cwd" ]]; then
+    aethyme repo record-wrapper-invocation \
         "$cwd" \
         --wrapper aethyme-sessionstart-hook \
         --detail source=claude-hook \

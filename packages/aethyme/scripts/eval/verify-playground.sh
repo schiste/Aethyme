@@ -212,6 +212,23 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
         grep -q 'facts function-usage' "$DEAD_CODE_REF" && check_pass "Dead-code reference includes usage facts command" || check_fail "Dead-code reference missing facts function-usage guidance"
     fi
 
+    # Wrapper/hook shells (Phase 3 hook flip, 2026-07-30): telemetry
+    # calls spell `aethyme repo record-wrapper-invocation`, guarded by
+    # `command -v aethyme`. Any executable `-m src.cli` line in a
+    # deployed shell is stale — redeploy with the current template.
+    for wrapper in ".codex/skills/aethyme/aethyme-explore" ".claude/hooks/aethyme-load-context.sh"; do
+        [[ -f "$wrapper" ]] || { check_fail "Missing deployed wrapper $wrapper"; continue; }
+        grep -q '{{AETHYME_ROOT}}' "$wrapper" && check_fail "$wrapper has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "$wrapper placeholders resolved"
+        grep -q 'aethyme repo record-wrapper-invocation' "$wrapper" \
+            && check_pass "$wrapper records telemetry via native router" \
+            || check_fail "$wrapper missing native record-wrapper-invocation call (redeploy with current template)"
+        if grep -- '-m src.cli' "$wrapper" >/dev/null; then
+            check_fail "$wrapper still invokes 'python -m src.cli' (Phase 3 hook flip; redeploy with current template)"
+        else
+            check_pass "$wrapper has no stale Python CLI invocation"
+        fi
+    done
+
     # Fragment graph + Redb graph store. Since 4.7.12 the engine
     # materializes the Redb store from committed fragments; the old
     # pass/parser fallback is gone.

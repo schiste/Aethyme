@@ -9,7 +9,8 @@
 //! flipped to `aethyme ...` spellings on 2026-07-30 (Class 3 change,
 //! in lockstep with verify-playground.sh greps and the consumer
 //! registry); the wrapper scripts' `record-wrapper-invocation` calls
-//! stay Python until the Phase 3 hook flip.
+//! flipped to the native `aethyme` router (guarded by `command -v
+//! aethyme`) in the Phase 3 hook flip, same lockstep protocol.
 
 pub const AGENTS_MD: &str = include_str!("../../../../skills/aethyme/AGENTS.md");
 pub const SKILL_MD: &str = include_str!("../../../../skills/aethyme/SKILL.md");

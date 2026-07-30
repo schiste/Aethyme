@@ -242,6 +242,44 @@ def test_static_wrapper_template_records_invocation_signal() -> None:
     assert "--wrapper aethyme-explore" in wrapper_text
 
 
+def test_deployed_session_hook_records_native_wrapper_invocation(tmp_path: Path) -> None:
+    """Phase 3 exit criterion: the deployed hook fires end-to-end natively.
+
+    Runs the deployed .claude/hooks/aethyme-load-context.sh exactly as
+    Claude Code would (CLAUDE_PROJECT_DIR set, `aethyme` on PATH) and
+    asserts the wrapper invocation landed in the repo-local ledger.
+    """
+    import subprocess
+
+    from tests.support.cli_invoke import aethyme_binary
+
+    repo_path = tmp_path / "demo-repo"
+    _build_repo(repo_path)
+    _deploy(repo_path)
+
+    hook = repo_path / ".claude" / "hooks" / "aethyme-load-context.sh"
+    assert "command -v aethyme" in hook.read_text(encoding="utf-8")
+    env = dict(os.environ)
+    env["CLAUDE_PROJECT_DIR"] = str(repo_path)
+    env["PATH"] = f"{aethyme_binary().parent}{os.pathsep}{env.get('PATH', '')}"
+    completed = subprocess.run(
+        ["bash", str(hook)], capture_output=True, text=True, env=env
+    )
+    assert completed.returncode == 0, completed.stderr
+    envelope = json.loads(completed.stdout)
+    assert envelope["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+
+    telemetry_lines = (repo_path / ".aethyme/generated/experience-telemetry.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    events = [json.loads(line) for line in telemetry_lines]
+    assert any(
+        event["event_type"] == "wrapper.invocation"
+        and event["payload"]["wrapper_name"] == "aethyme-sessionstart-hook"
+        for event in events
+    )
+
+
 def test_repo_experience_telemetry_reports_json_and_text(tmp_path: Path) -> None:
     repo_path = tmp_path / "demo-repo"
     _build_repo(repo_path)
