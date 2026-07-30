@@ -49,6 +49,7 @@
 //! - `re.escape` escapes more characters than `regex::escape`, but both
 //!   produce literal-matching patterns — semantics identical.
 
+pub mod ability_coverage;
 pub mod data_ui_coverage;
 pub mod folder_docs;
 pub mod generated_files;
@@ -87,5 +88,6 @@ pub fn all_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(generated_files::GeneratedFilesDetector),
         Box::new(schema_drift::SchemaDriftDetector),
         Box::new(route_coverage::RouteCoverageDetector),
+        Box::new(ability_coverage::AbilityCoverageDetector),
     ]
 }
