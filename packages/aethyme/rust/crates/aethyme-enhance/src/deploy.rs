@@ -9,8 +9,8 @@ use crate::agents::{
     render_agents_document,
 };
 use crate::onboarding::{
-    ACT_STARTER_JSON_PATH, ONBOARDING_JSON_PATH, expected_onboarding_files, override_freshness,
-    recommendation_summary,
+    expected_onboarding_files, override_freshness, recommendation_summary, ACT_STARTER_JSON_PATH,
+    ONBOARDING_JSON_PATH,
 };
 use crate::pyjson::{self, Value};
 use crate::render::substitute_root;
@@ -32,6 +32,10 @@ pub const TARGETS: &[(&str, &str)] = &[
     ("CLAUDE.md", templates::AGENTS_MD),
     (".claude/skills/aethyme/SKILL.md", templates::SKILL_MD),
     (".codex/skills/aethyme/SKILL.md", templates::SKILL_MD),
+    (
+        ".codex/skills/aethyme/aethyme-explore",
+        templates::AETHYME_EXPLORE,
+    ),
     (
         ".claude/skills/aethyme/references/explore.md",
         templates::REF_EXPLORE_MD,
@@ -81,6 +85,10 @@ fn is_executable(relative_path: &str) -> bool {
         .extension()
         .map(|ext| ext == "sh")
         .unwrap_or(false)
+        || Path::new(relative_path)
+            .file_name()
+            .map(|name| name == "aethyme-explore")
+            .unwrap_or(false)
 }
 
 fn ensure_executable(path: &Path) -> Result<(), String> {
@@ -261,7 +269,11 @@ fn migrate_legacy_agents_content(repo: &Path, root: &str) -> Result<Option<Deplo
             }
             clean_overrides.set(
                 "maintainer_markdown",
-                Value::str(format!("{}\n\n{}", markdown.trim_end(), legacy_content.trim())),
+                Value::str(format!(
+                    "{}\n\n{}",
+                    markdown.trim_end(),
+                    legacy_content.trim()
+                )),
             );
         }
         _ => {
@@ -568,8 +580,14 @@ pub fn summarize(repo: &Path, root: &str) -> Result<Value, String> {
             .ok_or_else(|| format!("KeyError: '{key}'"))
     };
     let mut summary = Value::object();
-    summary.set("recommended_skill", req(&recommendation, "recommended_skill")?);
-    summary.set("recommended_mode", req(&recommendation, "recommended_mode")?);
+    summary.set(
+        "recommended_skill",
+        req(&recommendation, "recommended_skill")?,
+    );
+    summary.set(
+        "recommended_mode",
+        req(&recommendation, "recommended_mode")?,
+    );
     summary.set("reason", req(&recommendation, "reason")?);
     summary.set("onboarding", onboarding_summary_payload(&onboarding)?);
     summary.set("act", act_summary_payload(&act)?);
@@ -607,23 +625,27 @@ mod tests {
         assert_eq!(actions.first().unwrap().relative_path, "AGENTS.md");
         assert_eq!(actions.last().unwrap().relative_path, SETTINGS_FILE);
         assert!(actions.iter().all(|a| a.action == "created"));
-        // 1 AGENTS + 6 onboarding + 10 targets + settings = 18.
-        assert_eq!(actions.len(), 18);
+        // 1 AGENTS + 6 onboarding + 11 targets + settings = 19.
+        assert_eq!(actions.len(), 19);
 
-        let settings =
-            std::fs::read_to_string(repo.join(SETTINGS_FILE)).unwrap();
+        let settings = std::fs::read_to_string(repo.join(SETTINGS_FILE)).unwrap();
         assert_eq!(
             settings,
             "{\n  \"hooks\": {\n    \"SessionStart\": [\n      {\n        \"matcher\": \"\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \".claude/hooks/aethyme-load-context.sh\"\n          }\n        ]\n      }\n    ]\n  }\n}\n"
         );
 
-        // Hook is executable.
+        // Hook and Codex wrapper are executable.
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(repo.join(".claude/hooks/aethyme-load-context.sh"))
             .unwrap()
             .permissions()
             .mode();
         assert_eq!(mode & 0o111, 0o111);
+        let wrapper_mode = std::fs::metadata(repo.join(".codex/skills/aethyme/aethyme-explore"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(wrapper_mode & 0o111, 0o111);
 
         // Second non-force deploy: everything unchanged except the two
         // freshness-stamped onboarding artifacts, which drift with the
@@ -634,8 +656,9 @@ mod tests {
             .filter(|a| a.action != "unchanged")
             .map(|a| a.relative_path.as_str())
             .collect();
-        assert!(changed.iter().all(|path| path.starts_with(".aethyme/generated/")
-            || path.contains("repo-onboarding")));
+        assert!(changed.iter().all(
+            |path| path.starts_with(".aethyme/generated/") || path.contains("repo-onboarding")
+        ));
 
         let results = verify(&repo, "/opt/aethyme").unwrap();
         assert!(is_ok(&results));
@@ -684,8 +707,7 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| a.relative_path == AGENTS_OVERRIDE_PATH && a.action == "created"));
-        let override_text =
-            std::fs::read_to_string(repo.join(AGENTS_OVERRIDE_PATH)).unwrap();
+        let override_text = std::fs::read_to_string(repo.join(AGENTS_OVERRIDE_PATH)).unwrap();
         assert_eq!(
             override_text,
             "{\n  \"maintainer_markdown\": \"Hand-written policy.\"\n}\n"
@@ -709,7 +731,9 @@ mod tests {
             format!("{}\n", pyjson::dumps_indent2(&overrides)),
         )
         .unwrap();
-        let action = drop_stale_generated_agents_override(&repo).unwrap().unwrap();
+        let action = drop_stale_generated_agents_override(&repo)
+            .unwrap()
+            .unwrap();
         assert_eq!(action.action, "updated");
         // Nothing else in the override file → deleted outright.
         assert!(!repo.join(AGENTS_OVERRIDE_PATH).exists());
