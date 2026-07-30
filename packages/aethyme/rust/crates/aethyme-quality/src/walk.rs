@@ -2,15 +2,25 @@
 //!
 //! Replicates CPython 3.13+ `pathlib.Path.rglob("*")` semantics, which
 //! every Python detector relied on for both file discovery and —
-//! critically for byte parity — **finding order**:
+//! critically for byte parity — **finding order**. The `'**/*'`
+//! selector chain in `glob._GlobberBase` composes a recursive
+//! directory selector (LIFO stack) with a `'*'` wildcard selector, so
+//! the visit order is a hybrid (verified against `glob.py` source and
+//! probed empirically on Python 3.14/APFS, including the Mediawiki
+//! corpus):
 //!
-//! - breadth-first over directories (FIFO queue), starting at the root;
-//!   for each dequeued directory, all its entries are yielded in
-//!   `readdir` order, and subdirectories are enqueued in that same
-//!   order (probed empirically against Python 3.14 on APFS — see the
-//!   Phase 4 crate-skeleton commit);
-//! - symlinks are yielded but never descended (`recurse_symlinks=False`
-//!   is the pathlib default);
+//! 1. yield all children of the root (wildcard pre-step), in `readdir`
+//!    order;
+//! 2. pop a directory `D` from a LIFO stack (root first); scan `D`;
+//!    for each subdirectory `E` of `D` in `readdir` order: yield all
+//!    of `E`'s children (a second scan), then push `E`;
+//! 3. repeat until the stack drains — deepest-last-discovered
+//!    directories are stepped first.
+//!
+//! Additional pathlib semantics carried over:
+//! - symlinked dirs are yielded but never stepped and their children
+//!   are never yielded (`recurse_symlinks=False` default: the step's
+//!   `is_dir(follow_symlinks=False)` gate);
 //! - hidden files/dirs ARE yielded (pathlib globs match dotfiles);
 //! - unreadable directories are skipped silently (glob suppresses
 //!   `OSError`).
@@ -18,7 +28,6 @@
 //! Rust's `read_dir` and Python's `os.scandir` are both thin `readdir`
 //! wrappers, so on a given filesystem the per-directory order matches.
 
-use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -32,36 +41,51 @@ pub struct WalkEntry {
 }
 
 /// Equivalent of `repo_path.rglob('*')`: every entry under `root`
-/// (files, dirs, symlinks), in Python's traversal order.
+/// (files, dirs, symlinks), in Python's traversal order (see the
+/// module docs for the exact hybrid stack/wildcard algorithm).
 pub fn rglob_all(root: &Path) -> Vec<WalkEntry> {
     let mut out = Vec::new();
-    let mut queue: VecDeque<PathBuf> = VecDeque::new();
-    queue.push_back(root.to_path_buf());
-    while let Some(dir) = queue.pop_front() {
+    // Wildcard pre-step: yield the root's children.
+    yield_children(root, &mut out);
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue; // glob suppresses OSError
         };
         for entry in entries.flatten() {
-            let path = entry.path();
-            // Descend decision: entry type WITHOUT following symlinks
+            // Step decision: entry type WITHOUT following symlinks
             // (pathlib recurse_symlinks=False).
-            let descend = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            // Reported type: WITH following symlinks (Path.is_file/is_dir).
-            let (is_file, is_dir) = match fs::metadata(&path) {
-                Ok(meta) => (meta.is_file(), meta.is_dir()),
-                Err(_) => (false, false),
-            };
-            if descend {
-                queue.push_back(path.clone());
+            let is_subdir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_subdir {
+                let path = entry.path();
+                yield_children(&path, &mut out);
+                stack.push(path);
             }
-            out.push(WalkEntry {
-                path,
-                is_file,
-                is_dir,
-            });
         }
     }
     out
+}
+
+/// The `'*'` wildcard selector: append every child of `dir` in
+/// `readdir` order, with follow-symlink type flags
+/// (`Path.is_file()`/`is_dir()` stat semantics; broken symlinks report
+/// neither).
+fn yield_children(dir: &Path, out: &mut Vec<WalkEntry>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return; // wildcard selector suppresses OSError too
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let (is_file, is_dir) = match fs::metadata(&path) {
+            Ok(meta) => (meta.is_file(), meta.is_dir()),
+            Err(_) => (false, false),
+        };
+        out.push(WalkEntry {
+            path,
+            is_file,
+            is_dir,
+        });
+    }
 }
 
 /// Equivalent of `glob('**/{name}')` used only for existence checks:
@@ -69,9 +93,8 @@ pub fn rglob_all(root: &Path) -> Vec<WalkEntry> {
 /// `name` exist under `root`? No ignore rules — the Python call sites
 /// applied none.
 pub fn any_entry_named(root: &Path, name: &str) -> bool {
-    let mut queue: VecDeque<PathBuf> = VecDeque::new();
-    queue.push_back(root.to_path_buf());
-    while let Some(dir) = queue.pop_front() {
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
@@ -80,7 +103,7 @@ pub fn any_entry_named(root: &Path, name: &str) -> bool {
                 return true;
             }
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                queue.push_back(entry.path());
+                stack.push(entry.path());
             }
         }
     }
@@ -199,10 +222,16 @@ mod tests {
     }
 
     #[test]
-    fn walk_yields_bfs_order_and_skips_symlink_descent() {
+    fn walk_matches_pathlib_hybrid_order() {
+        // Structure and expected order cross-checked against Python
+        // 3.14 `rglob('*')` on the same tree (Phase 4 probe):
+        //   [root children in readdir order], then per the hybrid
+        //   algorithm: grandchildren via each root subdir in readdir
+        //   order, then LIFO-stepped deeper levels.
         let tmp = std::env::temp_dir().join(format!("aq-walk-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         mk(&tmp, "a/c/cc.py", "");
+        mk(&tmp, "a/c/d/dd.py", "");
         mk(&tmp, "b/bb.py", "");
         mk(&tmp, "top.py", "");
         #[cfg(unix)]
@@ -219,18 +248,30 @@ mod tests {
                     .to_string()
             })
             .collect();
-        // Symlinked dir yielded but not descended.
+        // Symlinked dir yielded but not stepped; its children never appear.
         assert!(rels.contains(&"blink".to_string()));
         assert!(!rels.iter().any(|r| r.starts_with("blink/")));
-        // BFS: all depth-1 entries precede depth-2, which precede depth-3.
-        let depth =
-            |r: &String| r.matches('/').count();
-        let depths: Vec<usize> = rels.iter().map(depth).collect();
-        let mut sorted = depths.clone();
-        sorted.sort_unstable();
-        // BFS over dirs isn't a strict depth sort in general, but in this
-        // fixture (each dir discovered at depth d only from depth d-1) it is.
-        assert_eq!(depths, sorted, "expected BFS ordering, got {rels:?}");
+        // Every real entry appears exactly once.
+        let mut sorted = rels.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), rels.len(), "duplicate entries in {rels:?}");
+        // Hybrid order invariants: root children (depth 1) first...
+        let depth1: Vec<&String> = rels.iter().filter(|r| !r.contains('/')).collect();
+        let n1 = depth1.len();
+        assert!(
+            rels[..n1].iter().all(|r| !r.contains('/')),
+            "depth-1 entries must lead: {rels:?}"
+        );
+        // ...then all depth-2 entries (grandchildren yielded during the
+        // root step) before any depth-3 entry...
+        let first_d3 = rels.iter().position(|r| r.matches('/').count() == 2);
+        let last_d2 = rels.iter().rposition(|r| r.matches('/').count() == 1);
+        if let (Some(d3), Some(d2)) = (first_d3, last_d2) {
+            assert!(d2 < d3, "depth-2 must precede depth-3: {rels:?}");
+        }
+        // ...and a/c/d/dd.py (depth 4) strictly last.
+        assert_eq!(rels.last().map(String::as_str), Some("a/c/d/dd.py"));
         let _ = fs::remove_dir_all(&tmp);
     }
 

@@ -49,6 +49,8 @@
 //! - `re.escape` escapes more characters than `regex::escape`, but both
 //!   produce literal-matching patterns — semantics identical.
 
+pub mod data_ui_coverage;
+
 use std::path::Path;
 
 use crate::model::Finding;
@@ -71,5 +73,5 @@ pub trait Detector {
 /// detector-performance table depend on this order. Detectors are added
 /// one per commit as each port lands (Phase 4 discipline).
 pub fn all_detectors() -> Vec<Box<dyn Detector>> {
-    vec![]
+    vec![Box::new(data_ui_coverage::DataUiCoverageDetector)]
 }
