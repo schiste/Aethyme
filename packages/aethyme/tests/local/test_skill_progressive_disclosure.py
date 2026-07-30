@@ -52,7 +52,9 @@ def test_skill_md_is_concise_auto_load_card():
     assert "top_verification_targets" in text
     assert "observability.readiness" in text
     assert "verify-targets" in text
-    assert "80-120" in text
+    assert "120 output lines / 20k chars" in text
+    assert "multi-file `sed`" in text
+    assert "`rg -C` context dumps" in text
     assert "broad `rg`" in text
     assert "navigation_hints[]" not in text
     assert "references/explore.md" in text
@@ -66,7 +68,8 @@ def test_generated_agents_template_uses_projection_contract():
     assert "top_verification_targets" in text
     assert "observability.readiness" in text
     assert "verify-targets" in text
-    assert "80-120" in text
+    assert "120 output lines / 20k chars" in text
+    assert "multi-file `sed`" in text
     assert "navigation_hints[]" not in text
 
 

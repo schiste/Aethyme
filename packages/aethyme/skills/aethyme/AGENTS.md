@@ -57,9 +57,11 @@ Inspect only the printed projection first: `safe_to_use_as_answer`,
 file for audit/debug, not for dumping into the conversation.
 
 Verify from the bounded source spans first. Read full target files only if
-those spans are insufficient: at most 2-3 files, about 80-120 relevant lines
-each. Do not run broad `rg`, `rg --files`, or repository-wide grep unless the
-top targets fail.
+those spans are insufficient. Read only the missing line range from one target
+at a time. Keep each manual verification command under about 120 output lines / 20k chars,
+and keep the whole post-Explore source verification under about 200 lines. Do
+not run broad `rg`, `rg --files`, repository-wide grep, multi-file `sed`, or
+`rg -C` context dumps unless the top targets fail.
 
 The default detail is `compact`. Use `--detail standard` or `--detail full`
 only when the task needs more evidence payload — they trade tokens for

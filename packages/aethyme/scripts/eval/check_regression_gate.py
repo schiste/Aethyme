@@ -51,6 +51,18 @@ AUTH_SURFACE_LANE_ROLES = {
     "ingress_proxy",
     "provider_or_secondary_token",
 }
+AUTH_SURFACE_LANE_ROLE_ALIASES = {
+    "authoritative_pk_validator": "backend_validator",
+    "claims_pk_bearer_tokens_and_establishes_request_identity_and_tenant_context": "backend_validator",
+    "django_api_key_authentication": "backend_validator",
+    "validates_key_material_active_state_and_expiry": "backend_validator",
+    "classifies_and_forwards_strips_or_rewrites_inbound_authorization": "ingress_proxy",
+    "cloudflare_cloud_run_ingress_proxy": "ingress_proxy",
+    "cloudflare_worker": "ingress_proxy",
+    "edge_credential_transport": "ingress_proxy",
+    "decoy_or_secondary_token_subsystems": "provider_or_secondary_token",
+    "parallel_oauth_path_not_a_second_pk_validator": "provider_or_secondary_token",
+}
 AUTH_FIXTURE_REQUIRED_LANES = {
     "django_backend_auth": {"backend_validator"},
     "edge_proxy_backend_auth": {"backend_validator", "ingress_proxy"},
@@ -1642,8 +1654,7 @@ def _surface_flow_lanes_check(
         }
 
     roles = _surface_flow_lane_roles_from_metrics(aethyme_metrics)
-    if not roles:
-        roles = _surface_flow_lane_roles(aethyme)
+    roles.update(_surface_flow_lane_roles(aethyme))
     required_roles = _required_auth_surface_lane_roles(fixture_id)
     if required_roles:
         missing_roles = sorted(required_roles - roles)
@@ -1707,7 +1718,7 @@ def _surface_flow_lane_roles_from_metrics(metrics: dict[str, Any]) -> set[str]:
     value = metrics.get("surface_flow_lane_roles")
     if not isinstance(value, list):
         return set()
-    return {_normalize_fixture_id(item) for item in value if isinstance(item, str)}
+    return {_canonical_surface_flow_lane_role(item) for item in value if isinstance(item, str)}
 
 
 def _surface_flow_lane_roles(payload: dict[str, Any]) -> set[str]:
@@ -1745,9 +1756,14 @@ def _collect_surface_flow_lane_roles(value: Any, roles: set[str]) -> None:
     if isinstance(subsystems, list):
         for subsystem in subsystems:
             if isinstance(subsystem, dict) and isinstance(subsystem.get("role"), str):
-                roles.add(_normalize_fixture_id(subsystem["role"]))
+                roles.add(_canonical_surface_flow_lane_role(subsystem["role"]))
     for item in value.values():
         _collect_surface_flow_lane_roles(item, roles)
+
+
+def _canonical_surface_flow_lane_role(value: str) -> str:
+    normalized = _normalize_fixture_id(value)
+    return AUTH_SURFACE_LANE_ROLE_ALIASES.get(normalized, normalized)
 
 
 def _assess_coverage_candidate(
@@ -1843,13 +1859,23 @@ def _command_output_strings(value: Any, *, key: str | None = None) -> list[str]:
 
 def _decoded_json_values(value: str) -> list[Any]:
     decoded: list[Any] = []
-    for candidate in [value.strip(), *[line.strip() for line in value.splitlines()]]:
-        if not candidate or not candidate.startswith(("{", "[")):
-            continue
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(value):
+        next_object = len(value)
+        for marker in ("{", "["):
+            marker_index = value.find(marker, index)
+            if marker_index != -1:
+                next_object = min(next_object, marker_index)
+        if next_object == len(value):
+            break
         try:
-            decoded.append(json.loads(candidate))
+            parsed, end = decoder.raw_decode(value, next_object)
         except json.JSONDecodeError:
+            index = next_object + 1
             continue
+        decoded.append(parsed)
+        index = max(end, next_object + 1)
     return decoded
 
 
