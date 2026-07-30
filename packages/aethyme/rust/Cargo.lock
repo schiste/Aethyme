@@ -127,6 +127,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aethyme-quality"
+version = "0.1.0"
+dependencies = [
+ "aethyme-enhance",
+ "regex",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
