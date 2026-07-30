@@ -82,6 +82,11 @@ REQUIRED_PLAYGROUND_FIXTURE_ORDER = tuple(
 )
 REQUIRED_INT_METRICS = (
     "token_estimate",
+    "total_input_tokens",
+    "output_tokens",
+    "cached_input_tokens",
+    "uncached_input_tokens",
+    "uncached_plus_output_tokens",
     "selected_file_count",
     "snippet_count",
     "command_output_chars",
@@ -112,7 +117,12 @@ NONDETERMINISTIC_OUTPUT_FIELDS = {
     "event_log_chars",
     "stderr_chars",
     "input_tokens",
+    "total_input_tokens",
     "output_tokens",
+    "cached_input_tokens",
+    "uncached_input_tokens",
+    "uncached_plus_output_tokens",
+    "cache_write_input_tokens",
     "retries",
     "review_burden",
     "runner_settings",
@@ -273,10 +283,16 @@ def compare_runs(
             fixture_id=resolved_fixture_id,
             require=require_auth_surface_lanes,
         ),
+        _token_estimate_delta_observation(
+            control_metrics,
+            aethyme_metrics,
+            token_delta_ratio,
+            token_slack,
+        ),
         _delta_check(
-            "token_estimate_delta",
-            _metric_int(aethyme_metrics, "token_estimate"),
-            _metric_int(control_metrics, "token_estimate"),
+            "uncached_plus_output_budget_delta",
+            _metric_int(aethyme_metrics, "uncached_plus_output_tokens"),
+            _metric_int(control_metrics, "uncached_plus_output_tokens"),
             token_delta_ratio,
             token_slack,
         ),
@@ -329,6 +345,9 @@ def compare_runs(
         "contract": {
             "selected_file_contents_compared": False,
             "selected_file_count_compared": True,
+            "token_estimate_compared": False,
+            "budget_token_metric": "uncached_plus_output_tokens",
+            "token_estimate_role": "context-pressure telemetry only",
             "required_playground_fixtures": REQUIRED_PLAYGROUND_FIXTURES,
             "playground_fixture_cadence": list(REQUIRED_PLAYGROUND_FIXTURE_ORDER),
             "strict_playground_contract": require_playground_contract,
@@ -637,6 +656,7 @@ def _metrics(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalized_metrics(metrics: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    _normalize_token_metrics(metrics, payload)
     event_analysis = _event_log_analysis(payload)
     artifact_leakage = payload.get("artifact_leakage")
     generated_leak = metrics.get("generated_artifact_leaked")
@@ -681,6 +701,117 @@ def _normalized_metrics(metrics: dict[str, Any], payload: dict[str, Any]) -> dic
     metrics.setdefault("surface_flow_lane_roles", sorted(_surface_flow_lane_roles(payload)))
     metrics.setdefault("output_fingerprint", _output_fingerprint(payload))
     return metrics
+
+
+def _normalize_token_metrics(metrics: dict[str, Any], payload: dict[str, Any]) -> None:
+    event_usage = _event_usage_metrics(payload)
+    token_estimate = _first_int_metric(metrics.get("token_estimate"), payload.get("token_estimate"))
+    if token_estimate is None:
+        token_estimate = _token_estimate(payload)
+
+    total_input_tokens = _first_int_metric(
+        metrics.get("total_input_tokens"),
+        metrics.get("input_tokens"),
+        payload.get("total_input_tokens"),
+        payload.get("input_tokens"),
+        event_usage.get("total_input_tokens"),
+    )
+    output_tokens = _first_int_metric(
+        metrics.get("output_tokens"),
+        payload.get("output_tokens"),
+        event_usage.get("output_tokens"),
+    )
+    if total_input_tokens is None and output_tokens is None and token_estimate is not None:
+        total_input_tokens = token_estimate
+        output_tokens = 0
+
+    cached_input_tokens = _first_int_metric(
+        metrics.get("cached_input_tokens"),
+        payload.get("cached_input_tokens"),
+        event_usage.get("cached_input_tokens"),
+    )
+    if total_input_tokens is not None and cached_input_tokens is None:
+        cached_input_tokens = 0
+    if total_input_tokens is not None and cached_input_tokens is not None:
+        cached_input_tokens = min(cached_input_tokens, total_input_tokens)
+
+    uncached_input_tokens = _first_int_metric(
+        metrics.get("uncached_input_tokens"),
+        payload.get("uncached_input_tokens"),
+    )
+    if total_input_tokens is not None and cached_input_tokens is not None:
+        uncached_input_tokens = total_input_tokens - cached_input_tokens
+
+    uncached_plus_output_tokens = _first_int_metric(
+        metrics.get("uncached_plus_output_tokens"),
+        payload.get("uncached_plus_output_tokens"),
+    )
+    if uncached_input_tokens is not None and output_tokens is not None:
+        uncached_plus_output_tokens = uncached_input_tokens + output_tokens
+
+    if token_estimate is None and total_input_tokens is not None and output_tokens is not None:
+        token_estimate = total_input_tokens + output_tokens
+
+    if token_estimate is not None:
+        metrics["token_estimate"] = token_estimate
+    if total_input_tokens is not None:
+        metrics["total_input_tokens"] = total_input_tokens
+        metrics["input_tokens"] = total_input_tokens
+    if output_tokens is not None:
+        metrics["output_tokens"] = output_tokens
+    if cached_input_tokens is not None:
+        metrics["cached_input_tokens"] = cached_input_tokens
+    if uncached_input_tokens is not None:
+        metrics["uncached_input_tokens"] = uncached_input_tokens
+    if uncached_plus_output_tokens is not None:
+        metrics["uncached_plus_output_tokens"] = uncached_plus_output_tokens
+
+
+def _first_int_metric(*values: Any) -> int | None:
+    for value in values:
+        if type(value) is int and value >= 0:
+            return value
+    return None
+
+
+def _event_usage_metrics(payload: dict[str, Any]) -> dict[str, int]:
+    path = _event_log_path(payload)
+    if path is None:
+        return {}
+
+    usage: dict[str, int] = {}
+    for event in _event_log_events(path):
+        if not isinstance(event, dict) or event.get("type") != "turn.completed":
+            continue
+        usage_payload = event.get("usage")
+        if not isinstance(usage_payload, dict):
+            continue
+        total_input_tokens = _first_int_metric(usage_payload.get("input_tokens"))
+        output_tokens = _first_int_metric(usage_payload.get("output_tokens"))
+        cached_input_tokens = _event_cached_input_tokens(usage_payload)
+        if total_input_tokens is not None:
+            usage["total_input_tokens"] = total_input_tokens
+        if output_tokens is not None:
+            usage["output_tokens"] = output_tokens
+        if cached_input_tokens is not None:
+            usage["cached_input_tokens"] = cached_input_tokens
+    return usage
+
+
+def _event_cached_input_tokens(usage_payload: dict[str, Any]) -> int | None:
+    direct = _first_int_metric(
+        usage_payload.get("cached_input_tokens"),
+        usage_payload.get("cache_read_input_tokens"),
+    )
+    if direct is not None:
+        return direct
+    details = usage_payload.get("input_tokens_details")
+    if isinstance(details, dict):
+        return _first_int_metric(
+            details.get("cached_tokens"),
+            details.get("cache_read_tokens"),
+        )
+    return None
 
 
 def _artifact_leak_bool(payload: dict[str, Any], key: str) -> bool:
@@ -1909,6 +2040,31 @@ def _boolean_check(name: str, passed: bool, failure: str) -> dict[str, Any]:
         "name": name,
         "passed": passed,
         "failure": None if passed else failure,
+    }
+
+
+def _token_estimate_delta_observation(
+    control_metrics: dict[str, Any],
+    aethyme_metrics: dict[str, Any],
+    max_delta_ratio: float,
+    slack: int,
+) -> dict[str, Any]:
+    baseline = _metric_int(control_metrics, "token_estimate")
+    actual = _metric_int(aethyme_metrics, "token_estimate")
+    limit = int(baseline * (1.0 + max_delta_ratio)) + slack
+    return {
+        "name": "token_estimate_delta",
+        "passed": True,
+        "warning": actual > limit,
+        "baseline": baseline,
+        "actual": actual,
+        "delta": actual - baseline,
+        "limit": limit,
+        "max_delta_ratio": max_delta_ratio,
+        "slack": slack,
+        "budget_role": "context_pressure_telemetry",
+        "strict_budget_metric": "uncached_plus_output_tokens",
+        "failure": None,
     }
 
 

@@ -34,16 +34,20 @@ The remaining live eval surface is the playground A/B runner under
 - Runs preserve `events.jsonl`, `stderr.log`, `last-message.json`,
   `command.json`, and `contract.json`, and emit wall time, token usage,
   command-output chars, event-log chars, and stderr chars in the runner JSON.
+  Token usage is split into total input, output, cached input, uncached input,
+  and the strict budget estimate `uncached_input_tokens + output_tokens`.
 - Generated artifact leakage in selected files, snippets, command output, or
   the final answer is a hard regression. The bundled runner checks `.aethyme/`,
   `.chau7/`, `.codex/`, `.claude/`, generated `AGENTS.md`, generated
   `CLAUDE.md`, and `graph_store.redb`; it writes `leakage.json` and exits
   non-zero when the leak gate trips.
 - The regression gate compares stable budget and hygiene metrics, not selected
-  file identity: token estimate delta, selected file count delta, snippet count
-  delta, command-output char delta, generated-artifact leakage, Aethyme
-  invocation, deterministic repeat output, Surface/Flow coverage reporting, and
-  reviewer-rubric final answer quality.
+  file identity: uncached-plus-output budget delta, selected file count delta,
+  snippet count delta, command-output char delta, generated-artifact leakage,
+  Aethyme invocation, deterministic repeat output, Surface/Flow coverage
+  reporting, and reviewer-rubric final answer quality. Total token estimate is
+  still reported as context-pressure telemetry, but cached input does not count
+  as marginal spend.
 
 ### Required V2 Surface/Flow Fixtures
 

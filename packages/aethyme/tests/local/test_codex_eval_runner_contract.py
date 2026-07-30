@@ -89,6 +89,8 @@ def _strict_gate_payload(
     answer: str = "stable answer",
 ) -> dict[str, object]:
     invoked = arm == "aethyme" if aethyme_invoked is None else aethyme_invoked
+    output_tokens = min(100, token_estimate)
+    total_input_tokens = token_estimate - output_tokens
     structured_output: dict[str, object] = {
         "selected_files": ["src/auth.py", "src/routes.py"],
         "snippets": [{"path": "src/auth.py"}],
@@ -110,6 +112,11 @@ def _strict_gate_payload(
         },
         "regression_metrics": {
             "token_estimate": token_estimate,
+            "total_input_tokens": total_input_tokens,
+            "output_tokens": output_tokens,
+            "cached_input_tokens": 0,
+            "uncached_input_tokens": total_input_tokens,
+            "uncached_plus_output_tokens": token_estimate,
             "selected_file_count": 2,
             "snippet_count": 1,
             "command_output_chars": command_output_chars,
@@ -342,6 +349,32 @@ def test_command_output_metric_reads_event_output_fields(tmp_path: Path) -> None
     assert runner._command_output_chars(events_file) == 9
 
 
+def test_runner_usage_metrics_split_cached_and_uncached_tokens(tmp_path: Path) -> None:
+    runner = _load_runner()
+    events_file = tmp_path / "events.jsonl"
+    _write_events(
+        events_file,
+        [
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 355_332,
+                    "output_tokens": 4_526,
+                    "cached_input_tokens": 311_808,
+                },
+            }
+        ],
+    )
+
+    usage = runner._parse_usage(events_file)
+
+    assert usage["input_tokens"] == 355_332
+    assert usage["output_tokens"] == 4_526
+    assert usage["cached_input_tokens"] == 311_808
+    assert usage["uncached_input_tokens"] == 43_524
+    assert usage["uncached_plus_output_tokens"] == 48_050
+
+
 def test_runner_emits_stable_regression_metrics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -414,6 +447,11 @@ def test_runner_emits_stable_regression_metrics(
     payload = json.loads(capsys.readouterr().out)
     metrics = payload["regression_metrics"]
     assert metrics["token_estimate"] == 125
+    assert metrics["total_input_tokens"] == 100
+    assert metrics["output_tokens"] == 25
+    assert metrics["cached_input_tokens"] == 0
+    assert metrics["uncached_input_tokens"] == 100
+    assert metrics["uncached_plus_output_tokens"] == 125
     assert metrics["selected_file_count"] == 2
     assert metrics["snippet_count"] == 1
     assert metrics["command_output_chars"] == len(command_output)
@@ -694,6 +732,146 @@ def test_regression_gate_compares_counts_not_selected_file_identity() -> None:
     assert report["passed"] is True
     assert report["contract"]["selected_file_contents_compared"] is False
     assert report["contract"]["selected_file_count_compared"] is True
+
+
+def test_regression_gate_uses_uncached_plus_output_as_strict_budget_signal() -> None:
+    gate = _load_gate()
+    control = _strict_gate_payload(arm="control")
+    control["regression_metrics"].update(
+        {
+            "token_estimate": 208_655,
+            "total_input_tokens": 204_197,
+            "output_tokens": 4_458,
+            "cached_input_tokens": 139_264,
+            "uncached_input_tokens": 64_933,
+            "uncached_plus_output_tokens": 69_391,
+        }
+    )
+    aethyme = _strict_gate_payload(arm="aethyme")
+    aethyme["regression_metrics"].update(
+        {
+            "token_estimate": 359_858,
+            "total_input_tokens": 355_332,
+            "output_tokens": 4_526,
+            "cached_input_tokens": 311_808,
+            "uncached_input_tokens": 43_524,
+            "uncached_plus_output_tokens": 48_050,
+        }
+    )
+
+    report = gate.compare_runs(
+        control,
+        aethyme,
+        token_delta_ratio=0.0,
+        token_slack=0,
+    )
+
+    assert report["passed"] is True
+    budget_check = next(
+        check for check in report["checks"] if check["name"] == "uncached_plus_output_budget_delta"
+    )
+    assert budget_check["baseline"] == 69_391
+    assert budget_check["actual"] == 48_050
+    total_check = next(
+        check for check in report["checks"] if check["name"] == "token_estimate_delta"
+    )
+    assert total_check["warning"] is True
+
+
+def test_regression_gate_recovers_cached_usage_from_legacy_event_logs(tmp_path: Path) -> None:
+    gate = _load_gate()
+    control_events = tmp_path / "control-events.jsonl"
+    aethyme_events = tmp_path / "aethyme-events.jsonl"
+    _write_events(
+        control_events,
+        [
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 204_197,
+                    "output_tokens": 4_458,
+                    "cached_input_tokens": 139_264,
+                },
+            }
+        ],
+    )
+    _write_events(
+        aethyme_events,
+        [
+            {
+                "type": "item.completed",
+                "item": {
+                    "cmd": ["aethyme", "explore", "--request", "auth token"],
+                    "stdout": _explore_output_with_lanes(),
+                },
+            },
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 355_332,
+                    "output_tokens": 4_526,
+                    "cached_input_tokens": 311_808,
+                },
+            },
+        ],
+    )
+    control = _event_gate_payload(arm="control", event_log_file=control_events)
+    control["input_tokens"] = 204_197
+    control["output_tokens"] = 4_458
+    aethyme = _event_gate_payload(arm="aethyme", event_log_file=aethyme_events)
+    aethyme["input_tokens"] = 355_332
+    aethyme["output_tokens"] = 4_526
+
+    report = gate.compare_runs(
+        control,
+        aethyme,
+        token_delta_ratio=0.0,
+        token_slack=0,
+        command_output_delta_ratio=10.0,
+    )
+
+    assert report["passed"] is True
+    assert report["control_metrics"]["cached_input_tokens"] == 139_264
+    assert report["control_metrics"]["uncached_plus_output_tokens"] == 69_391
+    assert report["aethyme_metrics"]["cached_input_tokens"] == 311_808
+    assert report["aethyme_metrics"]["uncached_plus_output_tokens"] == 48_050
+
+
+def test_regression_gate_fails_uncached_budget_even_when_total_estimate_drops() -> None:
+    gate = _load_gate()
+    control = _strict_gate_payload(arm="control")
+    control["regression_metrics"].update(
+        {
+            "token_estimate": 100_000,
+            "total_input_tokens": 95_000,
+            "output_tokens": 5_000,
+            "cached_input_tokens": 80_000,
+            "uncached_input_tokens": 15_000,
+            "uncached_plus_output_tokens": 20_000,
+        }
+    )
+    aethyme = _strict_gate_payload(arm="aethyme")
+    aethyme["regression_metrics"].update(
+        {
+            "token_estimate": 80_000,
+            "total_input_tokens": 75_000,
+            "output_tokens": 5_000,
+            "cached_input_tokens": 45_000,
+            "uncached_input_tokens": 30_000,
+            "uncached_plus_output_tokens": 35_000,
+        }
+    )
+
+    report = gate.compare_runs(
+        control,
+        aethyme,
+        token_delta_ratio=0.0,
+        token_slack=0,
+    )
+
+    assert report["passed"] is False
+    failures = {check["name"] for check in report["checks"] if not check["passed"]}
+    assert failures == {"uncached_plus_output_budget_delta"}
 
 
 def test_regression_gate_can_infer_invocation_from_legacy_event_log(tmp_path: Path) -> None:
@@ -1085,7 +1263,7 @@ def test_regression_gate_fails_budget_delta_without_file_equality() -> None:
 
     assert report["passed"] is False
     failures = {check["name"] for check in report["checks"] if not check["passed"]}
-    assert failures == {"token_estimate_delta"}
+    assert failures == {"uncached_plus_output_budget_delta"}
 
 
 def test_strict_regression_gate_accepts_repeat_and_reported_missing_coverage() -> None:

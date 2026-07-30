@@ -144,7 +144,12 @@ def main() -> int:
             "event_log_chars": len(result.stdout),
             "stderr_chars": len(result.stderr),
             "input_tokens": usage.get("input_tokens"),
+            "total_input_tokens": usage.get("input_tokens"),
             "output_tokens": usage.get("output_tokens"),
+            "cached_input_tokens": usage.get("cached_input_tokens"),
+            "uncached_input_tokens": usage.get("uncached_input_tokens"),
+            "uncached_plus_output_tokens": usage.get("uncached_plus_output_tokens"),
+            "cache_write_input_tokens": usage.get("cache_write_input_tokens"),
             "retries": usage.get("retries"),
             "review_burden": None,
             "final_output_message": final_output_message or error_message,
@@ -432,6 +437,10 @@ def _parse_usage(events_file: Path) -> dict[str, int | None]:
     usage: dict[str, int | None] = {
         "input_tokens": None,
         "output_tokens": None,
+        "cached_input_tokens": None,
+        "uncached_input_tokens": None,
+        "uncached_plus_output_tokens": None,
+        "cache_write_input_tokens": None,
         "retries": None,
     }
     if not events_file.exists():
@@ -447,14 +456,77 @@ def _parse_usage(events_file: Path) -> dict[str, int | None]:
         if event.get("type") == "turn.completed":
             usage_payload = event.get("usage", {})
             if isinstance(usage_payload, dict):
-                input_tokens = usage_payload.get("input_tokens")
-                output_tokens = usage_payload.get("output_tokens")
-                usage["input_tokens"] = input_tokens if isinstance(input_tokens, int) else None
-                usage["output_tokens"] = output_tokens if isinstance(output_tokens, int) else None
+                usage["input_tokens"] = _usage_int(usage_payload.get("input_tokens"))
+                usage["output_tokens"] = _usage_int(usage_payload.get("output_tokens"))
+                usage["cached_input_tokens"] = _cached_input_tokens(usage_payload)
+                usage["cache_write_input_tokens"] = _cache_write_input_tokens(usage_payload)
         if event.get("type") == "turn.failed":
             turn_failures += 1
     usage["retries"] = turn_failures if turn_failures else 0
+    _derive_uncached_usage(usage)
     return usage
+
+
+def _usage_int(value: Any) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def _cached_input_tokens(usage_payload: dict[str, Any]) -> int | None:
+    direct = _first_usage_int(
+        usage_payload.get("cached_input_tokens"),
+        usage_payload.get("cache_read_input_tokens"),
+    )
+    if direct is not None:
+        return direct
+    details = usage_payload.get("input_tokens_details")
+    if isinstance(details, dict):
+        return _first_usage_int(
+            details.get("cached_tokens"),
+            details.get("cache_read_tokens"),
+        )
+    return None
+
+
+def _cache_write_input_tokens(usage_payload: dict[str, Any]) -> int | None:
+    direct = _first_usage_int(
+        usage_payload.get("cache_write_input_tokens"),
+        usage_payload.get("cache_creation_input_tokens"),
+    )
+    if direct is not None:
+        return direct
+    details = usage_payload.get("input_tokens_details")
+    if isinstance(details, dict):
+        return _first_usage_int(
+            details.get("cache_creation_tokens"),
+            details.get("cache_write_tokens"),
+        )
+    return None
+
+
+def _first_usage_int(*values: Any) -> int | None:
+    for value in values:
+        parsed = _usage_int(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _derive_uncached_usage(usage: dict[str, int | None]) -> None:
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    if input_tokens is None:
+        return
+
+    cached_input_tokens = usage.get("cached_input_tokens")
+    if cached_input_tokens is None:
+        cached_input_tokens = 0
+    cached_input_tokens = min(cached_input_tokens, input_tokens)
+    uncached_input_tokens = input_tokens - cached_input_tokens
+
+    usage["cached_input_tokens"] = cached_input_tokens
+    usage["uncached_input_tokens"] = uncached_input_tokens
+    if output_tokens is not None:
+        usage["uncached_plus_output_tokens"] = uncached_input_tokens + output_tokens
 
 
 def _command_output_chars(events_file: Path) -> int:
@@ -513,6 +585,12 @@ def _regression_metrics(
     token_estimate = _token_estimate(usage, event_log_chars)
     return {
         "token_estimate": token_estimate,
+        "total_input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "cached_input_tokens": usage.get("cached_input_tokens"),
+        "uncached_input_tokens": usage.get("uncached_input_tokens"),
+        "uncached_plus_output_tokens": usage.get("uncached_plus_output_tokens"),
+        "cache_write_input_tokens": usage.get("cache_write_input_tokens"),
         "selected_file_count": _selected_file_count(structured_output),
         "snippet_count": _snippet_count(structured_output),
         "command_output_chars": command_output_chars,
