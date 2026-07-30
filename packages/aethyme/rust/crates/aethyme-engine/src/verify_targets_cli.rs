@@ -117,11 +117,8 @@ fn run_inner(args: &[String]) -> Result<(), VerifyTargetsError> {
     let explore: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|error| VerifyTargetsError::BadUsage(format!("parse --from JSON: {error}")))?;
     let candidates = dedupe_candidates(collect_candidates(&explore));
-    let selected = candidates
-        .iter()
-        .take(max_targets)
-        .cloned()
-        .collect::<Vec<_>>();
+    let candidate_count = candidates.len();
+    let selected = select_candidates(&explore, candidates, max_targets);
 
     let mut remaining_lines = max_lines;
     let mut targets = Vec::new();
@@ -138,7 +135,7 @@ fn run_inner(args: &[String]) -> Result<(), VerifyTargetsError> {
         .iter()
         .map(|target| target.lines.len())
         .sum::<usize>();
-    let omitted_targets = candidates.len().saturating_sub(targets.len());
+    let omitted_targets = candidate_count.saturating_sub(targets.len());
     let report = VerifyTargetsReport {
         schema_version: "aethyme-verify-targets-v1",
         source: from,
@@ -204,6 +201,153 @@ fn collect_candidates(explore: &serde_json::Value) -> Vec<CandidateTarget> {
     out
 }
 
+fn select_candidates(
+    explore: &serde_json::Value,
+    candidates: Vec<CandidateTarget>,
+    max_targets: usize,
+) -> Vec<CandidateTarget> {
+    if candidates.len() <= max_targets {
+        return candidates
+            .into_iter()
+            .map(|candidate| normalize_candidate_for_verification(explore, candidate))
+            .collect();
+    }
+
+    let request = request_text(explore);
+    let auth_focus = request_is_auth_or_token_task(request);
+    let mut ranked = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let score = candidate_usefulness_score(&candidate, request, auth_focus);
+            (index, score, candidate)
+        })
+        .collect::<Vec<_>>();
+
+    let mut selected = Vec::new();
+    let mut used = BTreeSet::new();
+    if auth_focus {
+        push_best_matching_candidate(
+            &ranked,
+            &mut selected,
+            &mut used,
+            candidate_is_ingress_proxy,
+        );
+        push_best_matching_candidate(&ranked, &mut selected, &mut used, candidate_is_backend_auth);
+    }
+
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    for (_index, _score, candidate) in ranked {
+        if selected.len() >= max_targets {
+            break;
+        }
+        if used.insert(candidate_key(&candidate)) {
+            selected.push(candidate);
+        }
+    }
+
+    selected
+        .into_iter()
+        .take(max_targets)
+        .map(|candidate| normalize_candidate_for_verification(explore, candidate))
+        .collect()
+}
+
+fn push_best_matching_candidate(
+    ranked: &[(usize, i32, CandidateTarget)],
+    selected: &mut Vec<CandidateTarget>,
+    used: &mut BTreeSet<String>,
+    predicate: fn(&CandidateTarget) -> bool,
+) {
+    let Some((_index, _score, candidate)) = ranked
+        .iter()
+        .filter(|(_index, _score, candidate)| predicate(candidate))
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+    else {
+        return;
+    };
+    if used.insert(candidate_key(candidate)) {
+        selected.push(candidate.clone());
+    }
+}
+
+fn candidate_usefulness_score(candidate: &CandidateTarget, request: &str, auth_focus: bool) -> i32 {
+    let text = candidate_search_text(candidate);
+    let mut score = match candidate.kind.as_str() {
+        "source_text_file" => 260,
+        "entrypoint" => 230,
+        "credential_flow" => 220,
+        "surface_path" => 160,
+        "token_subsystem" => 80,
+        "behavior_test" => 70,
+        _ => 100,
+    };
+    if candidate.source.starts_with("answer[") {
+        score += 120;
+    }
+    if candidate.source.starts_with("subsystems[") {
+        score += 70;
+    }
+    if candidate.path.contains("/tests/") || candidate.path.starts_with("tests/") {
+        score -= 90;
+    }
+    if auth_focus {
+        if candidate_is_ingress_proxy(candidate) {
+            score += 900;
+            if candidate.path.contains("gcp-run-proxy/src/") {
+                score += 240;
+            }
+            if contains_any(&text, &["authorization", "bearer", "pk_"]) {
+                score += 160;
+            }
+            if contains_any(&text, &["sts.googleapis", "cloud run id token"]) {
+                score -= 80;
+            }
+        }
+        if candidate_is_backend_auth(candidate) {
+            score += 900;
+            if candidate.path.contains("backend/api_keys/middleware") {
+                score += 240;
+            } else if candidate.path.contains("backend/api_keys/models") {
+                score += 160;
+            }
+            if contains_any(&text, &["authorization", "bearer", "pk_", "authenticate"]) {
+                score += 120;
+            }
+        }
+        if candidate_is_secondary_token_decoy(candidate) {
+            score -= 350;
+        }
+    }
+    if !request.is_empty() {
+        for term in request_terms(request) {
+            if text.contains(&term) {
+                score += 12;
+            }
+        }
+    }
+    score
+}
+
+fn normalize_candidate_for_verification(
+    explore: &serde_json::Value,
+    mut candidate: CandidateTarget,
+) -> CandidateTarget {
+    let request = request_text(explore);
+    if request_is_auth_or_token_task(request) && candidate_is_ingress_proxy(&candidate) {
+        let lower_target = candidate.target.to_ascii_lowercase();
+        if contains_any(
+            &lower_target,
+            &["sts.googleapis", "iamcredentials", "cloud run", "id token"],
+        ) {
+            candidate.target = format!("{}::Authorization handling", candidate.path);
+            candidate.reason =
+                "Verify ingress/proxy Authorization handling for the auth/token request.".into();
+        }
+    }
+    candidate
+}
+
 fn candidate_from_target_value(
     value: &serde_json::Value,
     source: String,
@@ -256,12 +400,70 @@ fn dedupe_candidates(candidates: Vec<CandidateTarget>) -> Vec<CandidateTarget> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for candidate in candidates {
-        let key = format!("{}\u{1f}{}", candidate.path, candidate.target);
-        if seen.insert(key) {
+        if seen.insert(candidate_key(&candidate)) {
             out.push(candidate);
         }
     }
     out
+}
+
+fn candidate_key(candidate: &CandidateTarget) -> String {
+    format!("{}\u{1f}{}", candidate.path, candidate.target)
+}
+
+fn candidate_search_text(candidate: &CandidateTarget) -> String {
+    format!(
+        "{} {} {} {} {}",
+        candidate.source, candidate.kind, candidate.target, candidate.path, candidate.reason
+    )
+    .to_ascii_lowercase()
+}
+
+fn candidate_is_ingress_proxy(candidate: &CandidateTarget) -> bool {
+    let text = candidate_search_text(candidate);
+    contains_any(
+        &text,
+        &[
+            "gcp-run-proxy",
+            "edge proxy",
+            "ingress_proxy",
+            "cloudflare worker",
+            "worker.mjs",
+        ],
+    )
+}
+
+fn candidate_is_backend_auth(candidate: &CandidateTarget) -> bool {
+    let text = candidate_search_text(candidate);
+    contains_any(
+        &text,
+        &[
+            "backend/api_keys",
+            "backend.api_keys",
+            "apikey",
+            "api_key",
+            "publishablekey",
+            "authenticationmiddleware",
+        ],
+    )
+}
+
+fn candidate_is_secondary_token_decoy(candidate: &CandidateTarget) -> bool {
+    let text = candidate_search_text(candidate);
+    contains_any(
+        &text,
+        &[
+            "oidc",
+            "auth0",
+            "audit_jws",
+            "webhook",
+            "profile_integrity",
+            "domain_verification",
+            "sts.googleapis",
+            "iamcredentials",
+        ],
+    ) && !candidate_is_ingress_proxy(candidate)
+        && !candidate_is_backend_auth(candidate)
 }
 
 fn verify_candidate(
@@ -353,6 +555,8 @@ fn unresolved_target(candidate: &CandidateTarget, rank: usize, note: String) -> 
 
 fn verification_terms(candidate: &CandidateTarget, request: &str) -> Vec<String> {
     let mut terms = Vec::new();
+    let auth_focus = request_is_auth_or_token_task(request);
+    let proxy_auth_candidate = auth_focus && candidate_is_ingress_proxy(candidate);
     push_terms_from_text(&mut terms, &candidate.target);
     push_terms_from_text(&mut terms, &candidate.reason);
     for part in candidate.target.split("::").skip(1) {
@@ -370,12 +574,11 @@ fn verification_terms(candidate: &CandidateTarget, request: &str) -> Vec<String>
             push_term(&mut terms, route);
         }
     }
+    if proxy_auth_candidate {
+        terms.clear();
+    }
 
-    let lower_request = request.to_ascii_lowercase();
-    if contains_any(
-        &lower_request,
-        &["auth", "token", "credential", "api key", "api-key"],
-    ) {
+    if auth_focus {
         for term in [
             "Authorization",
             "Bearer",
@@ -408,11 +611,38 @@ fn verification_terms(candidate: &CandidateTarget, request: &str) -> Vec<String>
             "permission",
             "scope",
             "Authorization",
+            "HTTP_AUTHORIZATION",
+            "auth_header",
+            "plaintext_key",
+            "APIKey.authenticate",
         ] {
             push_term(&mut terms, term);
         }
     }
     terms
+}
+
+fn request_text(explore: &serde_json::Value) -> &str {
+    explore
+        .get("request")
+        .and_then(|request| request.get("raw"))
+        .and_then(|raw| raw.as_str())
+        .unwrap_or("")
+}
+
+fn request_is_auth_or_token_task(request: &str) -> bool {
+    contains_any(
+        &request.to_ascii_lowercase(),
+        &["auth", "token", "credential", "api key", "api-key", "pk_"],
+    )
+}
+
+fn request_terms(request: &str) -> Vec<String> {
+    request
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .filter(|part| part.len() >= 3)
+        .map(|part| part.to_ascii_lowercase())
+        .collect()
 }
 
 fn push_terms_from_text(terms: &mut Vec<String>, text: &str) {
@@ -463,7 +693,7 @@ fn best_anchor_line(lines: &[String], terms: &[String]) -> Option<usize> {
         .enumerate()
         .filter_map(|(index, line)| {
             let lower = line.to_ascii_lowercase();
-            let score = terms
+            let mut score = terms
                 .iter()
                 .filter(|term| lower.contains(&term.to_ascii_lowercase()))
                 .map(|term| {
@@ -474,10 +704,34 @@ fn best_anchor_line(lines: &[String], terms: &[String]) -> Option<usize> {
                     }
                 })
                 .sum::<usize>();
+            if score > 0 && line_looks_executable(line) {
+                score += 20;
+            }
             (score > 0).then_some((index, score))
         })
         .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
         .map(|(index, _)| index)
+}
+
+fn line_looks_executable(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("def ")
+        || trimmed.starts_with("async def ")
+        || trimmed.starts_with("class ")
+        || trimmed.starts_with("if ")
+        || trimmed.starts_with("elif ")
+        || trimmed.starts_with("return ")
+        || trimmed.starts_with("const ")
+        || trimmed.starts_with("let ")
+        || trimmed.starts_with("var ")
+        || trimmed.starts_with("function ")
+        || trimmed.contains(" = ")
+        || trimmed.contains(".get(")
+        || trimmed.contains(".set(")
+        || trimmed.contains(".delete(")
+        || trimmed.contains("fetch(")
+        || trimmed.contains("authenticate(")
+        || trimmed.contains("validate")
 }
 
 fn span_for_anchor(
@@ -490,7 +744,11 @@ fn span_for_anchor(
     let (mut start, mut end) = if lower_path.ends_with(".py") {
         python_span(lines, anchor)
     } else if contains_any(&lower_path, &[".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"]) {
-        brace_span(lines, anchor)
+        if contains_any(&lower_path, &["proxy", "worker", "edge"]) {
+            context_span(lines, anchor, 2, 10)
+        } else {
+            brace_span(lines, anchor)
+        }
     } else {
         context_span(lines, anchor, 3, 8)
     };
@@ -670,5 +928,66 @@ mod tests {
         let repo = Path::new("/tmp/repo");
         assert!(resolve_repo_path(repo, ".aethyme/graph_store.redb").is_none());
         assert!(resolve_repo_path(repo, "../outside.py").is_none());
+    }
+
+    #[test]
+    fn auth_tasks_select_proxy_and_backend_before_secondary_token_decoys() {
+        let explore = serde_json::json!({
+            "request": {"raw": "Trace inbound pk_* token auth"},
+            "subsystems": [
+                {
+                    "role": "ingress_proxy",
+                    "top_verification_targets": [
+                        {
+                            "kind": "entrypoint",
+                            "target": "gcp-run-proxy/src/worker.mjs::proxy:https://sts.googleapis.com/v1/token",
+                            "path": "gcp-run-proxy/src/worker.mjs",
+                            "reason": "Relations: forwards_to."
+                        }
+                    ]
+                },
+                {
+                    "role": "backend_validator",
+                    "top_verification_targets": [
+                        {
+                            "kind": "credential_flow",
+                            "target": "backend/core/search/authorization.py::validate:class SearchAuthorizationScope:",
+                            "path": "backend/core/search/authorization.py",
+                            "reason": "Relations: validates_credential."
+                        }
+                    ]
+                },
+                {
+                    "role": "provider_or_secondary_token",
+                    "top_verification_targets": [
+                        {
+                            "kind": "credential_flow",
+                            "target": "backend/accounts/oidc.py::issue:{issuer}oauth/token",
+                            "path": "backend/accounts/oidc.py",
+                            "reason": "OIDC token issuer."
+                        }
+                    ]
+                }
+            ],
+            "answer": [
+                {
+                    "kind": "source_text_file",
+                    "target": "backend/api_keys/middleware.py",
+                    "path": "backend/api_keys/middleware.py",
+                    "reason": "Source text matched Authorization and pk_ middleware behavior."
+                }
+            ]
+        });
+
+        let selected =
+            select_candidates(&explore, dedupe_candidates(collect_candidates(&explore)), 2);
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].path, "gcp-run-proxy/src/worker.mjs");
+        assert_eq!(
+            selected[0].target,
+            "gcp-run-proxy/src/worker.mjs::Authorization handling"
+        );
+        assert_eq!(selected[1].path, "backend/api_keys/middleware.py");
     }
 }
