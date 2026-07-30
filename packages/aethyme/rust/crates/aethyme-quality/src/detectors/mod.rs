@@ -54,6 +54,7 @@ pub mod folder_docs;
 pub mod generated_files;
 pub mod i18n_gaps;
 pub mod relative_links;
+pub mod schema_drift;
 
 use std::path::Path;
 
@@ -83,5 +84,6 @@ pub fn all_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(relative_links::RelativeLinksDetector),
         Box::new(i18n_gaps::I18nGapsDetector),
         Box::new(generated_files::GeneratedFilesDetector),
+        Box::new(schema_drift::SchemaDriftDetector),
     ]
 }
