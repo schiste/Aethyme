@@ -90,18 +90,6 @@ names/flags/output — golden-verified):
 |---|---|---|
 | `ai-ready` | command | `--repo` (path); `--repo-id`; `--format/-f` (choice, default 'md'); `--output/-o` (path); `--detectors` |
 | `autofix` | command | `repo_path` (arg, required); `--dry-run` (flag); `--apply` (flag); `--pr` (flag); `--fix-type` (choice, default 'all'); `--skip-approval` (flag) |
-| `repo` | group | — |
-| `repo commit-message-template` | command | `--type` (choice, default 'fix'); `--scope` (default 'scope') |
-| `repo compile-skills` | command | `repo_path` (arg, required); `--skill` (choice) |
-| `repo deploy-skills` | command | `repo_path` (arg, required); `--force` (flag); `--remove` (flag) |
-| `repo experience-status` | command | `repo_path` (arg, required); `--json-output` (flag) |
-| `repo experience-telemetry` | command | `repo_path` (arg, required); `--json-output` (flag); `--check` (flag) |
-| `repo init-agents-overrides` | command | `repo_path` (arg, required); `--force` (flag) |
-| `repo init-onboarding-overrides` | command | `repo_path` (arg, required); `--force` (flag) |
-| `repo lint-commit-message` | command | `message_path` (arg); `--message`; `--json-output` (flag) |
-| `repo record-wrapper-invocation` | command | `repo_path` (arg, required); `--wrapper` (required); `--detail` |
-| `repo validate-agents-overrides` | command | `repo_path` (arg, required) |
-| `repo validate-onboarding-overrides` | command | `repo_path` (arg, required) |
 
 ## Environment variables (non-option)
 

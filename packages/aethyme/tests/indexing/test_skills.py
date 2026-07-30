@@ -1,27 +1,56 @@
-"""Tests for deploying Aethyme skills into target repositories."""
+"""Implementation-blind tests for skill deployment and generated onboarding.
+
+Converted from `src.indexing.skills` / `src.indexing.onboarding` imports
+to drive the `aethyme` router when those modules were ported to the
+aethyme-enhance crate (Phase 3). `repo compile-skills` writes the exact
+`expected_onboarding_files` set, so the artifact assertions read the
+files it produced.
+"""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-from src.indexing.onboarding import expected_onboarding_files
-from src.indexing.skills import deploy_skills
+from tests.support.cli_invoke import invoke_aethyme
+
+
+def _compile_skills(repo_path: Path) -> str:
+    result = invoke_aethyme(["repo", "compile-skills", str(repo_path)])
+    assert result.exit_code == 0, result.output
+    return result.output
+
+
+def _read_artifact(repo_path: Path, relative: str) -> str:
+    return (repo_path / relative).read_text(encoding="utf-8")
 
 
 def test_deploy_skills_installs_only_runtime_navigation_skill(tmp_path: Path) -> None:
     repo_path = tmp_path / "target-repo"
     repo_path.mkdir()
 
-    deployed = deploy_skills(repo_path)
+    result = invoke_aethyme(["repo", "deploy-skills", str(repo_path)])
 
-    assert deployed == ["aethyme"]
+    assert result.exit_code == 0, result.output
+    assert "Deployed skills: aethyme" in result.output
     skills_dir = repo_path / ".codex" / "skills"
     assert (skills_dir / "aethyme" / "SKILL.md").is_file()
     assert not (skills_dir / "eval").exists()
 
 
-def test_expected_onboarding_files_render_repo_specific_artifacts(tmp_path: Path) -> None:
+def test_deploy_skills_remove_sweeps_deployed_skills(tmp_path: Path) -> None:
+    repo_path = tmp_path / "target-repo"
+    repo_path.mkdir()
+    invoke_aethyme(["repo", "deploy-skills", str(repo_path)])
+
+    result = invoke_aethyme(["repo", "deploy-skills", str(repo_path), "--remove"])
+
+    assert result.exit_code == 0, result.output
+    assert "Removed skills: aethyme" in result.output
+    assert not (repo_path / ".codex" / "skills" / "aethyme").exists()
+
+
+def test_compile_skills_renders_repo_specific_artifacts(tmp_path: Path) -> None:
     repo_path = tmp_path / "target-repo"
     repo_path.mkdir()
     (repo_path / "package.json").write_text(
@@ -32,17 +61,21 @@ def test_expected_onboarding_files_render_repo_specific_artifacts(tmp_path: Path
     (repo_path / "src").mkdir()
     (repo_path / "src" / "main.ts").write_text("console.log('demo')\n", encoding="utf-8")
 
-    files = expected_onboarding_files(repo_path)
+    output = _compile_skills(repo_path)
 
-    assert ".aethyme/generated/onboarding.json" in files
-    assert ".aethyme/generated/act-starter.json" in files
-    assert ".codex/skills/repo-onboarding/SKILL.md" in files
-    assert ".claude/skills/repo-onboarding/SKILL.md" in files
-    assert ".codex/skills/repo-act/SKILL.md" in files
-    assert ".claude/skills/repo-act/SKILL.md" in files
+    for relative in (
+        ".aethyme/generated/onboarding.json",
+        ".aethyme/generated/act-starter.json",
+        ".codex/skills/repo-onboarding/SKILL.md",
+        ".claude/skills/repo-onboarding/SKILL.md",
+        ".codex/skills/repo-act/SKILL.md",
+        ".claude/skills/repo-act/SKILL.md",
+    ):
+        assert f"  compiled   {relative}" in output
+        assert (repo_path / relative).is_file()
 
-    artifact = json.loads(files[".aethyme/generated/onboarding.json"])
-    act_artifact = json.loads(files[".aethyme/generated/act-starter.json"])
+    artifact = json.loads(_read_artifact(repo_path, ".aethyme/generated/onboarding.json"))
+    act_artifact = json.loads(_read_artifact(repo_path, ".aethyme/generated/act-starter.json"))
     assert artifact["repo"]["package_manager"] == "pnpm"
     assert any(cmd["command"] == "pnpm test" for cmd in artifact["commands"])
     assert artifact["primary_commands"]["fast_test"] == "pnpm test"
@@ -55,8 +88,12 @@ def test_expected_onboarding_files_render_repo_specific_artifacts(tmp_path: Path
     assert act_artifact["commands"]["fast_test"] == "pnpm test"
     assert act_artifact["commands"]["dev"] == "pnpm dev"
     assert act_artifact["primary_entrypoints"]["app"]["path"] == "src/main.ts"
-    assert "Repo Onboarding" in files[".codex/skills/repo-onboarding/SKILL.md"]
-    assert "## Debugging Checklist" in files[".codex/skills/repo-act/SKILL.md"]
+    assert "Repo Onboarding" in _read_artifact(
+        repo_path, ".codex/skills/repo-onboarding/SKILL.md"
+    )
+    assert "## Debugging Checklist" in _read_artifact(
+        repo_path, ".codex/skills/repo-act/SKILL.md"
+    )
 
 
 def test_onboarding_overrides_replace_selected_sections(tmp_path: Path) -> None:
@@ -89,8 +126,8 @@ def test_onboarding_overrides_replace_selected_sections(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    files = expected_onboarding_files(repo_path)
-    artifact = json.loads(files[".aethyme/generated/onboarding.json"])
+    _compile_skills(repo_path)
+    artifact = json.loads(_read_artifact(repo_path, ".aethyme/generated/onboarding.json"))
 
     assert artifact["repo"]["kind"] == "service"
     assert artifact["commands"] == [
@@ -109,8 +146,9 @@ def test_onboarding_overrides_replace_selected_sections(tmp_path: Path) -> None:
     assert artifact["telemetry"]["overrides_applied"] is True
     assert artifact["telemetry"]["override_source"] == ".aethyme/overrides/onboarding.json"
     assert artifact["telemetry"]["counts"]["notes"] == 2
-    assert "## Maintainer Notes" in files[".codex/skills/repo-onboarding/SKILL.md"]
-    assert "Use sandbox credentials from 1Password." in files[".codex/skills/repo-onboarding/SKILL.md"]
+    onboarding_skill = _read_artifact(repo_path, ".codex/skills/repo-onboarding/SKILL.md")
+    assert "## Maintainer Notes" in onboarding_skill
+    assert "Use sandbox credentials from 1Password." in onboarding_skill
 
 
 def test_onboarding_collects_ranked_primary_commands_from_multiple_sources(tmp_path: Path) -> None:
@@ -147,9 +185,9 @@ def test_onboarding_collects_ranked_primary_commands_from_multiple_sources(tmp_p
         encoding="utf-8",
     )
 
-    files = expected_onboarding_files(repo_path)
-    artifact = json.loads(files[".aethyme/generated/onboarding.json"])
-    act_artifact = json.loads(files[".aethyme/generated/act-starter.json"])
+    _compile_skills(repo_path)
+    artifact = json.loads(_read_artifact(repo_path, ".aethyme/generated/onboarding.json"))
+    act_artifact = json.loads(_read_artifact(repo_path, ".aethyme/generated/act-starter.json"))
 
     assert artifact["primary_commands"]["install"] == "just install"
     assert artifact["primary_commands"]["dev"] == "pnpm dev"
@@ -197,9 +235,9 @@ def test_onboarding_collects_ranked_primary_entrypoints_from_multiple_sources(tm
         encoding="utf-8",
     )
 
-    files = expected_onboarding_files(repo_path)
-    artifact = json.loads(files[".aethyme/generated/onboarding.json"])
-    act_artifact = json.loads(files[".aethyme/generated/act-starter.json"])
+    _compile_skills(repo_path)
+    artifact = json.loads(_read_artifact(repo_path, ".aethyme/generated/onboarding.json"))
+    act_artifact = json.loads(_read_artifact(repo_path, ".aethyme/generated/act-starter.json"))
 
     assert artifact["primary_entrypoints"]["app"]["path"] == "src/server.ts"
     assert artifact["primary_entrypoints"]["cli"]["path"] == "bin/demo.js"

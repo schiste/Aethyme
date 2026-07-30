@@ -38,7 +38,7 @@ consumer. This file exists so that doesn't happen again.
 
 ## Inventory
 
-### Skill template files (canonical sources, deployed by the `aethyme-enhance` crate / `indexing/skills.py`)
+### Skill template files (canonical sources, deployed by the `aethyme-enhance` crate)
 
 | Source | Deployed to | Invokes | Failure mode if entry point removed |
 |---|---|---|---|

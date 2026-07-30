@@ -6,8 +6,11 @@ import json
 import os
 from pathlib import Path
 
-from src.enhance import AGENTS_OVERRIDE_PATH
 from tests.support.cli_invoke import invoke_aethyme
+
+# Frozen contract path (was src.enhance.AGENTS_OVERRIDE_PATH; the Python
+# module is deleted — the aethyme-enhance crate owns the constant now).
+AGENTS_OVERRIDE_PATH = ".aethyme/overrides/agents.json"
 
 # CWD-independent package root (tests run with cwd=packages/aethyme in CI,
 # but repo-root-relative paths broke when invoked from elsewhere).
