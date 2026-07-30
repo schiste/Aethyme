@@ -104,7 +104,6 @@ names/flags/output — golden-verified):
 
 | Command | Kind | Parameters |
 |---|---|---|
-| `ai-ready` | command | `--repo` (path); `--repo-id`; `--format/-f` (choice, default 'md'); `--output/-o` (path); `--detectors` |
 | `autofix` | command | `repo_path` (arg, required); `--dry-run` (flag); `--apply` (flag); `--pr` (flag); `--fix-type` (choice, default 'all'); `--skip-approval` (flag) |
 
 ## Environment variables (non-option)
