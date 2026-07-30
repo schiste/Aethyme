@@ -50,6 +50,7 @@
 //!   produce literal-matching patterns — semantics identical.
 
 pub mod data_ui_coverage;
+pub mod folder_docs;
 
 use std::path::Path;
 
@@ -73,5 +74,8 @@ pub trait Detector {
 /// detector-performance table depend on this order. Detectors are added
 /// one per commit as each port lands (Phase 4 discipline).
 pub fn all_detectors() -> Vec<Box<dyn Detector>> {
-    vec![Box::new(data_ui_coverage::DataUiCoverageDetector)]
+    vec![
+        Box::new(data_ui_coverage::DataUiCoverageDetector),
+        Box::new(folder_docs::FolderDocsDetector),
+    ]
 }
