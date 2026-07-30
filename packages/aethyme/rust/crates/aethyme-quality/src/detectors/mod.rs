@@ -51,6 +51,7 @@
 
 pub mod data_ui_coverage;
 pub mod folder_docs;
+pub mod generated_files;
 pub mod i18n_gaps;
 pub mod relative_links;
 
@@ -81,5 +82,6 @@ pub fn all_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(folder_docs::FolderDocsDetector),
         Box::new(relative_links::RelativeLinksDetector),
         Box::new(i18n_gaps::I18nGapsDetector),
+        Box::new(generated_files::GeneratedFilesDetector),
     ]
 }
