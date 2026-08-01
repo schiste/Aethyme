@@ -557,3 +557,21 @@ Formerly open questions — all resolved; the phases above reflect them.
    on the shared files (`aethyme-engine-cli.rs`, navigation), and
    negotiates per-file rather than blocking on the redb set landing.
    The merged-tree gates remain the backstop.
+
+## Decisions (operator, 2026-08-01, during Phase 6)
+
+5. **`packages/aethyme` becomes 100% Rust — no Python at all, not even
+   dev-only.** This supersedes Phase 6 item 5's "either/or": `tests/local`
+   ports to Rust, and `pyproject.toml` (with its pytest/ruff config) is
+   deleted rather than reduced. The port is a dedicated follow-up session
+   — ~165 implementation-blind subprocess tests that deserve their own
+   parity discipline — so Phase 6 leaves the pytest harness working and
+   green, and hands over an explicit worklist of what must still die.
+6. **`packages/aethyme-eval` stays Python.** The eval harness is an
+   arm's-length acceptance check; keeping it out of the measured system's
+   language and toolchain preserves the independence that makes its
+   results trustworthy. Consequence for Phase 6's module audit: any
+   `src/` module genuinely consumed by aethyme-eval must be **moved into
+   aethyme-eval** (it owns its own inputs), never kept alive inside
+   `packages/aethyme` as a shared library. (Audited 2026-08-01: zero such
+   modules — aethyme-eval imports nothing from `src/`.)
