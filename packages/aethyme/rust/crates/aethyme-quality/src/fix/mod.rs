@@ -68,6 +68,9 @@ pub fn collect_group(
         FixSelection::Links => {
             fixers::process_directory(&fixers::LinkFixer::new(repo_path), repo_path)
         }
+        FixSelection::Selectors => {
+            fixers::process_directory(&fixers::SelectorInserter::new(repo_path), repo_path)
+        }
         _ => Vec::new(),
     })
 }
