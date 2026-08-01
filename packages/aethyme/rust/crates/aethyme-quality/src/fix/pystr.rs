@@ -5,7 +5,7 @@
 //! Rust's stdlib differs on every one of those, so the primitives live
 //! here with the divergence documented at the definition.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 /// CPython `str.splitlines()` boundaries. Beyond `\n` / `\r` / `\r\n`
 /// this includes the vertical tab, form feed, the three information
@@ -138,6 +138,48 @@ pub fn as_posix(path: &Path) -> String {
     } else {
         joined
     }
+}
+
+/// `posixpath.relpath(path, start)`: a purely LEXICAL relative path —
+/// no symlink resolution, no filesystem access. Relative inputs are
+/// anchored to the current directory first, exactly like `abspath`.
+pub fn relpath(path: &Path, start: &Path) -> PathBuf {
+    let path_list = abs_components(path);
+    let start_list = abs_components(start);
+    let common = path_list
+        .iter()
+        .zip(start_list.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut rel: Vec<String> = vec!["..".to_string(); start_list.len() - common];
+    rel.extend_from_slice(&path_list[common..]);
+    if rel.is_empty() {
+        return PathBuf::from(".");
+    }
+    PathBuf::from(rel.join("/"))
+}
+
+/// `abspath` + split into non-empty components. `..` is collapsed
+/// lexically (`normpath`), never resolved through the filesystem.
+fn abs_components(path: &Path) -> Vec<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
+    };
+    let mut out: Vec<String> = Vec::new();
+    for part in absolute.to_string_lossy().split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            other => out.push(other.to_string()),
+        }
+    }
+    out
 }
 
 /// `Path.parts` minus the root element: the named components only. The

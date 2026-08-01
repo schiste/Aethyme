@@ -25,6 +25,8 @@
 
 pub mod base;
 pub mod docs_regenerator;
+pub mod link_fixer;
 
 pub use base::{FixProposal, Fixer, process_directory};
 pub use docs_regenerator::DocsRegenerator;
+pub use link_fixer::LinkFixer;

@@ -64,8 +64,9 @@ pub fn collect_group(
         return None;
     }
     Some(match group {
-        FixSelection::Docs => {
-            fixers::DocsRegenerator::new(repo_path).create_folder_docs()
+        FixSelection::Docs => fixers::DocsRegenerator::new(repo_path).create_folder_docs(),
+        FixSelection::Links => {
+            fixers::process_directory(&fixers::LinkFixer::new(repo_path), repo_path)
         }
         _ => Vec::new(),
     })
