@@ -70,8 +70,14 @@ def aethyme_binary() -> Path:
     return debug_binary
 
 
-def invoke_aethyme(args: list[str], cwd: Path | None = None) -> InvokeResult:
-    """Run `aethyme <args>` and return exit code + merged output."""
+def invoke_aethyme(
+    args: list[str], cwd: Path | None = None, stdin: str | None = None
+) -> InvokeResult:
+    """Run `aethyme <args>` and return exit code + merged output.
+
+    `stdin` feeds the child's standard input, for reader commands that
+    accept `--from -` (e.g. `explore-summary`, `verify-targets`).
+    """
     env = dict(os.environ)
     env["AETHYME_ROOT"] = str(PACKAGE_ROOT)
     # Checkouts without a package-local .venv (broker merge-sim trees,
@@ -87,6 +93,7 @@ def invoke_aethyme(args: list[str], cwd: Path | None = None) -> InvokeResult:
         text=True,
         env=env,
         cwd=str(cwd) if cwd else None,
+        input=stdin,
     )
     return InvokeResult(
         exit_code=completed.returncode,

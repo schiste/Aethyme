@@ -16,7 +16,6 @@ contract; load a reference only if the first result is insufficient.
 ```bash
 AETHYME_ROOT="{{AETHYME_ROOT}}"
 AETHYME_BIN="$AETHYME_ROOT/rust/target/release/aethyme"
-AETHYME_PY="$AETHYME_ROOT/.venv/bin/python"
 REPO="$PWD"
 ```
 
@@ -31,24 +30,7 @@ binary for graph, task, facts, intents, analyze, enhance, and Explore.
 ```bash
 AETHYME_JSON="$(mktemp -t aethyme-explore.XXXXXX.json)"
 "$AETHYME_BIN" explore --repo "$REPO" --request "<user request>" --format answer-json --show-observability --depth 0 > "$AETHYME_JSON"
-"$AETHYME_PY" - "$AETHYME_JSON" <<'PY'
-import json, sys; d = json.load(open(sys.argv[1], encoding="utf-8"))
-targets = []; lanes = d.get("subsystems", [])[:3]
-subsystems = [{k: lane.get(k) for k in ("rank", "id", "label", "role", "confidence", "token_subsystems", "missing_coverage_warnings")} for lane in lanes]
-for lane in lanes:
-    for target in lane.get("top_verification_targets", [])[:2]:
-        if isinstance(target, dict):
-            row = dict(target); row.setdefault("subsystem", lane.get("role") or lane.get("id"))
-            targets.append(row)
-print(json.dumps({
-    "safe_to_use_as_answer": d.get("safe_to_use_as_answer"),
-    "trust_policy": d.get("trust_policy"),
-    "subsystems": subsystems,
-    "top_verification_targets": targets[:6],
-    "verification_steps": d.get("verification_steps", [])[:3],
-    "observability": {"readiness": d.get("observability", {}).get("readiness")},
-}, indent=2))
-PY
+"$AETHYME_BIN" explore-summary --from "$AETHYME_JSON"
 ```
 
 2. Inspect only: `safe_to_use_as_answer`, `trust_policy`, `subsystems`,

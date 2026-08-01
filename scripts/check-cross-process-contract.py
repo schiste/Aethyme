@@ -69,24 +69,32 @@ EXCLUDED_PATTERNS = (
     re.compile(r"^[A-Z]+\s*$"),  # bare ALLCAPS like "TODO"
     re.compile(r"^\d+$"),         # bare numbers
 )
+# python-retirement Phase 5.5 (2026-08-01): deployed templates project
+# Explore with `aethyme explore-summary --from <json>`. Any reference to
+# the Aethyme venv interpreter is stale — the product path must work with
+# no Python on PATH (Phase 6 exit criterion).
+_STALE_PYTHON_INVOCATIONS = (
+    "python -m src.cli explore",
+    ".venv/bin/python -m src.cli explore",
+    '"$AETHYME_PY" -m src.cli explore',
+    '"$AETHYME_ROOT/.venv/bin/python" -m src.cli explore',
+    ".venv/bin/python",
+    "$AETHYME_PY",
+)
 TEXT_CONSUMER_CHECKS = (
     (
         REPO_ROOT / "packages" / "aethyme" / "skills" / "aethyme" / "SKILL.md",
-        (
-            "python -m src.cli explore",
-            ".venv/bin/python -m src.cli explore",
-            '"$AETHYME_PY" -m src.cli explore',
-            '"$AETHYME_ROOT/.venv/bin/python" -m src.cli explore',
-        ),
+        _STALE_PYTHON_INVOCATIONS,
     ),
     (
         REPO_ROOT / "packages" / "aethyme" / "skills" / "aethyme" / "AGENTS.md",
-        (
-            "python -m src.cli explore",
-            ".venv/bin/python -m src.cli explore",
-            '"$AETHYME_PY" -m src.cli explore',
-            '"$AETHYME_ROOT/.venv/bin/python" -m src.cli explore',
-        ),
+        _STALE_PYTHON_INVOCATIONS,
+    ),
+    (
+        REPO_ROOT
+        / "packages" / "aethyme" / "skills" / "aethyme"
+        / "references" / "explore.md",
+        _STALE_PYTHON_INVOCATIONS,
     ),
 )
 

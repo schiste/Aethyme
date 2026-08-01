@@ -87,6 +87,21 @@ check_no_agent_guidance_files() {
         && check_pass "$label hidden from working-tree discovery" \
         || check_fail "$label still visible: ${visible//$'\n'/, }"
 }
+# python-retirement Phase 5.5 (2026-08-01): no deployed artifact may
+# invoke the Aethyme venv interpreter. Comment lines are tolerated —
+# current templates carry provenance comments naming the retired
+# spelling, exactly like the Phase 2/3 `-m src.cli` staleness checks.
+check_no_venv_python() {
+    local file="$1"
+    local label="$2"
+
+    if grep -- '.venv/bin/python' "$file" \
+        | grep -Ev '^[[:space:]]*#|Do not run|not a valid command|was removed|retired|previously' >/dev/null; then
+        check_fail "$label still invokes the Aethyme venv Python (Phase 5.5 flipped the Explore projection to 'aethyme explore-summary'; redeploy with current template)"
+    else
+        check_pass "$label has no Aethyme-venv Python invocation"
+    fi
+}
 check_root_guidance() {
     local file="$1"
     local label="$2"
@@ -105,6 +120,13 @@ check_root_guidance() {
     grep -q 'observability.readiness' "$file" \
         && check_pass "$label inspects compact readiness" \
         || check_fail "$label missing readiness-only observability guidance"
+    # 2026-08-01 (python-retirement Phase 5.5): the compact projection is
+    # built by `aethyme explore-summary --from <json>`, never by a
+    # `.venv/bin/python` heredoc — the product path must not need Python.
+    grep -q 'explore-summary --from' "$file" \
+        && check_pass "$label projects Explore via native explore-summary" \
+        || check_fail "$label missing native explore-summary projection"
+    check_no_venv_python "$file" "$label"
     grep -q 'verify-targets' "$file" \
         && check_pass "$label uses bounded verify-targets source spans" \
         || check_fail "$label missing bounded verify-targets source spans"
@@ -139,6 +161,7 @@ check_reference_file() {
     else
         check_pass "$label has no stale executable Python CLI guidance"
     fi
+    check_no_venv_python "$file" "$label"
 }
 
 # ── Control Repo ─────────────────────────────────────────────────────
@@ -224,6 +247,8 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
         grep -q 'mktemp -t aethyme-explore' "$SKILL_FILE" && check_pass "Skill writes full Explore JSON to temp" || check_fail "Skill missing temp-file Explore capture"
         grep -q 'top_verification_targets' "$SKILL_FILE" && check_pass "Skill prints compact verification-target projection" || check_fail "Skill missing compact verification-target projection"
         grep -q 'observability.readiness' "$SKILL_FILE" && check_pass "Skill inspects compact readiness" || check_fail "Skill missing readiness-only observability guidance"
+        grep -q 'explore-summary --from' "$SKILL_FILE" && check_pass "Skill projects Explore via native explore-summary" || check_fail "Skill missing native explore-summary projection (Phase 5.5)"
+        check_no_venv_python "$SKILL_FILE" "Skill"
         grep -q 'verify-targets' "$SKILL_FILE" && check_pass "Skill uses bounded verify-targets source spans" || check_fail "Skill missing bounded verify-targets source spans"
         grep -q '120 output lines / 20k chars' "$SKILL_FILE" && check_pass "Skill caps manual source output" || check_fail "Skill missing manual source-output cap"
         grep -q 'multi-file `sed`' "$SKILL_FILE" && check_pass "Skill blocks multi-file source dumps" || check_fail "Skill missing multi-file source-dump guard"
@@ -257,6 +282,7 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
     [[ -f .claude/skills/aethyme/references/dead-code.md ]] && check_pass "Claude dead-code reference present" || check_fail "Missing Claude dead-code reference"
     if [[ -f "$EXPLORE_REF" ]]; then
         grep -q 'aethyme intents' "$EXPLORE_REF" && check_pass "Explore reference includes current intent catalog guidance" || check_fail "Explore reference missing intents guidance"
+        grep -q 'explore-summary --from' "$EXPLORE_REF" && check_pass "Explore reference projects via native explore-summary" || check_fail "Explore reference missing native explore-summary projection (Phase 5.5)"
     fi
     if [[ -f "$GRAPH_REF" ]]; then
         grep -q 'graph callers' "$GRAPH_REF" && check_pass "Graph/task reference includes caller guidance" || check_fail "Graph/task reference missing caller guidance"
@@ -283,6 +309,7 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
         else
             check_pass "$wrapper has no stale Python CLI invocation"
         fi
+        check_no_venv_python "$wrapper" "$wrapper"
     done
 
     # Fragment graph + Redb graph store. Since 4.7.12 the engine
