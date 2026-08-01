@@ -55,7 +55,7 @@ At this stage:
 
 ```bash
 . .venv/bin/activate
-python -m pytest tests/local tests/indexing tests/scorecard tests/autofixers tests/contracts tests/docs -q
+python -m pytest tests/local tests/indexing tests/contracts tests/docs -q
 ```
 
 See `tests/README.md` for the suite layout.

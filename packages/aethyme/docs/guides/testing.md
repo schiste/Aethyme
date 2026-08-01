@@ -48,8 +48,8 @@ The active test model covers:
 - search
 - ego graph
 - impact analysis
-- scorecard
-- local autofixer behavior
+- scorecard (`ai-ready`, via the router)
+- autofix behavior (via the router)
 
 ## Test Support
 

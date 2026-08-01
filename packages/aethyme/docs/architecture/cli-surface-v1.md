@@ -129,7 +129,6 @@ names/flags/output — golden-verified):
 
 | Command | Kind | Parameters |
 |---|---|---|
-| `autofix` | command | `repo_path` (arg, required); `--dry-run` (flag); `--apply` (flag); `--pr` (flag); `--fix-type` (choice, default 'all'); `--skip-approval` (flag) |
 
 ## Environment variables (non-option)
 

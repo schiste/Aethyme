@@ -14,7 +14,8 @@ use crate::types::Lease;
 /// Files whose concurrent modification is expected and harmless —
 /// lockfiles regenerate deterministically, so two sessions touching only
 /// a lockfile must not warn (issue #14). Mirrors the autofixer safety
-/// list (`src/autofixers/safety.py:LOCK_FILES`) plus broker/engine
+/// list (`aethyme_quality::fix::safety::LOCK_FILES`, ported from
+/// `src/autofixers/safety.py` in retirement Phase 5) plus broker/engine
 /// artifacts.
 const DEFAULT_IGNORED_FILENAMES: &[&str] = &[
     "package-lock.json",
