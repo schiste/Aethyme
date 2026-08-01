@@ -475,17 +475,23 @@ These should become the real repograph core:
 - [`pipeline.rs`](../../rust/crates/aethyme-engine/src/pipeline.rs)
   - consume graph slices and overlays rather than the current thin map
 
-### Python modules to keep thin
+### Python modules to keep thin (all removed — retirement Phase 6)
 
-These should stay adapters and orchestration layers:
+This section was advice for a hybrid system: keep the Python layer thin
+so graph truth stays in the engine. The python-retirement finished the
+argument by deleting the layer. `src/` is gone as of 2026-08-01 and
+`packages/aethyme` has no Python product code at all.
 
-- [`../../src/indexing/engine.py`](../../src/indexing/engine.py)
-- [`../../src/indexing/repository_snapshot.py`](../../src/indexing/repository_snapshot.py)
-- [`../../src/cli.py`](../../src/cli.py)
+- `src/indexing/engine.py` (removed 2026-08-01 — a build-if-stale helper
+  for the dev test harness by the end; the transport adapter it once was
+  died with the native router in Phase 1)
+- `src/indexing/repository_snapshot.py`, `src/contracts/`, `src/models/`,
+  `src/cli.py` (removed 2026-08-01, retirement Phase 6)
 - `src/eval/` orchestration (removed 2026-07-13 with the eval harness; see [`eval-mining-notes.md`](eval-mining-notes.md))
 - `src/rendering/context_pack.py` (removed 2026-07-28 — renderers went native in `task_cli.rs`, retirement Phase 1)
 
-They should not become the place where graph truth is invented.
+The successor discipline is the same rule stated of Rust crates: the
+engine owns graph truth, and the CLI/enhance crates stay orchestration.
 
 ## Pass-Oriented Refactor Plan
 

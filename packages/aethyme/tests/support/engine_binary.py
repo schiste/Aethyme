@@ -1,8 +1,17 @@
-"""Engine binary bootstrap (build-if-stale) for tests and dev tooling.
+"""Engine binary bootstrap (build-if-stale) for the pytest harness.
 
-All production command paths went native in the router during
-python-retirement Phase 1; what remains here is the ensure-built
-helper the test fixtures use. Retires in Phase 6.
+DIES WITH THE tests/local PORT. This is test scaffolding, not product
+code: nothing outside `tests/` imports it, and the follow-up session that
+ports `tests/local` to Rust deletes it along with the rest of
+`tests/support/`. It lives here rather than in `src/` because
+python-retirement Phase 6 deleted `src/` entirely — leaving a
+three-file husk behind just to host this helper would have kept the
+whole `src.` import namespace alive, which is precisely the "deleted
+modules stay superficially importable" trap the phase set out to close.
+
+Formerly `src/indexing/engine.py`. All production command paths went
+native in the router during Phase 1; the ensure-built helper the test
+fixtures use is all that was left.
 """
 
 from __future__ import annotations
@@ -48,7 +57,9 @@ def ensure_engine_binary() -> Path:
             command.insert(2, "--release")
         result = subprocess.run(command, check=False, capture_output=True, text=True)
         if result.returncode != 0:
-            raise EngineError(result.stderr.strip() or result.stdout.strip() or "Rust engine build failed")
+            raise EngineError(
+                result.stderr.strip() or result.stdout.strip() or "Rust engine build failed"
+            )
 
     if not binary_path.exists():
         raise EngineError(f"Rust engine binary missing after build: {binary_path}")
