@@ -1,6 +1,6 @@
 <!--
 Aethyme PR template. Keep the sections; the `Contract:` line is read
-by CI (see scripts/check-cross-process-contract.sh) to flag PRs that
+by CI (see `aethyme broker check-contract`) to flag PRs that
 touch externally-consumed entry points without an explicit decision.
 -->
 

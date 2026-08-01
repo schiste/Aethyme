@@ -1,8 +1,10 @@
 # Python Retirement Plan — one binary, one runtime
 
-Last Updated: 2026-07-17
+Last Updated: 2026-08-01
 
-Status: PROPOSED. Owner: operator. Prereq reading:
+Status: PHASES 0–6 LANDED (2026-08-01). The product path is Python-free;
+`cargo install` yields the entire product. What remains is the dev test
+stack — see Phase 6's "What did NOT land" note. Owner: operator. Prereq reading:
 `cross-process-consumers.md`, `graph-schema.md`, the redb migration plans.
 
 ## Objective
@@ -500,6 +502,29 @@ then the full local suite + verify-playground + a playground enhance/
 deploy round-trip pass with no Python on PATH (for the product path).
 Registry contains zero Python invocations.
 
+**Status: MET 2026-08-01.** Proven on macOS behind a sandbox PATH holding
+only the Aethyme binaries and core utilities, with `python`/`python3`
+absent: `enhance deploy/verify`, `ai-ready`, `autofix --dry-run`, `repo
+commit-message-template`, the deployed SessionStart hook (valid envelope,
+exit 0), `aethyme-graph-index`, `aethyme-engine-cli index`, `explore`,
+`explore-summary`, `verify-targets`. `verify-playground.sh` reported 93
+passes with zero Python-related failures. Encoded as the
+`product-path-no-python` job in `oss-ci.yml`, which asserts up front that
+no interpreter is reachable so it cannot pass vacuously. The registry's
+only remaining Python invocations are the dev test lanes, each labelled
+DEV-ONLY; every product-path row is native.
+
+**What did NOT land in Phase 6** (deliberate — operator decision 5): the
+`tests/` pytest harness and `pyproject.toml` survive as dev-only
+scaffolding. `packages/aethyme` is not yet 100% Rust. The follow-up
+session ports `tests/local` (~126 tests) plus `tests/indexing` and
+`tests/docs` to Rust and then deletes `tests/`, `pyproject.toml`, the
+`ruff`/`pytest-local` gates, the Python setup in
+`aethyme-local-tests.yml` / `oss-ci.yml` / `aethyme-gates.yml`, and the
+three remaining dev scripts (`scripts/eval/run_codex_eval.py`,
+`scripts/eval/check_regression_gate.py`,
+`scripts/verify-grammar-provenance.py`).
+
 **Risks to manage.**
 - *Operator muscle memory and old notes* — `python -m src.cli` stops
   working. Ship a shim error for one release: a tiny `src/cli.py`
@@ -557,3 +582,21 @@ Formerly open questions — all resolved; the phases above reflect them.
    on the shared files (`aethyme-engine-cli.rs`, navigation), and
    negotiates per-file rather than blocking on the redb set landing.
    The merged-tree gates remain the backstop.
+
+## Decisions (operator, 2026-08-01, during Phase 6)
+
+5. **`packages/aethyme` becomes 100% Rust — no Python at all, not even
+   dev-only.** This supersedes Phase 6 item 5's "either/or": `tests/local`
+   ports to Rust, and `pyproject.toml` (with its pytest/ruff config) is
+   deleted rather than reduced. The port is a dedicated follow-up session
+   — ~165 implementation-blind subprocess tests that deserve their own
+   parity discipline — so Phase 6 leaves the pytest harness working and
+   green, and hands over an explicit worklist of what must still die.
+6. **`packages/aethyme-eval` stays Python.** The eval harness is an
+   arm's-length acceptance check; keeping it out of the measured system's
+   language and toolchain preserves the independence that makes its
+   results trustworthy. Consequence for Phase 6's module audit: any
+   `src/` module genuinely consumed by aethyme-eval must be **moved into
+   aethyme-eval** (it owns its own inputs), never kept alive inside
+   `packages/aethyme` as a shared library. (Audited 2026-08-01: zero such
+   modules — aethyme-eval imports nothing from `src/`.)

@@ -7,17 +7,15 @@
 //!      running for the target repo, the router starts one (detached, via
 //!      the sibling `aethyme-engine-cli` serve binary), waits for the
 //!      socket, and retries — `aethyme explore` just works.
-//!   2. `broker` and `certify` are native (aethyme-broker crate).
-//!   3. Everything else delegates to the Python CLI (`python -m src.cli`),
-//!      whose location is resolved by `resolve_aethyme_root()`:
-//!      `$AETHYME_ROOT` → pointer file `~/.config/aethyme/root` → upward
-//!      walk from the current directory. `aethyme root set/show` manages
-//!      the pointer file.
+//!   2. Everything else is native too: `broker`/`certify`/`init`
+//!      (aethyme-broker), `enhance`/`repo` UX (aethyme-enhance),
+//!      `ai-ready`/`autofix` (aethyme-quality), and the engine groups.
+//!      There is no delegation path: unknown subcommands are errors.
 //!
-//! The pip console script that used to shadow this binary was removed from
-//! pyproject.toml in the same change — `pip install -e .` no longer
-//! installs an `aethyme` executable; `python -m src.cli` remains the
-//! Python-side invocation.
+//! The python-retirement finished here (Phase 6, 2026-08-01). The router
+//! once shelled out to `python -m src.cli` for unflipped command groups
+//! and had to *find* that package; `src/` is deleted, so both the
+//! delegation and the package-finding are gone.
 //!
 //! The repo path for explore is found by:
 //!   1. `--repo <path>` flag (explicit)
@@ -26,7 +24,7 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
 use std::time::Duration;
 
 /// Upper bound for waiting on a freshly-spawned engine daemon. The socket
@@ -133,8 +131,7 @@ fn main() -> ExitCode {
             }
         },
         "root" => run_root_subcommand(&args[1..]),
-        // Broker commands are native Rust from birth (issue #31) — never
-        // delegated to Python.
+        // Broker commands have been native Rust from birth (issue #31).
         "broker" => ExitCode::from(aethyme_broker::cli::run(&args[1..])),
         // Certification — top-level by design (the "airport certification"
         // inspection). Strictly read-only; adaptive setup lives in
@@ -180,11 +177,7 @@ fn main() -> ExitCode {
             };
             ExitCode::from(aethyme_enhance::cli::run(&aethyme_root, &args[1..]))
         }
-        other => {
-            // Unknown to the Rust client — pass straight through to Python.
-            // This includes commands like `intents`, `eval`, etc.
-            delegate_to_python(other, &args[1..])
-        }
+        other => unknown_subcommand(other),
     }
 }
 
@@ -222,17 +215,17 @@ fn print_top_level_help() {
     eprintln!();
     eprintln!("Setup:");
     eprintln!(
-        "  root show|set <path>        where the Python package lives (for delegated commands)"
+        "  root show|set <path>        where the Aethyme checkout lives (used by `enhance` to"
     );
+    eprintln!("                              resolve {{{{AETHYME_ROOT}}}} in deployed artifacts)");
     eprintln!();
     eprintln!("Quality:");
     eprintln!("  ai-ready [--repo <path>]    AI-readiness scorecard");
     eprintln!("  autofix <path> [--dry-run|--apply|--pr]");
     eprintln!("                              safe automated fixes (see `autofix --help`)");
     eprintln!();
-    // Phase 5 emptied the Click tree: no command delegates any more.
-    // The delegation path itself retires with `src/` in Phase 6.
-    eprintln!("No subcommand delegates to Python; unknown ones are errors.");
+    // Phase 6 deleted `src/` and the delegation path with it.
+    eprintln!("Every subcommand is native; unknown ones are errors.");
 }
 
 // ── explore ─────────────────────────────────────────────────────────────────
@@ -357,14 +350,31 @@ fn engine_cli_binary_path() -> PathBuf {
     PathBuf::from("aethyme-engine-cli")
 }
 
-// ── aethyme root — where the Python package lives ───────────────────────────
+// ── aethyme root — where the Aethyme checkout lives ─────────────────────────
 //
-// Delegated commands (`enhance`, `repo`, `intents`, …) are implemented by
-// the Python package in the Aethyme source checkout. Resolution order:
+// SOLE REMAINING PURPOSE (python-retirement Phase 6): `enhance` and the two
+// skill-compiling `repo` subcommands substitute `{{AETHYME_ROOT}}` into the
+// artifacts they deploy, so they need a filesystem path to the checkout.
+// Deployed templates spell things like
+// `"$AETHYME_ROOT/rust/target/release/aethyme" explore`, which is why the
+// marker below is `rust/` — the thing those artifacts actually reach for.
+//
+// This used to be "where the Python package lives", and it recognised a
+// root by `src/cli.py` + `pyproject.toml`. Both of those tests are wrong
+// now: `src/` is deleted and `pyproject.toml` is dev-harness config that
+// retires with the test port. No other command needs a root — nothing is
+// delegated any more.
+//
+// Resolution order:
 //   1. $AETHYME_ROOT (explicit override, highest priority)
 //   2. pointer file: $XDG_CONFIG_HOME/aethyme/root (default ~/.config/aethyme/root)
 //   3. upward walk from the current directory (covers working inside the
 //      Aethyme repo or any of its worktrees with zero configuration)
+//
+// The pointer file survives the retirement because it is the only way an
+// operator who installed via `cargo install` — and so runs the router from
+// outside any checkout — can point `enhance` at one. `aethyme root
+// show/set` therefore keeps a real job and is NOT retired here.
 
 fn config_pointer_path() -> Option<PathBuf> {
     let base = env::var_os("XDG_CONFIG_HOME")
@@ -373,10 +383,11 @@ fn config_pointer_path() -> Option<PathBuf> {
     Some(base.join("aethyme").join("root"))
 }
 
-/// A directory qualifies as an Aethyme Python root when it contains the
-/// package sources this router delegates to.
+/// A directory qualifies as an Aethyme root when it holds the Rust
+/// workspace and the skill templates — the two things `{{AETHYME_ROOT}}`
+/// substitution and skill compilation point at.
 fn is_aethyme_root(dir: &Path) -> bool {
-    dir.join("src").join("cli.py").is_file() && dir.join("pyproject.toml").is_file()
+    dir.join("rust").join("Cargo.toml").is_file() && dir.join("skills").join("aethyme").is_dir()
 }
 
 fn resolve_aethyme_root() -> Option<(PathBuf, &'static str)> {
@@ -447,7 +458,7 @@ fn run_root_subcommand(args: &[String]) -> ExitCode {
                     nested
                 } else {
                     eprintln!(
-                        "aethyme root set: {} does not contain src/cli.py + pyproject.toml \
+                        "aethyme root set: {} does not contain rust/Cargo.toml + skills/aethyme \
                          (nor packages/aethyme/)",
                         path.display()
                     );
@@ -488,43 +499,11 @@ fn print_root_guidance() {
     eprintln!("  - export AETHYME_ROOT=/path/to/Aethyme/packages/aethyme");
 }
 
-// ── delegation to Python ────────────────────────────────────────────────────
-
-fn delegate_to_python(subcommand: &str, args: &[String]) -> ExitCode {
-    let Some((aethyme_root, _source)) = resolve_aethyme_root() else {
-        eprintln!(
-            "aethyme: cannot locate the Aethyme Python package for the \
-             '{subcommand}' command."
-        );
-        print_root_guidance();
-        return ExitCode::from(2);
-    };
-    let venv_python = aethyme_root.join(".venv").join("bin").join("python");
-    let python_bin: PathBuf = if venv_python.exists() {
-        venv_python
-    } else {
-        PathBuf::from("python3")
-    };
-
-    let mut cmd = Command::new(&python_bin);
-    cmd.arg("-m").arg("src.cli").arg(subcommand);
-    cmd.args(args);
-    cmd.current_dir(&aethyme_root);
-    cmd.stdin(Stdio::inherit());
-    cmd.stdout(Stdio::inherit());
-    cmd.stderr(Stdio::inherit());
-
-    match cmd.status() {
-        Ok(status) => match status.code() {
-            Some(code) if (0..=255).contains(&code) => ExitCode::from(code as u8),
-            _ => ExitCode::from(1),
-        },
-        Err(e) => {
-            eprintln!(
-                "aethyme: failed to spawn {} -m src.cli: {e}",
-                python_bin.display()
-            );
-            ExitCode::from(127)
-        }
-    }
+/// Unknown subcommand. Until python-retirement Phase 6 this fell through
+/// to `python -m src.cli <subcommand>`; `src/` is deleted, so an unknown
+/// name is simply an error.
+fn unknown_subcommand(subcommand: &str) -> ExitCode {
+    eprintln!("aethyme: unknown subcommand '{subcommand}'");
+    eprintln!("Run `aethyme --help` for the command list.");
+    ExitCode::from(2)
 }

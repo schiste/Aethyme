@@ -57,7 +57,11 @@ def _assert_native_root_guidance(repo_path: Path) -> None:
     for filename in ("AGENTS.md", "CLAUDE.md"):
         text = (repo_path / filename).read_text(encoding="utf-8")
         assert '"$AETHYME_ROOT/rust/target/release/aethyme" explore' in text
-        assert "Do not run `python -m src.cli explore`" in text
+        # Phase 6 (2026-08-01) widened the notice: the Python CLI is gone
+        # entirely, not just its `explore` subcommand. The "Do not run"
+        # marker must survive — the contract checker and verify-playground
+        # exempt lines carrying it from the stale-invocation greps.
+        assert "Do not run `python -m src.cli ...` for anything" in text
         assert '"$AETHYME_ROOT/.venv/bin/python" -m src.cli explore' not in text
         # Phase 5.5: the compact projection is native, and nothing in the
         # deployed root guidance may reach for the Aethyme venv Python.
@@ -157,7 +161,11 @@ def test_verify_playground_enforces_guidance_and_discovery_hygiene() -> None:
     assert "explore-summary --from" in script
     assert "check_no_venv_python" in script
     assert ".venv/bin/python" in script
-    assert "has no Aethyme-venv Python invocation" in script
+    # Phase 6 (2026-08-01): the check widened from the venv interpreter
+    # to ANY Python interpreter — the deployed SessionStart hook's last
+    # Python was a bare `python3` heredoc, now `repo hook-envelope`.
+    assert "python3?" in script
+    assert "has no Python invocation" in script
     assert "120 output lines / 20k chars" in script
     assert "multi-file `sed`" in script
     assert "navigation_hints\\[\\]" in script

@@ -1,6 +1,20 @@
 # CLI Reference
 
-Last Updated: 2026-07-29
+Last Updated: 2026-08-01
+
+## Install
+
+```bash
+cargo install --path packages/aethyme/rust/crates/aethyme-cli
+cargo install --path packages/aethyme/rust/crates/aethyme-engine
+```
+
+`aethyme` is a single Rust binary; no interpreter, virtualenv, or pip
+step is involved. **`python -m src.cli` no longer exists** — the Python
+package was deleted on 2026-08-01 (python-retirement Phase 6) with no
+shim, and the old spelling fails with `No module named src`. Every
+command below is native, and an unknown subcommand is an error (exit 2)
+rather than a fallthrough.
 
 ## Global Options
 
@@ -295,7 +309,7 @@ It does not yet claim actual agent adoption or downstream answer quality.
 
 ### High-Level Intent Surface
 
-> **Note (2026-05-12):** `aethyme explore` is served by the native Rust binary. The removed Python module form for Explore now prints a targeted recovery error if invoked. All examples below route through native.
+> **Note (2026-08-01):** every command is served by the native Rust binary. The Python CLI that once carried a targeted recovery error for `explore` is itself deleted; `python -m src.cli` now fails with `No module named src`.
 
 - `aethyme explore --repo /path/to/repo --request "Find public functions with no outside callers" --format answer-json`
 - `aethyme intents --request "Find public functions with no outside callers" --format compact-json`
@@ -441,7 +455,7 @@ candidate selection and graph navigation come from `.aethyme/graph_store.redb`.
 - `aethyme eval explain-repo --repo /path/to/repo --json-output`
 - `aethyme eval explain-repo --repo /path/to/repo --control-cmd "<cmd>" --explore-cmd "<cmd>" --leverage-cmd "<cmd>"`
 - `aethyme eval navigation-ctf --repo /path/to/repo --json-output`
-- Example Codex wrapper command: `packages/aethyme/.venv/bin/python packages/aethyme/scripts/eval/run_codex_eval.py`
+- Example Codex wrapper command: `packages/aethyme/.venv/bin/python packages/aethyme/scripts/eval/run_codex_eval.py` (eval tooling is dev-only Python; the product path needs none)
 - Example regression gate command: `packages/aethyme/.venv/bin/python packages/aethyme/scripts/eval/check_regression_gate.py --suite /path/to/suite.json`
 
 Current behavior:
@@ -458,7 +472,7 @@ Current behavior:
 
 ## Local Runtime Notes
 
-- the Python layer builds and executes the Rust engine binary directly
+- the router executes the engine in-process, auto-starting the engine daemon when needed; no interpreter is involved
 - local artifacts are cached by repository snapshot under `AETHYME_CACHE_DIR` or `/tmp/aethyme-cache`
 - Git repositories use commit plus dirty-state metadata for cache keys
 - `repo clear-cache` clears the current snapshot cache

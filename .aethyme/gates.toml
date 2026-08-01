@@ -31,7 +31,9 @@ name = "pytest-local"
 command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && cd packages/aethyme && "$MAIN/packages/aethyme/.venv/bin/python" -m pytest -q tests/local'
 cost = 2
 triggers = [
-    "packages/aethyme/src/**",
+    # `packages/aethyme/src/**` was dropped 2026-08-01: src/ is deleted
+    # (python-retirement Phase 6). A trigger on a nonexistent path never
+    # matches, which silently narrows a gate rather than failing loudly.
     "packages/aethyme/tests/**",
     "packages/aethyme/skills/**",
     "packages/aethyme/evals/**",
@@ -77,7 +79,11 @@ triggers = ["**/*.rs", "**/Cargo.toml"]
 # the real binary or it reads CTO fiction.
 # The gate also reads commit bodies, so tree-hash caching is unsound:
 # amending only `Contract decision: ...` keeps the tree unchanged.
+# 2026-08-01 (python-retirement Phase 6): the checker is native
+# (`aethyme broker check-contract`) and is built from the worktree under
+# test rather than taken from PATH — a gate that validated a diff using
+# a stale installed binary would be checking the wrong code.
 name = "cross-process-contract"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && BASE="$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)" && BODY="$(mktemp)" && git log --format=%B "$BASE"..HEAD > "$BODY" && "$MAIN/packages/aethyme/.venv/bin/python" scripts/check-cross-process-contract.py --base "$BASE" --pr-body "$BODY"'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/aethyme-cargo-target}" && BASE="$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)" && BODY="$(mktemp)" && git log --format=%B "$BASE"..HEAD > "$BODY" && cargo run --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --bin aethyme -- broker check-contract --base "$BASE" --pr-body "$BODY"'
 cost = 1
 cache = false

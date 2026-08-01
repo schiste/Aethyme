@@ -26,6 +26,11 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .venv/
+# Also match a `.venv` SYMLINK. Linked worktrees have no venv of their
+# own, so the documented workaround is to symlink the main checkout's —
+# and `.venv/` (trailing slash) matches directories only, so an unslashed
+# rule is what actually keeps that symlink out of a commit.
+.venv
 *.egg-info/
 .env
 .env.*

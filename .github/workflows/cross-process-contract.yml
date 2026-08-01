@@ -5,9 +5,14 @@ name: Cross-Process Contract Check
 # without declaring a contract decision in the PR body. This is the
 # friction layer for the cardinal rule: deleting a cross-process
 # entry point must be deliberate, not an accidental side effect of
-# refactoring. The 2026-05-08 hard-delete of `python -m src.cli
-# explore` broke the deployed `aethyme-explore` wrapper because
-# this check didn't exist; now it does.
+# refactoring. The 2026-05-08 hard-delete of the Python `explore`
+# command broke the deployed `aethyme-explore` wrapper because this
+# check didn't exist; now it does.
+#
+# The checker is native since python-retirement Phase 6 (2026-08-01):
+# `aethyme broker check-contract`, built from this checkout. It had to
+# be ported BEFORE `src/` was deleted, or the migration's biggest
+# deletion would have landed with its own guard switched off.
 
 on:
   pull_request:
@@ -26,13 +31,11 @@ jobs:
           # base ref present locally to `git diff base..HEAD`.
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Capture PR body
-        # Write the PR body to a file so the script can parse the
+        # Write the PR body to a file so the checker can parse the
         # `Contract:` checkbox. We avoid interpolating the body
         # into a shell command (injection-safe) by reading it from
         # the GitHub event payload via jq.
@@ -46,9 +49,16 @@ jobs:
         # context fields. github.base_ref is set by GitHub from the
         # branch protection target and isn't directly user-supplied,
         # but the same hygiene applies.
+        #
+        # `cargo run` from the repo root: the checker resolves the
+        # registry and the diff relative to the current worktree, so
+        # cwd must stay at the repository root.
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
-          python scripts/check-cross-process-contract.py \
+          cargo run --quiet \
+            --manifest-path packages/aethyme/rust/Cargo.toml \
+            -p aethyme-cli --bin aethyme -- \
+            broker check-contract \
             --base "origin/${BASE_REF}" \
             --pr-body /tmp/pr-body.md

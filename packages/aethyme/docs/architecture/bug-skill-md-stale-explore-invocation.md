@@ -246,8 +246,9 @@ recoverable hint.
 
 ### Option 4: Add SKILL.md content validation to the contract-check CI *(structural fix)*
 
-Extend the cross-process-consumers check (`scripts/check-cross-process-contract.py`,
-commit `07ec796`) to also scan SKILL.md and AGENTS.md for references
+Extend the cross-process-consumers check (`scripts/check-cross-process-contract.py`
+at the time of writing, commit `07ec796`; native as `aethyme broker
+check-contract` since 2026-08-01) to also scan SKILL.md and AGENTS.md for references
 to symbols that no longer exist in the source tree. Catches the next
 deletion-without-doc-update before it ships.
 

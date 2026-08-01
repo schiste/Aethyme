@@ -22,6 +22,7 @@
 
 mod broker;
 pub mod cli;
+pub mod contract_check;
 mod error;
 pub mod events;
 mod gates;

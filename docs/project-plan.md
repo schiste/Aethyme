@@ -41,25 +41,20 @@ Aethyme Core is moving toward a split architecture:
 - later, policy evaluation
 
 ### Python Retained Targets
-- CLI
-- scorecard orchestration
-- enhance/onboarding and product experimentation layers
+None. The python-retirement completed on 2026-08-01: the CLI, scorecard,
+autofixers, and the enhance/onboarding layer are all native Rust, and
+`packages/aethyme/src/` is deleted. `packages/aethyme-eval` stays Python
+by deliberate decision — an arm's-length acceptance check should not
+share the measured system's toolchain.
 
 ## Core Surface
 
 ### Business Logic
-- `packages/aethyme/src/indexer`
-- `packages/aethyme/src/indexing`
-- `packages/aethyme/src/graph`
-- `packages/aethyme/src/models`
-- `packages/aethyme/src/scorecard`
-- `packages/aethyme/src/autofixers`
-- `packages/aethyme/rust`
+- `packages/aethyme/rust` (engine, router, broker, enhance, quality —
+  the whole of it since `src/` was deleted 2026-08-01)
 
 ### Delivery
-- `packages/aethyme/src/api`
-- `packages/aethyme/src/cli.py`
-- `packages/aethyme/sdk/python`
+- the `aethyme` router binary (`cargo install`)
 
 ### Verification
 - `packages/aethyme/tests/api`

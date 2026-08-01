@@ -19,8 +19,9 @@ AETHYME_BIN="$AETHYME_ROOT/rust/target/release/aethyme"
 REPO="$PWD"
 ```
 
-Important: `python -m src.cli ...` commands are retired. Use the `aethyme`
-binary for graph, task, facts, intents, analyze, enhance, and Explore.
+Important: `python -m src.cli ...` was removed — the Python CLI no longer
+exists, so that spelling fails outright. Use the `aethyme` binary for
+graph, task, facts, intents, analyze, enhance, and Explore.
 
 ## Default Contract
 

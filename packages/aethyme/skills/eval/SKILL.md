@@ -249,10 +249,9 @@ The task-conditioned prompt can contain navigation context with function/file na
 The Aethyme condition is only meaningful if `.codex/skills/aethyme/SKILL.md`
 advertises current commands. `verify-playground.sh` must pass the skill freshness
 checks before a run. Treat old `$ENGINE unused --repo ...` guidance as stale.
-Also treat any executable `python -m src.cli ...` guidance as stale: the
-delegated command groups (`query`, `graph`, `task`, `facts`, `intents`,
-`analyze`, most of `repo`) went native during the python-retirement and were
-removed from the Click tree — `python -m src.cli facts ...` now fails. Use
+Also treat any executable `python -m src.cli ...` guidance as stale: every
+command went native during the python-retirement and the Python package was
+removed on 2026-08-01 — `python -m src.cli anything` now fails. Use
 bare `aethyme ...` from PATH. Explore starts with
 `$AETHYME_ROOT/rust/target/release/aethyme explore --repo ... --request ...
 --format answer-json`.

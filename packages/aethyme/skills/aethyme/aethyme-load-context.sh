@@ -20,6 +20,19 @@ set -uo pipefail
 AETHYME_ROOT="{{AETHYME_ROOT}}"
 cwd="${CLAUDE_PROJECT_DIR:-${PWD}}"
 
+# Resolve the router once, for both telemetry and the JSON envelope.
+# PATH first (the normal install); the checkout's release build is the
+# fallback for repos enhanced from a source tree that was never
+# `cargo install`ed. Empty means "no router" — telemetry is skipped and
+# the envelope cannot be emitted.
+if command -v aethyme >/dev/null 2>&1; then
+    aethyme_bin="aethyme"
+elif [[ -x "$AETHYME_ROOT/rust/target/release/aethyme" ]]; then
+    aethyme_bin="$AETHYME_ROOT/rust/target/release/aethyme"
+else
+    aethyme_bin=""
+fi
+
 agents="$cwd/AGENTS.md"
 claude_md="$cwd/CLAUDE.md"
 
@@ -48,23 +61,22 @@ fi
 # 2026-07-30; previously `$AETHYME_ROOT/.venv/bin/python -m src.cli`).
 # The native command also ledgers its own arg-parse failures, so this
 # fire-and-forget call no longer fails invisibly.
-if command -v aethyme >/dev/null 2>&1 && [[ -d "$cwd" ]]; then
-    aethyme repo record-wrapper-invocation \
+if [[ -n "$aethyme_bin" ]] && [[ -d "$cwd" ]]; then
+    "$aethyme_bin" repo record-wrapper-invocation \
         "$cwd" \
         --wrapper aethyme-sessionstart-hook \
         --detail source=claude-hook \
         >/dev/null 2>&1 || true
 fi
 
-# Emit the JSON envelope. Use python for safe JSON escaping rather than
-# hand-rolling string substitution.
-python3 - "$context" <<'PY'
-import json, sys
-ctx = sys.argv[1]
-print(json.dumps({
-    "hookSpecificOutput": {
-        "hookEventName": "SessionStart",
-        "additionalContext": ctx,
-    }
-}))
-PY
+# Emit the JSON envelope via the native router (python-retirement Phase
+# 6, 2026-08-01; previously a bare `python3` heredoc calling json.dumps
+# — the last Python invocation on the product path). Output is
+# byte-identical to the heredoc's. Context goes over a pipe, not argv,
+# so a large AGENTS.md cannot blow the argument-list limit.
+if [[ -z "$aethyme_bin" ]]; then
+    # No router reachable: emit nothing rather than an unescaped
+    # envelope. Empty stdout = no context injected, per the protocol.
+    exit 0
+fi
+printf '%s' "$context" | "$aethyme_bin" repo hook-envelope

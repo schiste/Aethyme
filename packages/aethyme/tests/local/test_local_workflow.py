@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from src.indexing.engine import ENGINE_MANIFEST_PATH, EngineError, ensure_engine_binary
 from tests.support.cli_invoke import invoke_aethyme
+from tests.support.engine_binary import ENGINE_MANIFEST_PATH, EngineError, ensure_engine_binary
 
 
 @lru_cache(maxsize=1)

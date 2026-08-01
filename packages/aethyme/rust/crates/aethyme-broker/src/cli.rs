@@ -168,6 +168,11 @@ Usage:
       Remove a session's worktree. Refuses on uncommitted changes or
       unmerged commits unless --force. Usually run only after finish says
       cleanup is safe.
+  aethyme broker check-contract [--base <ref>] [--pr-body <file>]
+      Cross-process contract gate: refuse a diff that removes symbols
+      listed in the consumers registry unless the PR body or commit
+      messages declare a contract decision. Run by CI and by the
+      `cross-process-contract` gate. Exit 1 = undeclared contract change.
 
 Overlaps warn — they never block (v0 policy).
 ";
@@ -181,6 +186,14 @@ fn now_ms() -> i64 {
 
 /// Entry point for the router. Returns a process exit code.
 pub fn run(args: &[String]) -> u8 {
+    // Dispatched before the shared parser: the contract check is a CI/gate
+    // entry point with its own flags (`--base`, `--pr-body`) and its own
+    // exit-code contract (2 = bad invocation), and it deliberately records
+    // no command metric — it runs on every submit and would swamp the
+    // ledger with noise.
+    if args.first().map(String::as_str) == Some("check-contract") {
+        return crate::contract_check::run(&args[1..]);
+    }
     let started = std::time::Instant::now();
     let code = match run_inner(args) {
         Ok(()) => 0,

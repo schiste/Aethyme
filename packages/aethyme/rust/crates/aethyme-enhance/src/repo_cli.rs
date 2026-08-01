@@ -56,6 +56,7 @@ pub fn run(args: &[String], resolve_root: &dyn Fn() -> Option<PathBuf>) -> Outco
         "init-agents-overrides" => run_init_agents_overrides(rest),
         "validate-agents-overrides" => run_validate_agents_overrides(rest),
         "record-wrapper-invocation" => run_record_wrapper_invocation(rest),
+        "hook-envelope" => run_hook_envelope(rest),
         "experience-telemetry" => run_experience_telemetry(rest),
         "experience-status" => run_experience_status(rest),
         "commit-message-template" => run_commit_message_template(rest),
@@ -760,6 +761,54 @@ fn run_experience_status(rest: &[String]) -> u8 {
 }
 
 // ── commit hygiene ──────────────────────────────────────────────────────────
+
+/// Hidden hook helper: wrap stdin in the SessionStart hook envelope.
+///
+/// python-retirement Phase 6 (2026-08-01). The deployed
+/// `.claude/hooks/aethyme-load-context.sh` used a bare `python3`
+/// heredoc to JSON-escape the collected AGENTS.md/CLAUDE.md text — the
+/// last Python invocation on the product path. This is that heredoc,
+/// natively: read the context from stdin, print
+/// `{"hookSpecificOutput": {"hookEventName": …, "additionalContext": …}}`.
+///
+/// Stdin rather than argv on purpose. The heredoc passed the context as
+/// `sys.argv[1]`, which put a whole AGENTS.md through the process
+/// argument list — a large repo's guidance could hit `E2BIG` and take
+/// context injection down with it. A pipe has no such ceiling and
+/// preserves the bytes exactly.
+///
+/// Output is byte-identical to `json.dumps(...)`: `pyjson::dumps_compact`
+/// applies Python's default separators and `ensure_ascii` escaping, so
+/// deployed hooks emit the same envelope before and after the flip.
+fn run_hook_envelope(rest: &[String]) -> u8 {
+    let parsed = match parse_args(rest, &[], &["--event"]) {
+        Ok(parsed) => parsed,
+        Err(message) => return usage_error(&message),
+    };
+    if let Some(extra) = parsed.positionals.first() {
+        return usage_error(&format!("Got unexpected extra argument ({extra})"));
+    }
+    let event = parsed.last_option("--event").unwrap_or("SessionStart");
+
+    let mut context = String::new();
+    if let Err(error) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut context) {
+        return runtime_error(&format!("could not read hook context from stdin: {error}"));
+    }
+    // Nothing to inject: emit nothing and succeed. The hook protocol
+    // treats empty stdout as "no context", so this keeps the shell's
+    // `exit 0` short-circuit and the empty-input case identical.
+    if context.is_empty() {
+        return 0;
+    }
+
+    let mut inner = Value::object();
+    inner.set("hookEventName", Value::str(event));
+    inner.set("additionalContext", Value::str(context));
+    let mut envelope = Value::object();
+    envelope.set("hookSpecificOutput", inner);
+    println!("{}", pyjson::dumps_compact(&envelope));
+    0
+}
 
 fn run_commit_message_template(rest: &[String]) -> u8 {
     let parsed = match parse_args(rest, &[], &["--type", "--scope"]) {
