@@ -153,6 +153,17 @@ fn main() -> ExitCode {
         // keep Click's `Error: {message}` line without the usage block
         // (Phase 2 precedent).
         "ai-ready" => ExitCode::from(aethyme_quality::ai_ready_cli::run(&args[1..])),
+        // Native since python-retirement Phase 5 (the Python `autofix`
+        // command and src/autofixers/ are deleted). The safety/risk
+        // engine, patch generation, the 5 fixers, and the git/PR helper
+        // live in the same aethyme-quality crate; stdout, produced
+        // unified diffs, and post-apply trees are parity-verified
+        // against the last Python implementation. The PR-mode approval
+        // gate is unchanged: medium/high-risk patches stop the flow
+        // before anything is applied, committed, or pushed. Usage
+        // errors keep Click's `Error: {message}` line without the usage
+        // block (Phase 2 precedent).
+        "autofix" => ExitCode::from(aethyme_quality::autofix_cli::run(&args[1..])),
         "enhance" => {
             let Some((aethyme_root, _source)) = resolve_aethyme_root() else {
                 eprintln!(
@@ -207,8 +218,14 @@ fn print_top_level_help() {
         "  root show|set <path>        where the Python package lives (for delegated commands)"
     );
     eprintln!();
-    eprintln!("Everything else delegates to the Python CLI:");
-    eprintln!("  autofix, ...");
+    eprintln!("Quality:");
+    eprintln!("  ai-ready [--repo <path>]    AI-readiness scorecard");
+    eprintln!("  autofix <path> [--dry-run|--apply|--pr]");
+    eprintln!("                              safe automated fixes (see `autofix --help`)");
+    eprintln!();
+    // Phase 5 emptied the Click tree: no command delegates any more.
+    // The delegation path itself retires with `src/` in Phase 6.
+    eprintln!("No subcommand delegates to Python; unknown ones are errors.");
 }
 
 // ── explore ─────────────────────────────────────────────────────────────────

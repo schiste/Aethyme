@@ -1,6 +1,6 @@
 # CLI Surface v1 (frozen 2026-07-17)
 
-Last Updated: 2026-07-30
+Last Updated: 2026-08-01
 
 The contract every python-retirement phase must hold: command names,
 flags, env-var bindings, and defaults of the delegated (Python) surface.
@@ -93,6 +93,31 @@ names/flags/output — golden-verified):
   companion commit (autofix never imported them);
   `record_scan_metrics` (in-process Prometheus, a no-op since the
   Phase 0 dependency purge) is retired with no replacement.
+- `autofix` (Phase 5 flip, 2026-08-01; `aethyme-quality` crate, fix
+  side: the safety/risk engine, patch generation and application, the
+  5 fixers, and the git/PR helper). Stdout, exit codes, produced
+  unified diffs, and post-apply file trees byte-identical to Python on
+  the parity corpus (6 fixture repos x 12 invocation shapes, plus this
+  repository; formatter-dependent runs pin deterministic tool shims on
+  PATH). Same argument and flags. The PR-mode approval gate is
+  unchanged: `create_autofix_pr` applies with `skip_approval=False`
+  hardcoded, so medium/high-risk patches stop the flow before anything
+  is applied, committed, or pushed, and `--skip-approval` does not
+  reach PR mode. Divergences per the Phase 2 precedent: usage errors
+  keep Click's `Error: {message}` line (exact Click 8.4 wording)
+  without the usage/`Try ...` preamble; `--help` prints the same body
+  with the `aethyme autofix` spelling. Two further recorded
+  divergences: the structlog console diagnostics the Python
+  interleaved into stdout (ANSI-coloured, timestamped,
+  `src.autofixers.*`-tagged internal warnings about unreadable or
+  generated files) are gone — the native command has no logging sink,
+  and its own `click.echo` output is unchanged; and a failed
+  `git checkout -b` in PR mode reports
+  `Error: failed to create the autofix branch` on stderr with exit 1
+  instead of the Python traceback that escaped `create_autofix_pr`
+  (same exit code). The Python command, `src/autofixers/`, and
+  `tests/autofixers/` are hard-deleted in the companion commit, which
+  leaves the Click tree with zero commands.
 
 ## Global options
 
