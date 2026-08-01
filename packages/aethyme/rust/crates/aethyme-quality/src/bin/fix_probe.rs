@@ -14,7 +14,8 @@ use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
 
-use aethyme_quality::fix::patch::FilePatch;
+use aethyme_quality::fix::FixSelection;
+use aethyme_quality::fix::patch::{FilePatch, PatchGenerator};
 use aethyme_quality::fix::safety::{RiskLevel, SafetyEngine};
 
 fn main() -> ExitCode {
@@ -23,6 +24,7 @@ fn main() -> ExitCode {
         Some("safety") => safety_mode(&args[1..]),
         Some("validate") => validate_mode(&args[1..]),
         Some("diff") => diff_mode(&args[1..]),
+        Some("patches") => patches_mode(&args[1..]),
         other => {
             eprintln!("unknown mode: {}", other.unwrap_or("<none>"));
             eprintln!(
@@ -56,6 +58,67 @@ fn safety_mode(args: &[String]) -> ExitCode {
         let skip = engine.should_skip_file(path);
         println!("{line}\t{generated}\t{risk}\t{skip}");
     }
+    ExitCode::SUCCESS
+}
+
+/// The full dry-run payload for a repository: every proposed patch's
+/// summary, the risk rollup, and the produced unified diff verbatim.
+/// This is the artifact the per-fixer corpus diff compares.
+fn patches_mode(args: &[String]) -> ExitCode {
+    let Some(repo) = args.first() else {
+        eprintln!("usage: fix-probe patches <repo> [fix-type]");
+        return ExitCode::from(2);
+    };
+    let selection = args
+        .get(1)
+        .map(String::as_str)
+        .and_then(FixSelection::parse)
+        .unwrap_or(FixSelection::All);
+    let repo_path = std::fs::canonicalize(repo).unwrap_or_else(|_| std::path::PathBuf::from(repo));
+
+    let mut generator = PatchGenerator::new(&repo_path, SafetyEngine::new());
+    for group in [
+        FixSelection::Docs,
+        FixSelection::Links,
+        FixSelection::Selectors,
+        FixSelection::I18n,
+        FixSelection::Format,
+    ] {
+        let Some(proposals) = aethyme_quality::fix::collect_group(&repo_path, selection, group)
+        else {
+            continue;
+        };
+        println!("GROUP\t{group:?}\t{}", proposals.len());
+        for proposal in proposals {
+            generator.add_patch(
+                &proposal.file_path,
+                &proposal.original_content,
+                &proposal.new_content,
+                &proposal.fix_type,
+            );
+        }
+    }
+
+    let (summary, diff, patches) = generator.dry_run();
+    for patch in &patches {
+        println!(
+            "PATCH\t{}\t{}\t{}\t{}\t{}\t{}",
+            patch.file, patch.fix_type, patch.risk_level.as_str(),
+            patch.lines_added, patch.size_change, patch.has_changes
+        );
+    }
+    println!(
+        "SUMMARY\t{}\t{}\t{}\t{}\t{}",
+        summary.total_files, summary.total_low_risk, summary.total_medium_risk,
+        summary.total_high_risk, summary.requires_approval
+    );
+    for (fix_type, count) in &summary.by_fix_type {
+        println!("BYFIX\t{fix_type}\t{count}");
+    }
+    println!("DIFF-BEGIN");
+    print!("{diff}");
+    println!();
+    println!("DIFF-END");
     ExitCode::SUCCESS
 }
 

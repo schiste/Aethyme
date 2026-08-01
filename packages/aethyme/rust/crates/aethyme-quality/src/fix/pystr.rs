@@ -60,6 +60,26 @@ pub fn splitlines(text: &str, keepends: bool) -> Vec<&str> {
     out
 }
 
+/// `"".join(handle.readline() for _ in range(n))` over already
+/// newline-translated text. `readline` splits on `\n` ONLY — the exotic
+/// `splitlines` boundaries are not line terminators for the file
+/// protocol, so this deliberately differs from `splitlines`.
+pub fn first_lines(text: &str, max_lines: usize) -> String {
+    let mut end = 0usize;
+    let mut lines = 0usize;
+    for (idx, byte) in text.as_bytes().iter().enumerate() {
+        if *byte == b'\n' {
+            lines += 1;
+            end = idx + 1;
+            if lines == max_lines {
+                return text[..end].to_string();
+            }
+        }
+    }
+    let _ = end;
+    text.to_string()
+}
+
 /// CPython `len(str)`: a count of code points, not bytes. Used for the
 /// safety engine's size comparisons and the patch summary's
 /// `size_change`, both of which are character deltas in the Python.
