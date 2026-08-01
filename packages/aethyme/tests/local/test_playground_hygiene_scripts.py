@@ -59,6 +59,10 @@ def _assert_native_root_guidance(repo_path: Path) -> None:
         assert '"$AETHYME_ROOT/rust/target/release/aethyme" explore' in text
         assert "Do not run `python -m src.cli explore`" in text
         assert '"$AETHYME_ROOT/.venv/bin/python" -m src.cli explore' not in text
+        # Phase 5.5: the compact projection is native, and nothing in the
+        # deployed root guidance may reach for the Aethyme venv Python.
+        assert "explore-summary --from" in text
+        assert ".venv/bin/python" not in text
 
 
 def test_enhance_deploy_root_guidance_uses_native_explore(tmp_path: Path) -> None:
@@ -146,6 +150,14 @@ def test_verify_playground_enforces_guidance_and_discovery_hygiene() -> None:
     assert "top_verification_targets" in script
     assert "observability.readiness" in script
     assert "verify-targets" in script
+    # Phase 5.5 template flip (2026-08-01): the compact projection is
+    # `aethyme explore-summary --from <json>`; no deployed artifact may
+    # invoke the Aethyme venv interpreter (comment lines tolerated, same
+    # as the Phase 2/3 `-m src.cli` staleness checks).
+    assert "explore-summary --from" in script
+    assert "check_no_venv_python" in script
+    assert ".venv/bin/python" in script
+    assert "has no Aethyme-venv Python invocation" in script
     assert "120 output lines / 20k chars" in script
     assert "multi-file `sed`" in script
     assert "navigation_hints\\[\\]" in script

@@ -52,6 +52,11 @@ def test_skill_md_is_concise_auto_load_card():
     assert "top_verification_targets" in text
     assert "observability.readiness" in text
     assert "verify-targets" in text
+    # Phase 5.5 (2026-08-01): the compact projection is a native reader
+    # command, not a `.venv/bin/python` heredoc — SKILL.md deploys into
+    # user repos, so the product path must not require Python.
+    assert "explore-summary --from" in text
+    assert ".venv/bin/python" not in text
     assert "120 output lines / 20k chars" in text
     assert "multi-file `sed`" in text
     assert "`rg -C` context dumps" in text
@@ -68,6 +73,8 @@ def test_generated_agents_template_uses_projection_contract():
     assert "top_verification_targets" in text
     assert "observability.readiness" in text
     assert "verify-targets" in text
+    assert "explore-summary --from" in text
+    assert ".venv/bin/python" not in text
     assert "120 output lines / 20k chars" in text
     assert "multi-file `sed`" in text
     assert "navigation_hints[]" not in text
@@ -76,6 +83,13 @@ def test_generated_agents_template_uses_projection_contract():
 def test_reference_files_exist():
     for path in (EXPLORE_REF_PATH, GRAPH_REF_PATH, DEAD_CODE_REF_PATH):
         assert path.exists(), f"missing Aethyme skill reference: {path}"
+
+
+def test_references_use_native_projection_and_no_venv_python():
+    explore_text = EXPLORE_REF_PATH.read_text()
+    assert "explore-summary --from" in explore_text
+    for path in (EXPLORE_REF_PATH, GRAPH_REF_PATH, DEAD_CODE_REF_PATH):
+        assert ".venv/bin/python" not in path.read_text(), path
 
 
 def test_enhance_deploys_aethyme_skill_references(tmp_path: Path) -> None:
