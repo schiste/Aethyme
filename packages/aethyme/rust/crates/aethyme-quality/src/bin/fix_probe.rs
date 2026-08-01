@@ -14,16 +14,20 @@ use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
 
-use aethyme_quality::fix::safety::SafetyEngine;
+use aethyme_quality::fix::patch::FilePatch;
+use aethyme_quality::fix::safety::{RiskLevel, SafetyEngine};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("safety") => safety_mode(&args[1..]),
         Some("validate") => validate_mode(&args[1..]),
+        Some("diff") => diff_mode(&args[1..]),
         other => {
             eprintln!("unknown mode: {}", other.unwrap_or("<none>"));
-            eprintln!("usage: fix-probe safety <fix_type> | fix-probe validate <a> <b>");
+            eprintln!(
+                "usage: fix-probe safety <fix_type> | validate <a> <b> | diff <a> <b> <name>"
+            );
             ExitCode::from(2)
         }
     }
@@ -52,6 +56,29 @@ fn safety_mode(args: &[String]) -> ExitCode {
         let skip = engine.should_skip_file(path);
         println!("{line}\t{generated}\t{risk}\t{skip}");
     }
+    ExitCode::SUCCESS
+}
+
+/// The produced unified diff for a content pair, byte-for-byte as
+/// `FilePatch.generate_diff` renders it.
+fn diff_mode(args: &[String]) -> ExitCode {
+    let (Some(a), Some(b)) = (args.first(), args.get(1)) else {
+        eprintln!("usage: fix-probe diff <original-file> <new-file> [name]");
+        return ExitCode::from(2);
+    };
+    let name = args.get(2).cloned().unwrap_or_else(|| "x.py".to_string());
+    let (Ok(original), Ok(new)) = (std::fs::read_to_string(a), std::fs::read_to_string(b)) else {
+        eprintln!("could not read inputs");
+        return ExitCode::from(2);
+    };
+    let patch = FilePatch::new(
+        std::path::PathBuf::from(name),
+        original,
+        new,
+        "probe".to_string(),
+        RiskLevel::Low,
+    );
+    print!("{}", patch.generate_diff());
     ExitCode::SUCCESS
 }
 

@@ -13,5 +13,7 @@
 //! against a progressively-rewritten buffer, risk patterns matched
 //! against absolute paths — the quirk is ported, not corrected.
 
+pub mod difflib;
+pub mod patch;
 pub mod pystr;
 pub mod safety;
