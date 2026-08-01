@@ -91,15 +91,22 @@ check_no_agent_guidance_files() {
 # invoke the Aethyme venv interpreter. Comment lines are tolerated —
 # current templates carry provenance comments naming the retired
 # spelling, exactly like the Phase 2/3 `-m src.cli` staleness checks.
+#
+# Phase 6 (2026-08-01) widened this to ANY Python interpreter, not just
+# the venv one: the deployed SessionStart hook used a bare `python3`
+# heredoc to build its JSON envelope, which is now
+# `aethyme repo hook-envelope`. A `python3`/`python` invocation in a
+# deployed artifact means the product path still needs Python on PATH —
+# the exact condition this phase exists to eliminate.
 check_no_venv_python() {
     local file="$1"
     local label="$2"
 
-    if grep -- '.venv/bin/python' "$file" \
+    if grep -E -- '\.venv/bin/python|(^|[^-[:alnum:]_/])python3?[[:space:]]' "$file" \
         | grep -Ev '^[[:space:]]*#|Do not run|not a valid command|was removed|retired|previously' >/dev/null; then
-        check_fail "$label still invokes the Aethyme venv Python (Phase 5.5 flipped the Explore projection to 'aethyme explore-summary'; redeploy with current template)"
+        check_fail "$label still invokes a Python interpreter (Phase 5.5 flipped the Explore projection to 'aethyme explore-summary'; Phase 6 flipped the hook envelope to 'aethyme repo hook-envelope'; redeploy with current template)"
     else
-        check_pass "$label has no Aethyme-venv Python invocation"
+        check_pass "$label has no Python invocation"
     fi
 }
 check_root_guidance() {
@@ -299,7 +306,11 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
     for wrapper in ".codex/skills/aethyme/aethyme-explore" ".claude/hooks/aethyme-load-context.sh"; do
         [[ -f "$wrapper" ]] || { check_fail "Missing deployed wrapper $wrapper"; continue; }
         grep -q '{{AETHYME_ROOT}}' "$wrapper" && check_fail "$wrapper has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "$wrapper placeholders resolved"
-        grep -q 'aethyme repo record-wrapper-invocation' "$wrapper" \
+        # The binary may be spelled bare (`aethyme`, from PATH) or through
+        # the hook's resolved `$aethyme_bin` (Phase 6, which added a
+        # checkout-release fallback so the hook works without an install).
+        # What matters is that telemetry goes through the native router.
+        grep -q 'repo record-wrapper-invocation' "$wrapper" \
             && check_pass "$wrapper records telemetry via native router" \
             || check_fail "$wrapper missing native record-wrapper-invocation call (redeploy with current template)"
         # Ignore comment lines: the current templates carry provenance

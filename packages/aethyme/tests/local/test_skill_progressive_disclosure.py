@@ -30,6 +30,7 @@ AGENTS_PATH = REPO_ROOT / "skills" / "aethyme" / "AGENTS.md"
 EXPLORE_REF_PATH = REPO_ROOT / "skills" / "aethyme" / "references" / "explore.md"
 GRAPH_REF_PATH = REPO_ROOT / "skills" / "aethyme" / "references" / "graph-task.md"
 DEAD_CODE_REF_PATH = REPO_ROOT / "skills" / "aethyme" / "references" / "dead-code.md"
+HOOK_PATH = REPO_ROOT / "skills" / "aethyme" / "aethyme-load-context.sh"
 
 
 def test_skill_md_exists():
@@ -90,6 +91,25 @@ def test_references_use_native_projection_and_no_venv_python():
     assert "explore-summary --from" in explore_text
     for path in (EXPLORE_REF_PATH, GRAPH_REF_PATH, DEAD_CODE_REF_PATH):
         assert ".venv/bin/python" not in path.read_text(), path
+
+
+def test_session_hook_template_emits_envelope_natively():
+    """Phase 6 (2026-08-01): the SessionStart hook template carried the
+    last Python invocation on the product path — a bare `python3`
+    heredoc that JSON-escaped the envelope. It is now
+    `aethyme repo hook-envelope`, so the deployed hook works on a
+    machine with no Python at all.
+
+    Mirrors `verify-playground.sh:check_no_venv_python`, which enforces
+    the same rule against *deployed* copies.
+    """
+    text = HOOK_PATH.read_text()
+    assert "repo hook-envelope" in text
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue  # provenance comments may name the retired spelling
+        assert "python3" not in line, line
+        assert ".venv/bin/python" not in line, line
 
 
 def test_enhance_deploys_aethyme_skill_references(tmp_path: Path) -> None:

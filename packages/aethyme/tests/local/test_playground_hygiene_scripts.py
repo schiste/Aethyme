@@ -157,7 +157,11 @@ def test_verify_playground_enforces_guidance_and_discovery_hygiene() -> None:
     assert "explore-summary --from" in script
     assert "check_no_venv_python" in script
     assert ".venv/bin/python" in script
-    assert "has no Aethyme-venv Python invocation" in script
+    # Phase 6 (2026-08-01): the check widened from the venv interpreter
+    # to ANY Python interpreter — the deployed SessionStart hook's last
+    # Python was a bare `python3` heredoc, now `repo hook-envelope`.
+    assert "python3?" in script
+    assert "has no Python invocation" in script
     assert "120 output lines / 20k chars" in script
     assert "multi-file `sed`" in script
     assert "navigation_hints\\[\\]" in script
