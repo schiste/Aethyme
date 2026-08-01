@@ -135,7 +135,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     let mut i = 0usize;
     while i < args.len() {
         let arg = args[i].as_str();
-        let mut take_value = |name: &str| -> Result<String, String> {
+        let take_value = |name: &str| -> Result<String, String> {
             match args.get(i + 1) {
                 Some(v) => Ok(v.clone()),
                 None => Err(format!("Option '{name}' requires an argument.")),

@@ -15,6 +15,7 @@
 pub mod ai_ready_cli;
 pub mod detectors;
 pub mod engine;
+pub mod fix;
 pub mod format;
 pub mod model;
 pub mod util;
