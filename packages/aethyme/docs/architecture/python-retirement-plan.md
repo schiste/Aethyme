@@ -1,8 +1,10 @@
 # Python Retirement Plan — one binary, one runtime
 
-Last Updated: 2026-07-17
+Last Updated: 2026-08-01
 
-Status: PROPOSED. Owner: operator. Prereq reading:
+Status: PHASES 0–6 LANDED (2026-08-01). The product path is Python-free;
+`cargo install` yields the entire product. What remains is the dev test
+stack — see Phase 6's "What did NOT land" note. Owner: operator. Prereq reading:
 `cross-process-consumers.md`, `graph-schema.md`, the redb migration plans.
 
 ## Objective
@@ -499,6 +501,29 @@ story.
 then the full local suite + verify-playground + a playground enhance/
 deploy round-trip pass with no Python on PATH (for the product path).
 Registry contains zero Python invocations.
+
+**Status: MET 2026-08-01.** Proven on macOS behind a sandbox PATH holding
+only the Aethyme binaries and core utilities, with `python`/`python3`
+absent: `enhance deploy/verify`, `ai-ready`, `autofix --dry-run`, `repo
+commit-message-template`, the deployed SessionStart hook (valid envelope,
+exit 0), `aethyme-graph-index`, `aethyme-engine-cli index`, `explore`,
+`explore-summary`, `verify-targets`. `verify-playground.sh` reported 93
+passes with zero Python-related failures. Encoded as the
+`product-path-no-python` job in `oss-ci.yml`, which asserts up front that
+no interpreter is reachable so it cannot pass vacuously. The registry's
+only remaining Python invocations are the dev test lanes, each labelled
+DEV-ONLY; every product-path row is native.
+
+**What did NOT land in Phase 6** (deliberate — operator decision 5): the
+`tests/` pytest harness and `pyproject.toml` survive as dev-only
+scaffolding. `packages/aethyme` is not yet 100% Rust. The follow-up
+session ports `tests/local` (~126 tests) plus `tests/indexing` and
+`tests/docs` to Rust and then deletes `tests/`, `pyproject.toml`, the
+`ruff`/`pytest-local` gates, the Python setup in
+`aethyme-local-tests.yml` / `oss-ci.yml` / `aethyme-gates.yml`, and the
+three remaining dev scripts (`scripts/eval/run_codex_eval.py`,
+`scripts/eval/check_regression_gate.py`,
+`scripts/verify-grammar-provenance.py`).
 
 **Risks to manage.**
 - *Operator muscle memory and old notes* — `python -m src.cli` stops
