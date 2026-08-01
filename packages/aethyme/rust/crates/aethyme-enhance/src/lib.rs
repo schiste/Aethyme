@@ -17,6 +17,7 @@
 pub mod agents;
 pub mod cli;
 pub mod deploy;
+pub mod explore_summary_cli;
 pub mod hygiene;
 pub mod onboarding;
 pub mod pyjson;

@@ -52,6 +52,11 @@ fn main() -> ExitCode {
         }
         "explore" => run_explore(&args[1..]),
         "verify-targets" => run_verify_targets(&args[1..]),
+        // Reader sibling of verify-targets over the SAME saved
+        // answer-json (python-retirement Phase 5.5): the compact
+        // decision surface deployed skills used to build with a
+        // `.venv/bin/python` heredoc.
+        "explore-summary" => run_explore_summary(&args[1..]),
         // Native since python-retirement Phase 1 (the Python `query`
         // group is deleted). Errors keep Click's `Error: {msg}` shape
         // and exit 1 so scripted consumers see the same surface.
@@ -203,6 +208,8 @@ fn print_top_level_help() {
     eprintln!("Hot path:");
     eprintln!("  explore --repo <path> --request \"<task>\" [--format answer-json]");
     eprintln!("                              in-process engine; auto-starts the engine daemon");
+    eprintln!("  explore-summary --from explore.json");
+    eprintln!("                              compact decision surface from a saved answer-json");
     eprintln!(
         "  verify-targets --repo <path> --from explore.json [--max-targets 2 --max-lines 80]"
     );
@@ -289,6 +296,21 @@ fn run_verify_targets(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
         VerifyTargetsCliOutcome::Failed(message) => {
+            eprintln!("{message}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_explore_summary(args: &[String]) -> ExitCode {
+    use aethyme_enhance::explore_summary_cli::{ExploreSummaryCliOutcome, run};
+    match run(args) {
+        ExploreSummaryCliOutcome::Done => ExitCode::SUCCESS,
+        ExploreSummaryCliOutcome::BadUsage(message) => {
+            eprintln!("{message}");
+            ExitCode::from(2)
+        }
+        ExploreSummaryCliOutcome::Failed(message) => {
             eprintln!("{message}");
             ExitCode::from(1)
         }
