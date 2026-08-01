@@ -74,6 +74,9 @@ pub fn collect_group(
         FixSelection::I18n => {
             fixers::process_directory(&fixers::I18nScaffolder::new(repo_path), repo_path)
         }
+        FixSelection::Format => {
+            fixers::process_directory(&fixers::FormatFixer::new(repo_path), repo_path)
+        }
         _ => Vec::new(),
     })
 }

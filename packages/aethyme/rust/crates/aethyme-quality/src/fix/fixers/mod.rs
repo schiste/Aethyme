@@ -26,11 +26,13 @@
 pub mod base;
 pub mod docs_regenerator;
 pub mod link_fixer;
+pub mod format_fixer;
 pub mod i18n_scaffolder;
 pub mod selector_inserter;
 
 pub use base::{FixProposal, Fixer, process_directory};
 pub use docs_regenerator::DocsRegenerator;
 pub use link_fixer::LinkFixer;
+pub use format_fixer::FormatFixer;
 pub use i18n_scaffolder::I18nScaffolder;
 pub use selector_inserter::SelectorInserter;
