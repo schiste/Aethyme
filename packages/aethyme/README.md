@@ -41,26 +41,27 @@ the default operator path.
 
 Aethyme is moving toward:
 
-- Rust for deterministic engine components
-- Python for CLI surfaces, enhance/onboarding, and scorecard orchestration
+- Rust for every shipped command: the engine, the router, enhance,
+  and the quality domain (scorecard + autofix)
+- Python only for development tooling, pending the Phase 6 sweep
 
 See [`docs/architecture/rust-transition.md`](docs/architecture/rust-transition.md) and [`rust/README.md`](rust/README.md).
 
 ## Active Surface
 
 ### Core Logic
-- `src/indexing` (engine adapter, onboarding, skills)
-- `src/scorecard`
-- `src/autofixers`
-- `rust` (engine + broker crates)
+- `rust` (engine, router, broker, enhance, and quality crates —
+  quality holds both the AI-readiness scorecard and the autofixers)
+- `src/indexing` (engine build bootstrap for the dev test harness)
 
 ### Delivery
-- `src/cli.py` (Python surfaces) and the Rust `aethyme` router (explore,
-  certify, broker)
+- the Rust `aethyme` router — every command is native since the
+  python-retirement Phase 5 flip (2026-08-01); `src/cli.py` carries no
+  commands and retires with `src/` in Phase 6
 
 ### Verification
-- `tests/local` (CI lane), `tests/indexing`, `tests/scorecard`,
-  `tests/autofixers`, `tests/contracts`, `tests/docs`, Rust workspace tests
+- `tests/local` (CI lane), `tests/indexing`, `tests/contracts`,
+  `tests/docs`, Rust workspace tests
 
 ## Local-First Workflow
 

@@ -11,10 +11,26 @@
 //! Parity-first discipline: detectors replicate Python quirks on
 //! purpose (see per-detector comments); improvements — graph-backed
 //! detection, smarter heuristics — are V2 material, not this port.
+//!
+//! # Fix side (retirement plan Phase 5)
+//!
+//! `fix` is the port of `src/autofixers/`: the safety/risk engine,
+//! patch generation and application, the five fixers, and the git/PR
+//! helper, behind the native `aethyme autofix` front end. Same
+//! contract, extended to the produced unified diffs: byte-identical
+//! patches on the parity corpus.
+//!
+//! The two sides share the crate (decision #1: "the unification is the
+//! point") but not yet a scan. The fixers keep their own scanning
+//! rather than consuming `Finding`s, because the two disagree about
+//! what counts — see `fix::fixers` for why that unification is deferred
+//! to a post-parity refactor.
 
 pub mod ai_ready_cli;
+pub mod autofix_cli;
 pub mod detectors;
 pub mod engine;
+pub mod fix;
 pub mod format;
 pub mod model;
 pub mod util;

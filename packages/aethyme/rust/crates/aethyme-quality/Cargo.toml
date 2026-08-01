@@ -2,12 +2,15 @@
 name = "aethyme-quality"
 version = "0.1.0"
 edition = "2024"
-description = "AI-readiness scorecard, detect side: the 8 detectors, the integer 100-point scoring engine, and json/md report rendering. Retirement-plan Phase 4 port of src/scorecard/; findings, scores, and rendered reports are byte-parity with the Python implementation (parity corpus verified, volatile fields normalized)."
+description = "The quality domain, detect and fix. Detect (retirement Phase 4, port of src/scorecard/): 8 detectors, the integer 100-point scoring engine, json/md report rendering. Fix (retirement Phase 5, port of src/autofixers/): the safety/risk engine, patch generation and application, 5 fixers, and the git/PR helper. Findings, scores, rendered reports and produced unified diffs are byte-parity with the Python implementations (parity corpus verified, volatile fields normalized)."
 
 [dependencies]
 # pyjson: CPython-exact JSON emission (insertion order, ensure_ascii,
 # repr float rendering) — the sanctioned serializer for parity output.
 aethyme-enhance = { path = "../aethyme-enhance" }
+# localtime_r: the autofix branch name is `datetime.now().strftime(...)`
+# in LOCAL time, which std cannot render.
+libc = "0.2"
 regex = "1"
 
 [[bin]]
@@ -15,3 +18,10 @@ regex = "1"
 # not part of the frozen CLI surface. Retires with the harness in Phase 6.
 name = "quality-probe"
 path = "src/bin/quality_probe.rs"
+
+[[bin]]
+# Fix-side counterpart of quality-probe (retirement Phase 5 parity
+# harness): safety verdicts, validation results, and produced patches.
+# Not part of the frozen CLI surface; retires with the harness.
+name = "fix-probe"
+path = "src/bin/fix_probe.rs"

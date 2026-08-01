@@ -24,7 +24,10 @@ def test_removed_python_explore_command_prints_native_recovery_hint() -> None:
     assert result.exit_code == 2
     assert "'explore' was removed from the Python CLI on 2026-05-08" in result.output
     assert '"$AETHYME_ROOT/rust/target/release/aethyme" explore' in result.output
-    assert "The Python CLI still handles graph, task, intents, facts, and analyze." in result.output
+    # The tombstone's closing line was stale from Phase 1 onward (graph,
+    # task, facts and analyze all went native then) and became plainly
+    # wrong at the Phase 5 flip, which emptied the Click tree.
+    assert "Every command is now native: run `aethyme --help`." in result.output
 
 
 def test_intents_compact_json_lists_default_task_localization_query() -> None:
