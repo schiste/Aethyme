@@ -1,5 +1,10 @@
 name: Aethyme Local Tests
 
+# DEV-ONLY lane. tests/local is implementation-blind pytest scaffolding
+# that drives the built `aethyme` binary; it retires when the suite ports
+# to Rust (operator decision 5, 2026-08-01). The PRODUCT path carries no
+# Python and is proven by the `product-path-no-python` job in oss-ci.yml.
+
 on:
   pull_request:
     paths:
@@ -22,21 +27,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Set up Python
+      - name: Set up Python (dev harness only)
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      # The documented dev setup uses a package-local .venv (the layout the
-      # broker gates and docs assume), so CI provides the same venv layout.
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install package + dev dependencies (into .venv)
+      # The documented dev setup uses a package-local .venv (the layout the
+      # broker gates and docs assume), so CI provides the same venv layout.
+      # Never `pip install -e .`: since python-retirement Phase 6 deleted
+      # src/, this package installs no code and has no runtime deps.
+      - name: Install the test harness (into .venv)
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/python -m pip install -e ".[dev]"
+          .venv/bin/python -m pip install pytest pytest-asyncio ruff
 
       # tests/local invoke the `aethyme` router binary as a subprocess
       # (python-retirement Phase 0 seam) — the router must exist in every
@@ -59,7 +66,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Set up Python
+      - name: Set up Python (dev harness only)
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -67,11 +74,11 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install package + dev dependencies (into .venv)
+      - name: Install the test harness (into .venv)
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/python -m pip install -e ".[dev]"
+          .venv/bin/python -m pip install pytest pytest-asyncio ruff
 
       - name: Build Rust engine + router binaries
         run: cargo build --quiet --manifest-path rust/Cargo.toml --bin aethyme-engine-cli --bin aethyme

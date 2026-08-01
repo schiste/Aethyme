@@ -9,8 +9,108 @@ permissions:
   contents: read
 
 jobs:
-  python-local-tests:
-    name: Python local tests
+  # ── Product path ────────────────────────────────────────────────────────
+  # The exit criterion of the python-retirement (plan Phase 6): a user who
+  # runs `cargo install` never needs Python. This job proves it by running
+  # the whole product surface behind a PATH that contains no interpreter.
+  # The dev lanes below cannot prove this — they have Python by
+  # construction — so if a product command ever reaches for an interpreter
+  # again, this is the only job that fails.
+  product-path-no-python:
+    name: Product path (no Python on PATH)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install the router and its sibling binaries
+        run: |
+          cargo install --path packages/aethyme/rust/crates/aethyme-cli --locked
+          cargo install --path packages/aethyme/rust/crates/aethyme-engine --locked
+          cargo install --path packages/aethyme/rust/crates/aethyme-graph-indexer --locked
+
+      - name: Exercise the product surface with no interpreter reachable
+        run: |
+          set -euo pipefail
+
+          # Stage a sandbox bin dir holding only the Aethyme binaries and
+          # the core utilities a shell/git needs. Symlink explicit absolute
+          # paths, never `command -v` results — a wrapper earlier on PATH
+          # can itself be an interpreter script, which would silently
+          # reintroduce the dependency this job exists to exclude.
+          SANDBOX="$RUNNER_TEMP/nopython-bin"
+          mkdir -p "$SANDBOX"
+          for p in /usr/bin/git /bin/bash /bin/sh /usr/bin/env /bin/cat /bin/cp /bin/mv \
+                   /bin/rm /bin/mkdir /bin/rmdir /bin/grep /bin/sed /usr/bin/awk \
+                   /usr/bin/diff /usr/bin/sort /usr/bin/head /usr/bin/tail /usr/bin/wc \
+                   /usr/bin/find /usr/bin/dirname /usr/bin/basename /bin/mktemp \
+                   /bin/chmod /bin/ln /bin/date /usr/bin/tr /bin/uname /bin/readlink \
+                   /usr/bin/touch /bin/ls /usr/bin/id /usr/bin/xargs /usr/bin/cut /usr/bin/tee; do
+            [ -x "$p" ] && ln -sf "$p" "$SANDBOX/$(basename "$p")"
+          done
+          for bin in aethyme aethyme-engine-cli aethyme-graph-index; do
+            ln -sf "$HOME/.cargo/bin/$bin" "$SANDBOX/$bin"
+          done
+          export PATH="$SANDBOX"
+          export AETHYME_ROOT="$GITHUB_WORKSPACE/packages/aethyme"
+
+          # Guard the guard: if an interpreter is reachable, this job
+          # proves nothing and must fail loudly rather than pass quietly.
+          if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
+            echo "FAIL: a Python interpreter is on PATH — this job cannot prove the product path" >&2
+            exit 1
+          fi
+
+          aethyme --version
+          aethyme --help
+
+          TARGET="$RUNNER_TEMP/product-repo"
+          mkdir -p "$TARGET/src" && cd "$TARGET"
+          git init -q .
+          git config user.email ci@example.com
+          git config user.name CI
+          printf 'def main():\n    return 0\n' > src/app.py
+          printf '# Demo\n' > README.md
+          git add -A && git commit -qm init
+
+          # Deploy + verify the discoverability artifacts.
+          aethyme enhance deploy --repo .
+          aethyme enhance verify --repo .
+
+          # Quality surface. ai-ready exits 1 when it reports warnings,
+          # which a fixture repo always does, so assert on the report
+          # rather than the exit code.
+          aethyme ai-ready --repo . > ai-ready.md || true
+          grep -q "Detector Performance" ai-ready.md
+          aethyme autofix . --dry-run
+          aethyme repo commit-message-template --type fix --scope api > /dev/null
+
+          # The deployed SessionStart hook — the last thing on the product
+          # path that used a Python heredoc (flipped in Phase 6).
+          CLAUDE_PROJECT_DIR="$TARGET" bash .claude/hooks/aethyme-load-context.sh > envelope.json
+          grep -q '"hookEventName": "SessionStart"' envelope.json
+          test -s envelope.json
+
+          # Index + the Explore chain and both readers over one saved file.
+          aethyme-graph-index --repo-root "$TARGET" --repo-name demo --engine-version ci
+          aethyme-engine-cli index --repo .
+          aethyme explore --repo . --request "where is main defined" --format answer-json > explore.json
+          grep -q '"schema_version": "aethyme-explore-v1"' explore.json
+          aethyme explore-summary --from explore.json > /dev/null
+          aethyme verify-targets --repo . --from explore.json > /dev/null
+
+          echo "product path is Python-free"
+
+  # ── Dev lanes ───────────────────────────────────────────────────────────
+  # The pytest harness is DEV-ONLY scaffolding and retires when tests/local
+  # ports to Rust (operator decision 5, 2026-08-01). CI installs the test
+  # tools directly — never `pip install -e .`, which would install nothing
+  # now that src/ is deleted and the package has no runtime dependencies.
+  local-tests:
+    name: Local tests (dev harness)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -19,18 +119,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Set up Python
+      - name: Set up Python (dev harness only)
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
       # The documented dev setup uses a package-local .venv (the layout the
       # broker gates and docs assume), so CI provides the same venv layout.
-      - name: Install package and dev dependencies (into .venv)
+      - name: Install the test harness (into .venv)
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/python -m pip install -e ".[dev]"
+          .venv/bin/python -m pip install pytest pytest-asyncio ruff
+
+      # tests/local drive the `aethyme` router binary as a subprocess, so
+      # the router must exist in every lane.
+      - name: Build Rust router binary
+        run: cargo build --quiet --manifest-path rust/Cargo.toml --bin aethyme
 
       - name: Run local tests
         run: .venv/bin/python -m pytest -q tests/local
