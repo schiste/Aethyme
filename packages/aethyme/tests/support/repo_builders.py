@@ -80,7 +80,8 @@ def build_medium_fixture_repo(dest: Path) -> Path:
     """Deterministic multi-language fixture for the migration parity corpus.
 
     Built on demand (never checked in — see CONTRIBUTING's fixture rule)
-    by tests and scripts/migration/golden-diff.sh. Exercises the edge
+    by tests (and, until Phase 6 retired it, the golden-diff harness).
+    Exercises the edge
     cases the python-retirement plan calls out: multiple languages,
     unicode filenames, nested areas, docs, configs, and a cross-file
     call chain.

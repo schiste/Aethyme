@@ -2,7 +2,7 @@
 name = "aethyme-enhance"
 version = "0.1.0"
 edition = "2021"
-description = "Deployment and templating for Aethyme discoverability: enhance deploy/verify, skill compilation, AGENTS.md rendering with overrides. Retirement-plan Phase 2 port of src/enhance.py + indexing/skills.py; outputs are byte-deterministic and golden-verified (scripts/migration/enhance-golden.sh)."
+description = "Deployment and templating for Aethyme discoverability: enhance deploy/verify, skill compilation, AGENTS.md rendering with overrides. Retirement-plan Phase 2 port of src/enhance.py + indexing/skills.py; outputs are byte-deterministic, held by `enhance verify` canonical-match checks and tests/local/test_enhance.py."
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
