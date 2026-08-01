@@ -57,6 +57,12 @@ use crate::graph::search::symbol_search_redb;
 use crate::model::task::TaskInput;
 use crate::store::redb::graph_store::{GraphStore, OverviewV2Limits, ReadOnlyGraphStore};
 
+/// Filename prefix for daemon sockets. Originally a disambiguator: the
+/// retired Python daemon (`src/daemon.py`, removed 2026-07-13) shared
+/// this `$TMPDIR/aethyme` namespace with its own `aethyme.sock`. There is
+/// only one daemon now, so the prefix is merely descriptive — kept as-is
+/// because renaming the socket buys nothing and orphans any daemon
+/// running across the upgrade.
 const SOCKET_PREFIX: &str = "engine-";
 const SOCKET_DIR_NAME: &str = "aethyme";
 pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 1800; // 30 min
@@ -460,8 +466,8 @@ fn handle_request(mut stream: UnixStream, state: &Arc<Mutex<DaemonState>>) -> bo
         "symbol-batch" => {
             // Run the redb-backed V2 matcher for each query.
             // Returns a JSON object keyed by query: {query → [SearchHit, ...]}.
-            // Mirrors the `aethyme-engine-cli symbol-batch` shape so the
-            // Python wrapper can route through the daemon transparently.
+            // Mirrors the `aethyme-engine-cli symbol-batch` shape so a client
+            // can route through the daemon or the CLI interchangeably.
             let queries: Vec<String> = request
                 .get("queries")
                 .and_then(|v| v.as_array())
