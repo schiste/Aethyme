@@ -57,7 +57,11 @@ def _assert_native_root_guidance(repo_path: Path) -> None:
     for filename in ("AGENTS.md", "CLAUDE.md"):
         text = (repo_path / filename).read_text(encoding="utf-8")
         assert '"$AETHYME_ROOT/rust/target/release/aethyme" explore' in text
-        assert "Do not run `python -m src.cli explore`" in text
+        # Phase 6 (2026-08-01) widened the notice: the Python CLI is gone
+        # entirely, not just its `explore` subcommand. The "Do not run"
+        # marker must survive — the contract checker and verify-playground
+        # exempt lines carrying it from the stale-invocation greps.
+        assert "Do not run `python -m src.cli ...` for anything" in text
         assert '"$AETHYME_ROOT/.venv/bin/python" -m src.cli explore' not in text
         # Phase 5.5: the compact projection is native, and nothing in the
         # deployed root guidance may reach for the Aethyme venv Python.

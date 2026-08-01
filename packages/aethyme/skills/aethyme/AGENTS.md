@@ -30,9 +30,10 @@ AETHYME_JSON="$(mktemp -t aethyme-explore.XXXXXX.json)"
     --max-targets 2 --max-lines 80
 ```
 
-Do not run `python -m src.cli explore`; the Python `explore` subcommand was
-removed. Use the native binary above for Explore and the `aethyme` binary for
-`graph`, `task`, `intents`, `facts`, and `analyze`.
+Do not run `python -m src.cli ...` for anything; the Python CLI was removed
+entirely and that spelling now fails. Use the native binary above for Explore
+and the `aethyme` binary for `graph`, `task`, `intents`, `facts`, `analyze`,
+and `enhance`.
 
 Inspect only the printed projection first: `safe_to_use_as_answer`,
 `trust_policy`, `subsystems`, `top_verification_targets`,
