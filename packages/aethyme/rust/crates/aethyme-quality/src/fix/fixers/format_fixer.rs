@@ -15,11 +15,10 @@
 //! argument that nothing ever reads. It is not carried over — it has no
 //! observable behavior — and the CLI never passed it.
 
-use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::fix::command::{CommandRunner, RunOutcome, SystemCommandRunner};
 use crate::fix::fixers::base::Fixer;
 use crate::walk;
 
@@ -46,96 +45,6 @@ fn language_for(file_path: &Path) -> Option<&'static str> {
         ".go" => Some("go"),
         ".rs" => Some("rust"),
         _ => None,
-    }
-}
-
-/// Outcome of one subprocess invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RunOutcome {
-    Completed { code: i32, stdout: Vec<u8> },
-    /// Spawn failure (`FileNotFoundError`) or timeout
-    /// (`TimeoutExpired`) — both are caught in the Python.
-    Failed,
-}
-
-/// Injection seam for the subprocess layer.
-pub trait CommandRunner {
-    fn run(&self, argv: &[&str], stdin: Option<&[u8]>, timeout: Duration) -> RunOutcome;
-}
-
-/// The real runner.
-pub struct SystemCommandRunner;
-
-impl CommandRunner for SystemCommandRunner {
-    fn run(&self, argv: &[&str], stdin: Option<&[u8]>, timeout: Duration) -> RunOutcome {
-        let Some((program, args)) = argv.split_first() else {
-            return RunOutcome::Failed;
-        };
-        let Ok(mut child) = Command::new(program)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        else {
-            return RunOutcome::Failed;
-        };
-
-        // stdin/stdout are pumped on their own threads so a child that
-        // fills its stdout pipe while we are still writing cannot
-        // deadlock us — the same guarantee `subprocess.run(input=...)`
-        // gives via communicate().
-        let input = stdin.map(|bytes| bytes.to_vec()).unwrap_or_default();
-        let mut child_stdin = child.stdin.take();
-        let writer = std::thread::spawn(move || {
-            if let Some(handle) = child_stdin.as_mut() {
-                let _ = handle.write_all(&input);
-            }
-            drop(child_stdin);
-        });
-        let mut child_stdout = child.stdout.take();
-        let reader = std::thread::spawn(move || {
-            let mut buffer = Vec::new();
-            if let Some(handle) = child_stdout.as_mut() {
-                let _ = handle.read_to_end(&mut buffer);
-            }
-            buffer
-        });
-        let mut child_stderr = child.stderr.take();
-        let draining = std::thread::spawn(move || {
-            let mut buffer = Vec::new();
-            if let Some(handle) = child_stderr.as_mut() {
-                let _ = handle.read_to_end(&mut buffer);
-            }
-        });
-
-        let started = Instant::now();
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => {
-                    if started.elapsed() >= timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break None;
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                Err(_) => break None,
-            }
-        };
-
-        let _ = writer.join();
-        let stdout = reader.join().unwrap_or_default();
-        let _ = draining.join();
-
-        match status {
-            Some(status) => RunOutcome::Completed {
-                code: status.code().unwrap_or(-1),
-                stdout,
-            },
-            None => RunOutcome::Failed,
-        }
     }
 }
 
@@ -189,18 +98,18 @@ impl FormatFixer {
     fn run_formatter(&self, tool: &str, file_path: &Path, content: &str) -> Option<String> {
         let input = content.as_bytes();
         let outcome = match tool {
-            "black" => self.runner.run(&["black", "--quiet", "-"], Some(input), FORMAT_TIMEOUT),
+            "black" => self.runner.run(&["black", "--quiet", "-"], Some(input), Some(FORMAT_TIMEOUT), None),
             "prettier" => {
                 let parser = prettier_parser(file_path);
                 self.runner
-                    .run(&["prettier", "--parser", parser], Some(input), FORMAT_TIMEOUT)
+                    .run(&["prettier", "--parser", parser], Some(input), Some(FORMAT_TIMEOUT), None)
             }
-            "gofmt" => self.runner.run(&["gofmt"], Some(input), FORMAT_TIMEOUT),
+            "gofmt" => self.runner.run(&["gofmt"], Some(input), Some(FORMAT_TIMEOUT), None),
             "rustfmt" => {
                 self.runner
-                    .run(&["rustfmt", "--emit", "stdout"], Some(input), FORMAT_TIMEOUT)
+                    .run(&["rustfmt", "--emit", "stdout"], Some(input), Some(FORMAT_TIMEOUT), None)
             }
-            "autopep8" => self.runner.run(&["autopep8", "-"], Some(input), FORMAT_TIMEOUT),
+            "autopep8" => self.runner.run(&["autopep8", "-"], Some(input), Some(FORMAT_TIMEOUT), None),
             _ => return None,
         };
         match outcome {
@@ -215,7 +124,7 @@ impl FormatFixer {
 /// Port of `_is_tool_available`.
 fn is_tool_available(runner: &dyn CommandRunner, tool: &str) -> bool {
     matches!(
-        runner.run(&[tool, "--version"], None, VERSION_TIMEOUT),
+        runner.run(&[tool, "--version"], None, Some(VERSION_TIMEOUT), None),
         RunOutcome::Completed { code: 0, .. }
     )
 }
@@ -273,7 +182,7 @@ mod tests {
     /// output.
     #[derive(Default)]
     struct FakeRunner {
-        calls: Mutex<Vec<(Vec<String>, Option<String>, Duration)>>,
+        calls: Mutex<Vec<(Vec<String>, Option<String>, Option<Duration>)>>,
         available: Vec<&'static str>,
         replies: Mutex<Vec<RunOutcome>>,
         default_reply: Mutex<Option<RunOutcome>>,
@@ -311,7 +220,7 @@ mod tests {
                 .collect()
         }
 
-        fn version_calls(&self) -> Vec<(Vec<String>, Option<String>, Duration)> {
+        fn version_calls(&self) -> Vec<(Vec<String>, Option<String>, Option<Duration>)> {
             self.calls
                 .lock()
                 .unwrap()
@@ -323,7 +232,13 @@ mod tests {
     }
 
     impl CommandRunner for FakeRunner {
-        fn run(&self, argv: &[&str], stdin: Option<&[u8]>, timeout: Duration) -> RunOutcome {
+        fn run(
+            &self,
+            argv: &[&str],
+            stdin: Option<&[u8]>,
+            timeout: Option<Duration>,
+            _cwd: Option<&Path>,
+        ) -> RunOutcome {
             self.calls.lock().unwrap().push((
                 argv.iter().map(|s| s.to_string()).collect(),
                 stdin.map(|b| String::from_utf8_lossy(b).to_string()),
@@ -355,8 +270,14 @@ mod tests {
     struct SharedRunner(Arc<FakeRunner>);
 
     impl CommandRunner for SharedRunner {
-        fn run(&self, argv: &[&str], stdin: Option<&[u8]>, timeout: Duration) -> RunOutcome {
-            self.0.run(argv, stdin, timeout)
+        fn run(
+            &self,
+            argv: &[&str],
+            stdin: Option<&[u8]>,
+            timeout: Option<Duration>,
+            cwd: Option<&Path>,
+        ) -> RunOutcome {
+            self.0.run(argv, stdin, timeout, cwd)
         }
     }
 
@@ -414,7 +335,7 @@ mod tests {
         discovered(&fake);
         for (argv, stdin, timeout) in fake.version_calls() {
             assert!(stdin.is_none(), "{argv:?} must not receive stdin");
-            assert_eq!(timeout, Duration::from_secs(5), "{argv:?}");
+            assert_eq!(timeout, Some(Duration::from_secs(5)), "{argv:?}");
         }
     }
 
@@ -472,7 +393,7 @@ mod tests {
             assert_eq!(fake.format_calls(), vec![expected], "{tool} on {file}");
             let recorded = fake.calls.lock().unwrap();
             assert_eq!(recorded[0].1.as_deref(), Some("in\n"), "{tool} stdin");
-            assert_eq!(recorded[0].2, Duration::from_secs(30), "{tool} timeout");
+            assert_eq!(recorded[0].2, Some(Duration::from_secs(30)), "{tool} timeout");
         }
     }
 
@@ -565,55 +486,4 @@ mod tests {
         assert_eq!(prettier_parser(Path::new("a.unknown")), "babel");
     }
 
-    // ── The real runner ──────────────────────────────────────────────
-
-    #[test]
-    fn system_runner_reports_exit_codes_stdin_and_spawn_failures() {
-        let runner = SystemCommandRunner;
-        assert_eq!(
-            runner.run(&["/bin/echo", "hi"], None, FORMAT_TIMEOUT),
-            RunOutcome::Completed {
-                code: 0,
-                stdout: b"hi\n".to_vec()
-            }
-        );
-        assert_eq!(
-            runner.run(&["/bin/cat"], Some(b"piped"), FORMAT_TIMEOUT),
-            RunOutcome::Completed {
-                code: 0,
-                stdout: b"piped".to_vec()
-            }
-        );
-        assert!(matches!(
-            runner.run(&["/bin/sh", "-c", "exit 3"], None, FORMAT_TIMEOUT),
-            RunOutcome::Completed { code: 3, .. }
-        ));
-        // FileNotFoundError equivalent.
-        assert_eq!(
-            runner.run(&["definitely-not-a-real-tool-xyz", "--version"], None, VERSION_TIMEOUT),
-            RunOutcome::Failed
-        );
-    }
-
-    #[test]
-    fn system_runner_kills_on_timeout() {
-        let runner = SystemCommandRunner;
-        let started = Instant::now();
-        assert_eq!(
-            runner.run(&["/bin/sleep", "30"], None, Duration::from_millis(150)),
-            RunOutcome::Failed
-        );
-        assert!(started.elapsed() < Duration::from_secs(5), "did not kill promptly");
-    }
-
-    #[test]
-    fn system_runner_survives_large_output_while_writing_stdin() {
-        // Would deadlock without the stdin/stdout pump threads.
-        let runner = SystemCommandRunner;
-        let input = "x".repeat(300_000);
-        match runner.run(&["/bin/cat"], Some(input.as_bytes()), FORMAT_TIMEOUT) {
-            RunOutcome::Completed { code: 0, stdout } => assert_eq!(stdout.len(), 300_000),
-            other => panic!("expected completion, got {other:?}"),
-        }
-    }
 }
