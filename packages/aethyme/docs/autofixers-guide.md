@@ -22,8 +22,7 @@ Autofixers are local operator tools. They are not a first-class API product surf
 
 ```bash
 cd packages/aethyme
-. .venv/bin/activate
-python -m src.cli autofix /absolute/path/to/repo --dry-run
+aethyme autofix /absolute/path/to/repo --dry-run
 ```
 
 ## Rule

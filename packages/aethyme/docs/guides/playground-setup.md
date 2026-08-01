@@ -8,7 +8,10 @@ How to create an eval playground — a pair of repos (Control + Aethyme) from an
 
 - Git
 - Engine binary compiled: `cd packages/aethyme/rust && cargo build --release`
-- Python venv: `cd packages/aethyme && python -m venv .venv && .venv/bin/pip install -e .`
+- Router on PATH: `cargo install --path packages/aethyme/rust/crates/aethyme-cli`
+  (no Python: the product path has needed none since 2026-08-01)
+- Python venv ONLY for the eval runner scripts under `scripts/eval/`:
+  `cd packages/aethyme && python3 -m venv .venv`
 - Disk space: ~2x the source repo size (two clones + graph DB)
 
 ## Quick Start
@@ -124,7 +127,7 @@ $GRAPH_INDEXER \
 $ENGINE index --repo .
 
 # Deploy generated root guidance and per-product skills.
-"$AETHYME_ROOT/.venv/bin/python" -m src.cli enhance deploy --repo "$PWD" --force
+"$AETHYME_ROOT/rust/target/release/aethyme" enhance deploy --repo "$PWD" --force
 ```
 
 The generated `AGENTS.md` and `CLAUDE.md` quick start must point Explore at
@@ -136,7 +139,8 @@ the native binary:
 ```
 
 They may warn that `python -m src.cli explore` was removed, but they must not
-present it as executable guidance.
+present it as executable guidance. Since 2026-08-01 the Python CLI does not
+exist at all — the old spelling fails with `No module named src`.
 
 ### 5. Verify
 
@@ -342,7 +346,7 @@ rm -rf "$DEST/Control/.chau7"
 
 **"Aethyme skill shows {{AETHYME_ROOT}}"** — The sed replacement failed. Check the path and re-run:
 ```bash
-"$AETHYME_ROOT/.venv/bin/python" -m src.cli enhance deploy --repo "$PWD" --force
+"$AETHYME_ROOT/rust/target/release/aethyme" enhance deploy --repo "$PWD" --force
 ```
 
 **"Generated artifacts appear in git status or rg output"** — The local

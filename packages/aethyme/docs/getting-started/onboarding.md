@@ -29,7 +29,6 @@ Aethyme Core is a backend for:
 
 ```bash
 cd packages/aethyme
-. .venv/bin/activate
-python -m src.cli stats
+aethyme repo inspect . --json-output
 make test-unit
 ```

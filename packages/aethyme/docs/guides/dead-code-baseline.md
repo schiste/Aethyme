@@ -32,17 +32,15 @@ Preferred analyzer path for collecting candidates:
 ```bash
 # `aethyme explore` is the canonical entry point; routes natively via Rust.
 # Requires `.aethyme/graph_store.redb` from `aethyme-engine-cli index --repo`.
-# `python -m src.cli intents` is still Python (intent catalog discovery).
-cd packages/aethyme
-.venv/bin/python -m src.cli intents --format compact-json
+aethyme intents --format compact-json
 aethyme explore --repo /path/to/repo --intent usage_boundary_query --request "Find public symbols in <scope> with no callers outside <scope>" --scope "<scope>" --search-root src --search-root tests --format answer-json --show-observability
 ```
 
 Fallback low-level path:
 ```bash
-.venv/bin/python -m src.cli facts public-functions --repo /path/to/repo --scope <scope> --json-output
-.venv/bin/python -m src.cli analyze dead-code --repo /path/to/repo --scope <scope> --boundary outside-directory --format eval-json --show-observability
-.venv/bin/python -m src.cli facts function-usage --repo /path/to/repo --target <function> --boundary <scope> --json-output
+aethyme facts public-functions --repo /path/to/repo --scope <scope> --json-output
+aethyme analyze dead-code --repo /path/to/repo --scope <scope> --boundary outside-directory --format eval-json --show-observability
+aethyme facts function-usage --repo /path/to/repo --target <function> --boundary <scope> --json-output
 ```
 
 Use `--include-methods` when the target language expresses the public API as

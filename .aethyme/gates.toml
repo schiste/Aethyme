@@ -31,7 +31,9 @@ name = "pytest-local"
 command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && cd packages/aethyme && "$MAIN/packages/aethyme/.venv/bin/python" -m pytest -q tests/local'
 cost = 2
 triggers = [
-    "packages/aethyme/src/**",
+    # `packages/aethyme/src/**` was dropped 2026-08-01: src/ is deleted
+    # (python-retirement Phase 6). A trigger on a nonexistent path never
+    # matches, which silently narrows a gate rather than failing loudly.
     "packages/aethyme/tests/**",
     "packages/aethyme/skills/**",
     "packages/aethyme/evals/**",

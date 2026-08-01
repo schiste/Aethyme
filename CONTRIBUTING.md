@@ -14,21 +14,29 @@ community support surface unless maintainers explicitly mark them as such.
 ## Development Setup
 
 ```bash
+cd packages/aethyme/rust
+cargo build --quiet --bin aethyme --bin aethyme-engine-cli
+```
+
+`packages/aethyme` has no Python product code — `src/` was deleted on
+2026-08-01 (python-retirement Phase 6) and there is nothing to
+`pip install`. A dev-only pytest harness still drives the built binary
+in `tests/local`; it needs the tools, never an editable install:
+
+```bash
 cd packages/aethyme
 python3 -m venv .venv
-. .venv/bin/activate
-pip install -e '.[dev]'
-cd rust
-cargo build --quiet --bin aethyme-engine-cli
+.venv/bin/python -m pip install pytest pytest-asyncio ruff
 ```
+
+That harness retires when `tests/local` ports to Rust.
 
 ## Core Checks
 
 ```bash
-cd packages/aethyme
-.venv/bin/python -m pytest -q tests/local
-cd rust
+cd packages/aethyme/rust
 cargo test --workspace
+cd .. && .venv/bin/python -m pytest -q tests/local   # dev harness
 ```
 
 ## Pull Request Expectations

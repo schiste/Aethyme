@@ -43,7 +43,9 @@ Aethyme is moving toward:
 
 - Rust for every shipped command: the engine, the router, enhance,
   and the quality domain (scorecard + autofix)
-- Python only for development tooling, pending the Phase 6 sweep
+- **No Python at all on the product path** since the Phase 6 sweep
+  (2026-08-01): `src/` is deleted and `cargo install` is the whole story.
+  A dev-only pytest harness remains in `tests/` until it ports to Rust
 
 See [`docs/architecture/rust-transition.md`](docs/architecture/rust-transition.md) and [`rust/README.md`](rust/README.md).
 
@@ -51,17 +53,19 @@ See [`docs/architecture/rust-transition.md`](docs/architecture/rust-transition.m
 
 ### Core Logic
 - `rust` (engine, router, broker, enhance, and quality crates —
-  quality holds both the AI-readiness scorecard and the autofixers)
-- `src/indexing` (engine build bootstrap for the dev test harness)
+  quality holds both the AI-readiness scorecard and the autofixers).
+  This is the entire product: `src/` was deleted 2026-08-01.
 
 ### Delivery
-- the Rust `aethyme` router — every command is native since the
-  python-retirement Phase 5 flip (2026-08-01); `src/cli.py` carries no
-  commands and retires with `src/` in Phase 6
+- the Rust `aethyme` router — every command is native, and there is no
+  delegation path: an unknown subcommand is an error. `python -m src.cli`
+  is **gone** (Phase 6, 2026-08-01) with no shim; it now fails with
+  `No module named src`. Run `aethyme --help`.
 
 ### Verification
-- `tests/local` (CI lane), `tests/indexing`, `tests/contracts`,
-  `tests/docs`, Rust workspace tests
+- Rust workspace tests (the real suite), plus the dev-only pytest
+  harness in `tests/local`, `tests/indexing`, `tests/docs`
+  (`tests/contracts` was removed with `src/contracts/`)
 
 ## Local-First Workflow
 
@@ -116,7 +120,7 @@ at [`docs/architecture/eval-mining-notes.md`](docs/architecture/eval-mining-note
 - Default local test runs skip engine-backed integration tests if the Rust engine cannot be built in the current environment.
 - Set `AETHYME_REQUIRE_LOCAL_ENGINE=1` to enforce strict mode (tests fail instead of skip when engine build/runtime is unavailable).
 - Strict lane example:
-  - `AETHYME_REQUIRE_LOCAL_ENGINE=1 python -m pytest packages/aethyme/tests/local/test_local_workflow.py -q`
+  - `AETHYME_REQUIRE_LOCAL_ENGINE=1 .venv/bin/python -m pytest packages/aethyme/tests/local/test_local_workflow.py -q`
 - CI runs both lanes in `.github/workflows/aethyme-local-tests.yml`.
 
 This local path is the shortest route to proving:
@@ -145,7 +149,7 @@ Runtime notes:
 - `aethyme repo commit-message-template` and `aethyme repo lint-commit-message` define and validate the typed commit contract Aethyme will later use for repo-memory extraction; substantive commit types (`fix`, `feat`, `refactor`, `perf`) require `Problem`, `Decision`, `Rationale`, and `Validation` sections
 - `explore --request ...` defaults to `task_localization_query`, a bounded general-purpose answer path that returns ranked candidate files/symbols/areas, compact evidence, verification steps, confidence, next actions, compact agent observability, `output_chars_estimate`, and `truncated`; on large repos it returns degraded `needs_verification` output instead of blocking or claiming answer safety
 - `explore --intent usage_boundary_query` now uses a scope-first PHP analyzer path that returns answer/excluded/confidence/observability without building the full repository graph
-- reports include an Aethyme Usage section so availability is not confused with actual `src.cli` invocation
+- reports include an Aethyme Usage section so availability is not confused with actual `aethyme` invocation
 
 ## Start Here
 

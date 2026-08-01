@@ -15,21 +15,29 @@ Do not add speculative status docs, sprint reports, or checked-in fake fixture r
 
 ```bash
 cd packages/aethyme
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e '.[dev]'
 cargo build --release --manifest-path rust/Cargo.toml
 ```
 
-No database or services are required; the CLI drives the built Rust
-engine binary directly.
+No database, services, **or Python** are required: `aethyme` is a single
+Rust binary. To run the dev test harness as well:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install pytest pytest-asyncio ruff
+```
+
+There is nothing to `pip install` from this repo: `src/` was deleted on
+2026-08-01 (python-retirement Phase 6) and `packages/aethyme` ships no
+Python. The venv exists only to run the dev test harness, which drives
+the built `aethyme` binary as a subprocess; it retires when `tests/local`
+ports to Rust.
 
 ## Run The Core Checks
 
 ```bash
-. .venv/bin/activate
-python -m pytest tests/local tests/scorecard -q
-python -m src.cli repo ingest .
+cd rust && cargo test --workspace && cd ..
+.venv/bin/python -m pytest -q tests/local   # dev harness
+aethyme repo ingest .
 ```
 
 ## Documentation Rule

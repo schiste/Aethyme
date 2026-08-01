@@ -216,11 +216,22 @@ longer guide at
 ## Development
 
 ```bash
-cd packages/aethyme
-python3 -m venv .venv && . .venv/bin/activate && pip install -e '.[dev]'
-python -m pytest -q tests/local
-cd rust && cargo test --workspace
+# Product: no Python anywhere.
+cargo install --path packages/aethyme/rust/crates/aethyme-cli
+cargo install --path packages/aethyme/rust/crates/aethyme-engine
+
+# Tests: Rust is the suite; a dev-only pytest harness drives the built
+# binary until it ports to Rust. Nothing is pip-installed from this repo.
+cd packages/aethyme/rust && cargo test --workspace
+cd .. && python3 -m venv .venv && .venv/bin/python -m pip install pytest pytest-asyncio ruff
+.venv/bin/python -m pytest -q tests/local
 ```
+
+> **`python -m src.cli` no longer exists.** The Python package was deleted
+> on 2026-08-01 (python-retirement Phase 6) and there is no shim: the old
+> spelling now fails with `No module named src`. Every command is native —
+> run `aethyme --help`. Installing the router is `cargo install`, with no
+> interpreter, virtualenv, or pip step on the product path.
 
 This repository dogfoods its own broker — see the Broker Coordination
 section in [`CLAUDE.md`](CLAUDE.md) / [`AGENTS.md`](AGENTS.md). Evaluation

@@ -12,7 +12,6 @@ Last Updated: 2026-03-06
 
 ```bash
 cd packages/aethyme
-. .venv/bin/activate
 bash scripts/start-api.sh
 ```
 
@@ -28,8 +27,7 @@ Verify:
 
 ```bash
 cd packages/aethyme
-. .venv/bin/activate
-python -m src.cli index . --name aethyme --use-fallback
+aethyme repo ingest .
 ```
 
 If fallback works and SCIP mode fails, the issue is in the language indexer toolchain rather than the shared indexing contract.
@@ -51,6 +49,5 @@ Verify that the repository path still exists and that the repository was indexed
 
 ```bash
 cd packages/aethyme
-. .venv/bin/activate
 make test-full
 ```
