@@ -10,9 +10,16 @@ from types import ModuleType
 
 import pytest
 
-_PACKAGE_ROOT = Path(__file__).resolve().parents[2]
-_RUNNER_PATH = _PACKAGE_ROOT / "scripts" / "eval" / "run_codex_eval.py"
-_GATE_PATH = _PACKAGE_ROOT / "scripts" / "eval" / "check_regression_gate.py"
+_EVAL_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+_MONOREPO_ROOT = _EVAL_PACKAGE_ROOT.parents[1]
+# The MEASURED system. Several cases below pass it where an "Aethyme
+# checkout" is expected — as the tool repo handed to the aethyme arm, and
+# as a repo path the contract must refuse as an eval target (cardinal
+# rule 1). It stays `packages/aethyme` after the python-retirement
+# Phase 7 move of this file into `packages/aethyme-eval`.
+_PACKAGE_ROOT = _MONOREPO_ROOT / "packages" / "aethyme"
+_RUNNER_PATH = _EVAL_PACKAGE_ROOT / "scripts" / "run_codex_eval.py"
+_GATE_PATH = _EVAL_PACKAGE_ROOT / "scripts" / "check_regression_gate.py"
 
 
 def _load_runner() -> ModuleType:

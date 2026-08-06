@@ -16,6 +16,22 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Checkout landmarks.
+#
+# This script lived at `packages/aethyme/scripts/eval/` until the
+# python-retirement Phase 7 move (2026-08-06) and derived both roots from
+# `parents[2]`. It now lives in `packages/aethyme-eval`, one package over,
+# so the two roots are named explicitly rather than counted:
+#
+# * TOOL_PACKAGE_ROOT is the MEASURED system (`packages/aethyme`) — the
+#   default `AETHYME_EVAL_TOOL_REPO` and the `AETHYME_ROOT` handed to the
+#   aethyme arm.
+# * MONOREPO_ROOT backs cardinal rule 1: an eval target inside this tree
+#   is Aethyme itself and is refused.
+EVAL_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+MONOREPO_ROOT = EVAL_PACKAGE_ROOT.parents[1]
+TOOL_PACKAGE_ROOT = MONOREPO_ROOT / "packages" / "aethyme"
+
 GENERATED_ARTIFACTS = (
     ".codex",
     ".aethyme",
@@ -69,7 +85,7 @@ def main() -> int:
     repo_path = Path(os.environ["AETHYME_EVAL_REPO"]).expanduser().resolve()
     schema_file, schema_cleanup_dir = _resolve_schema_file()
     tool_repo = Path(
-        os.environ.get("AETHYME_EVAL_TOOL_REPO", Path(__file__).resolve().parents[2])
+        os.environ.get("AETHYME_EVAL_TOOL_REPO", TOOL_PACKAGE_ROOT)
     ).resolve()
     arm = os.environ.get("AETHYME_EVAL_ARM", "")
 
@@ -339,9 +355,7 @@ def _enforce_eval_contract(
 
 
 def _assert_playground_repo(repo_path: Path, tool_repo: Path) -> None:
-    package_root = Path(__file__).resolve().parents[2]
-    monorepo_root = package_root.parents[1]
-    if _is_relative_to(repo_path, monorepo_root) or _is_relative_to(repo_path, tool_repo):
+    if _is_relative_to(repo_path, MONOREPO_ROOT) or _is_relative_to(repo_path, tool_repo):
         raise ContractError("Eval target must be a Playground repo, never Aethyme itself")
 
     roots = _playground_roots()

@@ -12,6 +12,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Checkout landmarks. This script lived at
+# `packages/aethyme/scripts/eval/` until the python-retirement Phase 7
+# move (2026-08-06) and derived both roots from `parents[2]`; from
+# `packages/aethyme-eval` they are named explicitly rather than counted.
+# TOOL_PACKAGE_ROOT is the MEASURED system; MONOREPO_ROOT backs cardinal
+# rule 1 (an eval target inside this tree is Aethyme itself).
+EVAL_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+MONOREPO_ROOT = EVAL_PACKAGE_ROOT.parents[1]
+TOOL_PACKAGE_ROOT = MONOREPO_ROOT / "packages" / "aethyme"
+
 DEFAULT_TOKEN_DELTA_RATIO = 0.0
 DEFAULT_SELECTED_FILE_DELTA_RATIO = 0.50
 DEFAULT_SNIPPET_DELTA_RATIO = 0.50
@@ -1500,9 +1510,7 @@ def _payload_repo_path(payload: dict[str, Any]) -> Path | None:
 
 
 def _is_aethyme_checkout_path(path: Path) -> bool:
-    package_root = Path(__file__).resolve().parents[2]
-    monorepo_root = package_root.parents[1]
-    return _is_relative_to(path, monorepo_root) or _is_relative_to(path, package_root)
+    return _is_relative_to(path, MONOREPO_ROOT) or _is_relative_to(path, TOOL_PACKAGE_ROOT)
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:

@@ -12,3 +12,10 @@ path = "src/lib.rs"
 [dependencies]
 serde_json = "1"
 tempfile = "3"
+
+# Repo-hygiene suites under `tests/` only: the grammar provenance
+# verifier reads `rust/grammars/manifest.toml` and re-checksums the
+# tracked `grammar.wasm` files.
+[dev-dependencies]
+sha2 = "0.10"
+toml = "0.8"

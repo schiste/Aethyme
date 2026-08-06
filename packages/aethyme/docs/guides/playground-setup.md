@@ -114,6 +114,10 @@ or deploying the Aethyme condition. The setup script handles this for you.
 
 ```bash
 AETHYME_ROOT=/path/to/Aethyme/packages/aethyme
+# The Codex eval runner and the regression gate live in the SEPARATE
+# aethyme-eval package (moved there in python-retirement Phase 7);
+# packages/aethyme itself carries no Python.
+AETHYME_EVAL_ROOT=/path/to/Aethyme/packages/aethyme-eval
 ENGINE="$AETHYME_ROOT/rust/target/release/aethyme-engine-cli"
 GRAPH_INDEXER="$AETHYME_ROOT/rust/target/release/aethyme-graph-index"
 
@@ -204,14 +208,14 @@ env "${COMMON_ENV[@]}" \
   AETHYME_EVAL_ARM=control \
   AETHYME_EVAL_REPO="$DEST/Mediawiki - Control" \
   AETHYME_EVAL_ARTIFACT_DIR=/tmp/aethyme-ab/control \
-  "$AETHYME_ROOT/.venv/bin/python" "$AETHYME_ROOT/scripts/eval/run_codex_eval.py"
+  "$AETHYME_EVAL_ROOT/.venv/bin/python" "$AETHYME_EVAL_ROOT/scripts/run_codex_eval.py"
 
 env "${COMMON_ENV[@]}" \
   AETHYME_EVAL_ARM=aethyme \
   AETHYME_EVAL_REPO="$DEST/Mediawiki - Aethyme" \
   AETHYME_EVAL_TOOL_REPO="$AETHYME_ROOT" \
   AETHYME_EVAL_ARTIFACT_DIR=/tmp/aethyme-ab/aethyme \
-  "$AETHYME_ROOT/.venv/bin/python" "$AETHYME_ROOT/scripts/eval/run_codex_eval.py"
+  "$AETHYME_EVAL_ROOT/.venv/bin/python" "$AETHYME_EVAL_ROOT/scripts/run_codex_eval.py"
 ```
 
 The wrapper runs both arms with `codex exec --ignore-user-config --json`,
@@ -238,7 +242,7 @@ env "${COMMON_ENV[@]}" \
   AETHYME_EVAL_ARM=control \
   AETHYME_EVAL_REPO="$DEST/Mediawiki - Control" \
   AETHYME_EVAL_ARTIFACT_DIR=/tmp/aethyme-ab/control \
-  "$AETHYME_ROOT/.venv/bin/python" "$AETHYME_ROOT/scripts/eval/run_codex_eval.py" \
+  "$AETHYME_EVAL_ROOT/.venv/bin/python" "$AETHYME_EVAL_ROOT/scripts/run_codex_eval.py" \
   > /tmp/aethyme-ab/control/result.json
 
 env "${COMMON_ENV[@]}" \
@@ -246,14 +250,14 @@ env "${COMMON_ENV[@]}" \
   AETHYME_EVAL_REPO="$DEST/Mediawiki - Aethyme" \
   AETHYME_EVAL_TOOL_REPO="$AETHYME_ROOT" \
   AETHYME_EVAL_ARTIFACT_DIR=/tmp/aethyme-ab/aethyme \
-  "$AETHYME_ROOT/.venv/bin/python" "$AETHYME_ROOT/scripts/eval/run_codex_eval.py" \
+  "$AETHYME_EVAL_ROOT/.venv/bin/python" "$AETHYME_EVAL_ROOT/scripts/run_codex_eval.py" \
   > /tmp/aethyme-ab/aethyme/result.json
 ```
 
 Compare a completed pair with the metric gate:
 
 ```bash
-"$AETHYME_ROOT/.venv/bin/python" "$AETHYME_ROOT/scripts/eval/check_regression_gate.py" \
+"$AETHYME_EVAL_ROOT/.venv/bin/python" "$AETHYME_EVAL_ROOT/scripts/check_regression_gate.py" \
   --control /tmp/aethyme-ab/control/result.json \
   --control-repeat /tmp/aethyme-ab/control-repeat/result.json \
   --aethyme /tmp/aethyme-ab/aethyme/result.json \

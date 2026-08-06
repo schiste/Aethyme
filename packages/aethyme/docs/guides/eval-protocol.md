@@ -73,7 +73,7 @@ fails unless Aethyme observability reports those missing Surface/Flow families
 instead of hiding them behind a generic freshness status.
 
 Set `AETHYME_EVAL_ARM=control` or `AETHYME_EVAL_ARM=aethyme` explicitly when
-using `scripts/eval/run_codex_eval.py`. For reproducible archives, set
+using `packages/aethyme-eval/scripts/run_codex_eval.py`. For reproducible archives, set
 `AETHYME_EVAL_ARTIFACT_DIR` to a run-specific directory outside the target
 repository.
 

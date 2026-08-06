@@ -24,16 +24,17 @@ commit, release tag, tree-sitter CLI version, or generation command.
 Before publishing binary releases, regenerate these files from pinned upstream
 grammar revisions or replace them with package-managed grammar artifacts.
 
-Development checksum verification:
+Development checksum verification (also runs as part of `cargo test`):
 
 ```bash
-packages/aethyme/.venv/bin/python packages/aethyme/scripts/verify-grammar-provenance.py
+cargo test -p aethyme-testkit --test grammar_provenance
 ```
 
-Release verification, expected to fail until all source refs are pinned:
+Release verification, expected to fail until all source refs are pinned —
+which is why it is `#[ignore]`d and must be asked for:
 
 ```bash
-packages/aethyme/.venv/bin/python packages/aethyme/scripts/verify-grammar-provenance.py --require-pinned
+cargo test -p aethyme-testkit --test grammar_provenance -- --ignored
 ```
 
 ## Checksums
