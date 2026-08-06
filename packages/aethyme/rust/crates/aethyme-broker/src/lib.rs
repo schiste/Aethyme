@@ -31,6 +31,7 @@ pub mod hooks;
 pub mod init;
 mod leases;
 mod merge;
+mod pr;
 mod quick_test;
 mod schema;
 mod store;
@@ -56,6 +57,10 @@ pub use git::{GitError, GitRepo, MergeSimulation};
 pub use hooks::{HookReport, HookState, HooksError};
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use merge::{ACTION_REQUIRED_RELPATH, PromoteConfig, SubmitOutcome};
+pub use pr::{
+    PrActivityItem, PrCheckOptions, PrCheckReport, PrCheckRun, PrDecision, PrDecisionStatus,
+    PrDispatchReport, PrDispatchStatus, PrError, PrMarker, PrSummary,
+};
 pub use quick_test::{
     Chau7Probe, QuickTestError, QuickTestGateOutcome, QuickTestGateReport, QuickTestMode,
     QuickTestOptions, QuickTestReport, QuickTestStep, run_broker_quick_test,
@@ -65,7 +70,8 @@ pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use store::BrokerStore;
 pub use types::{
     Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease, LeaseKind, MergeQueueEntry,
-    MergeStatus, NewGateResult, NewSession, Session, SessionOrigin, SessionStatus,
+    MergeStatus, NewGateResult, NewPrWatchState, NewSession, PrWatchState, Session, SessionOrigin,
+    SessionStatus,
 };
 pub use verify_loop::{
     VerifyLoopCommandReport, VerifyLoopReport, VerifyLoopStep, VerifyLoopStepStatus,

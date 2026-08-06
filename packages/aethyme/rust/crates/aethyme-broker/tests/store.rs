@@ -4,7 +4,7 @@
 
 use aethyme_broker::{
     BrokerError, BrokerStore, GateDef, GateFailureClass, GateStatus, LeaseKind, MergeStatus,
-    NewGateResult, NewSession, SessionOrigin, SessionStatus,
+    NewGateResult, NewPrWatchState, NewSession, SessionOrigin, SessionStatus,
 };
 
 fn open_temp() -> (tempfile::TempDir, BrokerStore) {
@@ -99,6 +99,46 @@ fn duplicate_live_worktree_is_rejected_but_cleaned_frees_the_slot() {
             log_path: None,
         })
         .unwrap();
+}
+
+#[test]
+fn pr_watch_state_round_trip_and_upsert() {
+    let (_tmp, mut store) = open_temp();
+
+    let first = store
+        .upsert_pr_watch_state(&NewPrWatchState {
+            target_branch: "production".into(),
+            pr_number: 42,
+            activity_fingerprint: "initial".into(),
+            marker: "none".into(),
+            last_dispatch_at: None,
+            last_agent_session_id: None,
+        })
+        .unwrap();
+    assert_eq!(first.target_branch, "production");
+    assert_eq!(first.pr_number, 42);
+    assert_eq!(first.activity_fingerprint, "initial");
+    assert_eq!(first.marker, "none");
+
+    let second = store
+        .upsert_pr_watch_state(&NewPrWatchState {
+            target_branch: "production".into(),
+            pr_number: 42,
+            activity_fingerprint: "changed".into(),
+            marker: "looking".into(),
+            last_dispatch_at: Some(123_000),
+            last_agent_session_id: Some(7),
+        })
+        .unwrap();
+    assert_eq!(second.id, first.id);
+    assert_eq!(second.activity_fingerprint, "changed");
+    assert_eq!(second.marker, "looking");
+    assert_eq!(second.last_dispatch_at, Some(123_000));
+    assert_eq!(second.last_agent_session_id, Some(7));
+
+    let fetched = store.pr_watch_state("production", 42).unwrap().unwrap();
+    assert_eq!(fetched.id, first.id);
+    assert_eq!(fetched.activity_fingerprint, "changed");
 }
 
 #[test]

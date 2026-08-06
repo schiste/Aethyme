@@ -16,7 +16,8 @@ use crate::error::BrokerError;
 use crate::schema::{self, EVENTS_SCHEMA_VERSION};
 use crate::types::{
     Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease, LeaseKind, MergeQueueEntry,
-    MergeStatus, NewGateResult, NewSession, Session, SessionOrigin, SessionStatus,
+    MergeStatus, NewGateResult, NewPrWatchState, NewSession, PrWatchState, Session, SessionOrigin,
+    SessionStatus,
 };
 
 /// Milliseconds a writer waits on a locked database before erroring.
@@ -674,6 +675,57 @@ impl BrokerStore {
         Ok(entries)
     }
 
+    // ── PR watch state ───────────────────────────────────────────────
+
+    /// Fetch the durable cursor for one PR follow-up watch.
+    pub fn pr_watch_state(
+        &self,
+        target_branch: &str,
+        pr_number: i64,
+    ) -> Result<Option<PrWatchState>, BrokerError> {
+        self.conn
+            .query_row(
+                &format!("{PR_WATCH_SELECT} WHERE target_branch = ?1 AND pr_number = ?2"),
+                params![target_branch, pr_number],
+                pr_watch_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Insert or update one PR follow-up cursor.
+    pub fn upsert_pr_watch_state(
+        &mut self,
+        state: &NewPrWatchState,
+    ) -> Result<PrWatchState, BrokerError> {
+        let now = now_ms();
+        self.conn.execute(
+            "INSERT INTO pr_watch_state (
+                 target_branch, pr_number, activity_fingerprint, marker,
+                 last_dispatch_at, last_agent_session_id, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(target_branch, pr_number) DO UPDATE SET
+                 activity_fingerprint = excluded.activity_fingerprint,
+                 marker = excluded.marker,
+                 last_dispatch_at = excluded.last_dispatch_at,
+                 last_agent_session_id = excluded.last_agent_session_id,
+                 updated_at = excluded.updated_at",
+            params![
+                state.target_branch,
+                state.pr_number,
+                state.activity_fingerprint,
+                state.marker,
+                state.last_dispatch_at,
+                state.last_agent_session_id,
+                now,
+            ],
+        )?;
+        Ok(self
+            .pr_watch_state(&state.target_branch, state.pr_number)?
+            .expect("upserted pr_watch_state row should be readable"))
+    }
+
     // ── events ────────────────────────────────────────────────────────
 
     /// Append one event. Most mutations already emit their own event in
@@ -766,6 +818,9 @@ const GATE_RESULT_SELECT: &str = "SELECT id, gate_name, tree_hash, status, failu
 const MERGE_SELECT: &str = "SELECT id, session_id, head_commit, base_commit, status, \
      merged_tree, details_json, created_at, updated_at FROM merge_queue";
 
+const PR_WATCH_SELECT: &str = "SELECT id, target_branch, pr_number, activity_fingerprint, \
+     marker, last_dispatch_at, last_agent_session_id, updated_at FROM pr_watch_state";
+
 type RowResult<T> = Result<Result<T, BrokerError>, rusqlite::Error>;
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> RowResult<Session> {
@@ -843,6 +898,19 @@ fn merge_from_row(row: &rusqlite::Row<'_>) -> RowResult<MergeQueueEntry> {
             updated_at: row.get(8)?,
         })
     })())
+}
+
+fn pr_watch_from_row(row: &rusqlite::Row<'_>) -> RowResult<PrWatchState> {
+    Ok(Ok(PrWatchState {
+        id: row.get(0)?,
+        target_branch: row.get(1)?,
+        pr_number: row.get(2)?,
+        activity_fingerprint: row.get(3)?,
+        marker: row.get(4)?,
+        last_dispatch_at: row.get(5)?,
+        last_agent_session_id: row.get(6)?,
+        updated_at: row.get(7)?,
+    }))
 }
 
 fn insert_event(

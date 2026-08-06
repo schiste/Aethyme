@@ -203,3 +203,28 @@ pub struct Event {
     /// JSON payload.
     pub payload_json: Option<String>,
 }
+
+/// Durable cursor for PR follow-up routing. The broker stores a compact
+/// fingerprint rather than every comment/review id, so the watch state
+/// stays small and remains independent from GitHub's full API shape.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PrWatchState {
+    pub id: i64,
+    pub target_branch: String,
+    pub pr_number: i64,
+    pub activity_fingerprint: String,
+    pub marker: String,
+    pub last_dispatch_at: Option<i64>,
+    pub last_agent_session_id: Option<i64>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewPrWatchState {
+    pub target_branch: String,
+    pub pr_number: i64,
+    pub activity_fingerprint: String,
+    pub marker: String,
+    pub last_dispatch_at: Option<i64>,
+    pub last_agent_session_id: Option<i64>,
+}

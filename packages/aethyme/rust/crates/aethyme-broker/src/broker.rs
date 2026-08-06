@@ -28,6 +28,8 @@ pub enum BrokerOpError {
     Git(#[from] GitError),
     #[error(transparent)]
     Store(#[from] BrokerError),
+    #[error(transparent)]
+    Pr(#[from] crate::pr::PrError),
     #[error("refusing to clean session {id}: {reason} (use --force to discard)")]
     DirtyWorktree { id: i64, reason: String },
     #[error(
@@ -592,6 +594,13 @@ impl Broker {
 
     pub(crate) fn repo_handle(&self) -> &GitRepo {
         &self.repo
+    }
+
+    pub fn pr_check(
+        &mut self,
+        options: crate::PrCheckOptions,
+    ) -> Result<crate::PrCheckReport, BrokerOpError> {
+        crate::pr::check_pr_followup(self, options)
     }
 
     // ── adopt (attach-first) ──────────────────────────────────────────

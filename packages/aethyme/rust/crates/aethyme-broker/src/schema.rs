@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -139,7 +139,24 @@ CREATE INDEX session_foreign_files_by_session
     ON session_foreign_files (session_id, path);
 ";
 
-const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3];
+const MIGRATION_V4: &str = "
+CREATE TABLE pr_watch_state (
+    id                    INTEGER PRIMARY KEY,
+    target_branch         TEXT NOT NULL,
+    pr_number             INTEGER NOT NULL,
+    activity_fingerprint  TEXT NOT NULL DEFAULT '',
+    marker                TEXT NOT NULL DEFAULT 'none',
+    last_dispatch_at      INTEGER,
+    last_agent_session_id INTEGER,
+    updated_at            INTEGER NOT NULL,
+    UNIQUE (target_branch, pr_number)
+);
+
+CREATE INDEX pr_watch_state_by_target
+    ON pr_watch_state (target_branch, pr_number);
+";
+
+const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4];
 
 fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
     let version = conn

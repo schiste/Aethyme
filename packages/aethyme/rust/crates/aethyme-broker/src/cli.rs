@@ -102,6 +102,14 @@ Usage:
       Report installed/absent/foreign per managed hook.
       (hooks pre-commit / hooks post-commit are the internal entry
       points the installed shims call — not for direct use.)
+  aethyme broker pr check [--target <branch>] [--pr <number>] [--agent <name>] [--dispatch] [--cmd <command>] [--json]
+      Inspect the open PR for the current branch targeting <branch>
+      (default: production). A thumbs-up marker in the PR body means all
+      good and skips activity checks. A looking-eyes marker or no marker
+      checks comments, reviews, and status checks; new actionable
+      activity prepares a Push2prod prompt. With --dispatch, the broker
+      attaches that prompt to an existing matching session when possible
+      or spawns a Codex agent command.
   aethyme broker submit --session <id> [--json]
       Submit the session's head commit: simulate the merge onto the local
       integration branch, run affected gates on the merged tree, and
@@ -238,6 +246,8 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "uninstall",
         "pre-commit",
         "post-commit",
+        "pr",
+        "check",
         "submit",
         "repair",
         "queue",
@@ -430,6 +440,33 @@ mod tests {
         assert_eq!(parsed.session, Some(7));
         assert_eq!(parsed.exec_command, vec!["cargo", "fmt", "--check"]);
     }
+
+    #[test]
+    fn parse_accepts_pr_check_routing_flags() {
+        let args = vec![
+            "check".to_string(),
+            "--target".to_string(),
+            "production".to_string(),
+            "--pr".to_string(),
+            "42".to_string(),
+            "--agent".to_string(),
+            "Push2prod".to_string(),
+            "--dispatch".to_string(),
+            "--cmd".to_string(),
+            "codex exec prompt".to_string(),
+        ];
+        let parsed = match super::parse(&args) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("pr check flags should parse"),
+        };
+
+        assert_eq!(parsed.positional, vec!["check"]);
+        assert_eq!(parsed.target.as_deref(), Some("production"));
+        assert_eq!(parsed.pr_number, Some(42));
+        assert_eq!(parsed.agent.as_deref(), Some("Push2prod"));
+        assert!(parsed.dispatch);
+        assert_eq!(parsed.cmd.as_deref(), Some("codex exec prompt"));
+    }
 }
 
 enum UsageError {
@@ -447,6 +484,9 @@ struct Parsed {
     positional: Vec<String>,
     task: Option<String>,
     cmd: Option<String>,
+    target: Option<String>,
+    agent: Option<String>,
+    pr_number: Option<i64>,
     session: Option<i64>,
     entry: Option<i64>,
     ttl_seconds: Option<i64>,
@@ -458,6 +498,7 @@ struct Parsed {
     json: bool,
     force: bool,
     check: bool,
+    dispatch: bool,
     reuse: bool,
     replace_stale: bool,
     all: bool,
@@ -472,6 +513,9 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         positional: Vec::new(),
         task: None,
         cmd: None,
+        target: None,
+        agent: None,
+        pr_number: None,
         session: None,
         entry: None,
         ttl_seconds: None,
@@ -483,6 +527,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         json: false,
         force: false,
         check: false,
+        dispatch: false,
         reuse: false,
         replace_stale: false,
         all: false,
@@ -510,6 +555,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             }
             "--force" => parsed.force = true,
             "--check" => parsed.check = true,
+            "--dispatch" => parsed.dispatch = true,
             "--reuse" => parsed.reuse = true,
             "--all" => parsed.all = true,
             "--chau7" => parsed.chau7 = true,
@@ -553,6 +599,28 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                         .ok_or(UsageError::Message("--cmd requires a value".into()))?
                         .clone(),
                 )
+            }
+            "--target" => {
+                parsed.target = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--target requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--agent" => {
+                parsed.agent = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--agent requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--pr" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--pr requires a value".into()))?;
+                parsed.pr_number = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--pr must be an integer PR number".into())
+                })?);
             }
             "--session" => {
                 let value = iter
@@ -633,6 +701,65 @@ fn render_hook_reports(reports: &[crate::HookReport], json: bool) -> Result<(), 
                 report.path
             );
         }
+    }
+    Ok(())
+}
+
+fn render_pr_check_report(report: &crate::PrCheckReport, json: bool) -> Result<(), UsageError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    match &report.pr {
+        Some(pr) => {
+            println!(
+                "PR #{} -> {}: {}",
+                pr.number, report.target_branch, pr.title
+            );
+            if let Some(url) = &pr.url {
+                println!("URL: {url}");
+            }
+        }
+        None => {
+            println!("{}", report.decision.summary);
+        }
+    }
+    println!("Marker: {}", report.marker.as_str());
+    println!(
+        "Activity: {}{}",
+        if report.checked_activity {
+            "checked"
+        } else {
+            "skipped"
+        },
+        if report.checked_activity {
+            format!(
+                " (new: {}, comments: {}, reviews: {}, failing checks: {})",
+                if report.new_activity { "yes" } else { "no" },
+                report.comments.len(),
+                report.reviews.len(),
+                report.failing_checks.len()
+            )
+        } else {
+            String::new()
+        }
+    );
+    println!("Decision: {}", report.decision.summary);
+    println!(
+        "Dispatch: {}{}",
+        report.dispatch.status.as_str(),
+        report
+            .dispatch
+            .session_id
+            .map(|id| format!(" (session {id})"))
+            .unwrap_or_default()
+    );
+    if let Some(path) = &report.prompt_path {
+        println!("Prompt: {path}");
+    }
+    for command in &report.next_commands {
+        println!("run: {command}");
     }
     Ok(())
 }
@@ -1502,6 +1629,32 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 other => {
                     return Err(UsageError::Message(format!(
                         "unknown gates action {other:?} — expected draft, validate, affected, semantic, or run"
+                    )));
+                }
+            }
+        }
+        "pr" => {
+            let action = parsed
+                .positional
+                .first()
+                .map(String::as_str)
+                .ok_or(UsageError::Message("pr requires an action: check".into()))?;
+            match action {
+                "check" => {
+                    let mut broker = open_broker()?;
+                    let report = broker.pr_check(crate::PrCheckOptions {
+                        target_branch: parsed.target.unwrap_or_else(|| "production".into()),
+                        pr_number: parsed.pr_number,
+                        agent_name: parsed.agent.unwrap_or_else(|| "Push2prod".into()),
+                        dispatch: parsed.dispatch,
+                        agent_command: parsed.cmd,
+                        now_ms: now_ms(),
+                    })?;
+                    render_pr_check_report(&report, parsed.json)?;
+                }
+                other => {
+                    return Err(UsageError::Message(format!(
+                        "unknown pr action {other:?} — expected check"
                     )));
                 }
             }
