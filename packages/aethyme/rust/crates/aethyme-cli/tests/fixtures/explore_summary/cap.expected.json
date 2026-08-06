@@ -1,0 +1,63 @@
+{
+  "safe_to_use_as_answer": null,
+  "trust_policy": null,
+  "subsystems": [
+    {
+      "rank": null,
+      "id": "lane1",
+      "label": null,
+      "role": null,
+      "confidence": null,
+      "token_subsystems": null,
+      "missing_coverage_warnings": null
+    },
+    {
+      "rank": null,
+      "id": "lane2",
+      "label": null,
+      "role": null,
+      "confidence": null,
+      "token_subsystems": null,
+      "missing_coverage_warnings": null
+    },
+    {
+      "rank": null,
+      "id": "lane3",
+      "label": null,
+      "role": null,
+      "confidence": null,
+      "token_subsystems": null,
+      "missing_coverage_warnings": null
+    }
+  ],
+  "top_verification_targets": [
+    {
+      "path": "l1-t1",
+      "subsystem": "lane1"
+    },
+    {
+      "path": "l1-t2",
+      "subsystem": "lane1"
+    },
+    {
+      "path": "l2-t1",
+      "subsystem": "lane2"
+    },
+    {
+      "path": "l2-t2",
+      "subsystem": "lane2"
+    },
+    {
+      "path": "l3-t1",
+      "subsystem": "lane3"
+    },
+    {
+      "path": "l3-t2",
+      "subsystem": "lane3"
+    }
+  ],
+  "verification_steps": [],
+  "observability": {
+    "readiness": null
+  }
+}

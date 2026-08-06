@@ -1,0 +1,1 @@
+{"trust_policy": "vérifier", "subsystems": [{"id": "café", "label": "日本語", "role": "", "top_verification_targets": [{"path": "src/naïve/🚀.py"}]}], "observability": {"readiness": "dégradé"}}
