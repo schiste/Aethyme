@@ -29,6 +29,7 @@ aethyme-producers = { path = "../aethyme-producers" }
 
 [dev-dependencies]
 aethyme-graph-indexer = { path = "../aethyme-graph-indexer" }
+aethyme-testkit = { path = "../aethyme-testkit" }
 tempfile = "3"
 
 [features]

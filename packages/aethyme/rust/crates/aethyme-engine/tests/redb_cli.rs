@@ -4,7 +4,7 @@
 //! `aethyme-engine-cli` as a subprocess. That keeps the repos tiny while still
 //! pinning the CLI contract that scripts and playground setup consume.
 
-mod common;
+
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
@@ -47,7 +47,7 @@ fn engine_bin() -> &'static str {
     env!("CARGO_BIN_EXE_aethyme-engine-cli")
 }
 
-use common::aethyme_bin;
+use aethyme_testkit::aethyme_bin;
 
 fn write(root: &Path, rel: &str, content: &[u8]) {
     let full = root.join(rel);

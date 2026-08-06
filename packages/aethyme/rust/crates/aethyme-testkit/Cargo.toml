@@ -1,0 +1,14 @@
+[package]
+name = "aethyme-testkit"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Dev-only test harness for the Aethyme workspace: builds and drives the product binaries as subprocesses, and builds fixture repositories. Successor to the retired pytest `tests/support/` package (python-retirement Phase 7). Consumed only as a dev-dependency, so it never enters `cargo install`."
+
+[lib]
+name = "aethyme_testkit"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = "1"
+tempfile = "3"

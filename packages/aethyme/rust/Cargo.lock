@@ -51,6 +51,7 @@ dependencies = [
  "aethyme-graph-schema",
  "aethyme-graph-storage",
  "aethyme-producers",
+ "aethyme-testkit",
  "bincode",
  "dhat",
  "libc",
@@ -135,6 +136,14 @@ dependencies = [
  "aethyme-enhance",
  "libc",
  "regex",
+]
+
+[[package]]
+name = "aethyme-testkit"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
