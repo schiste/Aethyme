@@ -1,9 +1,15 @@
 name: Aethyme Local Tests
 
-# DEV-ONLY lane. tests/local is implementation-blind pytest scaffolding
-# that drives the built `aethyme` binary; it retires when the suite ports
-# to Rust (operator decision 5, 2026-08-01). The PRODUCT path carries no
-# Python and is proven by the `product-path-no-python` job in oss-ci.yml.
+# The implementation-blind suites that drive the built `aethyme` binary.
+# They were pytest until python-retirement Phase 7 (2026-08-06); they are
+# now Rust integration tests in `aethyme-cli/tests/` and
+# `aethyme-testkit/tests/`, so this lane installs no Python.
+#
+# It stays separate from `oss-ci.yml:rust-tests` for one reason: the
+# suites shell out to the built binaries, and a lane scoped to
+# `packages/aethyme/**` gives that path its own signal on the PRs that
+# touch it. The PRODUCT path carries no Python and is proven by the
+# `product-path-no-python` job in oss-ci.yml.
 
 on:
   pull_request:
@@ -17,71 +23,28 @@ on:
       - ".github/workflows/aethyme-local-tests.yml"
 
 jobs:
-  local-tests-default:
-    name: Local tests (default lane)
+  binary-driven-tests:
+    name: Binary-driven tests
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: packages/aethyme
+        working-directory: packages/aethyme/rust
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Set up Python (dev harness only)
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # The documented dev setup uses a package-local .venv (the layout the
-      # broker gates and docs assume), so CI provides the same venv layout.
-      # Never `pip install -e .`: since python-retirement Phase 6 deleted
-      # src/, this package installs no code and has no runtime deps.
-      - name: Install the test harness (into .venv)
-        run: |
-          python -m venv .venv
-          .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/python -m pip install pytest pytest-asyncio ruff
+      # The suites resolve `aethyme`, `aethyme-engine-cli` and
+      # `aethyme-graph-index` through `aethyme_testkit::bins`, which builds
+      # them on demand. Building them up front keeps the cost visible as a
+      # build step instead of hiding it inside the first test.
+      - name: Build the binaries the suites drive
+        run: cargo build --quiet --bin aethyme --bin aethyme-engine-cli --bin aethyme-graph-index
 
-      # tests/local invoke the `aethyme` router binary as a subprocess
-      # (python-retirement Phase 0 seam) — the router must exist in every
-      # lane; only *engine-dependent* tests may skip here.
-      - name: Build Rust router binary
-        run: cargo build --quiet --manifest-path rust/Cargo.toml --bin aethyme
-
-      - name: Run local test suite (default lane)
-        run: .venv/bin/python -m pytest -q tests/local
-
-  local-tests-strict-engine:
-    name: Local tests (strict engine lane)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: packages/aethyme
-    env:
-      AETHYME_REQUIRE_LOCAL_ENGINE: "1"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up Python (dev harness only)
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install the test harness (into .venv)
-        run: |
-          python -m venv .venv
-          .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/python -m pip install pytest pytest-asyncio ruff
-
-      - name: Build Rust engine + router binaries
-        run: cargo build --quiet --manifest-path rust/Cargo.toml --bin aethyme-engine-cli --bin aethyme
-
-      - name: Run strict engine local tests
-        run: .venv/bin/python -m pytest -q tests/local
+      # `-p aethyme-cli -p aethyme-testkit` is the ported pytest surface:
+      # the CLI suites and the repo-hygiene suites. The rest of the
+      # workspace is covered by oss-ci.yml:rust-tests.
+      - name: Run the binary-driven suites
+        run: cargo test -p aethyme-cli -p aethyme-testkit

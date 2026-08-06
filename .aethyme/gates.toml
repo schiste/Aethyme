@@ -3,11 +3,14 @@
 # Contract notes:
 # - Commands run with cwd = the worktree being verified — including the
 #   throwaway merge-simulation worktrees — so nothing here may assume the
-#   main checkout's cwd. $MAIN resolves the main checkout from any
-#   worktree, letting gates reuse its .venv (linked worktrees have none).
-#   Caveat: pytest then runs the worktree's code/tests (cwd wins sys.path)
-#   with the main venv's dependencies — good enough for v0; log friction
-#   if a dependency-changing diff slips through.
+#   main checkout's cwd. Gates used to borrow the main checkout's
+#   interpreter through $MAIN because linked worktrees have no .venv;
+#   that coupling is gone (python-retirement Phase 7, 2026-08-06). The
+#   only Python left in this repo is `packages/aethyme-eval`, and its
+#   gate provisions a venv inside the tree under test, so a gate always
+#   runs the dependencies of the diff it is verifying — closing the v0
+#   caveat that a dependency-changing diff could pass against the main
+#   checkout's environment.
 # - CARGO_TARGET_DIR is shared so merge-sim worktrees don't cold-build the
 #   whole workspace on every submit.
 # - Gate outputs must be gitignored or they change the working-tree hash
@@ -20,38 +23,34 @@
 #   or the tests they run — that parse git output would read fiction.
 #   Blanket insurance until the wrapper passes through non-TTY output.
 
-[[gate]]
-name = "ruff"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && cd packages/aethyme && "$MAIN/packages/aethyme/.venv/bin/python" -m ruff check .'
-cost = 1
-triggers = ["packages/aethyme/**/*.py"]
-
-[[gate]]
-name = "pytest-local"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && cd packages/aethyme && "$MAIN/packages/aethyme/.venv/bin/python" -m pytest -q tests/local'
-cost = 2
-triggers = [
-    # `packages/aethyme/src/**` was dropped 2026-08-01: src/ is deleted
-    # (python-retirement Phase 6). A trigger on a nonexistent path never
-    # matches, which silently narrows a gate rather than failing loudly.
-    "packages/aethyme/tests/**",
-    "packages/aethyme/skills/**",
-    "packages/aethyme/evals/**",
-    "packages/aethyme/pyproject.toml",
-    # 2026-07-29: tests/local is implementation-blind since the
-    # retirement flips — it drives the aethyme binary, so RUST changes
-    # can break it. A rust-only entry previously skipped this gate and
-    # shipped a task-next regression (Surface/Flow anchors) unguarded.
-    "packages/aethyme/rust/**",
-]
+# The `ruff` and `pytest-local` gates were removed on 2026-08-06
+# (python-retirement Phase 7) together with the dev pytest stack they ran:
+# `packages/aethyme` holds no Python, so there is nothing for ruff to lint
+# and no pytest tree to collect. The implementation-blind suites they
+# guarded now live in `packages/aethyme/rust/crates/{aethyme-cli,
+# aethyme-testkit}/tests/` and run under `cargo-test`, whose triggers
+# (`**/*.rs`, `**/Cargo.toml`) already covered the Rust changes that used
+# to be the reason `pytest-local` triggered on `packages/aethyme/rust/**`.
+# `packages/aethyme/skills/**` is still covered: the ported
+# skill-template and playground-hygiene suites read those files, and
+# `cargo-test` runs the whole workspace on every entry that touches Rust.
 
 [[gate]]
 # Dogfood catch 2026-07-14: a NEW top-level package matched no trigger, so
 # its submit verified with gates:[] and auto-promoted unchecked. Every
 # package gets its own gate; when adding a package, add its gate in the
 # same change.
+# 2026-08-06 (python-retirement Phase 7): this gate used to borrow
+# `$MAIN/packages/aethyme/.venv`. That venv is an artifact of a package
+# that no longer contains any Python, and the CI gates lane stopped
+# creating it, so the borrow had to end. aethyme-eval is Python by
+# operator decision, so it provisions its own venv — inside the worktree
+# under test, which also means the gate runs the dependencies of the diff
+# it is verifying rather than the main checkout's. The venv is gitignored,
+# so it does not change the tree hash the result cache keys on. Creating
+# it costs ~2s once per worktree; every run after that reuses it.
 name = "pytest-aethyme-eval"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && PYTHONPATH=packages/aethyme-eval/src "$MAIN/packages/aethyme/.venv/bin/python" -m pytest -q packages/aethyme-eval/tests'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && cd packages/aethyme-eval && { [ -x .venv/bin/python ] || { python3 -m venv .venv && .venv/bin/python -m pip install --quiet pytest; }; } && PYTHONPATH=src .venv/bin/python -m pytest -q tests'
 cost = 1
 triggers = ["packages/aethyme-eval/**"]
 
@@ -59,7 +58,30 @@ triggers = ["packages/aethyme-eval/**"]
 name = "cargo-test"
 command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/aethyme-cargo-target}" cargo test --workspace --quiet --manifest-path packages/aethyme/rust/Cargo.toml'
 cost = 3
-triggers = ["**/*.rs", "**/Cargo.toml"]
+triggers = [
+    "**/*.rs",
+    "**/Cargo.toml",
+    # 2026-08-06 (python-retirement Phase 7): the workspace suites now
+    # include the implementation-blind tests ported from pytest, and
+    # several of them assert over NON-Rust files. Without these triggers a
+    # markdown-only entry would skip the gate that guards it — the same
+    # silent-narrowing failure the retired `pytest-local` gate documented
+    # when its `src/**` trigger outlived `src/`. Each entry names the
+    # suite that reads it.
+    #
+    # skill_templates.rs, playground_hygiene.rs (deployed templates,
+    # references, the SessionStart hook):
+    "packages/aethyme/skills/**",
+    # playground_hygiene.rs greps these two scripts, and their patterns
+    # must move in lockstep with the templates (Class-3 protocol):
+    "packages/aethyme/scripts/eval/*.sh",
+    # docs_hygiene.rs (links, required docs, last-updated, JSON fences):
+    "packages/aethyme/docs/**",
+    # pr_template.rs (the four contract labels, the cardinal-rule check):
+    ".github/pull_request_template.md",
+    # grammar_provenance.rs (manifest shape, licenses, wasm checksums):
+    "packages/aethyme/rust/grammars/**",
+]
 
 [[gate]]
 # 2026-07-27: the registry's enforcement previously ran ONLY in the

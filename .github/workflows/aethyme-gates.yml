@@ -5,6 +5,9 @@ name: Aethyme Gates
 # broker runs before promoting a session (`aethyme broker gates run
 # --all`). The pre-existing test workflows stay in place until this lane
 # has proven equivalent; deleting them is a separate, later decision.
+#
+# No untrusted event data (`github.event.*`) is interpolated into any
+# `run:` block here — every step is a fixed command.
 
 on:
   pull_request:
@@ -22,26 +25,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # The ruff and pytest-local gates still run the dev harness; the
-      # cross-process-contract gate went native in Phase 6 and builds the
-      # router from the worktree instead. Python leaves this workflow when
-      # tests/local ports to Rust.
-      - name: Set up Python (dev gates only)
+      # The `ruff` and `pytest-local` gates retired with the pytest stack
+      # on 2026-08-06 (python-retirement Phase 7), so this lane no longer
+      # provisions a venv for `packages/aethyme` — that package holds no
+      # Python. The one Python gate left, `pytest-aethyme-eval`,
+      # provisions its own venv inside the tree under test; it needs an
+      # interpreter on PATH and nothing else.
+      - name: Set up Python (for the aethyme-eval gate only)
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
-
-      # gates.toml commands resolve $MAIN/packages/aethyme/.venv from any
-      # worktree, so CI provides the documented package-local venv layout.
-      - name: Install the gate harness (into .venv)
-        working-directory: packages/aethyme
-        run: |
-          python -m venv .venv
-          .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/python -m pip install pytest pytest-asyncio ruff
 
       - name: Build aethyme binary
         run: cargo build --release --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme

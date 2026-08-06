@@ -104,45 +104,13 @@ jobs:
 
           echo "product path is Python-free"
 
-  # ── Dev lanes ───────────────────────────────────────────────────────────
-  # The pytest harness is DEV-ONLY scaffolding and retires when tests/local
-  # ports to Rust (operator decision 5, 2026-08-01). CI installs the test
-  # tools directly — never `pip install -e .`, which would install nothing
-  # now that src/ is deleted and the package has no runtime dependencies.
-  local-tests:
-    name: Local tests (dev harness)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: packages/aethyme
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up Python (dev harness only)
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      # The documented dev setup uses a package-local .venv (the layout the
-      # broker gates and docs assume), so CI provides the same venv layout.
-      - name: Install the test harness (into .venv)
-        run: |
-          python -m venv .venv
-          .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/python -m pip install pytest pytest-asyncio ruff
-
-      # tests/local drive the `aethyme` router binary as a subprocess, so
-      # the router must exist in every lane.
-      - name: Build Rust router binary
-        run: cargo build --quiet --manifest-path rust/Cargo.toml --bin aethyme
-
-      - name: Run local tests
-        run: .venv/bin/python -m pytest -q tests/local
-
+  # ── Dev lane ────────────────────────────────────────────────────────────
+  # The pytest harness that used to live here retired on 2026-08-06
+  # (python-retirement Phase 7). Its implementation-blind suites are now
+  # `aethyme-cli/tests/` and `aethyme-testkit/tests/`, so `cargo test
+  # --workspace` is the whole test story for packages/aethyme and this
+  # workflow installs no Python at all. `packages/aethyme-eval` keeps its
+  # own Python by design and its own gate.
   rust-tests:
     name: Rust workspace tests
     runs-on: ubuntu-latest
