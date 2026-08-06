@@ -14,7 +14,8 @@ front-door product.
 Use this when adding Aethyme to a repository for the first time.
 
 ```bash
-cargo install --path packages/aethyme/rust/crates/aethyme-engine
+cargo install --path packages/aethyme/rust/crates/aethyme-cli
+cargo install --path packages/aethyme/rust/crates/aethyme-engine  # engine-daemon sibling
 cd /path/to/repo
 aethyme init
 aethyme broker quick-test
