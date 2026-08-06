@@ -75,7 +75,8 @@ First-time flow: install -> `aethyme init` -> `aethyme broker quick-test` ->
 **1. Install the binary** (from a clone of this repository):
 
 ```bash
-cargo install --path packages/aethyme/rust/crates/aethyme-engine
+cargo install --path packages/aethyme/rust/crates/aethyme-cli
+cargo install --path packages/aethyme/rust/crates/aethyme-engine  # engine-daemon sibling
 ```
 
 **2. Certify and scaffold your target repo:**
