@@ -215,6 +215,9 @@ pub fn run(args: &[String]) -> u8 {
 /// session ids, task text) can never leak into the metrics file. Best
 /// effort — any failure is silently ignored.
 fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
+    if !command_records_metric(args) {
+        return;
+    }
     const KNOWN: &[&str] = &[
         "adopt",
         "start",
@@ -260,8 +263,8 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         .filter(|a| KNOWN.contains(a))
         .take(2)
         .collect();
-    if label.is_empty() || label == ["metrics"] || label == ["certify"] {
-        return; // nothing recognizable, or a command whose contract forbids telemetry writes
+    if label.is_empty() {
+        return; // nothing recognizable
     }
     let Ok(cwd) = std::env::current_dir() else {
         return;
@@ -292,8 +295,66 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
     }
 }
 
+/// Whether this invocation should contribute command-latency telemetry.
+/// Report-only commands stay telemetry-free; variants that mutate broker,
+/// repository, or installation state remain observable.
+fn command_records_metric(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some("certify" | "queue" | "metrics") => false,
+        Some("hooks") => args.get(1).map(String::as_str) != Some("status"),
+        Some("events") => args.get(1).map(String::as_str) == Some("prune"),
+        Some("gates") => !matches!(
+            args.get(1).map(String::as_str),
+            Some("validate" | "affected" | "semantic")
+        ),
+        Some("doctor") => args.iter().any(|arg| arg == "--fix-version"),
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    #[test]
+    fn telemetry_classification_tracks_semantic_mutability() {
+        for command in [
+            args(&["certify"]),
+            args(&["hooks", "status"]),
+            args(&["queue"]),
+            args(&["events"]),
+            args(&["events", "--follow"]),
+            args(&["metrics"]),
+            args(&["gates", "validate"]),
+            args(&["gates", "affected", "--session", "7"]),
+            args(&["gates", "semantic", "--session", "7"]),
+            args(&["doctor"]),
+        ] {
+            assert!(
+                !super::command_records_metric(&command),
+                "read-only reporter should not record telemetry: {command:?}"
+            );
+        }
+
+        for command in [
+            args(&["hooks", "install"]),
+            args(&["events", "prune", "--keep-days", "7"]),
+            args(&["gates", "run", "--session", "7"]),
+            args(&["doctor", "--fix-version"]),
+            args(&["status"]),
+            args(&["agents"]),
+            args(&["leases"]),
+            args(&["integration", "status"]),
+        ] {
+            assert!(
+                super::command_records_metric(&command),
+                "stateful command should record telemetry: {command:?}"
+            );
+        }
+    }
+
     #[test]
     fn init_next_steps_names_quick_test_before_start_and_submit() {
         let message = super::init_next_steps_message();
