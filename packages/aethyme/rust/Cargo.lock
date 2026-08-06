@@ -39,7 +39,9 @@ dependencies = [
  "aethyme-engine",
  "aethyme-enhance",
  "aethyme-quality",
+ "aethyme-testkit",
  "libc",
+ "serde_json",
  "tempfile",
 ]
 
