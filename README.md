@@ -55,7 +55,8 @@ sessions whose changes merged cleanly but broke together; the gate on the
 merged tree caught it). Friction and cost accounting are logged in
 [`docs/dogfood-friction.md`](docs/dogfood-friction.md).
 
-**V1 is in progress.** The dogfood week is hardening the loop; known edges:
+**V1 is active.** The dogfood week and issue #33 closed on 2026-07-17 after
+the broker passed its MVP exit checklist under real multi-agent load. Known edges:
 design ceiling of 15 concurrent sessions (stress-tested at 20), macOS/Linux
 only, implicit overlap warnings are advisory while explicit leases block, and
 graph-aware broker features (impact-hint advisories) are deferred. The deterministic graph
@@ -75,7 +76,8 @@ First-time flow: install -> `aethyme init` -> `aethyme broker quick-test` ->
 **1. Install the binary** (from a clone of this repository):
 
 ```bash
-cargo install --path packages/aethyme/rust/crates/aethyme-engine
+cargo install --path packages/aethyme/rust/crates/aethyme-cli
+cargo install --path packages/aethyme/rust/crates/aethyme-engine  # engine-daemon sibling
 ```
 
 **2. Certify and scaffold your target repo:**

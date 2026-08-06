@@ -33,13 +33,14 @@ dependencies = [
 
 [[package]]
 name = "aethyme-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aethyme-broker",
  "aethyme-engine",
  "aethyme-enhance",
  "aethyme-quality",
  "libc",
+ "tempfile",
 ]
 
 [[package]]

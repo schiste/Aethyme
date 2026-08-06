@@ -13,7 +13,7 @@ shape of the output will not.
 
 Prerequisites:
 
-- `aethyme` on PATH (`cargo install --path packages/aethyme/rust/crates/aethyme-engine`)
+- `aethyme` on PATH (`cargo install --path packages/aethyme/rust/crates/aethyme-cli`)
 - git ≥ 2.38 (merge simulation uses `git merge-tree`)
 - `python3` (used by the demo's one gate)
 
