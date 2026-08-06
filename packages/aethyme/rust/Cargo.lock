@@ -40,6 +40,7 @@ dependencies = [
  "aethyme-enhance",
  "aethyme-quality",
  "libc",
+ "tempfile",
 ]
 
 [[package]]

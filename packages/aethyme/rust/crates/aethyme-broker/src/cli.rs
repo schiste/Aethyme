@@ -247,8 +247,8 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         .filter(|a| KNOWN.contains(a))
         .take(2)
         .collect();
-    if label.is_empty() || label == ["metrics"] {
-        return; // nothing recognizable, or reading metrics itself
+    if label.is_empty() || label == ["metrics"] || label == ["certify"] {
+        return; // nothing recognizable, or a command whose contract forbids telemetry writes
     }
     let Ok(cwd) = std::env::current_dir() else {
         return;
