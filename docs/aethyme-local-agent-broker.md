@@ -1,6 +1,6 @@
 # Aethyme Local Agent Broker — Direction (v0)
 
-Status: **v0 built and in dogfood** (as of 2026-07-13; planned 2026-07-09)
+Status: **V1 active; dogfood stage exited** (as of 2026-07-17)
 Owner: Aethyme core
 Related: [`project-plan.md`](project-plan.md), [`../packages/aethyme/docs/vision.md`](../packages/aethyme/docs/vision.md) (historical)
 
@@ -94,7 +94,8 @@ affected gate runner, the merge queue with auto-promotion, and the event
 log, exposed as `aethyme broker ...` in the Rust router. The deterministic
 v0 scenario test covers the three-agent story end to end, and the first
 live dogfood loop ran on this repository on 2026-07-13 (see
-`docs/dogfood-friction.md`). Current stage: **the dogfood week (#33)**.
+`docs/dogfood-friction.md`). The dogfood week completed and **#33 closed on
+2026-07-17**; V1 is now active.
 
 The **deterministic Rust graph engine** (repo indexing, redb store,
 committed graph fragments, navigation and impact-frontier queries) remains
