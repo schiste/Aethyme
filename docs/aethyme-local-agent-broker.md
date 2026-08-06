@@ -71,8 +71,10 @@ contracts, so any future delivery surface is a client, not a rewrite.
 - **Kill criterion for the dogfood:** stop if costs increase too much AND
   no time is saved; the friction log includes cost/time accounting.
 - **Promotion lands on a local integration branch only.** The broker never
-  pushes and never opens PRs; GitHub review/PR flow stays fully human and
-  unchanged in v0.
+  pushes and never opens PRs. It may observe PR state through `gh` for routing
+  (`broker pr check`), but GitHub mutation — replying, resolving threads,
+  committing fixes, and pushing — belongs to the dispatched agent or human
+  operator.
 - **The broker manages conflicts; quality is repo-owned and optional**
   (clarified 2026-07-13). `gates.toml` is repo policy, not broker policy —
   the broker is pure mechanism (selection, ordering, caching,

@@ -1,6 +1,6 @@
 # Aethyme Public Product Surface
 
-Status: current public surface, 2026-07-29
+Status: current public surface, 2026-07-31
 
 Aethyme is a local-first CLI for coordinating AI coding agents and for
 answering bounded repository-navigation questions. The product surface is
@@ -104,6 +104,7 @@ the first-time story:
 - `aethyme broker metrics`
 - `aethyme broker doctor`
 - `aethyme broker leases ...`
+- `aethyme broker pr check`
 - `aethyme broker cleanup`
 - `aethyme graph ...`
 - `aethyme facts ...`
@@ -149,8 +150,8 @@ Only the frozen broker JSON contracts in
 
 Other JSON outputs are useful operationally but provisional until they are
 promoted into that contract document. In particular, `quick-test`, `verify-loop`,
-`doctor`, `certify`, `agents`, `adopt`, `leases`, and `gates` JSON should be
-treated as best-effort.
+`doctor`, `certify`, `agents`, `adopt`, `leases`, `gates`, and `pr check` JSON
+should be treated as best-effort.
 
 ## Broker As Repo Cleanliness Infrastructure
 
@@ -201,3 +202,25 @@ Highest-value improvements:
 
 The target product behavior is: before an agent reads the repo, it asks the
 broker for the smallest current-state packet that can steer the next action.
+
+## Broker As Production PR Follow-Up Infrastructure
+
+The broker can also reduce production-PR review loops after a branch has pushed.
+`aethyme broker pr check` observes the open PR from the current branch to a
+target branch (default `production`), classifies the PR body marker, fingerprints
+comments/reviews/checks, and prepares a bounded prompt for a `Push2prod` agent.
+
+The contract is intentionally split:
+
+- the broker reads and routes deterministic facts: PR body marker, comments,
+  reviews, status checks, last observed fingerprint, prompt path, and dispatch
+  status
+- the agent performs subjective and mutating work: fetch full threads, decide
+  what is actionable, edit code, commit, push, reply, and resolve comments
+- a thumbs-up marker means all good; looking-eyes or no marker means continue
+  watching activity
+
+Because Git has no native post-push hook, "after successful push" automation
+should call the command from a push wrapper, CI/webhook worker, or Chau7/MCP
+controller. The broker command itself is the deterministic core that those
+surfaces reuse.

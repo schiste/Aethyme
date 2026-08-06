@@ -53,6 +53,7 @@ product surface.
 - `aethyme broker metrics`
 - `aethyme broker doctor`
 - `aethyme broker leases ...`
+- `aethyme broker pr check`
 - `aethyme broker cleanup`
 - `aethyme graph ...`
 - `aethyme facts ...`
@@ -84,6 +85,7 @@ The broker is the stable product front door for multi-agent coordination:
 - `aethyme broker integration status [--json]`
 - `aethyme broker quick-test [--with-gate] [--json]`
 - `aethyme broker verify-loop [--json]`
+- `aethyme broker pr check [--target <branch>] [--pr <number>] [--agent <name>] [--dispatch] [--cmd <command>] [--json]`
 
 `quick-test` is the disposable install smoke. `verify-loop` is the stronger
 operator E2E: it reports the integration commit tested and flags movement during
@@ -92,6 +94,107 @@ the run, so callers know whether the result proves the current integration tip.
 Frozen broker JSON contracts are limited to the commands listed in
 [`../../../../docs/json-contracts.md`](../../../../docs/json-contracts.md).
 Other `--json` outputs are useful but provisional.
+
+### PR Follow-Up
+
+`aethyme broker pr check` is the first production-PR routing surface. It is
+designed for local push wrappers, CI pollers, or a future Chau7/MCP bridge after
+a branch has been pushed and an open PR to production exists.
+
+Default behavior:
+
+- target branch defaults to `production`; override with `--target <branch>`
+- PR selection defaults to the open PR whose head is the current branch and base
+  is the target; override with `--pr <number>`
+- agent name defaults to `Push2prod`; override with `--agent <name>`
+- without `--dispatch`, actionable new activity is reported and a prompt file
+  may be written, but the activity is not acknowledged, so the suggested
+  `--dispatch` rerun can still route it
+- unchanged, all-good, or non-actionable observations may advance the local
+  broker cursor in `.aethyme/broker.db`
+- with `--dispatch`, the broker writes a bounded prompt under
+  `.aethyme/run/pr-follow-up/`; it reuses an active/idle matching broker session
+  when one exists, otherwise it starts a Codex agent command
+- `--cmd <command>` overrides the default spawned command; the default command
+  is a Codex exec invocation that reads the generated prompt file
+
+Marker behavior:
+
+- PR body contains the Unicode thumbs-up character, `:+1:`, or `:thumbsup:`:
+  all good; skip comments, reviews, and checks
+- PR body contains the Unicode looking-eyes character or `:eyes:`: inspect
+  activity
+- no marker: inspect activity
+
+The activity fingerprint is deterministic over observed comments, reviews, and
+status-check rollup. Re-running the command against unchanged PR activity will
+report `new_activity: false` and will not dispatch again.
+
+Provisional JSON shape:
+
+```json
+{
+  "target_branch": "production",
+  "head_branch": "feature-branch",
+  "pr": {
+    "number": 42,
+    "title": "Ship change",
+    "url": "https://github.com/org/repo/pull/42",
+    "head_branch": "feature-branch",
+    "head_oid": "<commit>",
+    "base_branch": "production",
+    "is_draft": false,
+    "review_decision": "CHANGES_REQUESTED",
+    "updated_at": "2026-07-31T10:00:00Z"
+  },
+  "marker": "looking",
+  "checked_activity": true,
+  "previous_fingerprint": "old",
+  "activity_fingerprint": "new",
+  "new_activity": true,
+  "comments": [
+    {
+      "kind": "comment",
+      "id": "IC_kw...",
+      "author": "reviewer",
+      "state": null,
+      "body_preview": "Please adjust this edge case.",
+      "url": "https://github.com/org/repo/pull/42#issuecomment-1",
+      "updated_at": "2026-07-31T10:00:00Z"
+    }
+  ],
+  "reviews": [],
+  "checks": [],
+  "failing_checks": [],
+  "decision": {
+    "status": "needs_agent",
+    "should_check_activity": true,
+    "should_dispatch": true,
+    "summary": "new PR activity needs Push2prod follow-up"
+  },
+  "prompt_path": "/repo/.aethyme/run/pr-follow-up/pr-42-178....md",
+  "dispatch": {
+    "status": "not_requested",
+    "session_id": null,
+    "prompt_path": "/repo/.aethyme/run/pr-follow-up/pr-42-178....md",
+    "command": null,
+    "message": "dispatch not requested; prompt is ready on disk"
+  },
+  "next_commands": [
+    "aethyme broker pr check --target 'production' --pr 42 --dispatch"
+  ]
+}
+```
+
+Current scope limits:
+
+- the broker reads GitHub through `gh`; callers are responsible for
+  authentication and network access
+- the broker does not reply to comments, resolve review threads, push commits,
+  or mutate GitHub PR state; the dispatched agent does that work
+- Git has no native post-push hook, so "after successful push" automation should
+  call this command from a push wrapper, CI job, webhook worker, or Chau7/MCP
+  controller rather than from `pre-push`
 
 ## Core Commands
 

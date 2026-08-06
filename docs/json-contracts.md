@@ -16,11 +16,11 @@ may depend on their field names:
 | Submit outcome | `aethyme broker submit --json` | `SubmitOutcome` (`src/merge.rs`) |
 
 Every other `--json` output (doctor, certify, quick-test, verify-loop,
-agents, adopt, leases, gates, …) is best-effort: useful, but not yet frozen
-— do not build long-lived integrations on those without promoting them here
-first. `quick-test` and `verify-loop` are public operator confidence commands;
-their human-facing behavior is product surface, but their JSON shape is still
-provisional.
+agents, adopt, leases, gates, `pr check`, ...) is best-effort: useful, but not
+yet frozen — do not build long-lived integrations on those without promoting
+them here first. `quick-test` and `verify-loop` are public operator confidence
+commands; their human-facing behavior is product surface, but their JSON shape
+is still provisional.
 
 ## Change policy
 
