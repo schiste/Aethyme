@@ -200,6 +200,11 @@ fn print_top_level_help() {
     eprintln!("Agent broker:");
     eprintln!("  init                        guided setup: certify + scaffold + gates draft");
     eprintln!("  certify                     read-only certification checks for this repo");
+    eprintln!("  broker start --task <text>  create an isolated worktree + session");
+    eprintln!("  broker submit --session <id> simulate, gate, and promote a session");
+    eprintln!("  broker status              show sessions, conflicts, queue, and integration");
+    eprintln!("  broker finish --session <id> safely close a completed session");
+    eprintln!("  broker leases [claim|release] inspect or manage path ownership");
     eprintln!("  broker adopt|start-agent|agents|cleanup   (see `broker --help`)");
     eprintln!();
     eprintln!("Setup:");
