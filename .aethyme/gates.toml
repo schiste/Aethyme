@@ -50,7 +50,7 @@
 # so it does not change the tree hash the result cache keys on. Creating
 # it costs ~2s once per worktree; every run after that reuses it.
 name = "pytest-aethyme-eval"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && cd packages/aethyme-eval && { [ -x .venv/bin/python ] || { python3 -m venv .venv && .venv/bin/python -m pip install --quiet pytest; }; } && PYTHONPATH=src .venv/bin/python -m pytest -q tests'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && cd packages/aethyme-eval && { [ -x .venv/bin/python ] || { python3 -m venv .venv && .venv/bin/python -m pip install --quiet --disable-pip-version-check pytest; }; } && PYTHONPATH=src .venv/bin/python -m pytest -q tests'
 cost = 1
 triggers = ["packages/aethyme-eval/**"]
 
