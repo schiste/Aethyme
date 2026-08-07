@@ -505,10 +505,16 @@ fn commit_line_decisions(text: &str) -> Vec<Decision> {
     let mut out = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim_start();
-        if trimmed.len() < PREFIX.len() {
+        // `get` rather than `[..]`: PREFIX.len() is a BYTE offset, and a
+        // commit body line whose 18th byte falls inside a multi-byte
+        // character (an em dash at column 17, say) would panic the whole
+        // checker on a plain string slice. `None` is the right answer
+        // anyway — PREFIX is pure ASCII, so a line that does not split
+        // cleanly there cannot start with it.
+        let Some(head) = trimmed.get(..PREFIX.len()) else {
             continue;
-        }
-        if !trimmed[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        };
+        if !head.eq_ignore_ascii_case(PREFIX) {
             continue;
         }
         let rest = trimmed[PREFIX.len()..].trim_start();
@@ -603,6 +609,34 @@ mod tests {
         assert!(!tracked.contains("foo"));
         assert!(!tracked.contains("2024"));
         assert!(!tracked.contains("TODO"));
+    }
+
+    #[test]
+    fn commit_line_decisions_reads_the_label() {
+        assert_eq!(
+            commit_line_decisions("Contract decision: hard-delete (src/ is gone)\n"),
+            vec![Decision::HardDelete]
+        );
+        assert_eq!(
+            commit_line_decisions("  contract decision:none\n"),
+            vec![Decision::None]
+        );
+        assert!(commit_line_decisions("Contract decision: bogus\n").is_empty());
+    }
+
+    /// Regression, 2026-08-06: the prefix comparison sliced the line at a
+    /// BYTE offset, so a body line whose 18th byte landed inside a
+    /// multi-byte character panicked the whole checker — taking the
+    /// `cross-process-contract` gate down with it. Found by running the
+    /// gate over this very migration's commit bodies.
+    #[test]
+    fn commit_line_decisions_survives_multibyte_lines() {
+        // The em dash straddles byte 18 of this line.
+        let body = "Rationale: this — an em dash — sits across the prefix window.\n\
+             Contract decision: none (still parsed)\n";
+        assert_eq!(commit_line_decisions(body), vec![Decision::None]);
+        // Shorter than the prefix, and non-ASCII: must not panic either.
+        assert!(commit_line_decisions("é\n").is_empty());
     }
 
     #[test]
