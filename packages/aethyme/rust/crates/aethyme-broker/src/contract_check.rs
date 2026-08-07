@@ -369,30 +369,47 @@ fn read_diff(repo_root: &Path, base: &str) -> Result<Vec<String>, String> {
 ///   by being added.
 /// - Removed lines are the operation that breaks downstream consumers
 ///   (the entry point is gone; callers crash).
+///
+/// A symbol is only reported when the diff REDUCES its occurrences:
+/// removed-count > added-count. Rewriting a line — which is how every
+/// edit to a registry row appears, since a row is one long line — shows
+/// each of its symbols as both removed and added, and reduces nothing.
+/// Counting only removals flagged those rewrites (2026-08-07 sweep hit
+/// this while repairing a stale row), and the only way past the gate was
+/// to attach an introduce/soft-retire/hard-delete label to a change that
+/// did none of those things. A guard that can only be satisfied by
+/// mislabelling corrupts the signal it exists to give, so it counts both
+/// sides now.
 pub fn find_touched_symbols(
     diff_lines: &[String],
     tracked: &BTreeSet<String>,
 ) -> BTreeMap<String, Vec<String>> {
-    let mut findings: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut removed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut added: BTreeMap<String, usize> = BTreeMap::new();
     for line in diff_lines {
         // `--- a/path` and `+++ b/path` appear at hunk boundaries. Skip
         // them; real removals are `-text`, real additions `+text`.
         if line.starts_with("---") || line.starts_with("+++") {
             continue;
         }
-        let Some(body) = line.strip_prefix('-') else {
-            continue;
-        };
-        for symbol in tracked {
-            if body.contains(symbol.as_str()) {
-                findings
-                    .entry(symbol.clone())
-                    .or_default()
-                    .push(line.clone());
+        if let Some(body) = line.strip_prefix('-') {
+            for symbol in tracked {
+                if body.contains(symbol.as_str()) {
+                    removed.entry(symbol.clone()).or_default().push(line.clone());
+                }
+            }
+        } else if let Some(body) = line.strip_prefix('+') {
+            for symbol in tracked {
+                if body.contains(symbol.as_str()) {
+                    *added.entry(symbol.clone()).or_default() += 1;
+                }
             }
         }
     }
-    findings
+    removed
+        .into_iter()
+        .filter(|(symbol, lines)| lines.len() > added.get(symbol).copied().unwrap_or(0))
+        .collect()
 }
 
 /// The contract decision an author declared.
@@ -652,25 +669,60 @@ mod tests {
         assert!(inline_code_tokens("`abcd\nefgh`").is_empty());
     }
 
+    fn tracked_explore() -> BTreeSet<String> {
+        ["aethyme-explore".to_string()].into_iter().collect()
+    }
+
+    fn diff_of(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn find_touched_symbols_only_flags_removals() {
         // Added lines mentioning a tracked symbol are usually new
-        // consumers — they don't break things by being added.
-        let tracked: BTreeSet<String> = ["aethyme-explore".to_string()].into_iter().collect();
-        let diff: Vec<String> = [
+        // consumers — they don't break things by being added. A pure
+        // removal, with nothing added back, is the dangerous direction.
+        let diff = diff_of(&[
             "--- a/foo",
             "+++ b/foo",
-            "+ adding aethyme-explore (this is fine)",
+            "+ adding some-other-thing (this is fine)",
             "  context line mentions aethyme-explore (unchanged)",
             "- removing aethyme-explore (this is the dangerous direction)",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let findings = find_touched_symbols(&diff, &tracked);
+        ]);
+        let findings = find_touched_symbols(&diff, &tracked_explore());
         let hits = findings.get("aethyme-explore").expect("symbol flagged");
         assert_eq!(hits.len(), 1);
         assert!(hits[0].starts_with('-'));
+    }
+
+    #[test]
+    fn find_touched_symbols_ignores_in_place_rewrites() {
+        // Editing a registry row rewrites one long line, so every symbol
+        // in it appears as both removed and added. Nothing is reduced,
+        // so nothing is flagged — otherwise the only way to reword a row
+        // is to attach a contract label to a change that retires nothing.
+        let diff = diff_of(&[
+            "--- a/registry.md",
+            "+++ b/registry.md",
+            "- | `aethyme-explore` | old wording |",
+            "+ | `aethyme-explore` | new wording |",
+        ]);
+        assert!(find_touched_symbols(&diff, &tracked_explore()).is_empty());
+    }
+
+    #[test]
+    fn find_touched_symbols_flags_a_net_reduction() {
+        // Two mentions removed, one added back: the symbol lost ground,
+        // so the author still owes a decision.
+        let diff = diff_of(&[
+            "--- a/registry.md",
+            "+++ b/registry.md",
+            "- row one cites `aethyme-explore`",
+            "- row two cites `aethyme-explore`",
+            "+ merged row cites `aethyme-explore`",
+        ]);
+        let findings = find_touched_symbols(&diff, &tracked_explore());
+        assert_eq!(findings.get("aethyme-explore").map(Vec::len), Some(2));
     }
 
     #[test]
