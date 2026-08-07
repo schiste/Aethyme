@@ -123,15 +123,21 @@ Sweep recipe (the 2026-07-17 audit, distilled):
   symbols demand an explicit contract decision. Native since
   retirement Phase 6 (`aethyme broker check-contract`), and the gate
   builds it from the worktree under test.
-- ~~Surface-freeze test~~ and ~~golden harness~~ **retired 2026-08-01
-  (retirement Phase 6)**: both compared against a delegated Python
-  surface that no longer exists. What replaced them: the
+- ~~Surface-freeze test~~ and ~~golden harness~~ (the latter caught
+  cross-process output drift, the 12-day `query deps` class)
+  **retired 2026-08-01 (retirement Phase 6)**: both compared against a
+  delegated Python surface that no longer exists. What replaced them: the
   implementation-blind suites in `aethyme-cli/tests/` and
   `aethyme-testkit/tests/` drive the built binary and assert on
   stdout/artifacts, and `cargo-test`'s trigger list was widened to
   `skills/**`, `docs/**`, `rust/grammars/**`, `scripts/eval/*.sh` and
   the PR template so a non-Rust edit still runs the suites that read
   those files.
+- `query deps`/`impact` and the router-subprocess test seam: the
+  surfaces that were untested when the 12-day break slipped through
+  now fail loudly. The seam moved from pytest to
+  `aethyme-testkit::invoke` in Phase 7, but it still drives the built
+  binary and asserts on stdout, so the guarantee is unchanged.
 - `verify-playground.sh`: deployed-artifact freshness, including
   "no Python invocation" checks on the wrappers and hook.
 
