@@ -20,7 +20,6 @@
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use aethyme_graph_storage::{FragmentStore, OverlayFragment, bootstrap_repo};
 use aethyme_producers::{
@@ -146,8 +145,3 @@ fn payload_bounds_compile_for_btreemap() {
         .expect("build overlay");
     assert_eq!(frag.payload(), &payload);
 }
-
-// Suppress dead_code for the unused tempdir path return — referenced
-// only via the `_tmp` binding's Drop.
-#[allow(dead_code)]
-fn _path_marker(_p: &Path) {}
