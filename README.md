@@ -222,11 +222,8 @@ longer guide at
 cargo install --path packages/aethyme/rust/crates/aethyme-cli
 cargo install --path packages/aethyme/rust/crates/aethyme-engine
 
-# Tests: Rust is the suite; a dev-only pytest harness drives the built
-# binary until it ports to Rust. Nothing is pip-installed from this repo.
+# Tests: no Python there either, since 2026-08-06.
 cd packages/aethyme/rust && cargo test --workspace
-cd .. && python3 -m venv .venv && .venv/bin/python -m pip install pytest pytest-asyncio ruff
-.venv/bin/python -m pytest -q tests/local
 ```
 
 > **`python -m src.cli` no longer exists.** The Python package was deleted

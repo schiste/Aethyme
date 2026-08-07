@@ -1,6 +1,6 @@
 # Eval Protocol (removed)
 
-Last Updated: 2026-07-29
+Last Updated: 2026-08-06
 
 The evaluation harness (`src/eval/`, `evals/tools/*.toml`, the
 `aethyme eval` / `aethyme methodology` CLI groups, and

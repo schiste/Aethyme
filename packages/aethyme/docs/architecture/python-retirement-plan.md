@@ -1,10 +1,13 @@
 # Python Retirement Plan — one binary, one runtime
 
-Last Updated: 2026-08-01
+Last Updated: 2026-08-06
 
-Status: PHASES 0–6 LANDED (2026-08-01). The product path is Python-free;
-`cargo install` yields the entire product. What remains is the dev test
-stack — see Phase 6's "What did NOT land" note. Owner: operator. Prereq reading:
+Status: **COMPLETE. Phases 0–7 landed (0–6 on 2026-08-01, 7 on
+2026-08-06).** `packages/aethyme` is 100% Rust: `cargo install` yields the
+entire product and `cargo test --workspace` is the entire test suite.
+There is no Python left in the package — not on the product path, not in
+the dev harness, not in the scripts. `packages/aethyme-eval` stays Python
+by design (see Non-goals). Owner: operator. Prereq reading:
 `cross-process-consumers.md`, `graph-schema.md`, the redb migration plans.
 
 ## Objective
@@ -515,15 +518,60 @@ only remaining Python invocations are the dev test lanes, each labelled
 DEV-ONLY; every product-path row is native.
 
 **What did NOT land in Phase 6** (deliberate — operator decision 5): the
-`tests/` pytest harness and `pyproject.toml` survive as dev-only
-scaffolding. `packages/aethyme` is not yet 100% Rust. The follow-up
-session ports `tests/local` (~126 tests) plus `tests/indexing` and
-`tests/docs` to Rust and then deletes `tests/`, `pyproject.toml`, the
-`ruff`/`pytest-local` gates, the Python setup in
-`aethyme-local-tests.yml` / `oss-ci.yml` / `aethyme-gates.yml`, and the
-three remaining dev scripts (`scripts/eval/run_codex_eval.py`,
-`scripts/eval/check_regression_gate.py`,
-`scripts/verify-grammar-provenance.py`).
+`tests/` pytest harness and `pyproject.toml` survived as dev-only
+scaffolding. That is Phase 7's subject.
+
+## Phase 7 — the dev test stack (LANDED 2026-08-06)
+
+**Goal.** `packages/aethyme` becomes 100% Rust.
+
+**What landed.**
+
+1. `aethyme-testkit`, a `publish = false` workspace member consumed only
+   as a dev-dependency, replacing `tests/support/`: `bins` (build-if-
+   missing binary resolution), `invoke` (subprocess router invocation
+   with merged stdout+stderr, cwd, stdin), `repos` (fixture repositories),
+   `paths` (checkout roots from `CARGO_MANIFEST_DIR`). It is a crate
+   rather than a `tests/common/mod.rs` because three consumers need it —
+   `aethyme-cli`'s CLI suites, `aethyme-engine`'s existing subprocess
+   tests (whose private `aethyme_bin()` copy is deleted), and the
+   repo-hygiene suites that belong to no product crate.
+2. All 145 pytest cases dispositioned. 41 moved to `packages/aethyme-eval`
+   with the eval scripts; 102 ported to `aethyme-cli/tests/` (84) and
+   `aethyme-testkit/tests/` (18); 2 not ported — they tested the pytest
+   harness's own skip helper, and the Rust harness has no skip path.
+3. `tests/` and `pyproject.toml` deleted; the `ruff` and `pytest-local`
+   gates removed; Python removed from all three workflow lanes.
+4. The three remaining dev scripts settled: the two eval scripts MOVED to
+   `packages/aethyme-eval/scripts/` (that package owns eval tooling and
+   stays Python by operator decision 6); `verify-grammar-provenance.py`
+   PORTED to `aethyme-testkit/tests/grammar_provenance.rs`, since it
+   audits the Rust crates' own grammar assets.
+
+**Exit criteria.** `find packages/aethyme -name "*.py"` returns nothing;
+no `pyproject.toml`; `cargo test --workspace` green with zero warnings;
+`verify-playground.sh` still passes against a deployed repo; every gate
+in `.aethyme/gates.toml` passes.
+
+**Status: MET 2026-08-06.**
+
+**Two things worth remembering from the port.**
+
+- *The oracle problem.* `test_explore_summary_cli.py` compared the
+  command's bytes against a CPython `json.dumps(..., indent=2)` oracle it
+  built in-process. Rewriting that oracle in Rust would have produced a
+  second guess at the same answer, free to drift toward the
+  implementation it checks. The CPython output was captured once and
+  frozen as fixtures instead — same bytes, same guarantee, and a file
+  cannot drift.
+- *Gate triggers are coverage.* `pytest-local` triggered on
+  `packages/aethyme/{tests,skills,evals,rust}/**`; `cargo-test` triggered
+  only on `**/*.rs` + `**/Cargo.toml`. Deleting the former without
+  widening the latter would have let a skills- or docs-only entry skip
+  the suites that assert over those files — the same silent narrowing
+  `pytest-local`'s own comment recorded when a `src/**` trigger outlived
+  `src/`. `cargo-test` now names each non-Rust input and the suite that
+  reads it.
 
 **Risks to manage.**
 - *Operator muscle memory and old notes* — `python -m src.cli` stops

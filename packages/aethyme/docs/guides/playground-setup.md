@@ -1,6 +1,6 @@
 # Playground Setup Guide
 
-Last Updated: 2026-07-28
+Last Updated: 2026-08-06
 
 How to create an eval playground — a pair of repos (Control + Aethyme) from any source repository.
 

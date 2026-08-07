@@ -1,6 +1,6 @@
 # Aethyme Graph Engine Quick Start
 
-Last Updated: 2026-08-01
+Last Updated: 2026-08-06
 
 This page covers the lower-level graph-engine path. For the current public
 product quickstart, use the broker-first flow in
@@ -54,14 +54,12 @@ At this stage:
 ## 4. Run The Test Suite
 
 ```bash
-cd rust && cargo test --workspace && cd ..
-
-# Dev-only pytest harness (drives the built binary; retires when it
-# ports to Rust). Install the tools once — never `pip install -e .`,
-# there is no package to install:
-python3 -m venv .venv
-.venv/bin/python -m pip install pytest pytest-asyncio ruff
-.venv/bin/python -m pytest -q tests/local tests/indexing tests/docs
+cd rust && cargo test --workspace
 ```
 
-See `tests/README.md` for the suite layout.
+That is all of it — no venv, no `pip install`. The implementation-blind
+suites that drive the built binaries and the repo-hygiene suites over
+docs and templates are part of the workspace since python-retirement
+Phase 7 (2026-08-06).
+
+See [`../guides/testing.md`](../guides/testing.md) for the suite layout.

@@ -18,26 +18,25 @@ cd packages/aethyme/rust
 cargo build --quiet --bin aethyme --bin aethyme-engine-cli
 ```
 
-`packages/aethyme` has no Python product code — `src/` was deleted on
-2026-08-01 (python-retirement Phase 6) and there is nothing to
-`pip install`. A dev-only pytest harness still drives the built binary
-in `tests/local`; it needs the tools, never an editable install:
+That is the whole setup. `packages/aethyme` has no Python at all — `src/`
+was deleted on 2026-08-01 (python-retirement Phase 6) and the dev pytest
+harness followed on 2026-08-06 (Phase 7). No venv, no `pip install`, no
+`pyproject.toml`.
 
-```bash
-cd packages/aethyme
-python3 -m venv .venv
-.venv/bin/python -m pip install pytest pytest-asyncio ruff
-```
-
-That harness retires when `tests/local` ports to Rust.
+`packages/aethyme-eval` is a separate package and stays Python by design;
+it owns its own venv and its own gate.
 
 ## Core Checks
 
 ```bash
 cd packages/aethyme/rust
 cargo test --workspace
-cd .. && .venv/bin/python -m pytest -q tests/local   # dev harness
 ```
+
+That includes the implementation-blind suites that drive the built
+binaries (`aethyme-cli/tests/`) and the repo-hygiene suites over docs,
+templates, and the PR template (`aethyme-testkit/tests/`). See
+[`packages/aethyme/docs/guides/testing.md`](packages/aethyme/docs/guides/testing.md).
 
 ## Pull Request Expectations
 
