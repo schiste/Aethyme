@@ -13,9 +13,9 @@ Monorepo with primary package at `packages/aethyme/`.
   `aethyme --help`. If you have old notes or muscle memory pointing at
   `python -m src.cli <anything>`, the replacement is `aethyme <same
   thing>` with the same flags and output.
-- A dev-only pytest harness survives under `packages/aethyme/tests/`
-  (implementation-blind: it drives the built binary). It ports to Rust in
-  a follow-up and takes `pyproject.toml` with it. `packages/aethyme-eval`
+- **`packages/aethyme` is 100% Rust** since 2026-08-06 (Phase 7): the dev
+  pytest harness and `pyproject.toml` are deleted too. `cargo test
+  --workspace` is the whole test story. `packages/aethyme-eval`
   stays Python by design — an arm's-length acceptance check should not
   share the measured system's toolchain.
 

@@ -1,1 +1,0 @@
-"""Aethyme test package."""

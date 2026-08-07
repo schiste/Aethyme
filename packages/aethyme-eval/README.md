@@ -10,6 +10,29 @@ It compares new eval run records against a tracked historical baseline.
 Quality is recorded and used to avoid false positives, but the package is
 intentionally conservative about claims.
 
+## Layout
+
+- `src/aethyme_eval/` — the regression sentinel library and its
+  `aethyme-eval` CLI.
+- `scripts/run_codex_eval.py` — the headless Codex playground eval
+  runner. Reads `AETHYME_EVAL_*` env vars, runs one arm, emits runner
+  JSON on stdout.
+- `scripts/check_regression_gate.py` — compares a Control/Aethyme result
+  pair against the stable regression metrics.
+
+Both scripts moved here from `packages/aethyme/scripts/eval/` in
+python-retirement Phase 7 (2026-08-06), along with
+`tests/test_codex_eval_runner_contract.py`. They are eval tooling, this
+package owns eval tooling, and it stays Python by operator decision —
+an arm's-length acceptance check should not share the measured system's
+toolchain. `packages/aethyme` is now 100% Rust and carries no Python at
+all, so leaving them there was not an option either.
+
+They measure `packages/aethyme` from outside: `TOOL_PACKAGE_ROOT`
+resolves to the sibling package, and `MONOREPO_ROOT` backs cardinal
+rule 1 — an eval target inside this checkout is Aethyme itself and is
+refused.
+
 ## Commands
 
 Generate a baseline from historical run JSONL:

@@ -39,13 +39,16 @@ the default operator path.
 
 ## Language Direction
 
-Aethyme is moving toward:
+Arrived:
 
 - Rust for every shipped command: the engine, the router, enhance,
   and the quality domain (scorecard + autofix)
-- **No Python at all on the product path** since the Phase 6 sweep
-  (2026-08-01): `src/` is deleted and `cargo install` is the whole story.
-  A dev-only pytest harness remains in `tests/` until it ports to Rust
+- **No Python at all.** The product path went Python-free in the Phase 6
+  sweep (2026-08-01, `src/` deleted) and the dev test stack followed in
+  Phase 7 (2026-08-06, `tests/` and `pyproject.toml` deleted). This
+  package is 100% Rust: `cargo install` is the whole install story and
+  `cargo test --workspace` is the whole test story. `packages/aethyme-eval`
+  is a separate package and stays Python by design.
 
 See [`docs/architecture/rust-transition.md`](docs/architecture/rust-transition.md) and [`rust/README.md`](rust/README.md).
 
@@ -63,9 +66,12 @@ See [`docs/architecture/rust-transition.md`](docs/architecture/rust-transition.m
   `No module named src`. Run `aethyme --help`.
 
 ### Verification
-- Rust workspace tests (the real suite), plus the dev-only pytest
-  harness in `tests/local`, `tests/indexing`, `tests/docs`
-  (`tests/contracts` was removed with `src/contracts/`)
+- `cargo test --workspace`: per-crate unit tests, the
+  implementation-blind CLI suites in `rust/crates/aethyme-cli/tests/`
+  (they drive the built binary as a subprocess), and the repo-hygiene
+  suites in `rust/crates/aethyme-testkit/tests/` (docs, PR template,
+  grammar provenance). The pytest tree they were ported from is gone
+  (Phase 7, 2026-08-06)
 
 ## Local-First Workflow
 
@@ -115,13 +121,17 @@ Supporting commands:
 The evaluation harness was removed on 2026-07-13 — design knowledge preserved
 at [`docs/architecture/eval-mining-notes.md`](docs/architecture/eval-mining-notes.md).
 
-### Local workflow test lanes
+### Local workflow test lane
 
-- Default local test runs skip engine-backed integration tests if the Rust engine cannot be built in the current environment.
-- Set `AETHYME_REQUIRE_LOCAL_ENGINE=1` to enforce strict mode (tests fail instead of skip when engine build/runtime is unavailable).
-- Strict lane example:
-  - `AETHYME_REQUIRE_LOCAL_ENGINE=1 .venv/bin/python -m pytest packages/aethyme/tests/local/test_local_workflow.py -q`
-- CI runs both lanes in `.github/workflows/aethyme-local-tests.yml`.
+- `cargo test -p aethyme-cli --test local_workflow` indexes a fixture repo
+  the same way `scripts/eval/setup-playground.sh` does and drives the
+  router over it.
+- There is no skip path and no `AETHYME_REQUIRE_LOCAL_ENGINE` opt-in any
+  more: `aethyme_testkit::bins` asserts when a binary fails to build, so
+  what used to be the strict lane is now the only lane (Phase 7,
+  2026-08-06). An environment-dependent skip reports green while
+  verifying nothing.
+- CI runs it in `.github/workflows/aethyme-local-tests.yml`.
 
 This local path is the shortest route to proving:
 

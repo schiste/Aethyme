@@ -48,17 +48,22 @@ Before a public binary release, either:
 2. remove checked-in parser binaries and fetch/build them from package-managed
    dependencies during the build.
 
-The development verifier checks current file integrity:
+The development verifier checks current file integrity. It is a Rust test since
+python-retirement Phase 7, so it also runs on every `cargo test` rather than
+only when someone remembers the command:
 
 ```bash
-packages/aethyme/.venv/bin/python packages/aethyme/scripts/verify-grammar-provenance.py
+cargo test --manifest-path packages/aethyme/rust/Cargo.toml \
+  -p aethyme-testkit --test grammar_provenance
 ```
 
 The release verifier additionally requires pinned upstream refs and CLI
-versions:
+versions. It is marked `#[ignore]` because it is expected to fail until every
+grammar is pinned, so release automation opts in explicitly:
 
 ```bash
-packages/aethyme/.venv/bin/python packages/aethyme/scripts/verify-grammar-provenance.py --require-pinned
+cargo test --manifest-path packages/aethyme/rust/Cargo.toml \
+  -p aethyme-testkit --test grammar_provenance -- --ignored
 ```
 
 ## Direct Rust Dependency License Snapshot

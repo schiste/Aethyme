@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-08-01
+Last Updated: 2026-08-06
 
 ## Install
 
@@ -558,8 +558,8 @@ candidate selection and graph navigation come from `.aethyme/graph_store.redb`.
 - `aethyme eval explain-repo --repo /path/to/repo --json-output`
 - `aethyme eval explain-repo --repo /path/to/repo --control-cmd "<cmd>" --explore-cmd "<cmd>" --leverage-cmd "<cmd>"`
 - `aethyme eval navigation-ctf --repo /path/to/repo --json-output`
-- Example Codex wrapper command: `packages/aethyme/.venv/bin/python packages/aethyme/scripts/eval/run_codex_eval.py` (eval tooling is dev-only Python; the product path needs none)
-- Example regression gate command: `packages/aethyme/.venv/bin/python packages/aethyme/scripts/eval/check_regression_gate.py --suite /path/to/suite.json`
+- Example Codex wrapper command: `packages/aethyme-eval/.venv/bin/python packages/aethyme-eval/scripts/run_codex_eval.py` (eval tooling is Python and lives in the separate `aethyme-eval` package; `packages/aethyme` carries none)
+- Example regression gate command: `packages/aethyme-eval/.venv/bin/python packages/aethyme-eval/scripts/check_regression_gate.py --suite /path/to/suite.json`
 
 Current behavior:
 - with no commands, this builds the control artifacts and comparison report only

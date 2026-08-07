@@ -1,0 +1,25 @@
+{
+  "safe_to_use_as_answer": null,
+  "trust_policy": "v\u00e9rifier",
+  "subsystems": [
+    {
+      "rank": null,
+      "id": "caf\u00e9",
+      "label": "\u65e5\u672c\u8a9e",
+      "role": "",
+      "confidence": null,
+      "token_subsystems": null,
+      "missing_coverage_warnings": null
+    }
+  ],
+  "top_verification_targets": [
+    {
+      "path": "src/na\u00efve/\ud83d\ude80.py",
+      "subsystem": "caf\u00e9"
+    }
+  ],
+  "verification_steps": [],
+  "observability": {
+    "readiness": "d\u00e9grad\u00e9"
+  }
+}
