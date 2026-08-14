@@ -33,6 +33,7 @@ mod leases;
 mod merge;
 mod pr;
 mod quick_test;
+mod reconciliation;
 mod schema;
 mod store;
 mod types;
@@ -65,6 +66,10 @@ pub use quick_test::{
     Chau7Probe, QuickTestError, QuickTestGateOutcome, QuickTestGateReport, QuickTestMode,
     QuickTestOptions, QuickTestReport, QuickTestStep, run_broker_quick_test,
     run_broker_quick_test_with_options,
+};
+pub use reconciliation::{
+    IntegrationReconcileClassification, IntegrationReconcileEntry, IntegrationReconcileOptions,
+    IntegrationReconcileReport,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use store::BrokerStore;

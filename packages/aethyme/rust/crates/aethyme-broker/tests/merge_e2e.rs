@@ -5,7 +5,10 @@
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::{Broker, MergeStatus, RepairAction, RepairSource, StatusAdviceSeverity};
+use aethyme_broker::{
+    Broker, IntegrationReconcileClassification, IntegrationReconcileOptions, MergeStatus,
+    RepairAction, RepairSource, StatusAdviceSeverity,
+};
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -42,6 +45,10 @@ fn init_repo(root: &Path) {
 }
 
 fn agent_worktree(root: &Path, name: &str) -> std::path::PathBuf {
+    agent_worktree_at(root, name, "main")
+}
+
+fn agent_worktree_at(root: &Path, name: &str, base: &str) -> std::path::PathBuf {
     let path = root.join(".aethyme/worktrees").join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     sh(
@@ -53,10 +60,20 @@ fn agent_worktree(root: &Path, name: &str) -> std::path::PathBuf {
             "-b",
             &format!("agent/{name}"),
             path.to_str().unwrap(),
-            "main",
+            base,
         ],
     );
     path
+}
+
+fn file_at(root: &Path, rev: &str, path: &str) -> String {
+    let output = Command::new("git")
+        .args(["show", &format!("{rev}:{path}")])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git show {rev}:{path} failed");
+    String::from_utf8_lossy(&output.stdout).to_string()
 }
 
 fn commit_edit(worktree: &Path, file: &str, content: &str) {
@@ -596,6 +613,486 @@ fn repair_rebases_promoted_conflict_and_reports_affected_gates() {
     assert!(
         after.promoted_conflicts.is_empty(),
         "repair should refresh leases against the rebased worktree"
+    );
+}
+
+#[test]
+fn reconcile_recognizes_squash_preserves_followups_and_replays_pending_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let wt_a = agent_worktree(tmp.path(), "reconcile-a");
+    let wt_b = agent_worktree(tmp.path(), "reconcile-b");
+    let wt_pending = agent_worktree(tmp.path(), "reconcile-pending");
+    let session_a = broker.adopt(&wt_a, Some("land a externally")).unwrap();
+    let session_b = broker.adopt(&wt_b, Some("land b externally")).unwrap();
+    let pending = broker
+        .adopt(&wt_pending, Some("keep pending work"))
+        .unwrap();
+    commit_edit(&wt_a, "src/a.py", "a = 2\n");
+    commit_edit(&wt_b, "src/b.py", "b = 2\n");
+    commit_edit(&wt_pending, "src/c.py", "c = 2\n");
+    let promoted_a = broker.submit(session_a.id).unwrap();
+    let promoted_b = broker.submit(session_b.id).unwrap();
+    let promoted_pending = broker.submit(pending.id).unwrap();
+    assert!(promoted_a.promoted && promoted_b.promoted && promoted_pending.promoted);
+
+    // One upstream squash represents two queue entries, followed by a fix
+    // touching the same file. Local main deliberately remains at the old
+    // base, exactly like a fetch without a local checkout update.
+    sh(tmp.path(), &["switch", "-qc", "external-upstream", "main"]);
+    std::fs::write(tmp.path().join("src/a.py"), "a = 2\n").unwrap();
+    std::fs::write(tmp.path().join("src/b.py"), "b = 2\n").unwrap();
+    sh(tmp.path(), &["add", "src/a.py", "src/b.py"]);
+    sh(
+        tmp.path(),
+        &["commit", "-qm", "squash externally landed work"],
+    );
+    std::fs::write(tmp.path().join("src/a.py"), "a = 2\nfollowup = 1\n").unwrap();
+    sh(tmp.path(), &["add", "src/a.py"]);
+    sh(tmp.path(), &["commit", "-qm", "follow-up production fix"]);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(tmp.path(), &["switch", "main"]);
+
+    let old_integration = resolve(tmp.path(), "aethyme/integration");
+    let dry_run = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+        })
+        .unwrap();
+    assert!(dry_run.safe, "{dry_run:#?}");
+    assert!(!dry_run.applied);
+    assert_eq!(resolve(tmp.path(), "aethyme/integration"), old_integration);
+    assert_eq!(
+        dry_run
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.classification == IntegrationReconcileClassification::AlreadyLanded
+            })
+            .count(),
+        2,
+        "the two local promotions should match one upstream squash: {dry_run:?}"
+    );
+    assert_eq!(
+        dry_run
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.classification == IntegrationReconcileClassification::StillPending
+            })
+            .count(),
+        1,
+        "unshipped promoted work must remain pending: {dry_run:?}"
+    );
+
+    let applied = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: true,
+        })
+        .unwrap();
+    assert!(applied.safe && applied.applied);
+    assert!(
+        Command::new("git")
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                "origin/main",
+                "aethyme/integration",
+            ])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/a.py"),
+        "a = 2\nfollowup = 1\n",
+        "upstream follow-up fixes must survive reconciliation"
+    );
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/c.py"),
+        "c = 2\n",
+        "genuinely pending promoted work must be replayed"
+    );
+    let queue = broker.store().merge_queue().unwrap();
+    assert_eq!(
+        queue
+            .iter()
+            .find(|entry| entry.id == promoted_a.entry.id)
+            .unwrap()
+            .status,
+        MergeStatus::ExternallyLanded
+    );
+    assert_eq!(
+        queue
+            .iter()
+            .find(|entry| entry.id == promoted_b.entry.id)
+            .unwrap()
+            .status,
+        MergeStatus::ExternallyLanded
+    );
+    assert_eq!(
+        queue
+            .iter()
+            .find(|entry| entry.id == promoted_pending.entry.id)
+            .unwrap()
+            .status,
+        MergeStatus::Promoted
+    );
+
+    // A fresh session adopted from production submits only its own delta;
+    // the already-landed upstream commits are below its recorded baseline.
+    let wt_new = agent_worktree_at(tmp.path(), "after-reconcile", "origin/main");
+    let fresh = broker.adopt(&wt_new, Some("new delta only")).unwrap();
+    commit_edit(&wt_new, "src/d.py", "d = 1\n");
+    let fresh_out = broker.submit(fresh.id).unwrap();
+    assert!(
+        fresh_out.promoted,
+        "new work should submit after reconciliation"
+    );
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/d.py"),
+        "d = 1\n"
+    );
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/a.py"),
+        "a = 2\nfollowup = 1\n"
+    );
+}
+
+#[test]
+fn reconcile_blocks_ambiguous_patch_equivalence_without_mutating_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = agent_worktree(tmp.path(), "ambiguous-promotion");
+    let session = broker.adopt(&wt, Some("ambiguous upstream")).unwrap();
+    commit_edit(&wt, "src/a.py", "a = 2\n");
+    let promoted = broker.submit(session.id).unwrap();
+    let old_integration = resolve(tmp.path(), "aethyme/integration");
+
+    sh(tmp.path(), &["switch", "-qc", "ambiguous-upstream", "main"]);
+    for (content, message) in [
+        ("a = 2\n", "apply equivalent patch once"),
+        ("a = 1\n", "revert equivalent patch"),
+        ("a = 2\n", "apply equivalent patch twice"),
+    ] {
+        std::fs::write(tmp.path().join("src/a.py"), content).unwrap();
+        sh(tmp.path(), &["add", "src/a.py"]);
+        sh(tmp.path(), &["commit", "-qm", message]);
+    }
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(tmp.path(), &["switch", "main"]);
+
+    let report = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: true,
+        })
+        .unwrap();
+    assert!(!report.safe, "{report:#?}");
+    assert!(!report.applied);
+    assert_eq!(
+        report.entries[0].classification,
+        IntegrationReconcileClassification::Ambiguous
+    );
+    assert_eq!(resolve(tmp.path(), "aethyme/integration"), old_integration);
+    let queue = broker.store().merge_queue().unwrap();
+    assert_eq!(
+        queue
+            .iter()
+            .find(|entry| entry.id == promoted.entry.id)
+            .unwrap()
+            .status,
+        MergeStatus::Promoted
+    );
+}
+
+#[test]
+fn broker_open_finishes_reconciliation_interrupted_after_ref_move() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = agent_worktree(tmp.path(), "crash-recovery-promotion");
+    let session = broker.adopt(&wt, Some("crash recovery proof")).unwrap();
+    commit_edit(&wt, "src/a.py", "a = 2\n");
+    let promoted = broker.submit(session.id).unwrap();
+
+    sh(
+        tmp.path(),
+        &["switch", "-qc", "crash-recovery-upstream", "main"],
+    );
+    std::fs::write(tmp.path().join("src/a.py"), "a = 2\n").unwrap();
+    sh(tmp.path(), &["add", "src/a.py"]);
+    sh(tmp.path(), &["commit", "-qm", "external squash"]);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(tmp.path(), &["switch", "main"]);
+
+    let report = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+        })
+        .unwrap();
+    assert!(report.safe);
+    let entry = &report.entries[0];
+    let details = serde_json::json!({
+        "branch": report.branch,
+        "commit": entry.old_merge_commit,
+        "externally_landed": true,
+        "classification": "already_landed",
+        "upstream_ref": report.upstream_ref,
+        "upstream_landing": entry.upstream_landing,
+    })
+    .to_string();
+    let db_path = tmp.path().join(".aethyme/broker.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute(
+        "INSERT INTO integration_reconciliation_intent
+            (id, branch, upstream_ref, local_main_commit, old_integration,
+             upstream_commit, new_integration, created_at)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, 1)",
+        rusqlite::params![
+            report.branch,
+            report.upstream_ref,
+            report.local_main,
+            report.old_integration,
+            report.upstream_head,
+            report.new_integration,
+        ],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO integration_reconciliation_intent_entries
+            (queue_entry_id, status, details_json, classification,
+             old_merge_commit, upstream_landing)
+         VALUES (?1, 'externally_landed', ?2, 'already_landed', ?3, ?4)",
+        rusqlite::params![
+            entry.queue_entry_id,
+            details,
+            entry.old_merge_commit,
+            entry.upstream_landing,
+        ],
+    )
+    .unwrap();
+    drop(db);
+    sh(
+        tmp.path(),
+        &[
+            "update-ref",
+            "refs/heads/aethyme/integration",
+            &report.new_integration,
+            &report.old_integration,
+        ],
+    );
+    drop(broker); // Simulate process death before phase-two SQLite commit.
+
+    let mut recovered = Broker::open(tmp.path()).unwrap();
+    let queue = recovered.store().merge_queue().unwrap();
+    assert_eq!(
+        queue
+            .iter()
+            .find(|queue_entry| queue_entry.id == promoted.entry.id)
+            .unwrap()
+            .status,
+        MergeStatus::ExternallyLanded
+    );
+    let db = rusqlite::Connection::open(db_path).unwrap();
+    let pending: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM integration_reconciliation_intent",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 0, "recovery must consume the durable intent");
+}
+
+#[test]
+fn reconcile_refuses_to_discard_unrecorded_integration_commits() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    broker.integration_head().unwrap();
+    sh(tmp.path(), &["switch", "aethyme/integration"]);
+    std::fs::write(tmp.path().join("src/unrecorded.py"), "keep = 1\n").unwrap();
+    sh(tmp.path(), &["add", "src/unrecorded.py"]);
+    sh(
+        tmp.path(),
+        &["commit", "-qm", "unrecorded integration work"],
+    );
+    let old_integration = resolve(tmp.path(), "aethyme/integration");
+    sh(tmp.path(), &["switch", "main"]);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+
+    let report = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: true,
+        })
+        .unwrap();
+    assert!(!report.safe);
+    assert!(!report.applied);
+    assert!(report.warnings[0].contains("unrecorded work"));
+    assert_eq!(resolve(tmp.path(), "aethyme/integration"), old_integration);
+}
+
+#[test]
+fn failed_reconciliation_rolls_back_ref_and_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = agent_worktree(tmp.path(), "rollback-promotion");
+    let session = broker.adopt(&wt, Some("rollback proof")).unwrap();
+    commit_edit(&wt, "src/a.py", "a = 2\n");
+    let promoted = broker.submit(session.id).unwrap();
+    let old_integration = resolve(tmp.path(), "aethyme/integration");
+
+    sh(tmp.path(), &["switch", "-qc", "rollback-upstream", "main"]);
+    std::fs::write(tmp.path().join("src/a.py"), "a = 2\n").unwrap();
+    sh(tmp.path(), &["add", "src/a.py"]);
+    sh(tmp.path(), &["commit", "-qm", "external squash"]);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(tmp.path(), &["switch", "main"]);
+
+    let db = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER fail_reconcile
+         BEFORE INSERT ON integration_reconciliations
+         BEGIN SELECT RAISE(FAIL, 'injected reconciliation failure'); END;",
+    )
+    .unwrap();
+    drop(db);
+
+    let error = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: true,
+        })
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected reconciliation failure")
+    );
+    assert_eq!(resolve(tmp.path(), "aethyme/integration"), old_integration);
+    let queue = broker.store().merge_queue().unwrap();
+    assert_eq!(
+        queue
+            .iter()
+            .find(|entry| entry.id == promoted.entry.id)
+            .unwrap()
+            .status,
+        MergeStatus::Promoted,
+        "failed apply must leave the broker row unchanged"
+    );
+}
+
+#[test]
+fn repair_refuses_when_session_baseline_is_newer_than_integration() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let wt_promoted = agent_worktree(tmp.path(), "older-integration");
+    let promoted = broker.adopt(&wt_promoted, Some("older layer")).unwrap();
+    commit_edit(&wt_promoted, "src/a.py", "a = 2\n");
+    assert!(broker.submit(promoted.id).unwrap().promoted);
+
+    sh(tmp.path(), &["switch", "-qc", "newer-upstream", "main"]);
+    std::fs::write(tmp.path().join("src/b.py"), "b = 2\n").unwrap();
+    sh(tmp.path(), &["add", "src/b.py"]);
+    sh(tmp.path(), &["commit", "-qm", "upstream baseline"]);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(tmp.path(), &["switch", "main"]);
+
+    let wt_live = agent_worktree_at(tmp.path(), "newer-session", "origin/main");
+    let live = broker.adopt(&wt_live, Some("new production work")).unwrap();
+    commit_edit(&wt_live, "src/a.py", "a = 3\n");
+    let before = resolve(&wt_live, "HEAD");
+    let error = broker.repair(live.id).unwrap_err().to_string();
+    assert!(
+        error.contains("does not contain recorded session baseline"),
+        "{error}"
+    );
+    assert_eq!(resolve(&wt_live, "HEAD"), before);
+    assert!(!wt_live.join(".git/rebase-merge").exists());
+}
+
+#[test]
+fn status_distinguishes_stale_local_main_from_configured_upstream() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    sh(tmp.path(), &["switch", "-qc", "status-upstream", "main"]);
+    std::fs::write(tmp.path().join("src/a.py"), "a = 2\n").unwrap();
+    sh(tmp.path(), &["add", "src/a.py"]);
+    sh(tmp.path(), &["commit", "-qm", "upstream advances"]);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(tmp.path(), &["switch", "main"]);
+    sh(tmp.path(), &["config", "remote.origin.url", "."]);
+    sh(
+        tmp.path(),
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    sh(tmp.path(), &["config", "branch.main.remote", "origin"]);
+    sh(
+        tmp.path(),
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let status = broker.status(0).unwrap();
+    let expected_upstream = resolve(tmp.path(), "origin/main");
+    assert_eq!(status.main_head, resolve(tmp.path(), "main"));
+    assert_eq!(status.upstream_ref.as_deref(), Some("origin/main"));
+    assert_eq!(
+        status.upstream_head.as_deref(),
+        Some(expected_upstream.as_str())
+    );
+    assert_eq!(status.main_behind_upstream_commits, 1);
+    assert!(status.advice.iter().any(|advice| {
+        advice.id == "integration.upstream-main-ahead"
+            && advice.severity == StatusAdviceSeverity::Blocked
+    }));
+
+    let integration = broker.integration_status(0).unwrap();
+    assert_eq!(integration.main_behind_upstream_commits, 1);
+    assert!(integration.next_action.summary.contains("reconcile"));
+    assert!(
+        integration
+            .next_action
+            .commands
+            .iter()
+            .any(|command| command.contains("--upstream origin/main --dry-run"))
     );
 }
 

@@ -57,6 +57,29 @@ pub struct BrokerStore {
     path: PathBuf,
 }
 
+/// One queue-row mutation committed with an integration reconciliation.
+/// Kept crate-private so the storage transaction remains a broker detail.
+pub(crate) struct ReconciliationQueueUpdate {
+    pub queue_entry_id: i64,
+    pub status: MergeStatus,
+    pub merged_tree: Option<String>,
+    pub details_json: String,
+    pub classification: String,
+    pub old_merge_commit: String,
+    pub upstream_landing: Option<String>,
+    pub replayed_commit: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedIntegrationReconciliation {
+    pub branch: String,
+    pub upstream_ref: String,
+    pub local_main: String,
+    pub old_integration: String,
+    pub upstream_commit: String,
+    pub new_integration: String,
+}
+
 impl BrokerStore {
     /// Open (creating and migrating if needed) the broker database for a
     /// repository root: `<repo>/.aethyme/broker.db`.
@@ -673,6 +696,249 @@ impl BrokerStore {
             entries.push(row??);
         }
         Ok(entries)
+    }
+
+    /// Advance the durable session baseline after a successful explicit
+    /// rebase. Future repairs must only replay work created after this base.
+    pub fn set_session_diff_base(
+        &mut self,
+        session_id: i64,
+        diff_base: &str,
+    ) -> Result<(), BrokerError> {
+        self.conn.execute(
+            "UPDATE sessions SET diff_base = ?2, updated_at = ?3 WHERE id = ?1",
+            params![session_id, diff_base, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the complete reconciliation plan before moving its Git ref.
+    /// This is phase one of the crash-recoverable ref/database update.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_integration_reconciliation(
+        &mut self,
+        branch: &str,
+        upstream_ref: &str,
+        local_main: &str,
+        old_integration: &str,
+        upstream_commit: &str,
+        new_integration: &str,
+        updates: &[ReconciliationQueueUpdate],
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO integration_reconciliation_intent
+                (id, branch, upstream_ref, local_main_commit,
+                 old_integration, upstream_commit, new_integration, created_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                branch,
+                upstream_ref,
+                local_main,
+                old_integration,
+                upstream_commit,
+                new_integration,
+                now,
+            ],
+        )?;
+        for update in updates {
+            tx.execute(
+                "INSERT INTO integration_reconciliation_intent_entries
+                    (queue_entry_id, status, merged_tree, details_json,
+                     classification, old_merge_commit, upstream_landing,
+                     replayed_commit)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    update.queue_entry_id,
+                    update.status.as_str(),
+                    update.merged_tree,
+                    update.details_json,
+                    update.classification,
+                    update.old_merge_commit,
+                    update.upstream_landing,
+                    update.replayed_commit,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn prepared_integration_reconciliation(
+        &self,
+    ) -> Result<Option<PreparedIntegrationReconciliation>, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT branch, upstream_ref, local_main_commit,
+                        old_integration, upstream_commit, new_integration
+                 FROM integration_reconciliation_intent WHERE id = 1",
+                [],
+                |row| {
+                    Ok(PreparedIntegrationReconciliation {
+                        branch: row.get(0)?,
+                        upstream_ref: row.get(1)?,
+                        local_main: row.get(2)?,
+                        old_integration: row.get(3)?,
+                        upstream_commit: row.get(4)?,
+                        new_integration: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Phase two: apply all queue rows, audit rows, and events and remove
+    /// the durable intent in the same SQLite transaction.
+    pub(crate) fn finalize_integration_reconciliation(&mut self) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let prepared = tx.query_row(
+            "SELECT branch, upstream_ref, local_main_commit,
+                    old_integration, upstream_commit, new_integration
+             FROM integration_reconciliation_intent WHERE id = 1",
+            [],
+            |row| {
+                Ok(PreparedIntegrationReconciliation {
+                    branch: row.get(0)?,
+                    upstream_ref: row.get(1)?,
+                    local_main: row.get(2)?,
+                    old_integration: row.get(3)?,
+                    upstream_commit: row.get(4)?,
+                    new_integration: row.get(5)?,
+                })
+            },
+        )?;
+        let raw_updates = {
+            let mut stmt = tx.prepare(
+                "SELECT queue_entry_id, status, merged_tree, details_json,
+                        classification, old_merge_commit, upstream_landing,
+                        replayed_commit
+                 FROM integration_reconciliation_intent_entries
+                 ORDER BY queue_entry_id",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        let updates = raw_updates
+            .into_iter()
+            .map(
+                |(
+                    queue_entry_id,
+                    status,
+                    merged_tree,
+                    details_json,
+                    classification,
+                    old_merge_commit,
+                    upstream_landing,
+                    replayed_commit,
+                )| {
+                    Ok(ReconciliationQueueUpdate {
+                        queue_entry_id,
+                        status: MergeStatus::parse(&status)?,
+                        merged_tree,
+                        details_json,
+                        classification,
+                        old_merge_commit,
+                        upstream_landing,
+                        replayed_commit,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, BrokerError>>()?;
+
+        tx.execute(
+            "INSERT INTO integration_reconciliations
+                (upstream_ref, local_main_commit, old_integration,
+                 upstream_commit, new_integration, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                prepared.upstream_ref,
+                prepared.local_main,
+                prepared.old_integration,
+                prepared.upstream_commit,
+                prepared.new_integration,
+                now,
+            ],
+        )?;
+        let reconciliation_id = tx.last_insert_rowid();
+        for update in updates {
+            let session_id: i64 = tx.query_row(
+                "SELECT session_id FROM merge_queue WHERE id = ?1",
+                [update.queue_entry_id],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "UPDATE merge_queue
+                 SET status = ?2,
+                     merged_tree = COALESCE(?3, merged_tree),
+                     details_json = ?4,
+                     updated_at = ?5
+                 WHERE id = ?1",
+                params![
+                    update.queue_entry_id,
+                    update.status.as_str(),
+                    update.merged_tree,
+                    update.details_json,
+                    now,
+                ],
+            )?;
+            if update.status == MergeStatus::ExternallyLanded {
+                insert_event(
+                    &tx,
+                    now,
+                    "merge.externally_landed",
+                    Some(session_id),
+                    Some(&update.details_json),
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO integration_reconciliation_entries
+                    (reconciliation_id, queue_entry_id, classification,
+                     old_merge_commit, upstream_landing, replayed_commit,
+                     details_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    reconciliation_id,
+                    update.queue_entry_id,
+                    update.classification,
+                    update.old_merge_commit,
+                    update.upstream_landing,
+                    update.replayed_commit,
+                    update.details_json,
+                ],
+            )?;
+        }
+        tx.execute("DELETE FROM integration_reconciliation_intent_entries", [])?;
+        tx.execute(
+            "DELETE FROM integration_reconciliation_intent WHERE id = 1",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn abort_integration_reconciliation(&mut self) -> Result<(), BrokerError> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM integration_reconciliation_intent_entries", [])?;
+        tx.execute(
+            "DELETE FROM integration_reconciliation_intent WHERE id = 1",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     // ── PR watch state ───────────────────────────────────────────────

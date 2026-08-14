@@ -6,6 +6,7 @@
 //! makes the broker's git contract auditable and testable against real
 //! throwaway repositories.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -216,6 +217,23 @@ impl GitRepo {
         run_git(&self.root, &["rev-parse", "--abbrev-ref", "HEAD"])
     }
 
+    /// Configured tracking ref and its currently fetched commit. This is
+    /// read-only: status and reconciliation never perform an implicit fetch.
+    pub fn tracking_upstream(&self) -> Option<(String, String)> {
+        let upstream = run_git(
+            &self.root,
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ],
+        )
+        .ok()?;
+        let commit = self.resolve_ref(&upstream)?;
+        Some((upstream, commit))
+    }
+
     pub fn head_commit(&self) -> Result<String, GitError> {
         run_git(&self.root, &["rev-parse", "HEAD"])
     }
@@ -287,6 +305,131 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Compare-and-swap a branch ref. Reconciliation uses the expected
+    /// old value so a concurrent promotion cannot be silently overwritten.
+    pub fn update_branch_ref_checked(
+        &self,
+        branch: &str,
+        commit: &str,
+        expected_old: &str,
+    ) -> Result<(), GitError> {
+        run_git(
+            &self.root,
+            &[
+                "update-ref",
+                &format!("refs/heads/{branch}"),
+                commit,
+                expected_old,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// First parent of a commit, used to recover the exact promoted delta
+    /// even though promotion details intentionally keep a compact payload.
+    pub fn first_parent(&self, commit: &str) -> Result<String, GitError> {
+        run_git(&self.root, &["rev-parse", &format!("{commit}^1")])
+    }
+
+    /// Commits reachable from `to` but not `from`, oldest first.
+    pub fn commits_between_oldest(&self, from: &str, to: &str) -> Result<Vec<String>, GitError> {
+        let range = format!("{from}..{to}");
+        Ok(run_git(&self.root, &["rev-list", "--reverse", &range])?
+            .lines()
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Stable patch id for the cumulative diff `from..to`. Empty diffs
+    /// have no patch id and return `None`.
+    pub fn patch_id_between(&self, from: &str, to: &str) -> Result<Option<String>, GitError> {
+        let diff = Command::new("git")
+            .args(["diff", "--binary", from, to, "--"])
+            .current_dir(&self.root)
+            .output()
+            .map_err(|source| GitError::Spawn {
+                args: "diff --binary".into(),
+                source,
+            })?;
+        if !diff.status.success() {
+            return Err(GitError::Git {
+                args: "diff --binary".into(),
+                stderr: String::from_utf8_lossy(&diff.stderr).trim().to_string(),
+            });
+        }
+        if diff.stdout.is_empty() {
+            return Ok(None);
+        }
+        let mut child = Command::new("git")
+            .args(["patch-id", "--stable"])
+            .current_dir(&self.root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|source| GitError::Spawn {
+                args: "patch-id --stable".into(),
+                source,
+            })?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| GitError::Git {
+                args: "patch-id --stable".into(),
+                stderr: "failed to open patch-id stdin".into(),
+            })?
+            .write_all(&diff.stdout)
+            .map_err(|source| GitError::Spawn {
+                args: "patch-id --stable stdin".into(),
+                source,
+            })?;
+        let output = child.wait_with_output().map_err(|source| GitError::Spawn {
+            args: "patch-id --stable".into(),
+            source,
+        })?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: "patch-id --stable".into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .next()
+            .map(str::to_string))
+    }
+
+    /// Whether two commits have identical content for the supplied paths.
+    pub fn paths_equal(&self, left: &str, right: &str, paths: &[String]) -> Result<bool, GitError> {
+        if paths.is_empty() {
+            return Ok(true);
+        }
+        let mut args = vec![
+            "diff".to_string(),
+            "--quiet".to_string(),
+            left.into(),
+            right.into(),
+            "--".into(),
+        ];
+        args.extend(paths.iter().cloned());
+        let status = Command::new("git")
+            .args(&args)
+            .current_dir(&self.root)
+            .status()
+            .map_err(|source| GitError::Spawn {
+                args: "diff --quiet".into(),
+                source,
+            })?;
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(GitError::Git {
+                args: "diff --quiet".into(),
+                stderr: "git diff could not compare reconciled paths".into(),
+            }),
+        }
+    }
+
     /// Simulate merging `head` onto `base` without touching any worktree
     /// (`git merge-tree --write-tree`). Returns the resulting tree and
     /// the conflicted file list (empty = clean).
@@ -318,6 +461,50 @@ impl GitRepo {
         let mut lines = stdout.lines();
         let tree = lines.next().unwrap_or_default().trim().to_string();
         let conflicts: Vec<String> = lines
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        Ok(MergeSimulation { tree, conflicts })
+    }
+
+    /// Replay `old_base..incoming` onto `current` using an explicit merge
+    /// base. This preserves upstream follow-up fixes and never asks Git to
+    /// infer history across rewritten (for example squash-merged) commits.
+    pub fn merge_tree_with_base(
+        &self,
+        old_base: &str,
+        current: &str,
+        incoming: &str,
+    ) -> Result<MergeSimulation, GitError> {
+        let output = Command::new("git")
+            .args([
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--no-messages",
+                "--merge-base",
+                old_base,
+                current,
+                incoming,
+            ])
+            .current_dir(&self.root)
+            .output()
+            .map_err(|source| GitError::Spawn {
+                args: "merge-tree --write-tree --merge-base".into(),
+                source,
+            })?;
+        let code = output.status.code().unwrap_or(-1);
+        if code != 0 && code != 1 {
+            return Err(GitError::Git {
+                args: "merge-tree --write-tree --merge-base".into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut lines = stdout.lines();
+        let tree = lines.next().unwrap_or_default().trim().to_string();
+        let conflicts = lines
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .map(str::to_string)
@@ -525,6 +712,14 @@ impl GitRepo {
     /// in the paused rebase state for manual resolution.
     pub fn rebase_onto(&self, base: &str) -> Result<(), GitError> {
         run_git(&self.root, &["rebase", base])?;
+        Ok(())
+    }
+
+    /// Replay exactly `upstream..HEAD` onto `base`. Unlike a plain
+    /// `git rebase <base>`, this never lets Git infer an older merge-base
+    /// and accidentally include commits that predate the broker session.
+    pub fn rebase_onto_range(&self, base: &str, upstream: &str) -> Result<(), GitError> {
+        run_git(&self.root, &["rebase", "--onto", base, upstream])?;
         Ok(())
     }
 

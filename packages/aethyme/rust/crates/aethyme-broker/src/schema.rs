@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -156,7 +156,92 @@ CREATE INDEX pr_watch_state_by_target
     ON pr_watch_state (target_branch, pr_number);
 ";
 
-const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4];
+const MIGRATION_V5: &str = "
+-- SQLite cannot alter a CHECK constraint in place. Rebuild the queue so
+-- externally landed promotions have a durable, queryable terminal state.
+CREATE TABLE merge_queue_v5 (
+    id           INTEGER PRIMARY KEY,
+    session_id   INTEGER NOT NULL REFERENCES sessions (id),
+    head_commit  TEXT NOT NULL,
+    base_commit  TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'submitted'
+                 CHECK (status IN ('submitted', 'simulating', 'conflict',
+                                   'verified', 'promoted', 'externally_landed',
+                                   'rejected', 'superseded')),
+    merged_tree  TEXT,
+    details_json TEXT,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    UNIQUE (session_id, head_commit)
+);
+
+INSERT INTO merge_queue_v5
+SELECT id, session_id, head_commit, base_commit, status, merged_tree,
+       details_json, created_at, updated_at
+FROM merge_queue;
+DROP TABLE merge_queue;
+ALTER TABLE merge_queue_v5 RENAME TO merge_queue;
+
+CREATE TABLE integration_reconciliations (
+    id                   INTEGER PRIMARY KEY,
+    upstream_ref         TEXT NOT NULL,
+    local_main_commit    TEXT NOT NULL,
+    old_integration      TEXT NOT NULL,
+    upstream_commit      TEXT NOT NULL,
+    new_integration      TEXT NOT NULL,
+    created_at           INTEGER NOT NULL
+);
+
+CREATE TABLE integration_reconciliation_entries (
+    id                    INTEGER PRIMARY KEY,
+    reconciliation_id     INTEGER NOT NULL REFERENCES integration_reconciliations (id),
+    queue_entry_id         INTEGER NOT NULL REFERENCES merge_queue (id),
+    classification        TEXT NOT NULL CHECK (classification IN
+                              ('already_landed', 'superseded_upstream',
+                               'still_pending')),
+    old_merge_commit      TEXT NOT NULL,
+    upstream_landing      TEXT,
+    replayed_commit       TEXT,
+    details_json          TEXT,
+    UNIQUE (reconciliation_id, queue_entry_id)
+);
+
+CREATE INDEX integration_reconciliation_entries_by_queue
+    ON integration_reconciliation_entries (queue_entry_id, reconciliation_id);
+
+-- Durable two-phase intent: if the process dies after moving the Git ref
+-- but before committing queue rows, the next Broker::open can finish the
+-- transaction. If the ref never moved, it safely discards the intent.
+CREATE TABLE integration_reconciliation_intent (
+    id                   INTEGER PRIMARY KEY CHECK (id = 1),
+    branch               TEXT NOT NULL,
+    upstream_ref         TEXT NOT NULL,
+    local_main_commit    TEXT NOT NULL,
+    old_integration      TEXT NOT NULL,
+    upstream_commit      TEXT NOT NULL,
+    new_integration      TEXT NOT NULL,
+    created_at           INTEGER NOT NULL
+);
+
+CREATE TABLE integration_reconciliation_intent_entries (
+    queue_entry_id         INTEGER PRIMARY KEY REFERENCES merge_queue (id),
+    status                 TEXT NOT NULL,
+    merged_tree            TEXT,
+    details_json           TEXT NOT NULL,
+    classification         TEXT NOT NULL,
+    old_merge_commit       TEXT NOT NULL,
+    upstream_landing       TEXT,
+    replayed_commit        TEXT
+);
+";
+
+const MIGRATIONS: &[&str] = &[
+    MIGRATION_V1,
+    MIGRATION_V2,
+    MIGRATION_V3,
+    MIGRATION_V4,
+    MIGRATION_V5,
+];
 
 fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
     let version = conn

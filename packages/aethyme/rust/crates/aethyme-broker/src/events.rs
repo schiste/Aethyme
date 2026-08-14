@@ -95,3 +95,21 @@ pub fn integration_refreshed_payload(branch: &str, from: &str, to: &str) -> Stri
 pub fn merge_promoted_payload(branch: &str, commit: &str) -> String {
     json!({ "branch": branch, "commit": commit }).to_string()
 }
+
+pub fn merge_externally_landed_payload(
+    branch: &str,
+    commit: &str,
+    classification: &str,
+    upstream_ref: &str,
+    upstream_landing: Option<&str>,
+) -> String {
+    json!({
+        "branch": branch,
+        "commit": commit,
+        "externally_landed": true,
+        "classification": classification,
+        "upstream_ref": upstream_ref,
+        "upstream_landing": upstream_landing,
+    })
+    .to_string()
+}

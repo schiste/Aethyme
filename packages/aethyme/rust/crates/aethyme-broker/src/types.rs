@@ -81,6 +81,7 @@ text_enum!(MergeStatus, "merge_queue.status", {
     Conflict => "conflict",
     Verified => "verified",
     Promoted => "promoted",
+    ExternallyLanded => "externally_landed",
     Rejected => "rejected",
     Superseded => "superseded",
 });
