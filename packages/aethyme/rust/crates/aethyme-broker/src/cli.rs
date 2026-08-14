@@ -139,6 +139,10 @@ Usage:
       Sample integration, wait for a quiet window (default: 30s), then
       sample again. Fails if integration moved, printing the old and new
       tips so long checks are not mistaken for current-tip proof.
+  aethyme broker integration reconcile --upstream <ref> [--dry-run|--apply] [--json]
+      Compare already-fetched upstream with local main and promoted queue
+      state. Dry-run is the default. --apply marks externally landed work,
+      preserves pending promotions, and rebuilds integration.
   aethyme broker status [--json]
       The whole picture: agents, overlaps, promoted conflicts, merge
       queue, integration head.
@@ -421,6 +425,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_integration_reconcile_options() {
+        let args = vec![
+            "integration".to_string(),
+            "reconcile".to_string(),
+            "--upstream".to_string(),
+            "origin/main".to_string(),
+            "--apply".to_string(),
+        ];
+        let parsed = match super::parse(&args) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("integration reconcile options should parse"),
+        };
+
+        assert_eq!(parsed.upstream.as_deref(), Some("origin/main"));
+        assert!(parsed.apply);
+    }
+
+    #[test]
     fn parse_accepts_guarded_exec_command_after_separator() {
         let args = vec![
             "exec".to_string(),
@@ -494,6 +516,7 @@ struct Parsed {
     kind: Option<String>,
     keep_days: Option<i64>,
     seconds: Option<u64>,
+    upstream: Option<String>,
     follow: bool,
     json: bool,
     force: bool,
@@ -505,6 +528,8 @@ struct Parsed {
     chau7: bool,
     fix_version: bool,
     with_gate: bool,
+    apply: bool,
+    dry_run: bool,
     exec_command: Vec<String>,
 }
 
@@ -523,6 +548,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         kind: None,
         keep_days: None,
         seconds: None,
+        upstream: None,
         follow: false,
         json: false,
         force: false,
@@ -534,6 +560,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         chau7: false,
         fix_version: false,
         with_gate: false,
+        apply: false,
+        dry_run: false,
         exec_command: Vec::new(),
     };
     let mut iter = args.iter();
@@ -561,6 +589,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--chau7" => parsed.chau7 = true,
             "--fix-version" => parsed.fix_version = true,
             "--with-gate" => parsed.with_gate = true,
+            "--apply" => parsed.apply = true,
+            "--dry-run" => parsed.dry_run = true,
             "--replace-stale" => parsed.replace_stale = true,
             "--kind" => {
                 parsed.kind = Some(
@@ -585,6 +615,13 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 parsed.seconds = Some(value.parse().map_err(|_| {
                     UsageError::Message("--seconds must be a non-negative integer".into())
                 })?);
+            }
+            "--upstream" => {
+                parsed.upstream = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--upstream requires a ref".into()))?
+                        .clone(),
+                )
             }
             "--task" => {
                 parsed.task = Some(
@@ -1093,6 +1130,27 @@ fn render_integration_status(
         "Main:        {} ({main_relation})",
         short_commit(&report.main_head)
     );
+    if let (Some(upstream_ref), Some(upstream_head)) = (&report.upstream_ref, &report.upstream_head)
+    {
+        let relation = if report.main_behind_upstream_commits > 0 {
+            format!(
+                "local main behind by {} {}",
+                report.main_behind_upstream_commits,
+                plural(
+                    report.main_behind_upstream_commits as usize,
+                    "commit",
+                    "commits"
+                )
+            )
+        } else {
+            "no fetched commits ahead of local main".into()
+        };
+        println!(
+            "Upstream:    {} @ {} ({relation})",
+            upstream_ref,
+            short_commit(upstream_head)
+        );
+    }
     println!();
 
     if report.promoted_entries.is_empty() && report.changed_files.is_empty() {
@@ -1230,6 +1288,55 @@ fn render_integration_stability(
     for command in &report.commands {
         println!("run: {command}");
     }
+    Ok(())
+}
+
+fn render_integration_reconcile(
+    report: &crate::IntegrationReconcileReport,
+    json: bool,
+) -> Result<(), UsageError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    println!("Local main:  {}", short_commit(&report.local_main));
+    println!(
+        "Upstream:    {} @ {}",
+        report.upstream_ref,
+        short_commit(&report.upstream_head)
+    );
+    println!(
+        "Integration: {} -> {}",
+        short_commit(&report.old_integration),
+        short_commit(&report.new_integration)
+    );
+    println!(
+        "Result:      {}",
+        if report.applied {
+            "applied"
+        } else if report.safe {
+            "safe dry-run"
+        } else {
+            "blocked"
+        }
+    );
+    for entry in &report.entries {
+        println!(
+            "  q{} session {}: {} — {}",
+            entry.queue_entry_id,
+            entry.session_id,
+            entry.classification.as_str(),
+            entry.evidence
+        );
+        if !entry.conflicts.is_empty() {
+            println!("    conflicts: {}", capped_join(&entry.conflicts, 5));
+        }
+    }
+    for warning in &report.warnings {
+        println!("Warning: {warning}");
+    }
+    println!("Next action: {}", report.next_action);
     Ok(())
 }
 
@@ -1910,9 +2017,32 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         ));
                     }
                 }
+                "reconcile" => {
+                    if parsed.apply && parsed.dry_run {
+                        return Err(UsageError::Message(
+                            "choose either --dry-run or --apply, not both".into(),
+                        ));
+                    }
+                    let upstream = parsed.upstream.clone().ok_or(UsageError::Message(
+                        "integration reconcile requires --upstream <ref>".into(),
+                    ))?;
+                    let mut broker = open_broker()?;
+                    let report =
+                        broker.reconcile_integration(crate::IntegrationReconcileOptions {
+                            upstream,
+                            apply: parsed.apply,
+                        })?;
+                    render_integration_reconcile(&report, parsed.json)?;
+                    if !report.safe {
+                        return Err(UsageError::Message(
+                            "integration reconciliation is ambiguous or conflicting; no state changed"
+                                .into(),
+                        ));
+                    }
+                }
                 other => {
                     return Err(UsageError::Message(format!(
-                        "unknown integration action {other:?} — expected status or wait-stable"
+                        "unknown integration action {other:?} — expected status, wait-stable, or reconcile"
                     )));
                 }
             }
@@ -1928,6 +2058,17 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     status.integration_branch,
                     &status.integration_head[..12.min(status.integration_head.len())]
                 );
+                println!("Local main:  {}", short_commit(&status.main_head));
+                if let (Some(upstream_ref), Some(upstream_head)) =
+                    (&status.upstream_ref, &status.upstream_head)
+                {
+                    println!(
+                        "Upstream:    {} @ {} ({} commits ahead of local main)",
+                        upstream_ref,
+                        short_commit(upstream_head),
+                        status.main_behind_upstream_commits
+                    );
+                }
                 println!("Summary: {}", status.summary.message);
                 println!();
                 render_status_advice(&status.advice);

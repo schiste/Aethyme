@@ -42,6 +42,31 @@ pub enum BrokerOpError {
         base: String,
         message: String,
     },
+    #[error(
+        "refusing repair for session {id}: recorded adoption baseline {baseline} is not an ancestor of session HEAD; adopt/reuse the session from its intended baseline before repairing"
+    )]
+    InvalidRepairBaseline { id: i64, baseline: String },
+    #[error(
+        "refusing repair for session {id}: target integration {target} does not contain recorded session baseline {baseline}; reconcile integration with upstream before repairing"
+    )]
+    RepairTargetBehindBaseline {
+        id: i64,
+        baseline: String,
+        target: String,
+    },
+    #[error("cannot resolve upstream ref {upstream:?}; fetch it explicitly, then retry")]
+    UpstreamRefNotFound { upstream: String },
+    #[error("integration reconciliation failed and ref rollback also failed: {reason}")]
+    ReconciliationRollbackFailed { reason: String },
+    #[error(
+        "cannot recover prepared reconciliation for {branch}: ref is {actual}, expected either old {old} or new {new}; inspect the ref and broker database before continuing"
+    )]
+    ReconciliationRecoveryRequired {
+        branch: String,
+        actual: String,
+        old: String,
+        new: String,
+    },
     #[error("failed to spawn agent command {command:?}: {source}")]
     Spawn {
         command: String,
@@ -197,6 +222,12 @@ pub struct StatusView {
     pub queue: Vec<crate::types::MergeQueueEntry>,
     pub integration_branch: String,
     pub integration_head: String,
+    pub main_head: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_head: Option<String>,
+    pub main_behind_upstream_commits: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -337,6 +368,11 @@ pub struct IntegrationStatusView {
     pub branch: String,
     pub head: String,
     pub main_head: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_head: Option<String>,
+    pub main_behind_upstream_commits: u64,
     pub main_is_ancestor: bool,
     pub commits_ahead_main: u64,
     pub changed_files: Vec<String>,
@@ -573,11 +609,13 @@ impl Broker {
         let main_root = here.main_root()?;
         let repo = GitRepo::discover(&main_root)?;
         let store = BrokerStore::open_in_repo(&main_root)?;
-        Ok(Self {
+        let mut broker = Self {
             repo,
             store,
             main_root,
-        })
+        };
+        broker.recover_prepared_reconciliation()?;
+        Ok(broker)
     }
 
     pub fn main_root(&self) -> &Path {
@@ -1233,14 +1271,34 @@ impl Broker {
                     ),
                 });
             }
+            let baseline = session.diff_base.as_deref().ok_or_else(|| {
+                BrokerOpError::InvalidRepairBaseline {
+                    id: session_id,
+                    baseline: "<missing>".into(),
+                }
+            })?;
+            if !checkout.is_ancestor(baseline, "HEAD") {
+                return Err(BrokerOpError::InvalidRepairBaseline {
+                    id: session_id,
+                    baseline: baseline.to_string(),
+                });
+            }
             checkout.fetch_local_commit(base)?;
-            checkout
-                .rebase_onto(base)
-                .map_err(|err| BrokerOpError::RepairRebaseFailed {
+            if !checkout.is_ancestor(baseline, base) {
+                return Err(BrokerOpError::RepairTargetBehindBaseline {
+                    id: session_id,
+                    baseline: baseline.to_string(),
+                    target: base.to_string(),
+                });
+            }
+            checkout.rebase_onto_range(base, baseline).map_err(|err| {
+                BrokerOpError::RepairRebaseFailed {
                     id: session_id,
                     base: base.to_string(),
                     message: err.to_string(),
-                })?;
+                }
+            })?;
+            self.store.set_session_diff_base(session_id, base)?;
             let _ = std::fs::remove_file(
                 Path::new(&worktree_path).join(crate::ACTION_REQUIRED_RELPATH),
             );
@@ -1516,12 +1574,27 @@ impl Broker {
 
         let (branch, head) = self.integration_head()?;
         let main_head = self.repo.head_commit()?;
+        let (upstream_ref, upstream_head) = self
+            .repo
+            .tracking_upstream()
+            .map(|(name, commit)| (Some(name), Some(commit)))
+            .unwrap_or((None, None));
+        let main_behind_upstream_commits = upstream_head
+            .as_deref()
+            .filter(|upstream| self.repo.is_ancestor(&main_head, upstream))
+            .map(|upstream| self.repo.commit_count_between(&main_head, upstream))
+            .transpose()?
+            .unwrap_or(0);
+        let comparison_head = upstream_head
+            .as_deref()
+            .filter(|_| main_behind_upstream_commits > 0)
+            .unwrap_or(&main_head);
         let main_is_ancestor = self.repo.is_ancestor(&main_head, &head);
         let commits_ahead_main = self.repo.commit_count_between(&main_head, &head)?;
-        let changed_files = if head == main_head {
+        let changed_files = if head == comparison_head {
             Vec::new()
         } else {
-            self.repo.changed_between(&main_head, &head)?
+            self.repo.changed_between(comparison_head, &head)?
         };
 
         let mut promoted_entries = Vec::new();
@@ -1534,14 +1607,15 @@ impl Broker {
                 continue;
             };
             if !self.repo.is_ancestor(&merge_commit, &head)
-                || self.repo.is_ancestor(&merge_commit, &main_head)
+                || self.repo.is_ancestor(&merge_commit, comparison_head)
             {
                 continue;
             }
             let session = self.store.session(entry.session_id).ok();
             let files = self
                 .repo
-                .changed_between(&entry.base_commit, &entry.head_commit)
+                .first_parent(&merge_commit)
+                .and_then(|parent| self.repo.changed_between(&parent, &merge_commit))
                 .unwrap_or_default();
             promoted_entries.push(PromotedIntegrationEntry {
                 queue_entry_id: entry.id,
@@ -1567,18 +1641,32 @@ impl Broker {
                 })
                 .collect()
         };
-        let next_action = integration_next_action(
+        let mut next_action = integration_next_action(
             &branch,
             main_is_ancestor,
             &promoted_entries,
             &changed_files,
             &conflicts,
         );
+        if main_behind_upstream_commits > 0 {
+            let upstream = upstream_ref.as_deref().unwrap_or("@{upstream}");
+            next_action = IntegrationNextAction {
+                summary: format!(
+                    "local main is {main_behind_upstream_commits} commits behind {upstream}; reconcile before repair or submit"
+                ),
+                commands: vec![format!(
+                    "aethyme broker integration reconcile --upstream {upstream} --dry-run"
+                )],
+            };
+        }
 
         Ok(IntegrationStatusView {
             branch,
             head,
             main_head,
+            upstream_ref,
+            upstream_head,
+            main_behind_upstream_commits,
             main_is_ancestor,
             commits_ahead_main,
             changed_files,
@@ -1663,6 +1751,17 @@ impl Broker {
         let queue = self.store.merge_queue()?;
         let (integration_branch, integration_head) = self.integration_head()?;
         let main_head = self.repo.head_commit()?;
+        let (upstream_ref, upstream_head) = self
+            .repo
+            .tracking_upstream()
+            .map(|(name, commit)| (Some(name), Some(commit)))
+            .unwrap_or((None, None));
+        let main_behind_upstream_commits = upstream_head
+            .as_deref()
+            .filter(|upstream| self.repo.is_ancestor(&main_head, upstream))
+            .map(|upstream| self.repo.commit_count_between(&main_head, upstream))
+            .transpose()?
+            .unwrap_or(0);
         let (integration_relation, integration_ahead_main_commits) =
             if integration_head == main_head {
                 (StatusIntegrationRelation::CurrentWithMain, 0)
@@ -1685,13 +1784,36 @@ impl Broker {
             integration_relation,
             integration_ahead_main_commits,
         );
-        let advice = self.status_advice(
+        let mut advice = self.status_advice(
             &agents,
             &promoted_conflicts,
             &queue,
             &integration_branch,
             &integration_head,
         );
+        if main_behind_upstream_commits > 0 {
+            let upstream = upstream_ref.as_deref().unwrap_or("@{upstream}");
+            advice.insert(
+                0,
+                StatusAdvice {
+                    id: "integration.upstream-main-ahead".into(),
+                    severity: StatusAdviceSeverity::Blocked,
+                    reason: "configured upstream has commits absent from local main",
+                    summary: format!(
+                        "local main is {main_behind_upstream_commits} commits behind {upstream}; repair and submit are unsafe until integration is reconciled"
+                    ),
+                    session_id: None,
+                    queue_entry_id: None,
+                    evidence: vec![
+                        format!("local main: {}", short_commit(&main_head)),
+                        format!("{upstream}: {}", short_commit(upstream_head.as_deref().unwrap_or(""))),
+                    ],
+                    commands: vec![format!(
+                        "aethyme broker integration reconcile --upstream {upstream} --dry-run"
+                    )],
+                },
+            );
+        }
         Ok(StatusView {
             summary,
             advice,
@@ -1701,6 +1823,10 @@ impl Broker {
             queue,
             integration_branch,
             integration_head,
+            main_head,
+            upstream_ref,
+            upstream_head,
+            main_behind_upstream_commits,
         })
     }
 
@@ -1772,7 +1898,10 @@ impl Broker {
             if let Some(entry) = queue.iter().rev().find(|entry| {
                 entry.session_id == agent.session.id
                     && entry.head_commit == head
-                    && entry.status == MergeStatus::Promoted
+                    && matches!(
+                        entry.status,
+                        MergeStatus::Promoted | MergeStatus::ExternallyLanded
+                    )
             }) {
                 advice.push(promoted_clean_finish_advice(agent, entry));
             }
@@ -2146,7 +2275,7 @@ impl Broker {
 
         if let Some(entry) = latest_for_head {
             match entry.status {
-                MergeStatus::Promoted => {}
+                MergeStatus::Promoted | MergeStatus::ExternallyLanded => {}
                 MergeStatus::Verified => {
                     report.warnings.push(format!(
                         "queue entry {} is verified but not promoted; promote it before finish",

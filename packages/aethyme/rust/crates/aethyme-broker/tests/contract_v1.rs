@@ -27,6 +27,7 @@ const V1_KINDS: &[&str] = &[
     "lease.overlap",
     "lease.released",
     "merge.conflict",
+    "merge.externally_landed",
     "merge.integration_branch_created",
     "merge.integration_refreshed",
     "merge.promoted",
@@ -129,6 +130,7 @@ fn v1_kind_catalog_is_frozen() {
         MergeStatus::Conflict,
         MergeStatus::Verified,
         MergeStatus::Promoted,
+        MergeStatus::ExternallyLanded,
         MergeStatus::Rejected,
         MergeStatus::Superseded,
     ] {
@@ -194,6 +196,24 @@ fn v1_constructor_payload_field_names_are_frozen() {
         &events::merge_promoted_payload("b", "c"),
         &["branch", "commit"],
         "merge.promoted",
+    );
+    assert_keys(
+        &events::merge_externally_landed_payload(
+            "b",
+            "c",
+            "already_landed",
+            "origin/main",
+            Some("u"),
+        ),
+        &[
+            "branch",
+            "classification",
+            "commit",
+            "externally_landed",
+            "upstream_landing",
+            "upstream_ref",
+        ],
+        "merge.externally_landed",
     );
     // lease.overlap serializes the Overlap struct directly.
     let overlap = Overlap {

@@ -96,6 +96,7 @@ One JSON object per line:
 | `merge.verified` | the session | `merge_commit`, `base`, `gates[]` | gates passed on the merged tree |
 | `merge.rejected` | the session | `merge_commit`, `base`, `gates[]` | a gate failed on the merged tree |
 | `merge.promoted` | the session | `branch`, `commit` | integration branch advanced |
+| `merge.externally_landed` | the session | `branch`, `commit`, `externally_landed`, `classification`, `upstream_ref`, `upstream_landing` | reconciliation found equivalent or superseding content in the named upstream ref |
 | `merge.superseded` | the session | — | a newer head from the same session replaced this entry |
 | `merge.integration_branch_created` | — | `branch`, `at` | first submit created the local integration branch |
 | `merge.integration_refreshed` | — | `branch`, `from`, `to` | integration fast-forwarded to main's HEAD (only when it held no unmerged promotions) |

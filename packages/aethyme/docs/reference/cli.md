@@ -42,6 +42,7 @@ product surface.
 - `aethyme broker repair`
 - `aethyme broker finish`
 - `aethyme broker integration status`
+- `aethyme broker integration reconcile`
 - `aethyme broker quick-test`
 - `aethyme broker verify-loop`
 - `aethyme explore`
@@ -83,6 +84,7 @@ The broker is the stable product front door for multi-agent coordination:
 - `aethyme broker repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
 - `aethyme broker integration status [--json]`
+- `aethyme broker integration reconcile --upstream <ref> [--dry-run|--apply] [--json]`
 - `aethyme broker quick-test [--with-gate] [--json]`
 - `aethyme broker verify-loop [--json]`
 - `aethyme broker pr check [--target <branch>] [--pr <number>] [--agent <name>] [--dispatch] [--cmd <command>] [--json]`
@@ -94,6 +96,20 @@ the run, so callers know whether the result proves the current integration tip.
 Frozen broker JSON contracts are limited to the commands listed in
 [`../../../../docs/json-contracts.md`](../../../../docs/json-contracts.md).
 Other `--json` outputs are useful but provisional.
+
+`integration reconcile` is the recovery path when promoted work lands outside
+the broker, including squash merges. It never fetches: first update the remote
+tracking ref explicitly, then run the default dry-run. Exact ancestry, stable
+patch IDs, and path-tree equivalence classify externally landed work; remaining
+promotions are replayed in queue order on the named upstream. `--apply` moves
+the integration ref and queue state together. Ambiguous equivalence or a replay
+conflict blocks without changing either one. A durable two-phase intent makes
+the update crash-safe: the next broker open either completes the queue/audit
+transaction when the ref moved or cancels the intent when it did not.
+
+Session repair is bounded by the baseline recorded at `start` or `adopt`.
+Repair refuses when integration does not contain that baseline; reconcile the
+upstream first instead of replaying upstream commits as session work.
 
 ### PR Follow-Up
 
