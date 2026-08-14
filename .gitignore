@@ -3,6 +3,7 @@
 # runtime is not.
 .aethyme/broker.db*
 .aethyme/logs/
+.aethyme/locks/
 .aethyme/run/
 .aethyme/worktrees/
 .aethyme/broker-action-required.md
