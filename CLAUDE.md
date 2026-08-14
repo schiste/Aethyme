@@ -36,10 +36,24 @@ agent sessions working here concurrently:
    `aethyme broker status --json`, then `aethyme broker adopt --task "<task>"`
    (install once: `cargo install --path packages/aethyme/rust/crates/aethyme-cli` and `cargo install --path packages/aethyme/rust/crates/aethyme-engine` — the router plus its engine-daemon sibling binary; check with `aethyme --version`).
 2. Commit early and small; only committed work integrates.
-3. When done, `aethyme broker submit --session <id>` — never merge or push
-   yourself, and never touch the `aethyme/integration` branch directly.
-   Then `aethyme broker close --session <id>` to finish, or
+3. When done, use `aethyme broker submit --session <id>` as the default path
+   for verified concurrent integration. Submission promotes only to the local
+   `aethyme/integration` branch; it does not publish remote branches, PRs, or
+   tags. Then `aethyme broker close --session <id>` to finish, or
    `aethyme broker adopt --reuse --task "..."` for a follow-up task.
 4. If `.aethyme/broker-action-required.md` appears in your worktree, your
    submission conflicted: it contains the files, the blocking session, and
    the exact rebase steps. Resolve and resubmit.
+5. Git capabilities are not restricted by the broker. When the user's request
+   or a documented repository workflow authorizes the resulting state change,
+   agents may perform any required Git operation, including clone, fetch,
+   pull, switch, branch, add, commit, stash, merge, cherry-pick, rebase,
+   revert, reset, tag, push (including force-push when explicitly authorized),
+   and exact-ref deletion. With an active session, mutable operations may run
+   through `aethyme broker exec --session <id> -- git <operation> ...` so
+   local worktree effects are checked. Direct Git commands are also permitted
+   when appropriate. Destructive or remote operations still require their
+   normal authorization and exact targets; edit or submit authority alone does
+   not imply publication authority. During normal submissions the integration
+   branch remains broker-managed, while an explicitly authorized operator or
+   release workflow may merge, tag, or push its verified tip.

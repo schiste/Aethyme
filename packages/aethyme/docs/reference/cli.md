@@ -398,6 +398,9 @@ root files directly. The generated root instructions include:
 - primary fast test when detected
 - primary app entrypoint when detected
 - commit hygiene policy and commands
+- broker coordination when configured: verified local submission is the default,
+  while explicitly authorized agents retain the full Git command surface for
+  local and remote workflows
 
 Legacy block-managed `AGENTS.md` files are migration-only now. On deploy,
 Aethyme extracts maintainer-authored legacy content into
