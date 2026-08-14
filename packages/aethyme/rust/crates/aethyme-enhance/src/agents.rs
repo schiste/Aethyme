@@ -267,20 +267,26 @@ Follow this protocol:
    stash, merge, cherry-pick, rebase, revert, reset, tag, push (including
    force-push when explicitly authorized), and deletion of an exact ref.
 
-   With an active broker session, mutable Git commands can be run through the
-   session guard so their local worktree effects are checked:
+   Operations that require coordination **must go through the broker**. Use a
+   dedicated broker workflow when one exists (for example `broker submit` for
+   verified integration). Otherwise, run the authorized Git operation through
+   the session guard:
 
    ```bash
    aethyme broker exec --session <your-session-id> -- git <operation> ...
    ```
 
-   Direct Git commands are also permitted when appropriate. For destructive
-   or remote operations, resolve the exact repository and refs first, preserve
-   unrelated work, and require the authorization that operation normally
-   needs. Do not infer permission to publish merely from permission to edit or
-   submit. The `aethyme/integration` branch is broker-managed during normal
-   submissions, but an explicitly authorized operator or release workflow may
-   inspect, fast-forward, merge, tag, or push its verified tip."#
+   Direct Git is limited to read-only inspection and operations confined to
+   the isolated session worktree and session branch that cannot affect other
+   sessions. Any command that can move shared refs, the default branch,
+   `aethyme/integration`, remote-tracking refs, tags, or remote state is
+   coordinated and must not run outside the broker. For destructive or remote
+   operations, resolve the exact repository and refs first, preserve unrelated
+   work, and require the authorization that operation normally needs.
+   Do not infer permission to publish merely from permission to edit or submit.
+   An explicitly authorized operator or release workflow may merge, tag, push,
+   force-push, or delete refs through the broker; authorization does not permit
+   bypassing coordination."#
     )
 }
 

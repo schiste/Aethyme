@@ -63,11 +63,16 @@ agent sessions working here concurrently:
    pull, switch, branch, add, commit, stash, merge, cherry-pick, rebase,
    revert, reset, tag, push (including force-push when explicitly authorized),
    and exact-ref deletion.
-   With an active session, mutable operations may run through
-   `aethyme broker exec --session <id> -- git <operation> ...` so local
-   worktree effects are checked. Direct Git commands are also permitted when
-   appropriate. Destructive or remote operations still require their normal
-   authorization and exact targets; edit or submit authority alone does not
-   imply publication authority. During normal submissions the integration
-   branch remains broker-managed, while an explicitly authorized operator or
-   release workflow may merge, tag, or push its verified tip.
+   Operations that require coordination must go through the broker. Use a
+   dedicated broker workflow when one exists; otherwise run the authorized Git
+   operation through
+   `aethyme broker exec --session <id> -- git <operation> ...`.
+   Direct Git is limited to read-only inspection and operations confined to
+   the isolated session worktree and session branch that cannot affect other
+   sessions. Any command that can move shared refs, the default branch,
+   `aethyme/integration`, remote-tracking refs, tags, or remote state must not
+   run outside the broker. Destructive or remote operations still require
+   their normal authorization and exact targets; edit or submit authority
+   alone does not imply publication authority. An explicitly authorized
+   operator or release workflow may merge, tag, push, force-push, or delete
+   refs through the broker; authorization does not permit bypassing coordination.
