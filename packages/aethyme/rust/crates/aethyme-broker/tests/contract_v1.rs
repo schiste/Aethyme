@@ -12,7 +12,8 @@ use std::path::Path;
 use std::process::Command;
 
 use aethyme_broker::{
-    Broker, EVENTS_SCHEMA_VERSION, Event, GateStatus, MergeStatus, Overlap, SessionStatus, events,
+    Broker, EVENTS_SCHEMA_VERSION, Event, GateStatus, MergeStatus, OperationEffect,
+    OperationProvider, OperationStatus, Overlap, SessionStatus, events,
 };
 
 /// The complete v1 kind catalog. Additions append here (additive change);
@@ -36,6 +37,13 @@ const V1_KINDS: &[&str] = &[
     "merge.submitted",
     "merge.superseded",
     "merge.verified",
+    "operation.failed",
+    "operation.outcome_unknown",
+    "operation.prepared",
+    "operation.reconciled_failed",
+    "operation.reconciled_succeeded",
+    "operation.running",
+    "operation.succeeded",
     "session.active",
     "session.cleaned",
     "session.exited",
@@ -136,6 +144,17 @@ fn v1_kind_catalog_is_frozen() {
     ] {
         actual.push(format!("merge.{}", status.as_str()));
     }
+    for status in [
+        OperationStatus::Prepared,
+        OperationStatus::Running,
+        OperationStatus::Succeeded,
+        OperationStatus::Failed,
+        OperationStatus::OutcomeUnknown,
+        OperationStatus::ReconciledSucceeded,
+        OperationStatus::ReconciledFailed,
+    ] {
+        actual.push(format!("operation.{}", status.as_str()));
+    }
     actual.sort();
     assert_eq!(
         actual, V1_KINDS,
@@ -181,6 +200,27 @@ fn v1_constructor_payload_field_names_are_frozen() {
         &events::merge_submitted_payload("h"),
         &["head"],
         "merge.submitted",
+    );
+    assert_keys(
+        &events::operation_payload(
+            7,
+            OperationProvider::Github,
+            "owner/repo",
+            "pull-request:12",
+            OperationEffect::Write,
+            OperationStatus::Running,
+            None,
+        ),
+        &[
+            "effect",
+            "exit_code",
+            "operation_id",
+            "provider",
+            "repository",
+            "scope",
+            "status",
+        ],
+        "operation.<status>",
     );
     assert_keys(
         &events::integration_branch_created_payload("b", "c"),

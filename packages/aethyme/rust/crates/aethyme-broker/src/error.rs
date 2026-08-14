@@ -25,6 +25,9 @@ pub enum BrokerError {
     #[error("no session with id {0}")]
     SessionNotFound(i64),
 
+    #[error("no coordinated operation with id {0}")]
+    CoordinatedOperationNotFound(i64),
+
     #[error("a session already exists for worktree {0}")]
     WorktreeAlreadyRegistered(String),
 

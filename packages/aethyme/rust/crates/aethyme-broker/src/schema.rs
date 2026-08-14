@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -235,12 +235,42 @@ CREATE TABLE integration_reconciliation_intent_entries (
 );
 ";
 
+const MIGRATION_V6: &str = "
+CREATE TABLE coordinated_operations (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id   INTEGER NOT NULL REFERENCES sessions (id),
+    provider     TEXT NOT NULL CHECK (provider IN ('git', 'github')),
+    repository   TEXT NOT NULL,
+    scope        TEXT NOT NULL,
+    effect       TEXT NOT NULL CHECK (effect IN ('read', 'write', 'destructive')),
+    authorization_reason TEXT,
+    status       TEXT NOT NULL CHECK (status IN (
+                     'prepared', 'running', 'succeeded', 'failed',
+                     'outcome_unknown', 'reconciled_succeeded',
+                     'reconciled_failed'
+                 )),
+    command_json TEXT NOT NULL,
+    pid          INTEGER NOT NULL,
+    exit_code    INTEGER,
+    details_json TEXT,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    finished_at  INTEGER
+);
+
+CREATE INDEX coordinated_operations_by_repository
+    ON coordinated_operations (repository, status, id);
+CREATE INDEX coordinated_operations_by_session
+    ON coordinated_operations (session_id, id);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
     MIGRATION_V3,
     MIGRATION_V4,
     MIGRATION_V5,
+    MIGRATION_V6,
 ];
 
 fn current_version(conn: &Connection) -> Result<i64, BrokerError> {

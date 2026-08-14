@@ -70,11 +70,11 @@ contracts, so any future delivery surface is a client, not a rewrite.
   while the repository is private.
 - **Kill criterion for the dogfood:** stop if costs increase too much AND
   no time is saved; the friction log includes cost/time accounting.
-- **Promotion lands on a local integration branch only.** The broker never
-  pushes and never opens PRs. It may observe PR state through `gh` for routing
-  (`broker pr check`), but GitHub mutation — replying, resolving threads,
-  committing fixes, and pushing — belongs to the dispatched agent or human
-  operator.
+- **Promotion lands on a local integration branch only.** `broker submit`
+  never pushes and never opens PRs. Explicitly authorized Git and GitHub
+  mutations use `broker git` / `broker gh`: fixed executables, repository-wide
+  write serialization, a durable redacted journal, and fail-closed recovery
+  when a crashed operation has an unknown external outcome.
 - **The broker manages conflicts; quality is repo-owned and optional**
   (clarified 2026-07-13). `gates.toml` is repo policy, not broker policy —
   the broker is pure mechanism (selection, ordering, caching,
@@ -197,6 +197,10 @@ passing it is not the bar.
 - **Git-native operations first**, shelling out to `git` (worktree, diff,
   merge-tree) behind a clean internal Git service layer — no libgit2/gix
   dependency until a measured need appears.
+- **External mutations are journaled, not falsely transactional.** A repository
+  write lock serializes `git` and `gh` subprocesses. Prepared/running/terminal
+  states are durable; a process death after start becomes `outcome_unknown`
+  and blocks overlapping writes until operator reconciliation.
 - **No daemon in v0** unless unavoidable; CLI invocations coordinate through
   SQLite. A future daemon, if needed, follows the existing local
   unix-socket + line-delimited JSON pattern used by the engine daemon.

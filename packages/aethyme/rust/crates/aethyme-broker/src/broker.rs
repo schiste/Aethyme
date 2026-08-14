@@ -90,6 +90,25 @@ pub enum BrokerOpError {
     },
     #[error("guarded exec requires a command after --")]
     MissingExecCommand,
+    #[error("invalid coordinated operation: {reason}")]
+    InvalidCoordinatedOperation { reason: String },
+    #[error(
+        "coordinated operation blocked for {repository}: operation {operation_id} has an unknown outcome; inspect it and run `aethyme broker operations reconcile --operation {operation_id} --outcome succeeded --reason \"...\"` or use `--outcome failed`"
+    )]
+    CoordinatedOperationBlocked {
+        repository: String,
+        operation_id: i64,
+    },
+    #[error("coordinated operation lock at {path}: {source}")]
+    OperationIo {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to spawn coordinated {executable} command: {source}")]
+    OperationSpawn {
+        executable: String,
+        source: std::io::Error,
+    },
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error(transparent)]

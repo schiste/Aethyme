@@ -55,8 +55,9 @@ aethyme broker submit --session <id>     # simulate → affected gates on merged
                                          # branch when verified (default; [promote]
                                          # mode = "manual" for an explicit step)
 
-# Shipping stays yours — the broker never pushes:
-git merge aethyme/integration            # or cherry-pick / branch + PR, your call
+# Shipping remains explicit and authorized, but coordinated through the broker:
+aethyme broker git --session <id> --repo <owner/name> --reason "authorized release" -- push origin <refspec>
+aethyme broker gh --session <id> --repo <owner/name> --reason "authorized release" -- pr create ...
 
 # Done with a session:
 aethyme broker cleanup <id>              # refuses if work would be lost; --force discards
