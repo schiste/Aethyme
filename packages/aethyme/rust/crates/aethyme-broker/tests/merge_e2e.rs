@@ -26,6 +26,11 @@ fn sh(cwd: &Path, args: &[&str]) {
 
 fn init_repo(root: &Path) {
     sh(root, &["init", "-q", "-b", "main"]);
+    // Broker operations spawn their own Git processes, so configure the
+    // disposable repository itself instead of relying on the test runner's
+    // global identity or on environment variables attached to `sh` above.
+    sh(root, &["config", "user.name", "Aethyme Test"]);
+    sh(root, &["config", "user.email", "aethyme-test@example.invalid"]);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/a.py"), "a = 1\n").unwrap();
     std::fs::write(root.join("src/b.py"), "b = 1\n").unwrap();
