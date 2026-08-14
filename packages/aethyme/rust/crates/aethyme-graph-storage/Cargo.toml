@@ -1,6 +1,6 @@
 [package]
 name = "aethyme-graph-storage"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Storage layer for Aethyme graph fragments: per-file binary fragments (bincode) and per-module NDJSON index shards. Built on top of aethyme-graph-schema's pure types."
 license = "Apache-2.0"

@@ -1,6 +1,6 @@
 [package]
 name = "aethyme-enhance"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Deployment and templating for Aethyme discoverability: enhance deploy/verify, skill compilation, AGENTS.md rendering with overrides. Retirement-plan Phase 2 port of src/enhance.py + indexing/skills.py; outputs are byte-deterministic, held by `enhance verify` canonical-match checks and tests/local/test_enhance.py."
 
