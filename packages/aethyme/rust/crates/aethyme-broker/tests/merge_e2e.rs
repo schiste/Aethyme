@@ -179,7 +179,9 @@ fn conflicting_submission_rejected_pre_gate_with_instruction_drop() {
     // Both change the same line of the same file.
     commit_edit(&wt_a, "src/a.py", "a = 111\n");
     commit_edit(&wt_b, "src/a.py", "a = 222\n");
-    // Leases exist so the conflict can name the blocking session.
+    // Refresh leases before promotion. Once A promotes, its implicit lease
+    // may correctly disappear because its work is now integrated; the Git
+    // conflict remains real even when no live lease owner remains to name.
     broker.refresh_leases().unwrap();
 
     let out_a = broker.submit(a.id).unwrap();
@@ -195,7 +197,11 @@ fn conflicting_submission_rejected_pre_gate_with_instruction_drop() {
     // Marker file proves the gate never executed for B's submission
     // beyond A's earlier verified run.
     let details = out_b.entry.details_json.as_deref().unwrap();
-    assert!(details.contains("\"blocking_sessions\":[1]") || details.contains(&a.id.to_string()));
+    let details_json: serde_json::Value = serde_json::from_str(details).unwrap();
+    assert!(
+        details_json["blocking_sessions"].is_array(),
+        "conflict details must retain the blocking-session evidence field: {details}"
+    );
 
     // The agent-facing instruction drop exists in B's worktree and names
     // the conflicting file and the blocking session (#21 decision).
