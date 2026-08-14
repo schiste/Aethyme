@@ -69,7 +69,7 @@ pub use quick_test::{
 };
 pub use reconciliation::{
     IntegrationReconcileClassification, IntegrationReconcileEntry, IntegrationReconcileOptions,
-    IntegrationReconcileReport,
+    IntegrationReconcileReport, IntegrationReconcileResolutionAudit,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use store::BrokerStore;

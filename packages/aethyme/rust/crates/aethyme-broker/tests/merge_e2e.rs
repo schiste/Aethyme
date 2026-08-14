@@ -91,6 +91,14 @@ fn resolve(root: &Path, rev: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn promoted_merge_commit(entry: &aethyme_broker::MergeQueueEntry) -> String {
+    serde_json::from_str::<serde_json::Value>(entry.details_json.as_deref().unwrap())
+        .unwrap()["commit"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 #[test]
 fn two_clean_sessions_promote_with_requeue_on_base_move_manual_mode() {
     let tmp = tempfile::tempdir().unwrap();
@@ -669,6 +677,7 @@ fn reconcile_recognizes_squash_preserves_followups_and_replays_pending_work() {
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),
             apply: false,
+            resolution_file: None,
         })
         .unwrap();
     assert!(dry_run.safe, "{dry_run:#?}");
@@ -701,6 +710,7 @@ fn reconcile_recognizes_squash_preserves_followups_and_replays_pending_work() {
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),
             apply: true,
+            resolution_file: None,
         })
         .unwrap();
     assert!(applied.safe && applied.applied);
@@ -804,6 +814,7 @@ fn reconcile_blocks_ambiguous_patch_equivalence_without_mutating_state() {
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),
             apply: true,
+            resolution_file: None,
         })
         .unwrap();
     assert!(!report.safe, "{report:#?}");
@@ -822,6 +833,169 @@ fn reconcile_blocks_ambiguous_patch_equivalence_without_mutating_state() {
             .status,
         MergeStatus::Promoted
     );
+}
+
+#[test]
+fn reconcile_accepts_commit_bound_operator_supersession_with_durable_audit() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt_a = agent_worktree(tmp.path(), "operator-resolution-a");
+    let wt_b = agent_worktree(tmp.path(), "operator-resolution-b");
+    let session_a = broker.adopt(&wt_a, Some("superseded a")).unwrap();
+    let session_b = broker.adopt(&wt_b, Some("superseded b")).unwrap();
+    commit_edit(&wt_a, "src/a.py", "a = 2\n");
+    commit_edit(&wt_b, "src/b.py", "b = 2\n");
+    let promoted_a = broker.submit(session_a.id).unwrap();
+    let promoted_b = broker.submit(session_b.id).unwrap();
+    let old_integration = resolve(tmp.path(), "aethyme/integration");
+    let promoted_a_commit = promoted_merge_commit(&promoted_a.entry);
+    let promoted_b_commit = promoted_merge_commit(&promoted_b.entry);
+
+    // Both features landed externally and were subsequently improved, so
+    // neither original patch nor its final path content matches upstream.
+    sh(tmp.path(), &["switch", "-qc", "operator-upstream", "main"]);
+    std::fs::write(tmp.path().join("src/a.py"), "a = 3\n").unwrap();
+    std::fs::write(tmp.path().join("src/b.py"), "b = 3\n").unwrap();
+    sh(tmp.path(), &["add", "src/a.py", "src/b.py"]);
+    sh(
+        tmp.path(),
+        &["commit", "-qm", "land and improve both features"],
+    );
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    let upstream = resolve(tmp.path(), "origin/main");
+    sh(tmp.path(), &["switch", "main"]);
+
+    let blocked = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: None,
+        })
+        .unwrap();
+    assert!(!blocked.safe, "{blocked:#?}");
+    assert_eq!(
+        blocked.entries[0].classification,
+        IntegrationReconcileClassification::GenuinelyConflicting
+    );
+    assert_eq!(
+        blocked.entries[1].classification,
+        IntegrationReconcileClassification::Ambiguous
+    );
+
+    let resolution_path = tmp.path().join("reconciliation.json");
+    let resolution_document = |upstream_commit: &str| {
+        serde_json::json!({
+            "schema_version": 1,
+            "upstream_ref": "origin/main",
+            "upstream_commit": upstream_commit,
+            "old_integration": old_integration,
+            "operator": "release-operator@example.test",
+            "resolutions": [
+                {
+                    "queue_entry_id": promoted_a.entry.id,
+                    "old_merge_commit": promoted_a_commit,
+                    "classification": "superseded_upstream",
+                    "reason": "landed externally and improved in the production series"
+                },
+                {
+                    "queue_entry_id": promoted_b.entry.id,
+                    "old_merge_commit": promoted_b_commit,
+                    "classification": "superseded_upstream",
+                    "reason": "landed externally and improved in the production series"
+                }
+            ]
+        })
+    };
+
+    // A stale or mistyped upstream binding fails before planning or mutation.
+    std::fs::write(
+        &resolution_path,
+        serde_json::to_vec_pretty(&resolution_document(&"0".repeat(40))).unwrap(),
+    )
+    .unwrap();
+    let stale_error = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: true,
+            resolution_file: Some(resolution_path.clone()),
+        })
+        .unwrap_err();
+    assert!(stale_error.to_string().contains("upstream_commit"));
+    assert_eq!(resolve(tmp.path(), "aethyme/integration"), old_integration);
+    assert!(
+        broker
+            .store()
+            .merge_queue()
+            .unwrap()
+            .iter()
+            .filter(|entry| [promoted_a.entry.id, promoted_b.entry.id].contains(&entry.id))
+            .all(|entry| entry.status == MergeStatus::Promoted)
+    );
+
+    std::fs::write(
+        &resolution_path,
+        serde_json::to_vec_pretty(&resolution_document(&upstream)).unwrap(),
+    )
+    .unwrap();
+    let dry_run = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: Some(resolution_path.clone()),
+        })
+        .unwrap();
+    assert!(dry_run.safe && !dry_run.applied, "{dry_run:#?}");
+    assert_eq!(dry_run.new_integration, upstream);
+    assert!(dry_run.entries.iter().all(|entry| {
+        entry.classification == IntegrationReconcileClassification::SupersededUpstream
+            && entry.operator_resolution.is_some()
+    }));
+    assert_eq!(resolve(tmp.path(), "aethyme/integration"), old_integration);
+
+    let applied = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: true,
+            resolution_file: Some(resolution_path),
+        })
+        .unwrap();
+    assert!(applied.safe && applied.applied, "{applied:#?}");
+    assert_eq!(resolve(tmp.path(), "aethyme/integration"), upstream);
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/a.py"),
+        "a = 3\n"
+    );
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/b.py"),
+        "b = 3\n"
+    );
+
+    let queue = broker.store().merge_queue().unwrap();
+    assert!(
+        queue
+            .iter()
+            .filter(|entry| [promoted_a.entry.id, promoted_b.entry.id].contains(&entry.id))
+            .all(|entry| entry.status == MergeStatus::ExternallyLanded)
+    );
+    let db = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
+    let details: String = db
+        .query_row(
+            "SELECT details_json FROM integration_reconciliation_entries
+             WHERE queue_entry_id = ?1 ORDER BY id DESC LIMIT 1",
+            [promoted_a.entry.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let details: serde_json::Value = serde_json::from_str(&details).unwrap();
+    assert_eq!(
+        details["operator_resolution"]["operator"],
+        "release-operator@example.test"
+    );
+    assert_eq!(details["operator_resolution"]["upstream_commit"], upstream);
 }
 
 #[test]
@@ -851,6 +1025,7 @@ fn broker_open_finishes_reconciliation_interrupted_after_ref_move() {
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),
             apply: false,
+            resolution_file: None,
         })
         .unwrap();
     assert!(report.safe);
@@ -951,6 +1126,7 @@ fn reconcile_refuses_to_discard_unrecorded_integration_commits() {
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),
             apply: true,
+            resolution_file: None,
         })
         .unwrap();
     assert!(!report.safe);
@@ -993,6 +1169,7 @@ fn failed_reconciliation_rolls_back_ref_and_database() {
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),
             apply: true,
+            resolution_file: None,
         })
         .unwrap_err();
     assert!(
