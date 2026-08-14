@@ -222,7 +222,58 @@ impl Broker {
         // Every commit in the local pending layer must be explained by the
         // promoted queue. Otherwise rebuilding from only known entries could
         // silently discard an operator-created or partially recorded commit.
-        let described_chain_is_complete = if candidates.is_empty() {
+        // Once upstream is already an ancestor of integration, it is the
+        // trusted boundary. Local main may intentionally remain behind after
+        // a fetch, and upstream commits below this boundary are not pending
+        // integration work. Sort by first-parent position because queue IDs
+        // can be re-promoted out of order after older conflicts are retried.
+        let upstream_is_integration_base = self
+            .repo_handle()
+            .is_ancestor(&upstream_head, &old_integration);
+        let described_chain_is_complete = if upstream_is_integration_base {
+            let layer = self
+                .repo_handle()
+                .first_parent_commits_between_oldest(&upstream_head, &old_integration)?;
+            let positions: BTreeMap<String, usize> = layer
+                .iter()
+                .enumerate()
+                .map(|(index, commit)| (commit.clone(), index))
+                .collect();
+            let recorded: BTreeSet<&str> = candidates
+                .iter()
+                .map(|candidate| candidate.merge_commit.as_str())
+                .collect();
+            let mut ignored_empty_commits = 0usize;
+            let mut complete = true;
+            for commit in &layer {
+                if recorded.contains(commit.as_str()) {
+                    continue;
+                }
+                let parent = self.repo_handle().first_parent(commit)?;
+                if self
+                    .repo_handle()
+                    .changed_between(&parent, commit)?
+                    .is_empty()
+                {
+                    ignored_empty_commits += 1;
+                } else {
+                    complete = false;
+                    break;
+                }
+            }
+            candidates.sort_by_key(|candidate| {
+                positions
+                    .get(&candidate.merge_commit)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+            if ignored_empty_commits > 0 {
+                report.warnings.push(format!(
+                    "ignored {ignored_empty_commits} content-empty integration bookkeeping commit(s) not represented by current queue tips"
+                ));
+            }
+            complete
+        } else if candidates.is_empty() {
             self.repo_handle()
                 .is_ancestor(&old_integration, &upstream_head)
         } else {
@@ -281,6 +332,18 @@ impl Broker {
                     None,
                     Vec::new(),
                     "promoted merge commit is reachable from upstream".into(),
+                ));
+            } else if self
+                .repo_handle()
+                .is_ancestor(&candidate.entry.head_commit, &upstream_head)
+            {
+                classified[index] = Some(entry_report(
+                    candidate,
+                    IntegrationReconcileClassification::AlreadyLanded,
+                    Some(candidate.entry.head_commit.clone()),
+                    None,
+                    Vec::new(),
+                    "submitted session head is reachable from upstream".into(),
                 ));
             }
         }

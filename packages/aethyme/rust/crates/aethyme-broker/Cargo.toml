@@ -1,6 +1,6 @@
 [package]
 name = "aethyme-broker"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Local agent broker: operational state (sessions, worktrees, leases, gates, merge queue, events) for high-concurrency AI development. Library-first — the CLI is a thin client of this crate's typed API. Broker state lives in SQLite (.aethyme/broker.db); the graph engine's redb/fragment storage is a separate, read-only advisory concern."
 license = "Apache-2.0"
