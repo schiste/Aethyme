@@ -1,6 +1,6 @@
 [package]
 name = "aethyme-graph-indexer"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Indexers that walk source repos and produce aethyme-graph-schema nodes + edges. Phase 3 of the graph rewrite: turns real source files into typed graph payloads suitable for committed per-file fragments."
 license = "Apache-2.0"
