@@ -74,8 +74,8 @@ fn agents_document_includes_broker_protocol_only_when_configured() {
     assert!(!read(repo.join("AGENTS.md")).contains("Broker Coordination"));
 
     // Broker-configured repo -> the protocol appears, with the
-    // essentials: status-before-editing, submit-not-merge, the
-    // action-required file, and the never-touch-integration rule.
+    // essentials: status-before-editing, verified submit as the default,
+    // the action-required file, and authority-based Git operations.
     write(repo.join(".aethyme/gates.toml"), "[[gate]]\nname = \"ok\"\ncommand = \"true\"\n");
     deploy(&repo, true);
     let agents = read(repo.join("AGENTS.md"));
@@ -90,9 +90,17 @@ fn agents_document_includes_broker_protocol_only_when_configured() {
         "AETHYME_TEST_DB_SUFFIX",
         ".aethyme/broker-action-required.md",
         "aethyme/integration",
+        "Git operations remain available to agents",
+        "clone, fetch, pull, switch, branch, add, commit",
+        "stash, merge, cherry-pick, rebase, revert, reset, tag, push",
+        "force-push when explicitly authorized",
+        "deletion of an exact ref",
+        "broker exec --session <your-session-id> -- git <operation>",
+        "Do not infer permission to publish",
     ] {
         assert!(agents.contains(needle), "AGENTS.md missing {needle:?}");
     }
+    assert!(!agents.contains("**Never** push"));
     // CLAUDE.md renders from the same generated document.
     assert!(read(repo.join("CLAUDE.md")).contains("## Broker Coordination"));
 }

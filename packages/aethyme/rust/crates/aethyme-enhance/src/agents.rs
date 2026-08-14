@@ -239,14 +239,16 @@ Follow this protocol:
    external state should suffix it with that value instead of sharing one
    fixed name.
 
-6. **When your task is complete**, submit your head commit for verified
-   integration instead of merging anything yourself:
+6. **When your task is complete**, use verified broker integration by
+   default instead of manually combining concurrent session branches:
 
    ```bash
    aethyme broker submit --session <your-session-id>
    ```
 
    This simulates the merge and runs only the checks your diff affects.
+   `broker submit` promotes to the local integration branch; it does not
+   publish a remote branch, create a pull request, or push a release tag.
    Report the outcome (verified / rejected / conflict) in your summary.
    Afterwards, finish the session with
    `aethyme broker close --session <id>` (state only), or point it at
@@ -257,9 +259,28 @@ Follow this protocol:
    the conflicting files, the blocking session, and the exact rebase
    steps. Resolve, commit, and resubmit.
 
-8. **Never** push, merge to the default branch, or touch the
-   `aethyme/integration` branch directly — integration and shipping are
-   handled through the broker and the human operator."#
+8. **Git operations remain available to agents.** The broker coordinates
+   concurrent work; it does not remove Git capabilities. When the user's
+   request or the repository's documented workflow authorizes the resulting
+   local or remote state change, agents may perform every required Git
+   operation, including clone, fetch, pull, switch, branch, add, commit,
+   stash, merge, cherry-pick, rebase, revert, reset, tag, push (including
+   force-push when explicitly authorized), and deletion of an exact ref.
+
+   With an active broker session, mutable Git commands can be run through the
+   session guard so their local worktree effects are checked:
+
+   ```bash
+   aethyme broker exec --session <your-session-id> -- git <operation> ...
+   ```
+
+   Direct Git commands are also permitted when appropriate. For destructive
+   or remote operations, resolve the exact repository and refs first, preserve
+   unrelated work, and require the authorization that operation normally
+   needs. Do not infer permission to publish merely from permission to edit or
+   submit. The `aethyme/integration` branch is broker-managed during normal
+   submissions, but an explicitly authorized operator or release workflow may
+   inspect, fast-forward, merge, tag, or push its verified tip."#
     )
 }
 
