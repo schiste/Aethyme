@@ -14,9 +14,10 @@
 //! coverage, with a cap on the line-ref preview list to keep the
 //! response token-cheap.
 
+use std::ffi::OsStr;
 use std::path::Path;
 
-use super::{AnswerItem, extract_symbol_queries, ranking};
+use super::{extract_symbol_queries, ranking, AnswerItem};
 
 const RIPGREP_BIN: &str = "rg";
 const SOURCE_TEXT_FILE_SIZE_CAP_BYTES: u64 = 750_000;
@@ -79,12 +80,29 @@ pub(super) fn source_text_files(
     max_files: usize,
     max_line_refs: usize,
 ) -> Vec<AnswerItem> {
+    source_text_files_with_ripgrep(
+        repo,
+        terms,
+        max_files,
+        max_line_refs,
+        OsStr::new(RIPGREP_BIN),
+    )
+}
+
+fn source_text_files_with_ripgrep(
+    repo: &Path,
+    terms: &[String],
+    max_files: usize,
+    max_line_refs: usize,
+    ripgrep_bin: &OsStr,
+) -> Vec<AnswerItem> {
     if terms.is_empty() || max_files == 0 {
         return Vec::new();
     }
 
     let mut hits_by_file: std::collections::BTreeMap<String, TextHit> =
         std::collections::BTreeMap::new();
+    let mut needs_native_fallback = false;
 
     for chunk in terms.chunks(8) {
         let pattern = chunk
@@ -96,7 +114,7 @@ pub(super) fn source_text_files(
             continue;
         }
         let lowered_terms: Vec<String> = chunk.iter().map(|t| t.to_ascii_lowercase()).collect();
-        let output = match std::process::Command::new(RIPGREP_BIN)
+        let output = match std::process::Command::new(ripgrep_bin)
             .arg("-i")
             .arg("--no-heading")
             .arg("--with-filename")
@@ -109,12 +127,19 @@ pub(super) fn source_text_files(
             .arg(repo)
             .output()
         {
-            Ok(o) => o,
-            Err(_) => continue,
+            Ok(output) if output.status.success() || output.status.code() == Some(1) => output,
+            Ok(_) | Err(_) => {
+                needs_native_fallback = true;
+                break;
+            }
         };
         if !output.stdout.is_empty() {
             ingest_rg_output(&output.stdout, repo, &lowered_terms, &mut hits_by_file);
         }
+    }
+
+    if needs_native_fallback {
+        hits_by_file = native_text_hits(repo, terms);
     }
 
     let mut ranked: Vec<TextHit> = hits_by_file.into_values().collect();
@@ -218,6 +243,34 @@ pub(super) fn source_text_files(
             }
         })
         .collect()
+}
+
+fn native_text_hits(repo: &Path, terms: &[String]) -> std::collections::BTreeMap<String, TextHit> {
+    let mut hits_by_file = std::collections::BTreeMap::new();
+    let Ok(snapshot) = crate::repo::discover_repo(repo) else {
+        return hits_by_file;
+    };
+    let lowered_terms: Vec<String> = terms.iter().map(|term| term.to_ascii_lowercase()).collect();
+
+    for file in snapshot.files {
+        if file.size_bytes > SOURCE_TEXT_FILE_SIZE_CAP_BYTES {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(repo.join(&file.path)) else {
+            continue;
+        };
+        for (index, line) in contents.lines().enumerate() {
+            record_text_line(
+                &file.path,
+                index as u64 + 1,
+                line,
+                &lowered_terms,
+                &mut hits_by_file,
+            );
+        }
+    }
+
+    hits_by_file
 }
 
 fn auth_surface_for_text_hit(hit: &TextHit, request_terms: &[String]) -> ranking::SurfaceSignals {
@@ -339,38 +392,46 @@ fn ingest_rg_output(
             Ok(p) => p.to_string_lossy().to_string(),
             Err(_) => abs_path.to_string(),
         };
-        let lower = line_text.to_ascii_lowercase();
-        let matched: Vec<String> = lowered_terms
-            .iter()
-            .filter(|t| lower.contains(t.as_str()))
-            .cloned()
-            .collect();
-        if matched.is_empty() {
-            // `rg` matched but our local lowercase scan missed (rare —
-            // could happen with regex metachar quirks). Skip.
-            continue;
-        }
-        let entry = hits_by_file
-            .entry(rel_path.clone())
-            .or_insert_with(|| TextHit {
-                path: rel_path,
-                matched_terms: std::collections::BTreeSet::new(),
-                hit_count: 0,
-                line_refs: Vec::new(),
-            });
-        for term in &matched {
-            entry.matched_terms.insert(term.clone());
-        }
-        entry.hit_count += 1;
-        // Cap stored line refs per file to bound memory; the ranking
-        // step picks the top N by term coverage afterwards.
-        if entry.line_refs.len() < 32 {
-            entry.line_refs.push(TextLineRef {
-                line: line_no,
-                text: line_text.trim().chars().take(220).collect(),
-                matched_terms: matched,
-            });
-        }
+        record_text_line(&rel_path, line_no, line_text, lowered_terms, hits_by_file);
+    }
+}
+
+fn record_text_line(
+    rel_path: &str,
+    line_no: u64,
+    line_text: &str,
+    lowered_terms: &[String],
+    hits_by_file: &mut std::collections::BTreeMap<String, TextHit>,
+) {
+    let lower = line_text.to_ascii_lowercase();
+    let matched: Vec<String> = lowered_terms
+        .iter()
+        .filter(|term| lower.contains(term.as_str()))
+        .cloned()
+        .collect();
+    if matched.is_empty() {
+        return;
+    }
+    let entry = hits_by_file
+        .entry(rel_path.to_string())
+        .or_insert_with(|| TextHit {
+            path: rel_path.to_string(),
+            matched_terms: std::collections::BTreeSet::new(),
+            hit_count: 0,
+            line_refs: Vec::new(),
+        });
+    for term in &matched {
+        entry.matched_terms.insert(term.clone());
+    }
+    entry.hit_count += 1;
+    // Cap stored line refs per file to bound memory; the ranking step
+    // picks the top N by term coverage afterwards.
+    if entry.line_refs.len() < 32 {
+        entry.line_refs.push(TextLineRef {
+            line: line_no,
+            text: line_text.trim().chars().take(220).collect(),
+            matched_terms: matched,
+        });
     }
 }
 
@@ -379,7 +440,7 @@ mod tests {
     //! Regression tests for `suffix_class_rank` — moved here from
     //! explore.rs alongside the function in the 2026-05-08 split.
 
-    use super::{source_text_files, suffix_class_rank};
+    use super::{source_text_files, source_text_files_with_ripgrep, suffix_class_rank};
     use std::fs;
     use std::path::PathBuf;
 
@@ -473,6 +534,34 @@ mod tests {
         assert!(
             validation_script.evidence.get("ranking_signals").is_none(),
             "validation-only API script should not receive auth/token ranking evidence"
+        );
+    }
+
+    #[test]
+    fn source_text_files_falls_back_when_ripgrep_is_unavailable() {
+        let repo = temp_repo("aethyme-source-text-native-fallback");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(
+            repo.join("src/auth.rs"),
+            "fn authenticate(request: Request) { let token = request.token(); }\n",
+        )
+        .unwrap();
+        let missing_ripgrep = repo.join("definitely-missing-ripgrep");
+
+        let items = source_text_files_with_ripgrep(
+            &repo,
+            &["authenticate".to_string(), "token".to_string()],
+            2,
+            2,
+            missing_ripgrep.as_os_str(),
+        );
+        let _ = fs::remove_dir_all(&repo);
+
+        assert_eq!(items.len(), 1, "native fallback should preserve the hit");
+        assert_eq!(items[0].path.as_deref(), Some("src/auth.rs"));
+        assert_eq!(
+            items[0].evidence["matched_terms"],
+            serde_json::json!(["authenticate", "token"])
         );
     }
 
