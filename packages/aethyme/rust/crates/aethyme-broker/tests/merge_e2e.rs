@@ -1136,6 +1136,273 @@ fn reconcile_refuses_to_discard_unrecorded_integration_commits() {
 }
 
 #[test]
+fn promotion_does_not_resurrect_conflicts_from_cleaned_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let stale_a_wt = agent_worktree(tmp.path(), "cleaned-stale-a");
+    let stale_b_wt = agent_worktree(tmp.path(), "cleaned-stale-b");
+    let blocker_wt = agent_worktree(tmp.path(), "cleaned-blocker");
+    let stale_a = broker.adopt(&stale_a_wt, Some("old a")).unwrap();
+    let stale_b = broker.adopt(&stale_b_wt, Some("old b")).unwrap();
+    let blocker = broker
+        .adopt(&blocker_wt, Some("temporary blocker"))
+        .unwrap();
+    commit_edit(&stale_a_wt, "src/a.py", "a = 2\n");
+    commit_edit(&stale_b_wt, "src/b.py", "b = 2\n");
+    commit_edit(&blocker_wt, "src/a.py", "a = 99\n");
+    commit_edit(&blocker_wt, "src/b.py", "b = 99\n");
+
+    let blocker_entry = broker.submit(blocker.id).unwrap();
+    assert!(blocker_entry.promoted);
+    let old_a = broker.submit(stale_a.id).unwrap();
+    let old_b = broker.submit(stale_b.id).unwrap();
+    assert_eq!(old_a.entry.status, MergeStatus::Conflict);
+    assert_eq!(old_b.entry.status, MergeStatus::Conflict);
+    broker.close(stale_a.id).unwrap();
+    broker.close(stale_b.id).unwrap();
+
+    // Both old submitted heads later land upstream. Model an already
+    // completed reconciliation by moving only the integration ref; local
+    // main deliberately remains at the original checkout commit.
+    sh(tmp.path(), &["switch", "-qc", "external-cleaned", "main"]);
+    sh(
+        tmp.path(),
+        &["merge", "--no-edit", "--no-ff", "agent/cleaned-stale-a"],
+    );
+    sh(
+        tmp.path(),
+        &["merge", "--no-edit", "--no-ff", "agent/cleaned-stale-b"],
+    );
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/heads/aethyme/integration", "HEAD"],
+    );
+    sh(tmp.path(), &["switch", "main"]);
+    broker
+        .store()
+        .set_merge_status(
+            blocker_entry.entry.id,
+            MergeStatus::ExternallyLanded,
+            None,
+            None,
+        )
+        .unwrap();
+
+    let fresh_wt = agent_worktree_at(tmp.path(), "after-cleaned", "origin/main");
+    let fresh = broker.adopt(&fresh_wt, Some("fresh work")).unwrap();
+    commit_edit(&fresh_wt, "src/c.py", "c = 2\n");
+    assert!(broker.submit(fresh.id).unwrap().promoted);
+
+    let queue = broker.store().merge_queue().unwrap();
+    assert_eq!(
+        queue
+            .iter()
+            .find(|entry| entry.id == old_a.entry.id)
+            .unwrap()
+            .status,
+        MergeStatus::Superseded
+    );
+    assert_eq!(
+        queue
+            .iter()
+            .find(|entry| entry.id == old_b.entry.id)
+            .unwrap()
+            .status,
+        MergeStatus::Superseded
+    );
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/c.py"),
+        "c = 2\n"
+    );
+}
+
+#[test]
+fn reconcile_uses_upstream_boundary_and_recovers_repromoted_empty_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let stale_a_wt = agent_worktree(tmp.path(), "active-stale-a");
+    let stale_b_wt = agent_worktree(tmp.path(), "active-stale-b");
+    let blocker_wt = agent_worktree(tmp.path(), "active-blocker");
+    let stale_a = broker.adopt(&stale_a_wt, Some("old a")).unwrap();
+    let stale_b = broker.adopt(&stale_b_wt, Some("old b")).unwrap();
+    let blocker = broker
+        .adopt(&blocker_wt, Some("temporary blocker"))
+        .unwrap();
+    commit_edit(&stale_a_wt, "src/a.py", "a = 2\n");
+    commit_edit(&stale_b_wt, "src/b.py", "b = 2\n");
+    commit_edit(&blocker_wt, "src/a.py", "a = 99\n");
+    commit_edit(&blocker_wt, "src/b.py", "b = 99\n");
+
+    let blocker_entry = broker.submit(blocker.id).unwrap();
+    let old_a = broker.submit(stale_a.id).unwrap();
+    let old_b = broker.submit(stale_b.id).unwrap();
+    assert_eq!(old_a.entry.status, MergeStatus::Conflict);
+    assert_eq!(old_b.entry.status, MergeStatus::Conflict);
+
+    sh(tmp.path(), &["switch", "-qc", "external-active", "main"]);
+    sh(
+        tmp.path(),
+        &["merge", "--no-edit", "--no-ff", "agent/active-stale-a"],
+    );
+    sh(
+        tmp.path(),
+        &["merge", "--no-edit", "--no-ff", "agent/active-stale-b"],
+    );
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(tmp.path(), &["config", "remote.origin.url", "."]);
+    sh(
+        tmp.path(),
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    sh(tmp.path(), &["config", "branch.main.remote", "origin"]);
+    sh(
+        tmp.path(),
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+    let upstream = resolve(tmp.path(), "origin/main");
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/heads/aethyme/integration", "HEAD"],
+    );
+    sh(tmp.path(), &["switch", "main"]);
+    broker
+        .store()
+        .set_merge_status(
+            blocker_entry.entry.id,
+            MergeStatus::ExternallyLanded,
+            None,
+            None,
+        )
+        .unwrap();
+
+    let fresh_wt = agent_worktree_at(tmp.path(), "reconcile-fresh", "origin/main");
+    let fresh = broker.adopt(&fresh_wt, Some("fresh delta")).unwrap();
+    commit_edit(&fresh_wt, "src/c.py", "c = 2\n");
+    let fresh_out = broker.submit(fresh.id).unwrap();
+    assert!(fresh_out.promoted);
+
+    // The active old conflicts are revalidated once each and become
+    // content-empty promotions because their heads are already upstream.
+    // Add one more empty bookkeeping commit to reproduce the v0.1.3 state
+    // where a recursive stale snapshot promoted the same queue item twice.
+    let integration = resolve(tmp.path(), "aethyme/integration");
+    let tree = resolve(tmp.path(), "aethyme/integration^{tree}");
+    let output = Command::new("git")
+        .args([
+            "commit-tree",
+            &tree,
+            "-p",
+            &integration,
+            "-m",
+            "duplicate bookkeeping merge",
+        ])
+        .current_dir(tmp.path())
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let duplicate = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/heads/aethyme/integration", &duplicate],
+    );
+
+    let dry_run = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: None,
+        })
+        .unwrap();
+    assert!(dry_run.safe, "{dry_run:#?}");
+    assert!(
+        dry_run
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("content-empty"))
+    );
+    assert_eq!(
+        dry_run.entries[0].queue_entry_id, fresh_out.entry.id,
+        "entries must follow integration topology, not historical queue IDs"
+    );
+    assert_eq!(
+        dry_run.entries[0].classification,
+        IntegrationReconcileClassification::StillPending
+    );
+    assert!(dry_run.entries[1..].iter().all(|entry| {
+        entry.classification == IntegrationReconcileClassification::AlreadyLanded
+            && entry.evidence.contains("submitted session head")
+    }));
+
+    let applied = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: true,
+            resolution_file: None,
+        })
+        .unwrap();
+    assert!(applied.safe && applied.applied, "{applied:#?}");
+    assert!(
+        Command::new("git")
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                &upstream,
+                "aethyme/integration"
+            ])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/c.py"),
+        "c = 2\n"
+    );
+
+    let status = broker.status(0).unwrap();
+    assert!(
+        status.main_behind_upstream_commits > 0,
+        "expected stale local main: main={}, upstream={:?}, integration={}",
+        status.main_head,
+        status.upstream_head,
+        status.integration_head
+    );
+    let upstream_advice = status
+        .advice
+        .iter()
+        .find(|advice| advice.id == "integration.upstream-main-ahead")
+        .unwrap();
+    assert_eq!(upstream_advice.severity, StatusAdviceSeverity::Notice);
+    assert!(upstream_advice.commands.is_empty());
+    let integration_status = broker.integration_status(0).unwrap();
+    assert!(
+        !integration_status
+            .next_action
+            .summary
+            .contains("reconcile before")
+    );
+}
+
+#[test]
 fn failed_reconciliation_rolls_back_ref_and_database() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

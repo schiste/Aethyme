@@ -22,7 +22,7 @@ use std::path::Path;
 use crate::broker::{Broker, BrokerOpError};
 use crate::gates::GateRunOutcome;
 use crate::git::GitRepo;
-use crate::types::{MergeQueueEntry, MergeStatus};
+use crate::types::{MergeQueueEntry, MergeStatus, SessionStatus};
 
 pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
@@ -385,6 +385,34 @@ impl Broker {
             .map(|e| e.id)
             .collect();
         for stale_id in stale {
+            // Promoting an entry can recursively re-simulate and promote
+            // another queued entry. Re-read both queue and session state so
+            // the outer stale snapshot cannot promote that entry twice, and
+            // never resurrect abandoned work owned by a cleaned session.
+            let Ok(stale_entry) = self.queue_entry(stale_id) else {
+                continue;
+            };
+            if !matches!(
+                stale_entry.status,
+                MergeStatus::Submitted
+                    | MergeStatus::Simulating
+                    | MergeStatus::Verified
+                    | MergeStatus::Conflict
+            ) {
+                continue;
+            }
+            let Ok(stale_session) = self.store().session(stale_entry.session_id) else {
+                continue;
+            };
+            if stale_session.status == SessionStatus::Cleaned {
+                let _ = self.store().set_merge_status(
+                    stale_id,
+                    MergeStatus::Superseded,
+                    None,
+                    Some("{\"reason\":\"session cleaned before queue revalidation\"}"),
+                );
+                continue;
+            }
             // Best effort: a failure re-simulating one entry must not
             // abort the promotion that already happened.
             let _ = self.simulate_and_gate(stale_id);

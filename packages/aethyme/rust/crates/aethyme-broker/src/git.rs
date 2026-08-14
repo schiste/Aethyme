@@ -340,6 +340,25 @@ impl GitRepo {
             .collect())
     }
 
+    /// First-parent commits reachable from `to` but not `from`, oldest
+    /// first. Integration reconciliation uses this to inspect only the
+    /// broker-created layer, excluding submitted heads attached as second
+    /// parents of promotion merges.
+    pub fn first_parent_commits_between_oldest(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<String>, GitError> {
+        let range = format!("{from}..{to}");
+        Ok(run_git(
+            &self.root,
+            &["rev-list", "--first-parent", "--reverse", &range],
+        )?
+        .lines()
+        .map(str::to_string)
+        .collect())
+    }
+
     /// Stable patch id for the cumulative diff `from..to`. Empty diffs
     /// have no patch id and return `None`.
     pub fn patch_id_between(&self, from: &str, to: &str) -> Result<Option<String>, GitError> {

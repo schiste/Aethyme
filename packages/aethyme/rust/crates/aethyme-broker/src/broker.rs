@@ -1650,7 +1650,10 @@ impl Broker {
             &changed_files,
             &conflicts,
         );
-        if main_behind_upstream_commits > 0 {
+        let integration_contains_upstream = upstream_head
+            .as_deref()
+            .is_some_and(|upstream| self.repo.is_ancestor(upstream, &head));
+        if main_behind_upstream_commits > 0 && !integration_contains_upstream {
             let upstream = upstream_ref.as_deref().unwrap_or("@{upstream}");
             next_action = IntegrationNextAction {
                 summary: format!(
@@ -1793,26 +1796,43 @@ impl Broker {
             &integration_branch,
             &integration_head,
         );
+        let integration_contains_upstream = upstream_head
+            .as_deref()
+            .is_some_and(|upstream| self.repo.is_ancestor(upstream, &integration_head));
         if main_behind_upstream_commits > 0 {
             let upstream = upstream_ref.as_deref().unwrap_or("@{upstream}");
             advice.insert(
                 0,
                 StatusAdvice {
-                    id: "integration.upstream-main-ahead".into(),
-                    severity: StatusAdviceSeverity::Blocked,
+                    id: "integration.upstream-main-ahead",
+                    severity: if integration_contains_upstream {
+                        StatusAdviceSeverity::Notice
+                    } else {
+                        StatusAdviceSeverity::Blocked
+                    },
                     reason: "configured upstream has commits absent from local main",
-                    summary: format!(
-                        "local main is {main_behind_upstream_commits} commits behind {upstream}; repair and submit are unsafe until integration is reconciled"
-                    ),
+                    summary: if integration_contains_upstream {
+                        format!(
+                            "local main is {main_behind_upstream_commits} commits behind {upstream}; integration already contains upstream, so broker operations remain safe"
+                        )
+                    } else {
+                        format!(
+                            "local main is {main_behind_upstream_commits} commits behind {upstream}; repair and submit are unsafe until integration is reconciled"
+                        )
+                    },
                     session_id: None,
                     queue_entry_id: None,
                     evidence: vec![
                         format!("local main: {}", short_commit(&main_head)),
                         format!("{upstream}: {}", short_commit(upstream_head.as_deref().unwrap_or(""))),
                     ],
-                    commands: vec![format!(
-                        "aethyme broker integration reconcile --upstream {upstream} --dry-run"
-                    )],
+                    commands: if integration_contains_upstream {
+                        Vec::new()
+                    } else {
+                        vec![format!(
+                            "aethyme broker integration reconcile --upstream {upstream} --dry-run"
+                        )]
+                    },
                 },
             );
         }
