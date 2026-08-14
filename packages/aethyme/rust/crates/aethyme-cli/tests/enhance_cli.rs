@@ -95,12 +95,16 @@ fn agents_document_includes_broker_protocol_only_when_configured() {
         "stash, merge, cherry-pick, rebase, revert, reset, tag, push",
         "force-push when explicitly authorized",
         "deletion of an exact ref",
+        "Operations that require coordination **must go through the broker**",
+        "Direct Git is limited to read-only inspection",
+        "must not run outside the broker",
         "broker exec --session <your-session-id> -- git <operation>",
         "Do not infer permission to publish",
     ] {
         assert!(agents.contains(needle), "AGENTS.md missing {needle:?}");
     }
     assert!(!agents.contains("**Never** push"));
+    assert!(!agents.contains("Direct Git commands are also permitted when appropriate"));
     // CLAUDE.md renders from the same generated document.
     assert!(read(repo.join("CLAUDE.md")).contains("## Broker Coordination"));
 }
