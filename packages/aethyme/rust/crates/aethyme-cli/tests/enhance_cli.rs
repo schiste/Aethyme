@@ -98,7 +98,11 @@ fn agents_document_includes_broker_protocol_only_when_configured() {
         "Operations that require coordination **must go through the broker**",
         "Direct Git is limited to read-only inspection",
         "must not run outside the broker",
-        "broker exec --session <your-session-id> -- git <operation>",
+        "broker git --session <your-session-id>",
+        "broker gh --session <your-session-id>",
+        "Every GitHub repository or account mutation",
+        "broker operations reconcile",
+        "--effect read|write|destructive --scope <resource>",
         "Do not infer permission to publish",
     ] {
         assert!(agents.contains(needle), "AGENTS.md missing {needle:?}");

@@ -216,6 +216,8 @@ fn print_top_level_help() {
     eprintln!("  broker status              show sessions, conflicts, queue, and integration");
     eprintln!("  broker finish --session <id> safely close a completed session");
     eprintln!("  broker leases [claim|release] inspect or manage path ownership");
+    eprintln!("  broker git|gh --session <id> coordinate Git and GitHub operations");
+    eprintln!("  broker operations          inspect/reconcile the remote-operation journal");
     eprintln!("  broker adopt|start-agent|agents|cleanup   (see `broker --help`)");
     eprintln!();
     eprintln!("Setup:");

@@ -52,10 +52,23 @@ agent sessions working here concurrently:
    and exact-ref deletion. Operations that require coordination must go
    through the broker. Use a dedicated broker workflow when one exists;
    otherwise run the authorized Git operation through
-   `aethyme broker exec --session <id> -- git <operation> ...`. Direct Git is
+   `aethyme broker git --session <id> [--repo <owner/name>] --reason "<authorization>" -- <git-args> ...`.
+   Read-only GitHub CLI inspection and explicitly authorized local `gh auth`
+   setup may run directly. Every GitHub repository or account mutation
+   must run through
+   `aethyme broker gh --session <id> --repo <owner/name> --reason "<authorization>" -- <gh-args> ...`.
+   For an unrecognized command, declare
+   `--effect read|write|destructive --scope <resource>` before `--`;
+   destructive operations also require `--destructive`. Every coordinated
+   write requires a concise `--reason` identifying its
+   authorization. Reconcile a
+   crash-ambiguous outcome with `aethyme broker operations reconcile` after
+   inspecting external state; never retry it blindly. Direct Git is
    limited to read-only inspection and operations confined to the isolated
-   session worktree and session branch that cannot affect other sessions. Any
-   command that can move shared refs, the default branch,
+   session worktree and session branch that cannot affect other sessions.
+   Direct `gh` is limited to read-only inspection and local authentication
+   setup. Any command that can move
+   shared refs, the default branch,
    `aethyme/integration`, remote-tracking refs, tags, or remote state must not
    run outside the broker.
    Destructive or remote operations still require their normal authorization

@@ -15,9 +15,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::error::BrokerError;
 use crate::schema::{self, EVENTS_SCHEMA_VERSION};
 use crate::types::{
-    Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease, LeaseKind, MergeQueueEntry,
-    MergeStatus, NewGateResult, NewPrWatchState, NewSession, PrWatchState, Session, SessionOrigin,
-    SessionStatus,
+    CoordinatedOperation, Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease,
+    LeaseKind, MergeQueueEntry, MergeStatus, NewCoordinatedOperation, NewGateResult,
+    NewPrWatchState, NewSession, OperationEffect, OperationProvider, OperationStatus, PrWatchState,
+    Session, SessionOrigin, SessionStatus,
 };
 
 /// Milliseconds a writer waits on a locked database before erroring.
@@ -992,6 +993,166 @@ impl BrokerStore {
             .expect("upserted pr_watch_state row should be readable"))
     }
 
+    // ── coordinated operations ───────────────────────────────────────
+
+    pub fn create_coordinated_operation(
+        &mut self,
+        operation: &NewCoordinatedOperation,
+    ) -> Result<CoordinatedOperation, BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO coordinated_operations (
+                 session_id, provider, repository, scope, effect, status,
+                 authorization_reason, command_json, pid, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'prepared', ?6, ?7, ?8, ?9, ?9)",
+            params![
+                operation.session_id,
+                operation.provider.as_str(),
+                operation.repository,
+                operation.scope,
+                operation.effect.as_str(),
+                operation.authorization_reason,
+                operation.command_json,
+                operation.pid,
+                now,
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        let payload = crate::events::operation_payload(
+            id,
+            operation.provider,
+            &operation.repository,
+            &operation.scope,
+            operation.effect,
+            OperationStatus::Prepared,
+            None,
+        );
+        insert_event(
+            &tx,
+            now,
+            "operation.prepared",
+            Some(operation.session_id),
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        self.coordinated_operation(id)?
+            .ok_or(BrokerError::CoordinatedOperationNotFound(id))
+    }
+
+    pub fn coordinated_operation(
+        &self,
+        id: i64,
+    ) -> Result<Option<CoordinatedOperation>, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT id, session_id, provider, repository, scope, effect,
+                        status, authorization_reason, command_json, pid,
+                        exit_code, details_json,
+                        created_at, updated_at, finished_at
+                 FROM coordinated_operations WHERE id = ?1",
+                [id],
+                coordinated_operation_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    pub fn coordinated_operations(&self) -> Result<Vec<CoordinatedOperation>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, provider, repository, scope, effect,
+                    status, authorization_reason, command_json, pid,
+                    exit_code, details_json,
+                    created_at, updated_at, finished_at
+             FROM coordinated_operations ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], coordinated_operation_from_row)?;
+        let mut operations = Vec::new();
+        for row in rows {
+            operations.push(row??);
+        }
+        Ok(operations)
+    }
+
+    pub fn unresolved_coordinated_operations(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<CoordinatedOperation>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, provider, repository, scope, effect,
+                    status, authorization_reason, command_json, pid,
+                    exit_code, details_json,
+                    created_at, updated_at, finished_at
+             FROM coordinated_operations
+             WHERE repository = ?1
+               AND effect <> 'read'
+               AND status IN ('prepared', 'running', 'outcome_unknown')
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([repository], coordinated_operation_from_row)?;
+        let mut operations = Vec::new();
+        for row in rows {
+            operations.push(row??);
+        }
+        Ok(operations)
+    }
+
+    pub fn transition_coordinated_operation(
+        &mut self,
+        id: i64,
+        status: OperationStatus,
+        exit_code: Option<i64>,
+        details_json: Option<&str>,
+    ) -> Result<CoordinatedOperation, BrokerError> {
+        let operation = self
+            .coordinated_operation(id)?
+            .ok_or(BrokerError::CoordinatedOperationNotFound(id))?;
+        let now = now_ms();
+        let finished_at = matches!(
+            status,
+            OperationStatus::Succeeded
+                | OperationStatus::Failed
+                | OperationStatus::OutcomeUnknown
+                | OperationStatus::ReconciledSucceeded
+                | OperationStatus::ReconciledFailed
+        )
+        .then_some(now);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE coordinated_operations
+             SET status = ?2, exit_code = ?3, details_json = ?4,
+                 updated_at = ?5, finished_at = ?6
+             WHERE id = ?1",
+            params![
+                id,
+                status.as_str(),
+                exit_code,
+                details_json,
+                now,
+                finished_at,
+            ],
+        )?;
+        let payload = crate::events::operation_payload(
+            id,
+            operation.provider,
+            &operation.repository,
+            &operation.scope,
+            operation.effect,
+            status,
+            exit_code,
+        );
+        insert_event(
+            &tx,
+            now,
+            &format!("operation.{}", status.as_str()),
+            Some(operation.session_id),
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        self.coordinated_operation(id)?
+            .ok_or(BrokerError::CoordinatedOperationNotFound(id))
+    }
+
     // ── events ────────────────────────────────────────────────────────
 
     /// Append one event. Most mutations already emit their own event in
@@ -1177,6 +1338,31 @@ fn pr_watch_from_row(row: &rusqlite::Row<'_>) -> RowResult<PrWatchState> {
         last_agent_session_id: row.get(6)?,
         updated_at: row.get(7)?,
     }))
+}
+
+fn coordinated_operation_from_row(row: &rusqlite::Row<'_>) -> RowResult<CoordinatedOperation> {
+    let provider: String = row.get(2)?;
+    let effect: String = row.get(5)?;
+    let status: String = row.get(6)?;
+    Ok((|| {
+        Ok(CoordinatedOperation {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            provider: OperationProvider::parse(&provider)?,
+            repository: row.get(3)?,
+            scope: row.get(4)?,
+            effect: OperationEffect::parse(&effect)?,
+            status: OperationStatus::parse(&status)?,
+            authorization_reason: row.get(7)?,
+            command_json: row.get(8)?,
+            pid: row.get(9)?,
+            exit_code: row.get(10)?,
+            details_json: row.get(11)?,
+            created_at: row.get(12)?,
+            updated_at: row.get(13)?,
+            finished_at: row.get(14)?,
+        })
+    })())
 }
 
 fn insert_event(

@@ -69,6 +69,19 @@ Usage:
       Run a command in the session worktree, then fail if it leaves new
       dirty paths outside explicit leases or in adoption-time foreign
       files. Exports AETHYME_TEST_DB_SUFFIX=s<id>-exec.
+  aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--json] -- <git-args>
+      Run Git through the durable operation coordinator. Remote Git commands
+      require an exact --repo. Repository writes are serialized, journaled,
+      and fail closed after a crash with an unknown remote outcome.
+  aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--json] -- <gh-args>
+      Run GitHub CLI through the same repository coordinator. The broker sets
+      GH_REPO from the exact target and never persists command output or
+      secret-bearing argument values.
+  aethyme broker operations [--json]
+      List the durable coordinated-operation journal.
+  aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]
+      Resolve a crash-ambiguous operation after independently inspecting the
+      remote state. Overlapping writes remain blocked until reconciliation.
   aethyme broker gates validate [--json]
       Parse and validate .aethyme/gates.toml.
   aethyme broker gates affected --session <id> [--json]
@@ -236,6 +249,10 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "start",
         "start-agent",
         "exec",
+        "git",
+        "gh",
+        "operations",
+        "reconcile",
         "agents",
         "leases",
         "claim",
@@ -316,6 +333,20 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
 fn command_records_metric(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
         Some("certify" | "queue" | "metrics") => false,
+        Some("operations") => args.get(1).map(String::as_str) == Some("reconcile"),
+        Some("git" | "gh") => {
+            let command = args
+                .iter()
+                .position(|arg| arg == "--")
+                .map(|index| &args[index + 1..])
+                .unwrap_or(&[]);
+            let effect = if args.first().map(String::as_str) == Some("git") {
+                crate::classify_git(command)
+            } else {
+                crate::classify_gh(command)
+            };
+            effect != Some(crate::OperationEffect::Read)
+        }
         Some("hooks") => args.get(1).map(String::as_str) != Some("status"),
         Some("events") => args.get(1).map(String::as_str) == Some("prune"),
         Some("gates") => !matches!(
@@ -346,6 +377,19 @@ mod tests {
             args(&["gates", "affected", "--session", "7"]),
             args(&["gates", "semantic", "--session", "7"]),
             args(&["doctor"]),
+            args(&["operations"]),
+            args(&["git", "--session", "7", "--", "status"]),
+            args(&[
+                "gh",
+                "--session",
+                "7",
+                "--repo",
+                "o/r",
+                "--",
+                "pr",
+                "view",
+                "1",
+            ]),
         ] {
             assert!(
                 !super::command_records_metric(&command),
@@ -362,6 +406,19 @@ mod tests {
             args(&["agents"]),
             args(&["leases"]),
             args(&["integration", "status"]),
+            args(&["operations", "reconcile", "--operation", "1"]),
+            args(&["git", "--session", "7", "--", "push"]),
+            args(&[
+                "gh",
+                "--session",
+                "7",
+                "--repo",
+                "o/r",
+                "--",
+                "pr",
+                "merge",
+                "1",
+            ]),
         ] {
             assert!(
                 super::command_records_metric(&command),
@@ -471,6 +528,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_coordinated_github_operation() {
+        let args = vec![
+            "--session".to_string(),
+            "7".to_string(),
+            "--repo".to_string(),
+            "owner/repo".to_string(),
+            "--scope".to_string(),
+            "pull-request:42".to_string(),
+            "--effect".to_string(),
+            "write".to_string(),
+            "--reason".to_string(),
+            "reviewed release workflow".to_string(),
+            "--".to_string(),
+            "pr".to_string(),
+            "merge".to_string(),
+            "42".to_string(),
+        ];
+        let parsed = match super::parse(&args) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("coordinated gh operation should parse"),
+        };
+
+        assert_eq!(parsed.session, Some(7));
+        assert_eq!(parsed.repository.as_deref(), Some("owner/repo"));
+        assert_eq!(parsed.scope.as_deref(), Some("pull-request:42"));
+        assert_eq!(parsed.effect.as_deref(), Some("write"));
+        assert_eq!(parsed.reason.as_deref(), Some("reviewed release workflow"));
+        assert_eq!(parsed.exec_command, vec!["pr", "merge", "42"]);
+    }
+
+    #[test]
     fn parse_accepts_pr_check_routing_flags() {
         let args = vec![
             "check".to_string(),
@@ -514,10 +602,16 @@ struct Parsed {
     task: Option<String>,
     cmd: Option<String>,
     target: Option<String>,
+    repository: Option<String>,
+    scope: Option<String>,
+    effect: Option<String>,
+    outcome: Option<String>,
+    reason: Option<String>,
     agent: Option<String>,
     pr_number: Option<i64>,
     session: Option<i64>,
     entry: Option<i64>,
+    operation: Option<i64>,
     ttl_seconds: Option<i64>,
     since: Option<i64>,
     kind: Option<String>,
@@ -538,6 +632,7 @@ struct Parsed {
     with_gate: bool,
     apply: bool,
     dry_run: bool,
+    destructive: bool,
     exec_command: Vec<String>,
 }
 
@@ -547,10 +642,16 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         task: None,
         cmd: None,
         target: None,
+        repository: None,
+        scope: None,
+        effect: None,
+        outcome: None,
+        reason: None,
         agent: None,
         pr_number: None,
         session: None,
         entry: None,
+        operation: None,
         ttl_seconds: None,
         since: None,
         kind: None,
@@ -571,6 +672,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         with_gate: false,
         apply: false,
         dry_run: false,
+        destructive: false,
         exec_command: Vec::new(),
     };
     let mut iter = args.iter();
@@ -600,6 +702,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--with-gate" => parsed.with_gate = true,
             "--apply" => parsed.apply = true,
             "--dry-run" => parsed.dry_run = true,
+            "--destructive" => parsed.destructive = true,
             "--replace-stale" => parsed.replace_stale = true,
             "--kind" => {
                 parsed.kind = Some(
@@ -662,6 +765,41 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                         .clone(),
                 )
             }
+            "--repo" => {
+                parsed.repository = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--repo requires owner/name".into()))?
+                        .clone(),
+                )
+            }
+            "--scope" => {
+                parsed.scope = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--scope requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--effect" => {
+                parsed.effect = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--effect requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--outcome" => {
+                parsed.outcome = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--outcome requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--reason" => {
+                parsed.reason = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--reason requires a value".into()))?
+                        .clone(),
+                )
+            }
             "--agent" => {
                 parsed.agent = Some(
                     iter.next()
@@ -691,6 +829,14 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                     .ok_or(UsageError::Message("--entry requires a value".into()))?;
                 parsed.entry = Some(value.parse().map_err(|_| {
                     UsageError::Message("--entry must be an integer queue entry id".into())
+                })?);
+            }
+            "--operation" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--operation requires a value".into()))?;
+                parsed.operation = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--operation must be an integer operation id".into())
                 })?);
             }
             "--ttl" => {
@@ -1367,6 +1513,49 @@ fn open_broker() -> Result<Broker, UsageError> {
     Ok(Broker::open(&cwd)?)
 }
 
+fn parse_operation_effect(
+    value: Option<&str>,
+) -> Result<Option<crate::OperationEffect>, UsageError> {
+    value
+        .map(|value| {
+            crate::OperationEffect::parse(value).map_err(|_| {
+                UsageError::Message("--effect must be read, write, or destructive".into())
+            })
+        })
+        .transpose()
+}
+
+fn render_coordinated_operation(
+    report: &crate::CoordinatedOperationReport,
+    json: bool,
+) -> Result<(), UsageError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        if !report.stdout.is_empty() {
+            print!("{}", report.stdout);
+            if !report.stdout.ends_with('\n') {
+                println!();
+            }
+        }
+        if !report.stderr.is_empty() {
+            eprint!("{}", report.stderr);
+            if !report.stderr.ends_with('\n') {
+                eprintln!();
+            }
+        }
+        println!(
+            "operation {}: {} {} on {} ({})",
+            report.operation.id,
+            report.operation.provider.as_str(),
+            report.operation.status.as_str(),
+            report.operation.repository,
+            report.classification,
+        );
+    }
+    Ok(())
+}
+
 fn run_inner(args: &[String]) -> Result<(), UsageError> {
     let Some(subcommand) = args.first() else {
         return Err(UsageError::Help);
@@ -1588,6 +1777,100 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 return Err(UsageError::Message(
                     "guarded exec failed ownership or command checks".into(),
                 ));
+            }
+        }
+        "git" | "gh" => {
+            let session = parsed.session.ok_or(UsageError::Message(format!(
+                "{subcommand} requires --session <id>"
+            )))?;
+            let provider = if subcommand == "git" {
+                crate::OperationProvider::Git
+            } else {
+                crate::OperationProvider::Github
+            };
+            let request = crate::CoordinatedCommand {
+                session_id: session,
+                provider,
+                repository: parsed.repository,
+                scope: parsed.scope,
+                declared_effect: parse_operation_effect(parsed.effect.as_deref())?,
+                destructive_confirmed: parsed.destructive,
+                authorization_reason: parsed.reason,
+                args: parsed.exec_command,
+            };
+            let mut broker = open_broker()?;
+            let report = broker.run_coordinated_operation(request)?;
+            render_coordinated_operation(&report, parsed.json)?;
+            if !report.ok() {
+                return Err(UsageError::Message(format!(
+                    "coordinated {subcommand} operation {} failed",
+                    report.operation.id
+                )));
+            }
+        }
+        "operations" => {
+            let mut broker = open_broker()?;
+            match parsed.positional.first().map(String::as_str) {
+                None => {
+                    let operations = broker.store().coordinated_operations()?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&operations)?);
+                    } else if operations.is_empty() {
+                        println!("No coordinated operations recorded.");
+                    } else {
+                        println!(
+                            "{:<5} {:<8} {:<12} {:<22} SCOPE",
+                            "ID", "TOOL", "STATUS", "REPOSITORY"
+                        );
+                        for operation in operations {
+                            println!(
+                                "{:<5} {:<8} {:<12} {:<22} {}",
+                                operation.id,
+                                operation.provider.as_str(),
+                                operation.status.as_str(),
+                                operation.repository,
+                                operation.scope,
+                            );
+                        }
+                    }
+                }
+                Some("reconcile") => {
+                    let operation = parsed.operation.ok_or(UsageError::Message(
+                        "operations reconcile requires --operation <id>".into(),
+                    ))?;
+                    let outcome = parsed.outcome.as_deref().ok_or(UsageError::Message(
+                        "operations reconcile requires --outcome succeeded|failed".into(),
+                    ))?;
+                    let succeeded = match outcome {
+                        "succeeded" => true,
+                        "failed" => false,
+                        _ => {
+                            return Err(UsageError::Message(
+                                "--outcome must be succeeded or failed".into(),
+                            ));
+                        }
+                    };
+                    let reason = parsed.reason.as_deref().ok_or(UsageError::Message(
+                        "operations reconcile requires --reason <text>".into(),
+                    ))?;
+                    let report =
+                        broker.reconcile_coordinated_operation(operation, succeeded, reason)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!(
+                            "operation {} reconciled as {}: {}",
+                            report.operation.id,
+                            report.operation.status.as_str(),
+                            report.reason,
+                        );
+                    }
+                }
+                Some(other) => {
+                    return Err(UsageError::Message(format!(
+                        "unknown operations action {other:?} — expected reconcile"
+                    )));
+                }
             }
         }
         "gates" => {

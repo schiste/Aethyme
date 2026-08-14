@@ -269,16 +269,37 @@ Follow this protocol:
 
    Operations that require coordination **must go through the broker**. Use a
    dedicated broker workflow when one exists (for example `broker submit` for
-   verified integration). Otherwise, run the authorized Git operation through
-   the session guard:
+   verified integration). Run other coordinated Git operations through the
+   durable Git operation coordinator:
 
    ```bash
-   aethyme broker exec --session <your-session-id> -- git <operation> ...
+   aethyme broker git --session <your-session-id> \
+     [--repo <owner/name>] --reason "<authorization>" -- <git-args> ...
    ```
+
+   Read-only GitHub CLI inspection and explicitly authorized local `gh auth`
+   setup may run directly. Every GitHub repository or account mutation
+   (pull requests, issues, comments, workflows, releases, settings, secrets,
+   or non-GET API calls) must use the GitHub operation coordinator:
+
+   ```bash
+   aethyme broker gh --session <your-session-id> \
+     --repo <owner/name> --reason "<authorization>" -- <gh-args> ...
+   ```
+
+   The broker classifies known commands and fails closed on ambiguity. Add
+   `--effect read|write|destructive --scope <resource>` before `--` for an
+   unrecognized command. Destructive operations also require `--destructive`.
+   Every coordinated write requires a concise `--reason` identifying the user
+   request or documented workflow that authorized it.
+   If a crashed command leaves an unknown outcome, inspect external state and
+   use `aethyme broker operations reconcile`; do not retry blindly.
 
    Direct Git is limited to read-only inspection and operations confined to
    the isolated session worktree and session branch that cannot affect other
-   sessions. Any command that can move shared refs, the default branch,
+   sessions. Direct `gh` is limited to read-only inspection and local
+   authentication setup. Any command that
+   can move shared refs, the default branch,
    `aethyme/integration`, remote-tracking refs, tags, or remote state is
    coordinated and must not run outside the broker. For destructive or remote
    operations, resolve the exact repository and refs first, preserve unrelated

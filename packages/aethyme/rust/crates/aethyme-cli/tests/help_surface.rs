@@ -15,6 +15,8 @@ fn top_level_help_names_the_normal_broker_lifecycle() {
         "broker status",
         "broker finish --session <id>",
         "broker leases [claim|release]",
+        "broker git|gh --session <id>",
+        "broker operations",
     ] {
         assert!(help.contains(command), "help omitted {command:?}\n{help}");
     }

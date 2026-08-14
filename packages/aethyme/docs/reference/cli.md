@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-08-06
+Last Updated: 2026-08-14
 
 ## Install
 
@@ -8,6 +8,11 @@ Last Updated: 2026-08-06
 cargo install --path packages/aethyme/rust/crates/aethyme-cli
 cargo install --path packages/aethyme/rust/crates/aethyme-engine
 ```
+
+Publishing a release does not update installed Cargo binaries. Users must
+reinstall both packages from the desired release checkout (or install the
+published version explicitly) and verify `aethyme --version`. Aethyme has no
+self-update daemon or silent background upgrade path.
 
 `aethyme` is a single Rust binary; no interpreter, virtualenv, or pip
 step is involved. **`python -m src.cli` no longer exists** — the Python
@@ -38,6 +43,9 @@ product surface.
 - `aethyme broker start`
 - `aethyme broker adopt`
 - `aethyme broker exec`
+- `aethyme broker git`
+- `aethyme broker gh`
+- `aethyme broker operations`
 - `aethyme broker submit`
 - `aethyme broker repair`
 - `aethyme broker finish`
@@ -80,6 +88,10 @@ The broker is the stable product front door for multi-agent coordination:
 - `aethyme broker start --task "..." [--json]`
 - `aethyme broker adopt [<path>] --task "..." [--reuse] [--json]`
 - `aethyme broker exec --session <id> -- <command> [--json]`
+- `aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <git-args>`
+- `aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <gh-args>`
+- `aethyme broker operations [--json]`
+- `aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]`
 - `aethyme broker submit --session <id> [--json]`
 - `aethyme broker repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
@@ -96,6 +108,29 @@ the run, so callers know whether the result proves the current integration tip.
 Frozen broker JSON contracts are limited to the commands listed in
 [`../../../../docs/json-contracts.md`](../../../../docs/json-contracts.md).
 Other `--json` outputs are useful but provisional.
+
+`broker git` and `broker gh` are the coordinated route for commands that can
+affect shared refs or GitHub state. The executable is fixed (no shell), known
+commands are classified as read, write, or destructive, and ambiguous commands
+fail closed unless `--effect` and `--scope` are declared. Destructive commands
+also require `--destructive`. Remote Git operations and every `gh` operation
+require an exact `--repo owner/name` target.
+Every write also requires a concise `--reason` identifying the user request or
+documented workflow that authorized the state change.
+
+Read-only `git`/`gh` inspection may run directly, as may explicitly authorized
+local `gh auth` setup. The broker route is mandatory when a command can mutate
+shared refs, GitHub repository/account state, or another session's surface.
+
+Writes take a cross-process repository lock and write prepared/running/terminal
+rows to the broker database. Command output is returned to the caller but never
+persisted; content- and secret-bearing argument values are redacted from the
+journal. If a process dies after starting, the next overlapping write marks the
+operation `outcome_unknown` and refuses to run. Inspect external state, then use
+`operations reconcile` to attest `succeeded` or `failed`; never retry an unknown
+operation blindly. A non-zero write is also `outcome_unknown`, because a remote
+command may apply only part of its requested change before failing. V1
+deliberately serializes all writes for one repository.
 
 `integration reconcile` is the recovery path when promoted work lands outside
 the broker, including squash merges. It never fetches: first update the remote

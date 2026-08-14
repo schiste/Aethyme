@@ -27,6 +27,7 @@ pub const GATE_CACHED: &str = "gate.cached";
 // merge.<status> kinds derive from MergeStatus::as_str.
 pub const MERGE_INTEGRATION_BRANCH_CREATED: &str = "merge.integration_branch_created";
 pub const MERGE_INTEGRATION_REFRESHED: &str = "merge.integration_refreshed";
+// operation.<status> transition kinds derive from OperationStatus::as_str.
 
 // ── payload constructors ─────────────────────────────────────────────
 // Each returns the canonical JSON payload for its kind. Field names are
@@ -90,6 +91,27 @@ pub fn integration_branch_created_payload(branch: &str, at_commit: &str) -> Stri
 
 pub fn integration_refreshed_payload(branch: &str, from: &str, to: &str) -> String {
     json!({ "branch": branch, "from": from, "to": to }).to_string()
+}
+
+pub fn operation_payload(
+    operation_id: i64,
+    provider: crate::types::OperationProvider,
+    repository: &str,
+    scope: &str,
+    effect: crate::types::OperationEffect,
+    status: crate::types::OperationStatus,
+    exit_code: Option<i64>,
+) -> String {
+    json!({
+        "operation_id": operation_id,
+        "provider": provider.as_str(),
+        "repository": repository,
+        "scope": scope,
+        "effect": effect.as_str(),
+        "status": status.as_str(),
+        "exit_code": exit_code,
+    })
+    .to_string()
 }
 
 pub fn merge_promoted_payload(branch: &str, commit: &str) -> String {

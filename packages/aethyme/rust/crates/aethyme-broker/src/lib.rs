@@ -31,6 +31,7 @@ pub mod hooks;
 pub mod init;
 mod leases;
 mod merge;
+mod operations;
 mod pr;
 mod quick_test;
 mod reconciliation;
@@ -58,6 +59,10 @@ pub use git::{GitError, GitRepo, MergeSimulation};
 pub use hooks::{HookReport, HookState, HooksError};
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use merge::{ACTION_REQUIRED_RELPATH, PromoteConfig, SubmitOutcome};
+pub use operations::{
+    CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport, classify_gh,
+    classify_git,
+};
 pub use pr::{
     PrActivityItem, PrCheckOptions, PrCheckReport, PrCheckRun, PrDecision, PrDecisionStatus,
     PrDispatchReport, PrDispatchStatus, PrError, PrMarker, PrSummary,
@@ -74,9 +79,10 @@ pub use reconciliation::{
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use store::BrokerStore;
 pub use types::{
-    Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease, LeaseKind, MergeQueueEntry,
-    MergeStatus, NewGateResult, NewPrWatchState, NewSession, PrWatchState, Session, SessionOrigin,
-    SessionStatus,
+    CoordinatedOperation, Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease,
+    LeaseKind, MergeQueueEntry, MergeStatus, NewCoordinatedOperation, NewGateResult,
+    NewPrWatchState, NewSession, OperationEffect, OperationProvider, OperationStatus, PrWatchState,
+    Session, SessionOrigin, SessionStatus,
 };
 pub use verify_loop::{
     VerifyLoopCommandReport, VerifyLoopReport, VerifyLoopStep, VerifyLoopStepStatus,

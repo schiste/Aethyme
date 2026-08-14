@@ -40,6 +40,9 @@ aethyme broker status
 aethyme broker start --task "Describe the task"
 aethyme broker leases claim <path> --session <id>
 aethyme broker exec --session <id> -- <command>
+aethyme broker git --session <id> [--repo <owner/name>] [--reason <text>] -- <git-args>
+aethyme broker gh --session <id> --repo <owner/name> [--reason <text>] -- <gh-args>
+aethyme broker operations
 # edit and commit in the session worktree
 aethyme broker submit --session <id>
 aethyme broker repair --session <id>
@@ -52,6 +55,7 @@ What this provides:
 - broker-created worktrees, with `adopt` available for existing worktrees
 - dirty-worktree visibility, explicit leases, and overlap warnings
 - guarded command execution for broad rewrites
+- durable, repository-serialized Git and GitHub mutations with crash recovery
 - merge simulation before promotion
 - repo-owned gates on the merged tree
 - promoted-but-unmerged integration visibility
@@ -86,6 +90,9 @@ These commands are the public product path and should stay easy to explain:
 - `aethyme broker start`
 - `aethyme broker adopt`
 - `aethyme broker exec`
+- `aethyme broker git`
+- `aethyme broker gh`
+- `aethyme broker operations`
 - `aethyme broker submit`
 - `aethyme broker repair`
 - `aethyme broker finish`
@@ -215,12 +222,12 @@ The contract is intentionally split:
 - the broker reads and routes deterministic facts: PR body marker, comments,
   reviews, status checks, last observed fingerprint, prompt path, and dispatch
   status
-- the agent performs subjective and mutating work: fetch full threads, decide
-  what is actionable, edit code, commit, push, reply, and resolve comments
+- the agent performs subjective work, while mutations such as push, reply, and
+  thread resolution run through `broker git` / `broker gh` after authorization
 - a thumbs-up marker means all good; looking-eyes or no marker means continue
   watching activity
 
-Because Git has no native post-push hook, "after successful push" automation
-should call the command from a push wrapper, CI/webhook worker, or Chau7/MCP
-controller. The broker command itself is the deterministic core that those
-surfaces reuse.
+Because Git has no native post-push hook, controllers should run the push via
+`broker git`, then call `broker pr check` after the coordinated operation
+succeeds. The broker commands are the deterministic core reused by CI/webhook
+workers and Chau7/MCP controllers.

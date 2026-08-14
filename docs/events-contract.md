@@ -17,7 +17,8 @@ Allowed **without** a version bump (additive-only evolution):
 - Adding a **new kind** (new dotted `<domain>.<what>` string).
 - Adding a **new payload field** to an existing kind.
 - Adding a new enum-derived kind by adding a variant to
-  `SessionStatus`/`GateStatus`/`MergeStatus` (variants are add-only).
+  `SessionStatus`/`GateStatus`/`MergeStatus`/`OperationStatus` (variants
+  are add-only).
 
 Requires a **schema_version bump** (breaking — never do this silently):
 
@@ -100,6 +101,10 @@ One JSON object per line:
 | `merge.superseded` | the session | — | a newer head from the same session replaced this entry |
 | `merge.integration_branch_created` | — | `branch`, `at` | first submit created the local integration branch |
 | `merge.integration_refreshed` | — | `branch`, `from`, `to` | integration fast-forwarded to main's HEAD (only when it held no unmerged promotions) |
+| `operation.prepared` / `.running` | the session | `operation_id`, `provider`, `repository`, `scope`, `effect`, `status`, `exit_code` (nullable) | a redacted Git/GitHub operation intent was durably recorded, then began while holding the repository write lock when required |
+| `operation.succeeded` / `.failed` | the session | same operation fields | the fixed `git` or `gh` subprocess exited and its definitive status was durably recorded (`failed` is used for reads or commands that never started) |
+| `operation.outcome_unknown` | the session | same operation fields | a previous writer released its process lock without recording an outcome, or a write exited non-zero after possibly applying partial effects; overlapping writes fail closed |
+| `operation.reconciled_succeeded` / `.reconciled_failed` | the session | same operation fields | an operator inspected external state and attested the crash-ambiguous outcome |
 
 ## Operational commands
 

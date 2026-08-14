@@ -86,6 +86,60 @@ text_enum!(MergeStatus, "merge_queue.status", {
     Superseded => "superseded",
 });
 
+text_enum!(OperationProvider, "coordinated_operations.provider", {
+    Git => "git",
+    Github => "github",
+});
+
+text_enum!(OperationEffect, "coordinated_operations.effect", {
+    Read => "read",
+    Write => "write",
+    Destructive => "destructive",
+});
+
+text_enum!(OperationStatus, "coordinated_operations.status", {
+    Prepared => "prepared",
+    Running => "running",
+    Succeeded => "succeeded",
+    Failed => "failed",
+    OutcomeUnknown => "outcome_unknown",
+    ReconciledSucceeded => "reconciled_succeeded",
+    ReconciledFailed => "reconciled_failed",
+});
+
+/// Durable intent recorded before a coordinated command starts.
+#[derive(Debug, Clone)]
+pub struct NewCoordinatedOperation {
+    pub session_id: i64,
+    pub provider: OperationProvider,
+    pub repository: String,
+    pub scope: String,
+    pub effect: OperationEffect,
+    pub authorization_reason: Option<String>,
+    /// Redacted JSON array. Secret-bearing argument values never enter the DB.
+    pub command_json: String,
+    pub pid: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CoordinatedOperation {
+    pub id: i64,
+    pub session_id: i64,
+    pub provider: OperationProvider,
+    pub repository: String,
+    pub scope: String,
+    pub effect: OperationEffect,
+    pub status: OperationStatus,
+    pub authorization_reason: Option<String>,
+    pub command_json: String,
+    pub pid: i64,
+    pub exit_code: Option<i64>,
+    pub details_json: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub finished_at: Option<i64>,
+}
+
 /// Input for registering a session. Attach-first: only the worktree and
 /// branch are identity; everything else is optional metadata.
 #[derive(Debug, Clone)]

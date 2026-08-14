@@ -32,9 +32,10 @@ Two design commitments underneath all of it:
   different vendors coordinate because sessions are vendor-agnostic
   worktrees, not because of per-vendor adapters.
 - **API-first.** The broker core is a typed Rust library; the CLI is a thin
-  client and every command has a `--json` form. The promotion lands on a
-  *local* integration branch only — the broker never pushes, never opens
-  PRs; your GitHub flow stays human and unchanged.
+  client and every command has a `--json` form. `broker submit` promotes to a
+  *local* integration branch only; explicitly authorized remote changes use
+  the durable `broker git` / `broker gh` coordinators instead of bypassing the
+  broker.
 
 For the current public product map, including the three canonical user
 journeys, command tiers, confidence commands, JSON stability, and the next
@@ -79,6 +80,11 @@ First-time flow: install -> `aethyme init` -> `aethyme broker quick-test` ->
 cargo install --path packages/aethyme/rust/crates/aethyme-cli
 cargo install --path packages/aethyme/rust/crates/aethyme-engine  # engine-daemon sibling
 ```
+
+Releases do not auto-update existing installations. To upgrade, check out the
+desired release and rerun both `cargo install --path` commands above, then run
+`aethyme --version`. The router and engine-daemon sibling should be upgraded
+together; Aethyme does not silently mutate installed binaries in the background.
 
 **2. Certify and scaffold your target repo:**
 
