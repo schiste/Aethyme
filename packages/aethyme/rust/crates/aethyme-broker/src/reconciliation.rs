@@ -4,7 +4,8 @@
 //! This module deliberately does not fetch. Operators decide when remote
 //! state is current; reconciliation only inspects the named local ref.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use crate::broker::{Broker, BrokerOpError};
 use crate::store::ReconciliationQueueUpdate;
@@ -14,9 +15,10 @@ use crate::types::{MergeQueueEntry, MergeStatus};
 pub struct IntegrationReconcileOptions {
     pub upstream: String,
     pub apply: bool,
+    pub resolution_file: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegrationReconcileClassification {
     AlreadyLanded,
@@ -24,6 +26,35 @@ pub enum IntegrationReconcileClassification {
     StillPending,
     GenuinelyConflicting,
     Ambiguous,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntegrationReconcileResolutionFile {
+    schema_version: u32,
+    upstream_ref: String,
+    upstream_commit: String,
+    old_integration: String,
+    operator: String,
+    resolutions: Vec<IntegrationReconcileResolution>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntegrationReconcileResolution {
+    queue_entry_id: i64,
+    old_merge_commit: String,
+    classification: IntegrationReconcileClassification,
+    reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IntegrationReconcileResolutionAudit {
+    pub operator: String,
+    pub reason: String,
+    pub resolution_file: String,
+    pub upstream_commit: String,
+    pub old_integration: String,
 }
 
 impl IntegrationReconcileClassification {
@@ -51,6 +82,8 @@ pub struct IntegrationReconcileEntry {
     pub files: Vec<String>,
     pub conflicts: Vec<String>,
     pub evidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator_resolution: Option<IntegrationReconcileResolutionAudit>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -64,6 +97,8 @@ pub struct IntegrationReconcileReport {
     pub safe: bool,
     pub applied: bool,
     pub entries: Vec<IntegrationReconcileEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_file: Option<String>,
     pub warnings: Vec<String>,
     pub next_action: String,
 }
@@ -74,6 +109,12 @@ struct Candidate {
     merge_commit: String,
     old_parent: String,
     files: Vec<String>,
+}
+
+struct LoadedOperatorResolutions {
+    path: String,
+    operator: String,
+    resolutions: BTreeMap<i64, IntegrationReconcileResolution>,
 }
 
 impl Broker {
@@ -120,6 +161,8 @@ impl Broker {
             })?;
         let local_main = self.repo_handle().head_commit()?;
         let (branch, old_integration) = self.integration_head()?;
+        let operator_resolutions =
+            load_operator_resolutions(&options, &upstream_head, &old_integration)?;
         let mut report = IntegrationReconcileReport {
             branch: branch.clone(),
             upstream_ref: options.upstream.clone(),
@@ -130,6 +173,9 @@ impl Broker {
             safe: true,
             applied: false,
             entries: Vec::new(),
+            resolution_file: operator_resolutions
+                .as_ref()
+                .map(|loaded| loaded.path.clone()),
             warnings: Vec::new(),
             next_action: String::new(),
         };
@@ -199,6 +245,10 @@ impl Broker {
                 "inspect integration history and broker queue records; no refs or broker rows were changed"
                     .into();
             return Ok(report);
+        }
+
+        if let Some(loaded) = operator_resolutions.as_ref() {
+            validate_resolution_candidates(loaded, &candidates)?;
         }
 
         let upstream_commits = self
@@ -312,6 +362,55 @@ impl Broker {
             }
         }
 
+        // Explicit operator attestations are evaluated only after every
+        // conclusive automatic matcher. They cannot replace machine-derived
+        // evidence, and they run before replay so one resolved conflict can
+        // unblock classification of every later queue entry.
+        if let Some(loaded) = operator_resolutions.as_ref() {
+            for (index, candidate) in candidates.iter().enumerate() {
+                let Some(resolution) = loaded.resolutions.get(&candidate.entry.id) else {
+                    continue;
+                };
+                if let Some(automatic) = classified[index].as_ref()
+                    && matches!(
+                        automatic.classification,
+                        IntegrationReconcileClassification::AlreadyLanded
+                            | IntegrationReconcileClassification::SupersededUpstream
+                    )
+                {
+                    return Err(invalid_resolution(
+                        &loaded.path,
+                        format!(
+                            "queue entry {} is already classified automatically as {}; remove its redundant operator resolution",
+                            candidate.entry.id,
+                            automatic.classification.as_str()
+                        ),
+                    ));
+                }
+                let audit = IntegrationReconcileResolutionAudit {
+                    operator: loaded.operator.clone(),
+                    reason: resolution.reason.trim().to_string(),
+                    resolution_file: loaded.path.clone(),
+                    upstream_commit: upstream_head.clone(),
+                    old_integration: old_integration.clone(),
+                };
+                let mut entry = entry_report(
+                    candidate,
+                    IntegrationReconcileClassification::SupersededUpstream,
+                    Some(upstream_head.clone()),
+                    None,
+                    Vec::new(),
+                    format!(
+                        "operator {} attested that this promotion is superseded upstream: {}",
+                        loaded.operator,
+                        resolution.reason.trim()
+                    ),
+                );
+                entry.operator_resolution = Some(audit);
+                classified[index] = Some(entry);
+            }
+        }
+
         let mut rebuilt = upstream_head.clone();
         let mut replay_blocked = false;
         for (index, candidate) in candidates.iter().enumerate() {
@@ -388,16 +487,22 @@ impl Broker {
         report.new_integration = rebuilt;
 
         if !report.safe {
-            report.next_action =
-                "resolve the ambiguous/conflicting entries manually; no refs or broker rows were changed"
-                    .into();
+            report.next_action = if report.resolution_file.is_some() {
+                "the resolution file does not cover every ambiguous/conflicting entry; update the attestation and rerun the dry-run; no refs or broker rows were changed".into()
+            } else {
+                "automatic evidence is insufficient; review the blocked entries and use a commit-bound --resolution-file to attest only work that upstream supersedes; no refs or broker rows were changed".into()
+            };
             return Ok(report);
         }
         if !options.apply {
-            report.next_action = format!(
-                "review this dry-run, then run `aethyme broker integration reconcile --upstream {} --apply`",
-                options.upstream
-            );
+            report.next_action = if report.resolution_file.is_some() {
+                "review this dry-run and its operator attestations, then rerun the same command with --apply".into()
+            } else {
+                format!(
+                    "review this dry-run, then run `aethyme broker integration reconcile --upstream {} --apply`",
+                    options.upstream
+                )
+            };
             return Ok(report);
         }
 
@@ -441,6 +546,149 @@ impl Broker {
     }
 }
 
+fn load_operator_resolutions(
+    options: &IntegrationReconcileOptions,
+    upstream_head: &str,
+    old_integration: &str,
+) -> Result<Option<LoadedOperatorResolutions>, BrokerOpError> {
+    let Some(path) = options.resolution_file.as_ref() else {
+        return Ok(None);
+    };
+    let path_label = path.display().to_string();
+    let bytes = std::fs::read(path)
+        .map_err(|error| invalid_resolution(&path_label, format!("cannot read file: {error}")))?;
+    let document: IntegrationReconcileResolutionFile = serde_json::from_slice(&bytes)
+        .map_err(|error| invalid_resolution(&path_label, format!("invalid JSON: {error}")))?;
+
+    if document.schema_version != 1 {
+        return Err(invalid_resolution(
+            &path_label,
+            format!(
+                "unsupported schema_version {}; expected 1",
+                document.schema_version
+            ),
+        ));
+    }
+    if document.upstream_ref != options.upstream {
+        return Err(invalid_resolution(
+            &path_label,
+            format!(
+                "upstream_ref {:?} does not match requested upstream {:?}",
+                document.upstream_ref, options.upstream
+            ),
+        ));
+    }
+    if document.upstream_commit != upstream_head {
+        return Err(invalid_resolution(
+            &path_label,
+            format!(
+                "upstream_commit {} does not match current {} head {}; fetch/review upstream and create a new attestation",
+                document.upstream_commit, options.upstream, upstream_head
+            ),
+        ));
+    }
+    if document.old_integration != old_integration {
+        return Err(invalid_resolution(
+            &path_label,
+            format!(
+                "old_integration {} does not match current integration {}; create a new attestation for the current queue layer",
+                document.old_integration, old_integration
+            ),
+        ));
+    }
+    let operator = document.operator.trim();
+    if operator.is_empty() || operator.len() > 200 {
+        return Err(invalid_resolution(
+            &path_label,
+            "operator must contain 1–200 non-whitespace bytes".into(),
+        ));
+    }
+    if document.resolutions.is_empty() {
+        return Err(invalid_resolution(
+            &path_label,
+            "resolutions must contain at least one queue entry".into(),
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut resolutions = BTreeMap::new();
+    for resolution in document.resolutions {
+        if !seen.insert(resolution.queue_entry_id) {
+            return Err(invalid_resolution(
+                &path_label,
+                format!(
+                    "queue entry {} appears more than once",
+                    resolution.queue_entry_id
+                ),
+            ));
+        }
+        if resolution.classification != IntegrationReconcileClassification::SupersededUpstream {
+            return Err(invalid_resolution(
+                &path_label,
+                format!(
+                    "queue entry {} requests {}; operator resolutions may only attest superseded_upstream",
+                    resolution.queue_entry_id,
+                    resolution.classification.as_str()
+                ),
+            ));
+        }
+        let reason = resolution.reason.trim();
+        if reason.is_empty() || reason.len() > 4096 {
+            return Err(invalid_resolution(
+                &path_label,
+                format!(
+                    "queue entry {} reason must contain 1–4096 non-whitespace bytes",
+                    resolution.queue_entry_id
+                ),
+            ));
+        }
+        resolutions.insert(resolution.queue_entry_id, resolution);
+    }
+
+    Ok(Some(LoadedOperatorResolutions {
+        path: path_label,
+        operator: operator.to_string(),
+        resolutions,
+    }))
+}
+
+fn validate_resolution_candidates(
+    loaded: &LoadedOperatorResolutions,
+    candidates: &[Candidate],
+) -> Result<(), BrokerOpError> {
+    let candidates_by_id: BTreeMap<i64, &Candidate> = candidates
+        .iter()
+        .map(|candidate| (candidate.entry.id, candidate))
+        .collect();
+    for (queue_entry_id, resolution) in &loaded.resolutions {
+        let Some(candidate) = candidates_by_id.get(queue_entry_id) else {
+            return Err(invalid_resolution(
+                &loaded.path,
+                format!(
+                    "queue entry {queue_entry_id} is not a promoted entry in the current contiguous integration layer"
+                ),
+            ));
+        };
+        if resolution.old_merge_commit != candidate.merge_commit {
+            return Err(invalid_resolution(
+                &loaded.path,
+                format!(
+                    "queue entry {queue_entry_id} old_merge_commit {} does not match current promoted commit {}",
+                    resolution.old_merge_commit, candidate.merge_commit
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn invalid_resolution(path: &str, reason: String) -> BrokerOpError {
+    BrokerOpError::InvalidReconciliationResolution {
+        path: path.to_string(),
+        reason,
+    }
+}
+
 fn promoted_commit(entry: &MergeQueueEntry) -> Option<String> {
     let details: serde_json::Value = serde_json::from_str(entry.details_json.as_deref()?).ok()?;
     details.get("commit")?.as_str().map(str::to_string)
@@ -464,6 +712,7 @@ fn entry_report(
         files: candidate.files.clone(),
         conflicts,
         evidence,
+        operator_resolution: None,
     }
 }
 
@@ -484,6 +733,15 @@ fn reconciliation_updates(
                         entry.classification.as_str(),
                         upstream_ref,
                         entry.upstream_landing.as_deref(),
+                        entry.operator_resolution.as_ref().map(|resolution| {
+                            crate::events::OperatorResolutionPayload {
+                                operator: &resolution.operator,
+                                reason: &resolution.reason,
+                                resolution_file: &resolution.resolution_file,
+                                upstream_commit: &resolution.upstream_commit,
+                                old_integration: &resolution.old_integration,
+                            }
+                        }),
                     );
                     (MergeStatus::ExternallyLanded, details, None)
                 }

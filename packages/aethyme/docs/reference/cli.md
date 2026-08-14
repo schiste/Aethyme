@@ -84,7 +84,7 @@ The broker is the stable product front door for multi-agent coordination:
 - `aethyme broker repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
 - `aethyme broker integration status [--json]`
-- `aethyme broker integration reconcile --upstream <ref> [--dry-run|--apply] [--json]`
+- `aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--dry-run|--apply] [--json]`
 - `aethyme broker quick-test [--with-gate] [--json]`
 - `aethyme broker verify-loop [--json]`
 - `aethyme broker pr check [--target <branch>] [--pr <number>] [--agent <name>] [--dispatch] [--cmd <command>] [--json]`
@@ -106,6 +106,50 @@ the integration ref and queue state together. Ambiguous equivalence or a replay
 conflict blocks without changing either one. A durable two-phase intent makes
 the update crash-safe: the next broker open either completes the queue/audit
 transaction when the ref moved or cancels the intent when it did not.
+
+When automatic evidence correctly fails closed because landed work was later
+modified upstream, an operator can attest only the affected entries with a
+versioned resolution file. The file is single-use by construction: it binds the
+named ref's exact fetched commit, the old integration tip, each queue ID, and
+each original promoted merge commit. Only `superseded_upstream` is accepted;
+unknown fields, duplicate entries, stale commits, empty reasons, and redundant
+overrides of automatic matches are rejected before planning or mutation.
+
+```json
+{
+  "schema_version": 1,
+  "upstream_ref": "origin/main",
+  "upstream_commit": "7033b70ec0241a9f01ab7ac5577dd74039b53e38",
+  "old_integration": "3e150ec5c58196f6ed4a9d9d121e723be60872e8",
+  "operator": "release-operator@example.org",
+  "resolutions": [
+    {
+      "queue_entry_id": 1,
+      "old_merge_commit": "<full promoted merge commit>",
+      "classification": "superseded_upstream",
+      "reason": "Landed through reviewed PRs and subsequently improved upstream"
+    }
+  ]
+}
+```
+
+Always run the same document through a dry-run before apply:
+
+```bash
+aethyme broker integration reconcile \
+  --upstream origin/main \
+  --resolution-file reconciliation.json \
+  --dry-run
+
+aethyme broker integration reconcile \
+  --upstream origin/main \
+  --resolution-file reconciliation.json \
+  --apply
+```
+
+The operator, reason, file path, upstream commit, and old integration tip are
+stored in the queue details, reconciliation audit row, and
+`merge.externally_landed` event within the same crash-safe transaction.
 
 Session repair is bounded by the baseline recorded at `start` or `adopt`.
 Repair refuses when integration does not contain that baseline; reconcile the

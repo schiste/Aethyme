@@ -56,6 +56,8 @@ pub enum BrokerOpError {
     },
     #[error("cannot resolve upstream ref {upstream:?}; fetch it explicitly, then retry")]
     UpstreamRefNotFound { upstream: String },
+    #[error("invalid integration reconciliation resolution file {path:?}: {reason}")]
+    InvalidReconciliationResolution { path: String, reason: String },
     #[error("integration reconciliation failed and ref rollback also failed: {reason}")]
     ReconciliationRollbackFailed { reason: String },
     #[error(

@@ -139,10 +139,11 @@ Usage:
       Sample integration, wait for a quiet window (default: 30s), then
       sample again. Fails if integration moved, printing the old and new
       tips so long checks are not mistaken for current-tip proof.
-  aethyme broker integration reconcile --upstream <ref> [--dry-run|--apply] [--json]
+  aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--dry-run|--apply] [--json]
       Compare already-fetched upstream with local main and promoted queue
       state. Dry-run is the default. --apply marks externally landed work,
-      preserves pending promotions, and rebuilds integration.
+      preserves pending promotions, and rebuilds integration. A resolution
+      file may attest specific promoted entries as superseded upstream.
   aethyme broker status [--json]
       The whole picture: agents, overlaps, promoted conflicts, merge
       queue, integration head.
@@ -431,6 +432,8 @@ mod tests {
             "reconcile".to_string(),
             "--upstream".to_string(),
             "origin/main".to_string(),
+            "--resolution-file".to_string(),
+            "reconciliation.json".to_string(),
             "--apply".to_string(),
         ];
         let parsed = match super::parse(&args) {
@@ -439,6 +442,10 @@ mod tests {
         };
 
         assert_eq!(parsed.upstream.as_deref(), Some("origin/main"));
+        assert_eq!(
+            parsed.resolution_file.as_deref(),
+            Some(std::path::Path::new("reconciliation.json"))
+        );
         assert!(parsed.apply);
     }
 
@@ -517,6 +524,7 @@ struct Parsed {
     keep_days: Option<i64>,
     seconds: Option<u64>,
     upstream: Option<String>,
+    resolution_file: Option<PathBuf>,
     follow: bool,
     json: bool,
     force: bool,
@@ -549,6 +557,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         keep_days: None,
         seconds: None,
         upstream: None,
+        resolution_file: None,
         follow: false,
         json: false,
         force: false,
@@ -622,6 +631,15 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                         .ok_or(UsageError::Message("--upstream requires a ref".into()))?
                         .clone(),
                 )
+            }
+            "--resolution-file" => {
+                parsed.resolution_file = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or(UsageError::Message(
+                            "--resolution-file requires a path".into(),
+                        ))?
+                        .clone(),
+                ))
             }
             "--task" => {
                 parsed.task = Some(
@@ -1311,6 +1329,9 @@ fn render_integration_reconcile(
         short_commit(&report.old_integration),
         short_commit(&report.new_integration)
     );
+    if let Some(path) = &report.resolution_file {
+        println!("Resolution:  {path}");
+    }
     println!(
         "Result:      {}",
         if report.applied {
@@ -2031,6 +2052,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         broker.reconcile_integration(crate::IntegrationReconcileOptions {
                             upstream,
                             apply: parsed.apply,
+                            resolution_file: parsed.resolution_file.clone(),
                         })?;
                     render_integration_reconcile(&report, parsed.json)?;
                     if !report.safe {

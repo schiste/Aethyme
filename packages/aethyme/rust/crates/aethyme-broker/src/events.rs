@@ -96,12 +96,21 @@ pub fn merge_promoted_payload(branch: &str, commit: &str) -> String {
     json!({ "branch": branch, "commit": commit }).to_string()
 }
 
+pub struct OperatorResolutionPayload<'a> {
+    pub operator: &'a str,
+    pub reason: &'a str,
+    pub resolution_file: &'a str,
+    pub upstream_commit: &'a str,
+    pub old_integration: &'a str,
+}
+
 pub fn merge_externally_landed_payload(
     branch: &str,
     commit: &str,
     classification: &str,
     upstream_ref: &str,
     upstream_landing: Option<&str>,
+    operator_resolution: Option<OperatorResolutionPayload<'_>>,
 ) -> String {
     json!({
         "branch": branch,
@@ -110,6 +119,13 @@ pub fn merge_externally_landed_payload(
         "classification": classification,
         "upstream_ref": upstream_ref,
         "upstream_landing": upstream_landing,
+        "operator_resolution": operator_resolution.map(|resolution| json!({
+            "operator": resolution.operator,
+            "reason": resolution.reason,
+            "resolution_file": resolution.resolution_file,
+            "upstream_commit": resolution.upstream_commit,
+            "old_integration": resolution.old_integration,
+        })),
     })
     .to_string()
 }
