@@ -24,6 +24,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          # cross-process-contract falls back to HEAD~1 when the broker's
+          # local integration ref is absent on a clean GitHub runner.
+          fetch-depth: 0
 
       # The `ruff` and `pytest-local` gates retired with the pytest stack
       # on 2026-08-06 (python-retirement Phase 7), so this lane no longer
