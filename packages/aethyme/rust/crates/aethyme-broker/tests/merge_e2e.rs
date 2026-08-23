@@ -104,6 +104,77 @@ fn promoted_merge_commit(entry: &aethyme_broker::MergeQueueEntry) -> String {
         .to_string()
 }
 
+fn unmerged_paths(worktree: &Path) -> Vec<String> {
+    let output = Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .current_dir(worktree)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git diff for unmerged paths failed");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Build the dual-identity history from #56/#57:
+///
+/// - main and integration contain the same `a = 2` patch under different SHAs;
+/// - integration then advances both `a.py` and `b.py`;
+/// - the victim starts from main and authors only the competing `b.py` edit.
+///
+/// A real rebase drops main's duplicate `a.py` commit before finding the
+/// genuine `b.py` conflict. The legacy whole-head merge simulation instead
+/// reports both paths and attributes `a.py` to whichever live lease happens
+/// to own it.
+fn dual_identity_conflict_fixture(
+    root: &Path,
+) -> (Broker, std::path::PathBuf, i64, String) {
+    init_repo(root);
+    let mut broker = Broker::open(root).unwrap();
+
+    let duplicate_on_integration = agent_worktree(root, "integration-duplicate");
+    let duplicate_session = broker
+        .adopt(&duplicate_on_integration, Some("integration copy"))
+        .unwrap();
+    commit_edit(&duplicate_on_integration, "src/a.py", "a = 2\n");
+    assert!(broker.submit(duplicate_session.id).unwrap().promoted);
+    broker.close(duplicate_session.id).unwrap();
+    broker
+        .store()
+        .release_lease(duplicate_session.id, "src/a.py")
+        .unwrap();
+    let integration_with_duplicate = resolve(root, "aethyme/integration");
+
+    std::fs::write(root.join("src/a.py"), "a = 2\n").unwrap();
+    sh(root, &["add", "src/a.py"]);
+    sh(root, &["commit", "-qm", "same patch under a main identity"]);
+    let main_duplicate = resolve(root, "main");
+    assert_ne!(main_duplicate, resolve(&duplicate_on_integration, "HEAD"));
+
+    let integration_followup =
+        agent_worktree_at(root, "integration-followup", &integration_with_duplicate);
+    let followup_session = broker
+        .adopt(&integration_followup, Some("advance integration"))
+        .unwrap();
+    commit_edit(&integration_followup, "src/a.py", "a = 3\n");
+    commit_edit(&integration_followup, "src/b.py", "b = 3\n");
+    assert!(broker.submit(followup_session.id).unwrap().promoted);
+    broker.close(followup_session.id).unwrap();
+    for path in ["src/a.py", "src/b.py"] {
+        broker
+            .store()
+            .release_lease(followup_session.id, path)
+            .unwrap();
+    }
+
+    let victim = agent_worktree_at(root, "victim", &main_duplicate);
+    let victim_session = broker.adopt(&victim, Some("edit only b")).unwrap();
+    commit_edit(&victim, "src/b.py", "b = 2\n");
+
+    (broker, victim, victim_session.id, main_duplicate)
+}
+
 #[test]
 fn two_clean_sessions_promote_with_requeue_on_base_move_manual_mode() {
     let tmp = tempfile::tempdir().unwrap();
@@ -254,6 +325,63 @@ fn conflicting_submission_rejected_pre_gate_with_instruction_drop() {
         err.contains("repair paused during rebase"),
         "repair should apply the documented rebase path and stop for true content conflicts: {err}"
     );
+}
+
+#[test]
+fn characterizes_dual_identity_phantom_conflict_and_changing_blocker_blame() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut broker, victim, victim_id, victim_baseline) =
+        dual_identity_conflict_fixture(tmp.path());
+
+    let blocker_a_worktree = agent_worktree_at(tmp.path(), "blocker-a", &victim_baseline);
+    let blocker_a = broker
+        .adopt(&blocker_a_worktree, Some("unrelated lease owner A"))
+        .unwrap();
+    commit_edit(&blocker_a_worktree, "src/a.py", "a = 4\n");
+    broker.refresh_leases().unwrap();
+
+    let first = broker.submit(victim_id).unwrap();
+    assert_eq!(first.entry.status, MergeStatus::Conflict);
+    assert_eq!(
+        first.conflicts,
+        vec!["src/a.py".to_string(), "src/b.py".to_string()],
+        "legacy simulation reports duplicate history as well as the real conflict"
+    );
+    let first_details: serde_json::Value =
+        serde_json::from_str(first.entry.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(first_details["blocking_sessions"], serde_json::json!([blocker_a.id]));
+
+    broker.close(blocker_a.id).unwrap();
+    broker
+        .store()
+        .release_lease(blocker_a.id, "src/a.py")
+        .unwrap();
+    let blocker_b_worktree = agent_worktree_at(tmp.path(), "blocker-b", &victim_baseline);
+    let blocker_b = broker
+        .adopt(&blocker_b_worktree, Some("unrelated lease owner B"))
+        .unwrap();
+    commit_edit(&blocker_b_worktree, "src/a.py", "a = 5\n");
+    broker.refresh_leases().unwrap();
+
+    let second = broker.simulate_and_gate(first.entry.id).unwrap();
+    assert_eq!(second.conflicts, first.conflicts);
+    let second_details: serde_json::Value =
+        serde_json::from_str(second.entry.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(second_details["blocking_sessions"], serde_json::json!([blocker_b.id]));
+
+    let rebase = Command::new("git")
+        .args(["rebase", "aethyme/integration"])
+        .current_dir(&victim)
+        .env("GIT_EDITOR", "true")
+        .output()
+        .unwrap();
+    assert!(!rebase.status.success(), "the owned b.py edit should conflict");
+    assert_eq!(
+        unmerged_paths(&victim),
+        vec!["src/b.py".to_string()],
+        "rebase drops the patch-equivalent a.py commit and exposes only the real conflict"
+    );
+    sh(&victim, &["rebase", "--abort"]);
 }
 
 #[test]
