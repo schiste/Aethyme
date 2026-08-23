@@ -74,6 +74,12 @@ Usage:
       Inspect one captured report by filename or its repository-relative
       .aethyme/reports/<filename> path. Recomputes the current digest and
       refuses symlinks, path escapes, oversized files, and invalid schemas.
+  aethyme broker report render <filename> --form <form.yml> [--json]
+      Render a captured report through one repository issue form, entirely
+      offline. The form must be a .github/ISSUE_TEMPLATE/*.yml file. Known
+      allowlisted report fields become Markdown sections in form order;
+      unknown fields remain explicit unfilled sections. Exits non-zero after
+      rendering when any required field is still unfilled.
   aethyme broker start --task <text> [--json]
       Create a broker-managed worktree + branch and register a session,
       but do not spawn a process. Prefer this over adopting the main
@@ -821,6 +827,7 @@ struct Parsed {
     worktree: Option<PathBuf>,
     title: Option<String>,
     output: Option<PathBuf>,
+    form: Option<PathBuf>,
     follow: bool,
     json: bool,
     force: bool,
@@ -870,6 +877,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         worktree: None,
         title: None,
         output: None,
+        form: None,
         follow: false,
         json: false,
         force: false,
@@ -983,6 +991,13 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 parsed.output = Some(PathBuf::from(
                     iter.next()
                         .ok_or(UsageError::Message("--output requires a path".into()))?
+                        .clone(),
+                ))
+            }
+            "--form" => {
+                parsed.form = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or(UsageError::Message("--form requires a path".into()))?
                         .clone(),
                 ))
             }
@@ -2263,14 +2278,43 @@ fn run_report(parsed: Parsed) -> Result<(), UsageError> {
             }
             Ok(())
         }
-        Some("capture" | "list" | "show") => Err(UsageError::Message(
-            "invalid report arguments; expected capture, list, or show <filename>".into(),
+        Some("render") if parsed.positional.len() == 2 => {
+            let main_root = report_main_root()?;
+            let form = parsed.form.as_deref().ok_or(UsageError::Message(
+                "report render requires --form <form.yml>".into(),
+            ))?;
+            let rendered = crate::render_issue_form(
+                &main_root,
+                PathBuf::from(&parsed.positional[1]).as_path(),
+                form,
+            )?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&rendered)?);
+            } else {
+                print!("{}", rendered.markdown);
+                eprintln!("Issue title: {}", rendered.issue_title);
+                eprintln!("Report SHA-256: {}", rendered.report_digest);
+            }
+            if rendered.valid {
+                Ok(())
+            } else {
+                Err(UsageError::Exit {
+                    message: format!(
+                        "required issue-form fields remain unfilled: {}",
+                        rendered.missing_required.join(", ")
+                    ),
+                    code: 1,
+                })
+            }
+        }
+        Some("capture" | "list" | "show" | "render") => Err(UsageError::Message(
+            "invalid report arguments; expected capture, list, show <filename>, or render <filename> --form <form.yml>".into(),
         )),
         Some(other) => Err(UsageError::Message(format!(
-            "unknown report action {other:?}; expected capture, list, or show"
+            "unknown report action {other:?}; expected capture, list, show, or render"
         ))),
         None => Err(UsageError::Message(
-            "report requires an action: capture, list, or show".into(),
+            "report requires an action: capture, list, show, or render".into(),
         )),
     }
 }

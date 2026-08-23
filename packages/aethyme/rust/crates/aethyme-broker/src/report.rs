@@ -69,6 +69,16 @@ pub enum ReportCaptureError {
     DestinationExists(String),
     #[error("captured report not found: {0}")]
     ReportNotFound(String),
+    #[error(
+        "invalid issue form path {0:?}; use a .yml filename or .github/ISSUE_TEMPLATE/<filename>"
+    )]
+    InvalidIssueFormPath(String),
+    #[error("repository issue form not found: {0}")]
+    IssueFormNotFound(String),
+    #[error("invalid repository issue form {path}: {reason}")]
+    InvalidIssueForm { path: String, reason: String },
+    #[error("issue form path must not be a symbolic link: {0}")]
+    SymlinkedIssueFormPath(String),
     #[error("invalid captured report {path}: {reason}")]
     InvalidReport { path: String, reason: String },
     #[error("report directory must not be a symbolic link: {0}")]

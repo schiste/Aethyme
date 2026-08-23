@@ -30,6 +30,7 @@ mod git;
 mod graph_impact;
 pub mod hooks;
 pub mod init;
+mod issue_form;
 mod leases;
 mod merge;
 mod operations;
@@ -69,6 +70,10 @@ pub use graph_impact::{
     GraphStoreImpactProvider,
 };
 pub use hooks::{HookReport, HookState, HooksError};
+pub use issue_form::{
+    ISSUE_FORM_RENDER_SCHEMA_VERSION, IssueFormFieldKind, IssueFormFieldStatus,
+    IssueFormRenderResult, IssueFormRenderedField, render_issue_form,
+};
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use merge::{ACTION_REQUIRED_RELPATH, PromoteConfig, SubmitOutcome};
 pub use operations::{
