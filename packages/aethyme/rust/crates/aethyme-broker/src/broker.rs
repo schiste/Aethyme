@@ -217,12 +217,49 @@ impl AdoptOutcome {
     }
 }
 
+/// Relationship between the adopted checkout and the integration tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdoptIntegrationRelation {
+    Current,
+    Behind,
+    Ahead,
+    Diverged,
+}
+
+impl AdoptIntegrationRelation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Behind => "behind",
+            Self::Ahead => "ahead",
+            Self::Diverged => "diverged",
+        }
+    }
+}
+
+/// Structured integration drift observed while adopting with `--reuse`.
+#[derive(Debug, serde::Serialize)]
+pub struct AdoptIntegrationDrift {
+    pub session_head: String,
+    pub integration_branch: String,
+    pub integration_head: String,
+    pub relation: AdoptIntegrationRelation,
+    pub ahead_commits: u64,
+    pub behind_commits: u64,
+    pub overlapping_changed_paths: Vec<String>,
+    pub warning: Option<String>,
+    pub safe_next_action: String,
+}
+
 /// Adoption result with the session fields kept at the JSON top level.
 #[derive(Debug, serde::Serialize)]
 pub struct AdoptReport {
     #[serde(flatten)]
     pub session: Session,
     pub outcome: AdoptOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_drift: Option<AdoptIntegrationDrift>,
 }
 
 /// A session enriched with liveness derived at read time — what
@@ -806,9 +843,12 @@ impl Broker {
                             .reuse_session(existing.id, task, diff_base.as_deref())?;
                     self.store
                         .set_session_foreign_files(session.id, &foreign_files)?;
+                    let integration_drift =
+                        Some(self.adopt_integration_drift(&checkout, session.id)?);
                     return Ok(AdoptReport {
                         session,
                         outcome: AdoptOutcome::Reused,
+                        integration_drift,
                     });
                 }
                 AdoptMode::ReplaceStale => {
@@ -844,7 +884,91 @@ impl Broker {
         })?;
         self.store
             .set_session_foreign_files(session.id, &foreign_files)?;
-        Ok(AdoptReport { session, outcome })
+        let integration_drift = if mode == AdoptMode::Reuse {
+            Some(self.adopt_integration_drift(&checkout, session.id)?)
+        } else {
+            None
+        };
+        Ok(AdoptReport {
+            session,
+            outcome,
+            integration_drift,
+        })
+    }
+
+    fn adopt_integration_drift(
+        &mut self,
+        checkout: &GitRepo,
+        session_id: i64,
+    ) -> Result<AdoptIntegrationDrift, BrokerOpError> {
+        let session_head = checkout.head_commit()?;
+        let (integration_branch, integration_head) = self.integration_head()?;
+        let ahead_commits = checkout.commit_count_between(&integration_head, &session_head)?;
+        let behind_commits = checkout.commit_count_between(&session_head, &integration_head)?;
+        let relation = match (ahead_commits, behind_commits) {
+            (0, 0) => AdoptIntegrationRelation::Current,
+            (0, _) => AdoptIntegrationRelation::Behind,
+            (_, 0) => AdoptIntegrationRelation::Ahead,
+            _ => AdoptIntegrationRelation::Diverged,
+        };
+
+        let overlapping_changed_paths = checkout
+            .merge_base(&session_head, &integration_head)
+            .ok()
+            .map(|base| -> Result<Vec<String>, BrokerOpError> {
+                let session_paths = checkout.changed_files(&base)?;
+                let integration_paths = checkout.changed_between(&base, &integration_head)?;
+                let mut overlaps = session_paths
+                    .into_iter()
+                    .filter(|session_path| {
+                        integration_paths.iter().any(|integration_path| {
+                            crate::leases::paths_overlap(session_path, integration_path)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                overlaps.sort();
+                overlaps.dedup();
+                Ok(overlaps)
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        let (warning, safe_next_action) = match relation {
+            AdoptIntegrationRelation::Current => (
+                None,
+                format!("continue with session {session_id} on the current integration baseline"),
+            ),
+            AdoptIntegrationRelation::Behind => (
+                Some(format!(
+                    "session HEAD is {behind_commits} commit(s) behind {integration_branch}; inspect drift before editing"
+                )),
+                "aethyme broker integration status".into(),
+            ),
+            AdoptIntegrationRelation::Ahead => (
+                Some(format!(
+                    "session HEAD is {ahead_commits} commit(s) ahead of {integration_branch}; submit existing work before starting a follow-up"
+                )),
+                format!("aethyme broker submit --session {session_id}"),
+            ),
+            AdoptIntegrationRelation::Diverged => (
+                Some(format!(
+                    "session HEAD and {integration_branch} have diverged ({ahead_commits} ahead, {behind_commits} behind); reconcile before editing"
+                )),
+                "aethyme broker integration status".into(),
+            ),
+        };
+
+        Ok(AdoptIntegrationDrift {
+            session_head,
+            integration_branch,
+            integration_head,
+            relation,
+            ahead_commits,
+            behind_commits,
+            overlapping_changed_paths,
+            warning,
+            safe_next_action,
+        })
     }
 
     /// Mark a session finished without touching its worktree — the right

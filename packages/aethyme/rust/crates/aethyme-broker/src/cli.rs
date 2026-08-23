@@ -37,7 +37,8 @@ Usage:
   aethyme broker adopt [<path>] [--task <text>] [--reuse|--replace-stale] [--json]
       Register an existing worktree (attach-first). Defaults to the
       current directory. If the worktree already has a session:
-      --reuse points it at a follow-up task (fresh baseline);
+      --reuse points it at a follow-up task with a fresh baseline and
+      reports its relation to the current integration tip;
       --replace-stale closes it (state only) and registers fresh;
       neither flag = error listing your options.
   aethyme broker close --session <id> [--json]
@@ -1740,6 +1741,27 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                          (commits land on main before gates run); use a worktree \
                          session for enforced verification."
                     );
+                }
+                if let Some(drift) = &report.integration_drift {
+                    println!(
+                        "Integration drift: {} (session HEAD {}, {} HEAD {}; {} ahead, {} behind)",
+                        drift.relation.as_str(),
+                        short_commit(&drift.session_head),
+                        drift.integration_branch,
+                        short_commit(&drift.integration_head),
+                        drift.ahead_commits,
+                        drift.behind_commits,
+                    );
+                    if !drift.overlapping_changed_paths.is_empty() {
+                        println!("Overlapping changed paths:");
+                        for path in &drift.overlapping_changed_paths {
+                            println!("  {path}");
+                        }
+                    }
+                    if let Some(warning) = &drift.warning {
+                        println!("Warning: {warning}");
+                    }
+                    println!("Safe next action: {}", drift.safe_next_action);
                 }
             }
         }
