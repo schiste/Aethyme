@@ -28,6 +28,48 @@ pub enum IntegrationReconcileClassification {
     Ambiguous,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationReconcileCommitOrigin {
+    UpstreamOnlyExternalWork,
+    RecordedPromotedWork,
+    UnrecordedIntegrationCommit,
+    PendingQueueEntry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationReconcileEquivalence {
+    None,
+    Exact,
+    PatchEquivalent,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IntegrationReconcileCommit {
+    pub commit: String,
+    pub parents: Vec<String>,
+    pub origin: IntegrationReconcileCommitOrigin,
+    pub equivalence: IntegrationReconcileEquivalence,
+    pub matching_commits: Vec<String>,
+    pub patch_id: Option<String>,
+    pub files: Vec<String>,
+    pub content_empty: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_entry_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_status: Option<MergeStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IntegrationReconcilePlan {
+    pub common_base: String,
+    pub commits: Vec<IntegrationReconcileCommit>,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IntegrationReconcileResolutionFile {
@@ -96,6 +138,7 @@ pub struct IntegrationReconcileReport {
     pub new_integration: String,
     pub safe: bool,
     pub applied: bool,
+    pub plan: IntegrationReconcilePlan,
     pub entries: Vec<IntegrationReconcileEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution_file: Option<String>,
@@ -161,6 +204,13 @@ impl Broker {
             })?;
         let local_main = self.repo_handle().head_commit()?;
         let (branch, old_integration) = self.integration_head()?;
+        let queue = self.store().merge_queue()?;
+        let plan = build_reconciliation_plan(
+            self.repo_handle(),
+            &queue,
+            &upstream_head,
+            &old_integration,
+        )?;
         let operator_resolutions =
             load_operator_resolutions(&options, &upstream_head, &old_integration)?;
         let mut report = IntegrationReconcileReport {
@@ -172,6 +222,7 @@ impl Broker {
             new_integration: upstream_head.clone(),
             safe: true,
             applied: false,
+            plan,
             entries: Vec::new(),
             resolution_file: operator_resolutions
                 .as_ref()
@@ -192,10 +243,10 @@ impl Broker {
             return Ok(report);
         }
 
-        let queue = self.store().merge_queue()?;
         let mut candidates = Vec::new();
         for entry in queue
-            .into_iter()
+            .iter()
+            .cloned()
             .filter(|entry| entry.status == MergeStatus::Promoted)
         {
             let Some(merge_commit) = promoted_commit(&entry) else {
@@ -607,6 +658,151 @@ impl Broker {
             "integration and broker queue reconciled; submit new session work normally".into();
         Ok(report)
     }
+}
+
+fn build_reconciliation_plan(
+    repo: &crate::git::GitRepo,
+    queue: &[MergeQueueEntry],
+    upstream_head: &str,
+    old_integration: &str,
+) -> Result<IntegrationReconcilePlan, BrokerOpError> {
+    let common_base = repo.merge_base(upstream_head, old_integration)?;
+    let upstream_commits = repo.first_parent_commits_between_oldest(&common_base, upstream_head)?;
+    let integration_commits =
+        repo.first_parent_commits_between_oldest(&common_base, old_integration)?;
+
+    let mut upstream_by_patch: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for commit in &upstream_commits {
+        if let Some(patch_id) = commit_patch_id(repo, commit)? {
+            upstream_by_patch
+                .entry(patch_id)
+                .or_default()
+                .push(commit.clone());
+        }
+    }
+    let mut integration_by_patch: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for commit in &integration_commits {
+        if let Some(patch_id) = commit_patch_id(repo, commit)? {
+            integration_by_patch
+                .entry(patch_id)
+                .or_default()
+                .push(commit.clone());
+        }
+    }
+
+    let recorded: BTreeMap<String, &MergeQueueEntry> = queue
+        .iter()
+        .filter(|entry| entry.status == MergeStatus::Promoted)
+        .filter_map(|entry| promoted_commit(entry).map(|commit| (commit, entry)))
+        .collect();
+    let mut commits = Vec::new();
+    for commit in &upstream_commits {
+        commits.push(reconcile_commit(
+            repo,
+            commit,
+            IntegrationReconcileCommitOrigin::UpstreamOnlyExternalWork,
+            None,
+            &integration_by_patch,
+            old_integration,
+        )?);
+    }
+    for commit in &integration_commits {
+        let queue_entry = recorded.get(commit).copied();
+        commits.push(reconcile_commit(
+            repo,
+            commit,
+            if queue_entry.is_some() {
+                IntegrationReconcileCommitOrigin::RecordedPromotedWork
+            } else {
+                IntegrationReconcileCommitOrigin::UnrecordedIntegrationCommit
+            },
+            queue_entry,
+            &upstream_by_patch,
+            upstream_head,
+        )?);
+    }
+    for entry in queue.iter().filter(|entry| {
+        !matches!(
+            entry.status,
+            MergeStatus::Promoted | MergeStatus::ExternallyLanded | MergeStatus::Superseded
+        )
+    }) {
+        commits.push(reconcile_commit(
+            repo,
+            &entry.head_commit,
+            IntegrationReconcileCommitOrigin::PendingQueueEntry,
+            Some(entry),
+            &upstream_by_patch,
+            upstream_head,
+        )?);
+    }
+
+    Ok(IntegrationReconcilePlan {
+        common_base,
+        commits,
+    })
+}
+
+fn reconcile_commit(
+    repo: &crate::git::GitRepo,
+    commit: &str,
+    origin: IntegrationReconcileCommitOrigin,
+    queue_entry: Option<&MergeQueueEntry>,
+    other_side_by_patch: &BTreeMap<String, Vec<String>>,
+    other_side_head: &str,
+) -> Result<IntegrationReconcileCommit, BrokerOpError> {
+    let parents = repo.commit_parents(commit)?;
+    let files = if let Some(parent) = parents.first() {
+        repo.changed_between(parent, commit)?
+    } else {
+        Vec::new()
+    };
+    let patch_id = if let Some(parent) = parents.first() {
+        repo.patch_id_between(parent, commit)?
+    } else {
+        None
+    };
+    let (equivalence, matching_commits) = if repo.is_ancestor(commit, other_side_head) {
+        (
+            IntegrationReconcileEquivalence::Exact,
+            vec![commit.to_string()],
+        )
+    } else if let Some(matches) = patch_id
+        .as_ref()
+        .and_then(|patch_id| other_side_by_patch.get(patch_id))
+    {
+        if matches.len() == 1 {
+            (
+                IntegrationReconcileEquivalence::PatchEquivalent,
+                matches.clone(),
+            )
+        } else {
+            (IntegrationReconcileEquivalence::Ambiguous, matches.clone())
+        }
+    } else {
+        (IntegrationReconcileEquivalence::None, Vec::new())
+    };
+    Ok(IntegrationReconcileCommit {
+        commit: commit.to_string(),
+        parents,
+        origin,
+        equivalence,
+        matching_commits,
+        patch_id,
+        content_empty: files.is_empty(),
+        files,
+        queue_entry_id: queue_entry.map(|entry| entry.id),
+        session_id: queue_entry.map(|entry| entry.session_id),
+        queue_status: queue_entry.map(|entry| entry.status),
+    })
+}
+
+fn commit_patch_id(
+    repo: &crate::git::GitRepo,
+    commit: &str,
+) -> Result<Option<String>, BrokerOpError> {
+    let parent = repo.first_parent(commit)?;
+    Ok(repo.patch_id_between(&parent, commit)?)
 }
 
 fn load_operator_resolutions(
