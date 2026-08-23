@@ -28,6 +28,14 @@ use crate::types::{GateFailureClass, GateStatus, NewGateResult};
 
 pub const GATES_CONFIG_RELPATH: &str = ".aethyme/gates.toml";
 
+/// Whether a gate run may reuse a conclusive result for the same tree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CachePolicy {
+    #[default]
+    Use,
+    Bypass,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GateConfigError {
     #[error("no gates config at {0} (create it to define gates)")]
@@ -203,6 +211,11 @@ impl GateProgressSink for StderrGateProgressSink {
     }
 }
 
+pub(crate) struct GateExecutionContext<'a> {
+    pub cache_policy: CachePolicy,
+    pub progress: &'a dyn GateProgressSink,
+}
+
 fn heartbeat_interval() -> Duration {
     let seconds = std::env::var("AETHYME_GATE_HEARTBEAT_SECS")
         .ok()
@@ -281,33 +294,50 @@ pub fn cancel_obsolete_runs(
 /// caching. `session_id` scopes cancellation and result attribution.
 /// Stops after the first failure (later gates are pointless on a broken
 /// tree — and cheaper gates ran first by construction).
-pub fn run_affected(
+pub(crate) fn run_affected(
     store: &mut BrokerStore,
     main_root: &Path,
     checkout: &GitRepo,
     gates: &[Gate],
     changed: &[String],
     session_id: Option<i64>,
+    cache_policy: CachePolicy,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     let progress = StderrGateProgressSink;
     run_affected_with_progress(
-        store, main_root, checkout, gates, changed, session_id, &progress,
+        store,
+        main_root,
+        checkout,
+        gates,
+        changed,
+        session_id,
+        GateExecutionContext {
+            cache_policy,
+            progress: &progress,
+        },
     )
 }
 
-/// Like [`run_affected`], with an injectable progress sink for tests and
-/// future non-CLI surfaces.
-pub fn run_affected_with_progress(
+/// Like [`run_affected`], with an injectable progress sink.
+pub(crate) fn run_affected_with_progress(
     store: &mut BrokerStore,
     main_root: &Path,
     checkout: &GitRepo,
     gates: &[Gate],
     changed: &[String],
     session_id: Option<i64>,
-    progress: &dyn GateProgressSink,
+    context: GateExecutionContext<'_>,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     let selections = select_gates(gates, changed);
-    run_selections(store, main_root, checkout, selections, session_id, progress)
+    run_selections(
+        store,
+        main_root,
+        checkout,
+        selections,
+        session_id,
+        context.cache_policy,
+        context.progress,
+    )
 }
 
 /// Run EVERY configured gate cheap-first — no diff selection. This is
@@ -315,24 +345,34 @@ pub fn run_affected_with_progress(
 /// and the broker: the exact same executor as [`run_affected`], so
 /// streaming progress, the tree-hash result cache, and fail-fast
 /// semantics are identical by construction.
-pub fn run_all(
+pub(crate) fn run_all(
     store: &mut BrokerStore,
     main_root: &Path,
     checkout: &GitRepo,
     gates: &[Gate],
     session_id: Option<i64>,
+    cache_policy: CachePolicy,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     let progress = StderrGateProgressSink;
-    run_all_with_progress(store, main_root, checkout, gates, session_id, &progress)
+    run_all_with_progress(
+        store,
+        main_root,
+        checkout,
+        gates,
+        session_id,
+        cache_policy,
+        &progress,
+    )
 }
 
 /// Like [`run_all`], with an injectable progress sink.
-pub fn run_all_with_progress(
+pub(crate) fn run_all_with_progress(
     store: &mut BrokerStore,
     main_root: &Path,
     checkout: &GitRepo,
     gates: &[Gate],
     session_id: Option<i64>,
+    cache_policy: CachePolicy,
     progress: &dyn GateProgressSink,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     // Every gate, already cost-sorted by load_gates; `triggered_by` is
@@ -345,7 +385,15 @@ pub fn run_all_with_progress(
             owner_paths: Vec::new(),
         })
         .collect();
-    run_selections(store, main_root, checkout, selections, session_id, progress)
+    run_selections(
+        store,
+        main_root,
+        checkout,
+        selections,
+        session_id,
+        cache_policy,
+        progress,
+    )
 }
 
 struct GateOwnerLocks {
@@ -478,6 +526,7 @@ fn run_selections(
     checkout: &GitRepo,
     selections: Vec<Selection<'_>>,
     session_id: Option<i64>,
+    cache_policy: CachePolicy,
     progress: &dyn GateProgressSink,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     let tree = checkout.working_tree_hash()?;
@@ -499,7 +548,8 @@ fn run_selections(
         // measurable (kill-criterion accounting). Gates that inspect
         // commit metadata must opt out: the tree can stay identical while
         // commit bodies change.
-        if gate.cache
+        if cache_policy == CachePolicy::Use
+            && gate.cache
             && let Some(hit) = store.cached_gate_result(&gate.name, &tree)?
         {
             let saved_ms = hit.duration_ms.unwrap_or(0);

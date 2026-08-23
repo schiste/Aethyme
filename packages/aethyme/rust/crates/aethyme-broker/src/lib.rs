@@ -56,7 +56,7 @@ pub use broker::{
 };
 pub use error::BrokerError;
 pub use gates::{
-    Gate, GateConfigError, GateProgressSink, GateRunOutcome, load_gates, select_gates,
+    CachePolicy, Gate, GateConfigError, GateProgressSink, GateRunOutcome, load_gates, select_gates,
 };
 pub use git::{GitError, GitRepo, MergeSimulation, RemoteDefaultBranch};
 pub use hooks::{HookReport, HookState, HooksError};

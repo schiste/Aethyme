@@ -114,6 +114,15 @@ impl Broker {
     /// configured. Uncommitted changes are NOT included — the head commit
     /// is the unit of promotion.
     pub fn submit(&mut self, session_id: i64) -> Result<SubmitOutcome, BrokerOpError> {
+        self.submit_with_policy(session_id, crate::gates::CachePolicy::Use)
+    }
+
+    /// Submit with an explicit policy for merged-tree gate cache lookup.
+    pub fn submit_with_policy(
+        &mut self,
+        session_id: i64,
+        cache_policy: crate::gates::CachePolicy,
+    ) -> Result<SubmitOutcome, BrokerOpError> {
         let session = self.store().session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let head = checkout.head_commit()?;
@@ -152,13 +161,21 @@ impl Broker {
             self.store()
                 .set_merge_status(stale_id, MergeStatus::Superseded, None, None)?;
         }
-        self.simulate_and_gate(entry.id)
+        self.simulate_and_gate_with_policy(entry.id, cache_policy)
     }
 
     /// Simulate (and, when clean, gate) one queue entry against the
     /// CURRENT integration head. Rebinds the entry's base if the branch
     /// moved since submission.
     pub fn simulate_and_gate(&mut self, entry_id: i64) -> Result<SubmitOutcome, BrokerOpError> {
+        self.simulate_and_gate_with_policy(entry_id, crate::gates::CachePolicy::Use)
+    }
+
+    fn simulate_and_gate_with_policy(
+        &mut self,
+        entry_id: i64,
+        cache_policy: crate::gates::CachePolicy,
+    ) -> Result<SubmitOutcome, BrokerOpError> {
         // #42: remember where the integration branch stood BEFORE the
         // follows-main refresh. Gate selection must diff against this —
         // for a main-checkout session the refresh fast-forwards the base
@@ -264,6 +281,7 @@ impl Broker {
             &gates,
             &changed,
             Some(entry.session_id),
+            cache_policy,
         );
         let _ = self.repo_handle().worktree_remove(&tmp_dir, true);
         let gate_outcomes = gate_outcomes?;

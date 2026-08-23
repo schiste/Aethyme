@@ -8,7 +8,7 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use aethyme_broker::{
-    Broker, GateFailureClass, GateProgressSink, GateStatus, SemanticGateSourceStatus,
+    Broker, CachePolicy, GateFailureClass, GateProgressSink, GateStatus, SemanticGateSourceStatus,
 };
 
 #[derive(Default)]
@@ -707,6 +707,42 @@ triggers = ["**/*.nomatch"]
     assert!(outcomes.iter().all(|o| o.tree_hash == tree_hash));
     let markers_after = std::fs::read_to_string(tmp.path().join("gate-markers.txt")).unwrap();
     assert_eq!(markers, markers_after, "cached rerun executed nothing");
+
+    let cached_before = broker
+        .store()
+        .cached_gate_result("cheap", &tree_hash)
+        .unwrap()
+        .unwrap();
+    let bypassed = broker
+        .run_all_gates_with_policy(tmp.path(), CachePolicy::Bypass)
+        .unwrap();
+    assert!(
+        bypassed.iter().all(|outcome| !outcome.cached),
+        "bypass executes every gate despite valid cache rows"
+    );
+    let markers_after_bypass =
+        std::fs::read_to_string(tmp.path().join("gate-markers.txt")).unwrap();
+    assert_eq!(
+        markers_after_bypass,
+        "cheap\nmid\nexpensive\ncheap\nmid\nexpensive\n"
+    );
+    let cached_after = broker
+        .store()
+        .cached_gate_result("cheap", &tree_hash)
+        .unwrap()
+        .unwrap();
+    assert!(
+        cached_after.id > cached_before.id,
+        "bypassed execution stores a fresh cache row"
+    );
+
+    let reused_fresh = broker.run_all_gates(tmp.path()).unwrap();
+    assert!(reused_fresh.iter().all(|outcome| outcome.cached));
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("gate-markers.txt")).unwrap(),
+        markers_after_bypass,
+        "normal run reuses the fresh bypass result"
+    );
 }
 
 #[test]

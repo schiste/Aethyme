@@ -1815,6 +1815,15 @@ impl Broker {
         &mut self,
         session_id: i64,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
+        self.run_gates_with_policy(session_id, crate::gates::CachePolicy::Use)
+    }
+
+    /// Run affected session gates with an explicit cache lookup policy.
+    pub fn run_gates_with_policy(
+        &mut self,
+        session_id: i64,
+        cache_policy: crate::gates::CachePolicy,
+    ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let (checkout, gates, changed) = self.gate_inputs(session_id)?;
         crate::gates::run_affected(
             &mut self.store,
@@ -1823,6 +1832,7 @@ impl Broker {
             &gates,
             &changed,
             Some(session_id),
+            cache_policy,
         )
     }
 
@@ -1833,6 +1843,20 @@ impl Broker {
         session_id: i64,
         progress: &dyn crate::gates::GateProgressSink,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
+        self.run_gates_with_policy_and_progress(
+            session_id,
+            crate::gates::CachePolicy::Use,
+            progress,
+        )
+    }
+
+    /// Run affected session gates with explicit cache policy and progress.
+    pub fn run_gates_with_policy_and_progress(
+        &mut self,
+        session_id: i64,
+        cache_policy: crate::gates::CachePolicy,
+        progress: &dyn crate::gates::GateProgressSink,
+    ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let (checkout, gates, changed) = self.gate_inputs(session_id)?;
         crate::gates::run_affected_with_progress(
             &mut self.store,
@@ -1841,7 +1865,10 @@ impl Broker {
             &gates,
             &changed,
             Some(session_id),
-            progress,
+            crate::gates::GateExecutionContext {
+                cache_policy,
+                progress,
+            },
         )
     }
 
@@ -1873,10 +1900,26 @@ impl Broker {
         &mut self,
         dir: &Path,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
+        self.run_all_gates_with_policy(dir, crate::gates::CachePolicy::Use)
+    }
+
+    /// Run every configured gate with an explicit cache lookup policy.
+    pub fn run_all_gates_with_policy(
+        &mut self,
+        dir: &Path,
+        cache_policy: crate::gates::CachePolicy,
+    ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let checkout = GitRepo::discover(dir)?;
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
-        crate::gates::run_all(&mut self.store, &self.main_root, &checkout, &gates, None)
+        crate::gates::run_all(
+            &mut self.store,
+            &self.main_root,
+            &checkout,
+            &gates,
+            None,
+            cache_policy,
+        )
     }
 
     /// Test/non-CLI entrypoint for [`Self::run_all_gates`] with injectable
@@ -1884,6 +1927,16 @@ impl Broker {
     pub fn run_all_gates_with_progress(
         &mut self,
         dir: &Path,
+        progress: &dyn crate::gates::GateProgressSink,
+    ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
+        self.run_all_gates_with_policy_and_progress(dir, crate::gates::CachePolicy::Use, progress)
+    }
+
+    /// Run all gates with explicit cache policy and progress reporting.
+    pub fn run_all_gates_with_policy_and_progress(
+        &mut self,
+        dir: &Path,
+        cache_policy: crate::gates::CachePolicy,
         progress: &dyn crate::gates::GateProgressSink,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let checkout = GitRepo::discover(dir)?;
@@ -1895,6 +1948,7 @@ impl Broker {
             &checkout,
             &gates,
             None,
+            cache_policy,
             progress,
         )
     }
