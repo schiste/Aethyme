@@ -1902,7 +1902,7 @@ fn repair_refuses_when_session_baseline_is_newer_than_integration() {
 }
 
 #[test]
-fn status_distinguishes_stale_local_main_from_configured_upstream() {
+fn status_warns_on_the_first_external_main_movement() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     sh(tmp.path(), &["switch", "-qc", "status-upstream", "main"]);
@@ -1942,11 +1942,19 @@ fn status_distinguishes_stale_local_main_from_configured_upstream() {
     assert!(status.advice.iter().any(|advice| {
         advice.id == "integration.upstream-main-ahead"
             && advice.severity == StatusAdviceSeverity::Blocked
+            && advice.summary.contains("external main movement detected")
+            && advice.commands
+                == vec!["aethyme broker integration reconcile --upstream origin/main --dry-run"]
     }));
 
     let integration = broker.integration_status(0).unwrap();
     assert_eq!(integration.main_behind_upstream_commits, 1);
-    assert!(integration.next_action.summary.contains("reconcile"));
+    assert!(
+        integration
+            .next_action
+            .summary
+            .contains("external main movement detected")
+    );
     assert!(
         integration
             .next_action
