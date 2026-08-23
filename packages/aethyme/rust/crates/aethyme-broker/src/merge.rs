@@ -10,9 +10,10 @@
 //! branch to the verified merge commit; other queued entries whose base
 //! moved are re-simulated.
 //!
-//! Boundary contract: the integration branch is **local only** — the
-//! broker never pushes and never opens PRs. The promotion trigger is a
-//! config setting (`[promote] mode = "auto" | "manual"`) — **auto by
+//! Boundary contract: promotion only advances the **local** integration
+//! branch; publication is an explicit, confirmed `broker ship` operation.
+//! The broker never opens PRs. The promotion trigger is a config setting
+//! (`[promote] mode = "auto" | "manual"`) — **auto by
 //! default** (decision 2026-07-13, after the first dogfood run: verified
 //! means verified; holding it for a human command makes the human the
 //! bottleneck). `mode = "manual"` restores explicit `broker promote`.
@@ -315,7 +316,7 @@ impl Broker {
 
     /// Advance the integration branch to a verified entry's merge commit,
     /// then re-simulate every other non-terminal entry whose base moved.
-    /// Never pushes; never touches GitHub.
+    /// Publication is a separate, explicit `broker ship` operation.
     pub fn promote(&mut self, entry_id: i64) -> Result<(), BrokerOpError> {
         let entry = self.queue_entry(entry_id)?;
         if entry.status != MergeStatus::Verified {

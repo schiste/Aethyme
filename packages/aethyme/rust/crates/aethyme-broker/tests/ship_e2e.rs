@@ -4,7 +4,9 @@ use std::process::Command;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use aethyme_broker::{Broker, BrokerOpError, OperationStatus, ShipFreshnessResult};
+use aethyme_broker::{
+    Broker, BrokerOpError, IntegrationDeliveryState, OperationStatus, ShipFreshnessResult,
+};
 
 fn git_output(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -244,6 +246,46 @@ fn ship_execute_sync_main_fast_forwards_a_clean_primary_checkout() {
         report.sync_operation.as_ref().unwrap().status,
         OperationStatus::Succeeded
     );
+}
+
+#[test]
+fn integration_status_routes_promoted_published_and_synchronized_states_through_ship() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    let mut broker = Broker::open(&fixture.repo).unwrap();
+
+    let promoted = broker.integration_status(0).unwrap();
+    assert_eq!(
+        promoted.next_action.state,
+        IntegrationDeliveryState::Promoted
+    );
+    assert_eq!(
+        promoted.next_action.commands,
+        vec![format!("aethyme broker ship plan --entry {entry_id}")]
+    );
+
+    broker.ship_execute(entry_id, &integration).unwrap();
+    let published = broker.integration_status(0).unwrap();
+    assert_eq!(
+        published.next_action.state,
+        IntegrationDeliveryState::Published
+    );
+    assert_eq!(
+        published.next_action.commands,
+        vec![format!(
+            "aethyme broker ship execute --entry {entry_id} --confirm {integration} --sync-main"
+        )]
+    );
+
+    broker
+        .ship_execute_with_sync(entry_id, &integration, true)
+        .unwrap();
+    let synchronized = broker.integration_status(0).unwrap();
+    assert_eq!(
+        synchronized.next_action.state,
+        IntegrationDeliveryState::LocallySynchronized
+    );
+    assert!(synchronized.next_action.commands.is_empty());
 }
 
 #[test]

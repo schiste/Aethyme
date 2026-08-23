@@ -6,8 +6,8 @@ use std::path::Path;
 use std::process::Command;
 
 use aethyme_broker::{
-    Broker, IntegrationReconcileClassification, IntegrationReconcileOptions, MergeStatus,
-    RepairAction, RepairSource, StatusAdviceSeverity,
+    Broker, IntegrationDeliveryState, IntegrationReconcileClassification,
+    IntegrationReconcileOptions, MergeStatus, RepairAction, RepairSource, StatusAdviceSeverity,
 };
 
 fn sh(cwd: &Path, args: &[&str]) {
@@ -570,6 +570,7 @@ fn integration_status_reports_pending_layer_entries_files_and_conflicts() {
             .any(|command| command == &format!("aethyme broker repair --session {}", live.id)),
         "{report:?}"
     );
+    assert_eq!(report.next_action.state, IntegrationDeliveryState::Blocked);
 
     sh(tmp.path(), &["merge", "--ff-only", "aethyme/integration"]);
     let report = broker.integration_status(0).unwrap();
@@ -582,7 +583,11 @@ fn integration_status_reports_pending_layer_entries_files_and_conflicts() {
     );
     assert_eq!(
         report.next_action.summary,
-        "no promoted work pending outside main"
+        "local main is synchronized with aethyme/integration"
+    );
+    assert_eq!(
+        report.next_action.state,
+        IntegrationDeliveryState::LocallySynchronized
     );
 }
 

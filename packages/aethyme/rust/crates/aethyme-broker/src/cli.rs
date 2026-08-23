@@ -143,7 +143,7 @@ Usage:
   aethyme broker promote --entry <id> [--json]
       Manual-mode only: advance the local integration branch to a verified
       entry's merge commit; other in-flight entries are re-simulated.
-      Never pushes.
+      Promotion stays local; publish through `broker ship plan --entry <id>`.
   aethyme broker ship plan --entry <id> [--json]
       Read-only publication plan for a promoted entry: resolve the exact
       integration tip, local and remote default-branch SHAs, freshness,
@@ -1465,6 +1465,7 @@ fn render_integration_status(
         }
     }
 
+    println!("Delivery state: {}", report.next_action.state.as_str());
     println!("Next action: {}", report.next_action.summary);
     for command in &report.next_action.commands {
         println!("  run: {command}");
@@ -2429,6 +2430,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 println!("{{\"promoted\":{entry}}}");
             } else {
                 println!("Promoted entry {entry} to the local integration branch.");
+                println!("Next: aethyme broker ship plan --entry {entry}");
             }
         }
         "ship" => {
