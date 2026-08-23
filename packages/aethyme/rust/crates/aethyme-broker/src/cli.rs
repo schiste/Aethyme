@@ -66,6 +66,14 @@ Usage:
       --stdout emits the exact report bytes and prints the digest to stderr.
       Task text and coordinated-operation reasons are omitted unless
       --include-task is explicit.
+  aethyme broker report list [--json]
+      List valid captured reports newest-first with capture time, kind,
+      Aethyme version, current SHA-256 digest, and filed/unfiled state.
+      Invalid local artifacts are reported separately; no state is changed.
+  aethyme broker report show <filename> [--json]
+      Inspect one captured report by filename or its repository-relative
+      .aethyme/reports/<filename> path. Recomputes the current digest and
+      refuses symlinks, path escapes, oversized files, and invalid schemas.
   aethyme broker start --task <text> [--json]
       Create a broker-managed worktree + branch and register a session,
       but do not spawn a process. Prefer this over adopting the main
@@ -2126,6 +2134,153 @@ fn render_coordinated_operation(
     Ok(())
 }
 
+fn run_report(parsed: Parsed) -> Result<(), UsageError> {
+    match parsed.positional.first().map(String::as_str) {
+        Some("capture") if parsed.positional.len() == 1 => {
+            if parsed.stdout && parsed.output.is_some() {
+                return Err(UsageError::Message(
+                    "--stdout and --output are mutually exclusive".into(),
+                ));
+            }
+            if parsed.stdout && parsed.json {
+                return Err(UsageError::Message(
+                    "--stdout already emits the JSON report; do not combine it with --json".into(),
+                ));
+            }
+            let kind = crate::ReportKind::parse(
+                parsed
+                    .kind
+                    .as_deref()
+                    .ok_or(UsageError::Message("report capture requires --kind".into()))?,
+            )?;
+            let title = parsed.title.as_deref().ok_or(UsageError::Message(
+                "report capture requires --title".into(),
+            ))?;
+            let mut broker = open_broker()?;
+            let selected_session = if let Some(session_id) = parsed.session {
+                Some(session_id)
+            } else {
+                let cwd = std::env::current_dir()
+                    .map_err(|error| UsageError::Message(error.to_string()))?;
+                let checkout = crate::GitRepo::discover(&cwd)?;
+                let worktree = checkout.root().to_string_lossy();
+                broker
+                    .store()
+                    .session_for_worktree(&worktree)?
+                    .map(|session| session.id)
+            };
+            let prepared = crate::prepare_report(
+                &mut broker,
+                kind,
+                title,
+                selected_session,
+                parsed.include_task,
+                now_ms(),
+            )?;
+            if parsed.stdout {
+                use std::io::Write;
+                std::io::stdout()
+                    .lock()
+                    .write_all(&prepared.bytes)
+                    .map_err(|error| UsageError::Message(error.to_string()))?;
+                eprintln!("SHA-256: {}", prepared.sha256);
+            } else {
+                let result = crate::write_report_atomic(
+                    broker.main_root(),
+                    parsed.output.as_deref(),
+                    &prepared,
+                )?;
+                if parsed.json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!(
+                        "Captured {} report: {}",
+                        kind.as_str(),
+                        result.path.as_deref().unwrap_or("-")
+                    );
+                    println!("SHA-256: {}", result.sha256);
+                    println!("Review this local report before any later filing step.");
+                }
+            }
+            Ok(())
+        }
+        Some("list") if parsed.positional.len() == 1 => {
+            let main_root = report_main_root()?;
+            let report = crate::list_reports(&main_root)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if report.reports.is_empty() && report.invalid.is_empty() {
+                println!("No captured reports.");
+            } else {
+                if report.reports.is_empty() {
+                    println!("No valid captured reports.");
+                } else {
+                    println!(
+                        "CAPTURED_AT    KIND          STATE     VERSION          DIGEST       PATH"
+                    );
+                    for item in &report.reports {
+                        println!(
+                            "{:<14} {:<13} {:<9} {:<16} {:<12} {}",
+                            item.captured_at,
+                            item.kind.as_str(),
+                            match item.filing_state {
+                                crate::ReportFilingState::Unfiled => "unfiled",
+                                crate::ReportFilingState::Filed => "filed",
+                            },
+                            item.version,
+                            &item.digest[..12],
+                            item.path,
+                        );
+                    }
+                }
+                for invalid in &report.invalid {
+                    eprintln!("Invalid report {}: {}", invalid.path, invalid.error);
+                }
+            }
+            Ok(())
+        }
+        Some("show") if parsed.positional.len() == 2 => {
+            let main_root = report_main_root()?;
+            let inspection =
+                crate::show_report(&main_root, PathBuf::from(&parsed.positional[1]).as_path())?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&inspection)?);
+            } else {
+                println!("Report: {}", inspection.summary.path);
+                println!("  title: {}", inspection.summary.title);
+                println!("  captured at: {}", inspection.summary.captured_at);
+                println!("  kind: {}", inspection.summary.kind.as_str());
+                println!("  version: {}", inspection.summary.version);
+                println!("  digest: {}", inspection.summary.digest);
+                println!(
+                    "  filing state: {}",
+                    match inspection.summary.filing_state {
+                        crate::ReportFilingState::Unfiled => "unfiled",
+                        crate::ReportFilingState::Filed => "filed",
+                    }
+                );
+                println!("\n{}", serde_json::to_string_pretty(&inspection.report)?);
+            }
+            Ok(())
+        }
+        Some("capture" | "list" | "show") => Err(UsageError::Message(
+            "invalid report arguments; expected capture, list, or show <filename>".into(),
+        )),
+        Some(other) => Err(UsageError::Message(format!(
+            "unknown report action {other:?}; expected capture, list, or show"
+        ))),
+        None => Err(UsageError::Message(
+            "report requires an action: capture, list, or show".into(),
+        )),
+    }
+}
+
+fn report_main_root() -> Result<PathBuf, UsageError> {
+    let cwd = std::env::current_dir().map_err(|error| UsageError::Message(error.to_string()))?;
+    let repo = crate::GitRepo::discover(&cwd)?;
+    Ok(repo.main_root()?)
+}
+
 fn run_inner(args: &[String]) -> Result<(), UsageError> {
     let Some(subcommand) = args.first() else {
         return Err(UsageError::Help);
@@ -2260,80 +2415,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 );
             }
         }
-        "report" => {
-            if parsed.positional.first().map(String::as_str) != Some("capture")
-                || parsed.positional.len() != 1
-            {
-                return Err(UsageError::Message(
-                    "report requires the capture action".into(),
-                ));
-            }
-            if parsed.stdout && parsed.output.is_some() {
-                return Err(UsageError::Message(
-                    "--stdout and --output are mutually exclusive".into(),
-                ));
-            }
-            if parsed.stdout && parsed.json {
-                return Err(UsageError::Message(
-                    "--stdout already emits the JSON report; do not combine it with --json".into(),
-                ));
-            }
-            let kind = crate::ReportKind::parse(
-                parsed
-                    .kind
-                    .as_deref()
-                    .ok_or(UsageError::Message("report capture requires --kind".into()))?,
-            )?;
-            let title = parsed.title.as_deref().ok_or(UsageError::Message(
-                "report capture requires --title".into(),
-            ))?;
-            let mut broker = open_broker()?;
-            let selected_session = if let Some(session_id) = parsed.session {
-                Some(session_id)
-            } else {
-                let cwd = std::env::current_dir()
-                    .map_err(|error| UsageError::Message(error.to_string()))?;
-                let checkout = crate::GitRepo::discover(&cwd)?;
-                let worktree = checkout.root().to_string_lossy();
-                broker
-                    .store()
-                    .session_for_worktree(&worktree)?
-                    .map(|session| session.id)
-            };
-            let prepared = crate::prepare_report(
-                &mut broker,
-                kind,
-                title,
-                selected_session,
-                parsed.include_task,
-                now_ms(),
-            )?;
-            if parsed.stdout {
-                use std::io::Write;
-                std::io::stdout()
-                    .lock()
-                    .write_all(&prepared.bytes)
-                    .map_err(|error| UsageError::Message(error.to_string()))?;
-                eprintln!("SHA-256: {}", prepared.sha256);
-            } else {
-                let result = crate::write_report_atomic(
-                    broker.main_root(),
-                    parsed.output.as_deref(),
-                    &prepared,
-                )?;
-                if parsed.json {
-                    println!("{}", serde_json::to_string_pretty(&result)?);
-                } else {
-                    println!(
-                        "Captured {} report: {}",
-                        kind.as_str(),
-                        result.path.as_deref().unwrap_or("-")
-                    );
-                    println!("SHA-256: {}", result.sha256);
-                    println!("Review this local report before any later filing step.");
-                }
-            }
-        }
+        "report" => run_report(parsed)?,
         "agents" => {
             let mut broker = open_broker()?;
             let overlaps = broker.refresh_leases()?;

@@ -4,7 +4,7 @@ Version: **1** — **FROZEN** (2026-07-17). Companion to
 [events-contract.md](events-contract.md), which covers the event stream
 itself; this file covers command outputs.
 
-Five command outputs are **stable v1 surfaces**. Scripts and integrations
+Seven command outputs are **stable v1 surfaces**. Scripts and integrations
 may depend on their field names:
 
 | Surface | Command | Shape (source of truth) |
@@ -14,6 +14,8 @@ may depend on their field names:
 | Events | `aethyme broker events --json` | `Event` rows (`src/types.rs`), NDJSON |
 | Metrics | `aethyme broker metrics --json` | inline object (`src/cli.rs`) |
 | Submit outcome | `aethyme broker submit --json` | `SubmitOutcome` (`src/merge.rs`) |
+| Report list | `aethyme broker report list --json` | `ReportList` (`src/report.rs`) |
+| Report show | `aethyme broker report show <filename> --json` | `ReportInspection` (`src/report.rs`) |
 
 Every other `--json` output (doctor, certify, quick-test, verify-loop,
 agents, adopt, leases, gates, `pr check`, ...) is best-effort: useful, but not
@@ -125,3 +127,58 @@ event-stream contract — see [events-contract.md](events-contract.md).
 
 `conflicts` non-empty means the submission was rejected pre-gate;
 `promoted: true` means the integration branch advanced in this call.
+
+### `report list --json`
+
+```
+{
+  "schema_version": 1,
+  "reports": [
+    {
+      "path": ".aethyme/reports/<filename>",
+      "title": "...",
+      "captured_at": 1234567890,
+      "kind": "bug" | "improvement",
+      "version": "<capturing Aethyme version>",
+      "report_schema_version": 1,
+      "digest": "<lowercase SHA-256 of exact current bytes>",
+      "filing_state": "filed" | "unfiled"
+    }
+  ],
+  "invalid": [
+    { "path": ".aethyme/reports/<filename>", "error": "..." }
+  ]
+}
+```
+
+Valid reports are ordered by `captured_at` descending, then `path` ascending.
+Invalid entries are ordered by `path`. A damaged artifact does not suppress
+valid summaries. Paths are always repository-relative. Filing state is keyed
+by the current digest; changing report bytes can only move an existing filed
+artifact to `unfiled`, never silently retain filed state.
+
+The local filing index is `.aethyme/reports/.filings.json`:
+
+```
+{ "schema_version": 1, "filings": { "<sha256>": {} } }
+```
+
+Filing-record objects are additive and reserved for the filing command's
+provider metadata. Inventory readers determine state from map membership and
+do not expose filing-record contents.
+
+### `report show <filename> --json`
+
+```
+{
+  "schema_version": 1,
+  "summary": ReportSummary,
+  "report": ReportDocument
+}
+```
+
+`summary` has exactly the report-list summary fields above. `report` is the
+parsed allowlist-only capture artifact (`schema_version`, `kind`, `title`,
+`captured_at`, and `snapshot`). Invalid JSON, unsupported report/snapshot
+schemas, symlinks, oversized artifacts, and paths outside
+`.aethyme/reports/` fail closed.

@@ -89,12 +89,15 @@ pub use reconciliation::{
     IntegrationReconcileReport, IntegrationReconcileResolutionAudit,
 };
 pub use report::{
-    PreparedReport, REPORT_DOCUMENT_SCHEMA_VERSION, REPORT_RECENT_EVENT_LIMIT,
-    REPORT_RECENT_GATE_LIMIT, REPORT_RECENT_OPERATION_LIMIT, REPORT_SNAPSHOT_SCHEMA_VERSION,
-    ReportBuild, ReportCaptureError, ReportCaptureResult, ReportDocument, ReportEventType,
-    ReportGateCacheSource, ReportGateObservation, ReportGateProvenance, ReportKind,
-    ReportLastFailure, ReportOperation, ReportPlatform, ReportSession, ReportSnapshot,
-    ReportSnapshotBuilder, prepare_report, write_report_atomic,
+    InvalidReportEntry, PreparedReport, REPORT_DOCUMENT_SCHEMA_VERSION, REPORT_FILINGS_FILENAME,
+    REPORT_FILINGS_SCHEMA_VERSION, REPORT_INVENTORY_SCHEMA_VERSION, REPORT_MAX_BYTES,
+    REPORT_RECENT_EVENT_LIMIT, REPORT_RECENT_GATE_LIMIT, REPORT_RECENT_OPERATION_LIMIT,
+    REPORT_SNAPSHOT_SCHEMA_VERSION, ReportBuild, ReportCaptureError, ReportCaptureResult,
+    ReportDocument, ReportEventType, ReportFilingState, ReportGateCacheSource,
+    ReportGateObservation, ReportGateProvenance, ReportInspection, ReportKind, ReportLastFailure,
+    ReportList, ReportOperation, ReportPlatform, ReportSession, ReportSnapshot,
+    ReportSnapshotBuilder, ReportSummary, list_reports, prepare_report, show_report,
+    write_report_atomic,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use ship::{
