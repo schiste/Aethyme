@@ -66,6 +66,14 @@ download() {
     curl --fail --silent --show-error --location "$1" --output "$2"
 }
 
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{ print $1 }'
+    else
+        shasum -a 256 "$1" | awk '{ print $1 }'
+    fi
+}
+
 if [ -n "$requested_version" ]; then
     release_path="releases/download/v${requested_version}"
 else
@@ -103,6 +111,24 @@ if [ "$verify_signature" = true ]; then
         --certificate-identity "https://github.com/schiste/Aethyme/.github/workflows/release.yml@refs/tags/v${version}" \
         --certificate-oidc-issuer https://token.actions.githubusercontent.com \
         "$manifest" >/dev/null
+    [ -f "$0" ] || {
+        printf 'install: signature verification requires running a reviewed installer file\n' >&2
+        exit 1
+    }
+    installer_digest="$(awk '
+        /"installer"[[:space:]]*:/ { in_installer = 1 }
+        in_installer && /"sha256"[[:space:]]*:/ {
+            value = $0
+            sub(/^.*"sha256"[[:space:]]*:[[:space:]]*"/, "", value)
+            sub(/".*$/, "", value)
+            print value
+            exit
+        }
+    ' "$manifest")"
+    [ "$(sha256_file "$0")" = "$installer_digest" ] || {
+        printf 'install: reviewed installer does not match the signed manifest\n' >&2
+        exit 1
+    }
 fi
 
 archive="aethyme-v${version}-${target}.tar.gz"
@@ -128,11 +154,7 @@ esac
     printf 'install: invalid checksum asset for %s\n' "$archive" >&2
     exit 1
 }
-if command -v sha256sum >/dev/null 2>&1; then
-    actual="$(sha256sum "$archive_path" | awk '{ print $1 }')"
-else
-    actual="$(shasum -a 256 "$archive_path" | awk '{ print $1 }')"
-fi
+actual="$(sha256_file "$archive_path")"
 [ "$actual" = "$expected" ] || {
     printf 'install: SHA-256 mismatch for %s\n' "$archive" >&2
     exit 1
