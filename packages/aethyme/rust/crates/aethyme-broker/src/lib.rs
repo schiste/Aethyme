@@ -58,7 +58,7 @@ pub use broker::{
     RepairAction, RepairGateSelection, RepairReport, RepairSource, SemanticGateAdvice,
     SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus,
     SemanticGateSuggestionChain, SessionHandoffReport, StatusAdvice, StatusAdviceSeverity,
-    StatusIntegrationRelation, StatusSummary, StatusView, VersionRepairReport,
+    StatusIntegrationRelation, StatusSummary, StatusView, VersionRepairReport, VersionRepairStep,
 };
 pub use error::BrokerError;
 pub use gates::{

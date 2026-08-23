@@ -415,7 +415,7 @@ impl DoctorRepairStatus {
     }
 }
 
-/// Result of the explicit local CLI repair path.
+/// Result of the explicit local product-binary repair path.
 #[derive(Debug, serde::Serialize)]
 pub struct VersionRepairReport {
     pub status: DoctorRepairStatus,
@@ -428,12 +428,27 @@ pub struct VersionRepairReport {
     pub message: String,
     pub stdout_tail: Vec<String>,
     pub stderr_tail: Vec<String>,
+    /// Exact install and verification commands, in execution order.
+    pub commands: Vec<Vec<String>>,
+    /// Per-component outcomes. Overall pass requires every step to pass.
+    pub steps: Vec<VersionRepairStep>,
 }
 
 impl VersionRepairReport {
     pub fn repaired(&self) -> bool {
         self.status == DoctorRepairStatus::Pass
     }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct VersionRepairStep {
+    pub component: String,
+    pub action: String,
+    pub command: Vec<String>,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub stdout_tail: Vec<String>,
+    pub stderr_tail: Vec<String>,
 }
 
 /// Everything `broker status` renders, in one serializable shape.
@@ -2802,12 +2817,14 @@ impl Broker {
     }
 
     fn repair_local_cli_version(&mut self, version: &VersionDriftReport) -> VersionRepairReport {
+        let placeholder_commands = local_cli_repair_commands(None, None);
+        let placeholder_command = placeholder_commands[0].clone();
         match version.status {
             VersionDriftStatus::Current | VersionDriftStatus::AheadOfIntegration => {
                 return VersionRepairReport {
                     status: DoctorRepairStatus::NotNeeded,
                     attempted: false,
-                    command: local_cli_install_command(None),
+                    command: placeholder_command.clone(),
                     install_source: None,
                     integration_head: version.integration_head.clone(),
                     exit_code: None,
@@ -2818,13 +2835,15 @@ impl Broker {
                     ),
                     stdout_tail: Vec::new(),
                     stderr_tail: Vec::new(),
+                    commands: placeholder_commands.clone(),
+                    steps: Vec::new(),
                 };
             }
             VersionDriftStatus::NotAethymeSource | VersionDriftStatus::Unknown => {
                 return VersionRepairReport {
                     status: DoctorRepairStatus::Skipped,
                     attempted: false,
-                    command: local_cli_install_command(None),
+                    command: placeholder_command.clone(),
                     install_source: None,
                     integration_head: version.integration_head.clone(),
                     exit_code: None,
@@ -2835,6 +2854,8 @@ impl Broker {
                     ),
                     stdout_tail: Vec::new(),
                     stderr_tail: Vec::new(),
+                    commands: placeholder_commands.clone(),
+                    steps: Vec::new(),
                 };
             }
             VersionDriftStatus::BehindIntegration
@@ -2845,7 +2866,7 @@ impl Broker {
             return VersionRepairReport {
                 status: DoctorRepairStatus::Skipped,
                 attempted: false,
-                command: local_cli_install_command(None),
+                command: placeholder_command.clone(),
                 install_source: None,
                 integration_head: None,
                 exit_code: None,
@@ -2853,13 +2874,15 @@ impl Broker {
                 message: "integration head is unavailable; cannot choose a repair source".into(),
                 stdout_tail: Vec::new(),
                 stderr_tail: Vec::new(),
+                commands: placeholder_commands.clone(),
+                steps: Vec::new(),
             };
         };
         if !version.repo_is_aethyme_source {
             return VersionRepairReport {
                 status: DoctorRepairStatus::Skipped,
                 attempted: false,
-                command: local_cli_install_command(None),
+                command: placeholder_command,
                 install_source: None,
                 integration_head: Some(integration_head.to_string()),
                 exit_code: None,
@@ -2867,6 +2890,8 @@ impl Broker {
                 message: "not an Aethyme source checkout; refusing to reinstall local CLI".into(),
                 stdout_tail: Vec::new(),
                 stderr_tail: Vec::new(),
+                commands: placeholder_commands,
+                steps: Vec::new(),
             };
         }
 
@@ -2879,8 +2904,9 @@ impl Broker {
                 std::process::id(),
                 now_ms()
             ));
-        let engine_path = temp_root.join("packages/aethyme/rust/crates/aethyme-engine");
-        let command = local_cli_install_command(Some(&engine_path));
+        let install_bin = cargo_install_bin_dir();
+        let commands = local_cli_repair_commands(Some(&temp_root), Some(&install_bin));
+        let command = commands[0].clone();
         let start = now_ms();
         let worktree = self
             .repo
@@ -2897,63 +2923,70 @@ impl Broker {
                 message: format!("failed to create temporary integration worktree: {err}"),
                 stdout_tail: Vec::new(),
                 stderr_tail: Vec::new(),
+                commands,
+                steps: Vec::new(),
             };
         }
 
-        let output = Command::new("cargo")
-            .args(&command[1..])
-            .current_dir(&temp_root)
-            .output();
+        let specs = local_cli_repair_step_specs(Some(&temp_root), Some(&install_bin));
+        let steps = execute_version_repair_steps(&specs, |command| {
+            let output = Command::new(&command[0])
+                .args(&command[1..])
+                .current_dir(&temp_root)
+                .output()
+                .map_err(|error| error.to_string())?;
+            Ok(RepairCommandOutput {
+                success: output.status.success(),
+                exit_code: output.status.code(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            })
+        });
         let duration_ms = now_ms().saturating_sub(start);
         let _ = self.repo.worktree_remove(&temp_root, true);
-
-        match output {
-            Ok(output) => {
-                let stdout_tail = tail_lines(&String::from_utf8_lossy(&output.stdout), 12);
-                let stderr_tail = tail_lines(&String::from_utf8_lossy(&output.stderr), 12);
-                let status = if output.status.success() {
-                    DoctorRepairStatus::Pass
-                } else {
-                    DoctorRepairStatus::Fail
-                };
-                let message = if output.status.success() {
-                    format!(
-                        "installed local CLI from {} {}; rerun doctor to observe the repaired binary",
-                        version.integration_branch,
-                        short_commit(integration_head)
-                    )
-                } else {
-                    format!(
-                        "cargo install failed while repairing local CLI from {} {}",
-                        version.integration_branch,
-                        short_commit(integration_head)
-                    )
-                };
-                VersionRepairReport {
-                    status,
-                    attempted: true,
-                    command,
-                    install_source: Some(temp_root.to_string_lossy().into_owned()),
-                    integration_head: Some(integration_head.to_string()),
-                    exit_code: output.status.code(),
-                    duration_ms,
-                    message,
-                    stdout_tail,
-                    stderr_tail,
-                }
-            }
-            Err(err) => VersionRepairReport {
-                status: DoctorRepairStatus::Fail,
-                attempted: true,
-                command,
-                install_source: Some(temp_root.to_string_lossy().into_owned()),
-                integration_head: Some(integration_head.to_string()),
-                exit_code: None,
-                duration_ms,
-                message: format!("failed to run cargo install: {err}"),
-                stdout_tail: Vec::new(),
-                stderr_tail: Vec::new(),
+        let all_passed = steps.iter().all(|step| step.success);
+        let failed = steps
+            .iter()
+            .filter(|step| !step.success)
+            .map(|step| format!("{} {}", step.component, step.action))
+            .collect::<Vec<_>>();
+        let stdout_tail = combined_repair_tail(&steps, true);
+        let stderr_tail = combined_repair_tail(&steps, false);
+        let exit_code = steps
+            .iter()
+            .find(|step| !step.success)
+            .or_else(|| steps.last())
+            .and_then(|step| step.exit_code);
+        VersionRepairReport {
+            status: if all_passed {
+                DoctorRepairStatus::Pass
+            } else {
+                DoctorRepairStatus::Fail
             },
+            attempted: true,
+            command,
+            install_source: Some(temp_root.to_string_lossy().into_owned()),
+            integration_head: Some(integration_head.to_string()),
+            exit_code,
+            duration_ms,
+            message: if all_passed {
+                format!(
+                    "installed and verified aethyme plus aethyme-engine-cli from {} {}; rerun doctor to observe the repaired binaries",
+                    version.integration_branch,
+                    short_commit(integration_head)
+                )
+            } else {
+                format!(
+                    "local binary repair from {} {} failed at: {}",
+                    version.integration_branch,
+                    short_commit(integration_head),
+                    failed.join(", ")
+                )
+            },
+            stdout_tail,
+            stderr_tail,
+            commands,
+            steps,
         }
     }
 
@@ -4131,20 +4164,129 @@ fn tail_lines(text: &str, limit: usize) -> Vec<String> {
     lines
 }
 
-fn local_cli_install_command(path: Option<&Path>) -> Vec<String> {
-    let install_path = path
+#[derive(Clone)]
+struct RepairStepSpec {
+    component: &'static str,
+    action: &'static str,
+    command: Vec<String>,
+}
+
+struct RepairCommandOutput {
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+fn cargo_install_bin_dir() -> PathBuf {
+    if let Some(root) = std::env::var_os("CARGO_INSTALL_ROOT") {
+        return PathBuf::from(root).join("bin");
+    }
+    if let Some(home) = std::env::var_os("CARGO_HOME") {
+        return PathBuf::from(home).join("bin");
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cargo/bin")
+}
+
+fn local_cli_repair_step_specs(
+    source_root: Option<&Path>,
+    install_bin: Option<&Path>,
+) -> Vec<RepairStepSpec> {
+    let source_root = source_root
         .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| {
-            "<integration-worktree>/packages/aethyme/rust/crates/aethyme-engine".into()
-        });
-    vec![
-        "cargo".into(),
-        "install".into(),
-        "--path".into(),
-        install_path,
-        "--force".into(),
-        "--locked".into(),
+        .unwrap_or_else(|| "<integration-worktree>".into());
+    let install_bin = install_bin
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<cargo-install-root>/bin".into());
+    [
+        ("router", "aethyme-cli", "aethyme"),
+        ("engine", "aethyme-engine", "aethyme-engine-cli"),
     ]
+    .into_iter()
+    .flat_map(|(component, crate_name, binary)| {
+        let install = RepairStepSpec {
+            component,
+            action: "install",
+            command: vec![
+                "cargo".into(),
+                "install".into(),
+                "--path".into(),
+                format!("{source_root}/packages/aethyme/rust/crates/{crate_name}"),
+                "--force".into(),
+                "--locked".into(),
+            ],
+        };
+        let verify = RepairStepSpec {
+            component,
+            action: "verify",
+            command: vec![format!("{install_bin}/{binary}"), "--version".into()],
+        };
+        [install, verify]
+    })
+    .collect()
+}
+
+fn local_cli_repair_commands(
+    source_root: Option<&Path>,
+    install_bin: Option<&Path>,
+) -> Vec<Vec<String>> {
+    local_cli_repair_step_specs(source_root, install_bin)
+        .into_iter()
+        .map(|step| step.command)
+        .collect()
+}
+
+fn execute_version_repair_steps(
+    specs: &[RepairStepSpec],
+    mut run: impl FnMut(&[String]) -> Result<RepairCommandOutput, String>,
+) -> Vec<VersionRepairStep> {
+    specs
+        .iter()
+        .map(|spec| match run(&spec.command) {
+            Ok(output) => VersionRepairStep {
+                component: spec.component.into(),
+                action: spec.action.into(),
+                command: spec.command.clone(),
+                success: output.success,
+                exit_code: output.exit_code,
+                stdout_tail: tail_lines(&output.stdout, 12),
+                stderr_tail: tail_lines(&output.stderr, 12),
+            },
+            Err(error) => VersionRepairStep {
+                component: spec.component.into(),
+                action: spec.action.into(),
+                command: spec.command.clone(),
+                success: false,
+                exit_code: None,
+                stdout_tail: Vec::new(),
+                stderr_tail: vec![error],
+            },
+        })
+        .collect()
+}
+
+fn combined_repair_tail(steps: &[VersionRepairStep], stdout: bool) -> Vec<String> {
+    let mut lines = steps
+        .iter()
+        .flat_map(|step| {
+            let source = if stdout {
+                &step.stdout_tail
+            } else {
+                &step.stderr_tail
+            };
+            source
+                .iter()
+                .map(|line| format!("{} {}: {line}", step.component, step.action))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if lines.len() > 12 {
+        lines = lines.split_off(lines.len() - 12);
+    }
+    lines
 }
 
 fn shell_quote(value: &str) -> String {
@@ -4219,7 +4361,10 @@ fn slugify(task: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DoctorRepairStatus, DoctorReport, VersionRepairReport, slugify};
+    use super::{
+        DoctorRepairStatus, DoctorReport, RepairCommandOutput, VersionRepairReport,
+        execute_version_repair_steps, local_cli_repair_step_specs, slugify,
+    };
     use crate::types::{MergeQueueEntry, Session, SessionOrigin, SessionStatus};
     use crate::version::{BinaryBuild, VersionDriftReport, VersionDriftStatus};
 
@@ -4250,6 +4395,62 @@ mod tests {
         );
 
         assert!(!report.healthy());
+    }
+
+    #[test]
+    fn version_repair_targets_and_verifies_both_required_binaries() {
+        let source = std::path::Path::new("/tmp/aethyme-release-source");
+        let install_bin = std::path::Path::new("/tmp/cargo-root/bin");
+
+        let specs = local_cli_repair_step_specs(Some(source), Some(install_bin));
+
+        assert_eq!(specs.len(), 4);
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| (spec.component, spec.action))
+                .collect::<Vec<_>>(),
+            vec![
+                ("router", "install"),
+                ("router", "verify"),
+                ("engine", "install"),
+                ("engine", "verify"),
+            ]
+        );
+        assert!(specs[0].command.join(" ").contains("aethyme-cli"));
+        assert_eq!(
+            specs[1].command,
+            vec!["/tmp/cargo-root/bin/aethyme", "--version"]
+        );
+        assert!(specs[2].command.join(" ").contains("aethyme-engine"));
+        assert_eq!(
+            specs[3].command,
+            vec!["/tmp/cargo-root/bin/aethyme-engine-cli", "--version"]
+        );
+    }
+
+    #[test]
+    fn version_repair_requires_every_install_and_verification_step() {
+        let specs = local_cli_repair_step_specs(None, None);
+
+        for failed_index in 0..specs.len() {
+            let mut observed = 0;
+            let steps = execute_version_repair_steps(&specs, |_| {
+                let current = observed;
+                observed += 1;
+                Ok(RepairCommandOutput {
+                    success: current != failed_index,
+                    exit_code: Some(if current == failed_index { 7 } else { 0 }),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            });
+
+            assert_eq!(observed, 4, "all outcomes must remain observable");
+            assert!(!steps.iter().all(|step| step.success));
+            assert_eq!(steps.iter().filter(|step| !step.success).count(), 1);
+            assert_eq!(steps[failed_index].exit_code, Some(7));
+        }
     }
 
     #[test]
@@ -4401,6 +4602,8 @@ mod tests {
             message: "test repair".into(),
             stdout_tail: Vec::new(),
             stderr_tail: Vec::new(),
+            commands: Vec::new(),
+            steps: Vec::new(),
         }
     }
 
