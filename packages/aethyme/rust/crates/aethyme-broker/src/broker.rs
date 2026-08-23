@@ -115,6 +115,21 @@ pub enum BrokerOpError {
     GateConfig(#[from] crate::gates::GateConfigError),
     #[error("queue entry {entry} is not verified (status: {status}) — submit/simulate first")]
     NotVerified { entry: i64, status: &'static str },
+    #[error("ship queue entry {entry} was not found")]
+    ShipEntryNotFound { entry: i64 },
+    #[error("ship requires a promoted queue entry; entry {entry} is {status}")]
+    ShipEntryNotPromoted { entry: i64, status: &'static str },
+    #[error(
+        "ship entry {entry} promotion {promotion} is not reachable from integration {integration} at {head}"
+    )]
+    ShipEntryNotOnIntegration {
+        entry: i64,
+        promotion: String,
+        integration: String,
+        head: String,
+    },
+    #[error("ship cannot resolve {what}: {reason}")]
+    ShipPlanUnavailable { what: &'static str, reason: String },
     #[error(
         "session {id} ({status}) already exists for this worktree{task}. Options:\n  \
          aethyme broker submit --session {id}        submit its committed work\n  \

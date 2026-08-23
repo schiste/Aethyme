@@ -36,6 +36,7 @@ mod pr;
 mod quick_test;
 mod reconciliation;
 mod schema;
+mod ship;
 mod store;
 mod types;
 mod verify_loop;
@@ -55,7 +56,7 @@ pub use error::BrokerError;
 pub use gates::{
     Gate, GateConfigError, GateProgressSink, GateRunOutcome, load_gates, select_gates,
 };
-pub use git::{GitError, GitRepo, MergeSimulation};
+pub use git::{GitError, GitRepo, MergeSimulation, RemoteDefaultBranch};
 pub use hooks::{HookReport, HookState, HooksError};
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use merge::{ACTION_REQUIRED_RELPATH, PromoteConfig, SubmitOutcome};
@@ -77,6 +78,7 @@ pub use reconciliation::{
     IntegrationReconcileReport, IntegrationReconcileResolutionAudit,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
+pub use ship::{ShipFreshness, ShipFreshnessResult, ShipPlan, ShipPush};
 pub use store::BrokerStore;
 pub use types::{
     CoordinatedOperation, Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease,

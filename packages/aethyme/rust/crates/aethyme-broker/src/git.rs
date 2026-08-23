@@ -163,6 +163,13 @@ pub struct MergeSimulation {
     pub conflicts: Vec<String>,
 }
 
+/// Default branch advertised by a configured Git remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDefaultBranch {
+    pub ref_name: String,
+    pub sha: String,
+}
+
 /// A handle on one git checkout (the main repository or a linked
 /// worktree). Constructed via [`GitRepo::discover`].
 pub struct GitRepo {
@@ -254,6 +261,44 @@ impl GitRepo {
         run_git(&self.root, &["config", "--get", key])
             .ok()
             .filter(|value| !value.is_empty())
+    }
+
+    /// Configured URL for `remote`.
+    pub fn remote_url(&self, remote: &str) -> Result<String, GitError> {
+        run_git(&self.root, &["remote", "get-url", remote])
+    }
+
+    /// Query the remote's advertised HEAD without updating any local ref.
+    pub fn remote_default_branch(&self, remote: &str) -> Result<RemoteDefaultBranch, GitError> {
+        let output = run_git(&self.root, &["ls-remote", "--symref", remote, "HEAD"])?;
+        let ref_name = output
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("ref: ")
+                    .and_then(|rest| rest.split_once('\t'))
+                    .filter(|(_, name)| *name == "HEAD")
+                    .map(|(name, _)| name.to_string())
+            })
+            .ok_or_else(|| GitError::Git {
+                args: format!("ls-remote --symref {remote} HEAD"),
+                stderr: format!("remote {remote:?} did not advertise a symbolic HEAD"),
+            })?;
+        let sha = output
+            .lines()
+            .find_map(|line| {
+                line.split_once('\t')
+                    .filter(|(sha, name)| {
+                        *name == "HEAD"
+                            && sha.len() == 40
+                            && sha.chars().all(|character| character.is_ascii_hexdigit())
+                    })
+                    .map(|(sha, _)| sha.to_string())
+            })
+            .ok_or_else(|| GitError::Git {
+                args: format!("ls-remote --symref {remote} HEAD"),
+                stderr: format!("remote {remote:?} did not advertise a HEAD commit"),
+            })?;
+        Ok(RemoteDefaultBranch { ref_name, sha })
     }
 
     pub fn resolve_ref(&self, name: &str) -> Option<String> {
