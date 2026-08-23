@@ -96,6 +96,9 @@ The broker is the stable product front door for multi-agent coordination:
 - `aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]`
 - `aethyme broker gates run --session <id> [--no-cache] [--json]`
 - `aethyme broker gates run --all [--no-cache] [--json]`
+- `aethyme broker hooks install [--json]`
+- `aethyme broker hooks uninstall [--json]`
+- `aethyme broker hooks status [--json]`
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
 - `aethyme broker repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
@@ -122,6 +125,13 @@ the full hash in `tree_hash` for both executed and cached results.
 Pass `--no-cache` to either gate-run form or submit to require fresh gate
 execution. Bypass skips cache lookup only: the fresh result is stored normally
 and is available to a subsequent run using the default cache policy.
+
+`broker hooks install` installs shared pre-commit and post-commit shims. The
+pre-commit hook runs matching cost-1 gates against the staged change and stays
+silent when they pass. If a gate fails, the hook replays its complete standard
+output and error, prints the broker diagnosis, returns the gate's non-zero exit
+code, and blocks the commit. The one-shot Git escape hatch remains
+`git commit --no-verify`.
 
 Promotion only advances the local integration ref. Use `broker ship plan` to
 inspect the promoted queue entry, exact integration SHA, remote freshness,

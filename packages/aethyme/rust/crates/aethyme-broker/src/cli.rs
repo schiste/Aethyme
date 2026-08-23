@@ -109,10 +109,12 @@ Usage:
   aethyme broker hooks install [--json]
       Explicitly install the two managed git hooks into the shared
       <git-common-dir>/hooks (all worktrees see them): pre-commit runs
-      the cost<=1 gates whose triggers match the staged files (failure
-      blocks the commit); post-commit warns when the new commit touches
-      files another live session is editing (informational — never
-      blocks). Refuses to touch a hook file it does not own (no aethyme
+      the cost<=1 gates whose triggers match the staged files. Successful
+      gates are silent; a failure replays its complete stdout/stderr,
+      reports the diagnosis, preserves its exit code, and blocks the
+      commit. Post-commit warns when the new commit touches files another
+      live session is editing (informational — never blocks). Refuses to
+      touch a hook file it does not own (no aethyme
       marker); with the marker, only the marker block is replaced. The
       hook shims embed this binary's absolute path.
   aethyme broker hooks uninstall [--json]
@@ -248,6 +250,10 @@ pub fn run(args: &[String]) -> u8 {
         Err(UsageError::Message(message)) => {
             eprintln!("Error: {message}");
             1
+        }
+        Err(UsageError::Exit { message, code }) => {
+            eprintln!("Error: {message}");
+            code
         }
     };
     record_command_metric(args, code, started.elapsed().as_millis() as i64);
@@ -657,6 +663,7 @@ mod tests {
 enum UsageError {
     Help,
     Message(String),
+    Exit { message: String, code: u8 },
 }
 
 impl<E: std::fmt::Display> From<E> for UsageError {
@@ -2338,7 +2345,17 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     render_hook_reports(&reports, parsed.json)?;
                 }
                 // Internal entry points the installed shims call.
-                "pre-commit" => crate::hooks::run_pre_commit(&cwd)?,
+                "pre-commit" => {
+                    if let Err(err) = crate::hooks::run_pre_commit(&cwd) {
+                        if let Some(code) = err.exit_code() {
+                            return Err(UsageError::Exit {
+                                message: err.to_string(),
+                                code,
+                            });
+                        }
+                        return Err(err.into());
+                    }
+                }
                 "post-commit" => crate::hooks::run_post_commit(&cwd),
                 other => {
                     return Err(UsageError::Message(format!(

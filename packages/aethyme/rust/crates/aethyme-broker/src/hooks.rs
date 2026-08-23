@@ -47,6 +47,11 @@ pub enum HooksError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("failed to replay pre-commit gate {stream}: {source}")]
+    ReplayOutput {
+        stream: &'static str,
+        source: std::io::Error,
+    },
     #[error(
         "refusing to install: {path} exists without the aethyme marker — that hook belongs \
          to you (or another tool) and is never clobbered. Move it aside or merge it \
@@ -66,6 +71,21 @@ pub enum HooksError {
          with `git commit --no-verify`."
     )]
     GateFailed { gate: String, code: i32 },
+}
+
+impl HooksError {
+    /// Original non-zero gate exit code when this is a gate failure.
+    pub fn exit_code(&self) -> Option<u8> {
+        let Self::GateFailed { code, .. } = self else {
+            return None;
+        };
+        Some(
+            u8::try_from(*code)
+                .ok()
+                .filter(|code| *code != 0)
+                .unwrap_or(1),
+        )
+    }
 }
 
 fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> HooksError + '_ {
@@ -350,8 +370,9 @@ pub fn status(repo: &GitRepo) -> Result<Vec<HookReport>, HooksError> {
 /// The pre-commit shim's target: run the cost≤1 gates whose triggers
 /// match the staged files, in the checkout the commit is happening in.
 /// No gates config, or no matching gates, is an instant pass; the first
-/// failing gate blocks the commit and is named in the error. Gate
-/// output inherits the hook's stdio so the user sees why.
+/// failing gate blocks the commit and is named in the error. Successful
+/// gate output stays quiet; a failing gate's complete stdout and stderr
+/// are replayed before the actionable error.
 pub fn run_pre_commit(cwd: &Path) -> Result<(), HooksError> {
     let checkout = GitRepo::discover(cwd)?;
     let main_root = checkout.main_root()?;
@@ -369,20 +390,45 @@ pub fn run_pre_commit(cwd: &Path) -> Result<(), HooksError> {
     // load_gates sorts cheap-first, so selections run in cost order.
     for selection in select_gates(&cheap, &staged) {
         let gate = selection.gate;
-        eprintln!("aethyme pre-commit: {} — {}", gate.name, gate.command);
-        let status = std::process::Command::new("sh")
+        let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(&gate.command)
             .current_dir(checkout.root())
-            .status()
+            .output()
             .map_err(io_err(checkout.root()))?;
-        if !status.success() {
+        if !output.status.success() {
+            replay_gate_output(&output)?;
             return Err(HooksError::GateFailed {
                 gate: gate.name.clone(),
-                code: status.code().unwrap_or(-1),
+                code: output.status.code().unwrap_or(-1),
             });
         }
     }
+    Ok(())
+}
+
+fn replay_gate_output(output: &std::process::Output) -> Result<(), HooksError> {
+    use std::io::Write;
+
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    stdout
+        .write_all(&output.stdout)
+        .and_then(|()| stdout.flush())
+        .map_err(|source| HooksError::ReplayOutput {
+            stream: "stdout",
+            source,
+        })?;
+
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    stderr
+        .write_all(&output.stderr)
+        .and_then(|()| stderr.flush())
+        .map_err(|source| HooksError::ReplayOutput {
+            stream: "stderr",
+            source,
+        })?;
     Ok(())
 }
 
