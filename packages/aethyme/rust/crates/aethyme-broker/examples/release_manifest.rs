@@ -96,7 +96,7 @@ fn build_manifest(options: &Options) -> Result<Value, String> {
     for target in TARGETS {
         let archive = format!("aethyme-{}-{target}.tar.gz", options.tag);
         let path = options.dist.join(&archive);
-        let (sha256, size_bytes) = hash_archive(&path)?;
+        let (sha256, size_bytes) = hash_file(&path)?;
         artifacts.push(json!({
             "archive": archive,
             "binaries": BINARIES,
@@ -105,6 +105,8 @@ fn build_manifest(options: &Options) -> Result<Value, String> {
             "target": target,
         }));
     }
+    let installer_name = "install.sh";
+    let (installer_sha256, installer_size_bytes) = hash_file(&options.dist.join(installer_name))?;
 
     Ok(json!({
         "artifacts": artifacts,
@@ -115,6 +117,11 @@ fn build_manifest(options: &Options) -> Result<Value, String> {
             },
             "engine_protocol": ENGINE_PROTOCOL_VERSION,
             "minimum_git_version": MINIMUM_GIT_VERSION,
+        },
+        "installer": {
+            "filename": installer_name,
+            "sha256": installer_sha256,
+            "size_bytes": installer_size_bytes,
         },
         "release_channel": options.channel,
         "required_binaries": BINARIES,
@@ -142,6 +149,20 @@ fn write_outputs(options: &Options, manifest: &Value) -> Result<(), String> {
             .map_err(|error| format!("write checksum for {archive}: {error}"))?;
         aggregate.push_str(&line);
     }
+    let installer = &manifest["installer"];
+    let installer_name = installer["filename"]
+        .as_str()
+        .ok_or("installer filename is not a string")?;
+    let installer_digest = installer["sha256"]
+        .as_str()
+        .ok_or("installer sha256 is not a string")?;
+    let installer_line = format!("{installer_digest}  {installer_name}\n");
+    fs::write(
+        options.dist.join(format!("{installer_name}.sha256")),
+        &installer_line,
+    )
+    .map_err(|error| format!("write checksum for {installer_name}: {error}"))?;
+    aggregate.push_str(&installer_line);
     fs::write(options.dist.join("SHA256SUMS"), aggregate)
         .map_err(|error| format!("write SHA256SUMS: {error}"))?;
     let mut encoded =
@@ -151,7 +172,7 @@ fn write_outputs(options: &Options, manifest: &Value) -> Result<(), String> {
         .map_err(|error| format!("write {}: {error}", options.output.display()))
 }
 
-fn hash_archive(path: &Path) -> Result<(String, u64), String> {
+fn hash_file(path: &Path) -> Result<(String, u64), String> {
     let mut file =
         fs::File::open(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     let size = file
@@ -191,6 +212,7 @@ mod tests {
             )
             .unwrap();
         }
+        fs::write(temp.path().join("install.sh"), "#!/bin/sh\n").unwrap();
         let options = Options {
             dist: temp.path().to_path_buf(),
             tag,
@@ -212,6 +234,8 @@ mod tests {
         assert_eq!(manifest["release_channel"], "stable");
         assert_eq!(manifest["artifacts"].as_array().unwrap().len(), 3);
         assert_eq!(manifest["required_binaries"], json!(BINARIES));
+        assert_eq!(manifest["installer"]["filename"], "install.sh");
+        assert_eq!(manifest["installer"]["sha256"].as_str().unwrap().len(), 64);
         assert_eq!(
             manifest["compatibility"]["engine_protocol"],
             ENGINE_PROTOCOL_VERSION
@@ -235,12 +259,13 @@ mod tests {
 
         assert!(options.output.is_file());
         let sums = fs::read_to_string(options.dist.join("SHA256SUMS")).unwrap();
-        assert_eq!(sums.lines().count(), TARGETS.len());
+        assert_eq!(sums.lines().count(), TARGETS.len() + 1);
         for target in TARGETS {
             let archive = format!("aethyme-{}-{target}.tar.gz", options.tag);
             assert!(sums.contains(&archive));
             assert!(options.dist.join(format!("{archive}.sha256")).is_file());
         }
+        assert!(options.dist.join("install.sh.sha256").is_file());
     }
 
     #[test]

@@ -113,6 +113,7 @@ jobs:
         run: |
           source_sha="$(git rev-parse HEAD)"
           test "$source_sha" = "$GITHUB_SHA"
+          cp install.sh dist/install.sh
           cargo run --locked --manifest-path packages/aethyme/rust/Cargo.toml \
             -p aethyme-broker --example release_manifest -- \
             --dist "$GITHUB_WORKSPACE/dist" \
