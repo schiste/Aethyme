@@ -232,7 +232,15 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
     init_repo(tmp.path());
     let mut broker = Broker::open(tmp.path()).unwrap();
 
-    let first = broker.adopt(tmp.path(), Some("first task")).unwrap();
+    let first = broker
+        .adopt_with(
+            tmp.path(),
+            Some("first task"),
+            aethyme_broker::AdoptMode::New,
+        )
+        .unwrap();
+    assert_eq!(first.outcome, aethyme_broker::AdoptOutcome::Created);
+    let first = first.session;
 
     // Bare re-adopt fails with guidance naming the session and options.
     let err = broker.adopt(tmp.path(), Some("second task")).unwrap_err();
@@ -261,6 +269,8 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
             aethyme_broker::AdoptMode::Reuse,
         )
         .unwrap();
+    assert_eq!(reused.outcome, aethyme_broker::AdoptOutcome::Reused);
+    let reused = reused.session;
     assert_eq!(reused.id, first.id);
     assert_eq!(reused.task.as_deref(), Some("follow-up task"));
     assert_ne!(reused.diff_base, first.diff_base, "baseline must refresh");
@@ -271,8 +281,16 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
     assert_eq!(closed.status, SessionStatus::Cleaned);
     assert!(tmp.path().join("README.md").exists());
 
-    // After close, plain adopt works again (no --replace-stale needed).
-    let second = broker.adopt(tmp.path(), Some("third task")).unwrap();
+    // After close, --reuse creates a fresh session because no live identity remains.
+    let second = broker
+        .adopt_with(
+            tmp.path(),
+            Some("third task"),
+            aethyme_broker::AdoptMode::Reuse,
+        )
+        .unwrap();
+    assert_eq!(second.outcome, aethyme_broker::AdoptOutcome::Created);
+    let second = second.session;
     assert_ne!(second.id, first.id);
 
     // --replace-stale swaps a lingering session for a fresh one.
@@ -283,6 +301,8 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
             aethyme_broker::AdoptMode::ReplaceStale,
         )
         .unwrap();
+    assert_eq!(replaced.outcome, aethyme_broker::AdoptOutcome::Replaced);
+    let replaced = replaced.session;
     assert_ne!(replaced.id, second.id);
     assert_eq!(
         broker.store().session(second.id).unwrap().status,

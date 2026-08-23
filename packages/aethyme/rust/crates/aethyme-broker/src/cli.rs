@@ -1715,9 +1715,10 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 (false, true) => crate::AdoptMode::ReplaceStale,
                 (false, false) => crate::AdoptMode::New,
             };
-            let session = broker.adopt_with(&path, parsed.task.as_deref(), mode)?;
+            let report = broker.adopt_with(&path, parsed.task.as_deref(), mode)?;
+            let session = &report.session;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&session)?);
+                println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 let verb = if parsed.reuse { "Reusing" } else { "Adopted" };
                 println!(

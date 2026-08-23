@@ -198,6 +198,33 @@ pub enum AdoptMode {
     ReplaceStale,
 }
 
+/// The lifecycle transition actually performed by `adopt_with`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdoptOutcome {
+    Created,
+    Reused,
+    Replaced,
+}
+
+impl AdoptOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Reused => "reused",
+            Self::Replaced => "replaced",
+        }
+    }
+}
+
+/// Adoption result with the session fields kept at the JSON top level.
+#[derive(Debug, serde::Serialize)]
+pub struct AdoptReport {
+    #[serde(flatten)]
+    pub session: Session,
+    pub outcome: AdoptOutcome,
+}
+
 /// A session enriched with liveness derived at read time — what
 /// `broker agents` renders. Serializes as the session's fields plus the
 /// derived ones.
@@ -749,7 +776,7 @@ impl Broker {
     /// Register an existing worktree the user already launched an agent
     /// in. `worktree` may be any path inside it.
     pub fn adopt(&mut self, worktree: &Path, task: Option<&str>) -> Result<Session, BrokerOpError> {
-        self.adopt_with(worktree, task, AdoptMode::New)
+        Ok(self.adopt_with(worktree, task, AdoptMode::New)?.session)
     }
 
     /// `adopt` with an explicit policy for the "this worktree already has
@@ -760,12 +787,13 @@ impl Broker {
         worktree: &Path,
         task: Option<&str>,
         mode: AdoptMode,
-    ) -> Result<Session, BrokerOpError> {
+    ) -> Result<AdoptReport, BrokerOpError> {
         let checkout = GitRepo::discover(worktree)?;
         let branch = checkout.current_branch()?;
         let diff_base = checkout.head_commit().ok();
         let worktree_path = checkout.root().to_string_lossy().into_owned();
         let foreign_files = checkout.untracked_paths()?;
+        let mut outcome = AdoptOutcome::Created;
 
         if let Some(existing) = self.store.session_for_worktree(&worktree_path)? {
             match mode {
@@ -778,13 +806,17 @@ impl Broker {
                             .reuse_session(existing.id, task, diff_base.as_deref())?;
                     self.store
                         .set_session_foreign_files(session.id, &foreign_files)?;
-                    return Ok(session);
+                    return Ok(AdoptReport {
+                        session,
+                        outcome: AdoptOutcome::Reused,
+                    });
                 }
                 AdoptMode::ReplaceStale => {
                     // State-only close (never touches the filesystem),
                     // then a fresh registration.
                     self.store
                         .set_session_status(existing.id, SessionStatus::Cleaned, None)?;
+                    outcome = AdoptOutcome::Replaced;
                 }
                 AdoptMode::New => {
                     return Err(BrokerOpError::SessionExistsForWorktree {
@@ -812,7 +844,7 @@ impl Broker {
         })?;
         self.store
             .set_session_foreign_files(session.id, &foreign_files)?;
-        Ok(session)
+        Ok(AdoptReport { session, outcome })
     }
 
     /// Mark a session finished without touching its worktree — the right
