@@ -39,6 +39,7 @@ struct DeployDivergenceFixture {
     old_integration: String,
     upstream_head: String,
     promoted_commit: String,
+    promoted_entry_id: i64,
     functional_upstream: String,
     unrecorded_commit: String,
     pending_head: String,
@@ -144,6 +145,7 @@ impl DeployDivergenceFixture {
             old_integration,
             upstream_head,
             promoted_commit,
+            promoted_entry_id: promoted.entry.id,
             functional_upstream,
             unrecorded_commit,
             pending_head,
@@ -161,6 +163,7 @@ fn reconciliation_plan_classifies_every_relevant_commit_with_full_provenance() {
             upstream: "origin/main".into(),
             apply: false,
             resolution_file: None,
+            confirm: None,
         })
         .unwrap();
 
@@ -291,6 +294,7 @@ fn reviewed_unrecorded_resolutions_are_commit_bound_and_never_blanket_discards()
             upstream: "origin/main".into(),
             apply: false,
             resolution_file: Some(resolution_path.clone()),
+            confirm: None,
         })
         .unwrap();
     let reviewed = preserved
@@ -310,6 +314,17 @@ fn reviewed_unrecorded_resolutions_are_commit_bound_and_never_blanket_discards()
             .iter()
             .any(|warning| warning.contains("validated reviewed dispositions"))
     );
+    assert!(!preserved.safe);
+    assert_eq!(
+        preserved
+            .plan
+            .commits
+            .iter()
+            .find(|commit| commit.commit == fixture.unrecorded_commit)
+            .unwrap()
+            .conflicts,
+        vec!["docs/CHANGELOG.md"]
+    );
 
     std::fs::write(
         &resolution_path,
@@ -325,6 +340,7 @@ fn reviewed_unrecorded_resolutions_are_commit_bound_and_never_blanket_discards()
             upstream: "origin/main".into(),
             apply: false,
             resolution_file: Some(resolution_path.clone()),
+            confirm: None,
         })
         .unwrap();
     let reviewed = replaced
@@ -356,6 +372,7 @@ fn reviewed_unrecorded_resolutions_are_commit_bound_and_never_blanket_discards()
                 upstream: "origin/main".into(),
                 apply: false,
                 resolution_file: Some(resolution_path.clone()),
+                confirm: None,
             })
             .unwrap_err();
         if disposition == "drop_because_content_empty" {
@@ -364,6 +381,213 @@ fn reviewed_unrecorded_resolutions_are_commit_bound_and_never_blanket_discards()
             assert!(error.to_string().contains("invalid JSON"));
         }
     }
+}
+
+#[test]
+fn confirmed_reconciliation_rebuilds_from_upstream_and_journals_the_reviewed_digest() {
+    let fixture = DeployDivergenceFixture::new();
+    let resolution_path = fixture.repo.join("resolution.json");
+    std::fs::write(
+        &resolution_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 2,
+            "upstream_ref": "origin/main",
+            "upstream_commit": fixture.upstream_head,
+            "old_integration": fixture.old_integration,
+            "operator": "release-operator@example.test",
+            "unrecorded_resolutions": [{
+                "integration_commit": fixture.unrecorded_commit,
+                "disposition": "replaced_by_exact_upstream_sha",
+                "upstream_commit": fixture.upstream_head,
+                "reason": "the deploy-authored release commit is the reviewed replacement"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let dry_run = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: Some(resolution_path.clone()),
+            confirm: None,
+        })
+        .unwrap();
+    assert!(dry_run.safe, "{dry_run:#?}");
+    let digest = dry_run.plan_digest.clone().unwrap();
+    assert_eq!(digest.len(), 64);
+
+    let missing = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: true,
+            resolution_file: Some(resolution_path.clone()),
+            confirm: None,
+        })
+        .unwrap_err();
+    assert!(missing.to_string().contains(&digest));
+    let mismatch = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: true,
+            resolution_file: Some(resolution_path.clone()),
+            confirm: Some("0".repeat(64)),
+        })
+        .unwrap_err();
+    assert!(mismatch.to_string().contains("confirmation mismatch"));
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "aethyme/integration"]),
+        fixture.old_integration
+    );
+
+    let applied = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: true,
+            resolution_file: Some(resolution_path),
+            confirm: Some(digest.clone()),
+        })
+        .unwrap();
+    assert!(applied.safe && applied.applied, "{applied:#?}");
+    assert_eq!(applied.new_integration, fixture.upstream_head);
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "aethyme/integration"]),
+        fixture.upstream_head
+    );
+    let queue = broker.store().merge_queue().unwrap();
+    assert_eq!(
+        queue
+            .iter()
+            .find(|entry| entry.id == fixture.promoted_entry_id)
+            .unwrap()
+            .status,
+        MergeStatus::ExternallyLanded
+    );
+    assert_eq!(
+        queue
+            .iter()
+            .find(|entry| entry.id == fixture.pending_entry_id)
+            .unwrap()
+            .status,
+        MergeStatus::Verified
+    );
+    let database = rusqlite::Connection::open(fixture.repo.join(".aethyme/broker.db")).unwrap();
+    let journaled: String = database
+        .query_row(
+            "SELECT plan_digest FROM integration_reconciliations ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(journaled, digest);
+}
+
+#[test]
+fn reviewed_unrecorded_work_is_replayed_in_integration_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    git(repo, &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir_all(repo.join("docs")).unwrap();
+    std::fs::write(repo.join(".gitignore"), ".aethyme/\n").unwrap();
+    std::fs::write(repo.join("src/service.txt"), "feature=off\n").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-qm", "initial"]);
+
+    let mut broker = Broker::open(repo).unwrap();
+    let session = broker.start_worktree("pending functional work").unwrap();
+    commit(
+        Path::new(&session.worktree_path),
+        "src/service.txt",
+        "feature=on\n",
+        "enable feature",
+    );
+    assert!(broker.submit(session.id).unwrap().promoted);
+    git(repo, &["switch", "aethyme/integration"]);
+    std::fs::create_dir_all(repo.join("docs")).unwrap();
+    let unrecorded = commit(
+        repo,
+        "docs/operator-note.md",
+        "keep this operator decision\n",
+        "record operator decision",
+    );
+    let old_integration = git(repo, &["rev-parse", "HEAD"]);
+    git(repo, &["switch", "main"]);
+
+    git(repo, &["switch", "-qc", "external-upstream", "main"]);
+    std::fs::create_dir_all(repo.join("docs")).unwrap();
+    let upstream = commit(
+        repo,
+        "docs/release-note.md",
+        "release 1\n",
+        "deploy release note",
+    );
+    git(repo, &["update-ref", "refs/remotes/origin/main", &upstream]);
+    git(repo, &["switch", "main"]);
+
+    let resolution_path = repo.join("resolution.json");
+    std::fs::write(
+        &resolution_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 2,
+            "upstream_ref": "origin/main",
+            "upstream_commit": upstream,
+            "old_integration": old_integration,
+            "operator": "release-operator@example.test",
+            "unrecorded_resolutions": [{
+                "integration_commit": unrecorded,
+                "disposition": "preserve_and_replay",
+                "reason": "this operator-authored decision is not represented upstream"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let dry_run = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: Some(resolution_path.clone()),
+            confirm: None,
+        })
+        .unwrap();
+    assert!(dry_run.safe, "{dry_run:#?}");
+    let reviewed = dry_run
+        .plan
+        .commits
+        .iter()
+        .find(|commit| commit.commit == unrecorded)
+        .unwrap();
+    assert!(reviewed.replayed_commit.is_some());
+    assert_eq!(
+        reviewed.execution_evidence.as_deref(),
+        Some("reviewed unrecorded delta replays cleanly")
+    );
+
+    let applied = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: true,
+            resolution_file: Some(resolution_path),
+            confirm: dry_run.plan_digest.clone(),
+        })
+        .unwrap();
+    assert!(applied.safe && applied.applied, "{applied:#?}");
+    assert_eq!(
+        git(repo, &["show", "aethyme/integration:docs/release-note.md"]),
+        "release 1"
+    );
+    assert_eq!(
+        git(repo, &["show", "aethyme/integration:docs/operator-note.md"]),
+        "keep this operator decision"
+    );
+    assert_eq!(
+        git(repo, &["show", "aethyme/integration:src/service.txt"]),
+        "feature=on"
+    );
 }
 
 #[test]
@@ -406,6 +630,7 @@ fn deploy_written_main_divergence_is_blocked_by_unrecorded_integration_work() {
             upstream: "origin/main".into(),
             apply: false,
             resolution_file: None,
+            confirm: None,
         })
         .unwrap();
 

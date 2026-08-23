@@ -79,6 +79,7 @@ pub(crate) struct PreparedIntegrationReconciliation {
     pub old_integration: String,
     pub upstream_commit: String,
     pub new_integration: String,
+    pub plan_digest: String,
 }
 
 impl BrokerStore {
@@ -768,6 +769,7 @@ impl BrokerStore {
         old_integration: &str,
         upstream_commit: &str,
         new_integration: &str,
+        plan_digest: &str,
         updates: &[ReconciliationQueueUpdate],
     ) -> Result<(), BrokerError> {
         let now = now_ms();
@@ -775,8 +777,8 @@ impl BrokerStore {
         tx.execute(
             "INSERT INTO integration_reconciliation_intent
                 (id, branch, upstream_ref, local_main_commit,
-                 old_integration, upstream_commit, new_integration, created_at)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 old_integration, upstream_commit, new_integration, plan_digest, created_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 branch,
                 upstream_ref,
@@ -784,6 +786,7 @@ impl BrokerStore {
                 old_integration,
                 upstream_commit,
                 new_integration,
+                plan_digest,
                 now,
             ],
         )?;
@@ -816,7 +819,7 @@ impl BrokerStore {
         self.conn
             .query_row(
                 "SELECT branch, upstream_ref, local_main_commit,
-                        old_integration, upstream_commit, new_integration
+                        old_integration, upstream_commit, new_integration, plan_digest
                  FROM integration_reconciliation_intent WHERE id = 1",
                 [],
                 |row| {
@@ -827,6 +830,7 @@ impl BrokerStore {
                         old_integration: row.get(3)?,
                         upstream_commit: row.get(4)?,
                         new_integration: row.get(5)?,
+                        plan_digest: row.get(6)?,
                     })
                 },
             )
@@ -841,7 +845,7 @@ impl BrokerStore {
         let tx = self.conn.transaction()?;
         let prepared = tx.query_row(
             "SELECT branch, upstream_ref, local_main_commit,
-                    old_integration, upstream_commit, new_integration
+                    old_integration, upstream_commit, new_integration, plan_digest
              FROM integration_reconciliation_intent WHERE id = 1",
             [],
             |row| {
@@ -852,6 +856,7 @@ impl BrokerStore {
                     old_integration: row.get(3)?,
                     upstream_commit: row.get(4)?,
                     new_integration: row.get(5)?,
+                    plan_digest: row.get(6)?,
                 })
             },
         )?;
@@ -907,14 +912,15 @@ impl BrokerStore {
         tx.execute(
             "INSERT INTO integration_reconciliations
                 (upstream_ref, local_main_commit, old_integration,
-                 upstream_commit, new_integration, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 upstream_commit, new_integration, plan_digest, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 prepared.upstream_ref,
                 prepared.local_main,
                 prepared.old_integration,
                 prepared.upstream_commit,
                 prepared.new_integration,
+                prepared.plan_digest,
                 now,
             ],
         )?;

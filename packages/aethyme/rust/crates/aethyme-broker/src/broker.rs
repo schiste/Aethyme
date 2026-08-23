@@ -157,6 +157,16 @@ pub enum BrokerOpError {
     ShipConfirmationNotFullSha,
     #[error("ship confirmation mismatch: expected integration {expected}, received {actual}")]
     ShipConfirmationMismatch { expected: String, actual: String },
+    #[error(
+        "integration reconciliation apply requires --confirm {expected}; review the dry-run plan first"
+    )]
+    ReconciliationConfirmationRequired { expected: String },
+    #[error("integration reconciliation confirmation must be a full 64-character SHA-256 digest")]
+    ReconciliationConfirmationNotSha256,
+    #[error(
+        "integration reconciliation confirmation mismatch: expected {expected}, received {actual}"
+    )]
+    ReconciliationConfirmationMismatch { expected: String, actual: String },
     #[error("ship cannot execute without a fetched remote base for {tracking_ref}")]
     ShipRemoteBaseUnavailable { tracking_ref: String },
     #[error(

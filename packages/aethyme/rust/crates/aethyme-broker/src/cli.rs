@@ -211,7 +211,7 @@ Usage:
       Sample integration, wait for a quiet window (default: 30s), then
       sample again. Fails if integration moved, printing the old and new
       tips so long checks are not mistaken for current-tip proof.
-  aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--dry-run|--apply] [--json]
+  aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--dry-run|--apply --confirm <sha256>] [--json]
       Compare already-fetched upstream with local main and promoted queue
       state. Dry-run is the default. --apply marks externally landed work,
       preserves pending promotions, and rebuilds integration. A resolution
@@ -2084,6 +2084,9 @@ fn render_integration_reconcile(
     if let Some(path) = &report.resolution_file {
         println!("Resolution:  {path}");
     }
+    if let Some(digest) = &report.plan_digest {
+        println!("Plan digest: {digest}");
+    }
     println!(
         "Result:      {}",
         if report.applied {
@@ -3339,6 +3342,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                             upstream,
                             apply: parsed.apply,
                             resolution_file: parsed.resolution_file.clone(),
+                            confirm: parsed.confirm.clone(),
                         })?;
                     render_integration_reconcile(&report, parsed.json)?;
                     if !report.safe {

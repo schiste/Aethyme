@@ -7,6 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use sha2::{Digest, Sha256};
+
 use crate::broker::{Broker, BrokerOpError};
 use crate::store::ReconciliationQueueUpdate;
 use crate::types::{MergeQueueEntry, MergeStatus};
@@ -16,6 +18,7 @@ pub struct IntegrationReconcileOptions {
     pub upstream: String,
     pub apply: bool,
     pub resolution_file: Option<PathBuf>,
+    pub confirm: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -64,6 +67,11 @@ pub struct IntegrationReconcileCommit {
     pub queue_status: Option<MergeStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unrecorded_resolution: Option<IntegrationReconcileUnrecordedResolutionAudit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replayed_commit: Option<String>,
+    pub conflicts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_evidence: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -182,6 +190,8 @@ pub struct IntegrationReconcileReport {
     pub safe: bool,
     pub applied: bool,
     pub plan: IntegrationReconcilePlan,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_digest: Option<String>,
     pub entries: Vec<IntegrationReconcileEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution_file: Option<String>,
@@ -267,6 +277,7 @@ impl Broker {
             safe: true,
             applied: false,
             plan,
+            plan_digest: None,
             entries: Vec::new(),
             resolution_file: operator_resolutions
                 .as_ref()
@@ -314,14 +325,9 @@ impl Broker {
             return Ok(report);
         }
         if unrecorded_count > 0 {
-            report.safe = false;
             report.warnings.push(format!(
-                "validated reviewed dispositions for {unrecorded_count} unrecorded integration commit(s); execution remains disabled until the reviewed commits can be replayed"
+                "validated reviewed dispositions for {unrecorded_count} unrecorded integration commit(s)"
             ));
-            report.next_action =
-                "review the per-commit dispositions in this plan; no refs or broker rows were changed"
-                    .into();
-            return Ok(report);
         }
 
         let mut candidates = Vec::new();
@@ -359,65 +365,37 @@ impl Broker {
         // a fetch, and upstream commits below this boundary are not pending
         // integration work. Sort by first-parent position because queue IDs
         // can be re-promoted out of order after older conflicts are retried.
-        let upstream_is_integration_base = self
+        let integration_layer = self
             .repo_handle()
-            .is_ancestor(&upstream_head, &old_integration);
-        let described_chain_is_complete = if upstream_is_integration_base {
-            let layer = self
-                .repo_handle()
-                .first_parent_commits_between_oldest(&upstream_head, &old_integration)?;
-            let positions: BTreeMap<String, usize> = layer
-                .iter()
-                .enumerate()
-                .map(|(index, commit)| (commit.clone(), index))
-                .collect();
-            let recorded: BTreeSet<&str> = candidates
-                .iter()
-                .map(|candidate| candidate.merge_commit.as_str())
-                .collect();
-            let mut ignored_empty_commits = 0usize;
-            let mut complete = true;
-            for commit in &layer {
-                if recorded.contains(commit.as_str()) {
-                    continue;
-                }
-                let parent = self.repo_handle().first_parent(commit)?;
-                if self
-                    .repo_handle()
-                    .changed_between(&parent, commit)?
-                    .is_empty()
-                {
-                    ignored_empty_commits += 1;
-                } else {
-                    complete = false;
-                    break;
-                }
-            }
-            candidates.sort_by_key(|candidate| {
-                positions
-                    .get(&candidate.merge_commit)
-                    .copied()
-                    .unwrap_or(usize::MAX)
-            });
-            if ignored_empty_commits > 0 {
-                report.warnings.push(format!(
-                    "ignored {ignored_empty_commits} content-empty integration bookkeeping commit(s) not represented by current queue tips"
-                ));
-            }
-            complete
-        } else if candidates.is_empty() {
-            self.repo_handle()
-                .is_ancestor(&old_integration, &upstream_head)
-        } else {
-            self.repo_handle()
-                .is_ancestor(&candidates[0].old_parent, &upstream_head)
-                && candidates
-                    .windows(2)
-                    .all(|pair| pair[1].old_parent == pair[0].merge_commit)
-                && candidates
-                    .last()
-                    .is_some_and(|candidate| candidate.merge_commit == old_integration)
-        };
+            .first_parent_commits_between_oldest(&report.plan.common_base, &old_integration)?;
+        let positions: BTreeMap<String, usize> = integration_layer
+            .iter()
+            .enumerate()
+            .map(|(index, commit)| (commit.clone(), index))
+            .collect();
+        let recorded: BTreeSet<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.merge_commit.as_str())
+            .collect();
+        let reviewed_unrecorded: BTreeSet<&str> = report
+            .plan
+            .commits
+            .iter()
+            .filter(|commit| {
+                commit.origin == IntegrationReconcileCommitOrigin::UnrecordedIntegrationCommit
+                    && commit.unrecorded_resolution.is_some()
+            })
+            .map(|commit| commit.commit.as_str())
+            .collect();
+        let described_chain_is_complete = integration_layer.iter().all(|commit| {
+            recorded.contains(commit.as_str()) || reviewed_unrecorded.contains(commit.as_str())
+        });
+        candidates.sort_by_key(|candidate| {
+            positions
+                .get(&candidate.merge_commit)
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
         if !described_chain_is_complete {
             report.safe = false;
             report.warnings.push(
@@ -486,6 +464,12 @@ impl Broker {
             for start in 0..=candidates.len().saturating_sub(group_len) {
                 let end = start + group_len;
                 if classified[start..end].iter().any(Option::is_some) {
+                    continue;
+                }
+                if candidates[start..end]
+                    .windows(2)
+                    .any(|pair| pair[1].old_parent != pair[0].merge_commit)
+                {
                     continue;
                 }
                 let Some(patch_id) = self.repo_handle().patch_id_between(
@@ -606,80 +590,166 @@ impl Broker {
             }
         }
 
+        let candidates_by_commit: BTreeMap<String, usize> = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (candidate.merge_commit.clone(), index))
+            .collect();
+        let unrecorded_by_commit: BTreeMap<String, usize> = report
+            .plan
+            .commits
+            .iter()
+            .enumerate()
+            .filter(|(_, commit)| {
+                commit.origin == IntegrationReconcileCommitOrigin::UnrecordedIntegrationCommit
+            })
+            .map(|(index, commit)| (commit.commit.clone(), index))
+            .collect();
         let mut rebuilt = upstream_head.clone();
         let mut replay_blocked = false;
-        for (index, candidate) in candidates.iter().enumerate() {
-            if let Some(existing) = classified[index].as_ref() {
-                if matches!(
-                    existing.classification,
-                    IntegrationReconcileClassification::Ambiguous
-                        | IntegrationReconcileClassification::GenuinelyConflicting
-                ) {
-                    replay_blocked = true;
+        let mut replay_safe = true;
+        for integration_commit in &integration_layer {
+            if let Some(index) = candidates_by_commit.get(integration_commit).copied() {
+                let candidate = &candidates[index];
+                if let Some(existing) = classified[index].as_ref() {
+                    if matches!(
+                        existing.classification,
+                        IntegrationReconcileClassification::Ambiguous
+                            | IntegrationReconcileClassification::GenuinelyConflicting
+                    ) {
+                        replay_blocked = true;
+                        replay_safe = false;
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if candidate.files.is_empty() || replay_blocked {
+                if candidate.files.is_empty() || replay_blocked {
+                    classified[index] = Some(entry_report(
+                        candidate,
+                        IntegrationReconcileClassification::Ambiguous,
+                        None,
+                        None,
+                        Vec::new(),
+                        if replay_blocked {
+                            "cannot classify safely after an earlier unresolved replay".into()
+                        } else {
+                            "promotion has no changed-path evidence".into()
+                        },
+                    ));
+                    replay_blocked = true;
+                    replay_safe = false;
+                    continue;
+                }
+                let simulation = self.repo_handle().merge_tree_with_base(
+                    &candidate.old_parent,
+                    &rebuilt,
+                    &candidate.merge_commit,
+                )?;
+                if !simulation.conflicts.is_empty() {
+                    classified[index] = Some(entry_report(
+                        candidate,
+                        IntegrationReconcileClassification::GenuinelyConflicting,
+                        None,
+                        None,
+                        simulation.conflicts,
+                        "promoted delta conflicts when replayed onto current upstream".into(),
+                    ));
+                    replay_blocked = true;
+                    replay_safe = false;
+                    continue;
+                }
+                let replayed = self.repo_handle().commit_tree(
+                    &simulation.tree,
+                    &[&rebuilt],
+                    &format!(
+                        "broker: reconcile pending queue entry {} (session {})",
+                        candidate.entry.id, candidate.entry.session_id
+                    ),
+                )?;
+                rebuilt = replayed.clone();
                 classified[index] = Some(entry_report(
                     candidate,
-                    IntegrationReconcileClassification::Ambiguous,
+                    IntegrationReconcileClassification::StillPending,
                     None,
-                    None,
+                    Some(replayed),
                     Vec::new(),
-                    if replay_blocked {
-                        "cannot classify safely after an earlier unresolved queue entry".into()
-                    } else {
-                        "promotion has no changed-path evidence".into()
-                    },
+                    "promoted delta is absent upstream and replays cleanly".into(),
                 ));
-                replay_blocked = true;
                 continue;
             }
-            let simulation = self.repo_handle().merge_tree_with_base(
-                &candidate.old_parent,
-                &rebuilt,
-                &candidate.merge_commit,
-            )?;
-            if !simulation.conflicts.is_empty() {
-                classified[index] = Some(entry_report(
-                    candidate,
-                    IntegrationReconcileClassification::GenuinelyConflicting,
-                    None,
-                    None,
-                    simulation.conflicts,
-                    "promoted delta conflicts when replayed onto current upstream".into(),
-                ));
-                replay_blocked = true;
+
+            let Some(plan_index) = unrecorded_by_commit.get(integration_commit).copied() else {
+                continue;
+            };
+            let planned = &mut report.plan.commits[plan_index];
+            let resolution = planned
+                .unrecorded_resolution
+                .as_ref()
+                .expect("validated unrecorded resolution")
+                .clone();
+            if replay_blocked {
+                planned.execution_evidence =
+                    Some("cannot execute after an earlier unresolved replay".into());
+                replay_safe = false;
                 continue;
             }
-            let replayed = self.repo_handle().commit_tree(
-                &simulation.tree,
-                &[&rebuilt],
-                &format!(
-                    "broker: reconcile pending queue entry {} (session {})",
-                    candidate.entry.id, candidate.entry.session_id
-                ),
-            )?;
-            rebuilt = replayed.clone();
-            classified[index] = Some(entry_report(
-                candidate,
-                IntegrationReconcileClassification::StillPending,
-                None,
-                Some(replayed),
-                Vec::new(),
-                "promoted delta is absent upstream and replays cleanly".into(),
-            ));
+            match resolution.disposition {
+                IntegrationReconcileUnrecordedDisposition::PreserveAndReplay => {
+                    let old_parent = planned
+                        .parents
+                        .first()
+                        .expect("non-root integration commit");
+                    let simulation = self.repo_handle().merge_tree_with_base(
+                        old_parent,
+                        &rebuilt,
+                        &planned.commit,
+                    )?;
+                    if !simulation.conflicts.is_empty() {
+                        planned.conflicts = simulation.conflicts;
+                        planned.execution_evidence = Some(
+                            "reviewed unrecorded delta conflicts when replayed onto current upstream"
+                                .into(),
+                        );
+                        replay_blocked = true;
+                        replay_safe = false;
+                        continue;
+                    }
+                    let replayed = self.repo_handle().commit_tree(
+                        &simulation.tree,
+                        &[&rebuilt],
+                        &format!(
+                            "broker: preserve unrecorded integration commit {}",
+                            planned.commit
+                        ),
+                    )?;
+                    rebuilt = replayed.clone();
+                    planned.replayed_commit = Some(replayed);
+                    planned.execution_evidence =
+                        Some("reviewed unrecorded delta replays cleanly".into());
+                }
+                IntegrationReconcileUnrecordedDisposition::ReplacedByExactUpstreamSha => {
+                    planned.execution_evidence = Some(format!(
+                        "operator selected exact upstream replacement {}",
+                        resolution.upstream_commit.as_deref().unwrap_or_default()
+                    ));
+                }
+                IntegrationReconcileUnrecordedDisposition::DropBecauseContentEmpty => {
+                    planned.execution_evidence =
+                        Some("operator reviewed this commit as content-empty".into());
+                }
+            }
         }
 
         report.entries = classified.into_iter().flatten().collect();
-        report.safe = report.entries.iter().all(|entry| {
-            !matches!(
-                entry.classification,
-                IntegrationReconcileClassification::Ambiguous
-                    | IntegrationReconcileClassification::GenuinelyConflicting
-            )
-        });
+        report.safe = replay_safe
+            && report.entries.iter().all(|entry| {
+                !matches!(
+                    entry.classification,
+                    IntegrationReconcileClassification::Ambiguous
+                        | IntegrationReconcileClassification::GenuinelyConflicting
+                )
+            });
         report.new_integration = rebuilt;
+        report.plan_digest = Some(reconciliation_plan_digest(&report)?);
 
         if !report.safe {
             report.next_action = if report.resolution_file.is_some() {
@@ -690,15 +760,32 @@ impl Broker {
             return Ok(report);
         }
         if !options.apply {
+            let digest = report.plan_digest.as_deref().unwrap_or_default();
             report.next_action = if report.resolution_file.is_some() {
-                "review this dry-run and its operator attestations, then rerun the same command with --apply".into()
+                format!(
+                    "review this dry-run and its operator attestations, then rerun the same command with --apply --confirm {digest}"
+                )
             } else {
                 format!(
-                    "review this dry-run, then run `aethyme broker integration reconcile --upstream {} --apply`",
-                    options.upstream
+                    "review this dry-run, then run `aethyme broker integration reconcile --upstream {} --apply --confirm {digest}`",
+                    options.upstream,
                 )
             };
             return Ok(report);
+        }
+
+        let expected = report.plan_digest.clone().unwrap_or_default();
+        let Some(confirm) = options.confirm.as_deref() else {
+            return Err(BrokerOpError::ReconciliationConfirmationRequired { expected });
+        };
+        if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(BrokerOpError::ReconciliationConfirmationNotSha256);
+        }
+        if confirm != expected {
+            return Err(BrokerOpError::ReconciliationConfirmationMismatch {
+                expected,
+                actual: confirm.to_string(),
+            });
         }
 
         let updates = reconciliation_updates(&branch, &options.upstream, &report.entries);
@@ -709,6 +796,7 @@ impl Broker {
             &old_integration,
             &upstream_head,
             &report.new_integration,
+            report.plan_digest.as_deref().unwrap_or_default(),
             &updates,
         )?;
         if let Err(ref_error) = self.repo_handle().update_branch_ref_checked(
@@ -876,6 +964,9 @@ fn reconcile_commit(
         session_id: queue_entry.map(|entry| entry.session_id),
         queue_status: queue_entry.map(|entry| entry.status),
         unrecorded_resolution: None,
+        replayed_commit: None,
+        conflicts: Vec::new(),
+        execution_evidence: None,
     })
 }
 
@@ -1177,6 +1268,65 @@ fn invalid_resolution(path: &str, reason: String) -> BrokerOpError {
         path: path.to_string(),
         reason,
     }
+}
+
+/// Hash only reviewed, reproducible inputs. Replayed commit IDs are omitted:
+/// `git commit-tree` embeds time, so those objects may differ between a
+/// dry-run and a later confirmed execution even when every source fact and
+/// selected disposition is identical.
+fn reconciliation_plan_digest(
+    report: &IntegrationReconcileReport,
+) -> Result<String, BrokerOpError> {
+    let commits = report
+        .plan
+        .commits
+        .iter()
+        .map(|commit| {
+            serde_json::json!({
+                "commit": commit.commit,
+                "parents": commit.parents,
+                "origin": commit.origin,
+                "equivalence": commit.equivalence,
+                "matching_commits": commit.matching_commits,
+                "patch_id": commit.patch_id,
+                "files": commit.files,
+                "content_empty": commit.content_empty,
+                "queue_entry_id": commit.queue_entry_id,
+                "session_id": commit.session_id,
+                "queue_status": commit.queue_status,
+                "unrecorded_resolution": commit.unrecorded_resolution,
+            })
+        })
+        .collect::<Vec<_>>();
+    let entries = report
+        .entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "queue_entry_id": entry.queue_entry_id,
+                "session_id": entry.session_id,
+                "classification": entry.classification,
+                "old_merge_commit": entry.old_merge_commit,
+                "upstream_landing": entry.upstream_landing,
+                "files": entry.files,
+                "conflicts": entry.conflicts,
+                "evidence": entry.evidence,
+                "operator_resolution": entry.operator_resolution,
+            })
+        })
+        .collect::<Vec<_>>();
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "branch": report.branch,
+        "upstream_ref": report.upstream_ref,
+        "local_main": report.local_main,
+        "upstream_head": report.upstream_head,
+        "old_integration": report.old_integration,
+        "common_base": report.plan.common_base,
+        "commits": commits,
+        "entries": entries,
+    }))?;
+    Ok(format!("{:x}", Sha256::digest(canonical)))
 }
 
 fn promoted_commit(entry: &MergeQueueEntry) -> Option<String> {
