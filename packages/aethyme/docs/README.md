@@ -19,6 +19,7 @@ page before reaching for lower-level graph, eval, or architecture references.
 - [`architecture/graphability-and-navigability-signals.md`](architecture/graphability-and-navigability-signals.md)
 - [`architecture/core-architecture.md`](architecture/core-architecture.md)
 - [`architecture/rust-transition.md`](architecture/rust-transition.md)
+- [`architecture/distribution-tool-spike-2026-08-23.md`](architecture/distribution-tool-spike-2026-08-23.md)
 - [`getting-started/quickstart.md`](getting-started/quickstart.md)
 - [`guides/broker-workflows.md`](guides/broker-workflows.md)
 - [`guides/report-capture.md`](guides/report-capture.md)
