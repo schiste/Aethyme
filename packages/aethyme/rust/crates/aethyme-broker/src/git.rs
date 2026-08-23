@@ -341,6 +341,14 @@ impl GitRepo {
             .unwrap_or(false)
     }
 
+    /// Fast-forward the checked-out branch and worktree to an exact commit.
+    /// The caller is responsible for clean-worktree and ancestry preflight;
+    /// `--ff-only` keeps Git as the final enforcement boundary.
+    pub fn fast_forward_checkout(&self, commit: &str) -> Result<(), GitError> {
+        run_git(&self.root, &["merge", "--ff-only", commit])?;
+        Ok(())
+    }
+
     /// Create or fast-move a local branch ref to `commit` (no checkout).
     pub fn update_branch_ref(&self, branch: &str, commit: &str) -> Result<(), GitError> {
         run_git(

@@ -88,7 +88,7 @@ The broker is the stable product front door for multi-agent coordination:
 - `aethyme certify`
 - `aethyme broker status [--json]`
 - `aethyme broker start --task "..." [--json]`
-- `aethyme broker adopt [<path>] --task "..." [--reuse] [--json]`
+- `aethyme broker adopt [<path>] --task "..." [--reuse [--sync-integration]] [--json]`
 - `aethyme broker exec --session <id> -- <command> [--json]`
 - `aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <git-args>`
 - `aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <gh-args>`
@@ -108,6 +108,11 @@ The broker is the stable product front door for multi-agent coordination:
 `quick-test` is the disposable install smoke. `verify-loop` is the stronger
 operator E2E: it reports the integration commit tested and flags movement during
 the run, so callers know whether the result proves the current integration tip.
+
+`broker adopt --reuse --sync-integration` starts a follow-up from the current
+integration tip. It requires a clean session worktree, permits only a
+fast-forward, and synchronizes before recording the follow-up diff baseline;
+dirty or diverged worktrees are left unchanged.
 
 Promotion only advances the local integration ref. Use `broker ship plan` to
 inspect the promoted queue entry, exact integration SHA, remote freshness,

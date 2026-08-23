@@ -6,8 +6,8 @@ use std::path::Path;
 use std::process::Command;
 
 use aethyme_broker::{
-    AdoptIntegrationRelation, AdoptMode, Broker, BrokerOpError, FinishStatus, SessionOrigin,
-    SessionStatus, VersionDriftStatus,
+    AdoptIntegrationRelation, AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, Broker,
+    BrokerOpError, FinishStatus, SessionOrigin, SessionStatus, VersionDriftStatus,
 };
 
 fn sh(cwd: &Path, args: &[&str]) {
@@ -37,6 +37,7 @@ fn rev(cwd: &Path, reference: &str) -> String {
 fn init_repo(root: &Path) {
     sh(root, &["init", "-q", "-b", "main"]);
     std::fs::write(root.join("README.md"), "hello\n").unwrap();
+    std::fs::write(root.join(".gitignore"), "/.aethyme/\n").unwrap();
     sh(root, &["add", "-A"]);
     sh(root, &["commit", "-qm", "init"]);
 }
@@ -421,6 +422,152 @@ fn adopt_reuse_reports_ahead_work_and_routes_it_to_submit() {
         drift.safe_next_action,
         format!("aethyme broker submit --session {}", session.id)
     );
+}
+
+#[test]
+fn adopt_reuse_sync_fast_forwards_before_refreshing_the_baseline() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
+    let original_head = rev(tmp.path(), "HEAD");
+
+    sh(tmp.path(), &["checkout", "-qb", "integration-work"]);
+    std::fs::write(tmp.path().join("integration.txt"), "advance\n").unwrap();
+    sh(tmp.path(), &["add", "integration.txt"]);
+    sh(tmp.path(), &["commit", "-qm", "integration advances"]);
+    let integration_head = rev(tmp.path(), "HEAD");
+    sh(tmp.path(), &["branch", "aethyme/integration", "HEAD"]);
+    sh(tmp.path(), &["checkout", "-q", "main"]);
+
+    let report = broker
+        .adopt_with_options(
+            tmp.path(),
+            Some("synchronized follow-up"),
+            AdoptOptions {
+                mode: AdoptMode::Reuse,
+                sync_integration: true,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(report.session.id, session.id);
+    assert_eq!(rev(tmp.path(), "HEAD"), integration_head);
+    assert_eq!(
+        report.session.diff_base.as_deref(),
+        Some(integration_head.as_str())
+    );
+    let sync = report.integration_sync.expect("synchronization result");
+    assert_eq!(sync.outcome, AdoptIntegrationSyncOutcome::FastForwarded);
+    assert_eq!(sync.before_head, original_head);
+    assert_eq!(sync.after_head, integration_head);
+    assert_eq!(
+        report.integration_drift.expect("post-sync drift").relation,
+        AdoptIntegrationRelation::Current
+    );
+}
+
+#[test]
+fn adopt_reuse_sync_reports_an_already_current_checkout() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
+    let head = rev(tmp.path(), "HEAD");
+
+    let report = broker
+        .adopt_with_options(
+            tmp.path(),
+            Some("current follow-up"),
+            AdoptOptions {
+                mode: AdoptMode::Reuse,
+                sync_integration: true,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(report.session.id, session.id);
+    assert_eq!(report.session.diff_base.as_deref(), Some(head.as_str()));
+    let sync = report.integration_sync.expect("synchronization result");
+    assert_eq!(sync.outcome, AdoptIntegrationSyncOutcome::AlreadyCurrent);
+    assert_eq!(sync.before_head, head);
+    assert_eq!(sync.after_head, head);
+}
+
+#[test]
+fn adopt_reuse_sync_refuses_dirty_state_without_changing_head_or_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
+    let original_head = rev(tmp.path(), "HEAD");
+
+    sh(tmp.path(), &["checkout", "-qb", "integration-work"]);
+    std::fs::write(tmp.path().join("integration.txt"), "advance\n").unwrap();
+    sh(tmp.path(), &["add", "integration.txt"]);
+    sh(tmp.path(), &["commit", "-qm", "integration advances"]);
+    sh(tmp.path(), &["branch", "aethyme/integration", "HEAD"]);
+    sh(tmp.path(), &["checkout", "-q", "main"]);
+    std::fs::write(tmp.path().join("dirty.txt"), "wip\n").unwrap();
+
+    let err = broker
+        .adopt_with_options(
+            tmp.path(),
+            Some("must not persist"),
+            AdoptOptions {
+                mode: AdoptMode::Reuse,
+                sync_integration: true,
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(err, BrokerOpError::ReuseSyncDirty { .. }));
+    assert_eq!(rev(tmp.path(), "HEAD"), original_head);
+    let persisted = broker.store().session(session.id).unwrap();
+    assert_eq!(persisted.task, session.task);
+    assert_eq!(persisted.diff_base, session.diff_base);
+}
+
+#[test]
+fn adopt_reuse_sync_refuses_divergence_without_changing_head_or_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
+
+    sh(tmp.path(), &["checkout", "-qb", "integration-work"]);
+    std::fs::write(tmp.path().join("integration.txt"), "advance\n").unwrap();
+    sh(tmp.path(), &["add", "integration.txt"]);
+    sh(tmp.path(), &["commit", "-qm", "integration advances"]);
+    sh(tmp.path(), &["branch", "aethyme/integration", "HEAD"]);
+    sh(tmp.path(), &["checkout", "-q", "main"]);
+    std::fs::write(tmp.path().join("session.txt"), "advance\n").unwrap();
+    sh(tmp.path(), &["add", "session.txt"]);
+    sh(tmp.path(), &["commit", "-qm", "session advances"]);
+    let session_head = rev(tmp.path(), "HEAD");
+
+    let err = broker
+        .adopt_with_options(
+            tmp.path(),
+            Some("must not persist"),
+            AdoptOptions {
+                mode: AdoptMode::Reuse,
+                sync_integration: true,
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        BrokerOpError::ReuseSyncNotFastForward {
+            relation: "diverged",
+            ..
+        }
+    ));
+    assert_eq!(rev(tmp.path(), "HEAD"), session_head);
+    let persisted = broker.store().session(session.id).unwrap();
+    assert_eq!(persisted.task, session.task);
+    assert_eq!(persisted.diff_base, session.diff_base);
 }
 
 #[test]

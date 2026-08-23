@@ -43,8 +43,9 @@ mod verify_loop;
 mod version;
 
 pub use broker::{
-    AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptMode, AdoptOutcome, AdoptReport,
-    AgentView, Broker, BrokerOpError, DoctorRepairStatus, DoctorReport, FinishReport, FinishStatus,
+    AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
+    AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, AdoptOutcome, AdoptReport, AgentView,
+    Broker, BrokerOpError, DoctorRepairStatus, DoctorReport, FinishReport, FinishStatus,
     GuardedExecReport, IntegrationDeliveryState, IntegrationLiveSession,
     IntegrationMovementNotice, IntegrationNextAction, IntegrationStabilityReport,
     IntegrationStatusView, LeaseBlocker, LeaseClaimReport, OwnershipAuditReport,

@@ -49,7 +49,8 @@ fn fixture() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
-    git(tmp.path(), &["add", "README.md"]);
+    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+    git(tmp.path(), &["add", "README.md", ".gitignore"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
     tmp
 }
@@ -125,5 +126,67 @@ fn adopt_cli_exposes_structured_reuse_drift_and_safe_guidance() {
     assert!(
         rendered.contains("Safe next action: aethyme broker integration status"),
         "{rendered}"
+    );
+}
+
+#[test]
+fn adopt_cli_syncs_reuse_to_integration_and_exposes_the_exact_transition() {
+    let tmp = fixture();
+    stdout(&run(tmp.path(), &["adopt", "--task", "first"]));
+    let session_head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+
+    git(tmp.path(), &["checkout", "-qb", "integration-work"]);
+    std::fs::write(tmp.path().join("integration.txt"), "integration\n").unwrap();
+    git(tmp.path(), &["add", "integration.txt"]);
+    git(tmp.path(), &["commit", "-qm", "integration advances"]);
+    let integration_head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    git(tmp.path(), &["branch", "aethyme/integration", "HEAD"]);
+    git(tmp.path(), &["checkout", "-q", "main"]);
+
+    let json = stdout(&run(
+        tmp.path(),
+        &[
+            "adopt",
+            "--reuse",
+            "--sync-integration",
+            "--task",
+            "synchronized follow-up",
+            "--json",
+        ],
+    ));
+    let report: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(report["integration_sync"]["outcome"], "fast_forwarded");
+    assert_eq!(report["integration_sync"]["before_head"], session_head);
+    assert_eq!(report["integration_sync"]["after_head"], integration_head);
+    assert_eq!(report["diff_base"], integration_head);
+    assert_eq!(report["integration_drift"]["relation"], "current");
+    assert_eq!(
+        git_output(tmp.path(), &["rev-parse", "HEAD"]),
+        integration_head
+    );
+
+    let rendered = stdout(&run(
+        tmp.path(),
+        &[
+            "adopt",
+            "--reuse",
+            "--sync-integration",
+            "--task",
+            "current",
+        ],
+    ));
+    assert!(
+        rendered.contains("Integration synchronization: already current"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn adopt_cli_requires_reuse_for_integration_sync() {
+    let tmp = fixture();
+    let output = run(tmp.path(), &["adopt", "--sync-integration"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--sync-integration requires --reuse")
     );
 }
