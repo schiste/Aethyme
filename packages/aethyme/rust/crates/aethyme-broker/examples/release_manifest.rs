@@ -8,19 +8,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use aethyme_broker::{
-    BROKER_STORAGE_CURRENT_SCHEMA, BROKER_STORAGE_MINIMUM_SCHEMA, ENGINE_PROTOCOL_VERSION,
-    MINIMUM_GIT_VERSION,
+    RELEASE_TARGETS, REQUIRED_RELEASE_BINARIES, ReleaseArtifact, ReleaseInstaller, ReleaseManifest,
 };
-use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-
-const MANIFEST_SCHEMA_VERSION: u32 = 1;
-const TARGETS: &[&str] = &[
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
-    "x86_64-unknown-linux-gnu",
-];
-const BINARIES: &[&str] = &["aethyme", "aethyme-engine-cli"];
 
 #[derive(Debug, PartialEq)]
 struct Options {
@@ -72,7 +62,7 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options, Stri
     })
 }
 
-fn build_manifest(options: &Options) -> Result<Value, String> {
+fn build_manifest(options: &Options) -> Result<ReleaseManifest, String> {
     let version = env!("CARGO_PKG_VERSION");
     if options.tag != format!("v{version}") {
         return Err(format!(
@@ -92,70 +82,52 @@ fn build_manifest(options: &Options) -> Result<Value, String> {
         return Err("--channel must be stable, beta, or nightly".into());
     }
 
-    let mut artifacts = Vec::with_capacity(TARGETS.len());
-    for target in TARGETS {
+    let mut artifacts = Vec::with_capacity(RELEASE_TARGETS.len());
+    for target in RELEASE_TARGETS {
         let archive = format!("aethyme-{}-{target}.tar.gz", options.tag);
         let path = options.dist.join(&archive);
         let (sha256, size_bytes) = hash_file(&path)?;
-        artifacts.push(json!({
-            "archive": archive,
-            "binaries": BINARIES,
-            "sha256": sha256,
-            "size_bytes": size_bytes,
-            "target": target,
-        }));
+        artifacts.push(ReleaseArtifact {
+            archive,
+            binaries: REQUIRED_RELEASE_BINARIES
+                .iter()
+                .map(|binary| (*binary).to_string())
+                .collect(),
+            sha256,
+            size_bytes,
+            target: (*target).to_string(),
+        });
     }
     let installer_name = "install.sh";
     let (installer_sha256, installer_size_bytes) = hash_file(&options.dist.join(installer_name))?;
 
-    Ok(json!({
-        "artifacts": artifacts,
-        "compatibility": {
-            "broker_storage": {
-                "current_schema": BROKER_STORAGE_CURRENT_SCHEMA,
-                "minimum_readable_schema": BROKER_STORAGE_MINIMUM_SCHEMA,
-            },
-            "engine_protocol": ENGINE_PROTOCOL_VERSION,
-            "minimum_git_version": MINIMUM_GIT_VERSION,
+    let manifest = ReleaseManifest::new(
+        version,
+        options.source_sha.clone(),
+        options.channel.clone(),
+        artifacts,
+        ReleaseInstaller {
+            filename: installer_name.to_string(),
+            sha256: installer_sha256,
+            size_bytes: installer_size_bytes,
         },
-        "installer": {
-            "filename": installer_name,
-            "sha256": installer_sha256,
-            "size_bytes": installer_size_bytes,
-        },
-        "release_channel": options.channel,
-        "required_binaries": BINARIES,
-        "schema_version": MANIFEST_SCHEMA_VERSION,
-        "source_sha": options.source_sha,
-        "supported_platforms": TARGETS,
-        "version": version,
-    }))
+    );
+    manifest.validate()?;
+    Ok(manifest)
 }
 
-fn write_outputs(options: &Options, manifest: &Value) -> Result<(), String> {
-    let artifacts = manifest["artifacts"]
-        .as_array()
-        .ok_or("manifest artifacts are not an array")?;
+fn write_outputs(options: &Options, manifest: &ReleaseManifest) -> Result<(), String> {
     let mut aggregate = String::new();
-    for artifact in artifacts {
-        let archive = artifact["archive"]
-            .as_str()
-            .ok_or("archive is not a string")?;
-        let digest = artifact["sha256"]
-            .as_str()
-            .ok_or("sha256 is not a string")?;
+    for artifact in &manifest.artifacts {
+        let archive = &artifact.archive;
+        let digest = &artifact.sha256;
         let line = format!("{digest}  {archive}\n");
         fs::write(options.dist.join(format!("{archive}.sha256")), &line)
             .map_err(|error| format!("write checksum for {archive}: {error}"))?;
         aggregate.push_str(&line);
     }
-    let installer = &manifest["installer"];
-    let installer_name = installer["filename"]
-        .as_str()
-        .ok_or("installer filename is not a string")?;
-    let installer_digest = installer["sha256"]
-        .as_str()
-        .ok_or("installer sha256 is not a string")?;
+    let installer_name = &manifest.installer.filename;
+    let installer_digest = &manifest.installer.sha256;
     let installer_line = format!("{installer_digest}  {installer_name}\n");
     fs::write(
         options.dist.join(format!("{installer_name}.sha256")),
@@ -205,7 +177,7 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, Options) {
         let temp = tempfile::tempdir().unwrap();
         let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
-        for target in TARGETS {
+        for target in RELEASE_TARGETS {
             fs::write(
                 temp.path().join(format!("aethyme-{tag}-{target}.tar.gz")),
                 format!("archive for {target}"),
@@ -229,24 +201,30 @@ mod tests {
 
         let manifest = build_manifest(&options).unwrap();
 
-        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(manifest["source_sha"], "a".repeat(40));
-        assert_eq!(manifest["release_channel"], "stable");
-        assert_eq!(manifest["artifacts"].as_array().unwrap().len(), 3);
-        assert_eq!(manifest["required_binaries"], json!(BINARIES));
-        assert_eq!(manifest["installer"]["filename"], "install.sh");
-        assert_eq!(manifest["installer"]["sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(manifest.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(manifest.source_sha, "a".repeat(40));
+        assert_eq!(manifest.release_channel, "stable");
+        assert_eq!(manifest.artifacts.len(), 3);
         assert_eq!(
-            manifest["compatibility"]["engine_protocol"],
-            ENGINE_PROTOCOL_VERSION
+            manifest.required_binaries,
+            REQUIRED_RELEASE_BINARIES
+                .iter()
+                .map(|binary| (*binary).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(manifest.installer.filename, "install.sh");
+        assert_eq!(manifest.installer.sha256.len(), 64);
+        assert_eq!(
+            manifest.compatibility.engine_protocol,
+            aethyme_broker::ENGINE_PROTOCOL_VERSION
         );
         assert_eq!(
-            manifest["compatibility"]["broker_storage"]["current_schema"],
-            BROKER_STORAGE_CURRENT_SCHEMA
+            manifest.compatibility.broker_storage.current_schema,
+            aethyme_broker::BROKER_STORAGE_CURRENT_SCHEMA
         );
-        for artifact in manifest["artifacts"].as_array().unwrap() {
-            assert_eq!(artifact["sha256"].as_str().unwrap().len(), 64);
-            assert_eq!(artifact["binaries"], json!(BINARIES));
+        for artifact in &manifest.artifacts {
+            assert_eq!(artifact.sha256.len(), 64);
+            assert_eq!(artifact.binaries, manifest.required_binaries);
         }
     }
 
@@ -259,8 +237,8 @@ mod tests {
 
         assert!(options.output.is_file());
         let sums = fs::read_to_string(options.dist.join("SHA256SUMS")).unwrap();
-        assert_eq!(sums.lines().count(), TARGETS.len() + 1);
-        for target in TARGETS {
+        assert_eq!(sums.lines().count(), RELEASE_TARGETS.len() + 1);
+        for target in RELEASE_TARGETS {
             let archive = format!("aethyme-{}-{target}.tar.gz", options.tag);
             assert!(sums.contains(&archive));
             assert!(options.dist.join(format!("{archive}.sha256")).is_file());
