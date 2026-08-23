@@ -4,7 +4,10 @@
 //! supplied. Network access and plan persistence live at the CLI boundary.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -16,6 +19,8 @@ use crate::{ReleaseArtifact, ReleaseCompatibility, ReleaseManifest};
 pub const UPDATE_PLAN_SCHEMA_VERSION: u32 = 1;
 pub const INSTALL_RECEIPT_SCHEMA_VERSION: u32 = 1;
 pub const INSTALL_RECEIPT_FILENAME: &str = "install-receipt.json";
+const DEFAULT_RELEASE_BASE_URL: &str = "https://github.com/schiste/Aethyme";
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -324,6 +329,255 @@ pub fn build_update_plan(
 
 pub fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+pub fn run_update_cli(args: &[String]) -> u8 {
+    match run_update_cli_inner(args) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            1
+        }
+    }
+}
+
+fn run_update_cli_inner(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("--help" | "-h") | None => {
+            print_update_help();
+            Ok(())
+        }
+        Some("check") => {
+            let json = parse_json_only(&args[1..])?;
+            let plan = resolve_update_plan(UpdateChannel::Stable)?;
+            render_plan(&plan, json, false, None)
+        }
+        Some("plan") => {
+            let (channel, json) = parse_plan_options(&args[1..])?;
+            let plan = resolve_update_plan(channel)?;
+            let saved_to = persist_update_plan(&plan)?;
+            render_plan(&plan, json, true, saved_to.as_deref())
+        }
+        Some("execute") => Err(
+            "update execute is unavailable until the transactional installer layout is active"
+                .into(),
+        ),
+        Some(other) => Err(format!(
+            "unsupported update subcommand {other:?}; use check, plan, or execute"
+        )),
+    }
+}
+
+fn print_update_help() {
+    eprintln!("aethyme update — explicit paired-binary updates (never runs in the background)");
+    eprintln!();
+    eprintln!("Usage:");
+    eprintln!("  aethyme update check [--json]");
+    eprintln!("  aethyme update plan [--channel stable|preview] [--json]");
+    eprintln!("  aethyme update execute --confirm <manifest-sha256> [--json]");
+    eprintln!();
+    eprintln!("Homebrew installs are updated with `brew upgrade aethyme`.");
+}
+
+fn parse_json_only(args: &[String]) -> Result<bool, String> {
+    match args {
+        [] => Ok(false),
+        [flag] if flag == "--json" => Ok(true),
+        _ => Err("update check accepts only --json".into()),
+    }
+}
+
+fn parse_plan_options(args: &[String]) -> Result<(UpdateChannel, bool), String> {
+    let mut channel = UpdateChannel::Stable;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--channel" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or("update plan: --channel requires a value")?;
+                channel = value
+                    .parse()
+                    .map_err(|error: UpdateError| error.to_string())?;
+                index += 2;
+            }
+            other => return Err(format!("update plan: unknown option {other}")),
+        }
+    }
+    Ok((channel, json))
+}
+
+fn resolve_update_plan(channel: UpdateChannel) -> Result<UpdatePlan, String> {
+    let base_url = std::env::var("AETHYME_RELEASE_BASE_URL")
+        .unwrap_or_else(|_| DEFAULT_RELEASE_BASE_URL.to_string());
+    let manifest_url = update_manifest_url(&base_url, channel);
+    let manifest_bytes = fetch_bounded(&manifest_url, MAX_MANIFEST_BYTES)?;
+    let executable = std::env::current_exe().map_err(|error| format!("locate aethyme: {error}"))?;
+    let installation = detect_installation(&executable);
+    let target = current_release_target().map_err(|error| error.to_string())?;
+    build_update_plan(
+        &manifest_bytes,
+        channel,
+        installation,
+        env!("CARGO_PKG_VERSION"),
+        target,
+        &base_url,
+        &manifest_url,
+        now_unix_ms(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn update_manifest_url(base_url: &str, channel: UpdateChannel) -> String {
+    let base = base_url.trim_end_matches('/');
+    match channel {
+        UpdateChannel::Stable => {
+            format!("{base}/releases/latest/download/release-manifest.json")
+        }
+        UpdateChannel::Preview => {
+            format!("{base}/releases/download/preview/release-manifest.json")
+        }
+    }
+}
+
+fn fetch_bounded(url: &str, maximum_bytes: u64) -> Result<Vec<u8>, String> {
+    let temp = tempfile::tempdir().map_err(|error| format!("create update temp dir: {error}"))?;
+    let destination = temp.path().join("download");
+    download_to(url, &destination)?;
+    let metadata = fs::metadata(&destination)
+        .map_err(|error| format!("stat downloaded update metadata: {error}"))?;
+    if metadata.len() > maximum_bytes {
+        return Err(format!(
+            "downloaded update metadata is {} bytes; limit is {maximum_bytes}",
+            metadata.len()
+        ));
+    }
+    fs::read(&destination).map_err(|error| format!("read downloaded update metadata: {error}"))
+}
+
+fn download_to(url: &str, destination: &Path) -> Result<(), String> {
+    if let Some(path) = url.strip_prefix("file://") {
+        fs::copy(path, destination)
+            .map(|_| ())
+            .map_err(|error| format!("copy {url}: {error}"))
+    } else {
+        if !url.starts_with("https://") {
+            return Err(format!("refusing non-HTTPS update URL {url}"));
+        }
+        let output = Command::new("curl")
+            .args([
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--location",
+                "--proto",
+                "=https",
+                "--output",
+            ])
+            .arg(destination)
+            .arg(url)
+            .output()
+            .map_err(|error| format!("run curl: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "download {url}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn persist_update_plan(plan: &UpdatePlan) -> Result<Option<PathBuf>, String> {
+    if plan.action != UpdateAction::ExecuteInstallerUpdate {
+        return Ok(None);
+    }
+    let root = plan
+        .installation
+        .managed_root
+        .as_ref()
+        .ok_or("installer update plan has no managed root")?;
+    let directory = root.join("update-plans");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("create {}: {error}", directory.display()))?;
+    let destination = directory.join(format!("{}.json", plan.manifest_sha256));
+    let mut encoded =
+        serde_json::to_vec_pretty(plan).map_err(|error| format!("encode update plan: {error}"))?;
+    encoded.push(b'\n');
+    let mut temporary = tempfile::NamedTempFile::new_in(&directory)
+        .map_err(|error| format!("create update plan temp file: {error}"))?;
+    temporary
+        .write_all(&encoded)
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|error| format!("write update plan: {error}"))?;
+    temporary
+        .persist(&destination)
+        .map_err(|error| format!("publish {}: {}", destination.display(), error.error))?;
+    Ok(Some(destination))
+}
+
+fn render_plan(
+    plan: &UpdatePlan,
+    json: bool,
+    detailed: bool,
+    saved_to: Option<&Path>,
+) -> Result<(), String> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(plan)
+                .map_err(|error| format!("encode update plan: {error}"))?
+        );
+        return Ok(());
+    }
+    if detailed {
+        println!("Aethyme update plan");
+        println!("  Current:      {}", plan.current_version);
+        println!(
+            "  Target:       {} ({})",
+            plan.target_version,
+            plan.channel.as_str()
+        );
+        println!("  Installation: {:?}", plan.installation.method);
+        println!("  Manifest:     {}", plan.manifest_sha256);
+        println!("  Archive:      {}", plan.archive.archive);
+        println!("  Action:       {:?}", plan.action);
+        if let Some(path) = saved_to {
+            println!("  Reviewed plan: {}", path.display());
+            println!(
+                "Next: aethyme update execute --confirm {}",
+                plan.manifest_sha256
+            );
+        } else if let Some(command) = &plan.recommended_command {
+            println!("Next: {command}");
+        }
+    } else {
+        println!(
+            "Aethyme {} ({:?}); {} {} -> {:?}",
+            plan.current_version,
+            plan.installation.method,
+            plan.channel.as_str(),
+            plan.target_version,
+            plan.action
+        );
+        if let Some(command) = &plan.recommended_command {
+            println!("Next: {command}");
+        }
+    }
+    Ok(())
+}
+
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 fn action_for_installation(

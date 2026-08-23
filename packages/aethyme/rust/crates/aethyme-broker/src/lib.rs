@@ -144,7 +144,7 @@ pub use update::{
     INSTALL_RECEIPT_FILENAME, INSTALL_RECEIPT_SCHEMA_VERSION, InstallReceipt, InstallationMethod,
     InstallationProvenance, UPDATE_PLAN_SCHEMA_VERSION, UpdateAction, UpdateArchive, UpdateChannel,
     UpdateError, UpdatePlan, build_update_plan, current_release_target, detect_installation,
-    release_target_for, sha256_bytes,
+    release_target_for, run_update_cli, sha256_bytes,
 };
 pub use verify_loop::{
     VerifyLoopCommandReport, VerifyLoopReport, VerifyLoopStep, VerifyLoopStepStatus,
