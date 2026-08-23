@@ -2225,8 +2225,7 @@ fn change_task_order_redb(
 
 fn change_task_next_items(map: &RepositoryMap, anchors: &[Anchor]) -> Vec<GraphRelationItem> {
     let mut items = Vec::new();
-    for anchor in anchors.iter().take(2) {
-        let display = anchor.file.clone().unwrap_or_else(|| anchor.id.clone());
+    for display in change_task_anchor_displays(anchors) {
         if let Some(item) = relation_item_for_display(map, &display, "next") {
             items.push(item);
         }
@@ -2268,8 +2267,7 @@ fn change_task_next_items_redb(
     anchors: &[Anchor],
 ) -> Result<Vec<GraphRelationItem>, GraphStoreError> {
     let mut items = Vec::new();
-    for anchor in anchors.iter().take(2) {
-        let display = anchor.file.clone().unwrap_or_else(|| anchor.id.clone());
+    for display in change_task_anchor_displays(anchors) {
         if let Some(item) = relation_item_for_display_redb(store, &display, "next")? {
             items.push(item);
         }
@@ -2298,6 +2296,20 @@ fn change_task_next_items_redb(
         }
     }
     Ok(items)
+}
+
+fn change_task_anchor_displays(anchors: &[Anchor]) -> Vec<String> {
+    let mut displays = Vec::new();
+    for anchor in anchors {
+        let display = anchor.file.clone().unwrap_or_else(|| anchor.id.clone());
+        if !displays.contains(&display) {
+            displays.push(display);
+            if displays.len() == 2 {
+                break;
+            }
+        }
+    }
+    displays
 }
 
 fn extend_change_scope(
