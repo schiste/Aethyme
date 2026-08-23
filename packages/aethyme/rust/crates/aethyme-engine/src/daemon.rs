@@ -65,6 +65,8 @@ use crate::store::redb::graph_store::{GraphStore, OverviewV2Limits, ReadOnlyGrap
 /// running across the upgrade.
 const SOCKET_PREFIX: &str = "engine-";
 const SOCKET_DIR_NAME: &str = "aethyme";
+/// Version of the line-delimited JSON request/response contract.
+pub const ENGINE_PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 1800; // 30 min
 
 /// Compute the unix socket path for `repo`.

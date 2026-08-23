@@ -6,7 +6,7 @@ on:
 
 permissions:
   actions: read
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -35,11 +35,23 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Verify release version contract
+        env:
+          AETHYME_RELEASE_TAG: ${{ github.ref_name }}
+        run: cargo test --locked -p aethyme-testkit --test release_contract
+
       - name: Build release binaries
         run: cargo build --release --locked -p aethyme-cli --bin aethyme -p aethyme-engine --bin aethyme-engine-cli
 
-      - name: Report embedded version
-        run: ./target/release/aethyme --version
+      - name: Verify embedded release versions
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          expected="${REF_NAME#v}"
+          router_version="$(./target/release/aethyme --version | awk '{print $2}')"
+          engine_version="$(./target/release/aethyme-engine-cli --version | awk '{print $2}')"
+          test "$router_version" = "$expected"
+          test "$engine_version" = "$expected"
 
       - name: Package archive
         env:
@@ -61,7 +73,19 @@ jobs:
     name: Attach to GitHub release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
     steps:
+      - name: Checkout release source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Download artifacts
         env:
           GH_TOKEN: ${{ github.token }}
@@ -72,10 +96,42 @@ jobs:
           count="$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')"
           test "$count" = "3"
 
+      - name: Build release manifest and checksums
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          source_sha="$(git rev-parse HEAD)"
+          test "$source_sha" = "$GITHUB_SHA"
+          cargo run --locked --manifest-path packages/aethyme/rust/Cargo.toml \
+            -p aethyme-broker --example release_manifest -- \
+            --dist "$GITHUB_WORKSPACE/dist" \
+            --tag "$REF_NAME" \
+            --source-sha "$source_sha" \
+            --channel stable \
+            --output "$GITHUB_WORKSPACE/dist/release-manifest.json"
+          cd dist
+          sha256sum --check SHA256SUMS
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign and verify release manifest
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          cosign sign-blob --yes \
+            --bundle dist/release-manifest.sigstore.json \
+            dist/release-manifest.json
+          cosign verify-blob \
+            --bundle dist/release-manifest.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${REF_NAME}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            dist/release-manifest.json
+
       - name: Create or update release
         # Third-party action with a write-scoped token: pinned to a full
         # commit SHA rather than a movable tag.
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
-          files: dist/*.tar.gz
+          files: dist/*
           generate_release_notes: true
