@@ -49,19 +49,8 @@ pub fn session_exit_payload(exit_code: i64) -> String {
 /// Redacted durable handoff. Deliberately excludes the absolute worktree
 /// path, task/command text, warnings, logs, diffs, and file contents.
 pub fn session_finished_payload(report: &crate::broker::FinishReport) -> String {
-    json!({
-        "session_id": report.session_id,
-        "status": report.status,
-        "latest_queue_entry_id": report.latest_queue_entry_id,
-        "latest_queue_status": report.latest_queue_status,
-        "delivery": report.delivery,
-        "pending_work": report.pending_work,
-        "leases_held": report.leases_held,
-        "last_gate": report.last_gate,
-        "cleanup_safe": report.cleanup_safe,
-        "recommended_next_action": report.recommended_next_action,
-    })
-    .to_string()
+    serde_json::to_string(&crate::broker::FinishHandoff::from(report))
+        .expect("FinishHandoff contains only serializable fields")
 }
 
 pub fn lease_path_payload(path: &str) -> String {

@@ -114,6 +114,12 @@ pub enum BrokerOpError {
     },
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("session {session_id} has no completed handoff")]
+    HandoffNotFoundForSession { session_id: i64 },
+    #[error("worktree {worktree:?} has no completed handoff")]
+    HandoffNotFoundForWorktree { worktree: String },
+    #[error("session.finished event {event_id} is invalid: {reason}")]
+    InvalidHandoffEvent { event_id: i64, reason: String },
     #[error(transparent)]
     GateConfig(#[from] crate::gates::GateConfigError),
     #[error("queue entry {entry} is not verified (status: {status}) — submit/simulate first")]
@@ -716,7 +722,8 @@ pub struct RepairReport {
 
 /// Outcome class for `broker finish --session`: a human lifecycle helper
 /// that only mutates state when the session is safe to close.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FinishStatus {
     Blocked,
     Closed,
@@ -730,12 +737,6 @@ impl FinishStatus {
             Self::Closed => "closed",
             Self::AlreadyClosed => "already_closed",
         }
-    }
-}
-
-impl serde::Serialize for FinishStatus {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -762,7 +763,7 @@ pub struct FinishReport {
     pub next_commands: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct FinishDelivery {
     pub submitted: bool,
     pub promoted: bool,
@@ -770,7 +771,7 @@ pub struct FinishDelivery {
     pub promotion_commit: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct FinishPendingWork {
     pub present: bool,
     pub dirty_path_count: usize,
@@ -778,7 +779,9 @@ pub struct FinishPendingWork {
     pub worktree_missing: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishLeaseState {
     Active,
@@ -786,7 +789,7 @@ pub enum FinishLeaseState {
     Expired,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct FinishLease {
     pub path: String,
     pub kind: LeaseKind,
@@ -795,14 +798,14 @@ pub struct FinishLease {
     pub released_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishGateCacheSource {
     Executed,
     CacheHit,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct FinishGateRun {
     pub gate: String,
     pub status: GateStatus,
@@ -810,6 +813,48 @@ pub struct FinishGateRun {
     /// Unix epoch milliseconds from the event ledger.
     pub recorded_at: i64,
     pub cache_source: FinishGateCacheSource,
+}
+
+/// Redacted durable projection written to a `session.finished` event.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct FinishHandoff {
+    pub session_id: i64,
+    pub status: FinishStatus,
+    pub latest_queue_entry_id: Option<i64>,
+    pub latest_queue_status: Option<MergeStatus>,
+    pub delivery: FinishDelivery,
+    pub pending_work: FinishPendingWork,
+    pub leases_held: Vec<FinishLease>,
+    pub last_gate: Option<FinishGateRun>,
+    pub cleanup_safe: bool,
+    pub recommended_next_action: Option<String>,
+}
+
+impl From<&FinishReport> for FinishHandoff {
+    fn from(report: &FinishReport) -> Self {
+        Self {
+            session_id: report.session_id,
+            status: report.status,
+            latest_queue_entry_id: report.latest_queue_entry_id,
+            latest_queue_status: report.latest_queue_status,
+            delivery: report.delivery.clone(),
+            pending_work: report.pending_work.clone(),
+            leases_held: report.leases_held.clone(),
+            last_gate: report.last_gate.clone(),
+            cleanup_safe: report.cleanup_safe,
+            recommended_next_action: report.recommended_next_action.clone(),
+        }
+    }
+}
+
+/// Latest persisted handoff plus its append-only event provenance.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionHandoffReport {
+    pub event_id: i64,
+    /// Unix epoch milliseconds from the event ledger.
+    pub recorded_at: i64,
+    #[serde(flatten)]
+    pub handoff: FinishHandoff,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -2829,6 +2874,63 @@ impl Broker {
     }
 
     // ── finish ────────────────────────────────────────────────────────
+
+    fn handoff_report(event: crate::types::Event) -> Result<SessionHandoffReport, BrokerOpError> {
+        let payload =
+            event
+                .payload_json
+                .as_deref()
+                .ok_or_else(|| BrokerOpError::InvalidHandoffEvent {
+                    event_id: event.id,
+                    reason: "payload is missing".into(),
+                })?;
+        let handoff = serde_json::from_str::<FinishHandoff>(payload).map_err(|error| {
+            BrokerOpError::InvalidHandoffEvent {
+                event_id: event.id,
+                reason: error.to_string(),
+            }
+        })?;
+        if event.session_id != Some(handoff.session_id) {
+            return Err(BrokerOpError::InvalidHandoffEvent {
+                event_id: event.id,
+                reason: "payload session_id does not match event session_id".into(),
+            });
+        }
+        Ok(SessionHandoffReport {
+            event_id: event.id,
+            recorded_at: event.ts,
+            handoff,
+        })
+    }
+
+    /// Retrieve the latest durable finish handoff for one session.
+    pub fn latest_handoff_for_session(
+        &self,
+        session_id: i64,
+    ) -> Result<SessionHandoffReport, BrokerOpError> {
+        self.store.session(session_id)?;
+        let event = self
+            .store
+            .latest_session_finished_event(session_id)?
+            .ok_or(BrokerOpError::HandoffNotFoundForSession { session_id })?;
+        Self::handoff_report(event)
+    }
+
+    /// Retrieve the newest durable finish handoff across every session
+    /// registered for exactly this worktree path.
+    pub fn latest_handoff_for_worktree(
+        &self,
+        worktree: &Path,
+    ) -> Result<SessionHandoffReport, BrokerOpError> {
+        let worktree = worktree.to_string_lossy().into_owned();
+        let event = self
+            .store
+            .latest_worktree_finished_event(&worktree)?
+            .ok_or_else(|| BrokerOpError::HandoffNotFoundForWorktree {
+                worktree: worktree.clone(),
+            })?;
+        Self::handoff_report(event)
+    }
 
     fn finish_delivery(&self, entry: Option<&MergeQueueEntry>) -> FinishDelivery {
         let Some(entry) = entry else {

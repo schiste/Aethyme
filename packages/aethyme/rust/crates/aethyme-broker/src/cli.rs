@@ -54,6 +54,10 @@ Usage:
       cleanup would pass without --force. Successful closure atomically
       persists a redacted session.finished handoff with delivery, pending
       work, leases, last-gate provenance, and the recommended next action.
+  aethyme broker handoff (--session <id> | --worktree <path>) [--json]
+      Read the latest persisted session.finished handoff for one session,
+      or the newest completed session registered to a worktree. Does not
+      refresh sessions, leases, gates, events, or command telemetry.
   aethyme broker start --task <text> [--json]
       Create a broker-managed worktree + branch and register a session,
       but do not spawn a process. Prefer this over adopting the main
@@ -320,6 +324,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "verify-loop",
         "e2e",
         "finish",
+        "handoff",
         "cleanup",
         "certify",
         "scaffold",
@@ -368,7 +373,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
 /// repository, or installation state remain observable.
 fn command_records_metric(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        Some("certify" | "queue" | "metrics") => false,
+        Some("certify" | "queue" | "metrics" | "handoff") => false,
         Some("ship") => args.get(1).map(String::as_str) != Some("plan"),
         Some("operations") => args.get(1).map(String::as_str) == Some("reconcile"),
         Some("git" | "gh") => {
@@ -412,6 +417,8 @@ mod tests {
             args(&["events"]),
             args(&["events", "--follow"]),
             args(&["metrics"]),
+            args(&["handoff", "--session", "7"]),
+            args(&["handoff", "--worktree", "."]),
             args(&["gates", "validate"]),
             args(&["gates", "affected", "--session", "7"]),
             args(&["gates", "semantic", "--session", "7"]),
@@ -504,6 +511,33 @@ mod tests {
         assert!(parsed.json);
         assert!(!super::command_records_metric(&args(&[
             "ship", "plan", "--entry", "42"
+        ])));
+    }
+
+    #[test]
+    fn parse_accepts_read_only_handoff_selectors() {
+        let by_session = match super::parse(&args(&["handoff", "--session", "7", "--json"])) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("session handoff should parse"),
+        };
+        assert_eq!(by_session.session, Some(7));
+        assert!(by_session.worktree.is_none());
+        assert!(by_session.json);
+
+        let by_worktree =
+            match super::parse(&args(&["handoff", "--worktree", ".aethyme/worktrees/task"])) {
+                Ok(parsed) => parsed,
+                Err(_) => panic!("worktree handoff should parse"),
+            };
+        assert!(by_worktree.session.is_none());
+        assert_eq!(
+            by_worktree.worktree.as_deref(),
+            Some(std::path::Path::new(".aethyme/worktrees/task"))
+        );
+        assert!(!super::command_records_metric(&args(&[
+            "handoff",
+            "--session",
+            "7",
         ])));
     }
 
@@ -730,6 +764,7 @@ struct Parsed {
     seconds: Option<u64>,
     upstream: Option<String>,
     resolution_file: Option<PathBuf>,
+    worktree: Option<PathBuf>,
     follow: bool,
     json: bool,
     force: bool,
@@ -774,6 +809,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         seconds: None,
         upstream: None,
         resolution_file: None,
+        worktree: None,
         follow: false,
         json: false,
         force: false,
@@ -862,6 +898,13 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                         .ok_or(UsageError::Message(
                             "--resolution-file requires a path".into(),
                         ))?
+                        .clone(),
+                ))
+            }
+            "--worktree" => {
+                parsed.worktree = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or(UsageError::Message("--worktree requires a path".into()))?
                         .clone(),
                 ))
             }
@@ -1382,6 +1425,129 @@ fn render_finish_report(report: &crate::FinishReport) {
         "  recommended next: {}",
         report.recommended_next_action.as_deref().unwrap_or("none")
     );
+}
+
+fn render_handoff_report(report: &crate::SessionHandoffReport) {
+    let handoff = &report.handoff;
+    println!(
+        "Session {} handoff: {} (event {} at {})",
+        handoff.session_id,
+        handoff.status.as_str(),
+        report.event_id,
+        report.recorded_at
+    );
+    if let Some(entry_id) = handoff.latest_queue_entry_id {
+        let status = handoff
+            .latest_queue_status
+            .map(|status| status.as_str())
+            .unwrap_or("unknown");
+        println!("  latest queue: qid {entry_id} ({status})");
+    }
+    println!(
+        "  delivery: submitted={}, promoted={}, published={}",
+        if handoff.delivery.submitted {
+            "yes"
+        } else {
+            "no"
+        },
+        if handoff.delivery.promoted {
+            "yes"
+        } else {
+            "no"
+        },
+        if handoff.delivery.published {
+            "yes"
+        } else {
+            "no"
+        },
+    );
+    println!(
+        "  pending work: {} ({} dirty paths, {} unsubmitted commits{})",
+        if handoff.pending_work.present {
+            "yes"
+        } else {
+            "no"
+        },
+        handoff.pending_work.dirty_path_count,
+        handoff.pending_work.unsubmitted_commits,
+        if handoff.pending_work.worktree_missing {
+            ", worktree missing"
+        } else {
+            ""
+        },
+    );
+    let active = handoff
+        .leases_held
+        .iter()
+        .filter(|lease| lease.state == crate::FinishLeaseState::Active)
+        .count();
+    let released = handoff
+        .leases_held
+        .iter()
+        .filter(|lease| lease.state == crate::FinishLeaseState::Released)
+        .count();
+    let expired = handoff
+        .leases_held
+        .iter()
+        .filter(|lease| lease.state == crate::FinishLeaseState::Expired)
+        .count();
+    println!(
+        "  leases: {} recorded ({} active, {} released, {} expired)",
+        handoff.leases_held.len(),
+        active,
+        released,
+        expired
+    );
+    match &handoff.last_gate {
+        Some(gate) => println!(
+            "  last gate: {} {} on tree {} at {} ({})",
+            gate.gate,
+            gate.status.as_str(),
+            short_commit(&gate.tree_hash),
+            gate.recorded_at,
+            match gate.cache_source {
+                crate::FinishGateCacheSource::Executed => "executed",
+                crate::FinishGateCacheSource::CacheHit => "cache hit",
+            }
+        ),
+        None => println!("  last gate: none recorded"),
+    }
+    println!(
+        "  cleanup safe: {}",
+        if handoff.cleanup_safe { "yes" } else { "no" }
+    );
+    println!(
+        "  next: {}",
+        handoff.recommended_next_action.as_deref().unwrap_or("none")
+    );
+}
+
+fn resolve_handoff_worktree(path: &std::path::Path) -> Result<PathBuf, UsageError> {
+    if path.exists() {
+        return Ok(crate::GitRepo::discover(path)?.root().to_path_buf());
+    }
+    let mut existing = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?
+            .join(path)
+    };
+    let mut missing_tail = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            return Ok(existing);
+        };
+        missing_tail.push(name.to_os_string());
+        if !existing.pop() {
+            return Ok(existing);
+        }
+    }
+    let mut resolved = existing.canonicalize().unwrap_or(existing);
+    for name in missing_tail.into_iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
 }
 
 fn render_verify_loop_report(report: &crate::VerifyLoopReport) {
@@ -3235,6 +3401,31 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             }
             if !report.certified() {
                 return Err(UsageError::Message("certification failed".into()));
+            }
+        }
+        "handoff" => {
+            let broker = open_broker()?;
+            let report = match (parsed.session, parsed.worktree.as_deref()) {
+                (Some(session), None) => broker.latest_handoff_for_session(session)?,
+                (None, Some(worktree)) => {
+                    let worktree = resolve_handoff_worktree(worktree)?;
+                    broker.latest_handoff_for_worktree(&worktree)?
+                }
+                (Some(_), Some(_)) => {
+                    return Err(UsageError::Message(
+                        "handoff takes either --session <id> or --worktree <path>, not both".into(),
+                    ));
+                }
+                (None, None) => {
+                    return Err(UsageError::Message(
+                        "handoff requires --session <id> or --worktree <path>".into(),
+                    ));
+                }
+            };
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render_handoff_report(&report);
             }
         }
         "finish" => {

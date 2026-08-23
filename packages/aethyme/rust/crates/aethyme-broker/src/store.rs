@@ -1297,6 +1297,45 @@ impl BrokerStore {
             .optional()
             .map_err(BrokerError::from)
     }
+
+    /// Latest durable finish handoff for one session.
+    pub fn latest_session_finished_event(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<Event>, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT id, schema_version, ts, kind, session_id, payload_json
+                 FROM events
+                 WHERE session_id = ?1 AND kind = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![session_id, crate::events::SESSION_FINISHED],
+                event_from_row,
+            )
+            .optional()
+            .map_err(BrokerError::from)
+    }
+
+    /// Latest durable finish handoff across all sessions registered for
+    /// exactly one worktree path, including cleaned sessions.
+    pub fn latest_worktree_finished_event(
+        &self,
+        worktree_path: &str,
+    ) -> Result<Option<Event>, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT events.id, events.schema_version, events.ts, events.kind,
+                        events.session_id, events.payload_json
+                 FROM events
+                 JOIN sessions ON sessions.id = events.session_id
+                 WHERE sessions.worktree_path = ?1 AND events.kind = ?2
+                 ORDER BY events.id DESC LIMIT 1",
+                params![worktree_path, crate::events::SESSION_FINISHED],
+                event_from_row,
+            )
+            .optional()
+            .map_err(BrokerError::from)
+    }
 }
 
 // ── row mapping helpers ──────────────────────────────────────────────
@@ -1318,6 +1357,17 @@ const PR_WATCH_SELECT: &str = "SELECT id, target_branch, pr_number, activity_fin
      marker, last_dispatch_at, last_agent_session_id, updated_at FROM pr_watch_state";
 
 type RowResult<T> = Result<Result<T, BrokerError>, rusqlite::Error>;
+
+fn event_from_row(row: &rusqlite::Row<'_>) -> Result<Event, rusqlite::Error> {
+    Ok(Event {
+        id: row.get(0)?,
+        schema_version: row.get(1)?,
+        ts: row.get(2)?,
+        kind: row.get(3)?,
+        session_id: row.get(4)?,
+        payload_json: row.get(5)?,
+    })
+}
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> RowResult<Session> {
     let origin: String = row.get(3)?;

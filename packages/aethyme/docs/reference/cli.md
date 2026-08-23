@@ -49,6 +49,7 @@ product surface.
 - `aethyme broker submit`
 - `aethyme broker repair`
 - `aethyme broker finish`
+- `aethyme broker handoff`
 - `aethyme broker ship plan`
 - `aethyme broker ship execute`
 - `aethyme broker integration status`
@@ -103,6 +104,7 @@ The broker is the stable product front door for multi-agent coordination:
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
 - `aethyme broker repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
+- `aethyme broker handoff (--session <id> | --worktree <path>) [--json]`
 - `aethyme broker ship plan --entry <id> [--json]`
 - `aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--json]`
 - `aethyme broker integration status [--json]`
@@ -151,6 +153,21 @@ action. A successful close persists the same operational fields in a redacted
 `session.finished` event atomically with `session.cleaned`, so the handoff
 survives lease cleanup and session closure. Refused and already-closed finishes
 do not emit a misleading or duplicate completion event.
+
+Retrieve the newest persisted handoff without changing broker state:
+
+```bash
+aethyme broker handoff --session 110
+aethyme broker handoff --worktree .aethyme/worktrees/my-task --json
+```
+
+Exactly one selector is required. Session lookup returns that session's latest
+`session.finished` event. Worktree lookup considers cleaned sessions too and
+returns the newest completed handoff registered to the exact worktree path,
+including when the worktree has since been removed and its former absolute path
+is supplied. JSON adds the handoff event's stable `event_id` and `recorded_at`
+provenance without exposing the worktree path. The command does not refresh or
+append sessions, leases, gates, events, or command telemetry.
 
 Promotion only advances the local integration ref. Use `broker ship plan` to
 inspect the promoted queue entry, exact integration SHA, remote freshness,
