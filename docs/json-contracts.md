@@ -118,15 +118,47 @@ event-stream contract — see [events-contract.md](events-contract.md).
 ```
 {
   "entry": MergeQueueEntry,
+  "submission_plan": {
+    "session_id": n,
+    "recorded_baseline": "<full commit>" | null,
+    "session_head": "<full commit>",
+    "integration_head": "<full commit>",
+    "safe": true|false,
+    "commits": [
+      {
+        "commit": "<full commit>",
+        "parents": [ "<full commit>", ... ],
+        "ownership": "session_owned" | "inherited_from_recorded_baseline" | "ambiguous",
+        "integration_state": "pending" | "already_integrated_by_ancestry" |
+          "already_integrated_by_stable_patch_identity" | "ambiguous",
+        "patch_id": "<stable patch id>" | null,
+        "matching_integration_commits": [ "<full commit>", ... ]
+      }
+    ],
+    "warnings": [ "...", ... ]
+  },
   "conflicts": [ "path", ... ],
+  "conflict_details": [
+    {
+      "path": "path",
+      "originating_commit": "<full session commit>",
+      "ownership": "session_owned" | "inherited_from_recorded_baseline" | "ambiguous",
+      "integration_side_commits": [ "<full commit>", ... ],
+      "remediation": "...",
+      "commands": [ "...", ... ]
+    }
+  ],
   "gate_outcomes": [ { "gate", "status", "cached", "exit_code",
                        "duration_ms", "log_path" } ],
   "promoted": true|false
 }
 ```
 
-`conflicts` non-empty means the submission was rejected pre-gate;
-`promoted: true` means the integration branch advanced in this call.
+`submission_plan` preserves deterministic commit order and separates ownership
+from integration state. Full SHAs are never abbreviated in JSON. `conflicts`
+non-empty means the submission was rejected pre-gate; `conflict_details`
+provides provenance and recovery for the same paths. `promoted: true` means the
+integration branch advanced in this call.
 
 ### `report list --json`
 

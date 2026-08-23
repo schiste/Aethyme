@@ -138,6 +138,23 @@ integration tip. It requires a clean session worktree, permits only a
 fast-forward, and synchronizes before recording the follow-up diff baseline;
 dirty or diverged worktrees are left unchanged.
 
+`broker submit` builds a normalized commit-provenance plan before gate
+selection. It replays only pending `session_owned` single-parent patches onto
+the exact integration tip, in order. Patch-equivalent history already present
+under another SHA is classified as
+`already_integrated_by_stable_patch_identity` and is not replayed. Missing
+baselines, ambiguous ownership or patch identity, and pending owned merge
+commits are refused rather than guessed.
+
+With `--json`, `submission_plan` exposes the full recorded baseline, session
+HEAD, integration HEAD, ordered commits, their parents, ownership,
+integration state, stable patch ID, matching integration commits, safety flag,
+and warnings. On rejection, `conflict_details` supplements the compatible
+`conflicts` path list with the full originating commit, ownership, known
+integration-side commits, remediation text, and ordered commands. A blocking
+session is reported only when its current active lease overlaps a surviving
+replay conflict.
+
 Gate-run and submit outcomes identify the exact Git tree each result proves.
 Human-readable output abbreviates the tree hash to 12 characters; JSON retains
 the full hash in `tree_hash` for both executed and cached results.
