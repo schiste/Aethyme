@@ -38,6 +38,7 @@ globset = "0.4"
 # killpg for gate-run cancellation (the external `kill` utility parses
 # negative pgids as options on Linux).
 libc = "0.2"
-
-[dev-dependencies]
+# Offline report digests are the review/filing confirmation contract.
+sha2 = "0.10"
+# Atomic report publication uses a sibling tempfile plus persist_noclobber.
 tempfile = "3"

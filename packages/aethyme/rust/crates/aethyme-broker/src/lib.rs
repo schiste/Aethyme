@@ -89,10 +89,12 @@ pub use reconciliation::{
     IntegrationReconcileReport, IntegrationReconcileResolutionAudit,
 };
 pub use report::{
-    REPORT_RECENT_EVENT_LIMIT, REPORT_RECENT_GATE_LIMIT, REPORT_RECENT_OPERATION_LIMIT,
-    REPORT_SNAPSHOT_SCHEMA_VERSION, ReportBuild, ReportEventType, ReportGateCacheSource,
-    ReportGateObservation, ReportGateProvenance, ReportLastFailure, ReportOperation,
-    ReportPlatform, ReportSession, ReportSnapshot, ReportSnapshotBuilder,
+    PreparedReport, REPORT_DOCUMENT_SCHEMA_VERSION, REPORT_RECENT_EVENT_LIMIT,
+    REPORT_RECENT_GATE_LIMIT, REPORT_RECENT_OPERATION_LIMIT, REPORT_SNAPSHOT_SCHEMA_VERSION,
+    ReportBuild, ReportCaptureError, ReportCaptureResult, ReportDocument, ReportEventType,
+    ReportGateCacheSource, ReportGateObservation, ReportGateProvenance, ReportKind,
+    ReportLastFailure, ReportOperation, ReportPlatform, ReportSession, ReportSnapshot,
+    ReportSnapshotBuilder, prepare_report, write_report_atomic,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use ship::{
@@ -108,7 +110,9 @@ pub use types::{
 pub use verify_loop::{
     VerifyLoopCommandReport, VerifyLoopReport, VerifyLoopStep, VerifyLoopStepStatus,
 };
-pub use version::{BinaryBuild, VersionDriftReport, VersionDriftStatus, inspect_version};
+pub use version::{
+    BinaryBuild, VersionDriftReport, VersionDriftStatus, current_binary_build, inspect_version,
+};
 
 /// Repo-relative location of the broker database.
 pub const BROKER_DB_RELPATH: &str = ".aethyme/broker.db";

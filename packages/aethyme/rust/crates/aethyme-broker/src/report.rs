@@ -5,8 +5,12 @@
 //! enter a snapshot through generic serialization or JSON pass-through.
 
 use std::cmp::Ordering;
+use std::io::Write;
 use std::path::{Component, Path};
 
+use sha2::{Digest, Sha256};
+
+use crate::Broker;
 use crate::gates::GateRunOutcome;
 use crate::types::{
     CoordinatedOperation, Event, GateFailureClass, GateStatus, OperationEffect, OperationProvider,
@@ -15,9 +19,356 @@ use crate::types::{
 use crate::version::BinaryBuild;
 
 pub const REPORT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const REPORT_DOCUMENT_SCHEMA_VERSION: u32 = 1;
 pub const REPORT_RECENT_EVENT_LIMIT: usize = 20;
 pub const REPORT_RECENT_OPERATION_LIMIT: usize = 20;
 pub const REPORT_RECENT_GATE_LIMIT: usize = 20;
+
+/// User-facing report category. The spelling is part of the capture and
+/// future filing contract, so it is deliberately narrower than free text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportKind {
+    Bug,
+    Improvement,
+}
+
+impl ReportKind {
+    pub fn parse(value: &str) -> Result<Self, ReportCaptureError> {
+        match value {
+            "bug" => Ok(Self::Bug),
+            "improvement" => Ok(Self::Improvement),
+            other => Err(ReportCaptureError::InvalidKind(other.to_string())),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bug => "bug",
+            Self::Improvement => "improvement",
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReportCaptureError {
+    #[error("invalid report kind {0:?}; expected bug or improvement")]
+    InvalidKind(String),
+    #[error("invalid report title: {0}")]
+    InvalidTitle(String),
+    #[error(
+        "invalid report output {0:?}; use a filename or .aethyme/reports/<filename> without subdirectories"
+    )]
+    InvalidOutput(String),
+    #[error("report destination already exists: {0}")]
+    DestinationExists(String),
+    #[error("report directory must not be a symbolic link: {0}")]
+    SymlinkedReportDirectory(String),
+    #[error("report serialization: {0}")]
+    Serialize(#[from] serde_json::Error),
+    #[error(transparent)]
+    Store(#[from] crate::BrokerError),
+    #[error("{action} {path}: {source}")]
+    Io {
+        action: &'static str,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Complete, reviewable offline artifact. The title and kind are explicit
+/// user input; all diagnostic data comes through F1's allowlist snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReportDocument {
+    pub schema_version: u32,
+    pub kind: ReportKind,
+    pub title: String,
+    /// Unix epoch milliseconds supplied by the capture boundary.
+    pub captured_at: i64,
+    pub snapshot: ReportSnapshot,
+}
+
+/// A finalized report byte stream. All output modes consume these exact
+/// bytes, preventing serialization drift between stdout, disk, and digest.
+#[derive(Debug, Clone)]
+pub struct PreparedReport {
+    pub document: ReportDocument,
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    pub suggested_filename: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReportCaptureResult {
+    /// Repository-relative path. `None` means the report was emitted only
+    /// to stdout.
+    pub path: Option<String>,
+    pub sha256: String,
+    pub bytes: usize,
+}
+
+/// Gather local broker state and finalize one report without network, Git,
+/// graph, or gate activity.
+pub fn prepare_report(
+    broker: &mut Broker,
+    kind: ReportKind,
+    title: &str,
+    session_id: Option<i64>,
+    include_task: bool,
+    captured_at: i64,
+) -> Result<PreparedReport, ReportCaptureError> {
+    validate_title(title)?;
+
+    let session = session_id
+        .map(|id| broker.store().session(id))
+        .transpose()?;
+    let events = broker
+        .store()
+        .recent_events(REPORT_RECENT_EVENT_LIMIT as i64, session_id)?;
+    let operations = broker
+        .store()
+        .recent_coordinated_operations(REPORT_RECENT_OPERATION_LIMIT as i64, session_id)?;
+    let gate_events = broker
+        .store()
+        .recent_gate_events(REPORT_RECENT_GATE_LIMIT as i64, session_id)?;
+    let gate_rows = gate_events
+        .iter()
+        .filter_map(gate_observation_from_event)
+        .collect::<Vec<_>>();
+    let gate_observations = gate_rows
+        .iter()
+        .map(|(outcome, recorded_at)| ReportGateObservation {
+            outcome,
+            recorded_at: *recorded_at,
+            triggered_by: None,
+        })
+        .collect::<Vec<_>>();
+
+    let build = crate::version::current_binary_build();
+    let mut builder =
+        ReportSnapshotBuilder::new(&build, std::env::consts::OS, std::env::consts::ARCH)
+            .recent_events(&events)
+            .operations(&operations)
+            .gate_observations(&gate_observations)
+            .include_task(include_task);
+    if let Some(session) = session.as_ref() {
+        builder = builder.session(session);
+    }
+    let document = ReportDocument {
+        schema_version: REPORT_DOCUMENT_SCHEMA_VERSION,
+        kind,
+        title: title.to_string(),
+        captured_at,
+        snapshot: builder.build(),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&document)?;
+    bytes.push(b'\n');
+    let sha256 = sha256_hex(&bytes);
+    let suggested_filename = format!(
+        "{}-{}-{}.json",
+        captured_at,
+        kind.as_str(),
+        title_slug(title)
+    );
+    Ok(PreparedReport {
+        document,
+        bytes,
+        sha256,
+        suggested_filename,
+    })
+}
+
+/// Publish a prepared report atomically beneath `.aethyme/reports/`.
+/// Existing explicit destinations are never replaced.
+pub fn write_report_atomic(
+    main_root: &Path,
+    requested_output: Option<&Path>,
+    report: &PreparedReport,
+) -> Result<ReportCaptureResult, ReportCaptureError> {
+    let reports_root = main_root.join(".aethyme/reports");
+    if std::fs::symlink_metadata(&reports_root)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(ReportCaptureError::SymlinkedReportDirectory(
+            ".aethyme/reports".into(),
+        ));
+    }
+    std::fs::create_dir_all(&reports_root).map_err(|source| ReportCaptureError::Io {
+        action: "create report directory",
+        path: ".aethyme/reports".into(),
+        source,
+    })?;
+
+    let explicit_name = requested_output.map(report_filename).transpose()?;
+    let mut collision_index = 0_u32;
+    loop {
+        let filename = explicit_name.clone().unwrap_or_else(|| {
+            if collision_index == 0 {
+                report.suggested_filename.clone()
+            } else {
+                let stem = report
+                    .suggested_filename
+                    .strip_suffix(".json")
+                    .unwrap_or(&report.suggested_filename);
+                format!("{stem}-{collision_index}.json")
+            }
+        });
+        let destination = reports_root.join(&filename);
+        let relative = format!(".aethyme/reports/{filename}");
+
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".report-")
+            .tempfile_in(&reports_root)
+            .map_err(|source| ReportCaptureError::Io {
+                action: "create temporary report",
+                path: ".aethyme/reports".into(),
+                source,
+            })?;
+        temporary
+            .write_all(&report.bytes)
+            .and_then(|()| temporary.as_file().sync_all())
+            .map_err(|source| ReportCaptureError::Io {
+                action: "write temporary report",
+                path: relative.clone(),
+                source,
+            })?;
+
+        match temporary.persist_noclobber(&destination) {
+            Ok(_) => {
+                sync_directory(&reports_root)?;
+                return Ok(ReportCaptureResult {
+                    path: Some(relative),
+                    sha256: report.sha256.clone(),
+                    bytes: report.bytes.len(),
+                });
+            }
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if explicit_name.is_some() {
+                    return Err(ReportCaptureError::DestinationExists(relative));
+                }
+                collision_index = collision_index.saturating_add(1);
+            }
+            Err(error) => {
+                return Err(ReportCaptureError::Io {
+                    action: "publish report",
+                    path: relative,
+                    source: error.error,
+                });
+            }
+        }
+    }
+}
+
+fn validate_title(title: &str) -> Result<(), ReportCaptureError> {
+    if title.trim().is_empty() {
+        return Err(ReportCaptureError::InvalidTitle(
+            "title must not be empty".into(),
+        ));
+    }
+    if title.chars().any(char::is_control) {
+        return Err(ReportCaptureError::InvalidTitle(
+            "title must be a single line without control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn report_filename(path: &Path) -> Result<String, ReportCaptureError> {
+    let parts = path.components().collect::<Vec<_>>();
+    let name = match parts.as_slice() {
+        [Component::Normal(name)] => Some(name),
+        [
+            Component::Normal(aethyme),
+            Component::Normal(reports),
+            Component::Normal(name),
+        ] if *aethyme == ".aethyme" && *reports == "reports" => Some(name),
+        _ => None,
+    };
+    let Some(name) = name.and_then(|name| name.to_str()) else {
+        return Err(ReportCaptureError::InvalidOutput(
+            path.to_string_lossy().into_owned(),
+        ));
+    };
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(ReportCaptureError::InvalidOutput(
+            path.to_string_lossy().into_owned(),
+        ));
+    }
+    Ok(name.to_string())
+}
+
+fn sync_directory(path: &Path) -> Result<(), ReportCaptureError> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| ReportCaptureError::Io {
+            action: "sync report directory",
+            path: ".aethyme/reports".into(),
+            source,
+        })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn title_slug(title: &str) -> String {
+    let mut slug = String::new();
+    let mut separator = false;
+    for character in title.chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(character.to_ascii_lowercase());
+            separator = false;
+        } else {
+            separator = true;
+        }
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "report".into()
+    } else {
+        slug
+    }
+}
+
+fn gate_observation_from_event(event: &crate::Event) -> Option<(GateRunOutcome, i64)> {
+    let payload = serde_json::from_str::<serde_json::Value>(event.payload_json.as_deref()?).ok()?;
+    let gate = payload.get("gate")?.as_str()?.to_string();
+    let tree_hash = payload.get("tree")?.as_str()?.to_string();
+    let cached = event.kind == crate::events::GATE_CACHED;
+    let status = if cached {
+        crate::GateStatus::parse(payload.get("cached_status")?.as_str()?).ok()?
+    } else {
+        crate::GateStatus::parse(event.kind.strip_prefix("gate.")?).ok()?
+    };
+    let failure_class = payload
+        .get("failure_class")
+        .and_then(serde_json::Value::as_str)
+        .map(crate::GateFailureClass::parse)
+        .transpose()
+        .ok()?;
+    Some((
+        GateRunOutcome {
+            gate,
+            tree_hash,
+            status,
+            failure_class,
+            cached,
+            exit_code: None,
+            duration_ms: payload.get("saved_ms").and_then(serde_json::Value::as_i64),
+            log_path: None,
+        },
+        event.ts,
+    ))
+}
 
 /// One observed gate result plus the provenance not carried by
 /// [`GateRunOutcome`] itself.
@@ -435,6 +786,7 @@ fn looks_like_windows_absolute(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::process::Command;
 
     use super::*;
 
@@ -714,6 +1066,133 @@ mod tests {
                 recorded_at: 500,
                 exit_code: 17,
             })
+        );
+    }
+
+    fn init_repo(path: &Path) {
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn prepared_bytes_have_stable_sha256_and_atomic_no_clobber_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let mut broker = Broker::open(tmp.path()).unwrap();
+        let report = prepare_report(
+            &mut broker,
+            ReportKind::Bug,
+            "Gate failed",
+            None,
+            false,
+            1_234,
+        )
+        .unwrap();
+
+        assert_eq!(report.sha256, sha256_hex(&report.bytes));
+        assert_eq!(report.bytes.last(), Some(&b'\n'));
+        assert_eq!(report.suggested_filename, "1234-bug-gate-failed.json");
+
+        let first =
+            write_report_atomic(tmp.path(), Some(Path::new("review.json")), &report).unwrap();
+        assert_eq!(first.path.as_deref(), Some(".aethyme/reports/review.json"));
+        assert_eq!(
+            std::fs::read(tmp.path().join(first.path.unwrap())).unwrap(),
+            report.bytes
+        );
+        assert!(matches!(
+            write_report_atomic(tmp.path(), Some(Path::new("review.json")), &report),
+            Err(ReportCaptureError::DestinationExists(_))
+        ));
+        assert!(
+            std::fs::read_dir(tmp.path().join(".aethyme/reports"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".report-"))
+        );
+
+        let default_first = write_report_atomic(tmp.path(), None, &report).unwrap();
+        let default_second = write_report_atomic(tmp.path(), None, &report).unwrap();
+        assert_eq!(
+            default_first.path.as_deref(),
+            Some(".aethyme/reports/1234-bug-gate-failed.json")
+        );
+        assert_eq!(
+            default_second.path.as_deref(),
+            Some(".aethyme/reports/1234-bug-gate-failed-1.json")
+        );
+    }
+
+    #[test]
+    fn preparation_preserves_cached_gate_provenance_from_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let mut broker = Broker::open(tmp.path()).unwrap();
+        broker
+            .store()
+            .append_event(
+                crate::events::GATE_CACHED,
+                None,
+                Some(&crate::events::gate_cached_payload(
+                    "cargo-test",
+                    "0123456789abcdef",
+                    42,
+                    GateStatus::Pass,
+                    None,
+                )),
+            )
+            .unwrap();
+
+        let report = prepare_report(
+            &mut broker,
+            ReportKind::Improvement,
+            "Cache provenance",
+            None,
+            false,
+            2_000,
+        )
+        .unwrap();
+        let gate = &report.document.snapshot.gates[0];
+        assert_eq!(gate.gate, "cargo-test");
+        assert_eq!(gate.tree_hash, "0123456789abcdef");
+        assert_eq!(gate.cache_source, ReportGateCacheSource::CacheHit);
+        assert_eq!(gate.duration_ms, Some(42));
+    }
+
+    #[test]
+    fn report_output_is_confined_and_titles_are_single_line() {
+        for unsafe_path in [
+            Path::new("../report.json"),
+            Path::new("/tmp/report.json"),
+            Path::new("nested/report.json"),
+            Path::new(".aethyme/reports/nested/report.json"),
+        ] {
+            assert!(matches!(
+                report_filename(unsafe_path),
+                Err(ReportCaptureError::InvalidOutput(_))
+            ));
+        }
+        assert_eq!(
+            report_filename(Path::new(".aethyme/reports/review.json")).unwrap(),
+            "review.json"
+        );
+        assert!(validate_title("Useful title").is_ok());
+        assert!(validate_title("line one\nline two").is_err());
+        assert!(validate_title("  ").is_err());
+    }
+
+    #[test]
+    fn sha256_matches_the_standard_empty_vector() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
 }

@@ -58,6 +58,14 @@ Usage:
       Read the latest persisted session.finished handoff for one session,
       or the newest completed session registered to a worktree. Does not
       refresh sessions, leases, gates, events, or command telemetry.
+  aethyme broker report capture --kind <bug|improvement> --title <text> [--session <id>] [--include-task] [--stdout | --output <filename>] [--json]
+      Build an allowlist-only diagnostic snapshot entirely offline. By
+      default, atomically writes a new JSON artifact beneath
+      .aethyme/reports/ and prints its SHA-256 for review. --output accepts
+      a filename (or .aethyme/reports/<filename>) without overwriting;
+      --stdout emits the exact report bytes and prints the digest to stderr.
+      Task text and coordinated-operation reasons are omitted unless
+      --include-task is explicit.
   aethyme broker start --task <text> [--json]
       Create a broker-managed worktree + branch and register a session,
       but do not spawn a process. Prefer this over adopting the main
@@ -325,6 +333,8 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "e2e",
         "finish",
         "handoff",
+        "report",
+        "capture",
         "cleanup",
         "certify",
         "scaffold",
@@ -373,7 +383,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
 /// repository, or installation state remain observable.
 fn command_records_metric(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        Some("certify" | "queue" | "metrics" | "handoff") => false,
+        Some("certify" | "queue" | "metrics" | "handoff" | "report") => false,
         Some("ship") => args.get(1).map(String::as_str) != Some("plan"),
         Some("operations") => args.get(1).map(String::as_str) == Some("reconcile"),
         Some("git" | "gh") => {
@@ -538,6 +548,42 @@ mod tests {
             "handoff",
             "--session",
             "7",
+        ])));
+    }
+
+    #[test]
+    fn parse_accepts_offline_report_capture_outputs() {
+        let parsed = match super::parse(&args(&[
+            "capture",
+            "--kind",
+            "bug",
+            "--title",
+            "Gate failed",
+            "--session",
+            "7",
+            "--include-task",
+            "--output",
+            "reviewed.json",
+        ])) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("report capture should parse"),
+        };
+        assert_eq!(parsed.positional, vec!["capture"]);
+        assert_eq!(parsed.kind.as_deref(), Some("bug"));
+        assert_eq!(parsed.title.as_deref(), Some("Gate failed"));
+        assert_eq!(parsed.session, Some(7));
+        assert!(parsed.include_task);
+        assert_eq!(
+            parsed.output.as_deref(),
+            Some(std::path::Path::new("reviewed.json"))
+        );
+        assert!(!super::command_records_metric(&args(&[
+            "report",
+            "capture",
+            "--kind",
+            "bug",
+            "--title",
+            "Gate failed",
         ])));
     }
 
@@ -765,6 +811,8 @@ struct Parsed {
     upstream: Option<String>,
     resolution_file: Option<PathBuf>,
     worktree: Option<PathBuf>,
+    title: Option<String>,
+    output: Option<PathBuf>,
     follow: bool,
     json: bool,
     force: bool,
@@ -782,6 +830,8 @@ struct Parsed {
     sync_main: bool,
     sync_integration: bool,
     no_cache: bool,
+    stdout: bool,
+    include_task: bool,
     exec_command: Vec<String>,
 }
 
@@ -810,6 +860,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         upstream: None,
         resolution_file: None,
         worktree: None,
+        title: None,
+        output: None,
         follow: false,
         json: false,
         force: false,
@@ -827,6 +879,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         sync_main: false,
         sync_integration: false,
         no_cache: false,
+        stdout: false,
+        include_task: false,
         exec_command: Vec::new(),
     };
     let mut iter = args.iter();
@@ -860,6 +914,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--sync-main" => parsed.sync_main = true,
             "--sync-integration" => parsed.sync_integration = true,
             "--no-cache" => parsed.no_cache = true,
+            "--stdout" => parsed.stdout = true,
+            "--include-task" => parsed.include_task = true,
             "--replace-stale" => parsed.replace_stale = true,
             "--kind" => {
                 parsed.kind = Some(
@@ -905,6 +961,20 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 parsed.worktree = Some(PathBuf::from(
                     iter.next()
                         .ok_or(UsageError::Message("--worktree requires a path".into()))?
+                        .clone(),
+                ))
+            }
+            "--title" => {
+                parsed.title = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--title requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--output" => {
+                parsed.output = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or(UsageError::Message("--output requires a path".into()))?
                         .clone(),
                 ))
             }
@@ -2188,6 +2258,80 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     session.branch,
                     session.log_path.as_deref().unwrap_or("-"),
                 );
+            }
+        }
+        "report" => {
+            if parsed.positional.first().map(String::as_str) != Some("capture")
+                || parsed.positional.len() != 1
+            {
+                return Err(UsageError::Message(
+                    "report requires the capture action".into(),
+                ));
+            }
+            if parsed.stdout && parsed.output.is_some() {
+                return Err(UsageError::Message(
+                    "--stdout and --output are mutually exclusive".into(),
+                ));
+            }
+            if parsed.stdout && parsed.json {
+                return Err(UsageError::Message(
+                    "--stdout already emits the JSON report; do not combine it with --json".into(),
+                ));
+            }
+            let kind = crate::ReportKind::parse(
+                parsed
+                    .kind
+                    .as_deref()
+                    .ok_or(UsageError::Message("report capture requires --kind".into()))?,
+            )?;
+            let title = parsed.title.as_deref().ok_or(UsageError::Message(
+                "report capture requires --title".into(),
+            ))?;
+            let mut broker = open_broker()?;
+            let selected_session = if let Some(session_id) = parsed.session {
+                Some(session_id)
+            } else {
+                let cwd = std::env::current_dir()
+                    .map_err(|error| UsageError::Message(error.to_string()))?;
+                let checkout = crate::GitRepo::discover(&cwd)?;
+                let worktree = checkout.root().to_string_lossy();
+                broker
+                    .store()
+                    .session_for_worktree(&worktree)?
+                    .map(|session| session.id)
+            };
+            let prepared = crate::prepare_report(
+                &mut broker,
+                kind,
+                title,
+                selected_session,
+                parsed.include_task,
+                now_ms(),
+            )?;
+            if parsed.stdout {
+                use std::io::Write;
+                std::io::stdout()
+                    .lock()
+                    .write_all(&prepared.bytes)
+                    .map_err(|error| UsageError::Message(error.to_string()))?;
+                eprintln!("SHA-256: {}", prepared.sha256);
+            } else {
+                let result = crate::write_report_atomic(
+                    broker.main_root(),
+                    parsed.output.as_deref(),
+                    &prepared,
+                )?;
+                if parsed.json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!(
+                        "Captured {} report: {}",
+                        kind.as_str(),
+                        result.path.as_deref().unwrap_or("-")
+                    );
+                    println!("SHA-256: {}", result.sha256);
+                    println!("Review this local report before any later filing step.");
+                }
             }
         }
         "agents" => {

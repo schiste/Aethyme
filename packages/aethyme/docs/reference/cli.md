@@ -50,6 +50,7 @@ product surface.
 - `aethyme broker repair`
 - `aethyme broker finish`
 - `aethyme broker handoff`
+- `aethyme broker report capture`
 - `aethyme broker ship plan`
 - `aethyme broker ship execute`
 - `aethyme broker integration status`
@@ -111,6 +112,7 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
 - `aethyme broker handoff (--session <id> | --worktree <path>) [--json]`
+- `aethyme broker report capture --kind <bug|improvement> --title <text> [--session <id>] [--include-task] [--stdout | --output <filename>] [--json]`
 - `aethyme broker ship plan --entry <id> [--json]`
 - `aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--json]`
 - `aethyme broker integration status [--json]`
@@ -220,6 +222,32 @@ including when the worktree has since been removed and its former absolute path
 is supplied. JSON adds the handoff event's stable `event_id` and `recorded_at`
 provenance without exposing the worktree path. The command does not refresh or
 append sessions, leases, gates, events, or command telemetry.
+
+Capture a reviewable diagnostic report without contacting Git remotes,
+GitHub, the graph store, or gate runners:
+
+```bash
+aethyme broker report capture --kind bug --title "Submit gate failed"
+aethyme broker report capture --kind improvement \
+  --title "Explain cache misses" --output reviewed.json
+aethyme broker report capture --kind bug --title "Pipe this report" --stdout
+```
+
+The default and `--output` forms publish a new JSON file atomically beneath
+`.aethyme/reports/`; initialized repositories ignore that directory. An
+explicit output may be a filename or `.aethyme/reports/<filename>`, cannot
+escape the report directory, and never overwrites an existing artifact.
+`--stdout` emits the exact JSON bytes on standard output and puts the digest
+on standard error so pipelines remain clean. Every mode prints the SHA-256 of
+the exact report bytes for later review confirmation.
+
+When `--session` is omitted, capture uses the broker session registered for
+the current Git worktree when one exists. The snapshot remains allowlist-only:
+file contents, diffs, hunks, command arguments, logs, absolute paths, and event
+payloads are excluded. Task text and coordinated-operation authorization
+reasons appear only with explicit `--include-task`. `--stdout` and `--json`
+are intentionally mutually exclusive because stdout is already the report's
+JSON byte stream.
 
 Promotion only advances the local integration ref. Use `broker ship plan` to
 inspect the promoted queue entry, exact integration SHA, remote freshness,

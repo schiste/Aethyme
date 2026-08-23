@@ -1118,6 +1118,31 @@ impl BrokerStore {
         Ok(operations)
     }
 
+    /// Most recent coordinated operations for a report, newest first.
+    /// When a session is selected, unrelated operations stay out of the
+    /// snapshot rather than broadening its diagnostic scope.
+    pub(crate) fn recent_coordinated_operations(
+        &self,
+        limit: i64,
+        session_id: Option<i64>,
+    ) -> Result<Vec<CoordinatedOperation>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, provider, repository, scope, effect,
+                    status, authorization_reason, command_json, pid,
+                    exit_code, details_json,
+                    created_at, updated_at, finished_at
+             FROM coordinated_operations
+             WHERE (?2 IS NULL OR session_id = ?2)
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit, session_id], coordinated_operation_from_row)?;
+        let mut operations = Vec::new();
+        for row in rows {
+            operations.push(row??);
+        }
+        Ok(operations)
+    }
+
     pub fn unresolved_coordinated_operations(
         &self,
         repository: &str,
@@ -1270,6 +1295,40 @@ impl BrokerStore {
                 payload_json: row.get(5)?,
             })
         })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Most recent event rows for an offline report, newest first.
+    pub(crate) fn recent_events(
+        &self,
+        limit: i64,
+        session_id: Option<i64>,
+    ) -> Result<Vec<Event>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, schema_version, ts, kind, session_id, payload_json
+             FROM events
+             WHERE (?2 IS NULL OR session_id = ?2)
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit, session_id], event_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Most recent gate events for report provenance, including cache hits
+    /// (which intentionally do not duplicate rows in `gate_results`).
+    pub(crate) fn recent_gate_events(
+        &self,
+        limit: i64,
+        session_id: Option<i64>,
+    ) -> Result<Vec<Event>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, schema_version, ts, kind, session_id, payload_json
+             FROM events
+             WHERE kind IN ('gate.pass', 'gate.fail', 'gate.cancelled', 'gate.error', 'gate.cached')
+               AND (?2 IS NULL OR session_id = ?2)
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit, session_id], event_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
