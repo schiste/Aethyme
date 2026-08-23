@@ -1,6 +1,6 @@
 # Aethyme Graph Engine Quick Start
 
-Last Updated: 2026-08-06
+Last Updated: 2026-08-23
 
 This page covers the lower-level graph-engine path. For the current public
 product quickstart, use the broker-first flow in
@@ -11,12 +11,16 @@ install -> `aethyme init` -> `aethyme broker quick-test` -> start -> submit.
 ## 1. Install
 
 ```bash
-cargo install --path packages/aethyme/rust/crates/aethyme-cli
-cargo install --path packages/aethyme/rust/crates/aethyme-engine
+curl -fsSL https://github.com/schiste/Aethyme/releases/latest/download/install.sh | sh
+aethyme --version
+aethyme-engine-cli --version
 ```
 
-No interpreter, virtualenv, or pip step: `aethyme` is a single Rust
-binary and its engine-daemon sibling.
+This installs the Rust router and its required engine-daemon sibling from one
+checksum-verified archive. No interpreter, virtualenv, pip step, or background
+updater is involved. Re-run the command for the newest stable release; see the
+[v0.2.0 upgrade guide](../guides/upgrading-to-v0.2.0.md) for pinned versions,
+signature verification, source installation, and rollback.
 
 ## 2. Or Build From The Checkout
 

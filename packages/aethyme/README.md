@@ -1,19 +1,17 @@
 # Aethyme Core
 
-Last Updated: 2026-07-09
+Last Updated: 2026-08-23
 
 Aethyme Core is the deterministic repository tooling product in this repository.
 
-> **Direction note (2026-07):** Aethyme is repositioning toward a **local-first
-> agent broker** for high-concurrency AI development. The broker (per-agent
-> worktrees, session registry, leases, gate runner, merge simulation) is
-> **planned, not implemented** — see
+> **Direction note (2026-08):** Aethyme is a **local-first agent broker** for
+> high-concurrency AI development. Per-agent worktrees, sessions, leases,
+> gates, normalized submission, integration shipping, handoffs, and redacted
+> reports are implemented — see
 > [`../../docs/aethyme-local-agent-broker.md`](../../docs/aethyme-local-agent-broker.md).
-> The graph engine described below remains the supporting repo-intelligence
-> service. The Gen-0 PostgreSQL graph, the FastAPI service, and the
-> tenant CLI commands were REMOVED on 2026-07-13 (partial execution of the
-> cloud-lineage decision); `src/auth`, the SDK, and Postgres deps remain
-> for the final #30 sweep.
+> The graph engine remains the supporting repository-intelligence service.
+> The former Python, FastAPI, PostgreSQL, SDK, and tenant-command product paths
+> have all been removed.
 
 It owns:
 
@@ -29,13 +27,16 @@ It owns:
 
 Aethyme's public model is:
 
-- `Explore`: deterministic repository orientation, candidate answers, evidence, verification steps
-- `Act`: planned layer for task-shaped execution guidance built on Explore outputs
-- `Learn`: planned layer for post-task telemetry, ranking feedback, and future improvement
+- `Coordinate`: isolated sessions, leases, gates, submission, shipping, and
+  durable handoffs through the broker
+- `Explore`: deterministic repository orientation, candidate answers,
+  evidence, and verification steps through the graph engine
+- `Improve`: explicit local telemetry, scorecards, and controlled autofix
+  tooling without a cloud control plane
 
-Today, `Explore` is the implemented primary entry point. Lower-level graph,
-query, facts, and task commands remain available as supporting primitives, not
-the default operator path.
+The broker is the stable operator front door. Explore and lower-level graph,
+query, facts, and task commands remain available as supporting repository
+intelligence rather than a separate service.
 
 ## Language Direction
 
@@ -46,7 +47,8 @@ Arrived:
 - **No Python at all.** The product path went Python-free in the Phase 6
   sweep (2026-08-01, `src/` deleted) and the dev test stack followed in
   Phase 7 (2026-08-06, `tests/` and `pyproject.toml` deleted). This
-  package is 100% Rust: `cargo install` is the whole install story and
+  package is 100% Rust: paired release binaries are the recommended install
+  story, `cargo install` remains the source-build path, and
   `cargo test --workspace` is the whole test story. `packages/aethyme-eval`
   is a separate package and stays Python by design.
 
@@ -75,16 +77,13 @@ See [`docs/architecture/rust-transition.md`](docs/architecture/rust-transition.m
 
 ## Local-First Workflow
 
-For the first product proof, Aethyme can run against one local repository without any SaaS layer.
+Aethyme runs against local repositories without a SaaS layer.
 
 Primary commands:
 
 - `aethyme explore --repo /path/to/repo --request "<task>" --format answer-json`
-  (single Rust entrypoint since 2026-07-14 (#31): install with
-  `cargo install --path rust/crates/aethyme-cli` (plus `rust/crates/aethyme-engine` for the daemon sibling binary); the pip console script
-  was removed so nothing shadows the router. Explore runs in-process and
-  auto-starts the engine daemon. Delegated Python commands resolve the
-  package via `aethyme root show` — env var, pointer file, or upward walk.)
+  (native Rust entrypoint; the paired `aethyme-engine-cli` binary serves the
+  daemon protocol and is installed from the same release archive)
 - `aethyme enhance deploy --repo /path/to/repo`
 - `aethyme enhance verify --repo /path/to/repo`
 - `aethyme repo compile-skills /path/to/repo`

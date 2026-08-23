@@ -5,17 +5,21 @@ Last Updated: 2026-08-23
 ## Install
 
 ```bash
-cargo install --path packages/aethyme/rust/crates/aethyme-cli
-cargo install --path packages/aethyme/rust/crates/aethyme-engine
+curl -fsSL https://github.com/schiste/Aethyme/releases/latest/download/install.sh | sh
+aethyme --version
+aethyme-engine-cli --version
 ```
 
-Publishing a release does not update installed Cargo binaries. Users must
-reinstall both packages from the desired release checkout (or install the
-published version explicitly) and verify `aethyme --version`. Aethyme has no
-self-update daemon or silent background upgrade path.
+This is the explicit stable-channel update path as well as the first install.
+It replaces both required binaries from one verified archive; Aethyme has no
+self-update daemon or silent background upgrade path. Use `sh -s -- --version
+0.2.0` to pin a release, or follow the
+[v0.2.0 upgrade guide](../guides/upgrading-to-v0.2.0.md) for source installs,
+manifest signature verification, migration, and rollback.
 
-`aethyme` is a single Rust binary; no interpreter, virtualenv, or pip
-step is involved. **`python -m src.cli` no longer exists** — the Python
+`aethyme` and its required `aethyme-engine-cli` sibling are native Rust
+binaries; no interpreter, virtualenv, or pip step is involved.
+**`python -m src.cli` no longer exists** — the Python
 package was deleted on 2026-08-01 (python-retirement Phase 6) with no
 shim, and the old spelling fails with `No module named src`. Every
 command below is native, and an unknown subcommand is an error (exit 2)
