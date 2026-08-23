@@ -46,6 +46,7 @@ mod schema;
 mod ship;
 mod store;
 mod types;
+mod update;
 mod verify_loop;
 mod version;
 
@@ -138,6 +139,12 @@ pub use types::{
     LeaseKind, MergeQueueEntry, MergeStatus, NewCoordinatedOperation, NewGateResult,
     NewPrWatchState, NewSession, OperationEffect, OperationProvider, OperationStatus, PrWatchState,
     Session, SessionOrigin, SessionStatus,
+};
+pub use update::{
+    INSTALL_RECEIPT_FILENAME, INSTALL_RECEIPT_SCHEMA_VERSION, InstallReceipt, InstallationMethod,
+    InstallationProvenance, UPDATE_PLAN_SCHEMA_VERSION, UpdateAction, UpdateArchive, UpdateChannel,
+    UpdateError, UpdatePlan, build_update_plan, current_release_target, detect_installation,
+    release_target_for, sha256_bytes,
 };
 pub use verify_loop::{
     VerifyLoopCommandReport, VerifyLoopReport, VerifyLoopStep, VerifyLoopStepStatus,

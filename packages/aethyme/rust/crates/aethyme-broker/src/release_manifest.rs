@@ -106,17 +106,14 @@ impl ReleaseManifest {
         if !matches!(self.source_sha.len(), 40 | 64) || !is_lower_hex(&self.source_sha) {
             return Err("release manifest source SHA must be a full lowercase object id".into());
         }
-        if !matches!(self.release_channel.as_str(), "stable" | "beta" | "nightly") {
-            return Err("release manifest channel must be stable, beta, or nightly".into());
+        if !matches!(self.release_channel.as_str(), "stable" | "preview") {
+            return Err("release manifest channel must be stable or preview".into());
         }
         if self.required_binaries != required_binaries() {
             return Err("release manifest must require the complete Aethyme binary pair".into());
         }
-        if self.compatibility.engine_protocol != ENGINE_PROTOCOL_VERSION {
-            return Err(format!(
-                "release engine protocol {} is incompatible with updater protocol {}",
-                self.compatibility.engine_protocol, ENGINE_PROTOCOL_VERSION
-            ));
+        if self.compatibility.engine_protocol == 0 {
+            return Err("release engine protocol must be positive".into());
         }
         if self.compatibility.broker_storage.minimum_readable_schema
             > self.compatibility.broker_storage.current_schema
@@ -288,7 +285,7 @@ mod tests {
         assert!(invalid.validate().unwrap_err().contains("SHA-256"));
 
         let mut invalid = manifest();
-        invalid.compatibility.engine_protocol += 1;
+        invalid.compatibility.engine_protocol = 0;
         assert!(invalid.validate().unwrap_err().contains("engine protocol"));
 
         let mut invalid = manifest();

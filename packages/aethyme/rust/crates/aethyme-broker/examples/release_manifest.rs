@@ -78,8 +78,8 @@ fn build_manifest(options: &Options) -> Result<ReleaseManifest, String> {
     {
         return Err("--source-sha must be a full 40- or 64-character Git object id".into());
     }
-    if !matches!(options.channel.as_str(), "stable" | "beta" | "nightly") {
-        return Err("--channel must be stable, beta, or nightly".into());
+    if !matches!(options.channel.as_str(), "stable" | "preview") {
+        return Err("--channel must be stable or preview".into());
     }
 
     let mut artifacts = Vec::with_capacity(RELEASE_TARGETS.len());
@@ -269,7 +269,7 @@ mod tests {
         assert!(
             build_manifest(&options)
                 .unwrap_err()
-                .contains("stable, beta, or nightly")
+                .contains("stable or preview")
         );
 
         let (temp, options) = fixture();
