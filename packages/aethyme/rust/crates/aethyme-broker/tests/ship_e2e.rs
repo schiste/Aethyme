@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aethyme_broker::{Broker, ShipFreshnessResult};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+use aethyme_broker::{Broker, BrokerOpError, OperationStatus, ShipFreshnessResult};
 
 fn git_output(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -82,6 +85,38 @@ impl Fixture {
             ],
         )
     }
+
+    fn remote_main(&self) -> String {
+        git_output(&self.remote, &["rev-parse", "refs/heads/main"])
+    }
+
+    fn advance_remote(&self) -> String {
+        let outsider = self._tmp.path().join("outsider");
+        git(
+            self._tmp.path(),
+            &[
+                "clone",
+                "-q",
+                self.remote.to_str().unwrap(),
+                outsider.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(outsider.join("remote-only.txt"), "remote advance\n").unwrap();
+        git(&outsider, &["add", "remote-only.txt"]);
+        git(&outsider, &["commit", "-qm", "remote advance"]);
+        git(&outsider, &["push", "-q", "origin", "main"]);
+        self.remote_main()
+    }
+
+    #[cfg(unix)]
+    fn install_hook(&self, name: &str, script: &str) -> PathBuf {
+        let path = self.remote.join("hooks").join(name);
+        std::fs::write(&path, script).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
 }
 
 #[test]
@@ -141,4 +176,142 @@ fn ship_plan_rejects_an_entry_that_is_not_promoted() {
             .to_string()
             .contains("requires a promoted queue entry")
     );
+}
+
+#[test]
+fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    let main_before = git_output(&fixture.repo, &["rev-parse", "main"]);
+
+    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let report = broker.ship_execute(entry_id, &integration).unwrap();
+
+    assert_eq!(report.published_sha, integration);
+    assert_eq!(report.verified_remote_sha, integration);
+    assert_eq!(fixture.remote_main(), integration);
+    assert_eq!(
+        git_output(&fixture.repo, &["rev-parse", "main"]),
+        main_before
+    );
+    assert_eq!(report.fetch_operation.status, OperationStatus::Succeeded);
+    assert_eq!(report.push_operation.status, OperationStatus::Succeeded);
+    assert_eq!(report.verify_operation.status, OperationStatus::Succeeded);
+    assert!(!report.push_operation.command_json.contains("--force"));
+}
+
+#[test]
+fn ship_execute_rejects_abbreviated_and_mismatched_confirmations_before_operations() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    let mut broker = Broker::open(&fixture.repo).unwrap();
+
+    assert!(matches!(
+        broker.ship_execute(entry_id, &integration[..12]),
+        Err(BrokerOpError::ShipConfirmationNotFullSha)
+    ));
+    assert!(matches!(
+        broker.ship_execute(entry_id, &"0".repeat(40)),
+        Err(BrokerOpError::ShipConfirmationMismatch { .. })
+    ));
+    assert!(broker.store().coordinated_operations().unwrap().is_empty());
+}
+
+#[test]
+fn ship_execute_rejects_a_remote_that_moved_since_the_planned_base() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    let advanced = fixture.advance_remote();
+    let mut broker = Broker::open(&fixture.repo).unwrap();
+
+    let error = broker.ship_execute(entry_id, &integration).unwrap_err();
+    assert!(matches!(
+        error,
+        BrokerOpError::ShipRemoteMoved { actual, .. } if actual == advanced
+    ));
+    assert_eq!(fixture.remote_main(), advanced);
+    let operations = broker.store().coordinated_operations().unwrap();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].status, OperationStatus::Succeeded);
+}
+
+#[test]
+fn ship_execute_rejects_a_non_fast_forward_remote() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    let advanced = fixture.advance_remote();
+    git(&fixture.repo, &["fetch", "-q", "origin", "main"]);
+    let mut broker = Broker::open(&fixture.repo).unwrap();
+
+    let error = broker.ship_execute(entry_id, &integration).unwrap_err();
+    assert!(matches!(
+        error,
+        BrokerOpError::ShipNonFastForward { remote_sha, .. } if remote_sha == advanced
+    ));
+    assert_eq!(fixture.remote_main(), advanced);
+}
+
+#[cfg(unix)]
+#[test]
+fn ship_push_failure_is_unknown_and_blocks_until_reconciled() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    let hook = fixture.install_hook("pre-receive", "#!/bin/sh\nexit 1\n");
+    let mut broker = Broker::open(&fixture.repo).unwrap();
+
+    let error = broker.ship_execute(entry_id, &integration).unwrap_err();
+    let operation_id = match error {
+        BrokerOpError::ShipOperationFailed {
+            phase: "push",
+            operation_id,
+            status: "outcome_unknown",
+        } => operation_id,
+        other => panic!("unexpected push error: {other}"),
+    };
+    assert_eq!(
+        broker
+            .store()
+            .coordinated_operation(operation_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        OperationStatus::OutcomeUnknown
+    );
+    assert!(matches!(
+        broker.ship_execute(entry_id, &integration),
+        Err(BrokerOpError::CoordinatedOperationBlocked {
+            operation_id: blocked,
+            ..
+        }) if blocked == operation_id
+    ));
+
+    broker
+        .reconcile_coordinated_operation(operation_id, false, "remote main did not move")
+        .unwrap();
+    std::fs::remove_file(hook).unwrap();
+    let report = broker.ship_execute(entry_id, &integration).unwrap();
+    assert_eq!(report.verified_remote_sha, integration);
+}
+
+#[cfg(unix)]
+#[test]
+fn ship_verify_failure_is_journaled_as_failed() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    fixture.install_hook(
+        "post-receive",
+        "#!/bin/sh\ngit update-ref -d refs/heads/main\n",
+    );
+    let mut broker = Broker::open(&fixture.repo).unwrap();
+
+    let error = broker.ship_execute(entry_id, &integration).unwrap_err();
+    assert!(matches!(
+        error,
+        BrokerOpError::ShipVerificationMismatch { actual, .. } if actual == "<missing>"
+    ));
+    let operations = broker.store().coordinated_operations().unwrap();
+    assert_eq!(operations.len(), 3);
+    assert_eq!(operations[0].status, OperationStatus::Succeeded);
+    assert_eq!(operations[1].status, OperationStatus::Succeeded);
+    assert_eq!(operations[2].status, OperationStatus::Failed);
 }

@@ -394,6 +394,15 @@ impl Broker {
         &mut self,
         request: CoordinatedCommand,
     ) -> Result<CoordinatedOperationReport, BrokerOpError> {
+        let session = self.store().session(request.session_id)?;
+        self.run_coordinated_operation_at(request, Path::new(&session.worktree_path))
+    }
+
+    pub(crate) fn run_coordinated_operation_at(
+        &mut self,
+        request: CoordinatedCommand,
+        cwd: &Path,
+    ) -> Result<CoordinatedOperationReport, BrokerOpError> {
         if request.args.is_empty() {
             return Err(BrokerOpError::InvalidCoordinatedOperation {
                 reason: format!(
@@ -405,7 +414,6 @@ impl Broker {
         if request.provider == OperationProvider::Github {
             validate_gh_args(&request.args)?;
         }
-        let session = self.store().session(request.session_id)?;
         let inferred = match request.provider {
             OperationProvider::Git => classify_git(&request.args),
             OperationProvider::Github => classify_gh(&request.args),
@@ -525,7 +533,7 @@ impl Broker {
         let mut command = Command::new(executable);
         command
             .args(&request.args)
-            .current_dir(&session.worktree_path)
+            .current_dir(cwd)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

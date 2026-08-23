@@ -78,7 +78,9 @@ pub use reconciliation::{
     IntegrationReconcileReport, IntegrationReconcileResolutionAudit,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
-pub use ship::{ShipFreshness, ShipFreshnessResult, ShipPlan, ShipPush};
+pub use ship::{
+    ShipExecutionReport, ShipFreshness, ShipFreshnessResult, ShipPlan, ShipPush,
+};
 pub use store::BrokerStore;
 pub use types::{
     CoordinatedOperation, Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease,

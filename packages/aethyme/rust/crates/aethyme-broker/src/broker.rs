@@ -130,6 +130,40 @@ pub enum BrokerOpError {
     },
     #[error("ship cannot resolve {what}: {reason}")]
     ShipPlanUnavailable { what: &'static str, reason: String },
+    #[error("ship confirmation must be the full 40-character integration SHA")]
+    ShipConfirmationNotFullSha,
+    #[error("ship confirmation mismatch: expected integration {expected}, received {actual}")]
+    ShipConfirmationMismatch { expected: String, actual: String },
+    #[error("ship cannot execute without a fetched remote base for {tracking_ref}")]
+    ShipRemoteBaseUnavailable { tracking_ref: String },
+    #[error(
+        "ship remote moved since planning: expected {expected} at {remote_ref}, fetched {actual}"
+    )]
+    ShipRemoteMoved {
+        remote_ref: String,
+        expected: String,
+        actual: String,
+    },
+    #[error(
+        "ship would not fast-forward {remote_ref}: remote {remote_sha} is not an ancestor of confirmed integration {integration_sha}"
+    )]
+    ShipNonFastForward {
+        remote_ref: String,
+        remote_sha: String,
+        integration_sha: String,
+    },
+    #[error("ship {phase} operation {operation_id} ended {status}")]
+    ShipOperationFailed {
+        phase: &'static str,
+        operation_id: i64,
+        status: &'static str,
+    },
+    #[error("ship verification failed for {remote_ref}: expected {expected}, observed {actual}")]
+    ShipVerificationMismatch {
+        remote_ref: String,
+        expected: String,
+        actual: String,
+    },
     #[error(
         "session {id} ({status}) already exists for this worktree{task}. Options:\n  \
          aethyme broker submit --session {id}        submit its committed work\n  \

@@ -148,6 +148,9 @@ Usage:
       Read-only publication plan for a promoted entry: resolve the exact
       integration tip, local and remote default-branch SHAs, freshness,
       proposed push, and whether synchronizing local main is currently safe.
+  aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--json]
+      Fetch and revalidate the planned remote base, publish the exact confirmed
+      integration SHA with a non-force push, then verify the remote default ref.
   aethyme broker integration status [--json]
       Focused promoted-but-unmerged view: the local integration branch as
       a pending layer above main, with promoted entries, files changed,
@@ -280,6 +283,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "promote",
         "ship",
         "plan",
+        "execute",
         "integration",
         "status",
         "events",
@@ -445,6 +449,33 @@ mod tests {
         assert!(parsed.json);
         assert!(!super::command_records_metric(&args(&[
             "ship", "plan", "--entry", "42"
+        ])));
+    }
+
+    #[test]
+    fn parse_accepts_confirmed_ship_execution() {
+        let sha = "a".repeat(40);
+        let parsed = match super::parse(&args(&[
+            "ship",
+            "execute",
+            "--entry",
+            "42",
+            "--confirm",
+            &sha,
+        ])) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("ship execute should parse"),
+        };
+        assert_eq!(parsed.positional, vec!["ship", "execute"]);
+        assert_eq!(parsed.entry, Some(42));
+        assert_eq!(parsed.confirm.as_deref(), Some(sha.as_str()));
+        assert!(super::command_records_metric(&args(&[
+            "ship",
+            "execute",
+            "--entry",
+            "42",
+            "--confirm",
+            &sha,
         ])));
     }
 
@@ -632,6 +663,7 @@ struct Parsed {
     pr_number: Option<i64>,
     session: Option<i64>,
     entry: Option<i64>,
+    confirm: Option<String>,
     operation: Option<i64>,
     ttl_seconds: Option<i64>,
     since: Option<i64>,
@@ -672,6 +704,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         pr_number: None,
         session: None,
         entry: None,
+        confirm: None,
         operation: None,
         ttl_seconds: None,
         since: None,
@@ -851,6 +884,13 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 parsed.entry = Some(value.parse().map_err(|_| {
                     UsageError::Message("--entry must be an integer queue entry id".into())
                 })?);
+            }
+            "--confirm" => {
+                parsed.confirm = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--confirm requires a value".into()))?
+                        .clone(),
+                )
             }
             "--operation" => {
                 let value = iter
@@ -1460,6 +1500,26 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool) -> Result<(), UsageErr
     println!(
         "Confirm with: aethyme broker ship execute --entry {} --confirm {}",
         report.queue_entry.id, report.integration_sha
+    );
+    Ok(())
+}
+
+fn render_ship_execution(
+    report: &crate::ShipExecutionReport,
+    json: bool,
+) -> Result<(), UsageError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!(
+        "Published {} to {}/{}.",
+        report.published_sha, report.plan.remote, report.plan.remote_default_branch_ref
+    );
+    println!("Verified remote SHA: {}", report.verified_remote_sha);
+    println!(
+        "Operations: fetch {}, push {}, verify {}",
+        report.fetch_operation.id, report.push_operation.id, report.verify_operation.id
     );
     Ok(())
 }
@@ -2370,9 +2430,20 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     let report = broker.ship_plan(entry)?;
                     render_ship_plan(&report, parsed.json)?;
                 }
+                "execute" => {
+                    let entry = parsed.entry.ok_or(UsageError::Message(
+                        "ship execute requires --entry <id>".into(),
+                    ))?;
+                    let confirm = parsed.confirm.as_deref().ok_or(UsageError::Message(
+                        "ship execute requires --confirm <full-integration-sha>".into(),
+                    ))?;
+                    let mut broker = open_broker()?;
+                    let report = broker.ship_execute(entry, confirm)?;
+                    render_ship_execution(&report, parsed.json)?;
+                }
                 other => {
                     return Err(UsageError::Message(format!(
-                        "unknown ship action {other:?} — expected plan"
+                        "unknown ship action {other:?} — expected plan or execute"
                     )));
                 }
             }
