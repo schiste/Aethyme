@@ -255,6 +255,36 @@ fn build_task_redb_fixture() -> tempfile::TempDir {
     tmp
 }
 
+fn build_duplicate_anchor_redb_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "README.md", b"# Duplicate Anchor Fixture\n");
+    write(
+        tmp.path(),
+        "src/auth.py",
+        b"def validate_token(token):\n    return token\n\ndef validate_token_claims(token):\n    return token\n",
+    );
+    write(
+        tmp.path(),
+        "src/main.py",
+        b"from src.auth import validate_token\n\ndef validate_token_request():\n    return validate_token('token')\n",
+    );
+
+    let root = tmp.path().canonicalize().unwrap();
+    bootstrap_repo(&root, "test-engine").expect("bootstrap graph layout");
+    let ctx = IndexerContext::new("DuplicateAnchorRepo", root, "test-engine").unwrap();
+    let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
+    assert_eq!(summary.total_files, 3);
+
+    let output = run_engine([
+        "index",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&output);
+    tmp
+}
+
 fn build_surface_flow_auth_redb_fixture() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     write(
@@ -1542,6 +1572,51 @@ fn redb_task_views_match_repository_map_snapshots_for_phase6_task_kinds() {
             "Trace impact of load_token",
             "Find the manifest that owns the top-level area",
         ],
+    );
+}
+
+#[test]
+fn task_next_deduplicates_same_file_anchor_displays_with_map_redb_parity() {
+    let tmp = build_duplicate_anchor_redb_fixture();
+    let task = aethyme_engine::model::task::TaskInput::from_task_text("Update validate_token flow");
+    let map = RepositoryMap::build(tmp.path()).expect("build RepositoryMap task-next oracle");
+    let anchors = task_anchors_view(&map, &task).anchors;
+    assert!(anchors.len() >= 2, "expected two ranked symbol anchors");
+    assert_eq!(anchors[0].file.as_deref(), Some("src/auth.py"));
+    assert_eq!(anchors[1].file.as_deref(), Some("src/auth.py"));
+    assert!(
+        anchors
+            .iter()
+            .skip(2)
+            .any(|anchor| anchor.file.as_deref() == Some("src/main.py")),
+        "expected a lower-ranked distinct anchor file"
+    );
+
+    let expected = task_next_view(&map, &task);
+    let actual = task_cli_json(tmp.path(), "task-next", &task.raw);
+    assert_eq!(
+        actual,
+        repository_map_task_json(&map, "task-next", &task.raw),
+        "redb task-next should preserve RepositoryMap ranking and deduplication"
+    );
+
+    let displays: Vec<&str> = expected
+        .items
+        .iter()
+        .map(|item| item.display.as_str())
+        .collect();
+    assert_eq!(
+        displays
+            .iter()
+            .filter(|display| **display == "src/auth.py")
+            .count(),
+        1,
+        "the first-seen anchor file should appear exactly once"
+    );
+    assert_eq!(
+        displays.get(..2),
+        Some(["src/auth.py", "src/main.py"].as_slice()),
+        "deduplication should retain the first two distinct displays in rank order"
     );
 }
 
