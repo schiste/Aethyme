@@ -393,6 +393,54 @@ impl GitRepo {
             .collect())
     }
 
+    /// Commits reachable from `head` but not `excluded`, oldest first.
+    /// Unlike a `from..to` range this remains meaningful when the two
+    /// histories have diverged.
+    pub fn commits_excluding_oldest(
+        &self,
+        head: &str,
+        excluded: &str,
+    ) -> Result<Vec<String>, GitError> {
+        Ok(run_git(
+            &self.root,
+            &["rev-list", "--reverse", head, "--not", excluded],
+        )?
+        .lines()
+        .map(str::to_string)
+        .collect())
+    }
+
+    /// First-parent commits reachable from `head` but not `excluded`,
+    /// oldest first. Submission provenance uses only this layer so a
+    /// broker promotion merge and its submitted second parent do not
+    /// appear as two patch-identity candidates.
+    pub fn first_parent_commits_excluding_oldest(
+        &self,
+        head: &str,
+        excluded: &str,
+    ) -> Result<Vec<String>, GitError> {
+        Ok(run_git(
+            &self.root,
+            &[
+                "rev-list",
+                "--first-parent",
+                "--reverse",
+                head,
+                "--not",
+                excluded,
+            ],
+        )?
+        .lines()
+        .map(str::to_string)
+        .collect())
+    }
+
+    /// Every parent of a commit, in Git's stored order.
+    pub fn commit_parents(&self, commit: &str) -> Result<Vec<String>, GitError> {
+        let line = run_git(&self.root, &["rev-list", "--parents", "-n", "1", commit])?;
+        Ok(line.split_whitespace().skip(1).map(str::to_string).collect())
+    }
+
     /// First-parent commits reachable from `to` but not `from`, oldest
     /// first. Integration reconciliation uses this to inspect only the
     /// broker-created layer, excluding submitted heads attached as second

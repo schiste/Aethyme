@@ -7,7 +7,8 @@ use std::process::Command;
 
 use aethyme_broker::{
     Broker, IntegrationDeliveryState, IntegrationReconcileClassification,
-    IntegrationReconcileOptions, MergeStatus, RepairAction, RepairSource, StatusAdviceSeverity,
+    IntegrationReconcileOptions, MergeStatus, RepairAction, RepairSource,
+    SubmissionCommitOwnership, SubmissionIntegrationState, StatusAdviceSeverity,
 };
 
 fn sh(cwd: &Path, args: &[&str]) {
@@ -342,6 +343,41 @@ fn characterizes_dual_identity_phantom_conflict_and_changing_blocker_blame() {
 
     let first = broker.submit(victim_id).unwrap();
     assert_eq!(first.entry.status, MergeStatus::Conflict);
+    assert!(first.submission_plan.safe);
+    assert_eq!(first.submission_plan.session_head.len(), 40);
+    assert_eq!(first.submission_plan.integration_head.len(), 40);
+    assert_eq!(
+        first.submission_plan.recorded_baseline.as_deref(),
+        Some(victim_baseline.as_str())
+    );
+    assert_eq!(first.submission_plan.commits.len(), 2);
+    let inherited = &first.submission_plan.commits[0];
+    assert_eq!(
+        inherited.ownership,
+        SubmissionCommitOwnership::InheritedFromRecordedBaseline
+    );
+    assert_eq!(
+        inherited.integration_state,
+        SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity
+    );
+    assert_eq!(inherited.commit, victim_baseline);
+    assert_eq!(inherited.matching_integration_commits.len(), 1);
+    assert_eq!(inherited.matching_integration_commits[0].len(), 40);
+    let owned = &first.submission_plan.commits[1];
+    assert_eq!(owned.ownership, SubmissionCommitOwnership::SessionOwned);
+    assert_eq!(owned.integration_state, SubmissionIntegrationState::Pending);
+    assert_eq!(owned.commit.len(), 40);
+    let plan_json = serde_json::to_value(&first.submission_plan).unwrap();
+    assert_eq!(
+        plan_json["commits"][0]["ownership"],
+        "inherited_from_recorded_baseline"
+    );
+    assert_eq!(
+        plan_json["commits"][0]["integration_state"],
+        "already_integrated_by_stable_patch_identity"
+    );
+    assert_eq!(plan_json["commits"][1]["ownership"], "session_owned");
+    assert_eq!(plan_json["commits"][1]["integration_state"], "pending");
     assert_eq!(
         first.conflicts,
         vec!["src/a.py".to_string(), "src/b.py".to_string()],
