@@ -47,8 +47,9 @@ Arrived:
 - **No Python at all.** The product path went Python-free in the Phase 6
   sweep (2026-08-01, `src/` deleted) and the dev test stack followed in
   Phase 7 (2026-08-06, `tests/` and `pyproject.toml` deleted). This
-  package is 100% Rust: paired release binaries are the recommended install
-  story, `cargo install` remains the source-build path, and
+  package is 100% Rust: Homebrew or the paired release installer is the
+  recommended install story, `cargo install` remains the contributor/source
+  fallback, and
   `cargo test --workspace` is the whole test story. `packages/aethyme-eval`
   is a separate package and stays Python by design.
 

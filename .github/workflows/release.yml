@@ -121,6 +121,11 @@ jobs:
             --source-sha "$source_sha" \
             --channel stable \
             --output "$GITHUB_WORKSPACE/dist/release-manifest.json"
+          cargo run --locked --manifest-path packages/aethyme/rust/Cargo.toml \
+            -p aethyme-broker --example homebrew_formula -- \
+            --manifest "$GITHUB_WORKSPACE/dist/release-manifest.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --output "$GITHUB_WORKSPACE/dist/aethyme.rb"
           cd dist
           sha256sum --check SHA256SUMS
 

@@ -87,6 +87,35 @@ fn release_workflow_smokes_the_installed_archive_contract() {
 }
 
 #[test]
+fn release_workflow_renders_the_homebrew_formula_from_the_manifest() {
+    let workflow = std::fs::read_to_string(
+        aethyme_testkit::paths::repo_root().join(".github/workflows/release.yml"),
+    )
+    .unwrap();
+    let manifest_position = workflow.find("--example release_manifest").unwrap();
+    let formula_position = workflow.find("--example homebrew_formula").unwrap();
+
+    assert!(manifest_position < formula_position);
+    assert!(workflow.contains("--manifest \"$GITHUB_WORKSPACE/dist/release-manifest.json\""));
+    assert!(workflow.contains("--output \"$GITHUB_WORKSPACE/dist/aethyme.rb\""));
+}
+
+#[test]
+fn reviewed_homebrew_formula_installs_the_published_binary_pair() {
+    let formula = std::fs::read_to_string(
+        aethyme_testkit::paths::repo_root().join("packaging/homebrew/Formula/aethyme.rb"),
+    )
+    .unwrap();
+
+    assert!(formula.contains("bin.install \"aethyme\", \"aethyme-engine-cli\""));
+    assert_eq!(formula.matches("url \"").count(), 3);
+    assert_eq!(formula.matches("sha256 \"").count(), 3);
+    assert!(formula.contains("depends_on arch: :x86_64"));
+    assert!(formula.contains("system bin/\"aethyme\", \"broker\", \"quick-test\""));
+    assert!(!formula.contains("crates.io"));
+}
+
+#[test]
 fn release_notes_publish_migration_compatibility_rollback_and_known_issues() {
     let root = aethyme_testkit::paths::repo_root();
     let workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();

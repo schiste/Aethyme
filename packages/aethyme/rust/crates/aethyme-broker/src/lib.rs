@@ -28,6 +28,7 @@ pub mod events;
 mod gates;
 mod git;
 mod graph_impact;
+mod homebrew;
 pub mod hooks;
 pub mod init;
 mod issue_form;
@@ -38,6 +39,7 @@ mod pr;
 mod quick_test;
 mod reconciliation;
 mod release_compatibility;
+pub mod release_manifest;
 mod report;
 mod report_filing;
 mod schema;
@@ -71,6 +73,7 @@ pub use graph_impact::{
     GraphImpactLookup, GraphImpactProvider, GraphImpactQuery, GraphImpactStatus,
     GraphStoreImpactProvider,
 };
+pub use homebrew::render_homebrew_formula;
 pub use hooks::{HookReport, HookState, HooksError};
 pub use issue_form::{
     ISSUE_FORM_RENDER_SCHEMA_VERSION, ISSUE_REVIEW_ARTIFACT_SCHEMA_VERSION, IssueFormFieldKind,
@@ -105,6 +108,10 @@ pub use reconciliation::{
 pub use release_compatibility::{
     BROKER_STORAGE_CURRENT_SCHEMA, BROKER_STORAGE_MINIMUM_SCHEMA, ENGINE_PROTOCOL_VERSION,
     MINIMUM_GIT_VERSION,
+};
+pub use release_manifest::{
+    RELEASE_MANIFEST_SCHEMA_VERSION, RELEASE_TARGETS, REQUIRED_RELEASE_BINARIES, ReleaseArtifact,
+    ReleaseBrokerStorageCompatibility, ReleaseCompatibility, ReleaseInstaller, ReleaseManifest,
 };
 pub use report::{
     InvalidReportEntry, PreparedReport, REPORT_DOCUMENT_SCHEMA_VERSION, REPORT_FILINGS_FILENAME,
