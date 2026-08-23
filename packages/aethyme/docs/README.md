@@ -21,6 +21,7 @@ page before reaching for lower-level graph, eval, or architecture references.
 - [`architecture/rust-transition.md`](architecture/rust-transition.md)
 - [`getting-started/quickstart.md`](getting-started/quickstart.md)
 - [`guides/broker-workflows.md`](guides/broker-workflows.md)
+- [`guides/report-capture.md`](guides/report-capture.md)
 - [`reference/cli.md`](reference/cli.md)
 - [`architecture/eval-mining-notes.md`](architecture/eval-mining-notes.md)
 - [`guides/testing.md`](guides/testing.md)
@@ -33,8 +34,10 @@ For the current local-first product proof path, start with:
 1. [`../../../docs/product-surface.md`](../../../docs/product-surface.md)
 2. [`guides/broker-workflows.md`](guides/broker-workflows.md) for safe session
    reuse, gate cache, lease planning, and durable handoffs
-3. [`reference/cli.md`](reference/cli.md)
-4. [`getting-started/quickstart.md`](getting-started/quickstart.md) for the
+3. [`guides/report-capture.md`](guides/report-capture.md) for offline,
+   allowlist-only report capture and reviewed GitHub filing
+4. [`reference/cli.md`](reference/cli.md)
+5. [`getting-started/quickstart.md`](getting-started/quickstart.md) for the
    graph-engine path only
 
 ## Scope Rule

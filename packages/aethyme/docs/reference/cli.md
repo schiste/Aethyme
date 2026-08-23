@@ -234,6 +234,9 @@ append sessions, leases, gates, events, or command telemetry.
 Capture a reviewable diagnostic report without contacting Git remotes,
 GitHub, the graph store, or gate runners:
 
+For the end-to-end security workflow, private-repository warnings, and a
+redacted example, see [Capture And File Broker Reports Safely](../guides/report-capture.md).
+
 ```bash
 aethyme broker report capture --kind bug --title "Submit gate failed"
 aethyme broker report capture --kind improvement \
