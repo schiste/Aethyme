@@ -1,6 +1,6 @@
 # Aethyme Core Docs
 
-Last Updated: 2026-07-29
+Last Updated: 2026-08-23
 
 This directory documents the code that is active in `packages/aethyme`.
 The public product surface is broker-first and is documented canonically in
@@ -20,6 +20,7 @@ page before reaching for lower-level graph, eval, or architecture references.
 - [`architecture/core-architecture.md`](architecture/core-architecture.md)
 - [`architecture/rust-transition.md`](architecture/rust-transition.md)
 - [`getting-started/quickstart.md`](getting-started/quickstart.md)
+- [`guides/broker-workflows.md`](guides/broker-workflows.md)
 - [`reference/cli.md`](reference/cli.md)
 - [`architecture/eval-mining-notes.md`](architecture/eval-mining-notes.md)
 - [`guides/testing.md`](guides/testing.md)
@@ -30,8 +31,10 @@ page before reaching for lower-level graph, eval, or architecture references.
 For the current local-first product proof path, start with:
 
 1. [`../../../docs/product-surface.md`](../../../docs/product-surface.md)
-2. [`reference/cli.md`](reference/cli.md)
-3. [`getting-started/quickstart.md`](getting-started/quickstart.md) for the
+2. [`guides/broker-workflows.md`](guides/broker-workflows.md) for safe session
+   reuse, gate cache, lease planning, and durable handoffs
+3. [`reference/cli.md`](reference/cli.md)
+4. [`getting-started/quickstart.md`](getting-started/quickstart.md) for the
    graph-engine path only
 
 ## Scope Rule

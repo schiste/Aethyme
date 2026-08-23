@@ -62,6 +62,10 @@ What this provides:
 - promoted-but-unmerged integration visibility
 - written recovery steps for rejected submits
 
+The [broker follow-up workflows guide](../packages/aethyme/docs/guides/broker-workflows.md)
+connects the safe reuse, gate cache, lease planning, and durable handoff paths
+that follow this basic loop.
+
 ### 3. Navigate A Repo
 
 Use this when an agent needs a bounded answer about where to look.

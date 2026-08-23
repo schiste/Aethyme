@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-08-14
+Last Updated: 2026-08-23
 
 ## Install
 
@@ -84,6 +84,10 @@ for maintainers but should not lead user onboarding.
 ## Broker Commands
 
 The broker is the stable product front door for multi-agent coordination:
+
+For task-oriented examples that connect session reuse, gate cache policy,
+lease planning, and durable finish handoffs, see the
+[broker follow-up workflows guide](../guides/broker-workflows.md).
 
 - `aethyme init`
 - `aethyme certify`
