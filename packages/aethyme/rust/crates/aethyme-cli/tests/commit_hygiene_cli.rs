@@ -108,6 +108,34 @@ fn repo_lint_commit_message_accepts_structured_fix() {
 }
 
 #[test]
+fn repo_lint_commit_message_accepts_inline_sections() {
+    let message = "fix(hygiene): accept inline sections\n\n\
+         Problem: Standalone headers were the only accepted form.\n\
+         Decision: Parse initial content after a known header.\n\
+         Rationale: Both documented structured forms should be valid.\n\
+         Validation: Added inline and multiline coverage.\n";
+
+    let result = invoke_aethyme([
+        "repo",
+        "lint-commit-message",
+        "--message",
+        message,
+        "--json-output",
+    ]);
+    result.ok();
+    let payload = result.json();
+    assert_eq!(payload["ok"], true);
+    assert_eq!(
+        payload["sections"]["Problem"],
+        "Standalone headers were the only accepted form."
+    );
+    assert_eq!(
+        payload["sections"]["Rationale"],
+        "Both documented structured forms should be valid."
+    );
+}
+
+#[test]
 fn repo_lint_commit_message_command_fails_invalid_message() {
     let result = invoke_aethyme([
         "repo",

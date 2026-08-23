@@ -361,17 +361,18 @@ fn parse_sections(body_lines: &[&str]) -> Vec<(String, String)> {
     let mut current_section: Option<usize> = None;
     for raw_line in body_lines {
         let line = py_rstrip(raw_line);
-        let header = known_sections().find(|section| line == format!("{section}:"));
-        if let Some(section) = header {
-            current_section = Some(
-                match sections.iter().position(|(name, _)| name == section) {
-                    Some(index) => index,
-                    None => {
-                        sections.push((section.to_string(), Vec::new()));
-                        sections.len() - 1
-                    }
-                },
-            );
+        if let Some((section, initial_content)) = parse_section_header(line) {
+            let index = match sections.iter().position(|(name, _)| name == section) {
+                Some(index) => index,
+                None => {
+                    sections.push((section.to_string(), Vec::new()));
+                    sections.len() - 1
+                }
+            };
+            current_section = Some(index);
+            if !initial_content.is_empty() {
+                sections[index].1.push(initial_content.to_string());
+            }
             continue;
         }
         let Some(index) = current_section else {
@@ -387,6 +388,20 @@ fn parse_sections(body_lines: &[&str]) -> Vec<(String, String)> {
             (name, text)
         })
         .collect()
+}
+
+fn parse_section_header<'a>(line: &'a str) -> Option<(&'static str, &'a str)> {
+    known_sections().find_map(|section| {
+        let remainder = line.strip_prefix(section)?.strip_prefix(':')?;
+        if remainder.is_empty() {
+            return Some((section, ""));
+        }
+        remainder
+            .chars()
+            .next()
+            .filter(|character| py_isspace(*character))
+            .map(|_| (section, py_strip(remainder)))
+    })
 }
 
 fn memory_candidates(sections: &[(String, String)]) -> Vec<Value> {
@@ -503,6 +518,87 @@ mod tests {
             candidates
                 .iter()
                 .any(|c| c.get("type").and_then(Value::as_str) == Some("decision"))
+        );
+    }
+
+    #[test]
+    fn parse_sections_accepts_standalone_headers() {
+        assert_eq!(
+            parse_sections(&["Problem:", "Standalone content."]),
+            vec![("Problem".to_string(), "Standalone content.".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_sections_accepts_inline_and_multiline_content() {
+        assert_eq!(
+            parse_sections(&[
+                "Problem: Initial content.",
+                "Continuation.",
+                "Decision: Chosen approach.",
+            ]),
+            vec![
+                (
+                    "Problem".to_string(),
+                    "Initial content.\nContinuation.".to_string(),
+                ),
+                ("Decision".to_string(), "Chosen approach.".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_sections_append_duplicate_headers_deterministically() {
+        assert_eq!(
+            parse_sections(&["Problem: First.", "Problem:", "Second.", "Problem: Third.",]),
+            vec![("Problem".to_string(), "First.\nSecond.\nThird.".to_string(),)]
+        );
+    }
+
+    #[test]
+    fn parse_sections_accepts_empty_inline_headers() {
+        assert_eq!(
+            parse_sections(&["Problem:   "]),
+            vec![("Problem".to_string(), String::new())]
+        );
+    }
+
+    #[test]
+    fn parse_sections_accepts_unicode_inline_content_and_whitespace() {
+        assert_eq!(
+            parse_sections(&["Problem:\u{2003}Déjà vu — 問題"]),
+            vec![("Problem".to_string(), "Déjà vu — 問題".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_sections_leave_unknown_headers_as_content() {
+        assert_eq!(
+            parse_sections(&[
+                "Unknown: ignored before a known section",
+                "Problem: Known.",
+                "Unknown: retained inside the section",
+            ]),
+            vec![(
+                "Problem".to_string(),
+                "Known.\nUnknown: retained inside the section".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn parse_sections_do_not_recognize_headers_mid_line_or_without_spacing() {
+        assert_eq!(
+            parse_sections(&[
+                "The Problem: is described here.",
+                "Problem:text without separator whitespace",
+                "Decision: Valid header.",
+                "The Problem: remains ordinary prose.",
+            ]),
+            vec![(
+                "Decision".to_string(),
+                "Valid header.\nThe Problem: remains ordinary prose.".to_string(),
+            )]
         );
     }
 
