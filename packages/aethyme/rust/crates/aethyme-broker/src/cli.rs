@@ -1635,6 +1635,18 @@ fn render_semantic_gate_advice(report: &crate::SemanticGateAdvice) {
         report.semantic.status.as_str()
     );
     println!("    {}", report.semantic.reason);
+    if !report.semantic.impacted_paths.is_empty() {
+        println!(
+            "  semantic impact paths: {}",
+            capped_join(&report.semantic.impacted_paths, 8)
+        );
+    }
+    if report.semantic.truncated {
+        println!(
+            "  semantic impact result: truncated at {} paths",
+            report.semantic.result_limit
+        );
+    }
 
     if report.path_selected_gates.is_empty() {
         println!("  path-selected gates: none");

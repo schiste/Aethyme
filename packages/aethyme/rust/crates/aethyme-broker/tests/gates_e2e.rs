@@ -8,8 +8,26 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use aethyme_broker::{
-    Broker, CachePolicy, GateFailureClass, GateProgressSink, GateStatus, SemanticGateSourceStatus,
+    Broker, CachePolicy, GRAPH_IMPACT_RESULT_LIMIT, GateFailureClass, GateProgressSink, GateStatus,
+    GraphImpactLookup, GraphImpactProvider, GraphImpactQuery, GraphImpactStatus,
 };
+
+#[derive(Clone)]
+struct FixedGraphImpactProvider {
+    lookup: GraphImpactLookup,
+}
+
+impl GraphImpactProvider for FixedGraphImpactProvider {
+    fn name(&self) -> &str {
+        "test_graph"
+    }
+
+    fn lookup(&self, query: &GraphImpactQuery<'_>) -> GraphImpactLookup {
+        assert_eq!(query.max_results, GRAPH_IMPACT_RESULT_LIMIT);
+        assert!(!query.changed_files.is_empty());
+        self.lookup.clone()
+    }
+}
 
 #[derive(Default)]
 struct CapturedProgress {
@@ -167,12 +185,11 @@ triggers = ["docs/**"]
     );
     assert_eq!(report.path_selected_gates[1].reason, "path trigger");
     assert!(report.semantic_suggested_gates.is_empty());
-    assert_eq!(report.semantic.provider, "caller_edges");
-    assert_eq!(
-        report.semantic.status,
-        SemanticGateSourceStatus::Unavailable
-    );
-    assert!(report.semantic.reason.contains("path-triggered gates"));
+    assert_eq!(report.semantic.provider, "graph_store_probe");
+    assert_eq!(report.semantic.status, GraphImpactStatus::GraphMissing);
+    assert!(report.semantic.reason.contains("graph_store.redb"));
+    assert!(report.semantic.impacted_paths.is_empty());
+    assert!(!report.semantic.truncated);
     assert!(report.next_action.contains("gates run"));
 
     assert_eq!(
@@ -182,6 +199,138 @@ triggers = ["docs/**"]
             ("python-check".to_string(), Some("src/app.py".to_string()))
         ]
     );
+}
+
+#[test]
+fn ready_graph_impact_is_bounded_and_never_expands_enforced_gates() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "always-check"
+command = "true"
+cost = 0
+
+[[gate]]
+name = "python-check"
+command = "true"
+cost = 1
+triggers = ["**/*.py"]
+
+[[gate]]
+name = "docs-check"
+command = "true"
+cost = 1
+triggers = ["docs/**"]
+"#,
+    );
+    commit_all(tmp.path(), "add gates");
+
+    let wt = add_worktree(tmp.path(), "semantic-ready");
+    let mut setup = Broker::open(tmp.path()).unwrap();
+    let session = setup.adopt(&wt, None).unwrap();
+    drop(setup);
+    std::fs::write(wt.join("src/app.py"), "x = 42\n").unwrap();
+
+    let provider_paths = (0..GRAPH_IMPACT_RESULT_LIMIT + 8)
+        .map(|index| format!("docs/impact-{index:02}.md"))
+        .collect();
+    let provider = FixedGraphImpactProvider {
+        lookup: GraphImpactLookup::ready(provider_paths, false, "ready fixture"),
+    };
+    let mut broker = Broker::open_with_graph_impact_provider(tmp.path(), provider).unwrap();
+
+    let report = broker.semantic_gate_advice(session.id).unwrap();
+    assert_eq!(report.semantic.status, GraphImpactStatus::Ready);
+    assert_eq!(
+        report.semantic.impacted_paths.len(),
+        GRAPH_IMPACT_RESULT_LIMIT
+    );
+    assert!(report.semantic.truncated);
+    assert_eq!(report.semantic.result_limit, GRAPH_IMPACT_RESULT_LIMIT);
+    assert_eq!(report.semantic_suggested_gates.len(), 1);
+    assert_eq!(report.semantic_suggested_gates[0].gate, "docs-check");
+    assert_eq!(
+        report.semantic_suggested_gates[0].reason,
+        "graph impact hint"
+    );
+
+    assert_eq!(
+        broker.affected_gates(session.id).unwrap(),
+        vec![
+            ("always-check".to_string(), None),
+            ("python-check".to_string(), Some("src/app.py".to_string()))
+        ],
+        "semantic advice must not expand the enforced selector"
+    );
+    let executed = broker.run_gates(session.id).unwrap();
+    assert_eq!(
+        executed
+            .iter()
+            .map(|outcome| outcome.gate.as_str())
+            .collect::<Vec<_>>(),
+        vec!["always-check", "python-check"],
+        "semantic suggestions must not reach gate execution"
+    );
+}
+
+#[test]
+fn degraded_graph_provider_outcomes_are_successful_advisory_reports() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "python-check"
+command = "true"
+cost = 1
+triggers = ["**/*.py"]
+"#,
+    );
+    commit_all(tmp.path(), "add gates");
+
+    let wt = add_worktree(tmp.path(), "semantic-degraded");
+    let mut setup = Broker::open(tmp.path()).unwrap();
+    let session = setup.adopt(&wt, None).unwrap();
+    drop(setup);
+    std::fs::write(wt.join("src/app.py"), "x = 42\n").unwrap();
+
+    let outcomes = [
+        (
+            GraphImpactLookup::graph_missing("cold graph fixture"),
+            GraphImpactStatus::GraphMissing,
+            "cold graph fixture",
+        ),
+        (
+            GraphImpactLookup::graph_stale("stale graph fixture"),
+            GraphImpactStatus::GraphStale,
+            "stale graph fixture",
+        ),
+        (
+            GraphImpactLookup::provider_error("provider failure fixture"),
+            GraphImpactStatus::ProviderError,
+            "provider failure fixture",
+        ),
+    ];
+
+    for (lookup, expected_status, expected_reason) in outcomes {
+        let provider = FixedGraphImpactProvider { lookup };
+        let mut broker = Broker::open_with_graph_impact_provider(tmp.path(), provider).unwrap();
+        let report = broker
+            .semantic_gate_advice(session.id)
+            .expect("degraded graph state must remain a successful broker report");
+
+        assert_eq!(report.semantic.status, expected_status);
+        assert_eq!(report.semantic.reason, expected_reason);
+        assert!(report.semantic.impacted_paths.is_empty());
+        assert!(report.semantic_suggested_gates.is_empty());
+        assert_eq!(report.path_selected_gates.len(), 1);
+        assert_eq!(report.path_selected_gates[0].gate, "python-check");
+        assert!(!report.enforced);
+    }
 }
 
 #[test]

@@ -27,6 +27,7 @@ mod error;
 pub mod events;
 mod gates;
 mod git;
+mod graph_impact;
 pub mod hooks;
 pub mod init;
 mod leases;
@@ -61,6 +62,10 @@ pub use gates::{
     CachePolicy, Gate, GateConfigError, GateProgressSink, GateRunOutcome, load_gates, select_gates,
 };
 pub use git::{GitError, GitRepo, MergeSimulation, RemoteDefaultBranch};
+pub use graph_impact::{
+    GRAPH_IMPACT_RESULT_LIMIT, GraphImpactLookup, GraphImpactProvider, GraphImpactQuery,
+    GraphImpactStatus, GraphStoreImpactProvider,
+};
 pub use hooks::{HookReport, HookState, HooksError};
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use merge::{ACTION_REQUIRED_RELPATH, PromoteConfig, SubmitOutcome};

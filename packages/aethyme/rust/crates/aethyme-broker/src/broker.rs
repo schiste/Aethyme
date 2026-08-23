@@ -10,6 +10,10 @@ use std::process::{Command, Stdio};
 
 use crate::error::BrokerError;
 use crate::git::{GitError, GitRepo};
+use crate::graph_impact::{
+    GRAPH_IMPACT_RESULT_LIMIT, GraphImpactProvider, GraphImpactQuery, GraphImpactStatus,
+    GraphStoreImpactProvider,
+};
 use crate::store::BrokerStore;
 use crate::types::{
     GateStatus, LeaseKind, MergeQueueEntry, MergeStatus, NewSession, Session, SessionOrigin,
@@ -923,27 +927,17 @@ pub struct SemanticGateSelection {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SemanticGateSource {
     pub provider: String,
-    pub status: SemanticGateSourceStatus,
+    pub status: GraphImpactStatus,
     pub reason: String,
     pub graph_store_path: String,
     pub graph_fragments_path: String,
+    pub impacted_paths: Vec<String>,
+    pub result_limit: usize,
+    pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SemanticGateSourceStatus {
-    Unavailable,
-    ProviderPending,
-}
-
-impl SemanticGateSourceStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Unavailable => "unavailable",
-            Self::ProviderPending => "provider_pending",
-        }
-    }
-}
+/// Backwards-compatible name for the status nested in semantic gate reports.
+pub type SemanticGateSourceStatus = GraphImpactStatus;
 
 /// Operator guidance derived from `broker status` facts. This is
 /// deliberately local and deterministic: no model-generated prose, no
@@ -999,10 +993,20 @@ pub struct Broker {
     repo: GitRepo,
     store: BrokerStore,
     main_root: PathBuf,
+    graph_impact_provider: Box<dyn GraphImpactProvider>,
 }
 
 impl Broker {
     pub fn open(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
+        Self::open_with_graph_impact_provider(path_inside_repo, GraphStoreImpactProvider)
+    }
+
+    /// Open a broker with an alternate read-only graph-impact provider.
+    /// Provider outcomes remain confined to [`Self::semantic_gate_advice`].
+    pub fn open_with_graph_impact_provider(
+        path_inside_repo: &Path,
+        graph_impact_provider: impl GraphImpactProvider + 'static,
+    ) -> Result<Self, BrokerOpError> {
         let here = GitRepo::discover(path_inside_repo)?;
         let main_root = here.main_root()?;
         let repo = GitRepo::discover(&main_root)?;
@@ -1011,6 +1015,7 @@ impl Broker {
             repo,
             store,
             main_root,
+            graph_impact_provider: Box::new(graph_impact_provider),
         };
         broker.recover_prepared_reconciliation()?;
         Ok(broker)
@@ -2015,23 +2020,40 @@ impl Broker {
             })
             .collect::<Vec<_>>();
 
-        let graph_store = self.main_root.join(".aethyme/graph_store.redb");
-        let semantic = if graph_store.exists() {
-            SemanticGateSource {
-                provider: "caller_edges".into(),
-                status: SemanticGateSourceStatus::ProviderPending,
-                reason: "graph store is present, but broker semantic gate selection is not wired to caller edges yet".into(),
-                graph_store_path: ".aethyme/graph_store.redb".into(),
-                graph_fragments_path: ".aethyme/graph/".into(),
-            }
+        let lookup = self
+            .graph_impact_provider
+            .lookup(&GraphImpactQuery {
+                repo_root: &self.main_root,
+                changed_files: &changed,
+                max_results: GRAPH_IMPACT_RESULT_LIMIT,
+            })
+            .bounded(GRAPH_IMPACT_RESULT_LIMIT);
+        let path_selected_names = path_selected_gates
+            .iter()
+            .map(|selection| selection.gate.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let semantic_suggested_gates = if lookup.status == GraphImpactStatus::Ready {
+            crate::gates::select_gates(&gates, &lookup.impacted_paths)
+                .into_iter()
+                .filter(|selection| !path_selected_names.contains(selection.gate.name.as_str()))
+                .map(|selection| SemanticGateSelection {
+                    gate: selection.gate.name.clone(),
+                    triggered_by: selection.triggered_by,
+                    reason: "graph impact hint".into(),
+                })
+                .collect()
         } else {
-            SemanticGateSource {
-                provider: "caller_edges".into(),
-                status: SemanticGateSourceStatus::Unavailable,
-                reason: "no .aethyme/graph_store.redb found; path-triggered gates remain the only enforced selection".into(),
-                graph_store_path: ".aethyme/graph_store.redb".into(),
-                graph_fragments_path: ".aethyme/graph/".into(),
-            }
+            Vec::new()
+        };
+        let semantic = SemanticGateSource {
+            provider: self.graph_impact_provider.name().into(),
+            status: lookup.status,
+            reason: lookup.explanation,
+            graph_store_path: ".aethyme/graph_store.redb".into(),
+            graph_fragments_path: ".aethyme/graph/".into(),
+            impacted_paths: lookup.impacted_paths,
+            result_limit: GRAPH_IMPACT_RESULT_LIMIT,
+            truncated: lookup.truncated,
         };
 
         let next_action = if path_selected_gates.is_empty() {
@@ -2048,7 +2070,7 @@ impl Broker {
             enforced: false,
             changed_files: changed,
             path_selected_gates,
-            semantic_suggested_gates: Vec::new(),
+            semantic_suggested_gates,
             semantic,
             next_action,
         })
