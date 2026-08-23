@@ -83,6 +83,8 @@ pub enum BrokerOpError {
         blocker_count: usize,
         blockers: Vec<LeaseBlocker>,
     },
+    #[error("invalid lease path {path:?}: {reason}")]
+    InvalidLeasePath { path: String, reason: String },
     #[error("{summary}")]
     OwnershipViolation {
         summary: String,
@@ -478,6 +480,85 @@ pub struct LeaseClaimReport {
     pub path: String,
     pub accepted: bool,
     pub blockers: Vec<LeaseBlocker>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseOverlapRelation {
+    Exact,
+    Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LeasePlanOverlap {
+    pub relation: LeaseOverlapRelation,
+    pub session_id: i64,
+    pub path: String,
+    pub kind: LeaseKind,
+    /// Unix epoch milliseconds; `None` means the lease does not expire.
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LeasePathPlan {
+    pub path: String,
+    pub owned: Vec<LeasePlanOverlap>,
+    pub conflicts: Vec<LeasePlanOverlap>,
+    pub would_conflict: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LeasePlan {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<i64>,
+    pub paths: Vec<LeasePathPlan>,
+    pub would_conflict: bool,
+}
+
+fn normalize_lease_path(path: &str) -> Result<String, BrokerOpError> {
+    let invalid = |reason: &str| BrokerOpError::InvalidLeasePath {
+        path: path.to_string(),
+        reason: reason.to_string(),
+    };
+    if path.is_empty() {
+        return Err(invalid("path must not be empty"));
+    }
+    if path.contains('\0') {
+        return Err(invalid("path must not contain NUL"));
+    }
+    if Path::new(path).is_absolute() {
+        return Err(invalid("path must be repository-relative"));
+    }
+
+    let directory = path.ends_with('/');
+    let segments = path.split('/').collect::<Vec<_>>();
+    for (index, segment) in segments.iter().enumerate() {
+        let final_directory_marker = directory && index + 1 == segments.len();
+        if segment.is_empty() && !final_directory_marker {
+            return Err(invalid("empty path segments are ambiguous"));
+        }
+        if matches!(*segment, "." | "..") {
+            return Err(invalid("`.` and `..` path segments are ambiguous"));
+        }
+    }
+    Ok(path.to_string())
+}
+
+fn lease_plan_overlap_order(a: &LeasePlanOverlap, b: &LeasePlanOverlap) -> std::cmp::Ordering {
+    (
+        a.session_id,
+        a.path.as_str(),
+        a.kind.as_str(),
+        a.relation,
+        a.expires_at,
+    )
+        .cmp(&(
+            b.session_id,
+            b.path.as_str(),
+            b.kind.as_str(),
+            b.relation,
+            b.expires_at,
+        ))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1321,22 +1402,86 @@ impl Broker {
         ttl_ms: Option<i64>,
     ) -> Result<LeaseClaimReport, BrokerOpError> {
         self.store.session(session_id)?;
+        let path = normalize_lease_path(path)?;
         self.refresh_leases()?;
-        let blockers = self.lease_blockers(session_id, path, false)?;
+        let blockers = self.lease_blockers(session_id, &path, false)?;
         if !blockers.is_empty() {
             return Err(BrokerOpError::LeaseClaimConflict {
                 session_id,
-                path: path.to_string(),
+                path,
                 blocker_count: blockers.len(),
                 blockers,
             });
         }
-        self.store.claim_lease(session_id, path, ttl_ms)?;
+        self.store.claim_lease(session_id, &path, ttl_ms)?;
         Ok(LeaseClaimReport {
             session_id,
-            path: path.to_string(),
+            path,
             accepted: true,
             blockers: Vec::new(),
+        })
+    }
+
+    /// Inspect how proposed explicit lease claims intersect the current
+    /// active lease set. This deliberately does not refresh implicit
+    /// leases, touch expiries, or append events: it is a snapshot query.
+    pub fn plan_leases(
+        &self,
+        paths: &[String],
+        session_id: Option<i64>,
+    ) -> Result<LeasePlan, BrokerOpError> {
+        if let Some(session_id) = session_id {
+            self.store.session(session_id)?;
+        }
+
+        let mut normalized = paths
+            .iter()
+            .map(|path| normalize_lease_path(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        normalized.sort();
+        normalized.dedup();
+
+        let leases = self.store.active_leases()?;
+        let mut planned = Vec::with_capacity(normalized.len());
+        for path in normalized {
+            let mut owned = Vec::new();
+            let mut conflicts = Vec::new();
+            for lease in leases
+                .iter()
+                .filter(|lease| crate::leases::paths_overlap(&path, &lease.path))
+            {
+                let overlap = LeasePlanOverlap {
+                    relation: if path == lease.path {
+                        LeaseOverlapRelation::Exact
+                    } else {
+                        LeaseOverlapRelation::Directory
+                    },
+                    session_id: lease.session_id,
+                    path: lease.path.clone(),
+                    kind: lease.kind,
+                    expires_at: lease.expires_at,
+                };
+                if Some(lease.session_id) == session_id {
+                    owned.push(overlap);
+                } else {
+                    conflicts.push(overlap);
+                }
+            }
+            owned.sort_by(lease_plan_overlap_order);
+            conflicts.sort_by(lease_plan_overlap_order);
+            let would_conflict = !conflicts.is_empty();
+            planned.push(LeasePathPlan {
+                path,
+                owned,
+                conflicts,
+                would_conflict,
+            });
+        }
+
+        Ok(LeasePlan {
+            session_id,
+            would_conflict: planned.iter().any(|path| path.would_conflict),
+            paths: planned,
         })
     }
 

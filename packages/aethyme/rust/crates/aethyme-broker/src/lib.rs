@@ -46,13 +46,13 @@ pub use broker::{
     AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
     AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, AdoptOutcome, AdoptReport, AgentView,
     Broker, BrokerOpError, DoctorRepairStatus, DoctorReport, FinishReport, FinishStatus,
-    GuardedExecReport, IntegrationDeliveryState, IntegrationLiveSession,
-    IntegrationMovementNotice, IntegrationNextAction, IntegrationStabilityReport,
-    IntegrationStatusView, LeaseBlocker, LeaseClaimReport, OwnershipAuditReport,
-    PromotedConflict, PromotedIntegrationEntry, RepairAction, RepairGateSelection, RepairReport,
-    RepairSource, SemanticGateAdvice, SemanticGateSelection, SemanticGateSource,
-    SemanticGateSourceStatus, StatusAdvice, StatusAdviceSeverity, StatusIntegrationRelation,
-    StatusSummary, StatusView, VersionRepairReport,
+    GuardedExecReport, IntegrationDeliveryState, IntegrationLiveSession, IntegrationMovementNotice,
+    IntegrationNextAction, IntegrationStabilityReport, IntegrationStatusView, LeaseBlocker,
+    LeaseClaimReport, LeaseOverlapRelation, LeasePathPlan, LeasePlan, LeasePlanOverlap,
+    OwnershipAuditReport, PromotedConflict, PromotedIntegrationEntry, RepairAction,
+    RepairGateSelection, RepairReport, RepairSource, SemanticGateAdvice, SemanticGateSelection,
+    SemanticGateSource, SemanticGateSourceStatus, StatusAdvice, StatusAdviceSeverity,
+    StatusIntegrationRelation, StatusSummary, StatusView, VersionRepairReport,
 };
 pub use error::BrokerError;
 pub use gates::{

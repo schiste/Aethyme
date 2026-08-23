@@ -66,6 +66,10 @@ Usage:
       Refresh and list active leases plus current overlaps.
   aethyme broker leases claim <path> --session <id> [--ttl <seconds>] [--json]
       Explicitly claim a path (end it with / for a directory claim).
+  aethyme broker leases plan <paths...> [--session <id>] [--json]
+      Read-only preflight for proposed claims. Reports exact and directory
+      overlaps, current ownership, expiry, and whether each claim conflicts.
+      Does not create or refresh leases.
   aethyme broker leases release <path> --session <id> [--json]
       Release an explicit claim.
   aethyme broker exec --session <id> -- <command> [--json]
@@ -379,6 +383,7 @@ fn command_records_metric(args: &[String]) -> bool {
             effect != Some(crate::OperationEffect::Read)
         }
         Some("hooks") => args.get(1).map(String::as_str) != Some("status"),
+        Some("leases") => args.get(1).map(String::as_str) != Some("plan"),
         Some("events") => args.get(1).map(String::as_str) == Some("prune"),
         Some("gates") => !matches!(
             args.get(1).map(String::as_str),
@@ -400,6 +405,7 @@ mod tests {
         for command in [
             args(&["certify"]),
             args(&["hooks", "status"]),
+            args(&["leases", "plan", "src/lib.rs"]),
             args(&["queue"]),
             args(&["events"]),
             args(&["events", "--follow"]),
@@ -456,6 +462,33 @@ mod tests {
                 "stateful command should record telemetry: {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_accepts_read_only_lease_plan_with_multiple_paths() {
+        let parsed = match super::parse(&args(&[
+            "leases",
+            "plan",
+            "src/lib.rs",
+            "docs/",
+            "--session",
+            "7",
+            "--json",
+        ])) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("lease plan should parse"),
+        };
+        assert_eq!(
+            parsed.positional,
+            vec!["leases", "plan", "src/lib.rs", "docs/"]
+        );
+        assert_eq!(parsed.session, Some(7));
+        assert!(parsed.json);
+        assert!(!super::command_records_metric(&args(&[
+            "leases",
+            "plan",
+            "src/lib.rs"
+        ])));
     }
 
     #[test]
@@ -994,6 +1027,47 @@ fn render_hook_reports(reports: &[crate::HookReport], json: bool) -> Result<(), 
                 report.state.as_str(),
                 report.path
             );
+        }
+    }
+    Ok(())
+}
+
+fn render_lease_plan(report: &crate::LeasePlan, json: bool) -> Result<(), UsageError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    for path in &report.paths {
+        println!(
+            "{} — {}",
+            path.path,
+            if path.would_conflict {
+                "would conflict"
+            } else {
+                "clear"
+            }
+        );
+        for (label, overlaps) in [("owned", &path.owned), ("conflict", &path.conflicts)] {
+            for overlap in overlaps {
+                println!(
+                    "  {label:<8} {:<9} session {:<4} {:<9} {} (expires {})",
+                    match overlap.relation {
+                        crate::LeaseOverlapRelation::Exact => "exact",
+                        crate::LeaseOverlapRelation::Directory => "directory",
+                    },
+                    overlap.session_id,
+                    overlap.kind.as_str(),
+                    overlap.path,
+                    overlap
+                        .expires_at
+                        .map(|expiry| expiry.to_string())
+                        .unwrap_or_else(|| "never".to_string()),
+                );
+            }
+        }
+        if path.owned.is_empty() && path.conflicts.is_empty() {
+            println!("  no active overlaps");
         }
     }
     Ok(())
@@ -1931,6 +2005,16 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         println!("Session {session} claimed {path}.");
                     }
                 }
+                Some("plan") => {
+                    let paths = parsed.positional.get(1..).unwrap_or_default();
+                    if paths.is_empty() {
+                        return Err(UsageError::Message(
+                            "plan requires at least one path".into(),
+                        ));
+                    }
+                    let report = broker.plan_leases(paths, parsed.session)?;
+                    render_lease_plan(&report, parsed.json)?;
+                }
                 Some("release") => {
                     let path = parsed
                         .positional
@@ -1948,7 +2032,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 }
                 Some(other) => {
                     return Err(UsageError::Message(format!(
-                        "unknown leases action {other:?} — expected claim or release"
+                        "unknown leases action {other:?} — expected claim, plan, or release"
                     )));
                 }
             }

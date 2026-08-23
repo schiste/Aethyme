@@ -99,6 +99,7 @@ The broker is the stable product front door for multi-agent coordination:
 - `aethyme broker hooks install [--json]`
 - `aethyme broker hooks uninstall [--json]`
 - `aethyme broker hooks status [--json]`
+- `aethyme broker leases plan <paths...> [--session <id>] [--json]`
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
 - `aethyme broker repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
@@ -132,6 +133,15 @@ silent when they pass. If a gate fails, the hook replays its complete standard
 output and error, prints the broker diagnosis, returns the gate's non-zero exit
 code, and blocks the commit. The one-shot Git escape hatch remains
 `git commit --no-verify`.
+
+`broker leases plan` is a read-only preflight for files or trailing-slash
+directory claims. It reports exact and directory overlaps with each active
+lease's owning session, implicit or explicit kind, and expiry. Supplying
+`--session` separates leases already owned by that session from foreign
+conflicts; without it, every overlap is a potential conflict. Planning neither
+claims nor refreshes leases and does not append broker events or command
+telemetry. Paths are sorted deterministically and must be unambiguous,
+repository-relative spellings without `.` or `..` components.
 
 Promotion only advances the local integration ref. Use `broker ship plan` to
 inspect the promoted queue entry, exact integration SHA, remote freshness,

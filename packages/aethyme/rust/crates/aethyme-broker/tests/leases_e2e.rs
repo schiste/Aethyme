@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::{Broker, BrokerOpError};
+use aethyme_broker::{Broker, BrokerOpError, LeaseOverlapRelation};
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -164,6 +164,166 @@ fn explicit_claim_blocks_paths_owned_by_another_live_session() {
         }
     ));
     assert!(err.to_string().contains("overlaps 1 active lease"));
+}
+
+#[test]
+fn lease_plan_reports_all_overlap_shapes_and_never_mutates_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let wt_a = add_worktree(tmp.path(), "planner");
+    let wt_b = add_worktree(tmp.path(), "owner");
+    let session_a = broker.adopt(&wt_a, None).unwrap();
+    let session_b = broker.adopt(&wt_b, None).unwrap();
+    broker
+        .store()
+        .claim_lease(session_a.id, "src/auth.py", None)
+        .unwrap();
+    broker
+        .store()
+        .set_implicit_leases(session_b.id, &["src/auth.py".into()])
+        .unwrap();
+    broker
+        .store()
+        .claim_lease(session_b.id, "src/", Some(60_000))
+        .unwrap();
+    broker
+        .store()
+        .claim_lease(session_b.id, "docs/api/", None)
+        .unwrap();
+    broker
+        .store()
+        .claim_lease(session_b.id, "expired.py", Some(-1))
+        .unwrap();
+
+    let leases_before = serde_json::to_value(broker.store().active_leases().unwrap()).unwrap();
+    let events_before =
+        serde_json::to_value(broker.store().events_after(0, i64::MAX).unwrap()).unwrap();
+    let report = broker
+        .plan_leases(
+            &[
+                "src/new.py".into(),
+                "src/auth.py".into(),
+                "src/".into(),
+                "docs/".into(),
+                "clear.txt".into(),
+                "expired.py".into(),
+            ],
+            Some(session_a.id),
+        )
+        .unwrap();
+
+    assert_eq!(
+        report
+            .paths
+            .iter()
+            .map(|path| path.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "clear.txt",
+            "docs/",
+            "expired.py",
+            "src/",
+            "src/auth.py",
+            "src/new.py"
+        ]
+    );
+    assert!(report.would_conflict);
+    let auth = report
+        .paths
+        .iter()
+        .find(|path| path.path == "src/auth.py")
+        .unwrap();
+    assert_eq!(auth.owned.len(), 1);
+    assert_eq!(auth.owned[0].session_id, session_a.id);
+    assert_eq!(auth.owned[0].relation, LeaseOverlapRelation::Exact);
+    assert_eq!(auth.conflicts.len(), 2);
+    assert!(
+        auth.conflicts
+            .iter()
+            .any(|lease| lease.relation == LeaseOverlapRelation::Exact)
+    );
+    assert!(
+        auth.conflicts
+            .iter()
+            .any(|lease| lease.relation == LeaseOverlapRelation::Directory)
+    );
+
+    let directory = report
+        .paths
+        .iter()
+        .find(|path| path.path == "src/")
+        .unwrap();
+    assert!(
+        directory
+            .owned
+            .iter()
+            .any(|lease| lease.path == "src/auth.py")
+    );
+    assert!(
+        directory
+            .conflicts
+            .iter()
+            .any(|lease| lease.path == "src/auth.py")
+    );
+    let nested_directories = report
+        .paths
+        .iter()
+        .find(|path| path.path == "docs/")
+        .unwrap();
+    assert_eq!(nested_directories.conflicts.len(), 1);
+    assert_eq!(
+        nested_directories.conflicts[0].relation,
+        LeaseOverlapRelation::Directory
+    );
+    for clear in ["clear.txt", "expired.py"] {
+        let path = report.paths.iter().find(|path| path.path == clear).unwrap();
+        assert!(!path.would_conflict);
+        assert!(path.owned.is_empty());
+        assert!(path.conflicts.is_empty());
+    }
+
+    let anonymous = broker.plan_leases(&["src/auth.py".into()], None).unwrap();
+    assert!(anonymous.paths[0].owned.is_empty());
+    assert_eq!(anonymous.paths[0].conflicts.len(), 3);
+    assert!(anonymous.paths[0].would_conflict);
+
+    assert_eq!(
+        serde_json::to_value(broker.store().active_leases().unwrap()).unwrap(),
+        leases_before,
+        "planning must not claim or refresh leases"
+    );
+    assert_eq!(
+        serde_json::to_value(broker.store().events_after(0, i64::MAX).unwrap()).unwrap(),
+        events_before,
+        "planning must not append events"
+    );
+}
+
+#[test]
+fn lease_plan_and_claim_share_strict_repo_relative_path_validation() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), None).unwrap();
+
+    for path in [
+        "",
+        "/absolute",
+        "../outside",
+        "src/../file",
+        "./src/file",
+        "src//file",
+    ] {
+        let plan_error = broker.plan_leases(&[path.into()], None).unwrap_err();
+        let claim_error = broker.claim_lease(session.id, path, None).unwrap_err();
+        assert!(
+            matches!(plan_error, BrokerOpError::InvalidLeasePath { .. }),
+            "plan accepted {path:?}: {plan_error}"
+        );
+        assert_eq!(plan_error.to_string(), claim_error.to_string());
+    }
 }
 
 #[test]

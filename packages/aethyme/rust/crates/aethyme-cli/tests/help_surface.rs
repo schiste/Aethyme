@@ -14,7 +14,7 @@ fn top_level_help_names_the_normal_broker_lifecycle() {
         "broker submit --session <id>",
         "broker status",
         "broker finish --session <id>",
-        "broker leases [claim|release]",
+        "broker leases [claim|plan|release]",
         "broker git|gh --session <id>",
         "broker operations",
     ] {
