@@ -63,3 +63,25 @@ fn production_crates_and_binaries_share_the_release_version() {
         assert!(engine.contains(&format!("({tag})")), "{engine}");
     }
 }
+
+#[test]
+fn release_workflow_smokes_the_installed_archive_contract() {
+    let workflow = std::fs::read_to_string(
+        aethyme_testkit::paths::repo_root().join(".github/workflows/release.yml"),
+    )
+    .unwrap();
+    let smoke = workflow
+        .split("- name: Smoke installed archive")
+        .nth(1)
+        .and_then(|tail| tail.split("- name: Upload artifact").next())
+        .expect("release workflow must smoke each matrix archive before upload");
+
+    for command in [
+        "tar -xzf",
+        "\"$smoke_root/aethyme\" --version",
+        "\"$smoke_root/aethyme-engine-cli\" --version",
+        "\"$smoke_root/aethyme\" broker quick-test",
+    ] {
+        assert!(smoke.contains(command), "smoke step is missing {command}");
+    }
+}

@@ -62,6 +62,17 @@ jobs:
           tar -C target/release -czf "aethyme-${REF_NAME}-${{ matrix.target }}.tar.gz" \
             aethyme aethyme-engine-cli
 
+      - name: Smoke installed archive
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          smoke_root="$(mktemp -d)"
+          trap 'rm -rf "$smoke_root"' EXIT
+          tar -xzf "aethyme-${REF_NAME}-${{ matrix.target }}.tar.gz" -C "$smoke_root"
+          "$smoke_root/aethyme" --version
+          "$smoke_root/aethyme-engine-cli" --version
+          "$smoke_root/aethyme" broker quick-test
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
