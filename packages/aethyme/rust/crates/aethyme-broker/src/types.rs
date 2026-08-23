@@ -38,6 +38,13 @@ macro_rules! text_enum {
                 s.serialize_str(self.as_str())
             }
         }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let value = <String as serde::Deserialize>::deserialize(d)?;
+                Self::parse(&value).map_err(serde::de::Error::custom)
+            }
+        }
     };
 }
 

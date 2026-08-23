@@ -13,9 +13,9 @@ use std::process::Command;
 
 use aethyme_broker::{
     Broker, EVENTS_SCHEMA_VERSION, Event, FinishDelivery, FinishGateCacheSource, FinishGateRun,
-    FinishLease, FinishLeaseState, FinishPendingWork, FinishReport, FinishStatus, GateStatus,
-    LeaseKind, MergeStatus, OperationEffect, OperationProvider, OperationStatus, Overlap,
-    SessionStatus, events,
+    FinishHandoff, FinishLease, FinishLeaseState, FinishPendingWork, FinishReport, FinishStatus,
+    GateStatus, LeaseKind, MergeStatus, OperationEffect, OperationProvider, OperationStatus,
+    Overlap, SessionStatus, events,
 };
 
 /// The complete v1 kind catalog. Additions append here (additive change);
@@ -268,6 +268,10 @@ fn v1_constructor_payload_field_names_are_frozen() {
     assert!(!finished_payload.contains("secret summary"));
     assert!(!finished_payload.contains("secret warning"));
     assert!(!finished_payload.contains("secret command"));
+    let mut additive = finished.clone();
+    additive["future_additive_field"] = serde_json::json!({ "ignored": true });
+    let parsed: FinishHandoff = serde_json::from_value(additive).unwrap();
+    assert_eq!(parsed.session_id, finish.session_id);
     assert_keys(
         &events::lease_path_payload("p"),
         &["path"],

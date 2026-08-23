@@ -47,6 +47,7 @@ aethyme broker operations
 aethyme broker submit --session <id>
 aethyme broker repair --session <id>
 aethyme broker finish --session <id>
+aethyme broker handoff --session <id>
 aethyme broker integration status
 ```
 
@@ -96,6 +97,7 @@ These commands are the public product path and should stay easy to explain:
 - `aethyme broker submit`
 - `aethyme broker repair`
 - `aethyme broker finish`
+- `aethyme broker handoff`
 - `aethyme broker integration status`
 - `aethyme broker quick-test`
 - `aethyme broker verify-loop`
