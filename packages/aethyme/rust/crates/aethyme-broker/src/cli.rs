@@ -1720,11 +1720,20 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                let verb = if parsed.reuse { "Reusing" } else { "Adopted" };
-                println!(
-                    "{verb} session {} — worktree {} on branch {}",
-                    session.id, session.worktree_path, session.branch
-                );
+                match report.outcome {
+                    crate::AdoptOutcome::Created => println!(
+                        "Created session {} on the existing worktree — {} on branch {}",
+                        session.id, session.worktree_path, session.branch
+                    ),
+                    crate::AdoptOutcome::Reused => println!(
+                        "Reusing session {} — worktree {} on branch {}",
+                        session.id, session.worktree_path, session.branch
+                    ),
+                    crate::AdoptOutcome::Replaced => println!(
+                        "Replaced the prior session with session {} on the existing worktree — {} on branch {}",
+                        session.id, session.worktree_path, session.branch
+                    ),
+                }
                 if std::path::Path::new(&session.worktree_path) == broker.main_root() {
                     println!(
                         "note: main-checkout session — verification is advisory here \
