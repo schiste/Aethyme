@@ -93,17 +93,19 @@ Usage:
       Advisory semantic gate-selection report: shows enforced path-triggered
       gates plus caller-edge suggestion status. Never changes what submit,
       CI, or gates run execute.
-  aethyme broker gates run --session <id> [--json]
+  aethyme broker gates run --session <id> [--no-cache] [--json]
       Run affected gates cheap-first with tree-hash caching; cancels this
       session's obsolete in-flight runs; stops at first failure. Text
       abbreviates each proven tree hash; JSON includes the full hash.
-  aethyme broker gates run --all [--json]
+      --no-cache executes fresh, then stores the new result normally.
+  aethyme broker gates run --all [--no-cache] [--json]
       Run EVERY gate in cost order against the current worktree — no
       diff selection, no session. Same runner, streaming, and tree-hash
       result cache as session runs; stops at first failure and exits
       non-zero if any gate does not pass. The CI entrypoint: gates.toml
       is the single definition of verified for CI and broker alike. Text
       abbreviates each proven tree hash; JSON includes the full hash.
+      --no-cache executes fresh, then stores the new result normally.
   aethyme broker hooks install [--json]
       Explicitly install the two managed git hooks into the shared
       <git-common-dir>/hooks (all worktrees see them): pre-commit runs
@@ -128,7 +130,7 @@ Usage:
       activity prepares a Push2prod prompt. With --dispatch, the broker
       attaches that prompt to an existing matching session when possible
       or spawns a Codex agent command.
-  aethyme broker submit --session <id> [--json]
+  aethyme broker submit --session <id> [--no-cache] [--json]
       Submit the session's head commit: simulate the merge onto the local
       integration branch, run affected gates on the merged tree, and
       promote when verified (default; set [promote] mode = 'manual' to
@@ -138,6 +140,8 @@ Usage:
       whole session head only; --path/--commit scoping is intentionally
       out of scope while worktree identity is the coordination unit.
       Executed and cached gate results identify the proven tree hash.
+      --no-cache bypasses merged-tree cache lookup for this submission,
+      but stores each fresh result for later normal reuse.
   aethyme broker repair --session <id> [--json]
       One-command recovery for a blocked session: apply the documented
       local rebase path for the latest submit conflict, or rebase onto
@@ -293,6 +297,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "execute",
         "sync-main",
         "sync-integration",
+        "no-cache",
         "integration",
         "status",
         "events",
@@ -699,6 +704,7 @@ struct Parsed {
     destructive: bool,
     sync_main: bool,
     sync_integration: bool,
+    no_cache: bool,
     exec_command: Vec<String>,
 }
 
@@ -742,6 +748,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         destructive: false,
         sync_main: false,
         sync_integration: false,
+        no_cache: false,
         exec_command: Vec::new(),
     };
     let mut iter = args.iter();
@@ -774,6 +781,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--destructive" => parsed.destructive = true,
             "--sync-main" => parsed.sync_main = true,
             "--sync-integration" => parsed.sync_integration = true,
+            "--no-cache" => parsed.no_cache = true,
             "--replace-stale" => parsed.replace_stale = true,
             "--kind" => {
                 parsed.kind = Some(
@@ -2184,7 +2192,14 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     let cwd = std::env::current_dir()
                         .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
                     let mut broker = open_broker()?;
-                    let outcomes = broker.run_all_gates(&cwd)?;
+                    let outcomes = broker.run_all_gates_with_policy(
+                        &cwd,
+                        if parsed.no_cache {
+                            crate::CachePolicy::Bypass
+                        } else {
+                            crate::CachePolicy::Use
+                        },
+                    )?;
                     if parsed.json {
                         println!("{}", serde_json::to_string_pretty(&outcomes)?);
                     } else {
@@ -2216,7 +2231,14 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         "gates run requires --session <id> (or --all)".into(),
                     ))?;
                     let mut broker = open_broker()?;
-                    let outcomes = broker.run_gates(session)?;
+                    let outcomes = broker.run_gates_with_policy(
+                        session,
+                        if parsed.no_cache {
+                            crate::CachePolicy::Bypass
+                        } else {
+                            crate::CachePolicy::Use
+                        },
+                    )?;
                     if parsed.json {
                         println!("{}", serde_json::to_string_pretty(&outcomes)?);
                     } else if outcomes.is_empty() {
@@ -2370,7 +2392,14 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     );
                 }
             }
-            let outcome = broker.submit(session)?;
+            let outcome = broker.submit_with_policy(
+                session,
+                if parsed.no_cache {
+                    crate::CachePolicy::Bypass
+                } else {
+                    crate::CachePolicy::Use
+                },
+            )?;
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
             } else if !outcome.conflicts.is_empty() {

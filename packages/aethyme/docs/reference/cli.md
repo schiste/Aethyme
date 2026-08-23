@@ -94,9 +94,9 @@ The broker is the stable product front door for multi-agent coordination:
 - `aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <gh-args>`
 - `aethyme broker operations [--json]`
 - `aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]`
-- `aethyme broker gates run --session <id> [--json]`
-- `aethyme broker gates run --all [--json]`
-- `aethyme broker submit --session <id> [--json]`
+- `aethyme broker gates run --session <id> [--no-cache] [--json]`
+- `aethyme broker gates run --all [--no-cache] [--json]`
+- `aethyme broker submit --session <id> [--no-cache] [--json]`
 - `aethyme broker repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
 - `aethyme broker ship plan --entry <id> [--json]`
@@ -119,6 +119,9 @@ dirty or diverged worktrees are left unchanged.
 Gate-run and submit outcomes identify the exact Git tree each result proves.
 Human-readable output abbreviates the tree hash to 12 characters; JSON retains
 the full hash in `tree_hash` for both executed and cached results.
+Pass `--no-cache` to either gate-run form or submit to require fresh gate
+execution. Bypass skips cache lookup only: the fresh result is stored normally
+and is available to a subsequent run using the default cache policy.
 
 Promotion only advances the local integration ref. Use `broker ship plan` to
 inspect the promoted queue entry, exact integration SHA, remote freshness,
