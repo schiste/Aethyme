@@ -179,6 +179,8 @@ pub fn select_gates<'g>(gates: &'g [Gate], changed: &[String]) -> Vec<Selection<
 #[derive(Debug, serde::Serialize)]
 pub struct GateRunOutcome {
     pub gate: String,
+    /// Full Git tree object id proven by this result.
+    pub tree_hash: String,
     pub status: GateStatus,
     pub failure_class: Option<GateFailureClass>,
     pub cached: bool,
@@ -502,9 +504,10 @@ fn run_selections(
         {
             let saved_ms = hit.duration_ms.unwrap_or(0);
             progress.report(&format!(
-                "gate {} cached ({}, saved {}ms)",
+                "gate {} cached ({}, tree {}, saved {}ms)",
                 gate.name,
                 hit.status.as_str(),
+                short_tree_hash(&tree),
                 saved_ms
             ));
             let _ = store.append_event(
@@ -521,6 +524,7 @@ fn run_selections(
             let failed = hit.status == GateStatus::Fail;
             outcomes.push(GateRunOutcome {
                 gate: gate.name.clone(),
+                tree_hash: tree.clone(),
                 status: hit.status,
                 failure_class: cached_failure_class(hit.status),
                 cached: true,
@@ -547,7 +551,12 @@ fn run_selections(
             &tree[..8.min(tree.len())],
             worker_id
         ));
-        progress.report(&format!("gate {} started (cost {})", gate.name, gate.cost));
+        progress.report(&format!(
+            "gate {} started (cost {}, tree {})",
+            gate.name,
+            gate.cost,
+            short_tree_hash(&tree)
+        ));
         let started = Instant::now();
         let status = run_gate_command(
             &gate.command,
@@ -569,10 +578,11 @@ fn run_selections(
         let (gate_status, failure_class, exit_code) =
             classify_gate_result(&gate.command, &log_path, status);
         progress.report(&format!(
-            "gate {} {} in {}s",
+            "gate {} {} in {}s (tree {})",
             gate.name,
             gate_status.as_str(),
-            started.elapsed().as_secs()
+            started.elapsed().as_secs(),
+            short_tree_hash(&tree)
         ));
         store.record_gate_result(&NewGateResult {
             gate_name: gate.name.clone(),
@@ -587,6 +597,7 @@ fn run_selections(
         let failed = gate_status != GateStatus::Pass;
         outcomes.push(GateRunOutcome {
             gate: gate.name.clone(),
+            tree_hash: tree.clone(),
             status: gate_status,
             failure_class,
             cached: false,
@@ -599,6 +610,10 @@ fn run_selections(
         }
     }
     Ok(outcomes)
+}
+
+fn short_tree_hash(tree_hash: &str) -> &str {
+    &tree_hash[..12.min(tree_hash.len())]
 }
 
 fn classify_gate_result(

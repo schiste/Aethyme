@@ -397,7 +397,7 @@ fn merge_lifecycle_payload_field_names_are_frozen_on_the_wire() {
         for gate in gates {
             assert_keys(
                 &gate.to_string(),
-                &["cached", "failure_class", "gate", "status"],
+                &["cached", "failure_class", "gate", "status", "tree_hash"],
                 &format!("{kind} gates[] element"),
             );
         }
