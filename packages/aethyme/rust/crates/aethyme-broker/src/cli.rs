@@ -148,9 +148,10 @@ Usage:
       Read-only publication plan for a promoted entry: resolve the exact
       integration tip, local and remote default-branch SHAs, freshness,
       proposed push, and whether synchronizing local main is currently safe.
-  aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--json]
+  aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--json]
       Fetch and revalidate the planned remote base, publish the exact confirmed
       integration SHA with a non-force push, then verify the remote default ref.
+      --sync-main additionally fast-forwards a clean, unchanged primary checkout.
   aethyme broker integration status [--json]
       Focused promoted-but-unmerged view: the local integration branch as
       a pending layer above main, with promoted entries, files changed,
@@ -284,6 +285,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "ship",
         "plan",
         "execute",
+        "sync-main",
         "integration",
         "status",
         "events",
@@ -462,6 +464,7 @@ mod tests {
             "42",
             "--confirm",
             &sha,
+            "--sync-main",
         ])) {
             Ok(parsed) => parsed,
             Err(_) => panic!("ship execute should parse"),
@@ -469,6 +472,7 @@ mod tests {
         assert_eq!(parsed.positional, vec!["ship", "execute"]);
         assert_eq!(parsed.entry, Some(42));
         assert_eq!(parsed.confirm.as_deref(), Some(sha.as_str()));
+        assert!(parsed.sync_main);
         assert!(super::command_records_metric(&args(&[
             "ship",
             "execute",
@@ -686,6 +690,7 @@ struct Parsed {
     apply: bool,
     dry_run: bool,
     destructive: bool,
+    sync_main: bool,
     exec_command: Vec<String>,
 }
 
@@ -727,6 +732,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         apply: false,
         dry_run: false,
         destructive: false,
+        sync_main: false,
         exec_command: Vec::new(),
     };
     let mut iter = args.iter();
@@ -757,6 +763,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--apply" => parsed.apply = true,
             "--dry-run" => parsed.dry_run = true,
             "--destructive" => parsed.destructive = true,
+            "--sync-main" => parsed.sync_main = true,
             "--replace-stale" => parsed.replace_stale = true,
             "--kind" => {
                 parsed.kind = Some(
@@ -1521,6 +1528,15 @@ fn render_ship_execution(
         "Operations: fetch {}, push {}, verify {}",
         report.fetch_operation.id, report.push_operation.id, report.verify_operation.id
     );
+    if report.local_main_sync.synchronized {
+        println!(
+            "Local main synchronized: {} -> {}",
+            report.local_main_sync.before_sha, report.local_main_sync.after_sha
+        );
+    } else if let Some(command) = &report.local_main_sync.follow_up_command {
+        println!("Local main unchanged. To synchronize it explicitly:");
+        println!("  {command}");
+    }
     Ok(())
 }
 
@@ -2438,7 +2454,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         "ship execute requires --confirm <full-integration-sha>".into(),
                     ))?;
                     let mut broker = open_broker()?;
-                    let report = broker.ship_execute(entry, confirm)?;
+                    let report = broker.ship_execute_with_sync(entry, confirm, parsed.sync_main)?;
                     render_ship_execution(&report, parsed.json)?;
                 }
                 other => {

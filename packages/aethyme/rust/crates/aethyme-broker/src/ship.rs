@@ -65,6 +65,19 @@ pub struct ShipExecutionReport {
     pub verify_operation: CoordinatedOperation,
     pub published_sha: String,
     pub verified_remote_sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_operation: Option<CoordinatedOperation>,
+    pub local_main_sync: ShipLocalMainSync,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ShipLocalMainSync {
+    pub requested: bool,
+    pub synchronized: bool,
+    pub before_sha: String,
+    pub after_sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow_up_command: Option<String>,
 }
 
 impl Broker {
@@ -174,7 +187,6 @@ impl Broker {
         let local_main_sync_safe = current_branch == default_branch
             && self.repo_handle().head_commit()? == local_default_branch_sha
             && !self.repo_handle().is_dirty()?
-            && local_default_branch_sha == remote_default.sha
             && self
                 .repo_handle()
                 .is_ancestor(&local_default_branch_sha, &integration_sha);
@@ -212,6 +224,15 @@ impl Broker {
         entry_id: i64,
         confirm: &str,
     ) -> Result<ShipExecutionReport, BrokerOpError> {
+        self.ship_execute_with_sync(entry_id, confirm, false)
+    }
+
+    pub fn ship_execute_with_sync(
+        &mut self,
+        entry_id: i64,
+        confirm: &str,
+        sync_main: bool,
+    ) -> Result<ShipExecutionReport, BrokerOpError> {
         if confirm.len() != 40
             || !confirm
                 .chars()
@@ -225,6 +246,10 @@ impl Broker {
                 expected: plan.integration_sha,
                 actual: confirm.into(),
             });
+        }
+        if sync_main {
+            validate_local_main_sync(self, &plan, confirm)
+                .map_err(|reason| BrokerOpError::ShipLocalMainUnsafe { reason })?;
         }
         let planned_base = plan.planned_remote_base_sha.clone().ok_or_else(|| {
             BrokerOpError::ShipRemoteBaseUnavailable {
@@ -374,6 +399,84 @@ impl Broker {
             });
         }
 
+        let before_sha = plan.local_default_branch_sha.clone();
+        let (sync_operation, local_main_sync) = if sync_main {
+            validate_local_main_sync(self, &plan, confirm).map_err(|reason| {
+                BrokerOpError::ShipLocalMainMovedAfterPublish {
+                    published_sha: confirm.into(),
+                    reason,
+                }
+            })?;
+            let sync = self.run_coordinated_operation_at(
+                CoordinatedCommand {
+                    session_id: plan.originating_session.id,
+                    provider: OperationProvider::Git,
+                    repository: None,
+                    scope: Some(format!("ship:sync:{}", plan.local_default_branch_ref)),
+                    declared_effect: None,
+                    destructive_confirmed: false,
+                    authorization_reason: Some(format!(
+                        "explicit --sync-main after publishing queue entry {} at {confirm}",
+                        plan.queue_entry.id
+                    )),
+                    args: vec!["merge".into(), "--ff-only".into(), confirm.into()],
+                },
+                &main_root,
+            )?;
+            if !sync.ok() {
+                return Err(BrokerOpError::ShipOperationFailed {
+                    phase: "local-main synchronization",
+                    operation_id: sync.operation.id,
+                    status: sync.operation.status.as_str(),
+                });
+            }
+            let after_sha = self.repo_handle().head_commit()?;
+            if after_sha != confirm {
+                self.store().transition_coordinated_operation(
+                    sync.operation.id,
+                    crate::OperationStatus::Failed,
+                    Some(1),
+                    Some(
+                        &serde_json::json!({
+                            "reason": "local_main_verification_mismatch",
+                            "expected": confirm,
+                            "actual": after_sha,
+                        })
+                        .to_string(),
+                    ),
+                )?;
+                return Err(BrokerOpError::ShipLocalMainMovedAfterPublish {
+                    published_sha: confirm.into(),
+                    reason: format!("expected local main {confirm}, observed {after_sha}"),
+                });
+            }
+            (
+                Some(sync.operation),
+                ShipLocalMainSync {
+                    requested: true,
+                    synchronized: true,
+                    before_sha,
+                    after_sha,
+                    follow_up_command: None,
+                },
+            )
+        } else {
+            let after_sha = self.repo_handle().head_commit()?;
+            (
+                None,
+                ShipLocalMainSync {
+                    requested: false,
+                    synchronized: false,
+                    before_sha,
+                    after_sha,
+                    follow_up_command: Some(format!(
+                        "aethyme broker ship execute --entry {} --confirm {} --sync-main",
+                        plan.queue_entry.id, confirm
+                    )),
+                },
+            )
+        };
+
         Ok(ShipExecutionReport {
             plan,
             fetch_operation: fetch.operation,
@@ -381,8 +484,54 @@ impl Broker {
             verify_operation: verify.operation,
             published_sha: confirm.into(),
             verified_remote_sha,
+            sync_operation,
+            local_main_sync,
         })
     }
+}
+
+fn validate_local_main_sync(broker: &Broker, plan: &ShipPlan, confirm: &str) -> Result<(), String> {
+    let default_branch = plan
+        .local_default_branch_ref
+        .strip_prefix("refs/heads/")
+        .unwrap_or(&plan.local_default_branch_ref);
+    let current_branch = broker
+        .repo_handle()
+        .current_branch()
+        .map_err(|error| error.to_string())?;
+    if current_branch != default_branch {
+        return Err(format!(
+            "primary checkout is on {current_branch}, expected {default_branch}"
+        ));
+    }
+    if broker
+        .repo_handle()
+        .is_dirty()
+        .map_err(|error| error.to_string())?
+    {
+        return Err("primary default-branch checkout is dirty".into());
+    }
+    let current_head = broker
+        .repo_handle()
+        .head_commit()
+        .map_err(|error| error.to_string())?;
+    let current_ref = broker
+        .repo_handle()
+        .resolve_ref(&plan.local_default_branch_ref)
+        .ok_or_else(|| format!("{} no longer resolves", plan.local_default_branch_ref))?;
+    if current_head != plan.local_default_branch_sha || current_ref != plan.local_default_branch_sha
+    {
+        return Err(format!(
+            "local main moved since planning: expected {}, observed HEAD {} and ref {}",
+            plan.local_default_branch_sha, current_head, current_ref
+        ));
+    }
+    if !broker.repo_handle().is_ancestor(&current_head, confirm) {
+        return Err(format!(
+            "local main {current_head} has diverged from confirmed integration {confirm}"
+        ));
+    }
+    Ok(())
 }
 
 fn tracking_ref(plan: &ShipPlan) -> String {

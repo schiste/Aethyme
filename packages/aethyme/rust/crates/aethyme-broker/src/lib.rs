@@ -79,7 +79,7 @@ pub use reconciliation::{
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use ship::{
-    ShipExecutionReport, ShipFreshness, ShipFreshnessResult, ShipPlan, ShipPush,
+    ShipExecutionReport, ShipFreshness, ShipFreshnessResult, ShipLocalMainSync, ShipPlan, ShipPush,
 };
 pub use store::BrokerStore;
 pub use types::{

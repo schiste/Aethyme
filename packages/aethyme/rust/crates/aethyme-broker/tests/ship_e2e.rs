@@ -198,6 +198,124 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
     assert_eq!(report.push_operation.status, OperationStatus::Succeeded);
     assert_eq!(report.verify_operation.status, OperationStatus::Succeeded);
     assert!(!report.push_operation.command_json.contains("--force"));
+    assert!(!report.local_main_sync.requested);
+    assert!(!report.local_main_sync.synchronized);
+    assert_eq!(report.local_main_sync.before_sha, main_before);
+    assert_eq!(report.local_main_sync.after_sha, main_before);
+    let follow_up = format!(
+        "aethyme broker ship execute --entry {entry_id} --confirm {integration} --sync-main"
+    );
+    assert_eq!(
+        report.local_main_sync.follow_up_command.as_deref(),
+        Some(follow_up.as_str())
+    );
+}
+
+#[test]
+fn ship_execute_sync_main_fast_forwards_a_clean_primary_checkout() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    let main_before = git_output(&fixture.repo, &["rev-parse", "main"]);
+    let mut broker = Broker::open(&fixture.repo).unwrap();
+
+    let report = broker
+        .ship_execute_with_sync(entry_id, &integration, true)
+        .unwrap();
+
+    assert_eq!(fixture.remote_main(), integration);
+    assert_eq!(
+        git_output(&fixture.repo, &["rev-parse", "main"]),
+        integration
+    );
+    assert_eq!(
+        git_output(&fixture.repo, &["rev-parse", "HEAD"]),
+        integration
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo.join("feature.txt")).unwrap(),
+        "verified\n"
+    );
+    assert!(report.local_main_sync.requested);
+    assert!(report.local_main_sync.synchronized);
+    assert_eq!(report.local_main_sync.before_sha, main_before);
+    assert_eq!(report.local_main_sync.after_sha, integration);
+    assert!(report.local_main_sync.follow_up_command.is_none());
+    assert_eq!(
+        report.sync_operation.as_ref().unwrap().status,
+        OperationStatus::Succeeded
+    );
+}
+
+#[test]
+fn ship_execute_sync_main_refuses_a_dirty_primary_checkout_before_publish() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    let remote_before = fixture.remote_main();
+    std::fs::write(fixture.repo.join("dirty.txt"), "wip\n").unwrap();
+    let mut broker = Broker::open(&fixture.repo).unwrap();
+
+    let error = broker
+        .ship_execute_with_sync(entry_id, &integration, true)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        BrokerOpError::ShipLocalMainUnsafe { reason } if reason.contains("dirty")
+    ));
+    assert_eq!(fixture.remote_main(), remote_before);
+    assert!(broker.store().coordinated_operations().unwrap().is_empty());
+}
+
+#[test]
+fn ship_execute_sync_main_refuses_a_diverged_primary_checkout_before_publish() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    let remote_before = fixture.remote_main();
+    std::fs::write(fixture.repo.join("main-only.txt"), "diverged\n").unwrap();
+    git(&fixture.repo, &["add", "main-only.txt"]);
+    git(&fixture.repo, &["commit", "-qm", "main diverges"]);
+    let mut broker = Broker::open(&fixture.repo).unwrap();
+
+    let error = broker
+        .ship_execute_with_sync(entry_id, &integration, true)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        BrokerOpError::ShipLocalMainUnsafe { reason } if reason.contains("diverged")
+    ));
+    assert_eq!(fixture.remote_main(), remote_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn ship_execute_sync_main_rechecks_for_local_movement_after_publish() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    let main_before = git_output(&fixture.repo, &["rev-parse", "main"]);
+    let tree = git_output(&fixture.repo, &["rev-parse", "main^{tree}"]);
+    let moved = git_output(
+        &fixture.repo,
+        &["commit-tree", &tree, "-p", &main_before, "-m", "move main"],
+    );
+    fixture.install_hook(
+        "post-receive",
+        &format!(
+            "#!/bin/sh\nunset GIT_DIR\ngit -C {} update-ref refs/heads/main {}\n",
+            fixture.repo.display(),
+            moved
+        ),
+    );
+    let mut broker = Broker::open(&fixture.repo).unwrap();
+
+    let error = broker
+        .ship_execute_with_sync(entry_id, &integration, true)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        BrokerOpError::ShipLocalMainMovedAfterPublish { published_sha, reason }
+            if published_sha == integration && reason.contains("moved since planning")
+    ));
+    assert_eq!(fixture.remote_main(), integration);
+    assert_eq!(git_output(&fixture.repo, &["rev-parse", "main"]), moved);
 }
 
 #[test]

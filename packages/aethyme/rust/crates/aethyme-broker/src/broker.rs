@@ -164,6 +164,15 @@ pub enum BrokerOpError {
         expected: String,
         actual: String,
     },
+    #[error("ship local-main synchronization is unsafe: {reason}")]
+    ShipLocalMainUnsafe { reason: String },
+    #[error(
+        "remote {published_sha} was published, but local-main synchronization was refused after revalidation: {reason}"
+    )]
+    ShipLocalMainMovedAfterPublish {
+        published_sha: String,
+        reason: String,
+    },
     #[error(
         "session {id} ({status}) already exists for this worktree{task}. Options:\n  \
          aethyme broker submit --session {id}        submit its committed work\n  \
