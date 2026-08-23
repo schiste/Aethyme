@@ -11,8 +11,8 @@ use std::process::{Command, Stdio};
 use crate::error::BrokerError;
 use crate::git::{GitError, GitRepo};
 use crate::graph_impact::{
-    GRAPH_IMPACT_RESULT_LIMIT, GraphImpactProvider, GraphImpactQuery, GraphImpactStatus,
-    GraphStoreImpactProvider,
+    GRAPH_IMPACT_MAX_DEPTH, GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT, GraphImpactProvider,
+    GraphImpactQuery, GraphImpactStatus, GraphStoreImpactProvider,
 };
 use crate::store::BrokerStore;
 use crate::types::{
@@ -922,6 +922,15 @@ pub struct SemanticGateSelection {
     pub gate: String,
     pub triggered_by: Option<String>,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<SemanticGateSuggestionChain>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SemanticGateSuggestionChain {
+    pub changed_file: String,
+    pub caller_file: String,
+    pub suggested_gate: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -932,7 +941,11 @@ pub struct SemanticGateSource {
     pub graph_store_path: String,
     pub graph_fragments_path: String,
     pub impacted_paths: Vec<String>,
+    pub chains: Vec<crate::GraphImpactChain>,
     pub result_limit: usize,
+    pub frontier_max_depth: usize,
+    pub frontier_max_nodes: usize,
+    pub frontier_visited_nodes: usize,
     pub truncated: bool,
 }
 
@@ -2016,6 +2029,7 @@ impl Broker {
                     gate: selection.gate.name.clone(),
                     triggered_by,
                     reason: reason.into(),
+                    chain: None,
                 }
             })
             .collect::<Vec<_>>();
@@ -2026,6 +2040,8 @@ impl Broker {
                 repo_root: &self.main_root,
                 changed_files: &changed,
                 max_results: GRAPH_IMPACT_RESULT_LIMIT,
+                max_depth: GRAPH_IMPACT_MAX_DEPTH,
+                max_nodes: GRAPH_IMPACT_MAX_NODES,
             })
             .bounded(GRAPH_IMPACT_RESULT_LIMIT);
         let path_selected_names = path_selected_gates
@@ -2036,10 +2052,26 @@ impl Broker {
             crate::gates::select_gates(&gates, &lookup.impacted_paths)
                 .into_iter()
                 .filter(|selection| !path_selected_names.contains(selection.gate.name.as_str()))
-                .map(|selection| SemanticGateSelection {
-                    gate: selection.gate.name.clone(),
-                    triggered_by: selection.triggered_by,
-                    reason: "graph impact hint".into(),
+                .map(|selection| {
+                    let gate = selection.gate.name.clone();
+                    let triggered_by = selection.triggered_by;
+                    let chain = triggered_by.as_ref().and_then(|caller_file| {
+                        lookup
+                            .chains
+                            .iter()
+                            .find(|chain| &chain.caller_file == caller_file)
+                            .map(|chain| SemanticGateSuggestionChain {
+                                changed_file: chain.changed_file.clone(),
+                                caller_file: chain.caller_file.clone(),
+                                suggested_gate: gate.clone(),
+                            })
+                    });
+                    SemanticGateSelection {
+                        gate,
+                        triggered_by,
+                        reason: "incoming Calls frontier".into(),
+                        chain,
+                    }
                 })
                 .collect()
         } else {
@@ -2052,7 +2084,11 @@ impl Broker {
             graph_store_path: ".aethyme/graph_store.redb".into(),
             graph_fragments_path: ".aethyme/graph/".into(),
             impacted_paths: lookup.impacted_paths,
+            chains: lookup.chains,
             result_limit: GRAPH_IMPACT_RESULT_LIMIT,
+            frontier_max_depth: GRAPH_IMPACT_MAX_DEPTH,
+            frontier_max_nodes: GRAPH_IMPACT_MAX_NODES,
+            frontier_visited_nodes: lookup.visited_nodes,
             truncated: lookup.truncated,
         };
 
