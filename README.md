@@ -21,7 +21,7 @@ SQLite in `.aethyme/`, on macOS and Linux.
 | **Certification** | `aethyme init` / `aethyme certify` | `certify` is a read-only inspection (git version, repo state, config validity, gitignore contract, database integrity) you can run in CI or cron. `init` runs certify, then scaffolds only what's missing, then drafts gates from your manifests. Idempotent: a second run changes nothing and says so. |
 | **Preflight smoke** | `aethyme broker quick-test` | Creates a disposable repo, runs init → adopt → commit → submit, verifies promotion, then removes the repo. Use it after install/init to prove the local broker loop before starting real work. |
 | **Verification loop** | `aethyme broker verify-loop` | Operator E2E: snapshots the integration head, runs quick-test, runs doctor, runs broker source tests when invoked inside the Aethyme checkout, and fails if integration moved before the result could prove the current tip. Alias: `aethyme broker e2e`. |
-| **Charts** | the graph engine | A deterministic Rust repo-intelligence engine (indexing, graph navigation, impact frontiers, task-context packs). Today it serves queries on its own; feeding impact hints to the tower is planned, deliberately deferred. |
+| **Charts** | the graph engine | A deterministic Rust repo-intelligence engine (indexing, graph navigation, impact frontiers, task-context packs). Its bounded incoming-caller frontier also supplies optional hints to `broker gates semantic`; those suggestions never expand enforced gates. |
 | **The flight recorder** | `aethyme broker events` | Every mutation appends to a versioned event log ([`docs/events-contract.md`](docs/events-contract.md)) — the integration contract for any future surface (TUI, editor plugin). |
 
 Two design commitments underneath all of it:
@@ -63,8 +63,10 @@ merged tree caught it). Friction and cost accounting are logged in
 the broker passed its MVP exit checklist under real multi-agent load. Known edges:
 design ceiling of 15 concurrent sessions (stress-tested at 20), macOS/Linux
 only, implicit overlap warnings are advisory while explicit leases block, and
-graph-aware broker features (impact-hint advisories) are deferred. The deterministic graph
-engine remains a separate supporting service.
+graph-aware gate hints are exposed only through the read-only
+`broker gates semantic` report. The deterministic graph engine remains a
+separate supporting service; changed-path triggers still exclusively control
+`gates run` and submit-time verification.
 
 **Removed.** Earlier cloud/SaaS work was deleted in 2026-07; no cloud
 execution, auth, or team sync is part of the product. Direction doc:

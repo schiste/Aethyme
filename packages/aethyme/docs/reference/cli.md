@@ -99,6 +99,8 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <gh-args>`
 - `aethyme broker operations [--json]`
 - `aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]`
+- `aethyme broker gates affected --session <id> [--why] [--json]`
+- `aethyme broker gates semantic --session <id> [--json]`
 - `aethyme broker gates run --session <id> [--no-cache] [--json]`
 - `aethyme broker gates run --all [--no-cache] [--json]`
 - `aethyme broker hooks install [--json]`
@@ -132,6 +134,52 @@ the full hash in `tree_hash` for both executed and cached results.
 Pass `--no-cache` to either gate-run form or submit to require fresh gate
 execution. Bypass skips cache lookup only: the fresh result is stored normally
 and is available to a subsequent run using the default cache policy.
+
+`broker gates semantic` is a separate, strictly advisory read surface:
+
+```bash
+aethyme broker gates affected --session 111 --why
+aethyme broker gates semantic --session 111
+aethyme broker gates semantic --session 111 --json
+```
+
+The first command reports the path-triggered gates that `gates run` and
+`submit` enforce. The semantic command reports that same set plus optional
+caller-frontier suggestions; it does not run gates, change gate configuration,
+or add suggestions to either enforcement path.
+
+For a warm graph, the broker maps each changed repository-relative file to its
+indexed callable nodes, walks incoming `Calls` edges breadth-first, maps caller
+nodes back to files, and matches those files against gate triggers. Gates
+already selected by the changed paths are excluded. Each remaining suggestion
+can carry an auditable chain:
+
+```text
+src/core.rs -> src/service.rs -> service-integration
+```
+
+Traversal is deterministic and strictly bounded: changed files and caller
+adjacency are sorted, first-seen breadth-first order is preserved, depth is
+limited to 2 call edges, at most 128 callable nodes are visited, and at most 64
+caller paths enter one report. `truncated: true` means one of those bounds (or
+provider-result sanitization) omitted additional candidates; it never causes
+the broker to enforce the returned subset.
+
+| Graph condition | Semantic status | Result |
+| --- | --- | --- |
+| Warm, with matching callers | `ready` | Returns caller paths, suggestion chains, frontier counts, and matching advisory gates. |
+| Warm, but no changed-file callables or callers | `ready` | Returns an empty suggestion list; path-selected gates are unchanged. |
+| Cold/missing redb store | `graph_missing` | Returns a successful report explaining that semantic suggestions are unavailable. |
+| Stale store (committed graph fragments are newer) | `graph_stale` | Returns a successful report with no semantic suggestions and asks for a graph rebuild. |
+| Corrupted, unreadable, or query-failing store | `provider_error` | Returns a successful report with the provider diagnosis; gate operations remain available. |
+| Any warm lookup exceeding a bound | `ready` with `truncated: true` | Returns only the deterministic bounded prefix as advice. |
+
+JSON keeps enforced and advisory data visibly separate in
+`path_selected_gates` and `semantic_suggested_gates`. The nested `semantic`
+object includes provider status and reason, full caller chains with depth,
+configured result/depth/node limits, visited-node count, and truncation state.
+Suggestion entries include the explainable changed-file → caller-file → gate
+chain when the graph provider supplied one.
 
 `broker hooks install` installs shared pre-commit and post-commit shims. The
 pre-commit hook runs matching cost-1 gates against the staged change and stays

@@ -2,10 +2,11 @@
 
 Last Updated: 2026-08-23
 
-This guide covers four broker workflows that matter after the basic
+This guide covers five broker workflows that matter after the basic
 start-edit-submit loop: reusing a session worktree, choosing fresh or cached
-gate evidence, planning leases before claiming them, and leaving or retrieving
-a durable finish handoff. For the complete flag inventory, see the
+gate evidence, inspecting advisory semantic gate suggestions, planning leases
+before claiming them, and leaving or retrieving a durable finish handoff. For
+the complete flag inventory, see the
 [CLI reference](../reference/cli.md).
 
 ## Safety Model
@@ -16,6 +17,7 @@ Each workflow separates observation from mutation:
 | --- | --- | --- | --- |
 | Continue in an existing worktree | `broker integration status` | `adopt --reuse`, optionally with `--sync-integration` | synchronization requires a clean, fast-forwardable worktree |
 | Prove the current tree | default gate run and its tree provenance | rerun with `--no-cache` | a bypass never substitutes an older cached result |
+| Inspect graph-derived gate hints | `gates semantic` | none; suggestions remain advisory | only changed-path triggers reach `gates run` and `submit` |
 | Reserve paths | `leases plan` | `leases claim` | the claim, not the plan, decides whether a conflict exists now |
 | End or recover a session | `finish` report | successful `finish` closes and records the handoff | dirty or unsubmitted work refuses the finish |
 
@@ -91,6 +93,36 @@ fresh evidence.
 Managed pre-commit hooks follow the same diagnostic principle. Successful
 cheap gates stay quiet. A failure replays complete standard output and error,
 prints the broker diagnosis, and preserves the failing exit code.
+
+## Inspect Semantic Gate Suggestions
+
+Use the semantic report when you want to see which additional gate surfaces
+callers of changed code might exercise:
+
+```bash
+aethyme broker gates affected --session 111 --why
+aethyme broker gates semantic --session 111
+aethyme broker gates semantic --session 111 --json
+```
+
+`gates affected` is the enforced answer. `gates semantic` repeats that
+path-selected set and adds a separate suggestion list. A warm graph can explain
+each suggestion as changed file → caller file → gate, for example
+`src/core.rs -> src/service.rs -> service-integration`. Suggestions already
+selected by changed paths are omitted.
+
+The lookup is deterministic and bounded to two incoming call edges, 128
+callable nodes, and 64 caller paths. A truncated report is still useful as a
+bounded hint, but it is not a completeness claim. An empty warm result means
+the graph is usable but contains no relevant callable/caller path for the
+change.
+
+Cold, stale, and corrupted graphs do not block work. The command returns a
+successful report with `graph_missing`, `graph_stale`, or `provider_error` and
+an explanation, while the ordinary path-selected gates remain runnable. In
+all states, only path triggers from `.aethyme/gates.toml` reach `gates run` or
+submit-time merged-tree verification. See the [CLI reference](../reference/cli.md)
+for the complete status table and JSON fields.
 
 ## Plan Leases, Then Claim
 

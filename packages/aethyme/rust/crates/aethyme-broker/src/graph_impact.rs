@@ -436,21 +436,34 @@ mod tests {
     }
 
     #[test]
-    fn default_provider_distinguishes_missing_ready_and_stale_graphs() {
+    fn default_provider_reports_a_cold_graph() {
         let missing = tempfile::tempdir().unwrap();
         let provider = GraphStoreImpactProvider;
         assert_eq!(
             provider.lookup(&query(missing.path())).status,
             GraphImpactStatus::GraphMissing
         );
+    }
 
-        let ready = tempfile::tempdir().unwrap();
-        drop(GraphStore::open(ready.path()).unwrap());
-        assert_eq!(
-            provider.lookup(&query(ready.path())).status,
-            GraphImpactStatus::Ready
-        );
+    #[test]
+    fn default_provider_reports_an_empty_warm_graph() {
+        let root = tempfile::tempdir().unwrap();
+        drop(GraphStore::open(root.path()).unwrap());
+        let changed_files = vec!["src/empty.rs".to_string()];
+        let lookup = GraphStoreImpactProvider.lookup(&GraphImpactQuery {
+            changed_files: &changed_files,
+            ..query(root.path())
+        });
 
+        assert_eq!(lookup.status, GraphImpactStatus::Ready);
+        assert!(lookup.impacted_paths.is_empty());
+        assert!(lookup.chains.is_empty());
+        assert_eq!(lookup.visited_nodes, 0);
+        assert!(!lookup.truncated);
+    }
+
+    #[test]
+    fn default_provider_reports_a_stale_graph() {
         let stale = tempfile::tempdir().unwrap();
         let stale_aethyme = stale.path().join(".aethyme");
         std::fs::create_dir_all(stale_aethyme.join("graph")).unwrap();
@@ -458,8 +471,26 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(stale_aethyme.join("graph/newer.bin"), "fixture").unwrap();
         assert_eq!(
-            provider.lookup(&query(stale.path())).status,
+            GraphStoreImpactProvider.lookup(&query(stale.path())).status,
             GraphImpactStatus::GraphStale
+        );
+    }
+
+    #[test]
+    fn default_provider_reports_a_corrupted_graph_without_failing_the_broker() {
+        let corrupted = tempfile::tempdir().unwrap();
+        let aethyme = corrupted.path().join(".aethyme");
+        std::fs::create_dir_all(&aethyme).unwrap();
+        std::fs::write(aethyme.join("graph_store.redb"), b"not a redb database").unwrap();
+
+        let lookup = GraphStoreImpactProvider.lookup(&query(corrupted.path()));
+        assert_eq!(lookup.status, GraphImpactStatus::ProviderError);
+        assert!(lookup.impacted_paths.is_empty());
+        assert!(lookup.chains.is_empty());
+        assert!(
+            lookup
+                .explanation
+                .contains("could not open graph_store.redb")
         );
     }
 
@@ -501,21 +532,30 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = GraphStore::open(root.path()).unwrap();
         let changed_file = file("src/core.rs");
+        let adapter_file = file("src/adapter.rs");
         let caller_file = file("src/service.rs");
         let outer_file = file("src/api.rs");
         let beyond_file = file("src/bin.rs");
         let changed = function(&changed_file, "changed");
+        let adapter = function(&adapter_file, "adapter");
         let caller = function(&caller_file, "caller");
         let outer = function(&outer_file, "outer");
         let beyond = function(&beyond_file, "beyond");
         let mut session = store.begin_index().unwrap();
-        for file in [&changed_file, &caller_file, &outer_file, &beyond_file] {
+        for file in [
+            &changed_file,
+            &adapter_file,
+            &caller_file,
+            &outer_file,
+            &beyond_file,
+        ] {
             insert_file(&mut session, file).unwrap();
         }
-        for function in [&changed, &caller, &outer, &beyond] {
+        for function in [&changed, &caller, &outer, &beyond, &adapter] {
             insert_function(&mut session, function).unwrap();
         }
         for (from, to) in [
+            (adapter.id.as_str(), changed.id.as_str()),
             (caller.id.as_str(), changed.id.as_str()),
             (outer.id.as_str(), caller.id.as_str()),
             (beyond.id.as_str(), outer.id.as_str()),
@@ -545,11 +585,20 @@ mod tests {
         assert_eq!(first.status, GraphImpactStatus::Ready);
         assert_eq!(
             first.impacted_paths,
-            vec!["src/service.rs".to_string(), "src/api.rs".to_string()]
+            vec![
+                "src/adapter.rs".to_string(),
+                "src/service.rs".to_string(),
+                "src/api.rs".to_string()
+            ]
         );
         assert_eq!(
             first.chains,
             vec![
+                GraphImpactChain {
+                    changed_file: "src/core.rs".into(),
+                    caller_file: "src/adapter.rs".into(),
+                    depth: 1,
+                },
                 GraphImpactChain {
                     changed_file: "src/core.rs".into(),
                     caller_file: "src/service.rs".into(),
@@ -562,7 +611,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(first.visited_nodes, 3);
+        assert_eq!(first.visited_nodes, 4);
         assert!(
             first.truncated,
             "the depth-three caller must mark truncation"
@@ -572,7 +621,7 @@ mod tests {
             max_nodes: 2,
             ..query
         });
-        assert_eq!(node_limited.impacted_paths, vec!["src/service.rs"]);
+        assert_eq!(node_limited.impacted_paths, vec!["src/adapter.rs"]);
         assert_eq!(node_limited.visited_nodes, 2);
         assert!(node_limited.truncated);
     }
