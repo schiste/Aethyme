@@ -409,6 +409,78 @@ triggers = ["src/service.rs"]
 }
 
 #[test]
+fn semantic_suggestions_never_affect_gate_runs_or_submit() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "changed-check"
+command = "true"
+cost = 1
+triggers = ["src/app.py"]
+
+[[gate]]
+name = "semantic-only-failure"
+command = "false"
+cost = 1
+triggers = ["docs/**"]
+"#,
+    );
+    commit_all(tmp.path(), "add gates");
+
+    let wt = add_worktree(tmp.path(), "semantic-submit");
+    let mut setup = Broker::open(tmp.path()).unwrap();
+    let session = setup.adopt(&wt, None).unwrap();
+    drop(setup);
+    std::fs::write(wt.join("src/app.py"), "x = 42\n").unwrap();
+    commit_all(&wt, "change app");
+
+    let provider = FixedGraphImpactProvider {
+        lookup: GraphImpactLookup::ready(
+            vec!["docs/semantic-impact.md".into()],
+            false,
+            "semantic-only fixture",
+        ),
+    };
+    let mut broker = Broker::open_with_graph_impact_provider(tmp.path(), provider).unwrap();
+    let advice = broker.semantic_gate_advice(session.id).unwrap();
+    assert_eq!(advice.path_selected_gates.len(), 1);
+    assert_eq!(advice.path_selected_gates[0].gate, "changed-check");
+    assert_eq!(advice.semantic_suggested_gates.len(), 1);
+    assert_eq!(
+        advice.semantic_suggested_gates[0].gate,
+        "semantic-only-failure"
+    );
+
+    let executed = broker.run_gates(session.id).unwrap();
+    assert_eq!(
+        executed
+            .iter()
+            .map(|outcome| outcome.gate.as_str())
+            .collect::<Vec<_>>(),
+        vec!["changed-check"],
+        "gates run must ignore the failing semantic-only suggestion"
+    );
+
+    let submitted = broker.submit(session.id).unwrap();
+    assert!(
+        submitted.promoted,
+        "submit must promote when every path-selected gate passes"
+    );
+    assert_eq!(
+        submitted
+            .gate_outcomes
+            .iter()
+            .map(|outcome| outcome.gate.as_str())
+            .collect::<Vec<_>>(),
+        vec!["changed-check"],
+        "submit must ignore the failing semantic-only suggestion"
+    );
+}
+
+#[test]
 fn degraded_graph_provider_outcomes_are_successful_advisory_reports() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

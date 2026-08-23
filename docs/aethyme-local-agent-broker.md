@@ -101,16 +101,17 @@ live dogfood loop ran on this repository on 2026-07-13 (see
 
 The **deterministic Rust graph engine** (repo indexing, redb store,
 committed graph fragments, navigation and impact-frontier queries) remains
-a separate, supporting repo-intelligence service; graph-aware broker
-features are deliberately deferred (#28, #19).
+a separate, supporting repo-intelligence service. The broker now consults it
+read-only for bounded caller-frontier gate hints; those hints are reported
+separately and never alter path-triggered gate enforcement.
 
 ## Core architectural split
 
 Two stores, two responsibilities. Do not mix them.
 
 ```
-Graph engine (exists)              Broker (planned, new)
-─────────────────────              ─────────────────────
+Graph engine                       Broker
+────────────                       ──────
 code intelligence                  sessions
 impact hints                       worktrees
 repo structure                     leases
@@ -131,9 +132,12 @@ Semantic gate selection follows that same split. Path triggers in
 `.aethyme/gates.toml` remain the enforced selection surface for session submit
 and `broker gates run`; CI still runs the full gates definition via
 `broker gates run --all`. Caller-edge or impact-frontier data may only appear
-as advisory operator guidance until the #28 caller-edge pipeline has proven
-graph quality in real repos. The `broker gates semantic --session <id>`
-command is the intentionally separate read surface for that future signal.
+as advisory operator guidance. The `broker gates semantic --session <id>`
+command is the intentionally separate read surface: it walks a deterministic,
+strictly bounded incoming `Calls` frontier and reports explainable
+changed-file → caller-file → suggested-gate chains. Missing, stale, corrupted,
+empty, or truncated graph results remain successful advisory reports and do
+not affect `broker gates run` or submit-time merged-tree gates.
 
 ## v0 scope
 
