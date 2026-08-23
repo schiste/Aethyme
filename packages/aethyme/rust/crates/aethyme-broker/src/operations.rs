@@ -403,6 +403,23 @@ impl Broker {
         request: CoordinatedCommand,
         cwd: &Path,
     ) -> Result<CoordinatedOperationReport, BrokerOpError> {
+        self.run_coordinated_operation_at_with_hooks(request, cwd, || Ok(()), |_, _| Ok(None))
+    }
+
+    /// Execute through the normal coordinated-operation state machine while
+    /// allowing a caller to revalidate local state under the repository lock,
+    /// then durably journal structured successful stdout before success.
+    pub(crate) fn run_coordinated_operation_at_with_hooks<P, F>(
+        &mut self,
+        request: CoordinatedCommand,
+        cwd: &Path,
+        pre_execute: P,
+        on_success: F,
+    ) -> Result<CoordinatedOperationReport, BrokerOpError>
+    where
+        P: FnOnce() -> Result<(), String>,
+        F: FnOnce(&[u8], i64) -> Result<Option<serde_json::Value>, String>,
+    {
         if request.args.is_empty() {
             return Err(BrokerOpError::InvalidCoordinatedOperation {
                 reason: format!(
@@ -505,6 +522,7 @@ impl Broker {
                 }
             }
         }
+        pre_execute().map_err(|reason| BrokerOpError::InvalidCoordinatedOperation { reason })?;
 
         let command_json = redacted_command(request.provider, &request.args)?;
         let operation = self
@@ -557,21 +575,44 @@ impl Broker {
             }
         };
         let exit_code = output.status.code().map(i64::from);
-        let status = if output.status.success() {
-            OperationStatus::Succeeded
+        let (status, details) = if output.status.success() {
+            match on_success(&output.stdout, operation.id) {
+                Ok(Some(result)) => (
+                    OperationStatus::Succeeded,
+                    json!({ "classification": classification, "result": result }),
+                ),
+                Ok(None) => (
+                    OperationStatus::Succeeded,
+                    json!({ "classification": classification }),
+                ),
+                Err(reason) => (
+                    OperationStatus::OutcomeUnknown,
+                    json!({
+                        "classification": classification,
+                        "reason": "success_result_not_recorded",
+                        "diagnosis": reason,
+                    }),
+                ),
+            }
         } else if effect == OperationEffect::Read {
-            OperationStatus::Failed
+            (
+                OperationStatus::Failed,
+                json!({ "classification": classification }),
+            )
         } else {
             // A mutating command may have applied a subset of its effects
             // before returning non-zero. Treating that as safely failed would
             // make a blind retry possible, so require external inspection.
-            OperationStatus::OutcomeUnknown
+            (
+                OperationStatus::OutcomeUnknown,
+                json!({ "classification": classification }),
+            )
         };
         let operation = self.store().transition_coordinated_operation(
             operation.id,
             status,
             exit_code,
-            Some(&json!({ "classification": classification }).to_string()),
+            Some(&details.to_string()),
         )?;
         Ok(CoordinatedOperationReport {
             operation,

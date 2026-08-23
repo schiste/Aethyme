@@ -4,6 +4,7 @@
 //! schema. It does not open broker state, execute Git, or construct a network client.
 
 use std::fmt::Write as _;
+use std::io::Write as IoWrite;
 use std::path::{Component, Path};
 
 use crate::{
@@ -12,10 +13,12 @@ use crate::{
 };
 
 pub const ISSUE_FORM_RENDER_SCHEMA_VERSION: u32 = 1;
+pub const ISSUE_REVIEW_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const ISSUE_REVIEW_ARTIFACT_MARKER: &str = "aethyme-issue-report-v1";
 const ISSUE_FORM_MAX_BYTES: u64 = 1024 * 1024;
 const ISSUE_FORM_DIRECTORY: &str = ".github/ISSUE_TEMPLATE";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueFormFieldKind {
     Input,
@@ -26,7 +29,7 @@ pub enum IssueFormFieldKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueFormFieldStatus {
     Mapped,
@@ -34,7 +37,7 @@ pub enum IssueFormFieldStatus {
     Static,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IssueFormRenderedField {
     pub id: Option<String>,
     pub label: Option<String>,
@@ -45,7 +48,7 @@ pub struct IssueFormRenderedField {
 
 /// Complete local render result. `valid` is false when one or more required
 /// answer fields remain unfilled; the Markdown is still returned for review.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IssueFormRenderResult {
     pub schema_version: u32,
     pub report_path: String,
@@ -57,6 +60,24 @@ pub struct IssueFormRenderResult {
     pub missing_required: Vec<String>,
     pub fields: Vec<IssueFormRenderedField>,
     pub markdown: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IssueFormWriteResult {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: usize,
+    pub valid: bool,
+    pub missing_required: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct IssueReviewArtifactMetadata {
+    pub schema_version: u32,
+    pub issue_title: String,
+    pub report_digest: String,
+    pub form_path: String,
+    pub fields: Vec<IssueFormRenderedField>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -202,6 +223,104 @@ pub fn render_issue_form(
         fields,
         markdown: markdown.trim_end().to_string() + "\n",
     })
+}
+
+/// Atomically write a human-editable reviewed-issue artifact. Metadata stays
+/// in a hidden comment while the visible bytes are ordinary Markdown.
+pub fn write_issue_form_render_atomic(
+    main_root: &Path,
+    requested: &Path,
+    rendered: &IssueFormRenderResult,
+) -> Result<IssueFormWriteResult, ReportCaptureError> {
+    let filename = reviewed_issue_filename(requested)?;
+    let reports_root = main_root.join(".aethyme/reports");
+    if std::fs::symlink_metadata(&reports_root)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(ReportCaptureError::SymlinkedReportDirectory(
+            ".aethyme/reports".into(),
+        ));
+    }
+    std::fs::create_dir_all(&reports_root).map_err(|source| ReportCaptureError::Io {
+        action: "create report directory",
+        path: ".aethyme/reports".into(),
+        source,
+    })?;
+    let metadata = IssueReviewArtifactMetadata {
+        schema_version: ISSUE_REVIEW_ARTIFACT_SCHEMA_VERSION,
+        issue_title: rendered.issue_title.clone(),
+        report_digest: rendered.report_digest.clone(),
+        form_path: rendered.form_path.clone(),
+        fields: rendered.fields.clone(),
+    };
+    let metadata = serde_json::to_string(&metadata)?;
+    let bytes = format!(
+        "<!-- {ISSUE_REVIEW_ARTIFACT_MARKER}\n{metadata}\n-->\n{}",
+        rendered.markdown
+    )
+    .into_bytes();
+    let digest = crate::report::sha256_hex(&bytes);
+    let relative = format!(".aethyme/reports/{filename}");
+    let destination = reports_root.join(filename);
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".report-render-")
+        .tempfile_in(&reports_root)
+        .map_err(|source| ReportCaptureError::Io {
+            action: "create temporary reviewed report",
+            path: ".aethyme/reports".into(),
+            source,
+        })?;
+    temporary
+        .write_all(&bytes)
+        .and_then(|()| temporary.flush())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|source| ReportCaptureError::Io {
+            action: "write temporary reviewed report",
+            path: ".aethyme/reports/<temporary>".into(),
+            source,
+        })?;
+    temporary
+        .persist_noclobber(&destination)
+        .map_err(|error| match error.error.kind() {
+            std::io::ErrorKind::AlreadyExists => {
+                ReportCaptureError::DestinationExists(relative.clone())
+            }
+            _ => ReportCaptureError::Io {
+                action: "publish reviewed report",
+                path: relative.clone(),
+                source: error.error,
+            },
+        })?;
+    std::fs::File::open(&reports_root)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| ReportCaptureError::Io {
+            action: "sync report directory",
+            path: ".aethyme/reports".into(),
+            source,
+        })?;
+    Ok(IssueFormWriteResult {
+        path: relative,
+        sha256: digest,
+        bytes: bytes.len(),
+        valid: rendered.valid,
+        missing_required: rendered.missing_required.clone(),
+    })
+}
+
+fn reviewed_issue_filename(requested: &Path) -> Result<&str, ReportCaptureError> {
+    let components = requested.components().collect::<Vec<_>>();
+    let filename = match components.as_slice() {
+        [Component::Normal(filename)] => filename.to_str(),
+        [
+            Component::Normal(aethyme),
+            Component::Normal(reports),
+            Component::Normal(filename),
+        ] if *aethyme == ".aethyme" && *reports == "reports" => filename.to_str(),
+        _ => None,
+    }
+    .filter(|name| name.ends_with(".issue.md") && !name.starts_with(".report-"))
+    .ok_or_else(|| ReportCaptureError::InvalidOutput(requested.display().to_string()))?;
+    Ok(filename)
 }
 
 fn read_issue_form(

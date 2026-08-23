@@ -74,12 +74,19 @@ Usage:
       Inspect one captured report by filename or its repository-relative
       .aethyme/reports/<filename> path. Recomputes the current digest and
       refuses symlinks, path escapes, oversized files, and invalid schemas.
-  aethyme broker report render <filename> --form <form.yml> [--json]
+  aethyme broker report render <filename> --form <form.yml> [--output <name>.issue.md] [--json]
       Render a captured report through one repository issue form, entirely
       offline. The form must be a .github/ISSUE_TEMPLATE/*.yml file. Known
       allowlisted report fields become Markdown sections in form order;
       unknown fields remain explicit unfilled sections. Exits non-zero after
-      rendering when any required field is still unfilled.
+      rendering when any required field is still unfilled. --output atomically
+      creates an editable .aethyme/reports/*.issue.md review artifact.
+  aethyme broker report file <path> --repo <owner/name> --confirm <sha256> [--json]
+      File an exact reviewed `report render --output` artifact through the
+      coordinated GitHub operation layer. Refuses digest drift and unresolved
+      required fields. Successful issue URL/number metadata is journaled and
+      recorded locally; ambiguous outcomes require explicit reconciliation and
+      are never retried automatically.
   aethyme broker start --task <text> [--json]
       Create a broker-managed worktree + branch and register a session,
       but do not spawn a process. Prefer this over adopting the main
@@ -397,7 +404,8 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
 /// repository, or installation state remain observable.
 fn command_records_metric(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        Some("certify" | "queue" | "metrics" | "handoff" | "report") => false,
+        Some("certify" | "queue" | "metrics" | "handoff") => false,
+        Some("report") => args.get(1).map(String::as_str) == Some("file"),
         Some("ship") => args.get(1).map(String::as_str) != Some("plan"),
         Some("operations") => args.get(1).map(String::as_str) == Some("reconcile"),
         Some("git" | "gh") => {
@@ -443,6 +451,10 @@ mod tests {
             args(&["metrics"]),
             args(&["handoff", "--session", "7"]),
             args(&["handoff", "--worktree", "."]),
+            args(&["report", "capture"]),
+            args(&["report", "list"]),
+            args(&["report", "show", "report.json"]),
+            args(&["report", "render", "report.json"]),
             args(&["gates", "validate"]),
             args(&["gates", "affected", "--session", "7"]),
             args(&["gates", "semantic", "--session", "7"]),
@@ -472,6 +484,7 @@ mod tests {
             args(&["events", "prune", "--keep-days", "7"]),
             args(&["gates", "run", "--session", "7"]),
             args(&["doctor", "--fix-version"]),
+            args(&["report", "file", "reviewed.issue.md"]),
             args(&["status"]),
             args(&["agents"]),
             args(&["leases"]),
@@ -2288,7 +2301,21 @@ fn run_report(parsed: Parsed) -> Result<(), UsageError> {
                 PathBuf::from(&parsed.positional[1]).as_path(),
                 form,
             )?;
-            if parsed.json {
+            if let Some(output) = parsed.output.as_deref() {
+                let written = crate::write_issue_form_render_atomic(&main_root, output, &rendered)?;
+                if parsed.json {
+                    println!("{}", serde_json::to_string_pretty(&written)?);
+                } else {
+                    println!("Rendered reviewed report: {}", written.path);
+                    println!("SHA-256: {}", written.sha256);
+                    if !written.valid {
+                        println!(
+                            "Edit the required unfilled sections before filing: {}",
+                            written.missing_required.join(", ")
+                        );
+                    }
+                }
+            } else if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&rendered)?);
             } else {
                 print!("{}", rendered.markdown);
@@ -2307,14 +2334,74 @@ fn run_report(parsed: Parsed) -> Result<(), UsageError> {
                 })
             }
         }
-        Some("capture" | "list" | "show" | "render") => Err(UsageError::Message(
-            "invalid report arguments; expected capture, list, show <filename>, or render <filename> --form <form.yml>".into(),
+        Some("file") if parsed.positional.len() == 2 => {
+            let repository = parsed.repository.as_deref().ok_or(UsageError::Message(
+                "report file requires --repo <owner/name>".into(),
+            ))?;
+            let confirmation = parsed.confirm.as_deref().ok_or(UsageError::Message(
+                "report file requires --confirm <sha256>".into(),
+            ))?;
+            let cwd = std::env::current_dir()
+                .map_err(|error| UsageError::Message(error.to_string()))?;
+            let checkout = crate::GitRepo::discover(&cwd)?;
+            let worktree = checkout.root().to_string_lossy();
+            let mut broker = open_broker()?;
+            let session = broker
+                .store()
+                .session_for_worktree(&worktree)?
+                .ok_or(UsageError::Message(
+                    "report file requires a broker session for the current worktree; run `aethyme broker adopt --task \"File reviewed report\"` first".into(),
+                ))?;
+            let filed = crate::file_reviewed_report(
+                &mut broker,
+                session.id,
+                PathBuf::from(&parsed.positional[1]).as_path(),
+                repository,
+                confirmation,
+            )?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&filed)?);
+            } else {
+                match filed.state {
+                    crate::ReportFileState::Filed => {
+                        println!(
+                            "Filed {} as {}#{}",
+                            filed.path,
+                            filed.repository,
+                            filed.issue_number.unwrap_or_default()
+                        );
+                        if let Some(url) = filed.issue_url.as_deref() {
+                            println!("Issue: {url}");
+                        }
+                        println!("Operation: {}", filed.operation_id);
+                    }
+                    crate::ReportFileState::ReconciliationRequired => {
+                        println!(
+                            "Report filing outcome is unknown (operation {}).",
+                            filed.operation_id
+                        );
+                    }
+                }
+            }
+            if filed.state == crate::ReportFileState::ReconciliationRequired {
+                return Err(UsageError::Exit {
+                    message: format!(
+                        "do not retry; inspect repository {} and reconcile operation {}",
+                        filed.repository, filed.operation_id
+                    ),
+                    code: 1,
+                });
+            }
+            Ok(())
+        }
+        Some("capture" | "list" | "show" | "render" | "file") => Err(UsageError::Message(
+            "invalid report arguments; expected capture, list, show <filename>, render <filename> --form <form.yml> [--output <name>.issue.md], or file <path> --repo <owner/name> --confirm <sha256>".into(),
         )),
         Some(other) => Err(UsageError::Message(format!(
-            "unknown report action {other:?}; expected capture, list, show, or render"
+            "unknown report action {other:?}; expected capture, list, show, render, or file"
         ))),
         None => Err(UsageError::Message(
-            "report requires an action: capture, list, show, or render".into(),
+            "report requires an action: capture, list, show, render, or file".into(),
         )),
     }
 }

@@ -38,6 +38,15 @@ fn run(repo: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn run_with_env(repo: &Path, args: &[&str], environment: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(CLI);
+    command.args(args).current_dir(repo);
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    command.output().unwrap()
+}
+
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -60,6 +69,102 @@ fn write_issue_form(repo: &Path, filename: &str, source: &str) {
     let directory = repo.join(".github/ISSUE_TEMPLATE");
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(directory.join(filename), source).unwrap();
+}
+
+fn write_reviewed_issue_artifact(repo: &Path, filename: &str) -> Vec<u8> {
+    capture_report(repo, "bug", "Reviewed gate failure", "source.json");
+    write_issue_form(
+        repo,
+        "fileable.yml",
+        r#"name: Fileable Bug
+title: "[Bug]: "
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+    validations:
+      required: true
+"#,
+    );
+    let mut args = vec!["report", "render", "source.json", "--form", "fileable.yml"];
+    if filename.ends_with(".issue.md") {
+        args.extend(["--output", filename]);
+    } else {
+        args.push("--json");
+    }
+    let rendered = run(repo, &args);
+    assert!(
+        rendered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
+    let path = repo.join(".aethyme/reports").join(filename);
+    if filename.ends_with(".issue.md") {
+        std::fs::read(path).unwrap()
+    } else {
+        std::fs::write(path, &rendered.stdout).unwrap();
+        rendered.stdout
+    }
+}
+
+#[cfg(unix)]
+fn install_fake_gh(repo: &Path) -> (String, String, String, String) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = repo.join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        r#"#!/bin/sh
+printf '%s\n' "$@" > "$AETHYME_FAKE_GH_ARGS"
+printf 'called\n' >> "$AETHYME_FAKE_GH_CALLS"
+body_file=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '--body-file' ]; then
+    shift
+    body_file="$1"
+  fi
+  shift
+done
+if [ -n "$body_file" ]; then
+  cp "$body_file" "$AETHYME_FAKE_GH_BODY"
+fi
+case "$AETHYME_FAKE_GH_MODE" in
+  fail)
+    printf 'simulated ambiguous failure\n' >&2
+    exit 1
+    ;;
+  malformed)
+    printf 'created without an issue identity\n'
+    exit 0
+    ;;
+esac
+printf 'https://github.com/owner/repo/issues/42\n'
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&gh).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&gh, permissions).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (
+        path,
+        repo.join("gh-args").to_string_lossy().into_owned(),
+        repo.join("gh-calls").to_string_lossy().into_owned(),
+        repo.join("gh-body").to_string_lossy().into_owned(),
+    )
 }
 
 fn digest_from(stderr: &[u8]) -> String {
@@ -756,4 +861,401 @@ fn render_rejects_symlinked_issue_forms() {
     );
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("must not be a symbolic link"));
+}
+
+#[cfg(unix)]
+#[test]
+fn file_uses_the_confirmed_render_and_journals_the_returned_issue() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    broker.adopt(tmp.path(), Some("file report")).unwrap();
+    drop(broker);
+    let artifact = write_reviewed_issue_artifact(tmp.path(), "reviewed.issue.md");
+    let digest = sha256(&artifact);
+    let expected_body = std::str::from_utf8(&artifact)
+        .unwrap()
+        .split_once("\n-->\n")
+        .unwrap()
+        .1;
+    let source = run(tmp.path(), &["report", "show", "source.json", "--json"]);
+    let source: serde_json::Value = serde_json::from_slice(&source.stdout).unwrap();
+    let (path, args_path, calls_path, body_path) = install_fake_gh(tmp.path());
+
+    let output = run_with_env(
+        tmp.path(),
+        &[
+            "report",
+            "file",
+            ".aethyme/reports/reviewed.issue.md",
+            "--repo",
+            "owner/repo",
+            "--confirm",
+            &digest,
+            "--json",
+        ],
+        &[
+            ("PATH", &path),
+            ("AETHYME_FAKE_GH_ARGS", &args_path),
+            ("AETHYME_FAKE_GH_CALLS", &calls_path),
+            ("AETHYME_FAKE_GH_BODY", &body_path),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let filed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(filed["state"], "filed");
+    assert_eq!(filed["digest"], digest);
+    assert_eq!(filed["report_digest"], source["summary"]["digest"]);
+    assert_eq!(filed["repository"], "owner/repo");
+    assert_eq!(filed["issue_number"], 42);
+    assert_eq!(
+        filed["issue_url"],
+        "https://github.com/owner/repo/issues/42"
+    );
+    assert_eq!(std::fs::read_to_string(&body_path).unwrap(), expected_body);
+    let args = std::fs::read_to_string(&args_path).unwrap();
+    assert!(args.contains("issue\ncreate\n--title\n[Bug]: Reviewed gate failure"));
+    assert!(args.contains("--body-file"));
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let operation = broker
+        .store()
+        .coordinated_operations()
+        .unwrap()
+        .into_iter()
+        .last()
+        .unwrap();
+    assert_eq!(operation.status, aethyme_broker::OperationStatus::Succeeded);
+    let details: serde_json::Value =
+        serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["result"]["issue_number"], 42);
+    assert_eq!(
+        details["result"]["issue_url"],
+        "https://github.com/owner/repo/issues/42"
+    );
+    assert_eq!(details["result"]["reviewed_digest"], digest);
+    assert!(!operation.command_json.contains("Reviewed gate failure"));
+    assert!(!operation.command_json.contains(".report-file-"));
+    drop(broker);
+
+    let listed = run(tmp.path(), &["report", "list", "--json"]);
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["reports"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["invalid"].as_array().unwrap().len(), 0);
+    assert_eq!(listed["reports"][0]["filing_state"], "filed");
+
+    let duplicate = run_with_env(
+        tmp.path(),
+        &[
+            "report",
+            "file",
+            "reviewed.issue.md",
+            "--repo",
+            "owner/repo",
+            "--confirm",
+            &digest,
+        ],
+        &[
+            ("PATH", &path),
+            ("AETHYME_FAKE_GH_ARGS", &args_path),
+            ("AETHYME_FAKE_GH_CALLS", &calls_path),
+            ("AETHYME_FAKE_GH_BODY", &body_path),
+        ],
+    );
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already filed"));
+    assert_eq!(
+        std::fs::read_to_string(&calls_path)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn file_refuses_digest_drift_before_invoking_github() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    broker.adopt(tmp.path(), None).unwrap();
+    drop(broker);
+    let artifact = write_reviewed_issue_artifact(tmp.path(), "drift.issue.json");
+    let confirmed = sha256(&artifact);
+    let path_to_artifact = tmp.path().join(".aethyme/reports/drift.issue.json");
+    let mut changed = artifact;
+    changed.push(b' ');
+    std::fs::write(path_to_artifact, changed).unwrap();
+    let (path, args_path, calls_path, body_path) = install_fake_gh(tmp.path());
+
+    let output = run_with_env(
+        tmp.path(),
+        &[
+            "report",
+            "file",
+            "drift.issue.json",
+            "--repo",
+            "owner/repo",
+            "--confirm",
+            &confirmed,
+        ],
+        &[
+            ("PATH", &path),
+            ("AETHYME_FAKE_GH_ARGS", &args_path),
+            ("AETHYME_FAKE_GH_CALLS", &calls_path),
+            ("AETHYME_FAKE_GH_BODY", &body_path),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("changed after confirmation"));
+    assert!(!Path::new(&calls_path).exists());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    assert!(broker.store().coordinated_operations().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn file_refuses_required_unfilled_sections_before_invoking_github() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    broker.adopt(tmp.path(), None).unwrap();
+    drop(broker);
+    capture_report(tmp.path(), "bug", "Needs reproduction", "source.json");
+    write_issue_form(
+        tmp.path(),
+        "required.yml",
+        r#"name: Required Form
+body:
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+    validations:
+      required: true
+"#,
+    );
+    let rendered = run(
+        tmp.path(),
+        &[
+            "report",
+            "render",
+            "source.json",
+            "--form",
+            "required.yml",
+            "--json",
+        ],
+    );
+    assert!(!rendered.status.success());
+    std::fs::write(
+        tmp.path().join(".aethyme/reports/unfilled.issue.json"),
+        &rendered.stdout,
+    )
+    .unwrap();
+    let digest = sha256(&rendered.stdout);
+    let (path, args_path, calls_path, body_path) = install_fake_gh(tmp.path());
+
+    let output = run_with_env(
+        tmp.path(),
+        &[
+            "report",
+            "file",
+            "unfilled.issue.json",
+            "--repo",
+            "owner/repo",
+            "--confirm",
+            &digest,
+        ],
+        &[
+            ("PATH", &path),
+            ("AETHYME_FAKE_GH_ARGS", &args_path),
+            ("AETHYME_FAKE_GH_CALLS", &calls_path),
+            ("AETHYME_FAKE_GH_BODY", &body_path),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("required unfilled fields: reproduction")
+    );
+    assert!(!Path::new(&calls_path).exists());
+
+    let artifact_path = tmp.path().join(".aethyme/reports/unfilled.issue.json");
+    let mut reviewed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&artifact_path).unwrap()).unwrap();
+    reviewed["markdown"] = reviewed["markdown"]
+        .as_str()
+        .unwrap()
+        .replace(
+            "> Unfilled: no allowlisted report value maps to `reproduction` (Textarea).",
+            "1. Run `aethyme broker gates run`.\n2. Observe the failure.",
+        )
+        .into();
+    let reviewed = serde_json::to_vec_pretty(&reviewed).unwrap();
+    std::fs::write(&artifact_path, &reviewed).unwrap();
+    let reviewed_digest = sha256(&reviewed);
+    let filed = run_with_env(
+        tmp.path(),
+        &[
+            "report",
+            "file",
+            "unfilled.issue.json",
+            "--repo",
+            "owner/repo",
+            "--confirm",
+            &reviewed_digest,
+        ],
+        &[
+            ("PATH", &path),
+            ("AETHYME_FAKE_GH_ARGS", &args_path),
+            ("AETHYME_FAKE_GH_CALLS", &calls_path),
+            ("AETHYME_FAKE_GH_BODY", &body_path),
+        ],
+    );
+    assert!(
+        filed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&filed.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&calls_path)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ambiguous_file_outcome_requires_reconciliation_and_is_never_retried() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    broker.adopt(tmp.path(), None).unwrap();
+    drop(broker);
+    let artifact = write_reviewed_issue_artifact(tmp.path(), "ambiguous.issue.json");
+    let digest = sha256(&artifact);
+    let (path, args_path, calls_path, body_path) = install_fake_gh(tmp.path());
+    let environment = [
+        ("PATH", path.as_str()),
+        ("AETHYME_FAKE_GH_ARGS", args_path.as_str()),
+        ("AETHYME_FAKE_GH_CALLS", calls_path.as_str()),
+        ("AETHYME_FAKE_GH_BODY", body_path.as_str()),
+        ("AETHYME_FAKE_GH_MODE", "fail"),
+    ];
+    let args = [
+        "report",
+        "file",
+        "ambiguous.issue.json",
+        "--repo",
+        "owner/repo",
+        "--confirm",
+        digest.as_str(),
+        "--json",
+    ];
+
+    let first = run_with_env(tmp.path(), &args, &environment);
+    assert!(!first.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(result["state"], "reconciliation_required");
+    assert_eq!(result["operation_status"], "outcome_unknown");
+    assert!(String::from_utf8_lossy(&first.stderr).contains("do not retry"));
+    let operation_id = result["operation_id"].as_i64().unwrap();
+
+    let second = run_with_env(tmp.path(), &args, &environment);
+    assert!(!second.status.success());
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stderr.contains("has an unknown outcome"));
+    assert!(stderr.contains(&format!("--operation {operation_id}")));
+    assert_eq!(
+        std::fs::read_to_string(&calls_path)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    broker
+        .reconcile_coordinated_operation(operation_id, true, "external inspection found the issue")
+        .unwrap();
+    drop(broker);
+    let after_successful_reconciliation = run_with_env(tmp.path(), &args, &environment);
+    assert!(!after_successful_reconciliation.status.success());
+    assert!(
+        String::from_utf8_lossy(&after_successful_reconciliation.stderr)
+            .contains("already has completed filing operation")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&calls_path)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    let shown = run(tmp.path(), &["report", "show", "source.json", "--json"]);
+    assert!(shown.status.success());
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["summary"]["filing_state"], "unfiled");
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_command_without_a_parseable_issue_url_is_ambiguous() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    broker.adopt(tmp.path(), None).unwrap();
+    drop(broker);
+    let artifact = write_reviewed_issue_artifact(tmp.path(), "malformed.issue.json");
+    let digest = sha256(&artifact);
+    let (path, args_path, calls_path, body_path) = install_fake_gh(tmp.path());
+
+    let output = run_with_env(
+        tmp.path(),
+        &[
+            "report",
+            "file",
+            "malformed.issue.json",
+            "--repo",
+            "owner/repo",
+            "--confirm",
+            &digest,
+            "--json",
+        ],
+        &[
+            ("PATH", &path),
+            ("AETHYME_FAKE_GH_ARGS", &args_path),
+            ("AETHYME_FAKE_GH_CALLS", &calls_path),
+            ("AETHYME_FAKE_GH_BODY", &body_path),
+            ("AETHYME_FAKE_GH_MODE", "malformed"),
+        ],
+    );
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["state"], "reconciliation_required");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let operation = broker
+        .store()
+        .coordinated_operation(result["operation_id"].as_i64().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        operation.status,
+        aethyme_broker::OperationStatus::OutcomeUnknown
+    );
+    assert!(
+        operation
+            .details_json
+            .as_deref()
+            .unwrap()
+            .contains("success_result_not_recorded")
+    );
 }
