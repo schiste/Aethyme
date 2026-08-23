@@ -497,6 +497,7 @@ pub fn extract_legacy_agents_content(existing: &str, root: &str) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hygiene::COMMIT_POLICIES;
     use std::path::PathBuf;
 
     fn fixture_repo(tag: &str) -> PathBuf {
@@ -515,6 +516,62 @@ mod tests {
         assert!(doc.contains("AETHYME_ROOT=\"/opt/ae\""));
         assert!(!doc.contains("{{AETHYME_ROOT}}"));
         assert!(doc.ends_with("placeholders.\n"));
+    }
+
+    #[test]
+    fn generated_commit_guidance_matches_typed_policy() {
+        let doc = render_agents_document("/opt/ae", None).unwrap();
+        let allowed = COMMIT_POLICIES
+            .iter()
+            .map(|policy| format!("`{}`", policy.commit_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(doc.contains(&format!("- Allowed types: {allowed}")));
+
+        let substantive = COMMIT_POLICIES
+            .iter()
+            .filter(|policy| policy.body_required)
+            .collect::<Vec<_>>();
+        let substantive_types = substantive
+            .iter()
+            .map(|policy| format!("`{}`", policy.commit_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(doc.contains(&format!(
+            "- Substantive commits ({substantive_types}) must include:"
+        )));
+
+        let required_sections = substantive
+            .first()
+            .expect("at least one substantive commit policy")
+            .required_sections;
+        assert!(
+            substantive
+                .iter()
+                .all(|policy| policy.required_sections == required_sections)
+        );
+        for section in required_sections {
+            assert!(doc.contains(&format!("  - `{section}`")));
+        }
+
+        let non_substantive_types = COMMIT_POLICIES
+            .iter()
+            .filter(|policy| !policy.body_required)
+            .map(|policy| format!("`{}`", policy.commit_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(doc.contains(&format!(
+            "- Non-substantive commits ({non_substantive_types}) may use a subject-only message; structured bodies remain optional."
+        )));
+        assert!(
+            COMMIT_POLICIES
+                .iter()
+                .filter(|policy| !policy.body_required)
+                .all(|policy| policy.required_sections.is_empty())
+        );
+        assert!(doc.contains(
+            "- Section content may start on the header line (`Problem: text`) or the following line (`Problem:` then `text`)."
+        ));
     }
 
     #[test]

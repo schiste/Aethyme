@@ -29,15 +29,15 @@ fn repo_commit_message_template_command() {
 }
 
 #[test]
-fn repo_commit_message_template_docs_skips_rationale() {
-    let result = invoke_aethyme(["repo", "commit-message-template", "--type", "docs"]);
-    result.ok();
-    assert!(
-        result.output.starts_with("docs(scope): short summary\n"),
-        "{}",
-        result.output
-    );
-    result.assert_lacks("Rationale:");
+fn repo_commit_message_templates_are_subject_only_for_non_substantive_types() {
+    for commit_type in ["docs", "chore", "test", "build", "revert"] {
+        let result = invoke_aethyme(["repo", "commit-message-template", "--type", commit_type]);
+        result.ok();
+        assert_eq!(
+            result.output,
+            format!("{commit_type}(scope): short summary\n")
+        );
+    }
 }
 
 #[test]
@@ -104,6 +104,34 @@ fn repo_lint_commit_message_accepts_structured_fix() {
             .unwrap()
             .iter()
             .any(|candidate| candidate["type"] == "decision")
+    );
+}
+
+#[test]
+fn repo_lint_commit_message_accepts_inline_sections() {
+    let message = "fix(hygiene): accept inline sections\n\n\
+         Problem: Standalone headers were the only accepted form.\n\
+         Decision: Parse initial content after a known header.\n\
+         Rationale: Both documented structured forms should be valid.\n\
+         Validation: Added inline and multiline coverage.\n";
+
+    let result = invoke_aethyme([
+        "repo",
+        "lint-commit-message",
+        "--message",
+        message,
+        "--json-output",
+    ]);
+    result.ok();
+    let payload = result.json();
+    assert_eq!(payload["ok"], true);
+    assert_eq!(
+        payload["sections"]["Problem"],
+        "Standalone headers were the only accepted form."
+    );
+    assert_eq!(
+        payload["sections"]["Rationale"],
+        "Both documented structured forms should be valid."
     );
 }
 

@@ -10,15 +10,79 @@
 
 use crate::pyjson::Value;
 
-pub const SUBSTANTIVE_TYPES: [&str; 4] = ["fix", "feat", "refactor", "perf"];
-pub const ALLOWED_TYPES: [&str; 9] = [
-    "fix", "feat", "refactor", "perf", "test", "docs", "build", "chore", "revert",
+const SUBSTANTIVE_SECTIONS: &[&str] = &["Problem", "Decision", "Rationale", "Validation"];
+const SUBJECT_ONLY_SECTIONS: &[&str] = &[];
+pub const OPTIONAL_SECTIONS: [&str; 4] =
+    ["Alternatives considered", "Risks", "Follow-up", "Memory"];
+
+/// Commit-type-specific requirements shared by template generation,
+/// linting, and the generated agent-guidance contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitPolicy {
+    pub commit_type: &'static str,
+    pub body_required: bool,
+    pub required_sections: &'static [&'static str],
+}
+
+pub const COMMIT_POLICIES: [CommitPolicy; 9] = [
+    CommitPolicy {
+        commit_type: "fix",
+        body_required: true,
+        required_sections: SUBSTANTIVE_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "feat",
+        body_required: true,
+        required_sections: SUBSTANTIVE_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "refactor",
+        body_required: true,
+        required_sections: SUBSTANTIVE_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "perf",
+        body_required: true,
+        required_sections: SUBSTANTIVE_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "test",
+        body_required: false,
+        required_sections: SUBJECT_ONLY_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "docs",
+        body_required: false,
+        required_sections: SUBJECT_ONLY_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "build",
+        body_required: false,
+        required_sections: SUBJECT_ONLY_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "chore",
+        body_required: false,
+        required_sections: SUBJECT_ONLY_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "revert",
+        body_required: false,
+        required_sections: SUBJECT_ONLY_SECTIONS,
+    },
 ];
-pub const REQUIRED_SECTIONS: [&str; 4] = ["Problem", "Decision", "Rationale", "Validation"];
-pub const OPTIONAL_SECTIONS: [&str; 4] = ["Alternatives considered", "Risks", "Follow-up", "Memory"];
+
+pub fn commit_policy(commit_type: &str) -> Option<&'static CommitPolicy> {
+    COMMIT_POLICIES
+        .iter()
+        .find(|policy| policy.commit_type == commit_type)
+}
 
 fn known_sections() -> impl Iterator<Item = &'static str> {
-    REQUIRED_SECTIONS.into_iter().chain(OPTIONAL_SECTIONS)
+    SUBSTANTIVE_SECTIONS
+        .iter()
+        .copied()
+        .chain(OPTIONAL_SECTIONS)
 }
 
 /// Python `str.isspace()`-compatible whitespace test. `char::is_whitespace`
@@ -42,26 +106,21 @@ fn obj(pairs: Vec<(&str, Value)>) -> Value {
 
 /// The typed commit message template used by Aethyme commit hygiene.
 pub fn default_template(commit_type: &str, scope: &str) -> String {
-    let normalized_type = if ALLOWED_TYPES.contains(&commit_type) {
-        commit_type
-    } else {
-        "fix"
-    };
-    let mut lines: Vec<String> = vec![
-        format!("{normalized_type}({scope}): short summary"),
-        String::new(),
-        "Problem:".to_string(),
-        "...".to_string(),
-    ];
-    if SUBSTANTIVE_TYPES.contains(&normalized_type) {
-        lines.extend(
-            [
-                "", "Decision:", "...", "", "Rationale:", "...", "", "Validation:", "- ...",
-            ]
-            .map(str::to_string),
-        );
-    } else {
-        lines.extend(["", "Decision:", "...", "", "Validation:", "- ..."].map(str::to_string));
+    let policy = commit_policy(commit_type).unwrap_or_else(|| {
+        commit_policy("fix").expect("the built-in fix commit policy must exist")
+    });
+    let mut lines = vec![format!("{}({scope}): short summary", policy.commit_type)];
+    if !policy.body_required {
+        return format!("{}\n", lines[0]);
+    }
+    for section in policy.required_sections {
+        lines.push(String::new());
+        lines.push(format!("{section}:"));
+        lines.push(if *section == "Validation" {
+            "- ...".to_string()
+        } else {
+            "...".to_string()
+        });
     }
     lines.extend(
         [
@@ -132,27 +191,25 @@ pub fn lint_commit_message(message: &str) -> Value {
         }
     }
 
-    let mut required_sections: Vec<&str> = Vec::new();
+    let mut required_sections: &[&str] = &[];
     let mut body_required = false;
     if let Some(parsed) = &subject {
-        body_required = SUBSTANTIVE_TYPES.contains(&parsed.commit_type.as_str());
+        let policy = commit_policy(&parsed.commit_type)
+            .expect("parsed subjects always carry an allowed commit type");
+        body_required = policy.body_required;
+        required_sections = policy.required_sections;
         if body_required {
-            required_sections = REQUIRED_SECTIONS.to_vec();
-            let any_content = sections
-                .iter()
-                .any(|(_, text)| !py_strip(text).is_empty());
+            let any_content = sections.iter().any(|(_, text)| !py_strip(text).is_empty());
             if !any_content {
                 errors.push(format!(
                     "Structured body is required for substantive commits: {}.",
-                    REQUIRED_SECTIONS.join(", ")
+                    required_sections.join(", ")
                 ));
             }
-        } else {
-            required_sections = vec!["Problem", "Decision", "Validation"];
         }
     }
 
-    for section_name in &required_sections {
+    for section_name in required_sections {
         match sections.iter().find(|(name, _)| name == section_name) {
             None => {
                 errors.push(format!("Missing required section: {section_name}."));
@@ -274,10 +331,14 @@ fn parse_subject(subject_line: &str, errors: &mut Vec<String>) -> Option<ParsedS
         return no_match(errors);
     }
 
-    if !ALLOWED_TYPES.contains(&commit_type) {
+    if commit_policy(commit_type).is_none() {
         errors.push(format!(
             "Unsupported commit type `{commit_type}`. Allowed types: {}.",
-            ALLOWED_TYPES.join(", ")
+            COMMIT_POLICIES
+                .iter()
+                .map(|policy| policy.commit_type)
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
         return None;
     }
@@ -300,17 +361,18 @@ fn parse_sections(body_lines: &[&str]) -> Vec<(String, String)> {
     let mut current_section: Option<usize> = None;
     for raw_line in body_lines {
         let line = py_rstrip(raw_line);
-        let header = known_sections().find(|section| line == format!("{section}:"));
-        if let Some(section) = header {
-            current_section = Some(
-                match sections.iter().position(|(name, _)| name == section) {
-                    Some(index) => index,
-                    None => {
-                        sections.push((section.to_string(), Vec::new()));
-                        sections.len() - 1
-                    }
-                },
-            );
+        if let Some((section, initial_content)) = parse_section_header(line) {
+            let index = match sections.iter().position(|(name, _)| name == section) {
+                Some(index) => index,
+                None => {
+                    sections.push((section.to_string(), Vec::new()));
+                    sections.len() - 1
+                }
+            };
+            current_section = Some(index);
+            if !initial_content.is_empty() {
+                sections[index].1.push(initial_content.to_string());
+            }
             continue;
         }
         let Some(index) = current_section else {
@@ -326,6 +388,20 @@ fn parse_sections(body_lines: &[&str]) -> Vec<(String, String)> {
             (name, text)
         })
         .collect()
+}
+
+fn parse_section_header<'a>(line: &'a str) -> Option<(&'static str, &'a str)> {
+    known_sections().find_map(|section| {
+        let remainder = line.strip_prefix(section)?.strip_prefix(':')?;
+        if remainder.is_empty() {
+            return Some((section, ""));
+        }
+        remainder
+            .chars()
+            .next()
+            .filter(|character| py_isspace(*character))
+            .map(|_| (section, py_strip(remainder)))
+    })
 }
 
 fn memory_candidates(sections: &[(String, String)]) -> Vec<Value> {
@@ -371,6 +447,27 @@ mod tests {
     use crate::pyjson;
 
     #[test]
+    fn policy_table_covers_every_allowed_type_and_preserves_requirements() {
+        assert_eq!(
+            COMMIT_POLICIES
+                .iter()
+                .map(|policy| policy.commit_type)
+                .collect::<Vec<_>>(),
+            vec![
+                "fix", "feat", "refactor", "perf", "test", "docs", "build", "chore", "revert",
+            ]
+        );
+        for policy in &COMMIT_POLICIES[..4] {
+            assert!(policy.body_required);
+            assert_eq!(policy.required_sections, SUBSTANTIVE_SECTIONS);
+        }
+        for policy in &COMMIT_POLICIES[4..] {
+            assert!(!policy.body_required);
+            assert_eq!(policy.required_sections, SUBJECT_ONLY_SECTIONS);
+        }
+    }
+
+    #[test]
     fn default_template_includes_required_sections_for_fix() {
         let template = default_template("fix", "watchlist");
         assert!(template.starts_with("fix(watchlist): short summary\n"));
@@ -382,10 +479,16 @@ mod tests {
     }
 
     #[test]
-    fn default_template_docs_skips_rationale() {
-        let template = default_template("docs", "guide");
-        assert!(template.starts_with("docs(guide): short summary\n"));
-        assert!(!template.contains("Rationale:"));
+    fn default_templates_are_subject_only_for_non_substantive_types() {
+        for policy in COMMIT_POLICIES
+            .iter()
+            .filter(|policy| !policy.body_required)
+        {
+            assert_eq!(
+                default_template(policy.commit_type, "guide"),
+                format!("{}(guide): short summary\n", policy.commit_type)
+            );
+        }
         // Unknown type normalizes to fix.
         assert!(default_template("nope", "s").starts_with("fix(s): short summary\n"));
     }
@@ -415,6 +518,87 @@ mod tests {
             candidates
                 .iter()
                 .any(|c| c.get("type").and_then(Value::as_str) == Some("decision"))
+        );
+    }
+
+    #[test]
+    fn parse_sections_accepts_standalone_headers() {
+        assert_eq!(
+            parse_sections(&["Problem:", "Standalone content."]),
+            vec![("Problem".to_string(), "Standalone content.".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_sections_accepts_inline_and_multiline_content() {
+        assert_eq!(
+            parse_sections(&[
+                "Problem: Initial content.",
+                "Continuation.",
+                "Decision: Chosen approach.",
+            ]),
+            vec![
+                (
+                    "Problem".to_string(),
+                    "Initial content.\nContinuation.".to_string(),
+                ),
+                ("Decision".to_string(), "Chosen approach.".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_sections_append_duplicate_headers_deterministically() {
+        assert_eq!(
+            parse_sections(&["Problem: First.", "Problem:", "Second.", "Problem: Third.",]),
+            vec![("Problem".to_string(), "First.\nSecond.\nThird.".to_string(),)]
+        );
+    }
+
+    #[test]
+    fn parse_sections_accepts_empty_inline_headers() {
+        assert_eq!(
+            parse_sections(&["Problem:   "]),
+            vec![("Problem".to_string(), String::new())]
+        );
+    }
+
+    #[test]
+    fn parse_sections_accepts_unicode_inline_content_and_whitespace() {
+        assert_eq!(
+            parse_sections(&["Problem:\u{2003}Déjà vu — 問題"]),
+            vec![("Problem".to_string(), "Déjà vu — 問題".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_sections_leave_unknown_headers_as_content() {
+        assert_eq!(
+            parse_sections(&[
+                "Unknown: ignored before a known section",
+                "Problem: Known.",
+                "Unknown: retained inside the section",
+            ]),
+            vec![(
+                "Problem".to_string(),
+                "Known.\nUnknown: retained inside the section".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn parse_sections_do_not_recognize_headers_mid_line_or_without_spacing() {
+        assert_eq!(
+            parse_sections(&[
+                "The Problem: is described here.",
+                "Problem:text without separator whitespace",
+                "Decision: Valid header.",
+                "The Problem: remains ordinary prose.",
+            ]),
+            vec![(
+                "Decision".to_string(),
+                "Valid header.\nThe Problem: remains ordinary prose.".to_string(),
+            )]
         );
     }
 
@@ -461,13 +645,57 @@ mod tests {
             warnings[1].as_str(),
             Some("Subject has no scope; prefer `type(scope): summary` for durable routing.")
         );
-        // docs is non-substantive: Problem/Decision/Validation required.
-        let errors = result.get("errors").unwrap().as_array().unwrap();
+        assert_eq!(result.get("ok"), Some(&Value::Bool(true)));
+        assert!(result.get("errors").unwrap().as_array().unwrap().is_empty());
         assert!(
-            errors
-                .iter()
-                .any(|e| e.as_str() == Some("Missing required section: Problem."))
+            result
+                .get("required_sections")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
         );
+    }
+
+    #[test]
+    fn subject_only_messages_pass_for_every_non_substantive_type() {
+        for policy in COMMIT_POLICIES
+            .iter()
+            .filter(|policy| !policy.body_required)
+        {
+            let result = lint_commit_message(&format!("{}(scope): summary", policy.commit_type));
+            assert_eq!(
+                result.get("ok"),
+                Some(&Value::Bool(true)),
+                "{} should allow a subject-only message",
+                policy.commit_type
+            );
+            assert!(
+                result
+                    .get("required_sections")
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn subject_only_messages_fail_for_every_substantive_type() {
+        for policy in COMMIT_POLICIES.iter().filter(|policy| policy.body_required) {
+            let result = lint_commit_message(&format!("{}(scope): summary", policy.commit_type));
+            assert_eq!(result.get("ok"), Some(&Value::Bool(false)));
+            assert_eq!(
+                result
+                    .get("required_sections")
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                4
+            );
+        }
     }
 
     #[test]

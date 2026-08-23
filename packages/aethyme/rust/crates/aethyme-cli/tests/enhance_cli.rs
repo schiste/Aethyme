@@ -170,6 +170,8 @@ fn enhance_deploy_writes_generated_onboarding() {
         "Primary app entrypoint: `src/main.ts`",
         ".aethyme/generated/experience-status.md",
         "## Commit Hygiene",
+        "may use a subject-only message",
+        "Section content may start on the header line (`Problem: text`)",
         "repo lint-commit-message .git/COMMIT_EDITMSG",
     ] {
         assert!(agents.contains(needle), "AGENTS.md missing {needle:?}");
