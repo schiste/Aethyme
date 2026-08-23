@@ -53,6 +53,7 @@ product surface.
 - `aethyme broker report capture`
 - `aethyme broker report list`
 - `aethyme broker report show`
+- `aethyme broker report render`
 - `aethyme broker ship plan`
 - `aethyme broker ship execute`
 - `aethyme broker integration status`
@@ -117,6 +118,7 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker report capture --kind <bug|improvement> --title <text> [--session <id>] [--include-task] [--stdout | --output <filename>] [--json]`
 - `aethyme broker report list [--json]`
 - `aethyme broker report show <filename> [--json]`
+- `aethyme broker report render <filename> --form <form.yml> [--json]`
 - `aethyme broker ship plan --entry <id> [--json]`
 - `aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--json]`
 - `aethyme broker integration status [--json]`
@@ -276,6 +278,43 @@ digest and therefore returns it to unfiled. List reports corrupt, unsupported,
 oversized, non-file, or symlinked artifacts in `invalid`; show fails closed
 when its selected artifact has any of those conditions. Neither command opens
 or creates the broker database, appends telemetry, or contacts external state.
+
+Render a captured report into the repository's own GitHub issue-form order:
+
+```bash
+aethyme broker report render reviewed.json --form bug_report.yml
+aethyme broker report render reviewed.json \
+  --form .github/ISSUE_TEMPLATE/bug_report.yml --json
+```
+
+The form selector is confined to `.github/ISSUE_TEMPLATE/*.yml`; absolute
+paths, traversal, nested paths, other extensions, symlinks, oversized files,
+and malformed YAML fail locally. Rendering reads only the selected report and
+form. It does not open broker state, execute Git, contact GitHub, or make any
+network request.
+
+Form `body` entries retain their declared order. Static `markdown` entries are
+copied as repository-authored instructions. For `input`, `textarea`, and
+`dropdown` entries, exact field IDs from this allowlist can consume captured
+report data:
+
+- `summary`, `problem`, `description`
+- `kind`, `report_kind`, `digest`, `report_digest`
+- `version`, `aethyme_version`, `environment`, `platform`
+- `session`, `session_details`, `task`
+- `failure`, `last_failure`, `logs`, `logs_or_output`
+- `gates`, `gate_results`, `operations`, `recent_events`, `events`
+- `diagnostics`, `report`, `report_snapshot`
+
+Task text is available only when the report itself was captured with
+`--include-task`. Dropdown values are filled only when a mapped value matches
+one of the form's options case-insensitively. Checkboxes, unsupported controls,
+unknown IDs, and known IDs without captured data render as explicit `Unfilled`
+sections; they are never guessed or silently omitted. If any such field is
+required, the command still emits the complete reviewable Markdown (or JSON)
+and then exits non-zero with the missing IDs. Plain output writes only the
+issue body to stdout, while the proposed issue title and report digest go to
+stderr so redirection stays useful.
 
 Promotion only advances the local integration ref. Use `broker ship plan` to
 inspect the promoted queue entry, exact integration SHA, remote freshness,

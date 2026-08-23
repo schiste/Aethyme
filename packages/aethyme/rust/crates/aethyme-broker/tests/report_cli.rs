@@ -42,6 +42,26 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn capture_report(repo: &Path, kind: &str, title: &str, filename: &str) {
+    let output = run(
+        repo,
+        &[
+            "report", "capture", "--kind", kind, "--title", title, "--output", filename,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn write_issue_form(repo: &Path, filename: &str, source: &str) {
+    let directory = repo.join(".github/ISSUE_TEMPLATE");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join(filename), source).unwrap();
+}
+
 fn digest_from(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
@@ -472,4 +492,268 @@ fn show_rejects_path_escape_and_symlinked_artifacts() {
     let linked = run(tmp.path(), &["report", "show", "link.json", "--json"]);
     assert!(!linked.status.success());
     assert!(String::from_utf8_lossy(&linked.stderr).contains("regular file"));
+}
+
+#[test]
+fn render_preserves_form_order_and_reports_required_unfilled_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    capture_report(
+        tmp.path(),
+        "bug",
+        "Gate failed deterministically",
+        "bug.json",
+    );
+    write_issue_form(
+        tmp.path(),
+        "bug.yml",
+        r#"name: Bug Report
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: Review the generated diagnostic before filing.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+    validations:
+      required: true
+"#,
+    );
+
+    for name in ["broker.db", "broker.db-shm", "broker.db-wal"] {
+        let path = tmp.path().join(".aethyme").join(name);
+        if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let output = run(
+        tmp.path(),
+        &["report", "render", "bug.json", "--form", "bug.yml"],
+    );
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let intro = stdout.find("Review the generated diagnostic").unwrap();
+    let summary = stdout.find("## Summary").unwrap();
+    let reproduction = stdout.find("## Reproduction").unwrap();
+    let environment = stdout.find("## Environment").unwrap();
+    assert!(intro < summary && summary < reproduction && reproduction < environment);
+    assert!(stdout.contains("Gate failed deterministically"));
+    assert!(stdout.contains("Unfilled: no allowlisted report value maps to `reproduction`"));
+    assert!(stdout.contains("- OS:"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Issue title: [Bug]: Gate failed deterministically"));
+    assert!(stderr.contains("required issue-form fields remain unfilled: reproduction"));
+    assert!(
+        !tmp.path().join(".aethyme/broker.db").exists(),
+        "offline render recreated broker state"
+    );
+}
+
+#[test]
+fn render_json_maps_only_known_fields_and_validates_dropdown_options() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    capture_report(tmp.path(), "bug", "Inspectable failure", "report.json");
+    write_issue_form(
+        tmp.path(),
+        "complete.yml",
+        r#"name: Complete Form
+body:
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+    validations:
+      required: true
+  - type: dropdown
+    id: report_kind
+    attributes:
+      label: Kind
+      options:
+        - Bug
+        - Improvement
+    validations:
+      required: true
+  - type: input
+    id: report_digest
+    attributes:
+      label: Digest
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+    validations:
+      required: true
+  - type: textarea
+    id: notes_for_maintainer
+    attributes:
+      label: Maintainer Notes
+"#,
+    );
+
+    let output = run(
+        tmp.path(),
+        &[
+            "report",
+            "render",
+            ".aethyme/reports/report.json",
+            "--form",
+            ".github/ISSUE_TEMPLATE/complete.yml",
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rendered["schema_version"], 1);
+    assert_eq!(rendered["valid"], true);
+    assert_eq!(rendered["missing_required"], serde_json::json!([]));
+    assert_eq!(rendered["fields"][0]["status"], "mapped");
+    assert_eq!(rendered["fields"][1]["status"], "mapped");
+    assert_eq!(rendered["fields"][4]["status"], "unfilled");
+    assert!(
+        rendered["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("## Kind\n\nBug")
+    );
+    assert!(
+        rendered["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("`notes_for_maintainer`")
+    );
+}
+
+#[test]
+fn required_unknown_and_checkbox_fields_remain_explicitly_unfilled() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    capture_report(
+        tmp.path(),
+        "improvement",
+        "Better diagnostics",
+        "report.json",
+    );
+    write_issue_form(
+        tmp.path(),
+        "unknown.yml",
+        r#"name: Unknown Fields
+body:
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+    validations:
+      required: true
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Terms
+      options:
+        - label: I reviewed the report
+          required: true
+  - type: future-widget
+    id: future
+    attributes:
+      label: Future Field
+"#,
+    );
+
+    let output = run(
+        tmp.path(),
+        &[
+            "report",
+            "render",
+            "report.json",
+            "--form",
+            "unknown.yml",
+            "--json",
+        ],
+    );
+    assert!(!output.status.success());
+    let rendered: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rendered["valid"], false);
+    assert_eq!(
+        rendered["missing_required"],
+        serde_json::json!(["proposal", "terms"])
+    );
+    assert_eq!(rendered["fields"][0]["kind"], "textarea");
+    assert_eq!(rendered["fields"][1]["kind"], "checkboxes");
+    assert_eq!(rendered["fields"][2]["kind"], "unknown");
+    let markdown = rendered["markdown"].as_str().unwrap();
+    assert!(markdown.contains("## Proposal"));
+    assert!(markdown.contains("## Terms"));
+    assert!(markdown.contains("## Future Field"));
+}
+
+#[test]
+fn render_rejects_malformed_forms_and_path_escapes() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    capture_report(tmp.path(), "bug", "Invalid form", "report.json");
+    write_issue_form(tmp.path(), "broken.yml", "name: [\n");
+
+    let malformed = run(
+        tmp.path(),
+        &["report", "render", "report.json", "--form", "broken.yml"],
+    );
+    assert!(!malformed.status.success());
+    assert!(String::from_utf8_lossy(&malformed.stderr).contains("invalid repository issue form"));
+
+    for selector in [
+        "../broken.yml",
+        "/tmp/broken.yml",
+        "nested/broken.yml",
+        "broken.yaml",
+    ] {
+        let output = run(
+            tmp.path(),
+            &["report", "render", "report.json", "--form", selector],
+        );
+        assert!(!output.status.success(), "accepted {selector}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("invalid issue form path"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn render_rejects_symlinked_issue_forms() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    capture_report(tmp.path(), "bug", "Linked form", "report.json");
+    write_issue_form(tmp.path(), "outside.yml", "name: Outside\nbody: []\n");
+    symlink(
+        tmp.path().join(".github/ISSUE_TEMPLATE/outside.yml"),
+        tmp.path().join(".github/ISSUE_TEMPLATE/link.yml"),
+    )
+    .unwrap();
+
+    let output = run(
+        tmp.path(),
+        &["report", "render", "report.json", "--form", "link.yml"],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must not be a symbolic link"));
 }
