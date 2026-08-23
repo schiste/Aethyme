@@ -312,7 +312,7 @@ Current scope limits:
 - `aethyme repo experience-status /path/to/repo`
 - `aethyme repo commit-message-template --type fix --scope watchlist`
 - `aethyme repo lint-commit-message .git/COMMIT_EDITMSG`
-- `aethyme repo lint-commit-message --message "fix(scope): summary\n\nProblem:\n..."`
+- `aethyme repo lint-commit-message --message "docs(cli): clarify examples"`
 - `aethyme repo deploy-skills /path/to/repo --force`
 - `aethyme repo engine-info --json-output`
 - `aethyme repo engine-info --check`
@@ -378,21 +378,23 @@ Commit hygiene contract:
 - allowed types: `fix`, `feat`, `refactor`, `perf`, `test`, `docs`, `build`, `chore`, `revert`
 - substantive types `fix`, `feat`, `refactor`, and `perf` require structured
   body sections: `Problem`, `Decision`, `Rationale`, `Validation`
+- non-substantive types `test`, `docs`, `build`, `chore`, and `revert` may use
+  a subject-only message; their structured bodies are optional and are still parsed
+- section content may begin on the header line (`Problem: text`) or on the next
+  line after a standalone header (`Problem:` followed by `text`)
 - optional sections: `Alternatives considered`, `Risks`, `Follow-up`, `Memory`
 
-Example:
+Substantive example using both section forms:
 
 ```text
 fix(watchlist): mark only viewed revision as seen
 
-Problem:
-Viewing a diff marked every revision as seen.
+Problem: Viewing a diff marked every revision as seen.
 
 Decision:
 Use the viewed revision id for seen-marking.
 
-Rationale:
-Seen state is revision-scoped.
+Rationale: Seen state is revision-scoped.
 
 Validation:
 - Added regression coverage.
@@ -400,6 +402,12 @@ Validation:
 
 Memory:
 Watchlist seen-marking must remain revision-scoped.
+```
+
+Non-substantive subject-only example:
+
+```text
+docs(cli): clarify commit hygiene examples
 ```
 
 ### Local Discoverability

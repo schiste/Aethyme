@@ -553,6 +553,25 @@ mod tests {
         for section in required_sections {
             assert!(doc.contains(&format!("  - `{section}`")));
         }
+
+        let non_substantive_types = COMMIT_POLICIES
+            .iter()
+            .filter(|policy| !policy.body_required)
+            .map(|policy| format!("`{}`", policy.commit_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(doc.contains(&format!(
+            "- Non-substantive commits ({non_substantive_types}) may use a subject-only message; structured bodies remain optional."
+        )));
+        assert!(
+            COMMIT_POLICIES
+                .iter()
+                .filter(|policy| !policy.body_required)
+                .all(|policy| policy.required_sections.is_empty())
+        );
+        assert!(doc.contains(
+            "- Section content may start on the header line (`Problem: text`) or the following line (`Problem:` then `text`)."
+        ));
     }
 
     #[test]

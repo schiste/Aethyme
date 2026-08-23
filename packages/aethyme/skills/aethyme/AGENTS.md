@@ -76,6 +76,8 @@ Use typed commit messages.
   - `Decision`
   - `Rationale`
   - `Validation`
+- Non-substantive commits (`test`, `docs`, `build`, `chore`, `revert`) may use a subject-only message; structured bodies remain optional.
+- Section content may start on the header line (`Problem: text`) or the following line (`Problem:` then `text`).
 
 Useful commands:
 
