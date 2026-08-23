@@ -1665,9 +1665,15 @@ fn render_semantic_gate_advice(report: &crate::SemanticGateAdvice) {
     } else {
         println!("  semantic suggestions:");
         for gate in &report.semantic_suggested_gates {
-            match &gate.triggered_by {
-                Some(path) => println!("    - {} (via {})", gate.gate, path),
-                None => println!("    - {} ({})", gate.gate, gate.reason),
+            match &gate.chain {
+                Some(chain) => println!(
+                    "    - {} ({} -> {} -> {})",
+                    gate.gate, chain.changed_file, chain.caller_file, chain.suggested_gate
+                ),
+                None => match &gate.triggered_by {
+                    Some(path) => println!("    - {} (via {})", gate.gate, path),
+                    None => println!("    - {} ({})", gate.gate, gate.reason),
+                },
             }
         }
     }

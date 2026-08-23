@@ -53,9 +53,9 @@ pub use broker::{
     IntegrationStatusView, LeaseBlocker, LeaseClaimReport, LeaseOverlapRelation, LeasePathPlan,
     LeasePlan, LeasePlanOverlap, OwnershipAuditReport, PromotedConflict, PromotedIntegrationEntry,
     RepairAction, RepairGateSelection, RepairReport, RepairSource, SemanticGateAdvice,
-    SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus, SessionHandoffReport,
-    StatusAdvice, StatusAdviceSeverity, StatusIntegrationRelation, StatusSummary, StatusView,
-    VersionRepairReport,
+    SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus,
+    SemanticGateSuggestionChain, SessionHandoffReport, StatusAdvice, StatusAdviceSeverity,
+    StatusIntegrationRelation, StatusSummary, StatusView, VersionRepairReport,
 };
 pub use error::BrokerError;
 pub use gates::{
@@ -63,8 +63,9 @@ pub use gates::{
 };
 pub use git::{GitError, GitRepo, MergeSimulation, RemoteDefaultBranch};
 pub use graph_impact::{
-    GRAPH_IMPACT_RESULT_LIMIT, GraphImpactLookup, GraphImpactProvider, GraphImpactQuery,
-    GraphImpactStatus, GraphStoreImpactProvider,
+    GRAPH_IMPACT_MAX_DEPTH, GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT, GraphImpactChain,
+    GraphImpactLookup, GraphImpactProvider, GraphImpactQuery, GraphImpactStatus,
+    GraphStoreImpactProvider,
 };
 pub use hooks::{HookReport, HookState, HooksError};
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};

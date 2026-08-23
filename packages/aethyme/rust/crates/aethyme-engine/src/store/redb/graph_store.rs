@@ -155,6 +155,15 @@ pub struct AdjacencyRecord {
     pub source: InternedStr,
 }
 
+/// Strictly bounded callable ids contained by one exact repository-relative
+/// file path. The multimap value order is deterministic, so callers can use
+/// this directly as seed order without scanning a broader path prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedFunctionIds {
+    pub ids: Vec<String>,
+    pub truncated: bool,
+}
+
 #[derive(Debug)]
 pub enum GraphStoreError {
     Io(std::io::Error),
@@ -2339,6 +2348,29 @@ fn functions_under_path_from<D: ReadableDatabase>(
     Ok(functions)
 }
 
+fn function_ids_for_path_from<D: ReadableDatabase>(
+    db: &D,
+    path: &str,
+    limit: usize,
+) -> Result<BoundedFunctionIds, GraphStoreError> {
+    let txn = db.begin_read()?;
+    let table = txn.open_multimap_table(FUNCTIONS_BY_PATH)?;
+    let mut ids = Vec::new();
+    for row in table.get(path)? {
+        if ids.len() == limit {
+            return Ok(BoundedFunctionIds {
+                ids,
+                truncated: true,
+            });
+        }
+        ids.push(row?.value().to_string());
+    }
+    Ok(BoundedFunctionIds {
+        ids,
+        truncated: false,
+    })
+}
+
 fn resolve_file_path_from<D: ReadableDatabase>(
     db: &D,
     path: &str,
@@ -4260,6 +4292,15 @@ impl GraphStore {
         functions_under_path_from(&self.db, prefix)
     }
 
+    /// Return at most `limit` callable ids for one exact file path.
+    pub fn function_ids_for_path(
+        &self,
+        path: &str,
+        limit: usize,
+    ) -> Result<BoundedFunctionIds, GraphStoreError> {
+        function_ids_for_path_from(&self.db, path, limit)
+    }
+
     /// Return incoming or outgoing adjacency, optionally filtered by edge kind.
     pub fn neighbors(
         &self,
@@ -4503,6 +4544,15 @@ impl ReadOnlyGraphStore {
     /// Return all functions whose file path starts with `prefix`.
     pub fn functions_under_path(&self, prefix: &str) -> Result<Vec<FunctionNode>, GraphStoreError> {
         functions_under_path_from(&self.db, prefix)
+    }
+
+    /// Return at most `limit` callable ids for one exact file path.
+    pub fn function_ids_for_path(
+        &self,
+        path: &str,
+        limit: usize,
+    ) -> Result<BoundedFunctionIds, GraphStoreError> {
+        function_ids_for_path_from(&self.db, path, limit)
     }
 
     /// Return incoming or outgoing adjacency, optionally filtered by edge kind.
@@ -5897,6 +5947,40 @@ mod tests {
             collect_str_multimap(store.db(), SYMBOL_BY_PATH_COMPONENT, "lib"),
             vec![function.id.to_string()]
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exact_file_callable_lookup_is_deterministic_and_strictly_bounded() {
+        let root = tmp_root(function_name!());
+        let store = GraphStore::open(&root).expect("open");
+        let file = sample_file("Repo", "src/lib.rs", Some("area:Repo:src"));
+        let prefixed_file = sample_file("Repo", "src/lib.rs.extra", Some("area:Repo:src"));
+        let alpha = sample_function(&file, "Alpha", None);
+        let zeta = sample_function(&file, "Zeta", None);
+        let prefixed = sample_function(&prefixed_file, "Prefixed", None);
+
+        let mut session = store.begin_index().expect("session");
+        for function in [&zeta, &prefixed, &alpha] {
+            insert_function(&mut session, function).expect("insert_function");
+        }
+        session.commit().expect("commit");
+
+        let bounded = store
+            .function_ids_for_path("src/lib.rs", 1)
+            .expect("bounded exact lookup");
+        assert_eq!(bounded.ids, vec![alpha.id.to_string()]);
+        assert!(bounded.truncated);
+
+        let complete = store
+            .function_ids_for_path("src/lib.rs", 2)
+            .expect("complete exact lookup");
+        assert_eq!(
+            complete.ids,
+            vec![alpha.id.to_string(), zeta.id.to_string()]
+        );
+        assert!(!complete.truncated);
+        assert!(!complete.ids.contains(&prefixed.id.to_string()));
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -8,8 +8,9 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use aethyme_broker::{
-    Broker, CachePolicy, GRAPH_IMPACT_RESULT_LIMIT, GateFailureClass, GateProgressSink, GateStatus,
-    GraphImpactLookup, GraphImpactProvider, GraphImpactQuery, GraphImpactStatus,
+    Broker, CachePolicy, GRAPH_IMPACT_MAX_DEPTH, GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT,
+    GateFailureClass, GateProgressSink, GateStatus, GraphImpactLookup, GraphImpactProvider,
+    GraphImpactQuery, GraphImpactStatus,
 };
 
 #[derive(Clone)]
@@ -24,6 +25,8 @@ impl GraphImpactProvider for FixedGraphImpactProvider {
 
     fn lookup(&self, query: &GraphImpactQuery<'_>) -> GraphImpactLookup {
         assert_eq!(query.max_results, GRAPH_IMPACT_RESULT_LIMIT);
+        assert_eq!(query.max_depth, GRAPH_IMPACT_MAX_DEPTH);
+        assert_eq!(query.max_nodes, GRAPH_IMPACT_MAX_NODES);
         assert!(!query.changed_files.is_empty());
         self.lookup.clone()
     }
@@ -185,7 +188,7 @@ triggers = ["docs/**"]
     );
     assert_eq!(report.path_selected_gates[1].reason, "path trigger");
     assert!(report.semantic_suggested_gates.is_empty());
-    assert_eq!(report.semantic.provider, "graph_store_probe");
+    assert_eq!(report.semantic.provider, "caller_frontier");
     assert_eq!(report.semantic.status, GraphImpactStatus::GraphMissing);
     assert!(report.semantic.reason.contains("graph_store.redb"));
     assert!(report.semantic.impacted_paths.is_empty());
@@ -254,7 +257,7 @@ triggers = ["docs/**"]
     assert_eq!(report.semantic_suggested_gates[0].gate, "docs-check");
     assert_eq!(
         report.semantic_suggested_gates[0].reason,
-        "graph impact hint"
+        "incoming Calls frontier"
     );
 
     assert_eq!(
@@ -274,6 +277,135 @@ triggers = ["docs/**"]
         vec!["always-check", "python-check"],
         "semantic suggestions must not reach gate execution"
     );
+}
+
+#[test]
+fn warm_graph_caller_chain_suggests_but_does_not_run_a_gate() {
+    use aethyme_engine::model::edge::{Edge, EdgeKind};
+    use aethyme_engine::model::file::{FileNode, FileRole};
+    use aethyme_engine::model::function::FunctionNode;
+    use aethyme_engine::model::intern::InternedStr;
+    use aethyme_engine::store::redb::graph_store::{
+        GraphStore, insert_edge, insert_file, insert_function,
+    };
+
+    fn function(file: &FileNode, name: &str) -> FunctionNode {
+        FunctionNode::new(
+            "Repo",
+            InternedStr::from(file.id.clone()),
+            InternedStr::from(file.path.clone()),
+            None,
+            None,
+            InternedStr::from("rust"),
+            InternedStr::from(name),
+            1,
+            InternedStr::from(format!("fn {name}()")),
+        )
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "changed-check"
+command = "true"
+cost = 1
+triggers = ["src/core.rs"]
+
+[[gate]]
+name = "caller-check"
+command = "true"
+cost = 1
+triggers = ["src/service.rs"]
+"#,
+    );
+    commit_all(tmp.path(), "add gates");
+
+    let changed_file = FileNode::new(
+        "Repo",
+        "src/core.rs",
+        Some("rust".into()),
+        FileRole::Source,
+        10,
+        100,
+        false,
+        None,
+    );
+    let caller_file = FileNode::new(
+        "Repo",
+        "src/service.rs",
+        Some("rust".into()),
+        FileRole::Source,
+        10,
+        100,
+        false,
+        None,
+    );
+    let changed_function = function(&changed_file, "changed");
+    let caller_function = function(&caller_file, "caller");
+    let graph = GraphStore::open(tmp.path()).unwrap();
+    let mut index = graph.begin_index().unwrap();
+    insert_file(&mut index, &changed_file).unwrap();
+    insert_file(&mut index, &caller_file).unwrap();
+    insert_function(&mut index, &changed_function).unwrap();
+    insert_function(&mut index, &caller_function).unwrap();
+    insert_edge(
+        &mut index,
+        &Edge::new(
+            caller_function.id.as_str(),
+            changed_function.id.as_str(),
+            EdgeKind::Calls,
+            1000,
+            "test",
+        ),
+    )
+    .unwrap();
+    index.commit().unwrap();
+    drop(graph);
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = add_worktree(tmp.path(), "semantic-warm");
+    let session = broker.adopt(&wt, None).unwrap();
+    std::fs::create_dir_all(wt.join("src")).unwrap();
+    std::fs::write(wt.join("src/core.rs"), "fn changed() {}\n").unwrap();
+
+    let report = broker.semantic_gate_advice(session.id).unwrap();
+    assert_eq!(report.semantic.status, GraphImpactStatus::Ready);
+    assert_eq!(report.semantic.impacted_paths, vec!["src/service.rs"]);
+    assert_eq!(report.semantic.frontier_max_depth, 2);
+    assert_eq!(report.semantic.frontier_max_nodes, 128);
+    assert_eq!(report.semantic.frontier_visited_nodes, 2);
+    assert!(!report.semantic.truncated);
+    assert_eq!(report.semantic_suggested_gates.len(), 1);
+    let suggestion = &report.semantic_suggested_gates[0];
+    assert_eq!(suggestion.gate, "caller-check");
+    let chain = suggestion.chain.as_ref().expect("explainable caller chain");
+    assert_eq!(chain.changed_file, "src/core.rs");
+    assert_eq!(chain.caller_file, "src/service.rs");
+    assert_eq!(chain.suggested_gate, "caller-check");
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(
+        json["semantic_suggested_gates"][0]["chain"]["changed_file"],
+        "src/core.rs"
+    );
+    assert_eq!(
+        json["semantic_suggested_gates"][0]["chain"]["caller_file"],
+        "src/service.rs"
+    );
+    assert_eq!(
+        json["semantic_suggested_gates"][0]["chain"]["suggested_gate"],
+        "caller-check"
+    );
+
+    assert_eq!(
+        broker.affected_gates(session.id).unwrap(),
+        vec![("changed-check".to_string(), Some("src/core.rs".to_string()))]
+    );
+    let executed = broker.run_gates(session.id).unwrap();
+    assert_eq!(executed.len(), 1);
+    assert_eq!(executed[0].gate, "changed-check");
 }
 
 #[test]
