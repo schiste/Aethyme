@@ -819,10 +819,10 @@ fn run_commit_message_template(rest: &[String]) -> u8 {
         return usage_error(&format!("Got unexpected extra argument ({extra})"));
     }
     let commit_type = parsed.last_option("--type").unwrap_or("fix");
-    if !hygiene::ALLOWED_TYPES.contains(&commit_type) {
-        let quoted: Vec<String> = hygiene::ALLOWED_TYPES
+    if hygiene::commit_policy(commit_type).is_none() {
+        let quoted: Vec<String> = hygiene::COMMIT_POLICIES
             .iter()
-            .map(|t| format!("'{t}'"))
+            .map(|policy| format!("'{}'", policy.commit_type))
             .collect();
         return usage_error(&format!(
             "Invalid value for '--type': '{commit_type}' is not one of {}.",

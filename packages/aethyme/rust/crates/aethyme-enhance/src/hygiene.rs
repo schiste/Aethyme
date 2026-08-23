@@ -10,15 +10,79 @@
 
 use crate::pyjson::Value;
 
-pub const SUBSTANTIVE_TYPES: [&str; 4] = ["fix", "feat", "refactor", "perf"];
-pub const ALLOWED_TYPES: [&str; 9] = [
-    "fix", "feat", "refactor", "perf", "test", "docs", "build", "chore", "revert",
+const SUBSTANTIVE_SECTIONS: &[&str] = &["Problem", "Decision", "Rationale", "Validation"];
+const NON_SUBSTANTIVE_SECTIONS: &[&str] = &["Problem", "Decision", "Validation"];
+pub const OPTIONAL_SECTIONS: [&str; 4] =
+    ["Alternatives considered", "Risks", "Follow-up", "Memory"];
+
+/// Commit-type-specific requirements shared by template generation,
+/// linting, and the generated agent-guidance contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitPolicy {
+    pub commit_type: &'static str,
+    pub body_required: bool,
+    pub required_sections: &'static [&'static str],
+}
+
+pub const COMMIT_POLICIES: [CommitPolicy; 9] = [
+    CommitPolicy {
+        commit_type: "fix",
+        body_required: true,
+        required_sections: SUBSTANTIVE_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "feat",
+        body_required: true,
+        required_sections: SUBSTANTIVE_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "refactor",
+        body_required: true,
+        required_sections: SUBSTANTIVE_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "perf",
+        body_required: true,
+        required_sections: SUBSTANTIVE_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "test",
+        body_required: false,
+        required_sections: NON_SUBSTANTIVE_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "docs",
+        body_required: false,
+        required_sections: NON_SUBSTANTIVE_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "build",
+        body_required: false,
+        required_sections: NON_SUBSTANTIVE_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "chore",
+        body_required: false,
+        required_sections: NON_SUBSTANTIVE_SECTIONS,
+    },
+    CommitPolicy {
+        commit_type: "revert",
+        body_required: false,
+        required_sections: NON_SUBSTANTIVE_SECTIONS,
+    },
 ];
-pub const REQUIRED_SECTIONS: [&str; 4] = ["Problem", "Decision", "Rationale", "Validation"];
-pub const OPTIONAL_SECTIONS: [&str; 4] = ["Alternatives considered", "Risks", "Follow-up", "Memory"];
+
+pub fn commit_policy(commit_type: &str) -> Option<&'static CommitPolicy> {
+    COMMIT_POLICIES
+        .iter()
+        .find(|policy| policy.commit_type == commit_type)
+}
 
 fn known_sections() -> impl Iterator<Item = &'static str> {
-    REQUIRED_SECTIONS.into_iter().chain(OPTIONAL_SECTIONS)
+    SUBSTANTIVE_SECTIONS
+        .iter()
+        .copied()
+        .chain(OPTIONAL_SECTIONS)
 }
 
 /// Python `str.isspace()`-compatible whitespace test. `char::is_whitespace`
@@ -42,26 +106,18 @@ fn obj(pairs: Vec<(&str, Value)>) -> Value {
 
 /// The typed commit message template used by Aethyme commit hygiene.
 pub fn default_template(commit_type: &str, scope: &str) -> String {
-    let normalized_type = if ALLOWED_TYPES.contains(&commit_type) {
-        commit_type
-    } else {
-        "fix"
-    };
-    let mut lines: Vec<String> = vec![
-        format!("{normalized_type}({scope}): short summary"),
-        String::new(),
-        "Problem:".to_string(),
-        "...".to_string(),
-    ];
-    if SUBSTANTIVE_TYPES.contains(&normalized_type) {
-        lines.extend(
-            [
-                "", "Decision:", "...", "", "Rationale:", "...", "", "Validation:", "- ...",
-            ]
-            .map(str::to_string),
-        );
-    } else {
-        lines.extend(["", "Decision:", "...", "", "Validation:", "- ..."].map(str::to_string));
+    let policy = commit_policy(commit_type).unwrap_or_else(|| {
+        commit_policy("fix").expect("the built-in fix commit policy must exist")
+    });
+    let mut lines = vec![format!("{}({scope}): short summary", policy.commit_type)];
+    for section in policy.required_sections {
+        lines.push(String::new());
+        lines.push(format!("{section}:"));
+        lines.push(if *section == "Validation" {
+            "- ...".to_string()
+        } else {
+            "...".to_string()
+        });
     }
     lines.extend(
         [
@@ -132,27 +188,25 @@ pub fn lint_commit_message(message: &str) -> Value {
         }
     }
 
-    let mut required_sections: Vec<&str> = Vec::new();
+    let mut required_sections: &[&str] = &[];
     let mut body_required = false;
     if let Some(parsed) = &subject {
-        body_required = SUBSTANTIVE_TYPES.contains(&parsed.commit_type.as_str());
+        let policy = commit_policy(&parsed.commit_type)
+            .expect("parsed subjects always carry an allowed commit type");
+        body_required = policy.body_required;
+        required_sections = policy.required_sections;
         if body_required {
-            required_sections = REQUIRED_SECTIONS.to_vec();
-            let any_content = sections
-                .iter()
-                .any(|(_, text)| !py_strip(text).is_empty());
+            let any_content = sections.iter().any(|(_, text)| !py_strip(text).is_empty());
             if !any_content {
                 errors.push(format!(
                     "Structured body is required for substantive commits: {}.",
-                    REQUIRED_SECTIONS.join(", ")
+                    required_sections.join(", ")
                 ));
             }
-        } else {
-            required_sections = vec!["Problem", "Decision", "Validation"];
         }
     }
 
-    for section_name in &required_sections {
+    for section_name in required_sections {
         match sections.iter().find(|(name, _)| name == section_name) {
             None => {
                 errors.push(format!("Missing required section: {section_name}."));
@@ -274,10 +328,14 @@ fn parse_subject(subject_line: &str, errors: &mut Vec<String>) -> Option<ParsedS
         return no_match(errors);
     }
 
-    if !ALLOWED_TYPES.contains(&commit_type) {
+    if commit_policy(commit_type).is_none() {
         errors.push(format!(
             "Unsupported commit type `{commit_type}`. Allowed types: {}.",
-            ALLOWED_TYPES.join(", ")
+            COMMIT_POLICIES
+                .iter()
+                .map(|policy| policy.commit_type)
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
         return None;
     }
@@ -369,6 +427,27 @@ fn first_line(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::pyjson;
+
+    #[test]
+    fn policy_table_covers_every_allowed_type_and_preserves_requirements() {
+        assert_eq!(
+            COMMIT_POLICIES
+                .iter()
+                .map(|policy| policy.commit_type)
+                .collect::<Vec<_>>(),
+            vec![
+                "fix", "feat", "refactor", "perf", "test", "docs", "build", "chore", "revert",
+            ]
+        );
+        for policy in &COMMIT_POLICIES[..4] {
+            assert!(policy.body_required);
+            assert_eq!(policy.required_sections, SUBSTANTIVE_SECTIONS);
+        }
+        for policy in &COMMIT_POLICIES[4..] {
+            assert!(!policy.body_required);
+            assert_eq!(policy.required_sections, NON_SUBSTANTIVE_SECTIONS);
+        }
+    }
 
     #[test]
     fn default_template_includes_required_sections_for_fix() {
