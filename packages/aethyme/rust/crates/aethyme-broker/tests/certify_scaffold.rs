@@ -513,5 +513,39 @@ fn existing_files_are_never_touched_and_gitignore_appends_preserving_content() {
         "content preserved"
     );
     assert!(gitignore.contains("aethyme-broker:begin"));
+    assert!(gitignore.contains(".aethyme/reports/"));
     assert!(gitignore.contains(".aethyme/worktrees/"));
+}
+
+#[test]
+fn scaffold_upgrades_an_older_managed_gitignore_block_for_reports() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let old_block = "custom-before/\n\n\
+# aethyme-broker:begin (managed block — do not edit inside)\n\
+.aethyme/broker.db*\n\
+.aethyme/logs/\n\
+.aethyme/run/\n\
+.aethyme/worktrees/\n\
+.aethyme/broker-action-required.md\n\
+# aethyme-broker:end\n\
+custom-after/\n";
+    std::fs::write(tmp.path().join(".gitignore"), old_block).unwrap();
+
+    let before = init::certify(tmp.path()).unwrap();
+    assert_eq!(status_of(&before, "certify.gitignore"), CheckStatus::Warn);
+    let scaffold = init::scaffold(tmp.path()).unwrap();
+    assert_eq!(
+        status_of(&scaffold, "scaffold.gitignore"),
+        CheckStatus::Created
+    );
+    let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+    assert!(gitignore.contains("custom-before/"));
+    assert!(gitignore.contains("custom-after/"));
+    assert!(gitignore.contains(".aethyme/reports/"));
+    assert_eq!(gitignore.matches("aethyme-broker:begin").count(), 1);
+    assert_eq!(
+        status_of(&init::certify(tmp.path()).unwrap(), "certify.gitignore"),
+        CheckStatus::Pass
+    );
 }

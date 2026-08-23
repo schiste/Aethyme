@@ -395,11 +395,7 @@ fn unknown_config_keys(value: &toml::Value) -> Vec<String> {
 
 fn check_gitignore_contract(main_root: &Path) -> Check {
     let existing = std::fs::read_to_string(main_root.join(".gitignore")).unwrap_or_default();
-    let satisfied = existing.contains("aethyme-broker:begin")
-        || GITIGNORE_BLOCK
-            .lines()
-            .filter(|line| !line.starts_with('#'))
-            .all(|line| existing.lines().any(|have| have.trim() == line));
+    let satisfied = gitignore_contract_satisfied(&existing);
     if satisfied {
         Check {
             id: "certify.gitignore",
@@ -548,6 +544,7 @@ const GITIGNORE_BLOCK: &str = "\
 # aethyme-broker:begin (managed block — do not edit inside)
 .aethyme/broker.db*
 .aethyme/logs/
+.aethyme/reports/
 .aethyme/run/
 .aethyme/worktrees/
 .aethyme/broker-action-required.md
@@ -557,33 +554,33 @@ const GITIGNORE_BLOCK: &str = "\
 fn ensure_gitignore_block(main_root: &Path) -> Check {
     let path = main_root.join(".gitignore");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    // Consider the contract satisfied if the managed block OR all its
-    // entries are already present (hand-maintained repos qualify).
-    let satisfied = existing.contains("aethyme-broker:begin")
-        || GITIGNORE_BLOCK
-            .lines()
-            .filter(|line| !line.starts_with('#'))
-            .all(|line| existing.lines().any(|have| have.trim() == line));
-    if satisfied {
+    // Hand-maintained repos qualify when every runtime entry is present.
+    // A managed block from an older release is upgraded in place below.
+    if gitignore_contract_satisfied(&existing) {
         return Check {
             id: "scaffold.gitignore",
             status: CheckStatus::Pass,
             detail: ".gitignore covers broker runtime state".into(),
         };
     }
-    let mut updated = existing;
-    if !updated.is_empty() && !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    if !updated.is_empty() {
-        updated.push('\n');
-    }
-    updated.push_str(GITIGNORE_BLOCK);
+    let (updated, detail) = if let Some(updated) = replace_managed_gitignore_block(&existing) {
+        (updated, "updated the aethyme-broker block in .gitignore")
+    } else {
+        let mut updated = existing;
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        if !updated.is_empty() {
+            updated.push('\n');
+        }
+        updated.push_str(GITIGNORE_BLOCK);
+        (updated, "appended the aethyme-broker block to .gitignore")
+    };
     match std::fs::write(&path, updated) {
         Ok(()) => Check {
             id: "scaffold.gitignore",
             status: CheckStatus::Created,
-            detail: "appended the aethyme-broker block to .gitignore".into(),
+            detail: detail.into(),
         },
         Err(err) => Check {
             id: "scaffold.gitignore",
@@ -591,6 +588,32 @@ fn ensure_gitignore_block(main_root: &Path) -> Check {
             detail: format!("cannot update .gitignore: {err}"),
         },
     }
+}
+
+fn gitignore_contract_satisfied(existing: &str) -> bool {
+    GITIGNORE_BLOCK
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .all(|required| existing.lines().any(|have| have.trim() == required))
+}
+
+fn replace_managed_gitignore_block(existing: &str) -> Option<String> {
+    const BEGIN: &str = "# aethyme-broker:begin";
+    const END: &str = "# aethyme-broker:end";
+    let start = existing.find(BEGIN)?;
+    let end_marker = start + existing[start..].find(END)?;
+    let mut end = end_marker + END.len();
+    if existing.as_bytes().get(end) == Some(&b'\r') {
+        end += 1;
+    }
+    if existing.as_bytes().get(end) == Some(&b'\n') {
+        end += 1;
+    }
+    let mut updated = String::with_capacity(existing.len() + GITIGNORE_BLOCK.len());
+    updated.push_str(&existing[..start]);
+    updated.push_str(GITIGNORE_BLOCK);
+    updated.push_str(&existing[end..]);
+    Some(updated)
 }
 
 const CONFIG_TEMPLATE: &str = "\
