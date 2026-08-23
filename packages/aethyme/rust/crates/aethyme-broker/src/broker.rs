@@ -12,7 +12,8 @@ use crate::error::BrokerError;
 use crate::git::{GitError, GitRepo};
 use crate::store::BrokerStore;
 use crate::types::{
-    LeaseKind, MergeQueueEntry, MergeStatus, NewSession, Session, SessionOrigin, SessionStatus,
+    GateStatus, LeaseKind, MergeQueueEntry, MergeStatus, NewSession, Session, SessionOrigin,
+    SessionStatus,
 };
 use crate::version::{VersionDriftReport, VersionDriftStatus};
 
@@ -750,10 +751,65 @@ pub struct FinishReport {
     pub unsubmitted_commits: u64,
     pub latest_queue_entry_id: Option<i64>,
     pub latest_queue_status: Option<MergeStatus>,
+    pub delivery: FinishDelivery,
+    pub pending_work: FinishPendingWork,
+    pub leases_held: Vec<FinishLease>,
+    pub last_gate: Option<FinishGateRun>,
     pub cleanup_safe: bool,
+    pub recommended_next_action: Option<String>,
     pub summary: String,
     pub warnings: Vec<String>,
     pub next_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct FinishDelivery {
+    pub submitted: bool,
+    pub promoted: bool,
+    pub published: bool,
+    pub promotion_commit: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct FinishPendingWork {
+    pub present: bool,
+    pub dirty_path_count: usize,
+    pub unsubmitted_commits: u64,
+    pub worktree_missing: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishLeaseState {
+    Active,
+    Released,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FinishLease {
+    pub path: String,
+    pub kind: LeaseKind,
+    pub state: FinishLeaseState,
+    pub expires_at: Option<i64>,
+    pub released_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishGateCacheSource {
+    Executed,
+    CacheHit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FinishGateRun {
+    pub gate: String,
+    pub status: GateStatus,
+    pub tree_hash: String,
+    /// Unix epoch milliseconds from the event ledger.
+    pub recorded_at: i64,
+    pub cache_source: FinishGateCacheSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -2774,12 +2830,162 @@ impl Broker {
 
     // ── finish ────────────────────────────────────────────────────────
 
+    fn finish_delivery(&self, entry: Option<&MergeQueueEntry>) -> FinishDelivery {
+        let Some(entry) = entry else {
+            return FinishDelivery::default();
+        };
+        let promoted = matches!(
+            entry.status,
+            MergeStatus::Promoted | MergeStatus::ExternallyLanded
+        );
+        let promotion_commit = details_string_value(entry.details_json.as_deref(), "commit");
+        let published = entry.status == MergeStatus::ExternallyLanded
+            || (promoted
+                && promotion_commit.as_deref().is_some_and(|promotion| {
+                    self.repo
+                        .tracking_upstream()
+                        .is_some_and(|(_, upstream)| self.repo.is_ancestor(promotion, &upstream))
+                }));
+        FinishDelivery {
+            submitted: true,
+            promoted,
+            published,
+            promotion_commit,
+        }
+    }
+
+    fn finish_leases(
+        &self,
+        session_id: i64,
+        at_ms: i64,
+    ) -> Result<Vec<FinishLease>, BrokerOpError> {
+        let mut leases = self
+            .store
+            .session_leases(session_id)?
+            .into_iter()
+            .map(|lease| FinishLease {
+                path: if Path::new(&lease.path).is_absolute() {
+                    "<absolute-path-redacted>".into()
+                } else {
+                    lease.path
+                },
+                kind: lease.kind,
+                state: if lease.released_at.is_some() {
+                    FinishLeaseState::Released
+                } else if lease
+                    .expires_at
+                    .is_some_and(|expires_at| expires_at <= at_ms)
+                {
+                    FinishLeaseState::Expired
+                } else {
+                    FinishLeaseState::Active
+                },
+                expires_at: lease.expires_at,
+                released_at: lease.released_at,
+            })
+            .collect::<Vec<_>>();
+        leases.sort_by(|a, b| {
+            (
+                a.path.as_str(),
+                a.kind.as_str(),
+                a.state,
+                a.expires_at,
+                a.released_at,
+            )
+                .cmp(&(
+                    b.path.as_str(),
+                    b.kind.as_str(),
+                    b.state,
+                    b.expires_at,
+                    b.released_at,
+                ))
+        });
+        Ok(leases)
+    }
+
+    fn finish_last_gate(&self, session_id: i64) -> Result<Option<FinishGateRun>, BrokerOpError> {
+        let Some(event) = self.store.latest_session_gate_event(session_id)? else {
+            return Ok(None);
+        };
+        let Some(payload) = event
+            .payload_json
+            .as_deref()
+            .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(gate) = payload.get("gate").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(tree_hash) = payload.get("tree").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let (status, cache_source) = if event.kind == crate::events::GATE_CACHED {
+            let Some(status) = payload
+                .get("cached_status")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|status| GateStatus::parse(status).ok())
+            else {
+                return Ok(None);
+            };
+            (status, FinishGateCacheSource::CacheHit)
+        } else {
+            let Some(status) = event
+                .kind
+                .strip_prefix("gate.")
+                .and_then(|status| GateStatus::parse(status).ok())
+            else {
+                return Ok(None);
+            };
+            (status, FinishGateCacheSource::Executed)
+        };
+        Ok(Some(FinishGateRun {
+            gate: gate.to_string(),
+            status,
+            tree_hash: tree_hash.to_string(),
+            recorded_at: event.ts,
+            cache_source,
+        }))
+    }
+
+    fn finalize_finish_report(&self, report: &mut FinishReport) {
+        report.pending_work = FinishPendingWork {
+            present: !report.dirty_paths.is_empty() || report.unsubmitted_commits > 0,
+            dirty_path_count: report.dirty_paths.len(),
+            unsubmitted_commits: report.unsubmitted_commits,
+            worktree_missing: report.pending_work.worktree_missing,
+        };
+        report.recommended_next_action = report.next_commands.first().cloned().or_else(|| {
+            if report.delivery.promoted && !report.delivery.published {
+                report
+                    .latest_queue_entry_id
+                    .map(|entry| format!("aethyme broker ship plan --entry {entry}"))
+            } else if report.delivery.published && !report.cleanup_safe {
+                Some("aethyme broker integration status".into())
+            } else {
+                None
+            }
+        });
+    }
+
+    fn persist_finish_report(&mut self, report: &FinishReport) -> Result<(), BrokerOpError> {
+        let payload = crate::events::session_finished_payload(report);
+        self.store.finish_session(report.session_id, &payload)?;
+        Ok(())
+    }
+
     /// Finish a session at the operator level: close it when there is no
     /// dirty work and no committed work waiting for submit/promotion;
     /// otherwise return actionable guidance without mutating state.
     pub fn finish(&mut self, session_id: i64) -> Result<FinishReport, BrokerOpError> {
         let session = self.store.session(session_id)?;
         let worktree_path = PathBuf::from(&session.worktree_path);
+        let at_ms = now_ms();
+        let queue = self.store.merge_queue()?;
+        let latest_for_session = queue
+            .iter()
+            .rev()
+            .find(|entry| entry.session_id == session_id);
         let mut report = FinishReport {
             session_id,
             worktree_path: session.worktree_path.clone(),
@@ -2787,20 +2993,25 @@ impl Broker {
             closed: false,
             dirty_paths: Vec::new(),
             unsubmitted_commits: 0,
-            latest_queue_entry_id: None,
-            latest_queue_status: None,
+            latest_queue_entry_id: latest_for_session.map(|entry| entry.id),
+            latest_queue_status: latest_for_session.map(|entry| entry.status),
+            delivery: self.finish_delivery(latest_for_session),
+            pending_work: FinishPendingWork::default(),
+            leases_held: self.finish_leases(session_id, at_ms)?,
+            last_gate: self.finish_last_gate(session_id)?,
             cleanup_safe: false,
+            recommended_next_action: None,
             summary: format!("session {session_id} is not finished yet"),
             warnings: Vec::new(),
             next_commands: Vec::new(),
         };
 
         if !worktree_path.exists() {
+            report.pending_work.worktree_missing = true;
             if session.status == SessionStatus::Cleaned {
                 report.status = FinishStatus::AlreadyClosed;
                 report.summary = format!("session {session_id} is already closed");
             } else {
-                self.close(session_id)?;
                 report.status = FinishStatus::Closed;
                 report.closed = true;
                 report.summary =
@@ -2809,6 +3020,10 @@ impl Broker {
             report
                 .warnings
                 .push("worktree path does not exist; cleanup is not applicable".into());
+            self.finalize_finish_report(&mut report);
+            if report.status == FinishStatus::Closed {
+                self.persist_finish_report(&report)?;
+            }
             return Ok(report);
         }
 
@@ -2816,7 +3031,6 @@ impl Broker {
         let head = checkout.head_commit()?;
         report.dirty_paths = checkout.dirty_paths()?;
 
-        let queue = self.store.merge_queue()?;
         let latest_for_head = queue
             .iter()
             .rev()
@@ -2829,6 +3043,7 @@ impl Broker {
         if let Some(entry) = visible_entry {
             report.latest_queue_entry_id = Some(entry.id);
             report.latest_queue_status = Some(entry.status);
+            report.delivery = self.finish_delivery(Some(entry));
         }
 
         let base = self
@@ -2852,6 +3067,7 @@ impl Broker {
                     plural_word(report.dirty_paths.len(), "path", "paths")
                 ));
             }
+            self.finalize_finish_report(&mut report);
             return Ok(report);
         }
 
@@ -2873,6 +3089,7 @@ impl Broker {
             report
                 .next_commands
                 .push(format!("git -C {} stash push", session.worktree_path));
+            self.finalize_finish_report(&mut report);
             return Ok(report);
         }
 
@@ -2890,6 +3107,7 @@ impl Broker {
                     report
                         .next_commands
                         .push(format!("aethyme broker finish --session {session_id}"));
+                    self.finalize_finish_report(&mut report);
                     return Ok(report);
                 }
                 MergeStatus::Conflict => {
@@ -2903,6 +3121,7 @@ impl Broker {
                     report
                         .next_commands
                         .push(format!("aethyme broker submit --session {session_id}"));
+                    self.finalize_finish_report(&mut report);
                     return Ok(report);
                 }
                 MergeStatus::Rejected => {
@@ -2913,6 +3132,7 @@ impl Broker {
                     report
                         .next_commands
                         .push(format!("aethyme broker submit --session {session_id}"));
+                    self.finalize_finish_report(&mut report);
                     return Ok(report);
                 }
                 MergeStatus::Submitted | MergeStatus::Simulating => {
@@ -2922,6 +3142,7 @@ impl Broker {
                         entry.status.as_str()
                     ));
                     report.next_commands.push("aethyme broker queue".into());
+                    self.finalize_finish_report(&mut report);
                     return Ok(report);
                 }
                 MergeStatus::Superseded => {}
@@ -2937,10 +3158,10 @@ impl Broker {
             report
                 .next_commands
                 .push(format!("aethyme broker submit --session {session_id}"));
+            self.finalize_finish_report(&mut report);
             return Ok(report);
         }
 
-        self.close(session_id)?;
         report.status = FinishStatus::Closed;
         report.closed = true;
         report.summary = format!("session {session_id} closed; worktree untouched");
@@ -2956,6 +3177,8 @@ impl Broker {
                     .into(),
             );
         }
+        self.finalize_finish_report(&mut report);
+        self.persist_finish_report(&report)?;
         Ok(report)
     }
 

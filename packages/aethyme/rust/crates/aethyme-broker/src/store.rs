@@ -325,6 +325,50 @@ impl BrokerStore {
         Ok(())
     }
 
+    /// Atomically close a successfully finished session and persist its
+    /// redacted structured handoff after snapshotting leases upstream.
+    pub fn finish_session(&mut self, id: i64, handoff_payload: &str) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE sessions SET status = 'cleaned', updated_at = ?2
+             WHERE id = ?1 AND status <> 'cleaned'",
+            params![id, now],
+        )?;
+        if changed == 0 {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                [id],
+                |row| row.get(0),
+            )?;
+            if exists {
+                return Ok(());
+            }
+            return Err(BrokerError::SessionNotFound(id));
+        }
+        tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
+        tx.execute(
+            "DELETE FROM session_foreign_files WHERE session_id = ?1",
+            [id],
+        )?;
+        insert_event(
+            &tx,
+            now,
+            &format!("session.{}", SessionStatus::Cleaned.as_str()),
+            Some(id),
+            None,
+        )?;
+        insert_event(
+            &tx,
+            now,
+            crate::events::SESSION_FINISHED,
+            Some(id),
+            Some(handoff_payload),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Replace the adoption-time foreign-file snapshot for a session.
     /// These are files that were already untracked when the session began,
     /// so later submit/exec checks can distinguish "mine" from inherited
@@ -1227,6 +1271,31 @@ impl BrokerStore {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Latest executed or cache-resolved gate activity for one session.
+    pub fn latest_session_gate_event(&self, session_id: i64) -> Result<Option<Event>, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT id, schema_version, ts, kind, session_id, payload_json
+                 FROM events
+                 WHERE session_id = ?1
+                   AND kind IN ('gate.pass', 'gate.fail', 'gate.cancelled', 'gate.error', 'gate.cached')
+                 ORDER BY id DESC LIMIT 1",
+                [session_id],
+                |row| {
+                    Ok(Event {
+                        id: row.get(0)?,
+                        schema_version: row.get(1)?,
+                        ts: row.get(2)?,
+                        kind: row.get(3)?,
+                        session_id: row.get(4)?,
+                        payload_json: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(BrokerError::from)
     }
 }
 

@@ -12,8 +12,10 @@ use std::path::Path;
 use std::process::Command;
 
 use aethyme_broker::{
-    Broker, EVENTS_SCHEMA_VERSION, Event, GateStatus, MergeStatus, OperationEffect,
-    OperationProvider, OperationStatus, Overlap, SessionStatus, events,
+    Broker, EVENTS_SCHEMA_VERSION, Event, FinishDelivery, FinishGateCacheSource, FinishGateRun,
+    FinishLease, FinishLeaseState, FinishPendingWork, FinishReport, FinishStatus, GateStatus,
+    LeaseKind, MergeStatus, OperationEffect, OperationProvider, OperationStatus, Overlap,
+    SessionStatus, events,
 };
 
 /// The complete v1 kind catalog. Additions append here (additive change);
@@ -47,6 +49,7 @@ const V1_KINDS: &[&str] = &[
     "session.active",
     "session.cleaned",
     "session.exited",
+    "session.finished",
     "session.idle",
     "session.registered",
     "session.reused",
@@ -108,6 +111,7 @@ fn v1_kind_catalog_is_frozen() {
     let mut actual: Vec<String> = vec![
         events::SESSION_REGISTERED.into(),
         events::SESSION_REUSED.into(),
+        events::SESSION_FINISHED.into(),
         events::LEASE_CLAIMED.into(),
         events::LEASE_RELEASED.into(),
         events::LEASE_OVERLAP.into(),
@@ -181,6 +185,89 @@ fn v1_constructor_payload_field_names_are_frozen() {
         &["exit_code"],
         "session.exited",
     );
+    let finish = FinishReport {
+        session_id: 7,
+        worktree_path: "/secret/worktree".into(),
+        status: FinishStatus::Closed,
+        closed: true,
+        dirty_paths: Vec::new(),
+        unsubmitted_commits: 0,
+        latest_queue_entry_id: Some(9),
+        latest_queue_status: Some(MergeStatus::Promoted),
+        delivery: FinishDelivery {
+            submitted: true,
+            promoted: true,
+            published: false,
+            promotion_commit: Some("commit".into()),
+        },
+        pending_work: FinishPendingWork::default(),
+        leases_held: vec![FinishLease {
+            path: "src/".into(),
+            kind: LeaseKind::Explicit,
+            state: FinishLeaseState::Active,
+            expires_at: None,
+            released_at: None,
+        }],
+        last_gate: Some(FinishGateRun {
+            gate: "test".into(),
+            status: GateStatus::Pass,
+            tree_hash: "tree".into(),
+            recorded_at: 1,
+            cache_source: FinishGateCacheSource::Executed,
+        }),
+        cleanup_safe: false,
+        recommended_next_action: Some("next".into()),
+        summary: "secret summary".into(),
+        warnings: vec!["secret warning".into()],
+        next_commands: vec!["secret command".into()],
+    };
+    let finished_payload = events::session_finished_payload(&finish);
+    assert_keys(
+        &finished_payload,
+        &[
+            "cleanup_safe",
+            "delivery",
+            "last_gate",
+            "latest_queue_entry_id",
+            "latest_queue_status",
+            "leases_held",
+            "pending_work",
+            "recommended_next_action",
+            "session_id",
+            "status",
+        ],
+        "session.finished",
+    );
+    let finished: serde_json::Value = serde_json::from_str(&finished_payload).unwrap();
+    assert_keys(
+        &finished["delivery"].to_string(),
+        &["promoted", "promotion_commit", "published", "submitted"],
+        "session.finished delivery",
+    );
+    assert_keys(
+        &finished["pending_work"].to_string(),
+        &[
+            "dirty_path_count",
+            "present",
+            "unsubmitted_commits",
+            "worktree_missing",
+        ],
+        "session.finished pending_work",
+    );
+    assert_keys(
+        &finished["leases_held"][0].to_string(),
+        &["expires_at", "kind", "path", "released_at", "state"],
+        "session.finished lease",
+    );
+    assert_keys(
+        &finished["last_gate"].to_string(),
+        &["cache_source", "gate", "recorded_at", "status", "tree_hash"],
+        "session.finished last_gate",
+    );
+    assert!(!finished_payload.contains("/secret/worktree"));
+    assert!(!finished_payload.contains("secret summary"));
+    assert!(!finished_payload.contains("secret warning"));
+    assert!(!finished_payload.contains("secret command"));
     assert_keys(
         &events::lease_path_payload("p"),
         &["path"],

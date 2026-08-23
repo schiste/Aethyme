@@ -45,7 +45,8 @@ mod version;
 pub use broker::{
     AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
     AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, AdoptOutcome, AdoptReport, AgentView,
-    Broker, BrokerOpError, DoctorRepairStatus, DoctorReport, FinishReport, FinishStatus,
+    Broker, BrokerOpError, DoctorRepairStatus, DoctorReport, FinishDelivery, FinishGateCacheSource,
+    FinishGateRun, FinishLease, FinishLeaseState, FinishPendingWork, FinishReport, FinishStatus,
     GuardedExecReport, IntegrationDeliveryState, IntegrationLiveSession, IntegrationMovementNotice,
     IntegrationNextAction, IntegrationStabilityReport, IntegrationStatusView, LeaseBlocker,
     LeaseClaimReport, LeaseOverlapRelation, LeasePathPlan, LeasePlan, LeasePlanOverlap,

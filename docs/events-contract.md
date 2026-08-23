@@ -86,6 +86,7 @@ One JSON object per line:
 | `session.active` / `.idle` / `.stale` | the session | — | liveness transition persisted (once per transition) |
 | `session.exited` | the session | `exit_code` (when known) | spawned PID died, or explicit transition |
 | `session.cleaned` | the session | — | `cleanup` removed the worktree, `close` marked the session finished (state only), or `adopt --replace-stale` retired the previous session |
+| `session.finished` | the session | `session_id`, `status`, `latest_queue_entry_id`, `latest_queue_status`, `delivery`, `pending_work`, `leases_held`, `last_gate`, `cleanup_safe`, `recommended_next_action` | `finish` successfully closed the session; written atomically with `session.cleaned`. The payload is a redacted handoff: no worktree/task/command/log paths, warnings, diffs, hunks, or file contents. |
 | `lease.claimed` / `lease.released` | claiming session | `path` | explicit lease operations |
 | `lease.overlap` | lower session of the pair | `session_a`, `session_b`, `path` | a NEW overlapping-edit pair is detected (never re-announced) |
 | `gate.pass` / `.fail` / `.error` | submitting session (nullable) | `gate`, `tree`, `failure_class` | a gate run concluded against tree `tree`; `failure_class` is nullable and classifies non-pass outcomes (`test_failure`, `environment`, `resource_contention`, `timeout`, `unknown`) |

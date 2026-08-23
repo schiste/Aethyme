@@ -143,6 +143,15 @@ claims nor refreshes leases and does not append broker events or command
 telemetry. Paths are sorted deterministically and must be unambiguous,
 repository-relative spellings without `.` or `..` components.
 
+`broker finish` returns a structured handoff covering the latest queue and
+submitted/promoted/published delivery state, pending work, every recorded
+active/released/expired lease, the latest executed or cache-resolved gate with
+its full tree hash and event time, cleanup safety, and one recommended next
+action. A successful close persists the same operational fields in a redacted
+`session.finished` event atomically with `session.cleaned`, so the handoff
+survives lease cleanup and session closure. Refused and already-closed finishes
+do not emit a misleading or duplicate completion event.
+
 Promotion only advances the local integration ref. Use `broker ship plan` to
 inspect the promoted queue entry, exact integration SHA, remote freshness,
 proposed non-force push, and local-main safety without mutating refs or remote
