@@ -387,9 +387,35 @@ fn normalized_replay_drops_dual_identity_noise_and_preserves_real_conflicts() {
         vec!["src/b.py".to_string()],
         "normalized replay must report only the session-owned conflict"
     );
+    assert_eq!(first.conflict_details.len(), 1);
+    let conflict = &first.conflict_details[0];
+    assert_eq!(conflict.path, "src/b.py");
+    assert_eq!(conflict.originating_commit, owned.commit);
+    assert_eq!(conflict.ownership, SubmissionCommitOwnership::SessionOwned);
+    assert_eq!(conflict.integration_side_commits.len(), 1);
+    assert_eq!(conflict.integration_side_commits[0].len(), 40);
+    assert!(conflict.remediation.contains(&owned.commit));
+    let expected_submit = format!("aethyme broker submit --session {victim_id}");
+    assert_eq!(
+        conflict.commands.last().map(String::as_str),
+        Some(expected_submit.as_str())
+    );
     let first_details: serde_json::Value =
         serde_json::from_str(first.entry.details_json.as_deref().unwrap()).unwrap();
     assert_eq!(first_details["blocking_sessions"], serde_json::json!([]));
+    assert_eq!(
+        first_details["conflict_details"][0]["originating_commit"],
+        owned.commit
+    );
+    assert_eq!(
+        first_details["conflict_details"][0]["ownership"],
+        "session_owned"
+    );
+
+    let note =
+        std::fs::read_to_string(victim.join(aethyme_broker::ACTION_REQUIRED_RELPATH)).unwrap();
+    assert!(note.contains(&owned.commit));
+    assert!(note.contains(&conflict.integration_side_commits[0]));
 
     broker.close(blocker_a.id).unwrap();
     broker
@@ -405,9 +431,30 @@ fn normalized_replay_drops_dual_identity_noise_and_preserves_real_conflicts() {
 
     let second = broker.simulate_and_gate(first.entry.id).unwrap();
     assert_eq!(second.conflicts, first.conflicts);
+    assert_eq!(second.conflict_details, first.conflict_details);
     let second_details: serde_json::Value =
         serde_json::from_str(second.entry.details_json.as_deref().unwrap()).unwrap();
     assert_eq!(second_details["blocking_sessions"], serde_json::json!([]));
+
+    let blocker_real_worktree = agent_worktree_at(tmp.path(), "blocker-real", &victim_baseline);
+    let blocker_real = broker
+        .adopt(
+            &blocker_real_worktree,
+            Some("actual conflicting lease owner"),
+        )
+        .unwrap();
+    commit_edit(&blocker_real_worktree, "src/b.py", "b = 5\n");
+    broker.refresh_leases().unwrap();
+
+    let third = broker.simulate_and_gate(first.entry.id).unwrap();
+    assert_eq!(third.conflicts, vec!["src/b.py".to_string()]);
+    assert_eq!(third.conflict_details, first.conflict_details);
+    let third_details: serde_json::Value =
+        serde_json::from_str(third.entry.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        third_details["blocking_sessions"],
+        serde_json::json!([blocker_real.id])
+    );
 
     let rebase = Command::new("git")
         .args(["rebase", "aethyme/integration"])

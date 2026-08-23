@@ -67,6 +67,7 @@ pub struct SubmitOutcome {
     pub entry: MergeQueueEntry,
     pub submission_plan: SubmissionPlan,
     pub conflicts: Vec<String>,
+    pub conflict_details: Vec<SubmissionConflict>,
     pub gate_outcomes: Vec<GateRunOutcome>,
     pub promoted: bool,
 }
@@ -78,6 +79,16 @@ pub enum SubmissionCommitOwnership {
     SessionOwned,
     InheritedFromRecordedBaseline,
     Ambiguous,
+}
+
+impl SubmissionCommitOwnership {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionOwned => "session_owned",
+            Self::InheritedFromRecordedBaseline => "inherited_from_recorded_baseline",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
 }
 
 /// How a commit relates to the current integration history.
@@ -113,9 +124,21 @@ pub struct SubmissionPlan {
     pub warnings: Vec<String>,
 }
 
+/// Provenance and recovery guidance for one surviving replay conflict.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SubmissionConflict {
+    pub path: String,
+    pub originating_commit: String,
+    pub ownership: SubmissionCommitOwnership,
+    pub integration_side_commits: Vec<String>,
+    pub remediation: String,
+    pub commands: Vec<String>,
+}
+
 struct SubmissionReplay {
     tree: String,
     conflicts: Vec<String>,
+    conflict_details: Vec<SubmissionConflict>,
 }
 
 impl Broker {
@@ -260,6 +283,7 @@ impl Broker {
             let blocking = self.blocking_sessions(entry.session_id, &simulation.conflicts)?;
             let details = serde_json::json!({
                 "conflicts": simulation.conflicts,
+                "conflict_details": simulation.conflict_details,
                 "blocking_sessions": blocking,
                 "base": base,
             });
@@ -272,7 +296,7 @@ impl Broker {
             write_action_required(
                 Path::new(&session.worktree_path),
                 &entry,
-                &simulation.conflicts,
+                &simulation.conflict_details,
                 &blocking,
                 &base,
             );
@@ -281,6 +305,7 @@ impl Broker {
                 entry,
                 submission_plan,
                 conflicts: simulation.conflicts,
+                conflict_details: simulation.conflict_details,
                 gate_outcomes: Vec::new(),
                 promoted: false,
             });
@@ -378,6 +403,7 @@ impl Broker {
             entry,
             submission_plan,
             conflicts: Vec::new(),
+            conflict_details: Vec::new(),
             gate_outcomes,
             promoted,
         })
@@ -416,9 +442,34 @@ impl Broker {
             let simulation =
                 repo.merge_tree_with_base(&commit.parents[0], &current, &commit.commit)?;
             if !simulation.conflicts.is_empty() {
+                let conflict_details = simulation
+                    .conflicts
+                    .iter()
+                    .map(|path| SubmissionConflict {
+                        path: path.clone(),
+                        originating_commit: commit.commit.clone(),
+                        ownership: commit.ownership,
+                        integration_side_commits: self
+                            .integration_commits_touching_path(
+                                &commit.parents[0],
+                                &plan.integration_head,
+                                path,
+                            ),
+                        remediation: format!(
+                            "rebase session {} onto integration {}, resolve {} while replaying {}, then resubmit",
+                            plan.session_id, plan.integration_head, path, commit.commit
+                        ),
+                        commands: vec![
+                            format!("git fetch . {}", plan.integration_head),
+                            format!("git rebase {}", plan.integration_head),
+                            format!("aethyme broker submit --session {}", plan.session_id),
+                        ],
+                    })
+                    .collect();
                 return Ok(SubmissionReplay {
                     tree: simulation.tree,
                     conflicts: simulation.conflicts,
+                    conflict_details,
                 });
             }
             current = repo.commit_tree(
@@ -434,7 +485,31 @@ impl Broker {
         Ok(SubmissionReplay {
             tree: repo.commit_tree_id(&current)?,
             conflicts: Vec::new(),
+            conflict_details: Vec::new(),
         })
+    }
+
+    fn integration_commits_touching_path(
+        &self,
+        session_parent: &str,
+        integration_head: &str,
+        path: &str,
+    ) -> Vec<String> {
+        let repo = self.repo_handle();
+        let Ok(base) = repo.merge_base(session_parent, integration_head) else {
+            return Vec::new();
+        };
+        let Ok(commits) = repo.first_parent_commits_between_oldest(&base, integration_head) else {
+            return Vec::new();
+        };
+        commits
+            .into_iter()
+            .filter(|commit| {
+                repo.first_parent(commit)
+                    .and_then(|parent| repo.changed_between(&parent, commit))
+                    .is_ok_and(|paths| paths.iter().any(|candidate| candidate == path))
+            })
+            .collect()
     }
 
     fn build_submission_plan(
@@ -764,7 +839,7 @@ fn clear_action_required(worktree: &Path) {
 fn write_action_required(
     worktree: &Path,
     entry: &MergeQueueEntry,
-    conflicts: &[String],
+    conflicts: &[SubmissionConflict],
     blocking: &[i64],
     base: &str,
 ) {
@@ -798,7 +873,19 @@ fn write_action_required(
         base = base,
         files = conflicts
             .iter()
-            .map(|c| format!("- {c}"))
+            .map(|conflict| {
+                let integration = if conflict.integration_side_commits.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    conflict.integration_side_commits.join(", ")
+                };
+                format!(
+                    "- `{path}` — session commit `{origin}` ({ownership}); integration commit(s): {integration}",
+                    path = conflict.path,
+                    origin = conflict.originating_commit,
+                    ownership = conflict.ownership.as_str(),
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         blocking_note = blocking_note,

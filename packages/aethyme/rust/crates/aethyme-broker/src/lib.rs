@@ -78,8 +78,8 @@ pub use issue_form::{
 };
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use merge::{
-    ACTION_REQUIRED_RELPATH, PromoteConfig, SubmissionCommitOwnership,
-    SubmissionCommitProvenance, SubmissionIntegrationState, SubmissionPlan, SubmitOutcome,
+    ACTION_REQUIRED_RELPATH, PromoteConfig, SubmissionCommitOwnership, SubmissionCommitProvenance,
+    SubmissionConflict, SubmissionIntegrationState, SubmissionPlan, SubmitOutcome,
 };
 pub use operations::{
     CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport, classify_gh,
