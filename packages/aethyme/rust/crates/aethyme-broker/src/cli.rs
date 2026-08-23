@@ -211,11 +211,12 @@ Usage:
       Sample integration, wait for a quiet window (default: 30s), then
       sample again. Fails if integration moved, printing the old and new
       tips so long checks are not mistaken for current-tip proof.
-  aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--dry-run|--apply] [--json]
+  aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--dry-run|--apply --confirm <sha256>] [--json]
       Compare already-fetched upstream with local main and promoted queue
       state. Dry-run is the default. --apply marks externally landed work,
-      preserves pending promotions, and rebuilds integration. A resolution
-      file may attest specific promoted entries as superseded upstream.
+      replays reviewed pending work, and rebuilds integration only when
+      --confirm matches the dry-run plan digest. A resolution file binds
+      queue attestations and per-SHA unrecorded-commit dispositions.
   aethyme broker status [--json]
       The whole picture: agents, overlaps, promoted conflicts, merge
       queue, integration head.
@@ -708,6 +709,8 @@ mod tests {
             "--resolution-file".to_string(),
             "reconciliation.json".to_string(),
             "--apply".to_string(),
+            "--confirm".to_string(),
+            "a".repeat(64),
         ];
         let parsed = match super::parse(&args) {
             Ok(parsed) => parsed,
@@ -720,6 +723,7 @@ mod tests {
             Some(std::path::Path::new("reconciliation.json"))
         );
         assert!(parsed.apply);
+        assert_eq!(parsed.confirm, Some("a".repeat(64)));
     }
 
     #[test]
@@ -2084,6 +2088,9 @@ fn render_integration_reconcile(
     if let Some(path) = &report.resolution_file {
         println!("Resolution:  {path}");
     }
+    if let Some(digest) = &report.plan_digest {
+        println!("Plan digest: {digest}");
+    }
     println!(
         "Result:      {}",
         if report.applied {
@@ -3339,6 +3346,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                             upstream,
                             apply: parsed.apply,
                             resolution_file: parsed.resolution_file.clone(),
+                            confirm: parsed.confirm.clone(),
                         })?;
                     render_integration_reconcile(&report, parsed.json)?;
                     if !report.safe {

@@ -95,8 +95,11 @@ pub use quick_test::{
     run_broker_quick_test_with_options,
 };
 pub use reconciliation::{
-    IntegrationReconcileClassification, IntegrationReconcileEntry, IntegrationReconcileOptions,
-    IntegrationReconcileReport, IntegrationReconcileResolutionAudit,
+    IntegrationReconcileClassification, IntegrationReconcileCommit,
+    IntegrationReconcileCommitOrigin, IntegrationReconcileEntry, IntegrationReconcileEquivalence,
+    IntegrationReconcileOptions, IntegrationReconcilePlan, IntegrationReconcileReport,
+    IntegrationReconcileResolutionAudit, IntegrationReconcileUnrecordedDisposition,
+    IntegrationReconcileUnrecordedResolutionAudit,
 };
 pub use report::{
     InvalidReportEntry, PreparedReport, REPORT_DOCUMENT_SCHEMA_VERSION, REPORT_FILINGS_FILENAME,

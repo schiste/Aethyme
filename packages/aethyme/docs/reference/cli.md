@@ -124,7 +124,7 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker ship plan --entry <id> [--json]`
 - `aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--json]`
 - `aethyme broker integration status [--json]`
-- `aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--dry-run|--apply] [--json]`
+- `aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--dry-run|--apply --confirm <sha256>] [--json]`
 - `aethyme broker quick-test [--with-gate] [--json]`
 - `aethyme broker verify-loop [--json]`
 - `aethyme broker pr check [--target <branch>] [--pr <number>] [--agent <name>] [--dispatch] [--cmd <command>] [--json]`
@@ -425,27 +425,46 @@ operation blindly. A non-zero write is also `outcome_unknown`, because a remote
 command may apply only part of its requested change before failing. V1
 deliberately serializes all writes for one repository.
 
-`integration reconcile` is the recovery path when promoted work lands outside
-the broker, including squash merges. It never fetches: first update the remote
-tracking ref explicitly, then run the default dry-run. Exact ancestry, stable
-patch IDs, and path-tree equivalence classify externally landed work; remaining
-promotions are replayed in queue order on the named upstream. `--apply` moves
-the integration ref and queue state together. Ambiguous equivalence or a replay
-conflict blocks without changing either one. A durable two-phase intent makes
-the update crash-safe: the next broker open either completes the queue/audit
-transaction when the ref moved or cancels the intent when it did not.
+`integration reconcile` is the recovery path when main moves outside the
+broker, including deploy-authored release commits and squash merges. It never
+fetches: first update the remote-tracking ref through an authorized coordinated
+Git operation, then run the default dry-run. The read-only plan enumerates
+upstream-only external work, recorded promotions, exact and patch-equivalent
+landings, unrecorded integration commits, pending queue entries, and ambiguous
+equivalence using full SHAs.
+
+Exact ancestry, stable patch IDs, and path-tree equivalence classify recorded
+work. Remaining promotions and explicitly preserved unrecorded commits are
+replayed in their original integration order onto the current upstream tip.
+Ambiguous equivalence or a replay conflict blocks without changing refs or
+broker rows. A safe dry-run prints `plan_digest`, a SHA-256 over the current
+upstream/integration inputs, classifications, and reviewed dispositions.
+`--apply` requires that exact digest with `--confirm`; ref drift or edited
+review inputs therefore requires a new dry-run.
+
+The confirmed update moves the integration ref and queue state together. A
+durable two-phase intent includes the reviewed digest, so the next broker open
+completes the queue/audit transaction if the ref moved, cancels the intent if
+it did not, and refuses to guess if the ref has a third value.
 
 When automatic evidence correctly fails closed because landed work was later
-modified upstream, an operator can attest only the affected entries with a
-versioned resolution file. The file is single-use by construction: it binds the
-named ref's exact fetched commit, the old integration tip, each queue ID, and
-each original promoted merge commit. Only `superseded_upstream` is accepted;
-unknown fields, duplicate entries, stale commits, empty reasons, and redundant
-overrides of automatic matches are rejected before planning or mutation.
+modified upstream, an operator can attest only the affected queue entries with
+a versioned resolution file. Schema 2 also requires one explicit disposition
+for every unrecorded integration SHA: `preserve_and_replay`,
+`replaced_by_exact_upstream_sha`, or `drop_because_content_empty`. Replacement
+must name one full SHA reachable from the bound upstream; dropping is accepted
+only when Git proves the commit tree is unchanged. There is deliberately no
+blanket discard option.
+
+The file is single-use by construction: it binds the named ref's exact fetched
+commit, the old integration tip, each queue ID and original promoted merge
+commit, and each unrecorded integration SHA. Unknown fields, duplicate entries,
+stale commits, empty reasons, invalid dispositions, and redundant overrides of
+automatic matches are rejected before planning or mutation.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "upstream_ref": "origin/main",
   "upstream_commit": "7033b70ec0241a9f01ab7ac5577dd74039b53e38",
   "old_integration": "3e150ec5c58196f6ed4a9d9d121e723be60872e8",
@@ -456,6 +475,13 @@ overrides of automatic matches are rejected before planning or mutation.
       "old_merge_commit": "<full promoted merge commit>",
       "classification": "superseded_upstream",
       "reason": "Landed through reviewed PRs and subsequently improved upstream"
+    }
+  ],
+  "unrecorded_resolutions": [
+    {
+      "integration_commit": "<full unrecorded integration commit>",
+      "disposition": "preserve_and_replay",
+      "reason": "Reviewed operator-authored release metadata that is absent upstream"
     }
   ]
 }
@@ -472,12 +498,14 @@ aethyme broker integration reconcile \
 aethyme broker integration reconcile \
   --upstream origin/main \
   --resolution-file reconciliation.json \
-  --apply
+  --apply \
+  --confirm <sha256-from-the-reviewed-dry-run>
 ```
 
-The operator, reason, file path, upstream commit, and old integration tip are
-stored in the queue details, reconciliation audit row, and
-`merge.externally_landed` event within the same crash-safe transaction.
+The plan digest is stored in the reconciliation journal. Queue-entry operator
+attestations retain the operator, reason, file path, upstream commit, and old
+integration tip in queue details, reconciliation audit rows, and
+`merge.externally_landed` events within the same crash-safe transaction.
 
 Session repair is bounded by the baseline recorded at `start` or `adopt`.
 Repair refuses when integration does not contain that baseline; reconcile the

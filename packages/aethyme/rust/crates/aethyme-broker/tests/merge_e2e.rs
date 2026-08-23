@@ -1048,6 +1048,7 @@ fn reconcile_recognizes_squash_preserves_followups_and_replays_pending_work() {
             upstream: "origin/main".into(),
             apply: false,
             resolution_file: None,
+            confirm: None,
         })
         .unwrap();
     assert!(dry_run.safe, "{dry_run:#?}");
@@ -1081,6 +1082,7 @@ fn reconcile_recognizes_squash_preserves_followups_and_replays_pending_work() {
             upstream: "origin/main".into(),
             apply: true,
             resolution_file: None,
+            confirm: dry_run.plan_digest.clone(),
         })
         .unwrap();
     assert!(applied.safe && applied.applied);
@@ -1185,6 +1187,7 @@ fn reconcile_blocks_ambiguous_patch_equivalence_without_mutating_state() {
             upstream: "origin/main".into(),
             apply: true,
             resolution_file: None,
+            confirm: None,
         })
         .unwrap();
     assert!(!report.safe, "{report:#?}");
@@ -1244,6 +1247,7 @@ fn reconcile_accepts_commit_bound_operator_supersession_with_durable_audit() {
             upstream: "origin/main".into(),
             apply: false,
             resolution_file: None,
+            confirm: None,
         })
         .unwrap();
     assert!(!blocked.safe, "{blocked:#?}");
@@ -1292,6 +1296,7 @@ fn reconcile_accepts_commit_bound_operator_supersession_with_durable_audit() {
             upstream: "origin/main".into(),
             apply: true,
             resolution_file: Some(resolution_path.clone()),
+            confirm: None,
         })
         .unwrap_err();
     assert!(stale_error.to_string().contains("upstream_commit"));
@@ -1316,6 +1321,7 @@ fn reconcile_accepts_commit_bound_operator_supersession_with_durable_audit() {
             upstream: "origin/main".into(),
             apply: false,
             resolution_file: Some(resolution_path.clone()),
+            confirm: None,
         })
         .unwrap();
     assert!(dry_run.safe && !dry_run.applied, "{dry_run:#?}");
@@ -1331,6 +1337,7 @@ fn reconcile_accepts_commit_bound_operator_supersession_with_durable_audit() {
             upstream: "origin/main".into(),
             apply: true,
             resolution_file: Some(resolution_path),
+            confirm: dry_run.plan_digest.clone(),
         })
         .unwrap();
     assert!(applied.safe && applied.applied, "{applied:#?}");
@@ -1396,6 +1403,7 @@ fn broker_open_finishes_reconciliation_interrupted_after_ref_move() {
             upstream: "origin/main".into(),
             apply: false,
             resolution_file: None,
+            confirm: None,
         })
         .unwrap();
     assert!(report.safe);
@@ -1497,6 +1505,7 @@ fn reconcile_refuses_to_discard_unrecorded_integration_commits() {
             upstream: "origin/main".into(),
             apply: true,
             resolution_file: None,
+            confirm: None,
         })
         .unwrap();
     assert!(!report.safe);
@@ -1694,12 +1703,31 @@ fn reconcile_uses_upstream_boundary_and_recovers_repromoted_empty_entries() {
         tmp.path(),
         &["update-ref", "refs/heads/aethyme/integration", &duplicate],
     );
+    let resolution_path = tmp.path().join("empty-bookkeeping-resolution.json");
+    std::fs::write(
+        &resolution_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 2,
+            "upstream_ref": "origin/main",
+            "upstream_commit": upstream,
+            "old_integration": duplicate,
+            "operator": "release-operator@example.test",
+            "unrecorded_resolutions": [{
+                "integration_commit": duplicate,
+                "disposition": "drop_because_content_empty",
+                "reason": "reviewed duplicate bookkeeping commit with an unchanged tree"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
     let dry_run = broker
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),
             apply: false,
-            resolution_file: None,
+            resolution_file: Some(resolution_path.clone()),
+            confirm: None,
         })
         .unwrap();
     assert!(dry_run.safe, "{dry_run:#?}");
@@ -1707,7 +1735,7 @@ fn reconcile_uses_upstream_boundary_and_recovers_repromoted_empty_entries() {
         dry_run
             .warnings
             .iter()
-            .any(|warning| warning.contains("content-empty"))
+            .any(|warning| warning.contains("validated reviewed dispositions"))
     );
     assert_eq!(
         dry_run.entries[0].queue_entry_id, fresh_out.entry.id,
@@ -1726,7 +1754,8 @@ fn reconcile_uses_upstream_boundary_and_recovers_repromoted_empty_entries() {
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),
             apply: true,
-            resolution_file: None,
+            resolution_file: Some(resolution_path),
+            confirm: dry_run.plan_digest.clone(),
         })
         .unwrap();
     assert!(applied.safe && applied.applied, "{applied:#?}");
@@ -1793,6 +1822,16 @@ fn failed_reconciliation_rolls_back_ref_and_database() {
     );
     sh(tmp.path(), &["switch", "main"]);
 
+    let dry_run = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: None,
+            confirm: None,
+        })
+        .unwrap();
+    assert!(dry_run.safe, "{dry_run:#?}");
+
     let db = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
     db.execute_batch(
         "CREATE TRIGGER fail_reconcile
@@ -1807,6 +1846,7 @@ fn failed_reconciliation_rolls_back_ref_and_database() {
             upstream: "origin/main".into(),
             apply: true,
             resolution_file: None,
+            confirm: dry_run.plan_digest,
         })
         .unwrap_err();
     assert!(
@@ -1862,7 +1902,7 @@ fn repair_refuses_when_session_baseline_is_newer_than_integration() {
 }
 
 #[test]
-fn status_distinguishes_stale_local_main_from_configured_upstream() {
+fn status_warns_on_the_first_external_main_movement() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     sh(tmp.path(), &["switch", "-qc", "status-upstream", "main"]);
@@ -1902,11 +1942,19 @@ fn status_distinguishes_stale_local_main_from_configured_upstream() {
     assert!(status.advice.iter().any(|advice| {
         advice.id == "integration.upstream-main-ahead"
             && advice.severity == StatusAdviceSeverity::Blocked
+            && advice.summary.contains("external main movement detected")
+            && advice.commands
+                == vec!["aethyme broker integration reconcile --upstream origin/main --dry-run"]
     }));
 
     let integration = broker.integration_status(0).unwrap();
     assert_eq!(integration.main_behind_upstream_commits, 1);
-    assert!(integration.next_action.summary.contains("reconcile"));
+    assert!(
+        integration
+            .next_action
+            .summary
+            .contains("external main movement detected")
+    );
     assert!(
         integration
             .next_action

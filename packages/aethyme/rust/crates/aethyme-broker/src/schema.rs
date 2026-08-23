@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -264,6 +264,13 @@ CREATE INDEX coordinated_operations_by_session
     ON coordinated_operations (session_id, id);
 ";
 
+const MIGRATION_V7: &str = "
+ALTER TABLE integration_reconciliation_intent
+    ADD COLUMN plan_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE integration_reconciliations
+    ADD COLUMN plan_digest TEXT NOT NULL DEFAULT '';
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -271,6 +278,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V4,
     MIGRATION_V5,
     MIGRATION_V6,
+    MIGRATION_V7,
 ];
 
 fn current_version(conn: &Connection) -> Result<i64, BrokerError> {

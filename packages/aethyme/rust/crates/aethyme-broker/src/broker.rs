@@ -157,6 +157,16 @@ pub enum BrokerOpError {
     ShipConfirmationNotFullSha,
     #[error("ship confirmation mismatch: expected integration {expected}, received {actual}")]
     ShipConfirmationMismatch { expected: String, actual: String },
+    #[error(
+        "integration reconciliation apply requires --confirm {expected}; review the dry-run plan first"
+    )]
+    ReconciliationConfirmationRequired { expected: String },
+    #[error("integration reconciliation confirmation must be a full 64-character SHA-256 digest")]
+    ReconciliationConfirmationNotSha256,
+    #[error(
+        "integration reconciliation confirmation mismatch: expected {expected}, received {actual}"
+    )]
+    ReconciliationConfirmationMismatch { expected: String, actual: String },
     #[error("ship cannot execute without a fetched remote base for {tracking_ref}")]
     ShipRemoteBaseUnavailable { tracking_ref: String },
     #[error(
@@ -2413,7 +2423,7 @@ impl Broker {
             next_action = IntegrationNextAction {
                 state: IntegrationDeliveryState::Blocked,
                 summary: format!(
-                    "local main is {main_behind_upstream_commits} commits behind {upstream}; reconcile before repair or submit"
+                    "external main movement detected: local main is {main_behind_upstream_commits} commits behind {upstream}; plan reconciliation before repair or submit"
                 ),
                 commands: vec![format!(
                     "aethyme broker integration reconcile --upstream {upstream} --dry-run"
@@ -2566,14 +2576,14 @@ impl Broker {
                     } else {
                         StatusAdviceSeverity::Blocked
                     },
-                    reason: "configured upstream has commits absent from local main",
+                    reason: "configured upstream moved outside broker-managed integration",
                     summary: if integration_contains_upstream {
                         format!(
                             "local main is {main_behind_upstream_commits} commits behind {upstream}; integration already contains upstream, so broker operations remain safe"
                         )
                     } else {
                         format!(
-                            "local main is {main_behind_upstream_commits} commits behind {upstream}; repair and submit are unsafe until integration is reconciled"
+                            "external main movement detected: local main is {main_behind_upstream_commits} commits behind {upstream}; repair and submit are unsafe until reconciliation is planned"
                         )
                     },
                     session_id: None,

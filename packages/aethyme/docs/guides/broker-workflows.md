@@ -18,12 +18,67 @@ Each workflow separates observation from mutation:
 | Continue in an existing worktree | `broker integration status` | `adopt --reuse`, optionally with `--sync-integration` | synchronization requires a clean, fast-forwardable worktree |
 | Prove the current tree | default gate run and its tree provenance | rerun with `--no-cache` | a bypass never substitutes an older cached result |
 | Inspect graph-derived gate hints | `gates semantic` | none; suggestions remain advisory | only changed-path triggers reach `gates run` and `submit` |
+| Recover external main movement | `integration reconcile --dry-run` | `--apply --confirm <plan-digest>` | every unrecorded SHA needs a reviewed disposition; drift invalidates confirmation |
 | Reserve paths | `leases plan` | `leases claim` | the claim, not the plan, decides whether a conflict exists now |
 | End or recover a session | `finish` report | successful `finish` closes and records the handoff | dirty or unsubmitted work refuses the finish |
 
 These commands coordinate local repository state. Submission promotes only to
 the local `aethyme/integration` branch. Use the separate
 `broker ship plan`/`broker ship execute` lane when publication is authorized.
+
+## Recover External Main Movement
+
+Status warns as soon as the configured upstream contains the first commit that
+broker-managed integration does not contain. This commonly happens when a
+release or deploy workflow writes changelogs directly to main. Do not merge or
+reset refs by hand: update the remote-tracking ref through the coordinated Git
+lane, then inspect a reconciliation plan:
+
+```bash
+aethyme broker git --session 111 --reason "inspect upstream for recovery" -- \
+  fetch origin main
+aethyme broker integration reconcile --upstream origin/main --dry-run --json
+```
+
+The plan classifies upstream-only external commits, recorded promotions, exact
+and patch-equivalent landings, unrecorded integration commits, pending queue
+entries, and ambiguous equivalence. Full SHAs in JSON let an operator trace
+each decision. Cold evidence never becomes a guess: ambiguous matches and
+replay conflicts return a successful read-only report marked unsafe.
+
+Every unrecorded integration commit must be reviewed individually in a schema-2
+resolution file:
+
+- `preserve_and_replay` keeps the commit's delta and can still report a real
+  conflict against upstream;
+- `replaced_by_exact_upstream_sha` names the full reachable upstream commit
+  that replaces it;
+- `drop_because_content_empty` is accepted only for a commit with no tree
+  change.
+
+There is no “discard unknown work” disposition. The file also binds the exact
+upstream and integration tips, so it becomes stale when either moves. See the
+[CLI reference](../reference/cli.md) for the complete schema and queue-entry
+attestation fields.
+
+When the dry-run is safe, review the complete report and copy its 64-character
+`plan_digest` into the apply command:
+
+```bash
+aethyme broker integration reconcile \
+  --upstream origin/main \
+  --resolution-file reconciliation.json \
+  --apply \
+  --confirm <reviewed-plan-digest>
+```
+
+Apply recomputes the plan from the current refs before comparing the digest.
+It rebuilds integration from the current upstream tip, replays preserved work
+in original first-parent order, updates queue records, and journals the digest
+through a crash-recoverable two-phase transaction. A missing or mismatched
+confirmation changes nothing. If a crash leaves an intent behind, the next
+broker open completes it only when the ref reached the planned new tip, aborts
+it only when the old tip remains, and otherwise requests explicit recovery.
 
 ## Reuse A Worktree Safely
 
