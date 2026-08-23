@@ -21,4 +21,5 @@ libc = "0.2"
 [dev-dependencies]
 aethyme-testkit = { path = "../aethyme-testkit" }
 serde_json = "1"
+sha2 = "0.10"
 tempfile = "3"

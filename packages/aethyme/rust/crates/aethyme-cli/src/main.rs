@@ -133,6 +133,7 @@ fn main() -> ExitCode {
         "root" => run_root_subcommand(&args[1..]),
         // Broker commands have been native Rust from birth (issue #31).
         "broker" => ExitCode::from(aethyme_broker::cli::run(&args[1..])),
+        "update" => ExitCode::from(aethyme_broker::run_update_cli(&args[1..])),
         // Certification — top-level by design (the "airport certification"
         // inspection). Strictly read-only; adaptive setup lives in
         // `broker scaffold`.
@@ -219,6 +220,7 @@ fn print_top_level_help() {
     eprintln!("  broker git|gh --session <id> coordinate Git and GitHub operations");
     eprintln!("  broker operations          inspect/reconcile the remote-operation journal");
     eprintln!("  broker adopt|start-agent|agents|cleanup   (see `broker --help`)");
+    eprintln!("  update check|plan|execute  explicit paired-binary updates; never background");
     eprintln!();
     eprintln!("Setup:");
     eprintln!(

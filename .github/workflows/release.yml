@@ -113,19 +113,25 @@ jobs:
         run: |
           source_sha="$(git rev-parse HEAD)"
           test "$source_sha" = "$GITHUB_SHA"
+          case "$REF_NAME" in
+            *-*) release_channel=preview ;;
+            *) release_channel=stable ;;
+          esac
           cp install.sh dist/install.sh
           cargo run --locked --manifest-path packages/aethyme/rust/Cargo.toml \
             -p aethyme-broker --example release_manifest -- \
             --dist "$GITHUB_WORKSPACE/dist" \
             --tag "$REF_NAME" \
             --source-sha "$source_sha" \
-            --channel stable \
+            --channel "$release_channel" \
             --output "$GITHUB_WORKSPACE/dist/release-manifest.json"
-          cargo run --locked --manifest-path packages/aethyme/rust/Cargo.toml \
-            -p aethyme-broker --example homebrew_formula -- \
-            --manifest "$GITHUB_WORKSPACE/dist/release-manifest.json" \
-            --repo "$GITHUB_REPOSITORY" \
-            --output "$GITHUB_WORKSPACE/dist/aethyme.rb"
+          if [ "$release_channel" = stable ]; then
+            cargo run --locked --manifest-path packages/aethyme/rust/Cargo.toml \
+              -p aethyme-broker --example homebrew_formula -- \
+              --manifest "$GITHUB_WORKSPACE/dist/release-manifest.json" \
+              --repo "$GITHUB_REPOSITORY" \
+              --output "$GITHUB_WORKSPACE/dist/aethyme.rb"
+          fi
           cd dist
           sha256sum --check SHA256SUMS
 
@@ -153,3 +159,4 @@ jobs:
           files: dist/*
           body_path: packages/aethyme/docs/guides/upgrading-to-v0.2.0.md
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

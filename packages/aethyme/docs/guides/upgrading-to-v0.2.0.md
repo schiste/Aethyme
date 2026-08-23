@@ -62,9 +62,26 @@ curl -fsSL https://github.com/schiste/Aethyme/releases/latest/download/install.s
 
 The installer selects the native target, downloads the exact versioned
 archive, verifies its standalone SHA-256, requires exactly the two expected
-archive members, verifies both embedded versions, and then replaces the engine
-sibling followed by the router. It installs to `~/.local/bin` unless
+archive members, verifies both embedded versions, and activates a versioned
+pair through one shared symlink. It installs to `~/.local/bin` unless
 `AETHYME_INSTALL_DIR` or `--install-dir` is supplied.
+
+Later installer-managed updates use an explicit review/confirm flow:
+
+```bash
+aethyme update check
+aethyme update plan --channel stable
+# Review the version, source SHA, compatibility, archive, and digest above.
+aethyme update execute --confirm <manifest-sha256>
+```
+
+`check` and `plan` are the only steps that discover a release, and they run
+only when invoked. `execute` re-downloads the exact reviewed manifest, verifies
+the archive digest and members, tests the staged pair, atomically changes the
+shared version link, and retains the former bundle for rollback. Use
+`--channel preview` only to discover the latest published GitHub prerelease;
+the saved plan pins its exact versioned manifest, and preview releases never
+change the stable Homebrew formula.
 
 For a reviewed, pinned install:
 
@@ -122,9 +139,9 @@ The index command detects incompatible redb formats, replaces only the derived
 Binary rollback and state rollback are separate operations.
 
 1. Stop the v0.2.0 engine daemon.
-2. Restore both earlier binaries together, either from backups or by checking
-   out the earlier tag and running both `cargo install --locked --path ...`
-   commands.
+2. Restore both earlier binaries together. Installer-managed updates report
+   the retained rollback bundle; otherwise use backups or check out the
+   earlier tag and run both `cargo install --locked --path ...` commands.
 3. If v0.2.0 opened and migrated a broker database, restore that repository's
    `broker.db.pre-v0.2.0` before running the older broker.
 4. Rebuild `.aethyme/graph_store.redb` with the restored engine if graph queries
@@ -138,9 +155,13 @@ saved binaries or a source checkout.
 ## Known issues
 
 - Windows and Linux ARM archives are not published in v0.2.0.
-- There is no silent or scheduled updater; Homebrew users explicitly run
-  `brew upgrade aethyme`, while installer users explicitly rerun the stable
-  installer or pin a version.
+- There is no silent or scheduled updater. Homebrew users explicitly run
+  `brew upgrade aethyme`; installer users explicitly run `update check`,
+  review `update plan`, and confirm `update execute` with the full manifest
+  digest.
+- Update execution validates the broker database in the current working
+  repository when present. It does not discover every broker-managed checkout;
+  retain backups for repositories whose schema rollback matters.
 - `aethyme broker doctor --fix-version` repairs source-checkout drift from the
   local integration ref. It is not the public GitHub release updater.
 - The first graph-store rebuild after an incompatible redb format can take as

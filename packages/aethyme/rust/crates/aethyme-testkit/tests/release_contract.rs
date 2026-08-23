@@ -96,8 +96,12 @@ fn release_workflow_renders_the_homebrew_formula_from_the_manifest() {
     let formula_position = workflow.find("--example homebrew_formula").unwrap();
 
     assert!(manifest_position < formula_position);
+    assert!(workflow.contains("*-*) release_channel=preview"));
+    assert!(workflow.contains("--channel \"$release_channel\""));
+    assert!(workflow.contains("if [ \"$release_channel\" = stable ]; then"));
     assert!(workflow.contains("--manifest \"$GITHUB_WORKSPACE/dist/release-manifest.json\""));
     assert!(workflow.contains("--output \"$GITHUB_WORKSPACE/dist/aethyme.rb\""));
+    assert!(workflow.contains("prerelease: ${{ contains(github.ref_name, '-') }}"));
 }
 
 #[test]
@@ -113,6 +117,22 @@ fn reviewed_homebrew_formula_installs_the_published_binary_pair() {
     assert!(formula.contains("depends_on arch: :x86_64"));
     assert!(formula.contains("system bin/\"aethyme\", \"broker\", \"quick-test\""));
     assert!(!formula.contains("crates.io"));
+}
+
+#[test]
+fn release_installer_delegates_pair_activation_to_the_native_transaction() {
+    let installer =
+        std::fs::read_to_string(aethyme_testkit::paths::repo_root().join("install.sh")).unwrap();
+    let bootstrap = installer
+        .split("\"$payload/aethyme\" update bootstrap")
+        .nth(1)
+        .expect("installer must delegate activation to the staged router");
+
+    for argument in ["--payload", "--install-dir", "--manifest", "--target"] {
+        assert!(bootstrap.contains(argument), "bootstrap omitted {argument}");
+    }
+    assert!(!installer.contains("mv \"$engine_stage\""));
+    assert!(!installer.contains("mv \"$router_stage\""));
 }
 
 #[test]

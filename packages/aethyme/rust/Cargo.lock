@@ -26,6 +26,7 @@ dependencies = [
  "libc",
  "noyalib",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -45,6 +46,7 @@ dependencies = [
  "aethyme-testkit",
  "libc",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

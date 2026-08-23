@@ -177,16 +177,11 @@ engine_version="$("$payload/aethyme-engine-cli" --version | awk '{ print $2 }')"
     exit 1
 }
 
-mkdir -p "$install_dir"
-router_stage="$install_dir/.aethyme.new.$$"
-engine_stage="$install_dir/.aethyme-engine-cli.new.$$"
-cp "$payload/aethyme" "$router_stage"
-cp "$payload/aethyme-engine-cli" "$engine_stage"
-chmod 755 "$router_stage" "$engine_stage"
-mv "$engine_stage" "$install_dir/aethyme-engine-cli"
-mv "$router_stage" "$install_dir/aethyme"
-
-printf 'Installed Aethyme %s (%s) to %s\n' "$version" "$target" "$install_dir"
+"$payload/aethyme" update bootstrap \
+    --payload "$payload" \
+    --install-dir "$install_dir" \
+    --manifest "$manifest" \
+    --target "$target"
 case ":${PATH}:" in
     *:"$install_dir":*) ;;
     *) printf 'Add %s to PATH before running aethyme.\n' "$install_dir" ;;
