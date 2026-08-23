@@ -79,8 +79,9 @@ aethyme update execute --confirm <manifest-sha256>
 only when invoked. `execute` re-downloads the exact reviewed manifest, verifies
 the archive digest and members, tests the staged pair, atomically changes the
 shared version link, and retains the former bundle for rollback. Use
-`--channel preview` only to opt into the explicitly maintained preview release;
-it never changes the stable Homebrew formula.
+`--channel preview` only to discover the latest published GitHub prerelease;
+the saved plan pins its exact versioned manifest, and preview releases never
+change the stable Homebrew formula.
 
 For a reviewed, pinned install:
 

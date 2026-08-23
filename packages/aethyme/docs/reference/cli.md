@@ -115,10 +115,12 @@ aethyme update execute --confirm <manifest-sha256> [--json]
 
 `check` and `plan` perform network access only when explicitly invoked. The
 stable channel reads GitHub's latest non-prerelease manifest; the preview
-channel reads the explicitly maintained `preview` release. A plan records the
-current and target versions, source SHA, installation provenance, full
-manifest digest, exact platform archive URL/digest/size, engine protocol, and
-broker-storage compatibility range.
+channel discovers GitHub's latest published prerelease. Discovery is then
+normalized to that release's version-specific manifest URL, so the saved plan
+never executes against a moving alias. A plan records the current and target
+versions, source SHA, installation provenance, full manifest digest, exact
+platform archive URL/digest/size, engine protocol, and broker-storage
+compatibility range.
 
 Update authority follows installation provenance:
 
