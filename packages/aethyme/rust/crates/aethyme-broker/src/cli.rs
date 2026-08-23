@@ -51,7 +51,9 @@ Usage:
       Higher-level lifecycle close: closes only when the session has no
       dirty WIP and no committed work waiting for submit/promotion. If it
       is not safe, prints the next command; suggests cleanup only when
-      cleanup would pass without --force.
+      cleanup would pass without --force. Successful closure atomically
+      persists a redacted session.finished handoff with delivery, pending
+      work, leases, last-gate provenance, and the recommended next action.
   aethyme broker start --task <text> [--json]
       Create a broker-managed worktree + branch and register a session,
       but do not spawn a process. Prefer this over adopting the main
@@ -1283,11 +1285,83 @@ fn render_finish_report(report: &crate::FinishReport) {
             .unwrap_or("unknown");
         println!("  latest queue: qid {entry_id} ({status})");
     }
+    println!(
+        "  delivery: submitted={}, promoted={}, published={}",
+        if report.delivery.submitted {
+            "yes"
+        } else {
+            "no"
+        },
+        if report.delivery.promoted {
+            "yes"
+        } else {
+            "no"
+        },
+        if report.delivery.published {
+            "yes"
+        } else {
+            "no"
+        },
+    );
     if !report.dirty_paths.is_empty() {
         println!("  dirty paths: {}", capped_join(&report.dirty_paths, 8));
     }
     if report.unsubmitted_commits > 0 {
         println!("  unsubmitted commits: {}", report.unsubmitted_commits);
+    }
+    println!(
+        "  pending work: {} ({} dirty paths, {} unsubmitted commits{})",
+        if report.pending_work.present {
+            "yes"
+        } else {
+            "no"
+        },
+        report.pending_work.dirty_path_count,
+        report.pending_work.unsubmitted_commits,
+        if report.pending_work.worktree_missing {
+            ", worktree missing"
+        } else {
+            ""
+        },
+    );
+    if report.leases_held.is_empty() {
+        println!("  leases held: none recorded");
+    } else {
+        println!("  leases held:");
+        for lease in &report.leases_held {
+            println!(
+                "    {} {} {} (expires {}, released {})",
+                lease.kind.as_str(),
+                match lease.state {
+                    crate::FinishLeaseState::Active => "active",
+                    crate::FinishLeaseState::Released => "released",
+                    crate::FinishLeaseState::Expired => "expired",
+                },
+                lease.path,
+                lease
+                    .expires_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "never".into()),
+                lease
+                    .released_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "never".into()),
+            );
+        }
+    }
+    match &report.last_gate {
+        Some(gate) => println!(
+            "  last gate: {} {} on tree {} at {} ({})",
+            gate.gate,
+            gate.status.as_str(),
+            short_commit(&gate.tree_hash),
+            gate.recorded_at,
+            match gate.cache_source {
+                crate::FinishGateCacheSource::Executed => "executed",
+                crate::FinishGateCacheSource::CacheHit => "cache hit",
+            }
+        ),
+        None => println!("  last gate: none recorded"),
     }
     println!(
         "  cleanup safe: {}",
@@ -1304,6 +1378,10 @@ fn render_finish_report(report: &crate::FinishReport) {
             println!("    run: {command}");
         }
     }
+    println!(
+        "  recommended next: {}",
+        report.recommended_next_action.as_deref().unwrap_or("none")
+    );
 }
 
 fn render_verify_loop_report(report: &crate::VerifyLoopReport) {

@@ -7,7 +7,8 @@ use std::process::Command;
 
 use aethyme_broker::{
     AdoptIntegrationRelation, AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, Broker,
-    BrokerOpError, FinishStatus, SessionOrigin, SessionStatus, VersionDriftStatus,
+    BrokerOpError, FinishGateCacheSource, FinishLeaseState, FinishStatus, GateStatus,
+    NewGateResult, SessionOrigin, SessionStatus, VersionDriftStatus, events,
 };
 
 fn sh(cwd: &Path, args: &[&str]) {
@@ -594,6 +595,10 @@ fn finish_blocks_dirty_then_unsubmitted_commits() {
     assert_eq!(dirty.status, FinishStatus::Blocked);
     assert!(!dirty.closed);
     assert_eq!(dirty.dirty_paths, vec!["wip.txt"]);
+    assert!(dirty.pending_work.present);
+    assert_eq!(dirty.pending_work.dirty_path_count, 1);
+    assert_eq!(dirty.pending_work.unsubmitted_commits, 0);
+    assert!(!dirty.delivery.submitted);
     assert!(
         dirty
             .next_commands
@@ -604,12 +609,24 @@ fn finish_blocks_dirty_then_unsubmitted_commits() {
         broker.store().session(session.id).unwrap().status,
         SessionStatus::Cleaned
     );
+    assert!(
+        broker
+            .store()
+            .events_after(0, i64::MAX)
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != events::SESSION_FINISHED),
+        "refused finishes must not persist a completed handoff"
+    );
 
     sh(&wt, &["add", "-A"]);
     sh(&wt, &["commit", "-qm", "finish wip"]);
     let unsubmitted = broker.finish(session.id).unwrap();
     assert_eq!(unsubmitted.status, FinishStatus::Blocked);
     assert_eq!(unsubmitted.unsubmitted_commits, 1);
+    assert!(unsubmitted.pending_work.present);
+    assert_eq!(unsubmitted.pending_work.dirty_path_count, 0);
+    assert_eq!(unsubmitted.pending_work.unsubmitted_commits, 1);
     assert_eq!(
         unsubmitted.next_commands,
         vec![format!("aethyme broker submit --session {}", session.id)]
@@ -617,6 +634,14 @@ fn finish_blocks_dirty_then_unsubmitted_commits() {
     assert_ne!(
         broker.store().session(session.id).unwrap().status,
         SessionStatus::Cleaned
+    );
+    assert!(
+        broker
+            .store()
+            .events_after(0, i64::MAX)
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != events::SESSION_FINISHED)
     );
 }
 
@@ -643,16 +668,142 @@ fn finish_closes_promoted_session_and_suggests_cleanup_only_when_main_contains_i
     sh(&wt, &["add", "-A"]);
     sh(&wt, &["commit", "-qm", "done"]);
     assert!(broker.submit(session.id).unwrap().promoted);
+    let queue_entry = broker
+        .store()
+        .merge_queue()
+        .unwrap()
+        .into_iter()
+        .last()
+        .unwrap();
+    broker
+        .store()
+        .claim_lease(session.id, "src/", None)
+        .unwrap();
+    broker
+        .store()
+        .claim_lease(session.id, "released.txt", None)
+        .unwrap();
+    broker
+        .store()
+        .release_lease(session.id, "released.txt")
+        .unwrap();
+    broker
+        .store()
+        .claim_lease(session.id, "expired.txt", Some(-1))
+        .unwrap();
+    broker
+        .store()
+        .claim_lease(session.id, "/must/not/enter/lease", None)
+        .unwrap();
+    let gate_tree = rev(&wt, "HEAD^{tree}");
+    broker
+        .store()
+        .record_gate_result(&NewGateResult {
+            gate_name: "handoff-gate".into(),
+            tree_hash: gate_tree.clone(),
+            status: GateStatus::Pass,
+            failure_class: None,
+            exit_code: Some(0),
+            duration_ms: Some(12),
+            log_path: Some("/must/not/enter/handoff.log".into()),
+            session_id: Some(session.id),
+        })
+        .unwrap();
+    broker
+        .store()
+        .append_event(
+            events::GATE_CACHED,
+            Some(session.id),
+            Some(&events::gate_cached_payload(
+                "handoff-gate",
+                &gate_tree,
+                12,
+                GateStatus::Pass,
+                None,
+            )),
+        )
+        .unwrap();
 
     let closed = broker.finish(session.id).unwrap();
     assert_eq!(closed.status, FinishStatus::Closed);
     assert!(closed.closed);
     assert!(!closed.cleanup_safe);
     assert!(closed.next_commands.is_empty());
+    assert!(closed.delivery.submitted);
+    assert!(closed.delivery.promoted);
+    assert!(!closed.delivery.published);
+    assert!(!closed.pending_work.present);
+    assert_eq!(closed.pending_work.dirty_path_count, 0);
+    assert_eq!(closed.pending_work.unsubmitted_commits, 0);
+    assert_eq!(
+        closed.recommended_next_action,
+        Some(format!(
+            "aethyme broker ship plan --entry {}",
+            queue_entry.id
+        ))
+    );
+    assert!(
+        closed
+            .leases_held
+            .iter()
+            .any(|lease| { lease.path == "src/" && lease.state == FinishLeaseState::Active })
+    );
+    assert!(closed.leases_held.iter().any(|lease| {
+        lease.path == "released.txt" && lease.state == FinishLeaseState::Released
+    }));
+    assert!(
+        closed.leases_held.iter().any(|lease| {
+            lease.path == "expired.txt" && lease.state == FinishLeaseState::Expired
+        })
+    );
+    assert!(
+        closed
+            .leases_held
+            .iter()
+            .any(|lease| lease.path == "<absolute-path-redacted>")
+    );
+    let last_gate = closed.last_gate.as_ref().unwrap();
+    assert_eq!(last_gate.gate, "handoff-gate");
+    assert_eq!(last_gate.tree_hash, gate_tree);
+    assert_eq!(last_gate.status, GateStatus::Pass);
+    assert_eq!(last_gate.cache_source, FinishGateCacheSource::CacheHit);
     assert_eq!(
         broker.store().session(session.id).unwrap().status,
         SessionStatus::Cleaned
     );
+    assert!(
+        broker
+            .store()
+            .session_leases(session.id)
+            .unwrap()
+            .is_empty()
+    );
+    let events = broker.store().events_after(0, i64::MAX).unwrap();
+    let finished = events
+        .iter()
+        .filter(|event| event.kind == events::SESSION_FINISHED)
+        .collect::<Vec<_>>();
+    assert_eq!(finished.len(), 1);
+    let cleaned_index = events
+        .iter()
+        .position(|event| event.kind == "session.cleaned")
+        .unwrap();
+    let finished_index = events
+        .iter()
+        .position(|event| event.kind == events::SESSION_FINISHED)
+        .unwrap();
+    assert_eq!(finished_index, cleaned_index + 1);
+    assert_eq!(events[cleaned_index].ts, events[finished_index].ts);
+    let payload = finished[0].payload_json.as_deref().unwrap();
+    let handoff: serde_json::Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(handoff["session_id"], session.id);
+    assert_eq!(handoff["delivery"]["promoted"], true);
+    assert_eq!(handoff["delivery"]["published"], false);
+    assert_eq!(handoff["last_gate"]["cache_source"], "cache_hit");
+    assert!(handoff["leases_held"].as_array().unwrap().len() >= 3);
+    assert!(handoff.get("worktree_path").is_none());
+    assert!(!payload.contains(tmp.path().to_str().unwrap()));
+    assert!(!payload.contains("must/not/enter"));
 
     sh(tmp.path(), &["merge", "--ff-only", "aethyme/integration"]);
     let already = broker.finish(session.id).unwrap();
@@ -662,4 +813,116 @@ fn finish_closes_promoted_session_and_suggests_cleanup_only_when_main_contains_i
         already.next_commands,
         vec![format!("aethyme broker cleanup {}", session.id)]
     );
+    assert_eq!(
+        broker
+            .store()
+            .events_after(0, i64::MAX)
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == events::SESSION_FINISHED)
+            .count(),
+        1,
+        "already-closed finish must not emit a duplicate handoff"
+    );
+}
+
+#[test]
+fn finish_distinguishes_fully_published_work_from_local_promotion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    sh(remote.path(), &["init", "--bare", "-q"]);
+    sh(
+        tmp.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    sh(tmp.path(), &["push", "-qu", "origin", "main"]);
+
+    let wt = tmp.path().join("published-finish-wt");
+    sh(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "agent/published-finish",
+            wt.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&wt, Some("published finish task")).unwrap();
+    std::fs::write(wt.join("published.txt"), "published\n").unwrap();
+    sh(&wt, &["add", "-A"]);
+    sh(&wt, &["commit", "-qm", "published"]);
+    assert!(broker.submit(session.id).unwrap().promoted);
+    sh(
+        tmp.path(),
+        &["push", "-q", "origin", "aethyme/integration:main"],
+    );
+    sh(tmp.path(), &["fetch", "-q", "origin", "main"]);
+
+    let closed = broker.finish(session.id).unwrap();
+    assert_eq!(closed.status, FinishStatus::Closed);
+    assert!(closed.delivery.submitted);
+    assert!(closed.delivery.promoted);
+    assert!(closed.delivery.published);
+    assert!(closed.last_gate.is_none());
+    assert_eq!(
+        closed.recommended_next_action.as_deref(),
+        Some("aethyme broker integration status")
+    );
+    let event = broker
+        .store()
+        .events_after(0, i64::MAX)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == events::SESSION_FINISHED)
+        .unwrap();
+    let handoff: serde_json::Value =
+        serde_json::from_str(event.payload_json.as_deref().unwrap()).unwrap();
+    assert_eq!(handoff["delivery"]["published"], true);
+    assert!(handoff["last_gate"].is_null());
+}
+
+#[test]
+fn finish_missing_worktree_persists_an_explicitly_incomplete_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let wt = tmp.path().join("missing-finish-wt");
+    sh(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "agent/missing-finish",
+            wt.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&wt, Some("missing finish task")).unwrap();
+    sh(
+        tmp.path(),
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+
+    let closed = broker.finish(session.id).unwrap();
+    assert_eq!(closed.status, FinishStatus::Closed);
+    assert!(closed.closed);
+    assert!(closed.pending_work.worktree_missing);
+    assert!(!closed.pending_work.present);
+    assert!(!closed.delivery.submitted);
+    assert!(!closed.cleanup_safe);
+    let event = broker
+        .store()
+        .events_after(0, i64::MAX)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == events::SESSION_FINISHED)
+        .unwrap();
+    let handoff: serde_json::Value =
+        serde_json::from_str(event.payload_json.as_deref().unwrap()).unwrap();
+    assert_eq!(handoff["pending_work"]["worktree_missing"], true);
 }
