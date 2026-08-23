@@ -4,7 +4,8 @@
 //! supplied. Network access and plan persistence live at the CLI boundary.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,6 +22,7 @@ pub const INSTALL_RECEIPT_SCHEMA_VERSION: u32 = 1;
 pub const INSTALL_RECEIPT_FILENAME: &str = "install-receipt.json";
 const DEFAULT_RELEASE_BASE_URL: &str = "https://github.com/schiste/Aethyme";
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,6 +105,7 @@ impl InstallReceipt {
         if self.current_link != self.managed_root.join("current")
             || self.previous_link != self.managed_root.join("previous")
             || self.versions_dir != self.managed_root.join("versions")
+            || self.managed_root != self.install_dir.join(".aethyme-managed")
             || self.router_path != self.install_dir.join("aethyme")
             || self.engine_path != self.install_dir.join("aethyme-engine-cli")
         {
@@ -160,6 +163,18 @@ pub struct UpdatePlan {
     pub installation: InstallationProvenance,
     pub action: UpdateAction,
     pub recommended_command: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateExecutionReport {
+    pub manifest_sha256: String,
+    pub installed_version: String,
+    pub installed_target: String,
+    pub router_path: PathBuf,
+    pub engine_path: PathBuf,
+    pub active_bundle: PathBuf,
+    pub rollback_bundle: Option<PathBuf>,
+    pub quick_test_passed: bool,
 }
 
 #[derive(Debug, Error)]
@@ -358,14 +373,81 @@ fn run_update_cli_inner(args: &[String]) -> Result<(), String> {
             let saved_to = persist_update_plan(&plan)?;
             render_plan(&plan, json, true, saved_to.as_deref())
         }
-        Some("execute") => Err(
-            "update execute is unavailable until the transactional installer layout is active"
-                .into(),
-        ),
+        Some("execute") => {
+            let (confirmation, json) = parse_execute_options(&args[1..])?;
+            let report = execute_confirmed_update(&confirmation)?;
+            render_execution(&report, json)
+        }
+        Some("bootstrap") => run_bootstrap(&args[1..]),
         Some(other) => Err(format!(
             "unsupported update subcommand {other:?}; use check, plan, or execute"
         )),
     }
+}
+
+fn parse_execute_options(args: &[String]) -> Result<(String, bool), String> {
+    let mut confirmation = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--confirm" => {
+                confirmation = Some(
+                    args.get(index + 1)
+                        .ok_or("update execute: --confirm requires a value")?
+                        .clone(),
+                );
+                index += 2;
+            }
+            other => return Err(format!("update execute: unknown option {other}")),
+        }
+    }
+    let confirmation = confirmation.ok_or("update execute requires --confirm <manifest-sha256>")?;
+    validate_digest(&confirmation, "confirmation")?;
+    Ok((confirmation, json))
+}
+
+fn run_bootstrap(args: &[String]) -> Result<(), String> {
+    let mut payload = None;
+    let mut install_dir = None;
+    let mut manifest_path = None;
+    let mut target = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("update bootstrap: {flag} requires a value"))?;
+        match flag {
+            "--payload" => payload = Some(PathBuf::from(value)),
+            "--install-dir" => install_dir = Some(PathBuf::from(value)),
+            "--manifest" => manifest_path = Some(PathBuf::from(value)),
+            "--target" => target = Some(value.clone()),
+            _ => return Err(format!("update bootstrap: unknown option {flag}")),
+        }
+        index += 2;
+    }
+    let report = bootstrap_install(
+        &payload.ok_or("update bootstrap requires --payload")?,
+        &install_dir.ok_or("update bootstrap requires --install-dir")?,
+        &manifest_path.ok_or("update bootstrap requires --manifest")?,
+        &target.ok_or("update bootstrap requires --target")?,
+    )?;
+    println!(
+        "Installed Aethyme {} ({}) to {}",
+        report.installed_version,
+        report.installed_target,
+        report
+            .router_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .display()
+    );
+    Ok(())
 }
 
 fn print_update_help() {
@@ -580,6 +662,556 @@ fn now_unix_ms() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+pub fn bootstrap_install(
+    payload: &Path,
+    install_dir: &Path,
+    manifest_path: &Path,
+    target: &str,
+) -> Result<UpdateExecutionReport, String> {
+    let manifest_bytes = fs::read(manifest_path)
+        .map_err(|error| format!("read {}: {error}", manifest_path.display()))?;
+    let manifest = parse_valid_manifest(&manifest_bytes)?;
+    let artifact = manifest
+        .artifact_for_target(target)
+        .ok_or_else(|| format!("release manifest has no artifact for {target}"))?;
+    let installed_target = artifact.target.clone();
+    verify_payload(payload, &manifest.version)?;
+
+    fs::create_dir_all(install_dir)
+        .map_err(|error| format!("create {}: {error}", install_dir.display()))?;
+    let install_dir = fs::canonicalize(install_dir)
+        .map_err(|error| format!("resolve {}: {error}", install_dir.display()))?;
+    let managed_root = install_dir.join(".aethyme-managed");
+    let receipt = InstallReceipt {
+        schema_version: INSTALL_RECEIPT_SCHEMA_VERSION,
+        method: "aethyme-installer".into(),
+        install_dir: install_dir.clone(),
+        managed_root: managed_root.clone(),
+        router_path: install_dir.join("aethyme"),
+        engine_path: install_dir.join("aethyme-engine-cli"),
+        current_link: managed_root.join("current"),
+        previous_link: managed_root.join("previous"),
+        versions_dir: managed_root.join("versions"),
+    };
+    receipt.validate().map_err(|error| error.to_string())?;
+    let manifest_sha256 = sha256_bytes(&manifest_bytes);
+    let (active_bundle, rollback_bundle) =
+        activate_payload(payload, &receipt, &manifest.version, &manifest_sha256)?;
+    write_receipt(&receipt)?;
+    Ok(UpdateExecutionReport {
+        manifest_sha256,
+        installed_version: manifest.version,
+        installed_target,
+        router_path: receipt.router_path,
+        engine_path: receipt.engine_path,
+        active_bundle,
+        rollback_bundle,
+        quick_test_passed: true,
+    })
+}
+
+pub fn execute_confirmed_update(confirmation: &str) -> Result<UpdateExecutionReport, String> {
+    validate_digest(confirmation, "confirmation")?;
+    let executable = std::env::current_exe().map_err(|error| format!("locate aethyme: {error}"))?;
+    let installation = detect_installation(&executable);
+    if installation.method != InstallationMethod::Installer {
+        return Err(format!(
+            "self-update is available only for installer-managed binaries; detected {:?}",
+            installation.method
+        ));
+    }
+    let receipt_path = installation
+        .receipt_path
+        .as_ref()
+        .ok_or("installer provenance has no receipt")?;
+    let receipt = read_receipt(receipt_path)?;
+    let plan_path = receipt
+        .managed_root
+        .join("update-plans")
+        .join(format!("{confirmation}.json"));
+    let plan_bytes = read_bounded_file(&plan_path, MAX_MANIFEST_BYTES)?;
+    let plan: UpdatePlan = serde_json::from_slice(&plan_bytes)
+        .map_err(|error| format!("parse {}: {error}", plan_path.display()))?;
+    validate_saved_plan(&plan, confirmation, &installation)?;
+
+    let temp = tempfile::tempdir().map_err(|error| format!("create update temp dir: {error}"))?;
+    let manifest_path = temp.path().join("release-manifest.json");
+    download_to(&plan.manifest_url, &manifest_path)?;
+    let manifest_bytes = read_bounded_file(&manifest_path, MAX_MANIFEST_BYTES)?;
+    if sha256_bytes(&manifest_bytes) != confirmation {
+        return Err(
+            "release manifest changed after review; run `aethyme update plan` again".into(),
+        );
+    }
+    let manifest = parse_valid_manifest(&manifest_bytes)?;
+    validate_manifest_against_plan(&manifest, &plan)?;
+    inspect_current_broker_schema(&manifest.compatibility)?;
+
+    let archive_path = temp.path().join(&plan.archive.archive);
+    download_to(&plan.archive.url, &archive_path)?;
+    let archive_size = fs::metadata(&archive_path)
+        .map_err(|error| format!("stat {}: {error}", archive_path.display()))?
+        .len();
+    if archive_size > MAX_ARCHIVE_BYTES {
+        return Err(format!(
+            "release archive is {archive_size} bytes; safety limit is {MAX_ARCHIVE_BYTES}"
+        ));
+    }
+    if archive_size != plan.archive.size_bytes {
+        return Err(format!(
+            "release archive size mismatch: planned {}, downloaded {archive_size}",
+            plan.archive.size_bytes
+        ));
+    }
+    let archive_digest = sha256_file(&archive_path)?;
+    if archive_digest != plan.archive.sha256 {
+        return Err(format!(
+            "release archive SHA-256 mismatch: planned {}, downloaded {archive_digest}",
+            plan.archive.sha256
+        ));
+    }
+    verify_archive_members(&archive_path)?;
+    let payload = temp.path().join("payload");
+    fs::create_dir(&payload).map_err(|error| format!("create payload directory: {error}"))?;
+    run_tar(&["-xzf"], &archive_path, Some(&payload))?;
+    verify_payload(&payload, &plan.target_version)?;
+
+    let (active_bundle, rollback_bundle) =
+        activate_payload(&payload, &receipt, &plan.target_version, confirmation)?;
+    fs::remove_file(&plan_path)
+        .map_err(|error| format!("remove consumed plan {}: {error}", plan_path.display()))?;
+    Ok(UpdateExecutionReport {
+        manifest_sha256: confirmation.to_string(),
+        installed_version: plan.target_version,
+        installed_target: plan.archive.target,
+        router_path: receipt.router_path,
+        engine_path: receipt.engine_path,
+        active_bundle,
+        rollback_bundle,
+        quick_test_passed: true,
+    })
+}
+
+fn render_execution(report: &UpdateExecutionReport, json: bool) -> Result<(), String> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(report)
+                .map_err(|error| format!("encode update result: {error}"))?
+        );
+    } else {
+        println!(
+            "Updated Aethyme to {} ({})",
+            report.installed_version, report.installed_target
+        );
+        println!("  Router: {}", report.router_path.display());
+        println!("  Engine: {}", report.engine_path.display());
+        if let Some(path) = &report.rollback_bundle {
+            println!("  Rollback bundle: {}", path.display());
+        }
+        println!("  Quick test: passed");
+    }
+    Ok(())
+}
+
+fn validate_saved_plan(
+    plan: &UpdatePlan,
+    confirmation: &str,
+    installation: &InstallationProvenance,
+) -> Result<(), String> {
+    if plan.schema_version != UPDATE_PLAN_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported saved update plan schema {}",
+            plan.schema_version
+        ));
+    }
+    if plan.manifest_sha256 != confirmation {
+        return Err("saved update plan does not match the confirmed manifest digest".into());
+    }
+    if plan.action != UpdateAction::ExecuteInstallerUpdate {
+        return Err(format!(
+            "saved update action {:?} is not executable",
+            plan.action
+        ));
+    }
+    if plan.current_version != env!("CARGO_PKG_VERSION") {
+        return Err(format!(
+            "running version moved since planning: planned {}, running {}",
+            plan.current_version,
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    if &plan.installation != installation {
+        return Err("installation provenance changed since planning".into());
+    }
+    Ok(())
+}
+
+fn validate_manifest_against_plan(
+    manifest: &ReleaseManifest,
+    plan: &UpdatePlan,
+) -> Result<(), String> {
+    if manifest.release_channel != plan.channel.as_str()
+        || manifest.version != plan.target_version
+        || manifest.source_sha != plan.source_sha
+        || manifest.compatibility != plan.compatibility
+    {
+        return Err("confirmed manifest no longer matches the reviewed update plan".into());
+    }
+    let artifact = manifest
+        .artifact_for_target(&plan.archive.target)
+        .ok_or("confirmed manifest no longer supports the planned target")?;
+    if artifact.archive != plan.archive.archive
+        || artifact.sha256 != plan.archive.sha256
+        || artifact.size_bytes != plan.archive.size_bytes
+    {
+        return Err(
+            "confirmed manifest artifact no longer matches the reviewed update plan".into(),
+        );
+    }
+    Ok(())
+}
+
+fn parse_valid_manifest(bytes: &[u8]) -> Result<ReleaseManifest, String> {
+    let manifest: ReleaseManifest = serde_json::from_slice(bytes)
+        .map_err(|error| format!("parse release manifest: {error}"))?;
+    manifest
+        .validate()
+        .map_err(|error| format!("invalid release manifest: {error}"))?;
+    Ok(manifest)
+}
+
+fn read_receipt(path: &Path) -> Result<InstallReceipt, String> {
+    let bytes = read_bounded_file(path, MAX_MANIFEST_BYTES)?;
+    let receipt: InstallReceipt = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    receipt.validate().map_err(|error| error.to_string())?;
+    Ok(receipt)
+}
+
+fn write_receipt(receipt: &InstallReceipt) -> Result<(), String> {
+    fs::create_dir_all(&receipt.managed_root)
+        .map_err(|error| format!("create {}: {error}", receipt.managed_root.display()))?;
+    let destination = receipt.managed_root.join(INSTALL_RECEIPT_FILENAME);
+    let mut bytes = serde_json::to_vec_pretty(receipt)
+        .map_err(|error| format!("encode install receipt: {error}"))?;
+    bytes.push(b'\n');
+    let mut temporary = tempfile::NamedTempFile::new_in(&receipt.managed_root)
+        .map_err(|error| format!("create install receipt temp file: {error}"))?;
+    temporary
+        .write_all(&bytes)
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|error| format!("write install receipt: {error}"))?;
+    temporary
+        .persist(&destination)
+        .map_err(|error| format!("publish {}: {}", destination.display(), error.error))?;
+    sync_directory(&receipt.managed_root)
+}
+
+fn activate_payload(
+    payload: &Path,
+    receipt: &InstallReceipt,
+    version: &str,
+    manifest_sha256: &str,
+) -> Result<(PathBuf, Option<PathBuf>), String> {
+    receipt.validate().map_err(|error| error.to_string())?;
+    validate_digest(manifest_sha256, "manifest")?;
+    verify_payload(payload, version)?;
+    fs::create_dir_all(&receipt.versions_dir)
+        .map_err(|error| format!("create {}: {error}", receipt.versions_dir.display()))?;
+
+    let bundle_name = format!("v{version}-{}", &manifest_sha256[..12]);
+    let final_bundle = receipt.versions_dir.join(&bundle_name);
+    if final_bundle.exists() {
+        verify_existing_bundle(payload, &final_bundle)?;
+    } else {
+        let staging = receipt
+            .versions_dir
+            .join(format!(".staging-{bundle_name}-{}", std::process::id()));
+        if staging.exists() {
+            fs::remove_dir_all(&staging)
+                .map_err(|error| format!("clear stale staging {}: {error}", staging.display()))?;
+        }
+        fs::create_dir(&staging)
+            .map_err(|error| format!("create staging {}: {error}", staging.display()))?;
+        for binary in ["aethyme", "aethyme-engine-cli"] {
+            let destination = staging.join(binary);
+            fs::copy(payload.join(binary), &destination)
+                .map_err(|error| format!("stage {binary}: {error}"))?;
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
+                .map_err(|error| format!("make staged {binary} executable: {error}"))?;
+            fs::File::open(&destination)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| format!("sync staged {binary}: {error}"))?;
+        }
+        fs::write(
+            staging.join("manifest.sha256"),
+            format!("{manifest_sha256}\n"),
+        )
+        .map_err(|error| format!("write staged manifest digest: {error}"))?;
+        verify_payload(&staging, version)?;
+        fs::rename(&staging, &final_bundle)
+            .map_err(|error| format!("publish staged bundle: {error}"))?;
+        sync_directory(&receipt.versions_dir)?;
+    }
+
+    let relative_target = PathBuf::from("versions").join(&bundle_name);
+    let old_target = fs::read_link(&receipt.current_link).ok();
+    if let Some(old) = &old_target {
+        if old != &relative_target {
+            atomic_symlink(old, &receipt.previous_link)?;
+        }
+    }
+    atomic_symlink(&relative_target, &receipt.current_link)?;
+    ensure_public_links(receipt)?;
+    if let Err(error) = verify_public_pair(receipt, version) {
+        if let Some(old) = &old_target {
+            atomic_symlink(old, &receipt.current_link)?;
+        }
+        return Err(format!(
+            "activation verification failed and was rolled back: {error}"
+        ));
+    }
+    cleanup_old_bundles(receipt)?;
+    let rollback_bundle = fs::read_link(&receipt.previous_link)
+        .ok()
+        .map(|path| receipt.managed_root.join(path));
+    Ok((final_bundle, rollback_bundle))
+}
+
+fn ensure_public_links(receipt: &InstallReceipt) -> Result<(), String> {
+    atomic_symlink(
+        Path::new(".aethyme-managed/current/aethyme"),
+        &receipt.router_path,
+    )?;
+    atomic_symlink(
+        Path::new(".aethyme-managed/current/aethyme-engine-cli"),
+        &receipt.engine_path,
+    )
+}
+
+fn atomic_symlink(target: &Path, destination: &Path) -> Result<(), String> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", destination.display()))?;
+    fs::create_dir_all(parent).map_err(|error| format!("create {}: {error}", parent.display()))?;
+    let name = destination
+        .file_name()
+        .ok_or_else(|| format!("{} has no filename", destination.display()))?
+        .to_string_lossy();
+    let temporary = parent.join(format!(
+        ".{name}.new-{}-{}",
+        std::process::id(),
+        now_unix_ms()
+    ));
+    std::os::unix::fs::symlink(target, &temporary)
+        .map_err(|error| format!("create symlink {}: {error}", temporary.display()))?;
+    if let Err(error) = fs::rename(&temporary, destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "activate symlink {}: {error}",
+            destination.display()
+        ));
+    }
+    sync_directory(parent)
+}
+
+fn verify_existing_bundle(payload: &Path, bundle: &Path) -> Result<(), String> {
+    for binary in ["aethyme", "aethyme-engine-cli"] {
+        if sha256_file(&payload.join(binary))? != sha256_file(&bundle.join(binary))? {
+            return Err(format!(
+                "existing bundle {} differs from reviewed payload",
+                bundle.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_old_bundles(receipt: &InstallReceipt) -> Result<(), String> {
+    let mut keep = Vec::new();
+    for link in [&receipt.current_link, &receipt.previous_link] {
+        if let Ok(target) = fs::read_link(link) {
+            if let Some(name) = target.file_name() {
+                keep.push(name.to_os_string());
+            }
+        }
+    }
+    for entry in fs::read_dir(&receipt.versions_dir)
+        .map_err(|error| format!("read {}: {error}", receipt.versions_dir.display()))?
+    {
+        let entry = entry.map_err(|error| format!("read version bundle: {error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("inspect {}: {error}", entry.path().display()))?;
+        if file_type.is_dir() && !file_type.is_symlink() && !keep.contains(&entry.file_name()) {
+            fs::remove_dir_all(entry.path()).map_err(|error| {
+                format!("remove old bundle {}: {error}", entry.path().display())
+            })?;
+        }
+    }
+    sync_directory(&receipt.versions_dir)
+}
+
+fn verify_payload(payload: &Path, version: &str) -> Result<(), String> {
+    verify_binary_version(&payload.join("aethyme"), "aethyme", version)?;
+    verify_binary_version(
+        &payload.join("aethyme-engine-cli"),
+        "aethyme-engine-cli",
+        version,
+    )?;
+    let output = Command::new(payload.join("aethyme"))
+        .args(["broker", "quick-test"])
+        .output()
+        .map_err(|error| format!("run staged aethyme broker quick-test: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "staged aethyme broker quick-test failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn verify_public_pair(receipt: &InstallReceipt, version: &str) -> Result<(), String> {
+    verify_binary_version(&receipt.router_path, "aethyme", version)?;
+    verify_binary_version(&receipt.engine_path, "aethyme-engine-cli", version)
+}
+
+fn verify_binary_version(path: &Path, name: &str, version: &str) -> Result<(), String> {
+    let output = Command::new(path)
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("run {} --version: {error}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!("{name} --version failed"));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.split_whitespace().nth(1) != Some(version) {
+        return Err(format!(
+            "{name} version does not match manifest {version}: {}",
+            stdout.trim()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_archive_members(archive: &Path) -> Result<(), String> {
+    let output = run_tar(&["-tzf"], archive, None)?;
+    let members = output
+        .lines()
+        .map(|line| line.strip_prefix("./").unwrap_or(line))
+        .collect::<Vec<_>>();
+    if members != ["aethyme", "aethyme-engine-cli"] {
+        return Err(format!(
+            "release archive contains unexpected paths: {members:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn run_tar(args: &[&str], archive: &Path, destination: Option<&Path>) -> Result<String, String> {
+    let mut command = Command::new("tar");
+    command.args(args).arg(archive);
+    if let Some(destination) = destination {
+        command.arg("-C").arg(destination);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("run tar: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tar failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn inspect_current_broker_schema(compatibility: &ReleaseCompatibility) -> Result<(), String> {
+    let cwd =
+        std::env::current_dir().map_err(|error| format!("resolve current directory: {error}"))?;
+    let database = cwd.join(".aethyme/broker.db");
+    if !database.is_file() {
+        return Ok(());
+    }
+    inspect_broker_schema_at(&database, compatibility)
+}
+
+fn inspect_broker_schema_at(
+    database: &Path,
+    compatibility: &ReleaseCompatibility,
+) -> Result<(), String> {
+    let connection = rusqlite::Connection::open_with_flags(
+        &database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("inspect broker schema {}: {error}", database.display()))?;
+    let schema: i64 = connection
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("read broker schema {}: {error}", database.display()))?;
+    let supported = &compatibility.broker_storage;
+    if schema < supported.minimum_readable_schema || schema > supported.current_schema {
+        return Err(format!(
+            "broker schema {schema} is incompatible with target range {}..={}; run the update outside this repository or choose a compatible release",
+            supported.minimum_readable_schema, supported.current_schema
+        ));
+    }
+    Ok(())
+}
+
+fn read_bounded_file(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>, String> {
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("stat {}: {error}", path.display()))?;
+    if metadata.len() > maximum_bytes {
+        return Err(format!(
+            "{} is {} bytes; limit is {maximum_bytes}",
+            path.display(),
+            metadata.len()
+        ));
+    }
+    fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validate_digest(value: &str, label: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{label} must be a full lowercase SHA-256"));
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<(), String> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync directory {}: {error}", path.display()))
+}
+
 fn action_for_installation(
     method: InstallationMethod,
     manager_command: Option<String>,
@@ -700,6 +1332,34 @@ mod tests {
                 .then(|| "brew upgrade aethyme".into()),
             explanation: "fixture".into(),
         }
+    }
+
+    fn fake_payload(root: &Path, version: &str, quick_test_passes: bool) -> PathBuf {
+        let payload = root.join(format!("payload-{version}"));
+        fs::create_dir(&payload).unwrap();
+        let quick_exit = if quick_test_passes { 0 } else { 1 };
+        fs::write(
+            payload.join("aethyme"),
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'aethyme {version}'; exit 0; fi\nif [ \"$1\" = broker ] && [ \"$2\" = quick-test ]; then exit {quick_exit}; fi\nexit 2\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            payload.join("aethyme-engine-cli"),
+            format!("#!/bin/sh\necho 'aethyme-engine-cli {version}'\n"),
+        )
+        .unwrap();
+        for binary in ["aethyme", "aethyme-engine-cli"] {
+            fs::set_permissions(payload.join(binary), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        payload
+    }
+
+    fn manifest_file(root: &Path, version: &str) -> PathBuf {
+        let path = root.join(format!("manifest-{version}.json"));
+        fs::write(&path, manifest("stable", version)).unwrap();
+        path
     }
 
     #[test]
@@ -877,5 +1537,110 @@ mod tests {
             detect_installation(&router).method,
             InstallationMethod::ManualArchive
         );
+    }
+
+    #[test]
+    fn bootstrap_switches_the_pair_once_and_retains_one_rollback_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+
+        let first = bootstrap_install(
+            &fake_payload(temp.path(), "0.2.0", true),
+            &install_dir,
+            &manifest_file(temp.path(), "0.2.0"),
+            RELEASE_TARGETS[0],
+        )
+        .unwrap();
+        assert!(first.rollback_bundle.is_none());
+        assert_eq!(
+            fs::canonicalize(&first.router_path).unwrap().parent(),
+            fs::canonicalize(&first.engine_path).unwrap().parent()
+        );
+        let root = install_dir.join(".aethyme-managed");
+        fs::create_dir(root.join("versions/orphan")).unwrap();
+
+        let second = bootstrap_install(
+            &fake_payload(temp.path(), "0.3.0", true),
+            &install_dir,
+            &manifest_file(temp.path(), "0.3.0"),
+            RELEASE_TARGETS[0],
+        )
+        .unwrap();
+        assert!(
+            second.rollback_bundle.as_ref().unwrap().ends_with(
+                fs::read_link(root.join("previous"))
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+            )
+        );
+        assert!(!root.join("versions/orphan").exists());
+
+        let third = bootstrap_install(
+            &fake_payload(temp.path(), "0.4.0", true),
+            &install_dir,
+            &manifest_file(temp.path(), "0.4.0"),
+            RELEASE_TARGETS[0],
+        )
+        .unwrap();
+        let versions = fs::read_dir(root.join("versions"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(versions.len(), 2, "current plus exactly one rollback");
+        assert!(
+            third.active_bundle.ends_with(
+                fs::read_link(root.join("current"))
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+            )
+        );
+        assert!(third.rollback_bundle.is_some());
+    }
+
+    #[test]
+    fn failed_staged_quick_test_never_moves_the_active_pair() {
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        bootstrap_install(
+            &fake_payload(temp.path(), "0.2.0", true),
+            &install_dir,
+            &manifest_file(temp.path(), "0.2.0"),
+            RELEASE_TARGETS[0],
+        )
+        .unwrap();
+        let current = install_dir.join(".aethyme-managed/current");
+        let before = fs::read_link(&current).unwrap();
+
+        let error = bootstrap_install(
+            &fake_payload(temp.path(), "0.3.0", false),
+            &install_dir,
+            &manifest_file(temp.path(), "0.3.0"),
+            RELEASE_TARGETS[0],
+        )
+        .unwrap_err();
+
+        assert!(error.contains("quick-test failed"));
+        assert_eq!(fs::read_link(current).unwrap(), before);
+    }
+
+    #[test]
+    fn incompatible_broker_schema_is_refused_without_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("broker.db");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n\
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '99');",
+            )
+            .unwrap();
+        drop(connection);
+        let manifest = parse_valid_manifest(&manifest("stable", "0.3.0")).unwrap();
+
+        let error = inspect_broker_schema_at(&database, &manifest.compatibility).unwrap_err();
+
+        assert!(error.contains("schema 99 is incompatible"));
     }
 }
