@@ -115,6 +115,64 @@ pub enum BrokerOpError {
     GateConfig(#[from] crate::gates::GateConfigError),
     #[error("queue entry {entry} is not verified (status: {status}) — submit/simulate first")]
     NotVerified { entry: i64, status: &'static str },
+    #[error("ship queue entry {entry} was not found")]
+    ShipEntryNotFound { entry: i64 },
+    #[error("ship requires a promoted queue entry; entry {entry} is {status}")]
+    ShipEntryNotPromoted { entry: i64, status: &'static str },
+    #[error(
+        "ship entry {entry} promotion {promotion} is not reachable from integration {integration} at {head}"
+    )]
+    ShipEntryNotOnIntegration {
+        entry: i64,
+        promotion: String,
+        integration: String,
+        head: String,
+    },
+    #[error("ship cannot resolve {what}: {reason}")]
+    ShipPlanUnavailable { what: &'static str, reason: String },
+    #[error("ship confirmation must be the full 40-character integration SHA")]
+    ShipConfirmationNotFullSha,
+    #[error("ship confirmation mismatch: expected integration {expected}, received {actual}")]
+    ShipConfirmationMismatch { expected: String, actual: String },
+    #[error("ship cannot execute without a fetched remote base for {tracking_ref}")]
+    ShipRemoteBaseUnavailable { tracking_ref: String },
+    #[error(
+        "ship remote moved since planning: expected {expected} at {remote_ref}, fetched {actual}"
+    )]
+    ShipRemoteMoved {
+        remote_ref: String,
+        expected: String,
+        actual: String,
+    },
+    #[error(
+        "ship would not fast-forward {remote_ref}: remote {remote_sha} is not an ancestor of confirmed integration {integration_sha}"
+    )]
+    ShipNonFastForward {
+        remote_ref: String,
+        remote_sha: String,
+        integration_sha: String,
+    },
+    #[error("ship {phase} operation {operation_id} ended {status}")]
+    ShipOperationFailed {
+        phase: &'static str,
+        operation_id: i64,
+        status: &'static str,
+    },
+    #[error("ship verification failed for {remote_ref}: expected {expected}, observed {actual}")]
+    ShipVerificationMismatch {
+        remote_ref: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("ship local-main synchronization is unsafe: {reason}")]
+    ShipLocalMainUnsafe { reason: String },
+    #[error(
+        "remote {published_sha} was published, but local-main synchronization was refused after revalidation: {reason}"
+    )]
+    ShipLocalMainMovedAfterPublish {
+        published_sha: String,
+        reason: String,
+    },
     #[error(
         "session {id} ({status}) already exists for this worktree{task}. Options:\n  \
          aethyme broker submit --session {id}        submit its committed work\n  \
@@ -419,8 +477,32 @@ pub struct PromotedIntegrationEntry {
 /// Deterministic operator guidance for the focused integration view.
 #[derive(Debug, serde::Serialize)]
 pub struct IntegrationNextAction {
+    pub state: IntegrationDeliveryState,
     pub summary: String,
     pub commands: Vec<String>,
+}
+
+/// Delivery stage of the current integration tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationDeliveryState {
+    Promoted,
+    Published,
+    LocallySynchronized,
+    Blocked,
+    Untracked,
+}
+
+impl IntegrationDeliveryState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Promoted => "promoted",
+            Self::Published => "published",
+            Self::LocallySynchronized => "locally_synchronized",
+            Self::Blocked => "blocked",
+            Self::Untracked => "untracked",
+        }
+    }
 }
 
 /// Result of `broker repair --session`: a conservative recovery action
@@ -1619,6 +1701,7 @@ impl Broker {
         };
 
         let mut promoted_entries = Vec::new();
+        let mut latest_delivery_entry_id = None;
         for entry in self.store.merge_queue()? {
             if entry.status != MergeStatus::Promoted {
                 continue;
@@ -1628,8 +1711,12 @@ impl Broker {
                 continue;
             };
             if !self.repo.is_ancestor(&merge_commit, &head)
-                || self.repo.is_ancestor(&merge_commit, comparison_head)
+                || self.repo.is_ancestor(&merge_commit, &main_head)
             {
+                continue;
+            }
+            latest_delivery_entry_id = Some(entry.id);
+            if self.repo.is_ancestor(&merge_commit, comparison_head) {
                 continue;
             }
             let session = self.store.session(entry.session_id).ok();
@@ -1664,7 +1751,11 @@ impl Broker {
         };
         let mut next_action = integration_next_action(
             &branch,
+            &head,
+            &main_head,
+            upstream_head.as_deref(),
             main_is_ancestor,
+            latest_delivery_entry_id,
             &promoted_entries,
             &changed_files,
             &conflicts,
@@ -1675,6 +1766,7 @@ impl Broker {
         if main_behind_upstream_commits > 0 && !integration_contains_upstream {
             let upstream = upstream_ref.as_deref().unwrap_or("@{upstream}");
             next_action = IntegrationNextAction {
+                state: IntegrationDeliveryState::Blocked,
                 summary: format!(
                     "local main is {main_behind_upstream_commits} commits behind {upstream}; reconcile before repair or submit"
                 ),
@@ -2829,7 +2921,11 @@ fn integration_movement_advice(
 
 fn integration_next_action(
     branch: &str,
+    integration_head: &str,
+    main_head: &str,
+    upstream_head: Option<&str>,
     main_is_ancestor: bool,
+    latest_delivery_entry_id: Option<i64>,
     promoted_entries: &[PromotedIntegrationEntry],
     changed_files: &[String],
     conflicts: &[PromotedConflict],
@@ -2850,11 +2946,34 @@ fn integration_next_action(
             .map(|session_id| format!("aethyme broker repair --session {session_id}"))
             .collect();
         return IntegrationNextAction {
+            state: IntegrationDeliveryState::Blocked,
             summary: format!(
                 "{count} {noun} {verb} the pending integration layer; repair or rebase before submit"
             ),
             commands,
         };
+    }
+
+    if main_head == integration_head {
+        return IntegrationNextAction {
+            state: IntegrationDeliveryState::LocallySynchronized,
+            summary: format!("local main is synchronized with {branch}"),
+            commands: Vec::new(),
+        };
+    }
+
+    if upstream_head == Some(integration_head) {
+        if let Some(entry_id) = latest_delivery_entry_id {
+            return IntegrationNextAction {
+                state: IntegrationDeliveryState::Published,
+                summary: format!(
+                    "{branch} is published at {integration_head}; local main is not synchronized"
+                ),
+                commands: vec![format!(
+                    "aethyme broker ship execute --entry {entry_id} --confirm {integration_head} --sync-main"
+                )],
+            };
+        }
     }
 
     if !promoted_entries.is_empty() {
@@ -2866,26 +2985,30 @@ fn integration_next_action(
         };
         let verb = if count == 1 { "is" } else { "are" };
         if main_is_ancestor {
+            let entry_id = latest_delivery_entry_id
+                .expect("visible promoted entries have a delivery queue entry");
             return IntegrationNextAction {
+                state: IntegrationDeliveryState::Promoted,
                 summary: format!(
-                    "{count} {noun} {verb} pending; fast-forward main from {branch} when ready"
+                    "{count} {noun} {verb} promoted on {branch} and ready for a ship plan"
                 ),
-                commands: vec![
-                    format!("git merge --ff-only {branch}"),
-                    "aethyme broker integration status".into(),
-                ],
+                commands: vec![format!("aethyme broker ship plan --entry {entry_id}")],
             };
         }
+        let entry_id =
+            latest_delivery_entry_id.expect("visible promoted entries have a delivery queue entry");
         return IntegrationNextAction {
+            state: IntegrationDeliveryState::Blocked,
             summary: format!(
-                "{count} {noun} {verb} pending, but main and {branch} have diverged; inspect before merging"
+                "{count} {noun} {verb} pending, but main and {branch} have diverged; inspect the blocked ship plan"
             ),
-            commands: vec![format!("git log --oneline --left-right HEAD...{branch}")],
+            commands: vec![format!("aethyme broker ship plan --entry {entry_id}")],
         };
     }
 
     if !changed_files.is_empty() {
         return IntegrationNextAction {
+            state: IntegrationDeliveryState::Untracked,
             summary: format!(
                 "{branch} differs from main, but no promoted queue entries describe the pending commits; inspect branch history"
             ),
@@ -2894,6 +3017,7 @@ fn integration_next_action(
     }
 
     IntegrationNextAction {
+        state: IntegrationDeliveryState::Untracked,
         summary: "no promoted work pending outside main".into(),
         commands: Vec::new(),
     }

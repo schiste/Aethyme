@@ -143,7 +143,15 @@ Usage:
   aethyme broker promote --entry <id> [--json]
       Manual-mode only: advance the local integration branch to a verified
       entry's merge commit; other in-flight entries are re-simulated.
-      Never pushes.
+      Promotion stays local; publish through `broker ship plan --entry <id>`.
+  aethyme broker ship plan --entry <id> [--json]
+      Read-only publication plan for a promoted entry: resolve the exact
+      integration tip, local and remote default-branch SHAs, freshness,
+      proposed push, and whether synchronizing local main is currently safe.
+  aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--json]
+      Fetch and revalidate the planned remote base, publish the exact confirmed
+      integration SHA with a non-force push, then verify the remote default ref.
+      --sync-main additionally fast-forwards a clean, unchanged primary checkout.
   aethyme broker integration status [--json]
       Focused promoted-but-unmerged view: the local integration branch as
       a pending layer above main, with promoted entries, files changed,
@@ -274,6 +282,10 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "repair",
         "queue",
         "promote",
+        "ship",
+        "plan",
+        "execute",
+        "sync-main",
         "integration",
         "status",
         "events",
@@ -333,6 +345,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
 fn command_records_metric(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
         Some("certify" | "queue" | "metrics") => false,
+        Some("ship") => args.get(1).map(String::as_str) != Some("plan"),
         Some("operations") => args.get(1).map(String::as_str) == Some("reconcile"),
         Some("git" | "gh") => {
             let command = args
@@ -425,6 +438,49 @@ mod tests {
                 "stateful command should record telemetry: {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_accepts_read_only_ship_plan() {
+        let parsed = match super::parse(&args(&["ship", "plan", "--entry", "42", "--json"])) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("ship plan should parse"),
+        };
+        assert_eq!(parsed.positional, vec!["ship", "plan"]);
+        assert_eq!(parsed.entry, Some(42));
+        assert!(parsed.json);
+        assert!(!super::command_records_metric(&args(&[
+            "ship", "plan", "--entry", "42"
+        ])));
+    }
+
+    #[test]
+    fn parse_accepts_confirmed_ship_execution() {
+        let sha = "a".repeat(40);
+        let parsed = match super::parse(&args(&[
+            "ship",
+            "execute",
+            "--entry",
+            "42",
+            "--confirm",
+            &sha,
+            "--sync-main",
+        ])) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("ship execute should parse"),
+        };
+        assert_eq!(parsed.positional, vec!["ship", "execute"]);
+        assert_eq!(parsed.entry, Some(42));
+        assert_eq!(parsed.confirm.as_deref(), Some(sha.as_str()));
+        assert!(parsed.sync_main);
+        assert!(super::command_records_metric(&args(&[
+            "ship",
+            "execute",
+            "--entry",
+            "42",
+            "--confirm",
+            &sha,
+        ])));
     }
 
     #[test]
@@ -611,6 +667,7 @@ struct Parsed {
     pr_number: Option<i64>,
     session: Option<i64>,
     entry: Option<i64>,
+    confirm: Option<String>,
     operation: Option<i64>,
     ttl_seconds: Option<i64>,
     since: Option<i64>,
@@ -633,6 +690,7 @@ struct Parsed {
     apply: bool,
     dry_run: bool,
     destructive: bool,
+    sync_main: bool,
     exec_command: Vec<String>,
 }
 
@@ -651,6 +709,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         pr_number: None,
         session: None,
         entry: None,
+        confirm: None,
         operation: None,
         ttl_seconds: None,
         since: None,
@@ -673,6 +732,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         apply: false,
         dry_run: false,
         destructive: false,
+        sync_main: false,
         exec_command: Vec::new(),
     };
     let mut iter = args.iter();
@@ -703,6 +763,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--apply" => parsed.apply = true,
             "--dry-run" => parsed.dry_run = true,
             "--destructive" => parsed.destructive = true,
+            "--sync-main" => parsed.sync_main = true,
             "--replace-stale" => parsed.replace_stale = true,
             "--kind" => {
                 parsed.kind = Some(
@@ -830,6 +891,13 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 parsed.entry = Some(value.parse().map_err(|_| {
                     UsageError::Message("--entry must be an integer queue entry id".into())
                 })?);
+            }
+            "--confirm" => {
+                parsed.confirm = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--confirm requires a value".into()))?
+                        .clone(),
+                )
             }
             "--operation" => {
                 let value = iter
@@ -1397,9 +1465,78 @@ fn render_integration_status(
         }
     }
 
+    println!("Delivery state: {}", report.next_action.state.as_str());
     println!("Next action: {}", report.next_action.summary);
     for command in &report.next_action.commands {
         println!("  run: {command}");
+    }
+    Ok(())
+}
+
+fn render_ship_plan(report: &crate::ShipPlan, json: bool) -> Result<(), UsageError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!(
+        "Ship plan q{} (session {})",
+        report.queue_entry.id, report.originating_session.id
+    );
+    println!(
+        "Integration: {} @ {}",
+        report.integration_ref, report.integration_sha
+    );
+    println!(
+        "Local default:  {} @ {}",
+        report.local_default_branch_ref, report.local_default_branch_sha
+    );
+    println!(
+        "Remote default: {}/{} @ {}",
+        report.remote, report.remote_default_branch_ref, report.remote_default_branch_sha
+    );
+    println!("Target: {}", report.target_repository);
+    println!("Freshness: {:?}", report.freshness.result);
+    println!("Proposed push: {}", report.proposed_push.command.join(" "));
+    println!(
+        "Local-main synchronization safe now: {}",
+        if report.local_main_sync_safe {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "Confirm with: aethyme broker ship execute --entry {} --confirm {}",
+        report.queue_entry.id, report.integration_sha
+    );
+    Ok(())
+}
+
+fn render_ship_execution(
+    report: &crate::ShipExecutionReport,
+    json: bool,
+) -> Result<(), UsageError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!(
+        "Published {} to {}/{}.",
+        report.published_sha, report.plan.remote, report.plan.remote_default_branch_ref
+    );
+    println!("Verified remote SHA: {}", report.verified_remote_sha);
+    println!(
+        "Operations: fetch {}, push {}, verify {}",
+        report.fetch_operation.id, report.push_operation.id, report.verify_operation.id
+    );
+    if report.local_main_sync.synchronized {
+        println!(
+            "Local main synchronized: {} -> {}",
+            report.local_main_sync.before_sha, report.local_main_sync.after_sha
+        );
+    } else if let Some(command) = &report.local_main_sync.follow_up_command {
+        println!("Local main unchanged. To synchronize it explicitly:");
+        println!("  {command}");
     }
     Ok(())
 }
@@ -2293,6 +2430,40 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 println!("{{\"promoted\":{entry}}}");
             } else {
                 println!("Promoted entry {entry} to the local integration branch.");
+                println!("Next: aethyme broker ship plan --entry {entry}");
+            }
+        }
+        "ship" => {
+            let action = parsed
+                .positional
+                .first()
+                .map(String::as_str)
+                .ok_or(UsageError::Message("ship requires an action: plan".into()))?;
+            match action {
+                "plan" => {
+                    let entry = parsed.entry.ok_or(UsageError::Message(
+                        "ship plan requires --entry <id>".into(),
+                    ))?;
+                    let mut broker = open_broker()?;
+                    let report = broker.ship_plan(entry)?;
+                    render_ship_plan(&report, parsed.json)?;
+                }
+                "execute" => {
+                    let entry = parsed.entry.ok_or(UsageError::Message(
+                        "ship execute requires --entry <id>".into(),
+                    ))?;
+                    let confirm = parsed.confirm.as_deref().ok_or(UsageError::Message(
+                        "ship execute requires --confirm <full-integration-sha>".into(),
+                    ))?;
+                    let mut broker = open_broker()?;
+                    let report = broker.ship_execute_with_sync(entry, confirm, parsed.sync_main)?;
+                    render_ship_execution(&report, parsed.json)?;
+                }
+                other => {
+                    return Err(UsageError::Message(format!(
+                        "unknown ship action {other:?} — expected plan or execute"
+                    )));
+                }
             }
         }
         "integration" => {

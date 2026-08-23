@@ -49,6 +49,8 @@ product surface.
 - `aethyme broker submit`
 - `aethyme broker repair`
 - `aethyme broker finish`
+- `aethyme broker ship plan`
+- `aethyme broker ship execute`
 - `aethyme broker integration status`
 - `aethyme broker integration reconcile`
 - `aethyme broker quick-test`
@@ -95,6 +97,8 @@ The broker is the stable product front door for multi-agent coordination:
 - `aethyme broker submit --session <id> [--json]`
 - `aethyme broker repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
+- `aethyme broker ship plan --entry <id> [--json]`
+- `aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--json]`
 - `aethyme broker integration status [--json]`
 - `aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--dry-run|--apply] [--json]`
 - `aethyme broker quick-test [--with-gate] [--json]`
@@ -104,6 +108,25 @@ The broker is the stable product front door for multi-agent coordination:
 `quick-test` is the disposable install smoke. `verify-loop` is the stronger
 operator E2E: it reports the integration commit tested and flags movement during
 the run, so callers know whether the result proves the current integration tip.
+
+Promotion only advances the local integration ref. Use `broker ship plan` to
+inspect the promoted queue entry, exact integration SHA, remote freshness,
+proposed non-force push, and local-main safety without mutating refs or remote
+state. Publish only with the plan's full integration SHA:
+
+```bash
+aethyme broker ship plan --entry 42
+aethyme broker ship execute --entry 42 \
+  --confirm 0123456789abcdef0123456789abcdef01234567
+```
+
+Execution fetches and revalidates the planned remote base, requires a
+fast-forward, pushes that exact SHA, and verifies the remote default ref. It
+leaves the primary checkout unchanged unless `--sync-main` is present; that
+option additionally requires a clean, unchanged, fast-forwardable local
+default branch. `broker integration status` reports whether the integration tip
+is promoted, published, or locally synchronized and routes its next action
+through this ship lane.
 
 Frozen broker JSON contracts are limited to the commands listed in
 [`../../../../docs/json-contracts.md`](../../../../docs/json-contracts.md).
