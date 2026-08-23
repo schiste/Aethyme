@@ -36,6 +36,7 @@ mod operations;
 mod pr;
 mod quick_test;
 mod reconciliation;
+mod report;
 mod schema;
 mod ship;
 mod store;
@@ -86,6 +87,12 @@ pub use quick_test::{
 pub use reconciliation::{
     IntegrationReconcileClassification, IntegrationReconcileEntry, IntegrationReconcileOptions,
     IntegrationReconcileReport, IntegrationReconcileResolutionAudit,
+};
+pub use report::{
+    REPORT_RECENT_EVENT_LIMIT, REPORT_RECENT_GATE_LIMIT, REPORT_RECENT_OPERATION_LIMIT,
+    REPORT_SNAPSHOT_SCHEMA_VERSION, ReportBuild, ReportEventType, ReportGateCacheSource,
+    ReportGateObservation, ReportGateProvenance, ReportLastFailure, ReportOperation,
+    ReportPlatform, ReportSession, ReportSnapshot, ReportSnapshotBuilder,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use ship::{
