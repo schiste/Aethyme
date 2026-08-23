@@ -185,10 +185,26 @@ pub enum BrokerOpError {
         status: &'static str,
         task: String,
     },
+    #[error("--sync-integration is valid only with adoption mode reuse")]
+    ReuseSyncRequiresReuse,
+    #[error("reuse synchronization requires a clean worktree; dirty paths: {paths:?}")]
+    ReuseSyncDirty { paths: Vec<String> },
+    #[error(
+        "reuse synchronization requires a fast-forward, but session HEAD {session_head} is {relation} relative to integration HEAD {integration_head}"
+    )]
+    ReuseSyncNotFastForward {
+        session_head: String,
+        integration_head: String,
+        relation: &'static str,
+    },
+    #[error(
+        "reuse synchronization verification failed: expected HEAD {expected}, observed {actual}"
+    )]
+    ReuseSyncVerification { expected: String, actual: String },
 }
 
 /// Policy for `adopt` when the worktree already has a live session.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdoptMode {
     /// Fail with guidance (default).
     New,
@@ -196,6 +212,21 @@ pub enum AdoptMode {
     Reuse,
     /// Close the existing session (state only) and register fresh.
     ReplaceStale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdoptOptions {
+    pub mode: AdoptMode,
+    pub sync_integration: bool,
+}
+
+impl AdoptOptions {
+    pub fn new(mode: AdoptMode) -> Self {
+        Self {
+            mode,
+            sync_integration: false,
+        }
+    }
 }
 
 /// The lifecycle transition actually performed by `adopt_with`.
@@ -252,6 +283,22 @@ pub struct AdoptIntegrationDrift {
     pub safe_next_action: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdoptIntegrationSyncOutcome {
+    AlreadyCurrent,
+    FastForwarded,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AdoptIntegrationSync {
+    pub outcome: AdoptIntegrationSyncOutcome,
+    pub integration_branch: String,
+    pub integration_head: String,
+    pub before_head: String,
+    pub after_head: String,
+}
+
 /// Adoption result with the session fields kept at the JSON top level.
 #[derive(Debug, serde::Serialize)]
 pub struct AdoptReport {
@@ -260,6 +307,8 @@ pub struct AdoptReport {
     pub outcome: AdoptOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration_drift: Option<AdoptIntegrationDrift>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_sync: Option<AdoptIntegrationSync>,
 }
 
 /// A session enriched with liveness derived at read time — what
@@ -825,15 +874,32 @@ impl Broker {
         task: Option<&str>,
         mode: AdoptMode,
     ) -> Result<AdoptReport, BrokerOpError> {
+        self.adopt_with_options(worktree, task, AdoptOptions::new(mode))
+    }
+
+    pub fn adopt_with_options(
+        &mut self,
+        worktree: &Path,
+        task: Option<&str>,
+        options: AdoptOptions,
+    ) -> Result<AdoptReport, BrokerOpError> {
+        if options.sync_integration && options.mode != AdoptMode::Reuse {
+            return Err(BrokerOpError::ReuseSyncRequiresReuse);
+        }
         let checkout = GitRepo::discover(worktree)?;
         let branch = checkout.current_branch()?;
+        let integration_sync = if options.sync_integration {
+            Some(self.synchronize_reuse_checkout(&checkout)?)
+        } else {
+            None
+        };
         let diff_base = checkout.head_commit().ok();
         let worktree_path = checkout.root().to_string_lossy().into_owned();
         let foreign_files = checkout.untracked_paths()?;
         let mut outcome = AdoptOutcome::Created;
 
         if let Some(existing) = self.store.session_for_worktree(&worktree_path)? {
-            match mode {
+            match options.mode {
                 AdoptMode::Reuse => {
                     // Follow-up task on the same worktree: same identity,
                     // fresh baseline so leases and submit scope reflect
@@ -849,6 +915,7 @@ impl Broker {
                         session,
                         outcome: AdoptOutcome::Reused,
                         integration_drift,
+                        integration_sync,
                     });
                 }
                 AdoptMode::ReplaceStale => {
@@ -884,7 +951,7 @@ impl Broker {
         })?;
         self.store
             .set_session_foreign_files(session.id, &foreign_files)?;
-        let integration_drift = if mode == AdoptMode::Reuse {
+        let integration_drift = if options.mode == AdoptMode::Reuse {
             Some(self.adopt_integration_drift(&checkout, session.id)?)
         } else {
             None
@@ -893,6 +960,54 @@ impl Broker {
             session,
             outcome,
             integration_drift,
+            integration_sync,
+        })
+    }
+
+    fn synchronize_reuse_checkout(
+        &mut self,
+        checkout: &GitRepo,
+    ) -> Result<AdoptIntegrationSync, BrokerOpError> {
+        let dirty_paths = checkout.dirty_paths()?;
+        if !dirty_paths.is_empty() {
+            return Err(BrokerOpError::ReuseSyncDirty { paths: dirty_paths });
+        }
+
+        let before_head = checkout.head_commit()?;
+        let (integration_branch, integration_head) = self.integration_head()?;
+        let outcome = if before_head == integration_head {
+            AdoptIntegrationSyncOutcome::AlreadyCurrent
+        } else {
+            if !checkout.is_ancestor(&before_head, &integration_head) {
+                let ahead = checkout.commit_count_between(&integration_head, &before_head)?;
+                let behind = checkout.commit_count_between(&before_head, &integration_head)?;
+                let relation = match (ahead, behind) {
+                    (_, 0) => AdoptIntegrationRelation::Ahead,
+                    _ => AdoptIntegrationRelation::Diverged,
+                };
+                return Err(BrokerOpError::ReuseSyncNotFastForward {
+                    session_head: before_head,
+                    integration_head,
+                    relation: relation.as_str(),
+                });
+            }
+            checkout.fast_forward_checkout(&integration_head)?;
+            AdoptIntegrationSyncOutcome::FastForwarded
+        };
+
+        let after_head = checkout.head_commit()?;
+        if after_head != integration_head {
+            return Err(BrokerOpError::ReuseSyncVerification {
+                expected: integration_head,
+                actual: after_head,
+            });
+        }
+        Ok(AdoptIntegrationSync {
+            outcome,
+            integration_branch,
+            integration_head,
+            before_head,
+            after_head,
         })
     }
 

@@ -34,11 +34,13 @@ Usage:
       Adaptive (NOT scaffolding): sniff this repo's manifests and draft
       a gates.toml. Output depends on the repo — review it, then run
       certify.
-  aethyme broker adopt [<path>] [--task <text>] [--reuse|--replace-stale] [--json]
+  aethyme broker adopt [<path>] [--task <text>] [--reuse [--sync-integration]|--replace-stale] [--json]
       Register an existing worktree (attach-first). Defaults to the
       current directory. If the worktree already has a session:
       --reuse points it at a follow-up task with a fresh baseline and
       reports its relation to the current integration tip;
+      --sync-integration requires --reuse and first fast-forwards a clean
+      session worktree to the exact integration tip;
       --replace-stale closes it (state only) and registers fresh;
       neither flag = error listing your options.
   aethyme broker close --session <id> [--json]
@@ -287,6 +289,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "plan",
         "execute",
         "sync-main",
+        "sync-integration",
         "integration",
         "status",
         "events",
@@ -692,6 +695,7 @@ struct Parsed {
     dry_run: bool,
     destructive: bool,
     sync_main: bool,
+    sync_integration: bool,
     exec_command: Vec<String>,
 }
 
@@ -734,6 +738,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         dry_run: false,
         destructive: false,
         sync_main: false,
+        sync_integration: false,
         exec_command: Vec::new(),
     };
     let mut iter = args.iter();
@@ -765,6 +770,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--dry-run" => parsed.dry_run = true,
             "--destructive" => parsed.destructive = true,
             "--sync-main" => parsed.sync_main = true,
+            "--sync-integration" => parsed.sync_integration = true,
             "--replace-stale" => parsed.replace_stale = true,
             "--kind" => {
                 parsed.kind = Some(
@@ -1716,7 +1722,19 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 (false, true) => crate::AdoptMode::ReplaceStale,
                 (false, false) => crate::AdoptMode::New,
             };
-            let report = broker.adopt_with(&path, parsed.task.as_deref(), mode)?;
+            if parsed.sync_integration && mode != crate::AdoptMode::Reuse {
+                return Err(UsageError::Message(
+                    "--sync-integration requires --reuse".into(),
+                ));
+            }
+            let report = broker.adopt_with_options(
+                &path,
+                parsed.task.as_deref(),
+                crate::AdoptOptions {
+                    mode,
+                    sync_integration: parsed.sync_integration,
+                },
+            )?;
             let session = &report.session;
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1740,6 +1758,19 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         "note: main-checkout session — verification is advisory here \
                          (commits land on main before gates run); use a worktree \
                          session for enforced verification."
+                    );
+                }
+                if let Some(sync) = &report.integration_sync {
+                    let summary = match sync.outcome {
+                        crate::AdoptIntegrationSyncOutcome::AlreadyCurrent => "already current",
+                        crate::AdoptIntegrationSyncOutcome::FastForwarded => "fast-forwarded",
+                    };
+                    println!(
+                        "Integration synchronization: {summary} ({} -> {}, {} at {})",
+                        short_commit(&sync.before_head),
+                        short_commit(&sync.after_head),
+                        sync.integration_branch,
+                        short_commit(&sync.integration_head),
                     );
                 }
                 if let Some(drift) = &report.integration_drift {
