@@ -116,6 +116,22 @@ fn reviewed_homebrew_formula_installs_the_published_binary_pair() {
 }
 
 #[test]
+fn release_installer_delegates_pair_activation_to_the_native_transaction() {
+    let installer =
+        std::fs::read_to_string(aethyme_testkit::paths::repo_root().join("install.sh")).unwrap();
+    let bootstrap = installer
+        .split("\"$payload/aethyme\" update bootstrap")
+        .nth(1)
+        .expect("installer must delegate activation to the staged router");
+
+    for argument in ["--payload", "--install-dir", "--manifest", "--target"] {
+        assert!(bootstrap.contains(argument), "bootstrap omitted {argument}");
+    }
+    assert!(!installer.contains("mv \"$engine_stage\""));
+    assert!(!installer.contains("mv \"$router_stage\""));
+}
+
+#[test]
 fn release_notes_publish_migration_compatibility_rollback_and_known_issues() {
     let root = aethyme_testkit::paths::repo_root();
     let workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
