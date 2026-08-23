@@ -172,10 +172,10 @@ pub struct ReportInspection {
     pub report: ReportDocument,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct ReportFilingIndex {
-    schema_version: u32,
-    filings: BTreeMap<String, serde_json::Value>,
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReportFilingIndex {
+    pub(crate) schema_version: u32,
+    pub(crate) filings: BTreeMap<String, serde_json::Value>,
 }
 
 /// List captured reports without mutating report bytes, filing state, or
@@ -207,7 +207,12 @@ pub fn list_reports(main_root: &Path) -> Result<ReportList, ReportCaptureError> 
         if path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name != REPORT_FILINGS_FILENAME && !name.starts_with(".report-"))
+            .is_some_and(|name| {
+                name != REPORT_FILINGS_FILENAME
+                    && !name.starts_with(".report-")
+                    && !name.ends_with(".issue.json")
+                    && !name.ends_with(".issue.md")
+            })
         {
             paths.push(path);
         }
@@ -263,7 +268,7 @@ pub fn show_report(
     })
 }
 
-fn ensure_safe_reports_directory(reports_root: &Path) -> Result<(), ReportCaptureError> {
+pub(crate) fn ensure_safe_reports_directory(reports_root: &Path) -> Result<(), ReportCaptureError> {
     if std::fs::symlink_metadata(reports_root)
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
     {
@@ -275,11 +280,25 @@ fn ensure_safe_reports_directory(reports_root: &Path) -> Result<(), ReportCaptur
 }
 
 fn load_filed_digests(reports_root: &Path) -> Result<BTreeSet<String>, ReportCaptureError> {
+    Ok(load_filing_index(reports_root)?
+        .filings
+        .into_keys()
+        .collect())
+}
+
+pub(crate) fn load_filing_index(
+    reports_root: &Path,
+) -> Result<ReportFilingIndex, ReportCaptureError> {
     let path = reports_root.join(REPORT_FILINGS_FILENAME);
     let relative = format!(".aethyme/reports/{REPORT_FILINGS_FILENAME}");
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ReportFilingIndex {
+                schema_version: REPORT_FILINGS_SCHEMA_VERSION,
+                filings: BTreeMap::new(),
+            });
+        }
         Err(source) => {
             return Err(ReportCaptureError::Io {
                 action: "inspect report filing index",
@@ -320,8 +339,7 @@ fn load_filed_digests(reports_root: &Path) -> Result<BTreeSet<String>, ReportCap
             ),
         });
     }
-    let mut digests = BTreeSet::new();
-    for digest in index.filings.into_keys() {
+    for digest in index.filings.keys() {
         if digest.len() != 64
             || !digest
                 .bytes()
@@ -332,9 +350,8 @@ fn load_filed_digests(reports_root: &Path) -> Result<BTreeSet<String>, ReportCap
                 reason: "filing index contains an invalid digest key".into(),
             });
         }
-        digests.insert(digest);
     }
-    Ok(digests)
+    Ok(index)
 }
 
 fn read_report(
@@ -665,6 +682,8 @@ fn report_filename(path: &Path) -> Result<String, ReportCaptureError> {
         || name == ".."
         || name == REPORT_FILINGS_FILENAME
         || name.starts_with(".report-")
+        || name.ends_with(".issue.json")
+        || name.ends_with(".issue.md")
     {
         return Err(ReportCaptureError::InvalidOutput(
             path.to_string_lossy().into_owned(),
@@ -683,7 +702,7 @@ fn sync_directory(path: &Path) -> Result<(), ReportCaptureError> {
         })
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 

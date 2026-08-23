@@ -54,6 +54,7 @@ product surface.
 - `aethyme broker report list`
 - `aethyme broker report show`
 - `aethyme broker report render`
+- `aethyme broker report file`
 - `aethyme broker ship plan`
 - `aethyme broker ship execute`
 - `aethyme broker integration status`
@@ -118,7 +119,8 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker report capture --kind <bug|improvement> --title <text> [--session <id>] [--include-task] [--stdout | --output <filename>] [--json]`
 - `aethyme broker report list [--json]`
 - `aethyme broker report show <filename> [--json]`
-- `aethyme broker report render <filename> --form <form.yml> [--json]`
+- `aethyme broker report render <filename> --form <form.yml> [--output <name>.issue.md] [--json]`
+- `aethyme broker report file <path> --repo <owner/name> --confirm <sha256> [--json]`
 - `aethyme broker ship plan --entry <id> [--json]`
 - `aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--json]`
 - `aethyme broker integration status [--json]`
@@ -315,6 +317,47 @@ required, the command still emits the complete reviewable Markdown (or JSON)
 and then exits non-zero with the missing IDs. Plain output writes only the
 issue body to stdout, while the proposed issue title and report digest go to
 stderr so redirection stays useful.
+
+For a review-and-file workflow, write a human-editable Markdown artifact:
+
+```bash
+aethyme broker report render reviewed.json --form bug_report.yml \
+  --output reviewed.issue.md
+# Read and edit .aethyme/reports/reviewed.issue.md, replacing required
+# Unfilled sections with the human-supplied answers.
+shasum -a 256 .aethyme/reports/reviewed.issue.md
+aethyme broker report file .aethyme/reports/reviewed.issue.md \
+  --repo owner/name \
+  --confirm <full-sha256-printed-above>
+```
+
+`--output` atomically creates, and never overwrites, an `.issue.md` file under
+`.aethyme/reports/`. Its visible content is ordinary editable Markdown. A
+hidden metadata comment preserves the proposed issue title, source report
+digest, form path, and required-field contract. Reviewed `.issue.md` artifacts
+are excluded from `report list`, which continues to inventory source captures.
+
+`report file` accepts that artifact by filename or its exact
+`.aethyme/reports/<filename>.issue.md` path. The full lowercase SHA-256 must
+match the current artifact bytes; a post-review edit therefore fails before
+`gh` is invoked. Filing also rechecks required sections and refuses any that
+are absent, empty, or still contain the generated `Unfilled` marker.
+
+The remote mutation runs as `gh issue create` through the existing coordinated
+operation layer, using the current worktree's broker session and the exact
+`--repo owner/name` target. Title and temporary body-file paths are redacted
+from the command journal. On success, the returned issue URL and number are
+validated against the requested repository, stored in the operation result,
+and recorded by source-report digest in `.filings.json`; `report list/show`
+then report that source capture as `filed`.
+
+Any non-zero mutating command, unparseable success response, or failure to
+persist the issue identity becomes `outcome_unknown`. The command prints the
+operation ID, exits non-zero, and directs the operator to inspect GitHub and run
+`broker operations reconcile`. A later `report file` does not retry while that
+unknown repository operation remains unresolved. Reconciliation as `succeeded`
+continues to block duplicate filing for that source report; reconciliation as
+`failed` permits a later, separately confirmed filing command.
 
 Promotion only advances the local integration ref. Use `broker ship plan` to
 inspect the promoted queue entry, exact integration SHA, remote freshness,

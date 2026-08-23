@@ -38,6 +38,7 @@ mod pr;
 mod quick_test;
 mod reconciliation;
 mod report;
+mod report_filing;
 mod schema;
 mod ship;
 mod store;
@@ -71,8 +72,9 @@ pub use graph_impact::{
 };
 pub use hooks::{HookReport, HookState, HooksError};
 pub use issue_form::{
-    ISSUE_FORM_RENDER_SCHEMA_VERSION, IssueFormFieldKind, IssueFormFieldStatus,
-    IssueFormRenderResult, IssueFormRenderedField, render_issue_form,
+    ISSUE_FORM_RENDER_SCHEMA_VERSION, ISSUE_REVIEW_ARTIFACT_SCHEMA_VERSION, IssueFormFieldKind,
+    IssueFormFieldStatus, IssueFormRenderResult, IssueFormRenderedField, IssueFormWriteResult,
+    render_issue_form, write_issue_form_render_atomic,
 };
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use merge::{ACTION_REQUIRED_RELPATH, PromoteConfig, SubmitOutcome};
@@ -103,6 +105,10 @@ pub use report::{
     ReportList, ReportOperation, ReportPlatform, ReportSession, ReportSnapshot,
     ReportSnapshotBuilder, ReportSummary, list_reports, prepare_report, show_report,
     write_report_atomic,
+};
+pub use report_filing::{
+    REPORT_FILE_SCHEMA_VERSION, ReportFileError, ReportFileResult, ReportFileState,
+    file_reviewed_report,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use ship::{
