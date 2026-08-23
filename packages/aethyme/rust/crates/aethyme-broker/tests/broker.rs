@@ -6,7 +6,8 @@ use std::path::Path;
 use std::process::Command;
 
 use aethyme_broker::{
-    Broker, BrokerOpError, FinishStatus, SessionOrigin, SessionStatus, VersionDriftStatus,
+    AdoptIntegrationRelation, AdoptMode, Broker, BrokerOpError, FinishStatus, SessionOrigin,
+    SessionStatus, VersionDriftStatus,
 };
 
 fn sh(cwd: &Path, args: &[&str]) {
@@ -21,6 +22,16 @@ fn sh(cwd: &Path, args: &[&str]) {
         .unwrap()
         .status;
     assert!(status.success(), "git {args:?} failed");
+}
+
+fn rev(cwd: &Path, reference: &str) -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", reference])
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 fn init_repo(root: &Path) {
@@ -232,7 +243,15 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
     init_repo(tmp.path());
     let mut broker = Broker::open(tmp.path()).unwrap();
 
-    let first = broker.adopt(tmp.path(), Some("first task")).unwrap();
+    let first = broker
+        .adopt_with(
+            tmp.path(),
+            Some("first task"),
+            aethyme_broker::AdoptMode::New,
+        )
+        .unwrap();
+    assert_eq!(first.outcome, aethyme_broker::AdoptOutcome::Created);
+    let first = first.session;
 
     // Bare re-adopt fails with guidance naming the session and options.
     let err = broker.adopt(tmp.path(), Some("second task")).unwrap_err();
@@ -261,6 +280,8 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
             aethyme_broker::AdoptMode::Reuse,
         )
         .unwrap();
+    assert_eq!(reused.outcome, aethyme_broker::AdoptOutcome::Reused);
+    let reused = reused.session;
     assert_eq!(reused.id, first.id);
     assert_eq!(reused.task.as_deref(), Some("follow-up task"));
     assert_ne!(reused.diff_base, first.diff_base, "baseline must refresh");
@@ -271,8 +292,16 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
     assert_eq!(closed.status, SessionStatus::Cleaned);
     assert!(tmp.path().join("README.md").exists());
 
-    // After close, plain adopt works again (no --replace-stale needed).
-    let second = broker.adopt(tmp.path(), Some("third task")).unwrap();
+    // After close, --reuse creates a fresh session because no live identity remains.
+    let second = broker
+        .adopt_with(
+            tmp.path(),
+            Some("third task"),
+            aethyme_broker::AdoptMode::Reuse,
+        )
+        .unwrap();
+    assert_eq!(second.outcome, aethyme_broker::AdoptOutcome::Created);
+    let second = second.session;
     assert_ne!(second.id, first.id);
 
     // --replace-stale swaps a lingering session for a fresh one.
@@ -283,6 +312,8 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
             aethyme_broker::AdoptMode::ReplaceStale,
         )
         .unwrap();
+    assert_eq!(replaced.outcome, aethyme_broker::AdoptOutcome::Replaced);
+    let replaced = replaced.session;
     assert_ne!(replaced.id, second.id);
     assert_eq!(
         broker.store().session(second.id).unwrap().status,
@@ -292,6 +323,104 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
     // The reuse left an audit trail.
     let events = broker.store().events_after(0, i64::MAX).unwrap();
     assert!(events.iter().any(|e| e.kind == "session.reused"));
+}
+
+#[test]
+fn adopt_reuse_reports_behind_drift_and_dirty_path_overlap() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
+
+    sh(tmp.path(), &["checkout", "-qb", "integration-work"]);
+    std::fs::write(tmp.path().join("shared.txt"), "integration\n").unwrap();
+    sh(tmp.path(), &["add", "shared.txt"]);
+    sh(tmp.path(), &["commit", "-qm", "integration advances"]);
+    let integration_head = rev(tmp.path(), "HEAD");
+    sh(tmp.path(), &["branch", "aethyme/integration", "HEAD"]);
+    sh(tmp.path(), &["checkout", "-q", "main"]);
+    std::fs::write(tmp.path().join("shared.txt"), "dirty session edit\n").unwrap();
+
+    let report = broker
+        .adopt_with(tmp.path(), Some("follow-up"), AdoptMode::Reuse)
+        .unwrap();
+    assert_eq!(report.session.id, session.id);
+    let drift = report.integration_drift.expect("reuse drift");
+    assert_eq!(drift.relation, AdoptIntegrationRelation::Behind);
+    assert_eq!(drift.session_head, rev(tmp.path(), "main"));
+    assert_eq!(drift.integration_head, integration_head);
+    assert_eq!(drift.ahead_commits, 0);
+    assert_eq!(drift.behind_commits, 1);
+    assert_eq!(drift.overlapping_changed_paths, vec!["shared.txt"]);
+    assert!(drift.warning.as_deref().unwrap().contains("behind"));
+    assert_eq!(drift.safe_next_action, "aethyme broker integration status");
+}
+
+#[test]
+fn adopt_reuse_reports_diverged_commit_counts_and_overlap() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
+
+    sh(tmp.path(), &["checkout", "-qb", "integration-work"]);
+    std::fs::write(tmp.path().join("README.md"), "integration\n").unwrap();
+    sh(tmp.path(), &["commit", "-qam", "integration advances"]);
+    let integration_head = rev(tmp.path(), "HEAD");
+    sh(tmp.path(), &["branch", "aethyme/integration", "HEAD"]);
+    sh(tmp.path(), &["checkout", "-q", "main"]);
+    std::fs::write(tmp.path().join("README.md"), "session\n").unwrap();
+    sh(tmp.path(), &["commit", "-qam", "session advances"]);
+    let session_head = rev(tmp.path(), "HEAD");
+
+    let report = broker
+        .adopt_with(tmp.path(), Some("follow-up"), AdoptMode::Reuse)
+        .unwrap();
+    assert_eq!(report.session.id, session.id);
+    let drift = report.integration_drift.expect("reuse drift");
+    assert_eq!(drift.relation, AdoptIntegrationRelation::Diverged);
+    assert_eq!(drift.session_head, session_head);
+    assert_eq!(drift.integration_head, integration_head);
+    assert_eq!(drift.ahead_commits, 1);
+    assert_eq!(drift.behind_commits, 1);
+    assert_eq!(drift.overlapping_changed_paths, vec!["README.md"]);
+    assert!(drift.warning.as_deref().unwrap().contains("diverged"));
+}
+
+#[test]
+fn adopt_reuse_reports_ahead_work_and_routes_it_to_submit() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let worktree = tmp.path().join("agent-wt");
+    sh(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/ahead",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, Some("first task")).unwrap();
+    std::fs::write(worktree.join("ahead.txt"), "session work\n").unwrap();
+    sh(&worktree, &["add", "ahead.txt"]);
+    sh(&worktree, &["commit", "-qm", "session advances"]);
+
+    let report = broker
+        .adopt_with(&worktree, Some("follow-up"), AdoptMode::Reuse)
+        .unwrap();
+    let drift = report.integration_drift.expect("reuse drift");
+    assert_eq!(drift.relation, AdoptIntegrationRelation::Ahead);
+    assert_eq!(drift.ahead_commits, 1);
+    assert_eq!(drift.behind_commits, 0);
+    assert_eq!(
+        drift.safe_next_action,
+        format!("aethyme broker submit --session {}", session.id)
+    );
 }
 
 #[test]

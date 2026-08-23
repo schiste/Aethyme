@@ -37,7 +37,8 @@ Usage:
   aethyme broker adopt [<path>] [--task <text>] [--reuse|--replace-stale] [--json]
       Register an existing worktree (attach-first). Defaults to the
       current directory. If the worktree already has a session:
-      --reuse points it at a follow-up task (fresh baseline);
+      --reuse points it at a follow-up task with a fresh baseline and
+      reports its relation to the current integration tip;
       --replace-stale closes it (state only) and registers fresh;
       neither flag = error listing your options.
   aethyme broker close --session <id> [--json]
@@ -1715,21 +1716,52 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 (false, true) => crate::AdoptMode::ReplaceStale,
                 (false, false) => crate::AdoptMode::New,
             };
-            let session = broker.adopt_with(&path, parsed.task.as_deref(), mode)?;
+            let report = broker.adopt_with(&path, parsed.task.as_deref(), mode)?;
+            let session = &report.session;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&session)?);
+                println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                let verb = if parsed.reuse { "Reusing" } else { "Adopted" };
-                println!(
-                    "{verb} session {} — worktree {} on branch {}",
-                    session.id, session.worktree_path, session.branch
-                );
+                match report.outcome {
+                    crate::AdoptOutcome::Created => println!(
+                        "Created session {} on the existing worktree — {} on branch {}",
+                        session.id, session.worktree_path, session.branch
+                    ),
+                    crate::AdoptOutcome::Reused => println!(
+                        "Reusing session {} — worktree {} on branch {}",
+                        session.id, session.worktree_path, session.branch
+                    ),
+                    crate::AdoptOutcome::Replaced => println!(
+                        "Replaced the prior session with session {} on the existing worktree — {} on branch {}",
+                        session.id, session.worktree_path, session.branch
+                    ),
+                }
                 if std::path::Path::new(&session.worktree_path) == broker.main_root() {
                     println!(
                         "note: main-checkout session — verification is advisory here \
                          (commits land on main before gates run); use a worktree \
                          session for enforced verification."
                     );
+                }
+                if let Some(drift) = &report.integration_drift {
+                    println!(
+                        "Integration drift: {} (session HEAD {}, {} HEAD {}; {} ahead, {} behind)",
+                        drift.relation.as_str(),
+                        short_commit(&drift.session_head),
+                        drift.integration_branch,
+                        short_commit(&drift.integration_head),
+                        drift.ahead_commits,
+                        drift.behind_commits,
+                    );
+                    if !drift.overlapping_changed_paths.is_empty() {
+                        println!("Overlapping changed paths:");
+                        for path in &drift.overlapping_changed_paths {
+                            println!("  {path}");
+                        }
+                    }
+                    if let Some(warning) = &drift.warning {
+                        println!("Warning: {warning}");
+                    }
+                    println!("Safe next action: {}", drift.safe_next_action);
                 }
             }
         }
