@@ -22,6 +22,7 @@ pub const INSTALL_RECEIPT_SCHEMA_VERSION: u32 = 1;
 pub const INSTALL_RECEIPT_FILENAME: &str = "install-receipt.json";
 const DEFAULT_RELEASE_BASE_URL: &str = "https://github.com/schiste/Aethyme";
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_RELEASE_INDEX_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,8 +498,14 @@ fn parse_plan_options(args: &[String]) -> Result<(UpdateChannel, bool), String> 
 fn resolve_update_plan(channel: UpdateChannel) -> Result<UpdatePlan, String> {
     let base_url = std::env::var("AETHYME_RELEASE_BASE_URL")
         .unwrap_or_else(|_| DEFAULT_RELEASE_BASE_URL.to_string());
-    let manifest_url = update_manifest_url(&base_url, channel);
-    let manifest_bytes = fetch_bounded(&manifest_url, MAX_MANIFEST_BYTES)?;
+    let discovery_url = resolve_manifest_discovery_url(&base_url, channel)?;
+    let manifest_bytes = fetch_bounded(&discovery_url, MAX_MANIFEST_BYTES)?;
+    let manifest = parse_valid_manifest(&manifest_bytes)?;
+    let manifest_url = format!(
+        "{}/releases/download/v{}/release-manifest.json",
+        base_url.trim_end_matches('/'),
+        manifest.version
+    );
     let executable = std::env::current_exe().map_err(|error| format!("locate aethyme: {error}"))?;
     let installation = detect_installation(&executable);
     let target = current_release_target().map_err(|error| error.to_string())?;
@@ -515,16 +522,65 @@ fn resolve_update_plan(channel: UpdateChannel) -> Result<UpdatePlan, String> {
     .map_err(|error| error.to_string())
 }
 
-fn update_manifest_url(base_url: &str, channel: UpdateChannel) -> String {
+fn resolve_manifest_discovery_url(
+    base_url: &str,
+    channel: UpdateChannel,
+) -> Result<String, String> {
     let base = base_url.trim_end_matches('/');
     match channel {
-        UpdateChannel::Stable => {
-            format!("{base}/releases/latest/download/release-manifest.json")
+        UpdateChannel::Stable => Ok(format!(
+            "{base}/releases/latest/download/release-manifest.json"
+        )),
+        UpdateChannel::Preview if base == DEFAULT_RELEASE_BASE_URL => latest_preview_manifest_url(),
+        UpdateChannel::Preview => Ok(format!(
+            "{base}/releases/download/preview/release-manifest.json"
+        )),
+    }
+}
+
+fn latest_preview_manifest_url() -> Result<String, String> {
+    let index = fetch_bounded(
+        "https://api.github.com/repos/schiste/Aethyme/releases?per_page=30",
+        MAX_RELEASE_INDEX_BYTES,
+    )?;
+    preview_manifest_url_from_index(&index)
+}
+
+fn preview_manifest_url_from_index(index: &[u8]) -> Result<String, String> {
+    let releases: serde_json::Value = serde_json::from_slice(&index)
+        .map_err(|error| format!("parse GitHub release index: {error}"))?;
+    let releases = releases
+        .as_array()
+        .ok_or("GitHub release index is not an array")?;
+    for release in releases {
+        if release
+            .get("prerelease")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+            || release.get("draft").and_then(serde_json::Value::as_bool) == Some(true)
+        {
+            continue;
         }
-        UpdateChannel::Preview => {
-            format!("{base}/releases/download/preview/release-manifest.json")
+        let assets = release
+            .get("assets")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("GitHub prerelease assets are not an array")?;
+        if let Some(url) = assets.iter().find_map(|asset| {
+            (asset.get("name").and_then(serde_json::Value::as_str) == Some("release-manifest.json"))
+                .then(|| {
+                    asset
+                        .get("browser_download_url")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .flatten()
+        }) {
+            if !url.starts_with("https://github.com/schiste/Aethyme/") {
+                return Err("GitHub preview manifest URL has an unexpected origin".into());
+            }
+            return Ok(url.to_string());
         }
     }
+    Err("no published preview release contains release-manifest.json".into())
 }
 
 fn fetch_bounded(url: &str, maximum_bytes: u64) -> Result<Vec<u8>, String> {
@@ -1473,6 +1529,65 @@ mod tests {
             ),
             Err(UpdateError::UnsupportedTarget(_))
         ));
+    }
+
+    #[test]
+    fn preview_discovery_selects_the_first_published_prerelease_manifest() {
+        let index = serde_json::json!([
+            {
+                "draft": true,
+                "prerelease": true,
+                "assets": [{
+                    "name": "release-manifest.json",
+                    "browser_download_url": "https://github.com/schiste/Aethyme/releases/download/v9.9.9-draft/release-manifest.json"
+                }]
+            },
+            {
+                "draft": false,
+                "prerelease": true,
+                "assets": [
+                    {
+                        "name": "notes.txt",
+                        "browser_download_url": "https://github.com/schiste/Aethyme/releases/download/v0.3.0-preview.1/notes.txt"
+                    },
+                    {
+                        "name": "release-manifest.json",
+                        "browser_download_url": "https://github.com/schiste/Aethyme/releases/download/v0.3.0-preview.1/release-manifest.json"
+                    }
+                ]
+            },
+            {
+                "draft": false,
+                "prerelease": true,
+                "assets": [{
+                    "name": "release-manifest.json",
+                    "browser_download_url": "https://github.com/schiste/Aethyme/releases/download/v0.2.0-preview.1/release-manifest.json"
+                }]
+            }
+        ]);
+
+        assert_eq!(
+            preview_manifest_url_from_index(&serde_json::to_vec(&index).unwrap()).unwrap(),
+            "https://github.com/schiste/Aethyme/releases/download/v0.3.0-preview.1/release-manifest.json"
+        );
+    }
+
+    #[test]
+    fn preview_discovery_rejects_an_unexpected_asset_origin() {
+        let index = serde_json::json!([{
+            "draft": false,
+            "prerelease": true,
+            "assets": [{
+                "name": "release-manifest.json",
+                "browser_download_url": "https://example.test/release-manifest.json"
+            }]
+        }]);
+
+        assert!(
+            preview_manifest_url_from_index(&serde_json::to_vec(&index).unwrap())
+                .unwrap_err()
+                .contains("unexpected origin")
+        );
     }
 
     #[test]

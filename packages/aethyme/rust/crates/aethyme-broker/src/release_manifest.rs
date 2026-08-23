@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 
+use semver::Version;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -196,12 +197,7 @@ fn is_lower_hex(value: &str) -> bool {
 }
 
 fn valid_version(version: &str) -> bool {
-    !version.is_empty()
-        && !version.starts_with('.')
-        && !version.ends_with('.')
-        && version
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    Version::parse(version).is_ok()
 }
 
 #[cfg(test)]
@@ -292,5 +288,17 @@ mod tests {
         invalid.compatibility.broker_storage.minimum_readable_schema =
             invalid.compatibility.broker_storage.current_schema + 1;
         assert!(invalid.validate().unwrap_err().contains("inverted"));
+    }
+
+    #[test]
+    fn accepts_semantic_preview_versions() {
+        let mut preview = manifest();
+        preview.version = "0.3.0-preview.1".into();
+        preview.release_channel = "preview".into();
+        for artifact in &mut preview.artifacts {
+            artifact.archive = format!("aethyme-v{}-{}.tar.gz", preview.version, artifact.target);
+        }
+
+        assert_eq!(preview.validate(), Ok(()));
     }
 }

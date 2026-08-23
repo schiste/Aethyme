@@ -61,11 +61,11 @@ fn write_manifest(root: &Path, channel: &str, version: &str, preview: bool) {
         "supported_platforms": targets,
         "version": version
     });
-    fs::write(
-        directory.join("release-manifest.json"),
-        serde_json::to_vec_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
+    let encoded = serde_json::to_vec_pretty(&manifest).unwrap();
+    fs::write(directory.join("release-manifest.json"), &encoded).unwrap();
+    let exact = root.join(format!("releases/download/v{version}"));
+    fs::create_dir_all(&exact).unwrap();
+    fs::write(exact.join("release-manifest.json"), encoded).unwrap();
 }
 
 fn command(root: &Path) -> Command {
@@ -150,9 +150,13 @@ fn write_executable_manifest(root: &Path, version: &str) {
     });
     let latest = root.join("releases/latest/download");
     fs::create_dir_all(&latest).unwrap();
+    let encoded = serde_json::to_vec_pretty(&manifest).unwrap();
+    fs::write(latest.join("release-manifest.json"), &encoded).unwrap();
     fs::write(
-        latest.join("release-manifest.json"),
-        serde_json::to_vec_pretty(&manifest).unwrap(),
+        root.join(format!(
+            "releases/download/v{version}/release-manifest.json"
+        )),
+        encoded,
     )
     .unwrap();
 }
@@ -277,7 +281,7 @@ fn preview_plan_uses_only_the_explicit_preview_channel() {
         plan["manifest_url"]
             .as_str()
             .unwrap()
-            .ends_with("/releases/download/preview/release-manifest.json")
+            .ends_with("/releases/download/v9.1.0/release-manifest.json")
     );
 }
 

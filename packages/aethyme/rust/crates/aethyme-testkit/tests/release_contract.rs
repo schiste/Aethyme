@@ -96,8 +96,12 @@ fn release_workflow_renders_the_homebrew_formula_from_the_manifest() {
     let formula_position = workflow.find("--example homebrew_formula").unwrap();
 
     assert!(manifest_position < formula_position);
+    assert!(workflow.contains("*-*) release_channel=preview"));
+    assert!(workflow.contains("--channel \"$release_channel\""));
+    assert!(workflow.contains("if [ \"$release_channel\" = stable ]; then"));
     assert!(workflow.contains("--manifest \"$GITHUB_WORKSPACE/dist/release-manifest.json\""));
     assert!(workflow.contains("--output \"$GITHUB_WORKSPACE/dist/aethyme.rb\""));
+    assert!(workflow.contains("prerelease: ${{ contains(github.ref_name, '-') }}"));
 }
 
 #[test]
