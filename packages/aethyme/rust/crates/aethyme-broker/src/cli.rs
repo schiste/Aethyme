@@ -214,8 +214,9 @@ Usage:
   aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--dry-run|--apply --confirm <sha256>] [--json]
       Compare already-fetched upstream with local main and promoted queue
       state. Dry-run is the default. --apply marks externally landed work,
-      preserves pending promotions, and rebuilds integration. A resolution
-      file may attest specific promoted entries as superseded upstream.
+      replays reviewed pending work, and rebuilds integration only when
+      --confirm matches the dry-run plan digest. A resolution file binds
+      queue attestations and per-SHA unrecorded-commit dispositions.
   aethyme broker status [--json]
       The whole picture: agents, overlaps, promoted conflicts, merge
       queue, integration head.
@@ -708,6 +709,8 @@ mod tests {
             "--resolution-file".to_string(),
             "reconciliation.json".to_string(),
             "--apply".to_string(),
+            "--confirm".to_string(),
+            "a".repeat(64),
         ];
         let parsed = match super::parse(&args) {
             Ok(parsed) => parsed,
@@ -720,6 +723,7 @@ mod tests {
             Some(std::path::Path::new("reconciliation.json"))
         );
         assert!(parsed.apply);
+        assert_eq!(parsed.confirm, Some("a".repeat(64)));
     }
 
     #[test]
