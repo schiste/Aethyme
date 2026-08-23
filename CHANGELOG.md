@@ -18,6 +18,10 @@ artifacts and their exact source revision are recorded in each signed
 - A Sigstore-signed release manifest containing the exact source SHA,
   supported platforms, both required binaries, artifact sizes and SHA-256
   digests, compatibility boundaries, minimum Git version, and release channel.
+- A public `schiste/homebrew-tap` formula that installs the router and engine
+  from one archive and participates in normal `brew update` / `brew upgrade`.
+- Explicit `aethyme update check`, `update plan`, and digest-confirmed
+  `update execute` commands for installer-managed binary pairs.
 
 ### Changed
 
@@ -31,6 +35,8 @@ artifacts and their exact source revision are recorded in each signed
 - Submission simulation replays session-owned patches onto integration and
   classifies exact and stable patch-equivalent history instead of treating two
   commit identities as an undifferentiated merge.
+- The portable installer and native updater use one versioned pair layout with
+  an atomic activation link and one retained rollback bundle.
 
 ### Fixed
 

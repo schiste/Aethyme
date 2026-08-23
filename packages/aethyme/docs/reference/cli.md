@@ -5,14 +5,26 @@ Last Updated: 2026-08-23
 ## Install
 
 ```bash
+brew install schiste/tap/aethyme
+aethyme --version
+aethyme-engine-cli --version
+```
+
+Homebrew is the primary stable install and update path. It installs both
+executables from one checksummed archive; update with `brew update` and
+`brew upgrade aethyme`.
+
+Without Homebrew:
+
+```bash
 curl -fsSL https://github.com/schiste/Aethyme/releases/latest/download/install.sh | sh
 aethyme --version
 aethyme-engine-cli --version
 ```
 
-This is the explicit stable-channel update path as well as the first install.
-It replaces both required binaries from one verified archive; Aethyme has no
-self-update daemon or silent background upgrade path. Use `sh -s -- --version
+The installer establishes a versioned, paired layout for explicit native
+updates. Aethyme has no self-update daemon or silent background upgrade path.
+Use `sh -s -- --version
 0.2.0` to pin a release, or follow the
 [v0.2.0 upgrade guide](../guides/upgrading-to-v0.2.0.md) for source installs,
 manifest signature verification, migration, and rollback.
@@ -65,6 +77,9 @@ product surface.
 - `aethyme broker integration reconcile`
 - `aethyme broker quick-test`
 - `aethyme broker verify-loop`
+- `aethyme update check`
+- `aethyme update plan`
+- `aethyme update execute`
 - `aethyme explore`
 
 ### Advanced Public Tools
@@ -89,6 +104,45 @@ product surface.
 Local eval harnesses, benchmark/report generators, storage implementation
 details, SaaS-era material, and compatibility-only commands may be documented
 for maintainers but should not lead user onboarding.
+
+## Update Commands
+
+```text
+aethyme update check [--json]
+aethyme update plan [--channel stable|preview] [--json]
+aethyme update execute --confirm <manifest-sha256> [--json]
+```
+
+`check` and `plan` perform network access only when explicitly invoked. The
+stable channel reads GitHub's latest non-prerelease manifest; the preview
+channel reads the explicitly maintained `preview` release. A plan records the
+current and target versions, source SHA, installation provenance, full
+manifest digest, exact platform archive URL/digest/size, engine protocol, and
+broker-storage compatibility range.
+
+Update authority follows installation provenance:
+
+- Homebrew: report `brew upgrade aethyme`; never modify the Cellar.
+- Aethyme installer: persist the reviewed plan and permit confirmed execution.
+- Cargo: report the paired contributor reinstall commands.
+- Manual archive or unknown: recommend adopting the managed installer.
+
+`execute` requires the full reviewed manifest SHA-256. It re-downloads and
+revalidates that exact manifest, verifies archive size and SHA-256, requires
+exactly the two expected archive members, validates both embedded versions,
+runs `aethyme broker quick-test` against the staged pair, then atomically swaps
+one shared `current` symlink. The prior bundle remains available as the single
+rollback bundle. A failed download, checksum, staged smoke, or activation
+verification leaves or restores the earlier `current` link.
+
+When run from a repository containing `.aethyme/broker.db`, execution opens
+that database read-only and refuses a target whose advertised readable schema
+range excludes the local schema. The updater does not scan the filesystem for
+other repositories; back up every broker database that must remain rollback
+safe before a compatibility-changing release.
+
+Neither `--help`, normal broker commands, nor any background process performs
+an update check.
 
 ## Broker Commands
 

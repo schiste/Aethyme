@@ -106,9 +106,17 @@ aethyme-engine-cli --version
 
 The installer discovers the stable channel through its release manifest,
 verifies the selected archive checksum and contents, and installs both required
-binaries together under `~/.local/bin` by default. Pass `--version` or
-`--install-dir` after `sh -s --` to pin a release or destination. Aethyme never
-updates silently in the background. Cargo installation is retained for
+binaries through one atomic version link under `~/.local/bin` by default. Pass
+`--version` or `--install-dir` after `sh -s --` to pin a release or destination.
+Installer-managed users can later review and confirm an update explicitly:
+
+```bash
+aethyme update check
+aethyme update plan --channel stable
+aethyme update execute --confirm <manifest-sha256>
+```
+
+Aethyme never updates silently in the background. Cargo installation is retained for
 contributors and unsupported targets, not as the primary quickstart. See the
 [v0.2.0 upgrade and rollback guide](packages/aethyme/docs/guides/upgrading-to-v0.2.0.md)
 for signature verification, source installation, migrations, and rollback.

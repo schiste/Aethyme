@@ -49,7 +49,8 @@ Arrived:
   Phase 7 (2026-08-06, `tests/` and `pyproject.toml` deleted). This
   package is 100% Rust: Homebrew or the paired release installer is the
   recommended install story, `cargo install` remains the contributor/source
-  fallback, and
+  fallback, installer-managed binaries expose explicit digest-confirmed
+  `aethyme update` commands, and
   `cargo test --workspace` is the whole test story. `packages/aethyme-eval`
   is a separate package and stays Python by design.
 

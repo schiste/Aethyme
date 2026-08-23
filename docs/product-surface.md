@@ -105,6 +105,9 @@ These commands are the public product path and should stay easy to explain:
 - `aethyme broker integration status`
 - `aethyme broker quick-test`
 - `aethyme broker verify-loop`
+- `aethyme update check`
+- `aethyme update plan`
+- `aethyme update execute`
 - `aethyme explore`
 
 ### Advanced Public Tools
