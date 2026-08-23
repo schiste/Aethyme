@@ -11,7 +11,7 @@
 use crate::pyjson::Value;
 
 const SUBSTANTIVE_SECTIONS: &[&str] = &["Problem", "Decision", "Rationale", "Validation"];
-const NON_SUBSTANTIVE_SECTIONS: &[&str] = &["Problem", "Decision", "Validation"];
+const SUBJECT_ONLY_SECTIONS: &[&str] = &[];
 pub const OPTIONAL_SECTIONS: [&str; 4] =
     ["Alternatives considered", "Risks", "Follow-up", "Memory"];
 
@@ -48,27 +48,27 @@ pub const COMMIT_POLICIES: [CommitPolicy; 9] = [
     CommitPolicy {
         commit_type: "test",
         body_required: false,
-        required_sections: NON_SUBSTANTIVE_SECTIONS,
+        required_sections: SUBJECT_ONLY_SECTIONS,
     },
     CommitPolicy {
         commit_type: "docs",
         body_required: false,
-        required_sections: NON_SUBSTANTIVE_SECTIONS,
+        required_sections: SUBJECT_ONLY_SECTIONS,
     },
     CommitPolicy {
         commit_type: "build",
         body_required: false,
-        required_sections: NON_SUBSTANTIVE_SECTIONS,
+        required_sections: SUBJECT_ONLY_SECTIONS,
     },
     CommitPolicy {
         commit_type: "chore",
         body_required: false,
-        required_sections: NON_SUBSTANTIVE_SECTIONS,
+        required_sections: SUBJECT_ONLY_SECTIONS,
     },
     CommitPolicy {
         commit_type: "revert",
         body_required: false,
-        required_sections: NON_SUBSTANTIVE_SECTIONS,
+        required_sections: SUBJECT_ONLY_SECTIONS,
     },
 ];
 
@@ -110,6 +110,9 @@ pub fn default_template(commit_type: &str, scope: &str) -> String {
         commit_policy("fix").expect("the built-in fix commit policy must exist")
     });
     let mut lines = vec![format!("{}({scope}): short summary", policy.commit_type)];
+    if !policy.body_required {
+        return format!("{}\n", lines[0]);
+    }
     for section in policy.required_sections {
         lines.push(String::new());
         lines.push(format!("{section}:"));
@@ -445,7 +448,7 @@ mod tests {
         }
         for policy in &COMMIT_POLICIES[4..] {
             assert!(!policy.body_required);
-            assert_eq!(policy.required_sections, NON_SUBSTANTIVE_SECTIONS);
+            assert_eq!(policy.required_sections, SUBJECT_ONLY_SECTIONS);
         }
     }
 
@@ -461,10 +464,16 @@ mod tests {
     }
 
     #[test]
-    fn default_template_docs_skips_rationale() {
-        let template = default_template("docs", "guide");
-        assert!(template.starts_with("docs(guide): short summary\n"));
-        assert!(!template.contains("Rationale:"));
+    fn default_templates_are_subject_only_for_non_substantive_types() {
+        for policy in COMMIT_POLICIES
+            .iter()
+            .filter(|policy| !policy.body_required)
+        {
+            assert_eq!(
+                default_template(policy.commit_type, "guide"),
+                format!("{}(guide): short summary\n", policy.commit_type)
+            );
+        }
         // Unknown type normalizes to fix.
         assert!(default_template("nope", "s").starts_with("fix(s): short summary\n"));
     }
@@ -540,13 +549,57 @@ mod tests {
             warnings[1].as_str(),
             Some("Subject has no scope; prefer `type(scope): summary` for durable routing.")
         );
-        // docs is non-substantive: Problem/Decision/Validation required.
-        let errors = result.get("errors").unwrap().as_array().unwrap();
+        assert_eq!(result.get("ok"), Some(&Value::Bool(true)));
+        assert!(result.get("errors").unwrap().as_array().unwrap().is_empty());
         assert!(
-            errors
-                .iter()
-                .any(|e| e.as_str() == Some("Missing required section: Problem."))
+            result
+                .get("required_sections")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
         );
+    }
+
+    #[test]
+    fn subject_only_messages_pass_for_every_non_substantive_type() {
+        for policy in COMMIT_POLICIES
+            .iter()
+            .filter(|policy| !policy.body_required)
+        {
+            let result = lint_commit_message(&format!("{}(scope): summary", policy.commit_type));
+            assert_eq!(
+                result.get("ok"),
+                Some(&Value::Bool(true)),
+                "{} should allow a subject-only message",
+                policy.commit_type
+            );
+            assert!(
+                result
+                    .get("required_sections")
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn subject_only_messages_fail_for_every_substantive_type() {
+        for policy in COMMIT_POLICIES.iter().filter(|policy| policy.body_required) {
+            let result = lint_commit_message(&format!("{}(scope): summary", policy.commit_type));
+            assert_eq!(result.get("ok"), Some(&Value::Bool(false)));
+            assert_eq!(
+                result
+                    .get("required_sections")
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                4
+            );
+        }
     }
 
     #[test]

@@ -29,15 +29,15 @@ fn repo_commit_message_template_command() {
 }
 
 #[test]
-fn repo_commit_message_template_docs_skips_rationale() {
-    let result = invoke_aethyme(["repo", "commit-message-template", "--type", "docs"]);
-    result.ok();
-    assert!(
-        result.output.starts_with("docs(scope): short summary\n"),
-        "{}",
-        result.output
-    );
-    result.assert_lacks("Rationale:");
+fn repo_commit_message_templates_are_subject_only_for_non_substantive_types() {
+    for commit_type in ["docs", "chore", "test", "build", "revert"] {
+        let result = invoke_aethyme(["repo", "commit-message-template", "--type", commit_type]);
+        result.ok();
+        assert_eq!(
+            result.output,
+            format!("{commit_type}(scope): short summary\n")
+        );
+    }
 }
 
 #[test]
