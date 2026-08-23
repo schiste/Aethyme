@@ -438,7 +438,16 @@ impl GitRepo {
     /// Every parent of a commit, in Git's stored order.
     pub fn commit_parents(&self, commit: &str) -> Result<Vec<String>, GitError> {
         let line = run_git(&self.root, &["rev-list", "--parents", "-n", "1", commit])?;
-        Ok(line.split_whitespace().skip(1).map(str::to_string).collect())
+        Ok(line
+            .split_whitespace()
+            .skip(1)
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Tree object referenced by a commit.
+    pub fn commit_tree_id(&self, commit: &str) -> Result<String, GitError> {
+        run_git(&self.root, &["rev-parse", &format!("{commit}^{{tree}}")])
     }
 
     /// First-parent commits reachable from `to` but not `from`, oldest

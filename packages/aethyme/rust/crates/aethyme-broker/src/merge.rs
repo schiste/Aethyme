@@ -113,6 +113,11 @@ pub struct SubmissionPlan {
     pub warnings: Vec<String>,
 }
 
+struct SubmissionReplay {
+    tree: String,
+    conflicts: Vec<String>,
+}
+
 impl Broker {
     /// Ensure the integration branch exists (created from the main
     /// checkout's HEAD with an explanatory event — issue #20) and return
@@ -242,17 +247,11 @@ impl Broker {
             .find(|e| e.id == entry_id)
             .ok_or(crate::BrokerError::SessionNotFound(entry_id))?;
         let session = self.store().session(entry.session_id)?;
-        let submission_plan = self.build_submission_plan(
-            &session,
-            &entry.head_commit,
-            &base,
-        )?;
+        let submission_plan = self.build_submission_plan(&session, &entry.head_commit, &base)?;
 
+        let simulation = self.replay_submission_plan(&submission_plan)?;
         self.store()
             .set_merge_status(entry.id, MergeStatus::Simulating, None, None)?;
-        let simulation = self
-            .repo_handle()
-            .merge_tree_simulate(&base, &entry.head_commit)?;
 
         if !simulation.conflicts.is_empty() {
             // Conflict: reject before any gate runs, name the blocking
@@ -291,7 +290,7 @@ impl Broker {
         // it in a throwaway detached worktree (#22).
         let merge_commit = self.repo_handle().commit_tree(
             &simulation.tree,
-            &[&base, &entry.head_commit],
+            &[&base],
             &format!(
                 "broker: promote session {} ({})",
                 session.id,
@@ -384,6 +383,60 @@ impl Broker {
         })
     }
 
+    fn replay_submission_plan(
+        &self,
+        plan: &SubmissionPlan,
+    ) -> Result<SubmissionReplay, BrokerOpError> {
+        if !plan.safe {
+            return Err(BrokerOpError::UnsafeSubmissionPlan {
+                session_id: plan.session_id,
+                reason: if plan.warnings.is_empty() {
+                    "commit provenance is ambiguous".into()
+                } else {
+                    plan.warnings.join("; ")
+                },
+            });
+        }
+
+        let repo = self.repo_handle();
+        let mut current = plan.integration_head.clone();
+        for commit in &plan.commits {
+            if commit.ownership != SubmissionCommitOwnership::SessionOwned
+                || commit.integration_state != SubmissionIntegrationState::Pending
+            {
+                continue;
+            }
+            if commit.parents.len() != 1 {
+                return Err(BrokerOpError::UnsupportedSubmissionCommit {
+                    session_id: plan.session_id,
+                    commit: commit.commit.clone(),
+                    parent_count: commit.parents.len(),
+                });
+            }
+            let simulation =
+                repo.merge_tree_with_base(&commit.parents[0], &current, &commit.commit)?;
+            if !simulation.conflicts.is_empty() {
+                return Ok(SubmissionReplay {
+                    tree: simulation.tree,
+                    conflicts: simulation.conflicts,
+                });
+            }
+            current = repo.commit_tree(
+                &simulation.tree,
+                &[&current],
+                &format!(
+                    "broker: replay {} for session {}",
+                    &commit.commit[..12],
+                    plan.session_id
+                ),
+            )?;
+        }
+        Ok(SubmissionReplay {
+            tree: repo.commit_tree_id(&current)?,
+            conflicts: Vec::new(),
+        })
+    }
+
     fn build_submission_plan(
         &self,
         session: &crate::types::Session,
@@ -405,7 +458,25 @@ impl Broker {
             });
         };
 
-        if !repo.is_ancestor(recorded_baseline, session_head) {
+        let mut warnings = Vec::new();
+        let (owned, inherited) = if repo.is_ancestor(recorded_baseline, session_head) {
+            let owned = repo.commits_between_oldest(recorded_baseline, session_head)?;
+            let owned_set = owned.iter().cloned().collect::<BTreeSet<_>>();
+            let inherited = repo
+                .commits_excluding_oldest(session_head, integration_head)?
+                .into_iter()
+                .filter(|commit| !owned_set.contains(commit))
+                .collect::<Vec<_>>();
+            (owned, inherited)
+        } else if repo.is_ancestor(integration_head, session_head) {
+            warnings.push(format!(
+                "recorded baseline {recorded_baseline} was rewritten; ownership uses the unambiguous rebased range {integration_head}..{session_head}"
+            ));
+            (
+                repo.commits_between_oldest(integration_head, session_head)?,
+                Vec::new(),
+            )
+        } else {
             return Ok(SubmissionPlan {
                 session_id: session.id,
                 recorded_baseline: Some(recorded_baseline.to_string()),
@@ -431,18 +502,10 @@ impl Broker {
                     "recorded baseline {recorded_baseline} is not an ancestor of session HEAD {session_head}; commit ownership is ambiguous"
                 )],
             });
-        }
+        };
 
-        let owned = repo.commits_between_oldest(recorded_baseline, session_head)?;
-        let owned_set = owned.iter().cloned().collect::<BTreeSet<_>>();
-        let inherited = repo
-            .commits_excluding_oldest(session_head, integration_head)?
-            .into_iter()
-            .filter(|commit| !owned_set.contains(commit))
-            .collect::<Vec<_>>();
-
-        let integration_candidates = repo
-            .first_parent_commits_excluding_oldest(integration_head, recorded_baseline)?;
+        let integration_candidates =
+            repo.first_parent_commits_excluding_oldest(integration_head, recorded_baseline)?;
         let mut integration_by_patch: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for commit in integration_candidates {
             let parents = repo.commit_parents(&commit)?;
@@ -506,11 +569,12 @@ impl Broker {
             commit.ownership == SubmissionCommitOwnership::Ambiguous
                 || commit.integration_state == SubmissionIntegrationState::Ambiguous
         });
-        let warnings = if ambiguous {
-            vec!["one or more commits have ambiguous provenance; normalized replay must refuse this plan".into()]
-        } else {
-            Vec::new()
-        };
+        if ambiguous {
+            warnings.push(
+                "one or more commits have ambiguous provenance; normalized replay must refuse this plan"
+                    .into(),
+            );
+        }
         Ok(SubmissionPlan {
             session_id: session.id,
             recorded_baseline: Some(recorded_baseline.to_string()),
