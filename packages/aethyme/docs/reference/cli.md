@@ -94,6 +94,8 @@ The broker is the stable product front door for multi-agent coordination:
 - `aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <gh-args>`
 - `aethyme broker operations [--json]`
 - `aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]`
+- `aethyme broker gates run --session <id> [--json]`
+- `aethyme broker gates run --all [--json]`
 - `aethyme broker submit --session <id> [--json]`
 - `aethyme broker repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
@@ -113,6 +115,10 @@ the run, so callers know whether the result proves the current integration tip.
 integration tip. It requires a clean session worktree, permits only a
 fast-forward, and synchronizes before recording the follow-up diff baseline;
 dirty or diverged worktrees are left unchanged.
+
+Gate-run and submit outcomes identify the exact Git tree each result proves.
+Human-readable output abbreviates the tree hash to 12 characters; JSON retains
+the full hash in `tree_hash` for both executed and cached results.
 
 Promotion only advances the local integration ref. Use `broker ship plan` to
 inspect the promoted queue entry, exact integration SHA, remote freshness,

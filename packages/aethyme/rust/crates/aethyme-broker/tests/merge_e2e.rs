@@ -128,6 +128,10 @@ fn two_clean_sessions_promote_with_requeue_on_base_move_manual_mode() {
     let out_a = broker.submit(a.id).unwrap();
     assert_eq!(out_a.entry.status, MergeStatus::Verified);
     assert_eq!(out_a.gate_outcomes.len(), 1);
+    assert_eq!(
+        out_a.gate_outcomes[0].tree_hash,
+        out_a.entry.merged_tree.as_deref().unwrap()
+    );
     assert!(!out_a.promoted, "manual mode holds verified entries");
     let out_b = broker.submit(b.id).unwrap();
     assert_eq!(out_b.entry.status, MergeStatus::Verified);

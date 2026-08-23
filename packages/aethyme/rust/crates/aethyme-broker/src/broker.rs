@@ -3333,6 +3333,7 @@ fn dirty_worktree_advice(agent: &AgentView, dirty: &[String]) -> StatusAdvice {
 #[derive(Debug)]
 struct GateFailure {
     name: String,
+    tree_hash: Option<String>,
     status: String,
     failure_class: Option<String>,
     cached: bool,
@@ -3345,12 +3346,18 @@ impl GateFailure {
             .as_deref()
             .map(|class| format!("/{class}"))
             .unwrap_or_default();
+        let tree = self
+            .tree_hash
+            .as_deref()
+            .map(|tree_hash| format!(" tree {}", short_commit(tree_hash)))
+            .unwrap_or_default();
         format!(
-            "gate {} status {}{}{}",
+            "gate {} status {}{}{}{}",
             self.name,
             self.status,
             class,
-            if self.cached { " (cached)" } else { "" }
+            if self.cached { " (cached)" } else { "" },
+            tree,
         )
     }
 }
@@ -3375,6 +3382,10 @@ fn gate_failures(details_json: Option<&str>) -> Vec<GateFailure> {
             }
             Some(GateFailure {
                 name: name.to_string(),
+                tree_hash: gate
+                    .get("tree_hash")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
                 status: status.to_string(),
                 failure_class: gate
                     .get("failure_class")

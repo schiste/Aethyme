@@ -276,6 +276,7 @@ impl Broker {
             "base": base,
             "gates": gate_outcomes.iter().map(|o| serde_json::json!({
                 "gate": o.gate,
+                "tree_hash": o.tree_hash,
                 "status": o.status,
                 "failure_class": o.failure_class,
                 "cached": o.cached,

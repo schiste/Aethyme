@@ -667,6 +667,10 @@ triggers = ["**/*.nomatch"]
 "#,
     );
     let mut broker = Broker::open(tmp.path()).unwrap();
+    let tree_hash = aethyme_broker::GitRepo::discover(tmp.path())
+        .unwrap()
+        .working_tree_hash()
+        .unwrap();
 
     // CI shape: run against the main checkout itself — clean tree, no
     // worktree, no session ever adopted.
@@ -681,13 +685,16 @@ triggers = ["**/*.nomatch"]
     );
     assert!(outcomes.iter().all(|o| o.status == GateStatus::Pass));
     assert!(outcomes.iter().all(|o| !o.cached), "first run executes");
+    assert!(outcomes.iter().all(|o| o.tree_hash == tree_hash));
     let markers = std::fs::read_to_string(tmp.path().join("gate-markers.txt")).unwrap();
     assert_eq!(markers, "cheap\nmid\nexpensive\n");
 
     // The existing streaming surface is reused: started/finished lines.
     let lines = progress.lines();
     assert!(
-        lines.iter().any(|l| l.starts_with("gate cheap started")),
+        lines.iter().any(|line| {
+            line.starts_with("gate cheap started") && line.contains(&tree_hash[..12])
+        }),
         "streaming progress present: {lines:?}"
     );
 
@@ -697,6 +704,7 @@ triggers = ["**/*.nomatch"]
         outcomes.iter().all(|o| o.cached),
         "second run is pure cache"
     );
+    assert!(outcomes.iter().all(|o| o.tree_hash == tree_hash));
     let markers_after = std::fs::read_to_string(tmp.path().join("gate-markers.txt")).unwrap();
     assert_eq!(markers, markers_after, "cached rerun executed nothing");
 }

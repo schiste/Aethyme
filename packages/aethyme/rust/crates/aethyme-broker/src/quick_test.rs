@@ -42,6 +42,7 @@ pub struct QuickTestOptions {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct QuickTestGateOutcome {
     pub gate: String,
+    pub tree_hash: String,
     pub status: GateStatus,
     pub failure_class: Option<GateFailureClass>,
     pub cached: bool,
@@ -354,6 +355,7 @@ fn gate_outcomes(outcomes: &[GateRunOutcome]) -> Vec<QuickTestGateOutcome> {
         .iter()
         .map(|outcome| QuickTestGateOutcome {
             gate: outcome.gate.clone(),
+            tree_hash: outcome.tree_hash.clone(),
             status: outcome.status,
             failure_class: outcome.failure_class,
             cached: outcome.cached,

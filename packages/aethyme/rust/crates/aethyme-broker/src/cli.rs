@@ -95,13 +95,15 @@ Usage:
       CI, or gates run execute.
   aethyme broker gates run --session <id> [--json]
       Run affected gates cheap-first with tree-hash caching; cancels this
-      session's obsolete in-flight runs; stops at first failure.
+      session's obsolete in-flight runs; stops at first failure. Text
+      abbreviates each proven tree hash; JSON includes the full hash.
   aethyme broker gates run --all [--json]
       Run EVERY gate in cost order against the current worktree — no
       diff selection, no session. Same runner, streaming, and tree-hash
       result cache as session runs; stops at first failure and exits
       non-zero if any gate does not pass. The CI entrypoint: gates.toml
-      is the single definition of verified for CI and broker alike.
+      is the single definition of verified for CI and broker alike. Text
+      abbreviates each proven tree hash; JSON includes the full hash.
   aethyme broker hooks install [--json]
       Explicitly install the two managed git hooks into the shared
       <git-common-dir>/hooks (all worktrees see them): pre-commit runs
@@ -135,6 +137,7 @@ Usage:
       <worktree>/.aethyme/broker-action-required.md. V1 submits the
       whole session head only; --path/--commit scoping is intentionally
       out of scope while worktree identity is the coordination unit.
+      Executed and cached gate results identify the proven tree hash.
   aethyme broker repair --session <id> [--json]
       One-command recovery for a blocked session: apply the documented
       local rebase path for the latest submit conflict, or rebase onto
@@ -1064,10 +1067,11 @@ fn render_quick_test_report(report: &crate::QuickTestReport, json: bool) -> Resu
         println!("  passing entry: q{}", gate.passing_entry_id);
         for outcome in &gate.passing_outcomes {
             println!(
-                "    {} {}{}",
+                "    {} {}{} (tree {})",
                 outcome.gate,
                 outcome.status.as_str(),
-                if outcome.cached { " (cached)" } else { "" }
+                if outcome.cached { " (cached)" } else { "" },
+                short_commit(&outcome.tree_hash),
             );
         }
         println!(
@@ -1077,10 +1081,11 @@ fn render_quick_test_report(report: &crate::QuickTestReport, json: bool) -> Resu
         );
         for outcome in &gate.failing_outcomes {
             println!(
-                "    {} {}{}",
+                "    {} {}{} (tree {})",
                 outcome.gate,
                 outcome.status.as_str(),
-                if outcome.cached { " (cached)" } else { "" }
+                if outcome.cached { " (cached)" } else { "" },
+                short_commit(&outcome.tree_hash),
             );
         }
     }
@@ -2185,7 +2190,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     } else {
                         for outcome in &outcomes {
                             println!(
-                                "{:<20} {:<10} {}{}",
+                                "{:<20} {:<10} {}{} (tree {})",
                                 outcome.gate,
                                 gate_status_label(outcome.status, outcome.failure_class),
                                 if outcome.cached { "(cached) " } else { "" },
@@ -2193,6 +2198,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                                     .duration_ms
                                     .map(|ms| format!("{ms}ms"))
                                     .unwrap_or_default(),
+                                short_commit(&outcome.tree_hash),
                             );
                         }
                     }
@@ -2219,7 +2225,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         let mut failed = false;
                         for outcome in &outcomes {
                             println!(
-                                "{:<20} {:<10} {}{}",
+                                "{:<20} {:<10} {}{} (tree {})",
                                 outcome.gate,
                                 gate_status_label(outcome.status, outcome.failure_class),
                                 if outcome.cached { "(cached) " } else { "" },
@@ -2227,6 +2233,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                                     .duration_ms
                                     .map(|ms| format!("{ms}ms"))
                                     .unwrap_or_default(),
+                                short_commit(&outcome.tree_hash),
                             );
                             failed |= outcome.status.as_str() != "pass";
                         }
@@ -2390,17 +2397,19 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 for gate in &outcome.gate_outcomes {
                     if gate.cached {
                         println!(
-                            "gate {:<20} {} (cached, saved {})",
+                            "gate {:<20} {} (cached, tree {}, saved {})",
                             gate.gate,
                             gate_status_label(gate.status, gate.failure_class),
+                            short_commit(&gate.tree_hash),
                             duration_label(gate.duration_ms)
                         );
                     } else {
                         println!(
-                            "gate {:<20} {} in {}",
+                            "gate {:<20} {} in {} (tree {})",
                             gate.gate,
                             gate_status_label(gate.status, gate.failure_class),
-                            duration_label(gate.duration_ms)
+                            duration_label(gate.duration_ms),
+                            short_commit(&gate.tree_hash),
                         );
                     }
                 }
