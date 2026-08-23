@@ -128,6 +128,16 @@ pub enum BrokerOpError {
     GateConfig(#[from] crate::gates::GateConfigError),
     #[error("queue entry {entry} is not verified (status: {status}) — submit/simulate first")]
     NotVerified { entry: i64, status: &'static str },
+    #[error("refusing submission for session {session_id}: unsafe submission plan: {reason}")]
+    UnsafeSubmissionPlan { session_id: i64, reason: String },
+    #[error(
+        "refusing submission for session {session_id}: owned commit {commit} has {parent_count} parents; normalized replay supports only single-parent commits"
+    )]
+    UnsupportedSubmissionCommit {
+        session_id: i64,
+        commit: String,
+        parent_count: usize,
+    },
     #[error("ship queue entry {entry} was not found")]
     ShipEntryNotFound { entry: i64 },
     #[error("ship requires a promoted queue entry; entry {entry} is {status}")]
@@ -1854,6 +1864,12 @@ impl Broker {
             let Ok(checkout) = GitRepo::discover(Path::new(&session.worktree_path)) else {
                 continue;
             };
+            let Ok(session_head) = checkout.head_commit() else {
+                continue;
+            };
+            if self.submitted_head_is_represented_on(session.id, &session_head, &integration)? {
+                continue;
+            }
             let Ok(base) = checkout.merge_base(&integration, "HEAD") else {
                 continue;
             };
@@ -3206,16 +3222,28 @@ impl Broker {
             report.delivery = self.finish_delivery(Some(entry));
         }
 
-        let base = self
-            .session_change_base(&checkout)
-            .or_else(|| session.diff_base.clone())
+        let base = session
+            .diff_base
+            .clone()
+            .or_else(|| self.session_change_base(&checkout))
             .unwrap_or_else(|| "HEAD".to_string());
-        report.unsubmitted_commits = checkout.commit_count_between(&base, "HEAD")?;
+        let submitted_head_is_delivered = latest_for_head.is_some_and(|entry| {
+            matches!(
+                entry.status,
+                MergeStatus::Promoted | MergeStatus::ExternallyLanded
+            )
+        });
+        report.unsubmitted_commits = if submitted_head_is_delivered {
+            0
+        } else {
+            checkout.commit_count_between(&base, "HEAD")?
+        };
 
         if session.status == SessionStatus::Cleaned {
             report.status = FinishStatus::AlreadyClosed;
             report.summary = format!("session {session_id} is already closed");
-            report.cleanup_safe = self.finish_cleanup_safe(&worktree_path, &report.dirty_paths)?;
+            report.cleanup_safe =
+                self.finish_cleanup_safe(session_id, &worktree_path, &report.dirty_paths)?;
             if report.cleanup_safe {
                 report
                     .next_commands
@@ -3325,7 +3353,8 @@ impl Broker {
         report.status = FinishStatus::Closed;
         report.closed = true;
         report.summary = format!("session {session_id} closed; worktree untouched");
-        report.cleanup_safe = self.finish_cleanup_safe(&worktree_path, &report.dirty_paths)?;
+        report.cleanup_safe =
+            self.finish_cleanup_safe(session_id, &worktree_path, &report.dirty_paths)?;
         if report.cleanup_safe {
             report
                 .next_commands
@@ -3344,6 +3373,7 @@ impl Broker {
 
     fn finish_cleanup_safe(
         &self,
+        session_id: i64,
         worktree_path: &Path,
         dirty_paths: &[String],
     ) -> Result<bool, BrokerOpError> {
@@ -3355,7 +3385,28 @@ impl Broker {
         }
         let checkout = GitRepo::discover(worktree_path)?;
         let main_head = self.repo.head_commit()?;
-        Ok(checkout.unmerged_commit_count(&main_head)? == 0)
+        let session_head = checkout.head_commit()?;
+        Ok(checkout.unmerged_commit_count(&main_head)? == 0
+            || self.submitted_head_is_represented_on(session_id, &session_head, &main_head)?)
+    }
+
+    fn submitted_head_is_represented_on(
+        &self,
+        session_id: i64,
+        session_head: &str,
+        target_head: &str,
+    ) -> Result<bool, BrokerOpError> {
+        let represented = self.store.merge_queue()?.into_iter().rev().any(|entry| {
+            entry.session_id == session_id
+                && entry.head_commit == session_head
+                && matches!(
+                    entry.status,
+                    MergeStatus::Promoted | MergeStatus::ExternallyLanded
+                )
+                && details_string_value(entry.details_json.as_deref(), "commit")
+                    .is_some_and(|promotion| self.repo.is_ancestor(&promotion, target_head))
+        });
+        Ok(represented)
     }
 
     // ── cleanup ───────────────────────────────────────────────────────
@@ -3378,7 +3429,14 @@ impl Broker {
                 }
                 let main_head = self.repo.head_commit()?;
                 let unmerged = checkout.unmerged_commit_count(&main_head)?;
-                if unmerged > 0 {
+                let session_head = checkout.head_commit()?;
+                if unmerged > 0
+                    && !self.submitted_head_is_represented_on(
+                        session_id,
+                        &session_head,
+                        &main_head,
+                    )?
+                {
                     return Err(BrokerOpError::DirtyWorktree {
                         id: session_id,
                         reason: format!(

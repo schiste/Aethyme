@@ -7,7 +7,8 @@ use std::process::Command;
 
 use aethyme_broker::{
     Broker, IntegrationDeliveryState, IntegrationReconcileClassification,
-    IntegrationReconcileOptions, MergeStatus, RepairAction, RepairSource, StatusAdviceSeverity,
+    IntegrationReconcileOptions, MergeStatus, NewSession, RepairAction, RepairSource,
+    SessionOrigin, StatusAdviceSeverity, SubmissionCommitOwnership, SubmissionIntegrationState,
 };
 
 fn sh(cwd: &Path, args: &[&str]) {
@@ -30,7 +31,10 @@ fn init_repo(root: &Path) {
     // disposable repository itself instead of relying on the test runner's
     // global identity or on environment variables attached to `sh` above.
     sh(root, &["config", "user.name", "Aethyme Test"]);
-    sh(root, &["config", "user.email", "aethyme-test@example.invalid"]);
+    sh(
+        root,
+        &["config", "user.email", "aethyme-test@example.invalid"],
+    );
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/a.py"), "a = 1\n").unwrap();
     std::fs::write(root.join("src/b.py"), "b = 1\n").unwrap();
@@ -102,6 +106,78 @@ fn promoted_merge_commit(entry: &aethyme_broker::MergeQueueEntry) -> String {
         .as_str()
         .unwrap()
         .to_string()
+}
+
+fn unmerged_paths(worktree: &Path) -> Vec<String> {
+    let output = Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .current_dir(worktree)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git diff for unmerged paths failed"
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Build the dual-identity history from #56/#57:
+///
+/// - main and integration contain the same `a = 2` patch under different SHAs;
+/// - integration then advances both `a.py` and `b.py`;
+/// - the victim starts from main and authors only the competing `b.py` edit.
+///
+/// A real rebase drops main's duplicate `a.py` commit before finding the
+/// genuine `b.py` conflict. The legacy whole-head merge simulation instead
+/// reports both paths and attributes `a.py` to whichever live lease happens
+/// to own it.
+fn dual_identity_conflict_fixture(root: &Path) -> (Broker, std::path::PathBuf, i64, String) {
+    init_repo(root);
+    let mut broker = Broker::open(root).unwrap();
+
+    let duplicate_on_integration = agent_worktree(root, "integration-duplicate");
+    let duplicate_session = broker
+        .adopt(&duplicate_on_integration, Some("integration copy"))
+        .unwrap();
+    commit_edit(&duplicate_on_integration, "src/a.py", "a = 2\n");
+    assert!(broker.submit(duplicate_session.id).unwrap().promoted);
+    broker.close(duplicate_session.id).unwrap();
+    broker
+        .store()
+        .release_lease(duplicate_session.id, "src/a.py")
+        .unwrap();
+    let integration_with_duplicate = resolve(root, "aethyme/integration");
+
+    std::fs::write(root.join("src/a.py"), "a = 2\n").unwrap();
+    sh(root, &["add", "src/a.py"]);
+    sh(root, &["commit", "-qm", "same patch under a main identity"]);
+    let main_duplicate = resolve(root, "main");
+    assert_ne!(main_duplicate, resolve(&duplicate_on_integration, "HEAD"));
+
+    let integration_followup =
+        agent_worktree_at(root, "integration-followup", &integration_with_duplicate);
+    let followup_session = broker
+        .adopt(&integration_followup, Some("advance integration"))
+        .unwrap();
+    commit_edit(&integration_followup, "src/a.py", "a = 3\n");
+    commit_edit(&integration_followup, "src/b.py", "b = 3\n");
+    assert!(broker.submit(followup_session.id).unwrap().promoted);
+    broker.close(followup_session.id).unwrap();
+    for path in ["src/a.py", "src/b.py"] {
+        broker
+            .store()
+            .release_lease(followup_session.id, path)
+            .unwrap();
+    }
+
+    let victim = agent_worktree_at(root, "victim", &main_duplicate);
+    let victim_session = broker.adopt(&victim, Some("edit only b")).unwrap();
+    commit_edit(&victim, "src/b.py", "b = 2\n");
+
+    (broker, victim, victim_session.id, main_duplicate)
 }
 
 #[test]
@@ -254,6 +330,286 @@ fn conflicting_submission_rejected_pre_gate_with_instruction_drop() {
         err.contains("repair paused during rebase"),
         "repair should apply the documented rebase path and stop for true content conflicts: {err}"
     );
+}
+
+#[test]
+fn normalized_replay_drops_dual_identity_noise_and_preserves_real_conflicts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut broker, victim, victim_id, victim_baseline) =
+        dual_identity_conflict_fixture(tmp.path());
+
+    let blocker_a_worktree = agent_worktree_at(tmp.path(), "blocker-a", &victim_baseline);
+    let blocker_a = broker
+        .adopt(&blocker_a_worktree, Some("unrelated lease owner A"))
+        .unwrap();
+    commit_edit(&blocker_a_worktree, "src/a.py", "a = 4\n");
+    broker.refresh_leases().unwrap();
+
+    let first = broker.submit(victim_id).unwrap();
+    assert_eq!(first.entry.status, MergeStatus::Conflict);
+    assert!(first.submission_plan.safe);
+    assert_eq!(first.submission_plan.session_head.len(), 40);
+    assert_eq!(first.submission_plan.integration_head.len(), 40);
+    assert_eq!(
+        first.submission_plan.recorded_baseline.as_deref(),
+        Some(victim_baseline.as_str())
+    );
+    assert_eq!(first.submission_plan.commits.len(), 2);
+    let inherited = &first.submission_plan.commits[0];
+    assert_eq!(
+        inherited.ownership,
+        SubmissionCommitOwnership::InheritedFromRecordedBaseline
+    );
+    assert_eq!(
+        inherited.integration_state,
+        SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity
+    );
+    assert_eq!(inherited.commit, victim_baseline);
+    assert_eq!(inherited.matching_integration_commits.len(), 1);
+    assert_eq!(inherited.matching_integration_commits[0].len(), 40);
+    let owned = &first.submission_plan.commits[1];
+    assert_eq!(owned.ownership, SubmissionCommitOwnership::SessionOwned);
+    assert_eq!(owned.integration_state, SubmissionIntegrationState::Pending);
+    assert_eq!(owned.commit.len(), 40);
+    let plan_json = serde_json::to_value(&first.submission_plan).unwrap();
+    assert_eq!(
+        plan_json["commits"][0]["ownership"],
+        "inherited_from_recorded_baseline"
+    );
+    assert_eq!(
+        plan_json["commits"][0]["integration_state"],
+        "already_integrated_by_stable_patch_identity"
+    );
+    assert_eq!(plan_json["commits"][1]["ownership"], "session_owned");
+    assert_eq!(plan_json["commits"][1]["integration_state"], "pending");
+    assert_eq!(
+        first.conflicts,
+        vec!["src/b.py".to_string()],
+        "normalized replay must report only the session-owned conflict"
+    );
+    assert_eq!(first.conflict_details.len(), 1);
+    let conflict = &first.conflict_details[0];
+    assert_eq!(conflict.path, "src/b.py");
+    assert_eq!(conflict.originating_commit, owned.commit);
+    assert_eq!(conflict.ownership, SubmissionCommitOwnership::SessionOwned);
+    assert_eq!(conflict.integration_side_commits.len(), 1);
+    assert_eq!(conflict.integration_side_commits[0].len(), 40);
+    assert!(conflict.remediation.contains(&owned.commit));
+    let expected_submit = format!("aethyme broker submit --session {victim_id}");
+    assert_eq!(
+        conflict.commands.last().map(String::as_str),
+        Some(expected_submit.as_str())
+    );
+    let first_details: serde_json::Value =
+        serde_json::from_str(first.entry.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(first_details["blocking_sessions"], serde_json::json!([]));
+    assert_eq!(
+        first_details["conflict_details"][0]["originating_commit"],
+        owned.commit
+    );
+    assert_eq!(
+        first_details["conflict_details"][0]["ownership"],
+        "session_owned"
+    );
+
+    let note =
+        std::fs::read_to_string(victim.join(aethyme_broker::ACTION_REQUIRED_RELPATH)).unwrap();
+    assert!(note.contains(&owned.commit));
+    assert!(note.contains(&conflict.integration_side_commits[0]));
+
+    broker.close(blocker_a.id).unwrap();
+    broker
+        .store()
+        .release_lease(blocker_a.id, "src/a.py")
+        .unwrap();
+    let blocker_b_worktree = agent_worktree_at(tmp.path(), "blocker-b", &victim_baseline);
+    let _blocker_b = broker
+        .adopt(&blocker_b_worktree, Some("unrelated lease owner B"))
+        .unwrap();
+    commit_edit(&blocker_b_worktree, "src/a.py", "a = 5\n");
+    broker.refresh_leases().unwrap();
+
+    let second = broker.simulate_and_gate(first.entry.id).unwrap();
+    assert_eq!(second.conflicts, first.conflicts);
+    assert_eq!(second.conflict_details, first.conflict_details);
+    let second_details: serde_json::Value =
+        serde_json::from_str(second.entry.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(second_details["blocking_sessions"], serde_json::json!([]));
+
+    let blocker_real_worktree = agent_worktree_at(tmp.path(), "blocker-real", &victim_baseline);
+    let blocker_real = broker
+        .adopt(
+            &blocker_real_worktree,
+            Some("actual conflicting lease owner"),
+        )
+        .unwrap();
+    commit_edit(&blocker_real_worktree, "src/b.py", "b = 5\n");
+    broker.refresh_leases().unwrap();
+
+    let third = broker.simulate_and_gate(first.entry.id).unwrap();
+    assert_eq!(third.conflicts, vec!["src/b.py".to_string()]);
+    assert_eq!(third.conflict_details, first.conflict_details);
+    let third_details: serde_json::Value =
+        serde_json::from_str(third.entry.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        third_details["blocking_sessions"],
+        serde_json::json!([blocker_real.id])
+    );
+
+    let rebase = Command::new("git")
+        .args(["rebase", "aethyme/integration"])
+        .current_dir(&victim)
+        .env("GIT_EDITOR", "true")
+        .output()
+        .unwrap();
+    assert!(
+        !rebase.status.success(),
+        "the owned b.py edit should conflict"
+    );
+    assert_eq!(
+        unmerged_paths(&victim),
+        vec!["src/b.py".to_string()],
+        "rebase drops the patch-equivalent a.py commit and exposes only the real conflict"
+    );
+    sh(&victim, &["rebase", "--abort"]);
+}
+
+#[test]
+fn normalized_replay_handles_rebased_rename_binary_empty_and_stable_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let integration_worktree = agent_worktree(tmp.path(), "integration-base");
+    let integration_session = broker.adopt(&integration_worktree, None).unwrap();
+    commit_edit(&integration_worktree, "src/a.py", "a = 2\n");
+    assert!(broker.submit(integration_session.id).unwrap().promoted);
+    broker.close(integration_session.id).unwrap();
+    broker
+        .store()
+        .release_lease(integration_session.id, "src/a.py")
+        .unwrap();
+
+    std::fs::write(tmp.path().join("src/a.py"), "a = 2\n").unwrap();
+    sh(tmp.path(), &["add", "src/a.py"]);
+    sh(tmp.path(), &["commit", "-qm", "duplicate main patch"]);
+    let old_baseline = resolve(tmp.path(), "main");
+
+    let rebased = agent_worktree_at(tmp.path(), "rebased", &old_baseline);
+    let rebased_session = broker.adopt(&rebased, None).unwrap();
+    commit_edit(&rebased, "src/b.py", "b = 2\n");
+    sh(&rebased, &["rebase", "aethyme/integration"]);
+    let rebased_outcome = broker.submit(rebased_session.id).unwrap();
+    assert!(rebased_outcome.promoted);
+    assert!(rebased_outcome.submission_plan.safe);
+    assert_eq!(rebased_outcome.submission_plan.commits.len(), 1);
+    assert!(
+        rebased_outcome
+            .submission_plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("unambiguous rebased range"))
+    );
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/a.py"),
+        "a = 2\n"
+    );
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/b.py"),
+        "b = 2\n"
+    );
+
+    let shapes = agent_worktree_at(tmp.path(), "file-shapes", "aethyme/integration");
+    let shapes_session = broker.adopt(&shapes, None).unwrap();
+    let shapes_baseline = resolve(&shapes, "HEAD");
+    sh(&shapes, &["mv", "src/a.py", "src/renamed.py"]);
+    sh(&shapes, &["commit", "-qm", "rename source"]);
+    std::fs::write(shapes.join("src/blob.bin"), [0_u8, 1, 255, 4]).unwrap();
+    sh(&shapes, &["add", "src/blob.bin"]);
+    sh(&shapes, &["commit", "-qm", "add binary"]);
+    sh(&shapes, &["commit", "--allow-empty", "-qm", "empty marker"]);
+    let expected_order = {
+        let output = Command::new("git")
+            .args(["rev-list", "--reverse", &format!("{shapes_baseline}..HEAD")])
+            .current_dir(&shapes)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let shapes_outcome = broker.submit(shapes_session.id).unwrap();
+    assert!(shapes_outcome.promoted);
+    assert_eq!(
+        shapes_outcome
+            .submission_plan
+            .commits
+            .iter()
+            .map(|commit| commit.commit.clone())
+            .collect::<Vec<_>>(),
+        expected_order
+    );
+    assert_eq!(
+        std::fs::read({
+            let checkout = agent_worktree_at(tmp.path(), "inspect-shapes", "aethyme/integration");
+            checkout.join("src/blob.bin")
+        })
+        .unwrap(),
+        vec![0_u8, 1, 255, 4]
+    );
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/renamed.py"),
+        "a = 2\n"
+    );
+}
+
+#[test]
+fn normalized_replay_refuses_missing_baseline_and_owned_merge_commits() {
+    let missing_tmp = tempfile::tempdir().unwrap();
+    init_repo(missing_tmp.path());
+    let mut missing_broker = Broker::open(missing_tmp.path()).unwrap();
+    let missing_worktree = agent_worktree(missing_tmp.path(), "missing-baseline");
+    let missing_session = missing_broker
+        .store()
+        .register_session(&NewSession {
+            worktree_path: missing_worktree.to_string_lossy().into_owned(),
+            branch: "agent/missing-baseline".into(),
+            origin: SessionOrigin::Adopted,
+            task: None,
+            diff_base: None,
+            pid: None,
+            command: None,
+            log_path: None,
+        })
+        .unwrap();
+    commit_edit(&missing_worktree, "src/a.py", "a = 9\n");
+    missing_broker
+        .claim_lease(missing_session.id, "src/a.py", None)
+        .unwrap();
+    let missing_error = missing_broker.submit(missing_session.id).unwrap_err();
+    assert!(
+        missing_error.to_string().contains("no recorded baseline"),
+        "{missing_error}"
+    );
+
+    let merge_tmp = tempfile::tempdir().unwrap();
+    init_repo(merge_tmp.path());
+    let mut merge_broker = Broker::open(merge_tmp.path()).unwrap();
+    let merge_worktree = agent_worktree(merge_tmp.path(), "merge-commit");
+    let merge_session = merge_broker.adopt(&merge_worktree, None).unwrap();
+    let baseline = resolve(&merge_worktree, "HEAD");
+    sh(&merge_worktree, &["branch", "side", &baseline]);
+    commit_edit(&merge_worktree, "src/a.py", "a = 7\n");
+    sh(&merge_worktree, &["checkout", "side"]);
+    commit_edit(&merge_worktree, "src/b.py", "b = 7\n");
+    sh(&merge_worktree, &["checkout", "agent/merge-commit"]);
+    sh(
+        &merge_worktree,
+        &["merge", "--no-ff", "side", "-m", "owned merge"],
+    );
+    let merge_error = merge_broker.submit(merge_session.id).unwrap_err();
+    assert!(merge_error.to_string().contains("has 2 parents"));
 }
 
 #[test]

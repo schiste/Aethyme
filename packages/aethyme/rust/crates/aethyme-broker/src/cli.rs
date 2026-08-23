@@ -3124,8 +3124,19 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
             } else if !outcome.conflicts.is_empty() {
                 eprintln!("✗ conflict — rejected before any gate ran. Conflicting files:");
-                for file in &outcome.conflicts {
-                    eprintln!("  - {file}");
+                for conflict in &outcome.conflict_details {
+                    eprintln!(
+                        "  - {} from session commit {} ({})",
+                        conflict.path,
+                        conflict.originating_commit,
+                        conflict.ownership.as_str()
+                    );
+                    if !conflict.integration_side_commits.is_empty() {
+                        eprintln!(
+                            "    integration side: {}",
+                            conflict.integration_side_commits.join(", ")
+                        );
+                    }
                 }
                 eprintln!(
                     "Instructions written to the session worktree at {}",

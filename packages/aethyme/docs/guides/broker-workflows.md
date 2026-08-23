@@ -2,12 +2,12 @@
 
 Last Updated: 2026-08-23
 
-This guide covers five broker workflows that matter after the basic
+This guide covers broker workflows that matter after the basic
 start-edit-submit loop: reusing a session worktree, choosing fresh or cached
-gate evidence, inspecting advisory semantic gate suggestions, planning leases
-before claiming them, and leaving or retrieving a durable finish handoff. For
-the complete flag inventory, see the
-[CLI reference](../reference/cli.md).
+gate evidence, understanding normalized submission planning, inspecting
+advisory semantic gate suggestions, planning leases before claiming them, and
+leaving or retrieving a durable finish handoff. For the complete flag
+inventory, see the [CLI reference](../reference/cli.md).
 
 ## Safety Model
 
@@ -93,6 +93,43 @@ fresh evidence.
 Managed pre-commit hooks follow the same diagnostic principle. Successful
 cheap gates stay quiet. A failure replays complete standard output and error,
 prints the broker diagnosis, and preserves the failing exit code.
+
+## Understand Normalized Submission Planning
+
+Submit plans commit provenance before it simulates a merge. This matters when
+main and integration contain patch-equivalent commits under different SHAs,
+as can happen after a rebase or cherry-pick. The broker does not merge the
+session HEAD as one undifferentiated history. It classifies the commits, then
+replays only pending session-owned single-parent patches onto the exact current
+integration tip, in their original order.
+
+The JSON result from `aethyme broker submit --session 111 --json` includes a
+`submission_plan` with full SHAs. Ownership and integration state are separate:
+
+| Dimension | Values | Meaning |
+| --- | --- | --- |
+| `ownership` | `session_owned`, `inherited_from_recorded_baseline`, `ambiguous` | whether the recorded task boundary proves the session owns the commit |
+| `integration_state` | `pending`, `already_integrated_by_ancestry`, `already_integrated_by_stable_patch_identity`, `ambiguous` | whether integration still needs that patch |
+
+An inherited commit that already exists under a stable patch identity is
+reported but not replayed. A pending owned commit is replayed using its parent
+tree as the three-way base. Promotion records a normalized integration commit;
+the original session SHA does not need to become an ancestor of integration.
+Finish, cleanup, and integration status use the verified queue record to track
+that delivered content safely.
+
+The broker refuses instead of guessing when the recorded baseline is missing,
+ownership or stable patch identity is ambiguous, or a pending owned commit is
+a merge commit. A session rebased directly onto the current integration tip is
+accepted only when that range is unambiguous.
+
+On a real conflict, `conflict_details` binds each surviving path to its full
+originating session commit, ownership, known integration-side commits, and
+ordered remediation commands. The legacy `conflicts` path list remains for
+compatibility. A live session is named in `blocking_sessions` only when its
+active lease overlaps one of those surviving paths; leases on duplicate-patch
+noise do not become blockers. The same evidence and recovery sequence are
+written to `.aethyme/broker-action-required.md`.
 
 ## Inspect Semantic Gate Suggestions
 

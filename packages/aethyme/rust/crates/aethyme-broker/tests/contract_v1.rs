@@ -474,11 +474,33 @@ fn merge_lifecycle_payload_field_names_are_frozen_on_the_wire() {
             .unwrap_or_else(|| panic!("{kind} has no payload"))
     };
 
+    let conflict_payload = payload_of("merge.conflict");
     assert_keys(
-        payload_of("merge.conflict"),
-        &["base", "blocking_sessions", "conflicts"],
+        conflict_payload,
+        &[
+            "base",
+            "blocking_sessions",
+            "conflict_details",
+            "conflicts",
+        ],
         "merge.conflict",
     );
+    let conflict_value: serde_json::Value = serde_json::from_str(conflict_payload).unwrap();
+    let conflict = &conflict_value["conflict_details"][0];
+    assert_keys(
+        &conflict.to_string(),
+        &[
+            "commands",
+            "integration_side_commits",
+            "originating_commit",
+            "ownership",
+            "path",
+            "remediation",
+        ],
+        "merge.conflict conflict_details[] element",
+    );
+    assert_eq!(conflict["ownership"], "session_owned");
+    assert_eq!(conflict["originating_commit"].as_str().unwrap().len(), 40);
     for kind in ["merge.verified", "merge.rejected"] {
         let payload = payload_of(kind);
         assert_keys(payload, &["base", "gates", "merge_commit"], kind);

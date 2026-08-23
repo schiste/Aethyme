@@ -77,7 +77,10 @@ pub use issue_form::{
     render_issue_form, write_issue_form_render_atomic,
 };
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
-pub use merge::{ACTION_REQUIRED_RELPATH, PromoteConfig, SubmitOutcome};
+pub use merge::{
+    ACTION_REQUIRED_RELPATH, PromoteConfig, SubmissionCommitOwnership, SubmissionCommitProvenance,
+    SubmissionConflict, SubmissionIntegrationState, SubmissionPlan, SubmitOutcome,
+};
 pub use operations::{
     CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport, classify_gh,
     classify_git,

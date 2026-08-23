@@ -94,7 +94,7 @@ One JSON object per line:
 | `gate.cached` | requesting session (nullable) | `gate`, `tree`, `saved_ms`, `cached_status`, `failure_class` | a cache hit avoided executing a gate (`saved_ms` = the cached run's duration; cached failed outcomes report `cached_prior_fail`) |
 | `merge.submitted` | the session | `head` | head commit entered the queue (idempotent: once per head) |
 | `merge.simulating` | the session | — | merge-tree simulation started |
-| `merge.conflict` | the session | `conflicts[]`, `blocking_sessions[]`, `base` | simulation found textual conflicts (rejected pre-gate) |
+| `merge.conflict` | the session | `conflicts[]`, `conflict_details[]` (`path`, `originating_commit`, `ownership`, `integration_side_commits[]`, `remediation`, `commands[]`), `blocking_sessions[]`, `base` | normalized patch replay found textual conflicts (rejected pre-gate); blockers are limited to active leases overlapping surviving paths |
 | `merge.verified` | the session | `merge_commit`, `base`, `gates[]` | gates passed on the merged tree |
 | `merge.rejected` | the session | `merge_commit`, `base`, `gates[]` | a gate failed on the merged tree |
 | `merge.promoted` | the session | `branch`, `commit` | integration branch advanced |
