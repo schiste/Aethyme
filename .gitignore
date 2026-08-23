@@ -4,6 +4,7 @@
 .aethyme/broker.db*
 .aethyme/logs/
 .aethyme/locks/
+.aethyme/reports/
 .aethyme/run/
 .aethyme/worktrees/
 .aethyme/broker-action-required.md
