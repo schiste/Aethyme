@@ -62,6 +62,8 @@ pub struct IntegrationReconcileCommit {
     pub session_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_status: Option<MergeStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unrecorded_resolution: Option<IntegrationReconcileUnrecordedResolutionAudit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -78,7 +80,10 @@ struct IntegrationReconcileResolutionFile {
     upstream_commit: String,
     old_integration: String,
     operator: String,
+    #[serde(default)]
     resolutions: Vec<IntegrationReconcileResolution>,
+    #[serde(default)]
+    unrecorded_resolutions: Vec<IntegrationReconcileUnrecordedResolution>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -88,6 +93,44 @@ struct IntegrationReconcileResolution {
     old_merge_commit: String,
     classification: IntegrationReconcileClassification,
     reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationReconcileUnrecordedDisposition {
+    PreserveAndReplay,
+    ReplacedByExactUpstreamSha,
+    DropBecauseContentEmpty,
+}
+
+impl IntegrationReconcileUnrecordedDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreserveAndReplay => "preserve_and_replay",
+            Self::ReplacedByExactUpstreamSha => "replaced_by_exact_upstream_sha",
+            Self::DropBecauseContentEmpty => "drop_because_content_empty",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntegrationReconcileUnrecordedResolution {
+    integration_commit: String,
+    disposition: IntegrationReconcileUnrecordedDisposition,
+    #[serde(default)]
+    upstream_commit: Option<String>,
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IntegrationReconcileUnrecordedResolutionAudit {
+    pub disposition: IntegrationReconcileUnrecordedDisposition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_commit: Option<String>,
+    pub operator: String,
+    pub reason: String,
+    pub resolution_file: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -158,6 +201,7 @@ struct LoadedOperatorResolutions {
     path: String,
     operator: String,
     resolutions: BTreeMap<i64, IntegrationReconcileResolution>,
+    unrecorded_resolutions: BTreeMap<String, IntegrationReconcileUnrecordedResolution>,
 }
 
 impl Broker {
@@ -239,6 +283,43 @@ impl Broker {
             ));
             report.next_action =
                 "inspect the main/upstream divergence, update the local main checkout, then rerun the dry-run"
+                    .into();
+            return Ok(report);
+        }
+
+        let missing_unrecorded = validate_unrecorded_resolutions(
+            self.repo_handle(),
+            operator_resolutions.as_ref(),
+            &mut report.plan,
+            &upstream_head,
+        )?;
+        let unrecorded_count = report
+            .plan
+            .commits
+            .iter()
+            .filter(|commit| {
+                commit.origin == IntegrationReconcileCommitOrigin::UnrecordedIntegrationCommit
+            })
+            .count();
+        if !missing_unrecorded.is_empty() {
+            report.safe = false;
+            report.warnings.push(format!(
+                "integration contains unrecorded work in {unrecorded_count} commit(s); every SHA requires an explicit reviewed disposition, missing: {}",
+                missing_unrecorded.join(", ")
+            ));
+            report.next_action = format!(
+                "create a schema_version 2 resolution file covering each unrecorded SHA, then rerun `aethyme broker integration reconcile --upstream {} --resolution-file <path> --dry-run`; no refs or broker rows were changed",
+                options.upstream
+            );
+            return Ok(report);
+        }
+        if unrecorded_count > 0 {
+            report.safe = false;
+            report.warnings.push(format!(
+                "validated reviewed dispositions for {unrecorded_count} unrecorded integration commit(s); execution remains disabled until the reviewed commits can be replayed"
+            ));
+            report.next_action =
+                "review the per-commit dispositions in this plan; no refs or broker rows were changed"
                     .into();
             return Ok(report);
         }
@@ -794,6 +875,7 @@ fn reconcile_commit(
         queue_entry_id: queue_entry.map(|entry| entry.id),
         session_id: queue_entry.map(|entry| entry.session_id),
         queue_status: queue_entry.map(|entry| entry.status),
+        unrecorded_resolution: None,
     })
 }
 
@@ -819,13 +901,19 @@ fn load_operator_resolutions(
     let document: IntegrationReconcileResolutionFile = serde_json::from_slice(&bytes)
         .map_err(|error| invalid_resolution(&path_label, format!("invalid JSON: {error}")))?;
 
-    if document.schema_version != 1 {
+    if !matches!(document.schema_version, 1 | 2) {
         return Err(invalid_resolution(
             &path_label,
             format!(
-                "unsupported schema_version {}; expected 1",
+                "unsupported schema_version {}; expected 1 or 2",
                 document.schema_version
             ),
+        ));
+    }
+    if document.schema_version == 1 && !document.unrecorded_resolutions.is_empty() {
+        return Err(invalid_resolution(
+            &path_label,
+            "unrecorded_resolutions require schema_version 2".into(),
         ));
     }
     if document.upstream_ref != options.upstream {
@@ -862,10 +950,10 @@ fn load_operator_resolutions(
             "operator must contain 1–200 non-whitespace bytes".into(),
         ));
     }
-    if document.resolutions.is_empty() {
+    if document.resolutions.is_empty() && document.unrecorded_resolutions.is_empty() {
         return Err(invalid_resolution(
             &path_label,
-            "resolutions must contain at least one queue entry".into(),
+            "resolutions or unrecorded_resolutions must contain at least one entry".into(),
         ));
     }
 
@@ -904,11 +992,154 @@ fn load_operator_resolutions(
         resolutions.insert(resolution.queue_entry_id, resolution);
     }
 
+    let mut seen_unrecorded = BTreeSet::new();
+    let mut unrecorded_resolutions = BTreeMap::new();
+    for resolution in document.unrecorded_resolutions {
+        if resolution.integration_commit.len() != 40
+            || !resolution
+                .integration_commit
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(invalid_resolution(
+                &path_label,
+                format!(
+                    "unrecorded integration_commit {} must be one full 40-character SHA",
+                    resolution.integration_commit
+                ),
+            ));
+        }
+        if !seen_unrecorded.insert(resolution.integration_commit.clone()) {
+            return Err(invalid_resolution(
+                &path_label,
+                format!(
+                    "unrecorded integration commit {} appears more than once",
+                    resolution.integration_commit
+                ),
+            ));
+        }
+        let reason = resolution.reason.trim();
+        if reason.is_empty() || reason.len() > 4096 {
+            return Err(invalid_resolution(
+                &path_label,
+                format!(
+                    "unrecorded integration commit {} reason must contain 1–4096 non-whitespace bytes",
+                    resolution.integration_commit
+                ),
+            ));
+        }
+        unrecorded_resolutions.insert(resolution.integration_commit.clone(), resolution);
+    }
+
     Ok(Some(LoadedOperatorResolutions {
         path: path_label,
         operator: operator.to_string(),
         resolutions,
+        unrecorded_resolutions,
     }))
+}
+
+fn validate_unrecorded_resolutions(
+    repo: &crate::git::GitRepo,
+    loaded: Option<&LoadedOperatorResolutions>,
+    plan: &mut IntegrationReconcilePlan,
+    upstream_head: &str,
+) -> Result<Vec<String>, BrokerOpError> {
+    let unrecorded: BTreeSet<String> = plan
+        .commits
+        .iter()
+        .filter(|commit| {
+            commit.origin == IntegrationReconcileCommitOrigin::UnrecordedIntegrationCommit
+        })
+        .map(|commit| commit.commit.clone())
+        .collect();
+    let Some(loaded) = loaded else {
+        return Ok(unrecorded.into_iter().collect());
+    };
+    for commit in loaded.unrecorded_resolutions.keys() {
+        if !unrecorded.contains(commit) {
+            return Err(invalid_resolution(
+                &loaded.path,
+                format!(
+                    "unrecorded integration commit {commit} is not present in the current reconciliation plan"
+                ),
+            ));
+        }
+    }
+
+    let mut missing = Vec::new();
+    for commit in plan.commits.iter_mut().filter(|commit| {
+        commit.origin == IntegrationReconcileCommitOrigin::UnrecordedIntegrationCommit
+    }) {
+        let Some(resolution) = loaded.unrecorded_resolutions.get(&commit.commit) else {
+            missing.push(commit.commit.clone());
+            continue;
+        };
+        match resolution.disposition {
+            IntegrationReconcileUnrecordedDisposition::PreserveAndReplay => {
+                if resolution.upstream_commit.is_some() {
+                    return Err(invalid_resolution(
+                        &loaded.path,
+                        format!(
+                            "unrecorded integration commit {} uses preserve_and_replay and must not name upstream_commit",
+                            commit.commit
+                        ),
+                    ));
+                }
+            }
+            IntegrationReconcileUnrecordedDisposition::ReplacedByExactUpstreamSha => {
+                let Some(replacement) = resolution.upstream_commit.as_deref() else {
+                    return Err(invalid_resolution(
+                        &loaded.path,
+                        format!(
+                            "unrecorded integration commit {} uses replaced_by_exact_upstream_sha and must name upstream_commit",
+                            commit.commit
+                        ),
+                    ));
+                };
+                if replacement.len() != 40
+                    || !replacement.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || !repo.is_ancestor(replacement, upstream_head)
+                {
+                    return Err(invalid_resolution(
+                        &loaded.path,
+                        format!(
+                            "unrecorded integration commit {} replacement {} is not one exact full SHA reachable from current upstream {}",
+                            commit.commit, replacement, upstream_head
+                        ),
+                    ));
+                }
+            }
+            IntegrationReconcileUnrecordedDisposition::DropBecauseContentEmpty => {
+                if !commit.content_empty {
+                    return Err(invalid_resolution(
+                        &loaded.path,
+                        format!(
+                            "unrecorded integration commit {} is not content-empty and cannot use drop_because_content_empty",
+                            commit.commit
+                        ),
+                    ));
+                }
+                if resolution.upstream_commit.is_some() {
+                    return Err(invalid_resolution(
+                        &loaded.path,
+                        format!(
+                            "unrecorded integration commit {} uses drop_because_content_empty and must not name upstream_commit",
+                            commit.commit
+                        ),
+                    ));
+                }
+            }
+        }
+        commit.unrecorded_resolution = Some(IntegrationReconcileUnrecordedResolutionAudit {
+            disposition: resolution.disposition,
+            upstream_commit: resolution.upstream_commit.clone(),
+            operator: loaded.operator.clone(),
+            reason: resolution.reason.trim().to_string(),
+            resolution_file: loaded.path.clone(),
+        });
+    }
+    Ok(missing)
 }
 
 fn validate_resolution_candidates(

@@ -98,7 +98,8 @@ pub use reconciliation::{
     IntegrationReconcileClassification, IntegrationReconcileCommit,
     IntegrationReconcileCommitOrigin, IntegrationReconcileEntry, IntegrationReconcileEquivalence,
     IntegrationReconcileOptions, IntegrationReconcilePlan, IntegrationReconcileReport,
-    IntegrationReconcileResolutionAudit,
+    IntegrationReconcileResolutionAudit, IntegrationReconcileUnrecordedDisposition,
+    IntegrationReconcileUnrecordedResolutionAudit,
 };
 pub use report::{
     InvalidReportEntry, PreparedReport, REPORT_DOCUMENT_SCHEMA_VERSION, REPORT_FILINGS_FILENAME,

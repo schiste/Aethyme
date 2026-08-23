@@ -259,6 +259,114 @@ fn reconciliation_plan_classifies_every_relevant_commit_with_full_provenance() {
 }
 
 #[test]
+fn reviewed_unrecorded_resolutions_are_commit_bound_and_never_blanket_discards() {
+    let fixture = DeployDivergenceFixture::new();
+    let resolution_path = fixture.repo.join("resolution.json");
+    let resolution = |disposition: &str, upstream_commit: Option<&str>| {
+        serde_json::json!({
+            "schema_version": 2,
+            "upstream_ref": "origin/main",
+            "upstream_commit": fixture.upstream_head,
+            "old_integration": fixture.old_integration,
+            "operator": "release-operator@example.test",
+            "unrecorded_resolutions": [
+                {
+                    "integration_commit": fixture.unrecorded_commit,
+                    "disposition": disposition,
+                    "upstream_commit": upstream_commit,
+                    "reason": "reviewed the deploy-written changelog replacement"
+                }
+            ]
+        })
+    };
+
+    std::fs::write(
+        &resolution_path,
+        serde_json::to_vec_pretty(&resolution("preserve_and_replay", None)).unwrap(),
+    )
+    .unwrap();
+    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let preserved = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: Some(resolution_path.clone()),
+        })
+        .unwrap();
+    let reviewed = preserved
+        .plan
+        .commits
+        .iter()
+        .find(|commit| commit.commit == fixture.unrecorded_commit)
+        .unwrap()
+        .unrecorded_resolution
+        .as_ref()
+        .unwrap();
+    assert_eq!(reviewed.disposition.as_str(), "preserve_and_replay");
+    assert!(reviewed.upstream_commit.is_none());
+    assert!(
+        preserved
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("validated reviewed dispositions"))
+    );
+
+    std::fs::write(
+        &resolution_path,
+        serde_json::to_vec_pretty(&resolution(
+            "replaced_by_exact_upstream_sha",
+            Some(&fixture.upstream_head),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let replaced = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: Some(resolution_path.clone()),
+        })
+        .unwrap();
+    let reviewed = replaced
+        .plan
+        .commits
+        .iter()
+        .find(|commit| commit.commit == fixture.unrecorded_commit)
+        .unwrap()
+        .unrecorded_resolution
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        reviewed.disposition.as_str(),
+        "replaced_by_exact_upstream_sha"
+    );
+    assert_eq!(
+        reviewed.upstream_commit.as_deref(),
+        Some(fixture.upstream_head.as_str())
+    );
+
+    for disposition in ["drop_because_content_empty", "discard_unknown_work"] {
+        std::fs::write(
+            &resolution_path,
+            serde_json::to_vec_pretty(&resolution(disposition, None)).unwrap(),
+        )
+        .unwrap();
+        let error = broker
+            .reconcile_integration(IntegrationReconcileOptions {
+                upstream: "origin/main".into(),
+                apply: false,
+                resolution_file: Some(resolution_path.clone()),
+            })
+            .unwrap_err();
+        if disposition == "drop_because_content_empty" {
+            assert!(error.to_string().contains("is not content-empty"));
+        } else {
+            assert!(error.to_string().contains("invalid JSON"));
+        }
+    }
+}
+
+#[test]
 fn deploy_written_main_divergence_is_blocked_by_unrecorded_integration_work() {
     let fixture = DeployDivergenceFixture::new();
     assert_eq!(
