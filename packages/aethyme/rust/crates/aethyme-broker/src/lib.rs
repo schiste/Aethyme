@@ -28,6 +28,7 @@ pub mod events;
 mod gates;
 mod git;
 mod graph_impact;
+mod homebrew;
 pub mod hooks;
 pub mod init;
 mod issue_form;
@@ -72,6 +73,7 @@ pub use graph_impact::{
     GraphImpactLookup, GraphImpactProvider, GraphImpactQuery, GraphImpactStatus,
     GraphStoreImpactProvider,
 };
+pub use homebrew::render_homebrew_formula;
 pub use hooks::{HookReport, HookState, HooksError};
 pub use issue_form::{
     ISSUE_FORM_RENDER_SCHEMA_VERSION, ISSUE_REVIEW_ARTIFACT_SCHEMA_VERSION, IssueFormFieldKind,
