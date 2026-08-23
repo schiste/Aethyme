@@ -82,7 +82,21 @@ one-time compile.
 First-time flow: install -> `aethyme init` -> `aethyme broker quick-test` ->
 `aethyme broker start --task "..."` -> `aethyme broker submit --session <id>`.
 
-**1. Install the latest stable binary pair:**
+**1. Install the latest stable binary pair with Homebrew:**
+
+```bash
+brew install schiste/tap/aethyme
+aethyme --version
+aethyme-engine-cli --version
+```
+
+Homebrew installs both executables from one checksummed platform archive.
+Future stable updates use the familiar `brew update` then
+`brew upgrade aethyme` flow. This is a third-party tap: direct formula
+installation trusts only `schiste/tap/aethyme`, while trusting the entire tap
+would extend that boundary to every formula and command it may contain.
+
+On a supported system without Homebrew, use the signed-manifest installer:
 
 ```bash
 curl -fsSL https://github.com/schiste/Aethyme/releases/latest/download/install.sh | sh
@@ -90,11 +104,12 @@ aethyme --version
 aethyme-engine-cli --version
 ```
 
-The installer discovers the stable channel through its signed release manifest,
+The installer discovers the stable channel through its release manifest,
 verifies the selected archive checksum and contents, and installs both required
-binaries together under `~/.local/bin` by default. Re-run the same command to
-update; pass `--version` or `--install-dir` after `sh -s --` to pin a release or
-destination. Aethyme never updates silently in the background. See the
+binaries together under `~/.local/bin` by default. Pass `--version` or
+`--install-dir` after `sh -s --` to pin a release or destination. Aethyme never
+updates silently in the background. Cargo installation is retained for
+contributors and unsupported targets, not as the primary quickstart. See the
 [v0.2.0 upgrade and rollback guide](packages/aethyme/docs/guides/upgrading-to-v0.2.0.md)
 for signature verification, source installation, migrations, and rollback.
 

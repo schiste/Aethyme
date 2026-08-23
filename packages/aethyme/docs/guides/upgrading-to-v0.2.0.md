@@ -40,7 +40,21 @@ is a derived local artifact rebuilt from committed `.aethyme/graph/` fragments.
 
 ## Install or update
 
-The shortest stable-channel path is:
+The primary stable-channel path for early macOS and Linux users is Homebrew:
+
+```bash
+brew install schiste/tap/aethyme
+# Later:
+brew update
+brew upgrade aethyme
+```
+
+The formula selects one platform archive and installs both required binaries
+from it. `schiste/tap` is a third-party source outside `homebrew/core`. Direct
+formula installation trusts only `schiste/tap/aethyme`; trusting the whole tap
+is a broader choice that is unnecessary for Aethyme.
+
+The portable installer path is:
 
 ```bash
 curl -fsSL https://github.com/schiste/Aethyme/releases/latest/download/install.sh | sh
@@ -66,7 +80,8 @@ before trusting the manifest. The manifest then authenticates the installer
 and archive digests. Without that flag, archive checksum and contents
 verification are still mandatory.
 
-Source installation remains available when a prebuilt target is unavailable:
+Source installation remains a contributor fallback when a prebuilt target is
+unavailable:
 
 ```bash
 git switch --detach v0.2.0
@@ -123,7 +138,8 @@ saved binaries or a source checkout.
 ## Known issues
 
 - Windows and Linux ARM archives are not published in v0.2.0.
-- There is no silent or scheduled updater; users explicitly rerun the stable
+- There is no silent or scheduled updater; Homebrew users explicitly run
+  `brew upgrade aethyme`, while installer users explicitly rerun the stable
   installer or pin a version.
 - `aethyme broker doctor --fix-version` repairs source-checkout drift from the
   local integration ref. It is not the public GitHub release updater.
