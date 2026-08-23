@@ -5,6 +5,7 @@
 //! enter a snapshot through generic serialization or JSON pass-through.
 
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Component, Path};
 
@@ -20,13 +21,17 @@ use crate::version::BinaryBuild;
 
 pub const REPORT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub const REPORT_DOCUMENT_SCHEMA_VERSION: u32 = 1;
+pub const REPORT_INVENTORY_SCHEMA_VERSION: u32 = 1;
+pub const REPORT_FILINGS_SCHEMA_VERSION: u32 = 1;
+pub const REPORT_FILINGS_FILENAME: &str = ".filings.json";
+pub const REPORT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 pub const REPORT_RECENT_EVENT_LIMIT: usize = 20;
 pub const REPORT_RECENT_OPERATION_LIMIT: usize = 20;
 pub const REPORT_RECENT_GATE_LIMIT: usize = 20;
 
 /// User-facing report category. The spelling is part of the capture and
 /// future filing contract, so it is deliberately narrower than free text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReportKind {
     Bug,
@@ -62,6 +67,10 @@ pub enum ReportCaptureError {
     InvalidOutput(String),
     #[error("report destination already exists: {0}")]
     DestinationExists(String),
+    #[error("captured report not found: {0}")]
+    ReportNotFound(String),
+    #[error("invalid captured report {path}: {reason}")]
+    InvalidReport { path: String, reason: String },
     #[error("report directory must not be a symbolic link: {0}")]
     SymlinkedReportDirectory(String),
     #[error("report serialization: {0}")]
@@ -79,7 +88,7 @@ pub enum ReportCaptureError {
 
 /// Complete, reviewable offline artifact. The title and kind are explicit
 /// user input; all diagnostic data comes through F1's allowlist snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReportDocument {
     pub schema_version: u32,
     pub kind: ReportKind,
@@ -106,6 +115,357 @@ pub struct ReportCaptureResult {
     pub path: Option<String>,
     pub sha256: String,
     pub bytes: usize,
+}
+
+/// Stable filed/unfiled state exposed by report inventory commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportFilingState {
+    Unfiled,
+    Filed,
+}
+
+/// Stable v1 summary shared by `report list --json` and `report show --json`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReportSummary {
+    pub path: String,
+    pub title: String,
+    pub captured_at: i64,
+    pub kind: ReportKind,
+    /// Aethyme binary version recorded in the report snapshot.
+    pub version: String,
+    pub report_schema_version: u32,
+    /// Lowercase SHA-256 of the exact current artifact bytes.
+    pub digest: String,
+    pub filing_state: ReportFilingState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct InvalidReportEntry {
+    pub path: String,
+    pub error: String,
+}
+
+/// Stable v1 JSON output of `report list`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReportList {
+    pub schema_version: u32,
+    pub reports: Vec<ReportSummary>,
+    pub invalid: Vec<InvalidReportEntry>,
+}
+
+/// Stable v1 JSON output of `report show`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReportInspection {
+    pub schema_version: u32,
+    pub summary: ReportSummary,
+    pub report: ReportDocument,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReportFilingIndex {
+    schema_version: u32,
+    filings: BTreeMap<String, serde_json::Value>,
+}
+
+/// List captured reports without mutating report bytes, filing state, or
+/// broker telemetry. Invalid artifacts are reported alongside valid ones.
+pub fn list_reports(main_root: &Path) -> Result<ReportList, ReportCaptureError> {
+    let reports_root = main_root.join(".aethyme/reports");
+    ensure_safe_reports_directory(&reports_root)?;
+    if !reports_root.exists() {
+        return Ok(ReportList {
+            schema_version: REPORT_INVENTORY_SCHEMA_VERSION,
+            reports: Vec::new(),
+            invalid: Vec::new(),
+        });
+    }
+    let filed_digests = load_filed_digests(&reports_root)?;
+    let entries = std::fs::read_dir(&reports_root).map_err(|source| ReportCaptureError::Io {
+        action: "read report directory",
+        path: ".aethyme/reports".into(),
+        source,
+    })?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| ReportCaptureError::Io {
+            action: "read report directory entry",
+            path: ".aethyme/reports".into(),
+            source,
+        })?;
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name != REPORT_FILINGS_FILENAME && !name.starts_with(".report-"))
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+
+    let mut reports = Vec::new();
+    let mut invalid = Vec::new();
+    for path in paths {
+        let relative = report_relative_path(&path);
+        match read_report(&path, &relative, &filed_digests) {
+            Ok((summary, _)) => reports.push(summary),
+            Err(error) => invalid.push(InvalidReportEntry {
+                path: relative,
+                error: inventory_error_message(&error),
+            }),
+        }
+    }
+    reports.sort_by(|left, right| {
+        right
+            .captured_at
+            .cmp(&left.captured_at)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    invalid.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(ReportList {
+        schema_version: REPORT_INVENTORY_SCHEMA_VERSION,
+        reports,
+        invalid,
+    })
+}
+
+/// Inspect one captured report selected by filename or its canonical
+/// repository-relative report path.
+pub fn show_report(
+    main_root: &Path,
+    requested: &Path,
+) -> Result<ReportInspection, ReportCaptureError> {
+    let reports_root = main_root.join(".aethyme/reports");
+    ensure_safe_reports_directory(&reports_root)?;
+    let filename = report_filename(requested)?;
+    let relative = format!(".aethyme/reports/{filename}");
+    let path = reports_root.join(filename);
+    if !path.exists() {
+        return Err(ReportCaptureError::ReportNotFound(relative));
+    }
+    let filed_digests = load_filed_digests(&reports_root)?;
+    let (summary, report) = read_report(&path, &relative, &filed_digests)?;
+    Ok(ReportInspection {
+        schema_version: REPORT_INVENTORY_SCHEMA_VERSION,
+        summary,
+        report,
+    })
+}
+
+fn ensure_safe_reports_directory(reports_root: &Path) -> Result<(), ReportCaptureError> {
+    if std::fs::symlink_metadata(reports_root)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(ReportCaptureError::SymlinkedReportDirectory(
+            ".aethyme/reports".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_filed_digests(reports_root: &Path) -> Result<BTreeSet<String>, ReportCaptureError> {
+    let path = reports_root.join(REPORT_FILINGS_FILENAME);
+    let relative = format!(".aethyme/reports/{REPORT_FILINGS_FILENAME}");
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(source) => {
+            return Err(ReportCaptureError::Io {
+                action: "inspect report filing index",
+                path: relative,
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ReportCaptureError::InvalidReport {
+            path: relative,
+            reason: "filing index must be a regular file".into(),
+        });
+    }
+    if metadata.len() > REPORT_MAX_BYTES {
+        return Err(ReportCaptureError::InvalidReport {
+            path: relative,
+            reason: format!("filing index exceeds {REPORT_MAX_BYTES} bytes"),
+        });
+    }
+    let bytes = std::fs::read(&path).map_err(|source| ReportCaptureError::Io {
+        action: "read report filing index",
+        path: relative.clone(),
+        source,
+    })?;
+    let index = serde_json::from_slice::<ReportFilingIndex>(&bytes).map_err(|_| {
+        ReportCaptureError::InvalidReport {
+            path: relative.clone(),
+            reason: "invalid filing index JSON or schema shape".into(),
+        }
+    })?;
+    if index.schema_version != REPORT_FILINGS_SCHEMA_VERSION {
+        return Err(ReportCaptureError::InvalidReport {
+            path: relative,
+            reason: format!(
+                "unsupported filing index schema {}; expected {}",
+                index.schema_version, REPORT_FILINGS_SCHEMA_VERSION
+            ),
+        });
+    }
+    let mut digests = BTreeSet::new();
+    for digest in index.filings.into_keys() {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ReportCaptureError::InvalidReport {
+                path: format!(".aethyme/reports/{REPORT_FILINGS_FILENAME}"),
+                reason: "filing index contains an invalid digest key".into(),
+            });
+        }
+        digests.insert(digest);
+    }
+    Ok(digests)
+}
+
+fn read_report(
+    path: &Path,
+    relative: &str,
+    filed_digests: &BTreeSet<String>,
+) -> Result<(ReportSummary, ReportDocument), ReportCaptureError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| ReportCaptureError::Io {
+        action: "inspect captured report",
+        path: relative.to_string(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ReportCaptureError::InvalidReport {
+            path: relative.to_string(),
+            reason: "captured report must be a regular file".into(),
+        });
+    }
+    if metadata.len() > REPORT_MAX_BYTES {
+        return Err(ReportCaptureError::InvalidReport {
+            path: relative.to_string(),
+            reason: format!("artifact exceeds {REPORT_MAX_BYTES} bytes"),
+        });
+    }
+    let bytes = std::fs::read(path).map_err(|source| ReportCaptureError::Io {
+        action: "read captured report",
+        path: relative.to_string(),
+        source,
+    })?;
+    let digest = sha256_hex(&bytes);
+    let report = serde_json::from_slice::<ReportDocument>(&bytes).map_err(|_| {
+        ReportCaptureError::InvalidReport {
+            path: relative.to_string(),
+            reason: "invalid report JSON or schema shape".into(),
+        }
+    })?;
+    if report.schema_version != REPORT_DOCUMENT_SCHEMA_VERSION {
+        return Err(ReportCaptureError::InvalidReport {
+            path: relative.to_string(),
+            reason: format!(
+                "unsupported report schema {}; expected {}",
+                report.schema_version, REPORT_DOCUMENT_SCHEMA_VERSION
+            ),
+        });
+    }
+    if report.snapshot.schema_version != REPORT_SNAPSHOT_SCHEMA_VERSION {
+        return Err(ReportCaptureError::InvalidReport {
+            path: relative.to_string(),
+            reason: format!(
+                "unsupported snapshot schema {}; expected {}",
+                report.snapshot.schema_version, REPORT_SNAPSHOT_SCHEMA_VERSION
+            ),
+        });
+    }
+    validate_report_document(&report, relative)?;
+    let summary = ReportSummary {
+        path: relative.to_string(),
+        title: report.title.clone(),
+        captured_at: report.captured_at,
+        kind: report.kind,
+        version: report.snapshot.build.version.clone(),
+        report_schema_version: report.schema_version,
+        filing_state: if filed_digests.contains(&digest) {
+            ReportFilingState::Filed
+        } else {
+            ReportFilingState::Unfiled
+        },
+        digest,
+    };
+    Ok((summary, report))
+}
+
+fn validate_report_document(
+    report: &ReportDocument,
+    relative: &str,
+) -> Result<(), ReportCaptureError> {
+    let invalid = |reason: String| ReportCaptureError::InvalidReport {
+        path: relative.to_string(),
+        reason,
+    };
+    validate_title(&report.title).map_err(|error| invalid(error.to_string()))?;
+    if report.captured_at < 0 {
+        return Err(invalid("captured_at must be non-negative".into()));
+    }
+    if report.snapshot.recent_event_types.len() > REPORT_RECENT_EVENT_LIMIT
+        || report.snapshot.operations.len() > REPORT_RECENT_OPERATION_LIMIT
+        || report.snapshot.gates.len() > REPORT_RECENT_GATE_LIMIT
+    {
+        return Err(invalid("snapshot exceeds report collection bounds".into()));
+    }
+    if report
+        .snapshot
+        .recent_event_types
+        .iter()
+        .any(|event| !is_safe_event_kind(&event.kind))
+    {
+        return Err(invalid("snapshot contains an invalid event kind".into()));
+    }
+    if report
+        .snapshot
+        .gates
+        .iter()
+        .filter_map(|gate| gate.triggered_by.as_deref())
+        .any(|path| !is_safe_repo_relative(path))
+    {
+        return Err(invalid(
+            "snapshot contains a non-repository-relative trigger path".into(),
+        ));
+    }
+    if !report.snapshot.includes_task
+        && (report
+            .snapshot
+            .session
+            .as_ref()
+            .is_some_and(|session| session.task.is_some())
+            || report
+                .snapshot
+                .operations
+                .iter()
+                .any(|operation| operation.authorization_reason.is_some()))
+    {
+        return Err(invalid(
+            "snapshot contains task text without includes_task opt-in".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn report_relative_path(path: &Path) -> String {
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    format!(".aethyme/reports/{filename}")
+}
+
+fn inventory_error_message(error: &ReportCaptureError) -> String {
+    match error {
+        ReportCaptureError::InvalidReport { reason, .. } => reason.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// Gather local broker state and finalize one report without network, Git,
@@ -290,7 +650,12 @@ fn report_filename(path: &Path) -> Result<String, ReportCaptureError> {
             path.to_string_lossy().into_owned(),
         ));
     };
-    if name.is_empty() || name == "." || name == ".." {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name == REPORT_FILINGS_FILENAME
+        || name.starts_with(".report-")
+    {
         return Err(ReportCaptureError::InvalidOutput(
             path.to_string_lossy().into_owned(),
         ));
@@ -550,7 +915,7 @@ impl<'a> ReportSnapshotBuilder<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReportSnapshot {
     pub schema_version: u32,
     pub includes_task: bool,
@@ -563,19 +928,19 @@ pub struct ReportSnapshot {
     pub last_known_failure: Option<ReportLastFailure>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReportBuild {
     pub version: String,
     pub commit: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReportPlatform {
     pub os: String,
     pub arch: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReportSession {
     pub id: i64,
     pub branch: String,
@@ -586,7 +951,7 @@ pub struct ReportSession {
     pub task: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReportEventType {
     pub id: i64,
     pub recorded_at: i64,
@@ -594,7 +959,7 @@ pub struct ReportEventType {
     pub session_id: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReportOperation {
     pub id: i64,
     pub session_id: i64,
@@ -609,14 +974,14 @@ pub struct ReportOperation {
     pub authorization_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReportGateCacheSource {
     Executed,
     CacheHit,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReportGateProvenance {
     pub gate: String,
     pub tree_hash: String,
@@ -630,7 +995,7 @@ pub struct ReportGateProvenance {
     pub triggered_by: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum ReportLastFailure {
     Session {
@@ -1173,6 +1538,8 @@ mod tests {
             Path::new("/tmp/report.json"),
             Path::new("nested/report.json"),
             Path::new(".aethyme/reports/nested/report.json"),
+            Path::new(".filings.json"),
+            Path::new(".report-temporary"),
         ] {
             assert!(matches!(
                 report_filename(unsafe_path),

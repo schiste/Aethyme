@@ -51,6 +51,8 @@ product surface.
 - `aethyme broker finish`
 - `aethyme broker handoff`
 - `aethyme broker report capture`
+- `aethyme broker report list`
+- `aethyme broker report show`
 - `aethyme broker ship plan`
 - `aethyme broker ship execute`
 - `aethyme broker integration status`
@@ -113,6 +115,8 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker finish --session <id> [--json]`
 - `aethyme broker handoff (--session <id> | --worktree <path>) [--json]`
 - `aethyme broker report capture --kind <bug|improvement> --title <text> [--session <id>] [--include-task] [--stdout | --output <filename>] [--json]`
+- `aethyme broker report list [--json]`
+- `aethyme broker report show <filename> [--json]`
 - `aethyme broker ship plan --entry <id> [--json]`
 - `aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--json]`
 - `aethyme broker integration status [--json]`
@@ -248,6 +252,30 @@ payloads are excluded. Task text and coordinated-operation authorization
 reasons appear only with explicit `--include-task`. `--stdout` and `--json`
 are intentionally mutually exclusive because stdout is already the report's
 JSON byte stream.
+
+Inspect the local report inventory without changing broker or report state:
+
+```bash
+aethyme broker report list
+aethyme broker report list --json
+aethyme broker report show reviewed.json
+aethyme broker report show .aethyme/reports/reviewed.json --json
+```
+
+List ordering is deterministic: valid reports are newest-first by
+`captured_at`, then by repository-relative path; invalid entries are sorted by
+path and do not hide valid artifacts. Both stable JSON surfaces include schema
+version 1, the current exact-byte SHA-256 digest, capture time, report kind,
+capturing Aethyme version, and `filed`/`unfiled` state. Show additionally
+returns the parsed allowlist-only report document.
+
+Filing state is read from the hidden local `.aethyme/reports/.filings.json`
+index by digest, never by filename. A missing index means every report is
+unfiled. Renaming a report preserves state; changing its bytes produces a new
+digest and therefore returns it to unfiled. List reports corrupt, unsupported,
+oversized, non-file, or symlinked artifacts in `invalid`; show fails closed
+when its selected artifact has any of those conditions. Neither command opens
+or creates the broker database, appends telemetry, or contacts external state.
 
 Promotion only advances the local integration ref. Use `broker ship plan` to
 inspect the promoted queue entry, exact integration SHA, remote freshness,
