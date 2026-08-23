@@ -432,17 +432,24 @@ fn check_git_version() -> Check {
         .to_string();
     let mut parts = version.split('.').filter_map(|p| p.parse::<u32>().ok());
     let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
-    if major > 2 || (major == 2 && minor >= 38) {
+    let minimum = crate::release_compatibility::minimum_git_version_parts();
+    if (major, minor) >= minimum {
         Check {
             id: "certify.git-version",
             status: CheckStatus::Pass,
-            detail: format!("git {version} (≥ 2.38 required for merge simulation)"),
+            detail: format!(
+                "git {version} (≥ {} required for merge simulation)",
+                crate::MINIMUM_GIT_VERSION
+            ),
         }
     } else {
         Check {
             id: "certify.git-version",
             status: CheckStatus::Fail,
-            detail: format!("git {version} — merge simulation needs git ≥ 2.38"),
+            detail: format!(
+                "git {version} — merge simulation needs git ≥ {}",
+                crate::MINIMUM_GIT_VERSION
+            ),
         }
     }
 }

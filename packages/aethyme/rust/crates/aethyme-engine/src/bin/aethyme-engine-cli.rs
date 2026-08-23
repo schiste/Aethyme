@@ -75,6 +75,10 @@ fn run() -> Result<(), String> {
     // `--no-fragments` errors because the rollback path is gone.
     let fragment_mode = FragmentBuildMode::from_flags(no_fragments, legacy_from_fragments)?;
     let command = args.remove(0);
+    if matches!(command.as_str(), "-V" | "--version") {
+        print_version();
+        return Ok(());
+    }
     match command.as_str() {
         "daemon" => return run_daemon_subcommand(&args, no_cache, fragment_mode),
         "explore" => return run_explore_via_shared_cli(&args),
@@ -764,6 +768,18 @@ fn run() -> Result<(), String> {
         other => return Err(format!("unsupported command: {other}")),
     }
     Ok(())
+}
+
+fn print_version() {
+    let describe = env!("AETHYME_GIT_DESCRIBE");
+    if describe.is_empty() {
+        println!("aethyme-engine-cli {}", env!("CARGO_PKG_VERSION"));
+    } else {
+        println!(
+            "aethyme-engine-cli {} ({describe})",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
 }
 
 fn run_verify_targets_via_shared_cli(args: &[String]) -> Result<(), String> {

@@ -1,6 +1,6 @@
 [package]
 name = "aethyme-cli"
-version = "0.1.5"
+version.workspace = true
 edition = "2024"
 description = "The aethyme router binary — single entrypoint for agents. Owns the app shell (native dispatch to engine/broker/enhance, Python delegation for unflipped groups); moved out of aethyme-engine (retirement plan Phase 1 item 1) so the engine lib no longer carries broker/enhance deps for the bin's sake."
 

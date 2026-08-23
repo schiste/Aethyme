@@ -234,10 +234,10 @@ Usage:
       any gate ran, overlaps warned.
   aethyme broker doctor [--fix-version] [--json]
       Health checks: database integrity, sessions whose worktree is
-      gone, orphaned gate pidfiles, and stale local CLI builds when run
+      gone, orphaned gate pidfiles, and stale local product binaries when run
       inside the Aethyme source checkout. --fix-version is explicit and
-      source-checkout-only: when the running CLI is behind integration,
-      reinstall it from a temporary integration worktree.
+      source-checkout-only: when the running CLI is behind integration, install
+      and verify both aethyme and aethyme-engine-cli from that exact revision.
   aethyme broker quick-test [--chau7] [--with-gate] [--json]
       Disposable first-run smoke: creates a temporary git repo, runs init,
       adopt, commit, submit, verifies promotion, and removes the repo.
@@ -3637,10 +3637,24 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         repair.message
                     );
                     if repair.attempted {
-                        println!("  command: {}", repair.command.join(" "));
                         println!("  duration: {}ms", repair.duration_ms);
                         if let Some(code) = repair.exit_code {
                             println!("  exit: {code}");
+                        }
+                        for step in &repair.steps {
+                            println!(
+                                "  {} {}: {}",
+                                step.component,
+                                step.action,
+                                if step.success { "pass" } else { "fail" }
+                            );
+                            println!("    command: {}", step.command.join(" "));
+                            if let Some(code) = step.exit_code {
+                                println!("    exit: {code}");
+                            }
+                        }
+                        if repair.steps.is_empty() {
+                            println!("  command: {}", repair.command.join(" "));
                         }
                     }
                     if !repair.stdout_tail.is_empty() {

@@ -37,6 +37,7 @@ mod operations;
 mod pr;
 mod quick_test;
 mod reconciliation;
+mod release_compatibility;
 mod report;
 mod report_filing;
 mod schema;
@@ -58,7 +59,7 @@ pub use broker::{
     RepairAction, RepairGateSelection, RepairReport, RepairSource, SemanticGateAdvice,
     SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus,
     SemanticGateSuggestionChain, SessionHandoffReport, StatusAdvice, StatusAdviceSeverity,
-    StatusIntegrationRelation, StatusSummary, StatusView, VersionRepairReport,
+    StatusIntegrationRelation, StatusSummary, StatusView, VersionRepairReport, VersionRepairStep,
 };
 pub use error::BrokerError;
 pub use gates::{
@@ -100,6 +101,10 @@ pub use reconciliation::{
     IntegrationReconcileOptions, IntegrationReconcilePlan, IntegrationReconcileReport,
     IntegrationReconcileResolutionAudit, IntegrationReconcileUnrecordedDisposition,
     IntegrationReconcileUnrecordedResolutionAudit,
+};
+pub use release_compatibility::{
+    BROKER_STORAGE_CURRENT_SCHEMA, BROKER_STORAGE_MINIMUM_SCHEMA, ENGINE_PROTOCOL_VERSION,
+    MINIMUM_GIT_VERSION,
 };
 pub use report::{
     InvalidReportEntry, PreparedReport, REPORT_DOCUMENT_SCHEMA_VERSION, REPORT_FILINGS_FILENAME,

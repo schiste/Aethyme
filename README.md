@@ -74,22 +74,29 @@ execution, auth, or team sync is part of the product. Direction doc:
 
 ## Quickstart: install -> init -> quick-test -> start -> submit
 
-Prerequisites: git ≥ 2.38, a Rust toolchain, ~2 GB free RAM for the one-time compile (the bundled SQLite build is memory-hungry; small VMs/containers may OOM — prebuilt release binaries avoid the compile entirely), and any repo to try it on.
+Prerequisites: git ≥ 2.38 and any repository to try it on. Prebuilt releases
+support Apple Silicon macOS, Intel macOS, and x86-64 Linux. Building from
+source additionally needs a Rust toolchain and about 2 GB of free RAM for the
+one-time compile.
 
 First-time flow: install -> `aethyme init` -> `aethyme broker quick-test` ->
 `aethyme broker start --task "..."` -> `aethyme broker submit --session <id>`.
 
-**1. Install the binary** (from a clone of this repository):
+**1. Install the latest stable binary pair:**
 
 ```bash
-cargo install --path packages/aethyme/rust/crates/aethyme-cli
-cargo install --path packages/aethyme/rust/crates/aethyme-engine  # engine-daemon sibling
+curl -fsSL https://github.com/schiste/Aethyme/releases/latest/download/install.sh | sh
+aethyme --version
+aethyme-engine-cli --version
 ```
 
-Releases do not auto-update existing installations. To upgrade, check out the
-desired release and rerun both `cargo install --path` commands above, then run
-`aethyme --version`. The router and engine-daemon sibling should be upgraded
-together; Aethyme does not silently mutate installed binaries in the background.
+The installer discovers the stable channel through its signed release manifest,
+verifies the selected archive checksum and contents, and installs both required
+binaries together under `~/.local/bin` by default. Re-run the same command to
+update; pass `--version` or `--install-dir` after `sh -s --` to pin a release or
+destination. Aethyme never updates silently in the background. See the
+[v0.2.0 upgrade and rollback guide](packages/aethyme/docs/guides/upgrading-to-v0.2.0.md)
+for signature verification, source installation, migrations, and rollback.
 
 **2. Certify and scaffold your target repo:**
 
@@ -213,8 +220,8 @@ see the tower actually direct traffic.
 - `packages/aethyme/rust`: the Rust workspace — `aethyme-engine` (graph
   engine + the `aethyme` router binary), `aethyme-broker` (the broker
   library and CLI), and the graph schema/storage/indexer crates.
-- `packages/aethyme`: the Python package (indexing, search, task context;
-  the Rust router delegates non-broker commands to it). See
+- `packages/aethyme`: the 100% Rust product package (broker, graph indexing,
+  search, task context, enhance, and quality tooling). See
   [`packages/aethyme/README.md`](packages/aethyme/README.md) and
   [`packages/aethyme/rust/README.md`](packages/aethyme/rust/README.md).
 - `docs`: project-level direction and contracts
