@@ -186,7 +186,7 @@ fn pre_commit_gate_blocks_failing_commit_and_passes_clean_one() {
         r#"
 [[gate]]
 name = "py-content"
-command = "grep -q ok src/app.py"
+command = "printf 'gate stdout one\\ngate stdout two\\n'; printf 'gate stderr one\\ngate stderr two\\n' >&2; grep -q ok src/app.py || exit 7"
 cost = 1
 triggers = ["**/*.py"]
 
@@ -205,10 +205,33 @@ triggers = ["**/*.py"]
     let head_before = head_commit(tmp.path());
     std::fs::write(tmp.path().join("src/app.py"), "bad\n").unwrap();
     sh(tmp.path(), &["add", "src/app.py"]);
+
+    // The internal hook command preserves the gate's exit code and
+    // replays both captured streams completely before its diagnosis.
+    let direct = Command::new(SHIM)
+        .args(["broker", "hooks", "pre-commit"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(direct.status.code(), Some(7));
+    assert_eq!(
+        String::from_utf8_lossy(&direct.stdout),
+        "gate stdout one\ngate stdout two\n"
+    );
+    let direct_stderr = String::from_utf8_lossy(&direct.stderr);
+    assert!(direct_stderr.contains("gate stderr one\ngate stderr two\n"));
+    assert!(direct_stderr.contains("gate py-content failed (exit 7)"));
+    assert!(direct_stderr.contains("git commit --no-verify"));
+
     let blocked = git_output(tmp.path(), &["commit", "-qm", "broken"]);
+    let stdout = String::from_utf8_lossy(&blocked.stdout);
     let stderr = String::from_utf8_lossy(&blocked.stderr);
+    let combined = format!("{stdout}{stderr}");
     assert!(!blocked.status.success(), "failing gate blocks the commit");
+    assert!(combined.contains("gate stdout one\ngate stdout two\n"));
+    assert!(combined.contains("gate stderr one\ngate stderr two\n"));
     assert!(stderr.contains("py-content"), "names the gate: {stderr}");
+    assert!(stderr.contains("exit 7"), "preserves diagnosis: {stderr}");
     assert_eq!(head_commit(tmp.path()), head_before, "nothing committed");
 
     // Docs-only staged change → no matching gate → instant pass, even
@@ -233,6 +256,21 @@ triggers = ["**/*.py"]
         "passing cost-1 gate allows the commit (cost-2 excluded): {}",
         String::from_utf8_lossy(&fixed.stderr)
     );
+    for output in [&fixed.stdout, &fixed.stderr] {
+        let output = String::from_utf8_lossy(output);
+        assert!(
+            !output.contains("gate stdout"),
+            "success stdout leaked: {output}"
+        );
+        assert!(
+            !output.contains("gate stderr"),
+            "success stderr leaked: {output}"
+        );
+        assert!(
+            !output.contains("aethyme pre-commit"),
+            "success progress leaked: {output}"
+        );
+    }
 
     // Hooks live in the common git dir: a linked worktree gets the same
     // policy with zero per-worktree setup.
