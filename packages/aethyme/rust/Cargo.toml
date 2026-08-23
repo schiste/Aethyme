@@ -12,3 +12,6 @@ members = [
     "crates/aethyme-testkit",
 ]
 resolver = "2"
+
+[workspace.package]
+version = "0.2.0"

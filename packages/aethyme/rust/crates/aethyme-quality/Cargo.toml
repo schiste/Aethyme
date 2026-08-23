@@ -1,6 +1,6 @@
 [package]
 name = "aethyme-quality"
-version = "0.1.5"
+version.workspace = true
 edition = "2024"
 description = "The quality domain, detect and fix. Detect (retirement Phase 4, port of src/scorecard/): 8 detectors, the integer 100-point scoring engine, json/md report rendering. Fix (retirement Phase 5, port of src/autofixers/): the safety/risk engine, patch generation and application, 5 fixers, and the git/PR helper. Findings, scores, rendered reports and produced unified diffs are byte-parity with the Python implementations (parity corpus verified, volatile fields normalized)."
 
