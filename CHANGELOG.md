@@ -4,7 +4,30 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
-## [0.2.0] - Unreleased
+## [0.2.1] - 2026-08-24
+
+### Changed
+
+- Stable release formula generation now emits Homebrew-audit-clean output
+  while continuing to install both product binaries from one archive.
+
+### Fixed
+
+- Reusing an active broker session preserves its recorded submission baseline,
+  so rebased or patch-equivalent commits cannot silently disappear from the
+  ownership calculation.
+- Submission, reuse-drift reporting, and finish handoffs now derive pending
+  work from the same normalized submission plan.
+- Patch-equivalent submissions whose content is already integrated are
+  recorded as superseded without rerunning gates or creating an empty
+  promotion commit.
+
+### Upgrade notes
+
+Read [Upgrading to v0.2.1](packages/aethyme/docs/guides/upgrading-to-v0.2.1.md)
+for compatibility, verification, rollback, and known-issue guidance.
+
+## [0.2.0] - 2026-08-24
 
 ### Added
 

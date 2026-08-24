@@ -118,7 +118,7 @@ aethyme update execute --confirm <manifest-sha256>
 
 Aethyme never updates silently in the background. Cargo installation is retained for
 contributors and unsupported targets, not as the primary quickstart. See the
-[v0.2.0 upgrade and rollback guide](packages/aethyme/docs/guides/upgrading-to-v0.2.0.md)
+[v0.2.1 upgrade and rollback guide](packages/aethyme/docs/guides/upgrading-to-v0.2.1.md)
 for signature verification, source installation, migrations, and rollback.
 
 **2. Deploy Aethyme into each target repository:**
