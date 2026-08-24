@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::init::{self, CheckStatus};
 use aethyme_broker::Gate;
+use aethyme_broker::init::{self, CheckStatus};
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -214,6 +214,40 @@ fn config_schema_key_is_accepted_and_unknown_keys_warn_never_fail() {
     std::fs::write(&config, "[promote\n").unwrap();
     let report = init::certify(tmp.path()).unwrap();
     assert!(!report.certified());
+}
+
+#[test]
+fn local_scaffold_uses_runtime_state_without_touching_gitignore() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+
+    let report = init::scaffold_local(tmp.path()).unwrap();
+    assert!(report.certified());
+    assert!(tmp.path().join(".aethyme/config.toml").is_file());
+    assert!(tmp.path().join(".aethyme/broker.db").is_file());
+    assert!(!tmp.path().join(".gitignore").exists());
+    assert_eq!(
+        status_of(&report, "scaffold-local.config-toml"),
+        CheckStatus::Created
+    );
+
+    let before_activation = init::certify(tmp.path()).unwrap();
+    assert_eq!(
+        status_of(&before_activation, "certify.agents-protocol"),
+        CheckStatus::Fail
+    );
+    std::fs::create_dir_all(tmp.path().join(".aethyme/local")).unwrap();
+    std::fs::write(tmp.path().join(".aethyme/local/enabled"), "schema = 1\n").unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/local/AGENTS.md"),
+        "## Broker Coordination\n",
+    )
+    .unwrap();
+    let activated = init::certify(tmp.path()).unwrap();
+    assert_eq!(
+        status_of(&activated, "certify.agents-protocol"),
+        CheckStatus::Pass
+    );
 }
 
 #[test]

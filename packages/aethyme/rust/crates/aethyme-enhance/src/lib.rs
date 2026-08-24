@@ -18,6 +18,7 @@ pub mod cli;
 pub mod deploy;
 pub mod explore_summary_cli;
 pub mod hygiene;
+pub mod local;
 pub mod onboarding;
 pub mod pyjson;
 pub mod render;
