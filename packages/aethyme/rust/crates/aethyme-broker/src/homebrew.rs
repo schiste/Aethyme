@@ -1,6 +1,6 @@
 //! Homebrew formula rendering from the validated release manifest.
 
-use crate::{REQUIRED_RELEASE_BINARIES, ReleaseManifest};
+use crate::ReleaseManifest;
 
 const MACOS_ARM_TARGET: &str = "aarch64-apple-darwin";
 const MACOS_INTEL_TARGET: &str = "x86_64-apple-darwin";
@@ -31,7 +31,6 @@ pub fn render_homebrew_formula(
 class Aethyme < Formula
   desc "Local-first flight control for concurrent AI coding agents"
   homepage "https://github.com/{repository}"
-  version "{version}"
   license "Apache-2.0"
 
   on_macos do
@@ -67,7 +66,6 @@ class Aethyme < Formula
 end
 "##,
         repository = repository,
-        version = manifest.version,
         release_url = release_url,
         macos_arm_archive = macos_arm.archive,
         macos_arm_sha = macos_arm.sha256,
@@ -108,7 +106,10 @@ fn repository_byte(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::{RELEASE_TARGETS, ReleaseArtifact, ReleaseInstaller, ReleaseManifest};
+    use crate::{
+        RELEASE_TARGETS, REQUIRED_RELEASE_BINARIES, ReleaseArtifact, ReleaseInstaller,
+        ReleaseManifest,
+    };
 
     use super::*;
 
@@ -146,6 +147,7 @@ mod tests {
         assert!(formula.contains("bin.install \"aethyme\", \"aethyme-engine-cli\""));
         assert_eq!(formula.matches("url \"").count(), 3);
         assert_eq!(formula.matches("sha256 \"").count(), 3);
+        assert!(!formula.contains("  version \""));
         for target in RELEASE_TARGETS {
             assert!(formula.contains(&format!("aethyme-v0.2.0-{target}.tar.gz")));
         }
