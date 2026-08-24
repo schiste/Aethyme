@@ -1,41 +1,47 @@
-//! Checkout-relative paths, resolved from this crate's manifest dir.
+//! Checkout-relative paths, resolved from the runtime checkout.
 //!
-//! Tests run with an arbitrary cwd (cargo sets it to the *package* root,
-//! and suites routinely `cd` into temp repos), so every path here is
-//! derived from `CARGO_MANIFEST_DIR` rather than from cwd. This is the
-//! Rust equivalent of the pytest suites' `Path(__file__).parents[n]`
-//! idiom.
+//! Broker gates share one Cargo target directory across temporary merge
+//! worktrees. Therefore `env!("CARGO_MANIFEST_DIR")` may name the worktree
+//! that first compiled a reused test binary, not the checkout currently under
+//! test — and that old worktree may already be deleted. Prefer discovering the
+//! repository from the process cwd and retain the compiled path only as a
+//! fallback for direct test-binary invocation.
 
 use std::path::{Path, PathBuf};
 
-fn manifest_dir() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    start.ancestors().find_map(|candidate| {
+        candidate
+            .join("packages/aethyme/rust/Cargo.toml")
+            .is_file()
+            .then(|| candidate.to_path_buf())
+    })
 }
 
-fn ancestor(levels: usize) -> PathBuf {
-    let mut path = manifest_dir().to_path_buf();
-    for _ in 0..levels {
-        path = path
-            .parent()
-            .expect("checkout layout: ran out of ancestors")
-            .to_path_buf();
-    }
-    path
+fn compiled_repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(5)
+        .expect("checkout layout: ran out of ancestors")
+        .to_path_buf()
 }
 
 /// `packages/aethyme/rust` — the Cargo workspace root.
 pub fn rust_workspace_root() -> PathBuf {
-    ancestor(2)
+    repo_root().join("packages/aethyme/rust")
 }
 
 /// `packages/aethyme` — the package root (`AETHYME_ROOT`).
 pub fn package_root() -> PathBuf {
-    ancestor(3)
+    repo_root().join("packages/aethyme")
 }
 
 /// The monorepo root, which owns `.github/` and the top-level docs.
 pub fn repo_root() -> PathBuf {
-    ancestor(5)
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| find_repo_root(&cwd))
+        .unwrap_or_else(compiled_repo_root)
 }
 
 #[cfg(test)]
@@ -47,5 +53,14 @@ mod tests {
         assert!(rust_workspace_root().join("Cargo.toml").is_file());
         assert!(package_root().join("skills/aethyme/SKILL.md").is_file());
         assert!(repo_root().join(".github/workflows").is_dir());
+    }
+
+    #[test]
+    fn runtime_discovery_finds_the_checkout_from_nested_directories() {
+        let compiled = compiled_repo_root();
+        assert_eq!(
+            find_repo_root(&compiled.join("packages/aethyme/rust/crates/aethyme-testkit/src")),
+            Some(compiled)
+        );
     }
 }
