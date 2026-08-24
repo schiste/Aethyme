@@ -12,7 +12,7 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
-use crate::pyjson::{self, Value, py_bool};
+use crate::pyjson::{self, py_bool, Value};
 use crate::timeutil::now_iso_utc;
 use crate::util::{py_splitlines, resolve_path};
 
@@ -100,7 +100,10 @@ pub fn build_onboarding_artifact(repo_path: &Path) -> Result<Value, String> {
             "repo",
             obj(vec![
                 ("name", Value::str(snapshot.repo_name.clone())),
-                ("root", Value::str(snapshot.repo_path.display().to_string())),
+                // The artifact is repository policy that is expected to be
+                // committed and consumed from other clones. Never persist the
+                // machine-specific checkout path.
+                ("root", Value::str(".")),
                 ("kind", Value::str(repo_kind)),
                 (
                     "languages",

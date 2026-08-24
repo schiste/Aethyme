@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::Gate;
 use aethyme_broker::init::{self, CheckStatus};
+use aethyme_broker::Gate;
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -540,6 +540,9 @@ fn existing_files_are_never_touched_and_gitignore_appends_preserving_content() {
     assert!(gitignore.contains("aethyme-broker:begin"));
     assert!(gitignore.contains(".aethyme/reports/"));
     assert!(gitignore.contains(".aethyme/worktrees/"));
+    assert!(gitignore.contains(".aethyme/generated/experience-telemetry.jsonl"));
+    assert!(gitignore.contains(".aethyme/generated/experience-status.json"));
+    assert!(gitignore.contains(".aethyme/generated/experience-status.md"));
 }
 
 #[test]
@@ -568,6 +571,7 @@ custom-after/\n";
     assert!(gitignore.contains("custom-before/"));
     assert!(gitignore.contains("custom-after/"));
     assert!(gitignore.contains(".aethyme/reports/"));
+    assert!(gitignore.contains(".aethyme/generated/experience-telemetry.jsonl"));
     assert_eq!(gitignore.matches("aethyme-broker:begin").count(), 1);
     assert_eq!(
         status_of(&init::certify(tmp.path()).unwrap(), "certify.gitignore"),

@@ -84,6 +84,10 @@ jobs:
             echo "FAIL: deployed policy embeds the build checkout" >&2
             exit 1
           fi
+          if grep -R "$TARGET" AGENTS.md CLAUDE.md .aethyme/generated/onboarding.json .codex .claude; then
+            echo "FAIL: deployed policy embeds the target checkout" >&2
+            exit 1
+          fi
 
           # Quality surface. ai-ready exits 1 when it reports warnings,
           # which a fixture repo always does, so assert on the report

@@ -61,7 +61,11 @@ pub fn run(args: &[String]) -> u8 {
         return deployed;
     }
 
-    verify_repository(&repo)
+    let verified = verify_repository(&repo);
+    if verified == 0 {
+        print_artifact_ownership();
+    }
+    verified
 }
 
 fn verify_repository(repo: &Path) -> u8 {
@@ -132,4 +136,40 @@ fn print_usage() {
     println!("Usage:");
     println!("  aethyme deploy [--repo <path>] [--force]");
     println!("  aethyme deploy verify [--repo <path>]");
+}
+
+fn print_artifact_ownership() {
+    println!();
+    println!("Repository deployment verified.");
+    println!("Review and commit repository policy:");
+    for path in [
+        ".gitignore",
+        ".aethyme/config.toml",
+        ".aethyme/gates.toml (when generated)",
+        ".aethyme/overrides/ (when present)",
+        ".aethyme/generated/onboarding.json",
+        ".aethyme/generated/act-starter.json",
+        "AGENTS.md and CLAUDE.md",
+        ".codex/skills/",
+        ".claude/skills/",
+        ".claude/hooks/aethyme-load-context.sh",
+        ".claude/settings.local.json",
+    ] {
+        println!("  {path}");
+    }
+    println!("Ignored machine-local runtime state:");
+    for path in [
+        ".aethyme/broker.db*",
+        ".aethyme/logs/",
+        ".aethyme/reports/",
+        ".aethyme/run/",
+        ".aethyme/worktrees/",
+        ".aethyme/broker-action-required.md",
+        ".aethyme/generated/experience-telemetry.jsonl",
+        ".aethyme/generated/experience-status.json",
+        ".aethyme/generated/experience-status.md",
+    ] {
+        println!("  {path}");
+    }
+    println!("Next: review the generated policy, commit it, and retain `aethyme deploy verify --repo .` in CI.");
 }

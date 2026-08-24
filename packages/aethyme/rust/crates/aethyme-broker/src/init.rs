@@ -555,6 +555,9 @@ const GITIGNORE_BLOCK: &str = "\
 .aethyme/run/
 .aethyme/worktrees/
 .aethyme/broker-action-required.md
+.aethyme/generated/experience-status.json
+.aethyme/generated/experience-status.md
+.aethyme/generated/experience-telemetry.jsonl
 # aethyme-broker:end
 ";
 

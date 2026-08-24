@@ -66,6 +66,40 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
     let agents = fs::read_to_string(repo.join("AGENTS.md")).unwrap();
     assert!(agents.contains("## Broker Coordination"));
     assert!(!agents.contains("AETHYME_ROOT"));
+    let onboarding = fs::read_to_string(repo.join(".aethyme/generated/onboarding.json")).unwrap();
+    assert!(onboarding.contains("\"root\": \".\""));
+    assert!(!onboarding.contains(repo.to_string_lossy().as_ref()));
+    let gitignore = fs::read_to_string(repo.join(".gitignore")).unwrap();
+    for runtime_path in [
+        ".aethyme/generated/experience-telemetry.jsonl",
+        ".aethyme/generated/experience-status.json",
+        ".aethyme/generated/experience-status.md",
+    ] {
+        assert!(gitignore.contains(runtime_path), "missing {runtime_path}");
+        let ignored = Command::new("git")
+            .args(["check-ignore", "--quiet", runtime_path])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(
+            ignored.success(),
+            "runtime path is not ignored: {runtime_path}"
+        );
+    }
+    let canonical_is_ignored = Command::new("git")
+        .args([
+            "check-ignore",
+            "--quiet",
+            ".aethyme/generated/onboarding.json",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(!canonical_is_ignored.success());
+    let stdout = String::from_utf8_lossy(&deployed.stdout);
+    assert!(stdout.contains("Review and commit repository policy:"));
+    assert!(stdout.contains("Ignored machine-local runtime state:"));
+    assert!(stdout.contains(".aethyme/generated/onboarding.json"));
 
     let verified = command(&repo)
         .args(["deploy", "verify", "--repo"])
@@ -116,5 +150,6 @@ fn oss_ci_enforces_self_contained_repository_deployment() {
     assert!(workflow.contains("aethyme deploy --repo ."));
     assert!(workflow.contains("aethyme deploy verify --repo ."));
     assert!(workflow.contains("deployed policy embeds the build checkout"));
+    assert!(workflow.contains("deployed policy embeds the target checkout"));
     assert!(!workflow.contains("export AETHYME_ROOT="));
 }
