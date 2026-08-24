@@ -10,15 +10,13 @@
 # Replaced the soft-retired Python `python -m src.cli explore` wrapper
 # on 2026-05-08 (task #59 — Python explore hard-deleted).
 #
-# `{{AETHYME_ROOT}}` is replaced by the aethyme-enhance crate's
-# `deploy_skills` (embedded templates) with the local package path.
+# The installed router is resolved through PATH; deployment never embeds a
+# source-checkout path.
 set -euo pipefail
 
-AETHYME_ROOT="{{AETHYME_ROOT}}"
 REPO="${PWD}"
 
-# Best-effort telemetry via the native router (Phase 3 hook flip,
-# 2026-07-30; previously `$AETHYME_ROOT/.venv/bin/python -m src.cli`).
+# Best-effort telemetry via the native router.
 if command -v aethyme >/dev/null 2>&1 && [[ -d "$REPO" ]]; then
     aethyme repo record-wrapper-invocation \
         "$REPO" \
@@ -27,4 +25,4 @@ if command -v aethyme >/dev/null 2>&1 && [[ -d "$REPO" ]]; then
         >/dev/null 2>&1 || true
 fi
 
-exec "$AETHYME_ROOT/rust/target/release/aethyme" explore "$@"
+exec aethyme explore "$@"

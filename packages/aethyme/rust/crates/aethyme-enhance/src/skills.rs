@@ -2,15 +2,14 @@
 //!
 //! The Python original copied `skills/aethyme/` from the source checkout;
 //! the port writes the same tree from the embedded templates (the Phase 2
-//! packaging change), substituting `{{AETHYME_ROOT}}` in markdown and
-//! shell files exactly as before. Executable bits are set explicitly for
+//! packaging change). Runtime commands resolve `aethyme` through PATH, so
+//! deployment never embeds a source-checkout path. Executable bits are set explicitly for
 //! the shell wrappers (the Python `copytree` inherited them from the
 //! checkout). `repo deploy-skills` / `compile-skills` dispatch here via
 //! `repo_cli` since the Phase 3 flip.
 
 use std::path::Path;
 
-use crate::render::substitute_root;
 use crate::templates::AETHYME_SKILL_FILES;
 
 const DEFAULT_RUNTIME_SKILLS: &[&str] = &["aethyme"];
@@ -22,24 +21,9 @@ const DEFAULT_RUNTIME_SKILLS: &[&str] = &["aethyme"];
 /// by older versions). Sorted order preserved.
 const REMOVABLE_SKILLS: &[&str] = &["aethyme", "eval"];
 
-fn should_substitute(relative_path: &str) -> bool {
-    // Python: markdown docs, shell scripts, and the extensionless
-    // `aethyme-explore` wrapper.
-    relative_path.ends_with(".md")
-        || relative_path.ends_with(".sh")
-        || Path::new(relative_path)
-            .file_name()
-            .map(|name| name == "aethyme-explore")
-            .unwrap_or(false)
-}
-
 /// Copy target-safe skill templates into `<target_repo>/.codex/skills/`.
 /// Returns the deployed skill names.
-pub fn deploy_skills(
-    target_repo: &Path,
-    aethyme_root: &str,
-    force: bool,
-) -> Result<Vec<String>, String> {
+pub fn deploy_skills(target_repo: &Path, force: bool) -> Result<Vec<String>, String> {
     let dest_base = crate::util::resolve_path(target_repo)
         .join(".codex")
         .join("skills");
@@ -62,12 +46,7 @@ pub fn deploy_skills(
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("{}: {e}", parent.display()))?;
             }
-            let rendered = if should_substitute(relative_path) {
-                substitute_root(content, aethyme_root)
-            } else {
-                content.to_string()
-            };
-            std::fs::write(&dest, rendered).map_err(|e| format!("{}: {e}", dest.display()))?;
+            std::fs::write(&dest, content).map_err(|e| format!("{}: {e}", dest.display()))?;
             if *executable {
                 use std::os::unix::fs::PermissionsExt;
                 let metadata =
@@ -122,14 +101,16 @@ mod tests {
     #[test]
     fn deploys_full_skill_tree_with_substitution() {
         let repo = fixture_repo("deploy");
-        let deployed = deploy_skills(&repo, "/opt/ae", false).unwrap();
+        let deployed = deploy_skills(&repo, false).unwrap();
         assert_eq!(deployed, vec!["aethyme".to_string()]);
-        let skill_md = std::fs::read_to_string(
-            repo.join(".codex/skills/aethyme/SKILL.md"),
-        )
-        .unwrap();
+        let skill_md =
+            std::fs::read_to_string(repo.join(".codex/skills/aethyme/SKILL.md")).unwrap();
+        assert!(skill_md.contains("AETHYME_BIN=\"${AETHYME_BIN:-aethyme}\""));
         assert!(!skill_md.contains("{{AETHYME_ROOT}}"));
-        assert!(repo.join(".codex/skills/aethyme/references/explore.md").exists());
+        assert!(
+            repo.join(".codex/skills/aethyme/references/explore.md")
+                .exists()
+        );
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(repo.join(".codex/skills/aethyme/aethyme-explore"))
             .unwrap()
@@ -138,9 +119,9 @@ mod tests {
         assert_eq!(mode & 0o111, 0o111);
 
         // Existing skill dir is skipped without force.
-        assert!(deploy_skills(&repo, "/opt/ae", false).unwrap().is_empty());
+        assert!(deploy_skills(&repo, false).unwrap().is_empty());
         assert_eq!(
-            deploy_skills(&repo, "/opt/ae", true).unwrap(),
+            deploy_skills(&repo, true).unwrap(),
             vec!["aethyme".to_string()]
         );
 
@@ -152,7 +133,7 @@ mod tests {
     #[test]
     fn remove_sweeps_legacy_eval_skill_too() {
         let repo = fixture_repo("remove-eval");
-        deploy_skills(&repo, "/opt/ae", false).unwrap();
+        deploy_skills(&repo, false).unwrap();
         std::fs::create_dir_all(repo.join(".codex/skills/eval")).unwrap();
         std::fs::write(repo.join(".codex/skills/eval/SKILL.md"), "old\n").unwrap();
         assert_eq!(

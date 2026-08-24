@@ -9,11 +9,10 @@ use crate::agents::{
     render_agents_document,
 };
 use crate::onboarding::{
-    expected_onboarding_files, override_freshness, recommendation_summary, ACT_STARTER_JSON_PATH,
-    ONBOARDING_JSON_PATH,
+    ACT_STARTER_JSON_PATH, ONBOARDING_JSON_PATH, expected_onboarding_files, override_freshness,
+    recommendation_summary,
 };
 use crate::pyjson::{self, Value};
-use crate::render::substitute_root;
 use crate::telemetry::{
     act_summary_payload, append_event, event_payload_from_generated_artifacts,
     onboarding_summary_payload, summarize_events, write_status_artifacts,
@@ -109,16 +108,16 @@ fn write_text(path: &Path, content: &str) -> Result<(), String> {
 
 /// Deploy all enhancement files into `repo`. Byte-parity with the Python
 /// `deploy()` — action list order, file contents, telemetry event.
-pub fn deploy(repo: &Path, root: &str, force: bool) -> Result<Vec<DeployAction>, String> {
+pub fn deploy(repo: &Path, force: bool) -> Result<Vec<DeployAction>, String> {
     let mut actions: Vec<DeployAction> = Vec::new();
     if let Some(action) = drop_stale_generated_agents_override(repo)? {
         actions.push(action);
     }
-    if let Some(action) = migrate_legacy_agents_content(repo, root)? {
+    if let Some(action) = migrate_legacy_agents_content(repo)? {
         actions.push(action);
     }
 
-    for (relative_path, content) in expected_onboarding_files(repo, Path::new(root))? {
+    for (relative_path, content) in expected_onboarding_files(repo)? {
         let dest = repo.join(&relative_path);
         if dest.exists() && !force && read_text(&dest)? == content {
             actions.push(DeployAction {
@@ -138,13 +137,13 @@ pub fn deploy(repo: &Path, root: &str, force: bool) -> Result<Vec<DeployAction>,
         });
     }
 
-    actions.insert(0, ensure_agents_document(repo, root, force)?);
+    actions.insert(0, ensure_agents_document(repo, force)?);
     for (relative_path, template) in TARGETS {
         let dest = repo.join(relative_path);
         let content = if *relative_path == "CLAUDE.md" {
-            render_agents_document(root, Some(repo))?
+            render_agents_document(Some(repo))?
         } else {
-            substitute_root(template, root)
+            template.to_string()
         };
         if dest.exists() && !force && read_text(&dest)? == content {
             // Still ensure the executable bit is right on shell scripts.
@@ -199,9 +198,9 @@ pub fn deploy(repo: &Path, root: &str, force: bool) -> Result<Vec<DeployAction>,
     Ok(actions)
 }
 
-fn ensure_agents_document(repo: &Path, root: &str, force: bool) -> Result<DeployAction, String> {
+fn ensure_agents_document(repo: &Path, force: bool) -> Result<DeployAction, String> {
     let dest = repo.join("AGENTS.md");
-    let content = render_agents_document(root, Some(repo))?;
+    let content = render_agents_document(Some(repo))?;
     let existed = dest.exists();
     if !existed {
         write_text(&dest, &content)?;
@@ -226,13 +225,13 @@ fn ensure_agents_document(repo: &Path, root: &str, force: bool) -> Result<Deploy
 
 /// Migrate legacy or hand-edited AGENTS.md content into structured
 /// overrides once.
-fn migrate_legacy_agents_content(repo: &Path, root: &str) -> Result<Option<DeployAction>, String> {
+fn migrate_legacy_agents_content(repo: &Path) -> Result<Option<DeployAction>, String> {
     let agents_path = repo.join("AGENTS.md");
     if !agents_path.exists() {
         return Ok(None);
     }
     let existing = read_text(&agents_path)?;
-    let legacy_content = extract_legacy_agents_content(&existing, root)?;
+    let legacy_content = extract_legacy_agents_content(&existing)?;
     if legacy_content.is_empty() {
         return Ok(None);
     }
@@ -438,9 +437,9 @@ fn ensure_settings_hook(repo: &Path) -> Result<DeployAction, String> {
 }
 
 /// Check each target plus the merged settings hook entry.
-pub fn verify(repo: &Path, root: &str) -> Result<Vec<VerifyResult>, String> {
+pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
     let mut out: Vec<VerifyResult> = Vec::new();
-    out.push(verify_agents_document(repo, root)?);
+    out.push(verify_agents_document(repo)?);
     for (relative_path, template) in TARGETS {
         let dest = repo.join(relative_path);
         if !dest.exists() {
@@ -454,9 +453,9 @@ pub fn verify(repo: &Path, root: &str) -> Result<Vec<VerifyResult>, String> {
         }
         let actual = read_text(&dest)?;
         let canonical = if *relative_path == "CLAUDE.md" {
-            render_agents_document(root, Some(repo))?
+            render_agents_document(Some(repo))?
         } else {
-            substitute_root(template, root)
+            template.to_string()
         };
         out.push(VerifyResult {
             relative_path: relative_path.to_string(),
@@ -466,7 +465,7 @@ pub fn verify(repo: &Path, root: &str) -> Result<Vec<VerifyResult>, String> {
         });
     }
 
-    for (relative_path, content) in expected_onboarding_files(repo, Path::new(root))? {
+    for (relative_path, content) in expected_onboarding_files(repo)? {
         let dest = repo.join(&relative_path);
         if !dest.exists() {
             out.push(VerifyResult {
@@ -529,7 +528,7 @@ pub fn verify(repo: &Path, root: &str) -> Result<Vec<VerifyResult>, String> {
     Ok(out)
 }
 
-fn verify_agents_document(repo: &Path, root: &str) -> Result<VerifyResult, String> {
+fn verify_agents_document(repo: &Path) -> Result<VerifyResult, String> {
     let dest = repo.join("AGENTS.md");
     if !dest.exists() {
         return Ok(VerifyResult {
@@ -540,7 +539,7 @@ fn verify_agents_document(repo: &Path, root: &str) -> Result<VerifyResult, Strin
         });
     }
     let actual = read_text(&dest)?;
-    let content = render_agents_document(root, Some(repo))?;
+    let content = render_agents_document(Some(repo))?;
     Ok(VerifyResult {
         relative_path: "AGENTS.md".to_string(),
         exists: true,
@@ -561,8 +560,8 @@ pub fn is_ok(results: &[VerifyResult]) -> bool {
 }
 
 /// Small enhancement summary with recommendations.
-pub fn summarize(repo: &Path, root: &str) -> Result<Value, String> {
-    let files = expected_onboarding_files(repo, Path::new(root))?;
+pub fn summarize(repo: &Path) -> Result<Value, String> {
+    let files = expected_onboarding_files(repo)?;
     let content_of = |path: &str| -> Result<Value, String> {
         let (_, content) = files
             .iter()
@@ -572,7 +571,7 @@ pub fn summarize(repo: &Path, root: &str) -> Result<Value, String> {
     };
     let onboarding = content_of(ONBOARDING_JSON_PATH)?;
     let act = content_of(ACT_STARTER_JSON_PATH)?;
-    let recommendation = recommendation_summary(repo, Path::new(root))?;
+    let recommendation = recommendation_summary(repo)?;
     let req = |value: &Value, key: &str| -> Result<Value, String> {
         value
             .get(key)
@@ -620,7 +619,7 @@ mod tests {
     #[test]
     fn deploy_writes_all_targets_and_settings() {
         let repo = fixture_repo("full");
-        let actions = deploy(&repo, "/opt/aethyme", true).unwrap();
+        let actions = deploy(&repo, true).unwrap();
         // AGENTS.md is inserted first; settings merge is last.
         assert_eq!(actions.first().unwrap().relative_path, "AGENTS.md");
         assert_eq!(actions.last().unwrap().relative_path, SETTINGS_FILE);
@@ -650,7 +649,7 @@ mod tests {
         // Second non-force deploy: everything unchanged except the two
         // freshness-stamped onboarding artifacts, which drift with the
         // snapshot (matching Python's behavior on a dirtier tree).
-        let actions = deploy(&repo, "/opt/aethyme", false).unwrap();
+        let actions = deploy(&repo, false).unwrap();
         let changed: Vec<&str> = actions
             .iter()
             .filter(|a| a.action != "unchanged")
@@ -660,7 +659,7 @@ mod tests {
             |path| path.starts_with(".aethyme/generated/") || path.contains("repo-onboarding")
         ));
 
-        let results = verify(&repo, "/opt/aethyme").unwrap();
+        let results = verify(&repo).unwrap();
         assert!(is_ok(&results));
         std::fs::remove_dir_all(&repo).unwrap();
     }
@@ -702,11 +701,13 @@ mod tests {
     fn legacy_agents_content_migrates_to_overrides() {
         let repo = fixture_repo("legacy");
         std::fs::write(repo.join("AGENTS.md"), "Hand-written policy.\n").unwrap();
-        let actions = deploy(&repo, "/opt/aethyme", false).unwrap();
+        let actions = deploy(&repo, false).unwrap();
         // Migration action reported, override created.
-        assert!(actions
-            .iter()
-            .any(|a| a.relative_path == AGENTS_OVERRIDE_PATH && a.action == "created"));
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.relative_path == AGENTS_OVERRIDE_PATH && a.action == "created")
+        );
         let override_text = std::fs::read_to_string(repo.join(AGENTS_OVERRIDE_PATH)).unwrap();
         assert_eq!(
             override_text,
@@ -723,7 +724,7 @@ mod tests {
         let repo = fixture_repo("stale");
         std::fs::create_dir_all(repo.join(".aethyme/overrides")).unwrap();
         // A maintainer_markdown that IS the generated document.
-        let generated = render_agents_document("/opt/aethyme", None).unwrap();
+        let generated = render_agents_document(None).unwrap();
         let mut overrides = Value::object();
         overrides.set("maintainer_markdown", Value::str(generated));
         std::fs::write(

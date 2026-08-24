@@ -99,12 +99,7 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
             aethyme_engine::repo_cli::Outcome::Delegate => {
-                // The UX slice resolves the package root lazily: only
-                // deploy-skills/compile-skills need it (template
-                // substitution); the hook-facing telemetry commands must
-                // work in repos with no Aethyme checkout reachable.
-                let resolve = || resolve_aethyme_root().map(|(path, _source)| path);
-                match aethyme_enhance::repo_cli::run(&args[1..], &resolve) {
+                match aethyme_enhance::repo_cli::run(&args[1..]) {
                     aethyme_enhance::repo_cli::Outcome::Handled(code) => ExitCode::from(code),
                     aethyme_enhance::repo_cli::Outcome::Delegate => {
                         eprintln!(
@@ -146,8 +141,6 @@ fn main() -> ExitCode {
         // group is deleted). deploy/verify answer natively; unknown
         // subcommands (and `--help`) get a native error like the other
         // native groups — there is no Python surface to delegate to.
-        // The package root is still resolved: rendered templates embed
-        // `{{AETHYME_ROOT}}` substitutions pointing at the checkout.
         // Native since python-retirement Phase 4 (the Python `ai-ready`
         // command and src/scorecard/ are deleted). The 8 detectors,
         // integer scoring, and json/md renderers live in the
@@ -167,17 +160,7 @@ fn main() -> ExitCode {
         // errors keep Click's `Error: {message}` line without the usage
         // block (Phase 2 precedent).
         "autofix" => ExitCode::from(aethyme_quality::autofix_cli::run(&args[1..])),
-        "enhance" => {
-            let Some((aethyme_root, _source)) = resolve_aethyme_root() else {
-                eprintln!(
-                    "aethyme: cannot locate the Aethyme package root for the \
-                     'enhance' command."
-                );
-                print_root_guidance();
-                return ExitCode::from(2);
-            };
-            ExitCode::from(aethyme_enhance::cli::run(&aethyme_root, &args[1..]))
-        }
+        "enhance" => ExitCode::from(aethyme_enhance::cli::run(&args[1..])),
         other => unknown_subcommand(other),
     }
 }
@@ -223,10 +206,7 @@ fn print_top_level_help() {
     eprintln!("  update check|plan|execute  explicit paired-binary updates; never background");
     eprintln!();
     eprintln!("Setup:");
-    eprintln!(
-        "  root show|set <path>        where the Aethyme checkout lives (used by `enhance` to"
-    );
-    eprintln!("                              resolve {{{{AETHYME_ROOT}}}} in deployed artifacts)");
+    eprintln!("  root show|set <path>        developer checkout pointer (legacy compatibility)");
     eprintln!();
     eprintln!("Quality:");
     eprintln!("  ai-ready [--repo <path>]    AI-readiness scorecard");
@@ -359,20 +339,11 @@ fn engine_cli_binary_path() -> PathBuf {
     PathBuf::from("aethyme-engine-cli")
 }
 
-// ── aethyme root — where the Aethyme checkout lives ─────────────────────────
+// ── aethyme root — legacy developer checkout pointer ────────────────────────
 //
-// SOLE REMAINING PURPOSE (python-retirement Phase 6): `enhance` and the two
-// skill-compiling `repo` subcommands substitute `{{AETHYME_ROOT}}` into the
-// artifacts they deploy, so they need a filesystem path to the checkout.
-// Deployed templates spell things like
-// `"$AETHYME_ROOT/rust/target/release/aethyme" explore`, which is why the
-// marker below is `rust/` — the thing those artifacts actually reach for.
-//
-// This used to be "where the Python package lives", and it recognised a
-// root by `src/cli.py` + `pyproject.toml`. Both of those tests are wrong
-// now: `src/` is deleted and `pyproject.toml` is dev-harness config that
-// retires with the test port. No other command needs a root — nothing is
-// delegated any more.
+// Repository deployment is self-contained and does not consult this pointer.
+// The command remains for developer compatibility and explicit inspection of
+// source checkouts configured by older installations.
 //
 // Resolution order:
 //   1. $AETHYME_ROOT (explicit override, highest priority)
@@ -380,10 +351,8 @@ fn engine_cli_binary_path() -> PathBuf {
 //   3. upward walk from the current directory (covers working inside the
 //      Aethyme repo or any of its worktrees with zero configuration)
 //
-// The pointer file survives the retirement because it is the only way an
-// operator who installed via `cargo install` — and so runs the router from
-// outside any checkout — can point `enhance` at one. `aethyme root
-// show/set` therefore keeps a real job and is NOT retired here.
+// Existing pointer files remain readable so upgrades do not destroy operator
+// configuration.
 
 fn config_pointer_path() -> Option<PathBuf> {
     let base = env::var_os("XDG_CONFIG_HOME")
@@ -392,9 +361,8 @@ fn config_pointer_path() -> Option<PathBuf> {
     Some(base.join("aethyme").join("root"))
 }
 
-/// A directory qualifies as an Aethyme root when it holds the Rust
-/// workspace and the skill templates — the two things `{{AETHYME_ROOT}}`
-/// substitution and skill compilation point at.
+/// A directory qualifies as an Aethyme developer checkout when it holds the
+/// Rust workspace and canonical skill sources.
 fn is_aethyme_root(dir: &Path) -> bool {
     dir.join("rust").join("Cargo.toml").is_file() && dir.join("skills").join("aethyme").is_dir()
 }

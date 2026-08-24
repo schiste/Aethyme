@@ -19,21 +19,19 @@ entrypoints, or where to begin.
 ## Quick start (any agent)
 
 ```bash
-AETHYME_ROOT="{{AETHYME_ROOT}}"
 AETHYME_JSON="$(mktemp -t aethyme-explore.XXXXXX.json)"
-"$AETHYME_ROOT/rust/target/release/aethyme" explore \
+aethyme explore \
     --repo "$PWD" --request "<your task>" \
     --format answer-json --show-observability --depth 0 > "$AETHYME_JSON"
-"$AETHYME_ROOT/rust/target/release/aethyme" explore-summary --from "$AETHYME_JSON"
-"$AETHYME_ROOT/rust/target/release/aethyme" verify-targets \
+aethyme explore-summary --from "$AETHYME_JSON"
+aethyme verify-targets \
     --repo "$PWD" --from "$AETHYME_JSON" \
     --max-targets 2 --max-lines 80
 ```
 
 Do not run `python -m src.cli ...` for anything; the Python CLI was removed
-entirely and that spelling now fails. Use the native binary above for Explore
-and the `aethyme` binary for `graph`, `task`, `intents`, `facts`, `analyze`,
-and `enhance`.
+entirely and that spelling now fails. Use the installed `aethyme` binary for
+Explore, `graph`, `task`, `intents`, `facts`, `analyze`, and `enhance`.
 
 Inspect only the printed projection first: `safe_to_use_as_answer`,
 `trust_policy`, `subsystems`, `top_verification_targets`,

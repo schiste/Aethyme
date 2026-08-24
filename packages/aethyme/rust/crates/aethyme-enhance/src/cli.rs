@@ -9,19 +9,15 @@ use std::path::{Path, PathBuf};
 use crate::deploy::{deploy, is_ok, refresh_status, summarize, verify};
 use crate::pyjson::{Value, py_bool};
 use crate::telemetry::append_event;
-use crate::util::resolve_path;
 
 /// Run `enhance <subcommand> ...` with `args` excluding the leading
 /// `enhance`. Prints its own output/errors; returns the process exit
-/// code. `aethyme_root` is the package root the router resolved (the
-/// equivalent of Python's `PACKAGE_ROOT`); it is canonicalized here the
-/// way `Path(__file__).resolve()` did.
-pub fn run(aethyme_root: &Path, args: &[String]) -> u8 {
-    let root = resolve_path(aethyme_root);
-    let root_str = root.display().to_string();
+/// code. Templates and runtime commands are embedded, so this command does
+/// not require an Aethyme source checkout.
+pub fn run(args: &[String]) -> u8 {
     match args.first().map(String::as_str) {
-        Some("deploy") => run_deploy(&root_str, &args[1..]),
-        Some("verify") => run_verify(&root_str, &args[1..]),
+        Some("deploy") => run_deploy(&args[1..]),
+        Some("verify") => run_verify(&args[1..]),
         other => {
             eprintln!(
                 "Error: unsupported enhance subcommand: {}",
@@ -81,7 +77,7 @@ fn parse_repo_arg(subcommand: &str, rest: &[String]) -> Result<(RepoArg, bool), 
     Ok((RepoArg { given: path }, force))
 }
 
-fn run_deploy(root: &str, rest: &[String]) -> u8 {
+fn run_deploy(rest: &[String]) -> u8 {
     let (repo, force) = match parse_repo_arg("deploy", rest) {
         Ok(parsed) => parsed,
         Err((message, code)) => {
@@ -89,7 +85,7 @@ fn run_deploy(root: &str, rest: &[String]) -> u8 {
             return code;
         }
     };
-    let actions = match deploy(&repo.given, root, force) {
+    let actions = match deploy(&repo.given, force) {
         Ok(actions) => actions,
         Err(message) => {
             eprintln!("Error: {message}");
@@ -104,7 +100,7 @@ fn run_deploy(root: &str, rest: &[String]) -> u8 {
     0
 }
 
-fn run_verify(root: &str, rest: &[String]) -> u8 {
+fn run_verify(rest: &[String]) -> u8 {
     let (repo, _force) = match parse_repo_arg("verify", rest) {
         Ok(parsed) => parsed,
         Err((message, code)) => {
@@ -112,7 +108,7 @@ fn run_verify(root: &str, rest: &[String]) -> u8 {
             return code;
         }
     };
-    let results = match verify(&repo.given, root) {
+    let results = match verify(&repo.given) {
         Ok(results) => results,
         Err(message) => {
             eprintln!("Error: {message}");
@@ -156,16 +152,15 @@ fn run_verify(root: &str, rest: &[String]) -> u8 {
         return 1;
     }
 
-    let summary = match summarize(&repo.given, root) {
+    let summary = match summarize(&repo.given) {
         Ok(summary) => summary,
         Err(message) => {
             eprintln!("Error: {message}");
             return 1;
         }
     };
-    let field = |value: &Value, key: &str| -> String {
-        value.get(key).unwrap_or(&Value::Null).py_str()
-    };
+    let field =
+        |value: &Value, key: &str| -> String { value.get(key).unwrap_or(&Value::Null).py_str() };
     let bool_field = |value: &Value, key: &str| -> String {
         match value.get(key) {
             Some(Value::Bool(b)) => py_bool(*b).to_string(),
@@ -178,11 +173,17 @@ fn run_verify(root: &str, rest: &[String]) -> u8 {
     event_payload.set("ok", Value::Bool(true));
     event_payload.set(
         "recommended_skill",
-        summary.get("recommended_skill").cloned().unwrap_or(Value::Null),
+        summary
+            .get("recommended_skill")
+            .cloned()
+            .unwrap_or(Value::Null),
     );
     event_payload.set(
         "recommended_mode",
-        summary.get("recommended_mode").cloned().unwrap_or(Value::Null),
+        summary
+            .get("recommended_mode")
+            .cloned()
+            .unwrap_or(Value::Null),
     );
     event_payload.set(
         "experience_telemetry_before_write",
@@ -242,7 +243,11 @@ fn run_verify(root: &str, rest: &[String]) -> u8 {
         println!(
             "  Override freshness: regeneration_required={}, stale_targets={}",
             bool_field(freshness, "regeneration_required"),
-            if stale_joined.is_empty() { "none".to_string() } else { stale_joined },
+            if stale_joined.is_empty() {
+                "none".to_string()
+            } else {
+                stale_joined
+            },
         );
     }
     println!(

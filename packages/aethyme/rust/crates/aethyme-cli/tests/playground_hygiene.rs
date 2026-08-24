@@ -53,7 +53,9 @@ Same content lives at both of these per-product skill paths.
 fn assert_native_root_guidance(repo: &Path) {
     for filename in ["AGENTS.md", "CLAUDE.md"] {
         let text = read(repo.join(filename));
-        assert!(text.contains(r#""$AETHYME_ROOT/rust/target/release/aethyme" explore"#));
+        assert!(text.contains("aethyme explore"));
+        assert!(!text.contains("AETHYME_ROOT"));
+        assert!(!text.contains("/rust/target/release/aethyme"));
         // Phase 6 (2026-08-01) widened the notice: the Python CLI is gone
         // entirely, not just its `explore` subcommand. The "Do not run"
         // marker must survive — the contract checker and verify-playground
@@ -63,7 +65,10 @@ fn assert_native_root_guidance(repo: &Path) {
         // Phase 5.5: the compact projection is native, and nothing in the
         // deployed root guidance may reach for the Aethyme venv Python.
         assert!(text.contains("explore-summary --from"));
-        assert!(!text.contains(".venv/bin/python"), "{filename} reaches for the venv");
+        assert!(
+            !text.contains(".venv/bin/python"),
+            "{filename} reaches for the venv"
+        );
     }
 }
 
@@ -134,7 +139,10 @@ fn setup_playground_installs_local_generated_artifact_excludes() {
         "generated_artifacts_are_ignored",
         "git check-ignore --no-index",
     ] {
-        assert!(script.contains(needle), "setup-playground.sh missing {needle:?}");
+        assert!(
+            script.contains(needle),
+            "setup-playground.sh missing {needle:?}"
+        );
     }
 }
 
@@ -184,6 +192,9 @@ fn verify_playground_enforces_guidance_and_discovery_hygiene() {
         "dead-code.md",
         "git status --porcelain --untracked-files=all",
     ] {
-        assert!(script.contains(needle), "verify-playground.sh missing {needle:?}");
+        assert!(
+            script.contains(needle),
+            "verify-playground.sh missing {needle:?}"
+        );
     }
 }
