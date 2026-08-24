@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+mod repository_deploy;
+
 /// Upper bound for waiting on a freshly-spawned engine daemon. The socket
 /// binds only after the initial map build (~70s on a 12K-file repo), so
 /// this is generous rather than snappy on purpose.
@@ -137,6 +139,7 @@ fn main() -> ExitCode {
         // idempotent. Top-level like certify: it is the first command a
         // new repo runs.
         "init" => ExitCode::from(aethyme_broker::cli::run(&args)),
+        "deploy" => ExitCode::from(repository_deploy::run(&args[1..])),
         // Native since python-retirement Phase 2 (the Python `enhance`
         // group is deleted). deploy/verify answer natively; unknown
         // subcommands (and `--help`) get a native error like the other
@@ -206,6 +209,7 @@ fn print_top_level_help() {
     eprintln!("  update check|plan|execute  explicit paired-binary updates; never background");
     eprintln!();
     eprintln!("Setup:");
+    eprintln!("  deploy [verify] [--repo <path>]  enroll or verify repository policy");
     eprintln!("  root show|set <path>        developer checkout pointer (legacy compatibility)");
     eprintln!();
     eprintln!("Quality:");
