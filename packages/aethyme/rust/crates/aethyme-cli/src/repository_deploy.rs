@@ -2,6 +2,20 @@
 
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Deploy,
+    Verify,
+    Bridge,
+}
+
+struct Options {
+    action: Action,
+    repo: PathBuf,
+    force: bool,
+    local_only: bool,
+}
+
 pub fn run(args: &[String]) -> u8 {
     if args
         .iter()
@@ -10,7 +24,7 @@ pub fn run(args: &[String]) -> u8 {
         print_usage();
         return 0;
     }
-    let (verify_only, repo, force) = match parse_args(args) {
+    let options = match parse_args(args) {
         Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("aethyme deploy: {message}");
@@ -19,19 +33,35 @@ pub fn run(args: &[String]) -> u8 {
         }
     };
 
-    let repo = match std::fs::canonicalize(&repo) {
+    let repo = match std::fs::canonicalize(&options.repo) {
         Ok(repo) if repo.is_dir() => repo,
         Ok(_) => {
-            eprintln!("aethyme deploy: {} is not a directory", repo.display());
+            eprintln!(
+                "aethyme deploy: {} is not a directory",
+                options.repo.display()
+            );
             return 2;
         }
         Err(error) => {
-            eprintln!("aethyme deploy: resolve {}: {error}", repo.display());
+            eprintln!(
+                "aethyme deploy: resolve {}: {error}",
+                options.repo.display()
+            );
             return 2;
         }
     };
 
-    if verify_only {
+    if options.action == Action::Bridge {
+        return install_bridge(&repo);
+    }
+    if options.local_only {
+        return if options.action == Action::Verify {
+            verify_local_repository(&repo)
+        } else {
+            deploy_local_repository(&repo, options.force)
+        };
+    }
+    if options.action == Action::Verify {
         return verify_repository(&repo);
     }
 
@@ -53,7 +83,7 @@ pub fn run(args: &[String]) -> u8 {
         "--repo".to_string(),
         repo.display().to_string(),
     ];
-    if force {
+    if options.force {
         deploy_args.push("--force".to_string());
     }
     let deployed = aethyme_enhance::cli::run(&deploy_args);
@@ -80,14 +110,22 @@ fn verify_repository(repo: &Path) -> u8 {
     in_repo(repo, || aethyme_broker::cli::run(&["certify".to_string()]))
 }
 
-fn parse_args(args: &[String]) -> Result<(bool, PathBuf, bool), String> {
-    let mut verify_only = false;
+fn parse_args(args: &[String]) -> Result<Options, String> {
+    let mut action = Action::Deploy;
     let mut repo = PathBuf::from(".");
     let mut force = false;
+    let mut local_only = false;
     let mut index = 0;
-    if args.first().map(String::as_str) == Some("verify") {
-        verify_only = true;
-        index += 1;
+    match args.first().map(String::as_str) {
+        Some("verify") => {
+            action = Action::Verify;
+            index += 1;
+        }
+        Some("bridge") => {
+            action = Action::Bridge;
+            index += 1;
+        }
+        _ => {}
     }
     while index < args.len() {
         match args[index].as_str() {
@@ -96,8 +134,12 @@ fn parse_args(args: &[String]) -> Result<(bool, PathBuf, bool), String> {
                 repo = PathBuf::from(value);
                 index += 2;
             }
-            "--force" if !verify_only => {
+            "--force" if action == Action::Deploy => {
                 force = true;
+                index += 1;
+            }
+            "--local-only" if action != Action::Bridge => {
+                local_only = true;
                 index += 1;
             }
             option if option.starts_with('-') => {
@@ -106,7 +148,12 @@ fn parse_args(args: &[String]) -> Result<(bool, PathBuf, bool), String> {
             value => return Err(format!("unexpected argument {value}")),
         }
     }
-    Ok((verify_only, repo, force))
+    Ok(Options {
+        action,
+        repo,
+        force,
+        local_only,
+    })
 }
 
 fn in_repo(repo: &Path, operation: impl FnOnce() -> u8) -> u8 {
@@ -135,7 +182,101 @@ fn in_repo(repo: &Path, operation: impl FnOnce() -> u8) -> u8 {
 fn print_usage() {
     println!("Usage:");
     println!("  aethyme deploy [--repo <path>] [--force]");
-    println!("  aethyme deploy verify [--repo <path>]");
+    println!("  aethyme deploy bridge [--repo <path>]");
+    println!("  aethyme deploy --local-only [--repo <path>] [--force]");
+    println!("  aethyme deploy verify [--repo <path>] [--local-only]");
+}
+
+fn install_bridge(repo: &Path) -> u8 {
+    match aethyme_enhance::local::install_bridge(repo) {
+        Ok(actions) => {
+            for action in actions {
+                println!("{:<9} {}", action.action, action.path);
+            }
+            println!(
+                "Review and commit AGENTS.md and CLAUDE.md; without local activation the bridge performs only one file-existence check."
+            );
+            0
+        }
+        Err(error) => {
+            eprintln!("aethyme deploy bridge: {error}");
+            1
+        }
+    }
+}
+
+fn deploy_local_repository(repo: &Path, force: bool) -> u8 {
+    if !aethyme_enhance::local::bridge_installed(repo) {
+        eprintln!(
+            "aethyme deploy: local-only activation requires the committed inert bridge; run `aethyme deploy bridge --repo .`, review it, and commit it first"
+        );
+        return 1;
+    }
+    if let Err(error) = aethyme_enhance::local::prepare(repo) {
+        eprintln!("aethyme deploy: {error}");
+        return 1;
+    }
+    let scaffold = match aethyme_broker::init::scaffold_local(repo) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("aethyme deploy: local broker scaffold: {error}");
+            return 1;
+        }
+    };
+    print_checks(&scaffold);
+    let gates = match aethyme_broker::init::draft_gates(repo) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("aethyme deploy: local gate draft: {error}");
+            return 1;
+        }
+    };
+    print_checks(&gates);
+    match aethyme_enhance::local::deploy(repo, force) {
+        Ok(actions) => {
+            for action in actions {
+                println!("{:<9} {}", action.action, action.path);
+            }
+        }
+        Err(error) => {
+            eprintln!("aethyme deploy: {error}");
+            return 1;
+        }
+    }
+    let verified = verify_local_repository(repo);
+    if verified == 0 {
+        println!("Local-only Aethyme activation verified; Git tracks no activation artifacts.");
+        println!("Other clones remain inactive unless they create .aethyme/local/enabled.");
+    }
+    verified
+}
+
+fn verify_local_repository(repo: &Path) -> u8 {
+    match aethyme_enhance::local::verify(repo) {
+        Ok(problems) if problems.is_empty() => {}
+        Ok(problems) => {
+            for problem in problems {
+                eprintln!("fail      {problem}");
+            }
+            return 1;
+        }
+        Err(error) => {
+            eprintln!("aethyme deploy verify: {error}");
+            return 1;
+        }
+    }
+    in_repo(repo, || aethyme_broker::cli::run(&["certify".to_string()]))
+}
+
+fn print_checks(report: &aethyme_broker::init::InitReport) {
+    for check in &report.checks {
+        println!(
+            "{:<9} {:<32} {}",
+            format!("{:?}", check.status).to_lowercase(),
+            check.id,
+            check.detail
+        );
+    }
 }
 
 fn print_artifact_ownership() {
@@ -171,5 +312,7 @@ fn print_artifact_ownership() {
     ] {
         println!("  {path}");
     }
-    println!("Next: review the generated policy, commit it, and retain `aethyme deploy verify --repo .` in CI.");
+    println!(
+        "Next: review the generated policy, commit it, and retain `aethyme deploy verify --repo .` in CI."
+    );
 }

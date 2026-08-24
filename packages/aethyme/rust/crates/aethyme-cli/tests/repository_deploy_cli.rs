@@ -38,6 +38,43 @@ fn command(repo: &std::path::Path) -> Command {
     command
 }
 
+fn commit_all(repo: &std::path::Path, message: &str) {
+    let added = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(added.status.success());
+    let committed = Command::new("git")
+        .args([
+            "-c",
+            "user.name=Aethyme Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            message,
+        ])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(
+        committed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+}
+
+fn status(repo: &std::path::Path) -> String {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 #[test]
 fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
     let temp = tmp_dir();
@@ -134,7 +171,7 @@ fn deploy_verify_is_read_only_and_rejects_missing_policy() {
 fn top_level_help_exposes_the_canonical_deployment_surface() {
     let help = Command::new(aethyme_bin()).arg("--help").output().unwrap();
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stderr).contains("deploy [verify]"));
+    assert!(String::from_utf8_lossy(&help.stderr).contains("deploy [verify|bridge]"));
 
     let deploy_help = Command::new(aethyme_bin())
         .args(["deploy", "--help"])
@@ -142,6 +179,151 @@ fn top_level_help_exposes_the_canonical_deployment_surface() {
         .unwrap();
     assert!(deploy_help.status.success());
     assert!(String::from_utf8_lossy(&deploy_help.stdout).contains("aethyme deploy verify"));
+    assert!(String::from_utf8_lossy(&deploy_help.stdout).contains("--local-only"));
+}
+
+#[test]
+fn local_only_activation_is_clean_and_does_not_follow_a_clone() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+
+    let bridge = command(&repo)
+        .args(["deploy", "bridge", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        bridge.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bridge.stderr)
+    );
+    for document in ["AGENTS.md", "CLAUDE.md"] {
+        let text = fs::read_to_string(repo.join(document)).unwrap();
+        assert!(text.contains(".aethyme/local/enabled"));
+        assert!(text.contains("do not run Aethyme"));
+    }
+    commit_all(&repo, "docs: add inert local activation bridge");
+
+    let activated = command(&repo)
+        .args(["deploy", "--local-only", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        activated.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&activated.stdout),
+        String::from_utf8_lossy(&activated.stderr)
+    );
+    assert!(repo.join(".aethyme/local/enabled").is_file());
+    let policy = fs::read_to_string(repo.join(".aethyme/local/AGENTS.md")).unwrap();
+    assert!(policy.contains("## Broker Coordination"));
+    assert!(repo.join(".codex/skills/aethyme/SKILL.md").is_file());
+    assert!(repo.join(".claude/skills/aethyme/SKILL.md").is_file());
+    assert!(!repo.join(".gitignore").exists());
+    assert_eq!(status(&repo), "");
+
+    let redeployed = command(&repo)
+        .args(["deploy", "--local-only", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        redeployed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&redeployed.stderr)
+    );
+    assert_eq!(status(&repo), "");
+
+    let before = [
+        ".aethyme/local/enabled",
+        ".aethyme/local/AGENTS.md",
+        ".aethyme/generated/onboarding.json",
+    ]
+    .map(|relative| fs::read(repo.join(relative)).unwrap());
+    let verified = command(&repo)
+        .args(["deploy", "verify", "--local-only", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    let after = [
+        ".aethyme/local/enabled",
+        ".aethyme/local/AGENTS.md",
+        ".aethyme/generated/onboarding.json",
+    ]
+    .map(|relative| fs::read(repo.join(relative)).unwrap());
+    assert_eq!(after, before, "local verification wrote activation state");
+
+    let clone = temp.path().join("clone");
+    let cloned = Command::new("git")
+        .args(["clone", "--quiet"])
+        .arg(&repo)
+        .arg(&clone)
+        .output()
+        .unwrap();
+    assert!(cloned.status.success());
+    assert!(clone.join("AGENTS.md").is_file());
+    assert!(!clone.join(".aethyme/local/enabled").exists());
+    assert!(!clone.join(".codex/skills/aethyme/SKILL.md").exists());
+    let clone_verify = command(&clone)
+        .args(["deploy", "verify", "--local-only", "--repo"])
+        .arg(&clone)
+        .output()
+        .unwrap();
+    assert!(!clone_verify.status.success());
+}
+
+#[test]
+fn local_only_requires_the_committed_bridge_before_writing() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    let deployed = command(&repo)
+        .args(["deploy", "--local-only", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(!deployed.status.success());
+    assert!(
+        String::from_utf8_lossy(&deployed.stderr).contains("requires the committed inert bridge")
+    );
+    assert!(!repo.join(".aethyme").exists());
+    assert_eq!(status(&repo), "");
+}
+
+#[test]
+fn local_only_refuses_to_mask_tracked_agent_policy() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    let bridge = command(&repo)
+        .args(["deploy", "bridge", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(bridge.status.success());
+    fs::create_dir_all(repo.join(".codex/skills/aethyme")).unwrap();
+    fs::write(
+        repo.join(".codex/skills/aethyme/SKILL.md"),
+        "tracked maintainer policy\n",
+    )
+    .unwrap();
+    commit_all(&repo, "docs: add bridge and maintainer policy");
+
+    let deployed = command(&repo)
+        .args(["deploy", "--local-only", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(!deployed.status.success());
+    assert!(
+        String::from_utf8_lossy(&deployed.stderr).contains("refuses to overwrite tracked policy")
+    );
+    assert!(!repo.join(".aethyme").exists());
+    assert_eq!(status(&repo), "");
 }
 
 #[test]
