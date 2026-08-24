@@ -1,7 +1,7 @@
 use std::fs;
 use std::process::Command;
 
-use aethyme_testkit::{aethyme_bin, tmp_dir};
+use aethyme_testkit::{aethyme_bin, repo_root, tmp_dir};
 
 fn repository(root: &std::path::Path) -> std::path::PathBuf {
     let repo = root.join("repo");
@@ -108,4 +108,13 @@ fn top_level_help_exposes_the_canonical_deployment_surface() {
         .unwrap();
     assert!(deploy_help.status.success());
     assert!(String::from_utf8_lossy(&deploy_help.stdout).contains("aethyme deploy verify"));
+}
+
+#[test]
+fn oss_ci_enforces_self_contained_repository_deployment() {
+    let workflow = fs::read_to_string(repo_root().join(".github/workflows/oss-ci.yml")).unwrap();
+    assert!(workflow.contains("aethyme deploy --repo ."));
+    assert!(workflow.contains("aethyme deploy verify --repo ."));
+    assert!(workflow.contains("deployed policy embeds the build checkout"));
+    assert!(!workflow.contains("export AETHYME_ROOT="));
 }
