@@ -6,6 +6,7 @@
 //! rendering, and every command has a `--json` form whose shape comes
 //! from the library's serializable types (#32).
 
+use std::io::Read;
 use std::path::PathBuf;
 
 use crate::broker::Broker;
@@ -160,6 +161,12 @@ Usage:
       is the single definition of verified for CI and broker alike. Text
       abbreviates each proven tree hash; JSON includes the full hash.
       --no-cache executes fresh, then stores the new result normally.
+  aethyme broker gates pre-push <remote-name> [<remote-url>] [--no-cache] [--json]
+      Opt-in adapter for a repository-owned Git pre-push hook. Reads Git's
+      ref-update protocol from stdin, requires one clean current-HEAD tip,
+      then runs every gate with the same cache and host-resource lifecycle.
+      Deletion-only pushes need no content gates. Aethyme never installs or
+      replaces a pre-push hook.
   aethyme broker hooks install [--json]
       Explicitly install the two managed git hooks into the shared
       <git-common-dir>/hooks (all worktrees see them): pre-commit runs
@@ -343,6 +350,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "affected",
         "semantic",
         "run",
+        "pre-push",
         "hooks",
         "install",
         "uninstall",
@@ -3002,7 +3010,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     .first()
                     .map(String::as_str)
                     .ok_or(UsageError::Message(
-                        "gates requires an action: draft, validate, affected, semantic, or run"
+                        "gates requires an action: draft, validate, affected, semantic, run, or pre-push"
                             .into(),
                     ))?;
             match action {
@@ -3180,9 +3188,78 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         }
                     }
                 }
+                "pre-push" => {
+                    if parsed.session.is_some() || parsed.all {
+                        return Err(UsageError::Message(
+                            "gates pre-push does not take --session or --all; it always validates the complete pushed tree".into(),
+                        ));
+                    }
+                    let remote = parsed.positional.get(1).ok_or(UsageError::Message(
+                        "gates pre-push requires Git's <remote-name> argument".into(),
+                    ))?;
+                    if parsed.positional.len() > 3 {
+                        return Err(UsageError::Message(
+                            "gates pre-push takes only Git's <remote-name> and optional <remote-url> arguments".into(),
+                        ));
+                    }
+                    let mut hook_input = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut hook_input)
+                        .map_err(|error| {
+                            UsageError::Message(format!("cannot read pre-push stdin: {error}"))
+                        })?;
+                    let cwd = std::env::current_dir().map_err(|error| {
+                        UsageError::Message(format!("cannot resolve cwd: {error}"))
+                    })?;
+                    let mut broker = open_broker()?;
+                    let report = broker.run_pre_push_gates(
+                        &cwd,
+                        remote,
+                        &hook_input,
+                        if parsed.no_cache {
+                            crate::CachePolicy::Bypass
+                        } else {
+                            crate::CachePolicy::Use
+                        },
+                    )?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else if report.plan.pushed_sha.is_none() {
+                        println!("Pre-push: deletion-only update; no content gates required.");
+                    } else {
+                        for outcome in &report.gate_outcomes {
+                            println!(
+                                "{:<20} {:<10} {}{} (tree {})",
+                                outcome.gate,
+                                gate_status_label(outcome.status, outcome.failure_class),
+                                if outcome.cached { "(cached) " } else { "" },
+                                outcome
+                                    .duration_ms
+                                    .map(|ms| format!("{ms}ms"))
+                                    .unwrap_or_default(),
+                                short_commit(&outcome.tree_hash),
+                            );
+                        }
+                        println!(
+                            "Pre-push: verified {} for {} ref update(s) to {}.",
+                            short_commit(report.plan.pushed_sha.as_deref().unwrap_or_default()),
+                            report.plan.updates.len(),
+                            report.plan.remote,
+                        );
+                    }
+                    if report
+                        .gate_outcomes
+                        .iter()
+                        .any(|outcome| outcome.status != crate::GateStatus::Pass)
+                    {
+                        return Err(UsageError::Message(
+                            "one or more pre-push gates did not pass".into(),
+                        ));
+                    }
+                }
                 other => {
                     return Err(UsageError::Message(format!(
-                        "unknown gates action {other:?} — expected draft, validate, affected, semantic, or run"
+                        "unknown gates action {other:?} — expected draft, validate, affected, semantic, run, or pre-push"
                     )));
                 }
             }

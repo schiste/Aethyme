@@ -9,6 +9,10 @@ advisory semantic gate suggestions, planning leases before claiming them, and
 leaving or retrieving a durable finish handoff. For the complete flag
 inventory, see the [CLI reference](../reference/cli.md).
 
+For concurrent validation that needs ports, Docker namespaces, databases, or
+host-capacity slots—including the opt-in repository-owned pre-push adapter—see
+[Concurrent Host Resource Coordination](host-resource-coordination.md).
+
 ## Safety Model
 
 Each workflow separates observation from mutation:

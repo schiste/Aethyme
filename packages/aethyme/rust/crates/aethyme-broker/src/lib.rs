@@ -68,7 +68,8 @@ pub use broker::{
 pub use error::BrokerError;
 pub use gates::{
     CachePolicy, Gate, GateConfigError, GateProgressSink, GateResourceProvenance, GateRunOutcome,
-    load_gates, select_gates,
+    PrePushPlan, PrePushReport, PrePushUpdate, PrePushValidationError, load_gates, plan_pre_push,
+    select_gates,
 };
 pub use git::{GitError, GitRepo, MergeSimulation, RemoteDefaultBranch};
 pub use graph_impact::{

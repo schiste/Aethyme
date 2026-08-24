@@ -24,6 +24,7 @@
 //! triggers matches every diff, and an unparseable glob fails config
 //! validation rather than silently never matching.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -281,6 +282,125 @@ pub struct GateResourceProvenance {
     pub generation: u64,
     pub expires_at: i64,
     pub allocations: Vec<crate::HostResourceAllocation>,
+}
+
+/// One ref update received from Git's `pre-push` hook protocol.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct PrePushUpdate {
+    pub local_ref: String,
+    pub local_sha: String,
+    pub remote_ref: String,
+    pub remote_sha: String,
+}
+
+/// Reviewed, read-only interpretation of a `pre-push` hook invocation.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct PrePushPlan {
+    pub remote: String,
+    pub pushed_sha: Option<String>,
+    pub updates: Vec<PrePushUpdate>,
+}
+
+/// Result of the opt-in repository-owned pre-push adapter.
+#[derive(Debug, serde::Serialize)]
+pub struct PrePushReport {
+    pub plan: PrePushPlan,
+    pub gate_outcomes: Vec<GateRunOutcome>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PrePushValidationError {
+    #[error(transparent)]
+    Git(#[from] crate::GitError),
+    #[error(
+        "pre-push received no ref updates on stdin; invoke this command from a Git pre-push hook"
+    )]
+    NoUpdates,
+    #[error(
+        "invalid pre-push update on line {line}; expected <local-ref> <local-sha> <remote-ref> <remote-sha>"
+    )]
+    MalformedUpdate { line: usize },
+    #[error("pre-push cannot prove multiple different local tips in one checkout: {shas}")]
+    MultipleTips { shas: String },
+    #[error(
+        "pre-push local tip {pushed_sha} is not this checkout's HEAD {head_sha}; run validation from a clean worktree checked out at the pushed tip"
+    )]
+    TipNotHead {
+        pushed_sha: String,
+        head_sha: String,
+    },
+    #[error(
+        "pre-push requires a clean checkout so evidence matches the pushed commit; dirty paths: {paths}"
+    )]
+    DirtyCheckout { paths: String },
+}
+
+/// Parse Git's pre-push stdin and prove that a single clean checkout can
+/// truthfully validate every non-deletion update. Deletion-only pushes need no
+/// content validation and therefore produce a plan without `pushed_sha`.
+pub fn plan_pre_push(
+    checkout: &GitRepo,
+    remote: &str,
+    input: &str,
+) -> Result<PrePushPlan, PrePushValidationError> {
+    let mut updates = Vec::new();
+    for (index, line) in input.lines().enumerate() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() != 4 {
+            return Err(PrePushValidationError::MalformedUpdate { line: index + 1 });
+        }
+        updates.push(PrePushUpdate {
+            local_ref: fields[0].to_string(),
+            local_sha: fields[1].to_string(),
+            remote_ref: fields[2].to_string(),
+            remote_sha: fields[3].to_string(),
+        });
+    }
+    if updates.is_empty() {
+        return Err(PrePushValidationError::NoUpdates);
+    }
+    updates.sort_by(|left, right| {
+        left.local_ref
+            .cmp(&right.local_ref)
+            .then(left.remote_ref.cmp(&right.remote_ref))
+            .then(left.local_sha.cmp(&right.local_sha))
+    });
+
+    let pushed_shas: BTreeSet<_> = updates
+        .iter()
+        .filter(|update| !update.local_sha.chars().all(|character| character == '0'))
+        .map(|update| update.local_sha.clone())
+        .collect();
+    let pushed_sha = match pushed_shas.len() {
+        0 => None,
+        1 => pushed_shas.into_iter().next(),
+        _ => {
+            return Err(PrePushValidationError::MultipleTips {
+                shas: pushed_shas.into_iter().collect::<Vec<_>>().join(", "),
+            });
+        }
+    };
+    if let Some(pushed_sha) = &pushed_sha {
+        let head_sha = checkout.head_commit()?;
+        if pushed_sha != &head_sha {
+            return Err(PrePushValidationError::TipNotHead {
+                pushed_sha: pushed_sha.clone(),
+                head_sha,
+            });
+        }
+        let dirty = checkout.dirty_paths()?;
+        if !dirty.is_empty() {
+            return Err(PrePushValidationError::DirtyCheckout {
+                paths: dirty.into_iter().take(10).collect::<Vec<_>>().join(", "),
+            });
+        }
+    }
+
+    Ok(PrePushPlan {
+        remote: remote.to_string(),
+        pushed_sha,
+        updates,
+    })
 }
 
 /// Sink for human-readable gate progress. Production uses stderr; tests can

@@ -247,8 +247,10 @@ impl HostResourceCoordinator {
                 path: parent.into(),
                 source,
             })?;
+            protect_host_state_path(parent, true)?;
         }
         let conn = Connection::open(path)?;
+        protect_host_state_path(path, false)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "wal")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -483,6 +485,24 @@ impl HostResourceCoordinator {
         }
         Ok(leases)
     }
+}
+
+#[cfg(unix)]
+fn protect_host_state_path(path: &Path, directory: bool) -> Result<(), HostResourceError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = if directory { 0o700 } else { 0o600 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|source| {
+        HostResourceError::Io {
+            path: path.into(),
+            source,
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn protect_host_state_path(_path: &Path, _directory: bool) -> Result<(), HostResourceError> {
+    Ok(())
 }
 
 fn validate_schema(conn: &Connection) -> Result<(), HostResourceError> {
@@ -946,6 +966,25 @@ mod tests {
             key: "database".into(),
             resource: HostResourceKind::ExclusiveKey { name: name.into() },
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_state_permissions_protect_ownership_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = tempfile::tempdir().unwrap();
+        let state = t.path().join("host-state");
+        let database = state.join("h.db");
+        HostResourceCoordinator::open(&database).unwrap();
+        assert_eq!(
+            std::fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

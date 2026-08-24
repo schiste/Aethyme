@@ -126,6 +126,8 @@ pub enum BrokerOpError {
     InvalidHandoffEvent { event_id: i64, reason: String },
     #[error(transparent)]
     GateConfig(#[from] crate::gates::GateConfigError),
+    #[error(transparent)]
+    PrePush(#[from] crate::gates::PrePushValidationError),
     #[error("queue entry {entry} is not verified (status: {status}) — submit/simulate first")]
     NotVerified { entry: i64, status: &'static str },
     #[error("refusing submission for session {session_id}: unsafe submission plan: {reason}")]
@@ -2297,6 +2299,29 @@ impl Broker {
             None,
             cache_policy,
         )
+    }
+
+    /// Validate Git's exact outgoing tip, then run the repository's complete
+    /// gate set. The repository owns the hook; the broker owns truthful
+    /// planning, gate execution, and any declared host-resource leases.
+    pub fn run_pre_push_gates(
+        &mut self,
+        dir: &Path,
+        remote: &str,
+        hook_input: &str,
+        cache_policy: crate::gates::CachePolicy,
+    ) -> Result<crate::gates::PrePushReport, BrokerOpError> {
+        let checkout = GitRepo::discover(dir)?;
+        let plan = crate::gates::plan_pre_push(&checkout, remote, hook_input)?;
+        let gate_outcomes = if plan.pushed_sha.is_some() {
+            self.run_all_gates_with_policy(dir, cache_policy)?
+        } else {
+            Vec::new()
+        };
+        Ok(crate::gates::PrePushReport {
+            plan,
+            gate_outcomes,
+        })
     }
 
     /// Test/non-CLI entrypoint for [`Self::run_all_gates`] with injectable

@@ -168,10 +168,18 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <gh-args>`
 - `aethyme broker operations [--json]`
 - `aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]`
+- `aethyme broker resources plan <request.json> [--json]`
+- `aethyme broker resources acquire <request.json> [--json]`
+- `aethyme broker resources renew <grant.json> --ttl <seconds> [--json]`
+- `aethyme broker resources release <grant.json> [--json]`
+- `aethyme broker resources list [--all] [--json]`
+- `aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]`
+- `aethyme broker gates validate [--json]`
 - `aethyme broker gates affected --session <id> [--why] [--json]`
 - `aethyme broker gates semantic --session <id> [--json]`
 - `aethyme broker gates run --session <id> [--no-cache] [--json]`
 - `aethyme broker gates run --all [--no-cache] [--json]`
+- `aethyme broker gates pre-push <remote-name> [<remote-url>] [--no-cache] [--json]`
 - `aethyme broker hooks install [--json]`
 - `aethyme broker hooks uninstall [--json]`
 - `aethyme broker hooks status [--json]`
@@ -196,6 +204,14 @@ lease planning, and durable finish handoffs, see the
 `quick-test` is the disposable install smoke. `verify-loop` is the stronger
 operator E2E: it reports the integration commit tested and flags movement during
 the run, so callers know whether the result proves the current integration tip.
+
+`broker gates pre-push` is an opt-in adapter for repository-owned hooks; the
+managed hook installer never writes `pre-push`. It reads Git's ref-update lines
+from stdin, requires all non-deletion updates to name one clean checked-out
+`HEAD`, and runs the complete gate set. This makes the reported tree truthful
+and lets declared host resources coordinate concurrent clones. See
+[Concurrent Host Resource Coordination](../guides/host-resource-coordination.md)
+for the gate schema, hook example, fallback contract, and quarantine recovery.
 
 `broker adopt --reuse --sync-integration` starts a follow-up from the current
 integration tip. It requires a clean session worktree, permits only a

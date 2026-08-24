@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -22,12 +23,40 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
+fn git_output(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
 fn run(repo: &Path, args: &[&str]) -> Output {
     Command::new(CLI)
         .args(args)
         .current_dir(repo)
         .output()
         .unwrap()
+}
+
+fn run_with_stdin(repo: &Path, args: &[&str], input: &str) -> Output {
+    let mut child = Command::new(CLI)
+        .args(args)
+        .current_dir(repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
 }
 
 fn stdout(output: Output) -> String {
@@ -145,6 +174,87 @@ fn gate_cli_reports_tree_provenance_for_executed_and_cached_results() {
     let session_cached: serde_json::Value = serde_json::from_str(&session_cached).unwrap();
     assert_eq!(session_cached[0]["cached"], true);
     assert_eq!(run_count(&tmp.path().join("gate-runs.txt")), 4);
+}
+
+#[test]
+fn pre_push_adapter_proves_the_clean_outgoing_head_and_refuses_drift() {
+    let tmp = fixture();
+    let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    let update = format!(
+        "refs/heads/main {head} refs/heads/main {}\n",
+        "0".repeat(40)
+    );
+
+    let verified = stdout(run_with_stdin(
+        tmp.path(),
+        &["gates", "pre-push", "origin", "unused-url", "--json"],
+        &update,
+    ));
+    let report: serde_json::Value = serde_json::from_str(&verified).unwrap();
+    assert_eq!(report["plan"]["remote"], "origin");
+    assert_eq!(report["plan"]["pushed_sha"], head);
+    assert_eq!(report["plan"]["updates"].as_array().unwrap().len(), 1);
+    assert_eq!(report["gate_outcomes"][0]["status"], "pass");
+    assert_eq!(run_count(&tmp.path().join("gate-runs.txt")), 1);
+
+    std::fs::write(tmp.path().join("tracked.txt"), "dirty\n").unwrap();
+    let dirty = run_with_stdin(
+        tmp.path(),
+        &["gates", "pre-push", "origin", "unused-url"],
+        &update,
+    );
+    assert!(!dirty.status.success());
+    assert!(String::from_utf8_lossy(&dirty.stderr).contains("requires a clean checkout"));
+    assert_eq!(run_count(&tmp.path().join("gate-runs.txt")), 1);
+
+    let wrong_tip = format!(
+        "refs/heads/main {} refs/heads/main {}\n",
+        "a".repeat(40),
+        "0".repeat(40)
+    );
+    let mismatch = run_with_stdin(
+        tmp.path(),
+        &["gates", "pre-push", "origin", "unused-url"],
+        &wrong_tip,
+    );
+    assert!(!mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("is not this checkout's HEAD"));
+
+    let multiple_tips = format!(
+        "refs/heads/a {} refs/heads/a {}\nrefs/heads/b {} refs/heads/b {}\n",
+        "a".repeat(40),
+        "0".repeat(40),
+        "b".repeat(40),
+        "0".repeat(40),
+    );
+    let ambiguous = run_with_stdin(
+        tmp.path(),
+        &["gates", "pre-push", "origin", "unused-url"],
+        &multiple_tips,
+    );
+    assert!(!ambiguous.status.success());
+    assert!(
+        String::from_utf8_lossy(&ambiguous.stderr)
+            .contains("cannot prove multiple different local tips")
+    );
+
+    let empty = run_with_stdin(
+        tmp.path(),
+        &["gates", "pre-push", "origin", "unused-url"],
+        "",
+    );
+    assert!(!empty.status.success());
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("received no ref updates"));
+
+    let deletion = format!("(delete) {} refs/heads/old {head}\n", "0".repeat(40));
+    let deleted = stdout(run_with_stdin(
+        tmp.path(),
+        &["gates", "pre-push", "origin", "unused-url", "--json"],
+        &deletion,
+    ));
+    let report: serde_json::Value = serde_json::from_str(&deleted).unwrap();
+    assert!(report["plan"]["pushed_sha"].is_null());
+    assert!(report["gate_outcomes"].as_array().unwrap().is_empty());
 }
 
 #[test]
