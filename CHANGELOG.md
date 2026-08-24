@@ -4,6 +4,44 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.2.2] - 2026-08-24
+
+### Added
+
+- Host-wide resource coordination allocates ports, Docker namespaces,
+  database names, and capacity slots as atomic lease bundles with TTL,
+  heartbeat, ownership credentials, and generation-fenced reconciliation.
+- Gate definitions can declare shared host resources. Broker gate execution
+  acquires those resources while preserving independent local test processes.
+- The opt-in pre-push adapter proves the outgoing commit and runs the selected
+  broker gates without making pre-commit hooks depend on shared services.
+- `aethyme upgrade plan` and digest-confirmed `aethyme upgrade apply` migrate
+  Aethyme-owned repository policy from logic embedded in the installed binary.
+
+### Changed
+
+- Canonical deployments track `.aethyme/repository.json`; local-only
+  deployments keep their repository schema marker clone-local and ignored.
+- Enrolled repositories fail closed on broker use when their generated policy
+  is missing a required migration or is newer than the installed binary.
+- Release manifests advertise repository schema compatibility, and successful
+  paired-binary updates name the explicit per-repository follow-up.
+
+### Security and reliability
+
+- Repository upgrade plans bind Git HEAD, deployment mode, relevant file
+  state, planned paths, and migrations into a full SHA-256 confirmation.
+- Upgrades refuse dirty worktrees, mismatched confirmations, malformed or
+  future markers, and managed paths that escape through symlinks.
+- An in-progress marker prevents an interrupted migration from appearing
+  current.
+
+### Upgrade notes
+
+Read [Upgrading to v0.2.2](packages/aethyme/docs/guides/upgrading-to-v0.2.2.md)
+before updating an enrolled repository. This release advances broker storage
+to schema 8 and introduces repository deployment schema 1.
+
 ## [0.2.1] - 2026-08-24
 
 ### Changed

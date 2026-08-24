@@ -19,7 +19,7 @@ aethyme-engine-cli --version
 This installs the Rust router and its required engine-daemon sibling from one
 checksum-verified archive. No interpreter, virtualenv, pip step, or background
 updater is involved. Re-run the command for the newest stable release; see the
-[v0.2.1 upgrade guide](../guides/upgrading-to-v0.2.1.md) for pinned versions,
+[v0.2.2 upgrade guide](../guides/upgrading-to-v0.2.2.md) for pinned versions,
 signature verification, source installation, and rollback.
 
 ## 2. Or Build From The Checkout

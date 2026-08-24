@@ -25,8 +25,8 @@ aethyme-engine-cli --version
 The installer establishes a versioned, paired layout for explicit native
 updates. Aethyme has no self-update daemon or silent background upgrade path.
 Use `sh -s -- --version
-0.2.1` to pin a release, or follow the
-[v0.2.1 upgrade guide](../guides/upgrading-to-v0.2.1.md) for source installs,
+0.2.2` to pin a release, or follow the
+[v0.2.2 upgrade guide](../guides/upgrading-to-v0.2.2.md) for source installs,
 manifest signature verification, migration, and rollback.
 
 `aethyme` and its required `aethyme-engine-cli` sibling are native Rust
