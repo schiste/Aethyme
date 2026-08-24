@@ -42,6 +42,7 @@ mod release_compatibility;
 pub mod release_manifest;
 mod report;
 mod report_filing;
+mod resources;
 mod schema;
 mod ship;
 mod store;
@@ -128,6 +129,12 @@ pub use report::{
 pub use report_filing::{
     REPORT_FILE_SCHEMA_VERSION, ReportFileError, ReportFileResult, ReportFileState,
     file_reviewed_report,
+};
+pub use resources::{
+    HOST_RESOURCE_REQUEST_SCHEMA_VERSION, HOST_RESOURCE_SCHEMA_VERSION, HostLeaseState,
+    HostResourceAllocation, HostResourceConflict, HostResourceCoordinator, HostResourceError,
+    HostResourceGrant, HostResourceKind, HostResourceLease, HostResourcePlan, HostResourceRequest,
+    HostResourceRequirement, default_host_resource_db_path, resource_environment_key,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use ship::{

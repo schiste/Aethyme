@@ -107,6 +107,21 @@ Usage:
       Does not create or refresh leases.
   aethyme broker leases release <path> --session <id> [--json]
       Release an explicit claim.
+  aethyme broker resources plan <request.json> [--json]
+      Read-only host-wide availability estimate for a typed resource bundle.
+      Never reserves a port, namespace, capacity slot, or exclusive key.
+  aethyme broker resources acquire <request.json> [--json]
+      Atomically reserve the full bundle across every clone run by this user.
+      The returned grant contains the ownership token; keep it private.
+  aethyme broker resources renew <grant.json> --ttl <seconds> [--json]
+  aethyme broker resources release <grant.json> [--json]
+      Renew or release with the exact grant returned by acquire. Tokens are
+      read from the file rather than command arguments or broker telemetry.
+  aethyme broker resources list [--all] [--json]
+      Read-only inventory. Ownership tokens are never included.
+  aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]
+      Release an expired, quarantined allocation after reviewing host cleanup.
+      The generation confirmation fences stale cleanup commands.
   aethyme broker exec --session <id> -- <command> [--json]
       Run a command in the session worktree, then fail if it leaves new
       dirty paths outside explicit leases or in adoption-time foreign
@@ -319,6 +334,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "reconcile",
         "agents",
         "leases",
+        "resources",
         "claim",
         "release",
         "gates",
@@ -424,6 +440,7 @@ fn command_records_metric(args: &[String]) -> bool {
         }
         Some("hooks") => args.get(1).map(String::as_str) != Some("status"),
         Some("leases") => args.get(1).map(String::as_str) != Some("plan"),
+        Some("resources") => !matches!(args.get(1).map(String::as_str), Some("plan" | "list")),
         Some("events") => args.get(1).map(String::as_str) == Some("prune"),
         Some("gates") => !matches!(
             args.get(1).map(String::as_str),
@@ -2418,6 +2435,181 @@ fn report_main_root() -> Result<PathBuf, UsageError> {
     Ok(repo.main_root()?)
 }
 
+const HOST_RESOURCE_INPUT_MAX_BYTES: u64 = 1024 * 1024;
+
+fn read_resource_json<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+) -> Result<T, UsageError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        UsageError::Message(format!("cannot inspect {}: {error}", path.display()))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(UsageError::Message(format!(
+            "resource input must be a regular, non-symlink file: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() > HOST_RESOURCE_INPUT_MAX_BYTES {
+        return Err(UsageError::Message(format!(
+            "resource input exceeds {HOST_RESOURCE_INPUT_MAX_BYTES} bytes"
+        )));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| UsageError::Message(format!("cannot read {}: {error}", path.display())))?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        UsageError::Message(format!("invalid JSON in {}: {error}", path.display()))
+    })
+}
+
+fn render_host_lease(lease: &crate::HostResourceLease) {
+    println!(
+        "{} generation {} — {} until {}",
+        lease.lease_id,
+        lease.generation,
+        lease.state.as_str(),
+        lease.expires_at
+    );
+    for allocation in &lease.allocations {
+        println!(
+            "  {:<20} {:<14} {}",
+            allocation.key, allocation.kind, allocation.value
+        );
+    }
+}
+
+fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
+    let action = parsed
+        .positional
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| {
+            UsageError::Message(
+                "resources requires plan, acquire, renew, release, list, or reconcile".into(),
+            )
+        })?;
+    match action {
+        "plan" | "acquire" => {
+            let path = parsed.positional.get(1).map(PathBuf::from).ok_or_else(|| {
+                UsageError::Message(format!("resources {action} requires <request.json>"))
+            })?;
+            let request: crate::HostResourceRequest = read_resource_json(&path)?;
+            if action == "plan" {
+                let coordinator = crate::HostResourceCoordinator::open_read_only_default()?;
+                let plan = coordinator.plan(&request)?;
+                if parsed.json {
+                    println!("{}", serde_json::to_string_pretty(&plan)?);
+                } else {
+                    println!(
+                        "Request {} — {} (advisory; acquire is authoritative)",
+                        plan.request_id,
+                        if plan.available {
+                            "available"
+                        } else {
+                            "blocked"
+                        }
+                    );
+                    for allocation in &plan.proposed {
+                        println!(
+                            "  proposed {:<20} {:<14} {}",
+                            allocation.key, allocation.kind, allocation.value
+                        );
+                    }
+                    for conflict in &plan.conflicts {
+                        println!(
+                            "  conflict {:<20} {}",
+                            conflict.resource_key, conflict.reason
+                        );
+                    }
+                }
+            } else {
+                let mut coordinator = crate::HostResourceCoordinator::open_default()?;
+                let grant = coordinator.acquire(&request)?;
+                if parsed.json {
+                    println!("{}", serde_json::to_string_pretty(&grant)?);
+                } else {
+                    render_host_lease(&grant.lease);
+                    println!("Ownership token: {}", grant.ownership_token);
+                    println!("Store the complete JSON grant privately for renew/release.");
+                }
+            }
+        }
+        "renew" | "release" => {
+            let mut coordinator = crate::HostResourceCoordinator::open_default()?;
+            let path = parsed.positional.get(1).map(PathBuf::from).ok_or_else(|| {
+                UsageError::Message(format!("resources {action} requires <grant.json>"))
+            })?;
+            let mut grant: crate::HostResourceGrant = read_resource_json(&path)?;
+            grant.lease = if action == "renew" {
+                let ttl = parsed.ttl_seconds.ok_or_else(|| {
+                    UsageError::Message("resources renew requires --ttl <seconds>".into())
+                })?;
+                let ttl = u64::try_from(ttl)
+                    .map_err(|_| UsageError::Message("--ttl must be positive".into()))?;
+                coordinator.renew(
+                    &grant.lease.lease_id,
+                    grant.lease.generation,
+                    &grant.ownership_token,
+                    ttl,
+                )?
+            } else {
+                coordinator.release(
+                    &grant.lease.lease_id,
+                    grant.lease.generation,
+                    &grant.ownership_token,
+                )?
+            };
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&grant)?);
+            } else {
+                render_host_lease(&grant.lease);
+            }
+        }
+        "list" => {
+            let coordinator = crate::HostResourceCoordinator::open_read_only_default()?;
+            let leases = coordinator.list(parsed.all)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&leases)?);
+            } else if leases.is_empty() {
+                println!("No active or quarantined host resource leases.");
+            } else {
+                for lease in &leases {
+                    render_host_lease(lease);
+                }
+            }
+        }
+        "reconcile" => {
+            let mut coordinator = crate::HostResourceCoordinator::open_default()?;
+            let lease_id = parsed.positional.get(1).ok_or_else(|| {
+                UsageError::Message("resources reconcile requires <lease-id>".into())
+            })?;
+            let generation = parsed
+                .confirm
+                .as_deref()
+                .ok_or_else(|| {
+                    UsageError::Message(
+                        "resources reconcile requires --confirm <generation>".into(),
+                    )
+                })?
+                .parse::<u64>()
+                .map_err(|_| {
+                    UsageError::Message("--confirm must be the full numeric generation".into())
+                })?;
+            let lease = coordinator.reconcile(lease_id, generation)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&lease)?);
+            } else {
+                render_host_lease(&lease);
+            }
+        }
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown resources action {other:?}; expected plan, acquire, renew, release, list, or reconcile"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn run_inner(args: &[String]) -> Result<(), UsageError> {
     let Some(subcommand) = args.first() else {
         return Err(UsageError::Help);
@@ -2553,6 +2745,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             }
         }
         "report" => run_report(parsed)?,
+        "resources" => run_resources(parsed)?,
         "agents" => {
             let mut broker = open_broker()?;
             let overlaps = broker.refresh_leases()?;
