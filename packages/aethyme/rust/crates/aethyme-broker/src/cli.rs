@@ -645,15 +645,15 @@ mod tests {
     }
 
     #[test]
-    fn init_next_steps_names_quick_test_before_start_and_submit() {
+    fn init_next_steps_names_deploy_before_quick_test_start_and_submit() {
         let message = super::init_next_steps_message();
-        let init = message.find("aethyme init").unwrap();
+        let deploy = message.find("aethyme deploy --repo .").unwrap();
         let quick_test = message.find("aethyme broker quick-test").unwrap();
         let start = message.find("aethyme broker start").unwrap();
         let submit = message
             .find("aethyme broker submit --session <id>")
             .unwrap();
-        assert!(init < quick_test);
+        assert!(deploy < quick_test);
         assert!(quick_test < start);
         assert!(start < submit);
     }
@@ -1348,11 +1348,10 @@ fn render_quick_test_report(report: &crate::QuickTestReport, json: bool) -> Resu
 }
 
 fn init_next_steps_message() -> &'static str {
-    "First-time flow: install -> `aethyme init` -> `aethyme broker quick-test` -> \
+    "First-time flow: install -> `aethyme deploy --repo .` -> `aethyme broker quick-test` -> \
      `aethyme broker start --task \"...\"` -> `aethyme broker submit --session <id>`.\n\
-     Next steps: review any drafts above, re-check anytime with `aethyme certify`, \
-     then run the disposable smoke before starting real sessions; optionally \
-     `aethyme enhance deploy` installs the agent protocol into AGENTS.md/CLAUDE.md."
+     This low-level init configured broker state only. Run `aethyme deploy --repo .` \
+     now to install mandatory agent policy and certify the complete deployment."
 }
 
 fn print_overlap_warnings(overlaps: &[crate::Overlap]) {

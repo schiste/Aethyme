@@ -72,14 +72,14 @@ separate supporting service; changed-path triggers still exclusively control
 execution, auth, or team sync is part of the product. Direction doc:
 [`docs/aethyme-local-agent-broker.md`](docs/aethyme-local-agent-broker.md).
 
-## Quickstart: install -> init -> quick-test -> start -> submit
+## Quickstart: install -> deploy -> quick-test -> start -> submit
 
 Prerequisites: git ≥ 2.38 and any repository to try it on. Prebuilt releases
 support Apple Silicon macOS, Intel macOS, and x86-64 Linux. Building from
 source additionally needs a Rust toolchain and about 2 GB of free RAM for the
 one-time compile.
 
-First-time flow: install -> `aethyme init` -> `aethyme broker quick-test` ->
+First-time flow: install -> `aethyme deploy` -> `aethyme broker quick-test` ->
 `aethyme broker start --task "..."` -> `aethyme broker submit --session <id>`.
 
 **1. Install the latest stable binary pair with Homebrew:**
@@ -121,42 +121,32 @@ contributors and unsupported targets, not as the primary quickstart. See the
 [v0.2.0 upgrade and rollback guide](packages/aethyme/docs/guides/upgrading-to-v0.2.0.md)
 for signature verification, source installation, migrations, and rollback.
 
-**2. Certify and scaffold your target repo:**
+**2. Deploy Aethyme into each target repository:**
 
 ```bash
 cd /path/to/your-repo
-aethyme init
+aethyme deploy --repo .
 ```
 
-```text
-Phase 1/3 — certify (read-only):
-pass     certify.git-version          git 2.55.0 (≥ 2.38 required for merge simulation)
-pass     certify.git-repo             inside a git repository
-pass     certify.head-commit          repository has at least one commit
-pass     certify.binary-path          the running aethyme is the one on PATH
-warn     certify.gates                no gates.toml — broker runs conflict-only (no verification); `aethyme broker gates draft` can draft one
-...
-
-Phase 2/3 — scaffold (deterministic, only-if-missing):
-created  scaffold.config-toml         .aethyme/config.toml written — review the draft
-created  scaffold.gitignore           appended the aethyme-broker block to .gitignore
-created  scaffold.broker-db           integrity: ok
-
-Phase 3/3 — gates draft (adaptive):
-warn     gates.draft                  no manifests recognized — define .aethyme/gates.toml yourself; until then the broker runs conflict-only (no verification)
-
-First-time flow: install -> `aethyme init` -> `aethyme broker quick-test` -> `aethyme broker start --task "..."` -> `aethyme broker submit --session <id>`.
-Next steps: review any drafts above, re-check anytime with `aethyme certify`, then run the disposable smoke before starting real sessions; optionally `aethyme enhance deploy` installs the agent protocol into AGENTS.md/CLAUDE.md.
-```
+This is the mandatory per-repository enrollment step. It scaffolds broker
+configuration and gates, installs the agent protocol and repository skills,
+then verifies and certifies the complete deployment. The globally installed
+binaries provide the executable; the committed repository policy makes every
+agent in this repository use it. Re-check the committed state locally and in
+CI with `aethyme deploy verify --repo .`.
 
 (On a repo with a `Cargo.toml`, `go.mod`, `package.json` scripts, or a
 `pyproject.toml` mentioning pytest/ruff, phase 3 drafts a `gates.toml` for
-you to review.) Commit the scaffold:
+you to review.) Commit the repository deployment:
 
 ```bash
-git add .gitignore .aethyme/config.toml
-git commit -m "chore: adopt aethyme broker (scaffold)"
+git add .gitignore .aethyme AGENTS.md CLAUDE.md .codex .claude
+git commit -m "chore: deploy aethyme repository policy"
 ```
+
+The deploy command prints the exact tracked-policy/runtime-state boundary.
+See the [repository deployment contract](packages/aethyme/docs/guides/repository-deployment.md)
+for clone behavior, ignored artifacts, and CI enforcement.
 
 **3. Run the disposable broker smoke** — this creates and removes a temporary
 repo; it does not touch your target repo:

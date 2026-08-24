@@ -7,9 +7,8 @@
 //! build time (`include_str!` from `skills/aethyme/`) so a
 //! `cargo install`ed binary deploys without a source checkout — the
 //! one-binary install story. The Python original read templates from
-//! `AETHYME_ROOT` at runtime; embedding is the sanctioned packaging
-//! change, with byte-identical rendered output verified by
-//! `scripts/migration/enhance-golden.sh`.
+//! source checkout at runtime. Deployed commands resolve the installed
+//! `aethyme` binary through PATH.
 //!
 //! The router dispatches `enhance deploy|verify` here unconditionally
 //! (Phase 2 flip, 2026-07-29); the Python `enhance` group is deleted.
@@ -29,7 +28,7 @@ pub mod templates;
 pub mod timeutil;
 pub mod util;
 
-/// The placeholder every template substitutes.
+/// Legacy placeholder rejected by deployment verification.
 pub const PLACEHOLDER: &str = "{{AETHYME_ROOT}}";
 pub const BLOCK_BEGIN: &str = "<!-- AETHYME:BEGIN generated -->";
 pub const BLOCK_END: &str = "<!-- AETHYME:END generated -->";

@@ -39,18 +39,16 @@ pub enum Outcome {
 }
 
 /// Run `repo <subcommand> ...` with `args` excluding the leading `repo`.
-/// `resolve_root` supplies the Aethyme package root lazily — only
-/// `deploy-skills` and `compile-skills` need it (template substitution
-/// and navigation recipes); the telemetry/hygiene commands must work in
-/// repos with no Aethyme checkout reachable (deployed-hook path).
-pub fn run(args: &[String], resolve_root: &dyn Fn() -> Option<PathBuf>) -> Outcome {
+/// Embedded templates and PATH-based commands keep every subcommand usable
+/// without an Aethyme source checkout.
+pub fn run(args: &[String]) -> Outcome {
     let Some(subcommand) = args.first() else {
         return Outcome::Delegate;
     };
     let rest = &args[1..];
     let code = match subcommand.as_str() {
-        "deploy-skills" => run_deploy_skills(rest, resolve_root),
-        "compile-skills" => run_compile_skills(rest, resolve_root),
+        "deploy-skills" => run_deploy_skills(rest),
+        "compile-skills" => run_compile_skills(rest),
         "init-onboarding-overrides" => run_init_onboarding_overrides(rest),
         "validate-onboarding-overrides" => run_validate_onboarding_overrides(rest),
         "init-agents-overrides" => run_init_agents_overrides(rest),
@@ -208,27 +206,7 @@ fn append_event_or_error(repo: &Path, event_type: &str, payload: Value) -> Resul
 
 // ── skills ──────────────────────────────────────────────────────────────────
 
-fn resolved_root(
-    subcommand: &str,
-    resolve_root: &dyn Fn() -> Option<PathBuf>,
-) -> Result<String, u8> {
-    match resolve_root() {
-        Some(root) => Ok(resolve_path(&root).display().to_string()),
-        None => {
-            eprintln!(
-                "aethyme: cannot locate the Aethyme package root for the 'repo {subcommand}' command."
-            );
-            eprintln!("  - run from inside an Aethyme checkout (auto-discovered), or");
-            eprintln!(
-                "  - `aethyme root set /path/to/Aethyme` (writes ~/.config/aethyme/root), or"
-            );
-            eprintln!("  - export AETHYME_ROOT=/path/to/Aethyme/packages/aethyme");
-            Err(2)
-        }
-    }
-}
-
-fn run_deploy_skills(rest: &[String], resolve_root: &dyn Fn() -> Option<PathBuf>) -> u8 {
+fn run_deploy_skills(rest: &[String]) -> u8 {
     let parsed = match parse_args(rest, &["--force", "--remove"], &[]) {
         Ok(parsed) => parsed,
         Err(message) => return usage_error(&message),
@@ -247,11 +225,7 @@ fn run_deploy_skills(rest: &[String], resolve_root: &dyn Fn() -> Option<PathBuf>
         }
         return 0;
     }
-    let root = match resolved_root("deploy-skills", resolve_root) {
-        Ok(root) => root,
-        Err(code) => return code,
-    };
-    match skills::deploy_skills(&repo, &root, parsed.has_flag("--force")) {
+    match skills::deploy_skills(&repo, parsed.has_flag("--force")) {
         Ok(deployed) if !deployed.is_empty() => {
             println!("Deployed skills: {}", deployed.join(", "));
         }
@@ -264,7 +238,7 @@ fn run_deploy_skills(rest: &[String], resolve_root: &dyn Fn() -> Option<PathBuf>
     0
 }
 
-fn run_compile_skills(rest: &[String], resolve_root: &dyn Fn() -> Option<PathBuf>) -> u8 {
+fn run_compile_skills(rest: &[String]) -> u8 {
     let parsed = match parse_args(rest, &[], &["--skill"]) {
         Ok(parsed) => parsed,
         Err(message) => return usage_error(&message),
@@ -286,14 +260,9 @@ fn run_compile_skills(rest: &[String], resolve_root: &dyn Fn() -> Option<PathBuf
     } else {
         skill_names
     };
-    let root = match resolved_root("compile-skills", resolve_root) {
-        Ok(root) => root,
-        Err(code) => return code,
-    };
-
     let mut written: Vec<String> = Vec::new();
     if selected.contains(&"repo-onboarding") {
-        let files = match onboarding::expected_onboarding_files(&repo, Path::new(&root)) {
+        let files = match onboarding::expected_onboarding_files(&repo) {
             Ok(files) => files,
             Err(message) => return runtime_error(&message),
         };
@@ -504,7 +473,11 @@ fn run_record_wrapper_invocation(rest: &[String]) -> u8 {
         };
         details.set(key, Value::str(value));
     }
-    let details = if details.truthy() { Some(details) } else { None };
+    let details = if details.truthy() {
+        Some(details)
+    } else {
+        None
+    };
     match telemetry::record_wrapper_invocation(&repo, wrapper_name, details) {
         Ok(()) => 0,
         Err(message) => runtime_error(&message),
@@ -574,7 +547,11 @@ fn run_experience_telemetry(rest: &[String]) -> u8 {
     println!("Path: {}", field("path").py_str());
     println!(
         "Exists: {}",
-        if field("exists").truthy() { "yes" } else { "no" }
+        if field("exists").truthy() {
+            "yes"
+        } else {
+            "no"
+        }
     );
     println!("Events: {}", field("event_count").py_str());
     println!("Last event: {}", {
@@ -627,7 +604,11 @@ fn run_experience_telemetry(rest: &[String]) -> u8 {
             let joined = join_str_list(kpis.get("stale_targets"));
             println!(
                 "- stale_targets: {}",
-                if joined.is_empty() { "none".to_string() } else { joined }
+                if joined.is_empty() {
+                    "none".to_string()
+                } else {
+                    joined
+                }
             );
         }
         let signals = kpi("signals");
@@ -916,7 +897,11 @@ fn run_lint_commit_message(rest: &[String]) -> u8 {
     let recognized = join_str_list(result.get("recognized_sections"));
     println!(
         "Sections: {}",
-        if recognized.is_empty() { "none".to_string() } else { recognized }
+        if recognized.is_empty() {
+            "none".to_string()
+        } else {
+            recognized
+        }
     );
     if let Some(candidates) = result.get("memory_candidates").and_then(Value::as_array) {
         if !candidates.is_empty() {

@@ -14,8 +14,7 @@ contract; load a reference only if the first result is insufficient.
 ## Setup
 
 ```bash
-AETHYME_ROOT="{{AETHYME_ROOT}}"
-AETHYME_BIN="$AETHYME_ROOT/rust/target/release/aethyme"
+AETHYME_BIN="${AETHYME_BIN:-aethyme}"
 REPO="$PWD"
 ```
 

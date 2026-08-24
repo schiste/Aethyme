@@ -83,11 +83,11 @@ Aethyme runs against local repositories without a SaaS layer.
 
 Primary commands:
 
+- `aethyme deploy --repo /path/to/repo`
+- `aethyme deploy verify --repo /path/to/repo`
 - `aethyme explore --repo /path/to/repo --request "<task>" --format answer-json`
   (native Rust entrypoint; the paired `aethyme-engine-cli` binary serves the
   daemon protocol and is installed from the same release archive)
-- `aethyme enhance deploy --repo /path/to/repo`
-- `aethyme enhance verify --repo /path/to/repo`
 - `aethyme repo compile-skills /path/to/repo`
 - `aethyme repo init-onboarding-overrides /path/to/repo`
 - `aethyme repo validate-onboarding-overrides /path/to/repo`
@@ -146,17 +146,18 @@ Runtime notes:
 - the Python layer now executes a built Rust binary rather than `cargo run` for every call
 - local repo artifacts are cached by snapshot key under `AETHYME_CACHE_DIR` or `/tmp/aethyme-cache`
 - Git repositories use commit plus dirty-state metadata for cache keys instead of a full recursive fingerprint on every call
-- `aethyme enhance deploy --repo <path>` is the primary real-repository enhancement path; it writes cross-product discoverability files plus generated repo-onboarding artifacts
+- `aethyme deploy --repo <path>` is the canonical mandatory repository-enrollment path; it composes broker scaffold, gate drafting, agent-policy deployment, verification, and certification
+- `aethyme deploy verify --repo <path>` is its read-only local and CI contract; `aethyme enhance deploy/verify` remain lower-level discoverability operations
 - `AGENTS.md` and `CLAUDE.md` are generated artifacts owned by Aethyme; customize them through `.aethyme/overrides/agents.json`, not by editing the root files directly
 - generated root instructions include compact repo routing such as skill paths, fast test, app entrypoint, experience status, and commit hygiene policy
 - legacy block-managed `AGENTS.md` files are migration-only now; deploy extracts legacy maintainer text into `.aethyme/overrides/agents.json` before rewriting the root file
 - `aethyme repo deploy-skills` remains a compatibility path for the static runtime skill and benchmark-oriented consumers
-- generated onboarding lives at `.aethyme/generated/onboarding.json` and renders to `.codex/skills/repo-onboarding/SKILL.md` and `.claude/skills/repo-onboarding/SKILL.md`
-- generated Act starter lives at `.aethyme/generated/act-starter.json` and renders to `.codex/skills/repo-act/SKILL.md` and `.claude/skills/repo-act/SKILL.md`
+- portable generated onboarding lives at `.aethyme/generated/onboarding.json` and renders to `.codex/skills/repo-onboarding/SKILL.md` and `.claude/skills/repo-onboarding/SKILL.md`; both the canonical input and rendered skills are committed
+- portable generated Act starter lives at `.aethyme/generated/act-starter.json` and renders to `.codex/skills/repo-act/SKILL.md` and `.claude/skills/repo-act/SKILL.md`; both are committed
 - repo-local onboarding overrides live at `.aethyme/overrides/onboarding.json`; this side owns summon policy, overrides, compact rendering, and generation telemetry, while graph quality stays below the contract boundary
-- stable experience-layer lifecycle telemetry is written to `.aethyme/generated/experience-telemetry.jsonl`
+- machine-local experience-layer lifecycle telemetry is written to the ignored `.aethyme/generated/experience-telemetry.jsonl`
 - `aethyme repo experience-telemetry --check` now exits nonzero on attention signals such as invalid overrides, no wrapper usage after enhancement, or override/artifact freshness drift
-- generated operator status artifacts now live at `.aethyme/generated/experience-status.json` and `.aethyme/generated/experience-status.md`
+- generated operator status artifacts are machine-local and ignored at `.aethyme/generated/experience-status.json` and `.aethyme/generated/experience-status.md`
 - `aethyme repo commit-message-template` and `aethyme repo lint-commit-message` define and validate the typed commit contract Aethyme will later use for repo-memory extraction; substantive commit types (`fix`, `feat`, `refactor`, `perf`) require `Problem`, `Decision`, `Rationale`, and `Validation` sections, while non-substantive types (`test`, `docs`, `build`, `chore`, `revert`) may be subject-only; structured section content can begin on the header line (`Problem: text`) or the following line
 - `explore --request ...` defaults to `task_localization_query`, a bounded general-purpose answer path that returns ranked candidate files/symbols/areas, compact evidence, verification steps, confidence, next actions, compact agent observability, `output_chars_estimate`, and `truncated`; on large repos it returns degraded `needs_verification` output instead of blocking or claiming answer safety
 - `explore --intent usage_boundary_query` now uses a scope-first PHP analyzer path that returns answer/excluded/confidence/observability without building the full repository graph

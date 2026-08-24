@@ -55,7 +55,6 @@ jobs:
             ln -sf "$HOME/.cargo/bin/$bin" "$SANDBOX/$bin"
           done
           export PATH="$SANDBOX"
-          export AETHYME_ROOT="$GITHUB_WORKSPACE/packages/aethyme"
 
           # Guard the guard: if an interpreter is reachable, this job
           # proves nothing and must fail loudly rather than pass quietly.
@@ -76,9 +75,19 @@ jobs:
           printf '# Demo\n' > README.md
           git add -A && git commit -qm init
 
-          # Deploy + verify the discoverability artifacts.
-          aethyme enhance deploy --repo .
-          aethyme enhance verify --repo .
+          # Canonical repository enrollment must work from only the installed
+          # binary pair. The read-only verification command is the CI policy
+          # gate repositories should retain after committing deployment files.
+          aethyme deploy --repo .
+          aethyme deploy verify --repo .
+          if grep -R "$GITHUB_WORKSPACE/packages/aethyme" AGENTS.md CLAUDE.md .codex .claude; then
+            echo "FAIL: deployed policy embeds the build checkout" >&2
+            exit 1
+          fi
+          if grep -R "$TARGET" AGENTS.md CLAUDE.md .aethyme/generated/onboarding.json .codex .claude; then
+            echo "FAIL: deployed policy embeds the target checkout" >&2
+            exit 1
+          fi
 
           # Quality surface. ai-ready exits 1 when it reports warnings,
           # which a fixture repo always does, so assert on the report

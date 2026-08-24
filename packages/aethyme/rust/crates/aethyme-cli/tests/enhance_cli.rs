@@ -76,7 +76,10 @@ fn agents_document_includes_broker_protocol_only_when_configured() {
     // Broker-configured repo -> the protocol appears, with the
     // essentials: status-before-editing, verified submit as the default,
     // the action-required file, and authority-based Git operations.
-    write(repo.join(".aethyme/gates.toml"), "[[gate]]\nname = \"ok\"\ncommand = \"true\"\n");
+    write(
+        repo.join(".aethyme/gates.toml"),
+        "[[gate]]\nname = \"ok\"\ncommand = \"true\"\n",
+    );
     deploy(&repo, true);
     let agents = read(repo.join("AGENTS.md"));
     for needle in [
@@ -130,17 +133,39 @@ fn enhance_deploy_writes_generated_onboarding() {
         ".aethyme/generated/onboarding.json",
         ".aethyme/generated/act-starter.json",
     ] {
-        assert!(written.contains(relative), "deploy did not write {relative:?}");
+        assert!(
+            written.contains(relative),
+            "deploy did not write {relative:?}"
+        );
     }
 
     let artifact: Value =
         serde_json::from_str(&read(repo.join(".aethyme/generated/onboarding.json"))).unwrap();
     let act: Value =
         serde_json::from_str(&read(repo.join(".aethyme/generated/act-starter.json"))).unwrap();
-    assert!(artifact["telemetry"]["counts"]["commands"].as_i64().unwrap() >= 1);
-    assert!(!artifact["summon"]["task_signals"].as_array().unwrap().is_empty());
-    assert!(!act["starter_checklists"]["debugging"].as_array().unwrap().is_empty());
-    assert!(event_types(&repo).iter().any(|kind| kind == "enhance.deploy"));
+    assert!(
+        artifact["telemetry"]["counts"]["commands"]
+            .as_i64()
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        !artifact["summon"]["task_signals"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !act["starter_checklists"]["debugging"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        event_types(&repo)
+            .iter()
+            .any(|kind| kind == "enhance.deploy")
+    );
 
     invoke_aethyme(["enhance", "verify", "--repo", &repo.display().to_string()])
         .assert_contains("All discoverability files present and substituted.")
@@ -154,7 +179,10 @@ fn enhance_deploy_writes_generated_onboarding() {
     let codex_text = read(&codex_wrapper);
     assert!(codex_text.contains("repo record-wrapper-invocation"));
     assert!(codex_text.contains("--wrapper aethyme-explore"));
-    assert!(is_executable(&codex_wrapper), "deployed wrapper must be executable");
+    assert!(
+        is_executable(&codex_wrapper),
+        "deployed wrapper must be executable"
+    );
 
     let agents = read(repo.join("AGENTS.md"));
     for needle in [
@@ -176,6 +204,40 @@ fn enhance_deploy_writes_generated_onboarding() {
     ] {
         assert!(agents.contains(needle), "AGENTS.md missing {needle:?}");
     }
+}
+
+#[test]
+fn installed_binary_deploys_without_a_source_checkout() {
+    let tmp = tmp_dir();
+    let repo = demo_repo(tmp.path());
+    let isolated_config = tmp.path().join("empty-config");
+    let output = std::process::Command::new(aethyme_bin())
+        .args(["enhance", "deploy", "--repo"])
+        .arg(&repo)
+        .env_remove("AETHYME_ROOT")
+        .env("XDG_CONFIG_HOME", isolated_config)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for relative in [
+        "AGENTS.md",
+        ".codex/skills/aethyme/SKILL.md",
+        ".claude/hooks/aethyme-load-context.sh",
+    ] {
+        let content = read(repo.join(relative));
+        assert!(!content.contains("AETHYME_ROOT"), "{relative}");
+        assert!(
+            !content.contains("/rust/target/release/aethyme"),
+            "{relative}"
+        );
+    }
+    assert!(read(repo.join("AGENTS.md")).contains("aethyme explore"));
 }
 
 #[test]
@@ -236,8 +298,16 @@ fn init_and_validate_onboarding_overrides_cli() {
         .ok();
 
     let types = event_types(&repo);
-    assert!(types.iter().any(|kind| kind == "repo.init-onboarding-overrides"));
-    assert!(types.iter().any(|kind| kind == "repo.validate-onboarding-overrides"));
+    assert!(
+        types
+            .iter()
+            .any(|kind| kind == "repo.init-onboarding-overrides")
+    );
+    assert!(
+        types
+            .iter()
+            .any(|kind| kind == "repo.validate-onboarding-overrides")
+    );
 }
 
 #[test]
@@ -254,8 +324,16 @@ fn init_and_validate_agents_overrides_cli() {
         .ok();
 
     let types = event_types(&repo);
-    assert!(types.iter().any(|kind| kind == "repo.init-agents-overrides"));
-    assert!(types.iter().any(|kind| kind == "repo.validate-agents-overrides"));
+    assert!(
+        types
+            .iter()
+            .any(|kind| kind == "repo.init-agents-overrides")
+    );
+    assert!(
+        types
+            .iter()
+            .any(|kind| kind == "repo.validate-agents-overrides")
+    );
 }
 
 #[test]
@@ -269,7 +347,11 @@ fn enhance_verify_prints_summary() {
     result.assert_contains("Enhancement summary:");
     result.assert_contains("Recommendation: load `repo-onboarding` then run `explore`");
     result.assert_contains("Experience telemetry:");
-    assert!(event_types(&repo).iter().any(|kind| kind == "enhance.verify"));
+    assert!(
+        event_types(&repo)
+            .iter()
+            .any(|kind| kind == "enhance.verify")
+    );
 }
 
 #[test]
@@ -312,7 +394,10 @@ fn deployed_session_hook_records_native_wrapper_invocation() {
     );
 
     let envelope: Value = serde_json::from_slice(&output.stdout).expect("hook stdout is JSON");
-    assert_eq!(envelope["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    assert_eq!(
+        envelope["hookSpecificOutput"]["hookEventName"],
+        "SessionStart"
+    );
 
     assert!(
         telemetry_events(&repo).iter().any(|event| {
@@ -344,7 +429,12 @@ fn repo_experience_telemetry_reports_json_and_text() {
     json_result.ok();
     let payload = json_result.json();
     assert!(payload["event_count"].as_i64().unwrap() >= 2);
-    assert!(payload["wrapper_invocations"]["aethyme-explore"].as_i64().unwrap() >= 1);
+    assert!(
+        payload["wrapper_invocations"]["aethyme-explore"]
+            .as_i64()
+            .unwrap()
+            >= 1
+    );
     assert!(payload["by_type"].get("enhance.deploy").is_some());
     assert!(payload["kpis"]["wrapper_total"].as_i64().unwrap() >= 1);
     assert_eq!(payload["kpis"]["act_has_fast_test"], true);
@@ -372,7 +462,10 @@ fn repo_experience_status_writes_artifacts() {
     let payload = result.json();
     assert_eq!(payload["schema_version"], "aethyme-experience-status-v1");
     assert!(payload.get("recommended_next_action").is_some());
-    assert!(repo.join(".aethyme/generated/experience-status.json").exists());
+    assert!(
+        repo.join(".aethyme/generated/experience-status.json")
+            .exists()
+    );
 
     let markdown = read(repo.join(".aethyme/generated/experience-status.md"));
     assert!(markdown.contains("# Aethyme Experience Status"));
@@ -389,7 +482,9 @@ fn repo_experience_telemetry_flags_no_wrapper_usage() {
     let result = invoke_aethyme(["repo", "experience-telemetry", &repo_arg, "--json-output"]);
     result.ok();
     let payload = result.json();
-    assert!(codes(&payload["kpis"]["signals"]).contains(&"enhanced_but_no_wrapper_usage".to_string()));
+    assert!(
+        codes(&payload["kpis"]["signals"]).contains(&"enhanced_but_no_wrapper_usage".to_string())
+    );
     assert!(
         codes(&payload["kpis"]["suggestions"])
             .contains(&"load_onboarding_and_use_wrapper".to_string())
@@ -484,7 +579,10 @@ fn enhance_verify_refreshes_experience_status() {
 
     let status_json = repo.join(".aethyme/generated/experience-status.json");
     assert!(status_json.exists());
-    assert!(repo.join(".aethyme/generated/experience-status.md").exists());
+    assert!(
+        repo.join(".aethyme/generated/experience-status.md")
+            .exists()
+    );
 
     let payload: Value = serde_json::from_str(&read(&status_json)).unwrap();
     assert!(

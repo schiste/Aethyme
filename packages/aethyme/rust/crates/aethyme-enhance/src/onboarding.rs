@@ -12,7 +12,7 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
-use crate::pyjson::{self, Value, py_bool};
+use crate::pyjson::{self, py_bool, Value};
 use crate::timeutil::now_iso_utc;
 use crate::util::{py_splitlines, resolve_path};
 
@@ -27,9 +27,7 @@ pub const ONBOARDING_OVERRIDE_PATH: &str = ".aethyme/overrides/onboarding.json";
 /// `KeyError`-style lookup: Python indexes (`artifact["repo"]`) crash on
 /// missing keys; the port surfaces the same condition as a command error.
 fn req<'a>(value: &'a Value, key: &str) -> Result<&'a Value, String> {
-    value
-        .get(key)
-        .ok_or_else(|| format!("KeyError: '{key}'"))
+    value.get(key).ok_or_else(|| format!("KeyError: '{key}'"))
 }
 
 fn obj(pairs: Vec<(&str, Value)>) -> Value {
@@ -55,11 +53,8 @@ fn join_items(value: &Value, sep: &str) -> String {
 /// Return deterministic onboarding artifacts for `repo_path` as ordered
 /// (relative path, content) pairs — the Python `expected_onboarding_files`
 /// dict in insertion order.
-pub fn expected_onboarding_files(
-    repo_path: &Path,
-    aethyme_root: &Path,
-) -> Result<Vec<(String, String)>, String> {
-    let artifact = build_onboarding_artifact(repo_path, aethyme_root)?;
+pub fn expected_onboarding_files(repo_path: &Path) -> Result<Vec<(String, String)>, String> {
+    let artifact = build_onboarding_artifact(repo_path)?;
     let onboarding_markdown = render_onboarding_skill(&artifact)?;
     let act_artifact = build_act_starter_artifact(&artifact)?;
     let act_markdown = render_act_skill(&act_artifact)?;
@@ -72,7 +67,10 @@ pub fn expected_onboarding_files(
             ACT_STARTER_JSON_PATH.to_string(),
             format!("{}\n", pyjson::dumps_indent2(&act_artifact)),
         ),
-        (ONBOARDING_CLAUDE_PATH.to_string(), onboarding_markdown.clone()),
+        (
+            ONBOARDING_CLAUDE_PATH.to_string(),
+            onboarding_markdown.clone(),
+        ),
         (ONBOARDING_CODEX_PATH.to_string(), onboarding_markdown),
         (ACT_CLAUDE_PATH.to_string(), act_markdown.clone()),
         (ACT_CODEX_PATH.to_string(), act_markdown),
@@ -80,10 +78,9 @@ pub fn expected_onboarding_files(
 }
 
 /// Build a deterministic onboarding artifact for a repository.
-pub fn build_onboarding_artifact(repo_path: &Path, aethyme_root: &Path) -> Result<Value, String> {
+pub fn build_onboarding_artifact(repo_path: &Path) -> Result<Value, String> {
     let repo_path = resolve_path(repo_path);
     let snapshot = snapshot_metadata(&repo_path)?;
-    let aethyme_root = resolve_path(aethyme_root);
 
     let manifests = detect_manifests(&repo_path);
     let package_manager = primary_package_manager(&repo_path, &manifests);
@@ -103,7 +100,10 @@ pub fn build_onboarding_artifact(repo_path: &Path, aethyme_root: &Path) -> Resul
             "repo",
             obj(vec![
                 ("name", Value::str(snapshot.repo_name.clone())),
-                ("root", Value::str(snapshot.repo_path.display().to_string())),
+                // The artifact is repository policy that is expected to be
+                // committed and consumed from other clones. Never persist the
+                // machine-specific checkout path.
+                ("root", Value::str(".")),
                 ("kind", Value::str(repo_kind)),
                 (
                     "languages",
@@ -122,7 +122,7 @@ pub fn build_onboarding_artifact(repo_path: &Path, aethyme_root: &Path) -> Resul
         ("entrypoints", Value::Array(entrypoints)),
         ("primary_entrypoints", primary_entrypoints),
         ("caution_zones", Value::Array(caution_zones)),
-        ("navigation_recipes", navigation_recipes(&aethyme_root)),
+        ("navigation_recipes", navigation_recipes()),
         ("summon", summon_policy()),
         (
             "freshness",
@@ -237,7 +237,10 @@ pub fn build_act_starter_artifact(onboarding_artifact: &Value) -> Result<Value, 
                 // fallback — a falsy-but-present value passes through.
                 (
                     "full_test",
-                    primary_commands.get("full_test").cloned().unwrap_or(Value::Null),
+                    primary_commands
+                        .get("full_test")
+                        .cloned()
+                        .unwrap_or(Value::Null),
                 ),
                 ("lint", primary_or_first("lint", "lint")?),
                 ("build", primary_or_first("build", "build")?),
@@ -704,8 +707,7 @@ fn collect_commands(
 ) -> Result<Vec<Value>, String> {
     let mut adder = CommandAdder::new();
 
-    if matches!(package_manager, "pnpm" | "npm" | "yarn")
-        && repo_path.join("package.json").exists()
+    if matches!(package_manager, "pnpm" | "npm" | "yarn") && repo_path.join("package.json").exists()
     {
         let package_json = load_json_file(&repo_path.join("package.json"))?;
         let empty = Value::object();
@@ -786,7 +788,12 @@ fn collect_commands(
     if has_manifest(manifests, "pyproject.toml") {
         adder.add("fast_test", "pytest", "pyproject.toml", "medium");
         adder.add("lint", "ruff check .", "pyproject.toml", "medium");
-        adder.add("install", "python -m pip install -e .", "pyproject.toml", "medium");
+        adder.add(
+            "install",
+            "python -m pip install -e .",
+            "pyproject.toml",
+            "medium",
+        );
     }
 
     if has_manifest(manifests, "Cargo.toml") {
@@ -805,7 +812,11 @@ fn collect_commands(
         };
         for script_name in ["test", "lint"] {
             if scripts.get(script_name).is_some() {
-                let mapped_kind = if script_name == "test" { "fast_test" } else { script_name };
+                let mapped_kind = if script_name == "test" {
+                    "fast_test"
+                } else {
+                    script_name
+                };
                 adder.add(
                     mapped_kind,
                     &format!("composer {script_name}"),
@@ -919,7 +930,11 @@ fn make_targets(makefile_path: &Path) -> Result<HashSet<String>, String> {
         if !line.contains(':') || line.starts_with('\t') || line.starts_with('#') {
             continue;
         }
-        let target = line.split_once(':').map(|(head, _)| head).unwrap_or(line).trim();
+        let target = line
+            .split_once(':')
+            .map(|(head, _)| head)
+            .unwrap_or(line)
+            .trim();
         if !target.is_empty() && !target.contains(' ') && !target.starts_with('.') {
             targets.insert(target.to_string());
         }
@@ -1059,20 +1074,104 @@ fn collect_entrypoints(repo_path: &Path, manifests: &[String]) -> Result<Vec<Val
     let mut adder = EntrypointAdder::new();
 
     let conventional_roots: &[(&str, &str, &str, &str, &str)] = &[
-        ("main.py", "file", "app", "conventional Python application entrypoint", "medium"),
-        ("app.py", "file", "app", "common Python application entrypoint", "medium"),
-        ("manage.py", "file", "cli", "common framework management entrypoint", "high"),
-        ("main.go", "file", "app", "conventional Go application entrypoint", "medium"),
-        ("cmd", "directory", "cli", "conventional Go or CLI command root", "medium"),
-        ("src/main.py", "file", "app", "conventional source application entrypoint", "medium"),
-        ("src/index.ts", "file", "app", "conventional TypeScript application entrypoint", "medium"),
-        ("src/index.js", "file", "app", "conventional JavaScript application entrypoint", "medium"),
-        ("src/main.ts", "file", "app", "conventional TypeScript application entrypoint", "medium"),
-        ("src/main.rs", "file", "app", "conventional Rust binary entrypoint", "high"),
-        ("public/index.php", "file", "app", "common PHP public entrypoint", "high"),
-        ("index.php", "file", "app", "common PHP entrypoint", "medium"),
-        ("tests", "directory", "test", "conventional test root", "medium"),
-        ("test", "directory", "test", "conventional test root", "medium"),
+        (
+            "main.py",
+            "file",
+            "app",
+            "conventional Python application entrypoint",
+            "medium",
+        ),
+        (
+            "app.py",
+            "file",
+            "app",
+            "common Python application entrypoint",
+            "medium",
+        ),
+        (
+            "manage.py",
+            "file",
+            "cli",
+            "common framework management entrypoint",
+            "high",
+        ),
+        (
+            "main.go",
+            "file",
+            "app",
+            "conventional Go application entrypoint",
+            "medium",
+        ),
+        (
+            "cmd",
+            "directory",
+            "cli",
+            "conventional Go or CLI command root",
+            "medium",
+        ),
+        (
+            "src/main.py",
+            "file",
+            "app",
+            "conventional source application entrypoint",
+            "medium",
+        ),
+        (
+            "src/index.ts",
+            "file",
+            "app",
+            "conventional TypeScript application entrypoint",
+            "medium",
+        ),
+        (
+            "src/index.js",
+            "file",
+            "app",
+            "conventional JavaScript application entrypoint",
+            "medium",
+        ),
+        (
+            "src/main.ts",
+            "file",
+            "app",
+            "conventional TypeScript application entrypoint",
+            "medium",
+        ),
+        (
+            "src/main.rs",
+            "file",
+            "app",
+            "conventional Rust binary entrypoint",
+            "high",
+        ),
+        (
+            "public/index.php",
+            "file",
+            "app",
+            "common PHP public entrypoint",
+            "high",
+        ),
+        (
+            "index.php",
+            "file",
+            "app",
+            "common PHP entrypoint",
+            "medium",
+        ),
+        (
+            "tests",
+            "directory",
+            "test",
+            "conventional test root",
+            "medium",
+        ),
+        (
+            "test",
+            "directory",
+            "test",
+            "conventional test root",
+            "medium",
+        ),
     ];
     for (relative, kind, role, reason, confidence) in conventional_roots.iter().copied() {
         if repo_path.join(relative).exists() {
@@ -1081,17 +1180,41 @@ fn collect_entrypoints(repo_path: &Path, manifests: &[String]) -> Result<Vec<Val
     }
 
     for candidate in entrypoints_from_package_json(repo_path)? {
-        adder.add(&candidate.0, &candidate.1, &candidate.2, &candidate.3, &candidate.4);
+        adder.add(
+            &candidate.0,
+            &candidate.1,
+            &candidate.2,
+            &candidate.3,
+            &candidate.4,
+        );
     }
     for candidate in entrypoints_from_procfile(repo_path)? {
-        adder.add(&candidate.0, &candidate.1, &candidate.2, &candidate.3, &candidate.4);
+        adder.add(
+            &candidate.0,
+            &candidate.1,
+            &candidate.2,
+            &candidate.3,
+            &candidate.4,
+        );
     }
     for candidate in entrypoints_from_compose(repo_path)? {
-        adder.add(&candidate.0, &candidate.1, &candidate.2, &candidate.3, &candidate.4);
+        adder.add(
+            &candidate.0,
+            &candidate.1,
+            &candidate.2,
+            &candidate.3,
+            &candidate.4,
+        );
     }
 
     if has_manifest(manifests, "Cargo.toml") && repo_path.join("src/lib.rs").exists() {
-        adder.add("src/lib.rs", "file", "cli", "library root for Rust crate", "medium");
+        adder.add(
+            "src/lib.rs",
+            "file",
+            "cli",
+            "library root for Rust crate",
+            "medium",
+        );
     }
 
     let mut candidates = adder.candidates;
@@ -1202,9 +1325,7 @@ fn infer_languages(repo_path: &Path, manifests: &[String]) -> Vec<&'static str> 
     languages
 }
 
-fn navigation_recipes(aethyme_root: &Path) -> Value {
-    let root = aethyme_root.display();
-    let bin_path = format!("{root}/rust/target/release/aethyme");
+fn navigation_recipes() -> Value {
     Value::Array(vec![
         obj(vec![
             (
@@ -1213,9 +1334,9 @@ fn navigation_recipes(aethyme_root: &Path) -> Value {
             ),
             (
                 "command",
-                Value::str(format!(
-                    "\"{bin_path}\" explore --repo \"$PWD\" --request \"<task>\" --format answer-json"
-                )),
+                Value::str(
+                    "aethyme explore --repo \"$PWD\" --request \"<task>\" --format answer-json",
+                ),
             ),
         ]),
         obj(vec![
@@ -1264,9 +1385,7 @@ fn commands_from_github_actions(repo_path: &Path) -> Vec<CommandTuple> {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                name.ends_with("ml")
-                    && name.len() > 2
-                    && name[..name.len() - 2].contains(".y")
+                name.ends_with("ml") && name.len() > 2 && name[..name.len() - 2].contains(".y")
             })
             .collect(),
         Err(_) => return Vec::new(),
@@ -1569,11 +1688,7 @@ fn primary_commands_map(commands: &[Value]) -> Value {
         ranked.sort_by(|a, b| {
             let key = |c: &Value| {
                 (
-                    -confidence_rank(
-                        &c.get("confidence")
-                            .unwrap_or(&Value::Null)
-                            .py_str(),
-                    ),
+                    -confidence_rank(&c.get("confidence").unwrap_or(&Value::Null).py_str()),
                     source_priority(kind, &c.get("source").unwrap_or(&Value::Null).py_str()),
                     c.get("command").unwrap_or(&Value::Null).py_str(),
                 )
@@ -1626,7 +1741,10 @@ fn entrypoint_kind_priority(kind: &str) -> i32 {
 }
 
 fn source_priority(kind: &str, source: &str) -> i32 {
-    if matches!(kind, "install" | "fast_test" | "full_test" | "lint" | "build") {
+    if matches!(
+        kind,
+        "install" | "fast_test" | "full_test" | "lint" | "build"
+    ) {
         if source.starts_with("justfile") || source.starts_with("Justfile") {
             return 0;
         }
@@ -1707,10 +1825,7 @@ pub fn load_overrides(repo_path: &Path) -> Value {
 fn apply_overrides(artifact: &mut Value, overrides: &Value) -> Result<(), String> {
     if let Some(Value::Object(repo_overrides)) = overrides.get("repo") {
         let repo_overrides = repo_overrides.clone();
-        let repo = artifact
-            .get("repo")
-            .cloned()
-            .ok_or("KeyError: 'repo'")?;
+        let repo = artifact.get("repo").cloned().ok_or("KeyError: 'repo'")?;
         let mut repo = repo;
         for (key, value) in &repo_overrides {
             if !matches!(value, Value::Null) {
@@ -1776,10 +1891,7 @@ pub fn override_template() -> Value {
         (
             "summon",
             obj(vec![
-                (
-                    "recommended_when",
-                    str_list(&["first touch", "broad task"]),
-                ),
+                ("recommended_when", str_list(&["first touch", "broad task"])),
                 ("skip_when", str_list(&["single known file"])),
             ]),
         ),
@@ -1938,7 +2050,10 @@ fn generation_telemetry(artifact: &Value, overrides: &Value) -> Value {
                 ("areas", Value::Int(count("areas"))),
                 ("entrypoints", Value::Int(count("entrypoints"))),
                 ("caution_zones", Value::Int(count("caution_zones"))),
-                ("navigation_recipes", Value::Int(count("navigation_recipes"))),
+                (
+                    "navigation_recipes",
+                    Value::Int(count("navigation_recipes")),
+                ),
                 ("notes", Value::Int(count("notes"))),
             ]),
         ),
@@ -1964,9 +2079,7 @@ fn generation_telemetry(artifact: &Value, overrides: &Value) -> Value {
 fn mtime_f64(path: &Path) -> Option<f64> {
     let metadata = std::fs::metadata(path).ok()?;
     let modified = metadata.modified().ok()?;
-    let duration = modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?;
+    let duration = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
     // CPython computes st_mtime as sec + nsec * 1e-9 in double math.
     Some(duration.as_secs() as f64 + duration.subsec_nanos() as f64 * 1e-9)
 }
@@ -1997,8 +2110,16 @@ pub fn override_freshness(repo_path: &Path) -> Value {
 
     let override_mtime = mtime_f64(&override_path).unwrap_or(0.0);
     let mut stale_targets = Vec::new();
-    let onboarding_mtime = if onboarding_exists { mtime_f64(&onboarding_path) } else { None };
-    let act_mtime = if act_exists { mtime_f64(&act_path) } else { None };
+    let onboarding_mtime = if onboarding_exists {
+        mtime_f64(&onboarding_path)
+    } else {
+        None
+    };
+    let act_mtime = if act_exists {
+        mtime_f64(&act_path)
+    } else {
+        None
+    };
     if !onboarding_exists || onboarding_mtime.unwrap_or(0.0) < override_mtime {
         stale_targets.push(Value::str("onboarding"));
     }
@@ -2027,14 +2148,17 @@ pub fn override_freshness(repo_path: &Path) -> Value {
                 ("act", act_mtime.map(Value::Float).unwrap_or(Value::Null)),
             ]),
         ),
-        ("regeneration_required", Value::Bool(!stale_targets.is_empty())),
+        (
+            "regeneration_required",
+            Value::Bool(!stale_targets.is_empty()),
+        ),
         ("stale_targets", Value::Array(stale_targets)),
     ])
 }
 
 /// Small deterministic recommendation surface for the repo.
-pub fn recommendation_summary(repo_path: &Path, aethyme_root: &Path) -> Result<Value, String> {
-    let artifact = build_onboarding_artifact(repo_path, aethyme_root)?;
+pub fn recommendation_summary(repo_path: &Path) -> Result<Value, String> {
+    let artifact = build_onboarding_artifact(repo_path)?;
     Ok(obj(vec![
         ("recommended_skill", Value::str("repo-onboarding")),
         ("recommended_mode", Value::str("explore")),
@@ -2103,13 +2227,22 @@ fn run_git(repo_path: &Path, args: &[&str]) -> Option<String> {
 fn git_snapshot(repo_path: &Path) -> (Option<String>, bool, String, usize) {
     let commit = run_git(repo_path, &["rev-parse", "HEAD"]).and_then(|stdout| {
         let trimmed = stdout.trim().to_string();
-        if trimmed.is_empty() { None } else { Some(trimmed) }
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
     });
     let status_lines: Vec<String> = run_git(
         repo_path,
         &["status", "--porcelain", "--untracked-files=all"],
     )
-    .map(|stdout| py_splitlines(&stdout).into_iter().map(str::to_string).collect())
+    .map(|stdout| {
+        py_splitlines(&stdout)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    })
     .unwrap_or_default();
     let dirty = !status_lines.is_empty();
     let file_count = run_git(
@@ -2213,11 +2346,13 @@ mod tests {
     #[test]
     fn bare_repo_artifact_matches_python_shapes() {
         let repo = fixture_repo("bare");
-        write(&repo.join("README.md"), "# Fixture Repo\n\nEnhance target.\n");
+        write(
+            &repo.join("README.md"),
+            "# Fixture Repo\n\nEnhance target.\n",
+        );
         write(&repo.join("src/main.py"), "def entry():\n    return 1\n");
 
-        let artifact =
-            build_onboarding_artifact(&repo, Path::new("/opt/aethyme")).unwrap();
+        let artifact = build_onboarding_artifact(&repo).unwrap();
         let json = pyjson::dumps_indent2(&artifact);
         assert!(json.contains("\"schema_version\": \"aethyme-onboarding-v1\""));
         assert!(json.contains("\"kind\": \"repository\""));
@@ -2257,11 +2392,13 @@ mod tests {
             r#"{"notes": ["Use sandbox creds"], "commands": [{"kind": "test", "command": "./t.sh", "source": "manual-override", "confidence": "high"}]}"#,
         );
 
-        let artifact = build_onboarding_artifact(&repo, Path::new("/opt/x")).unwrap();
+        let artifact = build_onboarding_artifact(&repo).unwrap();
         let json = pyjson::dumps_indent2(&artifact);
         assert!(json.contains("\"command\": \"./t.sh\""));
         // notes land after freshness, before telemetry (insertion order).
-        let notes_pos = json.find("\"notes\": [\n    \"Use sandbox creds\"").unwrap();
+        let notes_pos = json
+            .find("\"notes\": [\n    \"Use sandbox creds\"")
+            .unwrap();
         let freshness_pos = json.find("\"freshness\"").unwrap();
         let telemetry_pos = json.find("\"telemetry\"").unwrap();
         assert!(freshness_pos < notes_pos && notes_pos < telemetry_pos);
@@ -2271,7 +2408,11 @@ mod tests {
         // Act starter picks the override "test" command as fast_test.
         let act = build_act_starter_artifact(&artifact).unwrap();
         assert_eq!(
-            act.get("commands").unwrap().get("fast_test").unwrap().as_str(),
+            act.get("commands")
+                .unwrap()
+                .get("fast_test")
+                .unwrap()
+                .as_str(),
             Some("./t.sh")
         );
 
@@ -2306,7 +2447,10 @@ mod tests {
         write(&repo.join(ONBOARDING_OVERRIDE_PATH), "[1, 2]");
         let result = validate_overrides(&repo);
         let errors = result.get("errors").unwrap().as_array().unwrap();
-        assert_eq!(errors[0].as_str(), Some("override root must be a JSON object"));
+        assert_eq!(
+            errors[0].as_str(),
+            Some("override root must be a JSON object")
+        );
 
         // Field-level errors; JSON null values are tolerated (Python's
         // `is not None` guard).
@@ -2345,7 +2489,7 @@ mod tests {
     fn invalid_override_marks_telemetry() {
         let repo = fixture_repo("invalid-ovr");
         write(&repo.join(ONBOARDING_OVERRIDE_PATH), "not json");
-        let artifact = build_onboarding_artifact(&repo, Path::new("/opt/x")).unwrap();
+        let artifact = build_onboarding_artifact(&repo).unwrap();
         let telemetry = artifact.get("telemetry").unwrap();
         assert_eq!(telemetry.get("override_invalid"), Some(&Value::Bool(true)));
         assert_eq!(telemetry.get("overrides_applied"), Some(&Value::Bool(true)));

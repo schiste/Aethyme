@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-08-23
+Last Updated: 2026-08-24
 
 ## Install
 
@@ -53,6 +53,8 @@ product surface.
 
 ### Stable Front Door
 
+- `aethyme deploy`
+- `aethyme deploy verify`
 - `aethyme init`
 - `aethyme certify`
 - `aethyme broker status`
@@ -792,13 +794,22 @@ docs(cli): clarify commit hygiene examples
 ```
 
 ### Local Discoverability
+- `aethyme deploy --repo /path/to/repo`
+- `aethyme deploy verify --repo /path/to/repo`
 - `aethyme enhance deploy --repo /path/to/repo`
 - `aethyme enhance verify --repo /path/to/repo`
 - `aethyme query symbol /path/to/repo main`
 - `aethyme query deps /path/to/repo src/main.py`
 - `aethyme query impact /path/to/repo src/main.py`
 
-`enhance deploy` is the primary repo-facing discoverability path. It writes:
+`deploy` is the canonical repository-enrollment path. It runs broker scaffold,
+gate drafting, embedded agent-policy deployment, verification, and
+certification as one command. `deploy verify` performs the verification and
+certification checks without writing. Repositories should retain this command
+as a required CI check.
+
+`enhance deploy` is the lower-level discoverability operation used by the
+canonical command. It writes:
 - fully generated `AGENTS.md`
 - `CLAUDE.md`
 - `.claude/skills/aethyme/SKILL.md`
@@ -848,6 +859,13 @@ generated artifact.
 onboarding counts, override presence, override freshness, and Act starter
 readiness. Direct edits to `AGENTS.md` or `CLAUDE.md` are now verification
 failures; use `.aethyme/overrides/agents.json` instead.
+
+After a successful `deploy`, commit `.gitignore`, broker configuration and
+gates, overrides, the two canonical onboarding JSON artifacts, `AGENTS.md`,
+`CLAUDE.md`, and the `.codex`/`.claude` policy trees. Broker databases, logs,
+reports, run state, worktrees, conflict handoffs, experience telemetry, and
+experience status projections remain ignored machine-local state. See
+[`../guides/repository-deployment.md`](../guides/repository-deployment.md).
 
 Stable experience-layer telemetry is written to:
 - `.aethyme/generated/experience-telemetry.jsonl`

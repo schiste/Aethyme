@@ -5,7 +5,6 @@
 use std::path::Path;
 
 use crate::pyjson::{self, Value};
-use crate::render::substitute_root;
 use crate::templates;
 use crate::{AGENTS_OVERRIDE_PATH, BLOCK_BEGIN, BLOCK_END};
 
@@ -43,9 +42,8 @@ fn obj(pairs: Vec<(&str, Value)>) -> Value {
 /// `agents_override_template`: starter agents override for repo-specific
 /// root instructions.
 pub fn agents_override_template() -> Value {
-    let str_list = |items: &[&str]| -> Value {
-        Value::Array(items.iter().map(|s| Value::str(*s)).collect())
-    };
+    let str_list =
+        |items: &[&str]| -> Value { Value::Array(items.iter().map(|s| Value::str(*s)).collect()) };
     obj(vec![
         (
             "repo_summary",
@@ -158,14 +156,14 @@ pub fn validate_agents_overrides(repo: &Path) -> Value {
 
 /// `_render_agents_document`: template + routing + broker protocol +
 /// override sections, normalized to a single trailing newline.
-pub fn render_agents_document(root: &str, repo: Option<&Path>) -> Result<String, String> {
-    let mut content = substitute_root(templates::AGENTS_MD, root);
+pub fn render_agents_document(repo: Option<&Path>) -> Result<String, String> {
+    let mut content = templates::AGENTS_MD.to_string();
     if let Some(repo) = repo {
         let routing = render_repo_routing(repo)?;
         if !routing.is_empty() {
             content = format!("{}\n\n{routing}", content.trim_end());
         }
-        let broker = render_broker_protocol(repo, root);
+        let broker = render_broker_protocol(repo);
         if !broker.is_empty() {
             content = format!("{}\n\n{broker}", content.trim_end());
         }
@@ -179,19 +177,17 @@ pub fn render_agents_document(root: &str, repo: Option<&Path>) -> Result<String,
 
 /// Agent-facing broker coordination protocol, rendered only when the repo
 /// is broker-configured.
-fn render_broker_protocol(repo: &Path, root: &str) -> String {
+fn render_broker_protocol(repo: &Path) -> String {
     if !(repo.join(".aethyme/gates.toml").exists() || repo.join(".aethyme/config.toml").exists()) {
         return String::new();
     }
-    format!(
-        r#"## Broker Coordination (multi-agent repository)
+    r#"## Broker Coordination (multi-agent repository)
 
 This repository coordinates concurrent agent sessions through the Aethyme
 broker. Other agents may be working in sibling worktrees right now. The
-`aethyme` binary is installed once with
-`cargo install --path "{root}/rust/crates/aethyme-cli"` (plus
-`cargo install --path "{root}/rust/crates/aethyme-engine"` for the
-engine-daemon sibling binary; check with `aethyme --version`).
+`aethyme` router and its engine sibling are installed once for the user;
+check the paired runtime with `aethyme --version` and
+`aethyme-engine-cli --version`.
 Follow this protocol:
 
 1. **Broker entry point, before editing**: check current activity, create an
@@ -308,7 +304,7 @@ Follow this protocol:
    An explicitly authorized operator or release workflow may merge, tag, push,
    force-push, or delete refs through the broker; authorization does not permit
    bypassing coordination."#
-    )
+        .to_string()
 }
 
 fn render_repo_routing(repo: &Path) -> Result<String, String> {
@@ -461,7 +457,7 @@ pub fn looks_like_generated_agents_document(content: &str) -> bool {
 }
 
 /// `_extract_legacy_agents_content`.
-pub fn extract_legacy_agents_content(existing: &str, root: &str) -> Result<String, String> {
+pub fn extract_legacy_agents_content(existing: &str) -> Result<String, String> {
     let stripped = existing.trim();
     if stripped.is_empty() {
         return Ok(String::new());
@@ -487,8 +483,7 @@ pub fn extract_legacy_agents_content(existing: &str, root: &str) -> Result<Strin
         return Ok(String::new());
     }
 
-    let rendered_template = substitute_root(templates::AGENTS_MD, root);
-    if stripped == rendered_template.trim() {
+    if stripped == templates::AGENTS_MD.trim() {
         return Ok(String::new());
     }
     Ok(stripped.to_string())
@@ -511,16 +506,17 @@ mod tests {
     }
 
     #[test]
-    fn document_without_repo_is_template_with_root() {
-        let doc = render_agents_document("/opt/ae", None).unwrap();
-        assert!(doc.contains("AETHYME_ROOT=\"/opt/ae\""));
-        assert!(!doc.contains("{{AETHYME_ROOT}}"));
+    fn document_without_repo_uses_the_installed_runtime() {
+        let doc = render_agents_document(None).unwrap();
+        assert!(doc.contains("aethyme explore"));
+        assert!(!doc.contains("AETHYME_ROOT"));
+        assert!(!doc.contains("/rust/target/release/aethyme"));
         assert!(doc.ends_with("placeholders.\n"));
     }
 
     #[test]
     fn generated_commit_guidance_matches_typed_policy() {
-        let doc = render_agents_document("/opt/ae", None).unwrap();
+        let doc = render_agents_document(None).unwrap();
         let allowed = COMMIT_POLICIES
             .iter()
             .map(|policy| format!("`{}`", policy.commit_type))
@@ -577,11 +573,11 @@ mod tests {
     #[test]
     fn broker_section_gated_on_config() {
         let repo = fixture_repo("broker");
-        let doc = render_agents_document("/opt/ae", Some(&repo)).unwrap();
+        let doc = render_agents_document(Some(&repo)).unwrap();
         assert!(!doc.contains("## Broker Coordination"));
         std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
         std::fs::write(repo.join(".aethyme/gates.toml"), "[[gate]]\n").unwrap();
-        let doc = render_agents_document("/opt/ae", Some(&repo)).unwrap();
+        let doc = render_agents_document(Some(&repo)).unwrap();
         assert!(doc.contains("## Broker Coordination (multi-agent repository)"));
         assert!(doc.contains("aethyme broker submit --session"));
         std::fs::remove_dir_all(&repo).unwrap();
@@ -596,7 +592,7 @@ mod tests {
             r#"{"repo_summary": " Summary here. ", "hard_constraints": ["Never break tenancy", "", 42], "unknown_key": ["ignored"]}"#,
         )
         .unwrap();
-        let doc = render_agents_document("/opt/ae", Some(&repo)).unwrap();
+        let doc = render_agents_document(Some(&repo)).unwrap();
         assert!(doc.contains("## Repo Summary\n\nSummary here."));
         assert!(doc.contains("## Hard Constraints\n\n- Never break tenancy"));
         assert!(!doc.contains("ignored"));
@@ -609,7 +605,7 @@ mod tests {
         let repo = fixture_repo("invalid");
         std::fs::create_dir_all(repo.join(".aethyme/overrides")).unwrap();
         std::fs::write(repo.join(AGENTS_OVERRIDE_PATH), "{broken").unwrap();
-        let doc = render_agents_document("/opt/ae", Some(&repo)).unwrap();
+        let doc = render_agents_document(Some(&repo)).unwrap();
         assert!(doc.contains("## Aethyme Override Status"));
         assert!(doc.contains("is invalid JSON"));
         std::fs::remove_dir_all(&repo).unwrap();
@@ -668,18 +664,15 @@ mod tests {
         // Block-managed file: keep surroundings.
         let existing = format!("intro\n\n{BLOCK_BEGIN}\ngen\n{BLOCK_END}\n\noutro\n");
         assert_eq!(
-            extract_legacy_agents_content(&existing, "/opt/ae").unwrap(),
+            extract_legacy_agents_content(&existing).unwrap(),
             "intro\n\noutro"
         );
         // Generated document: nothing to migrate.
-        let generated = render_agents_document("/opt/ae", None).unwrap();
-        assert_eq!(
-            extract_legacy_agents_content(&generated, "/opt/ae").unwrap(),
-            ""
-        );
+        let generated = render_agents_document(None).unwrap();
+        assert_eq!(extract_legacy_agents_content(&generated).unwrap(), "");
         // Hand-written content: migrated verbatim (stripped).
         assert_eq!(
-            extract_legacy_agents_content("  my notes\n", "/opt/ae").unwrap(),
+            extract_legacy_agents_content("  my notes\n").unwrap(),
             "my notes"
         );
     }

@@ -1,6 +1,6 @@
 # Aethyme Public Product Surface
 
-Status: current public surface, 2026-07-31
+Status: current public surface, 2026-08-24
 
 Aethyme is a local-first CLI for coordinating AI coding agents and for
 answering bounded repository-navigation questions. The product surface is
@@ -14,18 +14,18 @@ front-door product.
 Use this when adding Aethyme to a repository for the first time.
 
 ```bash
-cargo install --path packages/aethyme/rust/crates/aethyme-cli
-cargo install --path packages/aethyme/rust/crates/aethyme-engine  # engine-daemon sibling
+brew install schiste/tap/aethyme
 cd /path/to/repo
-aethyme init
+aethyme deploy --repo .
+aethyme deploy verify --repo .
 aethyme broker quick-test
 aethyme broker verify-loop
 ```
 
 What this proves:
 
-- `aethyme init` certifies the repo, scaffolds `.aethyme/`, and drafts gates
-  when manifests make that possible.
+- `aethyme deploy` installs and certifies the mandatory agent and broker policy
+  in the target repository; `deploy verify` is its read-only CI contract.
 - `aethyme broker quick-test` proves the local broker loop in a disposable
   repo without touching the target repo.
 - `aethyme broker verify-loop` snapshots the integration tip, runs the smoke,
@@ -89,6 +89,8 @@ What this provides:
 
 These commands are the public product path and should stay easy to explain:
 
+- `aethyme deploy`
+- `aethyme deploy verify`
 - `aethyme init`
 - `aethyme certify`
 - `aethyme broker status`

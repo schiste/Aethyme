@@ -17,18 +17,13 @@
 
 set -uo pipefail
 
-AETHYME_ROOT="{{AETHYME_ROOT}}"
 cwd="${CLAUDE_PROJECT_DIR:-${PWD}}"
 
-# Resolve the router once, for both telemetry and the JSON envelope.
-# PATH first (the normal install); the checkout's release build is the
-# fallback for repos enhanced from a source tree that was never
-# `cargo install`ed. Empty means "no router" — telemetry is skipped and
-# the envelope cannot be emitted.
+# Resolve the installed router once, for both telemetry and the JSON envelope.
+# Empty means "no router" — telemetry is skipped and the envelope cannot be
+# emitted. Repository deployment never embeds a source-checkout path.
 if command -v aethyme >/dev/null 2>&1; then
     aethyme_bin="aethyme"
-elif [[ -x "$AETHYME_ROOT/rust/target/release/aethyme" ]]; then
-    aethyme_bin="$AETHYME_ROOT/rust/target/release/aethyme"
 else
     aethyme_bin=""
 fi
@@ -57,10 +52,9 @@ if [[ -z "$context" ]]; then
     exit 0
 fi
 
-# Best-effort telemetry via the native router (Phase 3 hook flip,
-# 2026-07-30; previously `$AETHYME_ROOT/.venv/bin/python -m src.cli`).
-# The native command also ledgers its own arg-parse failures, so this
-# fire-and-forget call no longer fails invisibly.
+# Best-effort telemetry via the native router. The native command also ledgers
+# its own arg-parse failures, so this fire-and-forget call does not fail
+# invisibly.
 if [[ -n "$aethyme_bin" ]] && [[ -d "$cwd" ]]; then
     "$aethyme_bin" repo record-wrapper-invocation \
         "$cwd" \
