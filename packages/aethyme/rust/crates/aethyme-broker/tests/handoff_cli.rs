@@ -74,6 +74,7 @@ fn finished_fixture() -> (tempfile::TempDir, PathBuf, i64) {
         .record_gate_result(&NewGateResult {
             gate_name: "handoff-cli-gate".into(),
             tree_hash: tree,
+            definition_hash: "test-definition".into(),
             status: GateStatus::Pass,
             failure_class: None,
             exit_code: Some(0),

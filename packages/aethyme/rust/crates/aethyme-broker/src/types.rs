@@ -205,6 +205,11 @@ pub struct GateDef {
     pub cost_tier: i64,
     /// JSON array of glob strings.
     pub triggers_json: String,
+    /// JSON array of generic host resource requirements.
+    pub resources_json: String,
+    pub resource_ttl_seconds: i64,
+    /// Stable digest of every execution-relevant field.
+    pub definition_hash: String,
     pub updated_at: i64,
 }
 
@@ -213,6 +218,7 @@ pub struct GateDef {
 pub struct NewGateResult {
     pub gate_name: String,
     pub tree_hash: String,
+    pub definition_hash: String,
     pub status: GateStatus,
     pub failure_class: Option<GateFailureClass>,
     pub exit_code: Option<i64>,
@@ -227,6 +233,7 @@ pub struct GateResult {
     pub gate_name: String,
     /// Git tree hash the gate ran against — the cache key.
     pub tree_hash: String,
+    pub definition_hash: String,
     pub status: GateStatus,
     pub failure_class: Option<GateFailureClass>,
     pub exit_code: Option<i64>,

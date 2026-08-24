@@ -705,6 +705,7 @@ fn finish_closes_promoted_session_and_suggests_cleanup_only_when_main_contains_i
         .record_gate_result(&NewGateResult {
             gate_name: "handoff-gate".into(),
             tree_hash: gate_tree.clone(),
+            definition_hash: "test-definition".into(),
             status: GateStatus::Pass,
             failure_class: None,
             exit_code: Some(0),

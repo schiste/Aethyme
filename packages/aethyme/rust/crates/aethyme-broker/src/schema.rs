@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -271,6 +271,15 @@ ALTER TABLE integration_reconciliations
     ADD COLUMN plan_digest TEXT NOT NULL DEFAULT '';
 ";
 
+const MIGRATION_V8: &str = "
+ALTER TABLE gates ADD COLUMN resources_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE gates ADD COLUMN resource_ttl_seconds INTEGER NOT NULL DEFAULT 300;
+ALTER TABLE gates ADD COLUMN definition_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE gate_results ADD COLUMN definition_hash TEXT NOT NULL DEFAULT '';
+CREATE INDEX gate_results_by_gate_tree_definition
+    ON gate_results (gate_name, tree_hash, definition_hash, id);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -279,6 +288,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V5,
     MIGRATION_V6,
     MIGRATION_V7,
+    MIGRATION_V8,
 ];
 
 fn current_version(conn: &Connection) -> Result<i64, BrokerError> {

@@ -531,6 +531,27 @@ pub fn resource_environment_key(key: &str) -> String {
     format!("AETHYME_RESOURCE_{suffix}")
 }
 
+/// Validate a gate's declarative resource profile without opening host state.
+pub fn validate_host_resource_requirements(
+    resources: &[HostResourceRequirement],
+    ttl_seconds: u64,
+) -> Result<(), HostResourceError> {
+    if resources.is_empty() {
+        validate_ttl(ttl_seconds)?;
+        return Ok(());
+    }
+    validate_request(&HostResourceRequest {
+        schema_version: HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+        request_id: "gate-validation".into(),
+        repository: "gate-validation".into(),
+        worktree_fingerprint: "gate-validation".into(),
+        run_id: "gate-validation".into(),
+        ttl_seconds,
+        holder_pid: None,
+        resources: resources.to_vec(),
+    })
+}
+
 fn validate_request(request: &HostResourceRequest) -> Result<(), HostResourceError> {
     if request.schema_version != HOST_RESOURCE_REQUEST_SCHEMA_VERSION {
         return Err(HostResourceError::InvalidRequest(format!(

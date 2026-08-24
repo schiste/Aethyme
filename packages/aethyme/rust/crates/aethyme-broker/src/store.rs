@@ -550,17 +550,24 @@ impl BrokerStore {
     /// Sync the gate-definition snapshot from parsed `gates.toml` content.
     pub fn upsert_gate(&mut self, gate: &GateDef) -> Result<(), BrokerError> {
         self.conn.execute(
-            "INSERT INTO gates (name, command, cost_tier, triggers_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO gates (name, command, cost_tier, triggers_json, resources_json,
+                                resource_ttl_seconds, definition_hash, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT (name) DO UPDATE SET command = excluded.command,
                                               cost_tier = excluded.cost_tier,
                                               triggers_json = excluded.triggers_json,
+                                              resources_json = excluded.resources_json,
+                                              resource_ttl_seconds = excluded.resource_ttl_seconds,
+                                              definition_hash = excluded.definition_hash,
                                               updated_at = excluded.updated_at",
             params![
                 gate.name,
                 gate.command,
                 gate.cost_tier,
                 gate.triggers_json,
+                gate.resources_json,
+                gate.resource_ttl_seconds,
+                gate.definition_hash,
                 now_ms()
             ],
         )?;
@@ -569,7 +576,8 @@ impl BrokerStore {
 
     pub fn gates(&self) -> Result<Vec<GateDef>, BrokerError> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, command, cost_tier, triggers_json, updated_at
+            "SELECT name, command, cost_tier, triggers_json, resources_json,
+                    resource_ttl_seconds, definition_hash, updated_at
              FROM gates ORDER BY cost_tier, name",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -578,7 +586,10 @@ impl BrokerStore {
                 command: row.get(1)?,
                 cost_tier: row.get(2)?,
                 triggers_json: row.get(3)?,
-                updated_at: row.get(4)?,
+                resources_json: row.get(4)?,
+                resource_ttl_seconds: row.get(5)?,
+                definition_hash: row.get(6)?,
+                updated_at: row.get(7)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -589,12 +600,14 @@ impl BrokerStore {
         let now = now_ms();
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO gate_results (gate_name, tree_hash, status, failure_class, exit_code,
-                                       duration_ms, log_path, session_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO gate_results (gate_name, tree_hash, definition_hash, status,
+                                       failure_class, exit_code, duration_ms, log_path,
+                                       session_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 result.gate_name,
                 result.tree_hash,
+                result.definition_hash,
                 result.status.as_str(),
                 result.failure_class.map(|class| class.as_str()),
                 result.exit_code,
@@ -636,13 +649,38 @@ impl BrokerStore {
                 &format!(
                     "{GATE_RESULT_SELECT}
                      WHERE gate_name = ?1 AND tree_hash = ?2
+                       AND (status = 'pass'
+                            OR (status = 'fail' AND failure_class = 'test_failure'))
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                params![gate_name, tree_hash],
+                gate_result_from_row,
+            )
+            .optional()?;
+        result.transpose()
+    }
+
+    /// Definition-bound cache lookup used by execution. The two-argument
+    /// reader remains available for diagnostics over historical rows.
+    pub fn cached_gate_result_for_definition(
+        &self,
+        gate_name: &str,
+        tree_hash: &str,
+        definition_hash: &str,
+    ) -> Result<Option<GateResult>, BrokerError> {
+        let result = self
+            .conn
+            .query_row(
+                &format!(
+                    "{GATE_RESULT_SELECT}
+                     WHERE gate_name = ?1 AND tree_hash = ?2 AND definition_hash = ?3
                        AND (
                             status = 'pass'
                             OR (status = 'fail' AND failure_class = 'test_failure')
                        )
                      ORDER BY id DESC LIMIT 1"
                 ),
-                params![gate_name, tree_hash],
+                params![gate_name, tree_hash, definition_hash],
                 gate_result_from_row,
             )
             .optional()?;
@@ -1414,8 +1452,8 @@ const SESSION_SELECT: &str = "SELECT id, worktree_path, branch, origin, status, 
 const LEASE_SELECT: &str =
     "SELECT id, session_id, path, kind, created_at, expires_at, released_at FROM leases";
 
-const GATE_RESULT_SELECT: &str = "SELECT id, gate_name, tree_hash, status, failure_class, \
-     exit_code, duration_ms, log_path, session_id, created_at FROM gate_results";
+const GATE_RESULT_SELECT: &str = "SELECT id, gate_name, tree_hash, definition_hash, status, \
+     failure_class, exit_code, duration_ms, log_path, session_id, created_at FROM gate_results";
 
 const MERGE_SELECT: &str = "SELECT id, session_id, head_commit, base_commit, status, \
      merged_tree, details_json, created_at, updated_at FROM merge_queue";
@@ -1475,23 +1513,24 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> RowResult<Lease> {
 }
 
 fn gate_result_from_row(row: &rusqlite::Row<'_>) -> RowResult<GateResult> {
-    let status: String = row.get(3)?;
-    let failure_class: Option<String> = row.get(4)?;
+    let status: String = row.get(4)?;
+    let failure_class: Option<String> = row.get(5)?;
     Ok((|| {
         Ok(GateResult {
             id: row.get(0)?,
             gate_name: row.get(1)?,
             tree_hash: row.get(2)?,
+            definition_hash: row.get(3)?,
             status: GateStatus::parse(&status)?,
             failure_class: failure_class
                 .as_deref()
                 .map(GateFailureClass::parse)
                 .transpose()?,
-            exit_code: row.get(5)?,
-            duration_ms: row.get(6)?,
-            log_path: row.get(7)?,
-            session_id: row.get(8)?,
-            created_at: row.get(9)?,
+            exit_code: row.get(6)?,
+            duration_ms: row.get(7)?,
+            log_path: row.get(8)?,
+            session_id: row.get(9)?,
+            created_at: row.get(10)?,
         })
     })())
 }

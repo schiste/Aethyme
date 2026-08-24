@@ -67,7 +67,8 @@ pub use broker::{
 };
 pub use error::BrokerError;
 pub use gates::{
-    CachePolicy, Gate, GateConfigError, GateProgressSink, GateRunOutcome, load_gates, select_gates,
+    CachePolicy, Gate, GateConfigError, GateProgressSink, GateResourceProvenance, GateRunOutcome,
+    load_gates, select_gates,
 };
 pub use git::{GitError, GitRepo, MergeSimulation, RemoteDefaultBranch};
 pub use graph_impact::{
@@ -135,6 +136,7 @@ pub use resources::{
     HostResourceAllocation, HostResourceConflict, HostResourceCoordinator, HostResourceError,
     HostResourceGrant, HostResourceKind, HostResourceLease, HostResourcePlan, HostResourceRequest,
     HostResourceRequirement, default_host_resource_db_path, resource_environment_key,
+    validate_host_resource_requirements,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use ship::{

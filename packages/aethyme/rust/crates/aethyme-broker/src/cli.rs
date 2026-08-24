@@ -3033,6 +3033,9 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                                     "name": g.name, "command": g.command,
                                     "cost": g.cost, "triggers": g.triggers,
                                     "cache": g.cache,
+                                    "resources": g.resources,
+                                    "resource_ttl_seconds": g.resource_ttl_seconds,
+                                    "definition_hash": g.definition_hash,
                                 })
                             })
                             .collect();
@@ -3041,7 +3044,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         println!("gates.toml OK — {} gate(s), cheap-first:", gates.len());
                         for gate in gates {
                             println!(
-                                "  [{}] {} — {} (triggers: {}{})",
+                                "  [{}] {} — {} (triggers: {}{}; resources: {}; definition: {})",
                                 gate.cost,
                                 gate.name,
                                 gate.command,
@@ -3050,7 +3053,9 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                                 } else {
                                     gate.triggers.join(", ")
                                 },
-                                if gate.cache { "" } else { "; cache: off" }
+                                if gate.cache { "" } else { "; cache: off" },
+                                gate.resources.len(),
+                                &gate.definition_hash[..12],
                             );
                         }
                     }

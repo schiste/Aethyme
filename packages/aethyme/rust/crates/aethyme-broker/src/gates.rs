@@ -11,6 +11,13 @@
 //! cost = 2                     # ascending = cheaper first (default 0)
 //! triggers = ["**/*.rs", "Cargo.toml"]   # empty/missing = always runs
 //! cache = true                 # false for gates that read commit metadata
+//! resource_ttl_seconds = 300
+//!
+//! [[gate.resources]]
+//! key = "database_port"
+//! kind = "tcp_port"
+//! start = 55000
+//! end = 55999
 //! ```
 //!
 //! Selection policy is deliberately over-selecting: a gate with no
@@ -18,9 +25,10 @@
 //! validation rather than silently never matching.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use sha2::{Digest, Sha256};
 
 use crate::git::GitRepo;
 use crate::store::BrokerStore;
@@ -48,6 +56,8 @@ pub enum GateConfigError {
         glob: String,
         message: String,
     },
+    #[error("gate {gate:?}: invalid host resource profile: {message}")]
+    BadResources { gate: String, message: String },
 }
 
 /// One configured gate, with its compiled trigger set.
@@ -58,6 +68,9 @@ pub struct Gate {
     pub cost: i64,
     pub triggers: Vec<String>,
     pub cache: bool,
+    pub resources: Vec<crate::HostResourceRequirement>,
+    pub resource_ttl_seconds: u64,
+    pub definition_hash: String,
     matcher: Option<GlobSet>,
 }
 
@@ -109,6 +122,42 @@ pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
                     .collect()
             })
             .unwrap_or_default();
+        let resources: Vec<crate::HostResourceRequirement> = entry
+            .get("resources")
+            .cloned()
+            .map(toml::Value::try_into)
+            .transpose()
+            .map_err(|error| GateConfigError::BadResources {
+                gate: name.clone(),
+                message: error.to_string(),
+            })?
+            .unwrap_or_default();
+        let resource_ttl_seconds = entry
+            .get("resource_ttl_seconds")
+            .and_then(toml::Value::as_integer)
+            .map(|value| {
+                u64::try_from(value).map_err(|_| GateConfigError::BadResources {
+                    gate: name.clone(),
+                    message: "resource_ttl_seconds must be positive".into(),
+                })
+            })
+            .transpose()?
+            .unwrap_or(300);
+        crate::validate_host_resource_requirements(&resources, resource_ttl_seconds).map_err(
+            |error| GateConfigError::BadResources {
+                gate: name.clone(),
+                message: error.to_string(),
+            },
+        )?;
+        let definition_hash = gate_definition_hash(
+            &name,
+            &command,
+            cost,
+            &triggers,
+            cache,
+            &resources,
+            resource_ttl_seconds,
+        );
 
         let matcher = if triggers.is_empty() {
             None
@@ -133,11 +182,36 @@ pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
             cost,
             triggers,
             cache,
+            resources,
+            resource_ttl_seconds,
+            definition_hash,
             matcher,
         });
     }
     gates.sort_by(|a, b| a.cost.cmp(&b.cost).then(a.name.cmp(&b.name)));
     Ok(gates)
+}
+
+fn gate_definition_hash(
+    name: &str,
+    command: &str,
+    cost: i64,
+    triggers: &[String],
+    cache: bool,
+    resources: &[crate::HostResourceRequirement],
+    resource_ttl_seconds: u64,
+) -> String {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "name": name,
+        "command": command,
+        "cost": cost,
+        "triggers": triggers,
+        "cache": cache,
+        "resources": resources,
+        "resource_ttl_seconds": resource_ttl_seconds,
+    }))
+    .expect("gate definition contains only serializable values");
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Why a gate was selected: the first changed file that triggered it
@@ -189,12 +263,24 @@ pub struct GateRunOutcome {
     pub gate: String,
     /// Full Git tree object id proven by this result.
     pub tree_hash: String,
+    /// Digest of the command, triggers, cache policy, and resource profile.
+    pub definition_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_lease: Option<GateResourceProvenance>,
     pub status: GateStatus,
     pub failure_class: Option<GateFailureClass>,
     pub cached: bool,
     pub exit_code: Option<i64>,
     pub duration_ms: Option<i64>,
     pub log_path: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GateResourceProvenance {
+    pub lease_id: String,
+    pub generation: u64,
+    pub expires_at: i64,
+    pub allocations: Vec<crate::HostResourceAllocation>,
 }
 
 /// Sink for human-readable gate progress. Production uses stderr; tests can
@@ -278,6 +364,7 @@ pub fn cancel_obsolete_runs(
         let _ = store.record_gate_result(&NewGateResult {
             gate_name: gate_name.to_string(),
             tree_hash: tree.to_string(),
+            definition_hash: String::new(),
             status: GateStatus::Cancelled,
             failure_class: None,
             exit_code: None,
@@ -517,6 +604,87 @@ fn gate_worker_id(session_id: Option<i64>, gate_name: &str) -> String {
     format!("{}-{}", owner, lock_segment(gate_name))
 }
 
+struct GateResourceRuntime {
+    grant: crate::HostResourceGrant,
+    ttl_seconds: u64,
+}
+
+impl GateResourceRuntime {
+    fn release(&mut self) -> Result<(), crate::HostResourceError> {
+        let mut coordinator = crate::HostResourceCoordinator::open_default()?;
+        self.grant.lease = coordinator.release(
+            &self.grant.lease.lease_id,
+            self.grant.lease.generation,
+            &self.grant.ownership_token,
+        )?;
+        Ok(())
+    }
+}
+
+fn acquire_gate_resources(
+    gate: &Gate,
+    checkout: &GitRepo,
+    tree: &str,
+    worker_id: &str,
+) -> Result<Option<GateResourceRuntime>, String> {
+    if gate.resources.is_empty() {
+        return Ok(None);
+    }
+    let repository = git_origin_fingerprint(checkout.root());
+    let worktree_fingerprint = sha256_text(&checkout.root().to_string_lossy());
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let request_id = sha256_text(&format!(
+        "{repository}:{worktree_fingerprint}:{tree}:{}:{worker_id}:{nonce}",
+        std::process::id()
+    ));
+    let request = crate::HostResourceRequest {
+        schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+        request_id,
+        repository,
+        worktree_fingerprint,
+        run_id: format!("{}-{}", worker_id, short_tree_hash(tree)),
+        ttl_seconds: gate.resource_ttl_seconds,
+        holder_pid: Some(std::process::id()),
+        resources: gate.resources.clone(),
+    };
+    let mut coordinator =
+        crate::HostResourceCoordinator::open_default().map_err(|error| error.to_string())?;
+    let grant = coordinator
+        .acquire(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Some(GateResourceRuntime {
+        grant,
+        ttl_seconds: gate.resource_ttl_seconds,
+    }))
+}
+
+fn git_origin_fingerprint(root: &Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(root)
+        .output();
+    let material = output
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("repository")
+                .to_string()
+        });
+    sha256_text(&material)
+}
+
+fn sha256_text(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
 /// Shared executor for a pre-computed selection: cheap-first order (the
 /// selection preserves `load_gates` sorting), tree-hash caching, one
 /// process group per gate, fail-fast.
@@ -550,7 +718,8 @@ fn run_selections(
         // commit bodies change.
         if cache_policy == CachePolicy::Use
             && gate.cache
-            && let Some(hit) = store.cached_gate_result(&gate.name, &tree)?
+            && let Some(hit) =
+                store.cached_gate_result_for_definition(&gate.name, &tree, &gate.definition_hash)?
         {
             let saved_ms = hit.duration_ms.unwrap_or(0);
             progress.report(&format!(
@@ -575,6 +744,8 @@ fn run_selections(
             outcomes.push(GateRunOutcome {
                 gate: gate.name.clone(),
                 tree_hash: tree.clone(),
+                definition_hash: gate.definition_hash.clone(),
+                resource_lease: None,
                 status: hit.status,
                 failure_class: cached_failure_class(hit.status),
                 cached: true,
@@ -601,6 +772,52 @@ fn run_selections(
             &tree[..8.min(tree.len())],
             worker_id
         ));
+        let mut resource_runtime = match acquire_gate_resources(gate, checkout, &tree, &worker_id) {
+            Ok(runtime) => runtime,
+            Err(message) => {
+                let _ = std::fs::write(
+                    &log_path,
+                    format!("aethyme host resource acquisition failed: {message}\n"),
+                );
+                progress.report(&format!(
+                    "gate {} blocked by host resources: {}",
+                    gate.name, message
+                ));
+                drop(owner_locks);
+                store.record_gate_result(&NewGateResult {
+                    gate_name: gate.name.clone(),
+                    tree_hash: tree.clone(),
+                    definition_hash: gate.definition_hash.clone(),
+                    status: GateStatus::Error,
+                    failure_class: Some(GateFailureClass::ResourceContention),
+                    exit_code: None,
+                    duration_ms: Some(0),
+                    log_path: Some(log_path.to_string_lossy().into_owned()),
+                    session_id,
+                })?;
+                outcomes.push(GateRunOutcome {
+                    gate: gate.name.clone(),
+                    tree_hash: tree.clone(),
+                    definition_hash: gate.definition_hash.clone(),
+                    resource_lease: None,
+                    status: GateStatus::Error,
+                    failure_class: Some(GateFailureClass::ResourceContention),
+                    cached: false,
+                    exit_code: None,
+                    duration_ms: Some(0),
+                    log_path: Some(log_path.to_string_lossy().into_owned()),
+                });
+                break;
+            }
+        };
+        let resource_provenance = resource_runtime
+            .as_ref()
+            .map(|runtime| GateResourceProvenance {
+                lease_id: runtime.grant.lease.lease_id.clone(),
+                generation: runtime.grant.lease.generation,
+                expires_at: runtime.grant.lease.expires_at,
+                allocations: runtime.grant.lease.allocations.clone(),
+            });
         progress.report(&format!(
             "gate {} started (cost {}, tree {})",
             gate.name,
@@ -621,10 +838,31 @@ fn run_selections(
                 owner_paths: &selection.owner_paths,
                 started,
                 progress,
+                resources: resource_runtime.as_ref(),
             },
         );
+        let release_error = resource_runtime
+            .as_mut()
+            .and_then(|runtime| runtime.release().err())
+            .map(|error| format!("host resource release failed: {error}"));
         drop(owner_locks);
         let duration_ms = started.elapsed().as_millis() as i64;
+        let status = match (status, release_error) {
+            (Ok(mut outcome), release_error) => {
+                if outcome.resource_error.is_none() {
+                    outcome.resource_error = release_error;
+                }
+                Ok(outcome)
+            }
+            // A failed spawn or wait is normally an environment error, but a
+            // simultaneous release failure is the more urgent invariant: the
+            // host bundle may still be owned and must be reconciled as such.
+            (Err(_), Some(release_error)) => Ok(GateCommandOutcome {
+                exit_code: None,
+                resource_error: Some(release_error),
+            }),
+            (Err(error), None) => Err(error),
+        };
         let (gate_status, failure_class, exit_code) =
             classify_gate_result(&gate.command, &log_path, status);
         progress.report(&format!(
@@ -637,6 +875,7 @@ fn run_selections(
         store.record_gate_result(&NewGateResult {
             gate_name: gate.name.clone(),
             tree_hash: tree.clone(),
+            definition_hash: gate.definition_hash.clone(),
             status: gate_status,
             failure_class,
             exit_code,
@@ -648,6 +887,8 @@ fn run_selections(
         outcomes.push(GateRunOutcome {
             gate: gate.name.clone(),
             tree_hash: tree.clone(),
+            definition_hash: gate.definition_hash.clone(),
+            resource_lease: resource_provenance,
             status: gate_status,
             failure_class,
             cached: false,
@@ -669,26 +910,52 @@ fn short_tree_hash(tree_hash: &str) -> &str {
 fn classify_gate_result(
     command: &str,
     log_path: &Path,
-    status: Result<Option<i32>, std::io::Error>,
+    status: Result<GateCommandOutcome, std::io::Error>,
 ) -> (GateStatus, Option<GateFailureClass>, Option<i64>) {
     match status {
-        Ok(Some(0)) => (GateStatus::Pass, None, Some(0)),
-        Ok(Some(code)) if is_timeout_error(code, log_path) => (
+        Ok(GateCommandOutcome {
+            exit_code,
+            resource_error: Some(error),
+        }) => {
+            let _ = append_gate_log(log_path, &format!("aethyme host resource error: {error}\n"));
+            (
+                GateStatus::Error,
+                Some(GateFailureClass::ResourceContention),
+                exit_code.map(i64::from),
+            )
+        }
+        Ok(GateCommandOutcome {
+            exit_code: Some(0),
+            resource_error: None,
+        }) => (GateStatus::Pass, None, Some(0)),
+        Ok(GateCommandOutcome {
+            exit_code: Some(code),
+            resource_error: None,
+        }) if is_timeout_error(code, log_path) => (
             GateStatus::Error,
             Some(GateFailureClass::Timeout),
             Some(code as i64),
         ),
-        Ok(Some(code)) if is_resource_contention_error(command, log_path) => (
+        Ok(GateCommandOutcome {
+            exit_code: Some(code),
+            resource_error: None,
+        }) if is_resource_contention_error(command, log_path) => (
             GateStatus::Error,
             Some(GateFailureClass::ResourceContention),
             Some(code as i64),
         ),
-        Ok(Some(code)) if is_environment_error(code, log_path) => (
+        Ok(GateCommandOutcome {
+            exit_code: Some(code),
+            resource_error: None,
+        }) if is_environment_error(code, log_path) => (
             GateStatus::Error,
             Some(GateFailureClass::Environment),
             Some(code as i64),
         ),
-        Ok(Some(code)) => (
+        Ok(GateCommandOutcome {
+            exit_code: Some(code),
+            resource_error: None,
+        }) => (
             GateStatus::Fail,
             Some(GateFailureClass::TestFailure),
             Some(code as i64),
@@ -697,7 +964,10 @@ fn classify_gate_result(
         // verdict on the code. Recording a conclusive fail here poisons
         // the tree-hash cache — if the same tree recurs, the cached
         // "fail" rejects a submission without ever running the gate.
-        Ok(None) => (GateStatus::Cancelled, None, None),
+        Ok(GateCommandOutcome {
+            exit_code: None,
+            resource_error: None,
+        }) => (GateStatus::Cancelled, None, None),
         Err(_) => (GateStatus::Error, Some(GateFailureClass::Environment), None),
     }
 }
@@ -808,17 +1078,24 @@ struct GateCommandContext<'a> {
     owner_paths: &'a [String],
     started: Instant,
     progress: &'a dyn GateProgressSink,
+    resources: Option<&'a GateResourceRuntime>,
+}
+
+struct GateCommandOutcome {
+    exit_code: Option<i32>,
+    resource_error: Option<String>,
 }
 
 fn run_gate_command(
     command: &str,
     context: GateCommandContext<'_>,
-) -> Result<Option<i32>, std::io::Error> {
+) -> Result<GateCommandOutcome, std::io::Error> {
     use std::os::unix::process::CommandExt;
 
     let log = std::fs::File::create(context.log_path)?;
     let log_err = log.try_clone()?;
-    let mut child = std::process::Command::new("sh")
+    let mut process = std::process::Command::new("sh");
+    process
         .arg("-c")
         .arg(command)
         .current_dir(context.cwd)
@@ -828,8 +1105,13 @@ fn run_gate_command(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err))
-        .process_group(0)
-        .spawn()?;
+        .process_group(0);
+    if let Some(resources) = context.resources {
+        for (key, value) in resources.grant.environment() {
+            process.env(key, value);
+        }
+    }
+    let mut child = process.spawn()?;
 
     let pidfile = context.session_id.map(|sid| {
         context
@@ -839,19 +1121,62 @@ fn run_gate_command(
     if let Some(pidfile) = &pidfile {
         let _ = std::fs::write(pidfile, format!("{} {}", child.id(), context.tree));
     }
+    let fatal_resource_error = std::sync::Arc::new(std::sync::Mutex::new(None));
     let status = std::thread::scope(|scope| {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let interval = heartbeat_interval();
+        let progress_interval = heartbeat_interval();
+        let renewal = context
+            .resources
+            .map(|runtime| (runtime.grant.clone(), runtime.ttl_seconds));
+        let interval = renewal
+            .as_ref()
+            .map(|(_, ttl)| Duration::from_secs((ttl / 3).max(1)))
+            .map(|renewal| renewal.min(progress_interval))
+            .unwrap_or(progress_interval);
+        let process_group = child.id() as i32;
+        let thread_error = fatal_resource_error.clone();
         scope.spawn(move || {
+            let mut renewal = renewal;
+            let mut last_progress = Instant::now();
             loop {
                 match done_rx.recv_timeout(interval) {
                     Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        context.progress.report(&format!(
-                            "gate {} running... {}s",
-                            context.gate_name,
-                            context.started.elapsed().as_secs()
-                        ));
+                        if let Some((grant, ttl_seconds)) = renewal.as_mut() {
+                            match crate::HostResourceCoordinator::open_default().and_then(
+                                |mut coordinator| {
+                                    coordinator.renew(
+                                        &grant.lease.lease_id,
+                                        grant.lease.generation,
+                                        &grant.ownership_token,
+                                        *ttl_seconds,
+                                    )
+                                },
+                            ) {
+                                Ok(lease) => grant.lease = lease,
+                                Err(error) => {
+                                    // Keep retrying while the last confirmed TTL still grants
+                                    // authority. Stop the process before that authority expires.
+                                    if epoch_ms().saturating_add(1_000) >= grant.lease.expires_at {
+                                        if let Ok(mut slot) = thread_error.lock() {
+                                            *slot = Some(error.to_string());
+                                        }
+                                        unsafe {
+                                            libc::killpg(process_group, libc::SIGTERM);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if last_progress.elapsed() >= progress_interval {
+                            context.progress.report(&format!(
+                                "gate {} running... {}s",
+                                context.gate_name,
+                                context.started.elapsed().as_secs()
+                            ));
+                            last_progress = Instant::now();
+                        }
                     }
                 }
             }
@@ -863,9 +1188,29 @@ fn run_gate_command(
     if let Some(pidfile) = &pidfile {
         let _ = std::fs::remove_file(pidfile);
     }
-    // Killed-by-signal surfaces as no exit code; `None` lets the caller
-    // record a non-conclusive `cancelled` row instead of a fake exit code.
-    Ok(status?.code())
+    let resource_error = fatal_resource_error
+        .lock()
+        .ok()
+        .and_then(|mut error| error.take());
+    // Killed-by-signal surfaces as no exit code; absent a resource error,
+    // `None` remains a non-conclusive cancellation.
+    Ok(GateCommandOutcome {
+        exit_code: status?.code(),
+        resource_error,
+    })
+}
+
+fn append_gate_log(path: &Path, message: &str) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+    file.write_all(message.as_bytes())
+}
+
+fn epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -888,6 +1233,13 @@ name = "pytest"
 command = "pytest -q"
 cost = 2
 triggers = ["**/*.py"]
+resource_ttl_seconds = 60
+
+[[gate.resources]]
+key = "database_port"
+kind = "tcp_port"
+start = 55000
+end = 55999
 
 [[gate]]
 name = "lint"
@@ -905,6 +1257,17 @@ command = "true"
             gates.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
             vec!["always", "lint", "pytest"]
         );
+        let pytest = gates.iter().find(|gate| gate.name == "pytest").unwrap();
+        assert_eq!(pytest.resource_ttl_seconds, 60);
+        assert_eq!(pytest.resources.len(), 1);
+        assert!(matches!(
+            pytest.resources[0].resource,
+            crate::HostResourceKind::TcpPort {
+                start: 55000,
+                end: 55999
+            }
+        ));
+        assert_eq!(pytest.definition_hash.len(), 64);
 
         write_config(
             tmp.path(),
@@ -913,6 +1276,16 @@ command = "true"
         assert!(matches!(
             load_gates(tmp.path()),
             Err(GateConfigError::BadGlob { .. })
+        ));
+
+        write_config(
+            tmp.path(),
+            "[[gate]]\nname='bad-resource'\ncommand='x'\nresource_ttl_seconds=1\n\
+             [[gate.resources]]\nkey='slot'\nkind='capacity'\npool='test'\nunits=1\nlimit=1\n",
+        );
+        assert!(matches!(
+            load_gates(tmp.path()),
+            Err(GateConfigError::BadResources { .. })
         ));
     }
 

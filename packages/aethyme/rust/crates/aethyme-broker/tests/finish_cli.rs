@@ -69,6 +69,7 @@ fn promoted_fixture() -> (tempfile::TempDir, i64) {
         .record_gate_result(&NewGateResult {
             gate_name: "finish-cli-gate".into(),
             tree_hash: tree,
+            definition_hash: "test-definition".into(),
             status: GateStatus::Pass,
             failure_class: None,
             exit_code: Some(0),

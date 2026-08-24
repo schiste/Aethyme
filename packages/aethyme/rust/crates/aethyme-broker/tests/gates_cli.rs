@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use aethyme_broker::GitRepo;
 
@@ -263,4 +263,129 @@ fn submit_cli_bypasses_and_then_refreshes_the_merged_tree_cache() {
     let refreshed: serde_json::Value = serde_json::from_str(&refreshed).unwrap();
     assert_eq!(refreshed["gate_outcomes"][0]["cached"], true);
     assert_eq!(run_count(&counter), 2);
+}
+
+#[test]
+fn independent_repositories_share_gate_host_resources_and_release_them() {
+    let first = fixture();
+    let second = fixture();
+    let state = tempfile::tempdir().unwrap();
+    let config = r#"
+[[gate]]
+name = "host-resources"
+command = "test -n \"$AETHYME_RESOURCE_DOCKER_PROJECT\" && test \"$AETHYME_RESOURCE_DATABASE\" = host-test-shared && sleep 6"
+cache = false
+resource_ttl_seconds = 15
+
+[[gate.resources]]
+key = "docker_project"
+kind = "namespace"
+prefix = "gate-test"
+
+[[gate.resources]]
+key = "database"
+kind = "exclusive_key"
+name = "host-test-shared"
+"#;
+    for repo in [first.path(), second.path()] {
+        std::fs::write(repo.join(".aethyme/gates.toml"), config).unwrap();
+        git(repo, &["add", ".aethyme/gates.toml"]);
+        git(repo, &["commit", "-qm", "configure host resource gate"]);
+    }
+
+    let running = Command::new(CLI)
+        .args(["gates", "run", "--all", "--no-cache", "--json"])
+        .current_dir(first.path())
+        .env("AETHYME_HOST_STATE_DIR", state.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let db_path = state.path().join("host-resources.db");
+    let mut observed = false;
+    for _ in 0..100 {
+        if db_path.exists()
+            && aethyme_broker::HostResourceCoordinator::open_read_only(&db_path)
+                .unwrap()
+                .list(false)
+                .unwrap()
+                .len()
+                == 1
+        {
+            observed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(observed, "first gate never acquired its host bundle");
+
+    let blocked = Command::new(CLI)
+        .args(["gates", "run", "--all", "--no-cache", "--json"])
+        .current_dir(second.path())
+        .env("AETHYME_HOST_STATE_DIR", state.path())
+        .output()
+        .unwrap();
+    assert!(!blocked.status.success());
+    let blocked_json: serde_json::Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(blocked_json[0]["status"], "error");
+    assert_eq!(blocked_json[0]["failure_class"], "resource_contention");
+    assert!(blocked_json[0].get("resource_lease").is_none());
+
+    let completed = running.wait_with_output().unwrap();
+    assert!(
+        completed.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&completed.stdout),
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let completed_json: serde_json::Value = serde_json::from_slice(&completed.stdout).unwrap();
+    assert_eq!(completed_json[0]["status"], "pass");
+    assert_eq!(
+        completed_json[0]["resource_lease"]["allocations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        completed_json[0]["definition_hash"].as_str().unwrap().len(),
+        64
+    );
+    let initial_expiry = completed_json[0]["resource_lease"]["expires_at"]
+        .as_i64()
+        .unwrap();
+    let inventory = aethyme_broker::HostResourceCoordinator::open_read_only(&db_path)
+        .unwrap()
+        .list(true)
+        .unwrap();
+    assert!(
+        inventory[0].expires_at > initial_expiry,
+        "long-running gate did not renew its host resource lease"
+    );
+    assert!(
+        aethyme_broker::HostResourceCoordinator::open_read_only(&db_path)
+            .unwrap()
+            .list(false)
+            .unwrap()
+            .is_empty(),
+        "successful gate did not release its host resources"
+    );
+
+    let failing_config = config.replace(" && sleep 6", " && false");
+    std::fs::write(first.path().join(".aethyme/gates.toml"), failing_config).unwrap();
+    let failed = Command::new(CLI)
+        .args(["gates", "run", "--all", "--no-cache", "--json"])
+        .current_dir(first.path())
+        .env("AETHYME_HOST_STATE_DIR", state.path())
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(
+        aethyme_broker::HostResourceCoordinator::open_read_only(&db_path)
+            .unwrap()
+            .list(false)
+            .unwrap()
+            .is_empty(),
+        "failing gate did not release its host resources"
+    );
 }

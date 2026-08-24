@@ -753,6 +753,8 @@ fn gate_observation_from_event(event: &crate::Event) -> Option<(GateRunOutcome, 
         GateRunOutcome {
             gate,
             tree_hash,
+            definition_hash: String::new(),
+            resource_lease: None,
             status,
             failure_class,
             cached,
@@ -1247,6 +1249,8 @@ mod tests {
         GateRunOutcome {
             gate: "cargo-test".into(),
             tree_hash: "fedcba9876543210".into(),
+            definition_hash: "test-definition".into(),
+            resource_lease: None,
             status: GateStatus::Fail,
             failure_class: Some(GateFailureClass::TestFailure),
             cached: false,
@@ -1397,6 +1401,8 @@ mod tests {
         let second_gate = GateRunOutcome {
             gate: "lint".into(),
             tree_hash: "aaaaaaaaaaaaaaaa".into(),
+            definition_hash: "lint-definition".into(),
+            resource_lease: None,
             status: GateStatus::Pass,
             failure_class: None,
             cached: false,

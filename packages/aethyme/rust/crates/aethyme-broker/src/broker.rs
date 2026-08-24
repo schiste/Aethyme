@@ -2359,6 +2359,9 @@ impl Broker {
                 command: gate.command.clone(),
                 cost_tier: gate.cost,
                 triggers_json: serde_json::to_string(&gate.triggers)?,
+                resources_json: serde_json::to_string(&gate.resources)?,
+                resource_ttl_seconds: gate.resource_ttl_seconds as i64,
+                definition_hash: gate.definition_hash.clone(),
                 updated_at: 0,
             })?;
         }

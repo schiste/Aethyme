@@ -253,6 +253,9 @@ fn gate_result_cache_ignores_cancelled_and_error_runs() {
             command: "pytest -q tests/local".into(),
             cost_tier: 2,
             triggers_json: "[\"**/*.py\"]".into(),
+            resources_json: "[]".into(),
+            resource_ttl_seconds: 300,
+            definition_hash: "test-definition".into(),
             updated_at: 0,
         })
         .unwrap();
@@ -269,6 +272,7 @@ fn gate_result_cache_ignores_cancelled_and_error_runs() {
         .record_gate_result(&NewGateResult {
             gate_name: "pytest".into(),
             tree_hash: "tree-a".into(),
+            definition_hash: "test-definition".into(),
             status: GateStatus::Cancelled,
             failure_class: None,
             exit_code: None,
@@ -289,6 +293,7 @@ fn gate_result_cache_ignores_cancelled_and_error_runs() {
         .record_gate_result(&NewGateResult {
             gate_name: "pytest".into(),
             tree_hash: "tree-a".into(),
+            definition_hash: "test-definition".into(),
             status: GateStatus::Pass,
             failure_class: None,
             exit_code: Some(0),
@@ -303,11 +308,25 @@ fn gate_result_cache_ignores_cancelled_and_error_runs() {
         .unwrap();
     assert_eq!(hit.status, GateStatus::Pass);
     assert_eq!(hit.failure_class, None);
+    assert!(
+        store
+            .cached_gate_result_for_definition("pytest", "tree-a", "test-definition")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .cached_gate_result_for_definition("pytest", "tree-a", "changed-definition")
+            .unwrap()
+            .is_none(),
+        "a changed gate definition must invalidate cached proof"
+    );
 
     store
         .record_gate_result(&NewGateResult {
             gate_name: "pytest".into(),
             tree_hash: "tree-c".into(),
+            definition_hash: "test-definition".into(),
             status: GateStatus::Fail,
             failure_class: None,
             exit_code: Some(1),
@@ -328,6 +347,7 @@ fn gate_result_cache_ignores_cancelled_and_error_runs() {
         .record_gate_result(&NewGateResult {
             gate_name: "pytest".into(),
             tree_hash: "tree-c".into(),
+            definition_hash: "test-definition".into(),
             status: GateStatus::Fail,
             failure_class: Some(GateFailureClass::TestFailure),
             exit_code: Some(1),
