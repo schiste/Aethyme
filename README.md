@@ -148,6 +148,26 @@ The deploy command prints the exact tracked-policy/runtime-state boundary.
 See the [repository deployment contract](packages/aethyme/docs/guides/repository-deployment.md)
 for clone behavior, ignored artifacts, and CI enforcement.
 
+For a private trial before team-wide enrollment, commit only the inert bridge:
+
+```bash
+aethyme deploy bridge --repo .
+git add AGENTS.md CLAUDE.md
+git commit -m "docs: add optional local Aethyme bridge"
+```
+
+Then each developer may opt in independently:
+
+```bash
+aethyme deploy --local-only --repo .
+aethyme deploy verify --local-only --repo .
+```
+
+Without `.aethyme/local/enabled`, the bridge tells agents to continue normally
+without probing for Aethyme, installing it, or mentioning its absence. Local
+activation writes only clone-ignored policy and runtime files, leaving the
+working tree clean and other clones inactive.
+
 **3. Run the disposable broker smoke** — this creates and removes a temporary
 repo; it does not touch your target repo:
 

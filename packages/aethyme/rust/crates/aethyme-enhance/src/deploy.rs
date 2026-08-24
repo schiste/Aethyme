@@ -376,7 +376,7 @@ fn session_start_hook_entry() -> Value {
 
 /// Add the SessionStart hook to `.claude/settings.local.json`
 /// (merge-aware, idempotent).
-fn ensure_settings_hook(repo: &Path) -> Result<DeployAction, String> {
+pub(crate) fn ensure_settings_hook(repo: &Path) -> Result<DeployAction, String> {
     let settings_path = repo.join(SETTINGS_FILE);
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;

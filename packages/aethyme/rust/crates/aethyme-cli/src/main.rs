@@ -209,7 +209,7 @@ fn print_top_level_help() {
     eprintln!("  update check|plan|execute  explicit paired-binary updates; never background");
     eprintln!();
     eprintln!("Setup:");
-    eprintln!("  deploy [verify] [--repo <path>]  enroll or verify repository policy");
+    eprintln!("  deploy [verify|bridge] [--repo <path>]  enroll repository policy");
     eprintln!("  root show|set <path>        developer checkout pointer (legacy compatibility)");
     eprintln!();
     eprintln!("Quality:");

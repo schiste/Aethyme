@@ -217,6 +217,44 @@ pub fn scaffold(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     })
 }
 
+/// Checkout-local scaffolding for an opt-in Aethyme activation.
+///
+/// This intentionally omits the tracked `.gitignore` contract. The caller
+/// owns local Git exclusions, while broker configuration, gate drafts, and
+/// the database retain their ordinary repository-relative locations so the
+/// rest of the broker needs no local-mode branches.
+pub fn scaffold_local(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
+    let mut checks = Vec::new();
+    let repo = crate::GitRepo::discover(repo_hint).map_err(BrokerOpError::Git)?;
+    let main_root = repo.main_root()?;
+
+    checks.push(ensure_file(
+        &main_root.join(".aethyme/config.toml"),
+        "scaffold-local.config-toml",
+        || CONFIG_TEMPLATE.to_string(),
+    ));
+
+    let db_existed = main_root.join(crate::BROKER_DB_RELPATH).exists();
+    let store = crate::BrokerStore::open_in_repo(&main_root)?;
+    let integrity = store.integrity_check()?;
+    checks.push(Check {
+        id: "scaffold-local.broker-db",
+        status: if integrity != "ok" {
+            CheckStatus::Fail
+        } else if db_existed {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Created
+        },
+        detail: format!("integrity: {integrity}"),
+    });
+
+    Ok(InitReport {
+        check_mode: false,
+        checks,
+    })
+}
+
 /// Adaptive gate drafting (`aethyme broker gates draft`): sniff the
 /// repo's manifests and write a draft gates.toml. Never overwrites.
 /// NOT scaffolding, NOT certification — output depends on the repo.
@@ -796,7 +834,11 @@ fn protocol_status(main_root: &Path) -> CheckStatus {
             .map(|text| text.contains("Broker Coordination"))
             .unwrap_or(false)
     });
-    if has_protocol {
+    let local_protocol = main_root.join(".aethyme/local/enabled").is_file()
+        && std::fs::read_to_string(main_root.join(".aethyme/local/AGENTS.md"))
+            .map(|text| text.contains("Broker Coordination"))
+            .unwrap_or(false);
+    if has_protocol || local_protocol {
         CheckStatus::Pass
     } else if broker_is_configured(main_root) {
         CheckStatus::Fail
@@ -812,7 +854,11 @@ fn broker_is_configured(main_root: &Path) -> bool {
 
 fn protocol_detail(main_root: &Path) -> String {
     if protocol_status(main_root) == CheckStatus::Pass {
-        "agent protocol present in AGENTS.md/CLAUDE.md".into()
+        if main_root.join(".aethyme/local/enabled").is_file() {
+            "local agent protocol active through .aethyme/local/AGENTS.md".into()
+        } else {
+            "agent protocol present in AGENTS.md/CLAUDE.md".into()
+        }
     } else if broker_is_configured(main_root) {
         "configured repository is missing the generated Broker Coordination policy — \
          run `aethyme deploy --repo .`; agents will not follow the loop without it"

@@ -85,6 +85,8 @@ Primary commands:
 
 - `aethyme deploy --repo /path/to/repo`
 - `aethyme deploy verify --repo /path/to/repo`
+- `aethyme deploy bridge --repo /path/to/repo`
+- `aethyme deploy --local-only --repo /path/to/repo`
 - `aethyme explore --repo /path/to/repo --request "<task>" --format answer-json`
   (native Rust entrypoint; the paired `aethyme-engine-cli` binary serves the
   daemon protocol and is installed from the same release archive)
@@ -148,6 +150,8 @@ Runtime notes:
 - Git repositories use commit plus dirty-state metadata for cache keys instead of a full recursive fingerprint on every call
 - `aethyme deploy --repo <path>` is the canonical mandatory repository-enrollment path; it composes broker scaffold, gate drafting, agent-policy deployment, verification, and certification
 - `aethyme deploy verify --repo <path>` is its read-only local and CI contract; `aethyme enhance deploy/verify` remain lower-level discoverability operations
+- `aethyme deploy bridge` installs a small committed AGENTS/CLAUDE rendezvous point; `deploy --local-only` keeps the full policy, skills, broker configuration, gates, and state clone-local behind `.aethyme/local/enabled`
+- an inactive bridge performs no PATH probe, process spawn, installation, warning, or hook work; a fresh clone remains inactive until its developer opts in
 - `AGENTS.md` and `CLAUDE.md` are generated artifacts owned by Aethyme; customize them through `.aethyme/overrides/agents.json`, not by editing the root files directly
 - generated root instructions include compact repo routing such as skill paths, fast test, app entrypoint, experience status, and commit hygiene policy
 - legacy block-managed `AGENTS.md` files are migration-only now; deploy extracts legacy maintainer text into `.aethyme/overrides/agents.json` before rewriting the root file
