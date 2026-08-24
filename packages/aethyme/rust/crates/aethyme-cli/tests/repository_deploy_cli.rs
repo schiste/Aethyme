@@ -220,6 +220,11 @@ fn local_only_activation_is_clean_and_does_not_follow_a_clone() {
     assert!(policy.contains("## Broker Coordination"));
     assert!(repo.join(".codex/skills/aethyme/SKILL.md").is_file());
     assert!(repo.join(".claude/skills/aethyme/SKILL.md").is_file());
+    assert!(
+        fs::read_to_string(repo.join(".claude/settings.local.json"))
+            .unwrap()
+            .contains(".claude/hooks/aethyme-load-context.sh")
+    );
     assert!(!repo.join(".gitignore").exists());
     assert_eq!(status(&repo), "");
 

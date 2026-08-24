@@ -5,7 +5,7 @@ use std::process::Command;
 
 use crate::PLACEHOLDER;
 use crate::agents::render_agents_document;
-use crate::deploy::TARGETS;
+use crate::deploy::{SETTINGS_FILE, TARGETS, ensure_settings_hook};
 use crate::onboarding::expected_onboarding_files;
 
 pub const LOCAL_MARKER_PATH: &str = ".aethyme/local/enabled";
@@ -33,6 +33,7 @@ const EXCLUDE_BLOCK: &str = "# aethyme-local:begin\n\
 .claude/skills/repo-onboarding/\n\
 .claude/skills/repo-act/\n\
 .claude/hooks/aethyme-load-context.sh\n\
+.claude/settings.local.json\n\
 # aethyme-local:end\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +112,11 @@ pub fn deploy(repo: &Path, force: bool) -> Result<Vec<LocalAction>, String> {
             is_executable(relative),
         )?);
     }
+    let settings = ensure_settings_hook(repo)?;
+    actions.push(LocalAction {
+        path: settings.relative_path,
+        action: settings.action,
+    });
 
     let policy = render_agents_document(Some(repo))?;
     actions.push(write_local_target(
@@ -157,11 +163,19 @@ pub fn verify(repo: &Path) -> Result<Vec<String>, String> {
             problems.push(format!("missing {relative}"));
         }
     }
+    match std::fs::read_to_string(repo.join(SETTINGS_FILE)) {
+        Ok(text) if text.contains(".claude/hooks/aethyme-load-context.sh") => {}
+        Ok(_) => problems.push(format!(
+            "{SETTINGS_FILE} does not wire the SessionStart hook"
+        )),
+        Err(_) => problems.push(format!("missing {SETTINGS_FILE}")),
+    }
     for relative in [
         LOCAL_MARKER_PATH,
         LOCAL_POLICY_PATH,
         ".codex/skills/aethyme/SKILL.md",
         ".claude/skills/aethyme/SKILL.md",
+        SETTINGS_FILE,
     ] {
         if repo.join(relative).exists() && !git_ignored(repo, relative)? {
             problems.push(format!("local artifact is not Git-ignored: {relative}"));
@@ -182,6 +196,7 @@ fn refuse_tracked_local_targets(repo: &Path) -> Result<(), String> {
             .map(|(path, _)| (*path).to_string()),
     );
     targets.extend([LOCAL_MARKER_PATH.into(), LOCAL_POLICY_PATH.into()]);
+    targets.push(SETTINGS_FILE.into());
     let tracked = targets
         .into_iter()
         .filter(|path| git_tracked(repo, path).unwrap_or(false))
