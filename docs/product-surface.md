@@ -91,6 +91,8 @@ These commands are the public product path and should stay easy to explain:
 
 - `aethyme deploy`
 - `aethyme deploy verify`
+- `aethyme deploy bridge`
+- `aethyme deploy --local-only`
 - `aethyme init`
 - `aethyme certify`
 - `aethyme broker status`

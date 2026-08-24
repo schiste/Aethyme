@@ -68,3 +68,39 @@ work then begins with `aethyme broker status --json` followed by
 Re-run `aethyme deploy --repo .` after changing gates, overrides, repository
 structure, or the installed Aethyme version; review and commit the resulting
 policy update.
+
+## Private adoption with an inert bridge
+
+When a team is not ready for mandatory repository-wide deployment, commit only
+the activation bridge:
+
+```bash
+aethyme deploy bridge --repo .
+git add AGENTS.md CLAUDE.md
+git commit -m "docs: add optional local Aethyme bridge"
+```
+
+The managed bridge gives Codex, Claude, and other root-policy readers one
+conditional instruction: if `.aethyme/local/enabled` exists, load
+`.aethyme/local/AGENTS.md` as mandatory policy. If the marker is absent, agents
+continue normally without running `command -v`, probing PATH, installing
+Aethyme, emitting a warning, or mentioning the inactive capability.
+
+An individual developer activates the full workflow with:
+
+```bash
+aethyme deploy --local-only --repo .
+aethyme deploy verify --local-only --repo .
+```
+
+Local deployment writes broker configuration, drafted gates, generated
+onboarding, product-specific skills, the complete agent policy, and runtime
+state under their ordinary repository-relative paths. A managed block in the
+clone's `.git/info/exclude` hides exactly those activation paths; tracked
+`.gitignore` is not modified. The command refuses to overwrite a tracked agent
+policy, preventing local mode from masking canonical team configuration.
+
+Re-running local deployment refreshes Aethyme-owned ignored files. Removing
+`.aethyme/local/enabled` immediately makes the committed bridge inert; the
+remaining ignored files perform no work and may be removed later. A fresh
+clone receives the bridge but none of the activation artifacts.

@@ -55,6 +55,8 @@ product surface.
 
 - `aethyme deploy`
 - `aethyme deploy verify`
+- `aethyme deploy bridge`
+- `aethyme deploy --local-only`
 - `aethyme init`
 - `aethyme certify`
 - `aethyme broker status`
@@ -807,6 +809,14 @@ gate drafting, embedded agent-policy deployment, verification, and
 certification as one command. `deploy verify` performs the verification and
 certification checks without writing. Repositories should retain this command
 as a required CI check.
+
+For staged team adoption, `deploy bridge` appends an inert managed block to
+`AGENTS.md` and `CLAUDE.md`; review and commit those two files. Individual
+developers then run `deploy --local-only`, which activates the complete policy
+behind `.aethyme/local/enabled` and excludes its files through local Git
+metadata rather than tracked `.gitignore`. `deploy verify --local-only` is
+read-only. Inactive clones perform only the bridge's marker existence check and
+do not probe for or invoke the binary.
 
 `enhance deploy` is the lower-level discoverability operation used by the
 canonical command. It writes:
