@@ -795,18 +795,28 @@ fn protocol_status(main_root: &Path) -> CheckStatus {
     });
     if has_protocol {
         CheckStatus::Pass
+    } else if broker_is_configured(main_root) {
+        CheckStatus::Fail
     } else {
         CheckStatus::Skipped
     }
 }
 
+fn broker_is_configured(main_root: &Path) -> bool {
+    main_root.join(".aethyme/config.toml").is_file()
+        || main_root.join(".aethyme/gates.toml").is_file()
+}
+
 fn protocol_detail(main_root: &Path) -> String {
     if protocol_status(main_root) == CheckStatus::Pass {
         "agent protocol present in AGENTS.md/CLAUDE.md".into()
+    } else if broker_is_configured(main_root) {
+        "configured repository is missing the generated Broker Coordination policy — \
+         run `aethyme deploy --repo .`; agents will not follow the loop without it"
+            .into()
     } else {
-        "no Broker Coordination section found — run `aethyme enhance deploy` \
-         (Aethyme-enhanced repos) or add the protocol to AGENTS.md; \
-         agents will not follow the loop without it"
+        "repository is not deployed — run `aethyme deploy --repo .` to initialize \
+         broker state and install mandatory agent policy"
             .into()
     }
 }

@@ -30,6 +30,14 @@ fn init_repo(root: &Path) {
     sh(root, &["commit", "-qm", "init"]);
 }
 
+fn write_agent_protocol(root: &Path) {
+    std::fs::write(
+        root.join("AGENTS.md"),
+        "# Agent Instructions\n\n## Broker Coordination\n",
+    )
+    .unwrap();
+}
+
 /// Snapshot every file under `.aethyme` + `.gitignore` (path → bytes),
 /// excluding the runtime db (its WAL bytes legitimately change).
 fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
@@ -137,7 +145,16 @@ fn certify_is_always_read_only_and_scaffold_rerun_is_byte_identical() {
     }
     assert_eq!(snapshot(tmp.path()), first, "re-run is byte-identical");
 
-    // Certify agrees with the scaffolded state and is still read-only.
+    // Broker configuration makes the agent protocol mandatory.
+    let report = init::certify(tmp.path()).unwrap();
+    assert!(!report.certified());
+    assert_eq!(
+        status_of(&report, "certify.agents-protocol"),
+        CheckStatus::Fail
+    );
+    assert_eq!(snapshot(tmp.path()), first, "certify still wrote nothing");
+
+    write_agent_protocol(tmp.path());
     let report = init::certify(tmp.path()).unwrap();
     assert!(report.certified());
     assert_eq!(status_of(&report, "certify.config"), CheckStatus::Pass);
@@ -149,6 +166,7 @@ fn certify_is_always_read_only_and_scaffold_rerun_is_byte_identical() {
 fn config_schema_key_is_accepted_and_unknown_keys_warn_never_fail() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
+    write_agent_protocol(tmp.path());
     std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
     let config = tmp.path().join(".aethyme/config.toml");
     let certify_config = || {
@@ -282,6 +300,10 @@ fn guided_init_sets_up_a_fresh_repo_and_second_run_is_a_no_op() {
     assert!(tmp.path().join(".aethyme/broker.db").exists());
     assert!(tmp.path().join(".aethyme/gates.toml").exists());
 
+    // A configured repository must install agent policy before it certifies.
+    assert!(!init::certify(tmp.path()).unwrap().certified());
+    write_agent_protocol(tmp.path());
+
     // Second run: nothing changes (byte for byte), and the report says so.
     let first = snapshot(tmp.path());
     let report = init::guided_init(tmp.path()).unwrap();
@@ -313,6 +335,9 @@ fn guided_init_without_manifests_drafts_nothing_and_stays_idempotent() {
     let gates = report.gates.as_ref().expect("gates phase ran");
     assert_eq!(status_of(gates, "gates.draft"), CheckStatus::Warn);
     assert!(!tmp.path().join(".aethyme/gates.toml").exists());
+
+    assert!(!init::certify(tmp.path()).unwrap().certified());
+    write_agent_protocol(tmp.path());
 
     // No gates.toml means the draft phase runs again — and still writes
     // nothing, so the run as a whole reports no changes.
