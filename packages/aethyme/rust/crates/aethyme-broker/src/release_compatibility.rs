@@ -12,6 +12,9 @@ pub const BROKER_STORAGE_CURRENT_SCHEMA: i64 = crate::schema::SCHEMA_VERSION;
 /// Engine daemon wire-protocol version used by the paired sibling binary.
 pub const ENGINE_PROTOCOL_VERSION: u32 = aethyme_engine::daemon::ENGINE_PROTOCOL_VERSION;
 
+/// Current schema for repository-owned deployment policy and generated files.
+pub const REPOSITORY_SCHEMA_VERSION: u32 = 1;
+
 /// Minimum Git release required for merge-tree submission simulation.
 pub const MINIMUM_GIT_VERSION: &str = "2.38";
 
@@ -37,6 +40,7 @@ mod tests {
             ENGINE_PROTOCOL_VERSION,
             aethyme_engine::daemon::ENGINE_PROTOCOL_VERSION
         );
+        assert_eq!(REPOSITORY_SCHEMA_VERSION, 1);
         assert_eq!(minimum_git_version_parts(), (2, 38));
     }
 }

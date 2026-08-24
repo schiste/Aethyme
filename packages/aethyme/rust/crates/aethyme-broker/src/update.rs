@@ -176,6 +176,7 @@ pub struct UpdateExecutionReport {
     pub active_bundle: PathBuf,
     pub rollback_bundle: Option<PathBuf>,
     pub quick_test_passed: bool,
+    pub repository_next_action: String,
 }
 
 #[derive(Debug, Error)]
@@ -448,6 +449,7 @@ fn run_bootstrap(args: &[String]) -> Result<(), String> {
             .unwrap_or(Path::new("."))
             .display()
     );
+    println!("Next: {}", report.repository_next_action);
     Ok(())
 }
 
@@ -460,6 +462,9 @@ fn print_update_help() {
     eprintln!("  aethyme update execute --confirm <manifest-sha256> [--json]");
     eprintln!();
     eprintln!("Homebrew installs are updated with `brew upgrade aethyme`.");
+    eprintln!(
+        "After either binary update, run `aethyme upgrade plan` in each enrolled repository."
+    );
 }
 
 fn parse_json_only(args: &[String]) -> Result<bool, String> {
@@ -763,6 +768,7 @@ pub fn bootstrap_install(
         active_bundle,
         rollback_bundle,
         quick_test_passed: true,
+        repository_next_action: repository_upgrade_next_action(),
     })
 }
 
@@ -845,6 +851,7 @@ pub fn execute_confirmed_update(confirmation: &str) -> Result<UpdateExecutionRep
         active_bundle,
         rollback_bundle,
         quick_test_passed: true,
+        repository_next_action: repository_upgrade_next_action(),
     })
 }
 
@@ -866,8 +873,13 @@ fn render_execution(report: &UpdateExecutionReport, json: bool) -> Result<(), St
             println!("  Rollback bundle: {}", path.display());
         }
         println!("  Quick test: passed");
+        println!("Next: {}", report.repository_next_action);
     }
     Ok(())
+}
+
+fn repository_upgrade_next_action() -> String {
+    "in each enrolled repository, run `aethyme upgrade plan`, review it, then confirm `aethyme upgrade apply` if required".into()
 }
 
 fn validate_saved_plan(

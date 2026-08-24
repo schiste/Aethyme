@@ -234,6 +234,7 @@ fn update_help_is_explicit_and_never_background() {
         "update execute --confirm <manifest-sha256>",
         "never runs in the background",
         "brew upgrade aethyme",
+        "aethyme upgrade plan",
     ] {
         assert!(stderr.contains(expected), "missing {expected:?}\n{stderr}");
     }

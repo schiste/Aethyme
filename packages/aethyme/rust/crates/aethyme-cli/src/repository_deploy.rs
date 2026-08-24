@@ -90,6 +90,13 @@ pub fn run(args: &[String]) -> u8 {
     if deployed != 0 {
         return deployed;
     }
+    if let Err(error) = crate::repository_upgrade::write_current_marker(
+        &repo,
+        crate::repository_upgrade::RepositoryMode::Canonical,
+    ) {
+        eprintln!("aethyme deploy: write repository schema marker: {error}");
+        return 1;
+    }
 
     let verified = verify_repository(&repo);
     if verified == 0 {
@@ -99,6 +106,13 @@ pub fn run(args: &[String]) -> u8 {
 }
 
 fn verify_repository(repo: &Path) -> u8 {
+    if let Err(error) = crate::repository_upgrade::verify_current_marker(
+        repo,
+        crate::repository_upgrade::RepositoryMode::Canonical,
+    ) {
+        eprintln!("aethyme deploy verify: {error}");
+        return 1;
+    }
     let verified = aethyme_enhance::cli::run(&[
         "verify".to_string(),
         "--repo".to_string(),
@@ -243,6 +257,13 @@ fn deploy_local_repository(repo: &Path, force: bool) -> u8 {
             return 1;
         }
     }
+    if let Err(error) = crate::repository_upgrade::write_current_marker(
+        repo,
+        crate::repository_upgrade::RepositoryMode::LocalOnly,
+    ) {
+        eprintln!("aethyme deploy: write local repository schema marker: {error}");
+        return 1;
+    }
     let verified = verify_local_repository(repo);
     if verified == 0 {
         println!("Local-only Aethyme activation verified; Git tracks no activation artifacts.");
@@ -252,6 +273,13 @@ fn deploy_local_repository(repo: &Path, force: bool) -> u8 {
 }
 
 fn verify_local_repository(repo: &Path) -> u8 {
+    if let Err(error) = crate::repository_upgrade::verify_current_marker(
+        repo,
+        crate::repository_upgrade::RepositoryMode::LocalOnly,
+    ) {
+        eprintln!("aethyme deploy verify: {error}");
+        return 1;
+    }
     match aethyme_enhance::local::verify(repo) {
         Ok(problems) if problems.is_empty() => {}
         Ok(problems) => {
@@ -286,6 +314,7 @@ fn print_artifact_ownership() {
     for path in [
         ".gitignore",
         ".aethyme/config.toml",
+        ".aethyme/repository.json",
         ".aethyme/gates.toml (when generated)",
         ".aethyme/overrides/ (when present)",
         ".aethyme/generated/onboarding.json",

@@ -116,6 +116,19 @@ aethyme update plan --channel stable
 aethyme update execute --confirm <manifest-sha256>
 ```
 
+After either Homebrew or installer updates the binary pair, review embedded
+repository migrations separately in every enrolled repository:
+
+```bash
+cd /path/to/your-repo
+aethyme upgrade plan
+aethyme upgrade apply --confirm <plan-sha256> # only when the plan requires it
+```
+
+The binary updater never scans for repositories or rewrites them implicitly.
+See the [repository upgrade contract](packages/aethyme/docs/guides/repository-upgrades.md)
+for canonical, local-only, interruption, and rollback behavior.
+
 Aethyme never updates silently in the background. Cargo installation is retained for
 contributors and unsupported targets, not as the primary quickstart. See the
 [v0.2.1 upgrade and rollback guide](packages/aethyme/docs/guides/upgrading-to-v0.2.1.md)

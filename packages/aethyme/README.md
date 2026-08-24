@@ -87,6 +87,8 @@ Primary commands:
 - `aethyme deploy verify --repo /path/to/repo`
 - `aethyme deploy bridge --repo /path/to/repo`
 - `aethyme deploy --local-only --repo /path/to/repo`
+- `aethyme upgrade plan --repo /path/to/repo`
+- `aethyme upgrade apply --repo /path/to/repo --confirm <plan-sha256>`
 - `aethyme explore --repo /path/to/repo --request "<task>" --format answer-json`
   (native Rust entrypoint; the paired `aethyme-engine-cli` binary serves the
   daemon protocol and is installed from the same release archive)
@@ -150,6 +152,8 @@ Runtime notes:
 - Git repositories use commit plus dirty-state metadata for cache keys instead of a full recursive fingerprint on every call
 - `aethyme deploy --repo <path>` is the canonical mandatory repository-enrollment path; it composes broker scaffold, gate drafting, agent-policy deployment, verification, and certification
 - `aethyme deploy verify --repo <path>` is its read-only local and CI contract; `aethyme enhance deploy/verify` remain lower-level discoverability operations
+- binary installation and repository migration are separate: after updating the paired binaries, `aethyme upgrade plan` reviews embedded repository-policy migrations one repository at a time, and `upgrade apply` requires the plan digest before changing files
+- canonical deployments track `.aethyme/repository.json`; local-only deployments keep the equivalent marker ignored, and enrolled repositories fail closed on broker use when their policy schema is stale or newer than the installed binary
 - `aethyme deploy bridge` installs a small committed AGENTS/CLAUDE rendezvous point; `deploy --local-only` keeps the full policy, skills, broker configuration, gates, and state clone-local behind `.aethyme/local/enabled`
 - an inactive bridge performs no PATH probe, process spawn, installation, warning, or hook work; a fresh clone remains inactive until its developer opts in
 - `AGENTS.md` and `CLAUDE.md` are generated artifacts owned by Aethyme; customize them through `.aethyme/overrides/agents.json`, not by editing the root files directly

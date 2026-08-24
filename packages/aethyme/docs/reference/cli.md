@@ -84,6 +84,8 @@ product surface.
 - `aethyme update check`
 - `aethyme update plan`
 - `aethyme update execute`
+- `aethyme upgrade plan`
+- `aethyme upgrade apply`
 - `aethyme explore`
 
 ### Advanced Public Tools
@@ -124,7 +126,8 @@ normalized to that release's version-specific manifest URL, so the saved plan
 never executes against a moving alias. A plan records the current and target
 versions, source SHA, installation provenance, full manifest digest, exact
 platform archive URL/digest/size, engine protocol, and broker-storage
-compatibility range.
+compatibility range, plus the repository deployment schema embedded in that
+release.
 
 Update authority follows installation provenance:
 
@@ -149,6 +152,26 @@ safe before a compatibility-changing release.
 
 Neither `--help`, normal broker commands, nor any background process performs
 an update check.
+
+## Repository Upgrade Commands
+
+```text
+aethyme upgrade plan [--repo <path>] [--local-only] [--json]
+aethyme upgrade apply [--repo <path>] [--local-only] --confirm <plan-sha256> [--json]
+```
+
+Binary updates and repository migrations are intentionally separate. Run
+`plan` in each enrolled repository after updating the binary pair. It is
+read-only and binds the repository HEAD, relevant file state, deployment mode,
+planned paths, and embedded migrations into a full SHA-256. `apply` requires
+that exact digest, a clean worktree, and a supported marker before converging
+and verifying Aethyme-owned repository files.
+
+Canonical deployments track `.aethyme/repository.json`; local-only deployments
+keep `.aethyme/local/repository.json` ignored. Broker commands fail closed in
+an enrolled repository whose marker is missing, incomplete, or newer than the
+binary. See the [repository upgrade guide](../guides/repository-upgrades.md)
+for review, interruption, and rollback behavior.
 
 ## Broker Commands
 

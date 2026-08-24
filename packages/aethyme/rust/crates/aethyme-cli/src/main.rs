@@ -28,6 +28,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod repository_deploy;
+mod repository_upgrade;
 
 /// Upper bound for waiting on a freshly-spawned engine daemon. The socket
 /// binds only after the initial map build (~70s on a 12K-file repo), so
@@ -39,6 +40,14 @@ fn main() -> ExitCode {
     if args.is_empty() {
         print_top_level_help();
         return ExitCode::from(2);
+    }
+
+    if args[0] == "broker"
+        && let Ok(cwd) = env::current_dir()
+        && let Some(message) = repository_upgrade::compatibility_blocker(&cwd)
+    {
+        eprintln!("Error: {message}");
+        return ExitCode::from(1);
     }
 
     match args[0].as_str() {
@@ -131,6 +140,7 @@ fn main() -> ExitCode {
         // Broker commands have been native Rust from birth (issue #31).
         "broker" => ExitCode::from(aethyme_broker::cli::run(&args[1..])),
         "update" => ExitCode::from(aethyme_broker::run_update_cli(&args[1..])),
+        "upgrade" => ExitCode::from(repository_upgrade::run(&args[1..])),
         // Certification — top-level by design (the "airport certification"
         // inspection). Strictly read-only; adaptive setup lives in
         // `broker scaffold`.
@@ -207,6 +217,7 @@ fn print_top_level_help() {
     eprintln!("  broker operations          inspect/reconcile the remote-operation journal");
     eprintln!("  broker adopt|start-agent|agents|cleanup   (see `broker --help`)");
     eprintln!("  update check|plan|execute  explicit paired-binary updates; never background");
+    eprintln!("  upgrade plan|apply         review and apply embedded repository migrations");
     eprintln!();
     eprintln!("Setup:");
     eprintln!("  deploy [verify|bridge] [--repo <path>]  enroll repository policy");

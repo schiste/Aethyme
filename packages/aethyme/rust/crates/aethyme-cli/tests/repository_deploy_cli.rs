@@ -93,6 +93,7 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
 
     for relative in [
         ".aethyme/config.toml",
+        ".aethyme/repository.json",
         "AGENTS.md",
         "CLAUDE.md",
         ".codex/skills/aethyme/SKILL.md",
@@ -163,7 +164,9 @@ fn deploy_verify_is_read_only_and_rejects_missing_policy() {
         .unwrap();
 
     assert!(!verified.status.success());
-    assert!(String::from_utf8_lossy(&verified.stderr).contains("Verification failed"));
+    let stderr = String::from_utf8_lossy(&verified.stderr);
+    assert!(stderr.contains("missing .aethyme/repository.json"));
+    assert!(stderr.contains("aethyme upgrade plan"));
     assert_eq!(fs::read_dir(&repo).unwrap().count(), before);
 }
 
@@ -172,6 +175,7 @@ fn top_level_help_exposes_the_canonical_deployment_surface() {
     let help = Command::new(aethyme_bin()).arg("--help").output().unwrap();
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stderr).contains("deploy [verify|bridge]"));
+    assert!(String::from_utf8_lossy(&help.stderr).contains("upgrade plan|apply"));
 
     let deploy_help = Command::new(aethyme_bin())
         .args(["deploy", "--help"])

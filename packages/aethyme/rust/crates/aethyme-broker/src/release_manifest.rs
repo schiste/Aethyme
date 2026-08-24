@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BROKER_STORAGE_CURRENT_SCHEMA, BROKER_STORAGE_MINIMUM_SCHEMA, ENGINE_PROTOCOL_VERSION,
-    MINIMUM_GIT_VERSION,
+    MINIMUM_GIT_VERSION, REPOSITORY_SCHEMA_VERSION,
 };
 
 pub const RELEASE_MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -41,6 +41,10 @@ pub struct ReleaseCompatibility {
     pub broker_storage: ReleaseBrokerStorageCompatibility,
     pub engine_protocol: u32,
     pub minimum_git_version: String,
+    /// Zero means a legacy manifest published before repository schemas were
+    /// advertised. New manifests are always generated with the current value.
+    #[serde(default)]
+    pub repository_schema: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +84,7 @@ impl ReleaseManifest {
                 },
                 engine_protocol: ENGINE_PROTOCOL_VERSION,
                 minimum_git_version: MINIMUM_GIT_VERSION.to_string(),
+                repository_schema: REPOSITORY_SCHEMA_VERSION,
             },
             installer,
             release_channel: release_channel.into(),
@@ -233,7 +238,12 @@ mod tests {
 
     #[test]
     fn validates_the_complete_release_contract() {
-        assert_eq!(manifest().validate(), Ok(()));
+        let manifest = manifest();
+        assert_eq!(
+            manifest.compatibility.repository_schema,
+            REPOSITORY_SCHEMA_VERSION
+        );
+        assert_eq!(manifest.validate(), Ok(()));
     }
 
     #[test]
