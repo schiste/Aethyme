@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Command;
 
 use aethyme_broker::{
-    Broker, IntegrationDeliveryState, IntegrationReconcileClassification,
+    AdoptMode, Broker, FinishStatus, IntegrationDeliveryState, IntegrationReconcileClassification,
     IntegrationReconcileOptions, MergeStatus, NewSession, RepairAction, RepairSource,
     SessionOrigin, StatusAdviceSeverity, SubmissionCommitOwnership, SubmissionIntegrationState,
 };
@@ -562,6 +562,109 @@ fn normalized_replay_handles_rebased_rename_binary_empty_and_stable_order() {
         file_at(tmp.path(), "aethyme/integration", "src/renamed.py"),
         "a = 2\n"
     );
+}
+
+#[test]
+fn repeated_reuse_after_rebase_preserves_owned_work_and_finish_truth() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "reuse-after-rebase");
+
+    let first = broker
+        .adopt(&worktree, Some("land the product change"))
+        .unwrap();
+    commit_edit(&worktree, "src/a.py", "a = 2\n");
+    assert!(broker.submit(first.id).unwrap().promoted);
+    assert_eq!(
+        broker.finish(first.id).unwrap().status,
+        FinishStatus::Closed
+    );
+
+    std::fs::create_dir_all(worktree.join("docs")).unwrap();
+    std::fs::write(
+        worktree.join("docs/RELEASE.md"),
+        "release notes for a = 2\n",
+    )
+    .unwrap();
+    sh(&worktree, &["add", "docs/RELEASE.md"]);
+    sh(&worktree, &["commit", "-qm", "document the product change"]);
+    let pre_rebase_head = resolve(&worktree, "HEAD");
+
+    // Reusing a closed worktree creates a new identity at its current HEAD.
+    let created = broker
+        .adopt_with(&worktree, Some("land the release notes"), AdoptMode::Reuse)
+        .unwrap();
+    assert_eq!(
+        created.session.diff_base.as_deref(),
+        Some(pre_rebase_head.as_str())
+    );
+
+    // The rebase drops the patch-equivalent product commit and rewrites the
+    // release-note commit. A second active reuse must preserve the original
+    // ownership boundary instead of replacing it with the rewritten HEAD.
+    sh(&worktree, &["rebase", "aethyme/integration"]);
+    let rebased_head = resolve(&worktree, "HEAD");
+    assert_ne!(rebased_head, pre_rebase_head);
+    let reused = broker
+        .adopt_with(&worktree, Some("land the release notes"), AdoptMode::Reuse)
+        .unwrap();
+    assert_eq!(reused.session.id, created.session.id);
+    assert_eq!(
+        reused.session.diff_base.as_deref(),
+        Some(pre_rebase_head.as_str())
+    );
+    assert_eq!(
+        reused
+            .integration_drift
+            .as_ref()
+            .expect("reuse drift")
+            .safe_next_action,
+        format!("aethyme broker submit --session {}", created.session.id)
+    );
+
+    let integration_before = resolve(tmp.path(), "aethyme/integration");
+    let outcome = broker.submit(created.session.id).unwrap();
+    assert!(outcome.promoted);
+    assert!(!outcome.no_changes);
+    let promotion = promoted_merge_commit(&outcome.entry);
+    assert_ne!(
+        resolve(tmp.path(), &format!("{integration_before}^{{tree}}")),
+        resolve(tmp.path(), &format!("{promotion}^{{tree}}")),
+        "a successful promotion must not reuse its parent tree"
+    );
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "docs/RELEASE.md"),
+        "release notes for a = 2\n"
+    );
+
+    // Once the checkout is exactly at integration, finish must not resurrect
+    // commits from the rewritten baseline as phantom pending work.
+    sh(&worktree, &["reset", "--hard", "aethyme/integration"]);
+    let finished = broker.finish(created.session.id).unwrap();
+    assert_eq!(finished.status, FinishStatus::Closed);
+    assert_eq!(finished.unsubmitted_commits, 0);
+}
+
+#[test]
+fn submission_with_unchanged_result_is_a_truthful_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "nothing-to-submit");
+    let session = broker.adopt(&worktree, Some("inspect only")).unwrap();
+    let integration_before = broker.integration_head().unwrap().1;
+
+    let outcome = broker.submit(session.id).unwrap();
+
+    assert!(outcome.no_changes);
+    assert!(!outcome.promoted);
+    assert_eq!(outcome.entry.status, MergeStatus::Superseded);
+    assert!(outcome.gate_outcomes.is_empty());
+    assert_eq!(broker.integration_head().unwrap().1, integration_before);
+    let details: serde_json::Value =
+        serde_json::from_str(outcome.entry.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["reason"], "submission produces no content change");
 }
 
 #[test]

@@ -271,7 +271,8 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
         assert!(msg.contains(needle), "guidance missing {needle:?}: {msg}");
     }
 
-    // --reuse keeps the identity, updates the task, refreshes the baseline.
+    // --reuse keeps the identity and updates the task, but the ownership
+    // baseline remains immutable while the session is live.
     std::fs::write(tmp.path().join("f.txt"), "x\n").unwrap();
     sh(tmp.path(), &["add", "-A"]);
     sh(tmp.path(), &["commit", "-qm", "advance head"]);
@@ -286,7 +287,10 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
     let reused = reused.session;
     assert_eq!(reused.id, first.id);
     assert_eq!(reused.task.as_deref(), Some("follow-up task"));
-    assert_ne!(reused.diff_base, first.diff_base, "baseline must refresh");
+    assert_eq!(
+        reused.diff_base, first.diff_base,
+        "plain active reuse must not absorb pending commits into the baseline"
+    );
 
     // close is state-only: session cleaned, worktree untouched.
     broker.close(first.id).unwrap();

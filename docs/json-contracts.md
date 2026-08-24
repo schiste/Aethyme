@@ -150,6 +150,7 @@ event-stream contract — see [events-contract.md](events-contract.md).
   ],
   "gate_outcomes": [ { "gate", "status", "cached", "exit_code",
                        "duration_ms", "log_path" } ],
+  "no_changes": true|false,
   "promoted": true|false
 }
 ```
@@ -158,7 +159,9 @@ event-stream contract — see [events-contract.md](events-contract.md).
 from integration state. Full SHAs are never abbreviated in JSON. `conflicts`
 non-empty means the submission was rejected pre-gate; `conflict_details`
 provides provenance and recovery for the same paths. `promoted: true` means the
-integration branch advanced in this call.
+integration branch advanced in this call. `no_changes: true` means replay left
+the integration tree unchanged: the queue entry is `superseded`, no gates ran,
+and no promotion commit or ref movement occurred.
 
 ### `report list --json`
 

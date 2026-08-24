@@ -148,6 +148,47 @@ fn gate_cli_reports_tree_provenance_for_executed_and_cached_results() {
 }
 
 #[test]
+fn submit_cli_reports_an_unchanged_worktree_submission_as_a_noop() {
+    let tmp = fixture();
+    let worktree = tmp.path().join(".aethyme/worktrees/noop-submit");
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    git(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/noop-submit",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let adopted = stdout(run(
+        &worktree,
+        &["adopt", "--task", "inspect only", "--json"],
+    ));
+    let session: serde_json::Value = serde_json::from_str(&adopted).unwrap();
+    let session_id = session["id"].as_i64().unwrap().to_string();
+
+    let json = stdout(run(
+        &worktree,
+        &["submit", "--session", &session_id, "--json"],
+    ));
+    let outcome: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(outcome["no_changes"], true);
+    assert_eq!(outcome["promoted"], false);
+    assert_eq!(outcome["entry"]["status"], "superseded");
+    assert_eq!(outcome["gate_outcomes"], serde_json::json!([]));
+    assert!(!tmp.path().join("gate-runs.txt").exists());
+
+    let text = stdout(run(&worktree, &["submit", "--session", &session_id]));
+    assert!(text.contains("no pending session-owned content"));
+    assert!(text.contains("integration was not moved and no gates ran"));
+    assert!(!text.contains("gate wall time"));
+}
+
+#[test]
 fn submit_cli_bypasses_and_then_refreshes_the_merged_tree_cache() {
     let tmp = fixture();
     let counter = tmp.path().join("submit-runs.txt");

@@ -229,7 +229,9 @@ impl BrokerStore {
     }
 
     /// Point an existing session at a follow-up task: new task text (when
-    /// given), fresh diff_base, activity touched. Emits `session.reused`.
+    /// given), an optional explicitly-safe diff-base refresh, and activity
+    /// touched. Plain active reuse preserves the ownership boundary.
+    /// Emits `session.reused`.
     pub fn reuse_session(
         &mut self,
         id: i64,

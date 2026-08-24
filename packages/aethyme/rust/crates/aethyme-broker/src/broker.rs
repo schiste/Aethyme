@@ -1136,12 +1136,18 @@ impl Broker {
         if let Some(existing) = self.store.session_for_worktree(&worktree_path)? {
             match options.mode {
                 AdoptMode::Reuse => {
-                    // Follow-up task on the same worktree: same identity,
-                    // fresh baseline so leases and submit scope reflect
-                    // work from *now*, not the previous task.
-                    let session =
-                        self.store
-                            .reuse_session(existing.id, task, diff_base.as_deref())?;
+                    // A live session's baseline is its durable ownership
+                    // boundary. A plain reuse may update task text and
+                    // liveness, but must never move that boundary across
+                    // pending commits. Explicit fast-forward synchronization
+                    // is the one safe refresh: it already proved the checkout
+                    // has no unique work before moving it to integration.
+                    let refreshed_base = integration_sync
+                        .as_ref()
+                        .map(|sync| sync.after_head.as_str());
+                    let session = self
+                        .store
+                        .reuse_session(existing.id, task, refreshed_base)?;
                     self.store
                         .set_session_foreign_files(session.id, &foreign_files)?;
                     let integration_drift =
@@ -1283,6 +1289,21 @@ impl Broker {
             .transpose()?
             .unwrap_or_default();
 
+        let submission_plan = self.store.session(session_id).ok().and_then(|session| {
+            self.build_submission_plan(&session, &session_head, &integration_head)
+                .ok()
+        });
+        let pending_owned_commits = submission_plan.as_ref().map(|plan| {
+            plan.commits
+                .iter()
+                .filter(|commit| {
+                    commit.ownership == crate::SubmissionCommitOwnership::SessionOwned
+                        && commit.integration_state == crate::SubmissionIntegrationState::Pending
+                })
+                .count()
+        });
+        let submission_plan_safe = submission_plan.as_ref().is_some_and(|plan| plan.safe);
+
         let (warning, safe_next_action) = match relation {
             AdoptIntegrationRelation::Current => (
                 None,
@@ -1294,11 +1315,22 @@ impl Broker {
                 )),
                 "aethyme broker integration status".into(),
             ),
+            AdoptIntegrationRelation::Ahead
+                if submission_plan_safe && pending_owned_commits.is_some_and(|count| count > 0) =>
+            {
+                (
+                    Some(format!(
+                        "session HEAD is {ahead_commits} commit(s) ahead of {integration_branch}; {pending} pending session-owned commit(s) are safe to submit before starting a follow-up",
+                        pending = pending_owned_commits.unwrap_or_default()
+                    )),
+                    format!("aethyme broker submit --session {session_id}"),
+                )
+            }
             AdoptIntegrationRelation::Ahead => (
                 Some(format!(
-                    "session HEAD is {ahead_commits} commit(s) ahead of {integration_branch}; submit existing work before starting a follow-up"
+                    "session HEAD is {ahead_commits} commit(s) ahead of {integration_branch}, but the submission plan has no safe pending session-owned commits; do not submit until ownership is reconciled"
                 )),
-                format!("aethyme broker submit --session {session_id}"),
+                "aethyme broker integration status".into(),
             ),
             AdoptIntegrationRelation::Diverged => (
                 Some(format!(
@@ -3265,11 +3297,6 @@ impl Broker {
             report.delivery = self.finish_delivery(Some(entry));
         }
 
-        let base = session
-            .diff_base
-            .clone()
-            .or_else(|| self.session_change_base(&checkout))
-            .unwrap_or_else(|| "HEAD".to_string());
         let submitted_head_is_delivered = latest_for_head.is_some_and(|entry| {
             matches!(
                 entry.status,
@@ -3279,7 +3306,31 @@ impl Broker {
         report.unsubmitted_commits = if submitted_head_is_delivered {
             0
         } else {
-            checkout.commit_count_between(&base, "HEAD")?
+            let pending_from_plan = self.integration_tip().and_then(|integration_head| {
+                self.build_submission_plan(&session, &head, &integration_head)
+                    .ok()
+                    .filter(|plan| plan.safe)
+                    .map(|plan| {
+                        plan.commits
+                            .iter()
+                            .filter(|commit| {
+                                commit.ownership == crate::SubmissionCommitOwnership::SessionOwned
+                                    && commit.integration_state
+                                        == crate::SubmissionIntegrationState::Pending
+                            })
+                            .count() as u64
+                    })
+            });
+            if let Some(pending) = pending_from_plan {
+                pending
+            } else {
+                let base = session
+                    .diff_base
+                    .clone()
+                    .or_else(|| self.session_change_base(&checkout))
+                    .unwrap_or_else(|| "HEAD".to_string());
+                checkout.commit_count_between(&base, "HEAD")?
+            }
         };
 
         if session.status == SessionStatus::Cleaned {

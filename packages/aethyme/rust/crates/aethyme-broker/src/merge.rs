@@ -69,6 +69,10 @@ pub struct SubmitOutcome {
     pub conflicts: Vec<String>,
     pub conflict_details: Vec<SubmissionConflict>,
     pub gate_outcomes: Vec<GateRunOutcome>,
+    /// True when every pending session-owned commit is already represented
+    /// by integration or produces no tree change. No gate or promotion runs
+    /// for this outcome.
+    pub no_changes: bool,
     pub promoted: bool,
 }
 
@@ -273,6 +277,8 @@ impl Broker {
         let submission_plan = self.build_submission_plan(&session, &entry.head_commit, &base)?;
 
         let simulation = self.replay_submission_plan(&submission_plan)?;
+        let base_tree = self.repo_handle().commit_tree_id(&base)?;
+        let main_checkout_session = Path::new(&session.worktree_path) == self.main_root_path();
         self.store()
             .set_merge_status(entry.id, MergeStatus::Simulating, None, None)?;
 
@@ -307,6 +313,43 @@ impl Broker {
                 conflicts: simulation.conflicts,
                 conflict_details: simulation.conflict_details,
                 gate_outcomes: Vec::new(),
+                no_changes: false,
+                promoted: false,
+            });
+        }
+
+        // A clean replay that leaves integration's tree unchanged has
+        // nothing to verify or promote. This is a normal terminal outcome
+        // when every owned patch already landed (or is content-empty), and
+        // a vital safety signal when a corrupted ownership baseline hid real
+        // work: never manufacture a successful parent-tree promotion.
+        // Primary-checkout sessions are the deliberate exception: the
+        // follows-main refresh has already advanced integration to their
+        // HEAD, and submit still needs to gate and record that externally
+        // visible main movement.
+        if simulation.tree == base_tree && !main_checkout_session {
+            let details = serde_json::json!({
+                "base": base,
+                "reason": "submission produces no content change",
+                "pending_session_owned_commits": submission_plan.commits.iter().filter(|commit| {
+                    commit.ownership == SubmissionCommitOwnership::SessionOwned
+                        && commit.integration_state == SubmissionIntegrationState::Pending
+                }).map(|commit| commit.commit.clone()).collect::<Vec<_>>(),
+            });
+            self.store().set_merge_status(
+                entry.id,
+                MergeStatus::Superseded,
+                Some(&simulation.tree),
+                Some(&details.to_string()),
+            )?;
+            clear_action_required(Path::new(&session.worktree_path));
+            return Ok(SubmitOutcome {
+                entry: self.queue_entry(entry.id)?,
+                submission_plan,
+                conflicts: Vec::new(),
+                conflict_details: Vec::new(),
+                gate_outcomes: Vec::new(),
+                no_changes: true,
                 promoted: false,
             });
         }
@@ -405,6 +448,7 @@ impl Broker {
             conflicts: Vec::new(),
             conflict_details: Vec::new(),
             gate_outcomes,
+            no_changes: false,
             promoted,
         })
     }
@@ -512,7 +556,7 @@ impl Broker {
             .collect()
     }
 
-    fn build_submission_plan(
+    pub(crate) fn build_submission_plan(
         &self,
         session: &crate::types::Session,
         session_head: &str,

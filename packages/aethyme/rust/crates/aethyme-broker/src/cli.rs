@@ -3179,7 +3179,9 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         );
                     }
                 }
-                println!("gate wall time: {}ms", gate_wall_ms);
+                if !outcome.no_changes {
+                    println!("gate wall time: {}ms", gate_wall_ms);
+                }
                 println!(
                     "entry {} → {}{}",
                     outcome.entry.id,
@@ -3190,6 +3192,13 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                         ""
                     }
                 );
+                if outcome.no_changes {
+                    println!(
+                        "What now: no pending session-owned content remains to integrate; \
+                         aethyme/integration was not moved and no gates ran."
+                    );
+                    return Ok(());
+                }
                 if outcome.entry.status.as_str() == "rejected" {
                     if let Ok(info) = broker.store().session(outcome.entry.session_id)
                         && std::path::Path::new(&info.worktree_path) == broker.main_root()

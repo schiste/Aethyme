@@ -202,6 +202,11 @@ integration tip. It requires a clean session worktree, permits only a
 fast-forward, and synchronizes before recording the follow-up diff baseline;
 dirty or diverged worktrees are left unchanged.
 
+Plain `broker adopt --reuse` preserves a live session's recorded ownership
+baseline. Reuse may update its task and activity, but cannot absorb pending
+commits into a new baseline. Close the completed session before adopting a new
+identity when a genuinely fresh ownership boundary is required.
+
 `broker submit` builds a normalized commit-provenance plan before gate
 selection. It replays only pending `session_owned` single-parent patches onto
 the exact integration tip, in order. Patch-equivalent history already present
@@ -209,6 +214,12 @@ under another SHA is classified as
 `already_integrated_by_stable_patch_identity` and is not replayed. Missing
 baselines, ambiguous ownership or patch identity, and pending owned merge
 commits are refused rather than guessed.
+
+If normalized replay produces the same tree as integration, submit reports a
+`superseded` queue entry with `no_changes: true`. It does not run gates, create
+an empty promotion commit, or move integration. Primary-checkout sessions keep
+their existing follows-main verification behavior because their work is
+already externally present on `main` before submit records it.
 
 With `--json`, `submission_plan` exposes the full recorded baseline, session
 HEAD, integration HEAD, ordered commits, their parents, ownership,
