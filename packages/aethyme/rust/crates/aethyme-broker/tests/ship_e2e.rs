@@ -5,7 +5,8 @@ use std::process::Command;
 use std::os::unix::fs::PermissionsExt;
 
 use aethyme_broker::{
-    Broker, BrokerOpError, IntegrationDeliveryState, OperationStatus, ShipFreshnessResult,
+    Broker, BrokerOpError, IntegrationDeliveryState, OperationIdentityProvenance, OperationStatus,
+    ShipFreshnessResult,
 };
 
 fn git_output(cwd: &Path, args: &[&str]) -> String {
@@ -36,6 +37,7 @@ struct Fixture {
     _tmp: tempfile::TempDir,
     repo: PathBuf,
     remote: PathBuf,
+    host_operations: PathBuf,
 }
 
 impl Fixture {
@@ -57,14 +59,21 @@ impl Fixture {
         );
         git(&repo, &["push", "-qu", "origin", "main"]);
         Self {
+            host_operations: tmp.path().join("host-state/operations.db"),
             _tmp: tmp,
             repo,
             remote,
         }
     }
 
+    fn broker(&self) -> Broker {
+        Broker::open(&self.repo)
+            .unwrap()
+            .with_host_operation_database(&self.host_operations)
+    }
+
     fn promoted_entry(&self) -> (i64, i64, String) {
-        let mut broker = Broker::open(&self.repo).unwrap();
+        let mut broker = self.broker();
         let session = broker.start_worktree("ship-plan").unwrap();
         let worktree = PathBuf::from(&session.worktree_path);
         std::fs::write(worktree.join("feature.txt"), "verified\n").unwrap();
@@ -128,7 +137,7 @@ fn ship_plan_reports_exact_tip_and_does_not_mutate_refs() {
     let refs_before = fixture.refs();
     let remote_before = git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]);
 
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture.broker();
     let plan = broker.ship_plan(entry_id).unwrap();
 
     assert_eq!(plan.queue_entry.id, entry_id);
@@ -176,7 +185,7 @@ fn ship_plan_reports_exact_tip_and_does_not_mutate_refs() {
 #[test]
 fn ship_plan_rejects_an_entry_that_is_not_promoted() {
     let fixture = Fixture::new();
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture.broker();
     let session = broker.start_worktree("unpromoted").unwrap();
     let entry = broker
         .store()
@@ -200,7 +209,7 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
     let (entry_id, _, integration) = fixture.promoted_entry();
     let main_before = git_output(&fixture.repo, &["rev-parse", "main"]);
 
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture.broker();
     let report = broker.ship_execute(entry_id, &integration).unwrap();
 
     assert_eq!(report.published_sha, integration);
@@ -213,6 +222,13 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
     assert_eq!(report.fetch_operation.status, OperationStatus::Succeeded);
     assert_eq!(report.push_operation.status, OperationStatus::Succeeded);
     assert_eq!(report.verify_operation.status, OperationStatus::Succeeded);
+    assert!(report.fetch_operation.host_operation_id.is_some());
+    assert!(report.push_operation.host_operation_id.is_some());
+    assert!(report.verify_operation.host_operation_id.is_none());
+    assert_eq!(
+        report.push_operation.identity_provenance,
+        OperationIdentityProvenance::VerifiedCanonical
+    );
     assert_eq!(
         report.fetch_operation.repository,
         report.plan.target.coordination_key
@@ -244,7 +260,7 @@ fn ship_execute_sync_main_fast_forwards_a_clean_primary_checkout() {
     let fixture = Fixture::new();
     let (entry_id, _, integration) = fixture.promoted_entry();
     let main_before = git_output(&fixture.repo, &["rev-parse", "main"]);
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture.broker();
 
     let report = broker
         .ship_execute_with_sync(entry_id, &integration, true)
@@ -278,7 +294,7 @@ fn ship_execute_sync_main_fast_forwards_a_clean_primary_checkout() {
 fn integration_status_routes_promoted_published_and_synchronized_states_through_ship() {
     let fixture = Fixture::new();
     let (entry_id, _, integration) = fixture.promoted_entry();
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture.broker();
 
     let promoted = broker.integration_status(0).unwrap();
     assert_eq!(
@@ -320,7 +336,7 @@ fn ship_execute_sync_main_refuses_a_dirty_primary_checkout_before_publish() {
     let (entry_id, _, integration) = fixture.promoted_entry();
     let remote_before = fixture.remote_main();
     std::fs::write(fixture.repo.join("dirty.txt"), "wip\n").unwrap();
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture.broker();
 
     let error = broker
         .ship_execute_with_sync(entry_id, &integration, true)
@@ -341,7 +357,7 @@ fn ship_execute_sync_main_refuses_a_diverged_primary_checkout_before_publish() {
     std::fs::write(fixture.repo.join("main-only.txt"), "diverged\n").unwrap();
     git(&fixture.repo, &["add", "main-only.txt"]);
     git(&fixture.repo, &["commit", "-qm", "main diverges"]);
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture.broker();
 
     let error = broker
         .ship_execute_with_sync(entry_id, &integration, true)
@@ -372,7 +388,7 @@ fn ship_execute_sync_main_rechecks_for_local_movement_after_publish() {
             moved
         ),
     );
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture.broker();
 
     let error = broker
         .ship_execute_with_sync(entry_id, &integration, true)
@@ -390,7 +406,7 @@ fn ship_execute_sync_main_rechecks_for_local_movement_after_publish() {
 fn ship_execute_rejects_abbreviated_and_mismatched_confirmations_before_operations() {
     let fixture = Fixture::new();
     let (entry_id, _, integration) = fixture.promoted_entry();
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture.broker();
 
     assert!(matches!(
         broker.ship_execute(entry_id, &integration[..12]),
@@ -408,7 +424,7 @@ fn ship_execute_rejects_a_remote_that_moved_since_the_planned_base() {
     let fixture = Fixture::new();
     let (entry_id, _, integration) = fixture.promoted_entry();
     let advanced = fixture.advance_remote();
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture.broker();
 
     let error = broker.ship_execute(entry_id, &integration).unwrap_err();
     assert!(matches!(
@@ -427,7 +443,7 @@ fn ship_execute_rejects_a_non_fast_forward_remote() {
     let (entry_id, _, integration) = fixture.promoted_entry();
     let advanced = fixture.advance_remote();
     git(&fixture.repo, &["fetch", "-q", "origin", "main"]);
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture.broker();
 
     let error = broker.ship_execute(entry_id, &integration).unwrap_err();
     assert!(matches!(
@@ -443,7 +459,7 @@ fn ship_push_failure_is_unknown_and_blocks_until_reconciled() {
     let fixture = Fixture::new();
     let (entry_id, _, integration) = fixture.promoted_entry();
     let hook = fixture.install_hook("pre-receive", "#!/bin/sh\nexit 1\n");
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture.broker();
 
     let error = broker.ship_execute(entry_id, &integration).unwrap_err();
     let operation_id = match error {
@@ -488,7 +504,7 @@ fn ship_verify_failure_is_journaled_as_failed() {
         "post-receive",
         "#!/bin/sh\ngit update-ref -d refs/heads/main\n",
     );
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture.broker();
 
     let error = broker.ship_execute(entry_id, &integration).unwrap_err();
     assert!(matches!(

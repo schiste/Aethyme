@@ -51,7 +51,7 @@ fn configured_https_fetch_and_ssh_push_resolve_to_one_redacted_target() {
         .unwrap();
     assert_eq!(target.normalized_host, "github.com");
     assert_eq!(target.repository_path, "Team/Project");
-    assert_eq!(target.coordination_key, "github.com/Team/Project");
+    assert_eq!(target.coordination_key, "github.com/team/project");
     assert_eq!(target.display_slug, "Team/Project");
     assert_eq!(target.remote_name, "origin");
     assert_eq!(target.fetch_url, "https://github.com/Team/Project");

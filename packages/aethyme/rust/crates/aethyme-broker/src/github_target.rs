@@ -2,8 +2,8 @@
 //!
 //! The broker's outer `--repo owner/name` is authoritative. GitHub treats
 //! repository names case-insensitively, so locks and journal identity use a
-//! lowercase key while the operator's spelling remains available for `GH_REPO`
-//! and audit output.
+//! lowercase `github.com/owner/repo` key while the operator's spelling remains
+//! available for `GH_REPO` and audit output.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,7 +51,7 @@ pub fn resolve_github_target(
     let endpoint = gh_api_endpoint(args)?;
     let Some(endpoint) = endpoint else {
         return Ok(ResolvedGithubTarget {
-            coordination_key: repository.to_ascii_lowercase(),
+            coordination_key: format!("github.com/{}", repository.to_ascii_lowercase()),
             display_slug: repository.into(),
             api_endpoint_repository: None,
             api_target: GithubApiTargetEvidence::NoRepositoryEndpoint,
@@ -59,7 +59,7 @@ pub fn resolve_github_target(
     };
     let Some((endpoint_owner, endpoint_repo)) = api_repository_components(endpoint)? else {
         return Ok(ResolvedGithubTarget {
-            coordination_key: repository.to_ascii_lowercase(),
+            coordination_key: format!("github.com/{}", repository.to_ascii_lowercase()),
             display_slug: repository.into(),
             api_endpoint_repository: None,
             api_target: GithubApiTargetEvidence::NoRepositoryEndpoint,
@@ -86,7 +86,7 @@ pub fn resolve_github_target(
     }
 
     Ok(ResolvedGithubTarget {
-        coordination_key: repository.to_ascii_lowercase(),
+        coordination_key: format!("github.com/{}", repository.to_ascii_lowercase()),
         display_slug: repository.into(),
         api_endpoint_repository: Some(endpoint_repository),
         api_target: if used_placeholders {
@@ -247,7 +247,7 @@ mod tests {
     #[test]
     fn coordination_is_case_insensitive_while_display_spelling_is_preserved() {
         let target = resolve_github_target("Schiste/Aethyme", &args(&["pr", "view", "1"])).unwrap();
-        assert_eq!(target.coordination_key, "schiste/aethyme");
+        assert_eq!(target.coordination_key, "github.com/schiste/aethyme");
         assert_eq!(target.display_slug, "Schiste/Aethyme");
         assert_eq!(
             target.api_target,

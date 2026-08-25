@@ -114,6 +114,12 @@ text_enum!(OperationStatus, "coordinated_operations.status", {
     ReconciledFailed => "reconciled_failed",
 });
 
+text_enum!(OperationIdentityProvenance, "coordinated_operations.identity_provenance", {
+    LegacyUnverifiedIdentity => "legacy_unverified_identity",
+    VerifiedCanonical => "verified_canonical",
+    LocalRepository => "local_repository",
+});
+
 /// Durable intent recorded before a coordinated command starts.
 #[derive(Debug, Clone)]
 pub struct NewCoordinatedOperation {
@@ -126,6 +132,8 @@ pub struct NewCoordinatedOperation {
     /// Redacted JSON array. Secret-bearing argument values never enter the DB.
     pub command_json: String,
     pub pid: i64,
+    pub host_operation_id: Option<String>,
+    pub identity_provenance: OperationIdentityProvenance,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -145,6 +153,9 @@ pub struct CoordinatedOperation {
     pub created_at: i64,
     pub updated_at: i64,
     pub finished_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_operation_id: Option<String>,
+    pub identity_provenance: OperationIdentityProvenance,
 }
 
 /// Input for registering a session. Attach-first: only the worktree and

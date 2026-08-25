@@ -247,10 +247,20 @@ impl HostResourceCoordinator {
                 path: parent.into(),
                 source,
             })?;
-            protect_host_state_path(parent, true)?;
+            crate::host_state::protect_host_state_path(parent, true).map_err(|source| {
+                HostResourceError::Io {
+                    path: parent.into(),
+                    source,
+                }
+            })?;
         }
         let conn = Connection::open(path)?;
-        protect_host_state_path(path, false)?;
+        crate::host_state::protect_host_state_path(path, false).map_err(|source| {
+            HostResourceError::Io {
+                path: path.into(),
+                source,
+            }
+        })?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "wal")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -487,24 +497,6 @@ impl HostResourceCoordinator {
     }
 }
 
-#[cfg(unix)]
-fn protect_host_state_path(path: &Path, directory: bool) -> Result<(), HostResourceError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mode = if directory { 0o700 } else { 0o600 };
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|source| {
-        HostResourceError::Io {
-            path: path.into(),
-            source,
-        }
-    })
-}
-
-#[cfg(not(unix))]
-fn protect_host_state_path(_path: &Path, _directory: bool) -> Result<(), HostResourceError> {
-    Ok(())
-}
-
 fn validate_schema(conn: &Connection) -> Result<(), HostResourceError> {
     let version: i64 = conn.query_row(
         "SELECT value FROM meta WHERE key='schema_version'",
@@ -520,21 +512,9 @@ fn validate_schema(conn: &Connection) -> Result<(), HostResourceError> {
 }
 
 pub fn default_host_resource_db_path() -> Result<PathBuf, HostResourceError> {
-    if let Some(path) = std::env::var_os("AETHYME_HOST_STATE_DIR").filter(|p| !p.is_empty()) {
-        return Ok(PathBuf::from(path).join("host-resources.db"));
-    }
-    if let Some(path) = std::env::var_os("XDG_STATE_HOME").filter(|p| !p.is_empty()) {
-        return Ok(PathBuf::from(path).join("aethyme/host-resources.db"));
-    }
-    let home = PathBuf::from(
-        std::env::var_os("HOME").ok_or(HostResourceError::StateDirectoryUnavailable)?,
-    );
-    let directory = if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/Aethyme")
-    } else {
-        home.join(".local/state/aethyme")
-    };
-    Ok(directory.join("host-resources.db"))
+    crate::host_state::default_host_state_dir()
+        .map(|directory| directory.join("host-resources.db"))
+        .ok_or(HostResourceError::StateDirectoryUnavailable)
 }
 
 pub fn resource_environment_key(key: &str) -> String {

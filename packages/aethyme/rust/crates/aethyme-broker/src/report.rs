@@ -1244,6 +1244,8 @@ mod tests {
             created_at: 200,
             updated_at: 300,
             finished_at: Some(300),
+            host_operation_id: None,
+            identity_provenance: crate::OperationIdentityProvenance::LegacyUnverifiedIdentity,
         }
     }
 

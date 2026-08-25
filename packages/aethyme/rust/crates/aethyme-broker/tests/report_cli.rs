@@ -30,17 +30,31 @@ fn init_repo(repo: &Path) {
     git(repo, &["commit", "-qm", "init"]);
 }
 
+fn host_state_dir(repo: &Path) -> std::path::PathBuf {
+    repo.join(".aethyme/test-host-state")
+}
+
+fn test_broker(repo: &Path) -> Broker {
+    Broker::open(repo)
+        .unwrap()
+        .with_host_operation_database(host_state_dir(repo).join("host-operations.db"))
+}
+
 fn run(repo: &Path, args: &[&str]) -> Output {
     Command::new(CLI)
         .args(args)
         .current_dir(repo)
+        .env("AETHYME_HOST_STATE_DIR", host_state_dir(repo))
         .output()
         .unwrap()
 }
 
 fn run_with_env(repo: &Path, args: &[&str], environment: &[(&str, &str)]) -> Output {
     let mut command = Command::new(CLI);
-    command.args(args).current_dir(repo);
+    command
+        .args(args)
+        .current_dir(repo)
+        .env("AETHYME_HOST_STATE_DIR", host_state_dir(repo));
     for (key, value) in environment {
         command.env(key, value);
     }
@@ -315,7 +329,7 @@ fn explicit_output_never_overwrites_and_cannot_escape_report_directory() {
 fn task_text_is_inferred_from_the_current_session_only_with_opt_in() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = test_broker(tmp.path());
     broker.adopt(tmp.path(), Some("TASK-TEXT-SECRET")).unwrap();
     drop(broker);
 
@@ -868,7 +882,7 @@ fn render_rejects_symlinked_issue_forms() {
 fn file_uses_the_confirmed_render_and_journals_the_returned_issue() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = test_broker(tmp.path());
     broker.adopt(tmp.path(), Some("file report")).unwrap();
     drop(broker);
     let artifact = write_reviewed_issue_artifact(tmp.path(), "reviewed.issue.md");
@@ -921,7 +935,7 @@ fn file_uses_the_confirmed_render_and_journals_the_returned_issue() {
     assert!(args.contains("issue\ncreate\n--title\n[Bug]: Reviewed gate failure"));
     assert!(args.contains("--body-file"));
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = test_broker(tmp.path());
     let operation = broker
         .store()
         .coordinated_operations()
@@ -983,7 +997,7 @@ fn file_uses_the_confirmed_render_and_journals_the_returned_issue() {
 fn file_refuses_digest_drift_before_invoking_github() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = test_broker(tmp.path());
     broker.adopt(tmp.path(), None).unwrap();
     drop(broker);
     let artifact = write_reviewed_issue_artifact(tmp.path(), "drift.issue.json");
@@ -1015,7 +1029,7 @@ fn file_refuses_digest_drift_before_invoking_github() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("changed after confirmation"));
     assert!(!Path::new(&calls_path).exists());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = test_broker(tmp.path());
     assert!(broker.store().coordinated_operations().unwrap().is_empty());
 }
 
@@ -1024,7 +1038,7 @@ fn file_refuses_digest_drift_before_invoking_github() {
 fn file_refuses_required_unfilled_sections_before_invoking_github() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = test_broker(tmp.path());
     broker.adopt(tmp.path(), None).unwrap();
     drop(broker);
     capture_report(tmp.path(), "bug", "Needs reproduction", "source.json");
@@ -1136,7 +1150,7 @@ body:
 fn ambiguous_file_outcome_requires_reconciliation_and_is_never_retried() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = test_broker(tmp.path());
     broker.adopt(tmp.path(), None).unwrap();
     drop(broker);
     let artifact = write_reviewed_issue_artifact(tmp.path(), "ambiguous.issue.json");
@@ -1181,16 +1195,17 @@ fn ambiguous_file_outcome_requires_reconciliation_and_is_never_retried() {
         1
     );
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = test_broker(tmp.path());
     broker
         .reconcile_coordinated_operation(operation_id, true, "external inspection found the issue")
         .unwrap();
     drop(broker);
     let after_successful_reconciliation = run_with_env(tmp.path(), &args, &environment);
     assert!(!after_successful_reconciliation.status.success());
+    let reconciliation_stderr = String::from_utf8_lossy(&after_successful_reconciliation.stderr);
     assert!(
-        String::from_utf8_lossy(&after_successful_reconciliation.stderr)
-            .contains("already has completed filing operation")
+        reconciliation_stderr.contains("already has completed filing operation"),
+        "{reconciliation_stderr}"
     );
     assert_eq!(
         std::fs::read_to_string(&calls_path)
@@ -1211,7 +1226,7 @@ fn ambiguous_file_outcome_requires_reconciliation_and_is_never_retried() {
 fn successful_command_without_a_parseable_issue_url_is_ambiguous() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = test_broker(tmp.path());
     broker.adopt(tmp.path(), None).unwrap();
     drop(broker);
     let artifact = write_reviewed_issue_artifact(tmp.path(), "malformed.issue.json");
@@ -1241,7 +1256,7 @@ fn successful_command_without_a_parseable_issue_url_is_ambiguous() {
     assert!(!output.status.success());
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["state"], "reconciliation_required");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = test_broker(tmp.path());
     let operation = broker
         .store()
         .coordinated_operation(result["operation_id"].as_i64().unwrap())

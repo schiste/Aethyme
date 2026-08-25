@@ -130,13 +130,18 @@ pub fn file_reviewed_report(
             digest: artifact.report_digest,
         });
     }
+    let coordination_key = crate::resolve_github_target(repository, &[])
+        .map_err(BrokerOpError::from)?
+        .coordination_key;
     let filing_scope = format!("report:{}", artifact.report_digest);
     if let Some(operation) = broker
         .store()
         .coordinated_operations()?
         .into_iter()
         .rev()
-        .find(|operation| operation.repository == repository && operation.scope == filing_scope)
+        .find(|operation| {
+            operation.repository == coordination_key && operation.scope == filing_scope
+        })
         .filter(|operation| {
             matches!(
                 operation.status,

@@ -205,7 +205,10 @@ fn resolve_remote_target_with_selection(
         .map(normalize_assertion)
         .transpose()?;
     let assertion_evidence = match normalized_assertion.as_deref() {
-        Some(assertion) if assertion == fetch.repository_path => {
+        Some(assertion)
+            if canonical_repository_path(&fetch.normalized_host, assertion)
+                == canonical_repository_path(&fetch.normalized_host, &fetch.repository_path) =>
+        {
             RemoteAssertionEvidence::MatchedRepositoryPath
         }
         Some(assertion) => {
@@ -603,7 +606,10 @@ fn parse_network_url(
     let normalized_host = normalize_host(host, scheme, role)?;
     let repository_path = normalize_repository_path(raw_path)
         .map_err(|reason| RemoteTargetError::InvalidUrl { role, reason })?;
-    let coordination_key = format!("{normalized_host}/{repository_path}");
+    let coordination_key = format!(
+        "{normalized_host}/{}",
+        canonical_repository_path(&normalized_host, &repository_path)
+    );
     let sanitized_url = format!("{scheme}://{normalized_host}/{repository_path}");
     Ok(ParsedRemoteUrl {
         normalized_host,
@@ -630,7 +636,10 @@ fn parse_scp_url(value: &str, role: &'static str) -> Result<ParsedRemoteUrl, Rem
     let repository_path = normalize_repository_path(raw_path)
         .map_err(|reason| RemoteTargetError::InvalidUrl { role, reason })?;
     Ok(ParsedRemoteUrl {
-        coordination_key: format!("{normalized_host}/{repository_path}"),
+        coordination_key: format!(
+            "{normalized_host}/{}",
+            canonical_repository_path(&normalized_host, &repository_path)
+        ),
         sanitized_url: format!("{normalized_host}:{repository_path}"),
         normalized_host,
         repository_path,
@@ -762,6 +771,14 @@ fn normalize_repository_path(value: &str) -> Result<String, &'static str> {
     Ok(value)
 }
 
+fn canonical_repository_path(normalized_host: &str, repository_path: &str) -> String {
+    if normalized_host == "github.com" {
+        repository_path.to_ascii_lowercase()
+    } else {
+        repository_path.to_string()
+    }
+}
+
 fn strip_dot_git(value: &mut String) {
     while value.ends_with('/') {
         value.pop();
@@ -845,12 +862,27 @@ mod tests {
                 RemoteUrlSyntax::Scp,
                 "github.com:Owner/Repo",
             ),
+            (
+                "http://github.com:80/OWNER/REPO.git",
+                RemoteUrlSyntax::Http,
+                "http://github.com/OWNER/REPO",
+            ),
+            (
+                "git+ssh://git@github.com/owner/repo.git",
+                RemoteUrlSyntax::Ssh,
+                "ssh://github.com/owner/repo",
+            ),
+            (
+                "git://github.com:9418/Owner/REPO.git",
+                RemoteUrlSyntax::Git,
+                "git://github.com/Owner/REPO",
+            ),
         ];
         for (url, syntax, sanitized) in cases {
             let parsed = parse_remote_url(url, root, "fetch").unwrap();
             assert_eq!(parsed.normalized_host, "github.com");
-            assert_eq!(parsed.repository_path, "Owner/Repo");
-            assert_eq!(parsed.coordination_key, "github.com/Owner/Repo");
+            assert_eq!(parsed.repository_path.to_ascii_lowercase(), "owner/repo");
+            assert_eq!(parsed.coordination_key, "github.com/owner/repo");
             assert_eq!(parsed.syntax, syntax);
             assert_eq!(parsed.sanitized_url, sanitized);
             assert!(!parsed.sanitized_url.contains("secret"));
@@ -892,7 +924,7 @@ mod tests {
             Some("Owner/Repo"),
         )
         .unwrap();
-        assert_eq!(target.coordination_key, "github.com/Owner/Repo");
+        assert_eq!(target.coordination_key, "github.com/owner/repo");
         assert_eq!(target.remote_name, "origin");
         assert_eq!(
             target.evidence.command_selection,

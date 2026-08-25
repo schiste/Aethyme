@@ -39,6 +39,8 @@ pub enum BrokerOpError {
     Pr(#[from] crate::pr::PrError),
     #[error(transparent)]
     RemoteTarget(#[from] crate::RemoteTargetError),
+    #[error(transparent)]
+    HostOperation(#[from] crate::HostOperationError),
     #[error("refusing to clean session {id}: {reason} (use --force to discard)")]
     DirtyWorktree { id: i64, reason: String },
     #[error(
@@ -1050,6 +1052,7 @@ pub struct Broker {
     store: BrokerStore,
     main_root: PathBuf,
     graph_impact_provider: Box<dyn GraphImpactProvider>,
+    host_operation_db_path: Option<PathBuf>,
 }
 
 impl Broker {
@@ -1071,6 +1074,7 @@ impl Broker {
             store,
             main_root,
             graph_impact_provider: Box::new(GraphStoreImpactProvider),
+            host_operation_db_path: None,
         })
     }
 
@@ -1089,6 +1093,7 @@ impl Broker {
             store,
             main_root,
             graph_impact_provider: Box::new(GraphStoreImpactProvider),
+            host_operation_db_path: None,
         };
         broker.backfill_live_repository_contracts()?;
         Ok(broker)
@@ -1109,6 +1114,7 @@ impl Broker {
             store,
             main_root,
             graph_impact_provider: Box::new(graph_impact_provider),
+            host_operation_db_path: None,
         };
         broker.backfill_live_repository_contracts()?;
         broker.recover_prepared_reconciliation()?;
@@ -1117,6 +1123,24 @@ impl Broker {
 
     pub fn main_root(&self) -> &Path {
         &self.main_root
+    }
+
+    /// Override the per-user host-operation database.
+    ///
+    /// Production callers should use the platform default. This hook lets
+    /// embedders and tests isolate host coordination without mutating process
+    /// environment variables shared by concurrent threads.
+    #[doc(hidden)]
+    pub fn with_host_operation_database(mut self, path: impl Into<PathBuf>) -> Self {
+        self.host_operation_db_path = Some(path.into());
+        self
+    }
+
+    pub(crate) fn host_operation_database_path(&self) -> Result<PathBuf, BrokerOpError> {
+        self.host_operation_db_path
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| crate::default_host_operation_db_path().map_err(Into::into))
     }
 
     pub fn store(&mut self) -> &mut BrokerStore {

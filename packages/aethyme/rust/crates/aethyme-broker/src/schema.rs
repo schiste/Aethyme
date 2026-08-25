@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -297,6 +297,21 @@ ALTER TABLE sessions ADD COLUMN repository_contract_backfilled INTEGER NOT NULL 
     CHECK (repository_contract_backfilled IN (0, 1));
 ";
 
+const MIGRATION_V10: &str = "
+-- Older operation rows used caller or clone-local repository spellings. Keep
+-- them readable, but never treat their identity as suitable for host-wide
+-- coordination without a fresh resolution.
+ALTER TABLE coordinated_operations ADD COLUMN host_operation_id TEXT;
+ALTER TABLE coordinated_operations ADD COLUMN identity_provenance TEXT NOT NULL
+    DEFAULT 'legacy_unverified_identity'
+    CHECK (identity_provenance IN (
+        'legacy_unverified_identity', 'verified_canonical', 'local_repository'
+    ));
+CREATE UNIQUE INDEX coordinated_operations_by_host_operation
+    ON coordinated_operations (host_operation_id)
+    WHERE host_operation_id IS NOT NULL;
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -307,6 +322,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V7,
     MIGRATION_V8,
     MIGRATION_V9,
+    MIGRATION_V10,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -423,5 +439,51 @@ mod tests {
         );
         assert!(!row.2);
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v10_marks_existing_operation_identity_as_legacy_unverified() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS[..9].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sessions (
+                worktree_path, branch, origin, status, created_at, updated_at,
+                last_activity_at
+             ) VALUES ('/repo', 'agent/legacy', 'adopted', 'cleaned', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO coordinated_operations (
+                session_id, provider, repository, scope, effect, status,
+                command_json, pid, created_at, updated_at
+             ) VALUES (1, 'git', 'GitHub.com/Owner/Repo', 'repository', 'write',
+                       'succeeded', '[]', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let row: (Option<String>, String) = conn
+            .query_row(
+                "SELECT host_operation_id, identity_provenance
+                 FROM coordinated_operations WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, None);
+        assert_eq!(row.1, "legacy_unverified_identity");
     }
 }

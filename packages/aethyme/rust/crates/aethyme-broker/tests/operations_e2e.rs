@@ -163,7 +163,7 @@ fn remote_git_journals_resolved_identity_and_assertion_evidence() {
 
     let report = broker.run_coordinated_operation(command).unwrap();
     assert!(report.ok());
-    assert_eq!(report.operation.repository, "github.com/Owner/Repo");
+    assert_eq!(report.operation.repository, "github.com/owner/repo");
     let target = report.resolved_target.as_ref().unwrap();
     assert_eq!(target.coordination_key, report.operation.repository);
     assert_eq!(target.caller_assertion.as_deref(), Some("Owner/Repo"));
@@ -174,7 +174,7 @@ fn remote_git_journals_resolved_identity_and_assertion_evidence() {
     assert_eq!(details["resolved_target"]["caller_assertion"], "Owner/Repo");
     assert_eq!(
         details["resolved_target"]["coordination_key"],
-        "github.com/Owner/Repo"
+        "github.com/owner/repo"
     );
 }
 
@@ -252,7 +252,7 @@ fn github_operations_journal_normalized_identity_and_display_spelling() {
         ))
         .unwrap();
     assert!(report.ok());
-    assert_eq!(report.operation.repository, "schiste/aethyme");
+    assert_eq!(report.operation.repository, "github.com/schiste/aethyme");
     let target = report.github_target.as_ref().unwrap();
     assert_eq!(target.coordination_key, report.operation.repository);
     assert_eq!(target.display_slug, "Schiste/Aethyme");
@@ -261,7 +261,7 @@ fn github_operations_journal_normalized_identity_and_display_spelling() {
         serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
     assert_eq!(
         details["github_target"]["coordination_key"],
-        "schiste/aethyme"
+        "github.com/schiste/aethyme"
     );
     assert_eq!(details["github_target"]["display_slug"], "Schiste/Aethyme");
 }
@@ -305,6 +305,8 @@ fn crashed_write_blocks_until_operator_reconciliation() {
             authorization_reason: Some("simulated authorized crash".into()),
             command_json: r#"["git","branch","possibly-created"]"#.into(),
             pid: 999_999,
+            host_operation_id: None,
+            identity_provenance: aethyme_broker::OperationIdentityProvenance::LocalRepository,
         })
         .unwrap();
     broker

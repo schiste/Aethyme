@@ -31,6 +31,8 @@ mod github_target;
 mod graph_impact;
 mod homebrew;
 pub mod hooks;
+mod host_operations;
+mod host_state;
 pub mod init;
 mod issue_form;
 mod leases;
@@ -85,6 +87,10 @@ pub use graph_impact::{
 };
 pub use homebrew::render_homebrew_formula;
 pub use hooks::{HookReport, HookState, HooksError};
+pub use host_operations::{
+    HostOperation, HostOperationError, HostOperationGuard, default_host_operation_db_path,
+    host_operation, reconcile_host_operation,
+};
 pub use issue_form::{
     ISSUE_FORM_RENDER_SCHEMA_VERSION, ISSUE_REVIEW_ARTIFACT_SCHEMA_VERSION, IssueFormFieldKind,
     IssueFormFieldStatus, IssueFormRenderResult, IssueFormRenderedField, IssueFormWriteResult,
@@ -163,8 +169,8 @@ pub use store::BrokerStore;
 pub use types::{
     CoordinatedOperation, Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease,
     LeaseKind, MergeQueueEntry, MergeStatus, NewCoordinatedOperation, NewGateResult,
-    NewPrWatchState, NewSession, OperationEffect, OperationProvider, OperationStatus, PrWatchState,
-    Session, SessionOrigin, SessionStatus,
+    NewPrWatchState, NewSession, OperationEffect, OperationIdentityProvenance, OperationProvider,
+    OperationStatus, PrWatchState, Session, SessionOrigin, SessionStatus,
 };
 pub use update::{
     INSTALL_RECEIPT_FILENAME, INSTALL_RECEIPT_SCHEMA_VERSION, InstallReceipt, InstallationMethod,

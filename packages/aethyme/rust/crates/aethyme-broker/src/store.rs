@@ -17,8 +17,8 @@ use crate::schema::{self, EVENTS_SCHEMA_VERSION};
 use crate::types::{
     CoordinatedOperation, Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease,
     LeaseKind, MergeQueueEntry, MergeStatus, NewCoordinatedOperation, NewGateResult,
-    NewPrWatchState, NewSession, OperationEffect, OperationProvider, OperationStatus, PrWatchState,
-    Session, SessionOrigin, SessionStatus,
+    NewPrWatchState, NewSession, OperationEffect, OperationIdentityProvenance, OperationProvider,
+    OperationStatus, PrWatchState, Session, SessionOrigin, SessionStatus,
 };
 
 /// Milliseconds a writer waits on a locked database before erroring.
@@ -1199,8 +1199,10 @@ impl BrokerStore {
         tx.execute(
             "INSERT INTO coordinated_operations (
                  session_id, provider, repository, scope, effect, status,
-                 authorization_reason, command_json, pid, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'prepared', ?6, ?7, ?8, ?9, ?9)",
+                 authorization_reason, command_json, pid, created_at, updated_at,
+                 host_operation_id, identity_provenance
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'prepared', ?6, ?7, ?8, ?9, ?9,
+                       ?10, ?11)",
             params![
                 operation.session_id,
                 operation.provider.as_str(),
@@ -1211,6 +1213,8 @@ impl BrokerStore {
                 operation.command_json,
                 operation.pid,
                 now,
+                operation.host_operation_id,
+                operation.identity_provenance.as_str(),
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -1244,7 +1248,8 @@ impl BrokerStore {
                 "SELECT id, session_id, provider, repository, scope, effect,
                         status, authorization_reason, command_json, pid,
                         exit_code, details_json,
-                        created_at, updated_at, finished_at
+                        created_at, updated_at, finished_at,
+                        host_operation_id, identity_provenance
                  FROM coordinated_operations WHERE id = ?1",
                 [id],
                 coordinated_operation_from_row,
@@ -1258,7 +1263,8 @@ impl BrokerStore {
             "SELECT id, session_id, provider, repository, scope, effect,
                     status, authorization_reason, command_json, pid,
                     exit_code, details_json,
-                    created_at, updated_at, finished_at
+                    created_at, updated_at, finished_at,
+                    host_operation_id, identity_provenance
              FROM coordinated_operations ORDER BY id",
         )?;
         let rows = stmt.query_map([], coordinated_operation_from_row)?;
@@ -1281,7 +1287,8 @@ impl BrokerStore {
             "SELECT id, session_id, provider, repository, scope, effect,
                     status, authorization_reason, command_json, pid,
                     exit_code, details_json,
-                    created_at, updated_at, finished_at
+                    created_at, updated_at, finished_at,
+                    host_operation_id, identity_provenance
              FROM coordinated_operations
              WHERE (?2 IS NULL OR session_id = ?2)
              ORDER BY id DESC LIMIT ?1",
@@ -1302,7 +1309,8 @@ impl BrokerStore {
             "SELECT id, session_id, provider, repository, scope, effect,
                     status, authorization_reason, command_json, pid,
                     exit_code, details_json,
-                    created_at, updated_at, finished_at
+                    created_at, updated_at, finished_at,
+                    host_operation_id, identity_provenance
              FROM coordinated_operations
              WHERE repository = ?1
                AND effect <> 'read'
@@ -1692,6 +1700,7 @@ fn coordinated_operation_from_row(row: &rusqlite::Row<'_>) -> RowResult<Coordina
     let provider: String = row.get(2)?;
     let effect: String = row.get(5)?;
     let status: String = row.get(6)?;
+    let identity_provenance: String = row.get(16)?;
     Ok((|| {
         Ok(CoordinatedOperation {
             id: row.get(0)?,
@@ -1709,6 +1718,8 @@ fn coordinated_operation_from_row(row: &rusqlite::Row<'_>) -> RowResult<Coordina
             created_at: row.get(12)?,
             updated_at: row.get(13)?,
             finished_at: row.get(14)?,
+            host_operation_id: row.get(15)?,
+            identity_provenance: OperationIdentityProvenance::parse(&identity_provenance)?,
         })
     })())
 }

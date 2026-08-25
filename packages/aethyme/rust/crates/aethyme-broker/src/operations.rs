@@ -15,8 +15,8 @@ use serde_json::json;
 
 use crate::broker::{Broker, BrokerOpError};
 use crate::types::{
-    CoordinatedOperation, NewCoordinatedOperation, OperationEffect, OperationProvider,
-    OperationStatus,
+    CoordinatedOperation, NewCoordinatedOperation, OperationEffect, OperationIdentityProvenance,
+    OperationProvider, OperationStatus,
 };
 
 #[derive(Debug, Clone)]
@@ -552,6 +552,8 @@ impl Broker {
             });
         }
 
+        let is_remote_write = effect != OperationEffect::Read
+            && (resolved_target.is_some() || github_target.is_some());
         let _lock = if effect == OperationEffect::Read {
             None
         } else {
@@ -593,6 +595,16 @@ impl Broker {
                 }
             }
         }
+        let mut host_guard = if is_remote_write {
+            Some(crate::HostOperationGuard::begin(
+                &self.host_operation_database_path()?,
+                &repository,
+                request.provider,
+                effect,
+            )?)
+        } else {
+            None
+        };
         pre_execute().map_err(|reason| BrokerOpError::InvalidCoordinatedOperation { reason })?;
 
         let command_json = redacted_command(request.provider, &request.args)?;
@@ -607,7 +619,18 @@ impl Broker {
                 authorization_reason,
                 command_json,
                 pid: i64::from(std::process::id()),
+                host_operation_id: host_guard
+                    .as_ref()
+                    .map(|guard| guard.operation().operation_id.clone()),
+                identity_provenance: if resolved_target.is_some() || github_target.is_some() {
+                    OperationIdentityProvenance::VerifiedCanonical
+                } else {
+                    OperationIdentityProvenance::LocalRepository
+                },
             })?;
+        if let Some(guard) = &mut host_guard {
+            guard.mark_running()?;
+        }
         self.store().transition_coordinated_operation(
             operation.id,
             OperationStatus::Running,
@@ -647,7 +670,7 @@ impl Broker {
         let output = match command.output() {
             Ok(output) => output,
             Err(source) => {
-                self.store().transition_coordinated_operation(
+                let operation = self.store().transition_coordinated_operation(
                     operation.id,
                     OperationStatus::Failed,
                     None,
@@ -661,6 +684,9 @@ impl Broker {
                         .to_string(),
                     ),
                 )?;
+                if let Some(guard) = &mut host_guard {
+                    guard.finish(operation.status)?;
+                }
                 return Err(BrokerOpError::OperationSpawn {
                     executable: executable.into(),
                     source,
@@ -731,6 +757,9 @@ impl Broker {
             exit_code,
             Some(&details.to_string()),
         )?;
+        if let Some(guard) = &mut host_guard {
+            guard.finish(operation.status)?;
+        }
         Ok(CoordinatedOperationReport {
             operation,
             classification,
@@ -756,7 +785,9 @@ impl Broker {
         let operation = self.store().coordinated_operation(operation_id)?.ok_or(
             crate::BrokerError::CoordinatedOperationNotFound(operation_id),
         )?;
-        if operation.status != OperationStatus::OutcomeUnknown {
+        if operation.host_operation_id.is_none()
+            && operation.status != OperationStatus::OutcomeUnknown
+        {
             return Err(BrokerOpError::InvalidCoordinatedOperation {
                 reason: format!(
                     "operation {} is {}, not outcome_unknown",
@@ -770,6 +801,13 @@ impl Broker {
         } else {
             OperationStatus::ReconciledFailed
         };
+        if let Some(host_operation_id) = &operation.host_operation_id {
+            crate::reconcile_host_operation(
+                &self.host_operation_database_path()?,
+                host_operation_id,
+                succeeded,
+            )?;
+        }
         let details = json!({ "operator_reason": reason }).to_string();
         let operation = self.store().transition_coordinated_operation(
             operation_id,
