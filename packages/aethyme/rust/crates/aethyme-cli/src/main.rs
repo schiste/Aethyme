@@ -70,9 +70,8 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         (Some("start" | "start-agent"), _) => CommandCapability::NewSession,
         (Some("adopt"), _) => CommandCapability::NewSession,
         (Some("submit" | "exec" | "repair"), _) => CommandCapability::SessionContinuation,
-        (Some("hooks"), Some("pre-commit" | "post-commit")) => {
-            CommandCapability::SessionContinuation
-        }
+        (Some("hooks"), Some("pre-commit")) => CommandCapability::ManagedPreCommit,
+        (Some("hooks"), Some("post-commit")) => CommandCapability::SessionContinuation,
         (Some("leases"), Some("claim" | "release")) => CommandCapability::SessionContinuation,
         (Some("gates"), Some("run" | "pre-push" | "affected" | "semantic")) => {
             CommandCapability::SessionContinuation
@@ -103,10 +102,15 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
     }
 }
 
-fn pinned_session_contract(
+fn eligible_pinned_session_contract(
     cwd: &Path,
     args: &[String],
 ) -> Option<aethyme_broker::RepositoryContract> {
+    let checkout = aethyme_broker::GitRepo::discover(cwd).ok()?;
+    let main_root = checkout.main_root().ok()?;
+    if !main_root.join(aethyme_broker::BROKER_DB_RELPATH).is_file() {
+        return None;
+    }
     let mut broker = aethyme_broker::Broker::open_for_compatibility_backfill(cwd).ok()?;
     let explicit_session = args
         .windows(2)
@@ -115,11 +119,17 @@ fn pinned_session_contract(
     let session = if let Some(session_id) = explicit_session {
         broker.store().session(session_id).ok()?
     } else {
-        let checkout = aethyme_broker::GitRepo::discover(cwd).ok()?;
         let worktree = checkout.root().to_string_lossy();
         broker.store().session_for_worktree(&worktree).ok()??
     };
-    session.repository_contract
+    matches!(
+        session.status,
+        aethyme_broker::SessionStatus::Active
+            | aethyme_broker::SessionStatus::Idle
+            | aethyme_broker::SessionStatus::Stale
+    )
+    .then_some(session.repository_contract)
+    .flatten()
 }
 
 fn main() -> ExitCode {
@@ -141,14 +151,17 @@ fn main() -> ExitCode {
         let pinned_contract = initial
             .as_ref()
             .filter(|decision| {
-                capability == repository_upgrade::CommandCapability::SessionContinuation
-                    && matches!(
-                        decision.repository,
-                        repository_upgrade::RepositoryCompatibility::UpgradeRequired
-                            | repository_upgrade::RepositoryCompatibility::UpgradeInProgress
-                    )
+                matches!(
+                    capability,
+                    repository_upgrade::CommandCapability::SessionContinuation
+                        | repository_upgrade::CommandCapability::ManagedPreCommit
+                ) && matches!(
+                    decision.repository,
+                    repository_upgrade::RepositoryCompatibility::UpgradeRequired
+                        | repository_upgrade::RepositoryCompatibility::UpgradeInProgress
+                )
             })
-            .and_then(|_| pinned_session_contract(&cwd, command.args));
+            .and_then(|_| eligible_pinned_session_contract(&cwd, command.args));
         let decision = if pinned_contract.is_some() {
             repository_upgrade::compatibility_decision(
                 &cwd,
@@ -162,7 +175,11 @@ fn main() -> ExitCode {
         };
         if let Some(decision) = decision {
             if let Some(message) = decision.refusal_message() {
-                eprintln!("Error: {message}");
+                if let Some(hook_message) = decision.managed_pre_commit_refusal_message() {
+                    eprintln!("{hook_message}");
+                } else {
+                    eprintln!("Error: {message}");
+                }
                 return ExitCode::from(1);
             }
             if decision.execution == repository_upgrade::CompatibilityExecution::ReadOnlySnapshot {
@@ -652,6 +669,10 @@ mod compatibility_command_tests {
                 CommandCapability::SessionContinuation,
             ),
             (
+                &["broker", "hooks", "pre-commit"][..],
+                CommandCapability::ManagedPreCommit,
+            ),
+            (
                 &["broker", "start", "--task", "work"][..],
                 CommandCapability::NewSession,
             ),
@@ -717,7 +738,7 @@ mod compatibility_command_tests {
             ),
             (
                 &["broker", "hooks", "pre-commit"][..],
-                CommandCapability::SessionContinuation,
+                CommandCapability::ManagedPreCommit,
             ),
             (
                 &["broker", "integration", "status"][..],

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{AdoptMode, AdoptOptions, Broker, BrokerStore};
+use aethyme_broker::{AdoptMode, AdoptOptions, Broker, BrokerStore, GitRepo, SessionStatus, hooks};
 use aethyme_testkit::{aethyme_bin, tmp_dir};
 use serde_json::Value;
 
@@ -311,6 +311,72 @@ fn older_repository_allows_diagnostics_recovery_and_only_pinned_continuation() {
 }
 
 #[test]
+fn managed_pre_commit_allows_an_accepted_session_pinned_to_the_old_contract() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    let session = adopt_legacy_session(&repo);
+    let stored = BrokerStore::open_in_repo(&repo)
+        .unwrap()
+        .session(session)
+        .unwrap();
+    assert_eq!(
+        stored
+            .repository_contract
+            .as_ref()
+            .and_then(|contract| contract.repository_schema),
+        None,
+        "the accepted session remains pinned to schema 0"
+    );
+
+    let checkout = GitRepo::discover(&repo).unwrap();
+    hooks::install(&checkout, &aethyme_bin()).unwrap();
+    fs::write(repo.join("accepted-wip.txt"), "preserved across update\n").unwrap();
+    git(&repo, &["add", "accepted-wip.txt"]);
+
+    let committed = git_commit(&repo, "commit accepted legacy work");
+    assert!(
+        committed.status.success(),
+        "accepted pinned session was stranded:\n{}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+    assert_eq!(git_status(&repo), "");
+}
+
+#[test]
+fn managed_pre_commit_refuses_without_an_eligible_session_and_preserves_work() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    let session = adopt_legacy_session(&repo);
+    let mut store = BrokerStore::open_in_repo(&repo).unwrap();
+    store
+        .set_session_status(session, SessionStatus::Exited, None)
+        .unwrap();
+
+    let checkout = GitRepo::discover(&repo).unwrap();
+    hooks::install(&checkout, &aethyme_bin()).unwrap();
+    fs::write(repo.join("retained-wip.txt"), "must remain staged\n").unwrap();
+    git(&repo, &["add", "retained-wip.txt"]);
+    let head_before = git_stdout(&repo, &["rev-parse", "HEAD"]);
+
+    let refused = git_commit(&repo, "must be refused");
+    assert!(!refused.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&refused.stderr),
+        "git commit refused by Aethyme pre-commit:\n\
+         repository deployment schema 0 must be upgraded to schema 1.\n\
+         Your changes remain in the worktree.\n"
+    );
+    assert_eq!(git_stdout(&repo, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(
+        fs::read_to_string(repo.join("retained-wip.txt")).unwrap(),
+        "must remain staged\n"
+    );
+    assert!(git_status(&repo).contains("A  retained-wip.txt"));
+}
+
+#[test]
 fn repository_compatibility_states_preserve_refusal_remediation() {
     let cases = [
         (
@@ -442,4 +508,40 @@ fn git_status(repo: &Path) -> String {
         .unwrap();
     assert!(output.status.success());
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git(repo: &Path, args: &[&str]) -> Output {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn git_stdout(repo: &Path, args: &[&str]) -> String {
+    String::from_utf8_lossy(&git(repo, args).stdout)
+        .trim()
+        .to_string()
+}
+
+fn git_commit(repo: &Path, message: &str) -> Output {
+    Command::new("git")
+        .args([
+            "-c",
+            "user.name=Aethyme Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            message,
+        ])
+        .current_dir(repo)
+        .output()
+        .unwrap()
 }

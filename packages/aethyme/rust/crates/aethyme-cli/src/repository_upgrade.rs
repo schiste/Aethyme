@@ -109,6 +109,7 @@ pub enum CommandCapability {
     DiagnosticRead,
     RecoveryWrite,
     SessionContinuation,
+    ManagedPreCommit,
     NewSession,
     SharedMutation,
     Upgrade,
@@ -138,6 +139,7 @@ pub struct CompatibilityContext<'a> {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CompatibilityDecision {
     pub repository: RepositoryCompatibility,
+    pub repository_schema: Option<u32>,
     pub capability: CommandCapability,
     pub allowed: bool,
     pub severity: CompatibilitySeverity,
@@ -154,6 +156,24 @@ impl CompatibilityDecision {
         Some(match &self.remediation {
             Some(remediation) => format!("{}; {remediation}", self.reason),
             None => self.reason.clone(),
+        })
+    }
+
+    /// The managed pre-commit hook is the last guard before Git writes a
+    /// commit. Its refusal must make clear that compatibility—not the staged
+    /// changes—caused the stop, and that the worktree was left untouched.
+    pub fn managed_pre_commit_refusal_message(&self) -> Option<String> {
+        if self.allowed || self.capability != CommandCapability::ManagedPreCommit {
+            return None;
+        }
+        let repository_schema = self.repository_schema?;
+        (repository_schema < REPOSITORY_SCHEMA_VERSION).then(|| {
+            format!(
+                "git commit refused by Aethyme pre-commit:\n\
+                 repository deployment schema {repository_schema} must be upgraded to schema \
+                 {REPOSITORY_SCHEMA_VERSION}.\n\
+                 Your changes remain in the worktree."
+            )
         })
     }
 }
@@ -240,7 +260,9 @@ fn decide_compatibility(
                 CommandCapability::DiagnosticRead
                 | CommandCapability::RecoveryWrite
                 | CommandCapability::Upgrade => true,
-                CommandCapability::SessionContinuation => pinned_session_is_executable,
+                CommandCapability::SessionContinuation | CommandCapability::ManagedPreCommit => {
+                    pinned_session_is_executable
+                }
                 CommandCapability::NewSession | CommandCapability::SharedMutation => false,
             }
         }
@@ -268,6 +290,7 @@ fn decide_compatibility(
     };
     CompatibilityDecision {
         repository,
+        repository_schema,
         capability,
         allowed,
         severity,
@@ -887,6 +910,7 @@ mod compatibility_tests {
             CommandCapability::DiagnosticRead,
             CommandCapability::RecoveryWrite,
             CommandCapability::SessionContinuation,
+            CommandCapability::ManagedPreCommit,
             CommandCapability::NewSession,
             CommandCapability::SharedMutation,
             CommandCapability::Upgrade,
@@ -953,23 +977,48 @@ mod compatibility_tests {
             repository_schema: Some(REPOSITORY_SCHEMA_VERSION),
             ..legacy.clone()
         };
-        for (contract, expected) in [
-            (Some(&legacy), true),
-            (Some(&current), false),
-            (None, false),
+        for capability in [
+            CommandCapability::SessionContinuation,
+            CommandCapability::ManagedPreCommit,
         ] {
-            let decision = decide_compatibility(
-                RepositoryCompatibility::UpgradeRequired,
-                Some(0),
-                CommandCapability::SessionContinuation,
-                CompatibilityContext {
-                    session_contract: contract,
-                },
-                "reason".into(),
-                Some("remediation".into()),
-            );
-            assert_eq!(decision.allowed, expected);
+            for (contract, expected) in [
+                (Some(&legacy), true),
+                (Some(&current), false),
+                (None, false),
+            ] {
+                let decision = decide_compatibility(
+                    RepositoryCompatibility::UpgradeRequired,
+                    Some(0),
+                    capability,
+                    CompatibilityContext {
+                        session_contract: contract,
+                    },
+                    "reason".into(),
+                    Some("remediation".into()),
+                );
+                assert_eq!(decision.allowed, expected);
+            }
         }
+    }
+
+    #[test]
+    fn managed_pre_commit_refusal_preserves_dirty_work_context() {
+        let decision = decide_compatibility(
+            RepositoryCompatibility::UpgradeRequired,
+            Some(0),
+            CommandCapability::ManagedPreCommit,
+            CompatibilityContext::default(),
+            "reason".into(),
+            Some("remediation".into()),
+        );
+        assert_eq!(
+            decision.managed_pre_commit_refusal_message().as_deref(),
+            Some(
+                "git commit refused by Aethyme pre-commit:\n\
+                 repository deployment schema 0 must be upgraded to schema 1.\n\
+                 Your changes remain in the worktree."
+            )
+        );
     }
 
     #[test]
