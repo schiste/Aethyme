@@ -598,6 +598,18 @@ impl Broker {
                     .collect::<Vec<_>>()
             };
             (owned, inherited)
+        } else if accepted_checkpoint.is_some() {
+            return Ok(SubmissionPlan {
+                session_id: session.id,
+                recorded_baseline: Some(recorded_baseline.to_string()),
+                session_head: session_head.to_string(),
+                integration_head: integration_head.to_string(),
+                safe: false,
+                commits: Vec::new(),
+                warnings: vec![format!(
+                    "accepted session checkpoint {recorded_baseline} is not an ancestor of session HEAD {session_head}; follow-up ownership must remain {recorded_baseline}..{session_head}, so integration HEAD {integration_head} cannot replace it as the ownership boundary"
+                )],
+            });
         } else if repo.is_ancestor(integration_head, session_head) {
             warnings.push(format!(
                 "recorded baseline {recorded_baseline} was rewritten; ownership uses the unambiguous rebased range {integration_head}..{session_head}"

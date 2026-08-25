@@ -3522,12 +3522,15 @@ impl Broker {
             report.delivery = self.finish_delivery(Some(entry));
         }
 
+        // Promotion commonly represents the accepted session tree under a
+        // different integration commit SHA. Resetting the checkout to that
+        // recorded counterpart is delivered even without a queue row at HEAD.
         let submitted_head_is_delivered = latest_for_head.is_some_and(|entry| {
             matches!(
                 entry.status,
                 MergeStatus::Promoted | MergeStatus::ExternallyLanded
             )
-        });
+        }) || session.accepted_integration_commit.as_deref() == Some(head.as_str());
         report.unsubmitted_commits = if submitted_head_is_delivered {
             0
         } else {

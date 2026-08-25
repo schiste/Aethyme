@@ -305,6 +305,17 @@ fn repeated_submission_uses_the_last_accepted_session_head_as_its_checkpoint() {
         Some(first_head.clone())
     );
 
+    let other_worktree =
+        agent_worktree_at(tmp.path(), "between-contributions", "aethyme/integration");
+    let other = broker
+        .adopt(&other_worktree, Some("advance integration independently"))
+        .unwrap();
+    commit_edit(&other_worktree, "src/c.py", "c = 2\n");
+    assert!(broker.submit(other.id).unwrap().promoted);
+    broker.close(other.id).unwrap();
+    broker.store().release_lease(other.id, "src/c.py").unwrap();
+    let integration_before_follow_up = resolve(tmp.path(), "aethyme/integration");
+
     commit_edit(&worktree, "src/b.py", "b = 2\n");
     let second_head = resolve(&worktree, "HEAD");
     let second = broker.submit(session.id).unwrap();
@@ -312,6 +323,11 @@ fn repeated_submission_uses_the_last_accepted_session_head_as_its_checkpoint() {
     assert_eq!(
         second.submission_plan.recorded_baseline.as_deref(),
         Some(first_head.as_str())
+    );
+    assert_eq!(
+        second.submission_plan.integration_head,
+        integration_before_follow_up,
+        "integration is the replay target, not the ownership boundary"
     );
     assert_eq!(second.submission_plan.commits.len(), 1);
     assert_eq!(
@@ -324,6 +340,47 @@ fn repeated_submission_uses_the_last_accepted_session_head_as_its_checkpoint() {
     assert_eq!(persisted.adopted_head, adopted_head);
     assert_eq!(persisted.accepted_session_head, Some(second_head));
     assert_eq!(persisted.accepted_queue_entry_id, Some(second.entry.id));
+}
+
+#[test]
+fn follow_up_refuses_to_replace_a_rewritten_accepted_checkpoint_with_integration() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "rewritten-follow-up");
+    let session = broker.adopt(&worktree, Some("two contributions")).unwrap();
+
+    commit_edit(&worktree, "src/a.py", "a = 2\n");
+    let accepted_head = resolve(&worktree, "HEAD");
+    assert!(broker.submit(session.id).unwrap().promoted);
+
+    commit_edit(&worktree, "src/b.py", "b = 2\n");
+    sh(&worktree, &["rebase", "aethyme/integration"]);
+    let rewritten_head = resolve(&worktree, "HEAD");
+    assert_ne!(rewritten_head, accepted_head);
+    assert!(
+        !Command::new("git")
+            .args(["merge-base", "--is-ancestor", &accepted_head, &rewritten_head])
+            .current_dir(&worktree)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let error = broker.submit(session.id).unwrap_err();
+
+    let message = error.to_string();
+    assert!(message.contains(&format!(
+        "follow-up ownership must remain {accepted_head}..{rewritten_head}"
+    )));
+    assert!(message.contains("cannot replace it as the ownership boundary"));
+    let persisted = broker.store().session(session.id).unwrap();
+    assert_eq!(persisted.accepted_session_head, Some(accepted_head));
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/b.py"),
+        "b = 1\n",
+        "an unsafe follow-up plan must not mutate integration"
+    );
 }
 
 #[test]
