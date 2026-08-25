@@ -129,6 +129,100 @@ fn destructive_and_ambiguous_operations_fail_closed() {
 }
 
 #[test]
+fn remote_git_journals_resolved_identity_and_assertion_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    git(
+        tmp.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/Owner/Repo.git",
+        ],
+    );
+    let worktree = add_worktree(tmp.path(), "remote-identity");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+    let mut command = request(session.id, &["ls-remote", "--get-url", "origin"]);
+    command.repository = Some("Owner/Repo".into());
+
+    let report = broker.run_coordinated_operation(command).unwrap();
+    assert!(report.ok());
+    assert_eq!(report.operation.repository, "github.com/Owner/Repo");
+    let target = report.resolved_target.as_ref().unwrap();
+    assert_eq!(target.coordination_key, report.operation.repository);
+    assert_eq!(target.caller_assertion.as_deref(), Some("Owner/Repo"));
+    assert_eq!(target.remote_name, "origin");
+
+    let details: serde_json::Value =
+        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["resolved_target"]["caller_assertion"], "Owner/Repo");
+    assert_eq!(
+        details["resolved_target"]["coordination_key"],
+        "github.com/Owner/Repo"
+    );
+}
+
+#[test]
+fn remote_git_refuses_mismatched_assertions_and_multiple_push_urls() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    git(
+        tmp.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/Owner/Repo.git",
+        ],
+    );
+    let worktree = add_worktree(tmp.path(), "remote-refusal");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+
+    let mut mismatch = request(session.id, &["ls-remote", "--get-url", "origin"]);
+    mismatch.repository = Some("Other/Repo".into());
+    assert!(
+        broker
+            .run_coordinated_operation(mismatch)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match resolved repository")
+    );
+    assert!(broker.store().coordinated_operations().unwrap().is_empty());
+
+    git(
+        tmp.path(),
+        &[
+            "config",
+            "--add",
+            "remote.origin.pushurl",
+            "git@github.com:Owner/Repo.git",
+        ],
+    );
+    git(
+        tmp.path(),
+        &[
+            "config",
+            "--add",
+            "remote.origin.pushurl",
+            "ssh://git@github.com/Owner/Repo.git",
+        ],
+    );
+    let mut ambiguous = request(session.id, &["ls-remote", "--get-url", "origin"]);
+    ambiguous.repository = Some("Owner/Repo".into());
+    assert!(
+        broker
+            .run_coordinated_operation(ambiguous)
+            .unwrap_err()
+            .to_string()
+            .contains("has 2 push URLs")
+    );
+    assert!(broker.store().coordinated_operations().unwrap().is_empty());
+}
+
+#[test]
 fn crashed_write_blocks_until_operator_reconciliation() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

@@ -35,6 +35,8 @@ pub enum BrokerOpError {
     Store(#[from] BrokerError),
     #[error(transparent)]
     Pr(#[from] crate::pr::PrError),
+    #[error(transparent)]
+    RemoteTarget(#[from] crate::RemoteTargetError),
     #[error("refusing to clean session {id}: {reason} (use --force to discard)")]
     DirtyWorktree { id: i64, reason: String },
     #[error(

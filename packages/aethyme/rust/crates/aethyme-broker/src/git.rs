@@ -273,6 +273,31 @@ impl GitRepo {
         run_git(&self.root, &["remote", "get-url", "--push", remote])
     }
 
+    /// Every configured push URL for `remote`, after Git's URL rewrite rules.
+    ///
+    /// A remote may have several `pushurl` entries. Callers coordinating a
+    /// publication must inspect the complete set rather than inheriting Git's
+    /// multi-destination behavior accidentally.
+    pub fn remote_push_urls(&self, remote: &str) -> Result<Vec<String>, GitError> {
+        Ok(run_git(
+            &self.root,
+            &["remote", "get-url", "--push", "--all", remote],
+        )?
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+    }
+
+    /// Configured remote names in Git's deterministic display order.
+    pub fn remotes(&self) -> Result<Vec<String>, GitError> {
+        Ok(run_git(&self.root, &["remote"])?
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Resolve a configured remote to one credential-free coordination target.
     pub fn resolve_remote_target(
         &self,
@@ -280,6 +305,15 @@ impl GitRepo {
         caller_assertion: Option<&str>,
     ) -> Result<crate::ResolvedRemoteTarget, crate::RemoteTargetError> {
         crate::remote_target::resolve_remote_target(self, remote, caller_assertion)
+    }
+
+    /// Resolve the one configured remote targeted by a Git command.
+    pub fn resolve_remote_command_target(
+        &self,
+        args: &[String],
+        caller_assertion: Option<&str>,
+    ) -> Result<crate::ResolvedRemoteTarget, crate::RemoteTargetError> {
+        crate::remote_target::resolve_remote_command_target(self, args, caller_assertion)
     }
 
     /// Query the remote's advertised HEAD without updating any local ref.

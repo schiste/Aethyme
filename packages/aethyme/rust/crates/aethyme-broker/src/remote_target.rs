@@ -48,8 +48,20 @@ pub enum RemoteIdentityEvidence {
     FetchAndPushMatched,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteCommandSelectionEvidence {
+    ExplicitArgument,
+    GitPushRepositoryOption,
+    BranchPushRemote,
+    RemotePushDefault,
+    BranchRemote,
+    OriginFallback,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RemoteResolutionEvidence {
+    pub command_selection: RemoteCommandSelectionEvidence,
     pub fetch: RemoteUrlEvidence,
     pub push: RemoteUrlEvidence,
     pub identity: RemoteIdentityEvidence,
@@ -95,6 +107,27 @@ pub enum RemoteTargetError {
         "caller repository assertion {assertion:?} does not match resolved repository {resolved:?}"
     )]
     AssertionMismatch { assertion: String, resolved: String },
+    #[error(
+        "configured remote {remote:?} has {count} push URLs; remote Git coordination requires exactly one"
+    )]
+    AmbiguousPushUrls { remote: String, count: usize },
+    #[error(
+        "Git command {command:?} does not have a supported single-remote coordination contract"
+    )]
+    UnsupportedRemoteCommand { command: String },
+    #[error("unsupported {command} option {option:?} prevents deterministic remote resolution")]
+    UnsupportedCommandOption {
+        command: &'static str,
+        option: String,
+    },
+    #[error("{command} targets multiple remotes; coordinated Git requires exactly one")]
+    MultipleCommandRemotes { command: &'static str },
+    #[error(
+        "cannot determine the target remote for git {command}; name a configured remote explicitly"
+    )]
+    MissingCommandRemote { command: &'static str },
+    #[error("git {command} target does not name a configured remote")]
+    UnknownCommandRemote { command: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,9 +144,54 @@ pub fn resolve_remote_target(
     remote_name: &str,
     caller_assertion: Option<&str>,
 ) -> Result<ResolvedRemoteTarget, RemoteTargetError> {
+    resolve_remote_target_with_selection(
+        repo,
+        remote_name,
+        caller_assertion,
+        RemoteCommandSelectionEvidence::ExplicitArgument,
+    )
+}
+
+/// Resolve the actual configured remote selected by one remote Git command.
+///
+/// This deliberately supports only single-target command forms. Direct URLs,
+/// multi-remote fetches, and commands whose grammar cannot be classified are
+/// refused rather than journaled under the caller's assertion.
+pub fn resolve_remote_command_target(
+    repo: &GitRepo,
+    args: &[String],
+    caller_assertion: Option<&str>,
+) -> Result<ResolvedRemoteTarget, RemoteTargetError> {
+    let command = args.first().map(String::as_str).unwrap_or_default();
+    let (explicit, explicit_source) = command_remote_argument(command, &args[1..])?;
+    let (remote_name, selection) = match explicit {
+        Some(remote) => (remote, explicit_source),
+        None => default_command_remote(repo, command)?,
+    };
+    if !repo.remotes()?.iter().any(|remote| remote == &remote_name) {
+        return Err(RemoteTargetError::UnknownCommandRemote {
+            command: command_name(command)?,
+        });
+    }
+    resolve_remote_target_with_selection(repo, &remote_name, caller_assertion, selection)
+}
+
+fn resolve_remote_target_with_selection(
+    repo: &GitRepo,
+    remote_name: &str,
+    caller_assertion: Option<&str>,
+    command_selection: RemoteCommandSelectionEvidence,
+) -> Result<ResolvedRemoteTarget, RemoteTargetError> {
     validate_remote_name(remote_name)?;
     let fetch = parse_remote_url(&repo.remote_url(remote_name)?, repo.root(), "fetch")?;
-    let push = parse_remote_url(&repo.remote_push_url(remote_name)?, repo.root(), "push")?;
+    let push_urls = repo.remote_push_urls(remote_name)?;
+    if push_urls.len() != 1 {
+        return Err(RemoteTargetError::AmbiguousPushUrls {
+            remote: remote_name.into(),
+            count: push_urls.len(),
+        });
+    }
+    let push = parse_remote_url(&push_urls[0], repo.root(), "push")?;
     if fetch.coordination_key != push.coordination_key {
         return Err(RemoteTargetError::FetchPushMismatch {
             fetch_key: fetch.coordination_key,
@@ -149,6 +227,7 @@ pub fn resolve_remote_target(
         push_url: push.sanitized_url,
         caller_assertion,
         evidence: RemoteResolutionEvidence {
+            command_selection,
             fetch: RemoteUrlEvidence {
                 source: RemoteUrlSource::GitRemoteGetUrl,
                 syntax: fetch.syntax,
@@ -161,6 +240,284 @@ pub fn resolve_remote_target(
             caller_assertion: assertion_evidence,
         },
     })
+}
+
+fn command_name(command: &str) -> Result<&'static str, RemoteTargetError> {
+    match command {
+        "fetch" => Ok("fetch"),
+        "pull" => Ok("pull"),
+        "push" => Ok("push"),
+        "ls-remote" => Ok("ls-remote"),
+        _ => Err(RemoteTargetError::UnsupportedRemoteCommand {
+            command: command.into(),
+        }),
+    }
+}
+
+fn command_remote_argument(
+    command: &str,
+    args: &[String],
+) -> Result<(Option<String>, RemoteCommandSelectionEvidence), RemoteTargetError> {
+    let command = command_name(command)?;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            return Ok((
+                args.get(index + 1).cloned(),
+                RemoteCommandSelectionEvidence::ExplicitArgument,
+            ));
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            return Ok((
+                Some(argument.clone()),
+                RemoteCommandSelectionEvidence::ExplicitArgument,
+            ));
+        }
+        if command == "fetch" && matches!(argument.as_str(), "--all" | "--multiple") {
+            return Err(RemoteTargetError::MultipleCommandRemotes { command });
+        }
+        if command == "push" {
+            if let Some(remote) = argument.strip_prefix("--repo=") {
+                return Ok((
+                    Some(remote.into()),
+                    RemoteCommandSelectionEvidence::GitPushRepositoryOption,
+                ));
+            }
+            if argument == "--repo" {
+                let remote = args.get(index + 1).cloned().ok_or_else(|| {
+                    RemoteTargetError::UnsupportedCommandOption {
+                        command,
+                        option: "--repo without a value".into(),
+                    }
+                })?;
+                return Ok((
+                    Some(remote),
+                    RemoteCommandSelectionEvidence::GitPushRepositoryOption,
+                ));
+            }
+        }
+
+        let option = argument.split('=').next().unwrap_or(argument);
+        if option_takes_value(command, option) && !argument.contains('=') {
+            if args.get(index + 1).is_none() {
+                return Err(RemoteTargetError::UnsupportedCommandOption {
+                    command,
+                    option: format!("{option} without a value"),
+                });
+            }
+            index += 2;
+            continue;
+        }
+        if option_takes_value(command, option) || option_is_flag(command, option) {
+            index += 1;
+            continue;
+        }
+        return Err(RemoteTargetError::UnsupportedCommandOption {
+            command,
+            option: option.into(),
+        });
+    }
+    Ok((None, RemoteCommandSelectionEvidence::ExplicitArgument))
+}
+
+fn option_takes_value(command: &str, option: &str) -> bool {
+    match command {
+        "fetch" => matches!(
+            option,
+            "--depth"
+                | "--deepen"
+                | "--shallow-since"
+                | "--shallow-exclude"
+                | "--negotiation-tip"
+                | "--refmap"
+                | "--recurse-submodules"
+                | "--jobs"
+                | "--upload-pack"
+                | "--server-option"
+                | "--filter"
+                | "-j"
+        ),
+        "pull" => matches!(
+            option,
+            "--cleanup"
+                | "--depth"
+                | "--deepen"
+                | "--shallow-since"
+                | "--shallow-exclude"
+                | "--negotiation-tip"
+                | "--recurse-submodules"
+                | "--jobs"
+                | "--upload-pack"
+                | "--server-option"
+                | "--filter"
+                | "--strategy"
+                | "--strategy-option"
+                | "-j"
+                | "-s"
+                | "-X"
+        ),
+        "push" => matches!(option, "--receive-pack" | "--exec" | "--push-option"),
+        "ls-remote" => matches!(option, "--upload-pack" | "--server-option" | "--sort"),
+        _ => false,
+    }
+}
+
+fn option_is_flag(command: &str, option: &str) -> bool {
+    match command {
+        "fetch" => matches!(
+            option,
+            "--append"
+                | "--atomic"
+                | "--dry-run"
+                | "--force"
+                | "--keep"
+                | "--no-tags"
+                | "--prune"
+                | "--prune-tags"
+                | "--quiet"
+                | "--show-forced-updates"
+                | "--stdin"
+                | "--tags"
+                | "--update-head-ok"
+                | "--verbose"
+                | "--write-commit-graph"
+                | "-a"
+                | "-f"
+                | "-k"
+                | "-n"
+                | "-p"
+                | "-q"
+                | "-t"
+                | "-v"
+        ),
+        "pull" => matches!(
+            option,
+            "--autostash"
+                | "--commit"
+                | "--dry-run"
+                | "--edit"
+                | "--ff"
+                | "--ff-only"
+                | "--force"
+                | "--no-autostash"
+                | "--no-commit"
+                | "--no-edit"
+                | "--no-ff"
+                | "--no-rebase"
+                | "--no-stat"
+                | "--quiet"
+                | "--rebase"
+                | "--signoff"
+                | "--stat"
+                | "--verbose"
+                | "-e"
+                | "-f"
+                | "-n"
+                | "-q"
+                | "-r"
+                | "-v"
+        ),
+        "push" => matches!(
+            option,
+            "--all"
+                | "--atomic"
+                | "--delete"
+                | "--dry-run"
+                | "--follow-tags"
+                | "--force"
+                | "--force-if-includes"
+                | "--force-with-lease"
+                | "--mirror"
+                | "--no-verify"
+                | "--porcelain"
+                | "--prune"
+                | "--quiet"
+                | "--set-upstream"
+                | "--signed"
+                | "--tags"
+                | "--thin"
+                | "--verbose"
+                | "-f"
+                | "-n"
+                | "-q"
+                | "-u"
+                | "-v"
+        ),
+        "ls-remote" => matches!(
+            option,
+            "--exit-code"
+                | "--get-url"
+                | "--heads"
+                | "--quiet"
+                | "--refs"
+                | "--symref"
+                | "--tags"
+                | "-h"
+                | "-q"
+                | "-t"
+        ),
+        _ => false,
+    }
+}
+
+fn default_command_remote(
+    repo: &GitRepo,
+    command: &str,
+) -> Result<(String, RemoteCommandSelectionEvidence), RemoteTargetError> {
+    let command = command_name(command)?;
+    if command == "ls-remote" {
+        return Err(RemoteTargetError::MissingCommandRemote { command });
+    }
+    let branch = repo.current_branch().ok();
+    if command == "push" {
+        if let Some(remote) = branch
+            .as_deref()
+            .and_then(|branch| repo.config_get(&format!("branch.{branch}.pushRemote")))
+        {
+            return local_remote_or(
+                command,
+                remote,
+                RemoteCommandSelectionEvidence::BranchPushRemote,
+            );
+        }
+        if let Some(remote) = repo.config_get("remote.pushDefault") {
+            return local_remote_or(
+                command,
+                remote,
+                RemoteCommandSelectionEvidence::RemotePushDefault,
+            );
+        }
+    }
+    if let Some(remote) = branch
+        .as_deref()
+        .and_then(|branch| repo.config_get(&format!("branch.{branch}.remote")))
+    {
+        return local_remote_or(
+            command,
+            remote,
+            RemoteCommandSelectionEvidence::BranchRemote,
+        );
+    }
+    if repo.remotes()?.iter().any(|remote| remote == "origin") {
+        return Ok((
+            "origin".into(),
+            RemoteCommandSelectionEvidence::OriginFallback,
+        ));
+    }
+    Err(RemoteTargetError::MissingCommandRemote { command })
+}
+
+fn local_remote_or(
+    command: &'static str,
+    remote: String,
+    selection: RemoteCommandSelectionEvidence,
+) -> Result<(String, RemoteCommandSelectionEvidence), RemoteTargetError> {
+    if remote == "." {
+        Err(RemoteTargetError::MissingCommandRemote { command })
+    } else {
+        Ok((remote, selection))
+    }
 }
 
 fn validate_remote_name(remote_name: &str) -> Result<(), RemoteTargetError> {
@@ -431,6 +788,43 @@ fn looks_like_scp(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    fn configured_repo() -> (tempfile::TempDir, GitRepo) {
+        let root = tempfile::tempdir().unwrap();
+        let output = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Owner/Repo.git",
+            ])
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let repo = GitRepo::discover(root.path()).unwrap();
+        (root, repo)
+    }
+
+    fn git(repo: &GitRepo, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo.root())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn network_syntaxes_share_one_coordination_identity() {
@@ -482,5 +876,115 @@ mod tests {
         for assertion in ["https://host/team/repo", "git@host:team/repo", "team:repo"] {
             assert!(normalize_assertion(assertion).is_err(), "{assertion}");
         }
+    }
+
+    #[test]
+    fn command_options_do_not_hide_the_explicit_remote() {
+        let (_root, repo) = configured_repo();
+        let target = resolve_remote_command_target(
+            &repo,
+            &[
+                "push".into(),
+                "--porcelain".into(),
+                "origin".into(),
+                "HEAD".into(),
+            ],
+            Some("Owner/Repo"),
+        )
+        .unwrap();
+        assert_eq!(target.coordination_key, "github.com/Owner/Repo");
+        assert_eq!(target.remote_name, "origin");
+        assert_eq!(
+            target.evidence.command_selection,
+            RemoteCommandSelectionEvidence::ExplicitArgument
+        );
+        assert_eq!(target.caller_assertion.as_deref(), Some("Owner/Repo"));
+    }
+
+    #[test]
+    fn push_default_precedence_matches_git_configuration() {
+        let (_root, repo) = configured_repo();
+        git(
+            &repo,
+            &["remote", "add", "publish", "git@github.com:Owner/Repo.git"],
+        );
+        git(&repo, &["config", "remote.pushDefault", "publish"]);
+
+        let target = resolve_remote_command_target(&repo, &["push".into()], None).unwrap();
+        assert_eq!(target.remote_name, "publish");
+        assert_eq!(
+            target.evidence.command_selection,
+            RemoteCommandSelectionEvidence::RemotePushDefault
+        );
+    }
+
+    #[test]
+    fn assertion_mismatch_and_direct_url_target_fail_before_execution() {
+        let (_root, repo) = configured_repo();
+        let mismatch = resolve_remote_command_target(
+            &repo,
+            &["fetch".into(), "origin".into()],
+            Some("Other/Repo"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            mismatch,
+            RemoteTargetError::AssertionMismatch { .. }
+        ));
+
+        let direct = resolve_remote_command_target(
+            &repo,
+            &["fetch".into(), "https://github.com/Owner/Repo.git".into()],
+            Some("Owner/Repo"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            direct,
+            RemoteTargetError::UnknownCommandRemote { .. }
+        ));
+    }
+
+    #[test]
+    fn multiple_push_urls_and_multi_remote_fetch_are_refused() {
+        let (_root, repo) = configured_repo();
+        git(
+            &repo,
+            &[
+                "config",
+                "--add",
+                "remote.origin.pushurl",
+                "git@github.com:Owner/Repo.git",
+            ],
+        );
+        git(
+            &repo,
+            &[
+                "config",
+                "--add",
+                "remote.origin.pushurl",
+                "ssh://git@github.com/Owner/Repo.git",
+            ],
+        );
+        let ambiguous = resolve_remote_command_target(
+            &repo,
+            &["push".into(), "origin".into()],
+            Some("Owner/Repo"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            ambiguous,
+            RemoteTargetError::AmbiguousPushUrls { count: 2, .. }
+        ));
+
+        let multiple = resolve_remote_command_target(
+            &repo,
+            &["fetch".into(), "--all".into()],
+            Some("Owner/Repo"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            multiple,
+            RemoteTargetError::MultipleCommandRemotes { .. }
+        ));
     }
 }

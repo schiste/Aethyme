@@ -120,9 +120,9 @@ pub use release_manifest::{
     ReleaseBrokerStorageCompatibility, ReleaseCompatibility, ReleaseInstaller, ReleaseManifest,
 };
 pub use remote_target::{
-    RemoteAssertionEvidence, RemoteIdentityEvidence, RemoteResolutionEvidence, RemoteTargetError,
-    RemoteUrlEvidence, RemoteUrlSource, RemoteUrlSyntax, ResolvedRemoteTarget,
-    resolve_remote_target,
+    RemoteAssertionEvidence, RemoteCommandSelectionEvidence, RemoteIdentityEvidence,
+    RemoteResolutionEvidence, RemoteTargetError, RemoteUrlEvidence, RemoteUrlSource,
+    RemoteUrlSyntax, ResolvedRemoteTarget, resolve_remote_command_target, resolve_remote_target,
 };
 pub use report::{
     InvalidReportEntry, PreparedReport, REPORT_DOCUMENT_SCHEMA_VERSION, REPORT_FILINGS_FILENAME,

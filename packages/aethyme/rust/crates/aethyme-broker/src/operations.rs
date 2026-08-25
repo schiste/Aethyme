@@ -41,6 +41,8 @@ pub struct CoordinatedCommand {
 pub struct CoordinatedOperationReport {
     pub operation: CoordinatedOperation,
     pub classification: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_target: Option<crate::ResolvedRemoteTarget>,
     pub command_success: bool,
     pub stdout: String,
     pub stderr: String,
@@ -188,7 +190,7 @@ pub fn classify_git(args: &[String]) -> Option<OperationEffect> {
         "status" | "diff" | "log" | "show" | "rev-parse" | "ls-files" | "ls-tree" | "cat-file"
         | "grep" | "blame" | "describe" | "shortlog" | "whatchanged" | "merge-base"
         | "name-rev" | "for-each-ref" | "check-ignore" | "count-objects" | "fsck" | "help"
-        | "version" | "--version" => Some(OperationEffect::Read),
+        | "ls-remote" | "version" | "--version" => Some(OperationEffect::Read),
         "branch" => {
             if has_any(args, &["-d", "-D", "--delete"]) {
                 Some(OperationEffect::Destructive)
@@ -320,12 +322,30 @@ pub fn classify_gh(args: &[String]) -> Option<OperationEffect> {
 }
 
 fn remote_git_operation(args: &[String]) -> bool {
-    args.first().is_some_and(|arg| {
-        matches!(
-            arg.as_str(),
-            "clone" | "fetch" | "pull" | "push" | "remote" | "ls-remote" | "submodule"
-        )
-    })
+    match args.first().map(String::as_str) {
+        Some("clone" | "fetch" | "pull" | "push" | "ls-remote" | "submodule") => true,
+        Some("remote") => args
+            .get(1)
+            .is_some_and(|arg| matches!(arg.as_str(), "show" | "prune" | "update")),
+        _ => false,
+    }
+}
+
+fn journal_details(
+    classification: &'static str,
+    resolved_target: Option<&crate::ResolvedRemoteTarget>,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    let mut details = json!({ "classification": classification });
+    if let Some(target) = resolved_target {
+        details["resolved_target"] = json!(target);
+    }
+    if let (Some(details), Some(extra)) = (details.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            details.insert(key.clone(), value.clone());
+        }
+    }
+    details
 }
 
 fn validate_gh_args(args: &[String]) -> Result<(), BrokerOpError> {
@@ -455,34 +475,65 @@ impl Broker {
             });
         }
 
-        let repository = match (
+        let is_remote_git =
+            request.provider == OperationProvider::Git && remote_git_operation(&request.args);
+        let resolved_target = match (
             &request.resolved_target,
             &request.repository,
             request.provider,
         ) {
-            (Some(target), None, OperationProvider::Git) => target.coordination_key.clone(),
+            (Some(expected), None, OperationProvider::Git) if is_remote_git => {
+                let repo = crate::GitRepo::discover(cwd)?;
+                let actual = repo.resolve_remote_command_target(&request.args, None)?;
+                if actual.remote_name != expected.remote_name
+                    || actual.coordination_key != expected.coordination_key
+                {
+                    return Err(BrokerOpError::InvalidCoordinatedOperation {
+                        reason: format!(
+                            "Git command resolved to {} via remote {:?}, but the internal workflow authorized {} via remote {:?}",
+                            actual.coordination_key,
+                            actual.remote_name,
+                            expected.coordination_key,
+                            expected.remote_name
+                        ),
+                    });
+                }
+                Some(actual)
+            }
             (Some(_), _, _) => {
                 return Err(BrokerOpError::InvalidCoordinatedOperation {
                     reason: "a resolved remote target is only valid for internal Git operations without a second repository assertion".into(),
                 });
             }
+            (None, Some(repository), OperationProvider::Git) if is_remote_git => {
+                validate_repository(repository)?;
+                let repo = crate::GitRepo::discover(cwd)?;
+                Some(repo.resolve_remote_command_target(&request.args, Some(repository))?)
+            }
             (None, Some(repository), _) => {
                 validate_repository(repository)?;
-                repository.clone()
+                None
             }
             (None, None, OperationProvider::Github) => {
                 return Err(BrokerOpError::InvalidCoordinatedOperation {
                     reason: "broker gh requires --repo owner/name".into(),
                 });
             }
-            (None, None, OperationProvider::Git) if remote_git_operation(&request.args) => {
+            (None, None, OperationProvider::Git) if is_remote_git => {
                 return Err(BrokerOpError::InvalidCoordinatedOperation {
                     reason: "remote Git operation requires --repo owner/name".into(),
                 });
             }
+            (None, None, OperationProvider::Git) => None,
+        };
+        let repository = match (&resolved_target, &request.repository, request.provider) {
+            (Some(target), _, OperationProvider::Git) => target.coordination_key.clone(),
+            (None, Some(repository), _) => repository.clone(),
             (None, None, OperationProvider::Git) => {
                 format!("local:{}", self.main_root().display())
             }
+            (Some(_), _, OperationProvider::Github) => unreachable!("validated above"),
+            (None, None, OperationProvider::Github) => unreachable!("validated above"),
         };
         let scope_was_declared = request.scope.is_some();
         let scope = request.scope.unwrap_or_else(|| "repository".into());
@@ -554,7 +605,7 @@ impl Broker {
             operation.id,
             OperationStatus::Running,
             None,
-            Some(&json!({ "classification": classification }).to_string()),
+            Some(&journal_details(classification, resolved_target.as_ref(), json!({})).to_string()),
         )?;
 
         let executable = match request.provider {
@@ -579,7 +630,14 @@ impl Broker {
                     operation.id,
                     OperationStatus::Failed,
                     None,
-                    Some(r#"{"reason":"spawn_failed"}"#),
+                    Some(
+                        &journal_details(
+                            classification,
+                            resolved_target.as_ref(),
+                            json!({ "reason": "spawn_failed" }),
+                        )
+                        .to_string(),
+                    ),
                 )?;
                 return Err(BrokerOpError::OperationSpawn {
                     executable: executable.into(),
@@ -592,25 +650,32 @@ impl Broker {
             match on_success(&output.stdout, operation.id) {
                 Ok(Some(result)) => (
                     OperationStatus::Succeeded,
-                    json!({ "classification": classification, "result": result }),
+                    journal_details(
+                        classification,
+                        resolved_target.as_ref(),
+                        json!({ "result": result }),
+                    ),
                 ),
                 Ok(None) => (
                     OperationStatus::Succeeded,
-                    json!({ "classification": classification }),
+                    journal_details(classification, resolved_target.as_ref(), json!({})),
                 ),
                 Err(reason) => (
                     OperationStatus::OutcomeUnknown,
-                    json!({
-                        "classification": classification,
-                        "reason": "success_result_not_recorded",
-                        "diagnosis": reason,
-                    }),
+                    journal_details(
+                        classification,
+                        resolved_target.as_ref(),
+                        json!({
+                            "reason": "success_result_not_recorded",
+                            "diagnosis": reason,
+                        }),
+                    ),
                 ),
             }
         } else if effect == OperationEffect::Read {
             (
                 OperationStatus::Failed,
-                json!({ "classification": classification }),
+                journal_details(classification, resolved_target.as_ref(), json!({})),
             )
         } else {
             // A mutating command may have applied a subset of its effects
@@ -618,7 +683,7 @@ impl Broker {
             // make a blind retry possible, so require external inspection.
             (
                 OperationStatus::OutcomeUnknown,
-                json!({ "classification": classification }),
+                journal_details(classification, resolved_target.as_ref(), json!({})),
             )
         };
         let operation = self.store().transition_coordinated_operation(
@@ -630,6 +695,7 @@ impl Broker {
         Ok(CoordinatedOperationReport {
             operation,
             classification,
+            resolved_target,
             command_success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
