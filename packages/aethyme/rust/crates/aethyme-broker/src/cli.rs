@@ -294,6 +294,19 @@ fn now_ms() -> i64 {
 
 /// Entry point for the router. Returns a process exit code.
 pub fn run(args: &[String]) -> u8 {
+    run_with_mode(args, CompatibilityMode::Normal)
+}
+
+/// How the router permits this broker invocation to observe broker state.
+/// Degraded repository compatibility uses `ReadOnlySnapshot`; ordinary
+/// current-repository operation retains reconciliation behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatibilityMode {
+    Normal,
+    ReadOnlySnapshot,
+}
+
+pub fn run_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
     // Dispatched before the shared parser: the contract check is a CI/gate
     // entry point with its own flags (`--base`, `--pr-body`) and its own
     // exit-code contract (2 = bad invocation), and it deliberately records
@@ -303,7 +316,7 @@ pub fn run(args: &[String]) -> u8 {
         return crate::contract_check::run(&args[1..]);
     }
     let started = std::time::Instant::now();
-    let code = match run_inner(args) {
+    let code = match run_inner(args, mode) {
         Ok(()) => 0,
         Err(UsageError::Help) => {
             eprint!("{USAGE}");
@@ -318,7 +331,9 @@ pub fn run(args: &[String]) -> u8 {
             code
         }
     };
-    record_command_metric(args, code, started.elapsed().as_millis() as i64);
+    if mode == CompatibilityMode::Normal {
+        record_command_metric(args, code, started.elapsed().as_millis() as i64);
+    }
     code
 }
 
@@ -844,6 +859,7 @@ impl<E: std::fmt::Display> From<E> for UsageError {
 }
 
 struct Parsed {
+    read_only_snapshot: bool,
     positional: Vec<String>,
     task: Option<String>,
     cmd: Option<String>,
@@ -894,6 +910,7 @@ struct Parsed {
 
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
     let mut parsed = Parsed {
+        read_only_snapshot: false,
         positional: Vec::new(),
         task: None,
         cmd: None,
@@ -2144,10 +2161,14 @@ fn render_integration_reconcile(
     Ok(())
 }
 
-fn open_broker() -> Result<Broker, UsageError> {
+fn open_broker(read_only_snapshot: bool) -> Result<Broker, UsageError> {
     let cwd = std::env::current_dir()
         .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
-    Ok(Broker::open(&cwd)?)
+    if read_only_snapshot {
+        Ok(Broker::open_snapshot(&cwd)?)
+    } else {
+        Ok(Broker::open(&cwd)?)
+    }
 }
 
 fn parse_operation_effect(
@@ -2215,7 +2236,7 @@ fn run_report(parsed: Parsed) -> Result<(), UsageError> {
             let title = parsed.title.as_deref().ok_or(UsageError::Message(
                 "report capture requires --title".into(),
             ))?;
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             let selected_session = if let Some(session_id) = parsed.session {
                 Some(session_id)
             } else {
@@ -2376,7 +2397,7 @@ fn run_report(parsed: Parsed) -> Result<(), UsageError> {
                 .map_err(|error| UsageError::Message(error.to_string()))?;
             let checkout = crate::GitRepo::discover(&cwd)?;
             let worktree = checkout.root().to_string_lossy();
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             let session = broker
                 .store()
                 .session_for_worktree(&worktree)?
@@ -2618,15 +2639,16 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
-fn run_inner(args: &[String]) -> Result<(), UsageError> {
+fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError> {
     let Some(subcommand) = args.first() else {
         return Err(UsageError::Help);
     };
-    let parsed = parse(&args[1..])?;
+    let mut parsed = parse(&args[1..])?;
+    parsed.read_only_snapshot = mode == CompatibilityMode::ReadOnlySnapshot;
 
     match subcommand.as_str() {
         "adopt" => {
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             let path = parsed.positional.first().map(PathBuf::from).unwrap_or(
                 std::env::current_dir().map_err(|e| UsageError::Message(e.to_string()))?,
             );
@@ -2718,7 +2740,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             let task = parsed
                 .task
                 .ok_or(UsageError::Message("start requires --task".into()))?;
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             let session = broker.start_worktree(&task)?;
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&session)?);
@@ -2737,7 +2759,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             let cmd = parsed
                 .cmd
                 .ok_or(UsageError::Message("start-agent requires --cmd".into()))?;
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             let session = broker.start_agent(&task, &cmd)?;
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&session)?);
@@ -2755,9 +2777,15 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
         "report" => run_report(parsed)?,
         "resources" => run_resources(parsed)?,
         "agents" => {
-            let mut broker = open_broker()?;
-            let overlaps = broker.refresh_leases()?;
-            let views = broker.agents(now_ms())?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            let (overlaps, views) = if parsed.read_only_snapshot {
+                (
+                    broker.lease_overlaps_snapshot()?,
+                    broker.agents_snapshot(now_ms())?,
+                )
+            } else {
+                (broker.refresh_leases()?, broker.agents(now_ms())?)
+            };
             if parsed.json {
                 println!(
                     "{}",
@@ -2787,10 +2815,14 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             }
         }
         "leases" => {
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             match parsed.positional.first().map(String::as_str) {
                 None => {
-                    let overlaps = broker.refresh_leases()?;
+                    let overlaps = if parsed.read_only_snapshot {
+                        broker.lease_overlaps_snapshot()?
+                    } else {
+                        broker.refresh_leases()?
+                    };
                     let leases = broker.store().active_leases()?;
                     if parsed.json {
                         println!(
@@ -2867,7 +2899,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             let session = parsed
                 .session
                 .ok_or(UsageError::Message("exec requires --session <id>".into()))?;
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             let report = broker.guarded_exec(session, &parsed.exec_command)?;
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2928,7 +2960,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 authorization_reason: parsed.reason,
                 args: parsed.exec_command,
             };
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             let report = broker.run_coordinated_operation(request)?;
             render_coordinated_operation(&report, parsed.json)?;
             if !report.ok() {
@@ -2939,7 +2971,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             }
         }
         "operations" => {
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             match parsed.positional.first().map(String::as_str) {
                 None => {
                     let operations = broker.store().coordinated_operations()?;
@@ -3004,15 +3036,14 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             }
         }
         "gates" => {
-            let action =
-                parsed
-                    .positional
-                    .first()
-                    .map(String::as_str)
-                    .ok_or(UsageError::Message(
-                        "gates requires an action: draft, validate, affected, semantic, run, or pre-push"
-                            .into(),
-                    ))?;
+            let action = parsed
+                .positional
+                .first()
+                .map(String::as_str)
+                .ok_or(UsageError::Message(
+                "gates requires an action: draft, validate, affected, semantic, run, or pre-push"
+                    .into(),
+            ))?;
             match action {
                 "draft" => {
                     let cwd = std::env::current_dir()
@@ -3031,7 +3062,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     }
                 }
                 "validate" => {
-                    let broker = open_broker()?;
+                    let broker = open_broker(parsed.read_only_snapshot)?;
                     let gates = aethyme_gates_load(broker.main_root())?;
                     if parsed.json {
                         let summary: Vec<_> = gates
@@ -3072,7 +3103,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     let session = parsed.session.ok_or(UsageError::Message(
                         "gates affected requires --session <id>".into(),
                     ))?;
-                    let mut broker = open_broker()?;
+                    let mut broker = open_broker(parsed.read_only_snapshot)?;
                     let selections = broker.affected_gates(session)?;
                     if parsed.json {
                         let out: Vec<_> = selections
@@ -3097,7 +3128,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     let session = parsed.session.ok_or(UsageError::Message(
                         "gates semantic requires --session <id>".into(),
                     ))?;
-                    let mut broker = open_broker()?;
+                    let mut broker = open_broker(parsed.read_only_snapshot)?;
                     let report = broker.semantic_gate_advice(session)?;
                     if parsed.json {
                         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -3113,7 +3144,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     }
                     let cwd = std::env::current_dir()
                         .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
-                    let mut broker = open_broker()?;
+                    let mut broker = open_broker(parsed.read_only_snapshot)?;
                     let outcomes = broker.run_all_gates_with_policy(
                         &cwd,
                         if parsed.no_cache {
@@ -3152,7 +3183,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     let session = parsed.session.ok_or(UsageError::Message(
                         "gates run requires --session <id> (or --all)".into(),
                     ))?;
-                    let mut broker = open_broker()?;
+                    let mut broker = open_broker(parsed.read_only_snapshot)?;
                     let outcomes = broker.run_gates_with_policy(
                         session,
                         if parsed.no_cache {
@@ -3211,7 +3242,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     let cwd = std::env::current_dir().map_err(|error| {
                         UsageError::Message(format!("cannot resolve cwd: {error}"))
                     })?;
-                    let mut broker = open_broker()?;
+                    let mut broker = open_broker(parsed.read_only_snapshot)?;
                     let report = broker.run_pre_push_gates(
                         &cwd,
                         remote,
@@ -3272,7 +3303,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 .ok_or(UsageError::Message("pr requires an action: check".into()))?;
             match action {
                 "check" => {
-                    let mut broker = open_broker()?;
+                    let mut broker = open_broker(parsed.read_only_snapshot)?;
                     let report = broker.pr_check(crate::PrCheckOptions {
                         target_branch: parsed.target.unwrap_or_else(|| "production".into()),
                         pr_number: parsed.pr_number,
@@ -3352,7 +3383,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             let session = parsed
                 .session
                 .ok_or(UsageError::Message("submit requires --session <id>".into()))?;
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             // Preflight (dogfood feedback 2026-07-14): show exactly what
             // will be submitted before anything runs — and warn about
             // uncommitted work, which never integrates.
@@ -3514,7 +3545,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             let session = parsed
                 .session
                 .ok_or(UsageError::Message("repair requires --session <id>".into()))?;
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             let report = broker.repair(session)?;
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -3523,7 +3554,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             }
         }
         "queue" => {
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             let entries = broker.store().merge_queue()?;
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&entries)?);
@@ -3546,7 +3577,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             let entry = parsed
                 .entry
                 .ok_or(UsageError::Message("promote requires --entry <id>".into()))?;
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             broker.promote(entry)?;
             if parsed.json {
                 println!("{{\"promoted\":{entry}}}");
@@ -3566,7 +3597,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     let entry = parsed.entry.ok_or(UsageError::Message(
                         "ship plan requires --entry <id>".into(),
                     ))?;
-                    let mut broker = open_broker()?;
+                    let mut broker = open_broker(parsed.read_only_snapshot)?;
                     let report = broker.ship_plan(entry)?;
                     render_ship_plan(&report, parsed.json)?;
                 }
@@ -3577,7 +3608,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     let confirm = parsed.confirm.as_deref().ok_or(UsageError::Message(
                         "ship execute requires --confirm <full-integration-sha>".into(),
                     ))?;
-                    let mut broker = open_broker()?;
+                    let mut broker = open_broker(parsed.read_only_snapshot)?;
                     let report = broker.ship_execute_with_sync(entry, confirm, parsed.sync_main)?;
                     render_ship_execution(&report, parsed.json)?;
                 }
@@ -3599,13 +3630,17 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     ))?;
             match action {
                 "status" => {
-                    let mut broker = open_broker()?;
-                    let report = broker.integration_status(now_ms())?;
+                    let mut broker = open_broker(parsed.read_only_snapshot)?;
+                    let report = if parsed.read_only_snapshot {
+                        broker.integration_status_snapshot()?
+                    } else {
+                        broker.integration_status(now_ms())?
+                    };
                     render_integration_status(&report, parsed.json)?;
                 }
                 "wait-stable" => {
                     let seconds = parsed.seconds.unwrap_or(30);
-                    let mut broker = open_broker()?;
+                    let mut broker = open_broker(parsed.read_only_snapshot)?;
                     let report = broker.wait_integration_stable(seconds)?;
                     render_integration_stability(&report, parsed.json)?;
                     if !report.stable {
@@ -3623,7 +3658,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                     let upstream = parsed.upstream.clone().ok_or(UsageError::Message(
                         "integration reconcile requires --upstream <ref>".into(),
                     ))?;
-                    let mut broker = open_broker()?;
+                    let mut broker = open_broker(parsed.read_only_snapshot)?;
                     let report =
                         broker.reconcile_integration(crate::IntegrationReconcileOptions {
                             upstream,
@@ -3647,8 +3682,12 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             }
         }
         "status" => {
-            let mut broker = open_broker()?;
-            let status = broker.status(now_ms())?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            let status = if parsed.read_only_snapshot {
+                broker.status_snapshot(now_ms())?
+            } else {
+                broker.status(now_ms())?
+            };
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
@@ -3712,7 +3751,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 let keep_days = parsed.keep_days.ok_or(UsageError::Message(
                     "events prune requires --keep-days <n>".into(),
                 ))?;
-                let mut broker = open_broker()?;
+                let mut broker = open_broker(parsed.read_only_snapshot)?;
                 let cutoff = now_ms() - keep_days * 24 * 60 * 60 * 1000;
                 let removed = broker.store().prune_events_before(cutoff)?;
                 if parsed.json {
@@ -3722,7 +3761,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 }
                 return Ok(());
             }
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             let mut cursor = parsed.since.unwrap_or(0);
             // --follow survives transient read errors (e.g. a checkpoint
             // or a busy writer) with bounded retries instead of dying.
@@ -3770,7 +3809,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             }
         }
         "metrics" => {
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             // Gate executions (pass/fail) vs cache hits with saved time.
             let executed = broker.store().gate_execution_totals()?;
             let cached = broker
@@ -3849,7 +3888,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             }
         }
         "doctor" => {
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             let report = if parsed.fix_version {
                 broker.doctor_with_version_fix()?
             } else {
@@ -3989,7 +4028,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             render_quick_test_report(&report, parsed.json)?;
         }
         "verify-loop" | "e2e" => {
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             let cwd = std::env::current_dir()
                 .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
             let report = broker.verify_loop_from(&cwd)?;
@@ -4095,7 +4134,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             }
         }
         "handoff" => {
-            let broker = open_broker()?;
+            let broker = open_broker(parsed.read_only_snapshot)?;
             let report = match (parsed.session, parsed.worktree.as_deref()) {
                 (Some(session), None) => broker.latest_handoff_for_session(session)?,
                 (None, Some(worktree)) => {
@@ -4123,7 +4162,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             let session = parsed
                 .session
                 .ok_or(UsageError::Message("finish requires --session <id>".into()))?;
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             let report = broker.finish(session)?;
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -4138,7 +4177,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
             let session = parsed
                 .session
                 .ok_or(UsageError::Message("close requires --session <id>".into()))?;
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             broker.close(session)?;
             if parsed.json {
                 println!("{}", serde_json::json!({ "closed": session }));
@@ -4156,7 +4195,7 @@ fn run_inner(args: &[String]) -> Result<(), UsageError> {
                 .ok_or(UsageError::Message("cleanup requires a session id".into()))?
                 .parse()
                 .map_err(|_| UsageError::Message("session id must be an integer".into()))?;
-            let mut broker = open_broker()?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
             broker.cleanup(id, parsed.force)?;
             if parsed.json {
                 println!("{{\"cleaned\":{id}}}");

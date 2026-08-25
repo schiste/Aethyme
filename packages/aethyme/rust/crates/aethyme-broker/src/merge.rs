@@ -871,6 +871,19 @@ impl Broker {
         self.repo_handle()
             .resolve_ref(&format!("refs/heads/{branch}"))
     }
+
+    /// Resolve the integration view without creating or fast-forwarding its
+    /// ref. Before the first promotion, a snapshot reports main as the
+    /// effective integration base while leaving the ref absent.
+    pub(crate) fn integration_head_snapshot(&self) -> Result<(String, String), BrokerOpError> {
+        let branch = PromoteConfig::load(&self.main_root_path()).branch;
+        let commit = self
+            .repo_handle()
+            .resolve_ref(&format!("refs/heads/{branch}"))
+            .map(Ok)
+            .unwrap_or_else(|| self.repo_handle().head_commit())?;
+        Ok((branch, commit))
+    }
 }
 
 /// Remove a stale action-required drop once the session's work promotes

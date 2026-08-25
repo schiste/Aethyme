@@ -17,6 +17,24 @@ const PLAN_SCHEMA_VERSION: u32 = 1;
 const MIGRATION_ID: &str = "repository-deployment-v1";
 const MIGRATION_IN_PROGRESS: &str = "repository-deployment-v1:in-progress";
 
+#[derive(Debug, Clone, Copy)]
+struct EmbeddedMigration {
+    id: &'static str,
+    from_schema: u32,
+    to_schema: u32,
+    /// Commands owned by a session pinned to `from_schema` may keep running
+    /// while this migration is pending. This is an explicit executable-code
+    /// promise, not an inference from the migration being additive.
+    backward_executable: bool,
+}
+
+const EMBEDDED_MIGRATIONS: &[EmbeddedMigration] = &[EmbeddedMigration {
+    id: MIGRATION_ID,
+    from_schema: 0,
+    to_schema: 1,
+    backward_executable: true,
+}];
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryMode {
@@ -104,6 +122,18 @@ pub enum CompatibilitySeverity {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatibilityExecution {
+    Normal,
+    ReadOnlySnapshot,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompatibilityContext<'a> {
+    pub session_contract: Option<&'a aethyme_broker::RepositoryContract>,
+}
+
 /// A pure, render-independent compatibility decision for one parsed command.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CompatibilityDecision {
@@ -111,6 +141,7 @@ pub struct CompatibilityDecision {
     pub capability: CommandCapability,
     pub allowed: bool,
     pub severity: CompatibilitySeverity,
+    pub execution: CompatibilityExecution,
     pub reason: String,
     pub remediation: Option<String>,
 }
@@ -132,12 +163,14 @@ impl CompatibilityDecision {
 pub fn compatibility_decision(
     repo_hint: &Path,
     capability: CommandCapability,
+    context: CompatibilityContext<'_>,
 ) -> Option<CompatibilityDecision> {
     let repo = git_root(repo_hint).ok()?;
     let mode = detect_mode(&repo)?;
-    let (repository, reason, remediation) = match read_marker(&repo, mode) {
+    let (repository, repository_schema, reason, remediation) = match read_marker(&repo, mode) {
         Ok(marker) => {
             let repository = classify_marker(marker.as_ref());
+            let repository_schema = marker.as_ref().map_or(0, |marker| marker.schema_version);
             let (reason, remediation) = match repository {
                 RepositoryCompatibility::Current => {
                     ("repository deployment is current".into(), None)
@@ -164,10 +197,11 @@ pub fn compatibility_decision(
                     unreachable!("marker parsing errors are handled separately")
                 }
             };
-            (repository, reason, remediation)
+            (repository, Some(repository_schema), reason, remediation)
         }
         Err(error) => (
             RepositoryCompatibility::Invalid,
+            None,
             format!("repository deployment marker is invalid: {error}"),
             Some(format!(
                 "inspect {} and run `aethyme upgrade plan --repo .`",
@@ -177,7 +211,9 @@ pub fn compatibility_decision(
     };
     Some(decide_compatibility(
         repository,
+        repository_schema,
         capability,
+        context,
         reason,
         remediation,
     ))
@@ -185,16 +221,42 @@ pub fn compatibility_decision(
 
 fn decide_compatibility(
     repository: RepositoryCompatibility,
+    repository_schema: Option<u32>,
     capability: CommandCapability,
+    context: CompatibilityContext<'_>,
     reason: String,
     remediation: Option<String>,
 ) -> CompatibilityDecision {
-    // I1 intentionally preserves the original policy: every broker command is
-    // refused for a non-current deployment, while the explicit upgrade path
-    // remains available. Later changes can relax individual capabilities here
-    // without reintroducing string-based command checks in the router.
-    let allowed =
-        repository == RepositoryCompatibility::Current || capability == CommandCapability::Upgrade;
+    let pinned_session_is_executable = repository_schema.is_some_and(|repository_schema| {
+        context.session_contract.is_some_and(|contract| {
+            contract.repository_schema.unwrap_or(0) == repository_schema
+                && migration_path_is_backward_executable(repository_schema)
+        })
+    });
+    let allowed = match repository {
+        RepositoryCompatibility::Current => true,
+        RepositoryCompatibility::UpgradeRequired | RepositoryCompatibility::UpgradeInProgress => {
+            match capability {
+                CommandCapability::DiagnosticRead
+                | CommandCapability::RecoveryWrite
+                | CommandCapability::Upgrade => true,
+                CommandCapability::SessionContinuation => pinned_session_is_executable,
+                CommandCapability::NewSession | CommandCapability::SharedMutation => false,
+            }
+        }
+        RepositoryCompatibility::NewerThanBinary | RepositoryCompatibility::Invalid => matches!(
+            capability,
+            CommandCapability::DiagnosticRead | CommandCapability::Upgrade
+        ),
+    };
+    let execution = if allowed
+        && repository != RepositoryCompatibility::Current
+        && capability == CommandCapability::DiagnosticRead
+    {
+        CompatibilityExecution::ReadOnlySnapshot
+    } else {
+        CompatibilityExecution::Normal
+    };
     let severity = match repository {
         RepositoryCompatibility::Current => CompatibilitySeverity::Info,
         RepositoryCompatibility::UpgradeRequired | RepositoryCompatibility::UpgradeInProgress => {
@@ -209,9 +271,29 @@ fn decide_compatibility(
         capability,
         allowed,
         severity,
+        execution,
         reason,
         remediation,
     }
+}
+
+fn migration_path_is_backward_executable(from_schema: u32) -> bool {
+    let mut cursor = from_schema;
+    let mut found = false;
+    for migration in EMBEDDED_MIGRATIONS {
+        if migration.from_schema != cursor {
+            continue;
+        }
+        found = true;
+        if !migration.backward_executable {
+            return false;
+        }
+        cursor = migration.to_schema;
+        if cursor == REPOSITORY_SCHEMA_VERSION {
+            return true;
+        }
+    }
+    found && cursor == REPOSITORY_SCHEMA_VERSION
 }
 
 pub fn write_current_marker(repo: &Path, mode: RepositoryMode) -> Result<(), String> {
@@ -375,11 +457,13 @@ pub fn plan(
         blockers.push("repository worktree is dirty; commit or stash changes before applying a repository upgrade".into());
     }
     let repository_head = git(&repo, &["rev-parse", "HEAD"])?;
-    let migrations = if from_schema < REPOSITORY_SCHEMA_VERSION {
-        vec![MIGRATION_ID.into()]
-    } else {
-        Vec::new()
-    };
+    let migrations = EMBEDDED_MIGRATIONS
+        .iter()
+        .filter(|migration| {
+            migration.from_schema >= from_schema && migration.to_schema <= REPOSITORY_SCHEMA_VERSION
+        })
+        .map(|migration| migration.id.to_string())
+        .collect::<Vec<_>>();
     let planned_paths = if migrations.is_empty() {
         Vec::new()
     } else {
@@ -734,10 +818,20 @@ fn print_usage() {
 #[cfg(test)]
 mod compatibility_tests {
     use super::{
-        CommandCapability, CompatibilitySeverity, MIGRATION_ID, MIGRATION_IN_PROGRESS,
-        REPOSITORY_SCHEMA_VERSION, RepositoryCompatibility, RepositoryMarker, classify_marker,
-        decide_compatibility,
+        CommandCapability, CompatibilityContext, CompatibilityExecution, CompatibilitySeverity,
+        MIGRATION_ID, MIGRATION_IN_PROGRESS, REPOSITORY_SCHEMA_VERSION, RepositoryCompatibility,
+        RepositoryMarker, classify_marker, decide_compatibility,
     };
+
+    fn schema(repository: RepositoryCompatibility) -> Option<u32> {
+        match repository {
+            RepositoryCompatibility::Current => Some(REPOSITORY_SCHEMA_VERSION),
+            RepositoryCompatibility::UpgradeRequired
+            | RepositoryCompatibility::UpgradeInProgress => Some(0),
+            RepositoryCompatibility::NewerThanBinary => Some(REPOSITORY_SCHEMA_VERSION + 1),
+            RepositoryCompatibility::Invalid => None,
+        }
+    }
 
     #[test]
     fn marker_classification_covers_every_non_invalid_repository_state() {
@@ -781,7 +875,7 @@ mod compatibility_tests {
     }
 
     #[test]
-    fn initial_policy_preserves_current_broker_behavior_for_every_capability() {
+    fn command_lanes_preserve_diagnostics_and_recovery_without_new_mutations() {
         let repository_states = [
             RepositoryCompatibility::Current,
             RepositoryCompatibility::UpgradeRequired,
@@ -802,20 +896,79 @@ mod compatibility_tests {
             for capability in capabilities {
                 let decision = decide_compatibility(
                     repository,
+                    schema(repository),
                     capability,
+                    CompatibilityContext::default(),
                     "reason".into(),
                     Some("remediation".into()),
                 );
+                let expected = match repository {
+                    RepositoryCompatibility::Current => true,
+                    RepositoryCompatibility::UpgradeRequired
+                    | RepositoryCompatibility::UpgradeInProgress => matches!(
+                        capability,
+                        CommandCapability::DiagnosticRead
+                            | CommandCapability::RecoveryWrite
+                            | CommandCapability::Upgrade
+                    ),
+                    RepositoryCompatibility::NewerThanBinary | RepositoryCompatibility::Invalid => {
+                        matches!(
+                            capability,
+                            CommandCapability::DiagnosticRead | CommandCapability::Upgrade
+                        )
+                    }
+                };
                 assert_eq!(
-                    decision.allowed,
-                    repository == RepositoryCompatibility::Current
-                        || capability == CommandCapability::Upgrade,
+                    decision.allowed, expected,
                     "unexpected decision for {repository:?} and {capability:?}"
                 );
                 assert_eq!(decision.repository, repository);
                 assert_eq!(decision.capability, capability);
                 assert_eq!(decision.refusal_message().is_none(), decision.allowed);
+                assert_eq!(
+                    decision.execution,
+                    if expected
+                        && repository != RepositoryCompatibility::Current
+                        && capability == CommandCapability::DiagnosticRead
+                    {
+                        CompatibilityExecution::ReadOnlySnapshot
+                    } else {
+                        CompatibilityExecution::Normal
+                    }
+                );
             }
+        }
+    }
+
+    #[test]
+    fn only_a_matching_pinned_contract_can_continue_a_backward_executable_migration() {
+        let legacy = aethyme_broker::RepositoryContract {
+            repository_schema: None,
+            deployment_state_digest: "a".repeat(64),
+            aethyme_version: "0.1.0".into(),
+            gate_definition_digest: None,
+            backfilled: true,
+        };
+        let current = aethyme_broker::RepositoryContract {
+            repository_schema: Some(REPOSITORY_SCHEMA_VERSION),
+            ..legacy.clone()
+        };
+        for (contract, expected) in [
+            (Some(&legacy), true),
+            (Some(&current), false),
+            (None, false),
+        ] {
+            let decision = decide_compatibility(
+                RepositoryCompatibility::UpgradeRequired,
+                Some(0),
+                CommandCapability::SessionContinuation,
+                CompatibilityContext {
+                    session_contract: contract,
+                },
+                "reason".into(),
+                Some("remediation".into()),
+            );
+            assert_eq!(decision.allowed, expected);
         }
     }
 
@@ -846,7 +999,9 @@ mod compatibility_tests {
         for (repository, severity) in cases {
             let decision = decide_compatibility(
                 repository,
+                schema(repository),
                 CommandCapability::Upgrade,
+                CompatibilityContext::default(),
                 "reason".into(),
                 None,
             );

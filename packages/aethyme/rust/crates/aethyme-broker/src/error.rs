@@ -22,6 +22,15 @@ pub enum BrokerError {
     )]
     SchemaTooNew { found: i64, supported: i64 },
 
+    #[error(
+        "broker db schema version {found} is outside this binary's non-mutating snapshot range {minimum}..={maximum}; use a compatible Aethyme binary for recovery"
+    )]
+    SnapshotSchemaMismatch {
+        found: i64,
+        minimum: i64,
+        maximum: i64,
+    },
+
     #[error("no session with id {0}")]
     SessionNotFound(i64),
 

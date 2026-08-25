@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::error::BrokerError;
 use crate::schema::{self, EVENTS_SCHEMA_VERSION};
@@ -56,6 +56,8 @@ fn now_ms() -> i64 {
 pub struct BrokerStore {
     conn: Connection,
     path: PathBuf,
+    /// Keeps a migrated temporary snapshot alive for the connection lifetime.
+    _snapshot_dir: Option<tempfile::TempDir>,
 }
 
 /// One queue-row mutation committed with an integration reconciliation.
@@ -87,6 +89,71 @@ impl BrokerStore {
     /// repository root: `<repo>/.aethyme/broker.db`.
     pub fn open_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
         Self::open(&repo_root.join(crate::BROKER_DB_RELPATH))
+    }
+
+    /// Open the current broker schema without creating, migrating, or
+    /// reconciling any persisted state. Compatibility diagnostics use this
+    /// path so an observational command cannot become the write that upgrades
+    /// storage or refreshes a session.
+    pub fn open_snapshot_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
+        let path = repo_root.join(crate::BROKER_DB_RELPATH);
+        if !path.is_file() {
+            let conn = Connection::open_in_memory()?;
+            schema::migrate(&conn)?;
+            conn.pragma_update(None, "query_only", true)?;
+            return Ok(Self {
+                conn,
+                path,
+                _snapshot_dir: None,
+            });
+        }
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        let found = schema::current_version(&conn)?;
+        if found > crate::SCHEMA_VERSION {
+            return Err(BrokerError::SchemaTooNew {
+                found,
+                supported: crate::SCHEMA_VERSION,
+            });
+        }
+        if found < crate::BROKER_STORAGE_MINIMUM_SCHEMA {
+            return Err(BrokerError::SnapshotSchemaMismatch {
+                found,
+                minimum: crate::BROKER_STORAGE_MINIMUM_SCHEMA,
+                maximum: crate::SCHEMA_VERSION,
+            });
+        }
+        if found == crate::SCHEMA_VERSION {
+            conn.pragma_update(None, "query_only", true)?;
+            return Ok(Self {
+                conn,
+                path,
+                _snapshot_dir: None,
+            });
+        }
+
+        // SQLite's VACUUM INTO reads a transactionally consistent image,
+        // including WAL contents, into a separate file without altering the
+        // source. Migrations then run only on that disposable copy.
+        let snapshot_dir = tempfile::tempdir().map_err(|source| BrokerError::Io {
+            path: std::env::temp_dir(),
+            source,
+        })?;
+        let snapshot_path = snapshot_dir.path().join("broker-snapshot.db");
+        conn.execute("VACUUM INTO ?1", [snapshot_path.to_string_lossy().as_ref()])?;
+        drop(conn);
+        let snapshot = Connection::open(&snapshot_path)?;
+        snapshot.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        schema::migrate(&snapshot)?;
+        snapshot.pragma_update(None, "query_only", true)?;
+        Ok(Self {
+            conn: snapshot,
+            path,
+            _snapshot_dir: Some(snapshot_dir),
+        })
     }
 
     /// Open (creating and migrating if needed) a broker database at an
@@ -132,6 +199,7 @@ impl BrokerStore {
         Ok(Self {
             conn,
             path: db_path.to_path_buf(),
+            _snapshot_dir: None,
         })
     }
 
@@ -1658,4 +1726,44 @@ fn insert_event(
         params![EVENTS_SCHEMA_VERSION, ts, kind, session_id, payload_json],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn readable_old_schema_is_migrated_only_in_a_temporary_snapshot() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".aethyme")).unwrap();
+        let database = repo.path().join(crate::BROKER_DB_RELPATH);
+        let source = Connection::open(&database).unwrap();
+        source
+            .execute_batch(&format!(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n\
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '1');\n{}",
+                crate::schema::MIGRATION_V1
+            ))
+            .unwrap();
+        drop(source);
+
+        let snapshot = BrokerStore::open_snapshot_in_repo(repo.path()).unwrap();
+        assert!(snapshot.live_sessions().unwrap().is_empty());
+        assert_eq!(
+            schema::current_version(&snapshot.conn).unwrap(),
+            crate::SCHEMA_VERSION
+        );
+        drop(snapshot);
+
+        let source =
+            Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(schema::current_version(&source).unwrap(), 1);
+        let adoption_base_exists = source
+            .prepare("PRAGMA table_info(sessions)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .any(|column| column.unwrap() == "adoption_base");
+        assert!(!adoption_base_exists);
+    }
 }

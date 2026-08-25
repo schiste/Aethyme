@@ -68,24 +68,29 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
     let nested = args.get(1).map(String::as_str);
     match (subcommand, nested) {
         (Some("start" | "start-agent"), _) => CommandCapability::NewSession,
-        (Some("adopt"), _) if args.iter().any(|arg| arg == "--reuse") => {
-            CommandCapability::SessionContinuation
-        }
         (Some("adopt"), _) => CommandCapability::NewSession,
-        (Some("close" | "finish" | "submit" | "exec" | "git" | "gh"), _) => {
+        (Some("submit" | "exec" | "repair"), _) => CommandCapability::SessionContinuation,
+        (Some("hooks"), Some("pre-commit" | "post-commit")) => {
             CommandCapability::SessionContinuation
         }
         (Some("leases"), Some("claim" | "release")) => CommandCapability::SessionContinuation,
-        (Some("gates"), Some("run" | "pre-push")) => CommandCapability::SessionContinuation,
-        (Some("repair" | "cleanup"), _) => CommandCapability::RecoveryWrite,
-        (Some("operations" | "resources"), Some("reconcile"))
-        | (Some("integration"), Some("reconcile")) => CommandCapability::RecoveryWrite,
+        (Some("gates"), Some("run" | "pre-push" | "affected" | "semantic")) => {
+            CommandCapability::SessionContinuation
+        }
+        (Some("close" | "finish" | "git" | "gh" | "cleanup"), _) => {
+            CommandCapability::RecoveryWrite
+        }
+        (Some("report"), Some("file")) => CommandCapability::RecoveryWrite,
+        (Some("operations" | "resources"), Some("reconcile")) => CommandCapability::RecoveryWrite,
+        (Some("integration"), Some("reconcile")) if args.iter().any(|arg| arg == "--apply") => {
+            CommandCapability::RecoveryWrite
+        }
         (Some("ship"), Some("plan"))
-        | (Some("integration"), Some("status" | "wait-stable"))
-        | (Some("leases"), Some("plan"))
+        | (Some("integration"), Some("status" | "reconcile"))
+        | (Some("leases"), _)
         | (Some("resources"), Some("plan" | "list"))
-        | (Some("gates"), Some("validate" | "affected" | "semantic"))
-        | (Some("report"), Some("list" | "show"))
+        | (Some("gates"), Some("validate"))
+        | (Some("report"), Some("capture" | "list" | "show" | "render"))
         | (Some("hooks"), Some("status"))
         | (Some("operations"), _)
         | (Some("handoff" | "queue" | "status" | "agents" | "metrics" | "certify"), _)
@@ -94,11 +99,27 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         {
             CommandCapability::DiagnosticRead
         }
-        (Some("doctor"), _) if !args.iter().any(|arg| arg == "--fix-version") => {
-            CommandCapability::DiagnosticRead
-        }
         _ => CommandCapability::SharedMutation,
     }
+}
+
+fn pinned_session_contract(
+    cwd: &Path,
+    args: &[String],
+) -> Option<aethyme_broker::RepositoryContract> {
+    let mut broker = aethyme_broker::Broker::open_for_compatibility_backfill(cwd).ok()?;
+    let explicit_session = args
+        .windows(2)
+        .find(|pair| pair[0] == "--session")
+        .and_then(|pair| pair[1].parse::<i64>().ok());
+    let session = if let Some(session_id) = explicit_session {
+        broker.store().session(session_id).ok()?
+    } else {
+        let checkout = aethyme_broker::GitRepo::discover(cwd).ok()?;
+        let worktree = checkout.root().to_string_lossy();
+        broker.store().session_for_worktree(&worktree).ok()??
+    };
+    session.repository_contract
 }
 
 fn main() -> ExitCode {
@@ -108,13 +129,47 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
+    let mut broker_compatibility_mode = aethyme_broker::cli::CompatibilityMode::Normal;
     if let Some(capability) = command.compatibility_capability
         && let Ok(cwd) = env::current_dir()
-        && let Some(decision) = repository_upgrade::compatibility_decision(&cwd, capability)
-        && let Some(message) = decision.refusal_message()
     {
-        eprintln!("Error: {message}");
-        return ExitCode::from(1);
+        let initial = repository_upgrade::compatibility_decision(
+            &cwd,
+            capability,
+            repository_upgrade::CompatibilityContext::default(),
+        );
+        let pinned_contract = initial
+            .as_ref()
+            .filter(|decision| {
+                capability == repository_upgrade::CommandCapability::SessionContinuation
+                    && matches!(
+                        decision.repository,
+                        repository_upgrade::RepositoryCompatibility::UpgradeRequired
+                            | repository_upgrade::RepositoryCompatibility::UpgradeInProgress
+                    )
+            })
+            .and_then(|_| pinned_session_contract(&cwd, command.args));
+        let decision = if pinned_contract.is_some() {
+            repository_upgrade::compatibility_decision(
+                &cwd,
+                capability,
+                repository_upgrade::CompatibilityContext {
+                    session_contract: pinned_contract.as_ref(),
+                },
+            )
+        } else {
+            initial
+        };
+        if let Some(decision) = decision {
+            if let Some(message) = decision.refusal_message() {
+                eprintln!("Error: {message}");
+                return ExitCode::from(1);
+            }
+            if decision.execution == repository_upgrade::CompatibilityExecution::ReadOnlySnapshot {
+                broker_compatibility_mode =
+                    aethyme_broker::cli::CompatibilityMode::ReadOnlySnapshot;
+            }
+        }
     }
 
     match command.name {
@@ -205,7 +260,10 @@ fn main() -> ExitCode {
         },
         "root" => run_root_subcommand(&args[1..]),
         // Broker commands have been native Rust from birth (issue #31).
-        "broker" => ExitCode::from(aethyme_broker::cli::run(command.args)),
+        "broker" => ExitCode::from(aethyme_broker::cli::run_with_mode(
+            command.args,
+            broker_compatibility_mode,
+        )),
         "update" => ExitCode::from(aethyme_broker::run_update_cli(command.args)),
         "upgrade" => ExitCode::from(repository_upgrade::run(command.args)),
         // Certification — top-level by design (the "airport certification"
@@ -586,7 +644,7 @@ mod compatibility_command_tests {
         let cases = [
             (&["broker", "status"][..], CommandCapability::DiagnosticRead),
             (
-                &["broker", "integration", "reconcile"][..],
+                &["broker", "integration", "reconcile", "--apply"][..],
                 CommandCapability::RecoveryWrite,
             ),
             (
@@ -617,12 +675,61 @@ mod compatibility_command_tests {
     fn compatibility_is_scoped_to_the_existing_broker_boundary() {
         assert_eq!(
             capability(&["broker", "adopt", "--reuse"]),
-            Some(CommandCapability::SessionContinuation)
+            Some(CommandCapability::NewSession)
         );
         assert_eq!(
             capability(&["broker", "adopt"]),
             Some(CommandCapability::NewSession)
         );
         assert_eq!(capability(&["explore"]), None);
+    }
+
+    #[test]
+    fn degraded_repository_lanes_match_command_semantics() {
+        let cases = [
+            (
+                &["broker", "integration", "reconcile", "--dry-run"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "integration", "reconcile", "--apply"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "report", "capture"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "report", "file"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "git", "--session", "7"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "finish", "--session", "7"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "close", "--session", "7"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "hooks", "pre-commit"][..],
+                CommandCapability::SessionContinuation,
+            ),
+            (
+                &["broker", "integration", "status"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+        ];
+        for (args, expected) in cases {
+            assert_eq!(
+                capability(args),
+                Some(expected),
+                "unexpected lane: {args:?}"
+            );
+        }
     }
 }

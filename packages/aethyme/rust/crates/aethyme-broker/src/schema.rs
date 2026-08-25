@@ -21,7 +21,7 @@ pub const SCHEMA_VERSION: i64 = 9;
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
 
-const MIGRATION_V1: &str = "
+pub(crate) const MIGRATION_V1: &str = "
 CREATE TABLE sessions (
     id               INTEGER PRIMARY KEY,
     worktree_path    TEXT NOT NULL,
@@ -309,7 +309,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V9,
 ];
 
-fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
+pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
     let version = conn
         .query_row(
             "SELECT value FROM meta WHERE key = 'schema_version'",

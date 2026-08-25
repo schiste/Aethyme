@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use aethyme_broker::{AdoptMode, AdoptOptions, Broker, BrokerStore};
 use aethyme_testkit::{aethyme_bin, tmp_dir};
 use serde_json::Value;
 
@@ -68,6 +69,22 @@ fn old_canonical_deployment(repo: &Path) {
     );
     fs::remove_file(repo.join(".aethyme/repository.json")).unwrap();
     commit_all(repo, "deploy old repository contract");
+}
+
+fn adopt_legacy_session(repo: &Path) -> i64 {
+    let mut broker = Broker::open(repo).unwrap();
+    broker
+        .adopt_with_options(
+            repo,
+            Some("legacy session"),
+            AdoptOptions {
+                mode: AdoptMode::New,
+                sync_integration: false,
+            },
+        )
+        .unwrap()
+        .session
+        .id
 }
 
 fn json(output: &Output) -> Value {
@@ -157,29 +174,123 @@ fn dirty_repository_blocks_upgrade_without_mutation() {
 }
 
 #[test]
-fn broker_refuses_an_obsolete_enrolled_repository() {
+fn obsolete_repository_status_is_a_genuinely_non_mutating_snapshot() {
     let temp = tmp_dir();
     let repo = repository(temp.path());
     old_canonical_deployment(&repo);
+    let session = adopt_legacy_session(&repo);
+    fs::write(repo.join("legacy-wip.txt"), "not leased by a snapshot\n").unwrap();
+
+    let before_store = BrokerStore::open_in_repo(&repo).unwrap();
+    let before_events = before_store.events_after(0, 10_000).unwrap();
+    let before_leases = before_store.active_leases().unwrap();
+    drop(before_store);
+    let metrics_path = repo.join(".aethyme/logs/command-metrics.jsonl");
+    let before_metrics = fs::read(&metrics_path).ok();
 
     let status = run(&repo, &["broker", "status", "--json"]);
-    assert!(!status.status.success());
-    let stderr = String::from_utf8_lossy(&status.stderr);
-    assert!(stderr.contains("repository deployment requires an embedded upgrade"));
-    assert!(stderr.contains("aethyme upgrade plan"));
+    let report = json(&status);
+    assert!(report["agents"].as_array().unwrap().iter().any(|agent| {
+        agent["id"] == session && agent["repository_contract"]["repository_schema"].is_null()
+    }));
+
+    let after_store = BrokerStore::open_in_repo(&repo).unwrap();
+    assert_eq!(
+        serde_json::to_value(after_store.events_after(0, 10_000).unwrap()).unwrap(),
+        serde_json::to_value(before_events).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(after_store.active_leases().unwrap()).unwrap(),
+        serde_json::to_value(before_leases).unwrap()
+    );
+    assert_eq!(fs::read(&metrics_path).ok(), before_metrics);
 }
 
 #[test]
-fn every_parsed_broker_capability_preserves_the_initial_refusal_policy() {
+fn older_repository_allows_diagnostics_recovery_and_only_pinned_continuation() {
     let temp = tmp_dir();
     let repo = repository(temp.path());
     old_canonical_deployment(&repo);
+    let session = adopt_legacy_session(&repo);
 
     for args in [
-        &["broker", "status"][..],
-        &["broker", "integration", "reconcile"][..],
-        &["broker", "submit", "--session", "7"][..],
+        &["broker", "status", "--json"][..],
+        &["broker", "integration", "status", "--json"][..],
+        &["broker", "agents", "--json"][..],
+        &["broker", "leases", "--json"][..],
+        &["broker", "operations", "--json"][..],
+        &["broker", "events", "--json"][..],
+        &["broker", "report", "list", "--json"][..],
+        &[
+            "broker",
+            "report",
+            "capture",
+            "--kind",
+            "bug",
+            "--title",
+            "legacy diagnostics",
+            "--stdout",
+        ][..],
+    ] {
+        let output = run(&repo, args);
+        assert!(
+            output.status.success(),
+            "diagnostic command failed: {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let session_arg = session.to_string();
+    let continued = run(
+        &repo,
+        &["broker", "exec", "--session", &session_arg, "--", "true"],
+    );
+    assert!(
+        continued.status.success(),
+        "{}",
+        String::from_utf8_lossy(&continued.stderr)
+    );
+    let coordinated_git = run(
+        &repo,
+        &[
+            "broker",
+            "git",
+            "--session",
+            &session_arg,
+            "--",
+            "status",
+            "--short",
+        ],
+    );
+    assert!(
+        coordinated_git.status.success(),
+        "{}",
+        String::from_utf8_lossy(&coordinated_git.stderr)
+    );
+
+    let finished = run(
+        &repo,
+        &["broker", "finish", "--session", &session_arg, "--json"],
+    );
+    assert!(
+        finished.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    let handoff = run(
+        &repo,
+        &["broker", "handoff", "--session", &session_arg, "--json"],
+    );
+    assert!(
+        handoff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&handoff.stderr)
+    );
+
+    for args in [
+        &["broker", "submit", "--session", "9999"][..],
         &["broker", "start", "--task", "work"][..],
+        &["broker", "adopt", "--reuse", "--task", "work"][..],
         &["broker", "ship", "execute"][..],
     ] {
         let output = run(&repo, args);
@@ -209,8 +320,13 @@ fn repository_compatibility_states_preserve_refusal_remediation() {
             }))
             .unwrap(),
             "newer than this binary supports",
+            false,
         ),
-        (b"{not-json\n".to_vec(), "deployment marker is invalid"),
+        (
+            b"{not-json\n".to_vec(),
+            "deployment marker is invalid",
+            false,
+        ),
         (
             serde_json::to_vec(&serde_json::json!({
                 "schema_version": 0,
@@ -218,21 +334,35 @@ fn repository_compatibility_states_preserve_refusal_remediation() {
             }))
             .unwrap(),
             "repository deployment requires an embedded upgrade",
+            true,
         ),
     ];
 
-    for (marker, expected) in cases {
+    for (marker, expected, recovery_allowed) in cases {
         let temp = tmp_dir();
         let repo = repository(temp.path());
         old_canonical_deployment(&repo);
         fs::write(repo.join(".aethyme/repository.json"), marker).unwrap();
 
-        let broker = run(&repo, &["broker", "status", "--json"]);
-        assert!(!broker.status.success());
-        let stderr = String::from_utf8_lossy(&broker.stderr);
+        let diagnostic = run(&repo, &["broker", "status", "--json"]);
         assert!(
-            stderr.contains(expected),
-            "expected {expected:?} in compatibility refusal: {stderr}"
+            diagnostic.status.success(),
+            "read-only diagnostics must survive {expected}: {}",
+            String::from_utf8_lossy(&diagnostic.stderr)
+        );
+
+        let mutation = run(&repo, &["broker", "start", "--task", "blocked"]);
+        assert!(!mutation.status.success());
+        let stderr = String::from_utf8_lossy(&mutation.stderr);
+        assert!(stderr.contains(expected), "expected {expected:?}: {stderr}");
+
+        let recovery = run(&repo, &["broker", "close", "--session", "9999"]);
+        let recovery_stderr = String::from_utf8_lossy(&recovery.stderr);
+        assert!(!recovery.status.success());
+        assert_eq!(
+            recovery_stderr.contains(expected),
+            !recovery_allowed,
+            "unexpected recovery routing for {expected}: {recovery_stderr}"
         );
 
         let upgrade = run(&repo, &["upgrade", "plan", "--json"]);

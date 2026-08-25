@@ -134,6 +134,47 @@ fn start_worktree_creates_broker_managed_session_without_process() {
 }
 
 #[test]
+fn compatibility_status_snapshot_derives_without_reconciling_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("snapshot task")).unwrap();
+    std::fs::write(tmp.path().join("uncommitted.txt"), "snapshot only\n").unwrap();
+    let event_count = broker.store().events_after(0, 10_000).unwrap().len();
+    assert!(broker.store().active_leases().unwrap().is_empty());
+    drop(broker);
+
+    let mut snapshot = Broker::open_snapshot(tmp.path()).unwrap();
+    let report = snapshot
+        .status_snapshot(now_ms() + 7 * 24 * 60 * 60 * 1_000)
+        .unwrap();
+    let agent = report
+        .agents
+        .iter()
+        .find(|agent| agent.session.id == session.id)
+        .unwrap();
+    assert_eq!(agent.derived_status, SessionStatus::Stale);
+    assert_eq!(
+        snapshot.store().session(session.id).unwrap().status,
+        SessionStatus::Active
+    );
+    assert!(snapshot.store().active_leases().unwrap().is_empty());
+    assert_eq!(
+        snapshot.store().events_after(0, 10_000).unwrap().len(),
+        event_count
+    );
+    assert!(
+        !Command::new("git")
+            .args(["show-ref", "--verify", "refs/heads/aethyme/integration"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
+
+#[test]
 fn session_creation_pins_repository_contract_and_reuse_does_not_refresh_it() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

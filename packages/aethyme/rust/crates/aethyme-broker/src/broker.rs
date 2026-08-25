@@ -1053,6 +1053,43 @@ impl Broker {
         Self::open_with_graph_impact_provider(path_inside_repo, GraphStoreImpactProvider)
     }
 
+    /// Open a broker for compatibility diagnostics without changing the
+    /// repository database, contracts, prepared operations, events, or refs.
+    /// Readable older storage is copied and migrated only in a temporary
+    /// snapshot owned by this broker instance.
+    pub fn open_snapshot(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
+        let here = GitRepo::discover(path_inside_repo)?;
+        let main_root = here.main_root()?;
+        let repo = GitRepo::discover(&main_root)?;
+        let store = BrokerStore::open_snapshot_in_repo(&main_root)?;
+        Ok(Self {
+            repo,
+            store,
+            main_root,
+            graph_impact_provider: Box::new(GraphStoreImpactProvider),
+        })
+    }
+
+    /// Open only far enough to migrate compatible broker storage and backfill
+    /// the immutable contract of live pre-v9 sessions. The CLI uses this for
+    /// an explicitly requested session continuation; unlike normal open it
+    /// does not reconcile prepared shared operations before compatibility has
+    /// authorized the command itself.
+    pub fn open_for_compatibility_backfill(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
+        let here = GitRepo::discover(path_inside_repo)?;
+        let main_root = here.main_root()?;
+        let repo = GitRepo::discover(&main_root)?;
+        let store = BrokerStore::open_in_repo(&main_root)?;
+        let mut broker = Self {
+            repo,
+            store,
+            main_root,
+            graph_impact_provider: Box::new(GraphStoreImpactProvider),
+        };
+        broker.backfill_live_repository_contracts()?;
+        Ok(broker)
+    }
+
     /// Open a broker with an alternate read-only graph-impact provider.
     /// Provider outcomes remain confined to [`Self::semantic_gate_advice`].
     pub fn open_with_graph_impact_provider(
@@ -1567,6 +1604,50 @@ impl Broker {
             });
         }
         Ok(views)
+    }
+
+    /// Derive current liveness without persisting status transitions. This is
+    /// deliberately allowed to inspect PIDs and worktree metadata, but never
+    /// changes a session row or appends an event.
+    pub fn agents_snapshot(&self, now_ms: i64) -> Result<Vec<AgentView>, BrokerOpError> {
+        let sessions = self.store.live_sessions()?;
+        let mut views = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            let fs_activity = worktree_activity_ms(&self.main_root, &session);
+            let activity_at = fs_activity.unwrap_or(0).max(session.last_activity_at);
+            let pid_alive = session.pid.map(pid_alive);
+            let mut derived_status = session.status;
+            if matches!(
+                session.status,
+                SessionStatus::Active | SessionStatus::Idle | SessionStatus::Stale
+            ) {
+                derived_status = if pid_alive == Some(false) {
+                    SessionStatus::Exited
+                } else {
+                    let age = now_ms.saturating_sub(activity_at);
+                    if age > STALE_AFTER_MS {
+                        SessionStatus::Stale
+                    } else if age > IDLE_AFTER_MS {
+                        SessionStatus::Idle
+                    } else {
+                        SessionStatus::Active
+                    }
+                };
+            }
+            views.push(AgentView {
+                session,
+                activity_at,
+                derived_status,
+                pid_alive,
+            });
+        }
+        Ok(views)
+    }
+
+    /// Return overlaps from the persisted lease snapshot without recomputing
+    /// implicit leases, extending expiries, or emitting overlap events.
+    pub fn lease_overlaps_snapshot(&self) -> Result<Vec<crate::Overlap>, BrokerOpError> {
+        Ok(crate::detect_overlaps(&self.store.active_leases()?))
     }
 
     // ── leases (Phase 3) ──────────────────────────────────────────────
@@ -2457,8 +2538,21 @@ impl Broker {
     ) -> Result<IntegrationStatusView, BrokerOpError> {
         self.refresh_leases()?;
         self.agents(now_ms)?;
+        let integration = self.integration_head()?;
+        self.build_integration_status(integration)
+    }
 
-        let (branch, head) = self.integration_head()?;
+    /// Focused integration status without lease/liveness reconciliation or
+    /// integration-ref creation/fast-forwarding.
+    pub fn integration_status_snapshot(&self) -> Result<IntegrationStatusView, BrokerOpError> {
+        let integration = self.integration_head_snapshot()?;
+        self.build_integration_status(integration)
+    }
+
+    fn build_integration_status(
+        &self,
+        (branch, head): (String, String),
+    ) -> Result<IntegrationStatusView, BrokerOpError> {
         let main_head = self.repo.head_commit()?;
         let (upstream_ref, upstream_head) = self
             .repo
@@ -2646,9 +2740,28 @@ impl Broker {
     pub fn status(&mut self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
         let overlaps = self.refresh_leases()?;
         let agents = self.agents(now_ms)?;
+        let integration = self.integration_head()?;
+        self.build_status(agents, overlaps, integration)
+    }
+
+    /// Render the same status contract from persisted state and derived
+    /// filesystem observations, but never reconcile that state as a side
+    /// effect. Used while repository deployment compatibility is degraded.
+    pub fn status_snapshot(&self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
+        let overlaps = self.lease_overlaps_snapshot()?;
+        let agents = self.agents_snapshot(now_ms)?;
+        let integration = self.integration_head_snapshot()?;
+        self.build_status(agents, overlaps, integration)
+    }
+
+    fn build_status(
+        &self,
+        agents: Vec<AgentView>,
+        overlaps: Vec<crate::Overlap>,
+        (integration_branch, integration_head): (String, String),
+    ) -> Result<StatusView, BrokerOpError> {
         let promoted_conflicts = self.promoted_conflicts()?;
         let queue = self.store.merge_queue()?;
-        let (integration_branch, integration_head) = self.integration_head()?;
         let main_head = self.repo.head_commit()?;
         let (upstream_ref, upstream_head) = self
             .repo
