@@ -72,15 +72,16 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     let mut checks = Vec::new();
 
     checks.push(check_git_version());
-    let main_root = match crate::GitRepo::discover(repo_hint) {
+    let (checkout_root, main_root) = match crate::GitRepo::discover(repo_hint) {
         Ok(repo) => {
-            let root = repo.main_root()?;
+            let checkout_root = repo.root().to_path_buf();
+            let main_root = repo.main_root()?;
             checks.push(Check {
                 id: "certify.git-repo",
                 status: CheckStatus::Pass,
                 detail: "inside a git repository".into(),
             });
-            match crate::GitRepo::discover(&root)?.head_commit() {
+            match repo.head_commit() {
                 Ok(_) => checks.push(Check {
                     id: "certify.head-commit",
                     status: CheckStatus::Pass,
@@ -94,7 +95,7 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
                         .into(),
                 }),
             }
-            root
+            (checkout_root, main_root)
         }
         Err(_) => {
             checks.push(Check {
@@ -112,8 +113,8 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     checks.push(check_binary_version(&main_root));
 
     // Document requirements: presence + validity, never generation.
-    checks.push(if main_root.join(".aethyme/gates.toml").exists() {
-        validate_gates(&main_root)
+    checks.push(if checkout_root.join(".aethyme/gates.toml").exists() {
+        validate_gates(&checkout_root)
     } else {
         Check {
             id: "certify.gates",
@@ -123,21 +124,21 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
                 .into(),
         }
     });
-    checks.push(check_config_valid(&main_root));
-    checks.push(check_gitignore_contract(&main_root));
+    checks.push(check_config_valid(&checkout_root));
+    checks.push(check_gitignore_contract(&checkout_root));
     checks.push(Check {
         id: "certify.agents-protocol",
-        status: protocol_status(&main_root),
-        detail: protocol_detail(&main_root),
+        status: protocol_status(&checkout_root),
+        detail: protocol_detail(&checkout_root),
     });
     checks.push(Check {
         id: "certify.graph",
-        status: if main_root.join(".aethyme/graph").is_dir() {
+        status: if checkout_root.join(".aethyme/graph").is_dir() {
             CheckStatus::Pass
         } else {
             CheckStatus::Skipped
         },
-        detail: if main_root.join(".aethyme/graph").is_dir() {
+        detail: if checkout_root.join(".aethyme/graph").is_dir() {
             "graph fragments present".into()
         } else {
             "no graph fragments — optional; run aethyme-graph-index to build the charts".into()
@@ -187,14 +188,15 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
 pub fn scaffold(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     let mut checks = Vec::new();
     let repo = crate::GitRepo::discover(repo_hint).map_err(BrokerOpError::Git)?;
+    let checkout_root = repo.root().to_path_buf();
     let main_root = repo.main_root()?;
 
     checks.push(ensure_file(
-        &main_root.join(".aethyme/config.toml"),
+        &checkout_root.join(".aethyme/config.toml"),
         "scaffold.config-toml",
         || CONFIG_TEMPLATE.to_string(),
     ));
-    checks.push(ensure_gitignore_block(&main_root));
+    checks.push(ensure_gitignore_block(&checkout_root));
 
     let db_existed = main_root.join(crate::BROKER_DB_RELPATH).exists();
     let store = crate::BrokerStore::open_in_repo(&main_root)?;
@@ -226,10 +228,11 @@ pub fn scaffold(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
 pub fn scaffold_local(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     let mut checks = Vec::new();
     let repo = crate::GitRepo::discover(repo_hint).map_err(BrokerOpError::Git)?;
+    let checkout_root = repo.root().to_path_buf();
     let main_root = repo.main_root()?;
 
     checks.push(ensure_file(
-        &main_root.join(".aethyme/config.toml"),
+        &checkout_root.join(".aethyme/config.toml"),
         "scaffold-local.config-toml",
         || CONFIG_TEMPLATE.to_string(),
     ));
@@ -260,14 +263,14 @@ pub fn scaffold_local(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
 /// NOT scaffolding, NOT certification — output depends on the repo.
 pub fn draft_gates(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     let repo = crate::GitRepo::discover(repo_hint).map_err(BrokerOpError::Git)?;
-    let main_root = repo.main_root()?;
-    let check = match draft_gates_toml(&main_root) {
+    let checkout_root = repo.root();
+    let check = match draft_gates_toml(checkout_root) {
         Some(draft) => ensure_file(
-            &main_root.join(".aethyme/gates.toml"),
+            &checkout_root.join(".aethyme/gates.toml"),
             "gates.draft",
             || draft,
         ),
-        None if main_root.join(".aethyme/gates.toml").exists() => Check {
+        None if checkout_root.join(".aethyme/gates.toml").exists() => Check {
             id: "gates.draft",
             status: CheckStatus::Pass,
             detail: ".aethyme/gates.toml present (never overwritten)".into(),

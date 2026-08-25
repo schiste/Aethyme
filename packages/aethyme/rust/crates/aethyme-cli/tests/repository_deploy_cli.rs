@@ -152,6 +152,56 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
 }
 
 #[test]
+fn deploy_in_a_linked_worktree_never_mutates_the_primary_checkout() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    let linked = temp.path().join("linked");
+    let added = Command::new("git")
+        .args(["worktree", "add", "-q", "-b", "agent/deploy"])
+        .arg(&linked)
+        .arg("main")
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+
+    let deployed = command(&linked)
+        .args(["deploy", "--repo"])
+        .arg(&linked)
+        .output()
+        .unwrap();
+    assert!(
+        deployed.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&deployed.stdout),
+        String::from_utf8_lossy(&deployed.stderr)
+    );
+
+    for relative in [
+        ".gitignore",
+        ".aethyme/config.toml",
+        ".aethyme/repository.json",
+        "AGENTS.md",
+        "CLAUDE.md",
+    ] {
+        assert!(linked.join(relative).is_file(), "missing {relative}");
+        assert!(
+            !repo.join(relative).exists(),
+            "primary checkout was mutated at {relative}"
+        );
+    }
+    assert!(
+        repo.join(".aethyme/broker.db").is_file(),
+        "broker runtime state should remain shared"
+    );
+    assert!(!linked.join(".aethyme/broker.db").exists());
+}
+
+#[test]
 fn deploy_verify_is_read_only_and_rejects_missing_policy() {
     let temp = tmp_dir();
     let repo = repository(temp.path());

@@ -251,6 +251,53 @@ fn local_scaffold_uses_runtime_state_without_touching_gitignore() {
 }
 
 #[test]
+fn linked_worktree_setup_targets_that_checkout_and_keeps_runtime_state_shared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("main");
+    let linked = tmp.path().join("linked");
+    std::fs::create_dir(&main).unwrap();
+    init_repo(&main);
+    sh(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/setup",
+            linked.to_str().unwrap(),
+            "main",
+        ],
+    );
+    std::fs::write(linked.join("Cargo.toml"), "[workspace]\n").unwrap();
+    write_agent_protocol(&linked);
+
+    let scaffold = init::scaffold(&linked).unwrap();
+    assert!(scaffold.certified());
+    let gates = init::draft_gates(&linked).unwrap();
+    assert_eq!(status_of(&gates, "gates.draft"), CheckStatus::Created);
+
+    assert!(linked.join(".aethyme/config.toml").is_file());
+    assert!(linked.join(".aethyme/gates.toml").is_file());
+    assert!(linked.join(".gitignore").is_file());
+    assert!(!main.join(".aethyme/config.toml").exists());
+    assert!(!main.join(".aethyme/gates.toml").exists());
+    assert!(!main.join(".gitignore").exists());
+
+    assert!(
+        main.join(".aethyme/broker.db").is_file(),
+        "broker runtime state remains shared through the primary checkout"
+    );
+    assert!(!linked.join(".aethyme/broker.db").exists());
+
+    let report = init::certify(&linked).unwrap();
+    assert!(report.certified(), "linked checkout should certify cleanly");
+    assert_eq!(status_of(&report, "certify.config"), CheckStatus::Pass);
+    assert_eq!(status_of(&report, "certify.gates"), CheckStatus::Pass);
+    assert_eq!(status_of(&report, "certify.gitignore"), CheckStatus::Pass);
+}
+
+#[test]
 fn gates_draft_detects_manifests_deterministically() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
