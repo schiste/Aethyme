@@ -2,7 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{AdoptMode, AdoptOptions, Broker, BrokerStore, GitRepo, SessionStatus, hooks};
+use aethyme_broker::{
+    AdoptMode, AdoptOptions, Broker, BrokerStore, GitRepo, NewSession, RepositoryContract,
+    SessionOrigin, SessionStatus, hooks,
+};
 use aethyme_testkit::{aethyme_bin, tmp_dir};
 use serde_json::Value;
 
@@ -87,6 +90,33 @@ fn adopt_legacy_session(repo: &Path) -> i64 {
         .id
 }
 
+fn register_version_pinned_session(repo: &Path, version: &str) -> i64 {
+    let checkout = GitRepo::discover(repo).unwrap();
+    let head = git_stdout(repo, &["rev-parse", "HEAD"]);
+    BrokerStore::open_in_repo(repo)
+        .unwrap()
+        .register_session(&NewSession {
+            worktree_path: checkout.root().to_string_lossy().into_owned(),
+            branch: git_stdout(repo, &["branch", "--show-current"]),
+            origin: SessionOrigin::Adopted,
+            task: Some("session accepted before Homebrew update".into()),
+            diff_base: Some(head.clone()),
+            adoption_base: Some(head),
+            repository_contract: Some(RepositoryContract {
+                repository_schema: None,
+                deployment_state_digest: "a".repeat(64),
+                aethyme_version: version.into(),
+                gate_definition_digest: None,
+                backfilled: false,
+            }),
+            pid: None,
+            command: None,
+            log_path: None,
+        })
+        .unwrap()
+        .id
+}
+
 fn json(output: &Output) -> Value {
     assert!(
         output.status.success(),
@@ -166,11 +196,190 @@ fn dirty_repository_blocks_upgrade_without_mutation() {
             .unwrap()
             .contains("worktree is dirty")
     );
+    let blocker = plan["blockers"][0].as_str().unwrap();
+    assert!(blocker.contains("managed Aethyme pre-commit lane"));
+    assert!(blocker.contains("broker finish --session <id>"));
+    assert!(!blocker.contains("stash"));
 
     let digest = plan["plan_digest"].as_str().unwrap();
     let applied = run(&repo, &["upgrade", "apply", "--confirm", digest]);
     assert!(!applied.status.success());
     assert!(!repo.join(".aethyme/repository.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    let session = register_version_pinned_session(&repo, "0.2.1");
+    let session_arg = session.to_string();
+
+    // 09:51 — the previously installed binary and managed hook accept work.
+    let installed_binary = temp.path().join("homebrew/bin/aethyme");
+    fs::create_dir_all(installed_binary.parent().unwrap()).unwrap();
+    write_executable(&installed_binary, "#!/bin/sh\nexit 0\n");
+    hooks::install(&GitRepo::discover(&repo).unwrap(), &installed_binary).unwrap();
+    fs::write(repo.join("before-update.txt"), "accepted before update\n").unwrap();
+    git(&repo, &["add", "before-update.txt"]);
+    assert!(
+        git_commit(&repo, "commit before Homebrew update")
+            .status
+            .success()
+    );
+
+    // 09:58 — Homebrew replaces the executable at the same path with the
+    // schema-1 binary while the accepted schema-0 session remains active.
+    write_executable(
+        &installed_binary,
+        &format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", aethyme_bin().display()),
+    );
+    fs::write(
+        repo.join("mid-session-wip.txt"),
+        "must remain committable\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "mid-session-wip.txt"]);
+
+    let upgrade_plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
+    let dirty_blocker = upgrade_plan["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|blocker| blocker.contains("worktree is dirty"))
+        .unwrap();
+    assert!(dirty_blocker.contains("managed Aethyme pre-commit lane"));
+    assert!(!dirty_blocker.contains("stash"));
+
+    // 10:11 — diagnostic and coordinated recovery surfaces remain reachable
+    // while the new binary sees the old repository deployment.
+    for args in [
+        &["broker", "status", "--json"][..],
+        &["broker", "leases", "--json"][..],
+        &["broker", "operations", "--json"][..],
+        &[
+            "broker",
+            "git",
+            "--session",
+            &session_arg,
+            "--",
+            "status",
+            "--short",
+        ][..],
+    ] {
+        let output = run(&repo, args);
+        assert!(
+            output.status.success(),
+            "recovery lane {args:?} was frozen: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let report_filing = run(
+        &repo,
+        &[
+            "broker",
+            "report",
+            "file",
+            "missing.issue.md",
+            "--repo",
+            "owner/repo",
+            "--confirm",
+            &"a".repeat(64),
+        ],
+    );
+    assert!(!report_filing.status.success());
+    assert!(!String::from_utf8_lossy(&report_filing.stderr).contains("embedded upgrade"));
+
+    // No --no-verify escape hatch: the updated binary honors the pinned
+    // session contract through the ordinary managed pre-commit lane.
+    let committed = git_commit(&repo, "commit after Homebrew update");
+    assert!(
+        committed.status.success(),
+        "updated binary stranded the session: {}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+
+    for args in [
+        &["broker", "start", "--task", "must stay blocked"][..],
+        &["broker", "ship", "execute"][..],
+    ] {
+        let blocked = run(&repo, args);
+        assert!(
+            !blocked.status.success(),
+            "incompatible mutation ran: {args:?}"
+        );
+        let stderr = String::from_utf8_lossy(&blocked.stderr);
+        assert!(stderr.contains("broker command refused"), "{stderr}");
+        assert!(stderr.contains("managed pre-commit lane"), "{stderr}");
+        assert!(!stderr.contains("stash"), "{stderr}");
+    }
+
+    let finish = json(&run(
+        &repo,
+        &["broker", "finish", "--session", &session_arg, "--json"],
+    ));
+    assert_eq!(finish["status"], "blocked");
+    assert!(
+        finish["recommended_next_action"]
+            .as_str()
+            .unwrap()
+            .contains("broker submit")
+    );
+}
+
+#[test]
+fn canonical_local_only_refusal_remains_exact() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+
+    let refused = run(&repo, &["upgrade", "plan", "--local-only"]);
+    assert!(!refused.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&refused.stderr),
+        "aethyme upgrade: repository is enrolled as Canonical, not LocalOnly\n"
+    );
+}
+
+#[test]
+fn newer_repository_names_coordinated_operation_refusals() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    fs::write(
+        repo.join(".aethyme/repository.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 2,
+            "applied_migrations": ["repository-deployment-v1"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let refused = run(
+        &repo,
+        &[
+            "broker",
+            "gh",
+            "--session",
+            "1",
+            "--repo",
+            "owner/repo",
+            "--",
+            "issue",
+            "list",
+        ],
+    );
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("coordinated operation refused"), "{stderr}");
+    assert!(
+        stderr.contains("update Aethyme before retrying the coordinated operation"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -544,4 +753,14 @@ fn git_commit(repo: &Path, message: &str) -> Output {
         .current_dir(repo)
         .output()
         .unwrap()
+}
+
+#[cfg(unix)]
+fn write_executable(path: &Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(path, contents).unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
 }

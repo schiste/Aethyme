@@ -115,6 +115,28 @@ pub enum CommandCapability {
     Upgrade,
 }
 
+/// User-visible surface that invoked repository compatibility policy.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationSurface {
+    Hook,
+    #[default]
+    BrokerCommand,
+    UpgradeCommand,
+    CoordinatedOperation,
+}
+
+impl InvocationSurface {
+    fn refusal_prefix(self) -> &'static str {
+        match self {
+            Self::Hook => "Aethyme hook refused the operation",
+            Self::BrokerCommand => "broker command refused",
+            Self::UpgradeCommand => "upgrade command refused",
+            Self::CoordinatedOperation => "coordinated operation refused",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompatibilitySeverity {
@@ -133,6 +155,7 @@ pub enum CompatibilityExecution {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CompatibilityContext<'a> {
     pub session_contract: Option<&'a aethyme_broker::RepositoryContract>,
+    pub surface: InvocationSurface,
 }
 
 /// A pure, render-independent compatibility decision for one parsed command.
@@ -141,6 +164,7 @@ pub struct CompatibilityDecision {
     pub repository: RepositoryCompatibility,
     pub repository_schema: Option<u32>,
     pub capability: CommandCapability,
+    pub surface: InvocationSurface,
     pub allowed: bool,
     pub severity: CompatibilitySeverity,
     pub execution: CompatibilityExecution,
@@ -153,9 +177,10 @@ impl CompatibilityDecision {
         if self.allowed {
             return None;
         }
+        let refusal = format!("{}: {}", self.surface.refusal_prefix(), self.reason);
         Some(match &self.remediation {
-            Some(remediation) => format!("{}; {remediation}", self.reason),
-            None => self.reason.clone(),
+            Some(remediation) => format!("{refusal}; {remediation}"),
+            None => refusal,
         })
     }
 
@@ -288,15 +313,52 @@ fn decide_compatibility(
             CompatibilitySeverity::Error
         }
     };
+    let remediation = contextual_remediation(repository, context.surface, remediation);
     CompatibilityDecision {
         repository,
         repository_schema,
         capability,
+        surface: context.surface,
         allowed,
         severity,
         execution,
         reason,
         remediation,
+    }
+}
+
+fn contextual_remediation(
+    repository: RepositoryCompatibility,
+    surface: InvocationSurface,
+    fallback: Option<String>,
+) -> Option<String> {
+    match repository {
+        RepositoryCompatibility::UpgradeRequired | RepositoryCompatibility::UpgradeInProgress => {
+            Some(match surface {
+                InvocationSurface::Hook => {
+                    "finish or upgrade the accepted session before retrying the hook".into()
+                }
+                InvocationSurface::BrokerCommand | InvocationSurface::CoordinatedOperation => {
+                    "commit pending work through the managed pre-commit lane or finish active sessions with `aethyme broker finish --session <id>`; then run `aethyme upgrade plan --repo .`, review it, and apply it with `aethyme upgrade apply --repo . --confirm <plan-sha256>`".into()
+                }
+                InvocationSurface::UpgradeCommand => fallback.unwrap_or_else(|| {
+                    "review the upgrade plan and apply it with its exact digest".into()
+                }),
+            })
+        }
+        RepositoryCompatibility::NewerThanBinary => Some(match surface {
+            InvocationSurface::CoordinatedOperation => {
+                "update Aethyme before retrying the coordinated operation".into()
+            }
+            InvocationSurface::Hook => "update Aethyme before retrying git commit".into(),
+            InvocationSurface::BrokerCommand => {
+                "update Aethyme before retrying the broker command".into()
+            }
+            InvocationSurface::UpgradeCommand => {
+                "update Aethyme before planning a repository downgrade".into()
+            }
+        }),
+        RepositoryCompatibility::Current | RepositoryCompatibility::Invalid => fallback,
     }
 }
 
@@ -477,7 +539,10 @@ pub fn plan(
     }
     let status = git(&repo, &["status", "--porcelain", "--untracked-files=all"])?;
     if !status.trim().is_empty() {
-        blockers.push("repository worktree is dirty; commit or stash changes before applying a repository upgrade".into());
+        blockers.push(
+            "repository worktree is dirty; commit this work through the managed Aethyme pre-commit lane, then finish active sessions with `aethyme broker finish --session <id>` before applying a repository upgrade"
+                .into(),
+        );
     }
     let repository_head = git(&repo, &["rev-parse", "HEAD"])?;
     let migrations = EMBEDDED_MIGRATIONS
@@ -842,8 +907,8 @@ fn print_usage() {
 mod compatibility_tests {
     use super::{
         CommandCapability, CompatibilityContext, CompatibilityExecution, CompatibilitySeverity,
-        MIGRATION_ID, MIGRATION_IN_PROGRESS, REPOSITORY_SCHEMA_VERSION, RepositoryCompatibility,
-        RepositoryMarker, classify_marker, decide_compatibility,
+        InvocationSurface, MIGRATION_ID, MIGRATION_IN_PROGRESS, REPOSITORY_SCHEMA_VERSION,
+        RepositoryCompatibility, RepositoryMarker, classify_marker, decide_compatibility,
     };
 
     fn schema(repository: RepositoryCompatibility) -> Option<u32> {
@@ -992,6 +1057,7 @@ mod compatibility_tests {
                     capability,
                     CompatibilityContext {
                         session_contract: contract,
+                        ..CompatibilityContext::default()
                     },
                     "reason".into(),
                     Some("remediation".into()),
@@ -1019,6 +1085,37 @@ mod compatibility_tests {
                  Your changes remain in the worktree."
             )
         );
+    }
+
+    #[test]
+    fn refusal_text_names_the_invoking_surface_and_legal_recovery_lane() {
+        for (surface, prefix) in [
+            (InvocationSurface::BrokerCommand, "broker command refused"),
+            (
+                InvocationSurface::CoordinatedOperation,
+                "coordinated operation refused",
+            ),
+        ] {
+            let decision = decide_compatibility(
+                RepositoryCompatibility::UpgradeRequired,
+                Some(0),
+                CommandCapability::SharedMutation,
+                CompatibilityContext {
+                    surface,
+                    ..CompatibilityContext::default()
+                },
+                "repository deployment requires an embedded upgrade".into(),
+                None,
+            );
+            let refusal = decision.refusal_message().unwrap();
+            assert!(refusal.starts_with(prefix), "{refusal}");
+            assert!(refusal.contains("managed pre-commit lane"), "{refusal}");
+            assert!(
+                refusal.contains("broker finish --session <id>"),
+                "{refusal}"
+            );
+            assert!(!refusal.contains("stash"), "{refusal}");
+        }
     }
 
     #[test]

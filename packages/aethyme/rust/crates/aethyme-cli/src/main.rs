@@ -40,24 +40,45 @@ struct ParsedCommand<'a> {
     name: &'a str,
     args: &'a [String],
     compatibility_capability: Option<repository_upgrade::CommandCapability>,
+    invocation_surface: Option<repository_upgrade::InvocationSurface>,
 }
 
 impl<'a> ParsedCommand<'a> {
     fn parse(args: &'a [String]) -> Option<Self> {
         let (name, tail) = args.split_first()?;
-        let compatibility_capability = match name.as_str() {
-            "broker" => Some(broker_command_capability(tail)),
-            "upgrade" => Some(repository_upgrade::CommandCapability::Upgrade),
+        let (compatibility_capability, invocation_surface) = match name.as_str() {
+            "broker" => (
+                Some(broker_command_capability(tail)),
+                Some(broker_invocation_surface(tail)),
+            ),
+            "upgrade" => (
+                Some(repository_upgrade::CommandCapability::Upgrade),
+                Some(repository_upgrade::InvocationSurface::UpgradeCommand),
+            ),
             // I1 preserves the previous enforcement boundary: repository
             // compatibility gates broker commands, while other top-level
             // commands retain their existing behavior.
-            _ => None,
+            _ => (None, None),
         };
         Some(Self {
             name,
             args: tail,
             compatibility_capability,
+            invocation_surface,
         })
+    }
+}
+
+fn broker_invocation_surface(args: &[String]) -> repository_upgrade::InvocationSurface {
+    use repository_upgrade::InvocationSurface;
+
+    match (
+        args.first().map(String::as_str),
+        args.get(1).map(String::as_str),
+    ) {
+        (Some("hooks"), Some("pre-commit" | "post-commit")) => InvocationSurface::Hook,
+        (Some("git" | "gh" | "operations"), _) => InvocationSurface::CoordinatedOperation,
+        _ => InvocationSurface::BrokerCommand,
     }
 }
 
@@ -143,10 +164,16 @@ fn main() -> ExitCode {
     if let Some(capability) = command.compatibility_capability
         && let Ok(cwd) = env::current_dir()
     {
+        let surface = command
+            .invocation_surface
+            .unwrap_or(repository_upgrade::InvocationSurface::BrokerCommand);
         let initial = repository_upgrade::compatibility_decision(
             &cwd,
             capability,
-            repository_upgrade::CompatibilityContext::default(),
+            repository_upgrade::CompatibilityContext {
+                surface,
+                ..repository_upgrade::CompatibilityContext::default()
+            },
         );
         let pinned_contract = initial
             .as_ref()
@@ -168,6 +195,7 @@ fn main() -> ExitCode {
                 capability,
                 repository_upgrade::CompatibilityContext {
                     session_contract: pinned_contract.as_ref(),
+                    surface,
                 },
             )
         } else {
@@ -644,7 +672,10 @@ fn unknown_subcommand(subcommand: &str) -> ExitCode {
 
 #[cfg(test)]
 mod compatibility_command_tests {
-    use super::{ParsedCommand, repository_upgrade::CommandCapability};
+    use super::{
+        ParsedCommand,
+        repository_upgrade::{CommandCapability, InvocationSurface},
+    };
 
     fn capability(args: &[&str]) -> Option<CommandCapability> {
         let args = args
@@ -654,6 +685,14 @@ mod compatibility_command_tests {
         ParsedCommand::parse(&args)
             .unwrap()
             .compatibility_capability
+    }
+
+    fn surface(args: &[&str]) -> Option<InvocationSurface> {
+        let args = args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        ParsedCommand::parse(&args).unwrap().invocation_surface
     }
 
     #[test]
@@ -703,6 +742,32 @@ mod compatibility_command_tests {
             Some(CommandCapability::NewSession)
         );
         assert_eq!(capability(&["explore"]), None);
+    }
+
+    #[test]
+    fn invoking_surface_is_identified_before_compatibility_rendering() {
+        for (args, expected) in [
+            (
+                &["broker", "hooks", "pre-commit"][..],
+                InvocationSurface::Hook,
+            ),
+            (&["broker", "status"][..], InvocationSurface::BrokerCommand),
+            (&["upgrade", "plan"][..], InvocationSurface::UpgradeCommand),
+            (
+                &["broker", "gh", "--session", "7"][..],
+                InvocationSurface::CoordinatedOperation,
+            ),
+            (
+                &["broker", "operations"][..],
+                InvocationSurface::CoordinatedOperation,
+            ),
+        ] {
+            assert_eq!(
+                surface(args),
+                Some(expected),
+                "unexpected surface: {args:?}"
+            );
+        }
     }
 
     #[test]

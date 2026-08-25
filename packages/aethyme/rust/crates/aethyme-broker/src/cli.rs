@@ -11,6 +11,13 @@ use std::path::PathBuf;
 
 use crate::broker::Broker;
 
+const RESOURCES_RECONCILE_USAGE: &str =
+    "usage: aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]";
+const OPERATIONS_RECONCILE_USAGE: &str = "usage: aethyme broker operations reconcile \
+     --operation <id> --outcome <succeeded|failed> --reason <text> [--json]";
+const INTEGRATION_RECONCILE_USAGE: &str = "usage: aethyme broker integration reconcile \
+     --upstream <ref> [--resolution-file <path>] [--dry-run | --apply --confirm <sha256>] [--json]";
+
 const USAGE: &str = "\
 aethyme broker — coordinate concurrent AI agent sessions on this repository
 
@@ -2608,20 +2615,19 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         }
         "reconcile" => {
             let mut coordinator = crate::HostResourceCoordinator::open_default()?;
-            let lease_id = parsed.positional.get(1).ok_or_else(|| {
-                UsageError::Message("resources reconcile requires <lease-id>".into())
-            })?;
+            let lease_id = parsed
+                .positional
+                .get(1)
+                .ok_or_else(|| UsageError::Message(RESOURCES_RECONCILE_USAGE.into()))?;
             let generation = parsed
                 .confirm
                 .as_deref()
-                .ok_or_else(|| {
-                    UsageError::Message(
-                        "resources reconcile requires --confirm <generation>".into(),
-                    )
-                })?
+                .ok_or_else(|| UsageError::Message(RESOURCES_RECONCILE_USAGE.into()))?
                 .parse::<u64>()
                 .map_err(|_| {
-                    UsageError::Message("--confirm must be the full numeric generation".into())
+                    UsageError::Message(format!(
+                        "--confirm must be the full numeric generation; {RESOURCES_RECONCILE_USAGE}"
+                    ))
                 })?;
             let lease = coordinator.reconcile(lease_id, generation)?;
             if parsed.json {
@@ -2997,24 +3003,26 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     }
                 }
                 Some("reconcile") => {
-                    let operation = parsed.operation.ok_or(UsageError::Message(
-                        "operations reconcile requires --operation <id>".into(),
-                    ))?;
-                    let outcome = parsed.outcome.as_deref().ok_or(UsageError::Message(
-                        "operations reconcile requires --outcome succeeded|failed".into(),
-                    ))?;
+                    let operation = parsed
+                        .operation
+                        .ok_or(UsageError::Message(OPERATIONS_RECONCILE_USAGE.into()))?;
+                    let outcome = parsed
+                        .outcome
+                        .as_deref()
+                        .ok_or(UsageError::Message(OPERATIONS_RECONCILE_USAGE.into()))?;
                     let succeeded = match outcome {
                         "succeeded" => true,
                         "failed" => false,
                         _ => {
-                            return Err(UsageError::Message(
-                                "--outcome must be succeeded or failed".into(),
-                            ));
+                            return Err(UsageError::Message(format!(
+                                "--outcome must be succeeded or failed; {OPERATIONS_RECONCILE_USAGE}"
+                            )));
                         }
                     };
-                    let reason = parsed.reason.as_deref().ok_or(UsageError::Message(
-                        "operations reconcile requires --reason <text>".into(),
-                    ))?;
+                    let reason = parsed
+                        .reason
+                        .as_deref()
+                        .ok_or(UsageError::Message(OPERATIONS_RECONCILE_USAGE.into()))?;
                     let report =
                         broker.reconcile_coordinated_operation(operation, succeeded, reason)?;
                     if parsed.json {
@@ -3651,13 +3659,17 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
                 "reconcile" => {
                     if parsed.apply && parsed.dry_run {
-                        return Err(UsageError::Message(
-                            "choose either --dry-run or --apply, not both".into(),
-                        ));
+                        return Err(UsageError::Message(format!(
+                            "choose either --dry-run or --apply, not both; {INTEGRATION_RECONCILE_USAGE}"
+                        )));
                     }
-                    let upstream = parsed.upstream.clone().ok_or(UsageError::Message(
-                        "integration reconcile requires --upstream <ref>".into(),
-                    ))?;
+                    let upstream = parsed
+                        .upstream
+                        .clone()
+                        .ok_or(UsageError::Message(INTEGRATION_RECONCILE_USAGE.into()))?;
+                    if parsed.apply && parsed.confirm.is_none() {
+                        return Err(UsageError::Message(INTEGRATION_RECONCILE_USAGE.into()));
+                    }
                     let mut broker = open_broker(parsed.read_only_snapshot)?;
                     let report =
                         broker.reconcile_integration(crate::IntegrationReconcileOptions {
