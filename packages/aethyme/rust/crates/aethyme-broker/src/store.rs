@@ -224,13 +224,14 @@ impl BrokerStore {
         let contract = new.repository_contract.as_ref();
         let inserted = tx.execute(
             "INSERT INTO sessions (worktree_path, branch, origin, status, task, diff_base,
-                                   adoption_base, repository_schema,
+                                   adoption_base, adopted_head, repository_schema,
                                    deployment_state_digest, aethyme_version,
                                    gate_definition_digest, repository_contract_backfilled,
                                    pid, command, log_path, created_at, updated_at,
                                    last_activity_at)
-             VALUES (?1, ?2, ?3, 'active', ?4, ?5, COALESCE(?6, ?5), ?7, ?8,
-                     ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15, ?15)",
+             VALUES (?1, ?2, ?3, 'active', ?4, ?5, COALESCE(?6, ?5),
+                     COALESCE(?7, ?6, ?5), ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?16, ?16)",
             params![
                 new.worktree_path,
                 new.branch,
@@ -238,6 +239,7 @@ impl BrokerStore {
                 new.task,
                 new.diff_base,
                 new.adoption_base,
+                new.adopted_head,
                 contract.and_then(|value| value.repository_schema),
                 contract.map(|value| &value.deployment_state_digest),
                 contract.map(|value| &value.aethyme_version),
@@ -874,6 +876,68 @@ impl BrokerStore {
             &format!("merge.{}", status.as_str()),
             session_id,
             details_json,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Mark one verified queue entry promoted and advance its session's
+    /// accepted contribution checkpoint in the same SQLite transaction.
+    pub fn record_merge_promotion(
+        &mut self,
+        entry_id: i64,
+        integration_commit: &str,
+        details_json: &str,
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let entry = tx
+            .query_row(
+                "SELECT session_id, head_commit, merged_tree
+                 FROM merge_queue WHERE id = ?1 AND status = 'verified'",
+                [entry_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((session_id, session_head, Some(integration_tree))) = entry else {
+            return Err(BrokerError::SessionNotFound(entry_id));
+        };
+        tx.execute(
+            "UPDATE merge_queue
+             SET status = 'promoted', details_json = ?2, updated_at = ?3
+             WHERE id = ?1",
+            params![entry_id, details_json, now],
+        )?;
+        tx.execute(
+            "UPDATE sessions
+             SET accepted_session_head = ?2,
+                 accepted_integration_commit = ?3,
+                 accepted_integration_tree = ?4,
+                 accepted_queue_entry_id = ?5,
+                 accepted_at = ?6,
+                 updated_at = ?6
+             WHERE id = ?1",
+            params![
+                session_id,
+                session_head,
+                integration_commit,
+                integration_tree,
+                entry_id,
+                now,
+            ],
+        )?;
+        insert_event(
+            &tx,
+            now,
+            "merge.promoted",
+            Some(session_id),
+            Some(details_json),
         )?;
         tx.commit()?;
         Ok(())
@@ -1559,7 +1623,9 @@ impl BrokerStore {
 // ── row mapping helpers ──────────────────────────────────────────────
 
 const SESSION_SELECT: &str = "SELECT id, worktree_path, branch, origin, status, task, \
-     diff_base, adoption_base, repository_schema, deployment_state_digest, aethyme_version, \
+     diff_base, adoption_base, adopted_head, accepted_session_head, \
+     accepted_integration_commit, accepted_integration_tree, accepted_queue_entry_id, \
+     accepted_at, repository_schema, deployment_state_digest, aethyme_version, \
      gate_definition_digest, repository_contract_backfilled, pid, command, log_path, \
      exit_code, created_at, updated_at, last_activity_at \
      FROM sessions";
@@ -1592,11 +1658,11 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> Result<Event, rusqlite::Error> {
 fn session_from_row(row: &rusqlite::Row<'_>) -> RowResult<Session> {
     let origin: String = row.get(3)?;
     let status: String = row.get(4)?;
-    let repository_schema: Option<u32> = row.get(8)?;
-    let deployment_state_digest: Option<String> = row.get(9)?;
-    let aethyme_version: Option<String> = row.get(10)?;
-    let gate_definition_digest: Option<String> = row.get(11)?;
-    let repository_contract_backfilled: bool = row.get(12)?;
+    let repository_schema: Option<u32> = row.get(14)?;
+    let deployment_state_digest: Option<String> = row.get(15)?;
+    let aethyme_version: Option<String> = row.get(16)?;
+    let gate_definition_digest: Option<String> = row.get(17)?;
+    let repository_contract_backfilled: bool = row.get(18)?;
     let repository_contract = deployment_state_digest.zip(aethyme_version).map(
         |(deployment_state_digest, aethyme_version)| crate::RepositoryContract {
             repository_schema,
@@ -1616,14 +1682,20 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> RowResult<Session> {
             task: row.get(5)?,
             diff_base: row.get(6)?,
             adoption_base: row.get(7)?,
+            adopted_head: row.get(8)?,
+            accepted_session_head: row.get(9)?,
+            accepted_integration_commit: row.get(10)?,
+            accepted_integration_tree: row.get(11)?,
+            accepted_queue_entry_id: row.get(12)?,
+            accepted_at: row.get(13)?,
             repository_contract,
-            pid: row.get(13)?,
-            command: row.get(14)?,
-            log_path: row.get(15)?,
-            exit_code: row.get(16)?,
-            created_at: row.get(17)?,
-            updated_at: row.get(18)?,
-            last_activity_at: row.get(19)?,
+            pid: row.get(19)?,
+            command: row.get(20)?,
+            log_path: row.get(21)?,
+            exit_code: row.get(22)?,
+            created_at: row.get(23)?,
+            updated_at: row.get(24)?,
+            last_activity_at: row.get(25)?,
         })
     })())
 }

@@ -171,6 +171,10 @@ pub struct NewSession {
     /// Immutable original adoption boundary. When omitted, storage seeds it
     /// from `diff_base`; later reuse may refresh only `diff_base`.
     pub adoption_base: Option<String>,
+    /// Immutable checkout HEAD observed when this session identity was created.
+    /// When omitted, storage conservatively seeds it from `adoption_base`, then
+    /// `diff_base`, for callers using the older registration contract.
+    pub adopted_head: Option<String>,
     /// Repository deployment contract accepted for this session.
     pub repository_contract: Option<crate::RepositoryContract>,
     /// Spawned sessions only.
@@ -189,6 +193,18 @@ pub struct Session {
     pub task: Option<String>,
     pub diff_base: Option<String>,
     pub adoption_base: Option<String>,
+    /// Immutable checkout HEAD observed when this session was first adopted.
+    pub adopted_head: Option<String>,
+    /// Session HEAD most recently accepted into integration.
+    pub accepted_session_head: Option<String>,
+    /// Integration commit produced by that acceptance.
+    pub accepted_integration_commit: Option<String>,
+    /// Integration tree verified for that acceptance.
+    pub accepted_integration_tree: Option<String>,
+    /// Queue entry proving the acceptance.
+    pub accepted_queue_entry_id: Option<i64>,
+    /// Unix epoch milliseconds when the acceptance was recorded.
+    pub accepted_at: Option<i64>,
     pub repository_contract: Option<crate::RepositoryContract>,
     pub pid: Option<i64>,
     pub command: Option<String>,

@@ -217,6 +217,21 @@ fn two_clean_sessions_promote_with_requeue_on_base_move_manual_mode() {
     broker.promote(out_a.entry.id).unwrap();
     let integration = resolve(tmp.path(), "aethyme/integration");
     assert_ne!(integration, resolve(tmp.path(), "main"));
+    let accepted_a = broker.store().session(a.id).unwrap();
+    assert_eq!(
+        accepted_a.accepted_session_head.as_deref(),
+        Some(out_a.entry.head_commit.as_str())
+    );
+    assert_eq!(
+        accepted_a.accepted_integration_commit.as_deref(),
+        Some(integration.as_str())
+    );
+    assert_eq!(
+        accepted_a.accepted_integration_tree,
+        out_a.entry.merged_tree
+    );
+    assert_eq!(accepted_a.accepted_queue_entry_id, Some(out_a.entry.id));
+    assert!(accepted_a.accepted_at.is_some());
 
     let queue = broker.store().merge_queue().unwrap();
     let entry_b = queue.iter().find(|e| e.id == out_b.entry.id).unwrap();
@@ -256,6 +271,49 @@ fn two_clean_sessions_promote_with_requeue_on_base_move_manual_mode() {
     ] {
         assert!(kinds.iter().any(|k| k == expected), "missing {expected}");
     }
+}
+
+#[test]
+fn repeated_submission_uses_the_last_accepted_session_head_as_its_checkpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "repeat");
+    let session = broker.adopt(&worktree, Some("two contributions")).unwrap();
+    let adopted_head = session.adopted_head.clone();
+
+    commit_edit(&worktree, "src/a.py", "a = 2\n");
+    let first_head = resolve(&worktree, "HEAD");
+    let first = broker.submit(session.id).unwrap();
+    assert!(first.promoted);
+    assert_eq!(
+        broker
+            .store()
+            .session(session.id)
+            .unwrap()
+            .accepted_session_head,
+        Some(first_head.clone())
+    );
+
+    commit_edit(&worktree, "src/b.py", "b = 2\n");
+    let second_head = resolve(&worktree, "HEAD");
+    let second = broker.submit(session.id).unwrap();
+    assert!(second.promoted);
+    assert_eq!(
+        second.submission_plan.recorded_baseline.as_deref(),
+        Some(first_head.as_str())
+    );
+    assert_eq!(second.submission_plan.commits.len(), 1);
+    assert_eq!(
+        second.submission_plan.commits[0].ownership,
+        SubmissionCommitOwnership::SessionOwned
+    );
+    assert_eq!(second.submission_plan.commits[0].commit, second_head);
+
+    let persisted = broker.store().session(session.id).unwrap();
+    assert_eq!(persisted.adopted_head, adopted_head);
+    assert_eq!(persisted.accepted_session_head, Some(second_head));
+    assert_eq!(persisted.accepted_queue_entry_id, Some(second.entry.id));
 }
 
 #[test]
@@ -682,6 +740,7 @@ fn normalized_replay_refuses_missing_baseline_and_owned_merge_commits() {
             task: None,
             diff_base: None,
             adoption_base: None,
+            adopted_head: None,
             repository_contract: None,
             pid: None,
             command: None,

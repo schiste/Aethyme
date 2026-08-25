@@ -102,6 +102,7 @@ fn register_version_pinned_session(repo: &Path, version: &str) -> i64 {
             task: Some("session accepted before Homebrew update".into()),
             diff_base: Some(head.clone()),
             adoption_base: Some(head),
+            adopted_head: None,
             repository_contract: Some(RepositoryContract {
                 repository_schema: None,
                 deployment_state_digest: "a".repeat(64),

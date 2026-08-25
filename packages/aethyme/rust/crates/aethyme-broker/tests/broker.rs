@@ -247,6 +247,7 @@ fn opening_the_broker_backfills_live_pre_contract_sessions() {
                 task: Some("pre-contract session".into()),
                 diff_base: Some(head.clone()),
                 adoption_base: None,
+                adopted_head: None,
                 repository_contract: None,
                 pid: None,
                 command: None,

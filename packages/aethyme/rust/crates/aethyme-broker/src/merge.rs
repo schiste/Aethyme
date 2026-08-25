@@ -563,7 +563,11 @@ impl Broker {
         integration_head: &str,
     ) -> Result<SubmissionPlan, BrokerOpError> {
         let repo = self.repo_handle();
-        let Some(recorded_baseline) = session.diff_base.as_deref() else {
+        // Once a contribution has been promoted, ownership begins after the
+        // last accepted session HEAD. `diff_base` remains the operational
+        // fallback for a session that has never contributed.
+        let accepted_checkpoint = session.accepted_session_head.as_deref();
+        let Some(recorded_baseline) = accepted_checkpoint.or(session.diff_base.as_deref()) else {
             return Ok(SubmissionPlan {
                 session_id: session.id,
                 recorded_baseline: None,
@@ -580,12 +584,19 @@ impl Broker {
         let mut warnings = Vec::new();
         let (owned, inherited) = if repo.is_ancestor(recorded_baseline, session_head) {
             let owned = repo.commits_between_oldest(recorded_baseline, session_head)?;
-            let owned_set = owned.iter().cloned().collect::<BTreeSet<_>>();
-            let inherited = repo
-                .commits_excluding_oldest(session_head, integration_head)?
-                .into_iter()
-                .filter(|commit| !owned_set.contains(commit))
-                .collect::<Vec<_>>();
+            let inherited = if accepted_checkpoint.is_some() {
+                // The checkpoint and everything before it already passed
+                // promotion. A replayed integration commit commonly has a
+                // different SHA, so ancestry alone must not reintroduce that
+                // proven contribution as inherited work.
+                Vec::new()
+            } else {
+                let owned_set = owned.iter().cloned().collect::<BTreeSet<_>>();
+                repo.commits_excluding_oldest(session_head, integration_head)?
+                    .into_iter()
+                    .filter(|commit| !owned_set.contains(commit))
+                    .collect::<Vec<_>>()
+            };
             (owned, inherited)
         } else if repo.is_ancestor(integration_head, session_head) {
             warnings.push(format!(
@@ -748,14 +759,10 @@ impl Broker {
 
         self.repo_handle()
             .update_branch_ref(&branch, &merge_commit)?;
-        self.store().set_merge_status(
+        self.store().record_merge_promotion(
             entry_id,
-            MergeStatus::Promoted,
-            None,
-            Some(&crate::events::merge_promoted_payload(
-                &branch,
-                &merge_commit,
-            )),
+            &merge_commit,
+            &crate::events::merge_promoted_payload(&branch, &merge_commit),
         )?;
 
         // Requeue: everything still in flight was verified/conflicted

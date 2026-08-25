@@ -38,6 +38,7 @@ fn main() {
         task: Some(format!("stress worker {worker_id}")),
         diff_base: None,
         adoption_base: None,
+        adopted_head: None,
         repository_contract: None,
         pid: None,
         command: None,

@@ -22,6 +22,7 @@ fn sample_session(store: &mut BrokerStore) -> aethyme_broker::Session {
             task: Some("Fix auth bug".into()),
             diff_base: Some("abc123".into()),
             adoption_base: None,
+            adopted_head: None,
             repository_contract: Some(RepositoryContract {
                 repository_schema: Some(1),
                 deployment_state_digest: "deployment-digest".into(),
@@ -60,6 +61,8 @@ fn session_round_trip_attach_first() {
     assert_eq!(fetched.worktree_path, session.worktree_path);
     assert_eq!(fetched.task.as_deref(), Some("Fix auth bug"));
     assert_eq!(fetched.adoption_base.as_deref(), Some("abc123"));
+    assert_eq!(fetched.adopted_head.as_deref(), Some("abc123"));
+    assert_eq!(fetched.accepted_session_head, None);
     assert_eq!(fetched.repository_contract, session.repository_contract);
 
     store.touch_session_activity(session.id, 42_000).unwrap();
@@ -85,6 +88,7 @@ fn duplicate_live_worktree_is_rejected_but_cleaned_frees_the_slot() {
         task: None,
         diff_base: None,
         adoption_base: None,
+        adopted_head: None,
         repository_contract: None,
         pid: Some(123),
         command: Some("claude".into()),
@@ -107,6 +111,7 @@ fn duplicate_live_worktree_is_rejected_but_cleaned_frees_the_slot() {
             task: None,
             diff_base: None,
             adoption_base: None,
+            adopted_head: None,
             repository_contract: None,
             pid: None,
             command: None,
@@ -237,6 +242,7 @@ fn retention_sweep_drops_leases_of_already_cleaned_sessions() {
             task: None,
             diff_base: None,
             adoption_base: None,
+            adopted_head: None,
             repository_contract: None,
             pid: None,
             command: None,
@@ -421,6 +427,52 @@ fn merge_queue_submit_is_idempotent_and_transitions_emit_events() {
     assert!(kinds.contains(&"merge.verified".to_string()));
     // Idempotent resubmit emitted no second submitted event.
     assert_eq!(kinds.iter().filter(|k| *k == "merge.submitted").count(), 1);
+}
+
+#[test]
+fn promotion_atomically_advances_the_contribution_checkpoint() {
+    let (_tmp, mut store) = open_temp();
+    let session = sample_session(&mut store);
+    let entry = store
+        .submit(session.id, "session-head-1", "integration-base")
+        .unwrap();
+    store
+        .set_merge_status(
+            entry.id,
+            MergeStatus::Verified,
+            Some("integration-tree-1"),
+            Some("{\"merge_commit\":\"candidate\"}"),
+        )
+        .unwrap();
+
+    store
+        .record_merge_promotion(
+            entry.id,
+            "integration-commit-1",
+            "{\"commit\":\"integration-commit-1\"}",
+        )
+        .unwrap();
+
+    let accepted = store.session(session.id).unwrap();
+    assert_eq!(accepted.adopted_head.as_deref(), Some("abc123"));
+    assert_eq!(
+        accepted.accepted_session_head.as_deref(),
+        Some("session-head-1")
+    );
+    assert_eq!(
+        accepted.accepted_integration_commit.as_deref(),
+        Some("integration-commit-1")
+    );
+    assert_eq!(
+        accepted.accepted_integration_tree.as_deref(),
+        Some("integration-tree-1")
+    );
+    assert_eq!(accepted.accepted_queue_entry_id, Some(entry.id));
+    assert!(accepted.accepted_at.is_some());
+    assert_eq!(
+        store.merge_queue().unwrap()[0].status,
+        MergeStatus::Promoted
+    );
 }
 
 #[test]

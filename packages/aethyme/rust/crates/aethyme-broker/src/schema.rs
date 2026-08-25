@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -312,6 +312,29 @@ CREATE UNIQUE INDEX coordinated_operations_by_host_operation
     WHERE host_operation_id IS NOT NULL;
 ";
 
+const MIGRATION_V11: &str = "
+-- Adoption provenance and accepted contribution state are different facts.
+-- Preserve the oldest durable provenance available, but do not infer that a
+-- legacy diff baseline proves a contribution was promoted.
+ALTER TABLE sessions ADD COLUMN adopted_head TEXT;
+ALTER TABLE sessions ADD COLUMN accepted_session_head TEXT;
+ALTER TABLE sessions ADD COLUMN accepted_integration_commit TEXT;
+ALTER TABLE sessions ADD COLUMN accepted_integration_tree TEXT;
+ALTER TABLE sessions ADD COLUMN accepted_queue_entry_id INTEGER
+    REFERENCES merge_queue (id);
+ALTER TABLE sessions ADD COLUMN accepted_at INTEGER;
+
+UPDATE sessions
+SET adopted_head = COALESCE(adoption_base, diff_base);
+
+CREATE TRIGGER sessions_adopted_head_immutable
+BEFORE UPDATE OF adopted_head ON sessions
+WHEN OLD.adopted_head IS NOT NEW.adopted_head
+BEGIN
+    SELECT RAISE(ABORT, 'sessions.adopted_head is immutable');
+END;
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -323,6 +346,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V8,
     MIGRATION_V9,
     MIGRATION_V10,
+    MIGRATION_V11,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -485,5 +509,66 @@ mod tests {
             .unwrap();
         assert_eq!(row.0, None);
         assert_eq!(row.1, "legacy_unverified_identity");
+    }
+
+    #[test]
+    fn v11_preserves_adoption_provenance_without_inventing_acceptance() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS[..10].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sessions (
+                worktree_path, branch, origin, status, diff_base, adoption_base,
+                created_at, updated_at, last_activity_at
+             ) VALUES ('/repo', 'agent/legacy', 'adopted', 'active',
+                       'refreshed-diff-base', 'original-adopted-head', 1, 2, 2)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let row = conn
+            .query_row(
+                "SELECT adopted_head, accepted_session_head,
+                        accepted_integration_commit, accepted_integration_tree,
+                        accepted_queue_entry_id, accepted_at
+                 FROM sessions WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0.as_deref(), Some("original-adopted-head"));
+        assert_eq!(
+            (row.1, row.2, row.3, row.4, row.5),
+            (None, None, None, None, None)
+        );
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let err = conn
+            .execute(
+                "UPDATE sessions SET adopted_head = 'rewritten' WHERE id = 1",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("adopted_head is immutable"));
     }
 }
