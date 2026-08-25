@@ -169,6 +169,81 @@ fn broker_refuses_an_obsolete_enrolled_repository() {
     assert!(stderr.contains("aethyme upgrade plan"));
 }
 
+#[test]
+fn every_parsed_broker_capability_preserves_the_initial_refusal_policy() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+
+    for args in [
+        &["broker", "status"][..],
+        &["broker", "integration", "reconcile"][..],
+        &["broker", "submit", "--session", "7"][..],
+        &["broker", "start", "--task", "work"][..],
+        &["broker", "ship", "execute"][..],
+    ] {
+        let output = run(&repo, args);
+        assert!(!output.status.success(), "broker command ran: {args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("repository deployment requires an embedded upgrade"),
+            "unexpected refusal for {args:?}: {stderr}"
+        );
+    }
+
+    let upgrade = run(&repo, &["upgrade", "plan", "--json"]);
+    assert!(
+        upgrade.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upgrade.stderr)
+    );
+}
+
+#[test]
+fn repository_compatibility_states_preserve_refusal_remediation() {
+    let cases = [
+        (
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 2,
+                "applied_migrations": ["repository-deployment-v1"]
+            }))
+            .unwrap(),
+            "newer than this binary supports",
+        ),
+        (b"{not-json\n".to_vec(), "deployment marker is invalid"),
+        (
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 0,
+                "applied_migrations": ["repository-deployment-v1:in-progress"]
+            }))
+            .unwrap(),
+            "repository deployment requires an embedded upgrade",
+        ),
+    ];
+
+    for (marker, expected) in cases {
+        let temp = tmp_dir();
+        let repo = repository(temp.path());
+        old_canonical_deployment(&repo);
+        fs::write(repo.join(".aethyme/repository.json"), marker).unwrap();
+
+        let broker = run(&repo, &["broker", "status", "--json"]);
+        assert!(!broker.status.success());
+        let stderr = String::from_utf8_lossy(&broker.stderr);
+        assert!(
+            stderr.contains(expected),
+            "expected {expected:?} in compatibility refusal: {stderr}"
+        );
+
+        let upgrade = run(&repo, &["upgrade", "plan", "--json"]);
+        assert!(
+            upgrade.status.success(),
+            "upgrade capability was blocked before dispatch: {}",
+            String::from_utf8_lossy(&upgrade.stderr)
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn plan_refuses_managed_paths_that_escape_through_symlinks() {

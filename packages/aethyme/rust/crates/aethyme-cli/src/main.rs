@@ -35,22 +35,89 @@ mod repository_upgrade;
 /// this is generous rather than snappy on purpose.
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(240);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedCommand<'a> {
+    name: &'a str,
+    args: &'a [String],
+    compatibility_capability: Option<repository_upgrade::CommandCapability>,
+}
+
+impl<'a> ParsedCommand<'a> {
+    fn parse(args: &'a [String]) -> Option<Self> {
+        let (name, tail) = args.split_first()?;
+        let compatibility_capability = match name.as_str() {
+            "broker" => Some(broker_command_capability(tail)),
+            "upgrade" => Some(repository_upgrade::CommandCapability::Upgrade),
+            // I1 preserves the previous enforcement boundary: repository
+            // compatibility gates broker commands, while other top-level
+            // commands retain their existing behavior.
+            _ => None,
+        };
+        Some(Self {
+            name,
+            args: tail,
+            compatibility_capability,
+        })
+    }
+}
+
+fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapability {
+    use repository_upgrade::CommandCapability;
+
+    let subcommand = args.first().map(String::as_str);
+    let nested = args.get(1).map(String::as_str);
+    match (subcommand, nested) {
+        (Some("start" | "start-agent"), _) => CommandCapability::NewSession,
+        (Some("adopt"), _) if args.iter().any(|arg| arg == "--reuse") => {
+            CommandCapability::SessionContinuation
+        }
+        (Some("adopt"), _) => CommandCapability::NewSession,
+        (Some("close" | "finish" | "submit" | "exec" | "git" | "gh"), _) => {
+            CommandCapability::SessionContinuation
+        }
+        (Some("leases"), Some("claim" | "release")) => CommandCapability::SessionContinuation,
+        (Some("gates"), Some("run" | "pre-push")) => CommandCapability::SessionContinuation,
+        (Some("repair" | "cleanup"), _) => CommandCapability::RecoveryWrite,
+        (Some("operations" | "resources"), Some("reconcile"))
+        | (Some("integration"), Some("reconcile")) => CommandCapability::RecoveryWrite,
+        (Some("ship"), Some("plan"))
+        | (Some("integration"), Some("status" | "wait-stable"))
+        | (Some("leases"), Some("plan"))
+        | (Some("resources"), Some("plan" | "list"))
+        | (Some("gates"), Some("validate" | "affected" | "semantic"))
+        | (Some("report"), Some("list" | "show"))
+        | (Some("hooks"), Some("status"))
+        | (Some("operations"), _)
+        | (Some("handoff" | "queue" | "status" | "agents" | "metrics" | "certify"), _)
+        | (Some("events"), _)
+            if nested != Some("prune") =>
+        {
+            CommandCapability::DiagnosticRead
+        }
+        (Some("doctor"), _) if !args.iter().any(|arg| arg == "--fix-version") => {
+            CommandCapability::DiagnosticRead
+        }
+        _ => CommandCapability::SharedMutation,
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() {
+    let Some(command) = ParsedCommand::parse(&args) else {
         print_top_level_help();
         return ExitCode::from(2);
-    }
+    };
 
-    if args[0] == "broker"
+    if let Some(capability) = command.compatibility_capability
         && let Ok(cwd) = env::current_dir()
-        && let Some(message) = repository_upgrade::compatibility_blocker(&cwd)
+        && let Some(decision) = repository_upgrade::compatibility_decision(&cwd, capability)
+        && let Some(message) = decision.refusal_message()
     {
         eprintln!("Error: {message}");
         return ExitCode::from(1);
     }
 
-    match args[0].as_str() {
+    match command.name {
         "-h" | "--help" => {
             print_top_level_help();
             ExitCode::SUCCESS
@@ -138,9 +205,9 @@ fn main() -> ExitCode {
         },
         "root" => run_root_subcommand(&args[1..]),
         // Broker commands have been native Rust from birth (issue #31).
-        "broker" => ExitCode::from(aethyme_broker::cli::run(&args[1..])),
-        "update" => ExitCode::from(aethyme_broker::run_update_cli(&args[1..])),
-        "upgrade" => ExitCode::from(repository_upgrade::run(&args[1..])),
+        "broker" => ExitCode::from(aethyme_broker::cli::run(command.args)),
+        "update" => ExitCode::from(aethyme_broker::run_update_cli(command.args)),
+        "upgrade" => ExitCode::from(repository_upgrade::run(command.args)),
         // Certification — top-level by design (the "airport certification"
         // inspection). Strictly read-only; adaptive setup lives in
         // `broker scaffold`.
@@ -498,4 +565,64 @@ fn unknown_subcommand(subcommand: &str) -> ExitCode {
     eprintln!("aethyme: unknown subcommand '{subcommand}'");
     eprintln!("Run `aethyme --help` for the command list.");
     ExitCode::from(2)
+}
+
+#[cfg(test)]
+mod compatibility_command_tests {
+    use super::{ParsedCommand, repository_upgrade::CommandCapability};
+
+    fn capability(args: &[&str]) -> Option<CommandCapability> {
+        let args = args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        ParsedCommand::parse(&args)
+            .unwrap()
+            .compatibility_capability
+    }
+
+    #[test]
+    fn parsed_commands_cover_every_compatibility_capability() {
+        let cases = [
+            (&["broker", "status"][..], CommandCapability::DiagnosticRead),
+            (
+                &["broker", "integration", "reconcile"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "submit", "--session", "7"][..],
+                CommandCapability::SessionContinuation,
+            ),
+            (
+                &["broker", "start", "--task", "work"][..],
+                CommandCapability::NewSession,
+            ),
+            (
+                &["broker", "ship", "execute"][..],
+                CommandCapability::SharedMutation,
+            ),
+            (&["upgrade", "plan"][..], CommandCapability::Upgrade),
+        ];
+
+        for (args, expected) in cases {
+            assert_eq!(
+                capability(args),
+                Some(expected),
+                "unexpected capability for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_is_scoped_to_the_existing_broker_boundary() {
+        assert_eq!(
+            capability(&["broker", "adopt", "--reuse"]),
+            Some(CommandCapability::SessionContinuation)
+        );
+        assert_eq!(
+            capability(&["broker", "adopt"]),
+            Some(CommandCapability::NewSession)
+        );
+        assert_eq!(capability(&["explore"]), None);
+    }
 }
