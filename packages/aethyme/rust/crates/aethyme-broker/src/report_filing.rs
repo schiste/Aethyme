@@ -174,6 +174,7 @@ pub fn file_reviewed_report(
         session_id,
         provider: OperationProvider::Github,
         repository: Some(repository.into()),
+        resolved_target: None,
         scope: Some(filing_scope),
         declared_effect: Some(OperationEffect::Write),
         destructive_confirmed: false,

@@ -25,6 +25,9 @@ pub struct CoordinatedCommand {
     pub provider: OperationProvider,
     /// Required for GitHub operations and remote Git operations. `owner/repo`.
     pub repository: Option<String>,
+    /// Broker-resolved identity for an internal remote Git workflow. This is
+    /// distinct from the caller's `--repo owner/name` assertion.
+    pub resolved_target: Option<crate::ResolvedRemoteTarget>,
     /// Audit scope. V1 deliberately locks the whole repository regardless.
     pub scope: Option<String>,
     pub declared_effect: Option<OperationEffect>,
@@ -452,22 +455,32 @@ impl Broker {
             });
         }
 
-        let repository = match (&request.repository, request.provider) {
-            (Some(repository), _) => {
+        let repository = match (
+            &request.resolved_target,
+            &request.repository,
+            request.provider,
+        ) {
+            (Some(target), None, OperationProvider::Git) => target.coordination_key.clone(),
+            (Some(_), _, _) => {
+                return Err(BrokerOpError::InvalidCoordinatedOperation {
+                    reason: "a resolved remote target is only valid for internal Git operations without a second repository assertion".into(),
+                });
+            }
+            (None, Some(repository), _) => {
                 validate_repository(repository)?;
                 repository.clone()
             }
-            (None, OperationProvider::Github) => {
+            (None, None, OperationProvider::Github) => {
                 return Err(BrokerOpError::InvalidCoordinatedOperation {
                     reason: "broker gh requires --repo owner/name".into(),
                 });
             }
-            (None, OperationProvider::Git) if remote_git_operation(&request.args) => {
+            (None, None, OperationProvider::Git) if remote_git_operation(&request.args) => {
                 return Err(BrokerOpError::InvalidCoordinatedOperation {
                     reason: "remote Git operation requires --repo owner/name".into(),
                 });
             }
-            (None, OperationProvider::Git) => {
+            (None, None, OperationProvider::Git) => {
                 format!("local:{}", self.main_root().display())
             }
         };

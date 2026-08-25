@@ -40,6 +40,7 @@ mod quick_test;
 mod reconciliation;
 mod release_compatibility;
 pub mod release_manifest;
+mod remote_target;
 mod report;
 mod report_filing;
 mod repository_contract;
@@ -117,6 +118,11 @@ pub use release_compatibility::{
 pub use release_manifest::{
     RELEASE_MANIFEST_SCHEMA_VERSION, RELEASE_TARGETS, REQUIRED_RELEASE_BINARIES, ReleaseArtifact,
     ReleaseBrokerStorageCompatibility, ReleaseCompatibility, ReleaseInstaller, ReleaseManifest,
+};
+pub use remote_target::{
+    RemoteAssertionEvidence, RemoteIdentityEvidence, RemoteResolutionEvidence, RemoteTargetError,
+    RemoteUrlEvidence, RemoteUrlSource, RemoteUrlSyntax, ResolvedRemoteTarget,
+    resolve_remote_target,
 };
 pub use report::{
     InvalidReportEntry, PreparedReport, REPORT_DOCUMENT_SCHEMA_VERSION, REPORT_FILINGS_FILENAME,

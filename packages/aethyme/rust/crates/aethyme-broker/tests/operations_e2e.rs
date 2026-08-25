@@ -54,6 +54,7 @@ fn request(session_id: i64, args: &[&str]) -> CoordinatedCommand {
         session_id,
         provider: OperationProvider::Git,
         repository: None,
+        resolved_target: None,
         scope: None,
         declared_effect: None,
         destructive_confirmed: false,
@@ -113,6 +114,17 @@ fn destructive_and_ambiguous_operations_fail_closed() {
         .run_coordinated_operation(missing_reason)
         .unwrap_err();
     assert!(missing_reason.to_string().contains("require --reason"));
+
+    let mut invalid_assertion = request(session.id, &["fetch", "origin"]);
+    invalid_assertion.repository = Some("not-a-slug".into());
+    let invalid_assertion = broker
+        .run_coordinated_operation(invalid_assertion)
+        .unwrap_err();
+    assert!(
+        invalid_assertion
+            .to_string()
+            .contains("exact owner/name slug")
+    );
     assert!(broker.store().coordinated_operations().unwrap().is_empty());
 }
 
@@ -214,6 +226,7 @@ fn repository_write_lock_serializes_independent_process_clients() {
                     session_id,
                     provider: OperationProvider::Git,
                     repository: None,
+                    resolved_target: None,
                     scope: Some("test:sleep".into()),
                     declared_effect: Some(OperationEffect::Write),
                     destructive_confirmed: false,

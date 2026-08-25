@@ -7,6 +7,7 @@
 use crate::broker::{Broker, BrokerOpError};
 use crate::merge::PromoteConfig;
 use crate::operations::CoordinatedCommand;
+use crate::remote_target::ResolvedRemoteTarget;
 use crate::types::{
     CoordinatedOperation, MergeQueueEntry, MergeStatus, OperationEffect, OperationProvider, Session,
 };
@@ -51,8 +52,7 @@ pub struct ShipPlan {
     pub remote_default_branch_sha: String,
     pub planned_remote_base_sha: Option<String>,
     pub freshness: ShipFreshness,
-    pub target_repository: String,
-    pub remote: String,
+    pub target: ResolvedRemoteTarget,
     pub proposed_push: ShipPush,
     pub local_main_sync_safe: bool,
 }
@@ -131,7 +131,13 @@ impl Broker {
             .config_get(&format!("branch.{current_branch}.remote"))
             .filter(|remote| remote != ".")
             .unwrap_or_else(|| "origin".into());
-        let target_repository = self.repo_handle().remote_url(&remote)?;
+        let target = self
+            .repo_handle()
+            .resolve_remote_target(&remote, None)
+            .map_err(|error| BrokerOpError::ShipPlanUnavailable {
+                what: "remote target",
+                reason: error.to_string(),
+            })?;
         let remote_default = self.repo_handle().remote_default_branch(&remote)?;
         let default_branch = remote_default
             .ref_name
@@ -208,8 +214,7 @@ impl Broker {
                 integration_is_ancestor_of_remote,
                 fast_forward,
             },
-            target_repository,
-            remote,
+            target,
             proposed_push,
             local_main_sync_safe,
         })
@@ -256,7 +261,6 @@ impl Broker {
                 tracking_ref: tracking_ref(&plan),
             }
         })?;
-        let repository = coordination_repository(&plan.target_repository);
         let main_root = self.main_root().to_path_buf();
         let tracking_ref = tracking_ref(&plan);
 
@@ -264,7 +268,8 @@ impl Broker {
             CoordinatedCommand {
                 session_id: plan.originating_session.id,
                 provider: OperationProvider::Git,
-                repository: Some(repository.clone()),
+                repository: None,
+                resolved_target: Some(plan.target.clone()),
                 scope: Some(format!("ship:fetch:{}", plan.remote_default_branch_ref)),
                 declared_effect: None,
                 destructive_confirmed: false,
@@ -276,7 +281,7 @@ impl Broker {
                     "fetch".into(),
                     "--no-tags".into(),
                     "--force".into(),
-                    plan.remote.clone(),
+                    plan.target.remote_name.clone(),
                     format!("{}:{tracking_ref}", plan.remote_default_branch_ref),
                 ],
             },
@@ -328,7 +333,8 @@ impl Broker {
             CoordinatedCommand {
                 session_id: plan.originating_session.id,
                 provider: OperationProvider::Git,
-                repository: Some(repository.clone()),
+                repository: None,
+                resolved_target: Some(plan.target.clone()),
                 scope: Some(format!("ship:push:{}", plan.remote_default_branch_ref)),
                 declared_effect: None,
                 destructive_confirmed: false,
@@ -338,7 +344,7 @@ impl Broker {
                 )),
                 args: vec![
                     "push".into(),
-                    plan.remote.clone(),
+                    plan.target.remote_name.clone(),
                     format!("{confirm}:{}", plan.remote_default_branch_ref),
                 ],
             },
@@ -356,14 +362,15 @@ impl Broker {
             CoordinatedCommand {
                 session_id: plan.originating_session.id,
                 provider: OperationProvider::Git,
-                repository: Some(repository),
+                repository: None,
+                resolved_target: Some(plan.target.clone()),
                 scope: Some(format!("ship:verify:{}", plan.remote_default_branch_ref)),
                 declared_effect: Some(OperationEffect::Read),
                 destructive_confirmed: false,
                 authorization_reason: None,
                 args: vec![
                     "ls-remote".into(),
-                    plan.remote.clone(),
+                    plan.target.remote_name.clone(),
                     plan.remote_default_branch_ref.clone(),
                 ],
             },
@@ -412,6 +419,7 @@ impl Broker {
                     session_id: plan.originating_session.id,
                     provider: OperationProvider::Git,
                     repository: None,
+                    resolved_target: None,
                     scope: Some(format!("ship:sync:{}", plan.local_default_branch_ref)),
                     declared_effect: None,
                     destructive_confirmed: false,
@@ -539,23 +547,7 @@ fn tracking_ref(plan: &ShipPlan) -> String {
         .remote_default_branch_ref
         .strip_prefix("refs/heads/")
         .unwrap_or(&plan.remote_default_branch_ref);
-    format!("refs/remotes/{}/{branch}", plan.remote)
-}
-
-fn coordination_repository(target: &str) -> String {
-    let trimmed = target.trim_end_matches('/').trim_end_matches(".git");
-    let path = trimmed
-        .strip_prefix("git@github.com:")
-        .or_else(|| trimmed.split_once("github.com/").map(|(_, path)| path));
-    if let Some(path) = path {
-        let mut parts = path.split('/');
-        if let (Some(owner), Some(repository), None) = (parts.next(), parts.next(), parts.next()) {
-            if !owner.is_empty() && !repository.is_empty() {
-                return format!("{owner}/{repository}");
-            }
-        }
-    }
-    "local/remote".into()
+    format!("refs/remotes/{}/{branch}", plan.target.remote_name)
 }
 
 fn ls_remote_sha(output: &str, ref_name: &str) -> Option<String> {

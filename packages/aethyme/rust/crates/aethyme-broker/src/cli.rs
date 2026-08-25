@@ -2013,9 +2013,14 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool) -> Result<(), UsageErr
     );
     println!(
         "Remote default: {}/{} @ {}",
-        report.remote, report.remote_default_branch_ref, report.remote_default_branch_sha
+        report.target.remote_name,
+        report.remote_default_branch_ref,
+        report.remote_default_branch_sha
     );
-    println!("Target: {}", report.target_repository);
+    println!(
+        "Target: {} ({})",
+        report.target.display_slug, report.target.normalized_host
+    );
     println!("Freshness: {:?}", report.freshness.result);
     println!("Proposed push: {}", report.proposed_push.command.join(" "));
     println!(
@@ -2043,7 +2048,7 @@ fn render_ship_execution(
     }
     println!(
         "Published {} to {}/{}.",
-        report.published_sha, report.plan.remote, report.plan.remote_default_branch_ref
+        report.published_sha, report.plan.target.remote_name, report.plan.remote_default_branch_ref
     );
     println!("Verified remote SHA: {}", report.verified_remote_sha);
     println!(
@@ -2960,6 +2965,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 session_id: session,
                 provider,
                 repository: parsed.repository,
+                resolved_target: None,
                 scope: parsed.scope,
                 declared_effect: parse_operation_effect(parsed.effect.as_deref())?,
                 destructive_confirmed: parsed.destructive,

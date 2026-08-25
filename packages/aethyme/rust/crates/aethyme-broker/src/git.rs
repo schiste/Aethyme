@@ -268,6 +268,20 @@ impl GitRepo {
         run_git(&self.root, &["remote", "get-url", remote])
     }
 
+    /// Configured push URL for `remote`, after Git's URL rewrite rules.
+    pub fn remote_push_url(&self, remote: &str) -> Result<String, GitError> {
+        run_git(&self.root, &["remote", "get-url", "--push", remote])
+    }
+
+    /// Resolve a configured remote to one credential-free coordination target.
+    pub fn resolve_remote_target(
+        &self,
+        remote: &str,
+        caller_assertion: Option<&str>,
+    ) -> Result<crate::ResolvedRemoteTarget, crate::RemoteTargetError> {
+        crate::remote_target::resolve_remote_target(self, remote, caller_assertion)
+    }
+
     /// Query the remote's advertised HEAD without updating any local ref.
     pub fn remote_default_branch(&self, remote: &str) -> Result<RemoteDefaultBranch, GitError> {
         let output = run_git(&self.root, &["ls-remote", "--symref", remote, "HEAD"])?;

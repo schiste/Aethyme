@@ -145,7 +145,21 @@ fn ship_plan_reports_exact_tip_and_does_not_mutate_refs() {
     assert_eq!(plan.freshness.result, ShipFreshnessResult::Ready);
     assert!(plan.freshness.fast_forward);
     assert!(plan.local_main_sync_safe);
-    assert_eq!(plan.target_repository, fixture.remote.to_string_lossy());
+    assert_eq!(plan.target.normalized_host, "local");
+    assert_eq!(
+        plan.target.fetch_url,
+        fixture.remote.to_string_lossy().trim_end_matches(".git")
+    );
+    assert_eq!(plan.target.fetch_url, plan.target.push_url);
+    assert_eq!(
+        plan.target.coordination_key,
+        format!(
+            "local:{}",
+            fixture.remote.to_string_lossy().trim_end_matches(".git")
+        )
+    );
+    assert_eq!(plan.target.remote_name, "origin");
+    assert!(plan.target.caller_assertion.is_none());
     assert_eq!(
         plan.proposed_push.refspec,
         format!("{}:refs/heads/main", plan.integration_sha)
@@ -199,6 +213,18 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
     assert_eq!(report.fetch_operation.status, OperationStatus::Succeeded);
     assert_eq!(report.push_operation.status, OperationStatus::Succeeded);
     assert_eq!(report.verify_operation.status, OperationStatus::Succeeded);
+    assert_eq!(
+        report.fetch_operation.repository,
+        report.plan.target.coordination_key
+    );
+    assert_eq!(
+        report.push_operation.repository,
+        report.plan.target.coordination_key
+    );
+    assert_eq!(
+        report.verify_operation.repository,
+        report.plan.target.coordination_key
+    );
     assert!(!report.push_operation.command_json.contains("--force"));
     assert!(!report.local_main_sync.requested);
     assert!(!report.local_main_sync.synchronized);
