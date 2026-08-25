@@ -123,3 +123,40 @@ fn github_and_destructive_frontends_fail_before_execution_without_required_scope
     .run()
     .ok();
 }
+
+#[test]
+fn github_frontend_refuses_targets_after_the_broker_separator() {
+    let (tmp, session) = repo();
+    let session_arg = session.to_string();
+
+    for (command, expected) in [
+        (
+            vec!["pr", "view", "1", "--repo", "Other/Repo"],
+            "do not pass a second repository target after --",
+        ),
+        (
+            vec!["api", "repos/Other/Repo/issues"],
+            "does not match broker --repo",
+        ),
+    ] {
+        let mut args = vec![
+            "broker",
+            "gh",
+            "--session",
+            &session_arg,
+            "--repo",
+            "Schiste/Aethyme",
+            "--",
+        ];
+        args.extend(command);
+        let refusal = Invoke::new(args).cwd(tmp.path()).run();
+        refusal.expect_code(1);
+        refusal.assert_contains(expected);
+    }
+
+    let journal = Invoke::new(["broker", "operations", "--json"])
+        .cwd(tmp.path())
+        .run();
+    journal.ok();
+    assert!(journal.json().as_array().unwrap().is_empty());
+}

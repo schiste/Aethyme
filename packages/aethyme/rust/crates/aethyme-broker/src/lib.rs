@@ -27,6 +27,7 @@ mod error;
 pub mod events;
 mod gates;
 mod git;
+mod github_target;
 mod graph_impact;
 mod homebrew;
 pub mod hooks;
@@ -74,6 +75,9 @@ pub use gates::{
     select_gates,
 };
 pub use git::{GitError, GitRepo, MergeSimulation, RemoteDefaultBranch};
+pub use github_target::{
+    GithubApiTargetEvidence, GithubTargetError, ResolvedGithubTarget, resolve_github_target,
+};
 pub use graph_impact::{
     GRAPH_IMPACT_MAX_DEPTH, GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT, GraphImpactChain,
     GraphImpactLookup, GraphImpactProvider, GraphImpactQuery, GraphImpactStatus,

@@ -43,6 +43,8 @@ pub struct CoordinatedOperationReport {
     pub classification: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_target: Option<crate::ResolvedRemoteTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_target: Option<crate::ResolvedGithubTarget>,
     pub command_success: bool,
     pub stdout: String,
     pub stderr: String,
@@ -334,11 +336,15 @@ fn remote_git_operation(args: &[String]) -> bool {
 fn journal_details(
     classification: &'static str,
     resolved_target: Option<&crate::ResolvedRemoteTarget>,
+    github_target: Option<&crate::ResolvedGithubTarget>,
     extra: serde_json::Value,
 ) -> serde_json::Value {
     let mut details = json!({ "classification": classification });
     if let Some(target) = resolved_target {
         details["resolved_target"] = json!(target);
+    }
+    if let Some(target) = github_target {
+        details["github_target"] = json!(target);
     }
     if let (Some(details), Some(extra)) = (details.as_object_mut(), extra.as_object()) {
         for (key, value) in extra {
@@ -346,20 +352,6 @@ fn journal_details(
         }
     }
     details
-}
-
-fn validate_gh_args(args: &[String]) -> Result<(), BrokerOpError> {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "-R" | "--repo") || arg.starts_with("--repo="))
-    {
-        return Err(BrokerOpError::InvalidCoordinatedOperation {
-            reason:
-                "do not pass a second repository target after --; use broker gh --repo owner/name"
-                    .into(),
-        });
-    }
-    Ok(())
 }
 
 fn redacted_command(provider: OperationProvider, args: &[String]) -> Result<String, BrokerOpError> {
@@ -451,9 +443,15 @@ impl Broker {
                 ),
             });
         }
-        if request.provider == OperationProvider::Github {
-            validate_gh_args(&request.args)?;
-        }
+        let github_target = if request.provider == OperationProvider::Github {
+            request
+                .repository
+                .as_deref()
+                .map(|repository| crate::resolve_github_target(repository, &request.args))
+                .transpose()?
+        } else {
+            None
+        };
         let inferred = match request.provider {
             OperationProvider::Git => classify_git(&request.args),
             OperationProvider::Github => classify_gh(&request.args),
@@ -510,7 +508,11 @@ impl Broker {
                 let repo = crate::GitRepo::discover(cwd)?;
                 Some(repo.resolve_remote_command_target(&request.args, Some(repository))?)
             }
-            (None, Some(repository), _) => {
+            (None, Some(_), OperationProvider::Github) => {
+                debug_assert!(github_target.is_some());
+                None
+            }
+            (None, Some(repository), OperationProvider::Git) => {
                 validate_repository(repository)?;
                 None
             }
@@ -528,7 +530,12 @@ impl Broker {
         };
         let repository = match (&resolved_target, &request.repository, request.provider) {
             (Some(target), _, OperationProvider::Git) => target.coordination_key.clone(),
-            (None, Some(repository), _) => repository.clone(),
+            (None, Some(_), OperationProvider::Github) => github_target
+                .as_ref()
+                .expect("resolved GitHub target")
+                .coordination_key
+                .clone(),
+            (None, Some(repository), OperationProvider::Git) => repository.clone(),
             (None, None, OperationProvider::Git) => {
                 format!("local:{}", self.main_root().display())
             }
@@ -605,7 +612,15 @@ impl Broker {
             operation.id,
             OperationStatus::Running,
             None,
-            Some(&journal_details(classification, resolved_target.as_ref(), json!({})).to_string()),
+            Some(
+                &journal_details(
+                    classification,
+                    resolved_target.as_ref(),
+                    github_target.as_ref(),
+                    json!({}),
+                )
+                .to_string(),
+            ),
         )?;
 
         let executable = match request.provider {
@@ -621,7 +636,13 @@ impl Broker {
             .stderr(Stdio::piped())
             .env("AETHYME_BROKER_SESSION_ID", request.session_id.to_string());
         if request.provider == OperationProvider::Github {
-            command.env("GH_REPO", &repository);
+            command.env(
+                "GH_REPO",
+                &github_target
+                    .as_ref()
+                    .expect("resolved GitHub target")
+                    .display_slug,
+            );
         }
         let output = match command.output() {
             Ok(output) => output,
@@ -634,6 +655,7 @@ impl Broker {
                         &journal_details(
                             classification,
                             resolved_target.as_ref(),
+                            github_target.as_ref(),
                             json!({ "reason": "spawn_failed" }),
                         )
                         .to_string(),
@@ -653,18 +675,25 @@ impl Broker {
                     journal_details(
                         classification,
                         resolved_target.as_ref(),
+                        github_target.as_ref(),
                         json!({ "result": result }),
                     ),
                 ),
                 Ok(None) => (
                     OperationStatus::Succeeded,
-                    journal_details(classification, resolved_target.as_ref(), json!({})),
+                    journal_details(
+                        classification,
+                        resolved_target.as_ref(),
+                        github_target.as_ref(),
+                        json!({}),
+                    ),
                 ),
                 Err(reason) => (
                     OperationStatus::OutcomeUnknown,
                     journal_details(
                         classification,
                         resolved_target.as_ref(),
+                        github_target.as_ref(),
                         json!({
                             "reason": "success_result_not_recorded",
                             "diagnosis": reason,
@@ -675,7 +704,12 @@ impl Broker {
         } else if effect == OperationEffect::Read {
             (
                 OperationStatus::Failed,
-                journal_details(classification, resolved_target.as_ref(), json!({})),
+                journal_details(
+                    classification,
+                    resolved_target.as_ref(),
+                    github_target.as_ref(),
+                    json!({}),
+                ),
             )
         } else {
             // A mutating command may have applied a subset of its effects
@@ -683,7 +717,12 @@ impl Broker {
             // make a blind retry possible, so require external inspection.
             (
                 OperationStatus::OutcomeUnknown,
-                journal_details(classification, resolved_target.as_ref(), json!({})),
+                journal_details(
+                    classification,
+                    resolved_target.as_ref(),
+                    github_target.as_ref(),
+                    json!({}),
+                ),
             )
         };
         let operation = self.store().transition_coordinated_operation(
@@ -696,6 +735,7 @@ impl Broker {
             operation,
             classification,
             resolved_target,
+            github_target,
             command_success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -793,8 +833,11 @@ mod tests {
 
     #[test]
     fn github_target_cannot_be_overridden_after_the_broker_boundary() {
-        let err =
-            validate_gh_args(&args(&["pr", "merge", "12", "--repo", "other/repo"])).unwrap_err();
+        let err = crate::resolve_github_target(
+            "owner/repo",
+            &args(&["pr", "merge", "12", "--repo", "other/repo"]),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("second repository target"));
     }
 }

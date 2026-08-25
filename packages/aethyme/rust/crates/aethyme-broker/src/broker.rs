@@ -32,6 +32,8 @@ pub enum BrokerOpError {
     #[error(transparent)]
     Git(#[from] GitError),
     #[error(transparent)]
+    GithubTarget(#[from] crate::GithubTargetError),
+    #[error(transparent)]
     Store(#[from] BrokerError),
     #[error(transparent)]
     Pr(#[from] crate::pr::PrError),

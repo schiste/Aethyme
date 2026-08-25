@@ -63,6 +63,20 @@ fn request(session_id: i64, args: &[&str]) -> CoordinatedCommand {
     }
 }
 
+fn github_request(session_id: i64, repository: &str, args: &[&str]) -> CoordinatedCommand {
+    CoordinatedCommand {
+        session_id,
+        provider: OperationProvider::Github,
+        repository: Some(repository.into()),
+        resolved_target: None,
+        scope: Some("github:test".into()),
+        declared_effect: Some(OperationEffect::Read),
+        destructive_confirmed: false,
+        authorization_reason: None,
+        args: args.iter().map(|arg| (*arg).into()).collect(),
+    }
+}
+
 #[test]
 fn successful_operation_is_durably_journaled_with_events() {
     let tmp = tempfile::tempdir().unwrap();
@@ -219,6 +233,55 @@ fn remote_git_refuses_mismatched_assertions_and_multiple_push_urls() {
             .to_string()
             .contains("has 2 push URLs")
     );
+    assert!(broker.store().coordinated_operations().unwrap().is_empty());
+}
+
+#[test]
+fn github_operations_journal_normalized_identity_and_display_spelling() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let worktree = add_worktree(tmp.path(), "github-identity");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+
+    let report = broker
+        .run_coordinated_operation(github_request(
+            session.id,
+            "Schiste/Aethyme",
+            &["--version"],
+        ))
+        .unwrap();
+    assert!(report.ok());
+    assert_eq!(report.operation.repository, "schiste/aethyme");
+    let target = report.github_target.as_ref().unwrap();
+    assert_eq!(target.coordination_key, report.operation.repository);
+    assert_eq!(target.display_slug, "Schiste/Aethyme");
+
+    let details: serde_json::Value =
+        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        details["github_target"]["coordination_key"],
+        "schiste/aethyme"
+    );
+    assert_eq!(details["github_target"]["display_slug"], "Schiste/Aethyme");
+}
+
+#[test]
+fn github_api_mismatch_is_refused_before_execution_or_journaling() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let worktree = add_worktree(tmp.path(), "github-mismatch");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+
+    let error = broker
+        .run_coordinated_operation(github_request(
+            session.id,
+            "Schiste/Aethyme",
+            &["api", "repos/Other/Repo/issues"],
+        ))
+        .unwrap_err();
+    assert!(error.to_string().contains("does not match broker --repo"));
     assert!(broker.store().coordinated_operations().unwrap().is_empty());
 }
 
