@@ -79,6 +79,8 @@ pub enum BrokerOpError {
         command: String,
         source: std::io::Error,
     },
+    #[error("cannot capture repository contract at {path}: {reason}")]
+    RepositoryContract { path: String, reason: String },
     #[error(
         "lease claim for {path} by session {session_id} overlaps {blocker_count} active lease(s) held by other sessions"
     )]
@@ -1067,6 +1069,7 @@ impl Broker {
             main_root,
             graph_impact_provider: Box::new(graph_impact_provider),
         };
+        broker.backfill_live_repository_contracts()?;
         broker.recover_prepared_reconciliation()?;
         Ok(broker)
     }
@@ -1085,6 +1088,47 @@ impl Broker {
 
     pub(crate) fn repo_handle(&self) -> &GitRepo {
         &self.repo
+    }
+
+    fn capture_repository_contract(
+        &self,
+        checkout_root: &Path,
+        backfilled: bool,
+    ) -> Result<crate::RepositoryContract, BrokerOpError> {
+        // Canonical deployment files travel with each worktree. Local-only
+        // artifacts are intentionally untracked and belong to the clone's
+        // primary checkout, so a spawned linked worktree cannot contain them.
+        let contract_root = if crate::detect_repository_mode(&self.main_root)
+            == crate::RepositoryDeploymentMode::LocalOnly
+        {
+            self.main_root.as_path()
+        } else {
+            checkout_root
+        };
+        crate::RepositoryContract::capture(contract_root, backfilled).map_err(|reason| {
+            BrokerOpError::RepositoryContract {
+                path: contract_root.display().to_string(),
+                reason,
+            }
+        })
+    }
+
+    fn backfill_live_repository_contracts(&mut self) -> Result<(), BrokerOpError> {
+        for session in self.store.live_sessions()? {
+            if session.repository_contract.is_some() {
+                continue;
+            }
+            let recorded_worktree = PathBuf::from(&session.worktree_path);
+            let checkout_root = if recorded_worktree.is_dir() {
+                recorded_worktree.as_path()
+            } else {
+                self.main_root.as_path()
+            };
+            let contract = self.capture_repository_contract(checkout_root, true)?;
+            self.store
+                .backfill_session_repository_contract(session.id, &contract)?;
+        }
+        Ok(())
     }
 
     pub fn pr_check(
@@ -1131,6 +1175,7 @@ impl Broker {
             None
         };
         let diff_base = checkout.head_commit().ok();
+        let repository_contract = self.capture_repository_contract(checkout.root(), false)?;
         let worktree_path = checkout.root().to_string_lossy().into_owned();
         let foreign_files = checkout.untracked_paths()?;
         let mut outcome = AdoptOutcome::Created;
@@ -1187,7 +1232,9 @@ impl Broker {
             branch,
             origin: SessionOrigin::Adopted,
             task: task.map(str::to_string),
+            adoption_base: diff_base.clone(),
             diff_base,
+            repository_contract: Some(repository_contract),
             pid: None,
             command: None,
             log_path: None,
@@ -1372,12 +1419,15 @@ impl Broker {
     /// returned path and continue with an isolated index and checkout.
     pub fn start_worktree(&mut self, task: &str) -> Result<Session, BrokerOpError> {
         let (_slug, branch, base, worktree) = self.create_session_worktree(task)?;
+        let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
         let session = self.store.register_session(&NewSession {
             worktree_path: worktree.root().to_string_lossy().into_owned(),
             branch,
             origin: SessionOrigin::Spawned,
             task: Some(task.to_string()),
+            adoption_base: Some(base.clone()),
             diff_base: Some(base),
+            repository_contract: Some(repository_contract),
             pid: None,
             command: None,
             log_path: None,
@@ -1392,6 +1442,7 @@ impl Broker {
     /// recording its PID).
     pub fn start_agent(&mut self, task: &str, command: &str) -> Result<Session, BrokerOpError> {
         let (slug, branch, base, worktree) = self.create_session_worktree(task)?;
+        let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
 
         let log_dir = self.main_root.join(".aethyme/logs");
         std::fs::create_dir_all(&log_dir).map_err(|source| BrokerError::Io {
@@ -1426,7 +1477,9 @@ impl Broker {
             branch,
             origin: SessionOrigin::Spawned,
             task: Some(task.to_string()),
+            adoption_base: Some(base.clone()),
             diff_base: Some(base),
+            repository_contract: Some(repository_contract),
             pid: Some(child.id() as i64),
             command: Some(command.to_string()),
             log_path: Some(log_path.to_string_lossy().into_owned()),
@@ -4695,6 +4748,8 @@ mod tests {
             status: SessionStatus::Active,
             task: Some("test".into()),
             diff_base: Some("HEAD".into()),
+            adoption_base: Some("HEAD".into()),
+            repository_contract: None,
             pid: None,
             command: None,
             log_path: None,

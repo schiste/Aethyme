@@ -42,6 +42,7 @@ mod release_compatibility;
 pub mod release_manifest;
 mod report;
 mod report_filing;
+mod repository_contract;
 mod resources;
 mod schema;
 mod ship;
@@ -131,6 +132,11 @@ pub use report::{
 pub use report_filing::{
     REPORT_FILE_SCHEMA_VERSION, ReportFileError, ReportFileResult, ReportFileState,
     file_reviewed_report,
+};
+pub use repository_contract::{
+    CANONICAL_REPOSITORY_MARKER_PATH, LOCAL_REPOSITORY_MARKER_PATH, RepositoryContract,
+    RepositoryDeploymentMode, detect_repository_mode, repository_managed_paths,
+    repository_state_digest,
 };
 pub use resources::{
     HOST_RESOURCE_REQUEST_SCHEMA_VERSION, HOST_RESOURCE_SCHEMA_VERSION, HostLeaseState,

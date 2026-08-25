@@ -153,17 +153,28 @@ impl BrokerStore {
     pub fn register_session(&mut self, new: &NewSession) -> Result<Session, BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
+        let contract = new.repository_contract.as_ref();
         let inserted = tx.execute(
             "INSERT INTO sessions (worktree_path, branch, origin, status, task, diff_base,
+                                   adoption_base, repository_schema,
+                                   deployment_state_digest, aethyme_version,
+                                   gate_definition_digest, repository_contract_backfilled,
                                    pid, command, log_path, created_at, updated_at,
                                    last_activity_at)
-             VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?9)",
+             VALUES (?1, ?2, ?3, 'active', ?4, ?5, COALESCE(?6, ?5), ?7, ?8,
+                     ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15, ?15)",
             params![
                 new.worktree_path,
                 new.branch,
                 new.origin.as_str(),
                 new.task,
                 new.diff_base,
+                new.adoption_base,
+                contract.and_then(|value| value.repository_schema),
+                contract.map(|value| &value.deployment_state_digest),
+                contract.map(|value| &value.aethyme_version),
+                contract.and_then(|value| value.gate_definition_digest.as_deref()),
+                contract.is_some_and(|value| value.backfilled),
                 new.pid,
                 new.command,
                 new.log_path,
@@ -271,6 +282,32 @@ impl BrokerStore {
             sessions.push(row??);
         }
         Ok(sessions)
+    }
+
+    /// Fill the repository contract for a live pre-v9 session exactly once.
+    /// The deployment digest is the presence marker because repository schema
+    /// and gate digest are both legitimately nullable.
+    pub fn backfill_session_repository_contract(
+        &mut self,
+        id: i64,
+        contract: &crate::RepositoryContract,
+    ) -> Result<bool, BrokerError> {
+        let changed = self.conn.execute(
+            "UPDATE sessions
+             SET repository_schema = ?2, deployment_state_digest = ?3,
+                 aethyme_version = ?4, gate_definition_digest = ?5,
+                 repository_contract_backfilled = 1, updated_at = ?6
+             WHERE id = ?1 AND status != 'cleaned' AND deployment_state_digest IS NULL",
+            params![
+                id,
+                contract.repository_schema,
+                contract.deployment_state_digest,
+                contract.aethyme_version,
+                contract.gate_definition_digest,
+                now_ms(),
+            ],
+        )?;
+        Ok(changed == 1)
     }
 
     pub fn touch_session_activity(&mut self, id: i64, at_ms: i64) -> Result<(), BrokerError> {
@@ -1446,7 +1483,9 @@ impl BrokerStore {
 // ── row mapping helpers ──────────────────────────────────────────────
 
 const SESSION_SELECT: &str = "SELECT id, worktree_path, branch, origin, status, task, \
-     diff_base, pid, command, log_path, exit_code, created_at, updated_at, last_activity_at \
+     diff_base, adoption_base, repository_schema, deployment_state_digest, aethyme_version, \
+     gate_definition_digest, repository_contract_backfilled, pid, command, log_path, \
+     exit_code, created_at, updated_at, last_activity_at \
      FROM sessions";
 
 const LEASE_SELECT: &str =
@@ -1477,6 +1516,20 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> Result<Event, rusqlite::Error> {
 fn session_from_row(row: &rusqlite::Row<'_>) -> RowResult<Session> {
     let origin: String = row.get(3)?;
     let status: String = row.get(4)?;
+    let repository_schema: Option<u32> = row.get(8)?;
+    let deployment_state_digest: Option<String> = row.get(9)?;
+    let aethyme_version: Option<String> = row.get(10)?;
+    let gate_definition_digest: Option<String> = row.get(11)?;
+    let repository_contract_backfilled: bool = row.get(12)?;
+    let repository_contract = deployment_state_digest.zip(aethyme_version).map(
+        |(deployment_state_digest, aethyme_version)| crate::RepositoryContract {
+            repository_schema,
+            deployment_state_digest,
+            aethyme_version,
+            gate_definition_digest,
+            backfilled: repository_contract_backfilled,
+        },
+    );
     Ok((|| {
         Ok(Session {
             id: row.get(0)?,
@@ -1486,13 +1539,15 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> RowResult<Session> {
             status: SessionStatus::parse(&status)?,
             task: row.get(5)?,
             diff_base: row.get(6)?,
-            pid: row.get(7)?,
-            command: row.get(8)?,
-            log_path: row.get(9)?,
-            exit_code: row.get(10)?,
-            created_at: row.get(11)?,
-            updated_at: row.get(12)?,
-            last_activity_at: row.get(13)?,
+            adoption_base: row.get(7)?,
+            repository_contract,
+            pid: row.get(13)?,
+            command: row.get(14)?,
+            log_path: row.get(15)?,
+            exit_code: row.get(16)?,
+            created_at: row.get(17)?,
+            updated_at: row.get(18)?,
+            last_activity_at: row.get(19)?,
         })
     })())
 }

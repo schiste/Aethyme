@@ -4,7 +4,6 @@
 //! package manager has no trustworthy repository scope; the first broker use
 //! in an enrolled repository refuses an old schema and points here instead.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -12,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const REPOSITORY_SCHEMA_VERSION: u32 = aethyme_broker::REPOSITORY_SCHEMA_VERSION;
-pub const CANONICAL_MARKER_PATH: &str = ".aethyme/repository.json";
-pub const LOCAL_MARKER_PATH: &str = ".aethyme/local/repository.json";
+pub const CANONICAL_MARKER_PATH: &str = aethyme_broker::CANONICAL_REPOSITORY_MARKER_PATH;
+pub const LOCAL_MARKER_PATH: &str = aethyme_broker::LOCAL_REPOSITORY_MARKER_PATH;
 const PLAN_SCHEMA_VERSION: u32 = 1;
 const MIGRATION_ID: &str = "repository-deployment-v1";
 const MIGRATION_IN_PROGRESS: &str = "repository-deployment-v1:in-progress";
@@ -550,45 +549,10 @@ fn detect_mode(repo: &Path) -> Option<RepositoryMode> {
 }
 
 fn managed_paths(mode: RepositoryMode) -> Vec<String> {
-    let mut paths = BTreeSet::new();
-    paths.extend([
-        ".aethyme/config.toml".into(),
-        ".aethyme/gates.toml".into(),
-        mode.marker_path().into(),
-    ]);
-    match mode {
-        RepositoryMode::Canonical => {
-            paths.insert(".gitignore".into());
-            paths.insert("AGENTS.md".into());
-            paths.insert("CLAUDE.md".into());
-            paths.extend(
-                aethyme_enhance::deploy::TARGETS
-                    .iter()
-                    .map(|(path, _)| (*path).into()),
-            );
-        }
-        RepositoryMode::LocalOnly => {
-            paths.insert(aethyme_enhance::local::LOCAL_MARKER_PATH.into());
-            paths.insert(aethyme_enhance::local::LOCAL_POLICY_PATH.into());
-            paths.extend(
-                aethyme_enhance::deploy::TARGETS
-                    .iter()
-                    .filter(|(path, _)| *path != "CLAUDE.md")
-                    .map(|(path, _)| (*path).into()),
-            );
-        }
-    }
-    paths.insert(aethyme_enhance::deploy::SETTINGS_FILE.into());
-    paths.extend([
-        aethyme_enhance::AGENTS_OVERRIDE_PATH.into(),
-        aethyme_enhance::onboarding::ONBOARDING_JSON_PATH.into(),
-        aethyme_enhance::onboarding::ACT_STARTER_JSON_PATH.into(),
-        aethyme_enhance::onboarding::ONBOARDING_CLAUDE_PATH.into(),
-        aethyme_enhance::onboarding::ONBOARDING_CODEX_PATH.into(),
-        aethyme_enhance::onboarding::ACT_CLAUDE_PATH.into(),
-        aethyme_enhance::onboarding::ACT_CODEX_PATH.into(),
-    ]);
-    paths.into_iter().collect()
+    aethyme_broker::repository_managed_paths(match mode {
+        RepositoryMode::Canonical => aethyme_broker::RepositoryDeploymentMode::Canonical,
+        RepositoryMode::LocalOnly => aethyme_broker::RepositoryDeploymentMode::LocalOnly,
+    })
 }
 
 fn managed_path_blocker(repo: &Path, relative: &str) -> Result<Option<String>, String> {
@@ -624,23 +588,13 @@ fn managed_path_blocker(repo: &Path, relative: &str) -> Result<Option<String>, S
 }
 
 fn repository_state_digest(repo: &Path, mode: RepositoryMode) -> Result<String, String> {
-    let mut hasher = Sha256::new();
-    for relative in managed_paths(mode) {
-        hasher.update(relative.as_bytes());
-        let path = repo.join(&relative);
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => hasher.update(b"symlink"),
-            Ok(metadata) if metadata.is_file() => {
-                hasher.update(b"file");
-                hasher
-                    .update(std::fs::read(&path).map_err(|error| format!("{relative}: {error}"))?);
-            }
-            Ok(_) => hasher.update(b"other"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => hasher.update(b"missing"),
-            Err(error) => return Err(format!("{relative}: {error}")),
-        }
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    aethyme_broker::repository_state_digest(
+        repo,
+        match mode {
+            RepositoryMode::Canonical => aethyme_broker::RepositoryDeploymentMode::Canonical,
+            RepositoryMode::LocalOnly => aethyme_broker::RepositoryDeploymentMode::LocalOnly,
+        },
+    )
 }
 
 fn git_root(repo_hint: &Path) -> Result<PathBuf, String> {

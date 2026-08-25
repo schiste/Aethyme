@@ -22,6 +22,7 @@ name = "aethyme-broker"
 version = "0.2.2"
 dependencies = [
  "aethyme-engine",
+ "aethyme-enhance",
  "globset",
  "libc",
  "noyalib",

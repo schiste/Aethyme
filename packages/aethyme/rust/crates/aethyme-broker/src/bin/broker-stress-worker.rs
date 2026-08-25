@@ -37,6 +37,8 @@ fn main() {
         origin: SessionOrigin::Adopted,
         task: Some(format!("stress worker {worker_id}")),
         diff_base: None,
+        adoption_base: None,
+        repository_contract: None,
         pid: None,
         command: None,
         log_path: None,

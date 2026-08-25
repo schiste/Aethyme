@@ -8,7 +8,7 @@ use std::process::Command;
 use aethyme_broker::{
     AdoptIntegrationRelation, AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, Broker,
     BrokerOpError, FinishGateCacheSource, FinishLeaseState, FinishStatus, GateStatus,
-    NewGateResult, SessionOrigin, SessionStatus, VersionDriftStatus, events,
+    NewGateResult, NewSession, SessionOrigin, SessionStatus, VersionDriftStatus, events,
 };
 
 fn sh(cwd: &Path, args: &[&str]) {
@@ -131,6 +131,99 @@ fn start_worktree_creates_broker_managed_session_without_process() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn session_creation_pins_repository_contract_and_reuse_does_not_refresh_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/repository.json"),
+        r#"{"schema_version":1,"applied_migrations":["repository-deployment-v1"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/gates.toml"),
+        "[[gate]]\nname = \"first\"\ncommand = \"true\"\n",
+    )
+    .unwrap();
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let created = broker.adopt(tmp.path(), Some("pinned task")).unwrap();
+    let original_contract = created
+        .repository_contract
+        .clone()
+        .expect("new sessions pin a repository contract");
+    assert_eq!(created.adoption_base, created.diff_base);
+    assert_eq!(original_contract.repository_schema, Some(1));
+    assert_eq!(original_contract.aethyme_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        original_contract
+            .gate_definition_digest
+            .as_deref()
+            .map(str::len),
+        Some(64)
+    );
+    assert!(!original_contract.backfilled);
+    let json = serde_json::to_value(&created).unwrap();
+    assert_eq!(json["adoption_base"], json["diff_base"]);
+    assert_eq!(json["repository_contract"]["repository_schema"], 1);
+    assert_eq!(
+        json["repository_contract"]["deployment_state_digest"]
+            .as_str()
+            .map(str::len),
+        Some(64)
+    );
+
+    std::fs::write(
+        tmp.path().join(".aethyme/gates.toml"),
+        "[[gate]]\nname = \"changed\"\ncommand = \"false\"\n",
+    )
+    .unwrap();
+    let reused = broker
+        .adopt_with(tmp.path(), Some("follow-up"), AdoptMode::Reuse)
+        .unwrap()
+        .session;
+    assert_eq!(reused.id, created.id);
+    assert_eq!(reused.repository_contract, Some(original_contract));
+    assert_eq!(reused.adoption_base, created.adoption_base);
+}
+
+#[test]
+fn opening_the_broker_backfills_live_pre_contract_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let head = rev(tmp.path(), "HEAD");
+    let session_id = {
+        let mut broker = Broker::open(tmp.path()).unwrap();
+        broker
+            .store()
+            .register_session(&NewSession {
+                worktree_path: tmp.path().to_string_lossy().into_owned(),
+                branch: "main".into(),
+                origin: SessionOrigin::Adopted,
+                task: Some("pre-contract session".into()),
+                diff_base: Some(head.clone()),
+                adoption_base: None,
+                repository_contract: None,
+                pid: None,
+                command: None,
+                log_path: None,
+            })
+            .unwrap()
+            .id
+    };
+
+    let mut reopened = Broker::open(tmp.path()).unwrap();
+    let backfilled = reopened.store().session(session_id).unwrap();
+    assert_eq!(backfilled.adoption_base.as_deref(), Some(head.as_str()));
+    let contract = backfilled
+        .repository_contract
+        .expect("live session contract was backfilled");
+    assert!(contract.backfilled);
+    assert_eq!(contract.aethyme_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(contract.deployment_state_digest.len(), 64);
 }
 
 #[test]
@@ -291,6 +384,8 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
         reused.diff_base, first.diff_base,
         "plain active reuse must not absorb pending commits into the baseline"
     );
+    assert_eq!(reused.adoption_base, first.adoption_base);
+    assert_eq!(reused.repository_contract, first.repository_contract);
 
     // close is state-only: session cleaned, worktree untouched.
     broker.close(first.id).unwrap();
@@ -461,6 +556,11 @@ fn adopt_reuse_sync_fast_forwards_before_refreshing_the_baseline() {
     assert_eq!(
         report.session.diff_base.as_deref(),
         Some(integration_head.as_str())
+    );
+    assert_eq!(
+        report.session.adoption_base.as_deref(),
+        Some(original_head.as_str()),
+        "guarded synchronization may refresh diff_base but not adoption_base"
     );
     let sync = report.integration_sync.expect("synchronization result");
     assert_eq!(sync.outcome, AdoptIntegrationSyncOutcome::FastForwarded);

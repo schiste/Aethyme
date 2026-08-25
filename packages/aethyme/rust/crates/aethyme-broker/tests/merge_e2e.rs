@@ -681,6 +681,8 @@ fn normalized_replay_refuses_missing_baseline_and_owned_merge_commits() {
             origin: SessionOrigin::Adopted,
             task: None,
             diff_base: None,
+            adoption_base: None,
+            repository_contract: None,
             pid: None,
             command: None,
             log_path: None,

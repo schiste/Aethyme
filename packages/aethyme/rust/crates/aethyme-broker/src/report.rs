@@ -1204,6 +1204,8 @@ mod tests {
             status: SessionStatus::Exited,
             task: Some("TASK-TEXT-SECRET".into()),
             diff_base: Some("0123456789abcdef".into()),
+            adoption_base: Some("0123456789abcdef".into()),
+            repository_contract: None,
             pid: Some(999),
             command: Some("COMMAND-SECRET --token TOKEN-SECRET".into()),
             log_path: Some("/private/log/SESSION-LOG-SECRET".into()),

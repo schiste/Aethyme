@@ -4,7 +4,7 @@
 
 use aethyme_broker::{
     BrokerError, BrokerStore, GateDef, GateFailureClass, GateStatus, LeaseKind, MergeStatus,
-    NewGateResult, NewPrWatchState, NewSession, SessionOrigin, SessionStatus,
+    NewGateResult, NewPrWatchState, NewSession, RepositoryContract, SessionOrigin, SessionStatus,
 };
 
 fn open_temp() -> (tempfile::TempDir, BrokerStore) {
@@ -21,6 +21,14 @@ fn sample_session(store: &mut BrokerStore) -> aethyme_broker::Session {
             origin: SessionOrigin::Adopted,
             task: Some("Fix auth bug".into()),
             diff_base: Some("abc123".into()),
+            adoption_base: None,
+            repository_contract: Some(RepositoryContract {
+                repository_schema: Some(1),
+                deployment_state_digest: "deployment-digest".into(),
+                aethyme_version: "0.2.2".into(),
+                gate_definition_digest: Some("gate-digest".into()),
+                backfilled: false,
+            }),
             pid: None,
             command: None,
             log_path: None,
@@ -51,6 +59,8 @@ fn session_round_trip_attach_first() {
     let fetched = store.session(session.id).unwrap();
     assert_eq!(fetched.worktree_path, session.worktree_path);
     assert_eq!(fetched.task.as_deref(), Some("Fix auth bug"));
+    assert_eq!(fetched.adoption_base.as_deref(), Some("abc123"));
+    assert_eq!(fetched.repository_contract, session.repository_contract);
 
     store.touch_session_activity(session.id, 42_000).unwrap();
     assert_eq!(store.session(session.id).unwrap().last_activity_at, 42_000);
@@ -74,6 +84,8 @@ fn duplicate_live_worktree_is_rejected_but_cleaned_frees_the_slot() {
         origin: SessionOrigin::Spawned,
         task: None,
         diff_base: None,
+        adoption_base: None,
+        repository_contract: None,
         pid: Some(123),
         command: Some("claude".into()),
         log_path: None,
@@ -94,6 +106,8 @@ fn duplicate_live_worktree_is_rejected_but_cleaned_frees_the_slot() {
             origin: SessionOrigin::Adopted,
             task: None,
             diff_base: None,
+            adoption_base: None,
+            repository_contract: None,
             pid: None,
             command: None,
             log_path: None,
@@ -222,6 +236,8 @@ fn retention_sweep_drops_leases_of_already_cleaned_sessions() {
             origin: SessionOrigin::Adopted,
             task: None,
             diff_base: None,
+            adoption_base: None,
+            repository_contract: None,
             pid: None,
             command: None,
             log_path: None,

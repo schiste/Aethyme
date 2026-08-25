@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -280,6 +280,23 @@ CREATE INDEX gate_results_by_gate_tree_definition
     ON gate_results (gate_name, tree_hash, definition_hash, id);
 ";
 
+const MIGRATION_V9: &str = "
+-- `diff_base` may advance after an explicitly guarded reuse sync. Preserve
+-- the original adoption boundary independently before that can happen.
+ALTER TABLE sessions ADD COLUMN adoption_base TEXT;
+UPDATE sessions SET adoption_base = diff_base;
+
+-- Repository-contract fields are nullable for cleaned historical sessions
+-- whose checkout may no longer exist. Broker::open backfills every live row
+-- from the best available worktree snapshot before serving it.
+ALTER TABLE sessions ADD COLUMN repository_schema INTEGER;
+ALTER TABLE sessions ADD COLUMN deployment_state_digest TEXT;
+ALTER TABLE sessions ADD COLUMN aethyme_version TEXT;
+ALTER TABLE sessions ADD COLUMN gate_definition_digest TEXT;
+ALTER TABLE sessions ADD COLUMN repository_contract_backfilled INTEGER NOT NULL DEFAULT 0
+    CHECK (repository_contract_backfilled IN (0, 1));
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -289,6 +306,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V6,
     MIGRATION_V7,
     MIGRATION_V8,
+    MIGRATION_V9,
 ];
 
 fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -351,4 +369,59 @@ pub fn migrate(conn: &Connection) -> Result<(), BrokerError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v9_preserves_the_original_baseline_for_live_pre_contract_sessions() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS[..8].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sessions (
+                worktree_path, branch, origin, status, task, diff_base,
+                created_at, updated_at, last_activity_at
+             ) VALUES ('/repo/worktree', 'agent/live', 'adopted', 'active',
+                       'task', 'original-sha', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let row = conn
+            .query_row(
+                "SELECT adoption_base, deployment_state_digest,
+                        repository_contract_backfilled
+                 FROM sessions WHERE branch = 'agent/live'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0.as_deref(), Some("original-sha"));
+        assert_eq!(
+            row.1, None,
+            "filesystem-dependent backfill runs in Broker::open"
+        );
+        assert!(!row.2);
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
 }

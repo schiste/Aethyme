@@ -157,6 +157,11 @@ pub struct NewSession {
     pub task: Option<String>,
     /// Merge base the session diffs against (commit hash).
     pub diff_base: Option<String>,
+    /// Immutable original adoption boundary. When omitted, storage seeds it
+    /// from `diff_base`; later reuse may refresh only `diff_base`.
+    pub adoption_base: Option<String>,
+    /// Repository deployment contract accepted for this session.
+    pub repository_contract: Option<crate::RepositoryContract>,
     /// Spawned sessions only.
     pub pid: Option<i64>,
     pub command: Option<String>,
@@ -172,6 +177,8 @@ pub struct Session {
     pub status: SessionStatus,
     pub task: Option<String>,
     pub diff_base: Option<String>,
+    pub adoption_base: Option<String>,
+    pub repository_contract: Option<crate::RepositoryContract>,
     pub pid: Option<i64>,
     pub command: Option<String>,
     pub log_path: Option<String>,
