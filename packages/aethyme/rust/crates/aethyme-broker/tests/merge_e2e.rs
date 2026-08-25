@@ -211,6 +211,16 @@ fn two_clean_sessions_promote_with_requeue_on_base_move_manual_mode() {
     assert!(!out_a.promoted, "manual mode holds verified entries");
     let out_b = broker.submit(b.id).unwrap();
     assert_eq!(out_b.entry.status, MergeStatus::Verified);
+    assert_eq!(
+        broker.store().session(a.id).unwrap().accepted_session_head,
+        None,
+        "verification alone must not accept A's session HEAD"
+    );
+    assert_eq!(
+        broker.store().session(b.id).unwrap().accepted_session_head,
+        None,
+        "verification alone must not accept B's session HEAD"
+    );
 
     // Promote A: integration branch advances; B was verified against the
     // OLD base and gets re-simulated automatically.
@@ -340,6 +350,11 @@ fn conflicting_submission_rejected_pre_gate_with_instruction_drop() {
 
     let out_b = broker.submit(b.id).unwrap();
     assert_eq!(out_b.entry.status, MergeStatus::Conflict);
+    assert_eq!(
+        broker.store().session(b.id).unwrap().accepted_session_head,
+        None,
+        "a conflicted submission must not advance the checkpoint"
+    );
     assert_eq!(out_b.conflicts, vec!["src/a.py".to_string()]);
     assert!(
         out_b.gate_outcomes.is_empty(),
@@ -711,7 +726,9 @@ fn submission_with_unchanged_result_is_a_truthful_noop() {
     let mut broker = Broker::open(tmp.path()).unwrap();
     let worktree = agent_worktree(tmp.path(), "nothing-to-submit");
     let session = broker.adopt(&worktree, Some("inspect only")).unwrap();
+    let submitted_head = resolve(&worktree, "HEAD");
     let integration_before = broker.integration_head().unwrap().1;
+    let integration_tree = resolve(tmp.path(), "aethyme/integration^{tree}");
 
     let outcome = broker.submit(session.id).unwrap();
 
@@ -723,6 +740,60 @@ fn submission_with_unchanged_result_is_a_truthful_noop() {
     let details: serde_json::Value =
         serde_json::from_str(outcome.entry.details_json.as_deref().unwrap()).unwrap();
     assert_eq!(details["reason"], "submission produces no content change");
+    let accepted = broker.store().session(session.id).unwrap();
+    assert_eq!(accepted.accepted_session_head, Some(submitted_head));
+    assert_eq!(
+        accepted.accepted_integration_commit,
+        Some(integration_before)
+    );
+    assert_eq!(accepted.accepted_integration_tree, Some(integration_tree));
+    assert_eq!(accepted.accepted_queue_entry_id, Some(outcome.entry.id));
+    assert!(accepted.accepted_at.is_some());
+}
+
+#[test]
+fn patch_equivalent_supersession_checkpoints_the_submitted_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let duplicate = agent_worktree(tmp.path(), "duplicate-patch");
+    let publisher = agent_worktree(tmp.path(), "patch-publisher");
+    let duplicate_session = broker
+        .adopt(&duplicate, Some("submit duplicate patch"))
+        .unwrap();
+    let publisher_session = broker.adopt(&publisher, Some("publish patch")).unwrap();
+
+    std::fs::write(publisher.join("src/a.py"), "a = 2\n").unwrap();
+    sh(&publisher, &["add", "src/a.py"]);
+    sh(&publisher, &["commit", "-qm", "publisher identity"]);
+    assert!(broker.submit(publisher_session.id).unwrap().promoted);
+    broker.close(publisher_session.id).unwrap();
+
+    std::fs::write(duplicate.join("src/a.py"), "a = 2\n").unwrap();
+    sh(&duplicate, &["add", "src/a.py"]);
+    sh(&duplicate, &["commit", "-qm", "duplicate identity"]);
+    let duplicate_head = resolve(&duplicate, "HEAD");
+    let integration_commit = resolve(tmp.path(), "aethyme/integration");
+    let integration_tree = resolve(tmp.path(), "aethyme/integration^{tree}");
+
+    let outcome = broker.submit(duplicate_session.id).unwrap();
+
+    assert!(outcome.no_changes);
+    assert!(!outcome.promoted);
+    assert_eq!(outcome.entry.status, MergeStatus::Superseded);
+    assert_eq!(
+        outcome.submission_plan.commits[0].integration_state,
+        SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity
+    );
+    let accepted = broker.store().session(duplicate_session.id).unwrap();
+    assert_eq!(accepted.accepted_session_head, Some(duplicate_head));
+    assert_eq!(
+        accepted.accepted_integration_commit,
+        Some(integration_commit)
+    );
+    assert_eq!(accepted.accepted_integration_tree, Some(integration_tree));
+    assert_eq!(accepted.accepted_queue_entry_id, Some(outcome.entry.id));
+    assert!(accepted.accepted_at.is_some());
 }
 
 #[test]
@@ -755,6 +826,15 @@ fn normalized_replay_refuses_missing_baseline_and_owned_merge_commits() {
     assert!(
         missing_error.to_string().contains("no recorded baseline"),
         "{missing_error}"
+    );
+    assert_eq!(
+        missing_broker
+            .store()
+            .session(missing_session.id)
+            .unwrap()
+            .accepted_session_head,
+        None,
+        "ambiguous ownership must not advance the checkpoint"
     );
 
     let merge_tmp = tempfile::tempdir().unwrap();
@@ -795,6 +875,15 @@ fn failing_gate_on_merged_tree_rejects_and_auto_mode_promotes() {
 
     let outcome = broker.submit(session.id).unwrap();
     assert_eq!(outcome.entry.status, MergeStatus::Rejected);
+    assert_eq!(
+        broker
+            .store()
+            .session(session.id)
+            .unwrap()
+            .accepted_session_head,
+        None,
+        "a rejected submission must not advance the checkpoint"
+    );
     assert!(
         broker.promote(outcome.entry.id).is_err(),
         "rejected entries cannot be promoted"

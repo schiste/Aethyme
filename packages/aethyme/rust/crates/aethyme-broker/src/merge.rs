@@ -336,11 +336,11 @@ impl Broker {
                         && commit.integration_state == SubmissionIntegrationState::Pending
                 }).map(|commit| commit.commit.clone()).collect::<Vec<_>>(),
             });
-            self.store().set_merge_status(
+            self.store().record_content_empty_supersession(
                 entry.id,
-                MergeStatus::Superseded,
-                Some(&simulation.tree),
-                Some(&details.to_string()),
+                &base,
+                &simulation.tree,
+                &details.to_string(),
             )?;
             clear_action_required(Path::new(&session.worktree_path));
             return Ok(SubmitOutcome {

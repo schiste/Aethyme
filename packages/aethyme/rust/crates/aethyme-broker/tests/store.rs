@@ -476,6 +476,92 @@ fn promotion_atomically_advances_the_contribution_checkpoint() {
 }
 
 #[test]
+fn content_empty_supersession_atomically_advances_the_contribution_checkpoint() {
+    let (_tmp, mut store) = open_temp();
+    let session = sample_session(&mut store);
+    let entry = store
+        .submit(session.id, "session-head-empty", "integration-base")
+        .unwrap();
+    store
+        .set_merge_status(entry.id, MergeStatus::Simulating, None, None)
+        .unwrap();
+
+    store
+        .record_content_empty_supersession(
+            entry.id,
+            "integration-commit-current",
+            "integration-tree-current",
+            "{\"reason\":\"submission produces no content change\"}",
+        )
+        .unwrap();
+
+    let accepted = store.session(session.id).unwrap();
+    assert_eq!(
+        accepted.accepted_session_head.as_deref(),
+        Some("session-head-empty")
+    );
+    assert_eq!(
+        accepted.accepted_integration_commit.as_deref(),
+        Some("integration-commit-current")
+    );
+    assert_eq!(
+        accepted.accepted_integration_tree.as_deref(),
+        Some("integration-tree-current")
+    );
+    assert_eq!(accepted.accepted_queue_entry_id, Some(entry.id));
+    assert!(accepted.accepted_at.is_some());
+    assert_eq!(
+        store.merge_queue().unwrap()[0].status,
+        MergeStatus::Superseded
+    );
+}
+
+#[test]
+fn generic_nonaccepted_outcomes_do_not_advance_the_contribution_checkpoint() {
+    let (_tmp, mut store) = open_temp();
+    let session = sample_session(&mut store);
+
+    for (index, status) in [
+        MergeStatus::Verified,
+        MergeStatus::Rejected,
+        MergeStatus::Conflict,
+        MergeStatus::Superseded,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let entry = store
+            .submit(
+                session.id,
+                &format!("unaccepted-head-{index}"),
+                "integration-base",
+            )
+            .unwrap();
+        store
+            .set_merge_status(entry.id, status, Some("candidate-tree"), None)
+            .unwrap();
+        assert!(
+            store
+                .record_content_empty_supersession(
+                    entry.id,
+                    "integration-current",
+                    "integration-tree-current",
+                    "{}",
+                )
+                .is_err(),
+            "{status:?} must not be accepted through the no-op transition"
+        );
+
+        let unchanged = store.session(session.id).unwrap();
+        assert_eq!(unchanged.accepted_session_head, None);
+        assert_eq!(unchanged.accepted_integration_commit, None);
+        assert_eq!(unchanged.accepted_integration_tree, None);
+        assert_eq!(unchanged.accepted_queue_entry_id, None);
+        assert_eq!(unchanged.accepted_at, None);
+    }
+}
+
+#[test]
 fn events_are_versioned_ordered_and_cursorable() {
     let (_tmp, mut store) = open_temp();
     let session = sample_session(&mut store);

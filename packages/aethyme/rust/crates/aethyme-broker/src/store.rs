@@ -914,28 +914,69 @@ impl BrokerStore {
              WHERE id = ?1",
             params![entry_id, details_json, now],
         )?;
-        tx.execute(
-            "UPDATE sessions
-             SET accepted_session_head = ?2,
-                 accepted_integration_commit = ?3,
-                 accepted_integration_tree = ?4,
-                 accepted_queue_entry_id = ?5,
-                 accepted_at = ?6,
-                 updated_at = ?6
-             WHERE id = ?1",
-            params![
-                session_id,
-                session_head,
-                integration_commit,
-                integration_tree,
-                entry_id,
-                now,
-            ],
+        update_accepted_checkpoint(
+            &tx,
+            session_id,
+            &session_head,
+            integration_commit,
+            &integration_tree,
+            entry_id,
+            now,
         )?;
         insert_event(
             &tx,
             now,
             "merge.promoted",
+            Some(session_id),
+            Some(details_json),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Mark one simulated queue entry superseded because normalized replay
+    /// proved it content-empty, and advance its session's accepted
+    /// contribution checkpoint in the same SQLite transaction.
+    pub fn record_content_empty_supersession(
+        &mut self,
+        entry_id: i64,
+        integration_commit: &str,
+        integration_tree: &str,
+        details_json: &str,
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let entry = tx
+            .query_row(
+                "SELECT session_id, head_commit
+                 FROM merge_queue WHERE id = ?1 AND status = 'simulating'",
+                [entry_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((session_id, session_head)) = entry else {
+            return Err(BrokerError::SessionNotFound(entry_id));
+        };
+        tx.execute(
+            "UPDATE merge_queue
+             SET status = 'superseded', merged_tree = ?2,
+                 details_json = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![entry_id, integration_tree, details_json, now],
+        )?;
+        update_accepted_checkpoint(
+            &tx,
+            session_id,
+            &session_head,
+            integration_commit,
+            integration_tree,
+            entry_id,
+            now,
+        )?;
+        insert_event(
+            &tx,
+            now,
+            "merge.superseded",
             Some(session_id),
             Some(details_json),
         )?;
@@ -1794,6 +1835,39 @@ fn coordinated_operation_from_row(row: &rusqlite::Row<'_>) -> RowResult<Coordina
             identity_provenance: OperationIdentityProvenance::parse(&identity_provenance)?,
         })
     })())
+}
+
+fn update_accepted_checkpoint(
+    conn: &Connection,
+    session_id: i64,
+    session_head: &str,
+    integration_commit: &str,
+    integration_tree: &str,
+    queue_entry_id: i64,
+    accepted_at: i64,
+) -> Result<(), BrokerError> {
+    let updated = conn.execute(
+        "UPDATE sessions
+         SET accepted_session_head = ?2,
+             accepted_integration_commit = ?3,
+             accepted_integration_tree = ?4,
+             accepted_queue_entry_id = ?5,
+             accepted_at = ?6,
+             updated_at = ?6
+         WHERE id = ?1",
+        params![
+            session_id,
+            session_head,
+            integration_commit,
+            integration_tree,
+            queue_entry_id,
+            accepted_at,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(BrokerError::SessionNotFound(session_id));
+    }
+    Ok(())
 }
 
 fn insert_event(
