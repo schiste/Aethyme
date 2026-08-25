@@ -1311,6 +1311,235 @@ fn repair_rebases_promoted_conflict_and_reports_affected_gates() {
 }
 
 #[test]
+fn session_161_rebase_submit_promote_continue_and_submit_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "session-161");
+    let session = broker
+        .adopt(&worktree, Some("session 161 sequence"))
+        .unwrap();
+    let adopted = resolve(&worktree, "HEAD");
+
+    commit_edit(&worktree, "src/a.py", "a = 2\n");
+    let concurrent = agent_worktree(tmp.path(), "session-161-concurrent");
+    let concurrent_session = broker.adopt(&concurrent, None).unwrap();
+    commit_edit(&concurrent, "src/b.py", "b = 2\n");
+    assert!(broker.submit(concurrent_session.id).unwrap().promoted);
+    broker.close(concurrent_session.id).unwrap();
+
+    sh(
+        &worktree,
+        &["rebase", "--onto", "aethyme/integration", &adopted, "HEAD"],
+    );
+    commit_edit(&worktree, "src/b.py", "b = 3\n");
+    let first_accepted_head = resolve(&worktree, "HEAD");
+    let first = broker.submit(session.id).unwrap();
+    assert!(first.promoted);
+    assert_eq!(
+        broker
+            .store()
+            .session(session.id)
+            .unwrap()
+            .accepted_session_head,
+        Some(first_accepted_head.clone())
+    );
+
+    std::fs::write(worktree.join("src/follow_up.py"), "pending = true\n").unwrap();
+    sh(&worktree, &["add", "src/follow_up.py"]);
+    sh(&worktree, &["commit", "-qm", "follow-up after promotion"]);
+    let follow_up = resolve(&worktree, "HEAD");
+    let second = broker.submit(session.id).unwrap();
+
+    assert!(second.promoted);
+    assert_eq!(
+        second.submission_plan.recorded_baseline.as_deref(),
+        Some(first_accepted_head.as_str())
+    );
+    assert_eq!(second.submission_plan.commits.len(), 1);
+    assert_eq!(second.submission_plan.commits[0].commit, follow_up);
+    assert_eq!(
+        second.submission_plan.commits[0].ownership,
+        SubmissionCommitOwnership::SessionOwned
+    );
+}
+
+#[test]
+fn repair_replays_only_submission_plan_pending_commits_after_a_promotion() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    std::fs::write(
+        tmp.path().join("src/a.py"),
+        "top = 1\nmiddle = 1\nbottom = 1\n",
+    )
+    .unwrap();
+    sh(tmp.path(), &["add", "src/a.py"]);
+    sh(tmp.path(), &["commit", "-qm", "separate repair lines"]);
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let worktree = agent_worktree(tmp.path(), "checkpoint-repair");
+    let session = broker.adopt(&worktree, Some("repair follow-up")).unwrap();
+    commit_edit(&worktree, "src/b.py", "b = 2\n");
+    assert!(broker.submit(session.id).unwrap().promoted);
+    let accepted = broker
+        .store()
+        .session(session.id)
+        .unwrap()
+        .accepted_session_head
+        .unwrap();
+
+    commit_edit(&worktree, "src/a.py", "top = 1\nmiddle = 1\nbottom = 2\n");
+    let pending_before_repair = resolve(&worktree, "HEAD");
+
+    let concurrent = agent_worktree_at(
+        tmp.path(),
+        "checkpoint-repair-concurrent",
+        "aethyme/integration",
+    );
+    let concurrent_session = broker.adopt(&concurrent, None).unwrap();
+    commit_edit(&concurrent, "src/a.py", "top = 2\nmiddle = 1\nbottom = 1\n");
+    assert!(broker.submit(concurrent_session.id).unwrap().promoted);
+    broker.close(concurrent_session.id).unwrap();
+    let repair_base = resolve(tmp.path(), "aethyme/integration");
+
+    broker.refresh_leases().unwrap();
+
+    let report = broker.repair(session.id).unwrap();
+    assert_eq!(report.action, RepairAction::Rebased);
+    assert_eq!(report.pending_commits, vec![pending_before_repair]);
+    assert!(report.submission_plan.safe);
+    assert_eq!(report.base.as_deref(), Some(repair_base.as_str()));
+
+    let repaired = broker.store().session(session.id).unwrap();
+    assert_eq!(
+        repaired.accepted_session_head.as_deref(),
+        Some(accepted.as_str())
+    );
+    assert_eq!(repaired.diff_base.as_deref(), Some(repair_base.as_str()));
+    assert_ne!(
+        repaired.diff_base.as_deref(),
+        Some(resolve(&worktree, "HEAD").as_str()),
+        "repair must never record the pending commit as its new baseline"
+    );
+
+    let reused = broker
+        .adopt_with(&worktree, Some("continue repaired work"), AdoptMode::Reuse)
+        .unwrap();
+    assert_eq!(
+        reused.integration_drift.unwrap().safe_next_action,
+        format!("aethyme broker submit --session {}", session.id)
+    );
+    let before_submit = broker.finish(session.id).unwrap();
+    assert_eq!(before_submit.status, FinishStatus::Blocked);
+    assert_eq!(before_submit.unsubmitted_commits, 1);
+
+    let submitted = broker.submit(session.id).unwrap();
+    assert!(submitted.promoted);
+    assert_eq!(submitted.submission_plan.commits.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("src/a.py")).unwrap(),
+        "top = 2\nmiddle = 1\nbottom = 2\n"
+    );
+    sh(&worktree, &["reset", "--hard", "aethyme/integration"]);
+    assert_eq!(
+        broker.finish(session.id).unwrap().status,
+        FinishStatus::Closed
+    );
+}
+
+#[test]
+fn unsafe_repair_guidance_preserves_pending_commits_before_any_reset() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "unsafe-repair");
+    let session = broker
+        .adopt(&worktree, Some("preserve pending work"))
+        .unwrap();
+    commit_edit(&worktree, "src/a.py", "a = 2\n");
+    assert!(broker.submit(session.id).unwrap().promoted);
+
+    let concurrent = agent_worktree_at(
+        tmp.path(),
+        "unsafe-repair-concurrent",
+        "aethyme/integration",
+    );
+    let concurrent_session = broker.adopt(&concurrent, None).unwrap();
+    commit_edit(&concurrent, "src/a.py", "a = 3\n");
+    assert!(broker.submit(concurrent_session.id).unwrap().promoted);
+    broker.close(concurrent_session.id).unwrap();
+
+    commit_edit(&worktree, "src/a.py", "a = 4\n");
+    let conflicted = broker.submit(session.id).unwrap();
+    assert_eq!(conflicted.entry.status, MergeStatus::Conflict);
+
+    sh(&worktree, &["reset", "--hard", "aethyme/integration"]);
+    commit_edit(&worktree, "src/b.py", "b = 4\n");
+    let pending = resolve(&worktree, "HEAD");
+    let error = broker.repair(session.id).unwrap_err().to_string();
+
+    assert!(error.contains(&pending), "{error}");
+    assert!(!error.contains("adopt/reuse"), "{error}");
+    let preserve = error.find("git branch aethyme/preserve-session-").unwrap();
+    let reset = error.find("git reset --hard").unwrap();
+    assert!(preserve < reset, "preservation must precede reset: {error}");
+    assert!(error.contains("git cherry-pick"), "{error}");
+}
+
+#[test]
+fn broker_open_checkpoints_a_promotion_interrupted_after_the_ref_move() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[promote]\nmode = \"manual\"\n",
+    )
+    .unwrap();
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "promotion-checkpoint-recovery");
+    let session = broker
+        .adopt(&worktree, Some("recover promotion checkpoint"))
+        .unwrap();
+    commit_edit(&worktree, "src/a.py", "a = 2\n");
+    let submitted_head = resolve(&worktree, "HEAD");
+    let outcome = broker.submit(session.id).unwrap();
+    assert_eq!(outcome.entry.status, MergeStatus::Verified);
+    let details: serde_json::Value =
+        serde_json::from_str(outcome.entry.details_json.as_deref().unwrap()).unwrap();
+    let merge_commit = details["merge_commit"].as_str().unwrap();
+
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/heads/aethyme/integration", merge_commit],
+    );
+    drop(broker);
+
+    let mut recovered = Broker::open(tmp.path()).unwrap();
+    let persisted = recovered.store().session(session.id).unwrap();
+    assert_eq!(persisted.accepted_session_head, Some(submitted_head));
+    assert_eq!(
+        persisted.accepted_integration_commit.as_deref(),
+        Some(merge_commit)
+    );
+    assert_eq!(
+        recovered
+            .store()
+            .merge_queue()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == outcome.entry.id)
+            .unwrap()
+            .status,
+        MergeStatus::Promoted
+    );
+
+    commit_edit(&worktree, "src/b.py", "b = 2\n");
+    let follow_up = recovered.submit(session.id).unwrap();
+    assert_eq!(follow_up.entry.status, MergeStatus::Verified);
+    assert_eq!(follow_up.submission_plan.commits.len(), 1);
+}
+
+#[test]
 fn reconcile_recognizes_squash_preserves_followups_and_replays_pending_work() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
@@ -2204,9 +2433,11 @@ fn repair_refuses_when_session_baseline_is_newer_than_integration() {
     let before = resolve(&wt_live, "HEAD");
     let error = broker.repair(live.id).unwrap_err().to_string();
     assert!(
-        error.contains("does not contain recorded session baseline"),
+        error.contains("does not contain replay boundary"),
         "{error}"
     );
+    assert!(error.contains("Preservation-first recovery"), "{error}");
+    assert!(!error.contains("adopt/reuse"), "{error}");
     assert_eq!(resolve(&wt_live, "HEAD"), before);
     assert!(!wt_live.join(".git/rebase-merge").exists());
 }

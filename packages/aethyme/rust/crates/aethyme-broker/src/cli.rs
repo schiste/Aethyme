@@ -1453,6 +1453,14 @@ fn render_repair_report(report: &crate::RepairReport) {
     if let Some(base) = &report.base {
         println!("  base: {}", &base[..12.min(base.len())]);
     }
+    if report.pending_commits.is_empty() {
+        println!("  pending commits: none");
+    } else {
+        println!("  pending commits:");
+        for commit in &report.pending_commits {
+            println!("    - {commit}");
+        }
+    }
     println!(
         "  leases refreshed: {}",
         if report.leases_refreshed { "yes" } else { "no" }

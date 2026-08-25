@@ -128,6 +128,79 @@ pub struct SubmissionPlan {
     pub warnings: Vec<String>,
 }
 
+impl SubmissionPlan {
+    pub(crate) fn pending_owned_commit_ids(&self) -> Vec<String> {
+        self.commits
+            .iter()
+            .filter(|commit| {
+                commit.ownership == SubmissionCommitOwnership::SessionOwned
+                    && commit.integration_state == SubmissionIntegrationState::Pending
+            })
+            .map(|commit| commit.commit.clone())
+            .collect()
+    }
+
+    pub(crate) fn preservation_commit_ids(&self) -> Vec<String> {
+        let pending = self.pending_owned_commit_ids();
+        if !pending.is_empty() {
+            return pending;
+        }
+        self.commits
+            .iter()
+            .filter(|commit| {
+                commit.ownership == SubmissionCommitOwnership::Ambiguous
+                    || commit.integration_state == SubmissionIntegrationState::Ambiguous
+            })
+            .map(|commit| commit.commit.clone())
+            .collect()
+    }
+
+    pub(crate) fn automatic_repair_upstream(&self) -> Result<Option<String>, String> {
+        if !self.safe {
+            return Err(if self.warnings.is_empty() {
+                "submission provenance is ambiguous".into()
+            } else {
+                self.warnings.join("; ")
+            });
+        }
+
+        let Some(first_pending) = self.commits.iter().position(|commit| {
+            commit.ownership == SubmissionCommitOwnership::SessionOwned
+                && commit.integration_state == SubmissionIntegrationState::Pending
+        }) else {
+            return Ok(None);
+        };
+        let pending = &self.commits[first_pending..];
+        if pending.iter().any(|commit| {
+            commit.ownership != SubmissionCommitOwnership::SessionOwned
+                || commit.integration_state != SubmissionIntegrationState::Pending
+        }) {
+            return Err(
+                "pending session commits are interleaved with already integrated or inherited commits"
+                    .into(),
+            );
+        }
+
+        let first = &pending[0];
+        if first.parents.len() != 1 {
+            return Err(format!(
+                "pending commit {} has {} parents; automatic repair supports only a linear pending suffix",
+                first.commit,
+                first.parents.len()
+            ));
+        }
+        for commits in pending.windows(2) {
+            if commits[1].parents.len() != 1 || commits[1].parents[0] != commits[0].commit {
+                return Err(format!(
+                    "pending commit {} does not directly follow {}; automatic repair supports only a linear pending suffix",
+                    commits[1].commit, commits[0].commit
+                ));
+            }
+        }
+        Ok(first.parents.first().cloned())
+    }
+}
+
 /// Provenance and recovery guidance for one surviving replay conflict.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SubmissionConflict {
@@ -331,10 +404,7 @@ impl Broker {
             let details = serde_json::json!({
                 "base": base,
                 "reason": "submission produces no content change",
-                "pending_session_owned_commits": submission_plan.commits.iter().filter(|commit| {
-                    commit.ownership == SubmissionCommitOwnership::SessionOwned
-                        && commit.integration_state == SubmissionIntegrationState::Pending
-                }).map(|commit| commit.commit.clone()).collect::<Vec<_>>(),
+                "pending_session_owned_commits": submission_plan.pending_owned_commit_ids(),
             });
             self.store().record_content_empty_supersession(
                 entry.id,
@@ -567,7 +637,26 @@ impl Broker {
         // last accepted session HEAD. `diff_base` remains the operational
         // fallback for a session that has never contributed.
         let accepted_checkpoint = session.accepted_session_head.as_deref();
-        let Some(recorded_baseline) = accepted_checkpoint.or(session.diff_base.as_deref()) else {
+        let accepted_is_ancestor = accepted_checkpoint
+            .is_some_and(|checkpoint| repo.is_ancestor(checkpoint, session_head));
+        let repaired_checkpoint = session.diff_base.as_deref().filter(|checkpoint| {
+            accepted_checkpoint.is_some()
+                && !accepted_is_ancestor
+                && session.adoption_base.as_deref() != Some(*checkpoint)
+                && repo.is_ancestor(checkpoint, session_head)
+        });
+        let selected_checkpoint = if accepted_is_ancestor {
+            accepted_checkpoint
+        } else {
+            repaired_checkpoint.or_else(|| {
+                if accepted_checkpoint.is_none() {
+                    session.diff_base.as_deref()
+                } else {
+                    accepted_checkpoint
+                }
+            })
+        };
+        let Some(recorded_baseline) = selected_checkpoint else {
             return Ok(SubmissionPlan {
                 session_id: session.id,
                 recorded_baseline: None,
@@ -582,6 +671,11 @@ impl Broker {
         };
 
         let mut warnings = Vec::new();
+        if let (Some(accepted), Some(repaired)) = (accepted_checkpoint, repaired_checkpoint) {
+            warnings.push(format!(
+                "accepted session checkpoint {accepted} was rewritten by broker repair; ownership resumes from the broker-recorded repair baseline {repaired}"
+            ));
+        }
         let (owned, inherited) = if repo.is_ancestor(recorded_baseline, session_head) {
             let owned = repo.commits_between_oldest(recorded_baseline, session_head)?;
             let inherited = if accepted_checkpoint.is_some() {
@@ -605,7 +699,21 @@ impl Broker {
                 session_head: session_head.to_string(),
                 integration_head: integration_head.to_string(),
                 safe: false,
-                commits: Vec::new(),
+                commits: repo
+                    .commits_excluding_oldest(session_head, integration_head)?
+                    .into_iter()
+                    .map(|commit| {
+                        let parents = repo.commit_parents(&commit)?;
+                        Ok(SubmissionCommitProvenance {
+                            commit,
+                            parents,
+                            ownership: SubmissionCommitOwnership::Ambiguous,
+                            integration_state: SubmissionIntegrationState::Ambiguous,
+                            patch_id: None,
+                            matching_integration_commits: Vec::new(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, BrokerOpError>>()?,
                 warnings: vec![format!(
                     "accepted session checkpoint {recorded_baseline} is not an ancestor of session HEAD {session_head}; follow-up ownership must remain {recorded_baseline}..{session_head}, so integration HEAD {integration_head} cannot replace it as the ownership boundary"
                 )],
@@ -726,6 +834,43 @@ impl Broker {
             commits,
             warnings,
         })
+    }
+
+    /// Complete the durable half of a promotion when the integration ref
+    /// already names a verified entry's exact merge commit. This is the
+    /// only ref/database ordering gap in normal promotion: the ref moves
+    /// first, so reopening the broker must checkpoint the accepted session
+    /// HEAD before any follow-up submission is planned.
+    pub(crate) fn recover_interrupted_promotion(&mut self) -> Result<(), BrokerOpError> {
+        let config = PromoteConfig::load(&self.main_root_path());
+        let Some(integration_head) = self.repo_handle().resolve_ref(&config.branch) else {
+            return Ok(());
+        };
+        let candidate = self.store().merge_queue()?.into_iter().find(|entry| {
+            if entry.status != MergeStatus::Verified {
+                return false;
+            }
+            entry
+                .details_json
+                .as_deref()
+                .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+                .and_then(|details| {
+                    details
+                        .get("merge_commit")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .as_deref()
+                == Some(integration_head.as_str())
+        });
+        if let Some(entry) = candidate {
+            self.store().record_merge_promotion(
+                entry.id,
+                &integration_head,
+                &crate::events::merge_promoted_payload(&config.branch, &integration_head),
+            )?;
+        }
+        Ok(())
     }
 
     /// Advance the integration branch to a verified entry's merge commit,

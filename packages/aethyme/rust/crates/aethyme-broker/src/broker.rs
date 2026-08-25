@@ -54,16 +54,15 @@ pub enum BrokerOpError {
         message: String,
     },
     #[error(
-        "refusing repair for session {id}: recorded adoption baseline {baseline} is not an ancestor of session HEAD; adopt/reuse the session from its intended baseline before repairing"
+        "refusing automatic repair for session {id}: {reason}\n\
+         Commits requiring preservation or review:\n{commits}\n\
+         Preservation-first recovery (do not reset before step 1):\n{guidance}"
     )]
-    InvalidRepairBaseline { id: i64, baseline: String },
-    #[error(
-        "refusing repair for session {id}: target integration {target} does not contain recorded session baseline {baseline}; reconcile integration with upstream before repairing"
-    )]
-    RepairTargetBehindBaseline {
+    UnsafeRepairPlan {
         id: i64,
-        baseline: String,
-        target: String,
+        reason: String,
+        commits: String,
+        guidance: String,
     },
     #[error("cannot resolve upstream ref {upstream:?}; fetch it explicitly, then retry")]
     UpstreamRefNotFound { upstream: String },
@@ -764,6 +763,8 @@ pub struct RepairReport {
     pub source: RepairSource,
     pub action: RepairAction,
     pub base: Option<String>,
+    pub pending_commits: Vec<String>,
+    pub submission_plan: crate::SubmissionPlan,
     pub leases_refreshed: bool,
     pub affected_gates: Vec<RepairGateSelection>,
     pub next_command: String,
@@ -1117,6 +1118,7 @@ impl Broker {
             host_operation_db_path: None,
         };
         broker.backfill_live_repository_contracts()?;
+        broker.recover_interrupted_promotion()?;
         broker.recover_prepared_reconciliation()?;
         Ok(broker)
     }
@@ -1408,15 +1410,9 @@ impl Broker {
             self.build_submission_plan(&session, &session_head, &integration_head)
                 .ok()
         });
-        let pending_owned_commits = submission_plan.as_ref().map(|plan| {
-            plan.commits
-                .iter()
-                .filter(|commit| {
-                    commit.ownership == crate::SubmissionCommitOwnership::SessionOwned
-                        && commit.integration_state == crate::SubmissionIntegrationState::Pending
-                })
-                .count()
-        });
+        let pending_owned_commits = submission_plan
+            .as_ref()
+            .map(|plan| plan.pending_owned_commit_ids().len());
         let submission_plan_safe = submission_plan.as_ref().is_some_and(|plan| plan.safe);
 
         let (warning, safe_next_action) = match relation {
@@ -2138,6 +2134,14 @@ impl Broker {
         let worktree_path = session.worktree_path.clone();
         let checkout = GitRepo::discover(Path::new(&worktree_path))?;
         let (source, base) = self.repair_target(session_id)?;
+        let plan_base = match base.as_deref() {
+            Some(base) => base.to_string(),
+            None => self.integration_head()?.1,
+        };
+        checkout.fetch_local_commit(&plan_base)?;
+        let session_head = checkout.head_commit()?;
+        let submission_plan = self.build_submission_plan(&session, &session_head, &plan_base)?;
+        let pending_commits = submission_plan.pending_owned_commit_ids();
         let action = if let Some(base) = base.as_deref() {
             let dirty = checkout.dirty_paths()?;
             if !dirty.is_empty() {
@@ -2149,38 +2153,69 @@ impl Broker {
                     ),
                 });
             }
-            let baseline = session.diff_base.as_deref().ok_or_else(|| {
-                BrokerOpError::InvalidRepairBaseline {
-                    id: session_id,
-                    baseline: "<missing>".into(),
+            let repair_upstream =
+                submission_plan
+                    .automatic_repair_upstream()
+                    .map_err(|reason| {
+                        self.unsafe_repair_plan_error(
+                            &session,
+                            &submission_plan,
+                            &session_head,
+                            base,
+                            reason,
+                        )
+                    })?;
+            if let Some(repair_upstream) = repair_upstream {
+                let upstream_is_integrated_session_commit = submission_plan.commits.iter().any(
+                    |commit| {
+                        commit.commit == repair_upstream
+                            && commit.ownership
+                                == crate::SubmissionCommitOwnership::SessionOwned
+                            && matches!(
+                                commit.integration_state,
+                                crate::SubmissionIntegrationState::AlreadyIntegratedByAncestry
+                                    | crate::SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity
+                            )
+                    },
+                );
+                let upstream_is_accepted_checkpoint = session.accepted_session_head.as_deref()
+                    == Some(repair_upstream.as_str())
+                    && session.accepted_integration_commit.as_deref().is_some_and(
+                        |accepted_integration| checkout.is_ancestor(accepted_integration, base),
+                    );
+                if !checkout.is_ancestor(&repair_upstream, base)
+                    && !upstream_is_integrated_session_commit
+                    && !upstream_is_accepted_checkpoint
+                {
+                    return Err(self.unsafe_repair_plan_error(
+                        &session,
+                        &submission_plan,
+                        &session_head,
+                        base,
+                        format!(
+                            "target integration {base} does not contain replay boundary {repair_upstream}, and SubmissionPlan does not prove that boundary already integrated"
+                        ),
+                    ));
                 }
-            })?;
-            if !checkout.is_ancestor(baseline, "HEAD") {
-                return Err(BrokerOpError::InvalidRepairBaseline {
-                    id: session_id,
-                    baseline: baseline.to_string(),
-                });
+                checkout
+                    .rebase_onto_range(base, &repair_upstream)
+                    .map_err(|err| BrokerOpError::RepairRebaseFailed {
+                        id: session_id,
+                        base: base.to_string(),
+                        message: err.to_string(),
+                    })?;
+                // This is the target below the replayed pending suffix, never
+                // the pending tip itself. Submission provenance may use it
+                // only when the older accepted session checkpoint was
+                // necessarily rewritten by this broker-controlled repair.
+                self.store.set_session_diff_base(session_id, base)?;
+                let _ = std::fs::remove_file(
+                    Path::new(&worktree_path).join(crate::ACTION_REQUIRED_RELPATH),
+                );
+                RepairAction::Rebased
+            } else {
+                RepairAction::None
             }
-            checkout.fetch_local_commit(base)?;
-            if !checkout.is_ancestor(baseline, base) {
-                return Err(BrokerOpError::RepairTargetBehindBaseline {
-                    id: session_id,
-                    baseline: baseline.to_string(),
-                    target: base.to_string(),
-                });
-            }
-            checkout.rebase_onto_range(base, baseline).map_err(|err| {
-                BrokerOpError::RepairRebaseFailed {
-                    id: session_id,
-                    base: base.to_string(),
-                    message: err.to_string(),
-                }
-            })?;
-            self.store.set_session_diff_base(session_id, base)?;
-            let _ = std::fs::remove_file(
-                Path::new(&worktree_path).join(crate::ACTION_REQUIRED_RELPATH),
-            );
-            RepairAction::Rebased
         } else {
             RepairAction::None
         };
@@ -2197,10 +2232,59 @@ impl Broker {
             source,
             action,
             base,
+            pending_commits,
+            submission_plan,
             leases_refreshed: true,
             affected_gates,
             next_command: format!("aethyme broker submit --session {session_id}"),
         })
+    }
+
+    fn unsafe_repair_plan_error(
+        &self,
+        session: &Session,
+        plan: &crate::SubmissionPlan,
+        session_head: &str,
+        target: &str,
+        reason: String,
+    ) -> BrokerOpError {
+        let commits = plan.preservation_commit_ids();
+        let preserve_branch = format!(
+            "aethyme/preserve-session-{}-{}",
+            session.id,
+            &session_head[..12.min(session_head.len())]
+        );
+        let commits_text = if commits.is_empty() {
+            format!("  - {session_head} (ownership ambiguous; preserve the complete session tip)")
+        } else {
+            commits
+                .iter()
+                .map(|commit| format!("  - {commit}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let cherry_pick = if commits.is_empty() {
+            format!("git log --reverse --oneline {target}..{preserve_branch}")
+        } else {
+            format!("git cherry-pick {}", commits.join(" "))
+        };
+        let guidance = [
+            format!("  1. git branch {preserve_branch} {session_head}"),
+            format!("  2. git reset --hard {target}"),
+            format!(
+                "  3. aethyme broker adopt --reuse --sync-integration --task \"continue preserved session {}\"",
+                session.id
+            ),
+            format!("  4. {cherry_pick}"),
+            format!("  5. aethyme broker submit --session {}", session.id),
+        ]
+        .join("\n");
+        BrokerOpError::UnsafeRepairPlan {
+            id: session.id,
+            reason,
+            commits: commits_text,
+            guidance,
+        }
     }
 
     fn repair_target(
@@ -3530,7 +3614,8 @@ impl Broker {
                 entry.status,
                 MergeStatus::Promoted | MergeStatus::ExternallyLanded
             )
-        }) || session.accepted_integration_commit.as_deref() == Some(head.as_str());
+        }) || session.accepted_integration_commit.as_deref()
+            == Some(head.as_str());
         report.unsubmitted_commits = if submitted_head_is_delivered {
             0
         } else {
@@ -3538,16 +3623,7 @@ impl Broker {
                 self.build_submission_plan(&session, &head, &integration_head)
                     .ok()
                     .filter(|plan| plan.safe)
-                    .map(|plan| {
-                        plan.commits
-                            .iter()
-                            .filter(|commit| {
-                                commit.ownership == crate::SubmissionCommitOwnership::SessionOwned
-                                    && commit.integration_state
-                                        == crate::SubmissionIntegrationState::Pending
-                            })
-                            .count() as u64
-                    })
+                    .map(|plan| plan.pending_owned_commit_ids().len() as u64)
             });
             if let Some(pending) = pending_from_plan {
                 pending
