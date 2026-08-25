@@ -1,0 +1,124 @@
+{
+  "schema_version": "aethyme-onboarding-v1",
+  "repo": {
+    "name": "repair-aethyme-canonical-repository-depl",
+    "root": ".",
+    "kind": "monorepo",
+    "languages": [],
+    "package_manager": "unknown",
+    "manifests": []
+  },
+  "commands": [
+    {
+      "kind": "fast_test",
+      "command": "cargo test",
+      "source": "github-actions",
+      "confidence": "medium"
+    },
+    {
+      "kind": "fast_test",
+      "command": "pytest",
+      "source": "github-actions",
+      "confidence": "medium"
+    },
+    {
+      "kind": "build",
+      "command": "cargo build",
+      "source": "github-actions",
+      "confidence": "medium"
+    }
+  ],
+  "primary_commands": {
+    "fast_test": "cargo test",
+    "build": "cargo build"
+  },
+  "areas": [
+    {
+      "path": ".github",
+      "role": "automation",
+      "reason": "automation and CI configuration",
+      "confidence": "high"
+    },
+    {
+      "path": "docs",
+      "role": "docs",
+      "reason": "documentation area",
+      "confidence": "high"
+    },
+    {
+      "path": "packages",
+      "role": "workspace",
+      "reason": "workspace-style package container",
+      "confidence": "high"
+    }
+  ],
+  "entrypoints": [],
+  "primary_entrypoints": {},
+  "caution_zones": [],
+  "navigation_recipes": [
+    {
+      "purpose": "Broad repository orientation for a user request",
+      "command": "aethyme explore --repo \"$PWD\" --request \"<task>\" --format answer-json"
+    },
+    {
+      "purpose": "Quick deterministic repo summary",
+      "command": "aethyme repo inspect \"$PWD\" --mode brief --json-output"
+    },
+    {
+      "purpose": "Trace likely impact before editing",
+      "command": "aethyme graph callers \"$PWD\" \"<symbol-or-file>\" --json-output"
+    }
+  ],
+  "summon": {
+    "description": "Use when starting work in an unfamiliar repository, when the task asks for repo overview, setup, architecture, entrypoints, test commands, or where to begin. Skip for narrow file-scoped edits once the relevant paths are already known.",
+    "recommended_when": [
+      "first task in repo",
+      "repo overview",
+      "setup or run instructions",
+      "architecture or entrypoints",
+      "where should I start",
+      "broad debugging or feature-localization request"
+    ],
+    "skip_when": [
+      "known file-scoped edit",
+      "follow-up inside already identified area",
+      "task already localized to concrete files"
+    ],
+    "task_signals": [
+      "unfamiliar repository",
+      "broad task with no path named",
+      "user asks how the repo is organized"
+    ]
+  },
+  "freshness": {
+    "generated_at": "2026-08-25T08:57:30+00:00",
+    "snapshot_key": "4dc754575977431e11dadcc1fc66604b9fbce935d04d7531bb57e66c23ead622",
+    "commit": "9df22342c7d34ed5f4898b50ec68483d63b04109",
+    "repo_dirty": true,
+    "file_count": 474,
+    "generator": "deterministic"
+  },
+  "telemetry": {
+    "sections": [
+      "repo",
+      "commands",
+      "areas",
+      "entrypoints",
+      "caution_zones",
+      "navigation_recipes",
+      "summon",
+      "freshness"
+    ],
+    "counts": {
+      "commands": 3,
+      "areas": 3,
+      "entrypoints": 0,
+      "caution_zones": 0,
+      "navigation_recipes": 3,
+      "notes": 0
+    },
+    "overrides_applied": false,
+    "override_source": null,
+    "override_invalid": false
+  }
+}
