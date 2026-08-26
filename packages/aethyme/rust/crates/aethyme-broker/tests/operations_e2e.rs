@@ -3,7 +3,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use aethyme_broker::{
-    Broker, BrokerOpError, CoordinatedCommand, NewCoordinatedOperation, OperationEffect,
+    Broker, BrokerOpError, CoordinatedCommand, GitRepo, NewCoordinatedOperation, OperationEffect,
     OperationProvider, OperationStatus,
 };
 
@@ -22,6 +22,24 @@ fn git(cwd: &Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 fn init_repo(root: &Path) {
@@ -61,6 +79,67 @@ fn request(session_id: i64, args: &[&str]) -> CoordinatedCommand {
         authorization_reason: Some("test workflow".into()),
         args: args.iter().map(|arg| (*arg).into()).collect(),
     }
+}
+
+struct PushFixture {
+    remote: std::path::PathBuf,
+    worktree: std::path::PathBuf,
+    broker: Broker,
+    session_id: i64,
+}
+
+fn push_fixture(root: &Path, name: &str) -> PushFixture {
+    let repo = root.join("repo");
+    let remote = root.join("remote.git");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    git(root, &["init", "--bare", "-q", remote.to_str().unwrap()]);
+    git(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let worktree = add_worktree(&repo, name);
+    let mut broker = Broker::open(&repo)
+        .unwrap()
+        .with_host_operation_database(root.join("host-operations.db"));
+    let session_id = broker.adopt(&worktree, None).unwrap().id;
+    PushFixture {
+        remote,
+        worktree,
+        broker,
+        session_id,
+    }
+}
+
+fn commit_push_fixture(fixture: &PushFixture, contents: &str) -> String {
+    std::fs::write(fixture.worktree.join("tracked.txt"), contents).unwrap();
+    git(&fixture.worktree, &["add", "tracked.txt"]);
+    git(&fixture.worktree, &["commit", "-qm", contents.trim()]);
+    git_output(&fixture.worktree, &["rev-parse", "HEAD"])
+}
+
+fn exact_push_request(session_id: i64, worktree: &Path, refspecs: &[&str]) -> CoordinatedCommand {
+    let mut args = vec!["push", "origin"];
+    args.extend(refspecs);
+    let mut command = request(session_id, &args);
+    command.resolved_target = Some(
+        GitRepo::discover(worktree)
+            .unwrap()
+            .resolve_remote_target("origin", None)
+            .unwrap(),
+    );
+    command
+}
+
+#[cfg(unix)]
+fn write_executable(path: &Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, contents).unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
 }
 
 fn github_request(session_id: i64, repository: &str, args: &[&str]) -> CoordinatedCommand {
@@ -283,6 +362,215 @@ fn github_api_mismatch_is_refused_before_execution_or_journaling() {
         .unwrap_err();
     assert!(error.to_string().contains("does not match broker --repo"));
     assert!(broker.store().coordinated_operations().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_rejected_push_is_failed_when_every_destination_remains_at_its_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "push-failed");
+    let base = git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let proposed = commit_push_fixture(&fixture, "rejected\n");
+    write_executable(
+        &fixture.remote.join("hooks/pre-receive"),
+        "#!/bin/sh\nprintf 'push succeeded according to stderr\\n' >&2\nexit 1\n",
+    );
+
+    let report = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/main"],
+        ))
+        .unwrap();
+    assert!(!report.command_success);
+    assert!(!report.ok());
+    assert_eq!(report.operation.status, OperationStatus::Failed);
+    assert!(report.stderr.contains("push succeeded according to stderr"));
+    let details: serde_json::Value =
+        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    let reconciliation = &details["push_reconciliation"];
+    assert_eq!(reconciliation["planning"], "planned");
+    assert_eq!(
+        reconciliation["plan"]["destinations"][0]["pre_push_sha"],
+        base
+    );
+    assert_eq!(
+        reconciliation["plan"]["destinations"][0]["proposed_sha"],
+        proposed
+    );
+    assert_eq!(reconciliation["evidence"]["classification"], "failed");
+    assert_eq!(
+        reconciliation["evidence"]["destinations"][0]["observed_sha"],
+        base
+    );
+
+    let second = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/main"],
+        ))
+        .unwrap();
+    assert_eq!(second.operation.status, OperationStatus::Failed);
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_push_is_succeeded_when_transport_exits_nonzero_after_every_update() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "push-succeeded");
+    let proposed = commit_push_fixture(&fixture, "landed\n");
+    let git_exec_path = git_output(&fixture.worktree, &["--exec-path"]);
+    let receive_pack = tmp.path().join("receive-pack-then-fail");
+    write_executable(
+        &receive_pack,
+        &format!(
+            "#!/bin/sh\n\"{git_exec_path}/git-receive-pack\" \"$@\"\nstatus=$?\nif [ \"$status\" -ne 0 ]; then exit \"$status\"; fi\nexit 1\n"
+        ),
+    );
+    git(
+        &fixture.worktree,
+        &[
+            "config",
+            "remote.origin.receivepack",
+            receive_pack.to_str().unwrap(),
+        ],
+    );
+
+    let report = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/main"],
+        ))
+        .unwrap();
+    assert!(
+        !report.command_success,
+        "fixture must exercise non-zero push"
+    );
+    assert!(report.ok());
+    assert_eq!(report.operation.status, OperationStatus::Succeeded);
+    assert_eq!(
+        git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        proposed
+    );
+    let details: serde_json::Value =
+        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        details["push_reconciliation"]["evidence"]["classification"],
+        "succeeded"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_exact_destinations_remain_partial_and_write_blocking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "push-partial");
+    commit_push_fixture(&fixture, "partial\n");
+    write_executable(
+        &fixture.remote.join("hooks/update"),
+        "#!/bin/sh\nif [ \"$1\" = 'refs/heads/rejected' ]; then exit 1; fi\nexit 0\n",
+    );
+
+    let report = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/accepted", "HEAD:refs/heads/rejected"],
+        ))
+        .unwrap();
+    assert!(!report.command_success);
+    assert_eq!(report.operation.status, OperationStatus::OutcomeUnknown);
+    let details: serde_json::Value =
+        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        details["push_reconciliation"]["evidence"]["classification"],
+        "partial"
+    );
+    assert!(
+        fixture
+            .broker
+            .run_coordinated_operation(exact_push_request(
+                fixture.session_id,
+                &fixture.worktree,
+                &["HEAD:refs/heads/after-partial"],
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("Blind retry is forbidden")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_post_push_evidence_keeps_an_exact_push_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "push-missing");
+    commit_push_fixture(&fixture, "missing evidence\n");
+    let receive_pack = tmp.path().join("remove-remote-then-fail");
+    write_executable(
+        &receive_pack,
+        "#!/bin/sh\nmv \"$1\" \"$1.unavailable\"\nprintf 'remote disappeared\\n' >&2\nexit 1\n",
+    );
+    git(
+        &fixture.worktree,
+        &[
+            "config",
+            "remote.origin.receivepack",
+            receive_pack.to_str().unwrap(),
+        ],
+    );
+
+    let report = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/main"],
+        ))
+        .unwrap();
+    assert_eq!(report.operation.status, OperationStatus::OutcomeUnknown);
+    let details: serde_json::Value =
+        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        details["push_reconciliation"]["evidence"]["reason"],
+        "post_push_remote_evidence_unavailable"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn complex_unplannable_push_remains_conservatively_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "push-unplanned");
+    commit_push_fixture(&fixture, "all branches\n");
+    write_executable(
+        &fixture.remote.join("hooks/pre-receive"),
+        "#!/bin/sh\nexit 1\n",
+    );
+    let mut command = request(fixture.session_id, &["push", "--all", "origin"]);
+    command.resolved_target = Some(
+        GitRepo::discover(&fixture.worktree)
+            .unwrap()
+            .resolve_remote_target("origin", None)
+            .unwrap(),
+    );
+
+    let report = fixture.broker.run_coordinated_operation(command).unwrap();
+    assert_eq!(report.operation.status, OperationStatus::OutcomeUnknown);
+    let details: serde_json::Value =
+        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["push_reconciliation"]["planning"], "unsupported");
+    assert_eq!(
+        details["push_reconciliation"]["evidence"]["classification"],
+        "unknown"
+    );
 }
 
 #[test]

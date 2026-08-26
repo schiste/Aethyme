@@ -6,6 +6,7 @@
 //! makes the broker's git contract auditable and testable against real
 //! throwaway repositories.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -314,6 +315,87 @@ impl GitRepo {
         caller_assertion: Option<&str>,
     ) -> Result<crate::ResolvedRemoteTarget, crate::RemoteTargetError> {
         crate::remote_target::resolve_remote_command_target(self, args, caller_assertion)
+    }
+
+    /// Resolve one explicit push source expression to the exact object ID Git
+    /// would advertise to the remote. The object is not peeled: annotated tag
+    /// refs must compare against their tag object, not the tagged commit.
+    pub fn resolve_push_source(&self, source: &str) -> Result<String, GitError> {
+        run_git(
+            &self.root,
+            &["rev-parse", "--verify", &format!("{source}^{{object}}")],
+        )
+    }
+
+    /// Validate one fully-qualified destination ref with Git's own grammar.
+    pub fn validate_push_destination(&self, destination: &str) -> Result<(), GitError> {
+        run_git(&self.root, &["check-ref-format", destination]).map(|_| ())
+    }
+
+    /// Observe exact remote refs without updating local tracking refs.
+    ///
+    /// A successful query that omits a requested ref proves that ref is
+    /// absent. Any command, parse, duplicate, or unexpected-ref failure makes
+    /// the complete observation unavailable; callers must not classify from a
+    /// partial parse.
+    pub fn remote_ref_oids(
+        &self,
+        remote: &str,
+        destinations: &[String],
+    ) -> Result<BTreeMap<String, Option<String>>, GitError> {
+        let push_url = run_git(&self.root, &["remote", "get-url", "--push", remote])?;
+        let display_args = format!("ls-remote --refs <push-url> {}", destinations.join(" "));
+        let output = Command::new("git")
+            .args(["ls-remote", "--refs", "aethyme-push-evidence"])
+            .args(destinations)
+            .current_dir(&self.root)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "remote.aethyme-push-evidence.url")
+            .env("GIT_CONFIG_VALUE_0", push_url)
+            .output()
+            .map_err(|source| GitError::Spawn {
+                args: display_args.clone(),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: display_args,
+                stderr: "remote ref evidence command failed".into(),
+            });
+        }
+        let output = String::from_utf8_lossy(&output.stdout);
+        let mut observed = destinations
+            .iter()
+            .cloned()
+            .map(|destination| (destination, None))
+            .collect::<BTreeMap<_, _>>();
+        for line in output.lines() {
+            let Some((sha, destination)) = line.split_once('\t') else {
+                return Err(GitError::Git {
+                    args: display_args.clone(),
+                    stderr: "remote ref evidence was not a SHA/ref pair".into(),
+                });
+            };
+            if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(GitError::Git {
+                    args: display_args.clone(),
+                    stderr: "remote ref evidence contained an invalid object ID".into(),
+                });
+            }
+            let Some(slot) = observed.get_mut(destination) else {
+                return Err(GitError::Git {
+                    args: display_args.clone(),
+                    stderr: "remote ref evidence contained an unrequested destination".into(),
+                });
+            };
+            if slot.replace(sha.to_ascii_lowercase()).is_some() {
+                return Err(GitError::Git {
+                    args: display_args.clone(),
+                    stderr: "remote ref evidence repeated one destination".into(),
+                });
+            }
+        }
+        Ok(observed)
     }
 
     /// Query the remote's advertised HEAD without updating any local ref.

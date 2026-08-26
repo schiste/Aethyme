@@ -455,28 +455,21 @@ fn ship_execute_rejects_a_non_fast_forward_remote() {
 
 #[cfg(unix)]
 #[test]
-fn ship_push_failure_is_unknown_and_blocks_until_reconciled() {
+fn ship_push_failure_with_unchanged_remote_is_failed_and_retryable() {
     let fixture = Fixture::new();
     let (entry_id, _, integration) = fixture.promoted_entry();
     let hook = fixture.install_hook("pre-receive", "#!/bin/sh\nexit 1\n");
     let mut broker = fixture.broker();
 
     let error = broker.ship_execute(entry_id, &integration).unwrap_err();
-    let (operation_id, recovery) = match error {
-        BrokerOpError::CoordinatedOperationBlocked {
+    let operation_id = match error {
+        BrokerOpError::ShipOperationFailed {
+            phase: "push",
             operation_id,
-            recovery,
-            ..
-        } => (operation_id, recovery),
+            status: "failed",
+        } => operation_id,
         other => panic!("unexpected push error: {other}"),
     };
-    assert!(recovery.canonical_repository.starts_with("local:"));
-    assert!(
-        recovery
-            .canonical_repository
-            .contains(fixture.remote.to_string_lossy().trim_end_matches(".git"))
-    );
-    assert!(recovery.to_string().contains("remote Git refs"));
     assert_eq!(
         broker
             .store()
@@ -484,19 +477,8 @@ fn ship_push_failure_is_unknown_and_blocks_until_reconciled() {
             .unwrap()
             .unwrap()
             .status,
-        OperationStatus::OutcomeUnknown
+        OperationStatus::Failed
     );
-    assert!(matches!(
-        broker.ship_execute(entry_id, &integration),
-        Err(BrokerOpError::CoordinatedOperationBlocked {
-            operation_id: blocked,
-            ..
-        }) if blocked == operation_id
-    ));
-
-    broker
-        .reconcile_coordinated_operation(operation_id, false, "remote main did not move")
-        .unwrap();
     std::fs::remove_file(hook).unwrap();
     let report = broker.ship_execute(entry_id, &integration).unwrap();
     assert_eq!(report.verified_remote_sha, integration);

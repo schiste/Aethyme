@@ -6,6 +6,7 @@
 //! after the command starts becomes `outcome_unknown`; later writes fail
 //! closed until an operator reconciles that journal row.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
@@ -53,12 +54,53 @@ pub struct CoordinatedOperationReport {
 
 impl CoordinatedOperationReport {
     pub fn ok(&self) -> bool {
-        self.command_success && self.operation.status == OperationStatus::Succeeded
+        self.operation.status == OperationStatus::Succeeded
     }
 
     pub fn unknown_outcome_recovery(&self) -> Option<UnknownOutcomeRecovery> {
         (self.operation.status == OperationStatus::OutcomeUnknown)
             .then(|| UnknownOutcomeRecovery::from_operation(&self.operation))
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ExactPushDestination {
+    destination_ref: String,
+    pre_push_sha: Option<String>,
+    proposed_sha: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ExactPushPlan {
+    remote: String,
+    destinations: Vec<ExactPushDestination>,
+}
+
+#[derive(Debug, Clone)]
+enum PushPlanning {
+    NotApplicable,
+    Unsupported { reason: &'static str },
+    Unavailable { reason: &'static str },
+    Planned(ExactPushPlan),
+}
+
+impl PushPlanning {
+    fn journal_value(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::NotApplicable => None,
+            Self::Unsupported { reason } => Some(json!({
+                "planning": "unsupported",
+                "reason": reason,
+            })),
+            Self::Unavailable { reason } => Some(json!({
+                "planning": "unavailable",
+                "reason": reason,
+            })),
+            Self::Planned(plan) => Some(json!({
+                "planning": "planned",
+                "plan": plan,
+            })),
+        }
     }
 }
 
@@ -440,6 +482,202 @@ fn journal_details(
     details
 }
 
+fn with_push_planning(mut extra: serde_json::Value, planning: &PushPlanning) -> serde_json::Value {
+    if let (Some(extra), Some(push)) = (extra.as_object_mut(), planning.journal_value()) {
+        extra.insert("push_reconciliation".into(), push);
+    }
+    extra
+}
+
+fn plan_exact_push(
+    cwd: &Path,
+    args: &[String],
+    target: Option<&crate::ResolvedRemoteTarget>,
+) -> PushPlanning {
+    if args.first().map(String::as_str) != Some("push") {
+        return PushPlanning::NotApplicable;
+    }
+    let Some(target) = target else {
+        return PushPlanning::Unsupported {
+            reason: "push_target_is_not_a_resolved_remote",
+        };
+    };
+    if args.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--all"
+                | "--delete"
+                | "--dry-run"
+                | "--follow-tags"
+                | "--mirror"
+                | "--prune"
+                | "--tags"
+        )
+    }) {
+        return PushPlanning::Unsupported {
+            reason: "push_uses_implicit_or_set_expanding_options",
+        };
+    }
+    let remote_positions = args
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(index, argument)| (argument == &target.remote_name).then_some(index))
+        .collect::<Vec<_>>();
+    let [remote_index] = remote_positions.as_slice() else {
+        return PushPlanning::Unsupported {
+            reason: "push_remote_position_is_not_unique",
+        };
+    };
+    let refspecs = &args[*remote_index + 1..];
+    if refspecs.is_empty()
+        || refspecs
+            .iter()
+            .any(|refspec| refspec.starts_with('-') || refspec == "--")
+    {
+        return PushPlanning::Unsupported {
+            reason: "push_does_not_have_only_explicit_refspecs",
+        };
+    }
+
+    let Ok(repo) = crate::GitRepo::discover(cwd) else {
+        return PushPlanning::Unavailable {
+            reason: "local_repository_evidence_unavailable",
+        };
+    };
+    let mut seen_destinations = BTreeSet::new();
+    let mut destinations = Vec::with_capacity(refspecs.len());
+    for refspec in refspecs {
+        let refspec = refspec.strip_prefix('+').unwrap_or(refspec);
+        let Some((source, destination)) = refspec.split_once(':') else {
+            return PushPlanning::Unsupported {
+                reason: "push_refspec_is_not_explicit_source_and_destination",
+            };
+        };
+        if source.is_empty()
+            || destination.is_empty()
+            || source.starts_with('-')
+            || source.contains(':')
+            || destination.contains(':')
+            || !destination.starts_with("refs/")
+            || !seen_destinations.insert(destination.to_string())
+            || repo.validate_push_destination(destination).is_err()
+        {
+            return PushPlanning::Unsupported {
+                reason: "push_refspec_is_not_one_unique_full_destination",
+            };
+        }
+        let Ok(proposed_sha) = repo.resolve_push_source(source) else {
+            return PushPlanning::Unavailable {
+                reason: "push_source_object_is_unavailable",
+            };
+        };
+        if proposed_sha.len() != 40 || !proposed_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return PushPlanning::Unavailable {
+                reason: "push_source_object_is_not_a_full_sha",
+            };
+        }
+        destinations.push(ExactPushDestination {
+            destination_ref: destination.into(),
+            pre_push_sha: None,
+            proposed_sha: proposed_sha.to_ascii_lowercase(),
+        });
+    }
+
+    let destination_refs = destinations
+        .iter()
+        .map(|destination| destination.destination_ref.clone())
+        .collect::<Vec<_>>();
+    let Ok(pre_push) = repo.remote_ref_oids(&target.remote_name, &destination_refs) else {
+        return PushPlanning::Unavailable {
+            reason: "pre_push_remote_evidence_unavailable",
+        };
+    };
+    for destination in &mut destinations {
+        destination.pre_push_sha = pre_push
+            .get(&destination.destination_ref)
+            .cloned()
+            .flatten();
+    }
+    PushPlanning::Planned(ExactPushPlan {
+        remote: target.remote_name.clone(),
+        destinations,
+    })
+}
+
+fn reconcile_failed_push(
+    cwd: &Path,
+    planning: &PushPlanning,
+) -> Option<(OperationStatus, serde_json::Value)> {
+    let PushPlanning::Planned(plan) = planning else {
+        return planning.journal_value().map(|mut value| {
+            value["evidence"] = json!({
+                "classification": "unknown",
+                "reason": "exact_push_plan_unavailable",
+            });
+            (OperationStatus::OutcomeUnknown, value)
+        });
+    };
+    let Ok(repo) = crate::GitRepo::discover(cwd) else {
+        let mut value = planning.journal_value().expect("planned push");
+        value["evidence"] = json!({
+            "classification": "unknown",
+            "reason": "local_repository_evidence_unavailable",
+        });
+        return Some((OperationStatus::OutcomeUnknown, value));
+    };
+    let destination_refs = plan
+        .destinations
+        .iter()
+        .map(|destination| destination.destination_ref.clone())
+        .collect::<Vec<_>>();
+    let Ok(observed) = repo.remote_ref_oids(&plan.remote, &destination_refs) else {
+        let mut value = planning.journal_value().expect("planned push");
+        value["evidence"] = json!({
+            "classification": "unknown",
+            "reason": "post_push_remote_evidence_unavailable",
+        });
+        return Some((OperationStatus::OutcomeUnknown, value));
+    };
+
+    let mut all_pre_push = true;
+    let mut all_proposed = true;
+    let mut every_observation_is_expected = true;
+    let observations = plan
+        .destinations
+        .iter()
+        .map(|destination| {
+            let observed_sha = observed
+                .get(&destination.destination_ref)
+                .cloned()
+                .flatten();
+            all_pre_push &= observed_sha == destination.pre_push_sha;
+            all_proposed &= observed_sha.as_deref() == Some(destination.proposed_sha.as_str());
+            every_observation_is_expected &= observed_sha == destination.pre_push_sha
+                || observed_sha.as_deref() == Some(destination.proposed_sha.as_str());
+            json!({
+                "destination_ref": destination.destination_ref,
+                "observed_sha": observed_sha,
+            })
+        })
+        .collect::<Vec<_>>();
+    let (status, classification) = if all_proposed {
+        (OperationStatus::Succeeded, "succeeded")
+    } else if all_pre_push {
+        (OperationStatus::Failed, "failed")
+    } else if every_observation_is_expected {
+        (OperationStatus::OutcomeUnknown, "partial")
+    } else {
+        (OperationStatus::OutcomeUnknown, "unknown")
+    };
+    let mut value = planning.journal_value().expect("planned push");
+    value["evidence"] = json!({
+        "classification": classification,
+        "destinations": observations,
+    });
+    Some((status, value))
+}
+
 fn redacted_command(provider: OperationProvider, args: &[String]) -> Result<String, BrokerOpError> {
     let sensitive_flags = [
         "-m",
@@ -695,6 +933,11 @@ impl Broker {
             None
         };
         pre_execute().map_err(|reason| BrokerOpError::InvalidCoordinatedOperation { reason })?;
+        let push_planning = if request.provider == OperationProvider::Git {
+            plan_exact_push(cwd, &request.args, resolved_target.as_ref())
+        } else {
+            PushPlanning::NotApplicable
+        };
 
         let command_json = redacted_command(request.provider, &request.args)?;
         let operation = self
@@ -729,7 +972,7 @@ impl Broker {
                     classification,
                     resolved_target.as_ref(),
                     github_target.as_ref(),
-                    json!({}),
+                    with_push_planning(json!({}), &push_planning),
                 )
                 .to_string(),
             ),
@@ -768,7 +1011,7 @@ impl Broker {
                             classification,
                             resolved_target.as_ref(),
                             github_target.as_ref(),
-                            json!({ "reason": "spawn_failed" }),
+                            with_push_planning(json!({ "reason": "spawn_failed" }), &push_planning),
                         )
                         .to_string(),
                     ),
@@ -791,7 +1034,7 @@ impl Broker {
                         classification,
                         resolved_target.as_ref(),
                         github_target.as_ref(),
-                        json!({ "result": result }),
+                        with_push_planning(json!({ "result": result }), &push_planning),
                     ),
                 ),
                 Ok(None) => (
@@ -800,7 +1043,7 @@ impl Broker {
                         classification,
                         resolved_target.as_ref(),
                         github_target.as_ref(),
-                        json!({}),
+                        with_push_planning(json!({}), &push_planning),
                     ),
                 ),
                 Err(reason) => (
@@ -809,10 +1052,13 @@ impl Broker {
                         classification,
                         resolved_target.as_ref(),
                         github_target.as_ref(),
-                        json!({
-                            "reason": "success_result_not_recorded",
-                            "diagnosis": reason,
-                        }),
+                        with_push_planning(
+                            json!({
+                                "reason": "success_result_not_recorded",
+                                "diagnosis": reason,
+                            }),
+                            &push_planning,
+                        ),
                     ),
                 ),
             }
@@ -824,6 +1070,18 @@ impl Broker {
                     resolved_target.as_ref(),
                     github_target.as_ref(),
                     json!({}),
+                ),
+            )
+        } else if let Some((status, push_reconciliation)) =
+            reconcile_failed_push(cwd, &push_planning)
+        {
+            (
+                status,
+                journal_details(
+                    classification,
+                    resolved_target.as_ref(),
+                    github_target.as_ref(),
+                    json!({ "push_reconciliation": push_reconciliation }),
                 ),
             )
         } else {

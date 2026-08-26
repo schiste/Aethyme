@@ -559,8 +559,19 @@ journal. If a process dies after starting, the next overlapping write marks the
 operation `outcome_unknown` and refuses to run. Inspect external state, then use
 `operations reconcile` to attest `succeeded` or `failed`; never retry an unknown
 operation blindly. A non-zero write is also `outcome_unknown`, because a remote
-command may apply only part of its requested change before failing. V1
-deliberately serializes all writes for one repository.
+command may apply only part of its requested change before failing. The broker
+can resolve a non-zero `git push` more precisely when every refspec explicitly
+names one non-deletion source and one fully-qualified destination
+(`[+]source:refs/...`). Before execution it records each proposed object and
+the exact destination's advertised SHA (or proven absence); afterward it
+queries every destination without updating local tracking refs. All refs still
+at their planned bases is a safe failure, while all refs at their proposed SHAs
+is a reconciled success. Missing, unexpected, or mixed evidence remains
+`outcome_unknown` (with mixed base/proposed refs recorded as `partial`). Pushes
+using shorthand, deletion, wildcard, `--all`, `--mirror`, `--tags`, or another
+unplannable shape remain conservatively unknown. Output text never participates
+in this classification. V1 deliberately serializes all writes for one
+repository.
 
 `integration reconcile` is the recovery path when main moves outside the
 broker, including deploy-authored release commits and squash merges. It never
