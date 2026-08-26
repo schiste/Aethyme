@@ -136,6 +136,7 @@ fn canonical_upgrade_is_read_only_then_digest_bound_and_verifiable() {
 
     let before = run(&repo, &["upgrade", "plan", "--json"]);
     let plan = json(&before);
+    assert_eq!(plan["schema_version"], 2);
     assert_eq!(plan["from_schema"], 0);
     assert_eq!(plan["to_schema"], 1);
     assert_eq!(plan["safe"], true);
@@ -146,6 +147,28 @@ fn canonical_upgrade_is_read_only_then_digest_bound_and_verifiable() {
     );
     assert_eq!(git_status(&repo), "");
     assert!(!String::from_utf8_lossy(&before.stdout).contains(repo.to_string_lossy().as_ref()));
+    assert!(
+        plan["examined_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "AGENTS.md")
+    );
+    let exact_writes = plan["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|change| change["action"] != "unchanged")
+        .map(|change| change["path"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(plan["planned_paths"], Value::Array(exact_writes));
+    for change in plan["changes"].as_array().unwrap() {
+        assert!(change.get("before_sha256").is_some());
+        assert!(change.get("after_sha256").is_some());
+        assert!(change.get("file_mode").is_some());
+        assert!(change.get("ownership").is_some());
+        assert!(change.get("requires_resolution").is_some());
+    }
 
     let rejected = run(
         &repo,
@@ -183,29 +206,59 @@ fn canonical_upgrade_is_read_only_then_digest_bound_and_verifiable() {
 }
 
 #[test]
-fn dirty_repository_blocks_upgrade_without_mutation() {
+fn plan_uses_committed_head_and_apply_still_refuses_dirty_mutation() {
     let temp = tmp_dir();
     let repo = repository(temp.path());
     old_canonical_deployment(&repo);
+    let clean_plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
     fs::write(repo.join("README.md"), "locally edited\n").unwrap();
+    fs::write(repo.join("package.json"), r#"{"scripts":{"test":"false"}}"#).unwrap();
+    fs::write(
+        repo.join(".aethyme/broker.db-incidental"),
+        "ignored and incidental\n",
+    )
+    .unwrap();
 
     let plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
-    assert_eq!(plan["safe"], false);
+    assert_eq!(plan["safe"], true);
+    assert_eq!(plan["plan_digest"], clean_plan["plan_digest"]);
+    assert_eq!(plan["changes"], clean_plan["changes"]);
+    assert_eq!(plan["examined_paths"], clean_plan["examined_paths"]);
     assert!(
-        plan["blockers"][0]
-            .as_str()
+        plan["examined_paths"]
+            .as_array()
             .unwrap()
-            .contains("worktree is dirty")
+            .iter()
+            .all(|path| path != "package.json" && path != ".aethyme/broker.db-incidental")
     );
-    let blocker = plan["blockers"][0].as_str().unwrap();
-    assert!(blocker.contains("managed Aethyme pre-commit lane"));
-    assert!(blocker.contains("broker finish --session <id>"));
-    assert!(!blocker.contains("stash"));
 
     let digest = plan["plan_digest"].as_str().unwrap();
     let applied = run(&repo, &["upgrade", "apply", "--confirm", digest]);
     assert!(!applied.status.success());
+    let error = String::from_utf8_lossy(&applied.stderr);
+    assert!(error.contains("worktree is dirty"));
+    assert!(error.contains("managed Aethyme pre-commit lane"));
+    assert!(!error.contains("stash"));
     assert!(!repo.join(".aethyme/repository.json").exists());
+}
+
+#[test]
+fn active_worktree_content_cannot_invent_canonical_enrollment() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    fs::write(
+        repo.join("AGENTS.md"),
+        "# Incidental local edit\n\n## Broker Coordination\n",
+    )
+    .unwrap();
+
+    let result = run(&repo, &["upgrade", "plan", "--json"]);
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("repository is not enrolled"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 }
 
 #[cfg(unix)]
@@ -244,15 +297,15 @@ fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
     git(&repo, &["add", "mid-session-wip.txt"]);
 
     let upgrade_plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
-    let dirty_blocker = upgrade_plan["blockers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(Value::as_str)
-        .find(|blocker| blocker.contains("worktree is dirty"))
-        .unwrap();
-    assert!(dirty_blocker.contains("managed Aethyme pre-commit lane"));
-    assert!(!dirty_blocker.contains("stash"));
+    assert_eq!(upgrade_plan["safe"], true);
+    assert!(upgrade_plan["blockers"].as_array().unwrap().is_empty());
+    assert!(
+        upgrade_plan["examined_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|path| path != "mid-session-wip.txt")
+    );
 
     // 10:11 — diagnostic and coordinated recovery surfaces remain reachable
     // while the new binary sees the old repository deployment.
@@ -662,6 +715,7 @@ fn plan_refuses_managed_paths_that_escape_through_symlinks() {
     let outside = temp.path().join("outside");
     fs::create_dir(&outside).unwrap();
     symlink(&outside, repo.join(".codex")).unwrap();
+    commit_all(&repo, "replace managed directory with a symlink");
 
     let plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
     assert_eq!(plan["safe"], false);
@@ -670,6 +724,9 @@ fn plan_refuses_managed_paths_that_escape_through_symlinks() {
             .as_str()
             .unwrap()
             .contains("never write through symlinks")
+    }));
+    assert!(plan["changes"].as_array().unwrap().iter().any(|change| {
+        change["path"] == ".codex/skills/aethyme/SKILL.md" && change["requires_resolution"] == true
     }));
     assert!(fs::read_dir(&outside).unwrap().next().is_none());
 }

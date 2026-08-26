@@ -4,6 +4,7 @@
 //! package manager has no trustworthy repository scope; the first broker use
 //! in an enrolled repository refuses an old schema and points here instead.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -13,7 +14,7 @@ use sha2::{Digest, Sha256};
 pub const REPOSITORY_SCHEMA_VERSION: u32 = aethyme_broker::REPOSITORY_SCHEMA_VERSION;
 pub const CANONICAL_MARKER_PATH: &str = aethyme_broker::CANONICAL_REPOSITORY_MARKER_PATH;
 pub const LOCAL_MARKER_PATH: &str = aethyme_broker::LOCAL_REPOSITORY_MARKER_PATH;
-const PLAN_SCHEMA_VERSION: u32 = 1;
+const PLAN_SCHEMA_VERSION: u32 = 2;
 const MIGRATION_ID: &str = "repository-deployment-v1";
 const MIGRATION_IN_PROGRESS: &str = "repository-deployment-v1:in-progress";
 
@@ -66,12 +67,42 @@ pub struct RepositoryUpgradePlan {
     pub repository_head: String,
     pub state_digest: String,
     pub migrations: Vec<String>,
+    pub changes: Vec<RepositoryTreeChange>,
     pub planned_paths: Vec<String>,
+    pub examined_paths: Vec<String>,
     pub applied: bool,
     pub safe: bool,
     pub blockers: Vec<String>,
     pub plan_digest: String,
     pub next_action: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryTreeAction {
+    Create,
+    Update,
+    Delete,
+    Unchanged,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryPathOwnership {
+    AethymeOwned,
+    ManagedBlock,
+    RepositoryOwned,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RepositoryTreeChange {
+    pub path: String,
+    pub action: RepositoryTreeAction,
+    pub before_sha256: Option<String>,
+    pub after_sha256: Option<String>,
+    pub file_mode: Option<String>,
+    pub ownership: RepositoryPathOwnership,
+    pub requires_resolution: bool,
 }
 
 #[derive(Serialize)]
@@ -83,7 +114,9 @@ struct PlanDigest<'a> {
     repository_head: &'a str,
     state_digest: &'a str,
     migrations: &'a [String],
+    changes: &'a [RepositoryTreeChange],
     planned_paths: &'a [String],
+    examined_paths: &'a [String],
     safe: bool,
     blockers: &'a [String],
 }
@@ -489,12 +522,227 @@ fn read_marker(repo: &Path, mode: RepositoryMode) -> Result<Option<RepositoryMar
     })
 }
 
+struct ProposedRepository {
+    _temporary: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl ProposedRepository {
+    fn from_committed_head(repo: &Path, head: &str) -> Result<Self, String> {
+        let temporary = tempfile::Builder::new()
+            .prefix("aethyme-upgrade-proposal-")
+            .tempdir()
+            .map_err(|error| format!("create disposable upgrade directory: {error}"))?;
+        let root = temporary.path().join("repository");
+        let cloned = Command::new("git")
+            .arg("clone")
+            .args(["--quiet", "--no-checkout", "--no-hardlinks"])
+            .arg(repo)
+            .arg(&root)
+            .output()
+            .map_err(|error| format!("materialize committed repository: {error}"))?;
+        if !cloned.status.success() {
+            return Err(format!(
+                "materialize committed repository: {}",
+                String::from_utf8_lossy(&cloned.stderr).trim()
+            ));
+        }
+        git(
+            &root,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "checkout",
+                "--quiet",
+                "--detach",
+                head,
+            ],
+        )?;
+
+        // A local clone rewrites origin to the source checkout path. Preserve
+        // the source repository's configured origin so generators derive the
+        // same canonical repository identity without reading worktree files.
+        if let Ok(origin) = git(repo, &["remote", "get-url", "origin"])
+            && !origin.is_empty()
+        {
+            git(&root, &["remote", "set-url", "origin", &origin])?;
+        }
+        Ok(Self {
+            _temporary: temporary,
+            root,
+        })
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeEntry {
+    sha256: String,
+    file_mode: String,
+}
+
+fn committed_paths(repo: &Path, head: &str) -> Result<Vec<String>, String> {
+    let output = git_bytes(repo, &["ls-tree", "-r", "--name-only", "-z", head])?;
+    utf8_paths_z(&output)
+}
+
+fn proposed_changed_paths(repo: &Path) -> Result<Vec<String>, String> {
+    let mut paths = BTreeSet::new();
+    for args in [
+        &["diff", "--name-only", "-z", "HEAD"][..],
+        &["diff", "--cached", "--name-only", "-z", "HEAD"][..],
+        &["ls-files", "--others", "--exclude-standard", "-z"][..],
+    ] {
+        paths.extend(utf8_paths_z(&git_bytes(repo, args)?)?);
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn utf8_paths_z(output: &[u8]) -> Result<Vec<String>, String> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            std::str::from_utf8(path)
+                .map(str::to_string)
+                .map_err(|_| "repository upgrade paths must be valid UTF-8".to_string())
+        })
+        .collect()
+}
+
+fn snapshot_paths(
+    repo: &Path,
+    paths: &[String],
+) -> Result<BTreeMap<String, Option<TreeEntry>>, String> {
+    paths
+        .iter()
+        .map(|relative| {
+            snapshot_entry(&repo.join(relative))
+                .map(|entry| (relative.clone(), entry))
+                .map_err(|error| format!("inspect proposed path {relative}: {error}"))
+        })
+        .collect()
+}
+
+fn snapshot_entry(path: &Path) -> Result<Option<TreeEntry>, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let (bytes, file_mode) = if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(path).map_err(|error| error.to_string())?;
+        (path_bytes(&target), "120000".to_string())
+    } else if metadata.is_file() {
+        (
+            std::fs::read(path).map_err(|error| error.to_string())?,
+            regular_file_mode(&metadata),
+        )
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(TreeEntry {
+        sha256: sha256(&bytes),
+        file_mode,
+    }))
+}
+
+fn classify_tree_changes(
+    mode: RepositoryMode,
+    paths: &[String],
+    before: &BTreeMap<String, Option<TreeEntry>>,
+    after: &BTreeMap<String, Option<TreeEntry>>,
+    resolution_paths: &BTreeSet<String>,
+) -> Vec<RepositoryTreeChange> {
+    paths
+        .iter()
+        .map(|path| {
+            let before = before.get(path).and_then(Option::as_ref);
+            let after = after.get(path).and_then(Option::as_ref);
+            let action = match (before, after) {
+                (None, None) => RepositoryTreeAction::Unchanged,
+                (Some(before), Some(after)) if before == after => RepositoryTreeAction::Unchanged,
+                (None, Some(_)) => RepositoryTreeAction::Create,
+                (Some(_), None) => RepositoryTreeAction::Delete,
+                (Some(_), Some(_)) => RepositoryTreeAction::Update,
+            };
+            let ownership = path_ownership(mode, path);
+            let requires_resolution = resolution_paths.contains(path)
+                || (action != RepositoryTreeAction::Unchanged
+                    && ownership == RepositoryPathOwnership::RepositoryOwned
+                    && before.is_some());
+            RepositoryTreeChange {
+                path: path.clone(),
+                action,
+                before_sha256: before.map(|entry| entry.sha256.clone()),
+                after_sha256: after.map(|entry| entry.sha256.clone()),
+                file_mode: after.or(before).map(|entry| entry.file_mode.clone()),
+                ownership,
+                requires_resolution,
+            }
+        })
+        .collect()
+}
+
+fn path_ownership(_mode: RepositoryMode, path: &str) -> RepositoryPathOwnership {
+    if matches!(
+        path,
+        ".gitignore" | "AGENTS.md" | "CLAUDE.md" | ".claude/settings.local.json"
+    ) {
+        RepositoryPathOwnership::ManagedBlock
+    } else if matches!(
+        path,
+        ".aethyme/config.toml" | ".aethyme/gates.toml" | ".aethyme/overrides/agents.md"
+    ) {
+        RepositoryPathOwnership::RepositoryOwned
+    } else {
+        RepositoryPathOwnership::AethymeOwned
+    }
+}
+
+#[cfg(unix)]
+fn regular_file_mode(metadata: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o111 == 0 {
+        "100644".into()
+    } else {
+        "100755".into()
+    }
+}
+
+#[cfg(not(unix))]
+fn regular_file_mode(_metadata: &std::fs::Metadata) -> String {
+    "100644".into()
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().as_bytes().to_vec()
+}
+
 pub fn plan(
     repo_hint: &Path,
     requested_mode: Option<RepositoryMode>,
 ) -> Result<RepositoryUpgradePlan, String> {
     let repo = git_root(repo_hint)?;
-    let detected = detect_mode(&repo);
+    let repository_head = git(&repo, &["rev-parse", "HEAD"])?;
+    let proposal = ProposedRepository::from_committed_head(&repo, &repository_head)?;
+    let proposed_repo = proposal.root();
+    let detected = detect_mode(proposed_repo).or_else(|| {
+        // Local-only enrollment is deliberately clone-local and therefore
+        // absent from committed HEAD. Consult only its exact control markers;
+        // never let dirty or untracked repository content select a migration.
+        detect_local_only_enrollment(&repo).then_some(RepositoryMode::LocalOnly)
+    });
     let mode = requested_mode.or(detected).ok_or_else(|| {
         "repository is not enrolled; use `aethyme deploy` (or `aethyme deploy --local-only`) for first-time setup".to_string()
     })?;
@@ -507,7 +755,7 @@ pub fn plan(
     }
 
     let mut blockers = Vec::new();
-    let marker = match read_marker(&repo, mode) {
+    let marker = match read_marker(proposed_repo, mode) {
         Ok(marker) => marker,
         Err(error) => {
             blockers.push(error);
@@ -532,19 +780,14 @@ pub fn plan(
             "repository schema {from_schema} is newer than supported schema {REPOSITORY_SCHEMA_VERSION}"
         ));
     }
-    for relative in managed_paths(mode) {
-        if let Some(blocker) = managed_path_blocker(&repo, &relative)? {
+    let managed_paths = managed_paths(mode);
+    let mut resolution_paths = BTreeSet::new();
+    for relative in &managed_paths {
+        if let Some(blocker) = managed_path_blocker(proposed_repo, relative)? {
+            resolution_paths.insert(relative.clone());
             blockers.push(blocker);
         }
     }
-    let status = git(&repo, &["status", "--porcelain", "--untracked-files=all"])?;
-    if !status.trim().is_empty() {
-        blockers.push(
-            "repository worktree is dirty; commit this work through the managed Aethyme pre-commit lane, then finish active sessions with `aethyme broker finish --session <id>` before applying a repository upgrade"
-                .into(),
-        );
-    }
-    let repository_head = git(&repo, &["rev-parse", "HEAD"])?;
     let migrations = EMBEDDED_MIGRATIONS
         .iter()
         .filter(|migration| {
@@ -552,12 +795,41 @@ pub fn plan(
         })
         .map(|migration| migration.id.to_string())
         .collect::<Vec<_>>();
-    let planned_paths = if migrations.is_empty() {
-        Vec::new()
-    } else {
-        managed_paths(mode)
-    };
-    let state_digest = repository_state_digest(&repo, mode)?;
+    let mut examined_paths = committed_paths(proposed_repo, &repository_head)?;
+    examined_paths.extend(managed_paths.iter().cloned());
+    examined_paths.sort();
+    examined_paths.dedup();
+    let state_digest = repository_state_digest(proposed_repo, mode)?;
+    let before_tree = snapshot_paths(proposed_repo, &examined_paths)?;
+    if blockers.is_empty() && !migrations.is_empty() {
+        write_pending_marker(proposed_repo, mode)?;
+        match mode {
+            RepositoryMode::Canonical => migrate_canonical(proposed_repo)?,
+            RepositoryMode::LocalOnly => migrate_local(proposed_repo)?,
+        }
+        write_current_marker(proposed_repo, mode)?;
+        verify_deployment(proposed_repo, mode)?;
+    }
+    let mut change_paths = managed_paths;
+    change_paths.extend(proposed_changed_paths(proposed_repo)?);
+    change_paths.sort();
+    change_paths.dedup();
+    examined_paths.extend(change_paths.iter().cloned());
+    examined_paths.sort();
+    examined_paths.dedup();
+    let after_tree = snapshot_paths(proposed_repo, &change_paths)?;
+    let changes = classify_tree_changes(
+        mode,
+        &change_paths,
+        &before_tree,
+        &after_tree,
+        &resolution_paths,
+    );
+    let planned_paths = changes
+        .iter()
+        .filter(|change| change.action != RepositoryTreeAction::Unchanged)
+        .map(|change| change.path.clone())
+        .collect::<Vec<_>>();
     let safe = blockers.is_empty();
     let digest_input = PlanDigest {
         schema_version: PLAN_SCHEMA_VERSION,
@@ -567,7 +839,9 @@ pub fn plan(
         repository_head: &repository_head,
         state_digest: &state_digest,
         migrations: &migrations,
+        changes: &changes,
         planned_paths: &planned_paths,
+        examined_paths: &examined_paths,
         safe,
         blockers: &blockers,
     };
@@ -590,7 +864,9 @@ pub fn plan(
         repository_head,
         state_digest,
         migrations,
+        changes,
         planned_paths,
+        examined_paths,
         applied: false,
         safe,
         blockers,
@@ -625,6 +901,7 @@ pub fn apply(
     }
 
     let repo = git_root(repo_hint)?;
+    ensure_apply_worktree_safe(&repo, &before)?;
     write_pending_marker(&repo, before.mode)?;
     match before.mode {
         RepositoryMode::Canonical => migrate_canonical(&repo)?,
@@ -704,11 +981,7 @@ fn verify_deployment(repo: &Path, mode: RepositoryMode) -> Result<(), String> {
 }
 
 fn detect_mode(repo: &Path) -> Option<RepositoryMode> {
-    if repo
-        .join(aethyme_enhance::local::LOCAL_MARKER_PATH)
-        .is_file()
-        || repo.join(LOCAL_MARKER_PATH).is_file()
-    {
+    if detect_local_only_enrollment(repo) {
         Some(RepositoryMode::LocalOnly)
     } else if std::fs::read_to_string(repo.join("AGENTS.md"))
         .map(|text| text.contains("Broker Coordination"))
@@ -718,6 +991,12 @@ fn detect_mode(repo: &Path) -> Option<RepositoryMode> {
     } else {
         None
     }
+}
+
+fn detect_local_only_enrollment(repo: &Path) -> bool {
+    repo.join(aethyme_enhance::local::LOCAL_MARKER_PATH)
+        .is_file()
+        || repo.join(LOCAL_MARKER_PATH).is_file()
 }
 
 fn managed_paths(mode: RepositoryMode) -> Vec<String> {
@@ -759,6 +1038,29 @@ fn managed_path_blocker(repo: &Path, relative: &str) -> Result<Option<String>, S
     Ok(None)
 }
 
+fn ensure_apply_worktree_safe(repo: &Path, plan: &RepositoryUpgradePlan) -> Result<(), String> {
+    let current_head = git(repo, &["rev-parse", "HEAD"])?;
+    if current_head != plan.repository_head {
+        return Err(format!(
+            "repository HEAD moved after review; planned {}, found {current_head}; regenerate the plan",
+            plan.repository_head
+        ));
+    }
+    let status = git(repo, &["status", "--porcelain", "--untracked-files=all"])?;
+    if !status.trim().is_empty() {
+        return Err(
+            "repository worktree is dirty; commit this work through the managed Aethyme pre-commit lane, then finish active sessions with `aethyme broker finish --session <id>` before applying a repository upgrade"
+                .into(),
+        );
+    }
+    for relative in &plan.planned_paths {
+        if let Some(blocker) = managed_path_blocker(repo, relative)? {
+            return Err(blocker);
+        }
+    }
+    Ok(())
+}
+
 fn repository_state_digest(repo: &Path, mode: RepositoryMode) -> Result<String, String> {
     aethyme_broker::repository_state_digest(
         repo,
@@ -775,6 +1077,11 @@ fn git_root(repo_hint: &Path) -> Result<PathBuf, String> {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let output = git_bytes(repo, args)?;
+    Ok(String::from_utf8_lossy(&output).trim().to_string())
+}
+
+fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(repo)
@@ -787,7 +1094,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(output.stdout)
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -1154,5 +1461,66 @@ mod compatibility_tests {
             assert!(decision.allowed);
             assert_eq!(decision.severity, severity);
         }
+    }
+}
+
+#[cfg(test)]
+mod proposed_tree_tests {
+    use super::*;
+
+    fn entry(digest: &str, mode: &str) -> Option<TreeEntry> {
+        Some(TreeEntry {
+            sha256: digest.into(),
+            file_mode: mode.into(),
+        })
+    }
+
+    #[test]
+    fn change_classification_covers_every_action_and_resolution_boundary() {
+        let paths = vec![
+            ".aethyme/config.toml".to_string(),
+            "create".to_string(),
+            "delete".to_string(),
+            "unchanged".to_string(),
+        ];
+        let before = BTreeMap::from([
+            (".aethyme/config.toml".into(), entry("old", "100644")),
+            ("create".into(), None),
+            ("delete".into(), entry("old", "100755")),
+            ("unchanged".into(), entry("same", "100644")),
+        ]);
+        let after = BTreeMap::from([
+            (".aethyme/config.toml".into(), entry("new", "100644")),
+            ("create".into(), entry("new", "100644")),
+            ("delete".into(), None),
+            ("unchanged".into(), entry("same", "100644")),
+        ]);
+
+        let changes = classify_tree_changes(
+            RepositoryMode::Canonical,
+            &paths,
+            &before,
+            &after,
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.action)
+                .collect::<Vec<_>>(),
+            vec![
+                RepositoryTreeAction::Update,
+                RepositoryTreeAction::Create,
+                RepositoryTreeAction::Delete,
+                RepositoryTreeAction::Unchanged,
+            ]
+        );
+        assert!(changes[0].requires_resolution);
+        assert_eq!(
+            changes[0].ownership,
+            RepositoryPathOwnership::RepositoryOwned
+        );
+        assert_eq!(changes[2].file_mode.as_deref(), Some("100755"));
+        assert!(!changes[3].requires_resolution);
     }
 }
