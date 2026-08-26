@@ -852,6 +852,9 @@ fn finish_closes_promoted_session_and_suggests_cleanup_only_when_main_contains_i
             failure_class: None,
             exit_code: Some(0),
             duration_ms: Some(12),
+            wait_duration_ms: Some(1),
+            first_output_ms: Some(2),
+            output_bytes: Some(3),
             log_path: Some("/must/not/enter/handoff.log".into()),
             session_id: Some(session.id),
         })

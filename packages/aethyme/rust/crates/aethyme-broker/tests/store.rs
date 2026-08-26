@@ -301,6 +301,9 @@ fn gate_result_cache_ignores_cancelled_and_error_runs() {
             failure_class: None,
             exit_code: None,
             duration_ms: None,
+            wait_duration_ms: None,
+            first_output_ms: None,
+            output_bytes: None,
             log_path: None,
             session_id: None,
         })
@@ -322,6 +325,9 @@ fn gate_result_cache_ignores_cancelled_and_error_runs() {
             failure_class: None,
             exit_code: Some(0),
             duration_ms: Some(1200),
+            wait_duration_ms: Some(25),
+            first_output_ms: Some(10),
+            output_bytes: Some(40),
             log_path: None,
             session_id: None,
         })
@@ -332,6 +338,9 @@ fn gate_result_cache_ignores_cancelled_and_error_runs() {
         .unwrap();
     assert_eq!(hit.status, GateStatus::Pass);
     assert_eq!(hit.failure_class, None);
+    assert_eq!(hit.wait_duration_ms, Some(25));
+    assert_eq!(hit.first_output_ms, Some(10));
+    assert_eq!(hit.output_bytes, Some(40));
     assert!(
         store
             .cached_gate_result_for_definition("pytest", "tree-a", "test-definition")
@@ -355,6 +364,9 @@ fn gate_result_cache_ignores_cancelled_and_error_runs() {
             failure_class: None,
             exit_code: Some(1),
             duration_ms: Some(100),
+            wait_duration_ms: None,
+            first_output_ms: None,
+            output_bytes: None,
             log_path: None,
             session_id: None,
         })
@@ -376,6 +388,9 @@ fn gate_result_cache_ignores_cancelled_and_error_runs() {
             failure_class: Some(GateFailureClass::TestFailure),
             exit_code: Some(1),
             duration_ms: Some(100),
+            wait_duration_ms: None,
+            first_output_ms: None,
+            output_bytes: None,
             log_path: None,
             session_id: None,
         })

@@ -81,7 +81,7 @@ fn fixture() -> tempfile::TempDir {
     .unwrap();
     std::fs::write(
         tmp.path().join(".aethyme/gates.toml"),
-        "[[gate]]\nname = \"provenance\"\ncommand = \"echo run >> gate-runs.txt\"\n",
+        "[[gate]]\nname = \"provenance\"\ncommand = \"echo gate-output; echo run >> gate-runs.txt\"\n",
     )
     .unwrap();
     git(tmp.path(), &["add", "-A"]);
@@ -114,6 +114,9 @@ fn gate_cli_reports_tree_provenance_for_executed_and_cached_results() {
     let cached: serde_json::Value = serde_json::from_str(&cached_json).unwrap();
     assert_eq!(cached[0]["cached"], true);
     assert_eq!(cached[0]["tree_hash"], first_tree);
+    assert_eq!(cached[0]["wait_duration_ms"], 0);
+    assert!(cached[0]["first_output_ms"].as_i64().is_some());
+    assert!(cached[0]["output_bytes"].as_i64().unwrap() > 0);
     assert_eq!(run_count(&tmp.path().join("gate-runs.txt")), 1);
 
     std::fs::write(tmp.path().join("tracked.txt"), "second\n").unwrap();
@@ -124,6 +127,9 @@ fn gate_cli_reports_tree_provenance_for_executed_and_cached_results() {
     let executed: serde_json::Value = serde_json::from_str(&executed_json).unwrap();
     assert_eq!(executed[0]["cached"], false);
     assert_eq!(executed[0]["tree_hash"], second_tree);
+    assert!(executed[0]["wait_duration_ms"].as_i64().is_some());
+    assert!(executed[0]["first_output_ms"].as_i64().is_some());
+    assert!(executed[0]["output_bytes"].as_i64().unwrap() > 0);
     assert_eq!(run_count(&tmp.path().join("gate-runs.txt")), 2);
 
     let cached_text = stdout(run(tmp.path(), &["gates", "run", "--all"]));

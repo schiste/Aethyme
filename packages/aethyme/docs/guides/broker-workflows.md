@@ -137,8 +137,12 @@ landing check.
 
 Text output shows an abbreviated 12-character tree hash. JSON returns the full
 hash in `tree_hash` and identifies whether the result was executed or cached.
-Before acting on any result, compare that tree with the tree you intend to
-submit.
+Executed results also separate `wait_duration_ms` from command `duration_ms`,
+record `first_output_ms`, and count combined `output_bytes` without storing
+output content in telemetry. Cached results preserve the original execution's
+startup/output measurements and report zero new wait. Use these fields to tell
+resource contention from slow startup and slow test execution. Before acting
+on any result, compare its tree with the tree you intend to submit.
 
 Use a cache bypass when fresh execution itself is required—for example, after
 repairing an external dependency or validating a flaky-environment

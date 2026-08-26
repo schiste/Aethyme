@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -347,6 +347,14 @@ const MIGRATION_V13: &str = "
 ALTER TABLE gates ADD COLUMN managed_cache_json TEXT;
 ";
 
+const MIGRATION_V14: &str = "
+-- Content-free execution telemetry separates coordination delay, command
+-- startup, and logging volume without storing command output.
+ALTER TABLE gate_results ADD COLUMN wait_duration_ms INTEGER;
+ALTER TABLE gate_results ADD COLUMN first_output_ms INTEGER;
+ALTER TABLE gate_results ADD COLUMN output_bytes INTEGER;
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -361,6 +369,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V11,
     MIGRATION_V12,
     MIGRATION_V13,
+    MIGRATION_V14,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {

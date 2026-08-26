@@ -717,8 +717,9 @@ impl BrokerStore {
         tx.execute(
             "INSERT INTO gate_results (gate_name, tree_hash, definition_hash, status,
                                        failure_class, exit_code, duration_ms, log_path,
-                                       session_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                       session_id, created_at, wait_duration_ms,
+                                       first_output_ms, output_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 result.gate_name,
                 result.tree_hash,
@@ -729,7 +730,10 @@ impl BrokerStore {
                 result.duration_ms,
                 result.log_path,
                 result.session_id,
-                now
+                now,
+                result.wait_duration_ms,
+                result.first_output_ms,
+                result.output_bytes,
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -1683,7 +1687,8 @@ const LEASE_SELECT: &str =
     "SELECT id, session_id, path, kind, created_at, expires_at, released_at FROM leases";
 
 const GATE_RESULT_SELECT: &str = "SELECT id, gate_name, tree_hash, definition_hash, status, \
-     failure_class, exit_code, duration_ms, log_path, session_id, created_at FROM gate_results";
+     failure_class, exit_code, duration_ms, log_path, session_id, created_at, wait_duration_ms, \
+     first_output_ms, output_bytes FROM gate_results";
 
 const MERGE_SELECT: &str = "SELECT id, session_id, head_commit, base_commit, status, \
      merged_tree, details_json, created_at, updated_at FROM merge_queue";
@@ -1783,6 +1788,9 @@ fn gate_result_from_row(row: &rusqlite::Row<'_>) -> RowResult<GateResult> {
             log_path: row.get(8)?,
             session_id: row.get(9)?,
             created_at: row.get(10)?,
+            wait_duration_ms: row.get(11)?,
+            first_output_ms: row.get(12)?,
+            output_bytes: row.get(13)?,
         })
     })())
 }

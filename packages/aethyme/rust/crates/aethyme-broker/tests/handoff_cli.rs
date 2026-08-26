@@ -79,6 +79,9 @@ fn finished_fixture() -> (tempfile::TempDir, PathBuf, i64) {
             failure_class: None,
             exit_code: Some(0),
             duration_ms: Some(4),
+            wait_duration_ms: Some(1),
+            first_output_ms: Some(2),
+            output_bytes: Some(3),
             log_path: Some("/redacted/gate.log".into()),
             session_id: Some(session.id),
         })

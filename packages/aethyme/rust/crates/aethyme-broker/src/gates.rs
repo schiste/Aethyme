@@ -350,6 +350,12 @@ pub struct GateRunOutcome {
     pub cached: bool,
     pub exit_code: Option<i64>,
     pub duration_ms: Option<i64>,
+    /// Time spent waiting for owner locks, host resources, and cache prep.
+    pub wait_duration_ms: Option<i64>,
+    /// Time from command spawn until the first stdout/stderr byte appeared.
+    pub first_output_ms: Option<i64>,
+    /// Combined stdout/stderr bytes captured without exposing their content.
+    pub output_bytes: Option<i64>,
     pub log_path: Option<String>,
 }
 
@@ -575,6 +581,9 @@ pub fn cancel_obsolete_runs(
             failure_class: None,
             exit_code: None,
             duration_ms: None,
+            wait_duration_ms: None,
+            first_output_ms: None,
+            output_bytes: None,
             log_path: None,
             session_id: Some(session_id),
         });
@@ -1062,6 +1071,9 @@ fn run_selections(
                 cached: true,
                 exit_code: hit.exit_code,
                 duration_ms: hit.duration_ms,
+                wait_duration_ms: Some(0),
+                first_output_ms: hit.first_output_ms,
+                output_bytes: hit.output_bytes,
                 log_path: hit.log_path,
             });
             if failed {
@@ -1070,6 +1082,7 @@ fn run_selections(
             continue;
         }
 
+        let wait_started = Instant::now();
         let owner_dir = run_dir.join("owners");
         let owner_locks =
             GateOwnerLocks::acquire(&owner_dir, &gate.name, &selection.owner_paths, progress)
@@ -1104,6 +1117,9 @@ fn run_selections(
                         failure_class: Some(GateFailureClass::ResourceContention),
                         exit_code: None,
                         duration_ms: Some(0),
+                        wait_duration_ms: Some(wait_started.elapsed().as_millis() as i64),
+                        first_output_ms: None,
+                        output_bytes: Some(0),
                         log_path: Some(log_path.to_string_lossy().into_owned()),
                         session_id,
                     })?;
@@ -1118,6 +1134,9 @@ fn run_selections(
                         cached: false,
                         exit_code: None,
                         duration_ms: Some(0),
+                        wait_duration_ms: Some(wait_started.elapsed().as_millis() as i64),
+                        first_output_ms: None,
+                        output_bytes: Some(0),
                         log_path: Some(log_path.to_string_lossy().into_owned()),
                     });
                     break;
@@ -1153,6 +1172,9 @@ fn run_selections(
                     failure_class: Some(GateFailureClass::Environment),
                     exit_code: None,
                     duration_ms: Some(0),
+                    wait_duration_ms: Some(wait_started.elapsed().as_millis() as i64),
+                    first_output_ms: None,
+                    output_bytes: Some(0),
                     log_path: Some(log_path.to_string_lossy().into_owned()),
                     session_id,
                 })?;
@@ -1167,11 +1189,15 @@ fn run_selections(
                     cached: false,
                     exit_code: None,
                     duration_ms: Some(0),
+                    wait_duration_ms: Some(wait_started.elapsed().as_millis() as i64),
+                    first_output_ms: None,
+                    output_bytes: Some(0),
                     log_path: Some(log_path.to_string_lossy().into_owned()),
                 });
                 break;
             }
         };
+        let wait_duration_ms = wait_started.elapsed().as_millis() as i64;
         progress.report(&format!(
             "gate {} started (cost {}, tree {})",
             gate.name,
@@ -1218,9 +1244,19 @@ fn run_selections(
             (Err(_), Some(release_error)) => Ok(GateCommandOutcome {
                 exit_code: None,
                 resource_error: Some(release_error),
+                first_output_ms: None,
+                output_bytes: 0,
             }),
             (Err(error), None) => Err(error),
         };
+        let first_output_ms = status
+            .as_ref()
+            .ok()
+            .and_then(|outcome| outcome.first_output_ms);
+        let output_bytes = status
+            .as_ref()
+            .ok()
+            .map(|outcome| outcome.output_bytes as i64);
         let (gate_status, failure_class, exit_code) =
             classify_gate_result(&gate.command, &log_path, status);
         progress.report(&format!(
@@ -1238,6 +1274,9 @@ fn run_selections(
             failure_class,
             exit_code,
             duration_ms: Some(duration_ms),
+            wait_duration_ms: Some(wait_duration_ms),
+            first_output_ms,
+            output_bytes,
             log_path: Some(log_path.to_string_lossy().into_owned()),
             session_id,
         })?;
@@ -1253,6 +1292,9 @@ fn run_selections(
             cached: false,
             exit_code,
             duration_ms: Some(duration_ms),
+            wait_duration_ms: Some(wait_duration_ms),
+            first_output_ms,
+            output_bytes,
             log_path: Some(log_path.to_string_lossy().into_owned()),
         });
         if failed {
@@ -1275,6 +1317,7 @@ fn classify_gate_result(
         Ok(GateCommandOutcome {
             exit_code,
             resource_error: Some(error),
+            ..
         }) => {
             let _ = append_gate_log(log_path, &format!("aethyme host resource error: {error}\n"));
             (
@@ -1286,10 +1329,12 @@ fn classify_gate_result(
         Ok(GateCommandOutcome {
             exit_code: Some(0),
             resource_error: None,
+            ..
         }) => (GateStatus::Pass, None, Some(0)),
         Ok(GateCommandOutcome {
             exit_code: Some(code),
             resource_error: None,
+            ..
         }) if is_timeout_error(code, log_path) => (
             GateStatus::Error,
             Some(GateFailureClass::Timeout),
@@ -1298,6 +1343,7 @@ fn classify_gate_result(
         Ok(GateCommandOutcome {
             exit_code: Some(code),
             resource_error: None,
+            ..
         }) if is_resource_contention_error(command, log_path) => (
             GateStatus::Error,
             Some(GateFailureClass::ResourceContention),
@@ -1306,6 +1352,7 @@ fn classify_gate_result(
         Ok(GateCommandOutcome {
             exit_code: Some(code),
             resource_error: None,
+            ..
         }) if is_environment_error(code, log_path) => (
             GateStatus::Error,
             Some(GateFailureClass::Environment),
@@ -1314,6 +1361,7 @@ fn classify_gate_result(
         Ok(GateCommandOutcome {
             exit_code: Some(code),
             resource_error: None,
+            ..
         }) => (
             GateStatus::Fail,
             Some(GateFailureClass::TestFailure),
@@ -1326,6 +1374,7 @@ fn classify_gate_result(
         Ok(GateCommandOutcome {
             exit_code: None,
             resource_error: None,
+            ..
         }) => (GateStatus::Cancelled, None, None),
         Err(_) => (GateStatus::Error, Some(GateFailureClass::Environment), None),
     }
@@ -1444,6 +1493,8 @@ struct GateCommandContext<'a> {
 struct GateCommandOutcome {
     exit_code: Option<i32>,
     resource_error: Option<String>,
+    first_output_ms: Option<i64>,
+    output_bytes: u64,
 }
 
 fn run_gate_command(
@@ -1485,6 +1536,8 @@ fn run_gate_command(
         let _ = std::fs::write(pidfile, format!("{} {}", child.id(), context.tree));
     }
     let fatal_resource_error = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let first_output = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
+    let output_monitor_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let status = std::thread::scope(|scope| {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let progress_interval = heartbeat_interval();
@@ -1498,6 +1551,26 @@ fn run_gate_command(
             .unwrap_or(progress_interval);
         let process_group = child.id() as i32;
         let thread_error = fatal_resource_error.clone();
+        let monitor_result = first_output.clone();
+        let monitor_done = output_monitor_done.clone();
+        scope.spawn(move || {
+            while !monitor_done.load(std::sync::atomic::Ordering::Acquire) {
+                if std::fs::metadata(context.log_path)
+                    .map(|metadata| metadata.len() > 0)
+                    .unwrap_or(false)
+                {
+                    let elapsed = context.started.elapsed().as_millis() as i64;
+                    let _ = monitor_result.compare_exchange(
+                        -1,
+                        elapsed,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    );
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        });
         scope.spawn(move || {
             let mut renewal = renewal;
             let mut last_progress = Instant::now();
@@ -1545,6 +1618,7 @@ fn run_gate_command(
             }
         });
         let status = child.wait();
+        output_monitor_done.store(true, std::sync::atomic::Ordering::Release);
         let _ = done_tx.send(());
         status
     });
@@ -1557,9 +1631,19 @@ fn run_gate_command(
         .and_then(|mut error| error.take());
     // Killed-by-signal surfaces as no exit code; absent a resource error,
     // `None` remains a non-conclusive cancellation.
+    let output_bytes = std::fs::metadata(context.log_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let observed_first_output = first_output.load(std::sync::atomic::Ordering::Acquire);
     Ok(GateCommandOutcome {
         exit_code: status?.code(),
         resource_error,
+        first_output_ms: match observed_first_output {
+            -1 if output_bytes > 0 => Some(context.started.elapsed().as_millis() as i64),
+            -1 => None,
+            elapsed => Some(elapsed),
+        },
+        output_bytes,
     })
 }
 
