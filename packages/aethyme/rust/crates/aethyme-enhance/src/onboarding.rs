@@ -81,15 +81,16 @@ pub fn expected_onboarding_files(repo_path: &Path) -> Result<Vec<(String, String
 pub fn build_onboarding_artifact(repo_path: &Path) -> Result<Value, String> {
     let repo_path = resolve_path(repo_path);
     let snapshot = snapshot_metadata(&repo_path)?;
+    let surface_files = OnboardingFileSnapshot::discover(&repo_path)?;
 
     let manifests = detect_manifests(&repo_path);
     let package_manager = primary_package_manager(&repo_path, &manifests);
     let commands = collect_commands(&repo_path, &manifests, package_manager)?;
     let primary_commands = primary_commands_map(&commands);
-    let areas = collect_areas(&repo_path)?;
-    let entrypoints = collect_entrypoints(&repo_path, &manifests)?;
+    let areas = collect_areas(&surface_files);
+    let entrypoints = collect_entrypoints(&repo_path, &manifests, &surface_files)?;
     let primary_entrypoints = primary_entrypoints_map(&entrypoints);
-    let caution_zones = collect_caution_zones(&repo_path)?;
+    let caution_zones = collect_caution_zones(&surface_files);
     let repo_kind = infer_repo_kind(&repo_path, &manifests, &areas);
     let languages = infer_languages(&repo_path, &manifests);
     let overrides = load_overrides(&repo_path);
@@ -1005,29 +1006,83 @@ fn area_role_reason(role: &str) -> &'static str {
     }
 }
 
-fn sorted_dir_entries(repo_path: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(repo_path)
-        .map_err(|e| format!("{}: {e}", repo_path.display()))?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .collect();
-    entries.sort_by(|a, b| {
-        a.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .cmp(&b.file_name().map(|n| n.to_string_lossy().into_owned()))
-    });
-    Ok(entries)
+struct OnboardingFileSnapshot {
+    paths: HashSet<String>,
 }
 
-fn collect_areas(repo_path: &Path) -> Result<Vec<Value>, String> {
-    let mut areas = Vec::new();
-    for path in sorted_dir_entries(repo_path)? {
-        if !path.is_dir() {
-            continue;
+impl OnboardingFileSnapshot {
+    fn discover(repo_path: &Path) -> Result<Self, String> {
+        if let Some(output) = run_git_bytes(repo_path, &["ls-files", "--cached", "-z"]) {
+            return Ok(Self {
+                paths: parse_git_paths_z(&output).into_iter().collect(),
+            });
         }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        if repo_path.join(".git").exists() {
+            return Err("git ls-files failed while building onboarding surfaces".to_string());
+        }
+
+        let mut discovered = Vec::new();
+        collect_recursive(repo_path, &mut discovered)?;
+        let paths = discovered
+            .into_iter()
+            .filter(|path| path.is_file())
+            .filter_map(|path| {
+                path.strip_prefix(repo_path).ok().map(|relative| {
+                    relative
+                        .components()
+                        .map(|component| component.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+            })
+            .collect();
+        Ok(Self { paths })
+    }
+
+    fn contains_file(&self, path: &str) -> bool {
+        self.paths.contains(path)
+    }
+
+    fn contains_directory(&self, path: &str) -> bool {
+        let prefix = format!("{path}/");
+        self.paths
+            .iter()
+            .any(|candidate| candidate.starts_with(&prefix))
+    }
+
+    fn contains_kind(&self, path: &str, kind: &str) -> bool {
+        match kind {
+            "directory" => self.contains_directory(path),
+            _ => self.contains_file(path),
+        }
+    }
+
+    fn top_level_directories(&self) -> Vec<String> {
+        let mut directories = self
+            .paths
+            .iter()
+            .filter_map(|path| {
+                path.split_once('/')
+                    .map(|(directory, _)| directory.to_string())
+            })
+            .collect::<Vec<_>>();
+        directories.sort();
+        directories.dedup();
+        directories
+    }
+}
+
+fn parse_git_paths_z(output: &[u8]) -> Vec<String> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect()
+}
+
+fn collect_areas(surface_files: &OnboardingFileSnapshot) -> Vec<Value> {
+    let mut areas = Vec::new();
+    for name in surface_files.top_level_directories() {
         let Some((_, role)) = AREA_ROLE_MAP.iter().find(|(n, _)| *n == name) else {
             continue;
         };
@@ -1038,7 +1093,7 @@ fn collect_areas(repo_path: &Path) -> Result<Vec<Value>, String> {
             ("confidence", Value::str("high")),
         ]));
     }
-    Ok(areas)
+    areas
 }
 
 struct EntrypointAdder {
@@ -1070,7 +1125,11 @@ impl EntrypointAdder {
     }
 }
 
-fn collect_entrypoints(repo_path: &Path, manifests: &[String]) -> Result<Vec<Value>, String> {
+fn collect_entrypoints(
+    repo_path: &Path,
+    manifests: &[String],
+    surface_files: &OnboardingFileSnapshot,
+) -> Result<Vec<Value>, String> {
     let mut adder = EntrypointAdder::new();
 
     let conventional_roots: &[(&str, &str, &str, &str, &str)] = &[
@@ -1174,40 +1233,40 @@ fn collect_entrypoints(repo_path: &Path, manifests: &[String]) -> Result<Vec<Val
         ),
     ];
     for (relative, kind, role, reason, confidence) in conventional_roots.iter().copied() {
-        if repo_path.join(relative).exists() {
+        if surface_files.contains_kind(relative, kind) {
             adder.add(relative, kind, role, reason, confidence);
         }
     }
 
-    for candidate in entrypoints_from_package_json(repo_path)? {
-        adder.add(
-            &candidate.0,
-            &candidate.1,
-            &candidate.2,
-            &candidate.3,
-            &candidate.4,
+    if surface_files.contains_file("package.json") && repo_path.join("package.json").is_file() {
+        add_tracked_entrypoint_candidates(
+            &mut adder,
+            entrypoints_from_package_json(repo_path)?,
+            surface_files,
         );
     }
-    for candidate in entrypoints_from_procfile(repo_path)? {
-        adder.add(
-            &candidate.0,
-            &candidate.1,
-            &candidate.2,
-            &candidate.3,
-            &candidate.4,
+    if surface_files.contains_file("Procfile") && repo_path.join("Procfile").is_file() {
+        add_tracked_entrypoint_candidates(
+            &mut adder,
+            entrypoints_from_procfile(repo_path)?,
+            surface_files,
         );
     }
-    for candidate in entrypoints_from_compose(repo_path)? {
-        adder.add(
-            &candidate.0,
-            &candidate.1,
-            &candidate.2,
-            &candidate.3,
-            &candidate.4,
+    if let Some(compose_name) = COMPOSE_FILENAMES
+        .into_iter()
+        .find(|name| surface_files.contains_file(name) && repo_path.join(name).is_file())
+    {
+        add_tracked_entrypoint_candidates(
+            &mut adder,
+            entrypoints_from_compose_file(repo_path, compose_name)?,
+            surface_files,
         );
     }
 
-    if has_manifest(manifests, "Cargo.toml") && repo_path.join("src/lib.rs").exists() {
+    if has_manifest(manifests, "Cargo.toml")
+        && surface_files.contains_file("Cargo.toml")
+        && surface_files.contains_file("src/lib.rs")
+    {
         adder.add(
             "src/lib.rs",
             "file",
@@ -1232,6 +1291,25 @@ fn collect_entrypoints(repo_path: &Path, manifests: &[String]) -> Result<Vec<Val
     Ok(candidates)
 }
 
+fn add_tracked_entrypoint_candidates(
+    adder: &mut EntrypointAdder,
+    candidates: Vec<EntrypointTuple>,
+    surface_files: &OnboardingFileSnapshot,
+) {
+    for candidate in candidates {
+        let source_backed = matches!(candidate.1.as_str(), "script" | "process" | "service");
+        if source_backed || surface_files.contains_kind(&candidate.0, &candidate.1) {
+            adder.add(
+                &candidate.0,
+                &candidate.1,
+                &candidate.2,
+                &candidate.3,
+                &candidate.4,
+            );
+        }
+    }
+}
+
 const CAUTION_ZONE_NAMES: [&str; 11] = [
     "vendor",
     "third_party",
@@ -1246,16 +1324,9 @@ const CAUTION_ZONE_NAMES: [&str; 11] = [
     "snapshots",
 ];
 
-fn collect_caution_zones(repo_path: &Path) -> Result<Vec<Value>, String> {
+fn collect_caution_zones(surface_files: &OnboardingFileSnapshot) -> Vec<Value> {
     let mut caution = Vec::new();
-    for path in sorted_dir_entries(repo_path)? {
-        if !path.exists() {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+    for name in surface_files.top_level_directories() {
         if CAUTION_ZONE_NAMES.contains(&name.as_str()) {
             caution.push(obj(vec![
                 ("path", Value::str(name)),
@@ -1266,7 +1337,7 @@ fn collect_caution_zones(repo_path: &Path) -> Result<Vec<Value>, String> {
             ]));
         }
     }
-    Ok(caution)
+    caution
 }
 
 fn infer_repo_kind(repo_path: &Path, manifests: &[String], areas: &[Value]) -> &'static str {
@@ -1605,10 +1676,10 @@ fn entrypoints_from_procfile(repo_path: &Path) -> Result<Vec<EntrypointTuple>, S
     Ok(candidates)
 }
 
-fn entrypoints_from_compose(repo_path: &Path) -> Result<Vec<EntrypointTuple>, String> {
-    let Some(compose_name) = compose_file(repo_path) else {
-        return Ok(Vec::new());
-    };
+fn entrypoints_from_compose_file(
+    repo_path: &Path,
+    compose_name: &str,
+) -> Result<Vec<EntrypointTuple>, String> {
     let contents = read_text(&repo_path.join(compose_name))?;
     let mut candidates = Vec::new();
     for service_name in ["app", "web", "server", "worker", "test", "tests"] {
@@ -1860,6 +1931,9 @@ fn apply_overrides(artifact: &mut Value, overrides: &Value) -> Result<(), String
         if let Some(value @ Value::Array(_)) = overrides.get(key) {
             artifact.set(key, value.clone());
         }
+    }
+    if let Some(Value::Array(entrypoints)) = artifact.get("entrypoints") {
+        artifact.set("primary_entrypoints", primary_entrypoints_map(entrypoints));
     }
 
     if let Some(notes @ Value::Array(_)) = overrides.get("notes") {
@@ -2209,6 +2283,11 @@ fn snapshot_metadata(repo_path: &Path) -> Result<OnboardingSnapshot, String> {
 }
 
 fn run_git(repo_path: &Path, args: &[&str]) -> Option<String> {
+    let stdout = run_git_bytes(repo_path, args)?;
+    Some(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+fn run_git_bytes(repo_path: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_path)
@@ -2218,7 +2297,7 @@ fn run_git(repo_path: &Path, args: &[&str]) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    Some(output.stdout)
 }
 
 fn repository_name(repo_path: &Path) -> String {
@@ -2440,6 +2519,41 @@ mod tests {
         worktree
     }
 
+    fn artifact_paths(artifact: &Value, key: &str) -> Vec<String> {
+        artifact
+            .get(key)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("path").map(Value::py_str))
+            .collect()
+    }
+
+    #[test]
+    fn tracked_path_parser_is_nul_safe() {
+        assert_eq!(
+            parse_git_paths_z(b"src/main.rs\0misc\nnode_modules/pkg.js\0tab\tname.txt\0"),
+            vec!["src/main.rs", "misc\nnode_modules/pkg.js", "tab\tname.txt"]
+        );
+    }
+
+    #[test]
+    fn tracked_snapshot_does_not_split_newlines_inside_git_paths() {
+        let repo = committed_git_repo("nul-safe-paths");
+        let unusual_path = "misc\nnode_modules/package/index.js";
+        write(&repo.join(unusual_path), "module.exports = {};\n");
+        git(&repo, &["add", unusual_path]);
+
+        let snapshot = OnboardingFileSnapshot::discover(&repo).unwrap();
+        assert!(snapshot.contains_file(unusual_path));
+        assert!(!snapshot.contains_directory("node_modules"));
+        let artifact = build_onboarding_artifact(&repo).unwrap();
+        assert!(!artifact_paths(&artifact, "caution_zones").contains(&"node_modules".to_string()));
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
     #[test]
     fn repository_name_parses_common_remote_url_forms() {
         for (url, expected) in [
@@ -2497,6 +2611,108 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&worktree).unwrap();
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn onboarding_surfaces_use_only_tracked_paths() {
+        let repo = committed_git_repo("tracked-surfaces");
+        write(
+            &repo.join(".gitignore"),
+            "node_modules/\nbuild/\ntarget/\ndist/\n",
+        );
+        write(&repo.join("src/main.ts"), "export const main = true;\n");
+        write(&repo.join("tests/main.test.ts"), "export {};\n");
+        write(&repo.join("migrations/001.sql"), "select 1;\n");
+        write(
+            &repo.join("package.json"),
+            r#"{"main":"dist/index.js","scripts":{"start":"node dist/index.js"}}"#,
+        );
+        git(
+            &repo,
+            &[
+                "add",
+                ".gitignore",
+                "src/main.ts",
+                "tests/main.test.ts",
+                "migrations/001.sql",
+                "package.json",
+            ],
+        );
+
+        write(&repo.join("app.py"), "print('untracked')\n");
+        write(&repo.join("dist/index.js"), "console.log('ignored');\n");
+        write(&repo.join("build/generated.js"), "generated\n");
+        write(&repo.join("target/debug/local"), "local\n");
+        write(
+            &repo.join("node_modules/local-dependency/index.js"),
+            "module.exports = {};\n",
+        );
+
+        let artifact = build_onboarding_artifact(&repo).unwrap();
+        let areas = artifact_paths(&artifact, "areas");
+        assert!(areas.contains(&"src".to_string()));
+        assert!(areas.contains(&"tests".to_string()));
+        for excluded in ["node_modules", "build", "target", "dist"] {
+            assert!(!areas.contains(&excluded.to_string()), "area: {excluded}");
+        }
+
+        let entrypoints = artifact_paths(&artifact, "entrypoints");
+        assert!(entrypoints.contains(&"src/main.ts".to_string()));
+        assert!(entrypoints.contains(&"tests".to_string()));
+        assert!(entrypoints.contains(&"package.json:scripts.start".to_string()));
+        assert!(!entrypoints.contains(&"app.py".to_string()));
+        assert!(!entrypoints.contains(&"dist/index.js".to_string()));
+
+        let caution = artifact_paths(&artifact, "caution_zones");
+        assert!(caution.contains(&"migrations".to_string()));
+        for excluded in ["node_modules", "build", "target", "dist"] {
+            assert!(
+                !caution.contains(&excluded.to_string()),
+                "caution: {excluded}"
+            );
+        }
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn onboarding_overrides_can_opt_in_untracked_generated_surfaces() {
+        let repo = committed_git_repo("override-local-surface");
+        write(&repo.join(".gitignore"), "generated/\n");
+        write(&repo.join("generated/local-service.ts"), "export {};\n");
+        write(
+            &repo.join(ONBOARDING_OVERRIDE_PATH),
+            r#"{
+  "areas": [{"path": "generated", "role": "generated_or_vendor", "reason": "maintainer-approved local generator output", "confidence": "high"}],
+  "entrypoints": [{"path": "generated/local-service.ts", "kind": "file", "role": "app", "reason": "maintainer-approved local service", "confidence": "high"}],
+  "caution_zones": [{"path": "generated", "reason": "intentional local generated area"}]
+}"#,
+        );
+        git(&repo, &["add", ".gitignore", ONBOARDING_OVERRIDE_PATH]);
+
+        let artifact = build_onboarding_artifact(&repo).unwrap();
+        assert_eq!(artifact_paths(&artifact, "areas"), vec!["generated"]);
+        assert_eq!(
+            artifact_paths(&artifact, "entrypoints"),
+            vec!["generated/local-service.ts"]
+        );
+        assert_eq!(
+            artifact
+                .get("primary_entrypoints")
+                .unwrap()
+                .get("app")
+                .unwrap()
+                .get("path")
+                .unwrap()
+                .as_str(),
+            Some("generated/local-service.ts")
+        );
+        assert_eq!(
+            artifact_paths(&artifact, "caution_zones"),
+            vec!["generated"]
+        );
+
         std::fs::remove_dir_all(&repo).unwrap();
     }
 
