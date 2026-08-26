@@ -40,6 +40,41 @@ incidental worktree content when generating migration output. Applying still
 requires a clean worktree. An invalid marker, unsupported future schema, or
 enrollment-mode mismatch makes the plan unsafe.
 
+Policy ownership is explicit. Aethyme updates only its marked blocks in
+`.gitignore`, `AGENTS.md`, and `CLAUDE.md`; surrounding maintainer content is
+preserved. `gates.toml` migrations are structural and preserve comments and
+repository-defined gates. If a policy differs from every exact generated
+version known to the binary and has no valid managed block, the plan is unsafe
+until you provide a reviewed resolution file:
+
+```json
+{
+  "schema_version": 1,
+  "resolutions": {
+    "AGENTS.md": "merge",
+    "CLAUDE.md": "preserve",
+    ".aethyme/gates.toml": "merge"
+  }
+}
+```
+
+`preserve` leaves the file byte-for-byte unchanged, `merge` retains
+repository-owned content while adding or updating the Aethyme-owned structure,
+and `replace` explicitly authorizes a complete generated replacement. Use the
+same file for planning and application; its parsed choices are bound into the
+plan digest:
+
+```bash
+aethyme upgrade plan --resolution-file /path/to/resolutions.json --diff
+aethyme upgrade apply --resolution-file /path/to/resolutions.json \
+  --confirm <plan-sha256>
+```
+
+A resolution for an unmanaged or non-customized path is rejected. Malformed
+managed markers and unsupported gate schemas cannot be merged; choose
+`preserve` or an explicit `replace` after review. Policy files are never
+force-replaced merely because a binary is newer.
+
 After reviewing the plan and ensuring the repository is clean, apply exactly
 that plan:
 

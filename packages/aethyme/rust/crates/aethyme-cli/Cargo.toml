@@ -18,6 +18,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
+toml_edit = "0.22"
 
 # The implementation-blind CLI suites under `tests/` drive the built
 # `aethyme` binary as a subprocess and never link the product crates, so

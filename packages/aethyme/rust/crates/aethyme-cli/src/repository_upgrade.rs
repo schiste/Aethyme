@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 pub const REPOSITORY_SCHEMA_VERSION: u32 = aethyme_broker::REPOSITORY_SCHEMA_VERSION;
 pub const CANONICAL_MARKER_PATH: &str = aethyme_broker::CANONICAL_REPOSITORY_MARKER_PATH;
 pub const LOCAL_MARKER_PATH: &str = aethyme_broker::LOCAL_REPOSITORY_MARKER_PATH;
-const PLAN_SCHEMA_VERSION: u32 = 3;
+const PLAN_SCHEMA_VERSION: u32 = 4;
+const RESOLUTION_SCHEMA_VERSION: u32 = 1;
+const GATES_SCHEMA_VERSION: i64 = 1;
 const MIGRATION_ID: &str = "repository-deployment-v1";
 const MIGRATION_IN_PROGRESS: &str = "repository-deployment-v1:in-progress";
 
@@ -70,6 +72,7 @@ pub struct RepositoryUpgradePlan {
     pub active_sessions: Vec<UpgradeActiveSessionPrecondition>,
     pub migrations: Vec<String>,
     pub changes: Vec<RepositoryTreeChange>,
+    pub customizations: Vec<RepositoryCustomization>,
     pub resolution_choices: Vec<RepositoryResolution>,
     pub planned_paths: Vec<String>,
     pub examined_paths: Vec<String>,
@@ -91,16 +94,42 @@ pub struct UpgradeActiveSessionPrecondition {
     pub gate_definition_digest: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryResolutionChoice {
     Unresolved,
+    Preserve,
+    Merge,
+    Replace,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RepositoryResolution {
     pub path: String,
     pub choice: RepositoryResolutionChoice,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryCustomizationClassification {
+    Missing,
+    ManagedBlock,
+    KnownGenerated,
+    Customized,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RepositoryCustomization {
+    pub path: String,
+    pub classification: RepositoryCustomizationClassification,
+    pub resolution: Option<RepositoryResolutionChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryResolutionFile {
+    schema_version: u32,
+    resolutions: BTreeMap<String, RepositoryResolutionChoice>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -143,6 +172,7 @@ struct PlanDigest<'a> {
     active_sessions: &'a [UpgradeActiveSessionPrecondition],
     migrations: &'a [String],
     changes: &'a [RepositoryTreeChange],
+    customizations: &'a [RepositoryCustomization],
     resolution_choices: &'a [RepositoryResolution],
     planned_paths: &'a [String],
     examined_paths: &'a [String],
@@ -764,6 +794,393 @@ fn path_bytes(path: &Path) -> Vec<u8> {
     path.to_string_lossy().as_bytes().to_vec()
 }
 
+fn load_resolution_file(
+    repo: &Path,
+    resolution_file: Option<&Path>,
+) -> Result<BTreeMap<String, RepositoryResolutionChoice>, String> {
+    let Some(resolution_file) = resolution_file else {
+        return Ok(BTreeMap::new());
+    };
+    let path = if resolution_file.is_absolute() {
+        resolution_file.to_path_buf()
+    } else {
+        repo.join(resolution_file)
+    };
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|error| format!("read resolution file {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("upgrade resolution file must be a regular non-symlink file".into());
+    }
+    if metadata.len() > 1024 * 1024 {
+        return Err("upgrade resolution file exceeds the 1 MiB limit".into());
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("read resolution file {}: {error}", path.display()))?;
+    let parsed: RepositoryResolutionFile = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid upgrade resolution file: {error}"))?;
+    if parsed.schema_version != RESOLUTION_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported upgrade resolution schema {}; expected {RESOLUTION_SCHEMA_VERSION}",
+            parsed.schema_version
+        ));
+    }
+    if parsed
+        .resolutions
+        .values()
+        .any(|choice| *choice == RepositoryResolutionChoice::Unresolved)
+    {
+        return Err("resolution files must choose preserve, merge, or replace".into());
+    }
+    Ok(parsed.resolutions)
+}
+
+fn marked_policy(content: &str) -> String {
+    format!(
+        "{}\n{}\n{}",
+        aethyme_enhance::BLOCK_BEGIN,
+        content.trim_end(),
+        aethyme_enhance::BLOCK_END
+    )
+}
+
+fn classify_policy(
+    repo: &Path,
+    relative: &str,
+) -> Result<RepositoryCustomizationClassification, String> {
+    let path = repo.join(relative);
+    if !path.exists() {
+        return Ok(RepositoryCustomizationClassification::Missing);
+    }
+    let existing = std::fs::read_to_string(&path)
+        .map_err(|error| format!("inspect policy {relative}: {error}"))?;
+    let begin_count = existing.matches(aethyme_enhance::BLOCK_BEGIN).count();
+    let end_count = existing.matches(aethyme_enhance::BLOCK_END).count();
+    let ordered_markers = existing
+        .find(aethyme_enhance::BLOCK_BEGIN)
+        .zip(existing.find(aethyme_enhance::BLOCK_END))
+        .map(|(begin, end)| begin < end)
+        .unwrap_or(false);
+    if begin_count == 1 && end_count == 1 && ordered_markers {
+        return Ok(RepositoryCustomizationClassification::ManagedBlock);
+    }
+    let current = aethyme_enhance::agents::render_agents_document(Some(repo))?;
+    let base = aethyme_enhance::agents::render_agents_document(None)?;
+    if [
+        current.as_str(),
+        base.as_str(),
+        aethyme_enhance::templates::AGENTS_MD,
+    ]
+    .iter()
+    .any(|known| existing == *known)
+    {
+        Ok(RepositoryCustomizationClassification::KnownGenerated)
+    } else {
+        Ok(RepositoryCustomizationClassification::Customized)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatesDocumentVersion {
+    Legacy,
+    V1,
+}
+
+fn gates_document_version(
+    document: &toml_edit::DocumentMut,
+) -> Result<GatesDocumentVersion, String> {
+    match document.get("schema") {
+        None => Ok(GatesDocumentVersion::Legacy),
+        Some(schema) if schema.as_integer() == Some(GATES_SCHEMA_VERSION) => {
+            Ok(GatesDocumentVersion::V1)
+        }
+        Some(schema) => Err(format!(
+            "gates.toml schema must be {GATES_SCHEMA_VERSION}, found {schema}"
+        )),
+    }
+}
+
+fn migrate_gates_text(text: &str) -> Result<String, String> {
+    let mut document = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format!("gates.toml is not valid TOML: {error}"))?;
+    match gates_document_version(&document)? {
+        GatesDocumentVersion::Legacy => {
+            document["schema"] = toml_edit::value(GATES_SCHEMA_VERSION);
+        }
+        GatesDocumentVersion::V1 => {}
+    }
+    Ok(document.to_string())
+}
+
+fn classify_gates(repo: &Path) -> Result<RepositoryCustomizationClassification, String> {
+    let path = repo.join(aethyme_broker::GATES_CONFIG_RELPATH);
+    if !path.exists() {
+        return Ok(RepositoryCustomizationClassification::Missing);
+    }
+    let existing = std::fs::read_to_string(&path)
+        .map_err(|error| format!("inspect .aethyme/gates.toml: {error}"))?;
+    let Some(legacy_draft) = aethyme_broker::init::draft_gate_config(repo) else {
+        return Ok(RepositoryCustomizationClassification::Customized);
+    };
+    let current_draft = migrate_gates_text(&legacy_draft)?;
+    if existing == legacy_draft || existing == current_draft {
+        Ok(RepositoryCustomizationClassification::KnownGenerated)
+    } else {
+        Ok(RepositoryCustomizationClassification::Customized)
+    }
+}
+
+fn customization_paths(mode: RepositoryMode) -> Vec<&'static str> {
+    match mode {
+        RepositoryMode::Canonical => {
+            vec![
+                "AGENTS.md",
+                "CLAUDE.md",
+                aethyme_broker::GATES_CONFIG_RELPATH,
+            ]
+        }
+        RepositoryMode::LocalOnly => vec![
+            aethyme_enhance::local::LOCAL_POLICY_PATH,
+            aethyme_broker::GATES_CONFIG_RELPATH,
+        ],
+    }
+}
+
+fn assess_customizations(
+    repo: &Path,
+    mode: RepositoryMode,
+    requested: &BTreeMap<String, RepositoryResolutionChoice>,
+    blocked_paths: &BTreeSet<String>,
+) -> Result<
+    (
+        Vec<RepositoryCustomization>,
+        Vec<RepositoryResolution>,
+        Vec<String>,
+    ),
+    String,
+> {
+    let mut customizations = Vec::new();
+    for relative in customization_paths(mode) {
+        let classification = if blocked_paths.contains(relative) {
+            RepositoryCustomizationClassification::Customized
+        } else if relative == aethyme_broker::GATES_CONFIG_RELPATH {
+            classify_gates(repo)?
+        } else {
+            classify_policy(repo, relative)?
+        };
+        let resolution = (classification == RepositoryCustomizationClassification::Customized)
+            .then(|| requested.get(relative).copied())
+            .flatten();
+        customizations.push(RepositoryCustomization {
+            path: relative.to_string(),
+            classification,
+            resolution,
+        });
+    }
+    for path in requested.keys() {
+        let Some(customization) = customizations.iter().find(|item| item.path == *path) else {
+            return Err(format!(
+                "resolution file names unmanaged upgrade path {path}"
+            ));
+        };
+        if customization.classification != RepositoryCustomizationClassification::Customized {
+            return Err(format!(
+                "resolution for {} is unnecessary because it is classified as {:?}",
+                customization.path, customization.classification
+            ));
+        }
+    }
+    let mut blockers = Vec::new();
+    let resolutions = customizations
+        .iter()
+        .filter(|item| item.classification == RepositoryCustomizationClassification::Customized)
+        .map(|item| {
+            let choice = item
+                .resolution
+                .unwrap_or(RepositoryResolutionChoice::Unresolved);
+            if choice == RepositoryResolutionChoice::Unresolved {
+                blockers.push(format!(
+                    "customized policy {} requires an explicit preserve, merge, or replace resolution",
+                    item.path
+                ));
+            }
+            RepositoryResolution {
+                path: item.path.clone(),
+                choice,
+            }
+        })
+        .collect::<Vec<_>>();
+    for customization in &customizations {
+        if customization.classification != RepositoryCustomizationClassification::Customized {
+            continue;
+        }
+        match customization.resolution {
+            Some(RepositoryResolutionChoice::Merge)
+                if customization.path == aethyme_broker::GATES_CONFIG_RELPATH =>
+            {
+                let source = std::fs::read_to_string(repo.join(&customization.path))
+                    .map_err(|error| format!("inspect {}: {error}", customization.path))?;
+                if let Err(error) = migrate_gates_text(&source) {
+                    blockers.push(format!(
+                        "cannot merge customized {}: {error}; choose preserve or replace",
+                        customization.path
+                    ));
+                }
+            }
+            Some(RepositoryResolutionChoice::Merge) => {
+                let source = std::fs::read_to_string(repo.join(&customization.path))
+                    .map_err(|error| format!("inspect {}: {error}", customization.path))?;
+                if source.contains(aethyme_enhance::BLOCK_BEGIN)
+                    || source.contains(aethyme_enhance::BLOCK_END)
+                {
+                    blockers.push(format!(
+                        "cannot merge malformed managed markers in {}; choose preserve or replace",
+                        customization.path
+                    ));
+                }
+            }
+            Some(RepositoryResolutionChoice::Replace)
+                if customization.path == aethyme_broker::GATES_CONFIG_RELPATH
+                    && aethyme_broker::init::draft_gate_config(repo).is_none() =>
+            {
+                blockers.push(format!(
+                    "cannot replace {} because no supported manifest produces a gate draft; choose preserve or merge",
+                    customization.path
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok((customizations, resolutions, blockers))
+}
+
+fn resolved_choice(
+    customizations: &[RepositoryCustomization],
+    path: &str,
+) -> Option<RepositoryResolutionChoice> {
+    customizations
+        .iter()
+        .find(|item| item.path == path)
+        .and_then(|item| item.resolution)
+}
+
+fn migrate_policy_file(
+    repo: &Path,
+    relative: &str,
+    classification: RepositoryCustomizationClassification,
+    resolution: Option<RepositoryResolutionChoice>,
+) -> Result<(), String> {
+    let path = repo.join(relative);
+    let generated = aethyme_enhance::agents::render_agents_document(Some(repo))?;
+    let managed = marked_policy(&generated);
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("read policy {relative}: {error}")),
+    };
+    let updated = match classification {
+        RepositoryCustomizationClassification::Missing
+        | RepositoryCustomizationClassification::KnownGenerated => format!("{managed}\n"),
+        RepositoryCustomizationClassification::ManagedBlock => {
+            aethyme_enhance::render::splice_generated_block(&existing, &managed)
+        }
+        RepositoryCustomizationClassification::Customized => match resolution {
+            Some(RepositoryResolutionChoice::Preserve) => return Ok(()),
+            Some(RepositoryResolutionChoice::Merge) => {
+                if existing.contains(aethyme_enhance::BLOCK_BEGIN)
+                    || existing.contains(aethyme_enhance::BLOCK_END)
+                {
+                    return Err(format!(
+                        "cannot merge malformed managed markers in {relative}; choose preserve or replace"
+                    ));
+                }
+                let mut merged = existing.trim_end().to_string();
+                if !merged.is_empty() {
+                    merged.push_str("\n\n");
+                }
+                merged.push_str(&managed);
+                merged.push('\n');
+                merged
+            }
+            Some(RepositoryResolutionChoice::Replace) => format!("{managed}\n"),
+            Some(RepositoryResolutionChoice::Unresolved) | None => {
+                return Err(format!("unresolved customized policy {relative}"));
+            }
+        },
+    };
+    atomic_write(&path, updated.as_bytes())
+}
+
+fn migrate_gates_file(
+    repo: &Path,
+    classification: RepositoryCustomizationClassification,
+    resolution: Option<RepositoryResolutionChoice>,
+) -> Result<(), String> {
+    let path = repo.join(aethyme_broker::GATES_CONFIG_RELPATH);
+    let source = match classification {
+        RepositoryCustomizationClassification::Missing => {
+            let Some(draft) = aethyme_broker::init::draft_gate_config(repo) else {
+                return Ok(());
+            };
+            draft
+        }
+        RepositoryCustomizationClassification::KnownGenerated => std::fs::read_to_string(&path)
+            .map_err(|error| format!("read .aethyme/gates.toml: {error}"))?,
+        RepositoryCustomizationClassification::Customized => match resolution {
+            Some(RepositoryResolutionChoice::Preserve) => return Ok(()),
+            Some(RepositoryResolutionChoice::Merge) => std::fs::read_to_string(&path)
+                .map_err(|error| format!("read .aethyme/gates.toml: {error}"))?,
+            Some(RepositoryResolutionChoice::Replace) => {
+                aethyme_broker::init::draft_gate_config(repo).ok_or_else(|| {
+                    "cannot replace gates.toml because no supported manifests produce a gate draft"
+                        .to_string()
+                })?
+            }
+            Some(RepositoryResolutionChoice::Unresolved) | None => {
+                return Err("unresolved customized policy .aethyme/gates.toml".into());
+            }
+        },
+        RepositoryCustomizationClassification::ManagedBlock => unreachable!(),
+    };
+    let migrated = migrate_gates_text(&source)?;
+    atomic_write(&path, migrated.as_bytes())?;
+    aethyme_broker::load_gates(repo)
+        .map(|_| ())
+        .map_err(|error| format!("migrated gates.toml is invalid: {error}"))
+}
+
+fn apply_customization_migrations(
+    repo: &Path,
+    mode: RepositoryMode,
+    customizations: &[RepositoryCustomization],
+) -> Result<(), String> {
+    let gates = customizations
+        .iter()
+        .find(|item| item.path == aethyme_broker::GATES_CONFIG_RELPATH)
+        .expect("gates customization is always assessed");
+    migrate_gates_file(repo, gates.classification, gates.resolution)?;
+    match mode {
+        RepositoryMode::Canonical => {
+            aethyme_enhance::deploy::deploy_supporting_artifacts(repo, true)?;
+        }
+        RepositoryMode::LocalOnly => {
+            aethyme_enhance::local::deploy_supporting_artifacts(repo, true)?;
+        }
+    }
+    for customization in customizations {
+        if customization.path == aethyme_broker::GATES_CONFIG_RELPATH {
+            continue;
+        }
+        migrate_policy_file(
+            repo,
+            &customization.path,
+            customization.classification,
+            resolved_choice(customizations, &customization.path),
+        )?;
+    }
+    Ok(())
+}
+
 fn render_migration_diff(repo: &Path, planned_paths: &[String]) -> Result<String, String> {
     if planned_paths.is_empty() {
         return Ok(String::new());
@@ -850,8 +1267,10 @@ fn active_session_preconditions(
 fn build_plan(
     repo_hint: &Path,
     requested_mode: Option<RepositoryMode>,
+    resolution_file: Option<&Path>,
 ) -> Result<BuiltUpgradePlan, String> {
     let repo = git_root(repo_hint)?;
+    let requested_resolutions = load_resolution_file(&repo, resolution_file)?;
     let repository_head = git(&repo, &["rev-parse", "HEAD"])?;
     let proposal = ProposedRepository::from_committed_head(&repo, &repository_head)?;
     let proposed_repo = proposal.root();
@@ -906,6 +1325,13 @@ fn build_plan(
             blockers.push(blocker);
         }
     }
+    let (customizations, mut resolution_choices, customization_blockers) = assess_customizations(
+        proposed_repo,
+        mode,
+        &requested_resolutions,
+        &resolution_paths,
+    )?;
+    blockers.extend(customization_blockers);
     let migrations = EMBEDDED_MIGRATIONS
         .iter()
         .filter(|migration| {
@@ -932,11 +1358,11 @@ fn build_plan(
     if blockers.is_empty() && !migrations.is_empty() {
         write_pending_marker(proposed_repo, mode)?;
         match mode {
-            RepositoryMode::Canonical => migrate_canonical(proposed_repo)?,
-            RepositoryMode::LocalOnly => migrate_local(proposed_repo)?,
+            RepositoryMode::Canonical => migrate_canonical(proposed_repo, &customizations)?,
+            RepositoryMode::LocalOnly => migrate_local(proposed_repo, &customizations)?,
         }
         write_current_marker(proposed_repo, mode)?;
-        verify_deployment(proposed_repo, mode)?;
+        verify_deployment(proposed_repo, mode, &customizations)?;
     }
     let mut change_paths = managed_paths;
     change_paths.extend(proposed_changed_paths(proposed_repo)?);
@@ -958,14 +1384,18 @@ fn build_plan(
         .filter(|change| change.action != RepositoryTreeAction::Unchanged)
         .map(|change| change.path.clone())
         .collect::<Vec<_>>();
-    let resolution_choices = changes
-        .iter()
-        .filter(|change| change.requires_resolution)
-        .map(|change| RepositoryResolution {
-            path: change.path.clone(),
-            choice: RepositoryResolutionChoice::Unresolved,
-        })
-        .collect::<Vec<_>>();
+    for change in changes.iter().filter(|change| change.requires_resolution) {
+        if !resolution_choices
+            .iter()
+            .any(|resolution| resolution.path == change.path)
+        {
+            resolution_choices.push(RepositoryResolution {
+                path: change.path.clone(),
+                choice: RepositoryResolutionChoice::Unresolved,
+            });
+        }
+    }
+    resolution_choices.sort_by(|left, right| left.path.cmp(&right.path));
     let migration_diff = render_migration_diff(proposed_repo, &planned_paths)?;
     let diff_sha256 = sha256(migration_diff.as_bytes());
     let safe = blockers.is_empty();
@@ -980,6 +1410,7 @@ fn build_plan(
         active_sessions: &active_sessions,
         migrations: &migrations,
         changes: &changes,
+        customizations: &customizations,
         resolution_choices: &resolution_choices,
         planned_paths: &planned_paths,
         examined_paths: &examined_paths,
@@ -989,13 +1420,17 @@ fn build_plan(
     };
     let plan_digest =
         sha256(&serde_json::to_vec(&digest_input).map_err(|error| error.to_string())?);
+    let resolution_argument = resolution_file
+        .map(|path| format!(" --resolution-file {}", path.display()))
+        .unwrap_or_default();
     let next_action = if !safe {
-        "resolve every blocker, then regenerate the upgrade plan".into()
+        "create a schema-1 resolution file choosing preserve, merge, or replace for every customized policy, then regenerate the upgrade plan with --resolution-file <path>"
+            .into()
     } else if migrations.is_empty() {
         "repository deployment is current; no migration is required".into()
     } else {
         format!(
-            "review this plan, then run `aethyme upgrade apply --repo . --confirm {plan_digest}`"
+            "review this plan, then run `aethyme upgrade apply --repo .{resolution_argument} --confirm {plan_digest}`"
         )
     };
     Ok(BuiltUpgradePlan {
@@ -1010,6 +1445,7 @@ fn build_plan(
             active_sessions,
             migrations,
             changes,
+            customizations,
             resolution_choices,
             planned_paths,
             examined_paths,
@@ -1028,7 +1464,7 @@ pub fn plan(
     repo_hint: &Path,
     requested_mode: Option<RepositoryMode>,
 ) -> Result<RepositoryUpgradePlan, String> {
-    build_plan(repo_hint, requested_mode).map(|built| built.report)
+    build_plan(repo_hint, requested_mode, None).map(|built| built.report)
 }
 
 pub fn apply(
@@ -1036,10 +1472,19 @@ pub fn apply(
     requested_mode: Option<RepositoryMode>,
     confirmation: &str,
 ) -> Result<RepositoryUpgradePlan, String> {
+    apply_with_resolution_file(repo_hint, requested_mode, confirmation, None)
+}
+
+fn apply_with_resolution_file(
+    repo_hint: &Path,
+    requested_mode: Option<RepositoryMode>,
+    confirmation: &str,
+    resolution_file: Option<&Path>,
+) -> Result<RepositoryUpgradePlan, String> {
     if confirmation.len() != 64 || !confirmation.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("--confirm must be the full 64-character plan SHA-256".into());
     }
-    let mut before = plan(repo_hint, requested_mode)?;
+    let mut before = build_plan(repo_hint, requested_mode, resolution_file)?.report;
     if !before.safe {
         return Err(format!(
             "repository upgrade is blocked: {}",
@@ -1060,11 +1505,11 @@ pub fn apply(
     ensure_apply_worktree_safe(&repo, &before)?;
     write_pending_marker(&repo, before.mode)?;
     match before.mode {
-        RepositoryMode::Canonical => migrate_canonical(&repo)?,
-        RepositoryMode::LocalOnly => migrate_local(&repo)?,
+        RepositoryMode::Canonical => migrate_canonical(&repo, &before.customizations)?,
+        RepositoryMode::LocalOnly => migrate_local(&repo, &before.customizations)?,
     }
     write_current_marker(&repo, before.mode)?;
-    verify_deployment(&repo, before.mode)?;
+    verify_deployment(&repo, before.mode, &before.customizations)?;
     before.applied = true;
     before.next_action = match before.mode {
         RepositoryMode::Canonical => {
@@ -1078,40 +1523,51 @@ pub fn apply(
     Ok(before)
 }
 
-fn migrate_canonical(repo: &Path) -> Result<(), String> {
+fn migrate_canonical(
+    repo: &Path,
+    customizations: &[RepositoryCustomization],
+) -> Result<(), String> {
     aethyme_broker::init::scaffold(repo).map_err(|error| error.to_string())?;
-    if !repo.join(".aethyme/gates.toml").exists() {
-        aethyme_broker::init::draft_gates(repo).map_err(|error| error.to_string())?;
-    }
-    // A migration converges managed artifacts to the new binary's embedded
-    // contract. A normal deploy preserves existing files unless --force was
-    // requested, which is the wrong semantic for a reviewed schema upgrade.
-    aethyme_enhance::deploy::deploy(repo, true)?;
-    Ok(())
+    apply_customization_migrations(repo, RepositoryMode::Canonical, customizations)
 }
 
-fn migrate_local(repo: &Path) -> Result<(), String> {
-    aethyme_enhance::local::prepare(repo)?;
+fn migrate_local(repo: &Path, customizations: &[RepositoryCustomization]) -> Result<(), String> {
     aethyme_broker::init::scaffold_local(repo).map_err(|error| error.to_string())?;
-    if !repo.join(".aethyme/gates.toml").exists() {
-        aethyme_broker::init::draft_gates(repo).map_err(|error| error.to_string())?;
+    apply_customization_migrations(repo, RepositoryMode::LocalOnly, customizations)
+}
+
+fn verify_managed_policy(repo: &Path, relative: &str) -> Result<(), String> {
+    let actual = std::fs::read_to_string(repo.join(relative))
+        .map_err(|error| format!("post-migration verification failed for {relative}: {error}"))?;
+    let canonical = aethyme_enhance::agents::render_agents_document(Some(repo))?;
+    let expected = marked_policy(&canonical);
+    let begin_count = actual.matches(aethyme_enhance::BLOCK_BEGIN).count();
+    let end_count = actual.matches(aethyme_enhance::BLOCK_END).count();
+    if begin_count != 1
+        || end_count != 1
+        || aethyme_enhance::render::splice_generated_block(&actual, &expected) != actual
+    {
+        return Err(format!(
+            "post-migration verification failed: {relative} does not contain exactly one current Aethyme managed block"
+        ));
     }
-    aethyme_enhance::local::deploy(repo, true)?;
     Ok(())
 }
 
-fn verify_deployment(repo: &Path, mode: RepositoryMode) -> Result<(), String> {
+fn verify_deployment(
+    repo: &Path,
+    mode: RepositoryMode,
+    customizations: &[RepositoryCustomization],
+) -> Result<(), String> {
     verify_current_marker(repo, mode)?;
     match mode {
         RepositoryMode::Canonical => {
             let results = aethyme_enhance::deploy::verify(repo)?;
             let failures = results
                 .iter()
+                .filter(|result| !result.exists || result.placeholder_present)
                 .filter(|result| {
-                    !result.exists
-                        || result.placeholder_present
-                        || (!result.matches_canonical
-                            && matches!(result.relative_path.as_str(), "AGENTS.md" | "CLAUDE.md"))
+                    !matches!(result.relative_path.as_str(), "AGENTS.md" | "CLAUDE.md")
                 })
                 .map(|result| result.relative_path.clone())
                 .collect::<Vec<_>>();
@@ -1121,14 +1577,32 @@ fn verify_deployment(repo: &Path, mode: RepositoryMode) -> Result<(), String> {
                     failures.join(", ")
                 ));
             }
+            for relative in ["AGENTS.md", "CLAUDE.md"] {
+                let preserved = resolved_choice(customizations, relative)
+                    == Some(RepositoryResolutionChoice::Preserve);
+                if !preserved {
+                    verify_managed_policy(repo, relative)?;
+                }
+            }
         }
         RepositoryMode::LocalOnly => {
-            let failures = aethyme_enhance::local::verify(repo)?;
+            let preserved =
+                resolved_choice(customizations, aethyme_enhance::local::LOCAL_POLICY_PATH)
+                    == Some(RepositoryResolutionChoice::Preserve);
+            let failures = aethyme_enhance::local::verify(repo)?
+                .into_iter()
+                .filter(|failure| {
+                    !(preserved && failure.contains(aethyme_enhance::local::LOCAL_POLICY_PATH))
+                })
+                .collect::<Vec<_>>();
             if !failures.is_empty() {
                 return Err(format!(
                     "post-migration verification failed: {}",
                     failures.join("; ")
                 ));
+            }
+            if !preserved {
+                verify_managed_policy(repo, aethyme_enhance::local::LOCAL_POLICY_PATH)?;
             }
         }
     }
@@ -1138,9 +1612,11 @@ fn verify_deployment(repo: &Path, mode: RepositoryMode) -> Result<(), String> {
 fn detect_mode(repo: &Path) -> Option<RepositoryMode> {
     if detect_local_only_enrollment(repo) {
         Some(RepositoryMode::LocalOnly)
-    } else if std::fs::read_to_string(repo.join("AGENTS.md"))
-        .map(|text| text.contains("Broker Coordination"))
-        .unwrap_or(false)
+    } else if repo.join(CANONICAL_MARKER_PATH).is_file()
+        || repo.join(".codex/skills/aethyme/SKILL.md").is_file()
+        || std::fs::read_to_string(repo.join("AGENTS.md"))
+            .map(|text| text.contains("Broker Coordination"))
+            .unwrap_or(false)
     {
         Some(RepositoryMode::Canonical)
     } else {
@@ -1295,6 +1771,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     let mut repo = PathBuf::from(".");
     let mut mode = None;
     let mut confirm = None;
+    let mut resolution_file = None;
     let mut json = false;
     let mut diff = false;
     let mut index = 1;
@@ -1316,6 +1793,13 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 );
                 index += 2;
             }
+            "--resolution-file" => {
+                resolution_file = Some(PathBuf::from(
+                    args.get(index + 1)
+                        .ok_or("--resolution-file requires a path")?,
+                ));
+                index += 2;
+            }
             "--json" => {
                 json = true;
                 index += 1;
@@ -1333,7 +1817,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     let mut migration_diff = None;
     let report = match action {
         "plan" => {
-            let built = build_plan(&repo, mode)?;
+            let built = build_plan(&repo, mode, resolution_file.as_deref())?;
             if diff {
                 migration_diff = Some(built.migration_diff);
             }
@@ -1343,12 +1827,13 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             if diff {
                 return Err("--diff is available only for upgrade plan".into());
             }
-            apply(
+            apply_with_resolution_file(
                 &repo,
                 mode,
                 confirm
                     .as_deref()
                     .ok_or("apply requires --confirm <plan-sha256>")?,
+                resolution_file.as_deref(),
             )?
         }
         other => return Err(format!("unknown action {other}; expected plan or apply")),
@@ -1378,6 +1863,17 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         for blocker in &report.blockers {
             println!("  blocker: {blocker}");
         }
+        for customization in &report.customizations {
+            println!(
+                "  policy: {} ({:?}{})",
+                customization.path,
+                customization.classification,
+                customization
+                    .resolution
+                    .map(|choice| format!(", resolution: {choice:?}"))
+                    .unwrap_or_default()
+            );
+        }
         println!("Next: {}", report.next_action);
         if let Some(migration_diff) = migration_diff {
             println!("Migration diff:");
@@ -1393,9 +1889,11 @@ fn run_inner(args: &[String]) -> Result<(), String> {
 
 fn print_usage() {
     println!("Usage:");
-    println!("  aethyme upgrade plan [--repo <path>] [--local-only] [--diff|--json]");
     println!(
-        "  aethyme upgrade apply [--repo <path>] [--local-only] --confirm <plan-sha256> [--json]"
+        "  aethyme upgrade plan [--repo <path>] [--local-only] [--resolution-file <path>] [--diff|--json]"
+    );
+    println!(
+        "  aethyme upgrade apply [--repo <path>] [--local-only] [--resolution-file <path>] --confirm <plan-sha256> [--json]"
     );
 }
 

@@ -156,8 +156,8 @@ an update check.
 ## Repository Upgrade Commands
 
 ```text
-aethyme upgrade plan [--repo <path>] [--local-only] [--diff|--json]
-aethyme upgrade apply [--repo <path>] [--local-only] --confirm <plan-sha256> [--json]
+aethyme upgrade plan [--repo <path>] [--local-only] [--resolution-file <path>] [--diff|--json]
+aethyme upgrade apply [--repo <path>] [--local-only] [--resolution-file <path>] --confirm <plan-sha256> [--json]
 ```
 
 Binary updates and repository migrations are intentionally separate. Run
@@ -171,6 +171,14 @@ formats are intentionally exclusive. `apply` requires that exact plan digest,
 a clean worktree, and a supported marker before converging and verifying
 Aethyme-owned repository files. Diff bodies never enter broker reports,
 events, metrics, or command telemetry.
+
+When the plan classifies `AGENTS.md`, `CLAUDE.md`, or `.aethyme/gates.toml`
+as customized, `--resolution-file` accepts a schema-1 JSON object mapping each
+reported path to `preserve`, `merge`, or `replace`. The same resolution file
+must be supplied to `apply`; the choices participate in the confirmed digest.
+Marked Markdown and `.gitignore` blocks preserve surrounding content, while
+gate merges use the typed TOML migration and retain comments and custom gates.
+No policy file is implicitly force-replaced.
 
 Canonical deployments track `.aethyme/repository.json`; local-only deployments
 keep `.aethyme/local/repository.json` ignored. Broker commands fail closed in

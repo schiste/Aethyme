@@ -129,6 +129,20 @@ fn json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn write_resolutions(root: &Path, name: &str, resolutions: Value) -> PathBuf {
+    let path = root.join(name);
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "resolutions": resolutions,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    path
+}
+
 #[test]
 fn canonical_upgrade_is_read_only_then_digest_bound_and_verifiable() {
     let temp = tmp_dir();
@@ -137,7 +151,7 @@ fn canonical_upgrade_is_read_only_then_digest_bound_and_verifiable() {
 
     let before = run(&repo, &["upgrade", "plan", "--json"]);
     let plan = json(&before);
-    assert_eq!(plan["schema_version"], 3);
+    assert_eq!(plan["schema_version"], 4);
     assert_eq!(plan["from_schema"], 0);
     assert_eq!(plan["to_schema"], 1);
     assert_eq!(plan["safe"], true);
@@ -215,6 +229,253 @@ fn canonical_upgrade_is_read_only_then_digest_bound_and_verifiable() {
         "{}",
         String::from_utf8_lossy(&verified.stderr)
     );
+}
+
+#[test]
+fn customized_policies_block_until_every_resolution_is_explicit() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    let custom_agents = format!(
+        "{}\n## Maintainer-owned release process\nKeep this paragraph.\n",
+        fs::read_to_string(repo.join("AGENTS.md"))
+            .unwrap()
+            .trim_end()
+    );
+    fs::write(repo.join("AGENTS.md"), &custom_agents).unwrap();
+    let custom_gates = "# Maintainer gate policy\n\
+                        repository_policy = \"keep\"\n\n\
+                        [[gate]]\n\
+                        name = \"maintainer-check\"\n\
+                        command = \"true\"\n";
+    fs::write(repo.join(".aethyme/gates.toml"), &custom_gates).unwrap();
+    commit_all(&repo, "customize repository policy");
+
+    let blocked = json(&run(&repo, &["upgrade", "plan", "--json"]));
+    assert_eq!(blocked["safe"], false);
+    assert!(
+        blocked["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| {
+                blocker
+                    .as_str()
+                    .unwrap()
+                    .contains("customized policy AGENTS.md requires an explicit")
+            })
+    );
+    assert!(
+        blocked["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| {
+                blocker
+                    .as_str()
+                    .unwrap()
+                    .contains("customized policy .aethyme/gates.toml requires an explicit")
+            })
+    );
+    assert_eq!(git_status(&repo), "");
+
+    let partial = write_resolutions(
+        temp.path(),
+        "partial-resolutions.json",
+        serde_json::json!({"AGENTS.md": "preserve"}),
+    );
+    let partial_plan = json(&run(
+        &repo,
+        &[
+            "upgrade",
+            "plan",
+            "--resolution-file",
+            partial.to_str().unwrap(),
+            "--json",
+        ],
+    ));
+    assert_eq!(partial_plan["safe"], false);
+
+    let resolutions = write_resolutions(
+        temp.path(),
+        "resolutions.json",
+        serde_json::json!({
+            "AGENTS.md": "preserve",
+            ".aethyme/gates.toml": "merge"
+        }),
+    );
+    let planned = json(&run(
+        &repo,
+        &[
+            "upgrade",
+            "plan",
+            "--resolution-file",
+            resolutions.to_str().unwrap(),
+            "--json",
+        ],
+    ));
+    assert_eq!(planned["safe"], true);
+    assert_eq!(planned["customizations"][0]["classification"], "customized");
+    assert_eq!(planned["customizations"][0]["resolution"], "preserve");
+    assert_eq!(planned["customizations"][2]["classification"], "customized");
+    assert_eq!(planned["customizations"][2]["resolution"], "merge");
+
+    let digest = planned["plan_digest"].as_str().unwrap();
+    let applied = run(
+        &repo,
+        &[
+            "upgrade",
+            "apply",
+            "--resolution-file",
+            resolutions.to_str().unwrap(),
+            "--confirm",
+            digest,
+            "--json",
+        ],
+    );
+    assert_eq!(json(&applied)["applied"], true);
+    assert_eq!(
+        fs::read_to_string(repo.join("AGENTS.md")).unwrap(),
+        custom_agents
+    );
+    let gates = fs::read_to_string(repo.join(".aethyme/gates.toml")).unwrap();
+    assert!(gates.contains("# Maintainer gate policy"));
+    assert!(gates.contains("repository_policy = \"keep\""));
+    assert!(gates.contains("schema = 1"));
+}
+
+#[test]
+fn managed_policy_blocks_update_without_replacing_surrounding_text() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    for relative in ["AGENTS.md", "CLAUDE.md"] {
+        let generated = fs::read_to_string(repo.join(relative)).unwrap();
+        fs::write(
+            repo.join(relative),
+            format!(
+                "Maintainer preface\n\n<!-- AETHYME:BEGIN generated -->\n{}<!-- AETHYME:END generated -->\n\nMaintainer appendix\n",
+                generated
+            ),
+        )
+        .unwrap();
+    }
+    commit_all(&repo, "wrap generated policies in managed blocks");
+
+    let planned = json(&run(&repo, &["upgrade", "plan", "--json"]));
+    assert_eq!(planned["safe"], true);
+    assert!(
+        planned["customizations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| {
+                item["path"] == ".aethyme/gates.toml" || item["classification"] == "managed_block"
+            })
+    );
+    let digest = planned["plan_digest"].as_str().unwrap();
+    let applied = run(&repo, &["upgrade", "apply", "--confirm", digest, "--json"]);
+    assert_eq!(json(&applied)["applied"], true);
+
+    for relative in ["AGENTS.md", "CLAUDE.md"] {
+        let policy = fs::read_to_string(repo.join(relative)).unwrap();
+        assert!(policy.starts_with("Maintainer preface\n\n"));
+        assert!(policy.ends_with("\n\nMaintainer appendix\n"));
+        assert_eq!(
+            policy.matches("<!-- AETHYME:BEGIN generated -->").count(),
+            1
+        );
+        assert_eq!(policy.matches("<!-- AETHYME:END generated -->").count(), 1);
+    }
+}
+
+#[test]
+fn canonical_upgrade_only_appends_the_managed_gitignore_block() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    let maintainer_rules = "target/\n.env\n# keep this ordering\n";
+    fs::write(
+        repo.join(".gitignore"),
+        format!(
+            "{maintainer_rules}\n# aethyme-broker:begin (managed block — do not edit inside)\n\
+             .aethyme/broker.db*\n\
+             .aethyme/logs/\n\
+             .aethyme/worktrees/\n\
+             # aethyme-broker:end\n"
+        ),
+    )
+    .unwrap();
+    commit_all(&repo, "add maintainer ignore policy");
+    old_canonical_deployment(&repo);
+
+    let plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
+    assert_eq!(plan["safe"], true);
+    let repeated = json(&run(&repo, &["upgrade", "plan", "--json"]));
+    assert_eq!(
+        plan, repeated,
+        "identical committed input must plan identically"
+    );
+    let digest = plan["plan_digest"].as_str().unwrap();
+    let applied = run(&repo, &["upgrade", "apply", "--confirm", digest, "--json"]);
+    assert_eq!(json(&applied)["applied"], true);
+
+    let updated = fs::read_to_string(repo.join(".gitignore")).unwrap();
+    assert!(updated.starts_with(maintainer_rules));
+    assert_eq!(updated.matches("# aethyme-broker:begin").count(), 1);
+    assert_eq!(updated.matches("# aethyme-broker:end").count(), 1);
+    assert!(updated.contains(".aethyme/reports/"));
+}
+
+#[test]
+fn preserve_merge_and_replace_are_digest_bound_and_replace_is_never_implicit() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    fs::write(repo.join("AGENTS.md"), "maintainer-only policy\n").unwrap();
+    fs::write(repo.join("CLAUDE.md"), "maintainer-only claude policy\n").unwrap();
+    commit_all(&repo, "replace generated policy with maintainer policy");
+
+    let mut digests = Vec::new();
+    for choice in ["preserve", "merge", "replace"] {
+        let resolutions = write_resolutions(
+            temp.path(),
+            &format!("{choice}.json"),
+            serde_json::json!({"AGENTS.md": choice, "CLAUDE.md": choice}),
+        );
+        let plan = json(&run(
+            &repo,
+            &[
+                "upgrade",
+                "plan",
+                "--resolution-file",
+                resolutions.to_str().unwrap(),
+                "--json",
+            ],
+        ));
+        assert_eq!(plan["safe"], true);
+        digests.push(plan["plan_digest"].as_str().unwrap().to_string());
+    }
+    assert_ne!(digests[0], digests[1]);
+    assert_ne!(digests[1], digests[2]);
+    assert_ne!(digests[0], digests[2]);
+
+    let replace = temp.path().join("replace.json");
+    let applied = run(
+        &repo,
+        &[
+            "upgrade",
+            "apply",
+            "--resolution-file",
+            replace.to_str().unwrap(),
+            "--confirm",
+            &digests[2],
+            "--json",
+        ],
+    );
+    assert_eq!(json(&applied)["applied"], true);
+    let agents = fs::read_to_string(repo.join("AGENTS.md")).unwrap();
+    assert!(!agents.contains("maintainer-only policy"));
+    assert!(agents.contains("<!-- AETHYME:BEGIN generated -->"));
 }
 
 #[test]

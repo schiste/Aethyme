@@ -9,8 +9,8 @@ use crate::agents::{
     render_agents_document,
 };
 use crate::onboarding::{
-    ACT_STARTER_JSON_PATH, ONBOARDING_JSON_PATH, expected_onboarding_files, override_freshness,
-    recommendation_summary,
+    expected_onboarding_files, override_freshness, recommendation_summary, ACT_STARTER_JSON_PATH,
+    ONBOARDING_JSON_PATH,
 };
 use crate::pyjson::{self, Value};
 use crate::telemetry::{
@@ -109,12 +109,30 @@ fn write_text(path: &Path, content: &str) -> Result<(), String> {
 /// Deploy all enhancement files into `repo`. Byte-parity with the Python
 /// `deploy()` — action list order, file contents, telemetry event.
 pub fn deploy(repo: &Path, force: bool) -> Result<Vec<DeployAction>, String> {
+    deploy_inner(repo, force, true)
+}
+
+/// Converge generated supporting artifacts without reading or writing the
+/// repository's root policy files. Repository upgrades use this lane so
+/// AGENTS.md and CLAUDE.md can be migrated under an explicit ownership and
+/// resolution contract without a temporary force-replacement window.
+pub fn deploy_supporting_artifacts(repo: &Path, force: bool) -> Result<Vec<DeployAction>, String> {
+    deploy_inner(repo, force, false)
+}
+
+fn deploy_inner(
+    repo: &Path,
+    force: bool,
+    manage_root_policy: bool,
+) -> Result<Vec<DeployAction>, String> {
     let mut actions: Vec<DeployAction> = Vec::new();
-    if let Some(action) = drop_stale_generated_agents_override(repo)? {
-        actions.push(action);
-    }
-    if let Some(action) = migrate_legacy_agents_content(repo)? {
-        actions.push(action);
+    if manage_root_policy {
+        if let Some(action) = drop_stale_generated_agents_override(repo)? {
+            actions.push(action);
+        }
+        if let Some(action) = migrate_legacy_agents_content(repo)? {
+            actions.push(action);
+        }
     }
 
     for (relative_path, content) in expected_onboarding_files(repo)? {
@@ -137,8 +155,13 @@ pub fn deploy(repo: &Path, force: bool) -> Result<Vec<DeployAction>, String> {
         });
     }
 
-    actions.insert(0, ensure_agents_document(repo, force)?);
+    if manage_root_policy {
+        actions.insert(0, ensure_agents_document(repo, force)?);
+    }
     for (relative_path, template) in TARGETS {
+        if !manage_root_policy && *relative_path == "CLAUDE.md" {
+            continue;
+        }
         let dest = repo.join(relative_path);
         let content = if *relative_path == "CLAUDE.md" {
             render_agents_document(Some(repo))?
@@ -172,28 +195,30 @@ pub fn deploy(repo: &Path, force: bool) -> Result<Vec<DeployAction>, String> {
 
     actions.push(ensure_settings_hook(repo)?);
 
-    let mut payload = Value::object();
-    payload.set("force", Value::Bool(force));
-    payload.set(
-        "actions",
-        Value::Array(
-            actions
-                .iter()
-                .map(|action| {
-                    let mut entry = Value::object();
-                    entry.set("path", Value::str(action.relative_path.clone()));
-                    entry.set("action", Value::str(action.action));
-                    entry
-                })
-                .collect(),
-        ),
-    );
-    if let Some(entries) = event_payload_from_generated_artifacts(repo)?.as_object() {
-        for (key, value) in entries {
-            payload.set(key, value.clone());
+    if manage_root_policy {
+        let mut payload = Value::object();
+        payload.set("force", Value::Bool(force));
+        payload.set(
+            "actions",
+            Value::Array(
+                actions
+                    .iter()
+                    .map(|action| {
+                        let mut entry = Value::object();
+                        entry.set("path", Value::str(action.relative_path.clone()));
+                        entry.set("action", Value::str(action.action));
+                        entry
+                    })
+                    .collect(),
+            ),
+        );
+        if let Some(entries) = event_payload_from_generated_artifacts(repo)?.as_object() {
+            for (key, value) in entries {
+                payload.set(key, value.clone());
+            }
         }
+        append_event(repo, "enhance.deploy", payload)?;
     }
-    append_event(repo, "enhance.deploy", payload)?;
 
     Ok(actions)
 }
@@ -461,7 +486,11 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
             relative_path: relative_path.to_string(),
             exists: true,
             placeholder_present: actual.contains(PLACEHOLDER),
-            matches_canonical: actual == canonical,
+            matches_canonical: if *relative_path == "CLAUDE.md" {
+                policy_matches_canonical(&actual, &canonical)
+            } else {
+                actual == canonical
+            },
         });
     }
 
@@ -544,8 +573,26 @@ fn verify_agents_document(repo: &Path) -> Result<VerifyResult, String> {
         relative_path: "AGENTS.md".to_string(),
         exists: true,
         placeholder_present: actual.contains(PLACEHOLDER),
-        matches_canonical: actual == content,
+        matches_canonical: policy_matches_canonical(&actual, &content),
     })
+}
+
+fn policy_matches_canonical(actual: &str, canonical: &str) -> bool {
+    if actual == canonical {
+        return true;
+    }
+    if actual.matches(crate::BLOCK_BEGIN).count() != 1
+        || actual.matches(crate::BLOCK_END).count() != 1
+    {
+        return false;
+    }
+    let managed = format!(
+        "{}\n{}\n{}",
+        crate::BLOCK_BEGIN,
+        canonical.trim_end(),
+        crate::BLOCK_END
+    );
+    crate::render::splice_generated_block(actual, &managed) == actual
 }
 
 /// True iff every target exists and has its placeholder substituted;
@@ -665,6 +712,30 @@ mod tests {
     }
 
     #[test]
+    fn supporting_artifact_deploy_never_touches_root_policy() {
+        let repo = fixture_repo("supporting-only");
+        std::fs::write(repo.join("AGENTS.md"), "maintainer agents policy\n").unwrap();
+        std::fs::write(repo.join("CLAUDE.md"), "maintainer claude policy\n").unwrap();
+
+        let actions = deploy_supporting_artifacts(&repo, true).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("AGENTS.md")).unwrap(),
+            "maintainer agents policy\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("CLAUDE.md")).unwrap(),
+            "maintainer claude policy\n"
+        );
+        assert!(actions
+            .iter()
+            .all(|action| { !matches!(action.relative_path.as_str(), "AGENTS.md" | "CLAUDE.md") }));
+        assert!(!repo
+            .join(".aethyme/generated/experience-telemetry.jsonl")
+            .exists());
+    }
+
+    #[test]
     fn settings_merge_preserves_user_content() {
         let repo = fixture_repo("settings-merge");
         std::fs::create_dir_all(repo.join(".claude")).unwrap();
@@ -703,11 +774,9 @@ mod tests {
         std::fs::write(repo.join("AGENTS.md"), "Hand-written policy.\n").unwrap();
         let actions = deploy(&repo, false).unwrap();
         // Migration action reported, override created.
-        assert!(
-            actions
-                .iter()
-                .any(|a| a.relative_path == AGENTS_OVERRIDE_PATH && a.action == "created")
-        );
+        assert!(actions
+            .iter()
+            .any(|a| a.relative_path == AGENTS_OVERRIDE_PATH && a.action == "created"));
         let override_text = std::fs::read_to_string(repo.join(AGENTS_OVERRIDE_PATH)).unwrap();
         assert_eq!(
             override_text,

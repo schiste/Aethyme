@@ -3,10 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::PLACEHOLDER;
 use crate::agents::render_agents_document;
-use crate::deploy::{SETTINGS_FILE, TARGETS, ensure_settings_hook};
+use crate::deploy::{ensure_settings_hook, SETTINGS_FILE, TARGETS};
 use crate::onboarding::expected_onboarding_files;
+use crate::PLACEHOLDER;
 
 pub const LOCAL_MARKER_PATH: &str = ".aethyme/local/enabled";
 pub const LOCAL_POLICY_PATH: &str = ".aethyme/local/AGENTS.md";
@@ -87,6 +87,21 @@ pub fn prepare(repo: &Path) -> Result<(), String> {
 }
 
 pub fn deploy(repo: &Path, force: bool) -> Result<Vec<LocalAction>, String> {
+    deploy_inner(repo, force, true)
+}
+
+/// Converge local-only supporting artifacts without replacing the complete
+/// local agent policy. Repository upgrades migrate that policy separately
+/// under the same explicit customization-resolution contract as root policy.
+pub fn deploy_supporting_artifacts(repo: &Path, force: bool) -> Result<Vec<LocalAction>, String> {
+    deploy_inner(repo, force, false)
+}
+
+fn deploy_inner(
+    repo: &Path,
+    force: bool,
+    manage_local_policy: bool,
+) -> Result<Vec<LocalAction>, String> {
     prepare(repo)?;
     let update_owned = force || repo.join(LOCAL_MARKER_PATH).is_file();
 
@@ -118,14 +133,16 @@ pub fn deploy(repo: &Path, force: bool) -> Result<Vec<LocalAction>, String> {
         action: settings.action,
     });
 
-    let policy = render_agents_document(Some(repo))?;
-    actions.push(write_local_target(
-        repo,
-        LOCAL_POLICY_PATH,
-        &policy,
-        update_owned,
-        false,
-    )?);
+    if manage_local_policy {
+        let policy = render_agents_document(Some(repo))?;
+        actions.push(write_local_target(
+            repo,
+            LOCAL_POLICY_PATH,
+            &policy,
+            update_owned,
+            false,
+        )?);
+    }
     let marker = format!("schema = 1\nversion = \"{}\"\n", env!("CARGO_PKG_VERSION"));
     actions.push(write_local_target(
         repo,
