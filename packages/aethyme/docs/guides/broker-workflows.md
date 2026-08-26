@@ -128,6 +128,13 @@ aethyme broker gates run --session 111
 aethyme broker gates run --session 111 --json
 ```
 
+Run this session-scoped command after the final commit instead of invoking the
+same test suite directly. If integration does not move and normalized
+submission produces the identical tree, `broker submit` reuses that proof and
+does not execute the expensive gate a second time. If either tree or the full
+gate definition differs, submit runs it normally; cache reuse never weakens the
+landing check.
+
 Text output shows an abbreviated 12-character tree hash. JSON returns the full
 hash in `tree_hash` and identifies whether the result was executed or cached.
 Before acting on any result, compare that tree with the tree you intend to

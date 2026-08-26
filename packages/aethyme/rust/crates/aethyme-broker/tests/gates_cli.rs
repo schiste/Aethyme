@@ -177,6 +177,34 @@ fn gate_cli_reports_tree_provenance_for_executed_and_cached_results() {
 }
 
 #[test]
+fn gate_validate_reads_the_invoking_worktree_snapshot() {
+    let tmp = fixture();
+    let worktree = tmp.path().join(".aethyme/worktrees/validate");
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    git(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/validate",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    std::fs::write(
+        worktree.join(".aethyme/gates.toml"),
+        "[[gate]]\nname='worktree-only'\ncommand='true'\n",
+    )
+    .unwrap();
+
+    let output = stdout(run(&worktree, &["gates", "validate", "--json"]));
+    let gates: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(gates[0]["name"], "worktree-only");
+}
+
+#[test]
 fn pre_push_adapter_proves_the_clean_outgoing_head_and_refuses_drift() {
     let tmp = fixture();
     let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
@@ -373,6 +401,63 @@ fn submit_cli_bypasses_and_then_refreshes_the_merged_tree_cache() {
     let refreshed: serde_json::Value = serde_json::from_str(&refreshed).unwrap();
     assert_eq!(refreshed["gate_outcomes"][0]["cached"], true);
     assert_eq!(run_count(&counter), 2);
+}
+
+#[test]
+fn session_gate_proof_is_reused_by_unchanged_integration_submission() {
+    let tmp = fixture();
+    let counter = tmp.path().join("submit-runs.txt");
+    std::fs::write(
+        tmp.path().join(".aethyme/gates.toml"),
+        format!(
+            "[[gate]]\nname='exact-tree'\ncommand=\"echo run >> '{}'\"\ntriggers=['tracked.txt']\n",
+            counter.display()
+        ),
+    )
+    .unwrap();
+    git(tmp.path(), &["add", ".aethyme/gates.toml"]);
+    git(tmp.path(), &["commit", "-qm", "configure exact-tree gate"]);
+
+    let worktree = tmp.path().join(".aethyme/worktrees/exact-tree");
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    git(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/exact-tree",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let adopted = stdout(run(&worktree, &["adopt", "--task", "prove once", "--json"]));
+    let session: serde_json::Value = serde_json::from_str(&adopted).unwrap();
+    let session_id = session["id"].as_i64().unwrap().to_string();
+    std::fs::write(worktree.join("tracked.txt"), "proved\n").unwrap();
+    git(&worktree, &["add", "tracked.txt"]);
+    git(&worktree, &["commit", "-qm", "change tracked input"]);
+
+    let preflight = stdout(run(
+        &worktree,
+        &["gates", "run", "--session", &session_id, "--json"],
+    ));
+    let preflight: serde_json::Value = serde_json::from_str(&preflight).unwrap();
+    assert_eq!(preflight[0]["cached"], false);
+    assert_eq!(run_count(&counter), 1);
+
+    let submission = stdout(run(
+        &worktree,
+        &["submit", "--session", &session_id, "--json"],
+    ));
+    let submission: serde_json::Value = serde_json::from_str(&submission).unwrap();
+    assert_eq!(submission["gate_outcomes"][0]["cached"], true);
+    assert_eq!(
+        submission["gate_outcomes"][0]["tree_hash"],
+        preflight[0]["tree_hash"]
+    );
+    assert_eq!(run_count(&counter), 1);
 }
 
 #[test]

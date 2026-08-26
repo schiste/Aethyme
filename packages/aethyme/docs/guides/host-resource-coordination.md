@@ -1,6 +1,6 @@
 # Concurrent Host Resource Coordination
 
-Last Updated: 2026-08-24
+Last Updated: 2026-08-26
 
 Aethyme can run the same repository's validation gates concurrently from
 independent clones without sharing fixed ports, Docker project names, database
@@ -25,6 +25,7 @@ command = "./scripts/test-integration"
 cost = 3
 cache = false
 resource_ttl_seconds = 300
+resource_wait_seconds = 120
 
 [[gate.resources]]
 key = "docker_project"
@@ -88,6 +89,40 @@ terminates the gate's process group rather than let an unowned process keep
 using a resource. A crashed owner expires into quarantine; it is not silently
 reallocated until the operator confirms exact cleanup with the recorded lease
 generation.
+
+`resource_wait_seconds` controls ordinary contention before the command
+starts. Its default is `0`, preserving fail-fast behavior. A positive value
+retries only an unavailable bundle, reports bounded waiting progress, and
+returns the original `resource_contention` diagnosis at the deadline. Invalid
+requests, storage errors, and ownership failures are never retried.
+
+## Reuse A Bounded Artifact Cache
+
+For compilers or package managers whose artifacts are safe to reuse across
+worktrees, declare a broker-owned cache by logical key and byte budget:
+
+```toml
+[[gate]]
+name = "rust-workspace"
+command = 'CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" cargo test --workspace'
+resource_wait_seconds = 600
+
+[gate.managed_cache]
+key = "rust-workspace-v1"
+max_bytes = 12884901888
+```
+
+The key is not a path. Aethyme derives a private platform cache directory,
+scopes it by canonical repository identity, exports it as
+`AETHYME_GATE_CACHE_DIR`, and automatically adds an exclusive host lease.
+Before each executed run it measures stored file bytes and atomically rotates
+an over-budget cache while still holding that lease. JSON gate outcomes expose
+the key, budget, bytes before and after, and whether rotation occurred; they do
+not expose the absolute host path.
+
+Use a new key when intentionally resetting cache compatibility. Do not embed
+`$HOME` cache paths directly in commands: those paths have no broker ownership,
+budget, provenance, or cross-clone serialization.
 
 ## Install An Opt-In Pre-Push Adapter
 

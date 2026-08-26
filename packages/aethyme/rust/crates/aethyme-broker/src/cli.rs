@@ -3084,8 +3084,10 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     }
                 }
                 "validate" => {
-                    let broker = open_broker(parsed.read_only_snapshot)?;
-                    let gates = aethyme_gates_load(broker.main_root())?;
+                    let cwd = std::env::current_dir()
+                        .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
+                    let checkout = crate::GitRepo::discover(&cwd)?;
+                    let gates = aethyme_gates_load(checkout.root())?;
                     if parsed.json {
                         let summary: Vec<_> = gates
                             .iter()
