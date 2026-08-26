@@ -354,10 +354,25 @@ fn nonzero_write_is_unknown_because_partial_effects_are_possible() {
         .unwrap();
     assert!(!report.command_success);
     assert_eq!(report.operation.status, OperationStatus::OutcomeUnknown);
+    let recovery = report.unknown_outcome_recovery().unwrap().to_string();
+    assert!(recovery.contains("Canonical repository local:"));
+    assert!(recovery.contains("is now write-blocked"));
+    assert!(recovery.contains(&format!("Operation ID: {}", report.operation.id)));
+    assert!(recovery.contains("Inspect local Git refs and worktree state"));
+    assert!(recovery.contains(&format!(
+        "aethyme broker operations reconcile --operation {} --outcome succeeded --reason \"external inspection confirmed operation {} took effect\"",
+        report.operation.id, report.operation.id
+    )));
+    assert!(recovery.contains(&format!(
+        "aethyme broker operations reconcile --operation {} --outcome failed --reason \"external inspection confirmed operation {} did not take effect\"",
+        report.operation.id, report.operation.id
+    )));
+    assert!(recovery.contains("Blind retry is forbidden"));
 
     let blocked = broker
         .run_coordinated_operation(request(session.id, &["branch", "after-nonzero"]))
         .unwrap_err();
+    assert_eq!(blocked.to_string(), recovery);
     assert!(matches!(
         blocked,
         BrokerOpError::CoordinatedOperationBlocked { operation_id, .. }

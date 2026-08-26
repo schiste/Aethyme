@@ -106,12 +106,11 @@ pub enum BrokerOpError {
     MissingExecCommand,
     #[error("invalid coordinated operation: {reason}")]
     InvalidCoordinatedOperation { reason: String },
-    #[error(
-        "coordinated operation blocked for {repository}: operation {operation_id} has an unknown outcome; inspect it and run `aethyme broker operations reconcile --operation {operation_id} --outcome succeeded --reason \"...\"` or use `--outcome failed`"
-    )]
+    #[error("{recovery}")]
     CoordinatedOperationBlocked {
         repository: String,
         operation_id: i64,
+        recovery: crate::UnknownOutcomeRecovery,
     },
     #[error("coordinated operation lock at {path}: {source}")]
     OperationIo {

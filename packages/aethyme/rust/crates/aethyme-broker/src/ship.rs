@@ -6,7 +6,7 @@
 
 use crate::broker::{Broker, BrokerOpError};
 use crate::merge::PromoteConfig;
-use crate::operations::CoordinatedCommand;
+use crate::operations::{CoordinatedCommand, CoordinatedOperationReport, UnknownOutcomeRecovery};
 use crate::remote_target::ResolvedRemoteTarget;
 use crate::types::{
     CoordinatedOperation, MergeQueueEntry, MergeStatus, OperationEffect, OperationProvider, Session,
@@ -55,6 +55,25 @@ pub struct ShipPlan {
     pub target: ResolvedRemoteTarget,
     pub proposed_push: ShipPush,
     pub local_main_sync_safe: bool,
+}
+
+fn ship_operation_failure(
+    phase: &'static str,
+    report: &CoordinatedOperationReport,
+) -> BrokerOpError {
+    if report.operation.status == crate::OperationStatus::OutcomeUnknown {
+        BrokerOpError::CoordinatedOperationBlocked {
+            repository: report.operation.repository.clone(),
+            operation_id: report.operation.id,
+            recovery: UnknownOutcomeRecovery::from_operation(&report.operation),
+        }
+    } else {
+        BrokerOpError::ShipOperationFailed {
+            phase,
+            operation_id: report.operation.id,
+            status: report.operation.status.as_str(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -288,11 +307,7 @@ impl Broker {
             &main_root,
         )?;
         if !fetch.ok() {
-            return Err(BrokerOpError::ShipOperationFailed {
-                phase: "fetch",
-                operation_id: fetch.operation.id,
-                status: fetch.operation.status.as_str(),
-            });
+            return Err(ship_operation_failure("fetch", &fetch));
         }
         let fetched_remote = self
             .repo_handle()
@@ -351,11 +366,7 @@ impl Broker {
             &main_root,
         )?;
         if !push.ok() {
-            return Err(BrokerOpError::ShipOperationFailed {
-                phase: "push",
-                operation_id: push.operation.id,
-                status: push.operation.status.as_str(),
-            });
+            return Err(ship_operation_failure("push", &push));
         }
 
         let verify = self.run_coordinated_operation_at(
@@ -377,11 +388,7 @@ impl Broker {
             &main_root,
         )?;
         if !verify.ok() {
-            return Err(BrokerOpError::ShipOperationFailed {
-                phase: "verification",
-                operation_id: verify.operation.id,
-                status: verify.operation.status.as_str(),
-            });
+            return Err(ship_operation_failure("verification", &verify));
         }
         let verified_remote_sha = ls_remote_sha(&verify.stdout, &plan.remote_default_branch_ref)
             .unwrap_or_else(|| "<missing>".into());
@@ -432,11 +439,7 @@ impl Broker {
                 &main_root,
             )?;
             if !sync.ok() {
-                return Err(BrokerOpError::ShipOperationFailed {
-                    phase: "local-main synchronization",
-                    operation_id: sync.operation.id,
-                    status: sync.operation.status.as_str(),
-                });
+                return Err(ship_operation_failure("local-main synchronization", &sync));
             }
             let after_sha = self.repo_handle().head_commit()?;
             if after_sha != confirm {

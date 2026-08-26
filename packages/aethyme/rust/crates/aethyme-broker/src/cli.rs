@@ -2456,11 +2456,17 @@ fn run_report(parsed: Parsed) -> Result<(), UsageError> {
                 }
             }
             if filed.state == crate::ReportFileState::ReconciliationRequired {
+                let operation = broker
+                    .store()
+                    .coordinated_operation(filed.operation_id)?
+                    .ok_or_else(|| {
+                        UsageError::Message(format!(
+                            "coordinated operation {} disappeared before recovery guidance could be rendered",
+                            filed.operation_id
+                        ))
+                    })?;
                 return Err(UsageError::Exit {
-                    message: format!(
-                        "do not retry; inspect repository {} and reconcile operation {}",
-                        filed.repository, filed.operation_id
-                    ),
+                    message: crate::UnknownOutcomeRecovery::from_operation(&operation).to_string(),
                     code: 1,
                 });
             }
@@ -2984,6 +2990,12 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             let report = broker.run_coordinated_operation(request)?;
             render_coordinated_operation(&report, parsed.json)?;
             if !report.ok() {
+                if let Some(recovery) = report.unknown_outcome_recovery() {
+                    return Err(UsageError::Exit {
+                        message: recovery.to_string(),
+                        code: 1,
+                    });
+                }
                 return Err(UsageError::Message(format!(
                     "coordinated {subcommand} operation {} failed",
                     report.operation.id

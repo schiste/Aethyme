@@ -462,14 +462,21 @@ fn ship_push_failure_is_unknown_and_blocks_until_reconciled() {
     let mut broker = fixture.broker();
 
     let error = broker.ship_execute(entry_id, &integration).unwrap_err();
-    let operation_id = match error {
-        BrokerOpError::ShipOperationFailed {
-            phase: "push",
+    let (operation_id, recovery) = match error {
+        BrokerOpError::CoordinatedOperationBlocked {
             operation_id,
-            status: "outcome_unknown",
-        } => operation_id,
+            recovery,
+            ..
+        } => (operation_id, recovery),
         other => panic!("unexpected push error: {other}"),
     };
+    assert!(recovery.canonical_repository.starts_with("local:"));
+    assert!(
+        recovery
+            .canonical_repository
+            .contains(fixture.remote.to_string_lossy().trim_end_matches(".git"))
+    );
+    assert!(recovery.to_string().contains("remote Git refs"));
     assert_eq!(
         broker
             .store()

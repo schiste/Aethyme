@@ -6,6 +6,7 @@
 //! after the command starts becomes `outcome_unknown`; later writes fail
 //! closed until an operator reconciles that journal row.
 
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -53,6 +54,91 @@ pub struct CoordinatedOperationReport {
 impl CoordinatedOperationReport {
     pub fn ok(&self) -> bool {
         self.command_success && self.operation.status == OperationStatus::Succeeded
+    }
+
+    pub fn unknown_outcome_recovery(&self) -> Option<UnknownOutcomeRecovery> {
+        (self.operation.status == OperationStatus::OutcomeUnknown)
+            .then(|| UnknownOutcomeRecovery::from_operation(&self.operation))
+    }
+}
+
+/// Complete operator handoff for a write whose external outcome is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownOutcomeRecovery {
+    pub canonical_repository: String,
+    pub operation_id: i64,
+    pub provider: OperationProvider,
+    pub scope: String,
+    pub remote_write: bool,
+}
+
+impl UnknownOutcomeRecovery {
+    pub fn from_operation(operation: &CoordinatedOperation) -> Self {
+        Self {
+            canonical_repository: operation.repository.clone(),
+            operation_id: operation.id,
+            provider: operation.provider,
+            scope: operation.scope.clone(),
+            remote_write: operation.host_operation_id.is_some(),
+        }
+    }
+
+    fn inspection_instruction(&self) -> String {
+        match self.provider {
+            OperationProvider::Git if !self.remote_write => format!(
+                "Inspect local Git refs and worktree state for {} at scope {} to determine whether the write took effect.",
+                self.canonical_repository, self.scope
+            ),
+            OperationProvider::Git => format!(
+                "Inspect remote Git refs for canonical repository {} at scope {} to determine whether the write took effect.",
+                self.canonical_repository, self.scope
+            ),
+            OperationProvider::Github => format!(
+                "Inspect GitHub state for canonical repository {} at scope {} to determine whether the write took effect.",
+                self.canonical_repository, self.scope
+            ),
+        }
+    }
+
+    pub fn succeeded_command(&self) -> String {
+        format!(
+            "aethyme broker operations reconcile --operation {} --outcome succeeded --reason \"external inspection confirmed operation {} took effect\"",
+            self.operation_id, self.operation_id
+        )
+    }
+
+    pub fn failed_command(&self) -> String {
+        format!(
+            "aethyme broker operations reconcile --operation {} --outcome failed --reason \"external inspection confirmed operation {} did not take effect\"",
+            self.operation_id, self.operation_id
+        )
+    }
+}
+
+impl fmt::Display for UnknownOutcomeRecovery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            formatter,
+            "Canonical repository {} is now write-blocked because a coordinated write has an unknown outcome.",
+            self.canonical_repository
+        )?;
+        writeln!(formatter, "Operation ID: {}", self.operation_id)?;
+        writeln!(formatter, "{}", self.inspection_instruction())?;
+        writeln!(
+            formatter,
+            "If external inspection proves the write succeeded, run:"
+        )?;
+        writeln!(formatter, "  {}", self.succeeded_command())?;
+        writeln!(
+            formatter,
+            "If external inspection proves the write failed, run:"
+        )?;
+        writeln!(formatter, "  {}", self.failed_command())?;
+        write!(
+            formatter,
+            "Blind retry is forbidden until operation {} is reconciled.",
+            self.operation_id
+        )
     }
 }
 
@@ -574,7 +660,7 @@ impl Broker {
                         )?;
                     }
                     OperationStatus::Running => {
-                        self.store().transition_coordinated_operation(
+                        let operation = self.store().transition_coordinated_operation(
                             operation.id,
                             OperationStatus::OutcomeUnknown,
                             operation.exit_code,
@@ -583,12 +669,15 @@ impl Broker {
                         return Err(BrokerOpError::CoordinatedOperationBlocked {
                             repository,
                             operation_id: operation.id,
+                            recovery: UnknownOutcomeRecovery::from_operation(&operation),
                         });
                     }
                     OperationStatus::OutcomeUnknown => {
+                        let recovery = UnknownOutcomeRecovery::from_operation(&operation);
                         return Err(BrokerOpError::CoordinatedOperationBlocked {
                             repository,
                             operation_id: operation.id,
+                            recovery,
                         });
                     }
                     _ => {}

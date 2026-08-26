@@ -102,8 +102,8 @@ pub use merge::{
     SubmissionConflict, SubmissionIntegrationState, SubmissionPlan, SubmitOutcome,
 };
 pub use operations::{
-    CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport, classify_gh,
-    classify_git,
+    CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport,
+    UnknownOutcomeRecovery, classify_gh, classify_git,
 };
 pub use pr::{
     PrActivityItem, PrCheckOptions, PrCheckReport, PrCheckRun, PrDecision, PrDecisionStatus,

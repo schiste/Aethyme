@@ -1179,14 +1179,31 @@ fn ambiguous_file_outcome_requires_reconciliation_and_is_never_retried() {
     let result: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(result["state"], "reconciliation_required");
     assert_eq!(result["operation_status"], "outcome_unknown");
-    assert!(String::from_utf8_lossy(&first.stderr).contains("do not retry"));
     let operation_id = result["operation_id"].as_i64().unwrap();
+    let first_stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        first_stderr.contains("Canonical repository github.com/owner/repo is now write-blocked")
+    );
+    assert!(first_stderr.contains(&format!("Operation ID: {operation_id}")));
+    assert!(first_stderr.contains(
+        "Inspect GitHub state for canonical repository github.com/owner/repo at scope report:"
+    ));
+    assert!(first_stderr.contains(&format!(
+        "aethyme broker operations reconcile --operation {operation_id} --outcome succeeded --reason \"external inspection confirmed operation {operation_id} took effect\""
+    )));
+    assert!(first_stderr.contains(&format!(
+        "aethyme broker operations reconcile --operation {operation_id} --outcome failed --reason \"external inspection confirmed operation {operation_id} did not take effect\""
+    )));
+    assert!(first_stderr.contains("Blind retry is forbidden"));
 
     let second = run_with_env(tmp.path(), &args, &environment);
     assert!(!second.status.success());
     let stderr = String::from_utf8_lossy(&second.stderr);
-    assert!(stderr.contains("has an unknown outcome"));
-    assert!(stderr.contains(&format!("--operation {operation_id}")));
+    assert!(stderr.contains("is now write-blocked"));
+    assert!(stderr.contains(&format!("Operation ID: {operation_id}")));
+    assert!(stderr.contains(&format!("--operation {operation_id} --outcome succeeded")));
+    assert!(stderr.contains(&format!("--operation {operation_id} --outcome failed")));
+    assert!(stderr.contains("Blind retry is forbidden"));
     assert_eq!(
         std::fs::read_to_string(&calls_path)
             .unwrap()

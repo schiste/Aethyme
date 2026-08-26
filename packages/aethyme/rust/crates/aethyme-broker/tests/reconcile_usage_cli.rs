@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+use aethyme_broker::Broker;
+
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 const RESOURCES_USAGE: &str =
     "usage: aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]";
@@ -100,5 +102,83 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
         ][..],
     ] {
         assert_usage(run(&repo, &state, args), INTEGRATION_USAGE);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn originating_github_write_prints_the_complete_reconciliation_handoff() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    repository(&repo);
+    let state = temp.path().join("host-state");
+    let mut broker = Broker::open(&repo)
+        .unwrap()
+        .with_host_operation_database(state.join("host-operations.db"));
+    let session = broker.adopt(&repo, None).unwrap();
+    drop(broker);
+
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\nprintf 'ambiguous write failure\\n' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&gh).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&gh, permissions).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let session_id = session.id.to_string();
+    let output = Command::new(CLI)
+        .args([
+            "gh",
+            "--session",
+            &session_id,
+            "--repo",
+            "Owner/Repo",
+            "--reason",
+            "exercise unknown outcome recovery",
+            "--json",
+            "--",
+            "issue",
+            "create",
+            "--title",
+            "fixture",
+            "--body",
+            "fixture",
+        ])
+        .current_dir(&repo)
+        .env("AETHYME_HOST_STATE_DIR", &state)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["operation"]["repository"], "github.com/owner/repo");
+    assert_eq!(report["operation"]["status"], "outcome_unknown");
+    let operation_id = report["operation"]["id"].as_i64().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for required in [
+        "Canonical repository github.com/owner/repo is now write-blocked".to_string(),
+        format!("Operation ID: {operation_id}"),
+        "Inspect GitHub state for canonical repository github.com/owner/repo".to_string(),
+        format!("--operation {operation_id} --outcome succeeded --reason"),
+        format!("--operation {operation_id} --outcome failed --reason"),
+        "Blind retry is forbidden".to_string(),
+    ] {
+        assert!(
+            stderr.contains(&required),
+            "missing {required:?} in: {stderr}"
+        );
     }
 }
