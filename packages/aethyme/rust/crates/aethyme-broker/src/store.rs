@@ -659,14 +659,15 @@ impl BrokerStore {
         self.conn.execute(
             "INSERT INTO gates (name, command, cost_tier, triggers_json, resources_json,
                                 resource_ttl_seconds, resource_wait_seconds,
-                                definition_hash, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                                managed_cache_json, definition_hash, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT (name) DO UPDATE SET command = excluded.command,
                                               cost_tier = excluded.cost_tier,
                                               triggers_json = excluded.triggers_json,
                                               resources_json = excluded.resources_json,
                                               resource_ttl_seconds = excluded.resource_ttl_seconds,
                                               resource_wait_seconds = excluded.resource_wait_seconds,
+                                              managed_cache_json = excluded.managed_cache_json,
                                               definition_hash = excluded.definition_hash,
                                               updated_at = excluded.updated_at",
             params![
@@ -677,6 +678,7 @@ impl BrokerStore {
                 gate.resources_json,
                 gate.resource_ttl_seconds,
                 gate.resource_wait_seconds,
+                gate.managed_cache_json,
                 gate.definition_hash,
                 now_ms()
             ],
@@ -687,7 +689,8 @@ impl BrokerStore {
     pub fn gates(&self) -> Result<Vec<GateDef>, BrokerError> {
         let mut stmt = self.conn.prepare(
             "SELECT name, command, cost_tier, triggers_json, resources_json,
-                    resource_ttl_seconds, resource_wait_seconds, definition_hash, updated_at
+                    resource_ttl_seconds, resource_wait_seconds, managed_cache_json,
+                    definition_hash, updated_at
              FROM gates ORDER BY cost_tier, name",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -699,8 +702,9 @@ impl BrokerStore {
                 resources_json: row.get(4)?,
                 resource_ttl_seconds: row.get(5)?,
                 resource_wait_seconds: row.get(6)?,
-                definition_hash: row.get(7)?,
-                updated_at: row.get(8)?,
+                managed_cache_json: row.get(7)?,
+                definition_hash: row.get(8)?,
+                updated_at: row.get(9)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)

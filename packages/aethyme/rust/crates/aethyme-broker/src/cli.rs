@@ -3097,6 +3097,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                                     "resources": g.resources,
                                     "resource_ttl_seconds": g.resource_ttl_seconds,
                                     "resource_wait_seconds": g.resource_wait_seconds,
+                                    "managed_cache": g.managed_cache,
                                     "definition_hash": g.definition_hash,
                                 })
                             })

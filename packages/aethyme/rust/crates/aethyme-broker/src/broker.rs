@@ -2636,6 +2636,11 @@ impl Broker {
                 resources_json: serde_json::to_string(&gate.resources)?,
                 resource_ttl_seconds: gate.resource_ttl_seconds as i64,
                 resource_wait_seconds: gate.resource_wait_seconds as i64,
+                managed_cache_json: gate
+                    .managed_cache
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
                 definition_hash: gate.definition_hash.clone(),
                 updated_at: 0,
             })?;

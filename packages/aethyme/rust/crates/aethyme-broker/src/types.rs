@@ -243,6 +243,7 @@ pub struct GateDef {
     pub resources_json: String,
     pub resource_ttl_seconds: i64,
     pub resource_wait_seconds: i64,
+    pub managed_cache_json: Option<String>,
     /// Stable digest of every execution-relevant field.
     pub definition_hash: String,
     pub updated_at: i64,

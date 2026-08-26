@@ -74,8 +74,19 @@ pub struct Gate {
     /// Maximum time to wait for a contended host resource bundle. Zero
     /// preserves the historical fail-fast behavior.
     pub resource_wait_seconds: u64,
+    pub managed_cache: Option<ManagedGateCache>,
     pub definition_hash: String,
     matcher: Option<GlobSet>,
+}
+
+/// A broker-owned, repository-scoped artifact cache used by one gate.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedGateCache {
+    /// Stable logical name. It is never interpreted as a filesystem path.
+    pub key: String,
+    /// Rotate the cache before a run when its stored bytes exceed this bound.
+    pub max_bytes: u64,
 }
 
 impl Gate {
@@ -158,6 +169,30 @@ pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
             })
             .transpose()?
             .unwrap_or(0);
+        let managed_cache: Option<ManagedGateCache> = entry
+            .get("managed_cache")
+            .cloned()
+            .map(toml::Value::try_into)
+            .transpose()
+            .map_err(|error| GateConfigError::BadResources {
+                gate: name.clone(),
+                message: format!("invalid managed_cache: {error}"),
+            })?;
+        if let Some(cache) = &managed_cache {
+            validate_managed_cache(cache).map_err(|message| GateConfigError::BadResources {
+                gate: name.clone(),
+                message,
+            })?;
+            if resources
+                .iter()
+                .any(|resource| resource.key == "managed_cache")
+            {
+                return Err(GateConfigError::BadResources {
+                    gate: name.clone(),
+                    message: "resource key 'managed_cache' is reserved by managed_cache".into(),
+                });
+            }
+        }
         crate::validate_host_resource_requirements(&resources, resource_ttl_seconds).map_err(
             |error| GateConfigError::BadResources {
                 gate: name.clone(),
@@ -173,6 +208,7 @@ pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
             &resources,
             resource_ttl_seconds,
             resource_wait_seconds,
+            managed_cache.as_ref(),
         );
 
         let matcher = if triggers.is_empty() {
@@ -201,6 +237,7 @@ pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
             resources,
             resource_ttl_seconds,
             resource_wait_seconds,
+            managed_cache,
             definition_hash,
             matcher,
         });
@@ -218,6 +255,7 @@ fn gate_definition_hash(
     resources: &[crate::HostResourceRequirement],
     resource_ttl_seconds: u64,
     resource_wait_seconds: u64,
+    managed_cache: Option<&ManagedGateCache>,
 ) -> String {
     let bytes = serde_json::to_vec(&serde_json::json!({
         "name": name,
@@ -228,9 +266,28 @@ fn gate_definition_hash(
         "resources": resources,
         "resource_ttl_seconds": resource_ttl_seconds,
         "resource_wait_seconds": resource_wait_seconds,
+        "managed_cache": managed_cache,
     }))
     .expect("gate definition contains only serializable values");
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn validate_managed_cache(cache: &ManagedGateCache) -> Result<(), String> {
+    if cache.key.is_empty()
+        || cache.key.len() > 64
+        || !cache
+            .key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || cache.key == "."
+        || cache.key == ".."
+    {
+        return Err("managed_cache.key must be 1-64 ASCII letters, digits, '.', '_' or '-'".into());
+    }
+    if cache.max_bytes == 0 {
+        return Err("managed_cache.max_bytes must be positive".into());
+    }
+    Ok(())
 }
 
 /// Why a gate was selected: the first changed file that triggered it
@@ -286,12 +343,23 @@ pub struct GateRunOutcome {
     pub definition_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_lease: Option<GateResourceProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_cache: Option<ManagedGateCacheProvenance>,
     pub status: GateStatus,
     pub failure_class: Option<GateFailureClass>,
     pub cached: bool,
     pub exit_code: Option<i64>,
     pub duration_ms: Option<i64>,
     pub log_path: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ManagedGateCacheProvenance {
+    pub key: String,
+    pub max_bytes: u64,
+    pub bytes_before: u64,
+    pub bytes_after: Option<u64>,
+    pub rotated_before_run: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -747,6 +815,11 @@ struct GateResourceRuntime {
     ttl_seconds: u64,
 }
 
+struct ManagedGateCacheRuntime {
+    directory: PathBuf,
+    provenance: ManagedGateCacheProvenance,
+}
+
 impl GateResourceRuntime {
     fn release(&mut self) -> Result<(), crate::HostResourceError> {
         let mut coordinator = crate::HostResourceCoordinator::open_default()?;
@@ -766,10 +839,10 @@ fn acquire_gate_resources(
     worker_id: &str,
     progress: &dyn GateProgressSink,
 ) -> Result<Option<GateResourceRuntime>, String> {
-    if gate.resources.is_empty() {
+    if gate.resources.is_empty() && gate.managed_cache.is_none() {
         return Ok(None);
     }
-    let repository = git_origin_fingerprint(checkout.root());
+    let repository = git_origin_fingerprint(checkout);
     let worktree_fingerprint = sha256_text(&checkout.root().to_string_lossy());
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -779,6 +852,15 @@ fn acquire_gate_resources(
         "{repository}:{worktree_fingerprint}:{tree}:{}:{worker_id}:{nonce}",
         std::process::id()
     ));
+    let mut resources = gate.resources.clone();
+    if let Some(cache) = &gate.managed_cache {
+        resources.push(crate::HostResourceRequirement {
+            key: "managed_cache".into(),
+            resource: crate::HostResourceKind::ExclusiveKey {
+                name: format!("aethyme-gate-cache:{repository}:{}", cache.key),
+            },
+        });
+    }
     let request = crate::HostResourceRequest {
         schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
         request_id,
@@ -787,7 +869,7 @@ fn acquire_gate_resources(
         run_id: format!("{}-{}", worker_id, short_tree_hash(tree)),
         ttl_seconds: gate.resource_ttl_seconds,
         holder_pid: Some(std::process::id()),
-        resources: gate.resources.clone(),
+        resources,
     };
     let mut coordinator =
         crate::HostResourceCoordinator::open_default().map_err(|error| error.to_string())?;
@@ -814,24 +896,99 @@ fn acquire_gate_resources(
     }))
 }
 
-fn git_origin_fingerprint(root: &Path) -> String {
-    let output = std::process::Command::new("git")
-        .args(["config", "--get", "remote.origin.url"])
-        .current_dir(root)
-        .output();
-    let material = output
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            root.file_name()
+fn git_origin_fingerprint(repo: &GitRepo) -> String {
+    let material = repo
+        .resolve_remote_target("origin", None)
+        .map(|target| target.coordination_key)
+        .unwrap_or_else(|_| {
+            repo.root()
+                .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("repository")
                 .to_string()
         });
     sha256_text(&material)
+}
+
+fn prepare_managed_gate_cache(
+    policy: Option<&ManagedGateCache>,
+    repository: &str,
+    progress: &dyn GateProgressSink,
+    gate_name: &str,
+) -> Result<Option<ManagedGateCacheRuntime>, std::io::Error> {
+    if policy.is_none() {
+        return Ok(None);
+    }
+    let root = crate::host_state::default_host_cache_dir().ok_or_else(|| {
+        std::io::Error::other("cannot find per-user cache directory; set AETHYME_HOST_CACHE_DIR")
+    })?;
+    prepare_managed_gate_cache_in(policy, repository, progress, gate_name, &root)
+}
+
+fn prepare_managed_gate_cache_in(
+    policy: Option<&ManagedGateCache>,
+    repository: &str,
+    progress: &dyn GateProgressSink,
+    gate_name: &str,
+    root: &Path,
+) -> Result<Option<ManagedGateCacheRuntime>, std::io::Error> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(&root)?;
+    crate::host_state::protect_host_state_path(&root, true)?;
+    let repository_root = root.join("gates").join(repository);
+    std::fs::create_dir_all(&repository_root)?;
+    let directory = repository_root.join(&policy.key);
+    let bytes_before = directory_usage(&directory)?;
+    let rotated_before_run = bytes_before > policy.max_bytes;
+    if rotated_before_run {
+        progress.report(&format!(
+            "gate {gate_name} rotating managed cache {} ({} bytes exceeds {} bytes)",
+            policy.key, bytes_before, policy.max_bytes
+        ));
+        let retired = repository_root.join(format!(
+            ".{}.retired-{}-{}",
+            policy.key,
+            epoch_ms(),
+            std::process::id()
+        ));
+        std::fs::rename(&directory, &retired)?;
+        std::fs::create_dir_all(&directory)?;
+        std::fs::remove_dir_all(retired)?;
+    } else {
+        std::fs::create_dir_all(&directory)?;
+    }
+    Ok(Some(ManagedGateCacheRuntime {
+        directory,
+        provenance: ManagedGateCacheProvenance {
+            key: policy.key.clone(),
+            max_bytes: policy.max_bytes,
+            bytes_before,
+            bytes_after: None,
+            rotated_before_run,
+        },
+    }))
+}
+
+fn directory_usage(path: &Path) -> Result<u64, std::io::Error> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut bytes = 0_u64;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let metadata = entry.file_type()?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else {
+                bytes = bytes.saturating_add(entry.metadata()?.len());
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 fn sha256_text(value: &str) -> String {
@@ -899,6 +1056,7 @@ fn run_selections(
                 tree_hash: tree.clone(),
                 definition_hash: gate.definition_hash.clone(),
                 resource_lease: None,
+                managed_cache: None,
                 status: hit.status,
                 failure_class: cached_failure_class(hit.status),
                 cached: true,
@@ -954,6 +1112,7 @@ fn run_selections(
                         tree_hash: tree.clone(),
                         definition_hash: gate.definition_hash.clone(),
                         resource_lease: None,
+                        managed_cache: None,
                         status: GateStatus::Error,
                         failure_class: Some(GateFailureClass::ResourceContention),
                         cached: false,
@@ -972,6 +1131,47 @@ fn run_selections(
                 expires_at: runtime.grant.lease.expires_at,
                 allocations: runtime.grant.lease.allocations.clone(),
             });
+        let repository = git_origin_fingerprint(checkout);
+        let mut managed_cache_runtime = match prepare_managed_gate_cache(
+            gate.managed_cache.as_ref(),
+            &repository,
+            progress,
+            &gate.name,
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let message = format!("managed cache preparation failed: {error}");
+                let _ = std::fs::write(&log_path, format!("aethyme {message}\n"));
+                progress.report(&format!("gate {} environment error: {message}", gate.name));
+                let _ = resource_runtime.as_mut().map(GateResourceRuntime::release);
+                drop(owner_locks);
+                store.record_gate_result(&NewGateResult {
+                    gate_name: gate.name.clone(),
+                    tree_hash: tree.clone(),
+                    definition_hash: gate.definition_hash.clone(),
+                    status: GateStatus::Error,
+                    failure_class: Some(GateFailureClass::Environment),
+                    exit_code: None,
+                    duration_ms: Some(0),
+                    log_path: Some(log_path.to_string_lossy().into_owned()),
+                    session_id,
+                })?;
+                outcomes.push(GateRunOutcome {
+                    gate: gate.name.clone(),
+                    tree_hash: tree.clone(),
+                    definition_hash: gate.definition_hash.clone(),
+                    resource_lease: resource_provenance,
+                    managed_cache: None,
+                    status: GateStatus::Error,
+                    failure_class: Some(GateFailureClass::Environment),
+                    cached: false,
+                    exit_code: None,
+                    duration_ms: Some(0),
+                    log_path: Some(log_path.to_string_lossy().into_owned()),
+                });
+                break;
+            }
+        };
         progress.report(&format!(
             "gate {} started (cost {}, tree {})",
             gate.name,
@@ -993,8 +1193,12 @@ fn run_selections(
                 started,
                 progress,
                 resources: resource_runtime.as_ref(),
+                managed_cache: managed_cache_runtime.as_ref(),
             },
         );
+        if let Some(cache) = managed_cache_runtime.as_mut() {
+            cache.provenance.bytes_after = directory_usage(&cache.directory).ok();
+        }
         let release_error = resource_runtime
             .as_mut()
             .and_then(|runtime| runtime.release().err())
@@ -1043,6 +1247,7 @@ fn run_selections(
             tree_hash: tree.clone(),
             definition_hash: gate.definition_hash.clone(),
             resource_lease: resource_provenance,
+            managed_cache: managed_cache_runtime.map(|runtime| runtime.provenance),
             status: gate_status,
             failure_class,
             cached: false,
@@ -1233,6 +1438,7 @@ struct GateCommandContext<'a> {
     started: Instant,
     progress: &'a dyn GateProgressSink,
     resources: Option<&'a GateResourceRuntime>,
+    managed_cache: Option<&'a ManagedGateCacheRuntime>,
 }
 
 struct GateCommandOutcome {
@@ -1264,6 +1470,9 @@ fn run_gate_command(
         for (key, value) in resources.grant.environment() {
             process.env(key, value);
         }
+    }
+    if let Some(cache) = context.managed_cache {
+        process.env("AETHYME_GATE_CACHE_DIR", &cache.directory);
     }
     let mut child = process.spawn()?;
 
@@ -1390,6 +1599,10 @@ triggers = ["**/*.py"]
 resource_ttl_seconds = 60
 resource_wait_seconds = 15
 
+[gate.managed_cache]
+key = "python-env"
+max_bytes = 1048576
+
 [[gate.resources]]
 key = "database_port"
 kind = "tcp_port"
@@ -1415,6 +1628,13 @@ command = "true"
         let pytest = gates.iter().find(|gate| gate.name == "pytest").unwrap();
         assert_eq!(pytest.resource_ttl_seconds, 60);
         assert_eq!(pytest.resource_wait_seconds, 15);
+        assert_eq!(
+            pytest.managed_cache,
+            Some(ManagedGateCache {
+                key: "python-env".into(),
+                max_bytes: 1_048_576,
+            })
+        );
         assert_eq!(pytest.resources.len(), 1);
         assert!(matches!(
             pytest.resources[0].resource,
@@ -1443,6 +1663,39 @@ command = "true"
             load_gates(tmp.path()),
             Err(GateConfigError::BadResources { .. })
         ));
+    }
+
+    #[test]
+    fn managed_cache_rotates_only_its_broker_owned_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = ManagedGateCache {
+            key: "cargo".into(),
+            max_bytes: 3,
+        };
+        let directory = tmp.path().join("gates/repository/cargo");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("large"), b"1234").unwrap();
+
+        let runtime = prepare_managed_gate_cache_in(
+            Some(&policy),
+            "repository",
+            &StderrGateProgressSink,
+            "test",
+            tmp.path(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(runtime.provenance.rotated_before_run);
+        assert_eq!(runtime.provenance.bytes_before, 4);
+        assert!(runtime.directory.is_dir());
+        assert!(!runtime.directory.join("large").exists());
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join("gates/repository"))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[test]

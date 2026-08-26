@@ -499,3 +499,60 @@ name = "host-test-shared"
         "failing gate did not release its host resources"
     );
 }
+
+#[test]
+fn managed_gate_cache_is_bounded_exported_and_exclusively_leased() {
+    let repo = fixture();
+    let host_state = tempfile::tempdir().unwrap();
+    let host_cache = tempfile::tempdir().unwrap();
+    std::fs::write(
+        repo.path().join(".aethyme/gates.toml"),
+        r#"
+[[gate]]
+name = "managed-cache"
+command = "test -d \"$AETHYME_GATE_CACHE_DIR\" && printf 1234 > \"$AETHYME_GATE_CACHE_DIR/artifact\""
+cache = false
+resource_wait_seconds = 1
+
+[gate.managed_cache]
+key = "fixture"
+max_bytes = 3
+"#,
+    )
+    .unwrap();
+
+    let run = || {
+        Command::new(CLI)
+            .args(["gates", "run", "--all", "--no-cache", "--json"])
+            .current_dir(repo.path())
+            .env("AETHYME_HOST_STATE_DIR", host_state.path())
+            .env("AETHYME_HOST_CACHE_DIR", host_cache.path())
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first[0]["managed_cache"]["bytes_before"], 0);
+    assert_eq!(first[0]["managed_cache"]["bytes_after"], 4);
+    assert_eq!(first[0]["managed_cache"]["rotated_before_run"], false);
+    assert_eq!(
+        first[0]["resource_lease"]["allocations"][0]["kind"],
+        "exclusive_key"
+    );
+
+    let second = run();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second[0]["managed_cache"]["bytes_before"], 4);
+    assert_eq!(second[0]["managed_cache"]["bytes_after"], 4);
+    assert_eq!(second[0]["managed_cache"]["rotated_before_run"], true);
+}

@@ -21,6 +21,21 @@ pub(crate) fn default_host_state_dir() -> Option<PathBuf> {
     })
 }
 
+pub(crate) fn default_host_cache_dir() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("AETHYME_HOST_CACHE_DIR").filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    if let Some(path) = std::env::var_os("XDG_CACHE_HOME").filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path).join("aethyme"));
+    }
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    Some(if cfg!(target_os = "macos") {
+        home.join("Library/Caches/Aethyme")
+    } else {
+        home.join(".cache/aethyme")
+    })
+}
+
 #[cfg(unix)]
 pub(crate) fn protect_host_state_path(path: &Path, directory: bool) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
