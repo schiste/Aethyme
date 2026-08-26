@@ -5,8 +5,15 @@
 //! in an enrolled repository refuses an old schema and points here instead.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,6 +26,9 @@ const RESOLUTION_SCHEMA_VERSION: u32 = 1;
 const GATES_SCHEMA_VERSION: i64 = 1;
 const MIGRATION_ID: &str = "repository-deployment-v1";
 const MIGRATION_IN_PROGRESS: &str = "repository-deployment-v1:in-progress";
+const TRANSACTION_SCHEMA_VERSION: u32 = 1;
+const JOURNAL_MAX_BYTES: usize = 64 * 1024 * 1024;
+const CRASH_EXIT_CODE: i32 = 86;
 
 #[derive(Debug, Clone, Copy)]
 struct EmbeddedMigration {
@@ -110,6 +120,15 @@ pub struct UpgradeRelevantLease {
     pub overlapping_planned_paths: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct RepositoryUpgradeRecovery {
+    pub schema_version: u32,
+    pub plan_digest: String,
+    pub recovered: bool,
+    pub restored_paths: Vec<String>,
+    pub next_action: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryResolutionChoice {
@@ -148,7 +167,7 @@ struct RepositoryResolutionFile {
     resolutions: BTreeMap<String, RepositoryResolutionChoice>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryTreeAction {
     Create,
@@ -615,11 +634,52 @@ struct BuiltUpgradePlan {
     proposed_outputs: Vec<ProposedOutput>,
 }
 
+#[derive(Clone)]
 struct ProposedOutput {
     path: String,
     action: RepositoryTreeAction,
     bytes: Option<Vec<u8>>,
     file_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpgradeRollbackJournal {
+    schema_version: u32,
+    plan_digest: String,
+    repository_head: String,
+    existing_managed_state_digest: String,
+    mode: RepositoryMode,
+    marker_path: String,
+    entries: Vec<UpgradeRollbackEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpgradeRollbackEntry {
+    path: String,
+    action: RepositoryTreeAction,
+    before: Option<UpgradeBackup>,
+    after_sha256: Option<String>,
+    after_mode: Option<String>,
+    replacement_path: Option<String>,
+    tombstone_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpgradeBackup {
+    sha256: String,
+    file_mode: String,
+    bytes: Vec<u8>,
+}
+
+struct UpgradeLock {
+    file: File,
+}
+
+#[cfg(unix)]
+impl Drop for UpgradeLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 impl ProposedRepository {
@@ -1258,14 +1318,11 @@ fn render_migration_diff(repo: &Path, planned_paths: &[String]) -> Result<String
 
 fn collect_proposed_outputs(
     repo: &Path,
-    marker_path: &str,
     changes: &[RepositoryTreeChange],
 ) -> Result<Vec<ProposedOutput>, String> {
     changes
         .iter()
-        .filter(|change| {
-            change.action != RepositoryTreeAction::Unchanged && change.path != marker_path
-        })
+        .filter(|change| change.action != RepositoryTreeAction::Unchanged)
         .map(|change| {
             let bytes =
                 if change.action == RepositoryTreeAction::Delete {
@@ -1285,29 +1342,740 @@ fn collect_proposed_outputs(
         .collect()
 }
 
-fn apply_proposed_outputs(repo: &Path, outputs: &[ProposedOutput]) -> Result<(), String> {
-    for output in outputs {
-        let path = repo.join(&output.path);
-        match output.action {
-            RepositoryTreeAction::Delete => match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!("delete reviewed output {}: {error}", output.path));
-                }
-            },
-            RepositoryTreeAction::Create | RepositoryTreeAction::Update => {
-                let bytes = output
-                    .bytes
-                    .as_deref()
-                    .ok_or_else(|| format!("reviewed output {} has no content", output.path))?;
-                atomic_write(&path, bytes)?;
-                set_file_mode(&path, output.file_mode.as_deref())?;
+fn acquire_upgrade_lock(repo: &Path) -> Result<UpgradeLock, String> {
+    let common_dir = git_common_dir(repo)?;
+    let state_dir = common_dir.join("aethyme-upgrades");
+    ensure_private_directory(&state_dir)?;
+    let lock_path = state_dir.join("upgrade.lock");
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options
+        .open(&lock_path)
+        .map_err(|error| format!("open repository upgrade lock: {error}"))?;
+    set_private_file_mode(&lock_path)?;
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            return Err(
+                "another repository upgrade or recovery holds the exclusive upgrade lock".into(),
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        return Err("transactional repository upgrades require Unix file locking".into());
+    }
+    file.set_len(0)
+        .map_err(|error| format!("initialize repository upgrade lock: {error}"))?;
+    writeln!(file, "pid={}", std::process::id())
+        .map_err(|error| format!("initialize repository upgrade lock: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("sync repository upgrade lock: {error}"))?;
+    Ok(UpgradeLock { file })
+}
+
+fn git_common_dir(repo: &Path) -> Result<PathBuf, String> {
+    let path = PathBuf::from(git(repo, &["rev-parse", "--git-common-dir"])?);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        repo.join(path)
+    })
+}
+
+fn upgrade_state_dir(repo: &Path) -> Result<PathBuf, String> {
+    let canonical = repo
+        .canonicalize()
+        .map_err(|error| format!("resolve repository root: {error}"))?;
+    let worktree_key = sha256(&path_bytes(&canonical));
+    let directory = git_common_dir(repo)?
+        .join("aethyme-upgrades")
+        .join(worktree_key);
+    ensure_private_directory(&directory)?;
+    Ok(directory)
+}
+
+fn journal_path(repo: &Path, plan_digest: &str) -> Result<PathBuf, String> {
+    Ok(upgrade_state_dir(repo)?.join(format!("{plan_digest}.rollback.json")))
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), String> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || !metadata.is_dir())
+    {
+        return Err(format!(
+            "upgrade state path {} must be a directory",
+            path.display()
+        ));
+    }
+    std::fs::create_dir_all(path)
+        .map_err(|error| format!("create upgrade state directory {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("protect upgrade state directory: {error}"))?;
+    }
+    Ok(())
+}
+
+fn set_private_file_mode(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("protect upgrade state file {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn validate_plan_digest(plan_digest: &str) -> Result<(), String> {
+    if plan_digest.len() != 64 || !plan_digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("plan digest must be the full 64-character SHA-256".into());
+    }
+    Ok(())
+}
+
+fn sibling_transaction_path(
+    relative: &str,
+    plan_digest: &str,
+    index: usize,
+    suffix: &str,
+) -> Result<String, String> {
+    validate_relative_journal_path(relative)?;
+    let path = Path::new(relative);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("upgrade path {relative} has no valid file name"))?;
+    let name = format!(
+        ".{file_name}.aethyme-upgrade-{}-{index}.{suffix}",
+        &plan_digest[..12]
+    );
+    let sibling = path.parent().unwrap_or_else(|| Path::new("")).join(name);
+    sibling
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| "repository upgrade paths must be valid UTF-8".to_string())
+}
+
+fn backup_path(path: &Path) -> Result<Option<UpgradeBackup>, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "inspect rollback source {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "rollback source {} must be a regular non-symlink file",
+            path.display()
+        ));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("read rollback source {}: {error}", path.display()))?;
+    Ok(Some(UpgradeBackup {
+        sha256: sha256(&bytes),
+        file_mode: regular_file_mode(&metadata),
+        bytes,
+    }))
+}
+
+fn build_rollback_journal(
+    repo: &Path,
+    plan: &RepositoryUpgradePlan,
+    outputs: &[ProposedOutput],
+) -> Result<UpgradeRollbackJournal, String> {
+    let entries = outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            let before = backup_path(&repo.join(&output.path))?;
+            let planned_change = plan
+                .changes
+                .iter()
+                .find(|change| change.path == output.path)
+                .ok_or_else(|| format!("missing reviewed change {}", output.path))?;
+            let after_sha256 = output.bytes.as_deref().map(sha256);
+            if after_sha256 != planned_change.after_sha256
+                || output.action != planned_change.action
+                || output.file_mode != planned_change.file_mode
+            {
+                return Err(format!(
+                    "reviewed output {} does not match the authorized plan",
+                    output.path
+                ));
             }
-            RepositoryTreeAction::Unchanged => {}
+            let replacement_path = (output.action != RepositoryTreeAction::Delete)
+                .then(|| {
+                    sibling_transaction_path(&output.path, &plan.plan_digest, index, "replacement")
+                })
+                .transpose()?;
+            let tombstone_path = (output.action == RepositoryTreeAction::Delete)
+                .then(|| {
+                    sibling_transaction_path(&output.path, &plan.plan_digest, index, "removed")
+                })
+                .transpose()?;
+            for artifact in [&replacement_path, &tombstone_path].into_iter().flatten() {
+                match std::fs::symlink_metadata(repo.join(artifact)) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => {
+                        return Err(format!(
+                            "transaction artifact path {artifact} already exists; preserve or remove it before creating a fresh plan"
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(format!("inspect transaction artifact {artifact}: {error}"));
+                    }
+                }
+            }
+            Ok(UpgradeRollbackEntry {
+                path: output.path.clone(),
+                action: output.action,
+                before,
+                after_sha256,
+                after_mode: output.file_mode.clone(),
+                replacement_path,
+                tombstone_path,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(UpgradeRollbackJournal {
+        schema_version: TRANSACTION_SCHEMA_VERSION,
+        plan_digest: plan.plan_digest.clone(),
+        repository_head: plan.repository_head.clone(),
+        existing_managed_state_digest: plan.existing_managed_state_digest.clone(),
+        mode: plan.mode,
+        marker_path: plan.mode.marker_path().into(),
+        entries,
+    })
+}
+
+fn write_rollback_journal(path: &Path, journal: &UpgradeRollbackJournal) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "rollback journal already exists for plan {}; run `aethyme upgrade recover --plan {}`",
+                journal.plan_digest, journal.plan_digest
+            ));
+        }
+        Ok(_) => {
+            return Err(format!(
+                "rollback journal path {} must be a regular non-symlink file",
+                path.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("inspect rollback journal path: {error}")),
+    }
+    let mut bytes = serde_json::to_vec_pretty(journal).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    if bytes.len() > JOURNAL_MAX_BYTES {
+        return Err(format!(
+            "rollback journal would exceed the {} MiB safety limit; no repository files were replaced",
+            JOURNAL_MAX_BYTES / 1024 / 1024
+        ));
+    }
+    atomic_write_durable(path, &bytes, true)
+}
+
+fn prepare_replacement_files(
+    repo: &Path,
+    journal: &UpgradeRollbackJournal,
+    outputs: &[ProposedOutput],
+) -> Result<(), String> {
+    for entry in &journal.entries {
+        let Some(relative) = entry.replacement_path.as_deref() else {
+            continue;
+        };
+        let output = outputs
+            .iter()
+            .find(|output| output.path == entry.path)
+            .ok_or_else(|| format!("missing reviewed output {}", entry.path))?;
+        let bytes = output
+            .bytes
+            .as_deref()
+            .ok_or_else(|| format!("reviewed output {} has no content", entry.path))?;
+        let path = repo.join(relative);
+        write_new_file_durable(&path, bytes, entry.after_mode.as_deref())
+            .map_err(|error| format!("prepare replacement for {}: {error}", entry.path))?;
+    }
+    Ok(())
+}
+
+fn apply_transaction_entry(repo: &Path, entry: &UpgradeRollbackEntry) -> Result<(), String> {
+    let target = repo.join(&entry.path);
+    match entry.action {
+        RepositoryTreeAction::Create | RepositoryTreeAction::Update => {
+            let replacement = repo.join(
+                entry
+                    .replacement_path
+                    .as_deref()
+                    .ok_or_else(|| format!("missing replacement path for {}", entry.path))?,
+            );
+            std::fs::rename(&replacement, &target)
+                .map_err(|error| format!("atomically replace {}: {error}", entry.path))?;
+            sync_parent(&target)?;
+        }
+        RepositoryTreeAction::Delete => {
+            if target.exists() {
+                let tombstone = repo.join(
+                    entry
+                        .tombstone_path
+                        .as_deref()
+                        .ok_or_else(|| format!("missing tombstone path for {}", entry.path))?,
+                );
+                if tombstone.exists() {
+                    return Err(format!(
+                        "rollback tombstone already exists for {}",
+                        entry.path
+                    ));
+                }
+                std::fs::rename(&target, &tombstone)
+                    .map_err(|error| format!("atomically remove {}: {error}", entry.path))?;
+                sync_parent(&target)?;
+            }
+        }
+        RepositoryTreeAction::Unchanged => {}
+    }
+    Ok(())
+}
+
+fn verify_after_entry(repo: &Path, entry: &UpgradeRollbackEntry) -> Result<(), String> {
+    let actual = backup_path(&repo.join(&entry.path))?;
+    match entry.action {
+        RepositoryTreeAction::Delete if actual.is_none() => Ok(()),
+        RepositoryTreeAction::Delete => {
+            Err(format!("verify deletion {}: path still exists", entry.path))
+        }
+        RepositoryTreeAction::Create | RepositoryTreeAction::Update => {
+            let actual =
+                actual.ok_or_else(|| format!("verify output {}: path is missing", entry.path))?;
+            if Some(actual.sha256.as_str()) != entry.after_sha256.as_deref()
+                || Some(actual.file_mode.as_str()) != entry.after_mode.as_deref()
+            {
+                return Err(format!(
+                    "verify output {}: hash or mode differs from plan",
+                    entry.path
+                ));
+            }
+            Ok(())
+        }
+        RepositoryTreeAction::Unchanged => Ok(()),
+    }
+}
+
+fn cleanup_transaction_artifacts(
+    repo: &Path,
+    journal: &UpgradeRollbackJournal,
+) -> Result<(), String> {
+    for entry in &journal.entries {
+        for relative in [&entry.replacement_path, &entry.tombstone_path]
+            .into_iter()
+            .flatten()
+        {
+            let path = repo.join(relative);
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => remove_file_durable(&path)
+                    .map_err(|error| format!("remove transaction artifact {relative}: {error}"))?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("inspect transaction artifact: {error}")),
+            }
         }
     }
     Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn crash_if_requested(point: &str) {
+    if std::env::var("AETHYME_TEST_UPGRADE_CRASH").as_deref() == Ok(point) {
+        std::process::exit(CRASH_EXIT_CODE);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn crash_if_requested(_point: &str) {}
+
+fn execute_upgrade_transaction(
+    repo: &Path,
+    plan: &RepositoryUpgradePlan,
+    outputs: &[ProposedOutput],
+    customizations: &[RepositoryCustomization],
+) -> Result<(), String> {
+    let active_managed_state_digest = repository_state_digest(repo, plan.mode)?;
+    let journal = build_rollback_journal(repo, plan, outputs)?;
+    if repository_state_digest(repo, plan.mode)? != active_managed_state_digest {
+        return Err(
+            "managed repository state changed while the rollback journal was being prepared; no repository files were replaced"
+                .into(),
+        );
+    }
+    let journal_path = journal_path(repo, &plan.plan_digest)?;
+    write_rollback_journal(&journal_path, &journal)?;
+    crash_if_requested("after_journal");
+    let result: Result<(), String> = (|| {
+        prepare_replacement_files(repo, &journal, outputs)?;
+        crash_if_requested("after_replacements_prepared");
+        let mut replaced = 0;
+        for entry in journal
+            .entries
+            .iter()
+            .filter(|entry| entry.path != journal.marker_path)
+        {
+            verify_before_entry(repo, entry)?;
+            apply_transaction_entry(repo, entry)?;
+            replaced += 1;
+            if replaced == 1 {
+                crash_if_requested("after_first_replacement");
+            }
+        }
+        crash_if_requested("after_replacements");
+        for entry in journal
+            .entries
+            .iter()
+            .filter(|entry| entry.path != journal.marker_path)
+        {
+            verify_after_entry(repo, entry)?;
+        }
+        let marker = journal
+            .entries
+            .iter()
+            .find(|entry| entry.path == journal.marker_path)
+            .ok_or_else(|| {
+                "reviewed migration does not contain the repository marker".to_string()
+            })?;
+        verify_before_entry(repo, marker)?;
+        apply_transaction_entry(repo, marker)?;
+        crash_if_requested("after_marker");
+        for entry in &journal.entries {
+            verify_after_entry(repo, entry)?;
+        }
+        verify_deployment(repo, plan.mode, customizations)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        return Err(format!(
+            "{error}; rollback journal retained — run `aethyme upgrade recover --plan {}`",
+            plan.plan_digest
+        ));
+    }
+    cleanup_transaction_artifacts(repo, &journal).map_err(|error| {
+        format!(
+            "{error}; rollback journal retained — run `aethyme upgrade recover --plan {}`",
+            plan.plan_digest
+        )
+    })?;
+    remove_file_durable(&journal_path).map_err(|error| {
+        format!(
+            "{error}; verified migration completed but journal cleanup must be reconciled with `aethyme upgrade recover --plan {}`",
+            plan.plan_digest
+        )
+    })?;
+    Ok(())
+}
+
+fn read_rollback_journal(
+    repo: &Path,
+    plan_digest: &str,
+) -> Result<(PathBuf, UpgradeRollbackJournal), String> {
+    validate_plan_digest(plan_digest)?;
+    let path = journal_path(repo, plan_digest)?;
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+        format!(
+            "no rollback journal for plan {plan_digest}: {error}; an in-progress marker alone never authorizes retry"
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("rollback journal must be a regular non-symlink file".into());
+    }
+    if metadata.len() > JOURNAL_MAX_BYTES as u64 {
+        return Err("rollback journal exceeds the 64 MiB recovery limit".into());
+    }
+    let bytes = std::fs::read(&path).map_err(|error| format!("read rollback journal: {error}"))?;
+    let journal: UpgradeRollbackJournal = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid rollback journal: {error}"))?;
+    validate_rollback_journal(&journal, plan_digest)?;
+    Ok((path, journal))
+}
+
+fn validate_rollback_journal(
+    journal: &UpgradeRollbackJournal,
+    plan_digest: &str,
+) -> Result<(), String> {
+    if journal.schema_version != TRANSACTION_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported rollback journal schema {}; expected {TRANSACTION_SCHEMA_VERSION}",
+            journal.schema_version
+        ));
+    }
+    if journal.plan_digest != plan_digest {
+        return Err("rollback journal plan digest does not match --plan".into());
+    }
+    validate_sha256(
+        &journal.existing_managed_state_digest,
+        "journaled managed state",
+    )?;
+    if journal.marker_path != journal.mode.marker_path() {
+        return Err("rollback journal marker path does not match its repository mode".into());
+    }
+    let mut paths = BTreeSet::new();
+    if journal.entries.is_empty() {
+        return Err("rollback journal contains no repository changes".into());
+    }
+    for (index, entry) in journal.entries.iter().enumerate() {
+        validate_relative_journal_path(&entry.path)?;
+        if !paths.insert(entry.path.clone()) {
+            return Err(format!("rollback journal repeats path {}", entry.path));
+        }
+        if let Some(before) = &entry.before
+            && sha256(&before.bytes) != before.sha256
+        {
+            return Err(format!("rollback backup hash mismatch for {}", entry.path));
+        }
+        if let Some(before) = &entry.before {
+            validate_sha256(&before.sha256, "rollback backup")?;
+            validate_file_mode(&before.file_mode)?;
+        }
+        if let Some(after) = &entry.after_sha256 {
+            validate_sha256(after, "reviewed output")?;
+        }
+        if let Some(mode) = &entry.after_mode {
+            validate_file_mode(mode)?;
+        }
+        let expected_replacement = matches!(
+            entry.action,
+            RepositoryTreeAction::Create | RepositoryTreeAction::Update
+        )
+        .then(|| sibling_transaction_path(&entry.path, &journal.plan_digest, index, "replacement"))
+        .transpose()?;
+        let expected_tombstone = (entry.action == RepositoryTreeAction::Delete)
+            .then(|| sibling_transaction_path(&entry.path, &journal.plan_digest, index, "removed"))
+            .transpose()?;
+        if entry.replacement_path != expected_replacement
+            || entry.tombstone_path != expected_tombstone
+        {
+            return Err(format!(
+                "rollback journal transaction paths are invalid for {}",
+                entry.path
+            ));
+        }
+        match entry.action {
+            RepositoryTreeAction::Create | RepositoryTreeAction::Update
+                if entry.after_sha256.is_some() && entry.after_mode.is_some() => {}
+            RepositoryTreeAction::Delete if entry.after_sha256.is_none() => {}
+            RepositoryTreeAction::Unchanged => {
+                return Err(format!(
+                    "rollback journal contains unchanged path {}",
+                    entry.path
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "rollback journal action and output disagree for {}",
+                    entry.path
+                ));
+            }
+        }
+    }
+    let marker = journal
+        .entries
+        .iter()
+        .find(|entry| entry.path == journal.marker_path)
+        .ok_or("rollback journal does not contain the repository marker")?;
+    if !matches!(
+        marker.action,
+        RepositoryTreeAction::Create | RepositoryTreeAction::Update
+    ) {
+        return Err("rollback journal does not install the repository marker last".into());
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str, label: &str) -> Result<(), String> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("{label} contains an invalid SHA-256"));
+    }
+    Ok(())
+}
+
+fn validate_file_mode(mode: &str) -> Result<(), String> {
+    if matches!(mode, "100644" | "100755") {
+        Ok(())
+    } else {
+        Err(format!("rollback journal contains unsupported mode {mode}"))
+    }
+}
+
+fn verify_recovery_state_is_known(
+    repo: &Path,
+    journal: &UpgradeRollbackJournal,
+) -> Result<(), String> {
+    for entry in &journal.entries {
+        let actual = backup_path(&repo.join(&entry.path))?;
+        let known_target = match actual.as_ref() {
+            None => entry.before.is_none() || entry.action == RepositoryTreeAction::Delete,
+            Some(actual) => {
+                entry.before.as_ref().is_some_and(|before| {
+                    before.sha256 == actual.sha256 && before.file_mode == actual.file_mode
+                }) || (entry.after_sha256.as_deref() == Some(actual.sha256.as_str())
+                    && entry.after_mode.as_deref() == Some(actual.file_mode.as_str()))
+            }
+        };
+        if !known_target {
+            return Err(format!(
+                "recovery refused: {} changed after the interrupted upgrade; preserve that work and resolve it explicitly",
+                entry.path
+            ));
+        }
+        if let Some(relative) = &entry.replacement_path
+            && let Some(replacement) = backup_path(&repo.join(relative))?
+            && (entry.after_sha256.as_deref() != Some(replacement.sha256.as_str())
+                || entry.after_mode.as_deref() != Some(replacement.file_mode.as_str()))
+        {
+            return Err(format!(
+                "recovery replacement hash mismatch for {}",
+                entry.path
+            ));
+        }
+        if let Some(relative) = &entry.tombstone_path
+            && let Some(tombstone) = backup_path(&repo.join(relative))?
+            && !entry.before.as_ref().is_some_and(|before| {
+                before.sha256 == tombstone.sha256 && before.file_mode == tombstone.file_mode
+            })
+        {
+            return Err(format!(
+                "recovery tombstone hash mismatch for {}",
+                entry.path
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn restore_transaction_entry(
+    repo: &Path,
+    journal: &UpgradeRollbackJournal,
+    entry: &UpgradeRollbackEntry,
+    index: usize,
+) -> Result<(), String> {
+    let target = repo.join(&entry.path);
+    if let Some(before) = &entry.before {
+        let recovery_relative =
+            sibling_transaction_path(&entry.path, &journal.plan_digest, index, "recovery")?;
+        let recovery = repo.join(&recovery_relative);
+        match backup_path(&recovery)? {
+            None => write_new_file_durable(&recovery, &before.bytes, Some(&before.file_mode))?,
+            Some(existing)
+                if existing.sha256 == before.sha256 && existing.file_mode == before.file_mode => {}
+            Some(_) => {
+                return Err(format!(
+                    "recovery temporary file for {} is not the journaled before-state",
+                    entry.path
+                ));
+            }
+        }
+        std::fs::rename(&recovery, &target)
+            .map_err(|error| format!("restore {}: {error}", entry.path))?;
+        sync_parent(&target)?;
+    } else if target.exists() {
+        let removed_relative = entry
+            .replacement_path
+            .clone()
+            .unwrap_or(sibling_transaction_path(
+                &entry.path,
+                &journal.plan_digest,
+                index,
+                "recovery-removed",
+            )?);
+        let removed = repo.join(&removed_relative);
+        if removed.exists() {
+            return Err(format!(
+                "recovery cannot remove {} while its transaction temporary file also exists",
+                entry.path
+            ));
+        }
+        std::fs::rename(&target, &removed)
+            .map_err(|error| format!("remove created output {}: {error}", entry.path))?;
+        sync_parent(&target)?;
+        remove_file_durable(&removed)?;
+    }
+    Ok(())
+}
+
+fn verify_before_entry(repo: &Path, entry: &UpgradeRollbackEntry) -> Result<(), String> {
+    let actual = backup_path(&repo.join(&entry.path))?;
+    match (&entry.before, actual) {
+        (None, None) => Ok(()),
+        (Some(before), Some(actual))
+            if before.sha256 == actual.sha256 && before.file_mode == actual.file_mode =>
+        {
+            Ok(())
+        }
+        _ => Err(format!("recovery verification failed for {}", entry.path)),
+    }
+}
+
+fn recover(repo_hint: &Path, plan_digest: &str) -> Result<RepositoryUpgradeRecovery, String> {
+    validate_plan_digest(plan_digest)?;
+    let repo = git_root(repo_hint)?;
+    let _lock = acquire_upgrade_lock(&repo)?;
+    let (path, journal) = read_rollback_journal(&repo, plan_digest)?;
+    let current_head = git(&repo, &["rev-parse", "HEAD"])?;
+    if current_head != journal.repository_head {
+        return Err(format!(
+            "recovery refused: repository HEAD moved from {} to {current_head} after the interrupted upgrade",
+            journal.repository_head
+        ));
+    }
+    verify_recovery_state_is_known(&repo, &journal)?;
+    let mut ordered = journal
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.path != journal.marker_path)
+        .collect::<Vec<_>>();
+    ordered.extend(
+        journal
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.path == journal.marker_path),
+    );
+    let mut restored = 0;
+    for (index, entry) in ordered {
+        restore_transaction_entry(&repo, &journal, entry, index)?;
+        restored += 1;
+        if restored == 1 {
+            crash_if_requested("after_first_recovery_restore");
+        }
+    }
+    crash_if_requested("after_recovery_restores");
+    for entry in &journal.entries {
+        verify_before_entry(&repo, entry)?;
+    }
+    cleanup_transaction_artifacts(&repo, &journal)?;
+    crash_if_requested("after_recovery_cleanup");
+    remove_file_durable(&path)?;
+    let restored_paths = journal
+        .entries
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    Ok(RepositoryUpgradeRecovery {
+        schema_version: TRANSACTION_SCHEMA_VERSION,
+        plan_digest: plan_digest.into(),
+        recovered: true,
+        restored_paths,
+        next_action: "review the restored repository, then create and confirm a fresh upgrade plan"
+            .into(),
+    })
 }
 
 #[cfg(unix)]
@@ -1592,7 +2360,7 @@ fn build_plan(
     }
     resolution_choices.sort_by(|left, right| left.path.cmp(&right.path));
     let migration_diff = render_migration_diff(proposed_repo, &planned_paths)?;
-    let proposed_outputs = collect_proposed_outputs(proposed_repo, mode.marker_path(), &changes)?;
+    let proposed_outputs = collect_proposed_outputs(proposed_repo, &changes)?;
     let diff_sha256 = sha256(migration_diff.as_bytes());
     let dirty_paths = dirty_paths(&repo)?;
     let (overlapping_dirty_paths, disjoint_dirty_paths): (Vec<_>, Vec<_>) =
@@ -1722,15 +2490,36 @@ pub fn apply(
     apply_with_resolution_file(repo_hint, requested_mode, confirmation, None)
 }
 
+fn refuse_unjournaled_in_progress_marker(
+    repo: &Path,
+    requested_mode: Option<RepositoryMode>,
+) -> Result<(), String> {
+    let Some(mode) = requested_mode.or_else(|| detect_mode(repo)) else {
+        return Ok(());
+    };
+    if read_marker(repo, mode)?
+        .as_ref()
+        .is_some_and(marker_upgrade_is_in_progress)
+    {
+        return Err(format!(
+            "{} records an interrupted legacy upgrade; an in-progress marker never authorizes retry, and no rollback journal can be inferred — restore the repository from reviewed Git state before creating a new plan",
+            mode.marker_path()
+        ));
+    }
+    Ok(())
+}
+
 fn apply_with_resolution_file(
     repo_hint: &Path,
     requested_mode: Option<RepositoryMode>,
     confirmation: &str,
     resolution_file: Option<&Path>,
 ) -> Result<RepositoryUpgradePlan, String> {
-    if confirmation.len() != 64 || !confirmation.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("--confirm must be the full 64-character plan SHA-256".into());
-    }
+    validate_plan_digest(confirmation)
+        .map_err(|_| "--confirm must be the full 64-character plan SHA-256".to_string())?;
+    let repo = git_root(repo_hint)?;
+    let _lock = acquire_upgrade_lock(&repo)?;
+    refuse_unjournaled_in_progress_marker(&repo, requested_mode)?;
     let built = build_plan(repo_hint, requested_mode, resolution_file)?;
     let proposed_outputs = built.proposed_outputs;
     let mut before = built.report;
@@ -1750,12 +2539,8 @@ fn apply_with_resolution_file(
         return Ok(before);
     }
 
-    let repo = git_root(repo_hint)?;
     ensure_apply_worktree_safe(&repo, &before)?;
-    write_pending_marker(&repo, before.mode)?;
-    apply_proposed_outputs(&repo, &proposed_outputs)?;
-    write_current_marker(&repo, before.mode)?;
-    verify_deployment(&repo, before.mode, &before.customizations)?;
+    execute_upgrade_transaction(&repo, &before, &proposed_outputs, &before.customizations)?;
     before.applied = true;
     before.next_action = match before.mode {
         RepositoryMode::Canonical => {
@@ -2004,6 +2789,86 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn validate_relative_journal_path(relative: &str) -> Result<(), String> {
+    let path = Path::new(relative);
+    if relative.is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!(
+            "invalid repository-relative upgrade path {relative:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn sync_parent(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync directory {}: {error}", parent.display()))
+}
+
+fn atomic_write_durable(path: &Path, bytes: &[u8], private: bool) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("{}: {error}", temporary.display()))?;
+    if private {
+        set_private_file_mode(&temporary)?;
+    }
+    let result = (|| {
+        file.write_all(bytes)
+            .map_err(|error| format!("{}: {error}", temporary.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("{}: {error}", temporary.display()))?;
+        std::fs::rename(&temporary, path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        sync_parent(path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn write_new_file_durable(
+    path: &Path,
+    bytes: &[u8],
+    file_mode: Option<&str>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    set_file_mode(path, file_mode)?;
+    file.sync_all()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(())
+}
+
+fn remove_file_durable(path: &Path) -> Result<(), String> {
+    std::fs::remove_file(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    sync_parent(path)
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -2039,7 +2904,10 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     let action = args
         .first()
         .map(String::as_str)
-        .ok_or_else(|| "expected plan or apply".to_string())?;
+        .ok_or_else(|| "expected plan, apply, or recover".to_string())?;
+    if action == "recover" {
+        return run_recover(&args[1..]);
+    }
     let mut repo = PathBuf::from(".");
     let mut mode = None;
     let mut confirm = None;
@@ -2108,7 +2976,11 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 resolution_file.as_deref(),
             )?
         }
-        other => return Err(format!("unknown action {other}; expected plan or apply")),
+        other => {
+            return Err(format!(
+                "unknown action {other}; expected plan, apply, or recover"
+            ));
+        }
     };
     if json {
         println!(
@@ -2186,6 +3058,54 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_recover(args: &[String]) -> Result<(), String> {
+    let mut repo = PathBuf::from(".");
+    let mut plan_digest = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--repo" => {
+                repo = PathBuf::from(args.get(index + 1).ok_or("--repo requires a path")?);
+                index += 2;
+            }
+            "--plan" => {
+                plan_digest = Some(
+                    args.get(index + 1)
+                        .ok_or("--plan requires a digest")?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            option => return Err(format!("unknown recover option {option}")),
+        }
+    }
+
+    let recovery = recover(
+        &repo,
+        plan_digest
+            .as_deref()
+            .ok_or("recover requires --plan <plan-sha256>")?,
+    )?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&recovery).map_err(|error| error.to_string())?
+        );
+    } else {
+        println!("Recovered plan: {}", recovery.plan_digest);
+        for path in &recovery.restored_paths {
+            println!("  restored: {path}");
+        }
+        println!("Next: {}", recovery.next_action);
+    }
+    Ok(())
+}
+
 fn print_usage() {
     println!("Usage:");
     println!(
@@ -2194,6 +3114,7 @@ fn print_usage() {
     println!(
         "  aethyme upgrade apply [--repo <path>] [--local-only] [--resolution-file <path>] --confirm <plan-sha256> [--json]"
     );
+    println!("  aethyme upgrade recover [--repo <path>] --plan <plan-sha256> [--json]");
 }
 
 #[cfg(test)]
@@ -2201,8 +3122,30 @@ mod compatibility_tests {
     use super::{
         CommandCapability, CompatibilityContext, CompatibilityExecution, CompatibilitySeverity,
         InvocationSurface, MIGRATION_ID, MIGRATION_IN_PROGRESS, REPOSITORY_SCHEMA_VERSION,
-        RepositoryCompatibility, RepositoryMarker, classify_marker, decide_compatibility,
+        RepositoryCompatibility, RepositoryMarker, acquire_upgrade_lock, classify_marker,
+        decide_compatibility,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_upgrade_lock_is_exclusive_and_reusable() {
+        let temp = tempfile::tempdir().unwrap();
+        let initialized = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(temp.path())
+            .output()
+            .unwrap();
+        assert!(initialized.status.success());
+
+        let first = acquire_upgrade_lock(temp.path()).unwrap();
+        let second = acquire_upgrade_lock(temp.path());
+        assert!(
+            matches!(second, Err(error) if error.contains("exclusive upgrade lock")),
+            "a second upgrade unexpectedly acquired the repository lock"
+        );
+        drop(first);
+        assert!(acquire_upgrade_lock(temp.path()).is_ok());
+    }
 
     fn schema(repository: RepositoryCompatibility) -> Option<u32> {
         match repository {

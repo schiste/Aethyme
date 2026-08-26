@@ -90,6 +90,7 @@ Primary commands:
 - `aethyme upgrade plan --repo /path/to/repo --diff` (local content review)
 - `aethyme upgrade plan --repo /path/to/repo --json` (content-free automation)
 - `aethyme upgrade apply --repo /path/to/repo --confirm <plan-sha256>`
+- `aethyme upgrade recover --repo /path/to/repo --plan <plan-sha256>`
 - `aethyme explore --repo /path/to/repo --request "<task>" --format answer-json`
   (native Rust entrypoint; the paired `aethyme-engine-cli` binary serves the
   daemon protocol and is installed from the same release archive)
@@ -153,7 +154,7 @@ Runtime notes:
 - Git repositories use commit plus dirty-state metadata for cache keys instead of a full recursive fingerprint on every call
 - `aethyme deploy --repo <path>` is the canonical mandatory repository-enrollment path; it composes broker scaffold, gate drafting, agent-policy deployment, verification, and certification
 - `aethyme deploy verify --repo <path>` is its read-only local and CI contract; `aethyme enhance deploy/verify` remain lower-level discoverability operations
-- binary installation and repository migration are separate: after updating the paired binaries, `aethyme upgrade plan` reviews embedded repository-policy migrations one repository at a time, and `upgrade apply` requires the plan digest before changing files
+- binary installation and repository migration are separate: after updating the paired binaries, `aethyme upgrade plan` reviews embedded repository-policy migrations one repository at a time, `upgrade apply` requires the plan digest and uses a rollback journal, and an interrupted transaction is restored explicitly with `upgrade recover --plan <digest>`
 - canonical deployments track `.aethyme/repository.json`; local-only deployments keep the equivalent marker ignored, and enrolled repositories fail closed on broker use when their policy schema is stale or newer than the installed binary
 - `aethyme deploy bridge` installs a small committed AGENTS/CLAUDE rendezvous point; `deploy --local-only` keeps the full policy, skills, broker configuration, gates, and state clone-local behind `.aethyme/local/enabled`
 - an inactive bridge performs no PATH probe, process spawn, installation, warning, or hook work; a fresh clone remains inactive until its developer opts in

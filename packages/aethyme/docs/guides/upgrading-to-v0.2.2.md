@@ -138,9 +138,9 @@ rollback.
   run only when explicitly requested.
 - Repository upgrades are intentionally one repository at a time; Aethyme
   does not maintain or scan a machine-wide repository registry.
-- An interrupted repository migration remains visibly in progress. Inspect
-  and restore or commit the intended Git state, then generate a fresh plan;
-  never bypass the marker.
+- An interrupted repository migration requires the matching rollback journal
+  and explicit `aethyme upgrade recover --plan <plan-sha256>`. Recovery rolls
+  back; it never retries. An in-progress marker alone is not authority.
 - Host-resource fallback allocation belongs to the consuming repository.
   Aethyme refuses broker-managed allocation failures rather than falling back
   to a fixed port or shared Docker name.

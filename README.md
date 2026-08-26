@@ -123,9 +123,14 @@ repository migrations separately in every enrolled repository:
 cd /path/to/your-repo
 aethyme upgrade plan
 aethyme upgrade apply --confirm <plan-sha256> # only when the plan requires it
+# after an interrupted apply only:
+aethyme upgrade recover --plan <plan-sha256>
 ```
 
 The binary updater never scans for repositories or rewrites them implicitly.
+Repository application is journaled, writes the schema marker last, and uses
+explicit rollback recovery rather than treating an in-progress marker as
+permission to retry.
 See the [repository upgrade contract](packages/aethyme/docs/guides/repository-upgrades.md)
 for canonical, local-only, interruption, and rollback behavior.
 

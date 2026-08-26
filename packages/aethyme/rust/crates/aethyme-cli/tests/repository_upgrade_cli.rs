@@ -1255,6 +1255,289 @@ fn local_only_upgrade_stays_untracked_and_does_not_follow_the_clone() {
     assert_eq!(git_status(&repo), "");
 }
 
+#[cfg(unix)]
+#[test]
+fn interrupted_upgrades_recover_every_transaction_boundary() {
+    for crash_point in [
+        "after_journal",
+        "after_first_replacement",
+        "after_replacements",
+        "after_marker",
+    ] {
+        let temp = tmp_dir();
+        let repo = repository(temp.path());
+        old_canonical_deployment(&repo);
+        let plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
+        let digest = plan["plan_digest"].as_str().unwrap();
+
+        let crashed = command(&repo)
+            .env("AETHYME_TEST_UPGRADE_CRASH", crash_point)
+            .args(["upgrade", "apply", "--confirm", digest, "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            crashed.status.code(),
+            Some(86),
+            "crash seam {crash_point} did not terminate at the requested boundary: {}",
+            String::from_utf8_lossy(&crashed.stderr)
+        );
+
+        let recovered = json(&run(
+            &repo,
+            &["upgrade", "recover", "--plan", digest, "--json"],
+        ));
+        assert_eq!(recovered["schema_version"], 1);
+        assert_eq!(recovered["plan_digest"], digest);
+        assert_eq!(recovered["recovered"], true);
+        assert!(!recovered["restored_paths"].as_array().unwrap().is_empty());
+        assert_eq!(git_status(&repo), "", "failed after {crash_point}");
+
+        let replanned = json(&run(&repo, &["upgrade", "plan", "--json"]));
+        assert_eq!(replanned["plan_digest"], plan["plan_digest"]);
+        assert_eq!(replanned["safe"], plan["safe"]);
+        assert_eq!(replanned["planned_paths"], plan["planned_paths"]);
+        assert_eq!(replanned["changes"], plan["changes"]);
+
+        let repeated = run(&repo, &["upgrade", "recover", "--plan", digest, "--json"]);
+        assert!(!repeated.status.success());
+        assert!(
+            String::from_utf8_lossy(&repeated.stderr)
+                .contains("an in-progress marker alone never authorizes retry")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_refuses_unknown_worktree_edits_after_a_crash() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    let plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
+    let digest = plan["plan_digest"].as_str().unwrap();
+
+    let crashed = command(&repo)
+        .env("AETHYME_TEST_UPGRADE_CRASH", "after_replacements")
+        .args(["upgrade", "apply", "--confirm", digest])
+        .output()
+        .unwrap();
+    assert_eq!(crashed.status.code(), Some(86));
+    fs::write(
+        repo.join("AGENTS.md"),
+        "edited after the interrupted upgrade\n",
+    )
+    .unwrap();
+
+    let recovery = run(&repo, &["upgrade", "recover", "--plan", digest]);
+    assert!(!recovery.status.success());
+    assert!(
+        String::from_utf8_lossy(&recovery.stderr)
+            .contains("AGENTS.md changed after the interrupted upgrade")
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("AGENTS.md")).unwrap(),
+        "edited after the interrupted upgrade\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_recovery_resumes_the_same_rollback() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    let plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
+    let digest = plan["plan_digest"].as_str().unwrap();
+
+    let apply = command(&repo)
+        .env("AETHYME_TEST_UPGRADE_CRASH", "after_marker")
+        .args(["upgrade", "apply", "--confirm", digest])
+        .output()
+        .unwrap();
+    assert_eq!(apply.status.code(), Some(86));
+    let recovery = command(&repo)
+        .env("AETHYME_TEST_UPGRADE_CRASH", "after_first_recovery_restore")
+        .args(["upgrade", "recover", "--plan", digest])
+        .output()
+        .unwrap();
+    assert_eq!(recovery.status.code(), Some(86));
+
+    let resumed = json(&run(
+        &repo,
+        &["upgrade", "recover", "--plan", digest, "--json"],
+    ));
+    assert_eq!(resumed["recovered"], true);
+    assert_eq!(git_status(&repo), "");
+    assert_eq!(
+        json(&run(&repo, &["upgrade", "plan", "--json"]))["plan_digest"],
+        plan["plan_digest"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_refuses_repository_head_movement_after_a_crash() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    let plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
+    let digest = plan["plan_digest"].as_str().unwrap();
+    let crashed = command(&repo)
+        .env("AETHYME_TEST_UPGRADE_CRASH", "after_journal")
+        .args(["upgrade", "apply", "--confirm", digest])
+        .output()
+        .unwrap();
+    assert_eq!(crashed.status.code(), Some(86));
+
+    fs::write(repo.join("later.txt"), "committed after interruption\n").unwrap();
+    git(&repo, &["add", "later.txt"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Aethyme Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--no-verify",
+            "-m",
+            "record later work",
+        ],
+    );
+
+    let recovery = run(&repo, &["upgrade", "recover", "--plan", digest]);
+    assert!(!recovery.status.success());
+    assert!(String::from_utf8_lossy(&recovery.stderr).contains("HEAD moved"));
+    assert_eq!(
+        fs::read_to_string(repo.join("later.txt")).unwrap(),
+        "committed after interruption\n"
+    );
+}
+
+#[test]
+fn an_unjournaled_in_progress_marker_never_authorizes_retry() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    let plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
+    let digest = plan["plan_digest"].as_str().unwrap();
+    fs::write(
+        repo.join(".aethyme/repository.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 0,
+            "applied_migrations": ["repository-deployment-v1:in-progress"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let apply = run(&repo, &["upgrade", "apply", "--confirm", digest]);
+    assert!(!apply.status.success());
+    assert!(
+        String::from_utf8_lossy(&apply.stderr)
+            .contains("an in-progress marker never authorizes retry")
+    );
+
+    let recover = run(&repo, &["upgrade", "recover", "--plan", digest]);
+    assert!(!recover.status.success());
+    assert!(
+        String::from_utf8_lossy(&recover.stderr)
+            .contains("an in-progress marker alone never authorizes retry")
+    );
+}
+
+#[test]
+fn apply_revalidates_head_dirty_state_and_live_sessions_before_journaling() {
+    let head_temp = tmp_dir();
+    let head_repo = repository(head_temp.path());
+    old_canonical_deployment(&head_repo);
+    let head_plan = json(&run(&head_repo, &["upgrade", "plan", "--json"]));
+    let head_digest = head_plan["plan_digest"].as_str().unwrap();
+    fs::write(head_repo.join("later.txt"), "committed after review\n").unwrap();
+    commit_all(&head_repo, "move head after upgrade review");
+    let moved = run(&head_repo, &["upgrade", "apply", "--confirm", head_digest]);
+    assert!(!moved.status.success());
+    assert!(String::from_utf8_lossy(&moved.stderr).contains("changed after review"));
+    assert!(!head_repo.join(".aethyme/repository.json").exists());
+
+    let dirty_temp = tmp_dir();
+    let dirty_repo = repository(dirty_temp.path());
+    old_canonical_deployment(&dirty_repo);
+    let dirty_plan = json(&run(&dirty_repo, &["upgrade", "plan", "--json"]));
+    let dirty_digest = dirty_plan["plan_digest"].as_str().unwrap();
+    fs::write(dirty_repo.join("notes.txt"), "disjoint but added later\n").unwrap();
+    let dirtied = run(
+        &dirty_repo,
+        &["upgrade", "apply", "--confirm", dirty_digest],
+    );
+    assert!(!dirtied.status.success());
+    assert!(String::from_utf8_lossy(&dirtied.stderr).contains("changed after review"));
+    assert_eq!(
+        fs::read_to_string(dirty_repo.join("notes.txt")).unwrap(),
+        "disjoint but added later\n"
+    );
+
+    let session_temp = tmp_dir();
+    let session_repo = repository(session_temp.path());
+    old_canonical_deployment(&session_repo);
+    let session_plan = json(&run(&session_repo, &["upgrade", "plan", "--json"]));
+    let session_digest = session_plan["plan_digest"].as_str().unwrap();
+    let _session = adopt_legacy_session(&session_repo);
+    let active = run(
+        &session_repo,
+        &["upgrade", "apply", "--confirm", session_digest],
+    );
+    assert!(!active.status.success());
+    assert!(String::from_utf8_lossy(&active.stderr).contains("sessions are active"));
+    assert!(!session_repo.join(".aethyme/repository.json").exists());
+}
+
+#[test]
+fn reviewed_migration_diff_exactly_matches_the_applied_tree() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    let planned = run(&repo, &["upgrade", "plan", "--diff"]);
+    assert!(planned.status.success());
+    let planned_text = String::from_utf8(planned.stdout).unwrap();
+    let expected_diff = planned_text
+        .split_once("Migration diff:\n")
+        .expect("text plan must delimit its migration diff")
+        .1;
+    let plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
+    let digest = plan["plan_digest"].as_str().unwrap();
+    assert!(
+        run(&repo, &["upgrade", "apply", "--confirm", digest])
+            .status
+            .success()
+    );
+
+    let paths = plan["planned_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|path| path.as_str().unwrap())
+        .collect::<Vec<_>>();
+    let mut add_args = vec!["add", "-f", "--"];
+    add_args.extend(paths.iter().copied());
+    git(&repo, &add_args);
+    let mut diff_args = vec![
+        "diff",
+        "--cached",
+        "--binary",
+        "--full-index",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "HEAD",
+        "--",
+    ];
+    diff_args.extend(paths.iter().copied());
+    let actual_diff = String::from_utf8(git(&repo, &diff_args).stdout).unwrap();
+    assert_eq!(actual_diff, expected_diff);
+}
+
 fn git_status(repo: &Path) -> String {
     let output = Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=all"])

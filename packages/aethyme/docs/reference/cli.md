@@ -158,6 +158,7 @@ an update check.
 ```text
 aethyme upgrade plan [--repo <path>] [--local-only] [--resolution-file <path>] [--diff|--json]
 aethyme upgrade apply [--repo <path>] [--local-only] [--resolution-file <path>] --confirm <plan-sha256> [--json]
+aethyme upgrade recover [--repo <path>] --plan <plan-sha256> [--json]
 ```
 
 Binary updates and repository migrations are intentionally separate. Run
@@ -173,6 +174,13 @@ session during shared policy or gate migration. Disjoint dirty paths may remain
 because they are excluded from proposal inputs and `apply` writes only the
 exact reviewed outputs. Diff bodies and dirty file contents never enter broker
 reports, events, metrics, or command telemetry.
+
+`apply` runs under an exclusive upgrade lock, durably journals recoverable
+before-bytes, installs sibling temporary files with atomic renames, verifies
+every reviewed hash, and writes the repository marker last. If the process is
+interrupted, `recover --plan <plan-sha256>` rolls that journal back; it never
+infers a retry from an in-progress marker. Recovery refuses unknown edits made
+after the interruption.
 
 When the plan classifies `AGENTS.md`, `CLAUDE.md`, or `.aethyme/gates.toml`
 as customized, `--resolution-file` accepts a schema-1 JSON object mapping each

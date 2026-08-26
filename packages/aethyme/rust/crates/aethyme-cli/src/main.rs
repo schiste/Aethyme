@@ -387,7 +387,7 @@ fn print_top_level_help() {
     eprintln!("  broker operations          inspect/reconcile the remote-operation journal");
     eprintln!("  broker adopt|start-agent|agents|cleanup   (see `broker --help`)");
     eprintln!("  update check|plan|execute  explicit paired-binary updates; never background");
-    eprintln!("  upgrade plan|apply         review and apply embedded repository migrations");
+    eprintln!("  upgrade plan|apply|recover review, apply, or recover repository migrations");
     eprintln!();
     eprintln!("Setup:");
     eprintln!("  deploy [verify|bridge] [--repo <path>]  enroll repository policy");

@@ -95,12 +95,28 @@ aethyme deploy verify --repo .
 
 `apply` refuses a shortened digest, overlapping dirty paths, changed session or
 lease preconditions, or any source state that differs from the reviewed plan.
-It writes only the exact reviewed output paths, verifies the resulting
-deployment, and only then records the current repository schema. During
-convergence the marker records an in-progress schema, so an interrupted process
-cannot make an old or partial deployment appear current. If an upgrade is
-interrupted, do not hand-edit the marker: inspect the diff, restore or commit
-the intended state, obtain a fresh plan, and reapply.
+It takes an exclusive repository-upgrade lock and revalidates HEAD, managed
+state, resolutions, sessions, leases, and dirty overlap. Before changing a
+repository file it durably records that file's hash, mode, and recoverable bytes
+in a private rollback journal under the Git common directory. Replacements are
+written and synchronized as sibling temporary files, installed with atomic
+renames, and verified against the reviewed hashes. The repository marker is
+installed last. Only successful deployment verification permits transaction
+artifact and journal removal.
+
+If `apply` is interrupted, copy the plan digest from the reviewed plan or error
+and roll the transaction back explicitly:
+
+```bash
+aethyme upgrade recover --plan <plan-sha256>
+```
+
+Recovery takes the same lock, refuses repository files that changed to an
+unknown state after the interruption, restores the journaled bytes and modes,
+and removes the journal only after verification. It never continues or retries
+the migration. An in-progress marker without the matching rollback journal is
+not recovery authority; do not hand-edit it or rerun `apply`. After recovery,
+review the restored repository and create a fresh plan.
 
 ## Canonical deployment
 
