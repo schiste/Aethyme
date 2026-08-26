@@ -212,7 +212,8 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker exec --session <id> -- <command> [--json]`
 - `aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <git-args>`
 - `aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <gh-args>`
-- `aethyme broker operations [--json]`
+- `aethyme broker operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]`
+- `aethyme broker operations [same options]` (compatibility alias during deprecation)
 - `aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]`
 - `aethyme broker resources plan <request.json> [--json]`
 - `aethyme broker resources acquire <request.json> [--json]`
@@ -250,6 +251,24 @@ lease planning, and durable finish handoffs, see the
 `quick-test` is the disposable install smoke. `verify-loop` is the stronger
 operator E2E: it reports the integration commit tested and flags movement during
 the run, so callers know whether the result proves the current integration tip.
+
+`broker operations list` reads the durable operation journal newest-first. The
+default page size is 50 and `--limit` accepts 1 through 500. Filters combine
+with AND semantics; `--repo` matches the persisted canonical coordination ID
+exactly. JSON is a stable page object:
+
+```json
+{
+  "operations": [],
+  "next_before_id": null
+}
+```
+
+When `next_before_id` is non-null, pass it unchanged as `--before`; the cursor
+is exclusive, so adjacent pages do not duplicate the boundary row. A null
+cursor proves that no older matching row remains. The bare `broker operations`
+spelling is retained as an alias for `broker operations list` during its
+deprecation window.
 
 `broker gates pre-push` is an opt-in adapter for repository-owned hooks; the
 managed hook installer never writes `pre-push`. It reads Git's ref-update lines

@@ -167,10 +167,11 @@ pub use ship::{
 };
 pub use store::BrokerStore;
 pub use types::{
-    CoordinatedOperation, Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease,
-    LeaseKind, MergeQueueEntry, MergeStatus, NewCoordinatedOperation, NewGateResult,
-    NewPrWatchState, NewSession, OperationEffect, OperationIdentityProvenance, OperationProvider,
-    OperationStatus, PrWatchState, Session, SessionOrigin, SessionStatus,
+    CoordinatedOperation, DEFAULT_OPERATION_HISTORY_LIMIT, Event, GateDef, GateFailureClass,
+    GateResult, GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT, MergeQueueEntry,
+    MergeStatus, NewCoordinatedOperation, NewGateResult, NewPrWatchState, NewSession,
+    OperationEffect, OperationHistoryPage, OperationHistoryQuery, OperationIdentityProvenance,
+    OperationProvider, OperationStatus, PrWatchState, Session, SessionOrigin, SessionStatus,
 };
 pub use update::{
     INSTALL_RECEIPT_FILENAME, INSTALL_RECEIPT_SCHEMA_VERSION, InstallReceipt, InstallationMethod,

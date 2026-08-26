@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -355,6 +355,21 @@ ALTER TABLE gate_results ADD COLUMN first_output_ms INTEGER;
 ALTER TABLE gate_results ADD COLUMN output_bytes INTEGER;
 ";
 
+const MIGRATION_V15: &str = "
+-- Operation history is paged newest-first. Each optional selector gets an
+-- id-suffixed index so SQLite can filter and walk the page in cursor order.
+CREATE INDEX coordinated_operations_history_by_id
+    ON coordinated_operations (id DESC);
+CREATE INDEX coordinated_operations_history_by_session
+    ON coordinated_operations (session_id, id DESC);
+CREATE INDEX coordinated_operations_history_by_status
+    ON coordinated_operations (status, id DESC);
+CREATE INDEX coordinated_operations_history_by_repository
+    ON coordinated_operations (repository, id DESC);
+CREATE INDEX coordinated_operations_history_by_provider
+    ON coordinated_operations (provider, id DESC);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -370,6 +385,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V12,
     MIGRATION_V13,
     MIGRATION_V14,
+    MIGRATION_V15,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -437,6 +453,30 @@ pub fn migrate(conn: &Connection) -> Result<(), BrokerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v15_adds_newest_first_operation_history_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let mut statement = conn
+            .prepare("PRAGMA index_list('coordinated_operations')")
+            .unwrap();
+        let indexes = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for expected in [
+            "coordinated_operations_history_by_id",
+            "coordinated_operations_history_by_session",
+            "coordinated_operations_history_by_status",
+            "coordinated_operations_history_by_repository",
+            "coordinated_operations_history_by_provider",
+        ] {
+            assert!(indexes.iter().any(|index| index == expected), "{expected}");
+        }
+        assert_eq!(current_version(&conn).unwrap(), 15);
+    }
 
     #[test]
     fn v9_preserves_the_original_baseline_for_live_pre_contract_sessions() {

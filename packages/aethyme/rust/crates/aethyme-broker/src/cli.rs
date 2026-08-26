@@ -142,8 +142,9 @@ Usage:
       Run GitHub CLI through the same repository coordinator. The broker sets
       GH_REPO from the exact target and never persists command output or
       secret-bearing argument values.
-  aethyme broker operations [--json]
-      List the durable coordinated-operation journal.
+  aethyme broker operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]
+      List a filtered newest-first page of the durable operation journal.
+      `operations` without `list` is a compatibility alias during deprecation.
   aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]
       Resolve a crash-ambiguous operation after independently inspecting the
       remote state. Overlapping writes remain blocked until reconciliation.
@@ -882,6 +883,10 @@ struct Parsed {
     entry: Option<i64>,
     confirm: Option<String>,
     operation: Option<i64>,
+    before: Option<i64>,
+    limit: Option<u32>,
+    status: Option<String>,
+    provider: Option<String>,
     ttl_seconds: Option<i64>,
     since: Option<i64>,
     kind: Option<String>,
@@ -933,6 +938,10 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         entry: None,
         confirm: None,
         operation: None,
+        before: None,
+        limit: None,
+        status: None,
+        provider: None,
         ttl_seconds: None,
         since: None,
         kind: None,
@@ -980,6 +989,22 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                     .ok_or(UsageError::Message("--since requires a value".into()))?;
                 parsed.since = Some(value.parse().map_err(|_| {
                     UsageError::Message("--since must be an integer event id".into())
+                })?);
+            }
+            "--before" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--before requires a value".into()))?;
+                parsed.before = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--before must be an integer operation id".into())
+                })?);
+            }
+            "--limit" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--limit requires a value".into()))?;
+                parsed.limit = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--limit must be a positive integer".into())
                 })?);
             }
             "--force" => parsed.force = true,
@@ -1113,6 +1138,20 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 parsed.outcome = Some(
                     iter.next()
                         .ok_or(UsageError::Message("--outcome requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--status" => {
+                parsed.status = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--status requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--provider" => {
+                parsed.provider = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--provider requires a value".into()))?
                         .clone(),
                 )
             }
@@ -2203,6 +2242,50 @@ fn parse_operation_effect(
         .transpose()
 }
 
+fn operation_history_query(parsed: &Parsed) -> Result<crate::OperationHistoryQuery, UsageError> {
+    let limit = parsed
+        .limit
+        .unwrap_or(crate::DEFAULT_OPERATION_HISTORY_LIMIT);
+    if limit == 0 || limit > crate::MAX_OPERATION_HISTORY_LIMIT {
+        return Err(UsageError::Message(format!(
+            "--limit must be between 1 and {}",
+            crate::MAX_OPERATION_HISTORY_LIMIT
+        )));
+    }
+    if parsed.before.is_some_and(|id| id <= 0) {
+        return Err(UsageError::Message(
+            "--before must be a positive operation id".into(),
+        ));
+    }
+    let status = parsed
+        .status
+        .as_deref()
+        .map(|value| {
+            crate::OperationStatus::parse(value).map_err(|_| {
+                UsageError::Message(
+                    "--status must be prepared, running, succeeded, failed, outcome_unknown, reconciled_succeeded, or reconciled_failed".into(),
+                )
+            })
+        })
+        .transpose()?;
+    let provider = parsed
+        .provider
+        .as_deref()
+        .map(|value| {
+            crate::OperationProvider::parse(value)
+                .map_err(|_| UsageError::Message("--provider must be git or github".into()))
+        })
+        .transpose()?;
+    Ok(crate::OperationHistoryQuery {
+        limit,
+        before_id: parsed.before,
+        session_id: parsed.session,
+        status,
+        repository: parsed.repository.clone(),
+        provider,
+    })
+}
+
 fn render_coordinated_operation(
     report: &crate::CoordinatedOperationReport,
     json: bool,
@@ -3005,26 +3088,35 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         "operations" => {
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             match parsed.positional.first().map(String::as_str) {
-                None => {
-                    let operations = broker.store().coordinated_operations()?;
+                None | Some("list") => {
+                    if parsed.positional.len() > 1 {
+                        return Err(UsageError::Message(
+                            "operations list does not accept positional arguments".into(),
+                        ));
+                    }
+                    let query = operation_history_query(&parsed)?;
+                    let page = broker.store().operation_history(&query)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&operations)?);
-                    } else if operations.is_empty() {
+                        println!("{}", serde_json::to_string_pretty(&page)?);
+                    } else if page.operations.is_empty() {
                         println!("No coordinated operations recorded.");
                     } else {
                         println!(
-                            "{:<5} {:<8} {:<12} {:<22} SCOPE",
+                            "{:<5} {:<8} {:<21} {:<22} SCOPE",
                             "ID", "TOOL", "STATUS", "REPOSITORY"
                         );
-                        for operation in operations {
+                        for operation in page.operations {
                             println!(
-                                "{:<5} {:<8} {:<12} {:<22} {}",
+                                "{:<5} {:<8} {:<21} {:<22} {}",
                                 operation.id,
                                 operation.provider.as_str(),
                                 operation.status.as_str(),
                                 operation.repository,
                                 operation.scope,
                             );
+                        }
+                        if let Some(before_id) = page.next_before_id {
+                            println!("More operations: pass --before {before_id}.");
                         }
                     }
                 }
@@ -3064,7 +3156,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
                 Some(other) => {
                     return Err(UsageError::Message(format!(
-                        "unknown operations action {other:?} — expected reconcile"
+                        "unknown operations action {other:?} — expected list or reconcile"
                     )));
                 }
             }

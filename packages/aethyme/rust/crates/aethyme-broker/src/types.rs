@@ -158,6 +158,41 @@ pub struct CoordinatedOperation {
     pub identity_provenance: OperationIdentityProvenance,
 }
 
+pub const DEFAULT_OPERATION_HISTORY_LIMIT: u32 = 50;
+pub const MAX_OPERATION_HISTORY_LIMIT: u32 = 500;
+
+/// Stable newest-first query contract for the coordinated-operation journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationHistoryQuery {
+    pub limit: u32,
+    /// Exclusive operation-id cursor. Only rows with smaller ids are returned.
+    pub before_id: Option<i64>,
+    pub session_id: Option<i64>,
+    pub status: Option<OperationStatus>,
+    pub repository: Option<String>,
+    pub provider: Option<OperationProvider>,
+}
+
+impl Default for OperationHistoryQuery {
+    fn default() -> Self {
+        Self {
+            limit: DEFAULT_OPERATION_HISTORY_LIMIT,
+            before_id: None,
+            session_id: None,
+            status: None,
+            repository: None,
+            provider: None,
+        }
+    }
+}
+
+/// One stable cursor page from the coordinated-operation journal.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OperationHistoryPage {
+    pub operations: Vec<CoordinatedOperation>,
+    pub next_before_id: Option<i64>,
+}
+
 /// Input for registering a session. Attach-first: only the worktree and
 /// branch are identity; everything else is optional metadata.
 #[derive(Debug, Clone)]

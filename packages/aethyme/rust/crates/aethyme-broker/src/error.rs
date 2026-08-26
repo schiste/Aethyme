@@ -37,6 +37,9 @@ pub enum BrokerError {
     #[error("no coordinated operation with id {0}")]
     CoordinatedOperationNotFound(i64),
 
+    #[error("operation history --limit must be between 1 and {maximum}, got {limit}")]
+    InvalidOperationHistoryLimit { limit: u32, maximum: u32 },
+
     #[error("a session already exists for worktree {0}")]
     WorktreeAlreadyRegistered(String),
 

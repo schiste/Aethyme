@@ -16,9 +16,10 @@ use crate::error::BrokerError;
 use crate::schema::{self, EVENTS_SCHEMA_VERSION};
 use crate::types::{
     CoordinatedOperation, Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease,
-    LeaseKind, MergeQueueEntry, MergeStatus, NewCoordinatedOperation, NewGateResult,
-    NewPrWatchState, NewSession, OperationEffect, OperationIdentityProvenance, OperationProvider,
-    OperationStatus, PrWatchState, Session, SessionOrigin, SessionStatus,
+    LeaseKind, MAX_OPERATION_HISTORY_LIMIT, MergeQueueEntry, MergeStatus, NewCoordinatedOperation,
+    NewGateResult, NewPrWatchState, NewSession, OperationEffect, OperationHistoryPage,
+    OperationHistoryQuery, OperationIdentityProvenance, OperationProvider, OperationStatus,
+    PrWatchState, Session, SessionOrigin, SessionStatus,
 };
 
 /// Milliseconds a writer waits on a locked database before erroring.
@@ -1392,6 +1393,79 @@ impl BrokerStore {
         Ok(operations)
     }
 
+    /// Query one stable newest-first page of coordinated-operation history.
+    ///
+    /// Every value is bound, while the SQL shape contains only broker-owned
+    /// column predicates. `before_id` is exclusive so a caller can pass
+    /// `next_before_id` directly without duplicates.
+    pub fn operation_history(
+        &self,
+        query: &OperationHistoryQuery,
+    ) -> Result<OperationHistoryPage, BrokerError> {
+        if query.limit == 0 || query.limit > MAX_OPERATION_HISTORY_LIMIT {
+            return Err(BrokerError::InvalidOperationHistoryLimit {
+                limit: query.limit,
+                maximum: MAX_OPERATION_HISTORY_LIMIT,
+            });
+        }
+
+        let mut sql = String::from(
+            "SELECT id, session_id, provider, repository, scope, effect,
+                    status, authorization_reason, command_json, pid,
+                    exit_code, details_json,
+                    created_at, updated_at, finished_at,
+                    host_operation_id, identity_provenance
+             FROM coordinated_operations",
+        );
+        let mut clauses = Vec::new();
+        let mut values = Vec::<rusqlite::types::Value>::new();
+        if let Some(before_id) = query.before_id {
+            clauses.push("id < ?");
+            values.push(before_id.into());
+        }
+        if let Some(session_id) = query.session_id {
+            clauses.push("session_id = ?");
+            values.push(session_id.into());
+        }
+        if let Some(status) = query.status {
+            clauses.push("status = ?");
+            values.push(status.as_str().to_owned().into());
+        }
+        if let Some(repository) = &query.repository {
+            clauses.push("repository = ?");
+            values.push(repository.clone().into());
+        }
+        if let Some(provider) = query.provider {
+            clauses.push("provider = ?");
+            values.push(provider.as_str().to_owned().into());
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        values.push((i64::from(query.limit) + 1).into());
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(values.iter()),
+            coordinated_operation_from_row,
+        )?;
+        let mut operations = Vec::new();
+        for row in rows {
+            operations.push(row??);
+        }
+        let has_more = operations.len() > query.limit as usize;
+        operations.truncate(query.limit as usize);
+        let next_before_id = has_more
+            .then(|| operations.last().map(|operation| operation.id))
+            .flatten();
+        Ok(OperationHistoryPage {
+            operations,
+            next_before_id,
+        })
+    }
+
     /// Most recent coordinated operations for a report, newest first.
     /// When a session is selected, unrelated operations stay out of the
     /// snapshot rather than broadening its diagnostic scope.
@@ -1938,5 +2012,198 @@ mod snapshot_tests {
             .unwrap()
             .any(|column| column.unwrap() == "adoption_base");
         assert!(!adoption_base_exists);
+    }
+}
+
+#[cfg(test)]
+mod operation_history_tests {
+    use super::*;
+
+    fn store() -> BrokerStore {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (
+                 id, worktree_path, branch, origin, status,
+                 created_at, updated_at, last_activity_at
+             ) VALUES
+                 (1, '/repo/one', 'agent/one', 'adopted', 'active', 1, 1, 1),
+                 (2, '/repo/two', 'agent/two', 'adopted', 'active', 1, 1, 1);",
+        )
+        .unwrap();
+        BrokerStore {
+            conn,
+            path: PathBuf::from(":memory:"),
+            _snapshot_dir: None,
+        }
+    }
+
+    fn operation(
+        store: &mut BrokerStore,
+        session_id: i64,
+        provider: OperationProvider,
+        repository: &str,
+        status: OperationStatus,
+    ) -> i64 {
+        let operation = store
+            .create_coordinated_operation(&NewCoordinatedOperation {
+                session_id,
+                provider,
+                repository: repository.into(),
+                scope: "repository".into(),
+                effect: OperationEffect::Write,
+                authorization_reason: None,
+                command_json: "[]".into(),
+                pid: 1,
+                host_operation_id: None,
+                identity_provenance: OperationIdentityProvenance::VerifiedCanonical,
+            })
+            .unwrap();
+        if status != OperationStatus::Prepared {
+            store
+                .transition_coordinated_operation(operation.id, status, None, None)
+                .unwrap();
+        }
+        operation.id
+    }
+
+    fn ids(page: OperationHistoryPage) -> Vec<i64> {
+        page.operations
+            .into_iter()
+            .map(|operation| operation.id)
+            .collect()
+    }
+
+    #[test]
+    fn operation_history_is_stably_paged_and_filters_every_selector() {
+        let mut store = store();
+        operation(
+            &mut store,
+            1,
+            OperationProvider::Git,
+            "github.com/owner/a",
+            OperationStatus::Succeeded,
+        );
+        operation(
+            &mut store,
+            2,
+            OperationProvider::Github,
+            "github.com/owner/b",
+            OperationStatus::Failed,
+        );
+        operation(
+            &mut store,
+            1,
+            OperationProvider::Git,
+            "github.com/owner/a",
+            OperationStatus::Failed,
+        );
+        operation(
+            &mut store,
+            1,
+            OperationProvider::Github,
+            "github.com/owner/a",
+            OperationStatus::Succeeded,
+        );
+        operation(
+            &mut store,
+            2,
+            OperationProvider::Git,
+            "github.com/owner/a",
+            OperationStatus::Succeeded,
+        );
+        operation(
+            &mut store,
+            1,
+            OperationProvider::Git,
+            "github.com/owner/b",
+            OperationStatus::Running,
+        );
+
+        let first = store
+            .operation_history(&OperationHistoryQuery {
+                limit: 2,
+                ..OperationHistoryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(ids(first.clone()), vec![6, 5]);
+        assert_eq!(first.next_before_id, Some(5));
+        let second = store
+            .operation_history(&OperationHistoryQuery {
+                limit: 2,
+                before_id: first.next_before_id,
+                ..OperationHistoryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(ids(second.clone()), vec![4, 3]);
+        assert_eq!(second.next_before_id, Some(3));
+        let last = store
+            .operation_history(&OperationHistoryQuery {
+                limit: 2,
+                before_id: second.next_before_id,
+                ..OperationHistoryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(ids(last.clone()), vec![2, 1]);
+        assert_eq!(last.next_before_id, None);
+
+        let cases = [
+            (
+                OperationHistoryQuery {
+                    session_id: Some(1),
+                    ..OperationHistoryQuery::default()
+                },
+                vec![6, 4, 3, 1],
+            ),
+            (
+                OperationHistoryQuery {
+                    status: Some(OperationStatus::Failed),
+                    ..OperationHistoryQuery::default()
+                },
+                vec![3, 2],
+            ),
+            (
+                OperationHistoryQuery {
+                    repository: Some("github.com/owner/a".into()),
+                    ..OperationHistoryQuery::default()
+                },
+                vec![5, 4, 3, 1],
+            ),
+            (
+                OperationHistoryQuery {
+                    provider: Some(OperationProvider::Github),
+                    ..OperationHistoryQuery::default()
+                },
+                vec![4, 2],
+            ),
+        ];
+        for (query, expected) in cases {
+            assert_eq!(ids(store.operation_history(&query).unwrap()), expected);
+        }
+
+        let combined = store
+            .operation_history(&OperationHistoryQuery {
+                session_id: Some(1),
+                status: Some(OperationStatus::Succeeded),
+                repository: Some("github.com/owner/a".into()),
+                provider: Some(OperationProvider::Github),
+                ..OperationHistoryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(ids(combined), vec![4]);
+    }
+
+    #[test]
+    fn operation_history_refuses_unbounded_limits() {
+        let store = store();
+        for limit in [0, MAX_OPERATION_HISTORY_LIMIT + 1] {
+            assert!(matches!(
+                store.operation_history(&OperationHistoryQuery {
+                    limit,
+                    ..OperationHistoryQuery::default()
+                }),
+                Err(BrokerError::InvalidOperationHistoryLimit { .. })
+            ));
+        }
     }
 }

@@ -57,7 +57,8 @@ fn coordinated_git_frontend_journals_a_read() {
         .cwd(tmp.path())
         .run();
     journal.ok();
-    assert_eq!(journal.json().as_array().unwrap().len(), 1);
+    assert_eq!(journal.json()["operations"].as_array().unwrap().len(), 1);
+    assert_eq!(journal.json()["next_before_id"], serde_json::Value::Null);
 }
 
 #[test]
@@ -158,5 +159,84 @@ fn github_frontend_refuses_targets_after_the_broker_separator() {
         .cwd(tmp.path())
         .run();
     journal.ok();
-    assert!(journal.json().as_array().unwrap().is_empty());
+    assert!(journal.json()["operations"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn operation_history_lists_filters_and_pages_with_a_bare_alias() {
+    let (tmp, session) = repo();
+    let session_arg = session.to_string();
+    for _ in 0..4 {
+        Invoke::new([
+            "broker",
+            "git",
+            "--session",
+            &session_arg,
+            "--json",
+            "--",
+            "status",
+            "--short",
+        ])
+        .cwd(tmp.path())
+        .run()
+        .ok();
+    }
+
+    let first = Invoke::new(["broker", "operations", "list", "--limit", "2", "--json"])
+        .cwd(tmp.path())
+        .run();
+    first.ok();
+    let first_json = first.json();
+    let first_operations = first_json["operations"].as_array().unwrap();
+    assert_eq!(first_operations.len(), 2);
+    assert!(first_operations[0]["id"].as_i64() > first_operations[1]["id"].as_i64());
+    let before = first_json["next_before_id"].as_i64().unwrap().to_string();
+
+    let second = Invoke::new([
+        "broker",
+        "operations",
+        "list",
+        "--limit",
+        "2",
+        "--before",
+        &before,
+        "--json",
+    ])
+    .cwd(tmp.path())
+    .run();
+    second.ok();
+    assert_eq!(second.json()["operations"].as_array().unwrap().len(), 2);
+    assert_eq!(second.json()["next_before_id"], serde_json::Value::Null);
+
+    let repository = first_operations[0]["repository"].as_str().unwrap();
+    let filtered = Invoke::new([
+        "broker",
+        "operations",
+        "list",
+        "--session",
+        &session_arg,
+        "--status",
+        "succeeded",
+        "--repo",
+        repository,
+        "--provider",
+        "git",
+        "--json",
+    ])
+    .cwd(tmp.path())
+    .run();
+    filtered.ok();
+    assert_eq!(filtered.json()["operations"].as_array().unwrap().len(), 4);
+
+    let bare = Invoke::new(["broker", "operations", "--limit", "2", "--json"])
+        .cwd(tmp.path())
+        .run();
+    bare.ok();
+    assert_eq!(bare.json(), first_json);
+
+    let invalid = Invoke::new(["broker", "operations", "list", "--limit", "0"])
+        .cwd(tmp.path())
+        .run();
+    invalid.expect_code(1);
+    invalid.assert_contains("--limit must be between 1 and 500");
 }
