@@ -3282,11 +3282,21 @@ impl Broker {
                 .current_dir(&temp_root)
                 .output()
                 .map_err(|error| error.to_string())?;
+            let mut success = output.status.success();
+            let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            if success && !active_version_matches(command, &stdout, integration_head) {
+                success = false;
+                stderr.push_str(&format!(
+                    "\nactive PATH binary does not identify integration commit {}; PATH precedence still needs repair",
+                    short_commit(integration_head)
+                ));
+            }
             Ok(RepairCommandOutput {
-                success: output.status.success(),
+                success,
                 exit_code: output.status.code(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                stdout,
+                stderr,
             })
         });
         let duration_ms = now_ms().saturating_sub(start);
@@ -4585,9 +4595,28 @@ fn local_cli_repair_step_specs(
             action: "verify",
             command: vec![format!("{install_bin}/{binary}"), "--version".into()],
         };
-        [install, verify]
+        let verify_active = RepairStepSpec {
+            component,
+            action: "verify-active",
+            command: vec![binary.into(), "--version".into()],
+        };
+        [install, verify, verify_active]
     })
     .collect()
+}
+
+fn is_active_version_verification(command: &[String]) -> bool {
+    matches!(
+        command,
+        [binary, flag]
+            if matches!(binary.as_str(), "aethyme" | "aethyme-engine-cli")
+                && flag == "--version"
+    )
+}
+
+fn active_version_matches(command: &[String], stdout: &str, integration_head: &str) -> bool {
+    !is_active_version_verification(command)
+        || stdout.contains(&integration_head[..7.min(integration_head.len())])
 }
 
 fn local_cli_repair_commands(
@@ -4724,7 +4753,7 @@ fn slugify(task: &str) -> String {
 mod tests {
     use super::{
         DoctorRepairStatus, DoctorReport, RepairCommandOutput, VersionRepairReport,
-        execute_version_repair_steps, local_cli_repair_step_specs, slugify,
+        active_version_matches, execute_version_repair_steps, local_cli_repair_step_specs, slugify,
     };
     use crate::types::{MergeQueueEntry, Session, SessionOrigin, SessionStatus};
     use crate::version::{BinaryBuild, VersionDriftReport, VersionDriftStatus};
@@ -4765,7 +4794,7 @@ mod tests {
 
         let specs = local_cli_repair_step_specs(Some(source), Some(install_bin));
 
-        assert_eq!(specs.len(), 4);
+        assert_eq!(specs.len(), 6);
         assert_eq!(
             specs
                 .iter()
@@ -4774,8 +4803,10 @@ mod tests {
             vec![
                 ("router", "install"),
                 ("router", "verify"),
+                ("router", "verify-active"),
                 ("engine", "install"),
                 ("engine", "verify"),
+                ("engine", "verify-active"),
             ]
         );
         assert!(specs[0].command.join(" ").contains("aethyme-cli"));
@@ -4783,11 +4814,13 @@ mod tests {
             specs[1].command,
             vec!["/tmp/cargo-root/bin/aethyme", "--version"]
         );
-        assert!(specs[2].command.join(" ").contains("aethyme-engine"));
+        assert_eq!(specs[2].command, vec!["aethyme", "--version"]);
+        assert!(specs[3].command.join(" ").contains("aethyme-engine"));
         assert_eq!(
-            specs[3].command,
+            specs[4].command,
             vec!["/tmp/cargo-root/bin/aethyme-engine-cli", "--version"]
         );
+        assert_eq!(specs[5].command, vec!["aethyme-engine-cli", "--version"]);
     }
 
     #[test]
@@ -4807,11 +4840,26 @@ mod tests {
                 })
             });
 
-            assert_eq!(observed, 4, "all outcomes must remain observable");
+            assert_eq!(observed, 6, "all outcomes must remain observable");
             assert!(!steps.iter().all(|step| step.success));
             assert_eq!(steps.iter().filter(|step| !step.success).count(), 1);
             assert_eq!(steps[failed_index].exit_code, Some(7));
         }
+    }
+
+    #[test]
+    fn active_version_verification_rejects_a_shadowing_path_binary() {
+        let command = vec!["aethyme".into(), "--version".into()];
+        assert!(!active_version_matches(
+            &command,
+            "aethyme 0.2.2 (v0.2.2-2-gf8a2e3a)",
+            "ec334dfadcc1b692a02507306b3d9cb9052472a3",
+        ));
+        assert!(active_version_matches(
+            &command,
+            "aethyme 0.2.2 (v0.2.2-24-gec334df)",
+            "ec334dfadcc1b692a02507306b3d9cb9052472a3",
+        ));
     }
 
     #[test]
