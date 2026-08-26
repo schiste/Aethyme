@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 pub const REPOSITORY_SCHEMA_VERSION: u32 = aethyme_broker::REPOSITORY_SCHEMA_VERSION;
 pub const CANONICAL_MARKER_PATH: &str = aethyme_broker::CANONICAL_REPOSITORY_MARKER_PATH;
 pub const LOCAL_MARKER_PATH: &str = aethyme_broker::LOCAL_REPOSITORY_MARKER_PATH;
-const PLAN_SCHEMA_VERSION: u32 = 4;
+const PLAN_SCHEMA_VERSION: u32 = 5;
 const RESOLUTION_SCHEMA_VERSION: u32 = 1;
 const GATES_SCHEMA_VERSION: i64 = 1;
 const MIGRATION_ID: &str = "repository-deployment-v1";
@@ -70,6 +70,12 @@ pub struct RepositoryUpgradePlan {
     pub existing_managed_state_digest: String,
     pub compatibility: CompatibilityDecision,
     pub active_sessions: Vec<UpgradeActiveSessionPrecondition>,
+    pub dirty_paths: Vec<String>,
+    pub overlapping_dirty_paths: Vec<String>,
+    pub disjoint_dirty_paths: Vec<String>,
+    pub relevant_leases: Vec<UpgradeRelevantLease>,
+    pub shared_policy_or_gate_migration: bool,
+    pub warnings: Vec<String>,
     pub migrations: Vec<String>,
     pub changes: Vec<RepositoryTreeChange>,
     pub customizations: Vec<RepositoryCustomization>,
@@ -92,6 +98,16 @@ pub struct UpgradeActiveSessionPrecondition {
     pub deployment_state_digest: Option<String>,
     pub aethyme_version: Option<String>,
     pub gate_definition_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UpgradeRelevantLease {
+    pub lease_id: i64,
+    pub session_id: i64,
+    pub path: String,
+    pub kind: aethyme_broker::LeaseKind,
+    pub expires_at: Option<i64>,
+    pub overlapping_planned_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,6 +186,12 @@ struct PlanDigest<'a> {
     existing_managed_state_digest: &'a str,
     compatibility: &'a CompatibilityDecision,
     active_sessions: &'a [UpgradeActiveSessionPrecondition],
+    dirty_paths: &'a [String],
+    overlapping_dirty_paths: &'a [String],
+    disjoint_dirty_paths: &'a [String],
+    relevant_leases: &'a [UpgradeRelevantLease],
+    shared_policy_or_gate_migration: bool,
+    warnings: &'a [String],
     migrations: &'a [String],
     changes: &'a [RepositoryTreeChange],
     customizations: &'a [RepositoryCustomization],
@@ -590,6 +612,14 @@ struct ProposedRepository {
 struct BuiltUpgradePlan {
     report: RepositoryUpgradePlan,
     migration_diff: String,
+    proposed_outputs: Vec<ProposedOutput>,
+}
+
+struct ProposedOutput {
+    path: String,
+    action: RepositoryTreeAction,
+    bytes: Option<Vec<u8>>,
+    file_mode: Option<String>,
 }
 
 impl ProposedRepository {
@@ -1226,6 +1256,77 @@ fn render_migration_diff(repo: &Path, planned_paths: &[String]) -> Result<String
         .map_err(|_| "proposed migration diff is not valid UTF-8".to_string())
 }
 
+fn collect_proposed_outputs(
+    repo: &Path,
+    marker_path: &str,
+    changes: &[RepositoryTreeChange],
+) -> Result<Vec<ProposedOutput>, String> {
+    changes
+        .iter()
+        .filter(|change| {
+            change.action != RepositoryTreeAction::Unchanged && change.path != marker_path
+        })
+        .map(|change| {
+            let bytes =
+                if change.action == RepositoryTreeAction::Delete {
+                    None
+                } else {
+                    Some(std::fs::read(repo.join(&change.path)).map_err(|error| {
+                        format!("read proposed output {}: {error}", change.path)
+                    })?)
+                };
+            Ok(ProposedOutput {
+                path: change.path.clone(),
+                action: change.action,
+                bytes,
+                file_mode: change.file_mode.clone(),
+            })
+        })
+        .collect()
+}
+
+fn apply_proposed_outputs(repo: &Path, outputs: &[ProposedOutput]) -> Result<(), String> {
+    for output in outputs {
+        let path = repo.join(&output.path);
+        match output.action {
+            RepositoryTreeAction::Delete => match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("delete reviewed output {}: {error}", output.path));
+                }
+            },
+            RepositoryTreeAction::Create | RepositoryTreeAction::Update => {
+                let bytes = output
+                    .bytes
+                    .as_deref()
+                    .ok_or_else(|| format!("reviewed output {} has no content", output.path))?;
+                atomic_write(&path, bytes)?;
+                set_file_mode(&path, output.file_mode.as_deref())?;
+            }
+            RepositoryTreeAction::Unchanged => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_file_mode(path: &Path, mode: Option<&str>) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let permissions = match mode {
+        Some("100755") => 0o755,
+        Some("100644") | None => 0o644,
+        Some(other) => return Err(format!("unsupported reviewed file mode {other}")),
+    };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(permissions))
+        .map_err(|error| format!("set reviewed output mode {}: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_file_mode(_path: &Path, _mode: Option<&str>) -> Result<(), String> {
+    Ok(())
+}
+
 fn active_session_preconditions(
     repo: &Path,
 ) -> Result<Vec<UpgradeActiveSessionPrecondition>, String> {
@@ -1241,6 +1342,14 @@ fn active_session_preconditions(
         .live_sessions()
         .map_err(|error| error.to_string())?
         .into_iter()
+        .filter(|session| {
+            matches!(
+                session.status,
+                aethyme_broker::SessionStatus::Active
+                    | aethyme_broker::SessionStatus::Idle
+                    | aethyme_broker::SessionStatus::Stale
+            )
+        })
         .map(|session| {
             let contract = session.repository_contract;
             UpgradeActiveSessionPrecondition {
@@ -1262,6 +1371,92 @@ fn active_session_preconditions(
         .collect::<Vec<_>>();
     sessions.sort_by_key(|session| session.session_id);
     Ok(sessions)
+}
+
+fn dirty_paths(repo: &Path) -> Result<Vec<String>, String> {
+    let output = git_bytes(
+        repo,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    let records = output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .collect::<Vec<_>>();
+    let mut paths = BTreeSet::new();
+    let mut index = 0;
+    while index < records.len() {
+        let record = records[index];
+        if record.len() < 4 || record[2] != b' ' {
+            return Err("cannot parse repository dirty-path status".into());
+        }
+        let status = &record[..2];
+        let path = std::str::from_utf8(&record[3..])
+            .map_err(|_| "repository upgrade paths must be valid UTF-8".to_string())?;
+        paths.insert(path.to_string());
+        if status.iter().any(|byte| matches!(byte, b'R' | b'C')) {
+            index += 1;
+            let source = records
+                .get(index)
+                .ok_or_else(|| "cannot parse renamed repository dirty path".to_string())?;
+            let source = std::str::from_utf8(source)
+                .map_err(|_| "repository upgrade paths must be valid UTF-8".to_string())?;
+            paths.insert(source.to_string());
+        }
+        index += 1;
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || (left.ends_with('/') && right.starts_with(left))
+        || (right.ends_with('/') && left.starts_with(right))
+}
+
+fn relevant_leases(
+    repo: &Path,
+    planned_paths: &[String],
+) -> Result<Vec<UpgradeRelevantLease>, String> {
+    let checkout = aethyme_broker::GitRepo::discover(repo).map_err(|error| error.to_string())?;
+    let main_root = checkout.main_root().map_err(|error| error.to_string())?;
+    if !main_root.join(aethyme_broker::BROKER_DB_RELPATH).is_file() {
+        return Ok(Vec::new());
+    }
+    let mut broker =
+        aethyme_broker::Broker::open_snapshot(repo).map_err(|error| error.to_string())?;
+    let mut leases = broker
+        .store()
+        .active_leases()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter_map(|lease| {
+            let overlapping_planned_paths = planned_paths
+                .iter()
+                .filter(|path| paths_overlap(&lease.path, path))
+                .cloned()
+                .collect::<Vec<_>>();
+            (!overlapping_planned_paths.is_empty()).then_some(UpgradeRelevantLease {
+                lease_id: lease.id,
+                session_id: lease.session_id,
+                path: lease.path,
+                kind: lease.kind,
+                expires_at: lease.expires_at,
+                overlapping_planned_paths,
+            })
+        })
+        .collect::<Vec<_>>();
+    leases.sort_by(|left, right| {
+        left.session_id
+            .cmp(&right.session_id)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.lease_id.cmp(&right.lease_id))
+    });
+    Ok(leases)
+}
+
+fn is_shared_policy_or_gate_change(change: &RepositoryTreeChange) -> bool {
+    change.action != RepositoryTreeAction::Unchanged
+        && change.ownership != RepositoryPathOwnership::AethymeOwned
 }
 
 fn build_plan(
@@ -1397,7 +1592,40 @@ fn build_plan(
     }
     resolution_choices.sort_by(|left, right| left.path.cmp(&right.path));
     let migration_diff = render_migration_diff(proposed_repo, &planned_paths)?;
+    let proposed_outputs = collect_proposed_outputs(proposed_repo, mode.marker_path(), &changes)?;
     let diff_sha256 = sha256(migration_diff.as_bytes());
+    let dirty_paths = dirty_paths(&repo)?;
+    let (overlapping_dirty_paths, disjoint_dirty_paths): (Vec<_>, Vec<_>) =
+        dirty_paths.iter().cloned().partition(|dirty| {
+            planned_paths
+                .iter()
+                .any(|planned| paths_overlap(dirty, planned))
+        });
+    let relevant_leases = relevant_leases(&repo, &planned_paths)?;
+    let shared_policy_or_gate_migration = changes.iter().any(is_shared_policy_or_gate_change);
+    let mut warnings = Vec::new();
+    if !disjoint_dirty_paths.is_empty() {
+        warnings.push(
+            "uncommitted disjoint changes were not inputs to the proposed repository tree; apply will touch only the exact reviewed planned paths"
+                .into(),
+        );
+    }
+    if !overlapping_dirty_paths.is_empty() {
+        blockers.push(format!(
+            "uncommitted changes overlap proposed repository writes: {}; commit them through the managed Aethyme pre-commit lane before upgrading",
+            overlapping_dirty_paths.join(", ")
+        ));
+    }
+    if shared_policy_or_gate_migration && !active_sessions.is_empty() {
+        blockers.push(format!(
+            "shared policy or gate migration is blocked while broker sessions are active: {}; finish each session with `aethyme broker finish --session <id>` before upgrading",
+            active_sessions
+                .iter()
+                .map(|session| session.session_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     let safe = blockers.is_empty();
     let digest_input = PlanDigest {
         schema_version: PLAN_SCHEMA_VERSION,
@@ -1408,6 +1636,12 @@ fn build_plan(
         existing_managed_state_digest: &existing_managed_state_digest,
         compatibility: &compatibility,
         active_sessions: &active_sessions,
+        dirty_paths: &dirty_paths,
+        overlapping_dirty_paths: &overlapping_dirty_paths,
+        disjoint_dirty_paths: &disjoint_dirty_paths,
+        relevant_leases: &relevant_leases,
+        shared_policy_or_gate_migration,
+        warnings: &warnings,
         migrations: &migrations,
         changes: &changes,
         customizations: &customizations,
@@ -1423,7 +1657,13 @@ fn build_plan(
     let resolution_argument = resolution_file
         .map(|path| format!(" --resolution-file {}", path.display()))
         .unwrap_or_default();
-    let next_action = if !safe {
+    let next_action = if !overlapping_dirty_paths.is_empty() {
+        "commit the overlapping paths through the managed Aethyme pre-commit lane, then regenerate the upgrade plan"
+            .into()
+    } else if shared_policy_or_gate_migration && !active_sessions.is_empty() {
+        "finish every listed broker session, then regenerate the upgrade plan; disjoint worktree changes do not need to be moved"
+            .into()
+    } else if !safe {
         "create a schema-1 resolution file choosing preserve, merge, or replace for every customized policy, then regenerate the upgrade plan with --resolution-file <path>"
             .into()
     } else if migrations.is_empty() {
@@ -1443,6 +1683,12 @@ fn build_plan(
             existing_managed_state_digest,
             compatibility,
             active_sessions,
+            dirty_paths,
+            overlapping_dirty_paths,
+            disjoint_dirty_paths,
+            relevant_leases,
+            shared_policy_or_gate_migration,
+            warnings,
             migrations,
             changes,
             customizations,
@@ -1457,6 +1703,7 @@ fn build_plan(
             next_action,
         },
         migration_diff,
+        proposed_outputs,
     })
 }
 
@@ -1484,7 +1731,9 @@ fn apply_with_resolution_file(
     if confirmation.len() != 64 || !confirmation.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("--confirm must be the full 64-character plan SHA-256".into());
     }
-    let mut before = build_plan(repo_hint, requested_mode, resolution_file)?.report;
+    let built = build_plan(repo_hint, requested_mode, resolution_file)?;
+    let proposed_outputs = built.proposed_outputs;
+    let mut before = built.report;
     if !before.safe {
         return Err(format!(
             "repository upgrade is blocked: {}",
@@ -1504,10 +1753,7 @@ fn apply_with_resolution_file(
     let repo = git_root(repo_hint)?;
     ensure_apply_worktree_safe(&repo, &before)?;
     write_pending_marker(&repo, before.mode)?;
-    match before.mode {
-        RepositoryMode::Canonical => migrate_canonical(&repo, &before.customizations)?,
-        RepositoryMode::LocalOnly => migrate_local(&repo, &before.customizations)?,
-    }
+    apply_proposed_outputs(&repo, &proposed_outputs)?;
     write_current_marker(&repo, before.mode)?;
     verify_deployment(&repo, before.mode, &before.customizations)?;
     before.applied = true;
@@ -1677,10 +1923,36 @@ fn ensure_apply_worktree_safe(repo: &Path, plan: &RepositoryUpgradePlan) -> Resu
             plan.repository_head
         ));
     }
-    let status = git(repo, &["status", "--porcelain", "--untracked-files=all"])?;
-    if !status.trim().is_empty() {
+    let current_dirty_paths = dirty_paths(repo)?;
+    if current_dirty_paths != plan.dirty_paths {
         return Err(
-            "repository worktree is dirty; commit this work through the managed Aethyme pre-commit lane, then finish active sessions with `aethyme broker finish --session <id>` before applying a repository upgrade"
+            "repository dirty paths changed after review; regenerate the upgrade plan before applying exact reviewed outputs"
+                .into(),
+        );
+    }
+    if !plan.overlapping_dirty_paths.is_empty() {
+        return Err(format!(
+            "uncommitted changes overlap proposed repository writes: {}; commit them through the managed Aethyme pre-commit lane before upgrading",
+            plan.overlapping_dirty_paths.join(", ")
+        ));
+    }
+    let current_sessions = active_session_preconditions(repo)?;
+    if current_sessions != plan.active_sessions {
+        return Err(
+            "live broker sessions changed after review; regenerate the upgrade plan before applying"
+                .into(),
+        );
+    }
+    if plan.shared_policy_or_gate_migration && !current_sessions.is_empty() {
+        return Err(
+            "shared policy or gate migration is blocked while broker sessions are active; finish each listed session before upgrading"
+                .into(),
+        );
+    }
+    let current_leases = relevant_leases(repo, &plan.planned_paths)?;
+    if current_leases != plan.relevant_leases {
+        return Err(
+            "relevant broker leases changed after review; regenerate the upgrade plan before applying"
                 .into(),
         );
     }
@@ -1859,6 +2131,33 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         println!("Plan SHA-256: {}", report.plan_digest);
         for migration in &report.migrations {
             println!("  migration: {migration}");
+        }
+        for path in &report.dirty_paths {
+            println!("  dirty path: {path}");
+        }
+        for path in &report.overlapping_dirty_paths {
+            println!("  overlapping dirty path: {path}");
+        }
+        for path in &report.disjoint_dirty_paths {
+            println!("  disjoint dirty path: {path}");
+        }
+        for session in &report.active_sessions {
+            println!(
+                "  live session: {} ({:?})",
+                session.session_id, session.status
+            );
+        }
+        for lease in &report.relevant_leases {
+            println!(
+                "  relevant lease: {} by session {} ({:?}, overlaps {})",
+                lease.path,
+                lease.session_id,
+                lease.kind,
+                lease.overlapping_planned_paths.join(", ")
+            );
+        }
+        for warning in &report.warnings {
+            println!("  warning: {warning}");
         }
         for blocker in &report.blockers {
             println!("  blocker: {blocker}");

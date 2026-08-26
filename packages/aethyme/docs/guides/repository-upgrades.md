@@ -30,15 +30,22 @@ aethyme upgrade plan --json
 The plan identifies the current and target repository schema, exact embedded
 migrations, repository-relative paths that may change, the source Git HEAD,
 existing managed-state digest, proposed content hashes and modes, unresolved
-resolution choices, compatibility decision, active session contracts, and the
+resolution choices, compatibility decision, live session contracts, relevant
+leases, exact dirty paths split into overlapping and disjoint sets, and the
 local diff SHA-256. The plan digest binds every one of those fields. Task text,
-absolute worktree paths, and diff bodies are excluded from JSON. Diff bodies
-also never enter broker reports, events, metrics, or command telemetry.
+absolute worktree paths, dirty file contents, and diff bodies are excluded from
+JSON. Diff bodies also never enter broker reports, events, metrics, or command
+telemetry.
 
 Planning performs no writes to the selected repository and ignores dirty or
-incidental worktree content when generating migration output. Applying still
-requires a clean worktree. An invalid marker, unsupported future schema, or
-enrollment-mode mismatch makes the plan unsafe.
+incidental worktree content when generating migration output. Dirty paths that
+overlap an exact proposed write block application. Disjoint dirty paths may
+remain: the plan warns that they were not inputs, and `apply` materializes only
+the reviewed outputs from the disposable proposed tree. A live broker session
+blocks any migration that changes shared policy or gate files until that
+session finishes. An invalid marker, unsupported future schema, or
+enrollment-mode mismatch also makes the plan unsafe. The remediation never
+requires moving unrelated work out of the worktree.
 
 Policy ownership is explicit. Aethyme updates only its marked blocks in
 `.gitignore`, `AGENTS.md`, and `CLAUDE.md`; surrounding maintainer content is
@@ -75,8 +82,9 @@ managed markers and unsupported gate schemas cannot be merged; choose
 `preserve` or an explicit `replace` after review. Policy files are never
 force-replaced merely because a binary is newer.
 
-After reviewing the plan and ensuring the repository is clean, apply exactly
-that plan:
+After reviewing the plan, committing any overlapping work, and finishing the
+live sessions listed for a shared policy or gate migration, apply exactly that
+plan. Unrelated dirty files may remain:
 
 ```bash
 aethyme upgrade apply --confirm <plan-sha256>
@@ -85,14 +93,14 @@ git diff
 aethyme deploy verify --repo .
 ```
 
-`apply` refuses a shortened digest or any repository state that differs from
-the reviewed plan. It converges the repository from templates and migration
-logic embedded in the installed binary, verifies the resulting deployment,
-and only then records the current repository schema. During convergence the
-marker records an in-progress schema, so an interrupted process cannot make an
-old or partial deployment appear current. If an upgrade is interrupted, do
-not hand-edit the marker: inspect the diff, restore or commit the intended
-state, obtain a fresh plan, and reapply.
+`apply` refuses a shortened digest, overlapping dirty paths, changed session or
+lease preconditions, or any source state that differs from the reviewed plan.
+It writes only the exact reviewed output paths, verifies the resulting
+deployment, and only then records the current repository schema. During
+convergence the marker records an in-progress schema, so an interrupted process
+cannot make an old or partial deployment appear current. If an upgrade is
+interrupted, do not hand-edit the marker: inspect the diff, restore or commit
+the intended state, obtain a fresh plan, and reapply.
 
 ## Canonical deployment
 

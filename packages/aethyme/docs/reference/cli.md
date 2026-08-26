@@ -164,13 +164,15 @@ Binary updates and repository migrations are intentionally separate. Run
 `plan` in each enrolled repository after updating the binary pair. It is
 read-only and binds the source HEAD, existing managed-state digest, proposed
 content hashes and modes, resolution choices, compatibility decision, active
-session contracts, planned paths, and embedded migrations into a full
-SHA-256. `--diff` renders the exact binary-capable Git patch locally;
+session contracts, dirty-path overlap classification, relevant leases, planned
+paths, and embedded migrations into a full SHA-256. `--diff` renders the exact binary-capable Git patch locally;
 `--json` emits the content-free structured plan and the patch SHA-256. The two
 formats are intentionally exclusive. `apply` requires that exact plan digest,
-a clean worktree, and a supported marker before converging and verifying
-Aethyme-owned repository files. Diff bodies never enter broker reports,
-events, metrics, or command telemetry.
+a supported marker, no dirty path overlapping a proposed write, and no live
+session during shared policy or gate migration. Disjoint dirty paths may remain
+because they are excluded from proposal inputs and `apply` writes only the
+exact reviewed outputs. Diff bodies and dirty file contents never enter broker
+reports, events, metrics, or command telemetry.
 
 When the plan classifies `AGENTS.md`, `CLAUDE.md`, or `.aethyme/gates.toml`
 as customized, `--resolution-file` accepts a schema-1 JSON object mapping each

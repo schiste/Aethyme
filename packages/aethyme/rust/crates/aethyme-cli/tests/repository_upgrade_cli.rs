@@ -151,7 +151,7 @@ fn canonical_upgrade_is_read_only_then_digest_bound_and_verifiable() {
 
     let before = run(&repo, &["upgrade", "plan", "--json"]);
     let plan = json(&before);
-    assert_eq!(plan["schema_version"], 4);
+    assert_eq!(plan["schema_version"], 5);
     assert_eq!(plan["from_schema"], 0);
     assert_eq!(plan["to_schema"], 1);
     assert_eq!(plan["safe"], true);
@@ -523,6 +523,10 @@ fn active_session_contract_is_digest_bound_without_sensitive_context() {
     let without_session = json(&run(&repo, &["upgrade", "plan", "--json"]));
 
     let session_id = register_version_pinned_session(&repo, "0.2.1");
+    BrokerStore::open_in_repo(&repo)
+        .unwrap()
+        .claim_lease(session_id, "AGENTS.md", None)
+        .unwrap();
     let with_session_output = run(&repo, &["upgrade", "plan", "--json"]);
     let with_session = json(&with_session_output);
     assert_ne!(with_session["plan_digest"], without_session["plan_digest"]);
@@ -539,6 +543,16 @@ fn active_session_contract_is_digest_bound_without_sensitive_context() {
     assert_eq!(active[0]["session_id"], session_id);
     assert_eq!(active[0]["repository_schema"], Value::Null);
     assert_eq!(active[0]["aethyme_version"], "0.2.1");
+    assert_eq!(with_session["safe"], false);
+    assert_eq!(with_session["shared_policy_or_gate_migration"], true);
+    assert!(
+        with_session["blockers"][0]
+            .as_str()
+            .unwrap()
+            .contains("sessions are active")
+    );
+    assert_eq!(with_session["relevant_leases"][0]["session_id"], session_id);
+    assert_eq!(with_session["relevant_leases"][0]["path"], "AGENTS.md");
     let serialized = String::from_utf8(with_session_output.stdout).unwrap();
     assert!(!serialized.contains("session accepted before Homebrew update"));
     assert!(!serialized.contains(repo.to_string_lossy().as_ref()));
@@ -587,13 +601,14 @@ fn migration_diff_never_enters_reports_events_or_metrics() {
 }
 
 #[test]
-fn plan_uses_committed_head_and_apply_still_refuses_dirty_mutation() {
+fn plan_uses_committed_head_and_apply_preserves_disjoint_dirty_work() {
     let temp = tmp_dir();
     let repo = repository(temp.path());
     old_canonical_deployment(&repo);
     let clean_plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
     fs::write(repo.join("README.md"), "locally edited\n").unwrap();
     fs::write(repo.join("package.json"), r#"{"scripts":{"test":"false"}}"#).unwrap();
+    fs::write(repo.join("notes\nrésumé.txt"), "unicode and newline path\n").unwrap();
     fs::write(
         repo.join(".aethyme/broker.db-incidental"),
         "ignored and incidental\n",
@@ -602,9 +617,26 @@ fn plan_uses_committed_head_and_apply_still_refuses_dirty_mutation() {
 
     let plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
     assert_eq!(plan["safe"], true);
-    assert_eq!(plan["plan_digest"], clean_plan["plan_digest"]);
+    assert_ne!(plan["plan_digest"], clean_plan["plan_digest"]);
     assert_eq!(plan["changes"], clean_plan["changes"]);
     assert_eq!(plan["examined_paths"], clean_plan["examined_paths"]);
+    assert!(
+        plan["overlapping_dirty_paths"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        plan["dirty_paths"],
+        serde_json::json!(["README.md", "notes\nrésumé.txt", "package.json"])
+    );
+    assert_eq!(plan["disjoint_dirty_paths"], plan["dirty_paths"]);
+    assert!(
+        plan["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("were not inputs")
+    );
     assert!(
         plan["examined_paths"]
             .as_array()
@@ -614,13 +646,76 @@ fn plan_uses_committed_head_and_apply_still_refuses_dirty_mutation() {
     );
 
     let digest = plan["plan_digest"].as_str().unwrap();
-    let applied = run(&repo, &["upgrade", "apply", "--confirm", digest]);
-    assert!(!applied.status.success());
-    let error = String::from_utf8_lossy(&applied.stderr);
-    assert!(error.contains("worktree is dirty"));
-    assert!(error.contains("managed Aethyme pre-commit lane"));
-    assert!(!error.contains("stash"));
+    let applied = json(&run(
+        &repo,
+        &["upgrade", "apply", "--confirm", digest, "--json"],
+    ));
+    assert_eq!(applied["applied"], true);
+    assert_eq!(
+        fs::read_to_string(repo.join("README.md")).unwrap(),
+        "locally edited\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("package.json")).unwrap(),
+        r#"{"scripts":{"test":"false"}}"#
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("notes\nrésumé.txt")).unwrap(),
+        "unicode and newline path\n"
+    );
+}
+
+#[test]
+fn overlapping_dirty_paths_block_without_recommending_stash() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    fs::write(repo.join("AGENTS.md"), "locally customized policy\n").unwrap();
+
+    let plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
+    assert_eq!(plan["safe"], false);
+    assert!(
+        plan["dirty_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "AGENTS.md")
+    );
+    assert!(
+        plan["overlapping_dirty_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "AGENTS.md")
+    );
+    assert!(plan["disjoint_dirty_paths"].as_array().unwrap().is_empty());
+    let rendered = serde_json::to_string(&plan).unwrap();
+    assert!(rendered.contains("managed Aethyme pre-commit lane"));
+    assert!(!rendered.contains("stash"));
     assert!(!repo.join(".aethyme/repository.json").exists());
+}
+
+#[test]
+fn dirty_path_report_includes_both_sides_of_a_staged_rename() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    fs::write(repo.join("original.txt"), "tracked\n").unwrap();
+    commit_all(&repo, "add rename source");
+    git(&repo, &["mv", "original.txt", "renamed.txt"]);
+
+    let plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
+    assert_eq!(
+        plan["dirty_paths"],
+        serde_json::json!(["original.txt", "renamed.txt"])
+    );
+    assert_eq!(plan["disjoint_dirty_paths"], plan["dirty_paths"]);
+    assert!(
+        plan["overlapping_dirty_paths"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -678,8 +773,20 @@ fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
     git(&repo, &["add", "mid-session-wip.txt"]);
 
     let upgrade_plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
-    assert_eq!(upgrade_plan["safe"], true);
-    assert!(upgrade_plan["blockers"].as_array().unwrap().is_empty());
+    assert_eq!(upgrade_plan["safe"], false);
+    assert!(
+        upgrade_plan["blockers"][0]
+            .as_str()
+            .unwrap()
+            .contains("sessions are active")
+    );
+    assert!(
+        upgrade_plan["disjoint_dirty_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "mid-session-wip.txt")
+    );
     assert!(
         upgrade_plan["examined_paths"]
             .as_array()
