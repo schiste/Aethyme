@@ -13,7 +13,6 @@ use std::process::Command;
 use sha2::{Digest, Sha256};
 
 use crate::pyjson::{self, py_bool, Value};
-use crate::timeutil::now_iso_utc;
 use crate::util::{py_splitlines, resolve_path};
 
 pub const ONBOARDING_JSON_PATH: &str = ".aethyme/generated/onboarding.json";
@@ -23,6 +22,22 @@ pub const ONBOARDING_CODEX_PATH: &str = ".codex/skills/repo-onboarding/SKILL.md"
 pub const ACT_CLAUDE_PATH: &str = ".claude/skills/repo-act/SKILL.md";
 pub const ACT_CODEX_PATH: &str = ".codex/skills/repo-act/SKILL.md";
 pub const ONBOARDING_OVERRIDE_PATH: &str = ".aethyme/overrides/onboarding.json";
+
+const GENERATED_DEPLOY_PATHS: [&str; 4] = [
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".claude/settings.local.json",
+    ".claude/hooks/aethyme-load-context.sh",
+];
+const GENERATED_DEPLOY_PREFIXES: [&str; 7] = [
+    ".aethyme/generated/",
+    ".claude/skills/aethyme/",
+    ".codex/skills/aethyme/",
+    ".claude/skills/repo-onboarding/",
+    ".codex/skills/repo-onboarding/",
+    ".claude/skills/repo-act/",
+    ".codex/skills/repo-act/",
+];
 
 /// `KeyError`-style lookup: Python indexes (`artifact["repo"]`) crash on
 /// missing keys; the port surfaces the same condition as a command error.
@@ -128,17 +143,15 @@ pub fn build_onboarding_artifact(repo_path: &Path) -> Result<Value, String> {
         (
             "freshness",
             obj(vec![
-                ("generated_at", Value::str(now_iso_utc())),
-                ("snapshot_key", Value::str(snapshot.cache_key())),
+                ("source_digest", Value::str(snapshot.source_digest)),
+                // Commit identity is optional informational provenance, not
+                // part of the canonical artifact. Leaving the slot null keeps
+                // a commit or rebase from changing generated policy bytes.
+                ("source_commit", Value::Null),
                 (
-                    "commit",
-                    match &snapshot.commit {
-                        Some(c) => Value::str(c.clone()),
-                        None => Value::Null,
-                    },
+                    "source_file_count",
+                    Value::Int(snapshot.source_file_count as i128),
                 ),
-                ("repo_dirty", Value::Bool(snapshot.dirty)),
-                ("file_count", Value::Int(snapshot.file_count as i128)),
                 ("generator", Value::str("deterministic")),
             ]),
         ),
@@ -468,27 +481,16 @@ pub fn render_onboarding_skill(artifact: &Value) -> Result<String, String> {
     lines.push("## Freshness".to_string());
     lines.push(String::new());
     lines.push(format!(
-        "- Snapshot key: `{}`",
-        req(freshness, "snapshot_key")?.py_str()
+        "- Source digest: `{}`",
+        req(freshness, "source_digest")?.py_str()
     ));
-    lines.push(format!("- Commit: `{}`", {
-        let commit = req(freshness, "commit")?;
-        if commit.truthy() {
-            commit.py_str()
-        } else {
-            "working-tree".to_string()
-        }
-    }));
+    let source_commit = req(freshness, "source_commit")?;
+    if source_commit.truthy() {
+        lines.push(format!("- Source commit: `{}`", source_commit.py_str()));
+    }
     lines.push(format!(
-        "- Repo dirty: `{}`",
-        match req(freshness, "repo_dirty")? {
-            Value::Bool(b) => py_bool(*b).to_string(),
-            other => other.py_str(),
-        }
-    ));
-    lines.push(format!(
-        "- Generated at: `{}`",
-        req(freshness, "generated_at")?.py_str()
+        "- Tracked source files: `{}`",
+        req(freshness, "source_file_count")?.py_str()
     ));
     lines.push(format!(
         "- Overrides applied: `{}`",
@@ -2248,37 +2250,21 @@ pub fn recommendation_summary(repo_path: &Path) -> Result<Value, String> {
 // ── snapshots ───────────────────────────────────────────────────────────────
 
 struct OnboardingSnapshot {
-    repo_path: PathBuf,
     repo_name: String,
-    commit: Option<String>,
-    dirty: bool,
-    fingerprint: String,
-    file_count: usize,
-}
-
-impl OnboardingSnapshot {
-    fn cache_key(&self) -> String {
-        match &self.commit {
-            Some(commit) if !self.dirty => commit.clone(),
-            _ => self.fingerprint.clone(),
-        }
-    }
+    source_digest: String,
+    source_file_count: usize,
 }
 
 fn snapshot_metadata(repo_path: &Path) -> Result<OnboardingSnapshot, String> {
-    let (commit, dirty, fingerprint, file_count) = if repo_path.join(".git").exists() {
-        git_snapshot(repo_path)
+    let (source_digest, source_file_count) = if repo_path.join(".git").exists() {
+        git_snapshot(repo_path)?
     } else {
-        let (fingerprint, file_count) = filesystem_snapshot(repo_path)?;
-        (None, false, fingerprint, file_count)
+        filesystem_snapshot(repo_path)?
     };
     Ok(OnboardingSnapshot {
         repo_name: repository_name(repo_path),
-        repo_path: repo_path.to_path_buf(),
-        commit,
-        dirty,
-        fingerprint,
-        file_count,
+        source_digest,
+        source_file_count,
     })
 }
 
@@ -2354,48 +2340,22 @@ fn path_file_name(path: &Path) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-fn git_snapshot(repo_path: &Path) -> (Option<String>, bool, String, usize) {
-    let commit = run_git(repo_path, &["rev-parse", "HEAD"]).and_then(|stdout| {
-        let trimmed = stdout.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    });
-    let status_lines: Vec<String> = run_git(
-        repo_path,
-        &["status", "--porcelain", "--untracked-files=all"],
-    )
-    .map(|stdout| {
-        py_splitlines(&stdout)
-            .into_iter()
-            .map(str::to_string)
-            .collect()
-    })
-    .unwrap_or_default();
-    let dirty = !status_lines.is_empty();
-    let file_count = run_git(
-        repo_path,
-        &["ls-files", "--cached", "--others", "--exclude-standard"],
-    )
-    .map(|stdout| {
-        py_splitlines(&stdout)
-            .into_iter()
-            .filter(|line| !line.is_empty())
-            .count()
-    })
-    .unwrap_or(0);
+fn git_snapshot(repo_path: &Path) -> Result<(String, usize), String> {
+    let tracked = run_git_bytes(repo_path, &["ls-files", "--cached", "-z"])
+        .ok_or_else(|| "git ls-files failed while building onboarding source digest".to_string())?;
     let mut digest = Sha256::new();
-    digest.update(commit.as_deref().unwrap_or("no-commit").as_bytes());
-    for line in &status_lines {
-        digest.update(line.as_bytes());
+    let mut file_count = 0usize;
+    for relative in tracked
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        if is_generated_deploy_path(relative) {
+            continue;
+        }
+        hash_source_entry(&mut digest, repo_path, relative)?;
+        file_count += 1;
     }
-    if status_lines.is_empty() {
-        digest.update(b"clean");
-    }
-    let fingerprint = format!("{:x}", digest.finalize());
-    (commit, dirty, fingerprint, file_count)
+    Ok((format!("{:x}", digest.finalize()), file_count))
 }
 
 fn filesystem_snapshot(repo_path: &Path) -> Result<(String, usize), String> {
@@ -2414,9 +2374,6 @@ fn filesystem_snapshot(repo_path: &Path) -> Result<(String, usize), String> {
     let mut digest = Sha256::new();
     let mut file_count = 0usize;
     for path in paths {
-        if !path.is_file() {
-            continue;
-        }
         let relative = path
             .strip_prefix(repo_path)
             .map_err(|e| e.to_string())?
@@ -2424,19 +2381,88 @@ fn filesystem_snapshot(repo_path: &Path) -> Result<(String, usize), String> {
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/");
-        digest.update(relative.as_bytes());
-        let metadata = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        digest.update(metadata.len().to_string().as_bytes());
-        let mtime_ns: i128 = metadata
-            .modified()
-            .ok()
-            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos() as i128)
-            .unwrap_or(0);
-        digest.update(mtime_ns.to_string().as_bytes());
+        if is_generated_deploy_path(relative.as_bytes()) {
+            continue;
+        }
+        let metadata =
+            std::fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if metadata.is_dir() {
+            continue;
+        }
+        hash_source_entry(&mut digest, repo_path, relative.as_bytes())?;
         file_count += 1;
     }
     Ok((format!("{:x}", digest.finalize()), file_count))
+}
+
+fn is_generated_deploy_path(relative: &[u8]) -> bool {
+    GENERATED_DEPLOY_PATHS
+        .iter()
+        .any(|generated| generated.as_bytes() == relative)
+        || GENERATED_DEPLOY_PREFIXES
+            .iter()
+            .any(|generated| relative.starts_with(generated.as_bytes()))
+}
+
+fn hash_source_entry(digest: &mut Sha256, repo_path: &Path, relative: &[u8]) -> Result<(), String> {
+    hash_digest_frame(digest, relative);
+    let path = repo_path.join(path_buf_from_bytes(relative));
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            digest.update(b"symlink");
+            let target = std::fs::read_link(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            hash_digest_frame(digest, &path_bytes(&target));
+        }
+        Ok(metadata) if metadata.is_file() => {
+            digest.update(b"file");
+            let content =
+                std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            hash_digest_frame(digest, &content);
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            // Gitlinks are tracked directory entries. Their checked-out HEAD
+            // is the content identity available without traversing ignored
+            // or untracked files inside the nested repository.
+            digest.update(b"gitlink");
+            let head = run_git_bytes(&path, &["rev-parse", "HEAD"]).unwrap_or_default();
+            hash_digest_frame(digest, &head);
+        }
+        Ok(_) => digest.update(b"other"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            digest.update(b"missing");
+        }
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    }
+    Ok(())
+}
+
+fn hash_digest_frame(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+}
+
+#[cfg(unix)]
+fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(OsString::from_vec(bytes.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().as_bytes().to_vec()
 }
 
 fn collect_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -2677,6 +2703,94 @@ mod tests {
     }
 
     #[test]
+    fn onboarding_is_identical_across_linked_worktree_names() {
+        let repo = committed_git_repo("stable-across-worktrees");
+        let worktree = linked_worktree(&repo, "different-directory-name");
+
+        assert_eq!(
+            expected_onboarding_files(&repo).unwrap(),
+            expected_onboarding_files(&worktree).unwrap()
+        );
+
+        std::fs::remove_dir_all(&worktree).unwrap();
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn source_digest_tracks_bytes_not_only_dirty_path_names() {
+        let repo = committed_git_repo("content-digest");
+        write(&repo.join("README.md"), "first dirty contents\n");
+        let first = build_onboarding_artifact(&repo).unwrap();
+        write(&repo.join("README.md"), "second dirty content\n");
+        let second = build_onboarding_artifact(&repo).unwrap();
+
+        assert_ne!(
+            first
+                .get("freshness")
+                .unwrap()
+                .get("source_digest")
+                .unwrap(),
+            second
+                .get("freshness")
+                .unwrap()
+                .get("source_digest")
+                .unwrap()
+        );
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn generated_outputs_and_commit_identity_do_not_invalidate_onboarding() {
+        let repo = committed_git_repo("stable-after-commit");
+        let expected = expected_onboarding_files(&repo).unwrap();
+        crate::deploy::deploy(&repo, true).unwrap();
+        git(&repo, &["add", "--all"]);
+        git(&repo, &["commit", "-m", "docs: generate onboarding"]);
+
+        assert_eq!(expected_onboarding_files(&repo).unwrap(), expected);
+        let artifact = build_onboarding_artifact(&repo).unwrap();
+        let freshness = artifact.get("freshness").unwrap();
+        assert_eq!(freshness.get("source_commit"), Some(&Value::Null));
+        assert!(freshness.get("generated_at").is_none());
+        assert!(freshness.get("snapshot_key").is_none());
+        assert!(freshness.get("repo_dirty").is_none());
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn renderer_keeps_optional_source_commit_as_informational_provenance() {
+        let repo = committed_git_repo("optional-source-commit");
+        let mut artifact = build_onboarding_artifact(&repo).unwrap();
+        let mut freshness = artifact.get("freshness").unwrap().clone();
+        freshness.set("source_commit", Value::str("0123456789abcdef"));
+        artifact.set("freshness", freshness);
+
+        let rendered = render_onboarding_skill(&artifact).unwrap();
+        assert!(rendered.contains("- Source commit: `0123456789abcdef`"));
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn rebase_with_the_same_tracked_contents_keeps_onboarding_unchanged() {
+        let repo = committed_git_repo("rebase-independent");
+        git(&repo, &["checkout", "-b", "topic"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "test: topic"]);
+        let before = expected_onboarding_files(&repo).unwrap();
+
+        git(&repo, &["checkout", "-b", "upstream", "HEAD~1"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "test: upstream"]);
+        git(&repo, &["checkout", "topic"]);
+        git(&repo, &["rebase", "upstream"]);
+
+        assert_eq!(expected_onboarding_files(&repo).unwrap(), before);
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
     fn onboarding_overrides_can_opt_in_untracked_generated_surfaces() {
         let repo = committed_git_repo("override-local-surface");
         write(&repo.join(".gitignore"), "generated/\n");
@@ -2747,7 +2861,7 @@ mod tests {
         let skill = render_onboarding_skill(&artifact).unwrap();
         assert!(skill.contains("# Repo Onboarding:"));
         assert!(skill.contains("- Languages: `unknown`"));
-        assert!(skill.contains("- Repo dirty: `False`"));
+        assert!(skill.contains("- Source digest: `"));
 
         let act_skill = render_act_skill(&act).unwrap();
         assert!(act_skill.contains("# Repo Act:"));

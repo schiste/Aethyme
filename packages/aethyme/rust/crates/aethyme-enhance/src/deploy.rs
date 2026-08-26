@@ -646,18 +646,18 @@ mod tests {
             .mode();
         assert_eq!(wrapper_mode & 0o111, 0o111);
 
-        // Second non-force deploy: everything unchanged except the two
-        // freshness-stamped onboarding artifacts, which drift with the
-        // snapshot (matching Python's behavior on a dirtier tree).
+        // Content-addressed onboarding excludes its own generated outputs,
+        // so an unchanged source snapshot makes the whole deploy idempotent.
         let actions = deploy(&repo, false).unwrap();
         let changed: Vec<&str> = actions
             .iter()
             .filter(|a| a.action != "unchanged")
             .map(|a| a.relative_path.as_str())
             .collect();
-        assert!(changed.iter().all(
-            |path| path.starts_with(".aethyme/generated/") || path.contains("repo-onboarding")
-        ));
+        assert!(
+            changed.is_empty(),
+            "unexpected changed targets: {changed:?}"
+        );
 
         let results = verify(&repo).unwrap();
         assert!(is_ok(&results));
