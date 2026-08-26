@@ -8,6 +8,7 @@ use aethyme_broker::{
 };
 use aethyme_testkit::{aethyme_bin, tmp_dir};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 fn repository(root: &Path) -> PathBuf {
     let repo = root.join("repo");
@@ -136,11 +137,22 @@ fn canonical_upgrade_is_read_only_then_digest_bound_and_verifiable() {
 
     let before = run(&repo, &["upgrade", "plan", "--json"]);
     let plan = json(&before);
-    assert_eq!(plan["schema_version"], 2);
+    assert_eq!(plan["schema_version"], 3);
     assert_eq!(plan["from_schema"], 0);
     assert_eq!(plan["to_schema"], 1);
     assert_eq!(plan["safe"], true);
     assert_eq!(plan["applied"], false);
+    assert_eq!(plan["compatibility"]["capability"], "upgrade");
+    assert_eq!(plan["compatibility"]["allowed"], true);
+    assert!(plan["active_sessions"].as_array().unwrap().is_empty());
+    assert_eq!(
+        plan["existing_managed_state_digest"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(plan["diff_sha256"].as_str().unwrap().len(), 64);
     assert_eq!(
         plan["migrations"],
         serde_json::json!(["repository-deployment-v1"])
@@ -203,6 +215,114 @@ fn canonical_upgrade_is_read_only_then_digest_bound_and_verifiable() {
         "{}",
         String::from_utf8_lossy(&verified.stderr)
     );
+}
+
+#[test]
+fn migration_diff_is_exact_local_and_separate_from_json() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+
+    let structured = run(&repo, &["upgrade", "plan", "--repo", ".", "--json"]);
+    let plan = json(&structured);
+    assert!(plan.get("diff").is_none());
+    assert!(!String::from_utf8_lossy(&structured.stdout).contains("diff --git"));
+
+    let rendered = run(&repo, &["upgrade", "plan", "--repo", ".", "--diff"]);
+    assert!(
+        rendered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
+    let text = String::from_utf8(rendered.stdout).unwrap();
+    let plan_digest = plan["plan_digest"].as_str().unwrap();
+    assert!(text.contains(&format!("Plan SHA-256: {plan_digest}")));
+    assert!(text.contains("diff --git a/"));
+    assert!(!text.contains(repo.to_string_lossy().as_ref()));
+    let patch = text.split_once("Migration diff:\n").unwrap().1;
+    assert_eq!(
+        format!("{:x}", Sha256::digest(patch.as_bytes())),
+        plan["diff_sha256"]
+    );
+    assert_eq!(git_status(&repo), "");
+
+    let mixed = run(&repo, &["upgrade", "plan", "--diff", "--json"]);
+    assert!(!mixed.status.success());
+    assert!(
+        String::from_utf8_lossy(&mixed.stderr)
+            .contains("--diff and --json are separate review formats")
+    );
+}
+
+#[test]
+fn active_session_contract_is_digest_bound_without_sensitive_context() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    let without_session = json(&run(&repo, &["upgrade", "plan", "--json"]));
+
+    let session_id = register_version_pinned_session(&repo, "0.2.1");
+    let with_session_output = run(&repo, &["upgrade", "plan", "--json"]);
+    let with_session = json(&with_session_output);
+    assert_ne!(with_session["plan_digest"], without_session["plan_digest"]);
+    assert_eq!(
+        with_session["repository_head"],
+        without_session["repository_head"]
+    );
+    assert_eq!(
+        with_session["existing_managed_state_digest"],
+        without_session["existing_managed_state_digest"]
+    );
+    let active = with_session["active_sessions"].as_array().unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0]["session_id"], session_id);
+    assert_eq!(active[0]["repository_schema"], Value::Null);
+    assert_eq!(active[0]["aethyme_version"], "0.2.1");
+    let serialized = String::from_utf8(with_session_output.stdout).unwrap();
+    assert!(!serialized.contains("session accepted before Homebrew update"));
+    assert!(!serialized.contains(repo.to_string_lossy().as_ref()));
+}
+
+#[test]
+fn migration_diff_never_enters_reports_events_or_metrics() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    let reviewed = run(&repo, &["upgrade", "plan", "--diff"]);
+    assert!(reviewed.status.success());
+    assert!(String::from_utf8_lossy(&reviewed.stdout).contains("diff --git a/"));
+
+    for args in [
+        &[
+            "broker",
+            "report",
+            "capture",
+            "--kind",
+            "bug",
+            "--title",
+            "upgrade privacy",
+            "--stdout",
+        ][..],
+        &["broker", "metrics", "--json"][..],
+        &["broker", "events", "--json"][..],
+    ] {
+        let output = run(&repo, args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!rendered.contains("diff --git a/"), "{args:?}: {rendered}");
+        assert!(
+            !rendered.contains("Migration diff:"),
+            "{args:?}: {rendered}"
+        );
+    }
 }
 
 #[test]

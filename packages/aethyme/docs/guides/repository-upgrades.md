@@ -1,6 +1,6 @@
 # Repository upgrades
 
-Last Updated: 2026-08-24
+Last Updated: 2026-08-26
 
 Aethyme has two separate upgrade boundaries:
 
@@ -15,14 +15,30 @@ repository and create a read-only plan:
 
 ```bash
 cd /path/to/repository
-aethyme upgrade plan
+aethyme upgrade plan --diff
+```
+
+The local diff is generated only from the exact committed HEAD in a disposable
+repository. It includes creates, updates, deletes, file-mode changes, and
+binary patches without reading incidental ignored or untracked files. For
+automation or durable review metadata, request the content-free plan instead:
+
+```bash
+aethyme upgrade plan --json
 ```
 
 The plan identifies the current and target repository schema, exact embedded
-migrations, repository-relative paths that may change, the current Git HEAD,
-and a SHA-256 binding all of that state. Planning performs no writes. A dirty
-worktree, invalid marker, unsupported future schema, or enrollment-mode
-mismatch makes the plan unsafe.
+migrations, repository-relative paths that may change, the source Git HEAD,
+existing managed-state digest, proposed content hashes and modes, unresolved
+resolution choices, compatibility decision, active session contracts, and the
+local diff SHA-256. The plan digest binds every one of those fields. Task text,
+absolute worktree paths, and diff bodies are excluded from JSON. Diff bodies
+also never enter broker reports, events, metrics, or command telemetry.
+
+Planning performs no writes to the selected repository and ignores dirty or
+incidental worktree content when generating migration output. Applying still
+requires a clean worktree. An invalid marker, unsupported future schema, or
+enrollment-mode mismatch makes the plan unsafe.
 
 After reviewing the plan and ensuring the repository is clean, apply exactly
 that plan:

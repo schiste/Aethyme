@@ -87,7 +87,8 @@ Primary commands:
 - `aethyme deploy verify --repo /path/to/repo`
 - `aethyme deploy bridge --repo /path/to/repo`
 - `aethyme deploy --local-only --repo /path/to/repo`
-- `aethyme upgrade plan --repo /path/to/repo`
+- `aethyme upgrade plan --repo /path/to/repo --diff` (local content review)
+- `aethyme upgrade plan --repo /path/to/repo --json` (content-free automation)
 - `aethyme upgrade apply --repo /path/to/repo --confirm <plan-sha256>`
 - `aethyme explore --repo /path/to/repo --request "<task>" --format answer-json`
   (native Rust entrypoint; the paired `aethyme-engine-cli` binary serves the

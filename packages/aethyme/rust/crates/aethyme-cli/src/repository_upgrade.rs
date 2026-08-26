@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 pub const REPOSITORY_SCHEMA_VERSION: u32 = aethyme_broker::REPOSITORY_SCHEMA_VERSION;
 pub const CANONICAL_MARKER_PATH: &str = aethyme_broker::CANONICAL_REPOSITORY_MARKER_PATH;
 pub const LOCAL_MARKER_PATH: &str = aethyme_broker::LOCAL_REPOSITORY_MARKER_PATH;
-const PLAN_SCHEMA_VERSION: u32 = 2;
+const PLAN_SCHEMA_VERSION: u32 = 3;
 const MIGRATION_ID: &str = "repository-deployment-v1";
 const MIGRATION_IN_PROGRESS: &str = "repository-deployment-v1:in-progress";
 
@@ -65,16 +65,42 @@ pub struct RepositoryUpgradePlan {
     pub from_schema: u32,
     pub to_schema: u32,
     pub repository_head: String,
-    pub state_digest: String,
+    pub existing_managed_state_digest: String,
+    pub compatibility: CompatibilityDecision,
+    pub active_sessions: Vec<UpgradeActiveSessionPrecondition>,
     pub migrations: Vec<String>,
     pub changes: Vec<RepositoryTreeChange>,
+    pub resolution_choices: Vec<RepositoryResolution>,
     pub planned_paths: Vec<String>,
     pub examined_paths: Vec<String>,
+    pub diff_sha256: String,
     pub applied: bool,
     pub safe: bool,
     pub blockers: Vec<String>,
     pub plan_digest: String,
     pub next_action: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UpgradeActiveSessionPrecondition {
+    pub session_id: i64,
+    pub status: aethyme_broker::SessionStatus,
+    pub repository_schema: Option<u32>,
+    pub deployment_state_digest: Option<String>,
+    pub aethyme_version: Option<String>,
+    pub gate_definition_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryResolutionChoice {
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RepositoryResolution {
+    pub path: String,
+    pub choice: RepositoryResolutionChoice,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -112,11 +138,15 @@ struct PlanDigest<'a> {
     from_schema: u32,
     to_schema: u32,
     repository_head: &'a str,
-    state_digest: &'a str,
+    existing_managed_state_digest: &'a str,
+    compatibility: &'a CompatibilityDecision,
+    active_sessions: &'a [UpgradeActiveSessionPrecondition],
     migrations: &'a [String],
     changes: &'a [RepositoryTreeChange],
+    resolution_choices: &'a [RepositoryResolution],
     planned_paths: &'a [String],
     examined_paths: &'a [String],
+    diff_sha256: &'a str,
     safe: bool,
     blockers: &'a [String],
 }
@@ -527,6 +557,11 @@ struct ProposedRepository {
     root: PathBuf,
 }
 
+struct BuiltUpgradePlan {
+    report: RepositoryUpgradePlan,
+    migration_diff: String,
+}
+
 impl ProposedRepository {
     fn from_committed_head(repo: &Path, head: &str) -> Result<Self, String> {
         let temporary = tempfile::Builder::new()
@@ -729,10 +764,93 @@ fn path_bytes(path: &Path) -> Vec<u8> {
     path.to_string_lossy().as_bytes().to_vec()
 }
 
-pub fn plan(
+fn render_migration_diff(repo: &Path, planned_paths: &[String]) -> Result<String, String> {
+    if planned_paths.is_empty() {
+        return Ok(String::new());
+    }
+    let staged = Command::new("git")
+        .args(["-c", "core.hooksPath=/dev/null", "add", "-f", "-A", "--"])
+        .args(planned_paths)
+        .current_dir(repo)
+        .output()
+        .map_err(|error| format!("stage proposed migration tree: {error}"))?;
+    if !staged.status.success() {
+        return Err(format!(
+            "stage proposed migration tree: {}",
+            String::from_utf8_lossy(&staged.stderr).trim()
+        ));
+    }
+    let rendered = Command::new("git")
+        .args([
+            "-c",
+            "color.ui=false",
+            "diff",
+            "--cached",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "HEAD",
+            "--",
+        ])
+        .args(planned_paths)
+        .current_dir(repo)
+        .output()
+        .map_err(|error| format!("render proposed migration diff: {error}"))?;
+    if !rendered.status.success() {
+        return Err(format!(
+            "render proposed migration diff: {}",
+            String::from_utf8_lossy(&rendered.stderr).trim()
+        ));
+    }
+    String::from_utf8(rendered.stdout)
+        .map_err(|_| "proposed migration diff is not valid UTF-8".to_string())
+}
+
+fn active_session_preconditions(
+    repo: &Path,
+) -> Result<Vec<UpgradeActiveSessionPrecondition>, String> {
+    let checkout = aethyme_broker::GitRepo::discover(repo).map_err(|error| error.to_string())?;
+    let main_root = checkout.main_root().map_err(|error| error.to_string())?;
+    if !main_root.join(aethyme_broker::BROKER_DB_RELPATH).is_file() {
+        return Ok(Vec::new());
+    }
+    let mut broker =
+        aethyme_broker::Broker::open_snapshot(repo).map_err(|error| error.to_string())?;
+    let mut sessions = broker
+        .store()
+        .live_sessions()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|session| {
+            let contract = session.repository_contract;
+            UpgradeActiveSessionPrecondition {
+                session_id: session.id,
+                status: session.status,
+                repository_schema: contract
+                    .as_ref()
+                    .and_then(|contract| contract.repository_schema),
+                deployment_state_digest: contract
+                    .as_ref()
+                    .map(|contract| contract.deployment_state_digest.clone()),
+                aethyme_version: contract
+                    .as_ref()
+                    .map(|contract| contract.aethyme_version.clone()),
+                gate_definition_digest: contract
+                    .and_then(|contract| contract.gate_definition_digest),
+            }
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by_key(|session| session.session_id);
+    Ok(sessions)
+}
+
+fn build_plan(
     repo_hint: &Path,
     requested_mode: Option<RepositoryMode>,
-) -> Result<RepositoryUpgradePlan, String> {
+) -> Result<BuiltUpgradePlan, String> {
     let repo = git_root(repo_hint)?;
     let repository_head = git(&repo, &["rev-parse", "HEAD"])?;
     let proposal = ProposedRepository::from_committed_head(&repo, &repository_head)?;
@@ -799,7 +917,17 @@ pub fn plan(
     examined_paths.extend(managed_paths.iter().cloned());
     examined_paths.sort();
     examined_paths.dedup();
-    let state_digest = repository_state_digest(proposed_repo, mode)?;
+    let existing_managed_state_digest = repository_state_digest(proposed_repo, mode)?;
+    let compatibility = compatibility_decision(
+        &repo,
+        CommandCapability::Upgrade,
+        CompatibilityContext {
+            session_contract: None,
+            surface: InvocationSurface::UpgradeCommand,
+        },
+    )
+    .ok_or_else(|| "cannot determine repository upgrade compatibility".to_string())?;
+    let active_sessions = active_session_preconditions(&repo)?;
     let before_tree = snapshot_paths(proposed_repo, &examined_paths)?;
     if blockers.is_empty() && !migrations.is_empty() {
         write_pending_marker(proposed_repo, mode)?;
@@ -830,6 +958,16 @@ pub fn plan(
         .filter(|change| change.action != RepositoryTreeAction::Unchanged)
         .map(|change| change.path.clone())
         .collect::<Vec<_>>();
+    let resolution_choices = changes
+        .iter()
+        .filter(|change| change.requires_resolution)
+        .map(|change| RepositoryResolution {
+            path: change.path.clone(),
+            choice: RepositoryResolutionChoice::Unresolved,
+        })
+        .collect::<Vec<_>>();
+    let migration_diff = render_migration_diff(proposed_repo, &planned_paths)?;
+    let diff_sha256 = sha256(migration_diff.as_bytes());
     let safe = blockers.is_empty();
     let digest_input = PlanDigest {
         schema_version: PLAN_SCHEMA_VERSION,
@@ -837,11 +975,15 @@ pub fn plan(
         from_schema,
         to_schema: REPOSITORY_SCHEMA_VERSION,
         repository_head: &repository_head,
-        state_digest: &state_digest,
+        existing_managed_state_digest: &existing_managed_state_digest,
+        compatibility: &compatibility,
+        active_sessions: &active_sessions,
         migrations: &migrations,
         changes: &changes,
+        resolution_choices: &resolution_choices,
         planned_paths: &planned_paths,
         examined_paths: &examined_paths,
+        diff_sha256: &diff_sha256,
         safe,
         blockers: &blockers,
     };
@@ -856,23 +998,37 @@ pub fn plan(
             "review this plan, then run `aethyme upgrade apply --repo . --confirm {plan_digest}`"
         )
     };
-    Ok(RepositoryUpgradePlan {
-        schema_version: PLAN_SCHEMA_VERSION,
-        mode,
-        from_schema,
-        to_schema: REPOSITORY_SCHEMA_VERSION,
-        repository_head,
-        state_digest,
-        migrations,
-        changes,
-        planned_paths,
-        examined_paths,
-        applied: false,
-        safe,
-        blockers,
-        plan_digest,
-        next_action,
+    Ok(BuiltUpgradePlan {
+        report: RepositoryUpgradePlan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            mode,
+            from_schema,
+            to_schema: REPOSITORY_SCHEMA_VERSION,
+            repository_head,
+            existing_managed_state_digest,
+            compatibility,
+            active_sessions,
+            migrations,
+            changes,
+            resolution_choices,
+            planned_paths,
+            examined_paths,
+            diff_sha256,
+            applied: false,
+            safe,
+            blockers,
+            plan_digest,
+            next_action,
+        },
+        migration_diff,
     })
+}
+
+pub fn plan(
+    repo_hint: &Path,
+    requested_mode: Option<RepositoryMode>,
+) -> Result<RepositoryUpgradePlan, String> {
+    build_plan(repo_hint, requested_mode).map(|built| built.report)
 }
 
 pub fn apply(
@@ -910,7 +1066,6 @@ pub fn apply(
     write_current_marker(&repo, before.mode)?;
     verify_deployment(&repo, before.mode)?;
     before.applied = true;
-    before.state_digest = repository_state_digest(&repo, before.mode)?;
     before.next_action = match before.mode {
         RepositoryMode::Canonical => {
             "review and commit the migrated repository files; retain `aethyme deploy verify` in CI"
@@ -1141,6 +1296,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     let mut mode = None;
     let mut confirm = None;
     let mut json = false;
+    let mut diff = false;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
@@ -1164,18 +1320,37 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 json = true;
                 index += 1;
             }
+            "--diff" => {
+                diff = true;
+                index += 1;
+            }
             option => return Err(format!("unknown option {option}")),
         }
     }
+    if diff && json {
+        return Err("--diff and --json are separate review formats; choose one".into());
+    }
+    let mut migration_diff = None;
     let report = match action {
-        "plan" => plan(&repo, mode)?,
-        "apply" => apply(
-            &repo,
-            mode,
-            confirm
-                .as_deref()
-                .ok_or("apply requires --confirm <plan-sha256>")?,
-        )?,
+        "plan" => {
+            let built = build_plan(&repo, mode)?;
+            if diff {
+                migration_diff = Some(built.migration_diff);
+            }
+            built.report
+        }
+        "apply" => {
+            if diff {
+                return Err("--diff is available only for upgrade plan".into());
+            }
+            apply(
+                &repo,
+                mode,
+                confirm
+                    .as_deref()
+                    .ok_or("apply requires --confirm <plan-sha256>")?,
+            )?
+        }
         other => return Err(format!("unknown action {other}; expected plan or apply")),
     };
     if json {
@@ -1190,6 +1365,12 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         );
         println!("Mode: {:?}", report.mode);
         println!("Applied: {}", report.applied);
+        println!("Source HEAD: {}", report.repository_head);
+        println!(
+            "Existing managed state: {}",
+            report.existing_managed_state_digest
+        );
+        println!("Migration diff SHA-256: {}", report.diff_sha256);
         println!("Plan SHA-256: {}", report.plan_digest);
         for migration in &report.migrations {
             println!("  migration: {migration}");
@@ -1198,13 +1379,21 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             println!("  blocker: {blocker}");
         }
         println!("Next: {}", report.next_action);
+        if let Some(migration_diff) = migration_diff {
+            println!("Migration diff:");
+            if migration_diff.is_empty() {
+                println!("(no changes)");
+            } else {
+                print!("{migration_diff}");
+            }
+        }
     }
     Ok(())
 }
 
 fn print_usage() {
     println!("Usage:");
-    println!("  aethyme upgrade plan [--repo <path>] [--local-only] [--json]");
+    println!("  aethyme upgrade plan [--repo <path>] [--local-only] [--diff|--json]");
     println!(
         "  aethyme upgrade apply [--repo <path>] [--local-only] --confirm <plan-sha256> [--json]"
     );

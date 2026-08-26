@@ -156,16 +156,21 @@ an update check.
 ## Repository Upgrade Commands
 
 ```text
-aethyme upgrade plan [--repo <path>] [--local-only] [--json]
+aethyme upgrade plan [--repo <path>] [--local-only] [--diff|--json]
 aethyme upgrade apply [--repo <path>] [--local-only] --confirm <plan-sha256> [--json]
 ```
 
 Binary updates and repository migrations are intentionally separate. Run
 `plan` in each enrolled repository after updating the binary pair. It is
-read-only and binds the repository HEAD, relevant file state, deployment mode,
-planned paths, and embedded migrations into a full SHA-256. `apply` requires
-that exact digest, a clean worktree, and a supported marker before converging
-and verifying Aethyme-owned repository files.
+read-only and binds the source HEAD, existing managed-state digest, proposed
+content hashes and modes, resolution choices, compatibility decision, active
+session contracts, planned paths, and embedded migrations into a full
+SHA-256. `--diff` renders the exact binary-capable Git patch locally;
+`--json` emits the content-free structured plan and the patch SHA-256. The two
+formats are intentionally exclusive. `apply` requires that exact plan digest,
+a clean worktree, and a supported marker before converging and verifying
+Aethyme-owned repository files. Diff bodies never enter broker reports,
+events, metrics, or command telemetry.
 
 Canonical deployments track `.aethyme/repository.json`; local-only deployments
 keep `.aethyme/local/repository.json` ignored. Broker commands fail closed in
