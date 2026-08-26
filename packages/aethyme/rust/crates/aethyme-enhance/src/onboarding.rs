@@ -2199,10 +2199,7 @@ fn snapshot_metadata(repo_path: &Path) -> Result<OnboardingSnapshot, String> {
         (None, false, fingerprint, file_count)
     };
     Ok(OnboardingSnapshot {
-        repo_name: repo_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
+        repo_name: repository_name(repo_path),
         repo_path: repo_path.to_path_buf(),
         commit,
         dirty,
@@ -2222,6 +2219,60 @@ fn run_git(repo_path: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn repository_name(repo_path: &Path) -> String {
+    canonical_remote_repository_name(repo_path)
+        .or_else(|| common_git_directory_repository_name(repo_path))
+        .or_else(|| path_file_name(repo_path))
+        .unwrap_or_default()
+}
+
+fn canonical_remote_repository_name(repo_path: &Path) -> Option<String> {
+    let remotes = run_git(repo_path, &["remote"])?
+        .lines()
+        .filter(|remote| !remote.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let remote = if remotes.iter().any(|remote| remote == "origin") {
+        "origin"
+    } else if remotes.len() == 1 {
+        remotes[0].as_str()
+    } else {
+        return None;
+    };
+    let url = run_git(repo_path, &["remote", "get-url", remote])?;
+    repository_name_from_remote_url(url.trim())
+}
+
+fn repository_name_from_remote_url(url: &str) -> Option<String> {
+    let without_query = url.split(['?', '#']).next()?.trim_end_matches(['/', '\\']);
+    let name = without_query
+        .rsplit(|character| matches!(character, '/' | ':' | '\\'))
+        .next()?;
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    (!name.is_empty() && !matches!(name, "." | "..")).then(|| name.to_string())
+}
+
+fn common_git_directory_repository_name(repo_path: &Path) -> Option<String> {
+    let common = run_git(repo_path, &["rev-parse", "--git-common-dir"])?;
+    let common = PathBuf::from(common.trim());
+    let common = if common.is_relative() {
+        repo_path.join(common)
+    } else {
+        common
+    };
+    let common = common.canonicalize().unwrap_or(common);
+    if common.file_name().is_some_and(|name| name == ".git") {
+        return common.parent().and_then(path_file_name);
+    }
+    path_file_name(&common).map(|name| name.strip_suffix(".git").unwrap_or(&name).to_string())
+}
+
+fn path_file_name(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
 }
 
 fn git_snapshot(repo_path: &Path) -> (Option<String>, bool, String, usize) {
@@ -2341,6 +2392,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn committed_git_repo(tag: &str) -> PathBuf {
+        let repo = fixture_repo(tag);
+        git(&repo, &["init"]);
+        git(&repo, &["config", "user.name", "Aethyme Tests"]);
+        git(&repo, &["config", "user.email", "aethyme@example.test"]);
+        write(&repo.join("README.md"), "fixture\n");
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-m", "test: initialize fixture"]);
+        repo
+    }
+
+    fn linked_worktree(repo: &Path, tag: &str) -> PathBuf {
+        let worktree = repo.with_file_name(format!(
+            "aethyme-enhance-session-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&worktree);
+        let worktree_arg = worktree.to_string_lossy().into_owned();
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &format!("test/{tag}"),
+                &worktree_arg,
+            ],
+        );
+        worktree
+    }
+
+    #[test]
+    fn repository_name_parses_common_remote_url_forms() {
+        for (url, expected) in [
+            ("https://github.com/example/alpha.git", "alpha"),
+            ("ssh://git@github.com/example/bravo.git", "bravo"),
+            ("git@github.com:example/charlie.git", "charlie"),
+            ("/srv/git/delta.git", "delta"),
+            ("file:///srv/git/echo.git/", "echo"),
+        ] {
+            assert_eq!(
+                repository_name_from_remote_url(url).as_deref(),
+                Some(expected),
+                "remote URL: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_name_uses_canonical_remote_from_a_linked_worktree() {
+        let repo = committed_git_repo("remote-primary");
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:Example/Canonical-Repository.git",
+            ],
+        );
+        let worktree = linked_worktree(&repo, "remote-derived-name");
+
+        let artifact = build_onboarding_artifact(&worktree).unwrap();
+        assert_eq!(
+            artifact.get("repo").unwrap().get("name").unwrap().as_str(),
+            Some("Canonical-Repository")
+        );
+        assert!(render_onboarding_skill(&artifact)
+            .unwrap()
+            .contains("# Repo Onboarding: Canonical-Repository\n"));
+
+        std::fs::remove_dir_all(&worktree).unwrap();
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn repository_name_without_remote_uses_primary_worktree() {
+        let repo = committed_git_repo("canonical-primary");
+        let expected = repo.file_name().unwrap().to_string_lossy().into_owned();
+        let worktree = linked_worktree(&repo, "must-not-be-used");
+
+        let artifact = build_onboarding_artifact(&worktree).unwrap();
+        assert_eq!(
+            artifact.get("repo").unwrap().get("name").unwrap().as_str(),
+            Some(expected.as_str())
+        );
+
+        std::fs::remove_dir_all(&worktree).unwrap();
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     #[test]
