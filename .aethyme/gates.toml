@@ -12,7 +12,10 @@
 #   caveat that a dependency-changing diff could pass against the main
 #   checkout's environment.
 # - CARGO_TARGET_DIR is shared so merge-sim worktrees don't cold-build the
-#   whole workspace on every submit.
+#   whole workspace on every submit. The `v2` generation replaces the
+#   unbounded path-sensitive incremental cache retired on 2026-08-26.
+#   Authoritative disposable builds keep incremental compilation disabled and
+#   reduce debug information so the shared cache stays compact.
 # - Gate outputs must be gitignored or they change the working-tree hash
 #   and bust the result cache.
 # - Gate commands receive AETHYME_GATE_WORKER_ID and AETHYME_TEST_DB_SUFFIX.
@@ -56,7 +59,7 @@ triggers = ["packages/aethyme-eval/**"]
 
 [[gate]]
 name = "cargo-test"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/aethyme-cargo-target}" cargo test --workspace --quiet --manifest-path packages/aethyme/rust/Cargo.toml'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/aethyme-cargo-target-v2}" cargo test --workspace --quiet --manifest-path packages/aethyme/rust/Cargo.toml'
 cost = 3
 triggers = [
     "**/*.rs",
@@ -106,6 +109,6 @@ triggers = [
 # test rather than taken from PATH — a gate that validated a diff using
 # a stale installed binary would be checking the wrong code.
 name = "cross-process-contract"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/aethyme-cargo-target}" && BASE="$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)" && BODY="$(mktemp)" && git log --format=%B "$BASE"..HEAD > "$BODY" && cargo run --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --bin aethyme -- broker check-contract --base "$BASE" --pr-body "$BODY"'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=1 && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/aethyme-cargo-target-v2}" && BASE="$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)" && BODY="$(mktemp)" && git log --format=%B "$BASE"..HEAD > "$BODY" && cargo run --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --bin aethyme -- broker check-contract --base "$BASE" --pr-body "$BODY"'
 cost = 1
 cache = false
