@@ -387,6 +387,34 @@ impl HostResourceCoordinator {
         })
     }
 
+    /// Acquire a bundle, waiting only for ordinary contention. All other
+    /// failures are returned immediately. The same request id is reused for
+    /// every attempt so a successful acquire remains idempotent.
+    pub fn acquire_with_wait<F>(
+        &mut self,
+        request: &HostResourceRequest,
+        wait: std::time::Duration,
+        mut on_conflict: F,
+    ) -> Result<HostResourceGrant, HostResourceError>
+    where
+        F: FnMut(&str),
+    {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match self.acquire(request) {
+                Ok(grant) => return Ok(grant),
+                Err(HostResourceError::Conflict(message))
+                    if std::time::Instant::now() < deadline =>
+                {
+                    on_conflict(&message);
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(250)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub fn renew(
         &mut self,
         lease_id: &str,
@@ -1070,6 +1098,57 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn bounded_wait_acquires_after_the_owner_releases() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("h.db");
+        let mut owner = HostResourceCoordinator::open(&path).unwrap();
+        let grant = owner
+            .acquire(&req("owner", vec![exclusive("shared")]))
+            .unwrap();
+        let mut waiter = HostResourceCoordinator::open(&path).unwrap();
+        let waited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = waited.clone();
+        let handle = std::thread::spawn(move || {
+            waiter.acquire_with_wait(
+                &req("waiter", vec![exclusive("shared")]),
+                std::time::Duration::from_secs(2),
+                |_| {
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        owner
+            .release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )
+            .unwrap();
+        assert!(handle.join().unwrap().is_ok());
+        assert!(waited.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn bounded_wait_times_out_with_the_original_conflict() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("h.db");
+        let mut owner = HostResourceCoordinator::open(&path).unwrap();
+        owner
+            .acquire(&req("owner", vec![exclusive("shared")]))
+            .unwrap();
+        let mut waiter = HostResourceCoordinator::open(&path).unwrap();
+        let started = std::time::Instant::now();
+        let result = waiter.acquire_with_wait(
+            &req("waiter", vec![exclusive("shared")]),
+            std::time::Duration::from_millis(50),
+            |_| {},
+        );
+        assert!(matches!(result, Err(HostResourceError::Conflict(_))));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(50));
     }
 
     #[test]

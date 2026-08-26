@@ -71,6 +71,9 @@ pub struct Gate {
     pub cache: bool,
     pub resources: Vec<crate::HostResourceRequirement>,
     pub resource_ttl_seconds: u64,
+    /// Maximum time to wait for a contended host resource bundle. Zero
+    /// preserves the historical fail-fast behavior.
+    pub resource_wait_seconds: u64,
     pub definition_hash: String,
     matcher: Option<GlobSet>,
 }
@@ -144,6 +147,17 @@ pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
             })
             .transpose()?
             .unwrap_or(300);
+        let resource_wait_seconds = entry
+            .get("resource_wait_seconds")
+            .and_then(toml::Value::as_integer)
+            .map(|value| {
+                u64::try_from(value).map_err(|_| GateConfigError::BadResources {
+                    gate: name.clone(),
+                    message: "resource_wait_seconds must be non-negative".into(),
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
         crate::validate_host_resource_requirements(&resources, resource_ttl_seconds).map_err(
             |error| GateConfigError::BadResources {
                 gate: name.clone(),
@@ -158,6 +172,7 @@ pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
             cache,
             &resources,
             resource_ttl_seconds,
+            resource_wait_seconds,
         );
 
         let matcher = if triggers.is_empty() {
@@ -185,6 +200,7 @@ pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
             cache,
             resources,
             resource_ttl_seconds,
+            resource_wait_seconds,
             definition_hash,
             matcher,
         });
@@ -201,6 +217,7 @@ fn gate_definition_hash(
     cache: bool,
     resources: &[crate::HostResourceRequirement],
     resource_ttl_seconds: u64,
+    resource_wait_seconds: u64,
 ) -> String {
     let bytes = serde_json::to_vec(&serde_json::json!({
         "name": name,
@@ -210,6 +227,7 @@ fn gate_definition_hash(
         "cache": cache,
         "resources": resources,
         "resource_ttl_seconds": resource_ttl_seconds,
+        "resource_wait_seconds": resource_wait_seconds,
     }))
     .expect("gate definition contains only serializable values");
     format!("{:x}", Sha256::digest(bytes))
@@ -746,6 +764,7 @@ fn acquire_gate_resources(
     checkout: &GitRepo,
     tree: &str,
     worker_id: &str,
+    progress: &dyn GateProgressSink,
 ) -> Result<Option<GateResourceRuntime>, String> {
     if gate.resources.is_empty() {
         return Ok(None);
@@ -772,8 +791,22 @@ fn acquire_gate_resources(
     };
     let mut coordinator =
         crate::HostResourceCoordinator::open_default().map_err(|error| error.to_string())?;
+    let mut next_report = std::time::Instant::now();
     let grant = coordinator
-        .acquire(&request)
+        .acquire_with_wait(
+            &request,
+            std::time::Duration::from_secs(gate.resource_wait_seconds),
+            |message| {
+                let now = std::time::Instant::now();
+                if now >= next_report {
+                    progress.report(&format!(
+                        "gate {} waiting for host resources: {}",
+                        gate.name, message
+                    ));
+                    next_report = now + std::time::Duration::from_secs(5);
+                }
+            },
+        )
         .map_err(|error| error.to_string())?;
     Ok(Some(GateResourceRuntime {
         grant,
@@ -892,44 +925,45 @@ fn run_selections(
             &tree[..8.min(tree.len())],
             worker_id
         ));
-        let mut resource_runtime = match acquire_gate_resources(gate, checkout, &tree, &worker_id) {
-            Ok(runtime) => runtime,
-            Err(message) => {
-                let _ = std::fs::write(
-                    &log_path,
-                    format!("aethyme host resource acquisition failed: {message}\n"),
-                );
-                progress.report(&format!(
-                    "gate {} blocked by host resources: {}",
-                    gate.name, message
-                ));
-                drop(owner_locks);
-                store.record_gate_result(&NewGateResult {
-                    gate_name: gate.name.clone(),
-                    tree_hash: tree.clone(),
-                    definition_hash: gate.definition_hash.clone(),
-                    status: GateStatus::Error,
-                    failure_class: Some(GateFailureClass::ResourceContention),
-                    exit_code: None,
-                    duration_ms: Some(0),
-                    log_path: Some(log_path.to_string_lossy().into_owned()),
-                    session_id,
-                })?;
-                outcomes.push(GateRunOutcome {
-                    gate: gate.name.clone(),
-                    tree_hash: tree.clone(),
-                    definition_hash: gate.definition_hash.clone(),
-                    resource_lease: None,
-                    status: GateStatus::Error,
-                    failure_class: Some(GateFailureClass::ResourceContention),
-                    cached: false,
-                    exit_code: None,
-                    duration_ms: Some(0),
-                    log_path: Some(log_path.to_string_lossy().into_owned()),
-                });
-                break;
-            }
-        };
+        let mut resource_runtime =
+            match acquire_gate_resources(gate, checkout, &tree, &worker_id, progress) {
+                Ok(runtime) => runtime,
+                Err(message) => {
+                    let _ = std::fs::write(
+                        &log_path,
+                        format!("aethyme host resource acquisition failed: {message}\n"),
+                    );
+                    progress.report(&format!(
+                        "gate {} blocked by host resources: {}",
+                        gate.name, message
+                    ));
+                    drop(owner_locks);
+                    store.record_gate_result(&NewGateResult {
+                        gate_name: gate.name.clone(),
+                        tree_hash: tree.clone(),
+                        definition_hash: gate.definition_hash.clone(),
+                        status: GateStatus::Error,
+                        failure_class: Some(GateFailureClass::ResourceContention),
+                        exit_code: None,
+                        duration_ms: Some(0),
+                        log_path: Some(log_path.to_string_lossy().into_owned()),
+                        session_id,
+                    })?;
+                    outcomes.push(GateRunOutcome {
+                        gate: gate.name.clone(),
+                        tree_hash: tree.clone(),
+                        definition_hash: gate.definition_hash.clone(),
+                        resource_lease: None,
+                        status: GateStatus::Error,
+                        failure_class: Some(GateFailureClass::ResourceContention),
+                        cached: false,
+                        exit_code: None,
+                        duration_ms: Some(0),
+                        log_path: Some(log_path.to_string_lossy().into_owned()),
+                    });
+                    break;
+                }
+            };
         let resource_provenance = resource_runtime
             .as_ref()
             .map(|runtime| GateResourceProvenance {
@@ -1354,6 +1388,7 @@ command = "pytest -q"
 cost = 2
 triggers = ["**/*.py"]
 resource_ttl_seconds = 60
+resource_wait_seconds = 15
 
 [[gate.resources]]
 key = "database_port"
@@ -1379,6 +1414,7 @@ command = "true"
         );
         let pytest = gates.iter().find(|gate| gate.name == "pytest").unwrap();
         assert_eq!(pytest.resource_ttl_seconds, 60);
+        assert_eq!(pytest.resource_wait_seconds, 15);
         assert_eq!(pytest.resources.len(), 1);
         assert!(matches!(
             pytest.resources[0].resource,

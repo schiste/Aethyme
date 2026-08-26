@@ -2635,6 +2635,7 @@ impl Broker {
                 triggers_json: serde_json::to_string(&gate.triggers)?,
                 resources_json: serde_json::to_string(&gate.resources)?,
                 resource_ttl_seconds: gate.resource_ttl_seconds as i64,
+                resource_wait_seconds: gate.resource_wait_seconds as i64,
                 definition_hash: gate.definition_hash.clone(),
                 updated_at: 0,
             })?;

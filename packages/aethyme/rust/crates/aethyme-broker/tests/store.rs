@@ -277,6 +277,7 @@ fn gate_result_cache_ignores_cancelled_and_error_runs() {
             triggers_json: "[\"**/*.py\"]".into(),
             resources_json: "[]".into(),
             resource_ttl_seconds: 300,
+            resource_wait_seconds: 0,
             definition_hash: "test-definition".into(),
             updated_at: 0,
         })
