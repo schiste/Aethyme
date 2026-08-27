@@ -4,6 +4,51 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.3.0] - 2026-08-27
+
+### Added
+
+- Durable, non-blocking promotion advisories and queue-entry path exposures
+  remain visible until verified publication or confirmed reconciliation.
+- Operation history supports stable filtering, pagination, exact inspection,
+  and evidence-based reconciliation of failed or ambiguous pushes.
+- Repository upgrades expose exact content-and-mode plans, local diffs,
+  customization resolutions, transactional apply, and crash recovery.
+- Session handoffs, lease planning, gate provenance, cache bypass, canonical
+  remote coordination, and host-wide resource leasing are available through
+  stable broker surfaces.
+
+### Changed
+
+- Submission planning replays only session-owned commits from the accepted
+  checkpoint and classifies ancestry, patch identity, and ambiguity before
+  integration.
+- Active sessions pin their repository contract, keeping diagnostic,
+  recovery, finish, reporting, and eligible pre-commit lanes available across
+  binary updates.
+- Generated onboarding derives repository identity and surfaces from the
+  tracked snapshot and uses content-addressed, reproducible freshness data.
+- Generated AGENTS and CLAUDE policy teaches advisory delivery, persistence,
+  acknowledgment, rebase, session-close, and publication lifecycles.
+
+### Fixed
+
+- Canonical remote identity and host-wide write barriers now serialize Git and
+  GitHub mutations across independent clones without retaining credentials.
+- External-main reconciliation preserves reviewed unrecorded work and updates
+  integration and queue state under a digest-confirmed transaction.
+- Failed exact pushes are classified from destination-ref evidence rather
+  than stderr, while mixed or missing evidence remains safely unknown.
+- Synthetic submission commits preserve reviewed contract decisions without
+  copying arbitrary session commit bodies into integration.
+
+### Upgrade notes
+
+Read [Upgrading to v0.3.0](packages/aethyme/docs/guides/upgrading-to-v0.3.0.md)
+before updating an enrolled repository. This release advances broker storage
+to schema 17. Repository deployment remains schema 1, but regenerated policy
+and onboarding should be reviewed per repository.
+
 ## [0.2.2] - 2026-08-24
 
 ### Added
