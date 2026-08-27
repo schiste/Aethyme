@@ -166,6 +166,19 @@ Follow this protocol:
    This simulates the merge and runs only the checks your diff affects.
    `broker submit` promotes to the local integration branch; it does not
    publish a remote branch, create a pull request, or push a release tag.
+   Publication is a separate, explicitly authorized operator action. When
+   publication is authorized, review the exact promoted prefix first, then
+   confirm the plan's full publication SHA:
+
+   ```bash
+   aethyme broker ship plan --entry <promoted-entry-id>
+   aethyme broker ship execute --entry <promoted-entry-id> --confirm <full-publication-sha>
+   ```
+
+   Prefer this reviewed broker ship workflow over a raw push. Never infer
+   publication authority from permission to edit, submit, or promote.
+   Without publication authority, stop after submit and report the promoted
+   entry.
    Report the outcome (verified / rejected / conflict) in your summary.
    Afterwards, finish the session with
    `aethyme broker close --session <id>` (state only), or point it at
