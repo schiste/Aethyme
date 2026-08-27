@@ -507,11 +507,8 @@ name = "host-test-shared"
     for _ in 0..100 {
         if db_path.exists()
             && aethyme_broker::HostResourceCoordinator::open_read_only(&db_path)
-                .unwrap()
-                .list(false)
-                .unwrap()
-                .len()
-                == 1
+                .and_then(|coordinator| coordinator.list(false))
+                .is_ok_and(|leases| leases.len() == 1)
         {
             observed = true;
             break;
