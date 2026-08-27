@@ -321,12 +321,12 @@ fn print_artifact_ownership() {
         ".aethyme/generated/act-starter.json",
         "AGENTS.md and CLAUDE.md",
         ".codex/skills/",
-        ".claude/skills/",
-        ".claude/hooks/aethyme-load-context.sh",
-        ".claude/settings.local.json",
     ] {
         println!("  {path}");
     }
+    println!("Optional local Claude integration:");
+    println!("  .claude/skills/ and .claude/hooks/aethyme-load-context.sh");
+    println!("  .claude/settings.local.json (machine-local; never commit)");
     println!("Ignored machine-local runtime state:");
     for path in [
         ".aethyme/broker.db*",

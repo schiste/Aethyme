@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::deploy::{deploy, is_ok, refresh_status, summarize, verify};
-use crate::pyjson::{Value, py_bool};
+use crate::pyjson::{py_bool, Value};
 use crate::telemetry::append_event;
 
 /// Run `enhance <subcommand> ...` with `args` excluding the leading
@@ -119,7 +119,9 @@ fn run_verify(rest: &[String]) -> u8 {
         let ok = r.exists && !r.placeholder_present;
         let strict = matches!(r.relative_path.as_str(), "AGENTS.md" | "CLAUDE.md");
         let strict_direct_edit = strict && r.exists && !r.matches_canonical;
-        let marker = if strict_direct_edit {
+        let marker = if !r.required && (!ok || strict_direct_edit) {
+            "WARN"
+        } else if strict_direct_edit {
             "FAIL"
         } else if ok {
             "OK"
@@ -128,7 +130,11 @@ fn run_verify(rest: &[String]) -> u8 {
         };
         let mut notes: Vec<&str> = Vec::new();
         if !r.exists {
-            notes.push("missing");
+            notes.push(if r.required {
+                "missing"
+            } else {
+                "optional local integration not installed"
+            });
         } else if r.placeholder_present {
             notes.push("placeholder not substituted");
         }

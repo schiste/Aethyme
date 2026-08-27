@@ -138,6 +138,8 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
     assert!(stdout.contains("Review and commit repository policy:"));
     assert!(stdout.contains("Ignored machine-local runtime state:"));
     assert!(stdout.contains(".aethyme/generated/onboarding.json"));
+    assert!(stdout.contains("Optional local Claude integration:"));
+    assert!(stdout.contains("settings.local.json (machine-local; never commit)"));
 
     let verified = command(&repo)
         .args(["deploy", "verify", "--repo"])
@@ -149,6 +151,49 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
         "{}",
         String::from_utf8_lossy(&verified.stderr)
     );
+}
+
+#[test]
+fn canonical_clean_clone_verifies_without_ignored_claude_state() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    let deployed = command(&repo)
+        .args(["deploy", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        deployed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deployed.stderr)
+    );
+
+    fs::remove_dir_all(repo.join(".claude")).unwrap();
+    commit_all(&repo, "chore(aethyme): enroll portable policy");
+    let clone = temp.path().join("clean-clone");
+    let cloned = Command::new("git")
+        .args(["clone", "--quiet"])
+        .arg(&repo)
+        .arg(&clone)
+        .output()
+        .unwrap();
+    assert!(cloned.status.success());
+    assert!(!clone.join(".claude/settings.local.json").exists());
+
+    let verified = command(&clone)
+        .args(["deploy", "verify", "--repo"])
+        .arg(&clone)
+        .output()
+        .unwrap();
+    assert!(
+        verified.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&verified.stdout),
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&verified.stdout);
+    assert!(stdout.contains("[WARN] .claude/settings.local.json"));
+    assert!(stdout.contains("optional local integration not installed"));
 }
 
 #[test]
@@ -274,11 +319,9 @@ fn local_only_activation_is_clean_and_does_not_follow_a_clone() {
     assert!(policy.contains("## Broker Coordination"));
     assert!(repo.join(".codex/skills/aethyme/SKILL.md").is_file());
     assert!(repo.join(".claude/skills/aethyme/SKILL.md").is_file());
-    assert!(
-        fs::read_to_string(repo.join(".claude/settings.local.json"))
-            .unwrap()
-            .contains(".claude/hooks/aethyme-load-context.sh")
-    );
+    assert!(fs::read_to_string(repo.join(".claude/settings.local.json"))
+        .unwrap()
+        .contains(".claude/hooks/aethyme-load-context.sh"));
     assert!(!repo.join(".gitignore").exists());
     assert_eq!(status(&repo), "");
 

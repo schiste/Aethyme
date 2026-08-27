@@ -74,6 +74,9 @@ pub struct DeployAction {
 #[derive(Debug, Clone)]
 pub struct VerifyResult {
     pub relative_path: String,
+    /// Portable repository policy fails verification when absent. Optional
+    /// local integrations are reported without making a clean clone invalid.
+    pub required: bool,
     pub exists: bool,
     pub placeholder_present: bool,
     pub matches_canonical: bool,
@@ -470,6 +473,7 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
         if !dest.exists() {
             out.push(VerifyResult {
                 relative_path: relative_path.to_string(),
+                required: !relative_path.starts_with(".claude/"),
                 exists: false,
                 placeholder_present: false,
                 matches_canonical: false,
@@ -484,6 +488,7 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
         };
         out.push(VerifyResult {
             relative_path: relative_path.to_string(),
+            required: !relative_path.starts_with(".claude/"),
             exists: true,
             placeholder_present: actual.contains(PLACEHOLDER),
             matches_canonical: if *relative_path == "CLAUDE.md" {
@@ -497,8 +502,10 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
     for (relative_path, content) in expected_onboarding_files(repo)? {
         let dest = repo.join(&relative_path);
         if !dest.exists() {
+            let required = !relative_path.starts_with(".claude/");
             out.push(VerifyResult {
                 relative_path,
+                required,
                 exists: false,
                 placeholder_present: false,
                 matches_canonical: false,
@@ -507,6 +514,7 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
         }
         let actual = read_text(&dest)?;
         out.push(VerifyResult {
+            required: !relative_path.starts_with(".claude/"),
             relative_path,
             exists: true,
             placeholder_present: actual.contains(PLACEHOLDER),
@@ -520,6 +528,7 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
     if !settings_path.exists() {
         out.push(VerifyResult {
             relative_path: settings_label,
+            required: false,
             exists: false,
             placeholder_present: false,
             matches_canonical: false,
@@ -529,6 +538,7 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
         match pyjson::loads(&text) {
             Err(_) => out.push(VerifyResult {
                 relative_path: settings_label,
+                required: false,
                 exists: true,
                 placeholder_present: false,
                 matches_canonical: false,
@@ -546,6 +556,7 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
                 };
                 out.push(VerifyResult {
                     relative_path: settings_label,
+                    required: false,
                     exists: settings_has_hook_entry(session_start),
                     placeholder_present: false,
                     matches_canonical: true,
@@ -562,6 +573,7 @@ fn verify_agents_document(repo: &Path) -> Result<VerifyResult, String> {
     if !dest.exists() {
         return Ok(VerifyResult {
             relative_path: "AGENTS.md".to_string(),
+            required: true,
             exists: false,
             placeholder_present: false,
             matches_canonical: false,
@@ -571,6 +583,7 @@ fn verify_agents_document(repo: &Path) -> Result<VerifyResult, String> {
     let content = render_agents_document(Some(repo))?;
     Ok(VerifyResult {
         relative_path: "AGENTS.md".to_string(),
+        required: true,
         exists: true,
         placeholder_present: actual.contains(PLACEHOLDER),
         matches_canonical: policy_matches_canonical(&actual, &content),
@@ -599,10 +612,11 @@ fn policy_matches_canonical(actual: &str, canonical: &str) -> bool {
 /// content drift is allowed except for the generated root documents.
 pub fn is_ok(results: &[VerifyResult]) -> bool {
     results.iter().all(|r| {
-        r.exists
-            && !r.placeholder_present
-            && (r.matches_canonical
-                || !matches!(r.relative_path.as_str(), "AGENTS.md" | "CLAUDE.md"))
+        !r.required
+            || (r.exists
+                && !r.placeholder_present
+                && (r.matches_canonical
+                    || !matches!(r.relative_path.as_str(), "AGENTS.md" | "CLAUDE.md")))
     })
 }
 

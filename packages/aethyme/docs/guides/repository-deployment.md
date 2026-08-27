@@ -30,8 +30,13 @@ Review and commit:
   `.aethyme/generated/act-starter.json`;
 - `AGENTS.md` and `CLAUDE.md`;
 - `.codex/skills/`;
-- `.claude/skills/`, `.claude/hooks/aethyme-load-context.sh`, and
-  `.claude/settings.local.json`.
+
+Claude-specific skills and `.claude/hooks/aethyme-load-context.sh` are optional
+local integrations. A team may track them when it wants portable Claude
+support, but canonical verification does not require them in every clone.
+`.claude/settings.local.json` is always machine-local: it can contain private
+permission history and absolute paths, must not be committed, and is installed
+best-effort by `aethyme deploy` in each checkout.
 
 The two JSON artifacts under `.aethyme/generated/` are portable canonical
 inputs, not caches. They use repository-relative identity and allow another
@@ -64,6 +69,8 @@ The command is read-only. It fails when the repository is configured for the
 broker but its mandatory agent protocol is missing or invalid. Normal agent
 work then begins with `aethyme broker status --json` followed by
 `aethyme broker start --task "..."`, as required by the committed root policy.
+Missing optional `.claude/` integrations are warnings rather than failures, so
+a clean clone can verify portable canonical policy before local activation.
 
 Re-run `aethyme deploy --repo .` after changing gates, overrides, repository
 structure, or the installed Aethyme version; review and commit the resulting
