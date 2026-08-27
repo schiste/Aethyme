@@ -2045,6 +2045,24 @@ mod operation_history_tests {
         repository: &str,
         status: OperationStatus,
     ) -> i64 {
+        operation_with_identity(
+            store,
+            session_id,
+            provider,
+            repository,
+            status,
+            OperationIdentityProvenance::VerifiedCanonical,
+        )
+    }
+
+    fn operation_with_identity(
+        store: &mut BrokerStore,
+        session_id: i64,
+        provider: OperationProvider,
+        repository: &str,
+        status: OperationStatus,
+        identity_provenance: OperationIdentityProvenance,
+    ) -> i64 {
         let operation = store
             .create_coordinated_operation(&NewCoordinatedOperation {
                 session_id,
@@ -2056,7 +2074,7 @@ mod operation_history_tests {
                 command_json: "[]".into(),
                 pid: 1,
                 host_operation_id: None,
-                identity_provenance: OperationIdentityProvenance::VerifiedCanonical,
+                identity_provenance,
             })
             .unwrap();
         if status != OperationStatus::Prepared {
@@ -2205,5 +2223,44 @@ mod operation_history_tests {
                 Err(BrokerError::InvalidOperationHistoryLimit { .. })
             ));
         }
+    }
+
+    #[test]
+    fn operation_history_filters_legacy_and_canonical_identity_rows_by_persisted_values() {
+        let mut store = store();
+        operation_with_identity(
+            &mut store,
+            1,
+            OperationProvider::Git,
+            "github.com/owner/repo",
+            OperationStatus::Succeeded,
+            OperationIdentityProvenance::LegacyUnverifiedIdentity,
+        );
+        operation_with_identity(
+            &mut store,
+            2,
+            OperationProvider::Git,
+            "github.com/owner/repo",
+            OperationStatus::Succeeded,
+            OperationIdentityProvenance::VerifiedCanonical,
+        );
+
+        let page = store
+            .operation_history(&OperationHistoryQuery {
+                status: Some(OperationStatus::Succeeded),
+                repository: Some("github.com/owner/repo".into()),
+                provider: Some(OperationProvider::Git),
+                ..OperationHistoryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(ids(page.clone()), vec![2, 1]);
+        assert_eq!(
+            page.operations[0].identity_provenance,
+            OperationIdentityProvenance::VerifiedCanonical
+        );
+        assert_eq!(
+            page.operations[1].identity_provenance,
+            OperationIdentityProvenance::LegacyUnverifiedIdentity
+        );
     }
 }

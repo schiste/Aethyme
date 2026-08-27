@@ -103,7 +103,8 @@ pub use merge::{
 };
 pub use operations::{
     CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport,
-    UnknownOutcomeRecovery, classify_gh, classify_git,
+    OperationReconciliation, OperationReconciliationRecovery, OperationReconciliationState,
+    OperationShowReport, UnknownOutcomeRecovery, classify_gh, classify_git,
 };
 pub use pr::{
     PrActivityItem, PrCheckOptions, PrCheckReport, PrCheckRun, PrDecision, PrDecisionStatus,

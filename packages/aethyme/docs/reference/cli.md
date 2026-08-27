@@ -214,6 +214,7 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <gh-args>`
 - `aethyme broker operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]`
 - `aethyme broker operations [same options]` (compatibility alias during deprecation)
+- `aethyme broker operations show <id> [--json]`
 - `aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]`
 - `aethyme broker resources plan <request.json> [--json]`
 - `aethyme broker resources acquire <request.json> [--json]`
@@ -269,6 +270,19 @@ is exclusive, so adjacent pages do not duplicate the boundary row. A null
 cursor proves that no older matching row remains. The bare `broker operations`
 spelling is retained as an alias for `broker operations list` during its
 deprecation window.
+
+`broker operations show <id>` returns the exact durable row plus a typed
+reconciliation view. The view distinguishes `not_required`, `required`,
+`reconciled_succeeded`, and `reconciled_failed`; includes preserved exact-push
+evidence when available; and renders both complete reconciliation commands for
+an unknown outcome. `automatic_retry_allowed` is always false. A second clone
+remains blocked by the host-wide unknown-outcome barrier until an operator
+inspects external state and runs one explicit reconciliation command.
+
+Every `operations reconcile` usage or validation error repeats the complete
+contract—`--operation`, `--outcome`, and `--reason`—in one message. Successful
+manual reconciliation appends the operator outcome and reason without deleting
+the original push plan or remote evidence.
 
 `broker gates pre-push` is an opt-in adapter for repository-owned hooks; the
 managed hook installer never writes `pre-push`. It reads Git's ref-update lines

@@ -69,6 +69,11 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
     for args in [
         &["operations", "reconcile"][..],
         &["operations", "reconcile", "--operation", "1"][..],
+        &["operations", "reconcile", "--operation", "not-an-id"][..],
+        &["operations", "reconcile", "--operation"][..],
+        &["operations", "reconcile", "--outcome"][..],
+        &["operations", "reconcile", "--reason"][..],
+        &["operations", "reconcile", "--unexpected"][..],
         &[
             "operations",
             "reconcile",
@@ -84,6 +89,26 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
             "1",
             "--outcome",
             "failed",
+        ][..],
+        &[
+            "operations",
+            "reconcile",
+            "--operation",
+            "999",
+            "--outcome",
+            "failed",
+            "--reason",
+            "external inspection found no effect",
+        ][..],
+        &[
+            "operations",
+            "reconcile",
+            "--operation",
+            "1",
+            "--outcome",
+            "failed",
+            "--reason",
+            "   ",
         ][..],
     ] {
         assert_usage(run(&repo, &state, args), OPERATIONS_USAGE);
@@ -181,4 +206,36 @@ fn originating_github_write_prints_the_complete_reconciliation_handoff() {
             "missing {required:?} in: {stderr}"
         );
     }
+
+    let operation_id_arg = operation_id.to_string();
+    let shown = run(
+        &repo,
+        &state,
+        &["operations", "show", &operation_id_arg, "--json"],
+    );
+    assert!(shown.status.success());
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["operation"]["id"], operation_id);
+    assert_eq!(shown["reconciliation"]["state"], "required");
+    assert_eq!(shown["reconciliation"]["write_blocked"], true);
+    assert_eq!(shown["reconciliation"]["automatic_retry_allowed"], false);
+    assert!(
+        shown["reconciliation"]["recovery"]["succeeded_command"]
+            .as_str()
+            .unwrap()
+            .contains("--operation")
+    );
+    assert!(
+        shown["reconciliation"]["recovery"]["failed_command"]
+            .as_str()
+            .unwrap()
+            .contains("--reason")
+    );
+
+    let shown_text = run(&repo, &state, &["operations", "show", &operation_id_arg]);
+    assert!(shown_text.status.success());
+    let shown_text = String::from_utf8_lossy(&shown_text.stdout);
+    assert!(shown_text.contains("Reconciliation: required"));
+    assert!(shown_text.contains("Automatic retry: forbidden"));
+    assert!(shown_text.contains("Blind retry is forbidden"));
 }

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use aethyme_broker::{
     Broker, BrokerOpError, CoordinatedCommand, GitRepo, NewCoordinatedOperation, OperationEffect,
-    OperationProvider, OperationStatus,
+    OperationProvider, OperationReconciliationState, OperationStatus,
 };
 
 fn git(cwd: &Path, args: &[&str]) {
@@ -405,6 +405,20 @@ fn exact_rejected_push_is_failed_when_every_destination_remains_at_its_base() {
         reconciliation["evidence"]["destinations"][0]["observed_sha"],
         base
     );
+    let shown = fixture
+        .broker
+        .show_coordinated_operation(report.operation.id)
+        .unwrap();
+    assert_eq!(
+        shown.reconciliation.state,
+        OperationReconciliationState::NotRequired
+    );
+    assert!(!shown.reconciliation.write_blocked);
+    assert!(!shown.reconciliation.automatic_retry_allowed);
+    assert_eq!(
+        shown.reconciliation.evidence.as_ref().unwrap()["evidence"]["classification"],
+        "failed"
+    );
 
     let second = fixture
         .broker
@@ -464,6 +478,19 @@ fn exact_push_is_succeeded_when_transport_exits_nonzero_after_every_update() {
         details["push_reconciliation"]["evidence"]["classification"],
         "succeeded"
     );
+    let shown = fixture
+        .broker
+        .show_coordinated_operation(report.operation.id)
+        .unwrap();
+    assert_eq!(
+        shown.reconciliation.state,
+        OperationReconciliationState::NotRequired
+    );
+    assert!(!shown.reconciliation.automatic_retry_allowed);
+    assert_eq!(
+        shown.reconciliation.evidence.as_ref().unwrap()["evidence"]["classification"],
+        "succeeded"
+    );
 }
 
 #[cfg(unix)]
@@ -493,6 +520,19 @@ fn mixed_exact_destinations_remain_partial_and_write_blocking() {
         details["push_reconciliation"]["evidence"]["classification"],
         "partial"
     );
+    let shown = fixture
+        .broker
+        .show_coordinated_operation(report.operation.id)
+        .unwrap();
+    assert_eq!(
+        shown.reconciliation.state,
+        OperationReconciliationState::Required
+    );
+    assert!(shown.reconciliation.write_blocked);
+    assert!(!shown.reconciliation.automatic_retry_allowed);
+    let recovery = shown.reconciliation.recovery.as_ref().unwrap();
+    assert!(recovery.succeeded_command.contains("--outcome succeeded"));
+    assert!(recovery.failed_command.contains("--outcome failed"));
     assert!(
         fixture
             .broker
@@ -504,6 +544,30 @@ fn mixed_exact_destinations_remain_partial_and_write_blocking() {
             .unwrap_err()
             .to_string()
             .contains("Blind retry is forbidden")
+    );
+    fixture
+        .broker
+        .reconcile_coordinated_operation(
+            report.operation.id,
+            false,
+            "reviewed both destination refs",
+        )
+        .unwrap();
+    let reconciled = fixture
+        .broker
+        .show_coordinated_operation(report.operation.id)
+        .unwrap();
+    assert_eq!(
+        reconciled.reconciliation.state,
+        OperationReconciliationState::ReconciledFailed
+    );
+    assert_eq!(
+        reconciled.reconciliation.evidence.as_ref().unwrap()["evidence"]["classification"],
+        "partial"
+    );
+    assert_eq!(
+        reconciled.reconciliation.operator_reason.as_deref(),
+        Some("reviewed both destination refs")
     );
 }
 
@@ -540,6 +604,19 @@ fn missing_post_push_evidence_keeps_an_exact_push_unknown() {
         serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
     assert_eq!(
         details["push_reconciliation"]["evidence"]["reason"],
+        "post_push_remote_evidence_unavailable"
+    );
+    let shown = fixture
+        .broker
+        .show_coordinated_operation(report.operation.id)
+        .unwrap();
+    assert_eq!(
+        shown.reconciliation.state,
+        OperationReconciliationState::Required
+    );
+    assert!(!shown.reconciliation.automatic_retry_allowed);
+    assert_eq!(
+        shown.reconciliation.evidence.as_ref().unwrap()["evidence"]["reason"],
         "post_push_remote_evidence_unavailable"
     );
 }
@@ -619,10 +696,26 @@ fn crashed_write_blocks_until_operator_reconciliation() {
             .status,
         OperationStatus::OutcomeUnknown
     );
+    let shown = broker.show_coordinated_operation(stale.id).unwrap();
+    assert_eq!(
+        shown.reconciliation.state,
+        OperationReconciliationState::Required
+    );
+    assert!(!shown.reconciliation.automatic_retry_allowed);
 
     broker
         .reconcile_coordinated_operation(stale.id, false, "remote inspection found no change")
         .unwrap();
+    let reconciled = broker.show_coordinated_operation(stale.id).unwrap();
+    assert_eq!(
+        reconciled.reconciliation.state,
+        OperationReconciliationState::ReconciledFailed
+    );
+    assert_eq!(
+        reconciled.reconciliation.operator_reason.as_deref(),
+        Some("remote inspection found no change")
+    );
+    assert!(!reconciled.reconciliation.automatic_retry_allowed);
     let retry = broker
         .run_coordinated_operation(request(session.id, &["branch", "after-crash"]))
         .unwrap();

@@ -190,6 +190,103 @@ pub struct OperationReconcileReport {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationReconciliationState {
+    NotRequired,
+    Required,
+    ReconciledSucceeded,
+    ReconciledFailed,
+}
+
+impl OperationReconciliationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not_required",
+            Self::Required => "required",
+            Self::ReconciledSucceeded => "reconciled_succeeded",
+            Self::ReconciledFailed => "reconciled_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OperationReconciliationRecovery {
+    pub inspection: String,
+    pub succeeded_command: String,
+    pub failed_command: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OperationReconciliation {
+    pub state: OperationReconciliationState,
+    pub required: bool,
+    pub write_blocked: bool,
+    /// The broker never turns an inspection result into an automatic retry.
+    pub automatic_retry_allowed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<OperationReconciliationRecovery>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OperationShowReport {
+    pub operation: CoordinatedOperation,
+    pub reconciliation: OperationReconciliation,
+}
+
+impl OperationShowReport {
+    fn from_operation(operation: CoordinatedOperation) -> Self {
+        let details = operation
+            .details_json
+            .as_deref()
+            .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok());
+        let state = match operation.status {
+            OperationStatus::OutcomeUnknown => OperationReconciliationState::Required,
+            OperationStatus::ReconciledSucceeded => {
+                OperationReconciliationState::ReconciledSucceeded
+            }
+            OperationStatus::ReconciledFailed => OperationReconciliationState::ReconciledFailed,
+            _ => OperationReconciliationState::NotRequired,
+        };
+        let recovery = (state == OperationReconciliationState::Required).then(|| {
+            let recovery = UnknownOutcomeRecovery::from_operation(&operation);
+            OperationReconciliationRecovery {
+                inspection: recovery.inspection_instruction(),
+                succeeded_command: recovery.succeeded_command(),
+                failed_command: recovery.failed_command(),
+            }
+        });
+        let evidence = details
+            .as_ref()
+            .and_then(|details| details.get("push_reconciliation"))
+            .cloned();
+        let operator_reason = details.as_ref().and_then(|details| {
+            details
+                .get("reconciliation")
+                .and_then(|reconciliation| reconciliation.get("operator_reason"))
+                .or_else(|| details.get("operator_reason"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+        Self {
+            operation,
+            reconciliation: OperationReconciliation {
+                state,
+                required: state == OperationReconciliationState::Required,
+                write_blocked: state == OperationReconciliationState::Required,
+                automatic_retry_allowed: false,
+                evidence,
+                operator_reason,
+                recovery,
+            },
+        }
+    }
+}
+
 struct RepositoryWriteLock {
     file: File,
 }
@@ -729,6 +826,16 @@ fn redacted_command(provider: OperationProvider, args: &[String]) -> Result<Stri
 }
 
 impl Broker {
+    pub fn show_coordinated_operation(
+        &mut self,
+        operation_id: i64,
+    ) -> Result<OperationShowReport, BrokerOpError> {
+        let operation = self.store().coordinated_operation(operation_id)?.ok_or(
+            crate::BrokerError::CoordinatedOperationNotFound(operation_id),
+        )?;
+        Ok(OperationShowReport::from_operation(operation))
+    }
+
     pub fn run_coordinated_operation(
         &mut self,
         request: CoordinatedCommand,
@@ -1155,12 +1262,21 @@ impl Broker {
                 succeeded,
             )?;
         }
-        let details = json!({ "operator_reason": reason }).to_string();
+        let mut details = operation
+            .details_json
+            .as_deref()
+            .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        details["reconciliation"] = json!({
+            "operator_reason": reason,
+            "outcome": status.as_str(),
+        });
         let operation = self.store().transition_coordinated_operation(
             operation_id,
             status,
             operation.exit_code,
-            Some(&details),
+            Some(&details.to_string()),
         )?;
         Ok(OperationReconcileReport {
             operation,

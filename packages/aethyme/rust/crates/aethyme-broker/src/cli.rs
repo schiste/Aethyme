@@ -15,6 +15,7 @@ const RESOURCES_RECONCILE_USAGE: &str =
     "usage: aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]";
 const OPERATIONS_RECONCILE_USAGE: &str = "usage: aethyme broker operations reconcile \
      --operation <id> --outcome <succeeded|failed> --reason <text> [--json]";
+const OPERATIONS_SHOW_USAGE: &str = "usage: aethyme broker operations show <id> [--json]";
 const INTEGRATION_RECONCILE_USAGE: &str = "usage: aethyme broker integration reconcile \
      --upstream <ref> [--resolution-file <path>] [--dry-run | --apply --confirm <sha256>] [--json]";
 
@@ -145,6 +146,9 @@ Usage:
   aethyme broker operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]
       List a filtered newest-first page of the durable operation journal.
       `operations` without `list` is a compatibility alias during deprecation.
+  aethyme broker operations show <id> [--json]
+      Show one exact durable operation and its reconciliation state, evidence,
+      write barrier, and complete recovery commands when inspection is required.
   aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]
       Resolve a crash-ambiguous operation after independently inspecting the
       remote state. Overlapping writes remain blocked until reconciliation.
@@ -2286,6 +2290,51 @@ fn operation_history_query(parsed: &Parsed) -> Result<crate::OperationHistoryQue
     })
 }
 
+fn operations_reconcile_error(detail: impl std::fmt::Display) -> UsageError {
+    UsageError::Message(format!(
+        "{detail}\noperations reconcile requires every field: --operation <id>, --outcome <succeeded|failed>, and --reason <text>.\n{OPERATIONS_RECONCILE_USAGE}"
+    ))
+}
+
+fn render_operation_show(report: &crate::OperationShowReport) {
+    let operation = &report.operation;
+    println!("Operation:      {}", operation.id);
+    println!("Session:        {}", operation.session_id);
+    println!("Provider:       {}", operation.provider.as_str());
+    println!("Repository:     {}", operation.repository);
+    println!("Scope:          {}", operation.scope);
+    println!("Effect:         {}", operation.effect.as_str());
+    println!("Status:         {}", operation.status.as_str());
+    println!("Identity:       {}", operation.identity_provenance.as_str());
+    println!("Command:        {}", operation.command_json);
+    println!(
+        "Host operation: {}",
+        operation.host_operation_id.as_deref().unwrap_or("none")
+    );
+    println!("Reconciliation: {}", report.reconciliation.state.as_str());
+    println!(
+        "Write blocked:  {}",
+        if report.reconciliation.write_blocked {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!("Automatic retry: forbidden");
+    if let Some(evidence) = &report.reconciliation.evidence {
+        println!("Evidence:       {evidence}");
+    }
+    if let Some(reason) = &report.reconciliation.operator_reason {
+        println!("Operator reason: {reason}");
+    }
+    if let Some(recovery) = &report.reconciliation.recovery {
+        println!("Inspect:        {}", recovery.inspection);
+        println!("If succeeded:   {}", recovery.succeeded_command);
+        println!("If failed:      {}", recovery.failed_command);
+        println!("Blind retry is forbidden until reconciliation is recorded.");
+    }
+}
+
 fn render_coordinated_operation(
     report: &crate::CoordinatedOperationReport,
     json: bool,
@@ -2751,7 +2800,18 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
     let Some(subcommand) = args.first() else {
         return Err(UsageError::Help);
     };
-    let mut parsed = parse(&args[1..])?;
+    let mut parsed = parse(&args[1..]).map_err(|error| {
+        if subcommand == "operations" && args.get(1).map(String::as_str) == Some("reconcile") {
+            match error {
+                UsageError::Message(message) if !message.contains(OPERATIONS_RECONCILE_USAGE) => {
+                    operations_reconcile_error(message)
+                }
+                other => other,
+            }
+        } else {
+            error
+        }
+    })?;
     parsed.read_only_snapshot = mode == CompatibilityMode::ReadOnlySnapshot;
 
     match subcommand.as_str() {
@@ -3120,29 +3180,51 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         }
                     }
                 }
+                Some("show") => {
+                    if parsed.positional.len() != 2 {
+                        return Err(UsageError::Message(OPERATIONS_SHOW_USAGE.into()));
+                    }
+                    let operation_id = parsed.positional[1].parse::<i64>().map_err(|_| {
+                        UsageError::Message(format!(
+                            "operation id must be a positive integer; {OPERATIONS_SHOW_USAGE}"
+                        ))
+                    })?;
+                    if operation_id <= 0 {
+                        return Err(UsageError::Message(format!(
+                            "operation id must be a positive integer; {OPERATIONS_SHOW_USAGE}"
+                        )));
+                    }
+                    let report = broker.show_coordinated_operation(operation_id)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        render_operation_show(&report);
+                    }
+                }
                 Some("reconcile") => {
-                    let operation = parsed
-                        .operation
-                        .ok_or(UsageError::Message(OPERATIONS_RECONCILE_USAGE.into()))?;
-                    let outcome = parsed
-                        .outcome
-                        .as_deref()
-                        .ok_or(UsageError::Message(OPERATIONS_RECONCILE_USAGE.into()))?;
+                    if parsed.operation.is_none()
+                        || parsed.outcome.is_none()
+                        || parsed.reason.as_deref().is_none_or(str::is_empty)
+                    {
+                        return Err(operations_reconcile_error(
+                            "incomplete operation reconciliation request",
+                        ));
+                    }
+                    let operation = parsed.operation.expect("validated operation id");
+                    let outcome = parsed.outcome.as_deref().expect("validated outcome");
                     let succeeded = match outcome {
                         "succeeded" => true,
                         "failed" => false,
                         _ => {
-                            return Err(UsageError::Message(format!(
-                                "--outcome must be succeeded or failed; {OPERATIONS_RECONCILE_USAGE}"
-                            )));
+                            return Err(operations_reconcile_error(
+                                "--outcome must be succeeded or failed",
+                            ));
                         }
                     };
-                    let reason = parsed
-                        .reason
-                        .as_deref()
-                        .ok_or(UsageError::Message(OPERATIONS_RECONCILE_USAGE.into()))?;
-                    let report =
-                        broker.reconcile_coordinated_operation(operation, succeeded, reason)?;
+                    let reason = parsed.reason.as_deref().expect("validated reason");
+                    let report = broker
+                        .reconcile_coordinated_operation(operation, succeeded, reason)
+                        .map_err(operations_reconcile_error)?;
                     if parsed.json {
                         println!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
@@ -3156,7 +3238,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
                 Some(other) => {
                     return Err(UsageError::Message(format!(
-                        "unknown operations action {other:?} — expected list or reconcile"
+                        "unknown operations action {other:?} — expected list, show, or reconcile"
                     )));
                 }
             }

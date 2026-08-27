@@ -190,6 +190,24 @@ fn operation_history_lists_filters_and_pages_with_a_bare_alias() {
     let first_operations = first_json["operations"].as_array().unwrap();
     assert_eq!(first_operations.len(), 2);
     assert!(first_operations[0]["id"].as_i64() > first_operations[1]["id"].as_i64());
+    let first_id = first_operations[0]["id"].as_i64().unwrap().to_string();
+    let shown = Invoke::new(["broker", "operations", "show", &first_id, "--json"])
+        .cwd(tmp.path())
+        .run();
+    shown.ok();
+    assert_eq!(shown.json()["operation"], first_operations[0]);
+    assert_eq!(shown.json()["reconciliation"]["state"], "not_required");
+    assert_eq!(
+        shown.json()["reconciliation"]["automatic_retry_allowed"],
+        false
+    );
+
+    let shown_text = Invoke::new(["broker", "operations", "show", &first_id])
+        .cwd(tmp.path())
+        .run();
+    shown_text.ok();
+    shown_text.assert_contains("Reconciliation: not_required");
+    shown_text.assert_contains("Automatic retry: forbidden");
     let before = first_json["next_before_id"].as_i64().unwrap().to_string();
 
     let second = Invoke::new([
@@ -239,4 +257,10 @@ fn operation_history_lists_filters_and_pages_with_a_bare_alias() {
         .run();
     invalid.expect_code(1);
     invalid.assert_contains("--limit must be between 1 and 500");
+
+    let missing_show_id = Invoke::new(["broker", "operations", "show"])
+        .cwd(tmp.path())
+        .run();
+    missing_show_id.expect_code(1);
+    missing_show_id.assert_contains("operations show <id> [--json]");
 }
