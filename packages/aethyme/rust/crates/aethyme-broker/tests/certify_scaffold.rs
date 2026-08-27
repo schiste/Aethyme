@@ -621,6 +621,7 @@ fn existing_files_are_never_touched_and_gitignore_appends_preserving_content() {
     assert!(gitignore.contains("aethyme-broker:begin"));
     assert!(gitignore.contains(".aethyme/reports/"));
     assert!(gitignore.contains(".aethyme/worktrees/"));
+    assert!(gitignore.contains(".aethyme/broker-advisory.md"));
     assert!(gitignore.contains(".aethyme/generated/experience-telemetry.jsonl"));
     assert!(gitignore.contains(".aethyme/generated/experience-status.json"));
     assert!(gitignore.contains(".aethyme/generated/experience-status.md"));

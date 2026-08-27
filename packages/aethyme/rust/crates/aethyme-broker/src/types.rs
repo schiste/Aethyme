@@ -120,6 +120,61 @@ text_enum!(OperationIdentityProvenance, "coordinated_operations.identity_provena
     LocalRepository => "local_repository",
 });
 
+text_enum!(AdvisorySeverity, "advisories.severity", {
+    Info => "info",
+    Warning => "warning",
+    Critical => "critical",
+});
+
+text_enum!(AdvisoryResolutionState, "advisories.resolution_state", {
+    Outstanding => "outstanding",
+    Acknowledged => "acknowledged",
+});
+
+/// One bounded, structured fact supporting a non-blocking advisory.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AdvisoryEvidence {
+    pub kind: String,
+    pub summary: String,
+}
+
+/// Immutable input used by broker subsystems to persist an advisory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAdvisory {
+    /// Stable idempotency key chosen by the advisory producer.
+    pub identity: String,
+    pub session_id: Option<i64>,
+    pub severity: AdvisorySeverity,
+    pub queue_entry_id: Option<i64>,
+    pub integration_sha: Option<String>,
+    pub paths: Vec<String>,
+    pub evidence: Vec<AdvisoryEvidence>,
+}
+
+/// Authoritative durable advisory row. Acknowledgement never deletes history.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Advisory {
+    pub id: i64,
+    pub identity: String,
+    pub session_id: Option<i64>,
+    pub severity: AdvisorySeverity,
+    pub queue_entry_id: Option<i64>,
+    pub integration_sha: Option<String>,
+    pub paths: Vec<String>,
+    pub evidence: Vec<AdvisoryEvidence>,
+    pub created_at: i64,
+    pub resolution_state: AdvisoryResolutionState,
+    pub acknowledged_at: Option<i64>,
+}
+
+/// Stable JSON envelope for `advisories list`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AdvisoryList {
+    pub advisories: Vec<Advisory>,
+    pub outstanding_count: usize,
+    pub includes_acknowledged: bool,
+}
+
 /// Durable intent recorded before a coordinated command starts.
 #[derive(Debug, Clone)]
 pub struct NewCoordinatedOperation {

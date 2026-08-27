@@ -16,6 +16,8 @@ const RESOURCES_RECONCILE_USAGE: &str =
 const OPERATIONS_RECONCILE_USAGE: &str = "usage: aethyme broker operations reconcile \
      --operation <id> --outcome <succeeded|failed> --reason <text> [--json]";
 const OPERATIONS_SHOW_USAGE: &str = "usage: aethyme broker operations show <id> [--json]";
+const ADVISORIES_SHOW_USAGE: &str = "usage: aethyme broker advisories show <id> [--json]";
+const ADVISORIES_ACK_USAGE: &str = "usage: aethyme broker advisories ack <id> [--json]";
 const INTEGRATION_RECONCILE_USAGE: &str = "usage: aethyme broker integration reconcile \
      --upstream <ref> [--resolution-file <path>] [--dry-run | --apply --confirm <sha256>] [--json]";
 
@@ -152,6 +154,15 @@ Usage:
   aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]
       Resolve a crash-ambiguous operation after independently inspecting the
       remote state. Overlapping writes remain blocked until reconciliation.
+  aethyme broker advisories list [--all] [--json]
+      List outstanding non-blocking advisories newest-first. --all includes
+      acknowledged history. The broker database is authoritative.
+  aethyme broker advisories show <id> [--json]
+      Show one exact advisory with paths, evidence, integration provenance,
+      creation time, and resolution state.
+  aethyme broker advisories ack <id> [--json]
+      Acknowledge one advisory idempotently and atomically refresh
+      .aethyme/broker-advisory.md from the remaining outstanding rows.
   aethyme broker gates validate [--json]
       Parse and validate .aethyme/gates.toml.
   aethyme broker gates affected --session <id> [--json]
@@ -365,6 +376,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         "git",
         "gh",
         "operations",
+        "advisories",
         "reconcile",
         "agents",
         "leases",
@@ -457,6 +469,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
 fn command_records_metric(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
         Some("certify" | "queue" | "metrics" | "handoff") => false,
+        Some("advisories") => args.get(1).map(String::as_str) == Some("ack"),
         Some("report") => args.get(1).map(String::as_str) == Some("file"),
         Some("ship") => args.get(1).map(String::as_str) != Some("plan"),
         Some("operations") => args.get(1).map(String::as_str) == Some("reconcile"),
@@ -513,6 +526,8 @@ mod tests {
             args(&["gates", "semantic", "--session", "7"]),
             args(&["doctor"]),
             args(&["operations"]),
+            args(&["advisories", "list"]),
+            args(&["advisories", "show", "1"]),
             args(&["git", "--session", "7", "--", "status"]),
             args(&[
                 "gh",
@@ -543,6 +558,7 @@ mod tests {
             args(&["leases"]),
             args(&["integration", "status"]),
             args(&["operations", "reconcile", "--operation", "1"]),
+            args(&["advisories", "ack", "1"]),
             args(&["git", "--session", "7", "--", "push"]),
             args(&[
                 "gh",
@@ -2296,6 +2312,80 @@ fn operations_reconcile_error(detail: impl std::fmt::Display) -> UsageError {
     ))
 }
 
+fn advisory_text(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing advisory text cannot fail")
+}
+
+fn render_advisory(advisory: &crate::Advisory) {
+    println!(
+        "Advisory {}: {} [{} / {}]",
+        advisory.id,
+        advisory_text(&advisory.identity),
+        advisory.severity.as_str(),
+        advisory.resolution_state.as_str(),
+    );
+    println!(
+        "Session: {}",
+        advisory
+            .session_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".into())
+    );
+    println!(
+        "Queue entry: {}",
+        advisory
+            .queue_entry_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".into())
+    );
+    println!(
+        "Integration SHA: {}",
+        advisory.integration_sha.as_deref().unwrap_or("none")
+    );
+    println!("Created: {}", advisory.created_at);
+    println!(
+        "Acknowledged: {}",
+        advisory
+            .acknowledged_at
+            .map(|time| time.to_string())
+            .unwrap_or_else(|| "no".into())
+    );
+    if !advisory.paths.is_empty() {
+        println!("Paths:");
+        for path in &advisory.paths {
+            println!("  - {}", advisory_text(path));
+        }
+    }
+    if !advisory.evidence.is_empty() {
+        println!("Evidence:");
+        for evidence in &advisory.evidence {
+            println!(
+                "  - {}: {}",
+                advisory_text(&evidence.kind),
+                advisory_text(&evidence.summary)
+            );
+        }
+    }
+    if advisory.resolution_state == crate::AdvisoryResolutionState::Outstanding {
+        println!("Acknowledge: aethyme broker advisories ack {}", advisory.id);
+    }
+}
+
+fn parse_advisory_id(value: Option<&String>, usage: &str) -> Result<i64, UsageError> {
+    let id = value
+        .ok_or_else(|| UsageError::Message(usage.into()))?
+        .parse::<i64>()
+        .map_err(|_| {
+            UsageError::Message(format!("advisory id must be a positive integer; {usage}"))
+        })?;
+    if id <= 0 {
+        return Err(UsageError::Message(format!(
+            "advisory id must be a positive integer; {usage}"
+        )));
+    }
+    Ok(id)
+}
+
 fn render_operation_show(report: &crate::OperationShowReport) {
     let operation = &report.operation;
     println!("Operation:      {}", operation.id);
@@ -3143,6 +3233,75 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     "coordinated {subcommand} operation {} failed",
                     report.operation.id
                 )));
+            }
+        }
+        "advisories" => {
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            match parsed.positional.first().map(String::as_str) {
+                Some("list") => {
+                    if parsed.positional.len() != 1 {
+                        return Err(UsageError::Message(
+                            "usage: aethyme broker advisories list [--all] [--json]".into(),
+                        ));
+                    }
+                    let report = broker.advisory_list(parsed.all)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else if report.advisories.is_empty() {
+                        println!("No outstanding advisories.");
+                    } else {
+                        println!("{:<5} {:<9} {:<14} IDENTITY", "ID", "SEVERITY", "STATE");
+                        for advisory in &report.advisories {
+                            println!(
+                                "{:<5} {:<9} {:<14} {}",
+                                advisory.id,
+                                advisory.severity.as_str(),
+                                advisory.resolution_state.as_str(),
+                                advisory_text(&advisory.identity),
+                            );
+                        }
+                        println!("Outstanding: {}", report.outstanding_count);
+                    }
+                }
+                Some("show") => {
+                    if parsed.positional.len() != 2 {
+                        return Err(UsageError::Message(ADVISORIES_SHOW_USAGE.into()));
+                    }
+                    let id = parse_advisory_id(parsed.positional.get(1), ADVISORIES_SHOW_USAGE)?;
+                    let advisory = broker.advisory(id)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&advisory)?);
+                    } else {
+                        render_advisory(&advisory);
+                    }
+                }
+                Some("ack") => {
+                    if parsed.positional.len() != 2 {
+                        return Err(UsageError::Message(ADVISORIES_ACK_USAGE.into()));
+                    }
+                    let id = parse_advisory_id(parsed.positional.get(1), ADVISORIES_ACK_USAGE)?;
+                    let advisory = broker.acknowledge_advisory(id)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&advisory)?);
+                    } else {
+                        println!(
+                            "Acknowledged advisory {}: {}",
+                            advisory.id,
+                            advisory_text(&advisory.identity)
+                        );
+                        println!("Projection refreshed: {}", crate::BROKER_ADVISORY_RELPATH);
+                    }
+                }
+                Some(other) => {
+                    return Err(UsageError::Message(format!(
+                        "unknown advisories action {other:?} — expected list, show, or ack"
+                    )));
+                }
+                None => {
+                    return Err(UsageError::Message(
+                        "advisories requires an action: list, show, or ack".into(),
+                    ));
+                }
             }
         }
         "operations" => {

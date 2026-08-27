@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -370,6 +370,32 @@ CREATE INDEX coordinated_operations_history_by_provider
     ON coordinated_operations (provider, id DESC);
 ";
 
+const MIGRATION_V16: &str = "
+-- Non-blocking advisories are durable facts. Markdown is only a projection
+-- of rows whose resolution state remains outstanding.
+CREATE TABLE advisories (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    identity         TEXT NOT NULL UNIQUE,
+    session_id       INTEGER REFERENCES sessions (id),
+    severity         TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
+    queue_entry_id   INTEGER REFERENCES merge_queue (id),
+    integration_sha  TEXT,
+    paths_json       TEXT NOT NULL,
+    evidence_json    TEXT NOT NULL,
+    created_at       INTEGER NOT NULL,
+    resolution_state TEXT NOT NULL DEFAULT 'outstanding'
+                     CHECK (resolution_state IN ('outstanding', 'acknowledged')),
+    acknowledged_at  INTEGER
+);
+
+CREATE INDEX advisories_by_resolution
+    ON advisories (resolution_state, id DESC);
+CREATE INDEX advisories_by_session
+    ON advisories (session_id, id DESC);
+CREATE INDEX advisories_by_queue_entry
+    ON advisories (queue_entry_id, id DESC);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -386,6 +412,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V13,
     MIGRATION_V14,
     MIGRATION_V15,
+    MIGRATION_V16,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -475,7 +502,51 @@ mod tests {
         ] {
             assert!(indexes.iter().any(|index| index == expected), "{expected}");
         }
-        assert_eq!(current_version(&conn).unwrap(), 15);
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v16_adds_typed_advisory_storage_to_a_v15_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS[..15].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+
+        migrate(&conn).unwrap();
+
+        let columns = conn
+            .prepare("PRAGMA table_info(advisories)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for expected in [
+            "identity",
+            "session_id",
+            "severity",
+            "queue_entry_id",
+            "integration_sha",
+            "paths_json",
+            "evidence_json",
+            "created_at",
+            "resolution_state",
+            "acknowledged_at",
+        ] {
+            assert!(
+                columns.iter().any(|column| column == expected),
+                "{expected}"
+            );
+        }
+        assert_eq!(current_version(&conn).unwrap(), 16);
     }
 
     #[test]

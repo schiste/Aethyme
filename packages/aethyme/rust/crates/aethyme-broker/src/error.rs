@@ -37,6 +37,19 @@ pub enum BrokerError {
     #[error("no coordinated operation with id {0}")]
     CoordinatedOperationNotFound(i64),
 
+    #[error("no advisory with id {0}")]
+    AdvisoryNotFound(i64),
+
+    #[error("advisory identity {0:?} already exists with different immutable data")]
+    AdvisoryIdentityConflict(String),
+
+    #[error("invalid {field} JSON for advisory {id}: {source}")]
+    InvalidAdvisoryJson {
+        id: i64,
+        field: &'static str,
+        source: serde_json::Error,
+    },
+
     #[error("operation history --limit must be between 1 and {maximum}, got {limit}")]
     InvalidOperationHistoryLimit { limit: u32, maximum: u32 },
 

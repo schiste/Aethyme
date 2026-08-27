@@ -101,7 +101,8 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
             CommandCapability::RecoveryWrite
         }
         (Some("report"), Some("file")) => CommandCapability::RecoveryWrite,
-        (Some("operations" | "resources"), Some("reconcile")) => CommandCapability::RecoveryWrite,
+        (Some("operations" | "resources"), Some("reconcile"))
+        | (Some("advisories"), Some("ack")) => CommandCapability::RecoveryWrite,
         (Some("integration"), Some("reconcile")) if args.iter().any(|arg| arg == "--apply") => {
             CommandCapability::RecoveryWrite
         }
@@ -113,6 +114,7 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         | (Some("report"), Some("capture" | "list" | "show" | "render"))
         | (Some("hooks"), Some("status"))
         | (Some("operations"), _)
+        | (Some("advisories"), Some("list" | "show"))
         | (Some("handoff" | "queue" | "status" | "agents" | "metrics" | "certify"), _)
         | (Some("events"), _)
             if nested != Some("prune") =>
@@ -808,6 +810,18 @@ mod compatibility_command_tests {
             (
                 &["broker", "integration", "status"][..],
                 CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "advisories", "list"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "advisories", "show", "7"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "advisories", "ack", "7"][..],
+                CommandCapability::RecoveryWrite,
             ),
         ];
         for (args, expected) in cases {

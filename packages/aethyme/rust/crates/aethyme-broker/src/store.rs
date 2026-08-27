@@ -15,11 +15,12 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use crate::error::BrokerError;
 use crate::schema::{self, EVENTS_SCHEMA_VERSION};
 use crate::types::{
-    CoordinatedOperation, Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease,
-    LeaseKind, MAX_OPERATION_HISTORY_LIMIT, MergeQueueEntry, MergeStatus, NewCoordinatedOperation,
-    NewGateResult, NewPrWatchState, NewSession, OperationEffect, OperationHistoryPage,
-    OperationHistoryQuery, OperationIdentityProvenance, OperationProvider, OperationStatus,
-    PrWatchState, Session, SessionOrigin, SessionStatus,
+    Advisory, AdvisoryResolutionState, AdvisorySeverity, CoordinatedOperation, Event, GateDef,
+    GateFailureClass, GateResult, GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT,
+    MergeQueueEntry, MergeStatus, NewAdvisory, NewCoordinatedOperation, NewGateResult,
+    NewPrWatchState, NewSession, OperationEffect, OperationHistoryPage, OperationHistoryQuery,
+    OperationIdentityProvenance, OperationProvider, OperationStatus, PrWatchState, Session,
+    SessionOrigin, SessionStatus,
 };
 
 /// Milliseconds a writer waits on a locked database before erroring.
@@ -1572,6 +1573,112 @@ impl BrokerStore {
             .ok_or(BrokerError::CoordinatedOperationNotFound(id))
     }
 
+    // ── non-blocking advisories ─────────────────────────────────────
+
+    /// Persist one immutable advisory idempotently by producer identity.
+    /// Reusing an identity with different data is refused rather than
+    /// rewriting historical evidence.
+    pub fn record_advisory(&mut self, advisory: &NewAdvisory) -> Result<Advisory, BrokerError> {
+        let paths_json =
+            serde_json::to_string(&advisory.paths).expect("serializing advisory paths cannot fail");
+        let evidence_json = serde_json::to_string(&advisory.evidence)
+            .expect("serializing advisory evidence cannot fail");
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO advisories (
+                 identity, session_id, severity, queue_entry_id, integration_sha,
+                 paths_json, evidence_json, created_at, resolution_state
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'outstanding')",
+            params![
+                advisory.identity,
+                advisory.session_id,
+                advisory.severity.as_str(),
+                advisory.queue_entry_id,
+                advisory.integration_sha,
+                paths_json,
+                evidence_json,
+                now,
+            ],
+        )?;
+        let _ = inserted;
+        tx.commit()?;
+
+        let stored = self
+            .advisory_by_identity(&advisory.identity)?
+            .expect("insert or existing advisory identity must resolve");
+        if stored.session_id != advisory.session_id
+            || stored.severity != advisory.severity
+            || stored.queue_entry_id != advisory.queue_entry_id
+            || stored.integration_sha != advisory.integration_sha
+            || stored.paths != advisory.paths
+            || stored.evidence != advisory.evidence
+        {
+            return Err(BrokerError::AdvisoryIdentityConflict(
+                advisory.identity.clone(),
+            ));
+        }
+        Ok(stored)
+    }
+
+    /// Exact durable advisory lookup.
+    pub fn advisory(&self, id: i64) -> Result<Option<Advisory>, BrokerError> {
+        self.conn
+            .query_row(
+                &(ADVISORY_SELECT.to_owned() + " WHERE id = ?1"),
+                [id],
+                advisory_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    fn advisory_by_identity(&self, identity: &str) -> Result<Option<Advisory>, BrokerError> {
+        self.conn
+            .query_row(
+                &(ADVISORY_SELECT.to_owned() + " WHERE identity = ?1"),
+                [identity],
+                advisory_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Newest-first advisory inventory. The default operator view contains
+    /// only outstanding rows; history remains available with `include_all`.
+    pub fn advisories(&self, include_all: bool) -> Result<Vec<Advisory>, BrokerError> {
+        let sql = if include_all {
+            ADVISORY_SELECT.to_owned() + " ORDER BY id DESC"
+        } else {
+            ADVISORY_SELECT.to_owned() + " WHERE resolution_state = 'outstanding' ORDER BY id DESC"
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], advisory_from_row)?;
+        rows.map(|row| row?).collect()
+    }
+
+    /// Idempotently acknowledge one advisory without deleting its evidence.
+    pub fn acknowledge_advisory(&mut self, id: i64) -> Result<Advisory, BrokerError> {
+        let existing = self
+            .advisory(id)?
+            .ok_or(BrokerError::AdvisoryNotFound(id))?;
+        if existing.resolution_state == AdvisoryResolutionState::Acknowledged {
+            return Ok(existing);
+        }
+
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let updated = tx.execute(
+            "UPDATE advisories
+             SET resolution_state = 'acknowledged', acknowledged_at = ?2
+             WHERE id = ?1 AND resolution_state = 'outstanding'",
+            params![id, now],
+        )?;
+        let _ = updated;
+        tx.commit()?;
+        self.advisory(id)?.ok_or(BrokerError::AdvisoryNotFound(id))
+    }
+
     // ── events ────────────────────────────────────────────────────────
 
     /// Append one event. Most mutations already emit their own event in
@@ -1770,6 +1877,10 @@ const MERGE_SELECT: &str = "SELECT id, session_id, head_commit, base_commit, sta
 const PR_WATCH_SELECT: &str = "SELECT id, target_branch, pr_number, activity_fingerprint, \
      marker, last_dispatch_at, last_agent_session_id, updated_at FROM pr_watch_state";
 
+const ADVISORY_SELECT: &str = "SELECT id, identity, session_id, severity, queue_entry_id, \
+     integration_sha, paths_json, evidence_json, created_at, resolution_state, acknowledged_at \
+     FROM advisories";
+
 type RowResult<T> = Result<Result<T, BrokerError>, rusqlite::Error>;
 
 fn event_from_row(row: &rusqlite::Row<'_>) -> Result<Event, rusqlite::Error> {
@@ -1923,6 +2034,41 @@ fn coordinated_operation_from_row(row: &rusqlite::Row<'_>) -> RowResult<Coordina
             finished_at: row.get(14)?,
             host_operation_id: row.get(15)?,
             identity_provenance: OperationIdentityProvenance::parse(&identity_provenance)?,
+        })
+    })())
+}
+
+fn advisory_from_row(row: &rusqlite::Row<'_>) -> RowResult<Advisory> {
+    let id = row.get(0)?;
+    let severity: String = row.get(3)?;
+    let paths_json: String = row.get(6)?;
+    let evidence_json: String = row.get(7)?;
+    let resolution_state: String = row.get(9)?;
+    Ok((|| {
+        Ok(Advisory {
+            id,
+            identity: row.get(1)?,
+            session_id: row.get(2)?,
+            severity: AdvisorySeverity::parse(&severity)?,
+            queue_entry_id: row.get(4)?,
+            integration_sha: row.get(5)?,
+            paths: serde_json::from_str(&paths_json).map_err(|source| {
+                BrokerError::InvalidAdvisoryJson {
+                    id,
+                    field: "paths_json",
+                    source,
+                }
+            })?,
+            evidence: serde_json::from_str(&evidence_json).map_err(|source| {
+                BrokerError::InvalidAdvisoryJson {
+                    id,
+                    field: "evidence_json",
+                    source,
+                }
+            })?,
+            created_at: row.get(8)?,
+            resolution_state: AdvisoryResolutionState::parse(&resolution_state)?,
+            acknowledged_at: row.get(10)?,
         })
     })())
 }

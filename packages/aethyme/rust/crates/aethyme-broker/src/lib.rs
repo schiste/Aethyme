@@ -20,6 +20,7 @@
 //!   WAL mode + busy_timeout, no daemon. Designed for 15 concurrent
 //!   sessions, stress-tested at 20 (see `tests/stress.rs`).
 
+mod advisories;
 mod broker;
 pub mod cli;
 pub mod contract_check;
@@ -168,9 +169,10 @@ pub use ship::{
 };
 pub use store::BrokerStore;
 pub use types::{
+    Advisory, AdvisoryEvidence, AdvisoryList, AdvisoryResolutionState, AdvisorySeverity,
     CoordinatedOperation, DEFAULT_OPERATION_HISTORY_LIMIT, Event, GateDef, GateFailureClass,
     GateResult, GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT, MergeQueueEntry,
-    MergeStatus, NewCoordinatedOperation, NewGateResult, NewPrWatchState, NewSession,
+    MergeStatus, NewAdvisory, NewCoordinatedOperation, NewGateResult, NewPrWatchState, NewSession,
     OperationEffect, OperationHistoryPage, OperationHistoryQuery, OperationIdentityProvenance,
     OperationProvider, OperationStatus, PrWatchState, Session, SessionOrigin, SessionStatus,
 };
@@ -190,3 +192,6 @@ pub use version::{
 
 /// Repo-relative location of the broker database.
 pub const BROKER_DB_RELPATH: &str = ".aethyme/broker.db";
+
+/// Repo-relative generated projection of outstanding advisory rows.
+pub const BROKER_ADVISORY_RELPATH: &str = ".aethyme/broker-advisory.md";

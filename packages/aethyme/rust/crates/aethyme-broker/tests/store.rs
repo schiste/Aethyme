@@ -3,8 +3,9 @@
 //! issue #5: migrations from empty and from v1).
 
 use aethyme_broker::{
-    BrokerError, BrokerStore, GateDef, GateFailureClass, GateStatus, LeaseKind, MergeStatus,
-    NewGateResult, NewPrWatchState, NewSession, RepositoryContract, SessionOrigin, SessionStatus,
+    AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, BrokerError, BrokerStore, GateDef,
+    GateFailureClass, GateStatus, LeaseKind, MergeStatus, NewAdvisory, NewGateResult,
+    NewPrWatchState, NewSession, RepositoryContract, SessionOrigin, SessionStatus,
 };
 
 fn open_temp() -> (tempfile::TempDir, BrokerStore) {
@@ -74,6 +75,54 @@ fn session_round_trip_attach_first() {
     let exited = store.session(session.id).unwrap();
     assert_eq!(exited.status, SessionStatus::Exited);
     assert_eq!(exited.exit_code, Some(1));
+}
+
+#[test]
+fn advisory_round_trip_is_idempotent_and_acknowledgement_preserves_history() {
+    let (_tmp, mut store) = open_temp();
+    let session = sample_session(&mut store);
+    let advisory = NewAdvisory {
+        identity: "integration-drift:session-1".into(),
+        session_id: Some(session.id),
+        severity: AdvisorySeverity::Warning,
+        queue_entry_id: None,
+        integration_sha: Some("a".repeat(40)),
+        paths: vec!["src/lib.rs".into(), "src/main.rs".into()],
+        evidence: vec![AdvisoryEvidence {
+            kind: "drift".into(),
+            summary: "integration advanced after review".into(),
+        }],
+    };
+
+    let created = store.record_advisory(&advisory).unwrap();
+    assert_eq!(
+        created.resolution_state,
+        AdvisoryResolutionState::Outstanding
+    );
+    assert_eq!(store.record_advisory(&advisory).unwrap().id, created.id);
+    assert_eq!(store.advisories(false).unwrap(), vec![created.clone()]);
+
+    let mut conflicting = advisory.clone();
+    conflicting.severity = AdvisorySeverity::Critical;
+    assert!(matches!(
+        store.record_advisory(&conflicting),
+        Err(BrokerError::AdvisoryIdentityConflict(identity))
+            if identity == advisory.identity
+    ));
+
+    let acknowledged = store.acknowledge_advisory(created.id).unwrap();
+    assert_eq!(
+        acknowledged.resolution_state,
+        AdvisoryResolutionState::Acknowledged
+    );
+    assert!(acknowledged.acknowledged_at.is_some());
+    assert!(store.advisories(false).unwrap().is_empty());
+    assert_eq!(store.advisories(true).unwrap(), vec![acknowledged.clone()]);
+    assert_eq!(
+        store.acknowledge_advisory(created.id).unwrap(),
+        acknowledged,
+        "ack is idempotent"
+    );
 }
 
 #[test]

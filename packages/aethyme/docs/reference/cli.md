@@ -66,6 +66,7 @@ product surface.
 - `aethyme broker git`
 - `aethyme broker gh`
 - `aethyme broker operations`
+- `aethyme broker advisories`
 - `aethyme broker submit`
 - `aethyme broker repair`
 - `aethyme broker finish`
@@ -216,6 +217,9 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker operations [same options]` (compatibility alias during deprecation)
 - `aethyme broker operations show <id> [--json]`
 - `aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]`
+- `aethyme broker advisories list [--all] [--json]`
+- `aethyme broker advisories show <id> [--json]`
+- `aethyme broker advisories ack <id> [--json]`
 - `aethyme broker resources plan <request.json> [--json]`
 - `aethyme broker resources acquire <request.json> [--json]`
 - `aethyme broker resources renew <grant.json> --ttl <seconds> [--json]`
@@ -283,6 +287,21 @@ Every `operations reconcile` usage or validation error repeats the complete
 contract—`--operation`, `--outcome`, and `--reason`—in one message. Successful
 manual reconciliation appends the operator outcome and reason without deleting
 the original push plan or remote evidence.
+
+`broker advisories` exposes durable, explicitly non-blocking findings. Each row
+has an immutable producer identity, optional session and queue-entry links,
+severity, the exact integration SHA when relevant, repository-relative paths,
+structured evidence, creation time, and a typed `outstanding` or
+`acknowledged` resolution state. `list` returns outstanding rows newest-first;
+`list --all` includes acknowledged history, and `show <id>` returns one exact
+row. `ack <id>` is idempotent and preserves the row and evidence.
+
+After each advisory creation or acknowledgement, the broker takes a
+cross-process projection lock, re-reads outstanding rows from SQLite, and
+atomically replaces `.aethyme/broker-advisory.md`. That generated, gitignored
+file is a convenient agent-facing summary only: `.aethyme/broker.db` remains
+authoritative, and advisories never select gates or block submit, promotion, or
+shipping.
 
 `broker gates pre-push` is an opt-in adapter for repository-owned hooks; the
 managed hook installer never writes `pre-push`. It reads Git's ref-update lines

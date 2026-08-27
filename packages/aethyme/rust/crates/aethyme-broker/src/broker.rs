@@ -16,8 +16,8 @@ use crate::graph_impact::{
 };
 use crate::store::BrokerStore;
 use crate::types::{
-    GateStatus, LeaseKind, MergeQueueEntry, MergeStatus, NewSession, Session, SessionOrigin,
-    SessionStatus,
+    Advisory, AdvisoryList, GateStatus, LeaseKind, MergeQueueEntry, MergeStatus, NewAdvisory,
+    NewSession, Session, SessionOrigin, SessionStatus,
 };
 use crate::version::{VersionDriftReport, VersionDriftStatus};
 
@@ -97,6 +97,13 @@ pub enum BrokerOpError {
     },
     #[error("invalid lease path {path:?}: {reason}")]
     InvalidLeasePath { path: String, reason: String },
+    #[error("invalid advisory: {reason}")]
+    InvalidAdvisory { reason: String },
+    #[error("cannot project broker advisories at {path}: {source}")]
+    AdvisoryProjectionIo {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("{summary}")]
     OwnershipViolation {
         summary: String,
@@ -1146,6 +1153,120 @@ impl Broker {
 
     pub fn store(&mut self) -> &mut BrokerStore {
         &mut self.store
+    }
+
+    /// Persist an immutable non-blocking advisory and refresh the generated
+    /// outstanding-advisory projection from authoritative database state.
+    pub fn persist_advisory(
+        &mut self,
+        mut advisory: NewAdvisory,
+    ) -> Result<Advisory, BrokerOpError> {
+        let identity = advisory.identity.trim();
+        if identity.is_empty() || identity.len() > 256 {
+            return Err(BrokerOpError::InvalidAdvisory {
+                reason: "identity must contain 1..=256 bytes".into(),
+            });
+        }
+        advisory.identity = identity.to_string();
+        if advisory.paths.len() > 100 || advisory.evidence.len() > 100 {
+            return Err(BrokerOpError::InvalidAdvisory {
+                reason: "paths and evidence are each limited to 100 entries".into(),
+            });
+        }
+        advisory.paths = advisory
+            .paths
+            .iter()
+            .map(|path| {
+                if path.len() > 4_096 {
+                    return Err(BrokerOpError::InvalidAdvisory {
+                        reason: "each advisory path is limited to 4096 bytes".into(),
+                    });
+                }
+                normalize_lease_path(path)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        advisory.paths.sort();
+        advisory.paths.dedup();
+        for evidence in &advisory.evidence {
+            if evidence.kind.trim().is_empty()
+                || evidence.kind.len() > 128
+                || evidence.summary.trim().is_empty()
+                || evidence.summary.len() > 4_096
+            {
+                return Err(BrokerOpError::InvalidAdvisory {
+                    reason: "evidence kind must contain 1..=128 bytes and summary 1..=4096 bytes"
+                        .into(),
+                });
+            }
+        }
+        if let Some(sha) = &advisory.integration_sha
+            && (sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(BrokerOpError::InvalidAdvisory {
+                reason: "integration SHA must be a full 40-character hexadecimal object id".into(),
+            });
+        }
+        if let Some(session_id) = advisory.session_id {
+            self.store.session(session_id)?;
+        }
+        if let Some(queue_entry_id) = advisory.queue_entry_id {
+            let queue = self.store.merge_queue()?;
+            let entry = queue
+                .iter()
+                .find(|entry| entry.id == queue_entry_id)
+                .ok_or_else(|| BrokerOpError::InvalidAdvisory {
+                    reason: format!("queue entry {queue_entry_id} does not exist"),
+                })?;
+            if let Some(session_id) = advisory.session_id
+                && entry.session_id != session_id
+            {
+                return Err(BrokerOpError::InvalidAdvisory {
+                    reason: format!(
+                        "queue entry {queue_entry_id} belongs to session {}, not {session_id}",
+                        entry.session_id
+                    ),
+                });
+            }
+        }
+        let stored = self.store.record_advisory(&advisory)?;
+        self.refresh_advisory_projection()?;
+        Ok(stored)
+    }
+
+    pub fn advisories(&self, include_all: bool) -> Result<Vec<Advisory>, BrokerOpError> {
+        Ok(self.store.advisories(include_all)?)
+    }
+
+    pub fn advisory_list(&self, include_acknowledged: bool) -> Result<AdvisoryList, BrokerOpError> {
+        let advisories = self.store.advisories(include_acknowledged)?;
+        let outstanding_count = advisories
+            .iter()
+            .filter(|advisory| {
+                advisory.resolution_state == crate::AdvisoryResolutionState::Outstanding
+            })
+            .count();
+        Ok(AdvisoryList {
+            advisories,
+            outstanding_count,
+            includes_acknowledged: include_acknowledged,
+        })
+    }
+
+    pub fn advisory(&self, id: i64) -> Result<Advisory, BrokerOpError> {
+        self.store
+            .advisory(id)?
+            .ok_or_else(|| BrokerError::AdvisoryNotFound(id).into())
+    }
+
+    pub fn acknowledge_advisory(&mut self, id: i64) -> Result<Advisory, BrokerOpError> {
+        let advisory = self.store.acknowledge_advisory(id)?;
+        self.refresh_advisory_projection()?;
+        Ok(advisory)
+    }
+
+    pub fn refresh_advisory_projection(&mut self) -> Result<PathBuf, BrokerOpError> {
+        let main_root = self.main_root.clone();
+        crate::advisories::project(&main_root, || self.store.advisories(false))
     }
 
     pub(crate) fn main_root_path(&self) -> PathBuf {
