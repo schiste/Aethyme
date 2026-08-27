@@ -3,6 +3,7 @@
 //! never overwriting); manifest detection.
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -105,6 +106,7 @@ fn certify_is_always_read_only_and_scaffold_rerun_is_byte_identical() {
     );
     assert_eq!(status_of(&report, "certify.gates"), CheckStatus::Warn);
     assert_eq!(status_of(&report, "certify.config"), CheckStatus::Warn);
+    assert_eq!(status_of(&report, "certify.git-output"), CheckStatus::Pass);
     assert_eq!(snapshot(tmp.path()), before, "certify wrote nothing");
     assert!(
         !tmp.path().join(".aethyme/broker.db").exists(),
@@ -160,6 +162,52 @@ fn certify_is_always_read_only_and_scaffold_rerun_is_byte_identical() {
     assert_eq!(status_of(&report, "certify.config"), CheckStatus::Pass);
     assert_eq!(status_of(&report, "certify.gitignore"), CheckStatus::Pass);
     assert_eq!(snapshot(tmp.path()), first, "certify still wrote nothing");
+}
+
+#[test]
+fn certify_names_a_path_git_shim_that_decorates_known_empty_output() {
+    const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    init_repo(&repo);
+
+    let real_git = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("git"))
+                .find(|candidate| candidate.is_file())
+        })
+        .expect("git on PATH");
+    let shim = bin.join("git");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\nif [ \"$1\" = status ]; then\n  \"$REAL_GIT\" \"$@\"\n  result=$?\n  [ \"$result\" -eq 0 ] && printf 'ok ✓'\n  exit \"$result\"\nfi\nexec \"$REAL_GIT\" \"$@\"\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&shim, permissions).unwrap();
+
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![bin.clone()];
+    paths.extend(std::env::split_paths(&original_path));
+    let output = Command::new(CLI)
+        .arg("certify")
+        .current_dir(&repo)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("REAL_GIT", real_git)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(!output.status.success(), "{stdout}");
+    assert!(stdout.contains("certify.git-output"), "{stdout}");
+    assert!(stdout.contains("emitted 6 bytes"), "{stdout}");
+    assert!(stdout.contains(&shim.display().to_string()), "{stdout}");
 }
 
 #[test]

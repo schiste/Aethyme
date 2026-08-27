@@ -72,6 +72,7 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     let mut checks = Vec::new();
 
     checks.push(check_git_version());
+    checks.push(check_git_output());
     let (checkout_root, main_root) = match crate::GitRepo::discover(repo_hint) {
         Ok(repo) => {
             let checkout_root = repo.root().to_path_buf();
@@ -495,6 +496,134 @@ fn check_git_version() -> Check {
     }
 }
 
+fn check_git_output() -> Check {
+    let Some(resolved_git) = which_program("git") else {
+        return Check {
+            id: "certify.git-output",
+            status: CheckStatus::Fail,
+            detail: "git not found on PATH; output behavior cannot be certified".into(),
+        };
+    };
+    let resolved = resolved_git.display();
+    let probe = match tempfile::tempdir() {
+        Ok(probe) => probe,
+        Err(err) => {
+            return Check {
+                id: "certify.git-output",
+                status: CheckStatus::Skipped,
+                detail: format!(
+                    "could not create a temporary repository to probe git output ({err}); resolved: {resolved}"
+                ),
+            };
+        }
+    };
+    let empty_template = probe.path().join("empty-template");
+    let probe_repo = probe.path().join("repo");
+    if let Err(err) =
+        std::fs::create_dir(&empty_template).and_then(|()| std::fs::create_dir(&probe_repo))
+    {
+        return Check {
+            id: "certify.git-output",
+            status: CheckStatus::Skipped,
+            detail: format!(
+                "could not prepare the temporary git probe ({err}); resolved: {resolved}"
+            ),
+        };
+    }
+    let empty_config = probe.path().join("empty-gitconfig");
+    if let Err(err) = std::fs::write(&empty_config, []) {
+        return Check {
+            id: "certify.git-output",
+            status: CheckStatus::Skipped,
+            detail: format!(
+                "could not isolate the temporary git probe ({err}); resolved: {resolved}"
+            ),
+        };
+    }
+
+    let mut init = isolated_git_probe(&probe_repo, &empty_config);
+    let init_output = init
+        .arg("init")
+        .arg("-q")
+        .arg(format!("--template={}", empty_template.display()))
+        .output();
+    let Ok(init_output) = init_output else {
+        return Check {
+            id: "certify.git-output",
+            status: CheckStatus::Skipped,
+            detail: format!(
+                "could not execute git in the temporary output probe; resolved: {resolved}"
+            ),
+        };
+    };
+    if !init_output.status.success() {
+        return Check {
+            id: "certify.git-output",
+            status: CheckStatus::Skipped,
+            detail: format!(
+                "git init failed in the temporary output probe (exit {}); resolved: {resolved}",
+                init_output.status
+            ),
+        };
+    }
+
+    let status_output = isolated_git_probe(&probe_repo, &empty_config)
+        .arg("status")
+        .arg("--porcelain=v1")
+        .arg("-z")
+        .arg("--untracked-files=all")
+        .output();
+    let Ok(status_output) = status_output else {
+        return Check {
+            id: "certify.git-output",
+            status: CheckStatus::Fail,
+            detail: format!(
+                "git status could not execute in a clean temporary repository; resolved: {resolved}"
+            ),
+        };
+    };
+    if !status_output.status.success() {
+        return Check {
+            id: "certify.git-output",
+            status: CheckStatus::Fail,
+            detail: format!(
+                "git status failed in a clean temporary repository (exit {}); resolved: {resolved}",
+                status_output.status
+            ),
+        };
+    }
+    if !status_output.stdout.is_empty() {
+        return Check {
+            id: "certify.git-output",
+            status: CheckStatus::Fail,
+            detail: format!(
+                "git status --porcelain emitted {} bytes on a clean temporary repository; a PATH wrapper is rewriting git output (resolved: {resolved})",
+                status_output.stdout.len()
+            ),
+        };
+    }
+
+    Check {
+        id: "certify.git-output",
+        status: CheckStatus::Pass,
+        detail: format!("git preserves known-empty porcelain output (resolved: {resolved})"),
+    }
+}
+
+fn isolated_git_probe(repo: &Path, empty_config: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command
+        .current_dir(repo)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", empty_config)
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+    command
+}
+
 fn check_binary_shadowing() -> Check {
     // If `aethyme` on PATH resolves somewhere other than the running
     // binary, a pip entrypoint (or stale build) is shadowing it (#31).
@@ -542,10 +671,35 @@ fn check_binary_version(main_root: &Path) -> Check {
 }
 
 fn which_aethyme() -> Option<std::path::PathBuf> {
+    which_program("aethyme")
+}
+
+fn which_program(program: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
+    let cwd = std::env::current_dir().ok()?;
     std::env::split_paths(&path)
-        .map(|dir| dir.join("aethyme"))
-        .find(|candidate| candidate.is_file())
+        .map(|dir| {
+            let dir = if dir.is_absolute() {
+                dir
+            } else {
+                cwd.join(dir)
+            };
+            dir.join(program)
+        })
+        .find(|candidate| is_executable_file(candidate))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 // ── regulate helpers ─────────────────────────────────────────────────
