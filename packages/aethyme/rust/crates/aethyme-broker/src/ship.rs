@@ -41,12 +41,24 @@ pub struct ShipPush {
     pub command: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ShipPromotedEntry {
+    pub queue_entry_id: i64,
+    pub session_id: i64,
+    pub promotion_sha: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ShipPlan {
     pub queue_entry: MergeQueueEntry,
     pub originating_session: Session,
     pub integration_ref: String,
+    /// Current integration tip, retained as planning context.
     pub integration_sha: String,
+    /// Exact selected promoted prefix authorized for publication.
+    pub publication_sha: String,
+    pub included_entries: Vec<ShipPromotedEntry>,
+    pub excluded_entries: Vec<ShipPromotedEntry>,
     pub local_default_branch_ref: String,
     pub local_default_branch_sha: String,
     pub remote_default_branch_ref: String,
@@ -102,15 +114,16 @@ pub struct ShipLocalMainSync {
 }
 
 impl Broker {
-    /// Build a serializable, mutation-free publication plan for one promoted
-    /// queue entry. The selected entry identifies provenance; publication is
-    /// always the exact current integration tip containing that promotion.
+    /// Build a serializable, mutation-free publication plan through one exact
+    /// promoted queue entry. Later integration promotions are listed but never
+    /// silently added to the proposed push.
     pub fn ship_plan(&mut self, entry_id: i64) -> Result<ShipPlan, BrokerOpError> {
-        let entry = self
-            .store()
-            .merge_queue()?
+        let queue = self.store().merge_queue()?;
+        let entry = queue
+            .iter()
             .into_iter()
             .find(|entry| entry.id == entry_id)
+            .cloned()
             .ok_or(BrokerOpError::ShipEntryNotFound { entry: entry_id })?;
         if entry.status != MergeStatus::Promoted {
             return Err(BrokerOpError::ShipEntryNotPromoted {
@@ -145,6 +158,40 @@ impl Broker {
                 head: integration_sha,
             });
         }
+        let publication_sha = promotion.clone();
+        let mut included_entries = Vec::new();
+        let mut excluded_entries = Vec::new();
+        for promoted in queue
+            .iter()
+            .filter(|candidate| candidate.status == MergeStatus::Promoted)
+        {
+            let promoted_sha =
+                promotion_sha(promoted).ok_or_else(|| BrokerOpError::ShipPlanUnavailable {
+                    what: "promoted queue provenance",
+                    reason: format!("entry {} has no promoted commit detail", promoted.id),
+                })?;
+            if !self
+                .repo_handle()
+                .is_ancestor(&promoted_sha, &integration_sha)
+            {
+                continue;
+            }
+            let item = ShipPromotedEntry {
+                queue_entry_id: promoted.id,
+                session_id: promoted.session_id,
+                promotion_sha: promoted_sha.clone(),
+            };
+            if self
+                .repo_handle()
+                .is_ancestor(&promoted_sha, &publication_sha)
+            {
+                included_entries.push(item);
+            } else {
+                excluded_entries.push(item);
+            }
+        }
+        included_entries.sort_by_key(|item| item.queue_entry_id);
+        excluded_entries.sort_by_key(|item| item.queue_entry_id);
 
         let current_branch = self.repo_handle().current_branch()?;
         let remote = self
@@ -185,11 +232,11 @@ impl Broker {
             .is_some_and(|planned| planned == remote_default.sha);
         let remote_is_ancestor_of_integration = self
             .repo_handle()
-            .is_ancestor(&remote_default.sha, &integration_sha);
+            .is_ancestor(&remote_default.sha, &publication_sha);
         let integration_is_ancestor_of_remote = self
             .repo_handle()
-            .is_ancestor(&integration_sha, &remote_default.sha);
-        let result = if remote_default.sha == integration_sha {
+            .is_ancestor(&publication_sha, &remote_default.sha);
+        let result = if remote_default.sha == publication_sha {
             ShipFreshnessResult::AlreadyPublished
         } else if planned_remote_base_sha.is_none() {
             ShipFreshnessResult::RemoteTrackingMissing
@@ -202,11 +249,33 @@ impl Broker {
         };
         let fast_forward = remote_is_ancestor_of_integration;
 
+        if fast_forward {
+            let recorded = included_entries
+                .iter()
+                .map(|item| item.promotion_sha.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            let unrecorded = self
+                .repo_handle()
+                .first_parent_commits_between_oldest(&remote_default.sha, &publication_sha)?
+                .into_iter()
+                .filter(|commit| !recorded.contains(commit.as_str()))
+                .collect::<Vec<_>>();
+            if !unrecorded.is_empty() {
+                return Err(BrokerOpError::ShipPlanUnavailable {
+                    what: "publication prefix",
+                    reason: format!(
+                        "selected prefix contains unrecorded integration commits: {}",
+                        unrecorded.join(", ")
+                    ),
+                });
+            }
+        }
+
         let destination_ref = remote_default.ref_name.clone();
-        let refspec = format!("{integration_sha}:{destination_ref}");
+        let refspec = format!("{publication_sha}:{destination_ref}");
         let proposed_push = ShipPush {
             remote: remote.clone(),
-            source_sha: integration_sha.clone(),
+            source_sha: publication_sha.clone(),
             destination_ref,
             refspec: refspec.clone(),
             command: vec!["git".into(), "push".into(), remote.clone(), refspec],
@@ -216,13 +285,16 @@ impl Broker {
             && !self.repo_handle().is_dirty()?
             && self
                 .repo_handle()
-                .is_ancestor(&local_default_branch_sha, &integration_sha);
+                .is_ancestor(&local_default_branch_sha, &publication_sha);
 
         Ok(ShipPlan {
             queue_entry: entry,
             originating_session: session,
             integration_ref,
             integration_sha,
+            publication_sha,
+            included_entries,
+            excluded_entries,
             local_default_branch_ref,
             local_default_branch_sha,
             remote_default_branch_ref: remote_default.ref_name,
@@ -267,9 +339,9 @@ impl Broker {
             return Err(BrokerOpError::ShipConfirmationNotFullSha);
         }
         let plan = self.ship_plan(entry_id)?;
-        if confirm != plan.integration_sha {
+        if confirm != plan.publication_sha {
             return Err(BrokerOpError::ShipConfirmationMismatch {
-                expected: plan.integration_sha,
+                expected: plan.publication_sha,
                 actual: confirm.into(),
             });
         }
@@ -339,10 +411,15 @@ impl Broker {
                 what: "integration ref",
                 reason: format!("{} disappeared during execution", plan.integration_ref),
             })?;
-        if current_integration != confirm {
-            return Err(BrokerOpError::ShipConfirmationMismatch {
-                expected: current_integration,
-                actual: confirm.into(),
+        if !self
+            .repo_handle()
+            .is_ancestor(confirm, &current_integration)
+        {
+            return Err(BrokerOpError::ShipEntryNotOnIntegration {
+                entry: plan.queue_entry.id,
+                promotion: confirm.into(),
+                integration: plan.integration_ref.clone(),
+                head: current_integration,
             });
         }
 
@@ -528,6 +605,11 @@ impl Broker {
             local_main_sync,
         })
     }
+}
+
+fn promotion_sha(entry: &MergeQueueEntry) -> Option<String> {
+    let details = serde_json::from_str::<serde_json::Value>(entry.details_json.as_deref()?).ok()?;
+    details.get("commit")?.as_str().map(str::to_string)
 }
 
 fn validate_local_main_sync(broker: &Broker, plan: &ShipPlan, confirm: &str) -> Result<(), String> {

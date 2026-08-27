@@ -244,12 +244,12 @@ Usage:
       entry's merge commit; other in-flight entries are re-simulated.
       Promotion stays local; publish through `broker ship plan --entry <id>`.
   aethyme broker ship plan --entry <id> [--json]
-      Read-only publication plan for a promoted entry: resolve the exact
-      integration tip, local and remote default-branch SHAs, freshness,
-      proposed push, and whether synchronizing local main is currently safe.
-  aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--json]
+      Read-only publication plan through an exact promoted entry: resolve the
+      selected prefix SHA, included and excluded later entries, current
+      integration tip, remote freshness, proposed push, and local-main safety.
+  aethyme broker ship execute --entry <id> --confirm <full-publication-sha> [--sync-main] [--json]
       Fetch and revalidate the planned remote base, publish the exact confirmed
-      integration SHA with a non-force push, then verify the remote default ref.
+      promoted prefix with a non-force push, then verify the remote default ref.
       --sync-main additionally fast-forwards a clean, unchanged primary checkout.
   aethyme broker integration status [--json]
       Focused promoted-but-unmerged view: the local integration branch as
@@ -2077,6 +2077,27 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool) -> Result<(), UsageErr
         "Integration: {} @ {}",
         report.integration_ref, report.integration_sha
     );
+    println!("Publication prefix: {}", report.publication_sha);
+    println!(
+        "Included entries: {}",
+        report
+            .included_entries
+            .iter()
+            .map(|entry| format!("q{}@{}", entry.queue_entry_id, entry.promotion_sha))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if !report.excluded_entries.is_empty() {
+        println!(
+            "Excluded later entries: {}",
+            report
+                .excluded_entries
+                .iter()
+                .map(|entry| format!("q{}@{}", entry.queue_entry_id, entry.promotion_sha))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!(
         "Local default:  {} @ {}",
         report.local_default_branch_ref, report.local_default_branch_sha
@@ -2103,7 +2124,7 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool) -> Result<(), UsageErr
     );
     println!(
         "Confirm with: aethyme broker ship execute --entry {} --confirm {}",
-        report.queue_entry.id, report.integration_sha
+        report.queue_entry.id, report.publication_sha
     );
     Ok(())
 }

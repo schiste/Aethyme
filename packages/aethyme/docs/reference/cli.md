@@ -607,9 +607,10 @@ continues to block duplicate filing for that source report; reconciliation as
 `failed` permits a later, separately confirmed filing command.
 
 Promotion only advances the local integration ref. Use `broker ship plan` to
-inspect the promoted queue entry, exact integration SHA, remote freshness,
-proposed non-force push, and local-main safety without mutating refs or remote
-state. Publish only with the plan's full integration SHA:
+inspect the selected promoted-prefix SHA, the entries included through it,
+later entries explicitly excluded from it, the current integration tip, remote
+freshness, proposed non-force push, and local-main safety without mutating refs
+or remote state. Publish only with the plan's full publication SHA:
 
 ```bash
 aethyme broker ship plan --entry 42
@@ -618,7 +619,10 @@ aethyme broker ship execute --entry 42 \
 ```
 
 Execution fetches and revalidates the planned remote base, requires a
-fast-forward, pushes that exact SHA, and verifies the remote default ref. It
+fast-forward, pushes that exact selected-prefix SHA, and verifies the remote
+default ref. A later integration promotion does not broaden the confirmed
+publication. The planner refuses a prefix containing an integration commit
+without promoted queue provenance. It
 then resolves every outstanding entry exposure whose promotion is an ancestor
 of that verified remote SHA; selecting a later promoted entry therefore closes
 the verified published prefix without guessing about unrelated entries. It

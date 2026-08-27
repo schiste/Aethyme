@@ -145,6 +145,10 @@ fn ship_plan_reports_exact_tip_and_does_not_mutate_refs() {
     assert_eq!(plan.originating_session.id, session_id);
     assert_eq!(plan.integration_ref, "aethyme/integration");
     assert_eq!(plan.integration_sha, integration);
+    assert_eq!(plan.publication_sha, plan.integration_sha);
+    assert_eq!(plan.included_entries.len(), 1);
+    assert_eq!(plan.included_entries[0].queue_entry_id, entry_id);
+    assert!(plan.excluded_entries.is_empty());
     assert_eq!(plan.local_default_branch_ref, "refs/heads/main");
     assert_eq!(plan.remote_default_branch_ref, "refs/heads/main");
     assert_eq!(plan.remote_default_branch_sha, remote_before);
@@ -172,9 +176,9 @@ fn ship_plan_reports_exact_tip_and_does_not_mutate_refs() {
     assert!(plan.target.caller_assertion.is_none());
     assert_eq!(
         plan.proposed_push.refspec,
-        format!("{}:refs/heads/main", plan.integration_sha)
+        format!("{}:refs/heads/main", plan.publication_sha)
     );
-    assert_eq!(plan.proposed_push.source_sha, plan.integration_sha);
+    assert_eq!(plan.proposed_push.source_sha, plan.publication_sha);
 
     assert_eq!(fixture.refs(), refs_before);
     assert_eq!(
@@ -207,9 +211,11 @@ fn ship_plan_rejects_an_entry_that_is_not_promoted() {
         )
         .unwrap();
     let error = broker.ship_plan(entry.id).unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("requires a promoted queue entry"));
+    assert!(
+        error
+            .to_string()
+            .contains("requires a promoted queue entry")
+    );
 }
 
 #[test]
@@ -261,10 +267,12 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
         AdvisoryResolutionState::Resolved
     );
     assert_eq!(resolved_advisory.resolved_at.is_some(), true);
-    assert!(resolved_advisory
-        .resolution_evidence
-        .as_deref()
-        .is_some_and(|evidence| evidence.contains("ship verified remote")));
+    assert!(
+        resolved_advisory
+            .resolution_evidence
+            .as_deref()
+            .is_some_and(|evidence| evidence.contains("ship verified remote"))
+    );
     assert!(broker.advisories(false).unwrap().is_empty());
     assert!(report.fetch_operation.host_operation_id.is_some());
     assert!(report.push_operation.host_operation_id.is_some());
@@ -321,21 +329,36 @@ fn selected_prefix_publication_resolves_only_contained_promoted_entries() {
     let third = broker.submit(third_session.id).unwrap();
     assert!(third.promoted);
 
-    // Model publication through the selected second-entry prefix. The
-    // containment resolver must not clear the later promoted entry merely
-    // because it is already recorded in the queue.
-    git(
-        &fixture.repo,
-        &[
-            "update-ref",
-            "refs/heads/aethyme/integration",
-            &selected_integration,
-        ],
+    let current_integration = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
+    let plan = broker.ship_plan(second.entry.id).unwrap();
+    assert_eq!(plan.integration_sha, current_integration);
+    assert_eq!(plan.publication_sha, selected_integration);
+    assert_eq!(
+        plan.included_entries
+            .iter()
+            .map(|entry| entry.queue_entry_id)
+            .collect::<Vec<_>>(),
+        vec![first_entry, second.entry.id]
     );
+    assert_eq!(
+        plan.excluded_entries
+            .iter()
+            .map(|entry| entry.queue_entry_id)
+            .collect::<Vec<_>>(),
+        vec![third.entry.id]
+    );
+    assert_eq!(plan.proposed_push.source_sha, selected_integration);
 
     let report = broker
         .ship_execute(second.entry.id, &selected_integration)
         .unwrap();
+    assert_eq!(report.published_sha, selected_integration);
+    assert_eq!(fixture.remote_main(), report.published_sha);
+    assert_eq!(
+        git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]),
+        current_integration,
+        "publishing an older prefix must not rewind integration"
+    );
 
     assert_eq!(
         report
@@ -353,6 +376,52 @@ fn selected_prefix_publication_resolves_only_contained_promoted_entries() {
         EntryExposureState::Outstanding,
         "a later entry outside the verified published prefix remains exposed"
     );
+}
+
+#[test]
+fn ship_plan_refuses_a_selected_prefix_with_unrecorded_integration_commits() {
+    let fixture = Fixture::new();
+    fixture.promoted_entry();
+
+    let integration = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
+    let tree_ref = format!("{integration}^{{tree}}");
+    let tree = git_output(&fixture.repo, &["rev-parse", &tree_ref]);
+    let unrecorded = git_output(
+        &fixture.repo,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &integration,
+            "-m",
+            "unrecorded integration commit",
+        ],
+    );
+    git(
+        &fixture.repo,
+        &[
+            "update-ref",
+            "refs/heads/aethyme/integration",
+            &unrecorded,
+            &integration,
+        ],
+    );
+
+    let mut broker = fixture.broker();
+    let session = broker.start_worktree("after unrecorded commit").unwrap();
+    let worktree = PathBuf::from(&session.worktree_path);
+    std::fs::write(worktree.join("after-unrecorded.txt"), "change\n").unwrap();
+    git(&worktree, &["add", "after-unrecorded.txt"]);
+    git(&worktree, &["commit", "-qm", "feat: after unrecorded"]);
+    let outcome = broker.submit(session.id).unwrap();
+    assert!(outcome.promoted);
+
+    let error = broker.ship_plan(outcome.entry.id).unwrap_err().to_string();
+    assert!(
+        error.contains("selected prefix contains unrecorded integration commits"),
+        "{error}"
+    );
+    assert!(error.contains(&unrecorded), "{error}");
 }
 
 #[test]
