@@ -162,6 +162,7 @@ fn build_unresolved_fragment_fixture() -> tempfile::TempDir {
     let ctx = IndexerContext::new("UnresolvedRepo", root.clone(), "test-engine").unwrap();
     let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
     assert_eq!(summary.total_files, 1);
+    link_repo(&ctx).expect("leave genuinely missing imports unresolved");
     tmp
 }
 
@@ -243,6 +244,7 @@ fn build_task_redb_fixture() -> tempfile::TempDir {
     let ctx = IndexerContext::new("TaskRepo", root, "test-engine").unwrap();
     let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
     assert_eq!(summary.total_files, 5);
+    link_repo(&ctx).expect("resolve same-module and imported call edges");
 
     let output = run_engine([
         "index",
@@ -1503,6 +1505,35 @@ fn rendered_graph_commands_match_repository_map_snapshots_on_medium_fixture() {
     let tmp = build_medium_redb_fixture();
 
     assert_rendered_graph_command_parity(tmp.path(), &["load_token", "src/auth/token.py"]);
+}
+
+#[test]
+fn same_file_method_call_resolves_to_module_function_with_redb_parity() {
+    let tmp = build_task_redb_fixture();
+    let map = RepositoryMap::build(tmp.path()).expect("build RepositoryMap parity oracle");
+    let load = map
+        .functions
+        .iter()
+        .find(|function| {
+            function.name.as_str() == "load" && function.file_path.as_str() == "src/auth/token.py"
+        })
+        .expect("TokenLoader.load function");
+    let target = load.id.as_str();
+    let expected = callees_view(&map, target);
+
+    assert_eq!(expected.items.len(), 1, "{expected:#?}");
+    assert_eq!(expected.items[0].kind, "function");
+    assert!(
+        expected.items[0]
+            .id
+            .ends_with(":src/auth/token.py:load_token")
+    );
+    assert_eq!(
+        graph_cli_json(tmp.path(), "graph-callees", target),
+        serde_json::from_str::<serde_json::Value>(&aethyme_engine::json::graph_relation(&expected))
+            .expect("RepositoryMap graph JSON"),
+        "redb must expose the same resolved call edge as RepositoryMap"
+    );
 }
 
 fn assert_graph_overview_parity(repo: &Path) {
