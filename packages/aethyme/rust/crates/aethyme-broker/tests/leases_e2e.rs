@@ -5,7 +5,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::{Broker, BrokerOpError, LeaseOverlapRelation};
+use aethyme_broker::{
+    AdoptMode, AdoptOptions, Broker, BrokerOpError, LeaseKind, LeaseOverlapRelation,
+};
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -46,6 +48,122 @@ fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
         ],
     );
     path
+}
+
+fn managed_worktree_names(root: &Path) -> Vec<String> {
+    let mut names = std::fs::read_dir(root.join(".aethyme/worktrees"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+#[test]
+fn planned_start_claims_before_any_diff_and_refuses_a_second_rewrite() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let first = broker
+        .start_worktree_with_planned_paths("first rewrite", &["generated/".into()])
+        .unwrap();
+    assert_eq!(first.planned_explicit_leases.len(), 1);
+    assert_eq!(first.planned_explicit_leases[0].path, "generated/");
+    assert_eq!(first.planned_explicit_leases[0].kind, LeaseKind::Explicit);
+    let worktrees_before = managed_worktree_names(tmp.path());
+
+    let error = broker
+        .start_worktree_with_planned_paths("second rewrite", &["generated/policy.md".into()])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("planned lease"), "{error}");
+    assert!(error.contains("generated/"), "{error}");
+    assert_eq!(broker.store().live_sessions().unwrap().len(), 1);
+    assert_eq!(
+        managed_worktree_names(tmp.path()),
+        worktrees_before,
+        "a refused plan must not leave a worktree behind"
+    );
+}
+
+#[test]
+fn planned_reuse_is_all_or_nothing_and_does_not_retask_on_conflict() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let owner_worktree = add_worktree(tmp.path(), "plan-owner");
+    let reuse_worktree = add_worktree(tmp.path(), "plan-reuse");
+    let owner = broker.adopt(&owner_worktree, Some("owner")).unwrap();
+    let reused = broker
+        .adopt(&reuse_worktree, Some("original task"))
+        .unwrap();
+    broker.claim_lease(owner.id, "src/", None).unwrap();
+
+    let error = broker
+        .adopt_with_options(
+            &reuse_worktree,
+            Some("must not persist"),
+            AdoptOptions {
+                mode: AdoptMode::Reuse,
+                sync_integration: false,
+                planned_paths: vec!["docs/new.md".into(), "src/auth.py".into()],
+            },
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("src/auth.py"), "{error}");
+    assert_eq!(
+        broker.store().session(reused.id).unwrap().task.as_deref(),
+        Some("original task")
+    );
+    assert!(
+        broker
+            .store()
+            .active_leases()
+            .unwrap()
+            .iter()
+            .all(|lease| { lease.session_id != reused.id || lease.kind != LeaseKind::Explicit })
+    );
+}
+
+#[test]
+fn planned_reuse_is_deduplicated_sorted_and_expired_conflicts_do_not_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let owner_worktree = add_worktree(tmp.path(), "expiring-owner");
+    let reuse_worktree = add_worktree(tmp.path(), "successful-reuse");
+    let owner = broker.adopt(&owner_worktree, Some("owner")).unwrap();
+    let reused = broker.adopt(&reuse_worktree, Some("first task")).unwrap();
+    broker.claim_lease(owner.id, "expired/", Some(1)).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    let report = broker
+        .adopt_with_options(
+            &reuse_worktree,
+            Some("planned follow-up"),
+            AdoptOptions {
+                mode: AdoptMode::Reuse,
+                sync_integration: false,
+                planned_paths: vec![
+                    "zeta.txt".into(),
+                    "expired/file.txt".into(),
+                    "zeta.txt".into(),
+                ],
+            },
+        )
+        .unwrap();
+    assert_eq!(report.session.id, reused.id);
+    assert_eq!(report.session.task.as_deref(), Some("planned follow-up"));
+    assert_eq!(
+        report
+            .planned_explicit_leases
+            .iter()
+            .map(|lease| lease.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["expired/file.txt", "zeta.txt"]
+    );
 }
 
 #[test]

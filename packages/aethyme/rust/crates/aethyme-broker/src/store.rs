@@ -10,7 +10,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 
 use crate::error::BrokerError;
 use crate::schema::{self, EVENTS_SCHEMA_VERSION};
@@ -222,61 +224,24 @@ impl BrokerStore {
     /// Register a session (adopt an existing worktree, or record a spawn).
     /// Also emits a `session.registered` event in the same transaction.
     pub fn register_session(&mut self, new: &NewSession) -> Result<Session, BrokerError> {
+        self.register_session_with_leases(new, &[])
+    }
+
+    /// Register a session and materialize its planned explicit leases in one
+    /// immediate transaction. Directory overlap is rechecked after the write
+    /// lock is acquired, so concurrent planners cannot both succeed.
+    pub fn register_session_with_leases(
+        &mut self,
+        new: &NewSession,
+        planned_paths: &[String],
+    ) -> Result<Session, BrokerError> {
         let now = now_ms();
-        let tx = self.conn.transaction()?;
-        let contract = new.repository_contract.as_ref();
-        let inserted = tx.execute(
-            "INSERT INTO sessions (worktree_path, branch, origin, status, task, diff_base,
-                                   adoption_base, adopted_head, repository_schema,
-                                   deployment_state_digest, aethyme_version,
-                                   gate_definition_digest, repository_contract_backfilled,
-                                   pid, command, log_path, created_at, updated_at,
-                                   last_activity_at)
-             VALUES (?1, ?2, ?3, 'active', ?4, ?5, COALESCE(?6, ?5),
-                     COALESCE(?7, ?6, ?5), ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?16, ?16)",
-            params![
-                new.worktree_path,
-                new.branch,
-                new.origin.as_str(),
-                new.task,
-                new.diff_base,
-                new.adoption_base,
-                new.adopted_head,
-                contract.and_then(|value| value.repository_schema),
-                contract.map(|value| &value.deployment_state_digest),
-                contract.map(|value| &value.aethyme_version),
-                contract.and_then(|value| value.gate_definition_digest.as_deref()),
-                contract.is_some_and(|value| value.backfilled),
-                new.pid,
-                new.command,
-                new.log_path,
-                now,
-            ],
-        );
-        match inserted {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(err, _))
-                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                return Err(BrokerError::WorktreeAlreadyRegistered(
-                    new.worktree_path.clone(),
-                ));
-            }
-            Err(err) => return Err(err.into()),
-        }
-        let id = tx.last_insert_rowid();
-        insert_event(
-            &tx,
-            now,
-            crate::events::SESSION_REGISTERED,
-            Some(id),
-            Some(&crate::events::session_registered_payload(
-                new.origin.as_str(),
-                &new.branch,
-                &new.worktree_path,
-            )),
-        )?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_planned_lease_conflicts(&tx, None, planned_paths, now)?;
+        let id = insert_session(&tx, new, now)?;
+        insert_planned_explicit_leases(&tx, id, planned_paths, now)?;
         tx.commit()?;
         self.session(id)
     }
@@ -322,8 +287,21 @@ impl BrokerStore {
         task: Option<&str>,
         diff_base: Option<&str>,
     ) -> Result<Session, BrokerError> {
+        self.reuse_session_with_leases(id, task, diff_base, &[])
+    }
+
+    pub fn reuse_session_with_leases(
+        &mut self,
+        id: i64,
+        task: Option<&str>,
+        diff_base: Option<&str>,
+        planned_paths: &[String],
+    ) -> Result<Session, BrokerError> {
         let now = now_ms();
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_planned_lease_conflicts(&tx, Some(id), planned_paths, now)?;
         let changed = tx.execute(
             "UPDATE sessions SET task = COALESCE(?2, task), diff_base = COALESCE(?3, diff_base),
                                  status = 'active', last_activity_at = ?4, updated_at = ?4
@@ -340,6 +318,42 @@ impl BrokerStore {
             Some(id),
             Some(&crate::events::session_reused_payload(task, diff_base)),
         )?;
+        insert_planned_explicit_leases(&tx, id, planned_paths, now)?;
+        tx.commit()?;
+        self.session(id)
+    }
+
+    /// Atomically close one stale session, register its replacement, and
+    /// claim the reviewed path plan. The replaced session's leases are
+    /// excluded from conflict checks because they are deleted in this same
+    /// transaction; every other session remains authoritative.
+    pub fn replace_session_with_leases(
+        &mut self,
+        replaced_id: i64,
+        new: &NewSession,
+        planned_paths: &[String],
+    ) -> Result<Session, BrokerError> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_planned_lease_conflicts(&tx, Some(replaced_id), planned_paths, now)?;
+        let changed = tx.execute(
+            "UPDATE sessions SET status = 'cleaned', updated_at = ?2
+             WHERE id = ?1 AND status != 'cleaned'",
+            params![replaced_id, now],
+        )?;
+        if changed == 0 {
+            return Err(BrokerError::SessionNotFound(replaced_id));
+        }
+        tx.execute("DELETE FROM leases WHERE session_id = ?1", [replaced_id])?;
+        tx.execute(
+            "DELETE FROM session_foreign_files WHERE session_id = ?1",
+            [replaced_id],
+        )?;
+        insert_event(&tx, now, "session.cleaned", Some(replaced_id), None)?;
+        let id = insert_session(&tx, new, now)?;
+        insert_planned_explicit_leases(&tx, id, planned_paths, now)?;
         tx.commit()?;
         self.session(id)
     }
@@ -2025,6 +2039,130 @@ impl BrokerStore {
 }
 
 // ── row mapping helpers ──────────────────────────────────────────────
+
+fn insert_session(tx: &Transaction<'_>, new: &NewSession, now: i64) -> Result<i64, BrokerError> {
+    let contract = new.repository_contract.as_ref();
+    let inserted = tx.execute(
+        "INSERT INTO sessions (worktree_path, branch, origin, status, task, diff_base,
+                               adoption_base, adopted_head, repository_schema,
+                               deployment_state_digest, aethyme_version,
+                               gate_definition_digest, repository_contract_backfilled,
+                               pid, command, log_path, created_at, updated_at,
+                               last_activity_at)
+         VALUES (?1, ?2, ?3, 'active', ?4, ?5, COALESCE(?6, ?5),
+                 COALESCE(?7, ?6, ?5), ?8, ?9, ?10, ?11, ?12, ?13,
+                 ?14, ?15, ?16, ?16, ?16)",
+        params![
+            new.worktree_path,
+            new.branch,
+            new.origin.as_str(),
+            new.task,
+            new.diff_base,
+            new.adoption_base,
+            new.adopted_head,
+            contract.and_then(|value| value.repository_schema),
+            contract.map(|value| &value.deployment_state_digest),
+            contract.map(|value| &value.aethyme_version),
+            contract.and_then(|value| value.gate_definition_digest.as_deref()),
+            contract.is_some_and(|value| value.backfilled),
+            new.pid,
+            new.command,
+            new.log_path,
+            now,
+        ],
+    );
+    match inserted {
+        Ok(_) => {}
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            return Err(BrokerError::WorktreeAlreadyRegistered(
+                new.worktree_path.clone(),
+            ));
+        }
+        Err(err) => return Err(err.into()),
+    }
+    let id = tx.last_insert_rowid();
+    insert_event(
+        tx,
+        now,
+        crate::events::SESSION_REGISTERED,
+        Some(id),
+        Some(&crate::events::session_registered_payload(
+            new.origin.as_str(),
+            &new.branch,
+            &new.worktree_path,
+        )),
+    )?;
+    Ok(id)
+}
+
+fn validate_planned_lease_conflicts(
+    tx: &Transaction<'_>,
+    owner_session_id: Option<i64>,
+    planned_paths: &[String],
+    now: i64,
+) -> Result<(), BrokerError> {
+    let leases = {
+        let mut stmt = tx.prepare(&format!(
+            "{LEASE_SELECT}
+             WHERE released_at IS NULL
+               AND (expires_at IS NULL OR expires_at > ?1)
+               AND session_id IN
+                   (SELECT id FROM sessions WHERE status IN ('active', 'idle', 'stale'))
+             ORDER BY session_id, path, kind"
+        ))?;
+        let rows = stmt.query_map([now], lease_from_row)?;
+        let mut leases = Vec::new();
+        for row in rows {
+            leases.push(row??);
+        }
+        leases
+    };
+    for path in planned_paths {
+        if let Some(blocker) = leases.iter().find(|lease| {
+            Some(lease.session_id) != owner_session_id
+                && crate::leases::paths_overlap(path, &lease.path)
+        }) {
+            return Err(BrokerError::PlannedLeaseConflict {
+                path: path.clone(),
+                blocker_session_id: blocker.session_id,
+                blocker_path: blocker.path.clone(),
+                blocker_kind: blocker.kind.as_str().to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn insert_planned_explicit_leases(
+    tx: &Transaction<'_>,
+    session_id: i64,
+    planned_paths: &[String],
+    now: i64,
+) -> Result<(), BrokerError> {
+    for path in planned_paths {
+        tx.execute(
+            "INSERT INTO leases (session_id, path, kind, created_at, expires_at)
+             VALUES (?1, ?2, 'explicit', ?3, NULL)
+             ON CONFLICT (session_id, path, kind)
+             DO UPDATE SET created_at = excluded.created_at,
+                           expires_at = NULL,
+                           released_at = NULL
+             WHERE leases.released_at IS NOT NULL
+                OR (leases.expires_at IS NOT NULL AND leases.expires_at <= ?3)",
+            params![session_id, path, now],
+        )?;
+        insert_event(
+            tx,
+            now,
+            crate::events::LEASE_CLAIMED,
+            Some(session_id),
+            Some(&crate::events::lease_path_payload(path)),
+        )?;
+    }
+    Ok(())
+}
 
 const SESSION_SELECT: &str = "SELECT id, worktree_path, branch, origin, status, task, \
      diff_base, adoption_base, adopted_head, accepted_session_head, \

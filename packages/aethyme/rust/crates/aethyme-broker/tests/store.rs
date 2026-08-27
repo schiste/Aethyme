@@ -78,6 +78,61 @@ fn session_round_trip_attach_first() {
 }
 
 #[test]
+fn session_registration_and_planned_leases_rollback_as_one_transaction() {
+    let (_tmp, mut store) = open_temp();
+    let contract = RepositoryContract {
+        repository_schema: Some(1),
+        deployment_state_digest: "deployment-digest".into(),
+        aethyme_version: "0.3.0".into(),
+        gate_definition_digest: None,
+        backfilled: false,
+    };
+    let session = |name: &str| NewSession {
+        worktree_path: format!("/repo/.aethyme/worktrees/{name}"),
+        branch: format!("agent/{name}"),
+        origin: SessionOrigin::Spawned,
+        task: Some(name.to_string()),
+        diff_base: Some("abc123".into()),
+        adoption_base: None,
+        adopted_head: None,
+        repository_contract: Some(contract.clone()),
+        pid: None,
+        command: None,
+        log_path: None,
+    };
+
+    let first = store
+        .register_session_with_leases(&session("first"), &["generated/".into()])
+        .unwrap();
+    let error = store
+        .register_session_with_leases(
+            &session("second"),
+            &["docs/new.md".into(), "generated/policy.md".into()],
+        )
+        .unwrap_err();
+    assert!(matches!(error, BrokerError::PlannedLeaseConflict { .. }));
+    assert!(
+        store
+            .session_for_worktree("/repo/.aethyme/worktrees/second")
+            .unwrap()
+            .is_none(),
+        "the session row must roll back with its first non-conflicting claim"
+    );
+    let live = store.live_sessions().unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].id, first.id);
+    assert_eq!(
+        store
+            .active_leases()
+            .unwrap()
+            .iter()
+            .map(|lease| lease.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["generated/"]
+    );
+}
+
+#[test]
 fn advisory_round_trip_is_idempotent_and_acknowledgement_preserves_history() {
     let (_tmp, mut store) = open_temp();
     let session = sample_session(&mut store);

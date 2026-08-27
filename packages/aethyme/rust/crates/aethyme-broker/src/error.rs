@@ -66,6 +66,16 @@ pub enum BrokerError {
     #[error("a session already exists for worktree {0}")]
     WorktreeAlreadyRegistered(String),
 
+    #[error(
+        "planned lease {path:?} overlaps active {blocker_kind} lease {blocker_path:?} held by session {blocker_session_id}"
+    )]
+    PlannedLeaseConflict {
+        path: String,
+        blocker_session_id: i64,
+        blocker_path: String,
+        blocker_kind: String,
+    },
+
     #[error("invalid {field} value in broker db: {value:?}")]
     InvalidEnumValue { field: &'static str, value: String },
 }

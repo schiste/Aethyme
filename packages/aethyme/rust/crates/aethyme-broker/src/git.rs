@@ -1053,6 +1053,22 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Delete an exact local branch only when it still names the expected
+    /// object. Used to roll back a just-created session worktree if its
+    /// atomic database registration loses a planned-lease race.
+    pub fn delete_branch_ref_checked(&self, branch: &str, expected: &str) -> Result<(), GitError> {
+        run_git(
+            &self.root,
+            &[
+                "update-ref",
+                "-d",
+                &format!("refs/heads/{branch}"),
+                expected,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Paths of all linked worktrees registered on this repository
     /// (excluding the main checkout).
     pub fn worktree_paths(&self) -> Result<Vec<PathBuf>, GitError> {

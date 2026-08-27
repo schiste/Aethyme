@@ -56,6 +56,66 @@ fn fixture() -> tempfile::TempDir {
 }
 
 #[test]
+fn start_cli_returns_deterministic_planned_leases_and_status_exposes_them() {
+    let tmp = fixture();
+    let started = stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--task",
+            "planned rewrite",
+            "--path",
+            "zeta.txt",
+            "--path",
+            "generated/",
+            "--path",
+            "zeta.txt",
+            "--json",
+        ],
+    ));
+    let value: serde_json::Value = serde_json::from_str(&started).unwrap();
+    assert_eq!(
+        value["planned_explicit_leases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|lease| lease["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["generated/", "zeta.txt"]
+    );
+
+    let status = stdout(&run(tmp.path(), &["status", "--json"]));
+    let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+    assert_eq!(
+        status["leases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|lease| lease["kind"] == "explicit")
+            .count(),
+        2
+    );
+
+    let conflict = run(
+        tmp.path(),
+        &[
+            "start",
+            "--task",
+            "conflicting rewrite",
+            "--path",
+            "generated/policy.md",
+            "--json",
+        ],
+    );
+    assert!(!conflict.status.success());
+    assert!(
+        String::from_utf8_lossy(&conflict.stderr).contains("planned lease"),
+        "{}",
+        String::from_utf8_lossy(&conflict.stderr)
+    );
+}
+
+#[test]
 fn adopt_cli_distinguishes_created_and_reused_session_identities() {
     let tmp = fixture();
 

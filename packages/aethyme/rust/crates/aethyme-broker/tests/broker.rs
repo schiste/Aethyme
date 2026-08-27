@@ -589,6 +589,7 @@ fn adopt_reuse_sync_fast_forwards_before_refreshing_the_baseline() {
             AdoptOptions {
                 mode: AdoptMode::Reuse,
                 sync_integration: true,
+                planned_paths: Vec::new(),
             },
         )
         .unwrap();
@@ -629,6 +630,7 @@ fn adopt_reuse_sync_reports_an_already_current_checkout() {
             AdoptOptions {
                 mode: AdoptMode::Reuse,
                 sync_integration: true,
+                planned_paths: Vec::new(),
             },
         )
         .unwrap();
@@ -664,6 +666,7 @@ fn adopt_reuse_sync_refuses_dirty_state_without_changing_head_or_session() {
             AdoptOptions {
                 mode: AdoptMode::Reuse,
                 sync_integration: true,
+                planned_paths: Vec::new(),
             },
         )
         .unwrap_err();
@@ -700,6 +703,7 @@ fn adopt_reuse_sync_refuses_divergence_without_changing_head_or_session() {
             AdoptOptions {
                 mode: AdoptMode::Reuse,
                 sync_integration: true,
+                planned_paths: Vec::new(),
             },
         )
         .unwrap_err();

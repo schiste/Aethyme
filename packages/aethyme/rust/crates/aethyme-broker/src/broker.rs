@@ -262,10 +262,11 @@ pub enum AdoptMode {
     ReplaceStale,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdoptOptions {
     pub mode: AdoptMode,
     pub sync_integration: bool,
+    pub planned_paths: Vec<String>,
 }
 
 impl AdoptOptions {
@@ -273,6 +274,7 @@ impl AdoptOptions {
         Self {
             mode,
             sync_integration: false,
+            planned_paths: Vec::new(),
         }
     }
 }
@@ -357,6 +359,14 @@ pub struct AdoptReport {
     pub integration_drift: Option<AdoptIntegrationDrift>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration_sync: Option<AdoptIntegrationSync>,
+    pub planned_explicit_leases: Vec<crate::Lease>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct StartReport {
+    #[serde(flatten)]
+    pub session: Session,
+    pub planned_explicit_leases: Vec<crate::Lease>,
 }
 
 /// A session enriched with liveness derived at read time — what
@@ -476,6 +486,7 @@ pub struct StatusView {
     /// Promoted entry paths whose publication has not yet been proven.
     pub outstanding_entry_exposures: Vec<crate::EntryPathExposure>,
     pub agents: Vec<AgentView>,
+    pub leases: Vec<crate::Lease>,
     pub overlaps: Vec<crate::leases::Overlap>,
     pub promoted_conflicts: Vec<PromotedConflict>,
     pub queue: Vec<crate::types::MergeQueueEntry>,
@@ -607,6 +618,16 @@ fn normalize_lease_path(path: &str) -> Result<String, BrokerOpError> {
         }
     }
     Ok(path.to_string())
+}
+
+fn normalize_planned_paths(paths: &[String]) -> Result<Vec<String>, BrokerOpError> {
+    let mut normalized = paths
+        .iter()
+        .map(|path| normalize_lease_path(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
 }
 
 fn lease_plan_overlap_order(a: &LeasePlanOverlap, b: &LeasePlanOverlap) -> std::cmp::Ordering {
@@ -1351,6 +1372,27 @@ impl Broker {
         }
         let checkout = GitRepo::discover(worktree)?;
         let branch = checkout.current_branch()?;
+        let worktree_path = checkout.root().to_string_lossy().into_owned();
+        let existing = self.store.session_for_worktree(&worktree_path)?;
+        if options.mode == AdoptMode::New
+            && let Some(existing) = &existing
+        {
+            return Err(BrokerOpError::SessionExistsForWorktree {
+                id: existing.id,
+                status: existing.status.as_str(),
+                task: existing
+                    .task
+                    .as_deref()
+                    .map(|task| format!(", task: {task:?}"))
+                    .unwrap_or_default(),
+            });
+        }
+        let planned_paths = normalize_planned_paths(&options.planned_paths)?;
+        let plan_owner = existing.as_ref().and_then(|session| match options.mode {
+            AdoptMode::Reuse | AdoptMode::ReplaceStale => Some(session.id),
+            AdoptMode::New => None,
+        });
+        self.ensure_planned_paths_available(&planned_paths, plan_owner)?;
         let integration_sync = if options.sync_integration {
             Some(self.synchronize_reuse_checkout(&checkout)?)
         } else {
@@ -1358,11 +1400,11 @@ impl Broker {
         };
         let diff_base = checkout.head_commit().ok();
         let repository_contract = self.capture_repository_contract(checkout.root(), false)?;
-        let worktree_path = checkout.root().to_string_lossy().into_owned();
         let foreign_files = checkout.untracked_paths()?;
         let mut outcome = AdoptOutcome::Created;
+        let mut replaced_session_id = None;
 
-        if let Some(existing) = self.store.session_for_worktree(&worktree_path)? {
+        if let Some(existing) = existing {
             match options.mode {
                 AdoptMode::Reuse => {
                     // A live session's baseline is its durable ownership
@@ -1374,26 +1416,29 @@ impl Broker {
                     let refreshed_base = integration_sync
                         .as_ref()
                         .map(|sync| sync.after_head.as_str());
-                    let session = self
-                        .store
-                        .reuse_session(existing.id, task, refreshed_base)?;
+                    let session = self.store.reuse_session_with_leases(
+                        existing.id,
+                        task,
+                        refreshed_base,
+                        &planned_paths,
+                    )?;
                     self.store
                         .set_session_foreign_files(session.id, &foreign_files)?;
                     let integration_drift =
                         Some(self.adopt_integration_drift(&checkout, session.id)?);
+                    let planned_explicit_leases =
+                        self.planned_explicit_leases(session.id, &planned_paths)?;
                     return Ok(AdoptReport {
                         session,
                         outcome: AdoptOutcome::Reused,
                         integration_drift,
                         integration_sync,
+                        planned_explicit_leases,
                     });
                 }
                 AdoptMode::ReplaceStale => {
-                    // State-only close (never touches the filesystem),
-                    // then a fresh registration.
-                    self.store
-                        .set_session_status(existing.id, SessionStatus::Cleaned, None)?;
                     outcome = AdoptOutcome::Replaced;
+                    replaced_session_id = Some(existing.id);
                 }
                 AdoptMode::New => {
                     return Err(BrokerOpError::SessionExistsForWorktree {
@@ -1409,7 +1454,7 @@ impl Broker {
             }
         }
 
-        let session = self.store.register_session(&NewSession {
+        let new_session = NewSession {
             worktree_path,
             branch,
             origin: SessionOrigin::Adopted,
@@ -1421,7 +1466,17 @@ impl Broker {
             pid: None,
             command: None,
             log_path: None,
-        })?;
+        };
+        let session = if let Some(replaced_session_id) = replaced_session_id {
+            self.store.replace_session_with_leases(
+                replaced_session_id,
+                &new_session,
+                &planned_paths,
+            )?
+        } else {
+            self.store
+                .register_session_with_leases(&new_session, &planned_paths)?
+        };
         self.store
             .set_session_foreign_files(session.id, &foreign_files)?;
         let integration_drift = if options.mode == AdoptMode::Reuse {
@@ -1429,11 +1484,13 @@ impl Broker {
         } else {
             None
         };
+        let planned_explicit_leases = self.planned_explicit_leases(session.id, &planned_paths)?;
         Ok(AdoptReport {
             session,
             outcome,
             integration_drift,
             integration_sync,
+            planned_explicit_leases,
         })
     }
 
@@ -1595,23 +1652,49 @@ impl Broker {
     /// already running in an existing shell: the caller can `cd` into the
     /// returned path and continue with an isolated index and checkout.
     pub fn start_worktree(&mut self, task: &str) -> Result<Session, BrokerOpError> {
+        Ok(self.start_worktree_with_planned_paths(task, &[])?.session)
+    }
+
+    pub fn start_worktree_with_planned_paths(
+        &mut self,
+        task: &str,
+        paths: &[String],
+    ) -> Result<StartReport, BrokerOpError> {
+        let planned_paths = normalize_planned_paths(paths)?;
+        self.ensure_planned_paths_available(&planned_paths, None)?;
         let (_slug, branch, base, worktree) = self.create_session_worktree(task)?;
         let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
-        let session = self.store.register_session(&NewSession {
+        let new_session = NewSession {
             worktree_path: worktree.root().to_string_lossy().into_owned(),
-            branch,
+            branch: branch.clone(),
             origin: SessionOrigin::Spawned,
             task: Some(task.to_string()),
             adoption_base: Some(base.clone()),
             adopted_head: Some(base.clone()),
-            diff_base: Some(base),
+            diff_base: Some(base.clone()),
             repository_contract: Some(repository_contract),
             pid: None,
             command: None,
             log_path: None,
-        })?;
+        };
+        let session = match self
+            .store
+            .register_session_with_leases(&new_session, &planned_paths)
+        {
+            Ok(session) => session,
+            Err(error) => {
+                let worktree_path = worktree.root().to_path_buf();
+                let _ = self.repo.worktree_remove(&worktree_path, true);
+                let _ = self.repo.delete_branch_ref_checked(&branch, &base);
+                return Err(error.into());
+            }
+        };
         self.store.set_session_foreign_files(session.id, &[])?;
-        Ok(session)
+        let planned_explicit_leases = self.planned_explicit_leases(session.id, &planned_paths)?;
+        Ok(StartReport {
+            session,
+            planned_explicit_leases,
+        })
     }
 
     /// Create a worktree + branch for `task` and spawn `command` in it via
@@ -1947,6 +2030,47 @@ impl Broker {
             would_conflict: planned.iter().any(|path| path.would_conflict),
             paths: planned,
         })
+    }
+
+    fn ensure_planned_paths_available(
+        &self,
+        paths: &[String],
+        owner_session_id: Option<i64>,
+    ) -> Result<(), BrokerOpError> {
+        let plan = self.plan_leases(paths, owner_session_id)?;
+        if let Some(path) = plan.paths.iter().find(|path| path.would_conflict) {
+            let blocker = path
+                .conflicts
+                .first()
+                .expect("conflicting path has at least one blocker");
+            return Err(BrokerError::PlannedLeaseConflict {
+                path: path.path.clone(),
+                blocker_session_id: blocker.session_id,
+                blocker_path: blocker.path.clone(),
+                blocker_kind: blocker.kind.as_str().to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn planned_explicit_leases(
+        &self,
+        session_id: i64,
+        paths: &[String],
+    ) -> Result<Vec<crate::Lease>, BrokerOpError> {
+        let mut leases = self
+            .store
+            .active_leases()?
+            .into_iter()
+            .filter(|lease| {
+                lease.session_id == session_id
+                    && lease.kind == LeaseKind::Explicit
+                    && paths.binary_search(&lease.path).is_ok()
+            })
+            .collect::<Vec<_>>();
+        leases.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(leases)
     }
 
     /// Preflight a session's committed diff before submit. Every
@@ -3085,6 +3209,7 @@ impl Broker {
             outstanding_advisories: self.store.advisories(false)?,
             outstanding_entry_exposures: self.store.outstanding_entry_path_exposures()?,
             agents,
+            leases: self.store.active_leases()?,
             overlaps,
             promoted_conflicts,
             queue,

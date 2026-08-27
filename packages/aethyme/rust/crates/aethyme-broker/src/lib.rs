@@ -68,8 +68,9 @@ pub use broker::{
     LeasePlan, LeasePlanOverlap, OwnershipAuditReport, PromotedConflict, PromotedIntegrationEntry,
     RepairAction, RepairGateSelection, RepairReport, RepairSource, SemanticGateAdvice,
     SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus,
-    SemanticGateSuggestionChain, SessionHandoffReport, StatusAdvice, StatusAdviceSeverity,
-    StatusIntegrationRelation, StatusSummary, StatusView, VersionRepairReport, VersionRepairStep,
+    SemanticGateSuggestionChain, SessionHandoffReport, StartReport, StatusAdvice,
+    StatusAdviceSeverity, StatusIntegrationRelation, StatusSummary, StatusView,
+    VersionRepairReport, VersionRepairStep,
 };
 pub use error::BrokerError;
 pub use gates::{

@@ -45,7 +45,7 @@ Usage:
       Adaptive (NOT scaffolding): sniff this repo's manifests and draft
       a gates.toml. Output depends on the repo — review it, then run
       certify.
-  aethyme broker adopt [<path>] [--task <text>] [--reuse [--sync-integration]|--replace-stale] [--json]
+  aethyme broker adopt [<path>] [--task <text>] [--path <repo-path>]... [--reuse [--sync-integration]|--replace-stale] [--json]
       Register an existing worktree (attach-first). Defaults to the
       current directory. If the worktree already has a session:
       --reuse points it at a follow-up task with a fresh baseline and
@@ -53,7 +53,8 @@ Usage:
       --sync-integration requires --reuse and first fast-forwards a clean
       session worktree to the exact integration tip;
       --replace-stale closes it (state only) and registers fresh;
-      neither flag = error listing your options.
+      neither flag = error listing your options. Every --path is validated
+      and claimed explicitly in the same transaction as create/reuse.
   aethyme broker close --session <id> [--json]
       Low-level state-only close. Never touches the worktree and does
       not check whether commits were submitted. Prefer finish for normal
@@ -98,9 +99,10 @@ Usage:
       required fields. Successful issue URL/number metadata is journaled and
       recorded locally; ambiguous outcomes require explicit reconciliation and
       are never retried automatically.
-  aethyme broker start --task <text> [--json]
+  aethyme broker start --task <text> [--path <repo-path>]... [--json]
       Create a broker-managed worktree + branch and register a session,
-      but do not spawn a process. Prefer this over adopting the main
+      atomically claiming every reviewed --path, but do not spawn a process.
+      Prefer this over adopting the main
       checkout for agent work; it isolates the git index and worktree.
   aethyme broker start-agent --task <text> --cmd <command> [--json]
       Create a worktree + branch and spawn <command> in it (sh -c),
@@ -610,6 +612,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_repeated_planned_session_paths() {
+        let parsed = match super::parse(&args(&[
+            "--task",
+            "rewrite policies",
+            "--path",
+            "generated/",
+            "--path",
+            "AGENTS.md",
+            "--json",
+        ])) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("planned paths should parse"),
+        };
+        assert_eq!(
+            parsed.planned_paths,
+            vec!["generated/".to_string(), "AGENTS.md".to_string()]
+        );
+        assert!(parsed.json);
+    }
+
+    #[test]
     fn parse_accepts_read_only_ship_plan() {
         let parsed = match super::parse(&args(&["ship", "plan", "--entry", "42", "--json"])) {
             Ok(parsed) => parsed,
@@ -940,6 +963,7 @@ struct Parsed {
     no_cache: bool,
     stdout: bool,
     include_task: bool,
+    planned_paths: Vec<String>,
     exec_command: Vec<String>,
 }
 
@@ -995,6 +1019,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         no_cache: false,
         stdout: false,
         include_task: false,
+        planned_paths: Vec::new(),
         exec_command: Vec::new(),
     };
     let mut iter = args.iter();
@@ -1047,6 +1072,13 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--stdout" => parsed.stdout = true,
             "--include-task" => parsed.include_task = true,
             "--replace-stale" => parsed.replace_stale = true,
+            "--path" => parsed.planned_paths.push(
+                iter.next()
+                    .ok_or(UsageError::Message(
+                        "--path requires a repository-relative path".into(),
+                    ))?
+                    .clone(),
+            ),
             "--kind" => {
                 parsed.kind = Some(
                     iter.next()
@@ -1337,6 +1369,16 @@ fn render_lease_plan(report: &crate::LeasePlan, json: bool) -> Result<(), UsageE
         }
     }
     Ok(())
+}
+
+fn render_planned_explicit_leases(leases: &[crate::Lease]) {
+    if leases.is_empty() {
+        return;
+    }
+    println!("Planned explicit leases:");
+    for lease in leases {
+        println!("  {}", lease.path);
+    }
 }
 
 fn render_pr_check_report(report: &crate::PrCheckReport, json: bool) -> Result<(), UsageError> {
@@ -2937,6 +2979,11 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         }
     })?;
     parsed.read_only_snapshot = mode == CompatibilityMode::ReadOnlySnapshot;
+    if !parsed.planned_paths.is_empty() && !matches!(subcommand.as_str(), "start" | "adopt") {
+        return Err(UsageError::Message(
+            "--path is valid only with broker start or broker adopt".into(),
+        ));
+    }
     surface_command_advisories(subcommand, &parsed);
 
     match subcommand.as_str() {
@@ -2966,6 +3013,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 crate::AdoptOptions {
                     mode,
                     sync_integration: parsed.sync_integration,
+                    planned_paths: parsed.planned_paths,
                 },
             )?;
             let session = &report.session;
@@ -3027,6 +3075,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     }
                     println!("Safe next action: {}", drift.safe_next_action);
                 }
+                render_planned_explicit_leases(&report.planned_explicit_leases);
             }
         }
         "start" => {
@@ -3034,14 +3083,16 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .task
                 .ok_or(UsageError::Message("start requires --task".into()))?;
             let mut broker = open_broker(parsed.read_only_snapshot)?;
-            let session = broker.start_worktree(&task)?;
+            let report = broker.start_worktree_with_planned_paths(&task, &parsed.planned_paths)?;
+            let session = &report.session;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&session)?);
+                println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!(
                     "Started session {} — worktree {} on branch {}",
                     session.id, session.worktree_path, session.branch
                 );
+                render_planned_explicit_leases(&report.planned_explicit_leases);
                 println!("Next: cd {}", session.worktree_path);
             }
         }
@@ -4137,6 +4188,18 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             view.session.branch,
                             view.session.task.as_deref().unwrap_or("-"),
                         );
+                    }
+                }
+                let explicit_leases = status
+                    .leases
+                    .iter()
+                    .filter(|lease| lease.kind == crate::LeaseKind::Explicit)
+                    .collect::<Vec<_>>();
+                if !explicit_leases.is_empty() {
+                    println!();
+                    println!("Planned explicit leases:");
+                    for lease in explicit_leases {
+                        println!("  session {}: {}", lease.session_id, lease.path);
                     }
                 }
                 if !status.queue.is_empty() {

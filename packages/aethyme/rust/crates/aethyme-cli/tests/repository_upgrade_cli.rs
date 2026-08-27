@@ -84,6 +84,7 @@ fn adopt_legacy_session(repo: &Path) -> i64 {
             AdoptOptions {
                 mode: AdoptMode::New,
                 sync_integration: false,
+                planned_paths: Vec::new(),
             },
         )
         .unwrap()

@@ -208,8 +208,8 @@ lease planning, and durable finish handoffs, see the
 - `aethyme init`
 - `aethyme certify`
 - `aethyme broker status [--json]`
-- `aethyme broker start --task "..." [--json]`
-- `aethyme broker adopt [<path>] --task "..." [--reuse [--sync-integration]] [--json]`
+- `aethyme broker start --task "..." [--path <repo-path>]... [--json]`
+- `aethyme broker adopt [<path>] --task "..." [--path <repo-path>]... [--reuse [--sync-integration]] [--json]`
 - `aethyme broker exec --session <id> -- <command> [--json]`
 - `aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <git-args>`
 - `aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <gh-args>`
@@ -450,6 +450,17 @@ conflicts; without it, every overlap is a potential conflict. Planning neither
 claims nor refreshes leases and does not append broker events or command
 telemetry. Paths are sorted deterministically and must be unambiguous,
 repository-relative spellings without `.` or `..` components.
+
+`broker start` and `broker adopt` accept repeatable `--path` declarations for
+work known before a diff exists. The broker validates the complete normalized
+set first, then commits session creation or reuse and every accepted path as an
+ordinary explicit lease in one transaction. One exact or directory conflict
+refuses the whole operation: no partial claims, task retargeting, or leftover
+managed worktree. Reuse preserves an already-active owned lease without
+silently extending its expiry; expired or released owned claims are
+reactivated. Start/adopt text and JSON return the deterministic planned lease
+set, and `broker status` includes all active leases so other agents can inspect
+intent alongside task text before either session creates a diff.
 
 `broker finish` returns a structured handoff covering the latest queue and
 submitted/promoted/published delivery state, pending work, every recorded

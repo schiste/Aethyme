@@ -195,17 +195,22 @@ Follow this protocol:
 
    ```bash
    aethyme broker status --json    # who is working on what
-   aethyme broker start --task "<your task>"   # creates a worktree + session
+   aethyme broker start --task "<your task>" --path <planned-path>
    ```
 
    `cd` into the reported worktree before editing. If you are already in a
-   dedicated worktree, use `aethyme broker adopt --task "<your task>"` instead.
+   dedicated worktree, use
+   `aethyme broker adopt --task "<your task>" --path <planned-path>` instead.
+   Repeat `--path` for every file or trailing-slash directory known up front.
+   The broker validates the whole set first, then creates the session plus
+   explicit leases atomically. Omit `--path` only when no target is known yet.
    If `status` shows another session holding leases on the files you plan
    to change, prefer working elsewhere first or say so in your report —
    overlapping edits will conflict at merge time.
 
-2. **Lease known shared files before the diff exists**. If you know you will
-   edit a file or directory other agents may touch, claim it explicitly:
+2. **Lease additional shared files before the diff exists**. Prefer the
+   atomic `start/adopt --path` declaration above for initial intent. If the
+   session already exists and scope expands, claim the new path explicitly:
 
    ```bash
    aethyme broker leases claim <path> --session <your-session-id>
@@ -572,9 +577,11 @@ mod tests {
             .first()
             .expect("at least one substantive commit policy")
             .required_sections;
-        assert!(substantive
-            .iter()
-            .all(|policy| policy.required_sections == required_sections));
+        assert!(
+            substantive
+                .iter()
+                .all(|policy| policy.required_sections == required_sections)
+        );
         for section in required_sections {
             assert!(doc.contains(&format!("  - `{section}`")));
         }
@@ -588,10 +595,12 @@ mod tests {
         assert!(doc.contains(&format!(
             "- Non-substantive commits ({non_substantive_types}) may use a subject-only message; structured bodies remain optional."
         )));
-        assert!(COMMIT_POLICIES
-            .iter()
-            .filter(|policy| !policy.body_required)
-            .all(|policy| policy.required_sections.is_empty()));
+        assert!(
+            COMMIT_POLICIES
+                .iter()
+                .filter(|policy| !policy.body_required)
+                .all(|policy| policy.required_sections.is_empty())
+        );
         assert!(doc.contains(
             "- Section content may start on the header line (`Problem: text`) or the following line (`Problem:` then `text`)."
         ));
@@ -607,6 +616,10 @@ mod tests {
         let doc = render_agents_document(Some(&repo)).unwrap();
         assert!(doc.contains("## Broker Coordination (multi-agent repository)"));
         assert!(doc.contains("aethyme broker submit --session"));
+        assert!(doc.contains("broker start --task \"<your task>\" --path <planned-path>"));
+        assert!(doc.contains("Repeat `--path` for every file"));
+        assert!(doc.contains("explicit leases atomically"));
+        assert!(doc.contains("Prefer the\n   atomic `start/adopt --path` declaration"));
         assert!(doc.contains("aethyme broker ship plan --entry <promoted-entry-id>"));
         assert!(doc.contains(
             "aethyme broker ship execute --entry <promoted-entry-id> --confirm <full-publication-sha>"
