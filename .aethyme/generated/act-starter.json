@@ -1,7 +1,7 @@
 {
   "schema_version": "aethyme-act-starter-v1",
   "repo": {
-    "name": "repair-aethyme-canonical-repository-depl",
+    "name": "Aethyme",
     "kind": "monorepo"
   },
   "recommended_mode": "repo-act",

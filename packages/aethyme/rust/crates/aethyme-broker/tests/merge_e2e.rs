@@ -310,6 +310,7 @@ fn promotion_persists_one_non_blocking_advisory_per_affected_live_session() {
     let promoting = broker
         .adopt(&promoting_worktree, Some("promote a"))
         .unwrap();
+    commit_edit(&promoting_worktree, "src/b.py", "b = promoted\n");
     commit_edit(&promoting_worktree, "src/a.py", "a = promoted\n");
     let outcome = broker.submit(promoting.id).unwrap();
     assert_eq!(outcome.entry.status, MergeStatus::Verified);
@@ -325,9 +326,18 @@ fn promotion_persists_one_non_blocking_advisory_per_affected_live_session() {
         .unwrap();
     broker
         .store()
+        .release_lease(promoting.id, "src/b.py")
+        .unwrap();
+    broker
+        .store()
         .claim_lease(affected.id, "src/", None)
         .expect("directory lease");
     std::fs::write(affected_worktree.join("src/a.py"), "local dirty work\n").unwrap();
+    std::fs::write(
+        affected_worktree.join("src/b.py"),
+        "other local dirty work\n",
+    )
+    .unwrap();
     broker.refresh_leases().unwrap();
 
     // Force projection failure after the advisory row is stored. Promotion
@@ -347,7 +357,7 @@ fn promotion_persists_one_non_blocking_advisory_per_affected_live_session() {
         advisory.integration_sha.as_deref(),
         Some(integration_sha.as_str())
     );
-    assert_eq!(advisory.paths, vec!["src/a.py"]);
+    assert_eq!(advisory.paths, vec!["src/a.py", "src/b.py"]);
     assert_eq!(
         advisory.identity,
         format!(
@@ -393,8 +403,9 @@ fn promotion_persists_one_non_blocking_advisory_per_affected_live_session() {
         .entry_path_exposure(outcome.entry.id)
         .unwrap()
         .unwrap();
-    assert_eq!(exposure.paths, vec!["src/a.py"]);
+    assert_eq!(exposure.paths, vec!["src/a.py", "src/b.py"]);
     assert_eq!(exposure.state, EntryExposureState::Outstanding);
+    broker.close(promoting.id).unwrap();
     broker.close(affected.id).unwrap();
     assert_eq!(
         broker
@@ -404,7 +415,7 @@ fn promotion_persists_one_non_blocking_advisory_per_affected_live_session() {
             .unwrap()
             .state,
         EntryExposureState::Outstanding,
-        "closing an affected session must not erase entry publication exposure"
+        "closing the originating and affected sessions must not erase entry publication exposure"
     );
     assert_eq!(broker.advisories(false).unwrap(), advisories);
 
@@ -413,6 +424,81 @@ fn promotion_persists_one_non_blocking_advisory_per_affected_live_session() {
     let markdown = std::fs::read_to_string(&projection).unwrap();
     assert!(markdown.contains(&integration_sha));
     assert!(markdown.contains("safe_next_action"));
+
+    let acknowledged = broker.acknowledge_advisory(advisory.id).unwrap();
+    assert_eq!(
+        acknowledged.resolution_state,
+        aethyme_broker::AdvisoryResolutionState::Acknowledged
+    );
+    assert!(broker.advisories(false).unwrap().is_empty());
+    assert_eq!(
+        broker
+            .store()
+            .entry_path_exposure(outcome.entry.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        EntryExposureState::Outstanding,
+        "acknowledgement changes delivery, not publication exposure"
+    );
+
+    // A later session starts from the promoted integration tip, rewrites an
+    // exposed path, and can still submit. The old exposure persists because
+    // neither rebase-equivalent adoption nor advisory acknowledgement is
+    // publication evidence.
+    let later_worktree = agent_worktree_at(tmp.path(), "later", "aethyme/integration");
+    let later = broker
+        .adopt(&later_worktree, Some("rewrite an exposed path after rebasing"))
+        .unwrap();
+    commit_edit(&later_worktree, "src/a.py", "a = rewritten later\n");
+    let later_outcome = broker.submit(later.id).unwrap();
+    assert_eq!(later_outcome.entry.status, MergeStatus::Verified);
+    assert!(!later_outcome.promoted);
+    assert_eq!(
+        broker
+            .store()
+            .entry_path_exposure(outcome.entry.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        EntryExposureState::Outstanding
+    );
+}
+
+#[test]
+fn verification_commit_preserves_only_the_owned_contract_decision() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "contract-decision");
+    let session = broker
+        .adopt(&worktree, Some("document an agent protocol"))
+        .unwrap();
+    std::fs::write(worktree.join("src/a.py"), "a = protocol\n").unwrap();
+    sh(&worktree, &["add", "src/a.py"]);
+    sh(
+        &worktree,
+        &[
+            "commit",
+            "-qm",
+            "docs: document protocol",
+            "-m",
+            "Private implementation rationale.\n\nContract decision: introduce",
+        ],
+    );
+
+    let outcome = broker.submit(session.id).unwrap();
+    assert!(outcome.promoted);
+    let promoted = promoted_merge_commit(&outcome.entry);
+    let message = Command::new("git")
+        .args(["show", "-s", "--format=%B", &promoted])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(message.status.success());
+    let message = String::from_utf8_lossy(&message.stdout);
+    assert!(message.contains("Contract decision: introduce"));
+    assert!(!message.contains("Private implementation rationale"));
 }
 
 #[test]

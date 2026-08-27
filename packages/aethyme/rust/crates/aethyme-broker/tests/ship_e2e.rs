@@ -207,11 +207,9 @@ fn ship_plan_rejects_an_entry_that_is_not_promoted() {
         )
         .unwrap();
     let error = broker.ship_plan(entry.id).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("requires a promoted queue entry")
-    );
+    assert!(error
+        .to_string()
+        .contains("requires a promoted queue entry"));
 }
 
 #[test]
@@ -263,12 +261,10 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
         AdvisoryResolutionState::Resolved
     );
     assert_eq!(resolved_advisory.resolved_at.is_some(), true);
-    assert!(
-        resolved_advisory
-            .resolution_evidence
-            .as_deref()
-            .is_some_and(|evidence| evidence.contains("ship verified remote"))
-    );
+    assert!(resolved_advisory
+        .resolution_evidence
+        .as_deref()
+        .is_some_and(|evidence| evidence.contains("ship verified remote")));
     assert!(broker.advisories(false).unwrap().is_empty());
     assert!(report.fetch_operation.host_operation_id.is_some());
     assert!(report.push_operation.host_operation_id.is_some());
@@ -304,7 +300,7 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
 }
 
 #[test]
-fn ship_verification_resolves_every_contained_promoted_entry() {
+fn selected_prefix_publication_resolves_only_contained_promoted_entries() {
     let fixture = Fixture::new();
     let (first_entry, _, _) = fixture.promoted_entry();
     let mut broker = fixture.broker();
@@ -315,9 +311,31 @@ fn ship_verification_resolves_every_contained_promoted_entry() {
     git(&second_worktree, &["commit", "-qm", "feat: second"]);
     let second = broker.submit(second_session.id).unwrap();
     assert!(second.promoted);
-    let integration = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
+    let selected_integration = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
 
-    let report = broker.ship_execute(second.entry.id, &integration).unwrap();
+    let third_session = broker.start_worktree("later promoted entry").unwrap();
+    let third_worktree = PathBuf::from(&third_session.worktree_path);
+    std::fs::write(third_worktree.join("third.txt"), "third\n").unwrap();
+    git(&third_worktree, &["add", "third.txt"]);
+    git(&third_worktree, &["commit", "-qm", "feat: third"]);
+    let third = broker.submit(third_session.id).unwrap();
+    assert!(third.promoted);
+
+    // Model publication through the selected second-entry prefix. The
+    // containment resolver must not clear the later promoted entry merely
+    // because it is already recorded in the queue.
+    git(
+        &fixture.repo,
+        &[
+            "update-ref",
+            "refs/heads/aethyme/integration",
+            &selected_integration,
+        ],
+    );
+
+    let report = broker
+        .ship_execute(second.entry.id, &selected_integration)
+        .unwrap();
 
     assert_eq!(
         report
@@ -327,12 +345,13 @@ fn ship_verification_resolves_every_contained_promoted_entry() {
             .collect::<Vec<_>>(),
         vec![first_entry, second.entry.id]
     );
-    assert!(
-        broker
-            .store()
-            .outstanding_entry_path_exposures()
-            .unwrap()
-            .is_empty()
+    let outstanding = broker.store().outstanding_entry_path_exposures().unwrap();
+    assert_eq!(outstanding.len(), 1);
+    assert_eq!(outstanding[0].queue_entry_id, third.entry.id);
+    assert_eq!(
+        outstanding[0].state,
+        EntryExposureState::Outstanding,
+        "a later entry outside the verified published prefix remains exposed"
     );
 }
 

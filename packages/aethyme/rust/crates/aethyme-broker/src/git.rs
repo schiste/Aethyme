@@ -808,6 +808,11 @@ impl GitRepo {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    /// Read one commit's complete message without diff or decoration.
+    pub fn commit_message(&self, commit: &str) -> Result<String, GitError> {
+        run_git(&self.root, &["show", "-s", "--format=%B", commit])
+    }
+
     /// Changed files between two commits (for affected-gate selection on
     /// a simulated merged tree).
     pub fn changed_between(&self, from: &str, to: &str) -> Result<Vec<String>, GitError> {

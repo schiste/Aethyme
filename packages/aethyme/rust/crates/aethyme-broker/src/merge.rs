@@ -503,15 +503,24 @@ impl Broker {
         // stable, locked verification slot. The checkout is still disposable,
         // but its source path remains constant so build tools can reuse safe
         // path-sensitive fingerprints across queue entries.
-        let merge_commit = self.repo_handle().commit_tree(
-            &simulation.tree,
-            &[&base],
-            &format!(
-                "broker: promote session {} ({})",
-                session.id,
-                session.task.as_deref().unwrap_or("no task")
-            ),
-        )?;
+        let mut verification_message = format!(
+            "broker: promote session {} ({})",
+            session.id,
+            session.task.as_deref().unwrap_or("no task")
+        );
+        let pending_messages = submission_plan
+            .pending_owned_commit_ids()
+            .into_iter()
+            .map(|commit| self.repo_handle().commit_message(&commit))
+            .collect::<Result<Vec<_>, _>>()?
+            .join("\n");
+        if let Some(decision) = crate::contract_check::parse_contract_decision(&pending_messages) {
+            verification_message.push_str("\n\nContract decision: ");
+            verification_message.push_str(decision.label());
+        }
+        let merge_commit =
+            self.repo_handle()
+                .commit_tree(&simulation.tree, &[&base], &verification_message)?;
         let verify_base = pre_refresh.as_deref().unwrap_or(&base);
         let changed = self
             .repo_handle()

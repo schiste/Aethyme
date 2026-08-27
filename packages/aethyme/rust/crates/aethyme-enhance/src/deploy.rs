@@ -712,6 +712,34 @@ mod tests {
     }
 
     #[test]
+    fn generated_agents_and_claude_share_the_advisory_lifecycle_contract() {
+        let repo = fixture_repo("broker-advisory-protocol");
+        std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+        std::fs::write(repo.join(".aethyme/gates.toml"), "[[gate]]\n").unwrap();
+
+        deploy(&repo, true).unwrap();
+
+        let agents = std::fs::read_to_string(repo.join("AGENTS.md")).unwrap();
+        let claude = std::fs::read_to_string(repo.join("CLAUDE.md")).unwrap();
+        assert_eq!(agents, claude);
+        for required in [
+            "Treat broker advisories as delivered work context, not as blockers",
+            "aethyme broker status --json",
+            "gitignored persistence projection",
+            "Acknowledging a notice stops repeat delivery",
+            "selected integration prefix clears only entries contained",
+            "Advisories never expand gate selection or block submit",
+        ] {
+            assert!(
+                agents.contains(required),
+                "missing protocol clause: {required}"
+            );
+        }
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
     fn supporting_artifact_deploy_never_touches_root_policy() {
         let repo = fixture_repo("supporting-only");
         std::fs::write(repo.join("AGENTS.md"), "maintainer agents policy\n").unwrap();

@@ -255,7 +255,25 @@ Follow this protocol:
    the conflicting files, the blocking session, and the exact rebase
    steps. Resolve, commit, and resubmit.
 
-8. **Git operations remain available to agents.** The broker coordinates
+8. **Treat broker advisories as delivered work context, not as blockers.**
+   The broker surfaces outstanding session advisories after post-commit,
+   before expensive gates, and on common broker commands. When a notice
+   appears—or after rebasing or reusing a worktree—inspect
+   `aethyme broker status --json` before continuing on the named paths.
+
+   `.aethyme/broker-advisory.md` is a gitignored persistence projection; it
+   is not automatically visible to agents and the broker database remains
+   authoritative. Read it when a delivery surface points to it. Directory
+   leases cover descendants, and repeated overlaps are deduplicated and
+   deterministically ordered. Acknowledging a notice stops repeat delivery
+   but does not clear the queue entry's unpublished path exposure. Session
+   close and rebase do not clear it either. Only verified publication or
+   confirmed external reconciliation resolves an exposure; publishing a
+   selected integration prefix clears only entries contained in the verified
+   remote tip. Advisories never expand gate selection or block submit,
+   promotion, or shipping.
+
+9. **Git operations remain available to agents.** The broker coordinates
    concurrent work; it does not remove Git capabilities. When the user's
    request or the repository's documented workflow authorizes the resulting
    local or remote state change, agents may perform every required Git
@@ -541,11 +559,9 @@ mod tests {
             .first()
             .expect("at least one substantive commit policy")
             .required_sections;
-        assert!(
-            substantive
-                .iter()
-                .all(|policy| policy.required_sections == required_sections)
-        );
+        assert!(substantive
+            .iter()
+            .all(|policy| policy.required_sections == required_sections));
         for section in required_sections {
             assert!(doc.contains(&format!("  - `{section}`")));
         }
@@ -559,12 +575,10 @@ mod tests {
         assert!(doc.contains(&format!(
             "- Non-substantive commits ({non_substantive_types}) may use a subject-only message; structured bodies remain optional."
         )));
-        assert!(
-            COMMIT_POLICIES
-                .iter()
-                .filter(|policy| !policy.body_required)
-                .all(|policy| policy.required_sections.is_empty())
-        );
+        assert!(COMMIT_POLICIES
+            .iter()
+            .filter(|policy| !policy.body_required)
+            .all(|policy| policy.required_sections.is_empty()));
         assert!(doc.contains(
             "- Section content may start on the header line (`Problem: text`) or the following line (`Problem:` then `text`)."
         ));
@@ -580,6 +594,12 @@ mod tests {
         let doc = render_agents_document(Some(&repo)).unwrap();
         assert!(doc.contains("## Broker Coordination (multi-agent repository)"));
         assert!(doc.contains("aethyme broker submit --session"));
+        assert!(doc.contains("Treat broker advisories as delivered work context, not as blockers"));
+        assert!(doc.contains("after rebasing or reusing a worktree"));
+        assert!(doc.contains("gitignored persistence projection"));
+        assert!(doc.contains("Acknowledging a notice stops repeat delivery"));
+        assert!(doc.contains("selected integration prefix clears only entries contained"));
+        assert!(doc.contains("Advisories never expand gate selection or block submit"));
         std::fs::remove_dir_all(&repo).unwrap();
     }
 

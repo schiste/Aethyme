@@ -299,9 +299,14 @@ or publication-`resolved` state. `list` returns outstanding rows newest-first;
 After each advisory creation or acknowledgement, the broker takes a
 cross-process projection lock, re-reads outstanding rows from SQLite, and
 atomically replaces `.aethyme/broker-advisory.md`. That generated, gitignored
-file is a convenient agent-facing summary only: `.aethyme/broker.db` remains
-authoritative, and advisories never select gates or block submit, promotion, or
-shipping.
+file is a convenient persistent summary only: ignored files are not
+automatically visible to agents, `.aethyme/broker.db` remains authoritative,
+and advisories never select gates or block submit, promotion, or shipping.
+Managed post-commit output, common session-associated broker commands, and the
+pre-expensive-gate boundary deliver outstanding notices. Generated AGENTS and
+CLAUDE guidance tells agents to inspect `broker status --json` when a notice
+appears and after rebase or worktree reuse, then read the projection when a
+delivery surface points to it.
 
 When a verified promotion changes a path covered by another live session's
 explicit or implicit lease, the broker records one deterministic warning for
@@ -326,6 +331,12 @@ remote-main SHA containing the promotion, or a confirmed `integration
 reconcile --apply` proves an exact, patch-equivalent, or reviewed superseding
 landing. Read-only plans, stale remote state, failed verification, ambiguous
 outcomes, and pending replays retain the exposure.
+If publication targets a selected integration prefix, containment in the
+verified remote tip is still the resolution authority: included entries clear
+in deterministic queue order, while later or otherwise non-contained entries
+remain exposed. Directory-lease descendants are matched like exact paths;
+duplicate exact, directory, and implicit overlap evidence produces one sorted
+path set per affected session. Acknowledgement changes notice delivery only.
 On the first normal open after the storage upgrade, currently promoted legacy
 entries are backfilled from their exact first-parent commit deltas; diagnostic
 snapshot opens remain non-mutating.

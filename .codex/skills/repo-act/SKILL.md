@@ -3,7 +3,7 @@ name: repo-act
 description: Use after repo-onboarding or Explore when moving from orientation into execution planning, debugging checklists, and validation steps. Skip when only broad repo orientation is needed.
 ---
 
-# Repo Act: repair-aethyme-canonical-repository-depl
+# Repo Act: Aethyme
 
 ## When to Use
 

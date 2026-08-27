@@ -3,7 +3,7 @@ name: repo-onboarding
 description: Use when starting work in an unfamiliar repository, when the task asks for repo overview, setup, architecture, entrypoints, test commands, or where to begin. Skip for narrow file-scoped edits once the relevant paths are already known.
 ---
 
-# Repo Onboarding: repair-aethyme-canonical-repository-depl
+# Repo Onboarding: Aethyme
 
 ## When to Use
 
@@ -46,9 +46,7 @@ description: Use when starting work in an unfamiliar repository, when the task a
 
 ## Freshness
 
-- Snapshot key: `4dc754575977431e11dadcc1fc66604b9fbce935d04d7531bb57e66c23ead622`
-- Commit: `9df22342c7d34ed5f4898b50ec68483d63b04109`
-- Repo dirty: `True`
-- Generated at: `2026-08-25T08:57:30+00:00`
+- Source digest: `b0a60499f05281fff9f07cceaa5512008e9a1e1d886337805924ae937cfbfa0f`
+- Tracked source files: `482`
 - Overrides applied: `False`
 - Sections generated: `repo, commands, areas, entrypoints, caution_zones, navigation_recipes, summon, freshness`

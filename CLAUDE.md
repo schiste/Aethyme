@@ -176,7 +176,25 @@ Follow this protocol:
    the conflicting files, the blocking session, and the exact rebase
    steps. Resolve, commit, and resubmit.
 
-8. **Git operations remain available to agents.** The broker coordinates
+8. **Treat broker advisories as delivered work context, not as blockers.**
+   The broker surfaces outstanding session advisories after post-commit,
+   before expensive gates, and on common broker commands. When a notice
+   appears—or after rebasing or reusing a worktree—inspect
+   `aethyme broker status --json` before continuing on the named paths.
+
+   `.aethyme/broker-advisory.md` is a gitignored persistence projection; it
+   is not automatically visible to agents and the broker database remains
+   authoritative. Read it when a delivery surface points to it. Directory
+   leases cover descendants, and repeated overlaps are deduplicated and
+   deterministically ordered. Acknowledging a notice stops repeat delivery
+   but does not clear the queue entry's unpublished path exposure. Session
+   close and rebase do not clear it either. Only verified publication or
+   confirmed external reconciliation resolves an exposure; publishing a
+   selected integration prefix clears only entries contained in the verified
+   remote tip. Advisories never expand gate selection or block submit,
+   promotion, or shipping.
+
+9. **Git operations remain available to agents.** The broker coordinates
    concurrent work; it does not remove Git capabilities. When the user's
    request or the repository's documented workflow authorizes the resulting
    local or remote state change, agents may perform every required Git
