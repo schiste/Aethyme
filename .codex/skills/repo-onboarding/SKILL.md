@@ -46,7 +46,7 @@ description: Use when starting work in an unfamiliar repository, when the task a
 
 ## Freshness
 
-- Source digest: `25410767054bbfcc9114739db81b93828f46f0583297f8dbb8457d00ee62d943`
-- Tracked source files: `482`
+- Source digest: `dba457f65cdcb3f9271a75965ff3f7656c74378e4a2550692246e81c20471c23`
+- Tracked source files: `483`
 - Overrides applied: `False`
 - Sections generated: `repo, commands, areas, entrypoints, caution_zones, navigation_recipes, summon, freshness`
