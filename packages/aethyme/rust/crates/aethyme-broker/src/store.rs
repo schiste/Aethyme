@@ -1657,6 +1657,21 @@ impl BrokerStore {
         rows.map(|row| row?).collect()
     }
 
+    /// Outstanding advisories for one session, oldest first so repeated
+    /// command-boundary notices stay deterministic and preserve chronology.
+    pub fn outstanding_advisories_for_session(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<Advisory>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{ADVISORY_SELECT}
+             WHERE session_id = ?1 AND resolution_state = 'outstanding'
+             ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([session_id], advisory_from_row)?;
+        rows.map(|row| row?).collect()
+    }
+
     /// Idempotently acknowledge one advisory without deleting its evidence.
     pub fn acknowledge_advisory(&mut self, id: i64) -> Result<Advisory, BrokerError> {
         let existing = self

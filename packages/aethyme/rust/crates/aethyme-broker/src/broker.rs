@@ -471,6 +471,8 @@ pub struct VersionRepairStep {
 pub struct StatusView {
     pub summary: StatusSummary,
     pub advice: Vec<StatusAdvice>,
+    /// Durable, non-blocking advisories that still require acknowledgement.
+    pub outstanding_advisories: Vec<crate::Advisory>,
     pub agents: Vec<AgentView>,
     pub overlaps: Vec<crate::leases::Overlap>,
     pub promoted_conflicts: Vec<PromotedConflict>,
@@ -1211,22 +1213,12 @@ impl Broker {
         }
         if let Some(queue_entry_id) = advisory.queue_entry_id {
             let queue = self.store.merge_queue()?;
-            let entry = queue
+            queue
                 .iter()
                 .find(|entry| entry.id == queue_entry_id)
                 .ok_or_else(|| BrokerOpError::InvalidAdvisory {
                     reason: format!("queue entry {queue_entry_id} does not exist"),
                 })?;
-            if let Some(session_id) = advisory.session_id
-                && entry.session_id != session_id
-            {
-                return Err(BrokerOpError::InvalidAdvisory {
-                    reason: format!(
-                        "queue entry {queue_entry_id} belongs to session {}, not {session_id}",
-                        entry.session_id
-                    ),
-                });
-            }
         }
         let stored = self.store.record_advisory(&advisory)?;
         self.refresh_advisory_projection()?;
@@ -3087,6 +3079,7 @@ impl Broker {
         Ok(StatusView {
             summary,
             advice,
+            outstanding_advisories: self.store.advisories(false)?,
             agents,
             overlaps,
             promoted_conflicts,

@@ -284,6 +284,112 @@ fn two_clean_sessions_promote_with_requeue_on_base_move_manual_mode() {
 }
 
 #[test]
+fn promotion_persists_one_non_blocking_advisory_per_affected_live_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[promote]\nmode = \"manual\"\n",
+    )
+    .unwrap();
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let affected_worktree = agent_worktree(tmp.path(), "affected");
+    let affected = broker
+        .adopt(&affected_worktree, Some("continue editing a"))
+        .unwrap();
+    let unrelated_worktree = agent_worktree(tmp.path(), "unrelated");
+    let unrelated = broker
+        .adopt(&unrelated_worktree, Some("edit documentation"))
+        .unwrap();
+    broker
+        .claim_lease(unrelated.id, "docs/", None)
+        .expect("unrelated lease");
+    let promoting_worktree = agent_worktree(tmp.path(), "promoting");
+    let promoting = broker
+        .adopt(&promoting_worktree, Some("promote a"))
+        .unwrap();
+    commit_edit(&promoting_worktree, "src/a.py", "a = promoted\n");
+    let outcome = broker.submit(promoting.id).unwrap();
+    assert_eq!(outcome.entry.status, MergeStatus::Verified);
+    assert!(!outcome.promoted);
+
+    // The intersection appears after verification but before manual
+    // promotion. The submitter's implicit lease is no longer needed once its
+    // exact merged tree is verified, so release it before the other session
+    // establishes the explicit and implicit overlap under test.
+    broker
+        .store()
+        .release_lease(promoting.id, "src/a.py")
+        .unwrap();
+    broker
+        .store()
+        .claim_lease(affected.id, "src/", None)
+        .expect("directory lease");
+    std::fs::write(affected_worktree.join("src/a.py"), "local dirty work\n").unwrap();
+    broker.refresh_leases().unwrap();
+
+    // Force projection failure after the advisory row is stored. Promotion
+    // must remain successful and the database must retain the notification.
+    let projection = tmp.path().join(aethyme_broker::BROKER_ADVISORY_RELPATH);
+    std::fs::create_dir_all(&projection).unwrap();
+    broker.promote(outcome.entry.id).unwrap();
+
+    let integration_sha = resolve(tmp.path(), "aethyme/integration");
+    assert_eq!(integration_sha.len(), 40);
+    let advisories = broker.advisories(false).unwrap();
+    assert_eq!(advisories.len(), 1);
+    let advisory = &advisories[0];
+    assert_eq!(advisory.session_id, Some(affected.id));
+    assert_eq!(advisory.queue_entry_id, Some(outcome.entry.id));
+    assert_eq!(
+        advisory.integration_sha.as_deref(),
+        Some(integration_sha.as_str())
+    );
+    assert_eq!(advisory.paths, vec!["src/a.py"]);
+    assert_eq!(
+        advisory.identity,
+        format!(
+            "promotion_lease_intersection:{integration_sha}:{}",
+            affected.id
+        )
+    );
+    assert!(
+        advisory
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == "lease_overlap"
+                && evidence.summary.contains("explicit lease"))
+    );
+    assert!(
+        advisory
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == "lease_overlap"
+                && evidence.summary.contains("implicit lease"))
+    );
+    assert!(advisory.evidence.iter().any(|evidence| {
+        evidence.kind == "safe_next_action" && evidence.summary == "aethyme broker status --json"
+    }));
+    assert!(
+        advisories
+            .iter()
+            .all(|advisory| advisory.session_id != Some(unrelated.id)
+                && advisory.session_id != Some(promoting.id)),
+        "unrelated and promoting sessions are not affected sessions"
+    );
+
+    let status = broker.status_snapshot(0).unwrap();
+    assert_eq!(status.outstanding_advisories, advisories);
+
+    std::fs::remove_dir(&projection).unwrap();
+    broker.refresh_advisory_projection().unwrap();
+    let markdown = std::fs::read_to_string(&projection).unwrap();
+    assert!(markdown.contains(&integration_sha));
+    assert!(markdown.contains("safe_next_action"));
+}
+
+#[test]
 fn repeated_submission_uses_the_last_accepted_session_head_as_its_checkpoint() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
@@ -325,8 +431,7 @@ fn repeated_submission_uses_the_last_accepted_session_head_as_its_checkpoint() {
         Some(first_head.as_str())
     );
     assert_eq!(
-        second.submission_plan.integration_head,
-        integration_before_follow_up,
+        second.submission_plan.integration_head, integration_before_follow_up,
         "integration is the replay target, not the ownership boundary"
     );
     assert_eq!(second.submission_plan.commits.len(), 1);
@@ -360,7 +465,12 @@ fn follow_up_refuses_to_replace_a_rewritten_accepted_checkpoint_with_integration
     assert_ne!(rewritten_head, accepted_head);
     assert!(
         !Command::new("git")
-            .args(["merge-base", "--is-ancestor", &accepted_head, &rewritten_head])
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                &accepted_head,
+                &rewritten_head
+            ])
             .current_dir(&worktree)
             .status()
             .unwrap()

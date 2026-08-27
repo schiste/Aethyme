@@ -43,6 +43,47 @@ fn quoted(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string cannot fail")
 }
 
+/// Concise, deterministic command/hook boundary notices for one session.
+/// Producer-controlled strings stay JSON quoted so terminal control text or
+/// arbitrary Markdown cannot be mistaken for broker instructions.
+pub(crate) fn session_notice_lines(advisories: &[Advisory]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for advisory in advisories {
+        lines.push(format!(
+            "⚠ Aethyme advisory {} [{}]: {}",
+            advisory.id,
+            advisory.severity.as_str(),
+            quoted(&advisory.identity),
+        ));
+        if let Some(sha) = &advisory.integration_sha {
+            lines.push(format!("  integration SHA: {sha}"));
+        }
+        if !advisory.paths.is_empty() {
+            lines.push(format!(
+                "  affected paths: {}",
+                advisory
+                    .paths
+                    .iter()
+                    .map(|path| quoted(path))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(action) = advisory
+            .evidence
+            .iter()
+            .find(|evidence| evidence.kind == "safe_next_action")
+        {
+            lines.push(format!("  safe next action: {}", action.summary));
+        }
+        lines.push(format!(
+            "  inspect: aethyme broker advisories show {}",
+            advisory.id
+        ));
+    }
+    lines
+}
+
 pub(crate) fn render(advisories: &[Advisory]) -> String {
     let mut output = String::from(
         "# Aethyme Broker Advisories\n\n\
@@ -186,6 +227,23 @@ mod tests {
         assert!(rendered.contains("\"heading\\n## injected\""));
         assert!(rendered.contains("aethyme broker advisories ack 7"));
         assert_eq!(rendered, render(&[advisory("heading\n## injected")]));
+    }
+
+    #[test]
+    fn session_notices_include_exact_provenance_and_safe_action() {
+        let mut advisory = advisory("promotion lease intersection");
+        advisory.evidence.push(crate::AdvisoryEvidence {
+            kind: "safe_next_action".into(),
+            summary: "aethyme broker status --json".into(),
+        });
+        let lines = session_notice_lines(&[advisory]);
+        assert!(lines.iter().any(|line| line.contains(&"a".repeat(40))));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("safe next action: aethyme broker status --json"))
+        );
+        assert!(lines.iter().any(|line| line.contains("advisories show 7")));
     }
 
     #[test]

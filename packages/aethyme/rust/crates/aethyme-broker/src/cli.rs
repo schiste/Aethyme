@@ -163,6 +163,9 @@ Usage:
   aethyme broker advisories ack <id> [--json]
       Acknowledge one advisory idempotently and atomically refresh
       .aethyme/broker-advisory.md from the remaining outstanding rows.
+      Promotion/lease advisories repeat on session commands, after
+      post-commit, and before uncached gates whose cost exceeds 1; they
+      remain informational and never alter command or promotion outcomes.
   aethyme broker gates validate [--json]
       Parse and validate .aethyme/gates.toml.
   aethyme broker gates affected --session <id> [--json]
@@ -2903,6 +2906,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         }
     })?;
     parsed.read_only_snapshot = mode == CompatibilityMode::ReadOnlySnapshot;
+    surface_command_advisories(subcommand, &parsed);
 
     match subcommand.as_str() {
         "adopt" => {
@@ -4586,4 +4590,45 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         }
     }
     Ok(())
+}
+
+/// Every broker invocation associated with a live session surfaces its
+/// outstanding durable advisories on stderr. Stdout remains untouched so all
+/// existing `--json` contracts stay parseable. This is best effort and
+/// read-only: a notification failure must never change command behavior.
+fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
+    // Internal hooks are not interactive broker commands. Pre-commit remains
+    // quiet on success, while post-commit surfaces through run_post_commit
+    // after its conflict radar and therefore does not print twice.
+    if subcommand == "hooks" {
+        return;
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let Ok(checkout) = crate::GitRepo::discover(&cwd) else {
+        return;
+    };
+    let Ok(main_root) = checkout.main_root() else {
+        return;
+    };
+    let Ok(store) = crate::BrokerStore::open_snapshot_in_repo(&main_root) else {
+        return;
+    };
+    let session_id = parsed.session.or_else(|| {
+        store
+            .session_for_worktree(checkout.root().to_string_lossy().as_ref())
+            .ok()
+            .flatten()
+            .map(|session| session.id)
+    });
+    let Some(session_id) = session_id else {
+        return;
+    };
+    let Ok(advisories) = store.outstanding_advisories_for_session(session_id) else {
+        return;
+    };
+    for line in crate::advisories::session_notice_lines(&advisories) {
+        eprintln!("{line}");
+    }
 }

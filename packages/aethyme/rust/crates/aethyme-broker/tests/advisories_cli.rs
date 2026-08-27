@@ -212,3 +212,54 @@ fn advisory_cli_rejects_missing_invalid_and_unknown_ids() {
         assert!(!output.status.success(), "unexpected success for {args:?}");
     }
 }
+
+#[test]
+fn session_commands_surface_notices_without_corrupting_json() {
+    let tmp = fixture();
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("notice target")).unwrap();
+    let mut advisory = sample("promotion-session-notice", Some(session.id), None);
+    advisory.evidence.push(AdvisoryEvidence {
+        kind: "safe_next_action".into(),
+        summary: "aethyme broker status --json".into(),
+    });
+    let advisory = broker.persist_advisory(advisory).unwrap();
+
+    let session_id = session.id.to_string();
+    let command = run(
+        tmp.path(),
+        &[
+            "leases",
+            "plan",
+            "src/a.rs",
+            "--session",
+            &session_id,
+            "--json",
+        ],
+    );
+    assert!(command.status.success());
+    serde_json::from_slice::<serde_json::Value>(&command.stdout)
+        .expect("session command stdout remains stable JSON");
+    let stderr = String::from_utf8_lossy(&command.stderr);
+    assert!(stderr.contains(&format!("Aethyme advisory {}", advisory.id)));
+    assert!(stderr.contains(&"a".repeat(40)));
+    assert!(stderr.contains("safe next action: aethyme broker status --json"));
+
+    let status = run(tmp.path(), &["status", "--json"]);
+    assert!(status.status.success());
+    let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status_json["outstanding_advisories"][0]["id"], advisory.id);
+    assert!(
+        String::from_utf8_lossy(&status.stderr)
+            .contains(&format!("Aethyme advisory {}", advisory.id)),
+        "cwd-associated commands surface the live session advisory"
+    );
+
+    broker.acknowledge_advisory(advisory.id).unwrap();
+    let quiet = run(
+        tmp.path(),
+        &["leases", "plan", "src/a.rs", "--session", &session_id],
+    );
+    assert!(quiet.status.success());
+    assert!(!String::from_utf8_lossy(&quiet.stderr).contains("Aethyme advisory"));
+}

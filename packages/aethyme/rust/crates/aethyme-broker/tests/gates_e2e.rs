@@ -8,9 +8,10 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use aethyme_broker::{
-    Broker, CachePolicy, GRAPH_IMPACT_MAX_DEPTH, GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT,
-    GateFailureClass, GateProgressSink, GateStatus, GraphImpactLookup, GraphImpactProvider,
-    GraphImpactQuery, GraphImpactStatus,
+    AdvisoryEvidence, AdvisorySeverity, Broker, CachePolicy, GRAPH_IMPACT_MAX_DEPTH,
+    GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT, GateFailureClass, GateProgressSink,
+    GateStatus, GraphImpactLookup, GraphImpactProvider, GraphImpactQuery, GraphImpactStatus,
+    NewAdvisory,
 };
 
 #[derive(Clone)]
@@ -912,6 +913,73 @@ triggers = ["**/*.py"]
             .any(|line| line.starts_with("gate heartbeat running... ") && line.ends_with('s')),
         "expected heartbeat progress line, got {lines:?}"
     );
+}
+
+#[test]
+fn outstanding_advisory_is_repeated_immediately_before_expensive_gate_execution() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "cheap"
+command = "true"
+cost = 1
+triggers = ["**/*.py"]
+
+[[gate]]
+name = "expensive"
+command = "true"
+cost = 2
+triggers = ["**/*.py"]
+"#,
+    );
+    commit_all(tmp.path(), "add gates");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = add_worktree(tmp.path(), "advisory-before-expensive");
+    let session = broker.adopt(&wt, None).unwrap();
+    std::fs::write(wt.join("src/app.py"), "x = 3\n").unwrap();
+    let advisory = broker
+        .persist_advisory(NewAdvisory {
+            identity: "gate-boundary-advisory".into(),
+            session_id: Some(session.id),
+            severity: AdvisorySeverity::Warning,
+            queue_entry_id: None,
+            integration_sha: Some("c".repeat(40)),
+            paths: vec!["src/app.py".into()],
+            evidence: vec![AdvisoryEvidence {
+                kind: "safe_next_action".into(),
+                summary: "aethyme broker status --json".into(),
+            }],
+        })
+        .unwrap();
+
+    let progress = CapturedProgress::default();
+    let outcomes = broker
+        .run_gates_with_progress(session.id, &progress)
+        .unwrap();
+    assert_eq!(outcomes.len(), 2);
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome.status == GateStatus::Pass)
+    );
+    let lines = progress.lines();
+    let cheap_started = lines
+        .iter()
+        .position(|line| line.starts_with("gate cheap started"))
+        .unwrap();
+    let notice = lines
+        .iter()
+        .position(|line| line.contains(&format!("Aethyme advisory {}", advisory.id)))
+        .unwrap();
+    let expensive_started = lines
+        .iter()
+        .position(|line| line.starts_with("gate expensive started"))
+        .unwrap();
+    assert!(cheap_started < notice);
+    assert!(notice < expensive_started);
 }
 
 #[test]

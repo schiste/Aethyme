@@ -811,9 +811,9 @@ impl GitRepo {
     /// Changed files between two commits (for affected-gate selection on
     /// a simulated merged tree).
     pub fn changed_between(&self, from: &str, to: &str) -> Result<Vec<String>, GitError> {
-        Ok(parse_path_lines(&run_git(
+        Ok(parse_nul_paths(&run_git(
             &self.root,
-            &["diff", "--name-only", from, to],
+            &["diff", "--name-only", "-z", from, to],
         )?))
     }
 

@@ -1027,6 +1027,7 @@ fn run_selections(
     let _ = std::fs::create_dir_all(&run_dir);
 
     let mut outcomes = Vec::new();
+    let mut expensive_advisories_surfaced = false;
     for selection in selections {
         let gate = selection.gate;
         let worker_id = gate_worker_id(session_id, &gate.name);
@@ -1080,6 +1081,17 @@ fn run_selections(
                 break;
             }
             continue;
+        }
+
+        if gate.cost > 1 && !expensive_advisories_surfaced {
+            expensive_advisories_surfaced = true;
+            if let Some(session_id) = session_id
+                && let Ok(advisories) = store.outstanding_advisories_for_session(session_id)
+            {
+                for line in crate::advisories::session_notice_lines(&advisories) {
+                    progress.report(&line);
+                }
+            }
         }
 
         let wait_started = Instant::now();

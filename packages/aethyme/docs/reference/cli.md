@@ -303,6 +303,18 @@ file is a convenient agent-facing summary only: `.aethyme/broker.db` remains
 authoritative, and advisories never select gates or block submit, promotion, or
 shipping.
 
+When a verified promotion changes a path covered by another live session's
+explicit or implicit lease, the broker records one deterministic warning for
+that affected session. It binds the originating queue entry, exact 40-character
+integration SHA, intersecting promoted paths, lease evidence, and the safe next
+command. Promotion remains non-blocking and the broker never rebases or edits
+the affected worktree. Outstanding notices appear on stderr for every broker
+command associated with that session, after managed post-commit output, and
+immediately before an uncached gate with cost greater than 1 starts. JSON stdout
+remains parseable. `broker status --json` also includes the complete outstanding
+set in `outstanding_advisories`; acknowledgement stops future notices without
+deleting history.
+
 `broker gates pre-push` is an opt-in adapter for repository-owned hooks; the
 managed hook installer never writes `pre-push`. It reads Git's ref-update lines
 from stdin, requires all non-deletion updates to name one clean checked-out

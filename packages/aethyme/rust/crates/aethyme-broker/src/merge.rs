@@ -26,7 +26,9 @@ use std::path::{Path, PathBuf};
 use crate::broker::{Broker, BrokerOpError};
 use crate::gates::GateRunOutcome;
 use crate::git::GitRepo;
-use crate::types::{MergeQueueEntry, MergeStatus, SessionStatus};
+use crate::types::{
+    AdvisoryEvidence, AdvisorySeverity, MergeQueueEntry, MergeStatus, NewAdvisory, SessionStatus,
+};
 
 pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
@@ -980,6 +982,13 @@ impl Broker {
             return self.promote(entry_id);
         }
 
+        // Capture the exact promoted path set before moving the ref. Advisory
+        // calculation is best effort and cannot veto an otherwise verified
+        // promotion, but it must describe this exact base-to-tip transition.
+        let promoted_paths = self
+            .repo_handle()
+            .changed_between(&current_base, &merge_commit)
+            .unwrap_or_default();
         self.repo_handle()
             .update_branch_ref(&branch, &merge_commit)?;
         self.store().record_merge_promotion(
@@ -987,6 +996,7 @@ impl Broker {
             &merge_commit,
             &crate::events::merge_promoted_payload(&branch, &merge_commit),
         )?;
+        self.persist_promotion_lease_advisories(&entry, &merge_commit, &promoted_paths);
 
         // Requeue: everything still in flight was verified/conflicted
         // against a base that just moved (#23).
@@ -1040,6 +1050,104 @@ impl Broker {
             let _ = self.simulate_and_gate(stale_id);
         }
         Ok(())
+    }
+
+    /// Persist one idempotent advisory for every *other* live session whose
+    /// explicit or implicit lease intersects the newly promoted paths.
+    ///
+    /// The integration ref and promotion row are already authoritative when
+    /// this runs. Every failure is therefore swallowed: notifications may be
+    /// repaired or acknowledged, but they can never roll back or block a
+    /// verified promotion and they never mutate another worktree.
+    fn persist_promotion_lease_advisories(
+        &mut self,
+        entry: &MergeQueueEntry,
+        integration_sha: &str,
+        promoted_paths: &[String],
+    ) {
+        if promoted_paths.is_empty() {
+            return;
+        }
+        let Ok(live_sessions) = self.store().live_sessions() else {
+            return;
+        };
+        let live_session_ids: BTreeSet<i64> = live_sessions
+            .into_iter()
+            .filter(|session| session.id != entry.session_id)
+            .map(|session| session.id)
+            .collect();
+        let Ok(leases) = self.store().active_leases() else {
+            return;
+        };
+        let mut paths_by_session: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+        let mut lease_evidence_by_session: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+        for lease in leases {
+            if !live_session_ids.contains(&lease.session_id) {
+                continue;
+            }
+            for promoted_path in promoted_paths {
+                if crate::leases::paths_overlap(&lease.path, promoted_path) {
+                    paths_by_session
+                        .entry(lease.session_id)
+                        .or_default()
+                        .insert(promoted_path.clone());
+                    lease_evidence_by_session
+                        .entry(lease.session_id)
+                        .or_default()
+                        .insert(format!(
+                            "{} lease {:?} overlaps promoted path {:?}",
+                            lease.kind.as_str(),
+                            lease.path,
+                            promoted_path
+                        ));
+                }
+            }
+        }
+
+        for (session_id, paths) in paths_by_session {
+            let path_count = paths.len();
+            let paths = paths.into_iter().take(100).collect::<Vec<_>>();
+            let lease_evidence = lease_evidence_by_session
+                .remove(&session_id)
+                .unwrap_or_default();
+            let lease_evidence_count = lease_evidence.len();
+            let mut evidence = vec![AdvisoryEvidence {
+                kind: "promotion_intersects_lease".into(),
+                summary: format!(
+                    "integration {integration_sha} changed paths leased by session {session_id}; the broker did not rebase or modify that worktree"
+                ),
+            }];
+            evidence.extend(
+                lease_evidence
+                    .into_iter()
+                    .take(97)
+                    .map(|summary| AdvisoryEvidence {
+                        kind: "lease_overlap".into(),
+                        summary,
+                    }),
+            );
+            evidence.push(AdvisoryEvidence {
+                kind: "bounded_result".into(),
+                summary: format!(
+                    "recorded {} of {path_count} intersecting promoted paths and {} of {lease_evidence_count} lease overlaps",
+                    paths.len(),
+                    lease_evidence_count.min(97),
+                ),
+            });
+            evidence.push(AdvisoryEvidence {
+                kind: "safe_next_action".into(),
+                summary: "aethyme broker status --json".into(),
+            });
+            let _ = self.persist_advisory(NewAdvisory {
+                identity: format!("promotion_lease_intersection:{integration_sha}:{session_id}"),
+                session_id: Some(session_id),
+                severity: AdvisorySeverity::Warning,
+                queue_entry_id: Some(entry.id),
+                integration_sha: Some(integration_sha.to_string()),
+                paths,
+                evidence,
+            });
+        }
     }
 
     fn queue_entry(&mut self, entry_id: i64) -> Result<MergeQueueEntry, BrokerOpError> {

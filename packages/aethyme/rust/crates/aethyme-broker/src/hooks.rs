@@ -441,6 +441,29 @@ pub fn run_post_commit(cwd: &Path) {
             eprintln!("{line}");
         }
     }
+    if let Ok(notices) = session_advisory_notices(cwd) {
+        for line in notices {
+            eprintln!("{line}");
+        }
+    }
+}
+
+/// Read-only advisory notices for the live session owning this worktree.
+/// Called after the conflict radar so post-commit output reflects the new
+/// commit first and durable integration drift second.
+pub fn session_advisory_notices(cwd: &Path) -> Result<Vec<String>, HooksError> {
+    let checkout = GitRepo::discover(cwd)?;
+    let main_root = checkout.main_root()?;
+    if !main_root.join(crate::BROKER_DB_RELPATH).exists() {
+        return Ok(Vec::new());
+    }
+    let store = BrokerStore::open_snapshot_in_repo(&main_root)?;
+    let Some(session) = store.session_for_worktree(checkout.root().to_string_lossy().as_ref())?
+    else {
+        return Ok(Vec::new());
+    };
+    let advisories = store.outstanding_advisories_for_session(session.id)?;
+    Ok(crate::advisories::session_notice_lines(&advisories))
 }
 
 /// Compare the files changed in HEAD against other live sessions'

@@ -6,7 +6,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{Broker, GitRepo, HookState, hooks};
+use aethyme_broker::{
+    AdvisoryEvidence, AdvisorySeverity, Broker, GitRepo, HookState, NewAdvisory, hooks,
+};
 
 const SHIM: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -304,6 +306,20 @@ fn post_commit_radar_warns_on_overlap_and_never_blocks() {
     let b = broker.adopt(&wt_b, Some("committer")).unwrap();
     std::fs::write(wt_b.join("src/app.py"), "b's edit\n").unwrap();
     broker.refresh_leases().unwrap();
+    let advisory = broker
+        .persist_advisory(NewAdvisory {
+            identity: "post-commit-session-advisory".into(),
+            session_id: Some(b.id),
+            severity: AdvisorySeverity::Warning,
+            queue_entry_id: None,
+            integration_sha: Some("b".repeat(40)),
+            paths: vec!["src/app.py".into()],
+            evidence: vec![AdvisoryEvidence {
+                kind: "safe_next_action".into(),
+                summary: "aethyme broker status --json".into(),
+            }],
+        })
+        .unwrap();
 
     sh(&wt_b, &["add", "src/app.py"]);
     let commit = git_output(&wt_b, &["commit", "-qm", "b commits the contested file"]);
@@ -314,6 +330,14 @@ fn post_commit_radar_warns_on_overlap_and_never_blocks() {
         "warns naming the overlapping session: {stderr}"
     );
     assert!(stderr.contains("src/app.py"), "names the file: {stderr}");
+    let radar_position = stderr.rfind("conflict radar").unwrap();
+    let advisory_position = stderr
+        .rfind(&format!("Aethyme advisory {}", advisory.id))
+        .unwrap();
+    assert!(
+        advisory_position > radar_position,
+        "the durable advisory is surfaced after post-commit radar output: {stderr}"
+    );
     assert!(
         !stderr.contains(&format!("session {}", b.id)),
         "no self-warning for the committer's own session: {stderr}"
