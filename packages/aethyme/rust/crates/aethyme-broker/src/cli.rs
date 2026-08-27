@@ -156,7 +156,7 @@ Usage:
       remote state. Overlapping writes remain blocked until reconciliation.
   aethyme broker advisories list [--all] [--json]
       List outstanding non-blocking advisories newest-first. --all includes
-      acknowledged history. The broker database is authoritative.
+      acknowledged and publication-resolved history. The broker database is authoritative.
   aethyme broker advisories show <id> [--json]
       Show one exact advisory with paths, evidence, integration provenance,
       creation time, and resolution state.
@@ -2353,6 +2353,16 @@ fn render_advisory(advisory: &crate::Advisory) {
             .map(|time| time.to_string())
             .unwrap_or_else(|| "no".into())
     );
+    println!(
+        "Resolved: {}",
+        advisory
+            .resolved_at
+            .map(|time| time.to_string())
+            .unwrap_or_else(|| "no".into())
+    );
+    if let Some(evidence) = advisory.resolution_evidence.as_deref() {
+        println!("Resolution evidence: {}", advisory_text(evidence));
+    }
     if !advisory.paths.is_empty() {
         println!("Paths:");
         for path in &advisory.paths {
@@ -4118,6 +4128,23 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             entry.session_id,
                             entry.status.as_str(),
                             &entry.head_commit[..12.min(entry.head_commit.len())]
+                        );
+                    }
+                }
+                if !status.outstanding_entry_exposures.is_empty() {
+                    println!();
+                    println!(
+                        "Publication exposures: {} promoted {} not yet verified on remote main",
+                        status.outstanding_entry_exposures.len(),
+                        plural(status.outstanding_entry_exposures.len(), "entry", "entries")
+                    );
+                    for exposure in status.outstanding_entry_exposures.iter().take(10) {
+                        println!(
+                            "  qid {} @ {}: {} {}",
+                            exposure.queue_entry_id,
+                            short_commit(&exposure.promotion_sha),
+                            exposure.paths.len(),
+                            plural(exposure.paths.len(), "path", "paths")
                         );
                     }
                 }

@@ -129,6 +129,17 @@ text_enum!(AdvisorySeverity, "advisories.severity", {
 text_enum!(AdvisoryResolutionState, "advisories.resolution_state", {
     Outstanding => "outstanding",
     Acknowledged => "acknowledged",
+    Resolved => "resolved",
+});
+
+text_enum!(EntryExposureState, "entry_path_exposures.state", {
+    Outstanding => "outstanding",
+    Resolved => "resolved",
+});
+
+text_enum!(EntryExposureResolutionKind, "entry_path_exposures.resolution_kind", {
+    ShipVerified => "ship_verified",
+    ExternalReconciliation => "external_reconciliation",
 });
 
 /// One bounded, structured fact supporting a non-blocking advisory.
@@ -165,6 +176,26 @@ pub struct Advisory {
     pub created_at: i64,
     pub resolution_state: AdvisoryResolutionState,
     pub acknowledged_at: Option<i64>,
+    pub resolved_at: Option<i64>,
+    pub resolution_evidence: Option<String>,
+}
+
+/// Exact promoted paths that remain exposed until publication is proven.
+///
+/// Ownership follows the queue entry rather than a live session, so closing
+/// or rebasing a worktree cannot erase unpublished integration state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EntryPathExposure {
+    pub id: i64,
+    pub queue_entry_id: i64,
+    pub promotion_sha: String,
+    pub paths: Vec<String>,
+    pub created_at: i64,
+    pub state: EntryExposureState,
+    pub resolved_at: Option<i64>,
+    pub resolution_kind: Option<EntryExposureResolutionKind>,
+    pub resolution_sha: Option<String>,
+    pub resolution_evidence: Option<String>,
 }
 
 /// Stable JSON envelope for `advisories list`.

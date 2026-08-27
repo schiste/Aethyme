@@ -932,11 +932,61 @@ impl Broker {
                 == Some(integration_head.as_str())
         });
         if let Some(entry) = candidate {
+            let recorded_base = entry
+                .details_json
+                .as_deref()
+                .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+                .and_then(|details| details.get("base")?.as_str().map(str::to_string));
+            let promoted_base = match recorded_base {
+                Some(base) => base,
+                None => self.repo_handle().first_parent(&integration_head)?,
+            };
+            let promoted_paths = self
+                .repo_handle()
+                .changed_between(&promoted_base, &integration_head)?;
             self.store().record_merge_promotion(
                 entry.id,
                 &integration_head,
+                &promoted_paths,
                 &crate::events::merge_promoted_payload(&config.branch, &integration_head),
             )?;
+        }
+        Ok(())
+    }
+
+    /// Schema v17 compatibility: reconstruct exact outstanding exposure for
+    /// promotions recorded before exposure storage existed. Only currently
+    /// promoted entries qualify; externally landed and superseded history is
+    /// already terminal and must not be resurrected.
+    pub(crate) fn backfill_promoted_path_exposures(&mut self) -> Result<(), BrokerOpError> {
+        let promoted_entries = self
+            .store()
+            .merge_queue()?
+            .into_iter()
+            .filter(|entry| entry.status == MergeStatus::Promoted)
+            .collect::<Vec<_>>();
+        for entry in promoted_entries {
+            if self.store().entry_path_exposure(entry.id)?.is_some() {
+                continue;
+            }
+            let promotion_sha = entry
+                .details_json
+                .as_deref()
+                .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+                .and_then(|details| details.get("commit")?.as_str().map(str::to_string))
+                .ok_or_else(|| BrokerOpError::ShipPlanUnavailable {
+                    what: "promotion commit",
+                    reason: format!(
+                        "promoted queue entry {} has no commit detail for exposure backfill",
+                        entry.id
+                    ),
+                })?;
+            let parent = self.repo_handle().first_parent(&promotion_sha)?;
+            let promoted_paths = self
+                .repo_handle()
+                .changed_between(&parent, &promotion_sha)?;
+            self.store()
+                .backfill_entry_path_exposure(entry.id, &promotion_sha, &promoted_paths)?;
         }
         Ok(())
     }
@@ -982,18 +1032,18 @@ impl Broker {
             return self.promote(entry_id);
         }
 
-        // Capture the exact promoted path set before moving the ref. Advisory
-        // calculation is best effort and cannot veto an otherwise verified
-        // promotion, but it must describe this exact base-to-tip transition.
+        // Capture the exact promoted path set before moving the ref. This is
+        // durable publication state, so unlike notification projection it is
+        // part of the promotion transaction and cannot be best-effort.
         let promoted_paths = self
             .repo_handle()
-            .changed_between(&current_base, &merge_commit)
-            .unwrap_or_default();
+            .changed_between(&current_base, &merge_commit)?;
         self.repo_handle()
             .update_branch_ref(&branch, &merge_commit)?;
         self.store().record_merge_promotion(
             entry_id,
             &merge_commit,
+            &promoted_paths,
             &crate::events::merge_promoted_payload(&branch, &merge_commit),
         )?;
         self.persist_promotion_lease_advisories(&entry, &merge_commit, &promoted_paths);

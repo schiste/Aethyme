@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use aethyme_broker::{
-    Broker, IntegrationReconcileCommitOrigin, IntegrationReconcileEquivalence,
-    IntegrationReconcileOptions, MergeStatus,
+    Broker, EntryExposureResolutionKind, EntryExposureState, IntegrationReconcileCommitOrigin,
+    IntegrationReconcileEquivalence, IntegrationReconcileOptions, MergeStatus,
 };
 
 fn git(root: &Path, args: &[&str]) -> String {
@@ -418,6 +418,16 @@ fn confirmed_reconciliation_rebuilds_from_upstream_and_journals_the_reviewed_dig
     assert!(dry_run.safe, "{dry_run:#?}");
     let digest = dry_run.plan_digest.clone().unwrap();
     assert_eq!(digest.len(), 64);
+    assert_eq!(
+        broker
+            .store()
+            .entry_path_exposure(fixture.promoted_entry_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        EntryExposureState::Outstanding,
+        "a reviewed dry-run is not publication evidence"
+    );
 
     let missing = broker
         .reconcile_integration(IntegrationReconcileOptions {
@@ -482,6 +492,20 @@ fn confirmed_reconciliation_rebuilds_from_upstream_and_journals_the_reviewed_dig
         )
         .unwrap();
     assert_eq!(journaled, digest);
+    let exposure = broker
+        .store()
+        .entry_path_exposure(fixture.promoted_entry_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(exposure.state, EntryExposureState::Resolved);
+    assert_eq!(
+        exposure.resolution_kind,
+        Some(EntryExposureResolutionKind::ExternalReconciliation)
+    );
+    assert_eq!(
+        exposure.resolution_sha.as_deref(),
+        Some(fixture.functional_upstream.as_str())
+    );
 }
 
 #[test]

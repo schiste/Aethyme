@@ -227,6 +227,7 @@ impl Broker {
             .unwrap_or_else(|| "<missing>".into());
         if actual == prepared.new_integration {
             self.store().finalize_integration_reconciliation()?;
+            let _ = self.refresh_advisory_projection();
             return Ok(());
         }
         if actual == prepared.old_integration {
@@ -822,6 +823,7 @@ impl Broker {
             self.store().abort_integration_reconciliation()?;
             return Err(store_error.into());
         }
+        let _ = self.refresh_advisory_projection();
         report.applied = true;
         report.next_action =
             "integration and broker queue reconciled; submit new session work normally".into();

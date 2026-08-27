@@ -291,10 +291,10 @@ the original push plan or remote evidence.
 `broker advisories` exposes durable, explicitly non-blocking findings. Each row
 has an immutable producer identity, optional session and queue-entry links,
 severity, the exact integration SHA when relevant, repository-relative paths,
-structured evidence, creation time, and a typed `outstanding` or
-`acknowledged` resolution state. `list` returns outstanding rows newest-first;
-`list --all` includes acknowledged history, and `show <id>` returns one exact
-row. `ack <id>` is idempotent and preserves the row and evidence.
+structured evidence, creation time, and a typed `outstanding`, `acknowledged`,
+or publication-`resolved` state. `list` returns outstanding rows newest-first;
+`list --all` includes terminal history, and `show <id>` returns one exact row.
+`ack <id>` is idempotent and preserves the row and evidence.
 
 After each advisory creation or acknowledgement, the broker takes a
 cross-process projection lock, re-reads outstanding rows from SQLite, and
@@ -311,9 +311,24 @@ command. Promotion remains non-blocking and the broker never rebases or edits
 the affected worktree. Outstanding notices appear on stderr for every broker
 command associated with that session, after managed post-commit output, and
 immediately before an uncached gate with cost greater than 1 starts. JSON stdout
-remains parseable. `broker status --json` also includes the complete outstanding
-set in `outstanding_advisories`; acknowledgement stops future notices without
-deleting history.
+remains parseable. `broker status --json` includes both
+`outstanding_advisories` and the authoritative
+`outstanding_entry_exposures`; text status summarizes each exposed queue entry.
+Acknowledgement stops future session notices without deleting history or
+changing the underlying publication exposure.
+
+Every promotion also creates one authoritative path exposure owned by its
+queue entry. It contains the exact promoted SHA and repository-relative path
+set, survives closure of either the promoting or affected session, and is not
+cleared by a worktree rebase. The broker resolves it—and any still-outstanding
+advisory linked to that entry—only after `broker ship execute` observes a
+remote-main SHA containing the promotion, or a confirmed `integration
+reconcile --apply` proves an exact, patch-equivalent, or reviewed superseding
+landing. Read-only plans, stale remote state, failed verification, ambiguous
+outcomes, and pending replays retain the exposure.
+On the first normal open after the storage upgrade, currently promoted legacy
+entries are backfilled from their exact first-parent commit deltas; diagnostic
+snapshot opens remain non-mutating.
 
 `broker gates pre-push` is an opt-in adapter for repository-owned hooks; the
 managed hook installer never writes `pre-push`. It reads Git's ref-update lines
@@ -593,6 +608,9 @@ aethyme broker ship execute --entry 42 \
 
 Execution fetches and revalidates the planned remote base, requires a
 fast-forward, pushes that exact SHA, and verifies the remote default ref. It
+then resolves every outstanding entry exposure whose promotion is an ancestor
+of that verified remote SHA; selecting a later promoted entry therefore closes
+the verified published prefix without guessing about unrelated entries. It
 leaves the primary checkout unchanged unless `--sync-main` is present; that
 option additionally requires a clean, unchanged, fast-forwardable local
 default branch. `broker integration status` reports whether the integration tip
@@ -658,6 +676,9 @@ The confirmed update moves the integration ref and queue state together. A
 durable two-phase intent includes the reviewed digest, so the next broker open
 completes the queue/audit transaction if the ref moved, cancels the intent if
 it did not, and refuses to guess if the ref has a third value.
+Entries proven landed or superseded resolve their path exposures in that same
+database transaction. Entries replayed onto the new integration tip retain the
+same exposure with its promoted SHA retargeted to the replayed commit.
 
 When automatic evidence correctly fails closed because landed work was later
 modified upstream, an operator can attest only the affected queue entries with

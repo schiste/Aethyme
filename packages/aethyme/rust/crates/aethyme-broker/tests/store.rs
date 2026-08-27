@@ -3,9 +3,9 @@
 //! issue #5: migrations from empty and from v1).
 
 use aethyme_broker::{
-    AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, BrokerError, BrokerStore, GateDef,
-    GateFailureClass, GateStatus, LeaseKind, MergeStatus, NewAdvisory, NewGateResult,
-    NewPrWatchState, NewSession, RepositoryContract, SessionOrigin, SessionStatus,
+    AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, BrokerError, BrokerStore,
+    EntryExposureState, GateDef, GateFailureClass, GateStatus, LeaseKind, MergeStatus, NewAdvisory,
+    NewGateResult, NewPrWatchState, NewSession, RepositoryContract, SessionOrigin, SessionStatus,
 };
 
 fn open_temp() -> (tempfile::TempDir, BrokerStore) {
@@ -515,6 +515,7 @@ fn promotion_atomically_advances_the_contribution_checkpoint() {
         .record_merge_promotion(
             entry.id,
             "integration-commit-1",
+            &["src/lib.rs".into()],
             "{\"commit\":\"integration-commit-1\"}",
         )
         .unwrap();
@@ -539,6 +540,11 @@ fn promotion_atomically_advances_the_contribution_checkpoint() {
         store.merge_queue().unwrap()[0].status,
         MergeStatus::Promoted
     );
+    let exposure = store.entry_path_exposure(entry.id).unwrap().unwrap();
+    assert_eq!(exposure.queue_entry_id, entry.id);
+    assert_eq!(exposure.promotion_sha, "integration-commit-1");
+    assert_eq!(exposure.paths, vec!["src/lib.rs"]);
+    assert_eq!(exposure.state, EntryExposureState::Outstanding);
 }
 
 #[test]

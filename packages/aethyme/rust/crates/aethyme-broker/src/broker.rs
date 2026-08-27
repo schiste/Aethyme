@@ -471,8 +471,10 @@ pub struct VersionRepairStep {
 pub struct StatusView {
     pub summary: StatusSummary,
     pub advice: Vec<StatusAdvice>,
-    /// Durable, non-blocking advisories that still require acknowledgement.
+    /// Durable, non-blocking advisories that remain outstanding.
     pub outstanding_advisories: Vec<crate::Advisory>,
+    /// Promoted entry paths whose publication has not yet been proven.
+    pub outstanding_entry_exposures: Vec<crate::EntryPathExposure>,
     pub agents: Vec<AgentView>,
     pub overlaps: Vec<crate::leases::Overlap>,
     pub promoted_conflicts: Vec<PromotedConflict>,
@@ -1128,6 +1130,7 @@ impl Broker {
         broker.backfill_live_repository_contracts()?;
         broker.recover_interrupted_promotion()?;
         broker.recover_prepared_reconciliation()?;
+        broker.backfill_promoted_path_exposures()?;
         Ok(broker)
     }
 
@@ -3080,6 +3083,7 @@ impl Broker {
             summary,
             advice,
             outstanding_advisories: self.store.advisories(false)?,
+            outstanding_entry_exposures: self.store.outstanding_entry_path_exposures()?,
             agents,
             overlaps,
             promoted_conflicts,

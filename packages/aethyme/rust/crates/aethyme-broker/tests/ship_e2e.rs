@@ -5,8 +5,9 @@ use std::process::Command;
 use std::os::unix::fs::PermissionsExt;
 
 use aethyme_broker::{
-    Broker, BrokerOpError, IntegrationDeliveryState, OperationIdentityProvenance, OperationStatus,
-    ShipFreshnessResult,
+    AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, Broker, BrokerOpError,
+    EntryExposureResolutionKind, EntryExposureState, IntegrationDeliveryState, NewAdvisory,
+    OperationIdentityProvenance, OperationStatus, ShipFreshnessResult,
 };
 
 fn git_output(cwd: &Path, args: &[&str]) -> String {
@@ -180,6 +181,16 @@ fn ship_plan_reports_exact_tip_and_does_not_mutate_refs() {
         git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]),
         remote_before
     );
+    assert_eq!(
+        broker
+            .store()
+            .entry_path_exposure(entry_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        EntryExposureState::Outstanding,
+        "read-only ship planning must not resolve publication exposure"
+    );
 }
 
 #[test]
@@ -210,6 +221,20 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
     let main_before = git_output(&fixture.repo, &["rev-parse", "main"]);
 
     let mut broker = fixture.broker();
+    let advisory = broker
+        .persist_advisory(NewAdvisory {
+            identity: format!("test-promotion-exposure:{entry_id}"),
+            session_id: None,
+            severity: AdvisorySeverity::Warning,
+            queue_entry_id: Some(entry_id),
+            integration_sha: Some(integration.clone()),
+            paths: vec!["feature.txt".into()],
+            evidence: vec![AdvisoryEvidence {
+                kind: "lease_overlap".into(),
+                summary: "test exposure".into(),
+            }],
+        })
+        .unwrap();
     let report = broker.ship_execute(entry_id, &integration).unwrap();
 
     assert_eq!(report.published_sha, integration);
@@ -222,6 +247,29 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
     assert_eq!(report.fetch_operation.status, OperationStatus::Succeeded);
     assert_eq!(report.push_operation.status, OperationStatus::Succeeded);
     assert_eq!(report.verify_operation.status, OperationStatus::Succeeded);
+    assert_eq!(report.resolved_exposures.len(), 1);
+    assert_eq!(report.resolved_exposures[0].queue_entry_id, entry_id);
+    assert_eq!(
+        report.resolved_exposures[0].state,
+        EntryExposureState::Resolved
+    );
+    assert_eq!(
+        report.resolved_exposures[0].resolution_kind,
+        Some(EntryExposureResolutionKind::ShipVerified)
+    );
+    let resolved_advisory = broker.advisory(advisory.id).unwrap();
+    assert_eq!(
+        resolved_advisory.resolution_state,
+        AdvisoryResolutionState::Resolved
+    );
+    assert_eq!(resolved_advisory.resolved_at.is_some(), true);
+    assert!(
+        resolved_advisory
+            .resolution_evidence
+            .as_deref()
+            .is_some_and(|evidence| evidence.contains("ship verified remote"))
+    );
+    assert!(broker.advisories(false).unwrap().is_empty());
     assert!(report.fetch_operation.host_operation_id.is_some());
     assert!(report.push_operation.host_operation_id.is_some());
     assert!(report.verify_operation.host_operation_id.is_none());
@@ -252,6 +300,39 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
     assert_eq!(
         report.local_main_sync.follow_up_command.as_deref(),
         Some(follow_up.as_str())
+    );
+}
+
+#[test]
+fn ship_verification_resolves_every_contained_promoted_entry() {
+    let fixture = Fixture::new();
+    let (first_entry, _, _) = fixture.promoted_entry();
+    let mut broker = fixture.broker();
+    let second_session = broker.start_worktree("second promoted entry").unwrap();
+    let second_worktree = PathBuf::from(&second_session.worktree_path);
+    std::fs::write(second_worktree.join("second.txt"), "second\n").unwrap();
+    git(&second_worktree, &["add", "second.txt"]);
+    git(&second_worktree, &["commit", "-qm", "feat: second"]);
+    let second = broker.submit(second_session.id).unwrap();
+    assert!(second.promoted);
+    let integration = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
+
+    let report = broker.ship_execute(second.entry.id, &integration).unwrap();
+
+    assert_eq!(
+        report
+            .resolved_exposures
+            .iter()
+            .map(|exposure| exposure.queue_entry_id)
+            .collect::<Vec<_>>(),
+        vec![first_entry, second.entry.id]
+    );
+    assert!(
+        broker
+            .store()
+            .outstanding_entry_path_exposures()
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -435,6 +516,12 @@ fn ship_execute_rejects_a_remote_that_moved_since_the_planned_base() {
     let operations = broker.store().coordinated_operations().unwrap();
     assert_eq!(operations.len(), 1);
     assert_eq!(operations[0].status, OperationStatus::Succeeded);
+    let exposure = broker
+        .store()
+        .entry_path_exposure(entry_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(exposure.state, EntryExposureState::Outstanding);
 }
 
 #[test]
@@ -505,4 +592,10 @@ fn ship_verify_failure_is_journaled_as_failed() {
     assert_eq!(operations[0].status, OperationStatus::Succeeded);
     assert_eq!(operations[1].status, OperationStatus::Succeeded);
     assert_eq!(operations[2].status, OperationStatus::Failed);
+    let exposure = broker
+        .store()
+        .entry_path_exposure(entry_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(exposure.state, EntryExposureState::Outstanding);
 }

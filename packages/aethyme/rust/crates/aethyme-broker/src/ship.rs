@@ -9,7 +9,8 @@ use crate::merge::PromoteConfig;
 use crate::operations::{CoordinatedCommand, CoordinatedOperationReport, UnknownOutcomeRecovery};
 use crate::remote_target::ResolvedRemoteTarget;
 use crate::types::{
-    CoordinatedOperation, MergeQueueEntry, MergeStatus, OperationEffect, OperationProvider, Session,
+    CoordinatedOperation, EntryExposureResolutionKind, EntryPathExposure, MergeQueueEntry,
+    MergeStatus, OperationEffect, OperationProvider, Session,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -84,6 +85,7 @@ pub struct ShipExecutionReport {
     pub verify_operation: CoordinatedOperation,
     pub published_sha: String,
     pub verified_remote_sha: String,
+    pub resolved_exposures: Vec<EntryPathExposure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_operation: Option<CoordinatedOperation>,
     pub local_main_sync: ShipLocalMainSync,
@@ -413,6 +415,32 @@ impl Broker {
             });
         }
 
+        // Remote observation is the publication authority. Resolve every
+        // outstanding promoted entry contained in the verified tip, not only
+        // the entry selected to authorize this publication. Plans, pushes,
+        // and stale/unknown observations never reach this point.
+        let contained_entry_ids = self
+            .store()
+            .outstanding_entry_path_exposures()?
+            .into_iter()
+            .filter(|exposure| {
+                self.repo_handle()
+                    .is_ancestor(&exposure.promotion_sha, &verified_remote_sha)
+            })
+            .map(|exposure| exposure.queue_entry_id)
+            .collect::<Vec<_>>();
+        let resolution_evidence = format!(
+            "broker ship verified remote {} at {}",
+            plan.remote_default_branch_ref, verified_remote_sha
+        );
+        let resolved_exposures = self.store().resolve_entry_path_exposures(
+            &contained_entry_ids,
+            EntryExposureResolutionKind::ShipVerified,
+            &verified_remote_sha,
+            &resolution_evidence,
+        )?;
+        let _ = self.refresh_advisory_projection();
+
         let before_sha = plan.local_default_branch_sha.clone();
         let (sync_operation, local_main_sync) = if sync_main {
             validate_local_main_sync(self, &plan, confirm).map_err(|reason| {
@@ -495,6 +523,7 @@ impl Broker {
             verify_operation: verify.operation,
             published_sha: confirm.into(),
             verified_remote_sha,
+            resolved_exposures,
             sync_operation,
             local_main_sync,
         })

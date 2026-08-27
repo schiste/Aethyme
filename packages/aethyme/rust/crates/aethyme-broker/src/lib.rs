@@ -170,9 +170,10 @@ pub use ship::{
 pub use store::BrokerStore;
 pub use types::{
     Advisory, AdvisoryEvidence, AdvisoryList, AdvisoryResolutionState, AdvisorySeverity,
-    CoordinatedOperation, DEFAULT_OPERATION_HISTORY_LIMIT, Event, GateDef, GateFailureClass,
-    GateResult, GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT, MergeQueueEntry,
-    MergeStatus, NewAdvisory, NewCoordinatedOperation, NewGateResult, NewPrWatchState, NewSession,
+    CoordinatedOperation, DEFAULT_OPERATION_HISTORY_LIMIT, EntryExposureResolutionKind,
+    EntryExposureState, EntryPathExposure, Event, GateDef, GateFailureClass, GateResult,
+    GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT, MergeQueueEntry, MergeStatus,
+    NewAdvisory, NewCoordinatedOperation, NewGateResult, NewPrWatchState, NewSession,
     OperationEffect, OperationHistoryPage, OperationHistoryQuery, OperationIdentityProvenance,
     OperationProvider, OperationStatus, PrWatchState, Session, SessionOrigin, SessionStatus,
 };

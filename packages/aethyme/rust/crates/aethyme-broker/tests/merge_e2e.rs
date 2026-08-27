@@ -6,9 +6,10 @@ use std::path::Path;
 use std::process::Command;
 
 use aethyme_broker::{
-    AdoptMode, Broker, FinishStatus, IntegrationDeliveryState, IntegrationReconcileClassification,
-    IntegrationReconcileOptions, MergeStatus, NewSession, RepairAction, RepairSource,
-    SessionOrigin, StatusAdviceSeverity, SubmissionCommitOwnership, SubmissionIntegrationState,
+    AdoptMode, Broker, EntryExposureState, FinishStatus, IntegrationDeliveryState,
+    IntegrationReconcileClassification, IntegrationReconcileOptions, MergeStatus, NewSession,
+    RepairAction, RepairSource, SessionOrigin, StatusAdviceSeverity, SubmissionCommitOwnership,
+    SubmissionIntegrationState,
 };
 
 fn sh(cwd: &Path, args: &[&str]) {
@@ -381,6 +382,31 @@ fn promotion_persists_one_non_blocking_advisory_per_affected_live_session() {
 
     let status = broker.status_snapshot(0).unwrap();
     assert_eq!(status.outstanding_advisories, advisories);
+    assert_eq!(status.outstanding_entry_exposures.len(), 1);
+    assert_eq!(
+        status.outstanding_entry_exposures[0].queue_entry_id,
+        outcome.entry.id
+    );
+
+    let exposure = broker
+        .store()
+        .entry_path_exposure(outcome.entry.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(exposure.paths, vec!["src/a.py"]);
+    assert_eq!(exposure.state, EntryExposureState::Outstanding);
+    broker.close(affected.id).unwrap();
+    assert_eq!(
+        broker
+            .store()
+            .entry_path_exposure(outcome.entry.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        EntryExposureState::Outstanding,
+        "closing an affected session must not erase entry publication exposure"
+    );
+    assert_eq!(broker.advisories(false).unwrap(), advisories);
 
     std::fs::remove_dir(&projection).unwrap();
     broker.refresh_advisory_projection().unwrap();
@@ -1642,11 +1668,53 @@ fn broker_open_checkpoints_a_promotion_interrupted_after_the_ref_move() {
             .status,
         MergeStatus::Promoted
     );
+    let recovered_exposure = recovered
+        .store()
+        .entry_path_exposure(outcome.entry.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered_exposure.promotion_sha, merge_commit);
+    assert_eq!(recovered_exposure.paths, vec!["src/a.py"]);
 
     commit_edit(&worktree, "src/b.py", "b = 2\n");
     let follow_up = recovered.submit(session.id).unwrap();
     assert_eq!(follow_up.entry.status, MergeStatus::Verified);
     assert_eq!(follow_up.submission_plan.commits.len(), 1);
+}
+
+#[test]
+fn broker_open_backfills_exposure_for_a_pre_v17_promotion() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "legacy-promotion-exposure");
+    let session = broker
+        .adopt(&worktree, Some("legacy promoted entry"))
+        .unwrap();
+    commit_edit(&worktree, "src/a.py", "a = legacy promotion\n");
+    let outcome = broker.submit(session.id).unwrap();
+    assert!(outcome.promoted);
+    let promotion_sha = resolve(tmp.path(), "aethyme/integration");
+    drop(broker);
+
+    let database = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
+    database
+        .execute(
+            "DELETE FROM entry_path_exposures WHERE queue_entry_id = ?1",
+            [outcome.entry.id],
+        )
+        .unwrap();
+    drop(database);
+
+    let mut reopened = Broker::open(tmp.path()).unwrap();
+    let exposure = reopened
+        .store()
+        .entry_path_exposure(outcome.entry.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(exposure.promotion_sha, promotion_sha);
+    assert_eq!(exposure.paths, vec!["src/a.py"]);
+    assert_eq!(exposure.state, EntryExposureState::Outstanding);
 }
 
 #[test]
@@ -1758,6 +1826,30 @@ fn reconcile_recognizes_squash_preserves_followups_and_replays_pending_work() {
         "c = 2\n",
         "genuinely pending promoted work must be replayed"
     );
+    for landed_entry in [promoted_a.entry.id, promoted_b.entry.id] {
+        assert_eq!(
+            broker
+                .store()
+                .entry_path_exposure(landed_entry)
+                .unwrap()
+                .unwrap()
+                .state,
+            EntryExposureState::Resolved
+        );
+    }
+    let replayed_pending = applied
+        .entries
+        .iter()
+        .find(|entry| entry.queue_entry_id == promoted_pending.entry.id)
+        .and_then(|entry| entry.replayed_commit.as_deref())
+        .unwrap();
+    let pending_exposure = broker
+        .store()
+        .entry_path_exposure(promoted_pending.entry.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending_exposure.state, EntryExposureState::Outstanding);
+    assert_eq!(pending_exposure.promotion_sha, replayed_pending);
     let queue = broker.store().merge_queue().unwrap();
     assert_eq!(
         queue

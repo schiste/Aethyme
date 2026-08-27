@@ -218,6 +218,8 @@ mod tests {
             created_at: 42,
             resolution_state: AdvisoryResolutionState::Outstanding,
             acknowledged_at: None,
+            resolved_at: None,
+            resolution_evidence: None,
         }
     }
 

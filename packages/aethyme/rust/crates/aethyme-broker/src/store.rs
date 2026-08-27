@@ -15,7 +15,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use crate::error::BrokerError;
 use crate::schema::{self, EVENTS_SCHEMA_VERSION};
 use crate::types::{
-    Advisory, AdvisoryResolutionState, AdvisorySeverity, CoordinatedOperation, Event, GateDef,
+    Advisory, AdvisoryResolutionState, AdvisorySeverity, CoordinatedOperation,
+    EntryExposureResolutionKind, EntryExposureState, EntryPathExposure, Event, GateDef,
     GateFailureClass, GateResult, GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT,
     MergeQueueEntry, MergeStatus, NewAdvisory, NewCoordinatedOperation, NewGateResult,
     NewPrWatchState, NewSession, OperationEffect, OperationHistoryPage, OperationHistoryQuery,
@@ -901,6 +902,7 @@ impl BrokerStore {
         &mut self,
         entry_id: i64,
         integration_commit: &str,
+        promoted_paths: &[String],
         details_json: &str,
     ) -> Result<(), BrokerError> {
         let now = now_ms();
@@ -927,6 +929,17 @@ impl BrokerStore {
              SET status = 'promoted', details_json = ?2, updated_at = ?3
              WHERE id = ?1",
             params![entry_id, details_json, now],
+        )?;
+        let mut paths = promoted_paths.to_vec();
+        paths.sort();
+        paths.dedup();
+        let paths_json =
+            serde_json::to_string(&paths).expect("serializing exposure paths cannot fail");
+        tx.execute(
+            "INSERT INTO entry_path_exposures (
+                 queue_entry_id, promotion_sha, paths_json, created_at, state
+             ) VALUES (?1, ?2, ?3, ?4, 'outstanding')",
+            params![entry_id, integration_commit, paths_json, now],
         )?;
         update_accepted_checkpoint(
             &tx,
@@ -1217,6 +1230,51 @@ impl BrokerStore {
                     "merge.externally_landed",
                     Some(session_id),
                     Some(&update.details_json),
+                )?;
+                let resolution_sha = update
+                    .upstream_landing
+                    .as_deref()
+                    .unwrap_or(&prepared.upstream_commit);
+                let resolution_evidence = format!(
+                    "integration reconciliation classified queue entry {} as {} against {} at {}",
+                    update.queue_entry_id,
+                    update.classification,
+                    prepared.upstream_ref,
+                    prepared.upstream_commit
+                );
+                let resolved = tx.execute(
+                    "UPDATE entry_path_exposures
+                     SET state = 'resolved', resolved_at = ?2,
+                         resolution_kind = 'external_reconciliation',
+                         resolution_sha = ?3, resolution_evidence = ?4
+                     WHERE queue_entry_id = ?1 AND state = 'outstanding'",
+                    params![
+                        update.queue_entry_id,
+                        now,
+                        resolution_sha,
+                        resolution_evidence
+                    ],
+                )?;
+                if resolved > 0 {
+                    tx.execute(
+                        "UPDATE advisories
+                         SET resolution_state = 'resolved', resolved_at = ?2,
+                             resolution_evidence = ?3
+                         WHERE queue_entry_id = ?1 AND resolution_state = 'outstanding'",
+                        params![update.queue_entry_id, now, resolution_evidence],
+                    )?;
+                }
+            } else if update.status == MergeStatus::Promoted
+                && let Some(replayed_commit) = update.replayed_commit.as_deref()
+            {
+                // A reconciliation rebase can change commit identity without
+                // ending publication exposure. Retarget the same entry-level
+                // record and leave its state outstanding.
+                tx.execute(
+                    "UPDATE entry_path_exposures
+                     SET promotion_sha = ?2
+                     WHERE queue_entry_id = ?1 AND state = 'outstanding'",
+                    params![update.queue_entry_id, replayed_commit],
                 )?;
             }
             tx.execute(
@@ -1694,6 +1752,103 @@ impl BrokerStore {
         self.advisory(id)?.ok_or(BrokerError::AdvisoryNotFound(id))
     }
 
+    // ── promoted entry path exposures ────────────────────────────────
+
+    /// Exact durable exposure for one promoted queue entry.
+    pub fn entry_path_exposure(
+        &self,
+        queue_entry_id: i64,
+    ) -> Result<Option<EntryPathExposure>, BrokerError> {
+        self.conn
+            .query_row(
+                &(ENTRY_PATH_EXPOSURE_SELECT.to_owned() + " WHERE queue_entry_id = ?1"),
+                [queue_entry_id],
+                entry_path_exposure_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Idempotent compatibility backfill for an entry promoted before path
+    /// exposure storage existed. Normal promotion uses the atomic write in
+    /// [`Self::record_merge_promotion`] instead.
+    pub(crate) fn backfill_entry_path_exposure(
+        &mut self,
+        queue_entry_id: i64,
+        promotion_sha: &str,
+        promoted_paths: &[String],
+    ) -> Result<EntryPathExposure, BrokerError> {
+        let mut paths = promoted_paths.to_vec();
+        paths.sort();
+        paths.dedup();
+        let paths_json =
+            serde_json::to_string(&paths).expect("serializing exposure paths cannot fail");
+        self.conn.execute(
+            "INSERT OR IGNORE INTO entry_path_exposures (
+                 queue_entry_id, promotion_sha, paths_json, created_at, state
+             ) VALUES (?1, ?2, ?3, ?4, 'outstanding')",
+            params![queue_entry_id, promotion_sha, paths_json, now_ms()],
+        )?;
+        let stored = self
+            .entry_path_exposure(queue_entry_id)?
+            .expect("insert or existing exposure must resolve");
+        if stored.promotion_sha != promotion_sha || stored.paths != paths {
+            return Err(BrokerError::EntryExposureIdentityConflict(queue_entry_id));
+        }
+        Ok(stored)
+    }
+
+    /// Oldest-first outstanding exposures, suitable for deterministic
+    /// containment checks against one verified remote tip.
+    pub fn outstanding_entry_path_exposures(&self) -> Result<Vec<EntryPathExposure>, BrokerError> {
+        let mut statement = self.conn.prepare(&format!(
+            "{ENTRY_PATH_EXPOSURE_SELECT} WHERE state = 'outstanding' ORDER BY id"
+        ))?;
+        let rows = statement.query_map([], entry_path_exposure_from_row)?;
+        rows.map(|row| row?).collect()
+    }
+
+    /// Resolve exact entry exposures and their still-outstanding advisories
+    /// in one transaction. Unknown ids are ignored, making crash recovery and
+    /// repeated verified observations idempotent.
+    pub(crate) fn resolve_entry_path_exposures(
+        &mut self,
+        queue_entry_ids: &[i64],
+        kind: EntryExposureResolutionKind,
+        resolution_sha: &str,
+        evidence: &str,
+    ) -> Result<Vec<EntryPathExposure>, BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let mut resolved_ids = Vec::new();
+        for queue_entry_id in queue_entry_ids {
+            let updated = tx.execute(
+                "UPDATE entry_path_exposures
+                 SET state = 'resolved', resolved_at = ?2, resolution_kind = ?3,
+                     resolution_sha = ?4, resolution_evidence = ?5
+                 WHERE queue_entry_id = ?1 AND state = 'outstanding'",
+                params![queue_entry_id, now, kind.as_str(), resolution_sha, evidence],
+            )?;
+            if updated == 0 {
+                continue;
+            }
+            resolved_ids.push(*queue_entry_id);
+            tx.execute(
+                "UPDATE advisories
+                 SET resolution_state = 'resolved', resolved_at = ?2,
+                     resolution_evidence = ?3
+                 WHERE queue_entry_id = ?1 AND resolution_state = 'outstanding'",
+                params![queue_entry_id, now, evidence],
+            )?;
+        }
+        tx.commit()?;
+
+        resolved_ids
+            .into_iter()
+            .filter_map(|queue_entry_id| self.entry_path_exposure(queue_entry_id).transpose())
+            .collect()
+    }
+
     // ── events ────────────────────────────────────────────────────────
 
     /// Append one event. Most mutations already emit their own event in
@@ -1893,8 +2048,13 @@ const PR_WATCH_SELECT: &str = "SELECT id, target_branch, pr_number, activity_fin
      marker, last_dispatch_at, last_agent_session_id, updated_at FROM pr_watch_state";
 
 const ADVISORY_SELECT: &str = "SELECT id, identity, session_id, severity, queue_entry_id, \
-     integration_sha, paths_json, evidence_json, created_at, resolution_state, acknowledged_at \
+     integration_sha, paths_json, evidence_json, created_at, resolution_state, acknowledged_at, \
+     resolved_at, resolution_evidence \
      FROM advisories";
+
+const ENTRY_PATH_EXPOSURE_SELECT: &str = "SELECT id, queue_entry_id, promotion_sha, paths_json, \
+     created_at, state, resolved_at, resolution_kind, resolution_sha, resolution_evidence \
+     FROM entry_path_exposures";
 
 type RowResult<T> = Result<Result<T, BrokerError>, rusqlite::Error>;
 
@@ -2084,6 +2244,38 @@ fn advisory_from_row(row: &rusqlite::Row<'_>) -> RowResult<Advisory> {
             created_at: row.get(8)?,
             resolution_state: AdvisoryResolutionState::parse(&resolution_state)?,
             acknowledged_at: row.get(10)?,
+            resolved_at: row.get(11)?,
+            resolution_evidence: row.get(12)?,
+        })
+    })())
+}
+
+fn entry_path_exposure_from_row(row: &rusqlite::Row<'_>) -> RowResult<EntryPathExposure> {
+    let id = row.get(0)?;
+    let paths_json: String = row.get(3)?;
+    let state: String = row.get(5)?;
+    let resolution_kind: Option<String> = row.get(7)?;
+    Ok((|| {
+        Ok(EntryPathExposure {
+            id,
+            queue_entry_id: row.get(1)?,
+            promotion_sha: row.get(2)?,
+            paths: serde_json::from_str(&paths_json).map_err(|source| {
+                BrokerError::InvalidEntryExposureJson {
+                    id,
+                    field: "paths_json",
+                    source,
+                }
+            })?,
+            created_at: row.get(4)?,
+            state: EntryExposureState::parse(&state)?,
+            resolved_at: row.get(6)?,
+            resolution_kind: resolution_kind
+                .as_deref()
+                .map(EntryExposureResolutionKind::parse)
+                .transpose()?,
+            resolution_sha: row.get(8)?,
+            resolution_evidence: row.get(9)?,
         })
     })())
 }

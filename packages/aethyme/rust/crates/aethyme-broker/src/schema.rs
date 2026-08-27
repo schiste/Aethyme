@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 16;
+pub const SCHEMA_VERSION: i64 = 17;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -396,6 +396,68 @@ CREATE INDEX advisories_by_queue_entry
     ON advisories (queue_entry_id, id DESC);
 ";
 
+const MIGRATION_V17: &str = "
+-- Promoted paths remain an entry-level exposure until publication is proven.
+-- Advisory acknowledgement is an operator action; verified publication uses
+-- a separate terminal state with its own durable evidence.
+DROP INDEX advisories_by_resolution;
+DROP INDEX advisories_by_session;
+DROP INDEX advisories_by_queue_entry;
+ALTER TABLE advisories RENAME TO advisories_v16;
+
+CREATE TABLE advisories (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    identity            TEXT NOT NULL UNIQUE,
+    session_id          INTEGER REFERENCES sessions (id),
+    severity            TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
+    queue_entry_id      INTEGER REFERENCES merge_queue (id),
+    integration_sha     TEXT,
+    paths_json          TEXT NOT NULL,
+    evidence_json       TEXT NOT NULL,
+    created_at          INTEGER NOT NULL,
+    resolution_state    TEXT NOT NULL DEFAULT 'outstanding'
+                        CHECK (resolution_state IN ('outstanding', 'acknowledged', 'resolved')),
+    acknowledged_at     INTEGER,
+    resolved_at         INTEGER,
+    resolution_evidence TEXT
+);
+
+INSERT INTO advisories (
+    id, identity, session_id, severity, queue_entry_id, integration_sha,
+    paths_json, evidence_json, created_at, resolution_state, acknowledged_at
+)
+SELECT id, identity, session_id, severity, queue_entry_id, integration_sha,
+       paths_json, evidence_json, created_at, resolution_state, acknowledged_at
+FROM advisories_v16;
+DROP TABLE advisories_v16;
+
+CREATE INDEX advisories_by_resolution
+    ON advisories (resolution_state, id DESC);
+CREATE INDEX advisories_by_session
+    ON advisories (session_id, id DESC);
+CREATE INDEX advisories_by_queue_entry
+    ON advisories (queue_entry_id, id DESC);
+
+CREATE TABLE entry_path_exposures (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_entry_id      INTEGER NOT NULL UNIQUE REFERENCES merge_queue (id),
+    promotion_sha       TEXT NOT NULL,
+    paths_json          TEXT NOT NULL,
+    created_at          INTEGER NOT NULL,
+    state               TEXT NOT NULL DEFAULT 'outstanding'
+                        CHECK (state IN ('outstanding', 'resolved')),
+    resolved_at         INTEGER,
+    resolution_kind     TEXT CHECK (resolution_kind IS NULL OR resolution_kind IN (
+                            'ship_verified', 'external_reconciliation'
+                        )),
+    resolution_sha      TEXT,
+    resolution_evidence TEXT
+);
+
+CREATE INDEX entry_path_exposures_by_state
+    ON entry_path_exposures (state, id);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -413,6 +475,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V14,
     MIGRATION_V15,
     MIGRATION_V16,
+    MIGRATION_V17,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -506,11 +569,11 @@ mod tests {
     }
 
     #[test]
-    fn v16_adds_typed_advisory_storage_to_a_v15_database() {
+    fn v17_adds_entry_exposures_and_preserves_v16_advisories() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             .unwrap();
-        for (index, sql) in MIGRATIONS[..15].iter().enumerate() {
+        for (index, sql) in MIGRATIONS[..16].iter().enumerate() {
             conn.execute_batch(sql).unwrap();
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -519,6 +582,15 @@ mod tests {
             )
             .unwrap();
         }
+        conn.execute(
+            "INSERT INTO advisories (
+                 identity, severity, paths_json, evidence_json, created_at,
+                 resolution_state, acknowledged_at
+             ) VALUES ('legacy-advisory', 'warning', '[]', '[]', 1,
+                       'acknowledged', 2)",
+            [],
+        )
+        .unwrap();
 
         migrate(&conn).unwrap();
 
@@ -540,13 +612,52 @@ mod tests {
             "created_at",
             "resolution_state",
             "acknowledged_at",
+            "resolved_at",
+            "resolution_evidence",
         ] {
             assert!(
                 columns.iter().any(|column| column == expected),
                 "{expected}"
             );
         }
-        assert_eq!(current_version(&conn).unwrap(), 16);
+        let exposure_columns = conn
+            .prepare("PRAGMA table_info(entry_path_exposures)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for expected in [
+            "queue_entry_id",
+            "promotion_sha",
+            "paths_json",
+            "state",
+            "resolved_at",
+            "resolution_kind",
+            "resolution_sha",
+            "resolution_evidence",
+        ] {
+            assert!(
+                exposure_columns.iter().any(|column| column == expected),
+                "{expected}"
+            );
+        }
+        let preserved = conn
+            .query_row(
+                "SELECT resolution_state, acknowledged_at, resolved_at
+                 FROM advisories WHERE identity = 'legacy-advisory'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(preserved, ("acknowledged".into(), Some(2), None));
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]

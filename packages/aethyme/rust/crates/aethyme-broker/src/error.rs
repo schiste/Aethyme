@@ -43,8 +43,18 @@ pub enum BrokerError {
     #[error("advisory identity {0:?} already exists with different immutable data")]
     AdvisoryIdentityConflict(String),
 
+    #[error("entry path exposure for queue entry {0} already exists with different immutable data")]
+    EntryExposureIdentityConflict(i64),
+
     #[error("invalid {field} JSON for advisory {id}: {source}")]
     InvalidAdvisoryJson {
+        id: i64,
+        field: &'static str,
+        source: serde_json::Error,
+    },
+
+    #[error("invalid {field} JSON for entry path exposure {id}: {source}")]
+    InvalidEntryExposureJson {
         id: i64,
         field: &'static str,
         source: serde_json::Error,
