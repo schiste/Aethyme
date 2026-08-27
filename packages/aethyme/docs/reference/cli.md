@@ -221,7 +221,8 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker advisories show <id> [--json]`
 - `aethyme broker advisories ack <id> [--json]`
 - `aethyme broker resources plan <request.json> [--json]`
-- `aethyme broker resources acquire <request.json> [--json]`
+- `aethyme broker resources acquire <request.json> [--wait <duration>] [--grant-out <path>] [--json]`
+- `aethyme broker resources run <request.json> [--wait <duration>] [--cleanup-command <shell>] [--json] -- <command> ...`
 - `aethyme broker resources renew <grant.json> --ttl <seconds> [--json]`
 - `aethyme broker resources release <grant.json> [--json]`
 - `aethyme broker resources list [--all] [--json]`
@@ -347,7 +348,8 @@ from stdin, requires all non-deletion updates to name one clean checked-out
 `HEAD`, and runs the complete gate set. This makes the reported tree truthful
 and lets declared host resources coordinate concurrent clones. See
 [Concurrent Host Resource Coordination](../guides/host-resource-coordination.md)
-for the gate schema, hook example, fallback contract, and quarantine recovery.
+for the gate schema, repository-independent supervised runs, hook example,
+fallback contract, and quarantine recovery.
 
 `broker adopt --reuse --sync-integration` starts a follow-up from the current
 integration tip. It requires a clean session worktree, permits only a

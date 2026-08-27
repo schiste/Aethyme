@@ -2,16 +2,51 @@
 
 Last Updated: 2026-08-26
 
-Aethyme can run the same repository's validation gates concurrently from
-independent clones without sharing fixed ports, Docker project names, database
-names, or host-capacity slots. The repository still defines what validation
-means in `.aethyme/gates.toml`; the broker only allocates declared host
-resources and executes each gate locally.
+Aethyme can run validation concurrently from independent clones without
+sharing fixed ports, Docker project names, database names, or host-capacity
+slots. A repository may declare gates in `.aethyme/gates.toml`, or keep an
+existing runner and place only its process lifecycle under `resources run`.
+In both cases the repository defines what validation means; the broker owns
+host allocation and supervision, not gate selection.
 
 No daemon or central runner is required. A per-user SQLite registry coordinates
 all Aethyme processes on the host. Its default location follows the platform's
 user state convention and can be overridden with `AETHYME_HOST_STATE_DIR` for
 tests or an explicitly isolated environment.
+
+The entire `broker resources` surface is host infrastructure. It does not
+discover a Git repository, require Aethyme deployment, or enforce repository
+schema compatibility. It is safe to invoke from an unenrolled checkout or a
+private runtime directory. Repository and worktree fields in a request are
+opaque coordination/audit identities, never enrollment authority.
+
+## Supervise An Existing Runner
+
+Use the broker-owned lifecycle without migrating an established validation
+pipeline:
+
+```bash
+aethyme broker resources run request.json --wait 30m \
+  --cleanup-command './scripts/cleanup-exact-owned-services' \
+  -- ./scripts/existing-pre-push
+```
+
+The command acquires the complete bundle, exposes allocation variables plus
+lease id and generation, renews at one third of the request TTL, forwards
+`INT`, `TERM`, and `HUP` to the child's process group, and preserves a failing
+child exit code. The ownership token never enters the child environment.
+
+If supplied, `--cleanup-command` runs through `sh -c` with the same public
+allocation environment after the child exits. A successful cleanup permits
+release. A failed or unspawnable cleanup, or lost renewal authority,
+quarantines the exact generation rather than making its resources available.
+If the child succeeded but lifecycle cleanup did not, the command exits 70;
+otherwise a failing child's original exit code wins.
+
+Normal child stdout and stderr remain untouched. With `--json`, bounded wait,
+grant, signal, cleanup, and final lifecycle records are emitted as JSON lines
+on stderr, so automation can observe coordination without corrupting the
+existing runner's stdout protocol.
 
 ## Declare A Gate Bundle
 
@@ -185,15 +220,21 @@ Use the low-level resource commands for diagnosis or non-gate integrations:
 
 ```bash
 aethyme broker resources plan request.json --json
+aethyme broker resources acquire request.json --wait 30m \
+  --grant-out "$private_runtime/grant.json" --json
 aethyme broker resources list --json
 aethyme broker resources list --all --json
 aethyme broker resources reconcile <lease-id> --confirm <generation>
 ```
 
-`plan` and `list` are read-only. `acquire`, `renew`, and `release` also exist
-for advanced clients using the versioned JSON request/grant contract. Keep the
-grant file private: it contains the ownership token. Inventory and gate reports
-never contain that token, file contents, diffs, or absolute worktree paths.
+`plan` and `list` are read-only. `acquire`, `renew`, and `release` remain for
+advanced clients using the versioned JSON request/grant contract. `--wait`
+accepts bounded `ms`, `s`, `m`, or `h` durations. Timeout JSON uses stable
+`resource_contention`; a conflicting active capacity limit uses the distinct,
+non-retryable `capacity_policy_mismatch` code. `--grant-out` refuses overwrite,
+publishes atomically with mode 0600 on Unix, and omits the ownership token from
+stdout. Inventory and gate reports never contain that token, file contents,
+diffs, or absolute worktree paths.
 
 A minimal low-level request is:
 

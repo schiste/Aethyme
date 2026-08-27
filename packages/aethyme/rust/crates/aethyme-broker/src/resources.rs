@@ -67,8 +67,12 @@ pub enum HostResourceError {
     IdempotencyMismatch(String),
     #[error("request {request_id:?} is {state}; use a new request id")]
     RequestNotActive { request_id: String, state: String },
-    #[error("host resource bundle unavailable: {0}")]
-    Conflict(String),
+    #[error("host resource bundle unavailable: {message}")]
+    Conflict {
+        code: String,
+        message: String,
+        conflicts: Vec<HostResourceConflict>,
+    },
     #[error("no host resource lease {0:?}")]
     LeaseNotFound(String),
     #[error("ownership credentials do not match host resource lease {0:?}")]
@@ -212,6 +216,9 @@ impl HostResourceGrant {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HostResourceConflict {
+    /// Stable automation code. Capacity-policy disagreement is distinct from
+    /// ordinary contention because waiting cannot resolve configuration skew.
+    pub code: String,
     pub resource_key: String,
     pub kind: String,
     pub requested: String,
@@ -229,6 +236,35 @@ pub struct HostResourcePlan {
     pub conflicts: Vec<HostResourceConflict>,
     /// Always true: only acquire reserves a resource.
     pub advisory: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HostResourceRunReport {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub lease_id: String,
+    pub generation: u64,
+    pub waited_ms: u128,
+    pub child_exit_code: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_signal: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_exit_code: Option<u8>,
+    pub authority_lost: bool,
+    pub final_lease_state: HostLeaseState,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HostResourceRunError {
+    #[error(transparent)]
+    Resource(#[from] HostResourceError),
+    #[error("cannot start supervised command {program:?}: {source}")]
+    Spawn {
+        program: String,
+        source: std::io::Error,
+    },
+    #[error("cannot supervise process signals: {0}")]
+    Signals(std::io::Error),
 }
 
 pub struct HostResourceCoordinator {
@@ -345,13 +381,17 @@ impl HostResourceCoordinator {
         let occupied = load_occupied(&tx)?;
         let (allocations, conflicts) = plan_allocations(request, &occupied)?;
         if !conflicts.is_empty() {
-            return Err(HostResourceError::Conflict(
-                conflicts
-                    .iter()
-                    .map(|c| format!("{}: {}", c.resource_key, c.reason))
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            ));
+            let code = aggregate_conflict_code(&conflicts).to_string();
+            let message = conflicts
+                .iter()
+                .map(|c| format!("{}: {}", c.resource_key, c.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(HostResourceError::Conflict {
+                code,
+                message,
+                conflicts,
+            });
         }
         let generation: i64 = tx.query_row(
             "UPDATE meta SET value=value+1 WHERE key='generation' RETURNING value",
@@ -403,12 +443,25 @@ impl HostResourceCoordinator {
         loop {
             match self.acquire(request) {
                 Ok(grant) => return Ok(grant),
-                Err(HostResourceError::Conflict(message))
-                    if std::time::Instant::now() < deadline =>
-                {
+                Err(HostResourceError::Conflict {
+                    code: _,
+                    message,
+                    conflicts: _,
+                }) if std::time::Instant::now() < deadline => {
                     on_conflict(&message);
                     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     std::thread::sleep(remaining.min(std::time::Duration::from_millis(250)));
+                }
+                Err(HostResourceError::Conflict {
+                    code,
+                    message,
+                    conflicts,
+                }) => {
+                    return Err(HostResourceError::Conflict {
+                        code,
+                        message,
+                        conflicts,
+                    });
                 }
                 Err(error) => return Err(error),
             }
@@ -457,6 +510,162 @@ impl HostResourceCoordinator {
             .ok_or_else(|| HostResourceError::LeaseNotFound(lease_id.into()))?;
         tx.commit()?;
         Ok(lease)
+    }
+
+    /// Conservatively fence a grant whose exact cleanup or renewal authority
+    /// could not be proven. Quarantined allocations require generation-bound
+    /// reconciliation and are never silently reused.
+    pub fn quarantine(
+        &mut self,
+        lease_id: &str,
+        generation: u64,
+        token: &str,
+    ) -> Result<HostResourceLease, HostResourceError> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verify_ownership(&tx, lease_id, generation, token, false)?;
+        tx.execute(
+            "UPDATE resource_leases SET state='quarantined',updated_at=?2
+             WHERE lease_id=?1 AND state='active'",
+            params![lease_id, now],
+        )?;
+        let lease = load_lease(&tx, "lease_id", lease_id)?
+            .ok_or_else(|| HostResourceError::LeaseNotFound(lease_id.into()))?;
+        tx.commit()?;
+        Ok(lease)
+    }
+
+    /// Run an existing command under a complete host-resource lifecycle.
+    /// Ownership credentials remain in this process; the child receives only
+    /// public allocation values plus lease id and generation.
+    pub fn run_supervised<F>(
+        &mut self,
+        request: &HostResourceRequest,
+        wait: std::time::Duration,
+        command: &[String],
+        cleanup_command: Option<&str>,
+        cwd: &Path,
+        mut event: F,
+    ) -> Result<HostResourceRunReport, HostResourceRunError>
+    where
+        F: FnMut(&str),
+    {
+        if command.is_empty() {
+            return Err(HostResourceRunError::Resource(
+                HostResourceError::InvalidRequest("supervised command must not be empty".into()),
+            ));
+        }
+        let acquire_started = std::time::Instant::now();
+        let mut last_wait_notice = None;
+        let mut grant = self.acquire_with_wait(request, wait, |message| {
+            let emit = last_wait_notice.is_none_or(|last: std::time::Instant| {
+                last.elapsed() >= std::time::Duration::from_secs(10)
+            });
+            if emit {
+                event(&format!("waiting: {message}"));
+                last_wait_notice = Some(std::time::Instant::now());
+            }
+        })?;
+        let waited_ms = acquire_started.elapsed().as_millis();
+        event(&format!(
+            "granted lease {} generation {} after {}ms",
+            grant.lease.lease_id, grant.lease.generation, waited_ms
+        ));
+
+        let child = spawn_resource_process(command, cwd, &grant).map_err(|source| {
+            HostResourceRunError::Spawn {
+                program: command[0].clone(),
+                source,
+            }
+        });
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = self.quarantine(
+                    &grant.lease.lease_id,
+                    grant.lease.generation,
+                    &grant.ownership_token,
+                );
+                return Err(error);
+            }
+        };
+        let child_status = supervise_process(
+            self,
+            &mut grant,
+            request.ttl_seconds,
+            &mut child,
+            &mut event,
+        )?;
+        let child_signal = exit_signal(&child_status);
+        let child_exit_code = portable_exit_code(&child_status);
+
+        let mut cleanup_exit_code = None;
+        let mut lifecycle_safe = true;
+        if let Some(cleanup) = cleanup_command {
+            event("running exact cleanup command");
+            let cleanup_argv = vec!["sh".to_string(), "-c".to_string(), cleanup.to_string()];
+            let cleanup_child =
+                spawn_resource_process(&cleanup_argv, cwd, &grant).map_err(|source| {
+                    HostResourceRunError::Spawn {
+                        program: "sh".into(),
+                        source,
+                    }
+                });
+            let mut cleanup_child = match cleanup_child {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = self.quarantine(
+                        &grant.lease.lease_id,
+                        grant.lease.generation,
+                        &grant.ownership_token,
+                    );
+                    return Err(error);
+                }
+            };
+            let cleanup_status = supervise_process(
+                self,
+                &mut grant,
+                request.ttl_seconds,
+                &mut cleanup_child,
+                &mut event,
+            )?;
+            cleanup_exit_code = Some(portable_exit_code(&cleanup_status));
+            lifecycle_safe = cleanup_status.success();
+        }
+
+        let authority_lost = grant.lease.state != HostLeaseState::Active;
+        let final_lease = if lifecycle_safe && !authority_lost {
+            self.release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )?
+        } else {
+            self.quarantine(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )?
+        };
+        event(match final_lease.state {
+            HostLeaseState::Released => "released resource bundle",
+            HostLeaseState::Quarantined => "quarantined resource bundle; reconciliation required",
+            HostLeaseState::Active => "resource bundle remains active",
+        });
+        Ok(HostResourceRunReport {
+            schema_version: HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: request.request_id.clone(),
+            lease_id: final_lease.lease_id,
+            generation: final_lease.generation,
+            waited_ms,
+            child_exit_code,
+            child_signal,
+            cleanup_exit_code,
+            authority_lost,
+            final_lease_state: final_lease.state,
+        })
     }
 
     /// Reviewed crash recovery, fenced by the exact generation.
@@ -523,6 +732,193 @@ impl HostResourceCoordinator {
         }
         Ok(leases)
     }
+}
+
+struct ResourceChild {
+    child: std::process::Child,
+    #[cfg(unix)]
+    signals: BlockedSignals,
+}
+
+#[cfg(unix)]
+struct BlockedSignals {
+    watched: libc::sigset_t,
+    previous: libc::sigset_t,
+}
+
+#[cfg(unix)]
+impl BlockedSignals {
+    fn new() -> std::io::Result<Self> {
+        let mut watched = unsafe { std::mem::zeroed() };
+        let mut previous = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut watched);
+            libc::sigaddset(&mut watched, libc::SIGINT);
+            libc::sigaddset(&mut watched, libc::SIGTERM);
+            libc::sigaddset(&mut watched, libc::SIGHUP);
+            if libc::pthread_sigmask(libc::SIG_BLOCK, &watched, &mut previous) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(Self { watched, previous })
+    }
+
+    fn pending(&self) -> Option<i32> {
+        let mut pending = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigpending(&mut pending) } != 0 {
+            return None;
+        }
+        let has_watched = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+            .into_iter()
+            .any(|signal| unsafe { libc::sigismember(&pending, signal) } == 1);
+        if !has_watched {
+            return None;
+        }
+        let mut signal = 0;
+        (unsafe { libc::sigwait(&self.watched, &mut signal) } == 0).then_some(signal)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BlockedSignals {
+    fn drop(&mut self) {
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
+        }
+    }
+}
+
+fn spawn_resource_process(
+    command: &[String],
+    cwd: &Path,
+    grant: &HostResourceGrant,
+) -> std::io::Result<ResourceChild> {
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt as _;
+
+    #[cfg(unix)]
+    let signals = BlockedSignals::new()?;
+    let mut process = std::process::Command::new(&command[0]);
+    process
+        .args(&command[1..])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    for (key, value) in grant.environment() {
+        process.env(key, value);
+    }
+    #[cfg(unix)]
+    {
+        let previous = signals.previous;
+        process.process_group(0);
+        unsafe {
+            process.pre_exec(move || {
+                if libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let child = process.spawn()?;
+    Ok(ResourceChild {
+        child,
+        #[cfg(unix)]
+        signals,
+    })
+}
+
+fn supervise_process<F>(
+    coordinator: &mut HostResourceCoordinator,
+    grant: &mut HostResourceGrant,
+    ttl_seconds: u64,
+    process: &mut ResourceChild,
+    event: &mut F,
+) -> Result<std::process::ExitStatus, HostResourceRunError>
+where
+    F: FnMut(&str),
+{
+    let renewal_interval = std::time::Duration::from_secs((ttl_seconds / 3).max(1));
+    let mut next_renewal = std::time::Instant::now() + renewal_interval;
+    loop {
+        if let Some(status) =
+            process
+                .child
+                .try_wait()
+                .map_err(|source| HostResourceRunError::Spawn {
+                    program: "supervised child".into(),
+                    source,
+                })?
+        {
+            return Ok(status);
+        }
+        #[cfg(unix)]
+        if let Some(signal) = process.signals.pending() {
+            event(&format!(
+                "forwarding signal {signal} to supervised process group"
+            ));
+            unsafe {
+                libc::killpg(process.child.id() as i32, signal);
+            }
+        }
+        if std::time::Instant::now() >= next_renewal {
+            match coordinator.renew(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+                ttl_seconds,
+            ) {
+                Ok(lease) => {
+                    grant.lease = lease;
+                    next_renewal = std::time::Instant::now() + renewal_interval;
+                }
+                Err(error) if now_ms().saturating_add(1_000) < grant.lease.expires_at => {
+                    event(&format!("resource renewal retry: {error}"));
+                    next_renewal =
+                        std::time::Instant::now() + std::time::Duration::from_millis(250);
+                }
+                Err(error) => {
+                    event(&format!(
+                        "resource authority lost; terminating process group: {error}"
+                    ));
+                    grant.lease.state = HostLeaseState::Quarantined;
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::killpg(process.child.id() as i32, libc::SIGTERM);
+                    }
+                    #[cfg(not(unix))]
+                    let _ = process.child.kill();
+                    return process
+                        .child
+                        .wait()
+                        .map_err(|source| HostResourceRunError::Spawn {
+                            program: "supervised child".into(),
+                            source,
+                        });
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn portable_exit_code(status: &std::process::ExitStatus) -> u8 {
+    status
+        .code()
+        .and_then(|code| u8::try_from(code).ok())
+        .unwrap_or_else(|| exit_signal(status).map_or(1, |signal| (128 + signal).min(255) as u8))
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 fn validate_schema(conn: &Connection) -> Result<(), HostResourceError> {
@@ -719,6 +1115,7 @@ fn plan_allocations(
                     ));
                 } else {
                     conflicts.push(conflict(
+                        "resource_contention",
                         &requirement.key,
                         "tcp_port",
                         format!("{start}-{end}"),
@@ -734,6 +1131,7 @@ fn plan_allocations(
                     .collect::<Vec<_>>();
                 if let Some(owner) = matching.iter().find(|o| o.limit != Some(*limit)) {
                     conflicts.push(conflict(
+                        "capacity_policy_mismatch",
                         &requirement.key,
                         "capacity",
                         format!("{pool}:{units}/{limit}"),
@@ -745,6 +1143,7 @@ fn plan_allocations(
                 let used = matching.iter().filter_map(|o| o.units).sum::<u32>();
                 if used.saturating_add(*units) > *limit {
                     conflicts.push(conflict(
+                        "resource_contention",
                         &requirement.key,
                         "capacity",
                         format!("{pool}:{units}/{limit}"),
@@ -767,6 +1166,7 @@ fn plan_allocations(
                     .find(|o| o.kind == "exclusive_key" && o.value == *name)
                 {
                     conflicts.push(conflict(
+                        "resource_contention",
                         &requirement.key,
                         "exclusive_key",
                         name.clone(),
@@ -804,6 +1204,7 @@ fn allocation(
     }
 }
 fn conflict(
+    code: &str,
     key: &str,
     kind: &str,
     requested: String,
@@ -811,11 +1212,23 @@ fn conflict(
     owner: Option<String>,
 ) -> HostResourceConflict {
     HostResourceConflict {
+        code: code.into(),
         resource_key: key.into(),
         kind: kind.into(),
         requested,
         reason: reason.into(),
         owning_lease: owner,
+    }
+}
+
+fn aggregate_conflict_code(conflicts: &[HostResourceConflict]) -> &'static str {
+    if conflicts
+        .iter()
+        .any(|conflict| conflict.code == "capacity_policy_mismatch")
+    {
+        "capacity_policy_mismatch"
+    } else {
+        "resource_contention"
     }
 }
 fn sanitize(value: &str) -> String {
@@ -1016,7 +1429,7 @@ mod tests {
         );
         assert!(matches!(
             c.acquire(&r2),
-            Err(HostResourceError::Conflict(_))
+            Err(HostResourceError::Conflict { .. })
         ));
         assert_eq!(c.list(true).unwrap().len(), 1);
     }
@@ -1059,7 +1472,7 @@ mod tests {
         c.acquire(&cap("two")).unwrap();
         assert!(matches!(
             c.acquire(&cap("three")),
-            Err(HostResourceError::Conflict(_))
+            Err(HostResourceError::Conflict { .. })
         ));
     }
     #[test]
@@ -1094,7 +1507,7 @@ mod tests {
         assert_eq!(
             results
                 .iter()
-                .filter(|result| matches!(result, Err(HostResourceError::Conflict(_))))
+                .filter(|result| matches!(result, Err(HostResourceError::Conflict { .. })))
                 .count(),
             1
         );
@@ -1147,7 +1560,7 @@ mod tests {
             std::time::Duration::from_millis(50),
             |_| {},
         );
-        assert!(matches!(result, Err(HostResourceError::Conflict(_))));
+        assert!(matches!(result, Err(HostResourceError::Conflict { .. })));
         assert!(started.elapsed() >= std::time::Duration::from_millis(50));
     }
 
@@ -1164,7 +1577,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             c.acquire(&req("two", vec![exclusive("shared")])),
-            Err(HostResourceError::Conflict(_))
+            Err(HostResourceError::Conflict { .. })
         ));
         assert_eq!(c.list(false).unwrap()[0].state, HostLeaseState::Quarantined);
         assert!(matches!(

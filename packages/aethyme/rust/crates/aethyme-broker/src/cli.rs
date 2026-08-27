@@ -123,9 +123,14 @@ Usage:
   aethyme broker resources plan <request.json> [--json]
       Read-only host-wide availability estimate for a typed resource bundle.
       Never reserves a port, namespace, capacity slot, or exclusive key.
-  aethyme broker resources acquire <request.json> [--json]
-      Atomically reserve the full bundle across every clone run by this user.
-      The returned grant contains the ownership token; keep it private.
+  aethyme broker resources acquire <request.json> [--wait <duration>] [--grant-out <path>] [--json]
+      Atomically reserve the full bundle. --wait bounds contention retries.
+      --grant-out atomically creates a mode-0600 private grant and keeps the
+      ownership token out of command output.
+  aethyme broker resources run <request.json> [--wait <duration>] [--cleanup-command <shell>] [--json] -- <command> ...
+      Acquire, expose only public allocations, supervise the process group,
+      renew while it runs, execute optional exact cleanup, then release. Lost
+      authority or unproven cleanup quarantines the bundle.
   aethyme broker resources renew <grant.json> --ttl <seconds> [--json]
   aethyme broker resources release <grant.json> [--json]
       Renew or release with the exact grant returned by acquire. Tokens are
@@ -358,6 +363,7 @@ pub fn run_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
             eprintln!("Error: {message}");
             code
         }
+        Err(UsageError::SilentExit(code)) => code,
     };
     if mode == CompatibilityMode::Normal {
         record_command_metric(args, code, started.elapsed().as_millis() as i64);
@@ -904,6 +910,7 @@ enum UsageError {
     Help,
     Message(String),
     Exit { message: String, code: u8 },
+    SilentExit(u8),
 }
 
 impl<E: std::fmt::Display> From<E> for UsageError {
@@ -934,6 +941,7 @@ struct Parsed {
     status: Option<String>,
     provider: Option<String>,
     ttl_seconds: Option<i64>,
+    wait: Option<String>,
     since: Option<i64>,
     kind: Option<String>,
     keep_days: Option<i64>,
@@ -943,6 +951,8 @@ struct Parsed {
     worktree: Option<PathBuf>,
     title: Option<String>,
     output: Option<PathBuf>,
+    grant_out: Option<PathBuf>,
+    cleanup_command: Option<String>,
     form: Option<PathBuf>,
     follow: bool,
     json: bool,
@@ -990,6 +1000,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         status: None,
         provider: None,
         ttl_seconds: None,
+        wait: None,
         since: None,
         kind: None,
         keep_days: None,
@@ -999,6 +1010,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         worktree: None,
         title: None,
         output: None,
+        grant_out: None,
+        cleanup_command: None,
         form: None,
         follow: false,
         json: false,
@@ -1070,6 +1083,28 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--sync-integration" => parsed.sync_integration = true,
             "--no-cache" => parsed.no_cache = true,
             "--stdout" => parsed.stdout = true,
+            "--wait" => {
+                parsed.wait = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--wait requires a duration".into()))?
+                        .clone(),
+                )
+            }
+            "--grant-out" => {
+                parsed.grant_out = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or(UsageError::Message("--grant-out requires a path".into()))?,
+                ))
+            }
+            "--cleanup-command" => {
+                parsed.cleanup_command = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message(
+                            "--cleanup-command requires a shell command".into(),
+                        ))?
+                        .clone(),
+                )
+            }
             "--include-task" => parsed.include_task = true,
             "--replace-stale" => parsed.replace_stale = true,
             "--path" => parsed.planned_paths.push(
@@ -2814,6 +2849,91 @@ fn read_resource_json<T: serde::de::DeserializeOwned>(
     })
 }
 
+fn parse_resource_duration(value: &str) -> Result<std::time::Duration, UsageError> {
+    let (digits, multiplier) = if let Some(value) = value.strip_suffix("ms") {
+        (value, 1_u64)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1_000)
+    } else if let Some(value) = value.strip_suffix('m') {
+        (value, 60_000)
+    } else if let Some(value) = value.strip_suffix('h') {
+        (value, 3_600_000)
+    } else {
+        return Err(UsageError::Message(
+            "duration must use ms, s, m, or h (for example 30m)".into(),
+        ));
+    };
+    let amount = digits.parse::<u64>().map_err(|_| {
+        UsageError::Message("duration must be a non-negative integer plus ms, s, m, or h".into())
+    })?;
+    let millis = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| UsageError::Message("duration is too large".into()))?;
+    Ok(std::time::Duration::from_millis(millis))
+}
+
+fn write_private_grant(
+    path: &std::path::Path,
+    grant: &crate::HostResourceGrant,
+) -> Result<(), UsageError> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if path.exists() {
+        return Err(UsageError::Message(format!(
+            "refusing to overwrite existing grant file {}",
+            path.display()
+        )));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    if !parent.is_dir() {
+        return Err(UsageError::Message(format!(
+            "grant parent directory does not exist: {}",
+            parent.display()
+        )));
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        UsageError::Message(format!(
+            "cannot create private grant beside {}: {error}",
+            path.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    temporary
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| UsageError::Message(format!("cannot protect grant file: {error}")))?;
+    serde_json::to_writer_pretty(&mut temporary, grant)?;
+    temporary
+        .write_all(b"\n")
+        .map_err(|error| UsageError::Message(format!("cannot finish private grant: {error}")))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| UsageError::Message(format!("cannot sync private grant: {error}")))?;
+    temporary.persist_noclobber(path).map_err(|error| {
+        UsageError::Message(format!(
+            "cannot publish private grant {}: {}",
+            path.display(),
+            error.error
+        ))
+    })?;
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct ResourceAcquireFailure<'a> {
+    code: &'a str,
+    request_id: &'a str,
+    retryable: bool,
+    waited_ms: u128,
+    conflicts: &'a [crate::HostResourceConflict],
+}
+
 fn render_host_lease(lease: &crate::HostResourceLease) {
     println!(
         "{} generation {} — {} until {}",
@@ -2837,7 +2957,7 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         .map(String::as_str)
         .ok_or_else(|| {
             UsageError::Message(
-                "resources requires plan, acquire, renew, release, list, or reconcile".into(),
+                "resources requires plan, acquire, run, renew, release, list, or reconcile".into(),
             )
         })?;
     match action {
@@ -2876,13 +2996,58 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                 }
             } else {
                 let mut coordinator = crate::HostResourceCoordinator::open_default()?;
-                let grant = coordinator.acquire(&request)?;
-                if parsed.json {
+                let wait = parsed
+                    .wait
+                    .as_deref()
+                    .map(parse_resource_duration)
+                    .transpose()?
+                    .unwrap_or_default();
+                let started = std::time::Instant::now();
+                let acquired = if wait.is_zero() {
+                    coordinator.acquire(&request)
+                } else {
+                    coordinator.acquire_with_wait(&request, wait, |_| {})
+                };
+                let grant = match acquired {
+                    Ok(grant) => grant,
+                    Err(crate::HostResourceError::Conflict {
+                        code, conflicts, ..
+                    }) if parsed.json => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&ResourceAcquireFailure {
+                                retryable: code == "resource_contention",
+                                code: &code,
+                                request_id: &request.request_id,
+                                waited_ms: started.elapsed().as_millis(),
+                                conflicts: &conflicts,
+                            })?
+                        );
+                        return Err(UsageError::SilentExit(75));
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                if let Some(path) = parsed.grant_out.as_deref() {
+                    write_private_grant(path, &grant)?;
+                }
+                if parsed.json && parsed.grant_out.is_some() {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "lease": grant.lease,
+                            "grant_path": parsed.grant_out,
+                        }))?
+                    );
+                } else if parsed.json {
                     println!("{}", serde_json::to_string_pretty(&grant)?);
                 } else {
                     render_host_lease(&grant.lease);
-                    println!("Ownership token: {}", grant.ownership_token);
-                    println!("Store the complete JSON grant privately for renew/release.");
+                    if let Some(path) = parsed.grant_out {
+                        println!("Private grant: {}", path.display());
+                    } else {
+                        println!("Ownership token: {}", grant.ownership_token);
+                        println!("Store the complete JSON grant privately for renew/release.");
+                    }
                 }
             }
         }
@@ -2915,6 +3080,94 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                 println!("{}", serde_json::to_string_pretty(&grant)?);
             } else {
                 render_host_lease(&grant.lease);
+            }
+        }
+        "run" => {
+            let path = parsed.positional.get(1).map(PathBuf::from).ok_or_else(|| {
+                UsageError::Message("resources run requires <request.json>".into())
+            })?;
+            if parsed.exec_command.is_empty() {
+                return Err(UsageError::Message(
+                    "resources run requires -- <command> [args...]".into(),
+                ));
+            }
+            let request: crate::HostResourceRequest = read_resource_json(&path)?;
+            let wait = parsed
+                .wait
+                .as_deref()
+                .map(parse_resource_duration)
+                .transpose()?
+                .unwrap_or_default();
+            let cwd =
+                std::env::current_dir().map_err(|error| UsageError::Message(error.to_string()))?;
+            let mut coordinator = crate::HostResourceCoordinator::open_default()?;
+            let json = parsed.json;
+            let report = coordinator.run_supervised(
+                &request,
+                wait,
+                &parsed.exec_command,
+                parsed.cleanup_command.as_deref(),
+                &cwd,
+                |message| {
+                    if json {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "type": "resource_run_event",
+                                "request_id": request.request_id,
+                                "message": message,
+                            })
+                        );
+                    } else {
+                        eprintln!("resource run: {message}");
+                    }
+                },
+            );
+            let report = match report {
+                Ok(report) => report,
+                Err(crate::HostResourceRunError::Resource(
+                    crate::HostResourceError::Conflict {
+                        code, conflicts, ..
+                    },
+                )) if json => {
+                    eprintln!(
+                        "{}",
+                        serde_json::to_string(&ResourceAcquireFailure {
+                            retryable: code == "resource_contention",
+                            code: &code,
+                            request_id: &request.request_id,
+                            waited_ms: wait.as_millis(),
+                            conflicts: &conflicts,
+                        })?
+                    );
+                    return Err(UsageError::SilentExit(75));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if json {
+                eprintln!("{}", serde_json::to_string(&report)?);
+            } else {
+                eprintln!(
+                    "resource run: child={} cleanup={} final={}",
+                    report.child_exit_code,
+                    report
+                        .cleanup_exit_code
+                        .map_or_else(|| "not-requested".into(), |code| code.to_string()),
+                    report.final_lease_state.as_str()
+                );
+            }
+            let lifecycle_failed = report.authority_lost
+                || report.cleanup_exit_code.is_some_and(|code| code != 0)
+                || report.final_lease_state != crate::HostLeaseState::Released;
+            let exit = if report.child_exit_code != 0 {
+                report.child_exit_code
+            } else if lifecycle_failed {
+                70
+            } else {
+                0
+            };
+            if exit != 0 {
+                return Err(UsageError::SilentExit(exit));
             }
         }
         "list" => {
@@ -2955,7 +3208,7 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown resources action {other:?}; expected plan, acquire, renew, release, list, or reconcile"
+                "unknown resources action {other:?}; expected plan, acquire, run, renew, release, list, or reconcile"
             )));
         }
     }
