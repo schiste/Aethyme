@@ -100,6 +100,7 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         (Some("close" | "finish" | "git" | "gh" | "cleanup"), _) => {
             CommandCapability::RecoveryWrite
         }
+        (Some("checkpoint"), Some("apply")) => CommandCapability::RecoveryWrite,
         (Some("report"), Some("file")) => CommandCapability::RecoveryWrite,
         (Some("operations" | "resources"), Some("reconcile"))
         | (Some("advisories"), Some("ack")) => CommandCapability::RecoveryWrite,
@@ -107,6 +108,7 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
             CommandCapability::RecoveryWrite
         }
         (Some("ship"), Some("plan"))
+        | (Some("checkpoint"), Some("plan"))
         | (Some("integration"), Some("status" | "reconcile"))
         | (Some("leases"), _)
         | (Some("resources"), Some("plan" | "list"))
@@ -703,6 +705,14 @@ mod compatibility_command_tests {
             (&["broker", "status"][..], CommandCapability::DiagnosticRead),
             (
                 &["broker", "integration", "reconcile", "--apply"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "checkpoint", "plan", "--session", "7"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "checkpoint", "apply", "--session", "7"][..],
                 CommandCapability::RecoveryWrite,
             ),
             (

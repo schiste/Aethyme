@@ -18,6 +18,7 @@ use serde_json::json;
 pub const SESSION_REGISTERED: &str = "session.registered";
 pub const SESSION_REUSED: &str = "session.reused";
 pub const SESSION_FINISHED: &str = "session.finished";
+pub const SESSION_CHECKPOINT_REANCHORED: &str = "session.checkpoint_reanchored";
 pub const BROKER_COMMAND_FAILED: &str = "broker.command.failed";
 pub const BROKER_COMMAND_SUCCEEDED: &str = "broker.command.succeeded";
 // session.<status> transition kinds are derived from SessionStatus::as_str
@@ -43,6 +44,23 @@ pub fn session_registered_payload(origin: &str, branch: &str, worktree_path: &st
 
 pub fn session_reused_payload(task: Option<&str>, diff_base: Option<&str>) -> String {
     json!({ "task": task, "diff_base": diff_base }).to_string()
+}
+
+pub fn session_checkpoint_reanchored_payload(
+    old_checkpoint: &str,
+    new_checkpoint: &str,
+    session_head: &str,
+    plan_digest: &str,
+    preservation_ref: &str,
+) -> String {
+    json!({
+        "old_checkpoint": old_checkpoint,
+        "new_checkpoint": new_checkpoint,
+        "session_head": session_head,
+        "plan_digest": plan_digest,
+        "preservation_ref": preservation_ref,
+    })
+    .to_string()
 }
 
 pub fn session_exit_payload(exit_code: i64) -> String {

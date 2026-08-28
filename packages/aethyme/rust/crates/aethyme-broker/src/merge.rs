@@ -710,6 +710,13 @@ impl Broker {
         })
     }
 
+    pub(crate) fn validate_submission_plan(
+        &self,
+        plan: &SubmissionPlan,
+    ) -> Result<(), BrokerOpError> {
+        self.replay_submission_plan(plan).map(|_| ())
+    }
+
     fn integration_commits_touching_path(
         &self,
         session_parent: &str,

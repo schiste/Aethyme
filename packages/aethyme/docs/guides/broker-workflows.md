@@ -202,6 +202,24 @@ again. Never reset or rewrite the session before creating the preservation
 branch; the preserved ref is the rollback path if flattening included work you
 did not intend to own.
 
+If a clean session was deliberately rewritten onto the promoted integration
+history, its accepted session SHA can cease to be an ancestor even though the
+accepted content remains proven by the recorded integration commit. Do not
+replace that ownership boundary by hand. Review a typed recovery instead:
+
+```bash
+aethyme broker checkpoint plan --session <id> --json
+aethyme broker checkpoint apply --session <id> --confirm <plan-sha256>
+```
+
+The plan is read-only and binds the old checkpoint, proposed integration
+checkpoint, current session HEAD, relation, pending commits, normalized
+`SubmissionPlan`, safety conditions, and preservation ref. Apply rebuilds the
+plan, requires the exact digest, refuses dirty or divergent work, creates the
+recovery ref first, and then atomically journals the checkpoint update. It
+never rebases or resets the worktree. After a successful apply, submit normally;
+only commits after the reviewed integration checkpoint are session-owned.
+
 On a real conflict, `conflict_details` binds each surviving path to its full
 originating session commit, ownership, known integration-side commits, and
 ordered remediation commands. The legacy `conflicts` path list remains for

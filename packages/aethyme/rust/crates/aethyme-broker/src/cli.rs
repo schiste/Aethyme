@@ -244,6 +244,15 @@ Usage:
       promoted integration work when status reports that conflict surface.
       Then refresh leases and show affected gates. Never submits or
       promotes; run submit when the report is clean.
+  aethyme broker checkpoint plan --session <id> [--json]
+      Read-only recovery plan for a session whose accepted checkpoint is no
+      longer an ancestor of its rewritten branch. Reports the old and proposed
+      checkpoints, integration relation, pending commit provenance, safety
+      refusals, preservation branch, and review digest.
+  aethyme broker checkpoint apply --session <id> --confirm <sha256> [--json]
+      Rebuild and confirm the exact recovery plan, create the preservation ref
+      first, then atomically re-anchor the broker checkpoint. Never rewrites the
+      session worktree or hides uncommitted work.
   aethyme broker queue [--json]
       Show the merge queue.
   aethyme broker promote --entry <id> [--json]
@@ -409,6 +418,8 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "check",
     "submit",
     "repair",
+    "checkpoint",
+    "apply",
     "queue",
     "promote",
     "ship",
@@ -547,6 +558,7 @@ fn command_records_metric(args: &[String]) -> bool {
         Some("advisories") => args.get(1).map(String::as_str) == Some("ack"),
         Some("report") => args.get(1).map(String::as_str) == Some("file"),
         Some("ship") => args.get(1).map(String::as_str) != Some("plan"),
+        Some("checkpoint") => args.get(1).map(String::as_str) == Some("apply"),
         Some("operations") => args.get(1).map(String::as_str) == Some("reconcile"),
         Some("git" | "gh") => {
             let command = args
@@ -596,6 +608,7 @@ mod tests {
             args(&["report", "list"]),
             args(&["report", "show", "report.json"]),
             args(&["report", "render", "report.json"]),
+            args(&["checkpoint", "plan", "--session", "7"]),
             args(&["gates", "validate"]),
             args(&["gates", "affected", "--session", "7"]),
             args(&["gates", "semantic", "--session", "7"]),
@@ -628,6 +641,14 @@ mod tests {
             args(&["gates", "run", "--session", "7"]),
             args(&["doctor", "--fix-version"]),
             args(&["report", "file", "reviewed.issue.md"]),
+            args(&[
+                "checkpoint",
+                "apply",
+                "--session",
+                "7",
+                "--confirm",
+                "digest",
+            ]),
             args(&["status"]),
             args(&["agents"]),
             args(&["leases"]),
@@ -652,6 +673,24 @@ mod tests {
                 "stateful command should record telemetry: {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_accepts_checkpoint_recovery_confirmation() {
+        let parsed = super::parse(&args(&[
+            "checkpoint",
+            "apply",
+            "--session",
+            "7",
+            "--confirm",
+            "aabb",
+            "--json",
+        ]))
+        .unwrap_or_else(|_| panic!("checkpoint recovery should parse"));
+        assert_eq!(parsed.positional, vec!["checkpoint", "apply"]);
+        assert_eq!(parsed.session, Some(7));
+        assert_eq!(parsed.confirm.as_deref(), Some("aabb"));
+        assert!(parsed.json);
     }
 
     #[test]
@@ -4331,6 +4370,84 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 render_repair_report(&report);
+            }
+        }
+        "checkpoint" => {
+            let action =
+                parsed
+                    .positional
+                    .first()
+                    .map(String::as_str)
+                    .ok_or(UsageError::Message(
+                        "checkpoint requires plan or apply".into(),
+                    ))?;
+            let session = parsed.session.ok_or(UsageError::Message(
+                "checkpoint plan/apply requires --session <id>".into(),
+            ))?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            match action {
+                "plan" => {
+                    let report = broker.plan_session_checkpoint_recovery(session)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!(
+                            "Checkpoint recovery for session {}: {}",
+                            session,
+                            if report.safe { "safe" } else { "refused" }
+                        );
+                        println!(
+                            "  old: {}",
+                            report.old_checkpoint.as_deref().unwrap_or("missing")
+                        );
+                        println!(
+                            "  proposed: {}",
+                            report.proposed_checkpoint.as_deref().unwrap_or("missing")
+                        );
+                        println!(
+                            "  session HEAD: {} ({}; {} ahead, {} behind)",
+                            report.session_head,
+                            report
+                                .integration_relation
+                                .map(|relation| relation.as_str())
+                                .unwrap_or("unknown"),
+                            report.ahead_commits,
+                            report.behind_commits
+                        );
+                        println!("  pending commits: {}", report.pending_commits.len());
+                        println!("  preservation branch: {}", report.preservation_branch);
+                        for refusal in &report.refusals {
+                            println!("  refusal: {refusal}");
+                        }
+                        println!("Plan digest: {}", report.digest);
+                        if report.safe {
+                            println!(
+                                "Apply with: aethyme broker checkpoint apply --session {} --confirm {}",
+                                session, report.digest
+                            );
+                        }
+                    }
+                }
+                "apply" => {
+                    let confirm = parsed.confirm.as_deref().ok_or(UsageError::Message(
+                        "checkpoint apply requires --confirm <sha256>".into(),
+                    ))?;
+                    let report = broker.apply_session_checkpoint_recovery(session, confirm)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!(
+                            "Re-anchored session {} at {} after preserving {}.",
+                            session, report.accepted_session_head, report.preservation_ref
+                        );
+                        println!("Next: aethyme broker submit --session {session}");
+                    }
+                }
+                other => {
+                    return Err(UsageError::Message(format!(
+                        "unknown checkpoint action {other:?} — expected plan or apply"
+                    )));
+                }
             }
         }
         "queue" => {

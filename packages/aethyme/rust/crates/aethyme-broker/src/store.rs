@@ -1035,6 +1035,58 @@ impl BrokerStore {
         Ok(entries)
     }
 
+    /// Move a reviewed session ownership checkpoint and journal the exact
+    /// transition in one SQLite transaction. Git preservation happens before
+    /// this call, so a database failure can only leave an extra safe ref.
+    pub fn reanchor_session_checkpoint(
+        &mut self,
+        session_id: i64,
+        expected_old: &str,
+        new_checkpoint: &str,
+        event_payload: &str,
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let actual = tx
+            .query_row(
+                "SELECT accepted_session_head FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or(BrokerError::SessionNotFound(session_id))?;
+        if actual.as_deref() != Some(expected_old) {
+            return Err(BrokerError::SessionCheckpointChanged {
+                session_id,
+                expected: expected_old.to_string(),
+                actual: actual.unwrap_or_else(|| "<missing>".into()),
+            });
+        }
+        let updated = tx.execute(
+            "UPDATE sessions
+             SET accepted_session_head = ?2, diff_base = ?2,
+                 updated_at = ?3, last_activity_at = ?3
+             WHERE id = ?1 AND accepted_session_head = ?4",
+            params![session_id, new_checkpoint, now, expected_old],
+        )?;
+        if updated != 1 {
+            return Err(BrokerError::SessionCheckpointChanged {
+                session_id,
+                expected: expected_old.to_string(),
+                actual: "<changed concurrently>".into(),
+            });
+        }
+        insert_event(
+            &tx,
+            now,
+            crate::events::SESSION_CHECKPOINT_REANCHORED,
+            Some(session_id),
+            Some(event_payload),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Advance the durable session baseline after a successful explicit
     /// rebase. Future repairs must only replay work created after this base.
     pub fn set_session_diff_base(

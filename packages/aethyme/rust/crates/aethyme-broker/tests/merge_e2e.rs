@@ -618,6 +618,170 @@ fn follow_up_refuses_to_replace_a_rewritten_accepted_checkpoint_with_integration
 }
 
 #[test]
+fn reviewed_checkpoint_recovery_preserves_head_and_reanchors_without_hiding_followup_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "checkpoint-recovery");
+    let session = broker
+        .adopt(&worktree, Some("recover rewritten checkpoint"))
+        .unwrap();
+
+    commit_edit(&worktree, "src/a.py", "a = 2\n");
+    let accepted_head = resolve(&worktree, "HEAD");
+    assert!(broker.submit(session.id).unwrap().promoted);
+    let integration = resolve(tmp.path(), "aethyme/integration");
+
+    sh(&worktree, &["reset", "--hard", "aethyme/integration"]);
+    commit_edit(&worktree, "src/b.py", "b = 2\n");
+    let followup_head = resolve(&worktree, "HEAD");
+    assert!(
+        !Command::new("git")
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                &accepted_head,
+                &followup_head
+            ])
+            .current_dir(&worktree)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    std::fs::write(worktree.join("src/dirty.py"), "dirty = True\n").unwrap();
+    let dirty_plan = broker.plan_session_checkpoint_recovery(session.id).unwrap();
+    assert!(!dirty_plan.safe);
+    assert!(
+        dirty_plan
+            .refusals
+            .iter()
+            .any(|reason| reason.contains("worktree is dirty"))
+    );
+    std::fs::remove_file(worktree.join("src/dirty.py")).unwrap();
+
+    let plan = broker.plan_session_checkpoint_recovery(session.id).unwrap();
+    assert!(plan.safe, "{:?}", plan.refusals);
+    assert_eq!(plan.old_checkpoint, Some(accepted_head.clone()));
+    assert_eq!(plan.proposed_checkpoint, Some(integration.clone()));
+    assert_eq!(
+        plan.integration_relation,
+        Some(aethyme_broker::AdoptIntegrationRelation::Ahead)
+    );
+    assert_eq!(plan.pending_commits, vec![followup_head.clone()]);
+    assert_eq!(plan.digest.len(), 64);
+    let cli = Command::new(env!("CARGO_BIN_EXE_broker-cli-shim"))
+        .args([
+            "checkpoint",
+            "plan",
+            "--session",
+            &session.id.to_string(),
+            "--json",
+        ])
+        .current_dir(&worktree)
+        .output()
+        .unwrap();
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_plan: serde_json::Value = serde_json::from_slice(&cli.stdout).unwrap();
+    assert_eq!(cli_plan["digest"], plan.digest);
+    assert_eq!(cli_plan["pending_commits"][0], followup_head);
+    assert_eq!(cli_plan["integration_relation"], "ahead");
+
+    let mismatch = broker
+        .apply_session_checkpoint_recovery(session.id, &"0".repeat(64))
+        .unwrap_err();
+    assert!(mismatch.to_string().contains("confirmation mismatch"));
+    assert_eq!(
+        broker
+            .store()
+            .session(session.id)
+            .unwrap()
+            .accepted_session_head,
+        Some(accepted_head)
+    );
+
+    let applied = broker
+        .apply_session_checkpoint_recovery(session.id, &plan.digest)
+        .unwrap();
+    assert!(applied.applied);
+    assert_eq!(applied.accepted_session_head, integration);
+    assert_eq!(
+        resolve(tmp.path(), &applied.preservation_ref),
+        followup_head
+    );
+    let recovered = broker.store().session(session.id).unwrap();
+    assert_eq!(recovered.accepted_session_head, plan.proposed_checkpoint);
+    assert_eq!(recovered.diff_base, plan.proposed_checkpoint);
+    assert_eq!(
+        broker
+            .store()
+            .events_after_filtered(0, 10, Some("session.checkpoint_reanchored"))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let followup = broker.submit(session.id).unwrap();
+    assert!(followup.promoted);
+    let pending = followup
+        .submission_plan
+        .commits
+        .iter()
+        .filter(|commit| {
+            commit.ownership == SubmissionCommitOwnership::SessionOwned
+                && commit.integration_state == SubmissionIntegrationState::Pending
+        })
+        .map(|commit| commit.commit.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(pending, vec![followup_head]);
+}
+
+#[test]
+fn checkpoint_recovery_refuses_divergence_and_sessions_without_acceptance_proof() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let fresh_worktree = agent_worktree(tmp.path(), "no-checkpoint");
+    let fresh = broker.adopt(&fresh_worktree, None).unwrap();
+    let missing = broker.plan_session_checkpoint_recovery(fresh.id).unwrap();
+    assert!(!missing.safe);
+    assert!(
+        missing
+            .refusals
+            .iter()
+            .any(|reason| reason.contains("no accepted checkpoint"))
+    );
+    broker.close(fresh.id).unwrap();
+
+    let worktree = agent_worktree(tmp.path(), "diverged-checkpoint");
+    let session = broker.adopt(&worktree, None).unwrap();
+    commit_edit(&worktree, "src/a.py", "a = 2\n");
+    assert!(broker.submit(session.id).unwrap().promoted);
+    sh(&worktree, &["reset", "--hard", "main"]);
+    commit_edit(&worktree, "src/b.py", "b = 3\n");
+
+    let plan = broker.plan_session_checkpoint_recovery(session.id).unwrap();
+    assert!(!plan.safe);
+    assert_eq!(
+        plan.integration_relation,
+        Some(aethyme_broker::AdoptIntegrationRelation::Diverged)
+    );
+    assert!(
+        plan.refusals
+            .iter()
+            .any(|reason| reason.contains("recovery requires integration to be an ancestor"))
+    );
+    let error = broker
+        .apply_session_checkpoint_recovery(session.id, &plan.digest)
+        .unwrap_err();
+    assert!(error.to_string().contains("not safe"));
+}
+
+#[test]
 fn conflicting_submission_rejected_pre_gate_with_instruction_drop() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

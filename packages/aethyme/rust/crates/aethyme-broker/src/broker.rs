@@ -8,6 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use sha2::{Digest, Sha256};
+
 use crate::PromoteConfig;
 use crate::error::BrokerError;
 use crate::git::{GitError, GitRepo};
@@ -64,6 +66,22 @@ pub enum BrokerOpError {
         reason: String,
         commits: String,
         guidance: String,
+    },
+    #[error("session checkpoint recovery is not safe: {reasons}")]
+    UnsafeCheckpointRecovery { reasons: String },
+    #[error("session checkpoint recovery confirmation must be a full SHA-256 digest")]
+    CheckpointConfirmationNotSha256,
+    #[error(
+        "session checkpoint recovery confirmation mismatch: expected {expected}, received {actual}"
+    )]
+    CheckpointConfirmationMismatch { expected: String, actual: String },
+    #[error(
+        "session checkpoint recovery ref {reference} already points to {actual}, expected {expected}"
+    )]
+    CheckpointPreservationRefConflict {
+        reference: String,
+        actual: String,
+        expected: String,
     },
     #[error("cannot resolve upstream ref {upstream:?}; fetch it explicitly, then retry")]
     UpstreamRefNotFound { upstream: String },
@@ -833,6 +851,43 @@ pub struct RepairReport {
     pub leases_refreshed: bool,
     pub affected_gates: Vec<RepairGateSelection>,
     pub next_command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionCheckpointRecoveryPlan {
+    pub session_id: i64,
+    pub old_checkpoint: Option<String>,
+    pub proposed_checkpoint: Option<String>,
+    pub session_head: String,
+    pub integration_branch: String,
+    pub integration_head: Option<String>,
+    pub integration_relation: Option<AdoptIntegrationRelation>,
+    pub ahead_commits: u64,
+    pub behind_commits: u64,
+    pub pending_commits: Vec<String>,
+    pub submission_plan: Option<crate::SubmissionPlan>,
+    pub preservation_branch: String,
+    pub clean_worktree: bool,
+    pub safe: bool,
+    pub refusals: Vec<String>,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionCheckpointApplyReport {
+    pub plan: SessionCheckpointRecoveryPlan,
+    pub applied: bool,
+    pub accepted_session_head: String,
+    pub preservation_ref: String,
+}
+
+fn finish_checkpoint_recovery_plan(
+    mut plan: SessionCheckpointRecoveryPlan,
+) -> Result<SessionCheckpointRecoveryPlan, BrokerOpError> {
+    plan.digest.clear();
+    let bytes = serde_json::to_vec(&plan)?;
+    plan.digest = format!("{:x}", Sha256::digest(bytes));
+    Ok(plan)
 }
 
 /// Outcome class for `broker finish --session`: a human lifecycle helper
@@ -2453,6 +2508,220 @@ impl Broker {
     /// Recover a blocked session by applying the documented local rebase
     /// path when there is an actionable conflict, then refresh leases and
     /// return the affected gate selection. Does not submit or promote.
+    pub fn plan_session_checkpoint_recovery(
+        &mut self,
+        session_id: i64,
+    ) -> Result<SessionCheckpointRecoveryPlan, BrokerOpError> {
+        let session = self.store.session(session_id)?;
+        let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+        let session_head = checkout.head_commit()?;
+        let integration_branch = crate::PromoteConfig::load(&self.main_root).branch;
+        let integration_head = self.integration_tip();
+        let old_checkpoint = session.accepted_session_head.clone();
+        let preservation_branch = format!(
+            "aethyme/recovery/session-{}-{}",
+            session_id,
+            session_head.get(..12).unwrap_or(&session_head)
+        );
+        let clean_worktree = !checkout.is_dirty()?;
+        let mut refusals = Vec::new();
+        if !clean_worktree {
+            refusals.push("session worktree is dirty; commit through the managed hook before planning recovery".into());
+        }
+        let Some(old) = old_checkpoint.as_deref() else {
+            refusals.push("session has no accepted checkpoint to re-anchor".into());
+            return finish_checkpoint_recovery_plan(SessionCheckpointRecoveryPlan {
+                session_id,
+                old_checkpoint,
+                proposed_checkpoint: integration_head.clone(),
+                session_head,
+                integration_branch,
+                integration_head,
+                integration_relation: None,
+                ahead_commits: 0,
+                behind_commits: 0,
+                pending_commits: Vec::new(),
+                submission_plan: None,
+                preservation_branch,
+                clean_worktree,
+                safe: false,
+                refusals,
+                digest: String::new(),
+            });
+        };
+        if checkout.resolve_ref(old).is_none() {
+            refusals.push(format!("accepted checkpoint {old} is missing"));
+        } else if checkout.is_ancestor(old, &session_head) {
+            refusals.push(format!(
+                "accepted checkpoint {old} is still an ancestor of session HEAD; no re-anchor is required"
+            ));
+        }
+
+        let mut relation = None;
+        let mut ahead_commits = 0;
+        let mut behind_commits = 0;
+        let mut pending_commits = Vec::new();
+        let mut submission_plan = None;
+        if let Some(integration) = integration_head.as_deref() {
+            ahead_commits = checkout.commit_count_between(integration, &session_head)?;
+            behind_commits = checkout.commit_count_between(&session_head, integration)?;
+            let current_relation = match (ahead_commits, behind_commits) {
+                (0, 0) => AdoptIntegrationRelation::Current,
+                (0, _) => AdoptIntegrationRelation::Behind,
+                (_, 0) => AdoptIntegrationRelation::Ahead,
+                _ => AdoptIntegrationRelation::Diverged,
+            };
+            relation = Some(current_relation);
+            if !matches!(
+                current_relation,
+                AdoptIntegrationRelation::Current | AdoptIntegrationRelation::Ahead
+            ) {
+                refusals.push(format!(
+                    "session HEAD is {} relative to {integration_branch}; recovery requires integration to be an ancestor of the session",
+                    current_relation.as_str()
+                ));
+            }
+
+            match session.accepted_integration_commit.as_deref() {
+                Some(accepted_integration)
+                    if checkout.resolve_ref(accepted_integration).is_none() =>
+                {
+                    refusals.push(format!(
+                        "recorded accepted integration commit {accepted_integration} is missing"
+                    ));
+                }
+                Some(accepted_integration)
+                    if !checkout.is_ancestor(accepted_integration, integration) =>
+                {
+                    refusals.push(format!(
+                        "current integration {integration} does not contain the recorded accepted integration commit {accepted_integration}"
+                    ));
+                }
+                None => refusals.push(
+                    "session has no recorded accepted integration commit proving the old contribution was preserved"
+                        .into(),
+                ),
+                Some(_) => {}
+            }
+
+            if matches!(
+                current_relation,
+                AdoptIntegrationRelation::Current | AdoptIntegrationRelation::Ahead
+            ) {
+                let mut candidate = session.clone();
+                candidate.accepted_session_head = Some(integration.to_string());
+                candidate.diff_base = Some(integration.to_string());
+                match self.build_submission_plan(&candidate, &session_head, integration) {
+                    Ok(plan) => {
+                        pending_commits = plan.pending_owned_commit_ids();
+                        if let Err(error) = self.validate_submission_plan(&plan) {
+                            refusals.push(format!(
+                                "normalized submission provenance is not executable: {error}"
+                            ));
+                        }
+                        submission_plan = Some(plan);
+                    }
+                    Err(error) => refusals.push(format!(
+                        "normalized submission provenance could not be built: {error}"
+                    )),
+                }
+            }
+        } else {
+            refusals.push(format!(
+                "integration ref refs/heads/{integration_branch} is missing"
+            ));
+        }
+
+        let safe = refusals.is_empty();
+        finish_checkpoint_recovery_plan(SessionCheckpointRecoveryPlan {
+            session_id,
+            old_checkpoint,
+            proposed_checkpoint: integration_head.clone(),
+            session_head,
+            integration_branch,
+            integration_head,
+            integration_relation: relation,
+            ahead_commits,
+            behind_commits,
+            pending_commits,
+            submission_plan,
+            preservation_branch,
+            clean_worktree,
+            safe,
+            refusals,
+            digest: String::new(),
+        })
+    }
+
+    pub fn apply_session_checkpoint_recovery(
+        &mut self,
+        session_id: i64,
+        confirm: &str,
+    ) -> Result<SessionCheckpointApplyReport, BrokerOpError> {
+        if confirm.len() != 64
+            || !confirm
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        {
+            return Err(BrokerOpError::CheckpointConfirmationNotSha256);
+        }
+        let plan = self.plan_session_checkpoint_recovery(session_id)?;
+        if plan.digest != confirm {
+            return Err(BrokerOpError::CheckpointConfirmationMismatch {
+                expected: plan.digest,
+                actual: confirm.to_string(),
+            });
+        }
+        if !plan.safe {
+            return Err(BrokerOpError::UnsafeCheckpointRecovery {
+                reasons: plan.refusals.join("; "),
+            });
+        }
+        let old_checkpoint = plan
+            .old_checkpoint
+            .clone()
+            .expect("safe recovery has an old checkpoint");
+        let proposed_checkpoint = plan
+            .proposed_checkpoint
+            .clone()
+            .expect("safe recovery has a proposed checkpoint");
+        let preservation_ref = format!("refs/heads/{}", plan.preservation_branch);
+        match self.repo.resolve_ref(&preservation_ref) {
+            Some(actual) if actual != plan.session_head => {
+                return Err(BrokerOpError::CheckpointPreservationRefConflict {
+                    reference: preservation_ref,
+                    actual,
+                    expected: plan.session_head,
+                });
+            }
+            Some(_) => {}
+            None => self.repo.update_branch_ref_checked(
+                &plan.preservation_branch,
+                &plan.session_head,
+                "0000000000000000000000000000000000000000",
+            )?,
+        }
+        let event_payload = crate::events::session_checkpoint_reanchored_payload(
+            &old_checkpoint,
+            &proposed_checkpoint,
+            &plan.session_head,
+            &plan.digest,
+            &preservation_ref,
+        );
+        self.store.reanchor_session_checkpoint(
+            session_id,
+            &old_checkpoint,
+            &proposed_checkpoint,
+            &event_payload,
+        )?;
+        Ok(SessionCheckpointApplyReport {
+            plan,
+            applied: true,
+            accepted_session_head: proposed_checkpoint,
+            preservation_ref,
+        })
+    }
+
     pub fn repair(&mut self, session_id: i64) -> Result<RepairReport, BrokerOpError> {
         let session = self.store.session(session_id)?;
         let worktree_path = session.worktree_path.clone();

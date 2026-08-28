@@ -34,6 +34,15 @@ pub enum BrokerError {
     #[error("no session with id {0}")]
     SessionNotFound(i64),
 
+    #[error(
+        "session {session_id} checkpoint changed while recovery was being applied (expected {expected}, found {actual})"
+    )]
+    SessionCheckpointChanged {
+        session_id: i64,
+        expected: String,
+        actual: String,
+    },
+
     #[error("no coordinated operation with id {0}")]
     CoordinatedOperationNotFound(i64),
 
