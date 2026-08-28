@@ -3000,12 +3000,12 @@ impl Broker {
         let integration_contains_upstream = upstream_head
             .as_deref()
             .is_some_and(|upstream| self.repo.is_ancestor(upstream, &head));
-        if main_behind_upstream_commits > 0 && !integration_contains_upstream {
+        if upstream_head.is_some() && !integration_contains_upstream {
             let upstream = upstream_ref.as_deref().unwrap_or("@{upstream}");
             next_action = IntegrationNextAction {
                 state: IntegrationDeliveryState::Blocked,
                 summary: format!(
-                    "external main movement detected: local main is {main_behind_upstream_commits} commits behind {upstream}; plan reconciliation before repair or submit"
+                    "external main movement detected: integration does not contain {upstream}; plan reconciliation before repair or submit"
                 ),
                 commands: vec![format!(
                     "aethyme broker integration reconcile --upstream {upstream} --dry-run"
@@ -3166,7 +3166,9 @@ impl Broker {
         let integration_contains_upstream = upstream_head
             .as_deref()
             .is_some_and(|upstream| self.repo.is_ancestor(upstream, &integration_head));
-        if main_behind_upstream_commits > 0 {
+        if upstream_head.is_some()
+            && (main_behind_upstream_commits > 0 || !integration_contains_upstream)
+        {
             let upstream = upstream_ref.as_deref().unwrap_or("@{upstream}");
             advice.insert(
                 0,
@@ -3184,7 +3186,7 @@ impl Broker {
                         )
                     } else {
                         format!(
-                            "external main movement detected: local main is {main_behind_upstream_commits} commits behind {upstream}; repair and submit are unsafe until reconciliation is planned"
+                            "external main movement detected: integration does not contain {upstream}; repair and submit are unsafe until reconciliation is planned"
                         )
                     },
                     session_id: None,

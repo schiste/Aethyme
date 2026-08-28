@@ -448,7 +448,10 @@ fn promotion_persists_one_non_blocking_advisory_per_affected_live_session() {
     // publication evidence.
     let later_worktree = agent_worktree_at(tmp.path(), "later", "aethyme/integration");
     let later = broker
-        .adopt(&later_worktree, Some("rewrite an exposed path after rebasing"))
+        .adopt(
+            &later_worktree,
+            Some("rewrite an exposed path after rebasing"),
+        )
         .unwrap();
     commit_edit(&later_worktree, "src/a.py", "a = rewritten later\n");
     let later_outcome = broker.submit(later.id).unwrap();
@@ -2790,6 +2793,81 @@ fn status_warns_on_the_first_external_main_movement() {
             .commands
             .iter()
             .any(|command| command.contains("--upstream origin/main --dry-run"))
+    );
+}
+
+#[test]
+fn status_warns_when_local_and_upstream_main_move_together_beyond_integration() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    sh(tmp.path(), &["switch", "-qc", "promoted", "main"]);
+    std::fs::write(tmp.path().join("src/b.py"), "b = 2\n").unwrap();
+    sh(tmp.path(), &["add", "src/b.py"]);
+    sh(tmp.path(), &["commit", "-qm", "promoted integration work"]);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/heads/aethyme/integration", "HEAD"],
+    );
+    sh(tmp.path(), &["switch", "-qc", "external-main", "main"]);
+    std::fs::write(tmp.path().join("src/a.py"), "a = 2\n").unwrap();
+    sh(tmp.path(), &["add", "src/a.py"]);
+    sh(
+        tmp.path(),
+        &["commit", "-qm", "main advances outside broker"],
+    );
+    sh(tmp.path(), &["update-ref", "refs/heads/main", "HEAD"]);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(tmp.path(), &["switch", "main"]);
+    sh(tmp.path(), &["config", "remote.origin.url", "."]);
+    sh(
+        tmp.path(),
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    sh(tmp.path(), &["config", "branch.main.remote", "origin"]);
+    sh(
+        tmp.path(),
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+
+    let status = broker.status(0).unwrap();
+    assert_eq!(status.main_head, resolve(tmp.path(), "origin/main"));
+    assert_eq!(status.upstream_ref.as_deref(), Some("origin/main"));
+    assert_eq!(status.upstream_head, Some(status.main_head.clone()));
+    assert_ne!(status.integration_head, status.main_head);
+    assert_eq!(status.main_behind_upstream_commits, 0);
+    assert!(
+        status.advice.iter().any(|advice| {
+            advice.id == "integration.upstream-main-ahead"
+                && advice.severity == StatusAdviceSeverity::Blocked
+                && advice
+                    .summary
+                    .contains("integration does not contain origin/main")
+                && advice.commands
+                    == vec!["aethyme broker integration reconcile --upstream origin/main --dry-run"]
+        }),
+        "{:?}",
+        status.advice
+    );
+
+    let integration = broker.integration_status(0).unwrap();
+    assert_eq!(integration.main_behind_upstream_commits, 0);
+    assert_eq!(
+        integration.next_action.state,
+        IntegrationDeliveryState::Blocked
+    );
+    assert!(
+        integration
+            .next_action
+            .summary
+            .contains("integration does not contain origin/main")
     );
 }
 
