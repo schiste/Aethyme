@@ -3345,6 +3345,12 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     "Started session {} — worktree {} on branch {}",
                     session.id, session.worktree_path, session.branch
                 );
+                println!(
+                    "Start base: {} at {} ({})",
+                    report.start_base.ref_name,
+                    short_commit(&report.start_base.commit),
+                    report.start_base.evidence.as_str()
+                );
                 render_planned_explicit_leases(&report.planned_explicit_leases);
                 println!("Next: cd {}", session.worktree_path);
             }

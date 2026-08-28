@@ -225,6 +225,13 @@ impl GitRepo {
         run_git(&self.root, &["rev-parse", "--abbrev-ref", "HEAD"])
     }
 
+    /// Resolve a symbolic ref without falling back to the checked-out HEAD.
+    pub fn symbolic_ref(&self, name: &str) -> Option<String> {
+        run_git(&self.root, &["symbolic-ref", "--quiet", name])
+            .ok()
+            .filter(|value| !value.is_empty())
+    }
+
     /// Configured tracking ref and its currently fetched commit. This is
     /// read-only: status and reconciliation never perform an implicit fetch.
     pub fn tracking_upstream(&self) -> Option<(String, String)> {

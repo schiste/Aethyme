@@ -74,6 +74,8 @@ fn start_cli_returns_deterministic_planned_leases_and_status_exposes_them() {
         ],
     ));
     let value: serde_json::Value = serde_json::from_str(&started).unwrap();
+    assert_eq!(value["start_base"]["ref_name"], "refs/heads/main");
+    assert_eq!(value["start_base"]["evidence"], "conventional_main");
     assert_eq!(
         value["planned_explicit_leases"]
             .as_array()
@@ -112,6 +114,75 @@ fn start_cli_returns_deterministic_planned_leases_and_status_exposes_them() {
         String::from_utf8_lossy(&conflict.stderr).contains("planned lease"),
         "{}",
         String::from_utf8_lossy(&conflict.stderr)
+    );
+}
+
+#[test]
+fn start_selects_integration_or_default_branch_without_using_checkout_head() {
+    for checkout in ["main", "feature", "detached"] {
+        let tmp = fixture();
+        let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+        if checkout != "main" {
+            git(tmp.path(), &["switch", "-qc", "feature"]);
+            std::fs::write(tmp.path().join("feature.txt"), checkout).unwrap();
+            git(tmp.path(), &["add", "feature.txt"]);
+            git(tmp.path(), &["commit", "-qm", "throwaway feature"]);
+        }
+        if checkout == "detached" {
+            git(tmp.path(), &["checkout", "--detach", "HEAD"]);
+        }
+
+        let started = stdout(&run(tmp.path(), &["start", "--task", checkout, "--json"]));
+        let value: serde_json::Value = serde_json::from_str(&started).unwrap();
+        assert_eq!(value["start_base"]["ref_name"], "refs/heads/main");
+        assert_eq!(value["start_base"]["commit"], main);
+        assert_eq!(value["diff_base"], main);
+    }
+
+    let tmp = fixture();
+    git(tmp.path(), &["switch", "-qc", "promoted"]);
+    std::fs::write(tmp.path().join("promoted.txt"), "integration\n").unwrap();
+    git(tmp.path(), &["add", "promoted.txt"]);
+    git(tmp.path(), &["commit", "-qm", "promoted work"]);
+    let integration = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    git(
+        tmp.path(),
+        &["update-ref", "refs/heads/aethyme/integration", &integration],
+    );
+    let started = stdout(&run(
+        tmp.path(),
+        &["start", "--task", "from integration", "--json"],
+    ));
+    let value: serde_json::Value = serde_json::from_str(&started).unwrap();
+    assert_eq!(
+        value["start_base"]["ref_name"],
+        "refs/heads/aethyme/integration"
+    );
+    assert_eq!(value["start_base"]["commit"], integration);
+    assert_eq!(value["start_base"]["evidence"], "integration_tip");
+}
+
+#[test]
+fn start_refuses_ambiguous_or_missing_default_refs() {
+    let ambiguous = fixture();
+    git(ambiguous.path(), &["branch", "master", "main"]);
+    let output = run(ambiguous.path(), &["start", "--task", "ambiguous default"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("both refs/heads/main and refs/heads/master exist"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let missing = fixture();
+    git(missing.path(), &["branch", "-m", "feature-only"]);
+    let output = run(missing.path(), &["start", "--task", "missing default"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no integration tip"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

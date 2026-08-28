@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::PromoteConfig;
 use crate::error::BrokerError;
 use crate::git::{GitError, GitRepo};
 use crate::graph_impact::{
@@ -84,6 +85,8 @@ pub enum BrokerOpError {
         command: String,
         source: std::io::Error,
     },
+    #[error("cannot select a safe base for broker start: {reason}")]
+    StartBaseUnavailable { reason: String },
     #[error("cannot capture repository contract at {path}: {reason}")]
     RepositoryContract { path: String, reason: String },
     #[error(
@@ -369,7 +372,35 @@ pub struct AdoptReport {
 pub struct StartReport {
     #[serde(flatten)]
     pub session: Session,
+    pub start_base: SessionStartBase,
     pub planned_explicit_leases: Vec<crate::Lease>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStartBaseEvidence {
+    IntegrationTip,
+    RemoteDefaultBranch,
+    ConventionalMain,
+    ConventionalMaster,
+}
+
+impl SessionStartBaseEvidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IntegrationTip => "integration tip",
+            Self::RemoteDefaultBranch => "remote default branch",
+            Self::ConventionalMain => "conventional main branch",
+            Self::ConventionalMaster => "conventional master branch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionStartBase {
+    pub ref_name: String,
+    pub commit: String,
+    pub evidence: SessionStartBaseEvidence,
 }
 
 /// A session enriched with liveness derived at read time — what
@@ -1665,7 +1696,8 @@ impl Broker {
     ) -> Result<StartReport, BrokerOpError> {
         let planned_paths = normalize_planned_paths(paths)?;
         self.ensure_planned_paths_available(&planned_paths, None)?;
-        let (_slug, branch, base, worktree) = self.create_session_worktree(task)?;
+        let (_slug, branch, start_base, worktree) = self.create_session_worktree(task)?;
+        let base = start_base.commit.clone();
         let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
         let new_session = NewSession {
             worktree_path: worktree.root().to_string_lossy().into_owned(),
@@ -1696,6 +1728,7 @@ impl Broker {
         let planned_explicit_leases = self.planned_explicit_leases(session.id, &planned_paths)?;
         Ok(StartReport {
             session,
+            start_base,
             planned_explicit_leases,
         })
     }
@@ -1705,7 +1738,8 @@ impl Broker {
     /// the child runs detached (the broker never owns the process beyond
     /// recording its PID).
     pub fn start_agent(&mut self, task: &str, command: &str) -> Result<Session, BrokerOpError> {
-        let (slug, branch, base, worktree) = self.create_session_worktree(task)?;
+        let (slug, branch, start_base, worktree) = self.create_session_worktree(task)?;
+        let base = start_base.commit;
         let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
 
         let log_dir = self.main_root.join(".aethyme/logs");
@@ -1756,13 +1790,61 @@ impl Broker {
     fn create_session_worktree(
         &mut self,
         task: &str,
-    ) -> Result<(String, String, String, GitRepo), BrokerOpError> {
+    ) -> Result<(String, String, SessionStartBase, GitRepo), BrokerOpError> {
         let slug = self.next_worktree_slug(task);
         let worktree_path = self.main_root.join(".aethyme/worktrees").join(&slug);
         let branch = format!("agent/{slug}");
-        let base = self.repo.head_commit()?;
-        let worktree = self.repo.worktree_add(&worktree_path, &branch, &base)?;
-        Ok((slug, branch, base, worktree))
+        let start_base = self.select_session_start_base()?;
+        let worktree = self
+            .repo
+            .worktree_add(&worktree_path, &branch, &start_base.commit)?;
+        Ok((slug, branch, start_base, worktree))
+    }
+
+    fn select_session_start_base(&self) -> Result<SessionStartBase, BrokerOpError> {
+        let integration_branch = PromoteConfig::load(&self.main_root).branch;
+        let integration_ref = format!("refs/heads/{integration_branch}");
+        if let Some(commit) = self.repo.resolve_ref(&integration_ref) {
+            return Ok(SessionStartBase {
+                ref_name: integration_ref,
+                commit,
+                evidence: SessionStartBaseEvidence::IntegrationTip,
+            });
+        }
+
+        if let Some(remote_head) = self.repo.symbolic_ref("refs/remotes/origin/HEAD") {
+            if let Some(branch_name) = remote_head.strip_prefix("refs/remotes/origin/") {
+                let local_ref = format!("refs/heads/{branch_name}");
+                if let Some(commit) = self.repo.resolve_ref(&local_ref) {
+                    return Ok(SessionStartBase {
+                        ref_name: local_ref,
+                        commit,
+                        evidence: SessionStartBaseEvidence::RemoteDefaultBranch,
+                    });
+                }
+            }
+        }
+
+        let main = self.repo.resolve_ref("refs/heads/main");
+        let master = self.repo.resolve_ref("refs/heads/master");
+        match (main, master) {
+            (Some(commit), None) => Ok(SessionStartBase {
+                ref_name: "refs/heads/main".into(),
+                commit,
+                evidence: SessionStartBaseEvidence::ConventionalMain,
+            }),
+            (None, Some(commit)) => Ok(SessionStartBase {
+                ref_name: "refs/heads/master".into(),
+                commit,
+                evidence: SessionStartBaseEvidence::ConventionalMaster,
+            }),
+            (Some(_), Some(_)) => Err(BrokerOpError::StartBaseUnavailable {
+                reason: "both refs/heads/main and refs/heads/master exist, but origin/HEAD does not select one".into(),
+            }),
+            (None, None) => Err(BrokerOpError::StartBaseUnavailable {
+                reason: "no integration tip, origin/HEAD-backed local branch, or unambiguous main/master ref exists".into(),
+            }),
+        }
     }
 
     fn next_worktree_slug(&self, task: &str) -> String {
