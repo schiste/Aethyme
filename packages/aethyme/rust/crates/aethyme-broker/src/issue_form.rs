@@ -492,6 +492,20 @@ fn render_session(snapshot: &ReportSnapshot) -> Option<String> {
 fn render_last_failure(snapshot: &ReportSnapshot) -> Option<String> {
     let failure = snapshot.last_known_failure.as_ref()?;
     Some(match failure {
+        ReportLastFailure::BrokerCommand {
+            command_surface,
+            failure_class,
+            session_id,
+            operation_id,
+            queue_entry_id,
+            recorded_at,
+            exit_code,
+        } => format!(
+            "Command `{command_surface}` failed with class `{failure_class}` at {recorded_at} (session {}, operation {}, queue entry {}, exit code {exit_code}).",
+            session_id.map_or_else(|| "unknown".into(), |value| value.to_string()),
+            operation_id.map_or_else(|| "unknown".into(), |value| value.to_string()),
+            queue_entry_id.map_or_else(|| "unknown".into(), |value| value.to_string()),
+        ),
         ReportLastFailure::Session {
             session_id,
             recorded_at,

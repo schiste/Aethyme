@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use aethyme_broker::Broker;
+use aethyme_broker::{Broker, NewSession, SessionOrigin};
 use sha2::{Digest, Sha256};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
@@ -351,6 +351,67 @@ fn task_text_is_inferred_from_the_current_session_only_with_opt_in() {
     let included = run(tmp.path(), &included);
     assert!(included.status.success());
     assert!(String::from_utf8_lossy(&included.stdout).contains("TASK-TEXT-SECRET"));
+}
+
+#[test]
+fn failed_submit_is_captured_as_a_redacted_structured_command_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = test_broker(tmp.path());
+    let session = broker
+        .store()
+        .register_session(&NewSession {
+            worktree_path: tmp.path().to_string_lossy().into_owned(),
+            branch: "main".into(),
+            origin: SessionOrigin::Adopted,
+            task: Some("TASK-TEXT-SECRET".into()),
+            diff_base: None,
+            adoption_base: None,
+            adopted_head: None,
+            repository_contract: None,
+            pid: None,
+            command: None,
+            log_path: None,
+        })
+        .unwrap();
+    std::fs::write(tmp.path().join("README.md"), "pending change\n").unwrap();
+    git(tmp.path(), &["add", "README.md"]);
+    git(tmp.path(), &["commit", "-qm", "pending"]);
+    drop(broker);
+
+    let session_id = session.id.to_string();
+    let failed = run(tmp.path(), &["submit", "--session", &session_id]);
+    assert!(!failed.status.success());
+    let report = run(
+        tmp.path(),
+        &[
+            "report",
+            "capture",
+            "--kind",
+            "bug",
+            "--title",
+            "Submit failure",
+            "--session",
+            &session_id,
+            "--stdout",
+        ],
+    );
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let report_json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    let failure = &report_json["snapshot"]["last_known_failure"];
+    assert_eq!(failure["source"], "broker_command");
+    assert_eq!(failure["command_surface"], "broker.submit");
+    assert_eq!(failure["failure_class"], "submission_failed");
+    assert_eq!(failure["session_id"], session.id);
+    assert_eq!(failure["exit_code"], 1);
+    let bytes = String::from_utf8_lossy(&report.stdout);
+    assert!(!bytes.contains("TASK-TEXT-SECRET"));
+    assert!(!bytes.contains("no recorded baseline"));
+    assert!(!bytes.contains(tmp.path().to_string_lossy().as_ref()));
 }
 
 #[test]

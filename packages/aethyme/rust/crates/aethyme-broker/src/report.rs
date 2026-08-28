@@ -928,7 +928,8 @@ impl<'a> ReportSnapshotBuilder<'a> {
         });
         gates.truncate(REPORT_RECENT_GATE_LIMIT);
 
-        let last_known_failure = last_known_failure(self.session, self.operations, self.gates);
+        let last_known_failure =
+            last_known_failure(self.session, self.events, self.operations, self.gates);
 
         ReportSnapshot {
             schema_version: REPORT_SNAPSHOT_SCHEMA_VERSION,
@@ -1033,6 +1034,15 @@ pub struct ReportGateProvenance {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum ReportLastFailure {
+    BrokerCommand {
+        command_surface: String,
+        failure_class: String,
+        session_id: Option<i64>,
+        operation_id: Option<i64>,
+        queue_entry_id: Option<i64>,
+        recorded_at: i64,
+        exit_code: u8,
+    },
     Session {
         session_id: i64,
         recorded_at: i64,
@@ -1064,10 +1074,87 @@ struct FailureCandidate {
 
 fn last_known_failure(
     session: Option<&Session>,
+    events: &[Event],
     operations: &[CoordinatedOperation],
     gates: &[ReportGateObservation<'_>],
 ) -> Option<ReportLastFailure> {
     let mut candidates = Vec::new();
+    let mut command_outcomes = BTreeMap::<(Option<i64>, String), &Event>::new();
+    for event in events {
+        if !matches!(
+            event.kind.as_str(),
+            crate::events::BROKER_COMMAND_FAILED | crate::events::BROKER_COMMAND_SUCCEEDED
+        ) {
+            continue;
+        }
+        let Some(payload) = event
+            .payload_json
+            .as_deref()
+            .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        else {
+            continue;
+        };
+        let Some(surface) = payload
+            .get("command_surface")
+            .and_then(serde_json::Value::as_str)
+            .filter(|surface| safe_command_surface(surface))
+        else {
+            continue;
+        };
+        let key = (event.session_id, surface.to_string());
+        if command_outcomes
+            .get(&key)
+            .is_none_or(|current| event.id > current.id)
+        {
+            command_outcomes.insert(key, event);
+        }
+    }
+    for ((session_id, command_surface), event) in command_outcomes {
+        if event.kind != crate::events::BROKER_COMMAND_FAILED {
+            continue;
+        }
+        let Some(payload) = event
+            .payload_json
+            .as_deref()
+            .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        else {
+            continue;
+        };
+        let Some(failure_class) = payload
+            .get("failure_class")
+            .and_then(serde_json::Value::as_str)
+            .filter(|class| safe_failure_class(class))
+        else {
+            continue;
+        };
+        let Some(exit_code) = payload
+            .get("exit_code")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|code| u8::try_from(code).ok())
+        else {
+            continue;
+        };
+        let operation_id = payload
+            .get("operation_id")
+            .and_then(serde_json::Value::as_i64);
+        let queue_entry_id = payload
+            .get("queue_entry_id")
+            .and_then(serde_json::Value::as_i64);
+        candidates.push(FailureCandidate {
+            recorded_at: event.ts,
+            source_rank: 3,
+            stable_key: format!("{session_id:?}:{command_surface}"),
+            failure: ReportLastFailure::BrokerCommand {
+                command_surface,
+                failure_class: failure_class.to_string(),
+                session_id,
+                operation_id,
+                queue_entry_id,
+                recorded_at: event.ts,
+                exit_code,
+            },
+        });
+    }
     if let Some(session) = session
         && let Some(exit_code) = session.exit_code.filter(|code| *code != 0)
     {
@@ -1132,6 +1219,22 @@ fn last_known_failure(
         .into_iter()
         .max_by(compare_failure_candidates)
         .map(|candidate| candidate.failure)
+}
+
+fn safe_command_surface(surface: &str) -> bool {
+    surface.starts_with("broker.")
+        && surface.len() <= 80
+        && surface
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'.' || byte == b'-')
+}
+
+fn safe_failure_class(class: &str) -> bool {
+    !class.is_empty()
+        && class.len() <= 64
+        && class
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
 }
 
 fn compare_failure_candidates(left: &FailureCandidate, right: &FailureCandidate) -> Ordering {
@@ -1489,6 +1592,26 @@ mod tests {
                 exit_code: 17,
             })
         );
+    }
+
+    #[test]
+    fn successful_command_outcome_supersedes_the_same_redacted_failure() {
+        let build = build();
+        let failed = event(
+            60,
+            crate::events::BROKER_COMMAND_FAILED,
+            r#"{"command_surface":"broker.submit","exit_code":1,"failure_class":"submission_failed","operation_id":null,"queue_entry_id":null}"#,
+        );
+        let recovered = event(
+            61,
+            crate::events::BROKER_COMMAND_SUCCEEDED,
+            r#"{"command_surface":"broker.submit","exit_code":0,"failure_class":null,"operation_id":null,"queue_entry_id":12}"#,
+        );
+        let events = [failed, recovered];
+        let snapshot = ReportSnapshotBuilder::new(&build, "linux", "x86_64")
+            .recent_events(&events)
+            .build();
+        assert_eq!(snapshot.last_known_failure, None);
     }
 
     fn init_repo(path: &Path) {

@@ -18,6 +18,8 @@ use serde_json::json;
 pub const SESSION_REGISTERED: &str = "session.registered";
 pub const SESSION_REUSED: &str = "session.reused";
 pub const SESSION_FINISHED: &str = "session.finished";
+pub const BROKER_COMMAND_FAILED: &str = "broker.command.failed";
+pub const BROKER_COMMAND_SUCCEEDED: &str = "broker.command.succeeded";
 // session.<status> transition kinds are derived from SessionStatus::as_str
 // (active/idle/stale/exited/cleaned) by the store.
 pub const LEASE_CLAIMED: &str = "lease.claimed";
@@ -45,6 +47,23 @@ pub fn session_reused_payload(task: Option<&str>, diff_base: Option<&str>) -> St
 
 pub fn session_exit_payload(exit_code: i64) -> String {
     json!({ "exit_code": exit_code }).to_string()
+}
+
+pub fn broker_command_outcome_payload(
+    command_surface: &str,
+    exit_code: u8,
+    failure_class: Option<&str>,
+    operation_id: Option<i64>,
+    queue_entry_id: Option<i64>,
+) -> String {
+    json!({
+        "command_surface": command_surface,
+        "exit_code": exit_code,
+        "failure_class": failure_class,
+        "operation_id": operation_id,
+        "queue_entry_id": queue_entry_id,
+    })
+    .to_string()
 }
 
 /// Redacted durable handoff. Deliberately excludes the absolute worktree

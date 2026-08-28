@@ -349,23 +349,26 @@ pub fn run_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
         return crate::contract_check::run(&args[1..]);
     }
     let started = std::time::Instant::now();
-    let code = match run_inner(args, mode) {
-        Ok(()) => 0,
+    let (code, record_outcome) = match run_inner(args, mode) {
+        Ok(()) => (0, true),
         Err(UsageError::Help) => {
             eprint!("{USAGE}");
-            2
+            (2, false)
         }
         Err(UsageError::Message(message)) => {
             eprintln!("Error: {message}");
-            1
+            (1, true)
         }
         Err(UsageError::Exit { message, code }) => {
             eprintln!("Error: {message}");
-            code
+            (code, true)
         }
-        Err(UsageError::SilentExit(code)) => code,
+        Err(UsageError::SilentExit(code)) => (code, true),
     };
     if mode == CompatibilityMode::Normal {
+        if record_outcome {
+            record_command_outcome(args, code);
+        }
         record_command_metric(args, code, started.elapsed().as_millis() as i64);
     }
     code
@@ -375,76 +378,137 @@ pub fn run_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
 /// an allowlist of known subcommand words, so positional values (paths,
 /// session ids, task text) can never leak into the metrics file. Best
 /// effort — any failure is silently ignored.
+const KNOWN_COMMAND_WORDS: &[&str] = &[
+    "adopt",
+    "start",
+    "start-agent",
+    "exec",
+    "git",
+    "gh",
+    "operations",
+    "advisories",
+    "reconcile",
+    "agents",
+    "leases",
+    "resources",
+    "claim",
+    "release",
+    "gates",
+    "draft",
+    "validate",
+    "affected",
+    "semantic",
+    "run",
+    "pre-push",
+    "hooks",
+    "install",
+    "uninstall",
+    "pre-commit",
+    "post-commit",
+    "pr",
+    "check",
+    "submit",
+    "repair",
+    "queue",
+    "promote",
+    "ship",
+    "plan",
+    "execute",
+    "sync-main",
+    "sync-integration",
+    "no-cache",
+    "integration",
+    "status",
+    "events",
+    "prune",
+    "metrics",
+    "doctor",
+    "quick-test",
+    "verify-loop",
+    "e2e",
+    "finish",
+    "handoff",
+    "report",
+    "capture",
+    "cleanup",
+    "certify",
+    "scaffold",
+    "init",
+];
+
+fn safe_command_surface(args: &[String]) -> Option<String> {
+    let first = args.first()?.as_str();
+    if !KNOWN_COMMAND_WORDS.contains(&first) {
+        return None;
+    }
+    let mut words = vec![first];
+    if let Some(second) = args.get(1).map(String::as_str)
+        && KNOWN_COMMAND_WORDS.contains(&second)
+    {
+        words.push(second);
+    }
+    Some(words.join("."))
+}
+
+fn record_command_outcome(args: &[String], exit: u8) {
+    if !command_records_metric(args) {
+        return;
+    }
+    let Some(surface) = safe_command_surface(args) else {
+        return;
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let Ok(repo) = crate::GitRepo::discover(&cwd) else {
+        return;
+    };
+    let Ok(main_root) = repo.main_root() else {
+        return;
+    };
+    let Ok(mut store) = crate::BrokerStore::open_in_repo(&main_root) else {
+        return;
+    };
+    let explicit_session = args
+        .windows(2)
+        .find(|pair| pair[0] == "--session")
+        .and_then(|pair| pair[1].parse::<i64>().ok());
+    let session_id = explicit_session.or_else(|| {
+        store
+            .session_for_worktree(repo.root().to_string_lossy().as_ref())
+            .ok()
+            .flatten()
+            .map(|session| session.id)
+    });
+    let command_surface = format!("broker.{surface}");
+    let failure_class = (exit != 0).then_some(match args.first().map(String::as_str) {
+        Some("submit") => "submission_failed",
+        Some("repair") => "recovery_failed",
+        Some("git" | "gh") => "coordinated_operation_failed",
+        _ => "command_failed",
+    });
+    let payload = crate::events::broker_command_outcome_payload(
+        &command_surface,
+        exit,
+        failure_class,
+        None,
+        None,
+    );
+    let kind = if exit == 0 {
+        crate::events::BROKER_COMMAND_SUCCEEDED
+    } else {
+        crate::events::BROKER_COMMAND_FAILED
+    };
+    let _ = store.append_event(kind, session_id, Some(&payload));
+}
+
 fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
     if !command_records_metric(args) {
         return;
     }
-    const KNOWN: &[&str] = &[
-        "adopt",
-        "start",
-        "start-agent",
-        "exec",
-        "git",
-        "gh",
-        "operations",
-        "advisories",
-        "reconcile",
-        "agents",
-        "leases",
-        "resources",
-        "claim",
-        "release",
-        "gates",
-        "draft",
-        "validate",
-        "affected",
-        "semantic",
-        "run",
-        "pre-push",
-        "hooks",
-        "install",
-        "uninstall",
-        "pre-commit",
-        "post-commit",
-        "pr",
-        "check",
-        "submit",
-        "repair",
-        "queue",
-        "promote",
-        "ship",
-        "plan",
-        "execute",
-        "sync-main",
-        "sync-integration",
-        "no-cache",
-        "integration",
-        "status",
-        "events",
-        "prune",
-        "metrics",
-        "doctor",
-        "quick-test",
-        "verify-loop",
-        "e2e",
-        "finish",
-        "handoff",
-        "report",
-        "capture",
-        "cleanup",
-        "certify",
-        "scaffold",
-        "init",
-    ];
-    let label: Vec<&str> = args
-        .iter()
-        .map(String::as_str)
-        .filter(|a| KNOWN.contains(a))
-        .take(2)
-        .collect();
-    if label.is_empty() {
-        return; // nothing recognizable
-    }
+    let Some(label) = safe_command_surface(args) else {
+        return;
+    };
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
@@ -462,7 +526,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         .unwrap_or(0);
     let line = format!(
         "{{\"ts\":{ts},\"command\":\"{}\",\"duration_ms\":{duration_ms},\"exit\":{exit}}}\n",
-        label.join(".")
+        label
     );
     use std::io::Write;
     if let Ok(mut file) = std::fs::OpenOptions::new()
