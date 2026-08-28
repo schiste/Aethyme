@@ -601,6 +601,15 @@ fn follow_up_refuses_to_replace_a_rewritten_accepted_checkpoint_with_integration
     assert!(message.contains("cannot replace it as the ownership boundary"));
     let persisted = broker.store().session(session.id).unwrap();
     assert_eq!(persisted.accepted_session_head, Some(accepted_head));
+    assert!(
+        broker
+            .store()
+            .merge_queue()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.head_commit != rewritten_head),
+        "the refused rewritten head must not appear as submitted work"
+    );
     assert_eq!(
         file_at(tmp.path(), "aethyme/integration", "src/b.py"),
         "b = 1\n",
@@ -1118,6 +1127,21 @@ fn normalized_replay_refuses_missing_baseline_and_owned_merge_commits() {
         None,
         "ambiguous ownership must not advance the checkpoint"
     );
+    assert!(missing_broker.store().merge_queue().unwrap().is_empty());
+    assert!(missing_broker.submit(missing_session.id).is_err());
+    assert!(
+        missing_broker.store().merge_queue().unwrap().is_empty(),
+        "repeated planning failures must not accumulate queue entries"
+    );
+    assert_eq!(
+        missing_broker
+            .store()
+            .events_after_filtered(0, 10, Some("merge.submission_planning_failed"))
+            .unwrap()
+            .len(),
+        2,
+        "each refusal remains auditable without a live queue row"
+    );
 
     let merge_tmp = tempfile::tempdir().unwrap();
     init_repo(merge_tmp.path());
@@ -1165,6 +1189,9 @@ fn normalized_replay_refuses_missing_baseline_and_owned_merge_commits() {
         )),
         "{remediation}"
     );
+    assert!(merge_broker.store().merge_queue().unwrap().is_empty());
+    assert!(merge_broker.submit(merge_session.id).is_err());
+    assert!(merge_broker.store().merge_queue().unwrap().is_empty());
 }
 
 #[test]

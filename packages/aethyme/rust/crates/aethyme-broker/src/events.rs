@@ -28,6 +28,7 @@ pub const GATE_CACHED: &str = "gate.cached";
 // merge.<status> kinds derive from MergeStatus::as_str.
 pub const MERGE_INTEGRATION_BRANCH_CREATED: &str = "merge.integration_branch_created";
 pub const MERGE_INTEGRATION_REFRESHED: &str = "merge.integration_refreshed";
+pub const MERGE_SUBMISSION_PLANNING_FAILED: &str = "merge.submission_planning_failed";
 // operation.<status> transition kinds derive from OperationStatus::as_str.
 
 // ── payload constructors ─────────────────────────────────────────────
@@ -91,6 +92,10 @@ pub fn gate_cached_payload(
 
 pub fn merge_submitted_payload(head: &str) -> String {
     json!({ "head": head }).to_string()
+}
+
+pub fn merge_submission_planning_failed_payload(head: &str, failure_class: &str) -> String {
+    json!({ "head": head, "failure_class": failure_class }).to_string()
 }
 
 pub fn integration_branch_created_payload(branch: &str, at_commit: &str) -> String {

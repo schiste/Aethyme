@@ -359,6 +359,26 @@ impl Broker {
         }
         let (_branch, base) = self.integration_head()?;
 
+        // Provenance and replay planning are deterministic and ref-free. Run
+        // them before creating a live queue row so a fail-closed ownership
+        // decision cannot leave behind misleading `submitted` residue. The
+        // persisted entry is still planned again against the then-current
+        // integration tip below, because another process may move that ref.
+        let planning = self
+            .build_submission_plan(&session, &head, &base)
+            .and_then(|plan| self.replay_submission_plan(&plan).map(|_| ()));
+        if let Err(error) = planning {
+            self.store().append_event(
+                crate::events::MERGE_SUBMISSION_PLANNING_FAILED,
+                Some(session_id),
+                Some(&crate::events::merge_submission_planning_failed_payload(
+                    &head,
+                    submission_planning_failure_class(&error),
+                )),
+            )?;
+            return Err(error);
+        }
+
         let entry = self.store().submit(session_id, &head, &base)?;
         // A new head supersedes this session's older in-flight entries:
         // without this, a stale conflicted entry would be re-simulated
@@ -1249,6 +1269,14 @@ impl Broker {
         blocking.sort_unstable();
         blocking.dedup();
         Ok(blocking)
+    }
+}
+
+fn submission_planning_failure_class(error: &BrokerOpError) -> &'static str {
+    match error {
+        BrokerOpError::UnsafeSubmissionPlan { .. } => "unsafe_provenance",
+        BrokerOpError::UnsupportedSubmissionCommit { .. } => "unsupported_commit_shape",
+        _ => "planning_error",
     }
 }
 
