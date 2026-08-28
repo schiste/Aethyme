@@ -146,12 +146,15 @@ pub enum BrokerOpError {
     #[error("refusing submission for session {session_id}: unsafe submission plan: {reason}")]
     UnsafeSubmissionPlan { session_id: i64, reason: String },
     #[error(
-        "refusing submission for session {session_id}: owned commit {commit} has {parent_count} parents; normalized replay supports only single-parent commits"
+        "refusing submission for session {session_id}: owned commit {commit} has {parent_count} parents; normalized replay supports only single-parent commits\naccepted checkpoint: {recorded_baseline}\nsession HEAD: {session_head}\npreserve the pending history before rewriting it:\n  git branch {recovery_branch} {session_head}\nthen review and flatten the owned tree change from the accepted checkpoint:\n  git reset --soft {recorded_baseline}\n  git commit\n  aethyme broker submit --session {session_id}"
     )]
     UnsupportedSubmissionCommit {
         session_id: i64,
         commit: String,
         parent_count: usize,
+        recorded_baseline: String,
+        session_head: String,
+        recovery_branch: String,
     },
     #[error("ship queue entry {entry} was not found")]
     ShipEntryNotFound { entry: i64 },

@@ -193,6 +193,15 @@ ownership or stable patch identity is ambiguous, or a pending owned commit is
 a merge commit. A session rebased directly onto the current integration tip is
 accepted only when that range is unambiguous.
 
+For an owned merge commit, the refusal is also the recovery plan. It names the
+accepted checkpoint, the pending merge commit, and the current session HEAD.
+Run its commands in order: first preserve that HEAD on the uniquely named
+`aethyme/recovery/...` branch, then use `git reset --soft <accepted-checkpoint>`
+to stage the reviewed net tree change, commit it as a linear patch, and submit
+again. Never reset or rewrite the session before creating the preservation
+branch; the preserved ref is the rollback path if flattening included work you
+did not intend to own.
+
 On a real conflict, `conflict_details` binds each surviving path to its full
 originating session commit, ownership, known integration-side commits, and
 ordered remediation commands. The legacy `conflicts` path list remains for

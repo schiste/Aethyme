@@ -248,6 +248,11 @@ Follow this protocol:
    ```
 
    This simulates the merge and runs only the checks your diff affects.
+   Submit replays session-owned commits as an ordered, single-parent patch
+   series. If your session contains an owned merge commit, submission refuses
+   safely and prints the accepted checkpoint plus an exact recovery sequence.
+   Follow it in order: preserve the current HEAD on the named recovery branch
+   before flattening the reviewed tree change. Never reset first.
    `broker submit` promotes to the local integration branch; it does not
    publish a remote branch, create a pull request, or push a release tag.
    Publication is a separate, explicitly authorized operator action. When
@@ -616,6 +621,9 @@ mod tests {
         let doc = render_agents_document(Some(&repo)).unwrap();
         assert!(doc.contains("## Broker Coordination (multi-agent repository)"));
         assert!(doc.contains("aethyme broker submit --session"));
+        assert!(doc.contains("single-parent patch\n   series"));
+        assert!(doc.contains("preserve the current HEAD on the named recovery branch"));
+        assert!(doc.contains("Never reset first"));
         assert!(doc.contains("broker start --task \"<your task>\" --path <planned-path>"));
         assert!(doc.contains("Repeat `--path` for every file"));
         assert!(doc.contains("explicit leases atomically"));

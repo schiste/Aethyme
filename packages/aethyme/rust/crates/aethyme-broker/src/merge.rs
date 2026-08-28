@@ -624,10 +624,20 @@ impl Broker {
                 continue;
             }
             if commit.parents.len() != 1 {
+                let short_commit = commit.commit.get(..12).unwrap_or(&commit.commit);
                 return Err(BrokerOpError::UnsupportedSubmissionCommit {
                     session_id: plan.session_id,
                     commit: commit.commit.clone(),
                     parent_count: commit.parents.len(),
+                    recorded_baseline: plan
+                        .recorded_baseline
+                        .clone()
+                        .unwrap_or_else(|| "<missing>".into()),
+                    session_head: plan.session_head.clone(),
+                    recovery_branch: format!(
+                        "aethyme/recovery/session-{}-{short_commit}",
+                        plan.session_id
+                    ),
                 });
             }
             let simulation =

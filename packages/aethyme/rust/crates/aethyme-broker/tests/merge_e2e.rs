@@ -1134,8 +1134,37 @@ fn normalized_replay_refuses_missing_baseline_and_owned_merge_commits() {
         &merge_worktree,
         &["merge", "--no-ff", "side", "-m", "owned merge"],
     );
+    let merge_head = resolve(&merge_worktree, "HEAD");
     let merge_error = merge_broker.submit(merge_session.id).unwrap_err();
-    assert!(merge_error.to_string().contains("has 2 parents"));
+    let remediation = merge_error.to_string();
+    let recovery_branch = format!(
+        "aethyme/recovery/session-{}-{}",
+        merge_session.id,
+        &merge_head[..12]
+    );
+    assert!(remediation.contains("has 2 parents"), "{remediation}");
+    assert!(
+        remediation.contains(&format!("accepted checkpoint: {baseline}")),
+        "{remediation}"
+    );
+    assert!(
+        remediation.contains(&format!("owned commit {merge_head}")),
+        "{remediation}"
+    );
+    let preserve = remediation
+        .find(&format!("git branch {recovery_branch} {merge_head}"))
+        .unwrap();
+    let reset = remediation
+        .find(&format!("git reset --soft {baseline}"))
+        .unwrap();
+    assert!(preserve < reset, "recovery must preserve HEAD before reset");
+    assert!(
+        remediation.contains(&format!(
+            "aethyme broker submit --session {}",
+            merge_session.id
+        )),
+        "{remediation}"
+    );
 }
 
 #[test]
