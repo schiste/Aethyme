@@ -4,6 +4,23 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.4.1] - 2026-08-29
+
+### Fixed
+
+- Regenerated the checked-in AGENTS and CLAUDE protocol so the safe,
+  preservation-first remediation for unsupported session merge commits is
+  present in the released repository.
+- Refreshed deterministic onboarding freshness metadata after the v0.4.0
+  release inputs changed, restoring a clean `aethyme enhance verify` result
+  on the exact release tree.
+
+### Upgrade notes
+
+Read [Upgrading to v0.4.1](packages/aethyme/docs/guides/upgrading-to-v0.4.1.md).
+Binary protocols and repository schemas are unchanged from v0.4.0; no
+repository migration is required.
+
 ## [0.4.0] - 2026-08-29
 
 ### Added
