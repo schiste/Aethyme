@@ -111,7 +111,7 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
     assert_eq!(report["last_gate"]["cache_source"], "executed");
     assert!(report["last_gate"]["recorded_at"].is_i64());
     assert!(report["last_gate"]["tree_hash"].is_string());
-    assert_eq!(report["cleanup_safe"], false);
+    assert_eq!(report["cleanup_safe"], true);
     assert!(
         report["recommended_next_action"]
             .as_str()
@@ -154,7 +154,8 @@ fn finish_cli_text_summarizes_the_structured_handoff() {
         "{text}"
     );
     assert!(text.contains("(executed)"), "{text}");
-    assert!(text.contains("cleanup safe: no"), "{text}");
+    assert!(text.contains("cleanup safe: yes"), "{text}");
+    assert!(text.contains("aethyme broker cleanup"), "{text}");
     assert!(
         text.contains("recommended next: aethyme broker ship plan --entry"),
         "{text}"

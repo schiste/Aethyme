@@ -7,8 +7,9 @@ use std::process::Command;
 
 use aethyme_broker::{
     AdoptIntegrationRelation, AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, Broker,
-    BrokerOpError, FinishGateCacheSource, FinishLeaseState, FinishStatus, GateStatus,
-    NewGateResult, NewSession, SessionOrigin, SessionStatus, VersionDriftStatus, events,
+    BrokerOpError, CleanupDisposition, FinishGateCacheSource, FinishLeaseState, FinishStatus,
+    GateStatus, NewGateResult, NewSession, SessionOrigin, SessionStatus, VersionDriftStatus,
+    events,
 };
 
 fn sh(cwd: &Path, args: &[&str]) {
@@ -332,13 +333,81 @@ fn cleanup_refuses_dirty_and_unmerged_then_force_discards() {
     sh(&wt, &["add", "-A"]);
     sh(&wt, &["commit", "-qm", "wip"]);
     let err = broker.cleanup(session.id, false).unwrap_err();
-    assert!(err.to_string().contains("not reachable"));
+    assert!(err.to_string().contains("not represented"));
 
     // Force discards, marks cleaned, frees the worktree slot.
     broker.cleanup(session.id, true).unwrap();
     assert!(!wt.exists());
     let views = broker.agents(now_ms()).unwrap();
     assert!(views.iter().all(|v| v.session.id != session.id));
+}
+
+#[test]
+fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+    sh(tmp.path(), &["add", ".gitignore"]);
+    sh(tmp.path(), &["commit", "-qm", "ignore build output"]);
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let safe = broker.start_worktree("safe cleanup").unwrap();
+    let safe_path = std::path::PathBuf::from(&safe.worktree_path);
+    std::fs::write(safe_path.join("safe.txt"), "safe\n").unwrap();
+    sh(&safe_path, &["add", "safe.txt"]);
+    sh(&safe_path, &["commit", "-qm", "safe work"]);
+    assert!(broker.submit(safe.id).unwrap().promoted);
+    let finished = broker.finish(safe.id).unwrap();
+    assert!(finished.cleanup_safe);
+    std::fs::create_dir_all(safe_path.join("target/debug")).unwrap();
+    std::fs::write(safe_path.join("target/debug/cache.bin"), vec![7_u8; 4096]).unwrap();
+
+    let dirty = broker.start_worktree("dirty cleanup").unwrap();
+    let dirty_path = std::path::PathBuf::from(&dirty.worktree_path);
+    std::fs::write(dirty_path.join("dirty.txt"), "committed\n").unwrap();
+    sh(&dirty_path, &["add", "dirty.txt"]);
+    sh(&dirty_path, &["commit", "-qm", "delivered work"]);
+    assert!(broker.submit(dirty.id).unwrap().promoted);
+    assert_eq!(
+        broker.finish(dirty.id).unwrap().status,
+        FinishStatus::Closed
+    );
+    std::fs::write(dirty_path.join("untracked.txt"), "keep me\n").unwrap();
+
+    let status = broker.status(now_ms()).unwrap();
+    assert_eq!(status.cleanup_retention.broker_owned_worktree_count, 2);
+    assert!(
+        status
+            .advice
+            .iter()
+            .any(|advice| advice.id == "cleanup.retained-worktrees")
+    );
+
+    let dry_run = broker.cleanup_cleaned_worktrees(false).unwrap();
+    assert!(!dry_run.applied);
+    assert_eq!(dry_run.plan.retained_worktree_count, 2);
+    assert_eq!(dry_run.plan.eligible_worktree_count, 1);
+    assert!(dry_run.plan.estimated_reclaimable_bytes >= 4096);
+    assert!(dry_run.removed_session_ids.is_empty());
+    assert!(safe_path.exists());
+    assert!(dirty_path.exists());
+    assert_eq!(
+        dry_run
+            .plan
+            .worktrees
+            .iter()
+            .find(|item| item.session_id == dirty.id)
+            .unwrap()
+            .disposition,
+        CleanupDisposition::Dirty
+    );
+
+    let applied = broker.cleanup_cleaned_worktrees(true).unwrap();
+    assert!(applied.applied);
+    assert_eq!(applied.removed_session_ids, vec![safe.id]);
+    assert!(applied.failures.is_empty());
+    assert!(!safe_path.exists());
+    assert!(dirty_path.exists());
 }
 
 #[test]
@@ -796,7 +865,7 @@ fn finish_blocks_dirty_then_unsubmitted_commits() {
 }
 
 #[test]
-fn finish_closes_promoted_session_and_suggests_cleanup_only_when_main_contains_it() {
+fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains_it() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     let wt = tmp.path().join("promoted-finish-wt");
@@ -881,8 +950,11 @@ fn finish_closes_promoted_session_and_suggests_cleanup_only_when_main_contains_i
     let closed = broker.finish(session.id).unwrap();
     assert_eq!(closed.status, FinishStatus::Closed);
     assert!(closed.closed);
-    assert!(!closed.cleanup_safe);
-    assert!(closed.next_commands.is_empty());
+    assert!(closed.cleanup_safe);
+    assert_eq!(
+        closed.next_commands,
+        vec![format!("aethyme broker cleanup {}", session.id)]
+    );
     assert!(closed.delivery.submitted);
     assert!(closed.delivery.promoted);
     assert!(!closed.delivery.published);
@@ -1022,9 +1094,10 @@ fn finish_distinguishes_fully_published_work_from_local_promotion() {
     assert!(closed.delivery.promoted);
     assert!(closed.delivery.published);
     assert!(closed.last_gate.is_none());
+    assert!(closed.cleanup_safe);
     assert_eq!(
-        closed.recommended_next_action.as_deref(),
-        Some("aethyme broker integration status")
+        closed.recommended_next_action,
+        Some(format!("aethyme broker cleanup {}", session.id))
     );
     let event = broker
         .store()

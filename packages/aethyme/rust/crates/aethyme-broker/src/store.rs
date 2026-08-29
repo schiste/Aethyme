@@ -371,6 +371,22 @@ impl BrokerStore {
         Ok(sessions)
     }
 
+    /// All sessions already closed in broker state, oldest first.
+    ///
+    /// Cleanup planning uses this separate query so normal live-session
+    /// surfaces remain bounded to identities that can still act.
+    pub fn cleaned_sessions(&self) -> Result<Vec<Session>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SESSION_SELECT} WHERE status = 'cleaned' ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], session_from_row)?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row??);
+        }
+        Ok(sessions)
+    }
+
     /// Fill the repository contract for a live pre-v9 session exactly once.
     /// The deployment digest is the presence marker because repository schema
     /// and gate digest are both legitimately nullable.

@@ -533,6 +533,72 @@ pub struct VersionRepairStep {
     pub stderr_tail: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupDisposition {
+    Eligible,
+    Dirty,
+    UnrepresentedCommits,
+    UnsafePath,
+    InspectionFailed,
+}
+
+impl CleanupDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Eligible => "eligible",
+            Self::Dirty => "dirty",
+            Self::UnrepresentedCommits => "unrepresented_commits",
+            Self::UnsafePath => "unsafe_path",
+            Self::InspectionFailed => "inspection_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CleanupWorktreePlan {
+    pub session_id: i64,
+    pub worktree_path: String,
+    pub origin: SessionOrigin,
+    pub disposition: CleanupDisposition,
+    pub estimated_bytes: Option<u64>,
+    pub reason: String,
+}
+
+impl CleanupWorktreePlan {
+    pub fn eligible(&self) -> bool {
+        self.disposition == CleanupDisposition::Eligible
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CleanupPlan {
+    pub retained_worktree_count: usize,
+    pub eligible_worktree_count: usize,
+    pub estimated_retained_bytes: u64,
+    pub estimated_reclaimable_bytes: u64,
+    pub worktrees: Vec<CleanupWorktreePlan>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CleanupSweepFailure {
+    pub session_id: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CleanupSweepReport {
+    pub applied: bool,
+    pub plan: CleanupPlan,
+    pub removed_session_ids: Vec<i64>,
+    pub failures: Vec<CleanupSweepFailure>,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct CleanupRetention {
+    pub broker_owned_worktree_count: usize,
+}
+
 /// Everything `broker status` renders, in one serializable shape.
 #[derive(Debug, serde::Serialize)]
 pub struct StatusView {
@@ -555,6 +621,7 @@ pub struct StatusView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_head: Option<String>,
     pub main_behind_upstream_commits: u64,
+    pub cleanup_retention: CleanupRetention,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3652,7 +3719,27 @@ impl Broker {
                         )]
                     },
                 },
-            );
+                );
+        }
+        let cleanup_retention = self.cleanup_retention()?;
+        if cleanup_retention.broker_owned_worktree_count > 0 {
+            let count = cleanup_retention.broker_owned_worktree_count;
+            advice.push(StatusAdvice {
+                id: "cleanup.retained-worktrees",
+                severity: StatusAdviceSeverity::Warning,
+                reason: "closed broker-owned worktrees are retained until explicit cleanup",
+                summary: format!(
+                    "{count} closed broker-owned {} remain on disk; review reclaimable bytes and remove only eligible worktrees",
+                    plural_word(count, "worktree", "worktrees")
+                ),
+                session_id: None,
+                queue_entry_id: None,
+                evidence: vec![format!("retained broker-owned worktrees: {count}")],
+                commands: vec![
+                    "aethyme broker cleanup --all-cleaned".into(),
+                    "aethyme broker cleanup --all-cleaned --apply".into(),
+                ],
+            });
         }
         Ok(StatusView {
             summary,
@@ -3670,6 +3757,7 @@ impl Broker {
             upstream_ref,
             upstream_head,
             main_behind_upstream_commits,
+            cleanup_retention,
         })
     }
 
@@ -4224,17 +4312,16 @@ impl Broker {
             unsubmitted_commits: report.unsubmitted_commits,
             worktree_missing: report.pending_work.worktree_missing,
         };
-        report.recommended_next_action = report.next_commands.first().cloned().or_else(|| {
-            if report.delivery.promoted && !report.delivery.published {
-                report
-                    .latest_queue_entry_id
-                    .map(|entry| format!("aethyme broker ship plan --entry {entry}"))
-            } else if report.delivery.published && !report.cleanup_safe {
-                Some("aethyme broker integration status".into())
-            } else {
-                None
-            }
-        });
+        report.recommended_next_action = if report.delivery.promoted && !report.delivery.published {
+            report
+                .latest_queue_entry_id
+                .map(|entry| format!("aethyme broker ship plan --entry {entry}"))
+        } else {
+            report.next_commands.first().cloned().or_else(|| {
+                (report.delivery.published && !report.cleanup_safe)
+                    .then(|| "aethyme broker integration status".into())
+            })
+        };
     }
 
     fn persist_finish_report(&mut self, report: &FinishReport) -> Result<(), BrokerOpError> {
@@ -4490,11 +4577,10 @@ impl Broker {
         {
             return Ok(false);
         }
-        let checkout = GitRepo::discover(worktree_path)?;
-        let main_head = self.repo.head_commit()?;
-        let session_head = checkout.head_commit()?;
-        Ok(checkout.unmerged_commit_count(&main_head)? == 0
-            || self.submitted_head_is_represented_on(session_id, &session_head, &main_head)?)
+        Ok(matches!(
+            self.cleanup_eligibility(session_id, worktree_path)?,
+            (CleanupDisposition::Eligible, _)
+        ))
     }
 
     fn submitted_head_is_represented_on(
@@ -4518,38 +4604,193 @@ impl Broker {
 
     // ── cleanup ───────────────────────────────────────────────────────
 
+    fn broker_worktree_root(&self) -> PathBuf {
+        self.main_root.join(".aethyme/worktrees")
+    }
+
+    fn is_broker_owned_worktree(&self, session: &Session, path: &Path) -> bool {
+        if session.origin != SessionOrigin::Spawned || path == self.main_root.as_path() {
+            return false;
+        }
+        let Ok(root) = self.broker_worktree_root().canonicalize() else {
+            return false;
+        };
+        let Ok(path) = path.canonicalize() else {
+            return false;
+        };
+        path.starts_with(root)
+    }
+
+    fn cleanup_eligibility(
+        &self,
+        session_id: i64,
+        worktree_path: &Path,
+    ) -> Result<(CleanupDisposition, String), BrokerOpError> {
+        if worktree_path == self.main_root.as_path() {
+            return Ok((
+                CleanupDisposition::UnsafePath,
+                "the primary checkout is never removable by broker cleanup".into(),
+            ));
+        }
+        let metadata =
+            std::fs::symlink_metadata(worktree_path).map_err(|source| BrokerError::Io {
+                path: worktree_path.to_path_buf(),
+                source,
+            })?;
+        if metadata.file_type().is_symlink() {
+            return Ok((
+                CleanupDisposition::UnsafePath,
+                "worktree path is a symlink".into(),
+            ));
+        }
+
+        let checkout = GitRepo::discover(worktree_path)?;
+        if checkout.is_dirty()? {
+            return Ok((
+                CleanupDisposition::Dirty,
+                "worktree has uncommitted or untracked changes".into(),
+            ));
+        }
+
+        let session_head = checkout.head_commit()?;
+        let mut delivery_targets = vec![self.repo.head_commit()?];
+        if let Some(integration) = self.integration_tip() {
+            delivery_targets.push(integration);
+        }
+        if let Some((_upstream, head)) = self.repo.tracking_upstream() {
+            delivery_targets.push(head);
+        }
+        delivery_targets.sort();
+        delivery_targets.dedup();
+
+        for target in &delivery_targets {
+            if checkout.unmerged_commit_count(target)? == 0
+                || self.submitted_head_is_represented_on(session_id, &session_head, target)?
+            {
+                return Ok((
+                    CleanupDisposition::Eligible,
+                    format!(
+                        "clean session HEAD is represented on delivery target {}",
+                        short_commit(target)
+                    ),
+                ));
+            }
+        }
+
+        Ok((
+            CleanupDisposition::UnrepresentedCommits,
+            "session commits are not represented on local main, integration, or configured upstream"
+                .into(),
+        ))
+    }
+
+    /// Read-only inventory of retained broker-owned worktrees belonging to
+    /// sessions that are already closed in broker state.
+    pub fn cleanup_plan(&self) -> Result<CleanupPlan, BrokerOpError> {
+        let mut plan = CleanupPlan::default();
+        for session in self.store.cleaned_sessions()? {
+            let worktree_path = PathBuf::from(&session.worktree_path);
+            if session.origin != SessionOrigin::Spawned || !worktree_path.exists() {
+                continue;
+            }
+
+            let estimated_bytes = directory_size_without_following_links(&worktree_path).ok();
+            let (disposition, reason) = if !self.is_broker_owned_worktree(&session, &worktree_path)
+            {
+                (
+                    CleanupDisposition::UnsafePath,
+                    "spawned session path is outside the broker-owned worktree directory".into(),
+                )
+            } else {
+                match self.cleanup_eligibility(session.id, &worktree_path) {
+                    Ok(result) => result,
+                    Err(error) => (
+                        CleanupDisposition::InspectionFailed,
+                        format!("cleanup inspection failed: {error}"),
+                    ),
+                }
+            };
+            let item = CleanupWorktreePlan {
+                session_id: session.id,
+                worktree_path: session.worktree_path,
+                origin: session.origin,
+                disposition,
+                estimated_bytes,
+                reason,
+            };
+            plan.retained_worktree_count += 1;
+            plan.estimated_retained_bytes = plan
+                .estimated_retained_bytes
+                .saturating_add(item.estimated_bytes.unwrap_or(0));
+            if item.eligible() {
+                plan.eligible_worktree_count += 1;
+                plan.estimated_reclaimable_bytes = plan
+                    .estimated_reclaimable_bytes
+                    .saturating_add(item.estimated_bytes.unwrap_or(0));
+            }
+            plan.worktrees.push(item);
+        }
+        Ok(plan)
+    }
+
+    /// Remove every currently eligible worktree from a read-only cleanup
+    /// plan. Apply revalidates each worktree independently and never forces a
+    /// dirty, adopted, symlinked, or unrepresented checkout.
+    pub fn cleanup_cleaned_worktrees(
+        &mut self,
+        apply: bool,
+    ) -> Result<CleanupSweepReport, BrokerOpError> {
+        let plan = self.cleanup_plan()?;
+        let mut removed_session_ids = Vec::new();
+        let mut failures = Vec::new();
+        if apply {
+            for item in plan.worktrees.iter().filter(|item| item.eligible()) {
+                match self.cleanup(item.session_id, false) {
+                    Ok(()) => removed_session_ids.push(item.session_id),
+                    Err(error) => failures.push(CleanupSweepFailure {
+                        session_id: item.session_id,
+                        reason: error.to_string(),
+                    }),
+                }
+            }
+        }
+        Ok(CleanupSweepReport {
+            applied: apply,
+            plan,
+            removed_session_ids,
+            failures,
+        })
+    }
+
+    fn cleanup_retention(&self) -> Result<CleanupRetention, BrokerOpError> {
+        let count = self
+            .store
+            .cleaned_sessions()?
+            .into_iter()
+            .filter(|session| {
+                let path = Path::new(&session.worktree_path);
+                path.exists() && self.is_broker_owned_worktree(session, path)
+            })
+            .count();
+        Ok(CleanupRetention {
+            broker_owned_worktree_count: count,
+        })
+    }
+
     /// Remove a session's worktree and mark it cleaned. Refuses when the
-    /// worktree has uncommitted changes or commits not reachable from the
-    /// main checkout's HEAD, unless `force`.
+    /// worktree has uncommitted changes or commits not represented on a
+    /// delivery target, unless `force`.
     pub fn cleanup(&mut self, session_id: i64, force: bool) -> Result<(), BrokerOpError> {
         let session = self.store.session(session_id)?;
         let worktree_path = PathBuf::from(&session.worktree_path);
 
         if worktree_path.exists() {
-            let checkout = GitRepo::discover(&worktree_path)?;
             if !force {
-                if checkout.is_dirty()? {
+                let (disposition, reason) = self.cleanup_eligibility(session_id, &worktree_path)?;
+                if disposition != CleanupDisposition::Eligible {
                     return Err(BrokerOpError::DirtyWorktree {
                         id: session_id,
-                        reason: "worktree has uncommitted changes".into(),
-                    });
-                }
-                let main_head = self.repo.head_commit()?;
-                let unmerged = checkout.unmerged_commit_count(&main_head)?;
-                let session_head = checkout.head_commit()?;
-                if unmerged > 0
-                    && !self.submitted_head_is_represented_on(
-                        session_id,
-                        &session_head,
-                        &main_head,
-                    )?
-                {
-                    return Err(BrokerOpError::DirtyWorktree {
-                        id: session_id,
-                        reason: format!(
-                            "worktree has {unmerged} commit(s) not reachable from the \
-                             main checkout's HEAD"
-                        ),
+                        reason,
                     });
                 }
             }
@@ -4559,6 +4800,21 @@ impl Broker {
             .set_session_status(session_id, SessionStatus::Cleaned, None)?;
         Ok(())
     }
+}
+
+fn directory_size_without_following_links(path: &Path) -> std::io::Result<u64> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(0);
+    }
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(path)? {
+        total = total.saturating_add(directory_size_without_following_links(&entry?.path())?);
+    }
+    Ok(total)
 }
 
 fn plural_word(count: usize, singular: &'static str, plural: &'static str) -> &'static str {

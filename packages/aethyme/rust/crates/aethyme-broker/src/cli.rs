@@ -318,9 +318,12 @@ Usage:
       Aethyme source checkout, then fail if integration moved during the
       run so the result cannot be mistaken for current-tip proof.
   aethyme broker cleanup <session-id> [--force] [--json]
-      Remove a session's worktree. Refuses on uncommitted changes or
-      unmerged commits unless --force. Usually run only after finish says
-      cleanup is safe.
+  aethyme broker cleanup --all-cleaned [--apply] [--json]
+      Remove one session worktree, or inventory all retained broker-owned
+      worktrees from already-closed sessions. Bulk cleanup is a read-only plan
+      by default; --apply revalidates and removes only clean worktrees whose
+      session work is represented on main, integration, or configured upstream.
+      Adopted worktrees are never included in the bulk sweep.
   aethyme broker check-contract [--base <ref>] [--pr-body <file>]
       Cross-process contract gate: refuse a diff that removes symbols
       listed in the consumers registry unless the PR body or commit
@@ -1101,6 +1104,7 @@ struct Parsed {
     reuse: bool,
     replace_stale: bool,
     all: bool,
+    all_cleaned: bool,
     chau7: bool,
     fix_version: bool,
     with_gate: bool,
@@ -1161,6 +1165,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         reuse: false,
         replace_stale: false,
         all: false,
+        all_cleaned: false,
         chau7: false,
         fix_version: false,
         with_gate: false,
@@ -1213,6 +1218,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--dispatch" => parsed.dispatch = true,
             "--reuse" => parsed.reuse = true,
             "--all" => parsed.all = true,
+            "--all-cleaned" => parsed.all_cleaned = true,
             "--chau7" => parsed.chau7 = true,
             "--fix-version" => parsed.fix_version = true,
             "--with-gate" => parsed.with_gate = true,
@@ -1875,6 +1881,70 @@ fn render_finish_report(report: &crate::FinishReport) {
         "  recommended next: {}",
         report.recommended_next_action.as_deref().unwrap_or("none")
     );
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0_usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport) {
+    println!(
+        "Cleanup {}: {} retained broker-owned worktrees, {} eligible",
+        if report.applied { "apply" } else { "plan" },
+        report.plan.retained_worktree_count,
+        report.plan.eligible_worktree_count,
+    );
+    println!(
+        "  retained: {}; reclaimable now: {}",
+        human_bytes(report.plan.estimated_retained_bytes),
+        human_bytes(report.plan.estimated_reclaimable_bytes),
+    );
+    for item in &report.plan.worktrees {
+        println!(
+            "  session {}: {} ({}) — {}",
+            item.session_id,
+            item.disposition.as_str(),
+            item.estimated_bytes
+                .map(human_bytes)
+                .unwrap_or_else(|| "size unavailable".into()),
+            item.reason,
+        );
+        println!("    {}", item.worktree_path);
+    }
+    if report.applied {
+        println!(
+            "  removed: {}",
+            if report.removed_session_ids.is_empty() {
+                "none".into()
+            } else {
+                report
+                    .removed_session_ids
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        );
+        for failure in &report.failures {
+            println!(
+                "  retained session {} after revalidation: {}",
+                failure.session_id, failure.reason
+            );
+        }
+    } else if report.plan.eligible_worktree_count > 0 {
+        println!("  apply: aethyme broker cleanup --all-cleaned --apply");
+    }
 }
 
 fn render_handoff_report(report: &crate::SessionHandoffReport) {
@@ -5292,18 +5362,41 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             }
         }
         "cleanup" => {
-            let id: i64 = parsed
-                .positional
-                .first()
-                .ok_or(UsageError::Message("cleanup requires a session id".into()))?
-                .parse()
-                .map_err(|_| UsageError::Message("session id must be an integer".into()))?;
             let mut broker = open_broker(parsed.read_only_snapshot)?;
-            broker.cleanup(id, parsed.force)?;
-            if parsed.json {
-                println!("{{\"cleaned\":{id}}}");
+            if parsed.all_cleaned {
+                if !parsed.positional.is_empty() || parsed.force || parsed.dry_run {
+                    return Err(UsageError::Message(
+                        "cleanup --all-cleaned takes no session id, --force, or --dry-run; planning is already the default and --apply removes only revalidated eligible worktrees"
+                            .into(),
+                    ));
+                }
+                let report = broker.cleanup_cleaned_worktrees(parsed.apply)?;
+                if parsed.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    render_cleanup_sweep_report(&report);
+                }
             } else {
-                println!("Cleaned session {id}.");
+                if parsed.apply {
+                    return Err(UsageError::Message(
+                        "cleanup <session-id> does not take --apply; use the exact command after finish reports cleanup safe"
+                            .into(),
+                    ));
+                }
+                let id: i64 = parsed
+                    .positional
+                    .first()
+                    .ok_or(UsageError::Message(
+                        "cleanup requires a session id or --all-cleaned".into(),
+                    ))?
+                    .parse()
+                    .map_err(|_| UsageError::Message("session id must be an integer".into()))?;
+                broker.cleanup(id, parsed.force)?;
+                if parsed.json {
+                    println!("{{\"cleaned\":{id}}}");
+                } else {
+                    println!("Cleaned session {id}.");
+                }
             }
         }
         "-h" | "--help" => return Err(UsageError::Help),
