@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::{fs::File, io::Read};
 
 use sha2::{Digest, Sha256};
 
@@ -756,10 +757,81 @@ pub struct GuardedExecReport {
     pub command_success: bool,
     pub before_dirty_paths: Vec<String>,
     pub after_dirty_paths: Vec<String>,
+    pub newly_dirty_paths: Vec<String>,
+    pub modified_preexisting_dirty_paths: Vec<String>,
     pub touched_paths: Vec<String>,
     pub outside_lease_paths: Vec<String>,
     pub foreign_paths: Vec<String>,
     pub ok: bool,
+}
+
+fn snapshot_path_identities(
+    root: &Path,
+    paths: &[String],
+) -> Result<std::collections::BTreeMap<String, String>, BrokerOpError> {
+    paths
+        .iter()
+        .map(|path| Ok((path.clone(), working_path_identity(root, path)?)))
+        .collect()
+}
+
+/// Hash one working-tree path without retaining its contents. Missing paths,
+/// symlink targets, file modes, and regular file bytes have distinct identities.
+fn working_path_identity(root: &Path, relative: &str) -> Result<String, BrokerOpError> {
+    let path = root.join(relative);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok("missing".into());
+        }
+        Err(source) => {
+            return Err(BrokerError::Io {
+                path: path.clone(),
+                source,
+            }
+            .into());
+        }
+    };
+    let mut digest = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        digest.update(metadata.permissions().mode().to_le_bytes());
+    }
+    if metadata.file_type().is_symlink() {
+        digest.update(b"symlink\0");
+        let target = std::fs::read_link(&path).map_err(|source| BrokerError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        digest.update(target.to_string_lossy().as_bytes());
+    } else if metadata.is_file() {
+        digest.update(b"file\0");
+        let mut file = File::open(&path).map_err(|source| BrokerError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).map_err(|source| BrokerError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+    } else {
+        digest.update(b"other\0");
+        digest.update(metadata.len().to_le_bytes());
+        if let Ok(modified) = metadata.modified()
+            && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
+        {
+            digest.update(duration.as_nanos().to_le_bytes());
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 /// Result of `broker integration wait-stable`.
@@ -2365,9 +2437,10 @@ impl Broker {
     }
 
     /// Run a command inside a session worktree and fail the guard when it
-    /// leaves new dirty paths outside explicit leases. The command's own
-    /// exit status is preserved in the report; guard failure is separate
-    /// so callers can distinguish test failure from ownership failure.
+    /// changes paths outside explicit leases. Both newly dirty paths and
+    /// content changes to paths that were already dirty are attributed to
+    /// the command. Its exit status remains separate so callers can
+    /// distinguish command failure from ownership failure.
     pub fn guarded_exec(
         &mut self,
         session_id: i64,
@@ -2382,6 +2455,7 @@ impl Broker {
         let mut before_dirty = checkout.dirty_paths()?;
         before_dirty.sort();
         before_dirty.dedup();
+        let before_identities = snapshot_path_identities(checkout.root(), &before_dirty)?;
 
         let status = Command::new(&command[0])
             .args(&command[1..])
@@ -2399,11 +2473,26 @@ impl Broker {
         after_dirty.sort();
         after_dirty.dedup();
         let before_set: std::collections::BTreeSet<String> = before_dirty.iter().cloned().collect();
-        let touched: Vec<String> = after_dirty
+        let newly_dirty_paths: Vec<String> = after_dirty
             .iter()
             .filter(|path| !before_set.contains(*path))
             .cloned()
             .collect();
+        let modified_preexisting_dirty_paths: Vec<String> = before_dirty
+            .iter()
+            .filter_map(|path| {
+                let before = before_identities.get(path)?;
+                match working_path_identity(checkout.root(), path) {
+                    Ok(after) if &after != before => Some(Ok(path.clone())),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<_, BrokerOpError>>()?;
+        let mut touched = newly_dirty_paths.clone();
+        touched.extend(modified_preexisting_dirty_paths.iter().cloned());
+        touched.sort();
+        touched.dedup();
         let audit = self.audit_paths(
             session_id,
             "GUARDED_EXEC_BEFORE",
@@ -2420,6 +2509,8 @@ impl Broker {
             command_success,
             before_dirty_paths: before_dirty,
             after_dirty_paths: after_dirty,
+            newly_dirty_paths,
+            modified_preexisting_dirty_paths,
             touched_paths: touched,
             outside_lease_paths: audit.missing_lease_paths,
             foreign_paths: audit.foreign_paths,

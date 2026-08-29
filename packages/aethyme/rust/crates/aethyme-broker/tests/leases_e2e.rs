@@ -466,6 +466,56 @@ fn guarded_exec_requires_explicit_lease_for_new_dirty_paths() {
         .unwrap();
     assert!(allowed.ok, "{allowed:?}");
     assert_eq!(allowed.touched_paths, vec!["src/auth.py"]);
+    assert_eq!(allowed.newly_dirty_paths, vec!["src/auth.py"]);
+    assert!(allowed.modified_preexisting_dirty_paths.is_empty());
+
+    let modified = broker
+        .guarded_exec(
+            session.id,
+            &[
+                "sh".into(),
+                "-c".into(),
+                "printf revised > src/auth.py".into(),
+            ],
+        )
+        .unwrap();
+    assert!(modified.ok, "{modified:?}");
+    assert_eq!(modified.touched_paths, vec!["src/auth.py"]);
+    assert!(modified.newly_dirty_paths.is_empty());
+    assert_eq!(
+        modified.modified_preexisting_dirty_paths,
+        vec!["src/auth.py"]
+    );
+    let json = serde_json::to_value(&modified).unwrap();
+    assert_eq!(json["newly_dirty_paths"], serde_json::json!([]));
+    assert_eq!(
+        json["modified_preexisting_dirty_paths"],
+        serde_json::json!(["src/auth.py"])
+    );
+
+    broker
+        .store()
+        .release_lease(session.id, "src/auth.py")
+        .unwrap();
+    let modified_without_lease = broker
+        .guarded_exec(
+            session.id,
+            &[
+                "sh".into(),
+                "-c".into(),
+                "printf unowned > src/auth.py".into(),
+            ],
+        )
+        .unwrap();
+    assert!(!modified_without_lease.ok, "{modified_without_lease:?}");
+    assert_eq!(
+        modified_without_lease.modified_preexisting_dirty_paths,
+        vec!["src/auth.py"]
+    );
+    assert_eq!(
+        modified_without_lease.outside_lease_paths,
+        vec!["src/auth.py"]
+    );
 
     let blocked = broker
         .guarded_exec(

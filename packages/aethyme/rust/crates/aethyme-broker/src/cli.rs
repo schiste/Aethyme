@@ -141,9 +141,9 @@ Usage:
       Release an expired, quarantined allocation after reviewing host cleanup.
       The generation confirmation fences stale cleanup commands.
   aethyme broker exec --session <id> -- <command> [--json]
-      Run a command in the session worktree, then fail if it leaves new
-      dirty paths outside explicit leases or in adoption-time foreign
-      files. Exports AETHYME_TEST_DB_SUFFIX=s<id>-exec.
+      Run a command in the session worktree, then fail if it creates or
+      modifies dirty paths outside explicit leases or in adoption-time
+      foreign files. Exports AETHYME_TEST_DB_SUFFIX=s<id>-exec.
   aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--json] -- <git-args>
       Run Git through the durable operation coordinator. Remote Git commands
       require an exact --repo. Repository writes are serialized, journaled,
@@ -3627,6 +3627,18 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     println!("  touched paths: none");
                 } else {
                     println!("  touched paths: {}", capped_join(&report.touched_paths, 8));
+                }
+                if !report.newly_dirty_paths.is_empty() {
+                    println!(
+                        "  newly dirty: {}",
+                        capped_join(&report.newly_dirty_paths, 8)
+                    );
+                }
+                if !report.modified_preexisting_dirty_paths.is_empty() {
+                    println!(
+                        "  changed while already dirty: {}",
+                        capped_join(&report.modified_preexisting_dirty_paths, 8)
+                    );
                 }
                 if !report.outside_lease_paths.is_empty() {
                     println!(
