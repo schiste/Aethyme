@@ -413,17 +413,15 @@ impl Broker {
             validate_resolution_candidates(loaded, &candidates)?;
         }
 
-        let upstream_commits = self
-            .repo_handle()
-            .commits_between_oldest(&local_main, &upstream_head)?;
         let mut upstream_by_patch: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for commit in &upstream_commits {
-            let parent = self.repo_handle().first_parent(commit)?;
-            if let Some(patch_id) = self.repo_handle().patch_id_between(&parent, commit)? {
+        for commit in report.plan.commits.iter().filter(|commit| {
+            commit.origin == IntegrationReconcileCommitOrigin::UpstreamOnlyExternalWork
+        }) {
+            if let Some(patch_id) = commit.patch_id.as_ref() {
                 upstream_by_patch
-                    .entry(patch_id)
+                    .entry(patch_id.clone())
                     .or_default()
-                    .push(commit.clone());
+                    .push(commit.commit.clone());
             }
         }
 
@@ -656,6 +654,18 @@ impl Broker {
                     ));
                     replay_blocked = true;
                     replay_safe = false;
+                    continue;
+                }
+                if simulation.tree == self.repo_handle().commit_tree_id(&rebuilt)? {
+                    classified[index] = Some(entry_report(
+                        candidate,
+                        IntegrationReconcileClassification::SupersededUpstream,
+                        Some(rebuilt.clone()),
+                        None,
+                        Vec::new(),
+                        "promoted delta is content-empty when replayed onto current upstream"
+                            .into(),
+                    ));
                     continue;
                 }
                 let replayed = self.repo_handle().commit_tree(

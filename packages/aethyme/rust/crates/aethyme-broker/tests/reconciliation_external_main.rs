@@ -2,8 +2,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use aethyme_broker::{
-    Broker, EntryExposureResolutionKind, EntryExposureState, IntegrationReconcileCommitOrigin,
-    IntegrationReconcileEquivalence, IntegrationReconcileOptions, MergeStatus,
+    Broker, EntryExposureResolutionKind, EntryExposureState, IntegrationReconcileClassification,
+    IntegrationReconcileCommitOrigin, IntegrationReconcileEquivalence, IntegrationReconcileOptions,
+    MergeStatus,
 };
 
 fn git(root: &Path, args: &[&str]) -> String {
@@ -152,6 +153,123 @@ impl DeployDivergenceFixture {
             pending_entry_id: pending_outcome.entry.id,
         }
     }
+}
+
+#[test]
+fn patch_equivalent_promotion_is_landed_when_local_main_already_equals_upstream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let remote = tmp.path().join("remote.git");
+    let deploy = tmp.path().join("deploy");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&remote).unwrap();
+    git(&remote, &["init", "--bare", "-q", "-b", "main"]);
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join(".gitignore"), ".aethyme/\n").unwrap();
+    std::fs::write(repo.join("src/service.txt"), "feature=off\nmode=base\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "initial"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-qu", "origin", "main"]);
+
+    let mut broker = Broker::open(&repo).unwrap();
+    let session = broker.start_worktree("promote feature").unwrap();
+    let worktree = PathBuf::from(&session.worktree_path);
+    commit(
+        &worktree,
+        "src/service.txt",
+        "feature=on\nmode=base\n",
+        "enable feature",
+    );
+    let promoted = broker.submit(session.id).unwrap();
+    assert!(promoted.promoted);
+    let promoted_commit =
+        serde_json::from_str::<serde_json::Value>(promoted.entry.details_json.as_deref().unwrap())
+            .unwrap()["commit"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            remote.to_str().unwrap(),
+            deploy.to_str().unwrap(),
+        ],
+    );
+    let equivalent_upstream = commit(
+        &deploy,
+        "src/service.txt",
+        "feature=on\nmode=base\n",
+        "land equivalent feature",
+    );
+    let upstream_head = commit(
+        &deploy,
+        "src/service.txt",
+        "feature=on\nmode=deployed\n",
+        "configure deployed mode",
+    );
+    git(&deploy, &["push", "-q", "origin", "main"]);
+    git(&repo, &["fetch", "-q", "origin", "main"]);
+    git(&repo, &["merge", "--ff-only", "origin/main"]);
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), upstream_head);
+
+    let dry_run = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: None,
+            confirm: None,
+        })
+        .unwrap();
+    assert!(dry_run.safe, "{dry_run:#?}");
+    let entry = dry_run
+        .entries
+        .iter()
+        .find(|entry| entry.queue_entry_id == promoted.entry.id)
+        .unwrap();
+    assert_eq!(
+        entry.classification,
+        IntegrationReconcileClassification::AlreadyLanded
+    );
+    assert_eq!(
+        entry.upstream_landing.as_deref(),
+        Some(equivalent_upstream.as_str())
+    );
+    assert!(entry.replayed_commit.is_none());
+    assert_eq!(dry_run.new_integration, upstream_head);
+
+    let applied = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: true,
+            resolution_file: None,
+            confirm: dry_run.plan_digest,
+        })
+        .unwrap();
+    assert!(applied.applied);
+    assert_eq!(
+        git(&repo, &["rev-parse", "aethyme/integration"]),
+        upstream_head
+    );
+    assert_eq!(
+        broker
+            .store()
+            .merge_queue()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == promoted.entry.id)
+            .unwrap()
+            .status,
+        MergeStatus::ExternallyLanded
+    );
+    assert_ne!(promoted_commit, equivalent_upstream);
 }
 
 #[test]
