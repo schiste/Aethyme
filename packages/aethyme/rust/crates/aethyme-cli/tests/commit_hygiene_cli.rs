@@ -21,7 +21,9 @@ fn repo_commit_message_template_command() {
     ]);
     result.ok();
     assert!(
-        result.output.starts_with("feat(repo-memory): short summary\n"),
+        result
+            .output
+            .starts_with("feat(repo-memory): short summary\n"),
         "{}",
         result.output
     );

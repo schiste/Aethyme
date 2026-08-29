@@ -238,7 +238,11 @@ impl Fixer for I18nScaffolder {
             return None;
         }
         let (new_content, changes_made) = self.fix_jsx_strings(content, file_path);
-        if changes_made { Some(new_content) } else { None }
+        if changes_made {
+            Some(new_content)
+        } else {
+            None
+        }
     }
 }
 
@@ -288,7 +292,10 @@ mod tests {
                 "\nexport function UserGreeting() {\n  return <h1>Welcome Back</h1>;\n}\n",
             )
             .unwrap();
-        assert!(result.contains(r#"t("usergreeting.welcome_back")"#), "{result}");
+        assert!(
+            result.contains(r#"t("usergreeting.welcome_back")"#),
+            "{result}"
+        );
     }
 
     #[test]
@@ -355,10 +362,7 @@ mod tests {
         // regex consumed the leading space outside the group, so the
         // needle is not a substring and the fix is silently skipped.
         let f = fixer();
-        assert_eq!(
-            f.fix(Path::new("C.tsx"), "<h1> Welcome Back </h1>"),
-            None
-        );
+        assert_eq!(f.fix(Path::new("C.tsx"), "<h1> Welcome Back </h1>"), None);
         // Without the leading space it applies.
         assert!(f.fix(Path::new("C.tsx"), "<h1>Welcome Back</h1>").is_some());
     }
@@ -380,7 +384,10 @@ mod tests {
     fn without_an_import_no_scaffolding_is_added() {
         let f = fixer();
         let result = f
-            .fix(Path::new("Bare.tsx"), "export const a = <h1>No Import Here</h1>;\n")
+            .fix(
+                Path::new("Bare.tsx"),
+                "export const a = <h1>No Import Here</h1>;\n",
+            )
             .unwrap();
         assert!(!result.contains("useTranslation"), "{result}");
         assert!(result.contains(r#"{t("bare.no_import_here")}"#), "{result}");
@@ -424,7 +431,10 @@ mod tests {
         // the call.
         let f = fixer();
         let result = f
-            .fix(Path::new("Cfg.tsx"), "const o = { label: \"Some Plain Words\" };\n")
+            .fix(
+                Path::new("Cfg.tsx"),
+                "const o = { label: \"Some Plain Words\" };\n",
+            )
             .unwrap();
         assert!(
             result.contains(r#"label: "Some Plain Words"={t("cfg.some_plain_words")}"#),
@@ -454,7 +464,11 @@ mod tests {
         .unwrap();
         let f = I18nScaffolder::new(&tmp);
         let hardcoded = f.find_hardcoded_strings();
-        assert!(hardcoded.iter().any(|h| h.2 == "Welcome Back" && h.3 == "jsx_text"));
+        assert!(
+            hardcoded
+                .iter()
+                .any(|h| h.2 == "Welcome Back" && h.3 == "jsx_text")
+        );
         assert_eq!(hardcoded[0].0, "Greeting.tsx");
         assert_eq!(hardcoded[0].1, 3);
     }

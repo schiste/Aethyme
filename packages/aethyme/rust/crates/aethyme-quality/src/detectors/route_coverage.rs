@@ -85,8 +85,7 @@ impl RouteCoverageDetector {
                     // Flask routes: one route per listed method.
                     if let Some(caps) = patterns.flask.captures(line) {
                         for method in caps[2].split(',') {
-                            let method =
-                                method.trim_matches(|c| c == ' ' || c == '"' || c == '\'');
+                            let method = method.trim_matches(|c| c == ' ' || c == '"' || c == '\'');
                             routes.push(RouteDefinition {
                                 method: method.to_uppercase(),
                                 path: caps[1].to_string(),
@@ -170,10 +169,7 @@ impl RouteCoverageDetector {
                 findings.push(Finding {
                     detector: "route-coverage".to_string(),
                     severity: Severity::Warning,
-                    message: format!(
-                        "Undocumented API route: {} {}",
-                        route.method, route.path
-                    ),
+                    message: format!("Undocumented API route: {} {}", route.method, route.path),
                     file_path: rel,
                     line_number: Some(line_num as i64),
                     evidence: None,

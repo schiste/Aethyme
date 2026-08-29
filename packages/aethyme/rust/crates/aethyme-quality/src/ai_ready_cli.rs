@@ -65,9 +65,7 @@ pub fn run(args: &[String]) -> u8 {
             let given = PathBuf::from(repo);
             // click.Path(exists=True) validated before the command body.
             if !given.exists() {
-                eprintln!(
-                    "Error: Invalid value for '--repo': Path '{repo}' does not exist."
-                );
+                eprintln!("Error: Invalid value for '--repo': Path '{repo}' does not exist.");
                 return 2;
             }
             std::fs::canonicalize(&given).unwrap_or(given)
@@ -161,8 +159,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             }
             "--detectors" => {
                 let raw = take_value("--detectors")?;
-                parsed.detectors =
-                    Some(raw.split(',').map(|s| s.trim().to_string()).collect());
+                parsed.detectors = Some(raw.split(',').map(|s| s.trim().to_string()).collect());
                 i += 2;
             }
             other => {
@@ -281,7 +278,10 @@ mod tests {
     fn with_py_suffix_matches_pathlib() {
         assert_eq!(with_py_suffix("rep", ".json"), PathBuf::from("rep.json"));
         assert_eq!(with_py_suffix("rep.md", ".json"), PathBuf::from("rep.json"));
-        assert_eq!(with_py_suffix("rep.json", ".json"), PathBuf::from("rep.json"));
+        assert_eq!(
+            with_py_suffix("rep.json", ".json"),
+            PathBuf::from("rep.json")
+        );
         assert_eq!(
             with_py_suffix("a/b.c.md", ".json"),
             PathBuf::from("a/b.c.json")

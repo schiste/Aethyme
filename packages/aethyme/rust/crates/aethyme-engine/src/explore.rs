@@ -32,7 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::graph::navigation::{task_anchors_view_redb, task_next_view_redb, task_scope_view_redb};
-use crate::graph::search::{symbol_search_redb, SearchHit};
+use crate::graph::search::{SearchHit, symbol_search_redb};
 use crate::model::edge::EdgeKind;
 use crate::model::task::TaskInput;
 #[cfg(test)]
@@ -910,7 +910,7 @@ impl std::fmt::Display for ExploreError {
 impl std::error::Error for ExploreError {}
 
 mod usage_boundary;
-pub use usage_boundary::{explore_usage_boundary, UsageBoundaryParams};
+pub use usage_boundary::{UsageBoundaryParams, explore_usage_boundary};
 
 // ── orchestration entry point ───────────────────────────────────────────
 
@@ -6271,9 +6271,11 @@ mod tests {
     fn extract_symbol_queries_drops_stop_words_and_short_terms() {
         let queries = extract_symbol_queries("Find the file that handles WatchedItem revisions");
         // "find", "the", "that" are stop words. "Watcheditem" stays.
-        assert!(queries
-            .iter()
-            .any(|q| q.eq_ignore_ascii_case("WatchedItem")));
+        assert!(
+            queries
+                .iter()
+                .any(|q| q.eq_ignore_ascii_case("WatchedItem"))
+        );
         assert!(queries.iter().any(|q| q.eq_ignore_ascii_case("revisions")));
         assert!(!queries.iter().any(|q| q.eq_ignore_ascii_case("the")));
         assert!(!queries.iter().any(|q| q.eq_ignore_ascii_case("find")));

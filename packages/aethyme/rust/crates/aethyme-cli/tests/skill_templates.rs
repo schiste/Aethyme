@@ -105,7 +105,10 @@ fn generated_agents_template_uses_projection_contract() {
         "120 output lines / 20k chars",
         "multi-file `sed`",
     ] {
-        assert!(text.contains(needle), "AGENTS.md template missing {needle:?}");
+        assert!(
+            text.contains(needle),
+            "AGENTS.md template missing {needle:?}"
+        );
     }
     assert!(!text.contains(".venv/bin/python"));
     assert!(!text.contains("navigation_hints[]"));
@@ -114,7 +117,11 @@ fn generated_agents_template_uses_projection_contract() {
 #[test]
 fn reference_files_exist() {
     for path in [explore_ref_path(), graph_ref_path(), dead_code_ref_path()] {
-        assert!(path.exists(), "missing Aethyme skill reference: {}", path.display());
+        assert!(
+            path.exists(),
+            "missing Aethyme skill reference: {}",
+            path.display()
+        );
     }
 }
 
@@ -166,8 +173,15 @@ fn enhance_deploys_aethyme_skill_references() {
 
     for product in [".codex", ".claude"] {
         for name in ["explore.md", "graph-task.md", "dead-code.md"] {
-            let path = repo.join(product).join("skills/aethyme/references").join(name);
-            assert!(path.exists(), "missing deployed reference: {}", path.display());
+            let path = repo
+                .join(product)
+                .join("skills/aethyme/references")
+                .join(name);
+            assert!(
+                path.exists(),
+                "missing deployed reference: {}",
+                path.display()
+            );
             assert!(!read(&path).contains("{{AETHYME_ROOT}}"));
         }
     }
@@ -220,7 +234,8 @@ fn escalation_heuristics_present() {
 fn when_not_to_escalate_guard_present() {
     let text = read(explore_ref_path());
     assert!(
-        text.contains("When NOT to escalate") || text.to_lowercase().contains("when not to escalate"),
+        text.contains("When NOT to escalate")
+            || text.to_lowercase().contains("when not to escalate"),
         "references/explore.md must include a 'when NOT to escalate' guard. \
          Without it, the ladder degrades into 'always go deeper'."
     );

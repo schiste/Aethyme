@@ -31,7 +31,10 @@ mod tests {
     #[test]
     fn substitutes_all_occurrences() {
         assert_eq!(
-            substitute_root("run {{AETHYME_ROOT}}/bin and {{AETHYME_ROOT}}/lib", "/opt/ae"),
+            substitute_root(
+                "run {{AETHYME_ROOT}}/bin and {{AETHYME_ROOT}}/lib",
+                "/opt/ae"
+            ),
             "run /opt/ae/bin and /opt/ae/lib"
         );
     }

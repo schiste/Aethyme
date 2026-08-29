@@ -77,7 +77,10 @@ fn key_groups(text: &str, indent: usize) -> Vec<Vec<String>> {
             && let Some(rest) = trimmed.strip_prefix('"')
             && let Some(key) = rest.split('"').next()
         {
-            groups.last_mut().expect("object opened before its keys").push(key.to_string());
+            groups
+                .last_mut()
+                .expect("object opened before its keys")
+                .push(key.to_string());
         }
     }
     groups
@@ -86,7 +89,10 @@ fn key_groups(text: &str, indent: usize) -> Vec<Vec<String>> {
 /// The body of a top-level array-valued key, exclusive of its brackets.
 fn top_level_block<'a>(text: &'a str, key: &str) -> &'a str {
     let marker = format!("\n  \"{key}\": [\n");
-    let start = text.find(&marker).unwrap_or_else(|| panic!("no {key} block in:\n{text}")) + marker.len();
+    let start = text
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no {key} block in:\n{text}"))
+        + marker.len();
     let rest = &text[start..];
     &rest[..rest.find("\n  ]").expect("unterminated block")]
 }
@@ -117,7 +123,10 @@ fn missing_fields_render_as_null_not_omitted() {
     );
     assert!(payload["safe_to_use_as_answer"].is_null());
     assert!(payload["trust_policy"].is_null());
-    assert_eq!(payload["observability"], serde_json::json!({"readiness": null}));
+    assert_eq!(
+        payload["observability"],
+        serde_json::json!({"readiness": null})
+    );
     // Contract decision (Phase 5.5): no schema_version key, unlike
     // verify-targets — byte-parity with the retired heredoc keeps the
     // skill's "inspect only these fields" list exactly true.
@@ -178,7 +187,13 @@ fn overall_target_cap_is_six() {
     let output = run(&input);
     assert_eq!(output, expected);
     let payload: Value = serde_json::from_str(&output).unwrap();
-    assert_eq!(payload["top_verification_targets"].as_array().unwrap().len(), 6);
+    assert_eq!(
+        payload["top_verification_targets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
 }
 
 #[test]

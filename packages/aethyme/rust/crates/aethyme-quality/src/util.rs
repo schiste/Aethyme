@@ -52,12 +52,9 @@ pub fn now_timestamps() -> (String, String) {
     let iso = if micros == 0 {
         format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}+00:00")
     } else {
-        format!(
-            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{micros:06}+00:00"
-        )
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{micros:06}+00:00")
     };
-    let display =
-        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC");
+    let display = format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC");
     (iso, display)
 }
 

@@ -132,8 +132,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
         }
         "expand" => {
-            let node = opt_value(rest, "--node")
-                .ok_or_else(|| "usage: aethyme task expand --repo <path> --node <target>".to_string())?;
+            let node = opt_value(rest, "--node").ok_or_else(|| {
+                "usage: aethyme task expand --repo <path> --node <target>".to_string()
+            })?;
             let store = GraphStore::open_read_only(&repo).map_err(|e| e.to_string())?;
             let raw = crate::json::task_expand_view(
                 &task_expand_view_redb(&store, &node).map_err(|e| e.to_string())?,
@@ -179,7 +180,11 @@ fn value_reason_line(item: &Value) -> String {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| Value::Object(obj.clone()).to_string());
-        match obj.get("reason").and_then(Value::as_str).filter(|r| !r.is_empty()) {
+        match obj
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|r| !r.is_empty())
+        {
             Some(reason) => format!("- {value} ({reason})\n"),
             None => format!("- {value}\n"),
         }
@@ -383,12 +388,8 @@ fn render_explain_from_pack(pack: &Value) -> String {
                 .join(", ")
         })
         .unwrap_or_default();
-    let count = |count_key: &str| -> i64 {
-        summary
-            .get(count_key)
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-    };
+    let count =
+        |count_key: &str| -> i64 { summary.get(count_key).and_then(Value::as_i64).unwrap_or(0) };
     let mut lines = vec![
         format!(
             "Task: {}",
@@ -501,7 +502,10 @@ mod tests {
         )
         .unwrap();
         let rendered = super::render_scope(&payload);
-        assert!(rendered.contains("- src/auth.py (anchor file)"), "{rendered}");
+        assert!(
+            rendered.contains("- src/auth.py (anchor file)"),
+            "{rendered}"
+        );
         assert!(rendered.contains("- src (contains anchor)"), "{rendered}");
         assert!(rendered.contains("- docs (non-runtime)"), "{rendered}");
         assert!(rendered.contains("- auth regression"), "{rendered}");
@@ -523,7 +527,10 @@ mod tests {
             rendered.contains("Confidence: anchor=0.91, scope=0.73"),
             "{rendered}"
         );
-        assert!(rendered.contains("Caps: max_anchors=3, max_files=5"), "{rendered}");
+        assert!(
+            rendered.contains("Caps: max_anchors=3, max_files=5"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("- src/big.py (120/300 lines)"),
             "{rendered}"

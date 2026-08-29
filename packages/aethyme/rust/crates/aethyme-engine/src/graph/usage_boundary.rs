@@ -1492,11 +1492,7 @@ fn php_function_name(line: &str) -> Option<String> {
     while chars.peek().is_some_and(|value| is_identifier_char(*value)) {
         name.push(chars.next().expect("peeked char"));
     }
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
+    if name.is_empty() { None } else { Some(name) }
 }
 
 fn is_public_php_method(line: &str) -> bool {
@@ -1882,9 +1878,11 @@ mod tests {
             .find(|candidate| candidate.function.name == "internalOnly")
             .expect("internal only method");
         assert_eq!(internal.status, AnswerStatus::Ambiguous);
-        assert!(internal
-            .ambiguity
-            .contains(&"exported_but_internal_only".to_string()));
+        assert!(
+            internal
+                .ambiguity
+                .contains(&"exported_but_internal_only".to_string())
+        );
 
         let used = answer
             .excluded

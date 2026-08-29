@@ -66,11 +66,7 @@ impl GitHubIntegration {
         Self::with_runner(repo_path, true, Box::new(SystemCommandRunner))
     }
 
-    pub fn with_runner(
-        repo_path: &Path,
-        use_gh_cli: bool,
-        runner: Box<dyn CommandRunner>,
-    ) -> Self {
+    pub fn with_runner(repo_path: &Path, use_gh_cli: bool, runner: Box<dyn CommandRunner>) -> Self {
         GitHubIntegration {
             repo_path: repo_path.to_path_buf(),
             use_gh_cli,
@@ -79,8 +75,7 @@ impl GitHubIntegration {
     }
 
     fn git(&self, args: &[&str]) -> RunOutcome {
-        self.runner
-            .run(args, None, None, Some(&self.repo_path))
+        self.runner.run(args, None, None, Some(&self.repo_path))
     }
 
     /// Port of `create_branch`. The default name is
@@ -91,7 +86,10 @@ impl GitHubIntegration {
             Some(name) => name.to_string(),
             None => format!("{BRANCH_PREFIX}/{}", local_compact_timestamp()),
         };
-        if self.git(&["git", "checkout", "-b", &branch_name]).succeeded() {
+        if self
+            .git(&["git", "checkout", "-b", &branch_name])
+            .succeeded()
+        {
             Some(branch_name)
         } else {
             None
@@ -277,10 +275,7 @@ impl GitHubIntegration {
 fn generate_pr_title(summary: &GeneratorSummary) -> String {
     let total = summary.total_files;
     if summary.by_fix_type.len() == 1 {
-        format!(
-            "fix: apply {} to {total} files",
-            summary.by_fix_type[0].0
-        )
+        format!("fix: apply {} to {total} files", summary.by_fix_type[0].0)
     } else {
         format!("fix: apply autofixes to {total} files")
     }
@@ -520,7 +515,10 @@ mod tests {
         let fake = FakeRunner::ok();
         let gh = integration(Path::new("/repo"), &fake);
         assert!(gh.push_branch("autofix/x", true));
-        assert_eq!(fake.argv()[0], vec!["git", "push", "-u", "origin", "autofix/x"]);
+        assert_eq!(
+            fake.argv()[0],
+            vec!["git", "push", "-u", "origin", "autofix/x"]
+        );
 
         let fake = FakeRunner::ok();
         let gh = integration(Path::new("/repo"), &fake);
@@ -552,13 +550,21 @@ mod tests {
         assert_eq!(
             fake.argv()[0],
             vec![
-                "gh", "pr", "create",
-                "--title", "title",
-                "--body", "body",
-                "--base", "main",
-                "--head", "autofix/x",
-                "--label", "autofix,automated",
-                "--reviewer", "alice,bob",
+                "gh",
+                "pr",
+                "create",
+                "--title",
+                "title",
+                "--body",
+                "body",
+                "--base",
+                "main",
+                "--head",
+                "autofix/x",
+                "--label",
+                "autofix,automated",
+                "--reviewer",
+                "alice,bob",
             ]
         );
     }
@@ -571,7 +577,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             fake.argv()[0],
-            vec!["gh", "pr", "create", "--title", "t", "--body", "b", "--base", "develop"]
+            vec![
+                "gh", "pr", "create", "--title", "t", "--body", "b", "--base", "develop"
+            ]
         );
 
         let fake = FakeRunner::ok();
@@ -580,8 +588,14 @@ mod tests {
             false,
             Box::new(Shared(fake.clone())),
         );
-        assert_eq!(gh.create_pull_request("t", "b", "main", None, None, None), None);
-        assert!(fake.argv().is_empty(), "gh must not be invoked when disabled");
+        assert_eq!(
+            gh.create_pull_request("t", "b", "main", None, None, None),
+            None
+        );
+        assert!(
+            fake.argv().is_empty(),
+            "gh must not be invoked when disabled"
+        );
     }
 
     #[test]
@@ -629,7 +643,10 @@ mod tests {
         let argv = fake.argv();
         assert_eq!(argv.len(), 1);
         assert_eq!(argv[0][..3], ["git", "checkout", "-b"]);
-        assert_eq!(std::fs::read_to_string(tmp.join("routes.py")).unwrap(), "aaaa");
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("routes.py")).unwrap(),
+            "aaaa"
+        );
     }
 
     #[test]
@@ -656,11 +673,11 @@ mod tests {
         let tmp = tmpdir("gh-happy");
         let pg = low_risk_generator(&tmp);
         let fake = FakeRunner::scripted(vec![
-            ok(""),          // checkout -b
-            ok(""),          // add README.md
-            ok(""),          // commit
-            ok("deadbeef\n"), // rev-parse
-            ok(""),          // push
+            ok(""),                                // checkout -b
+            ok(""),                                // add README.md
+            ok(""),                                // commit
+            ok("deadbeef\n"),                      // rev-parse
+            ok(""),                                // push
             ok("https://github.com/o/r/pull/7\n"), // gh pr create
         ]);
         let gh = integration(&tmp, &fake);
@@ -678,7 +695,10 @@ mod tests {
             other => panic!("expected Created, got {other:?}"),
         }
         // Patches were actually written before the commit.
-        assert_eq!(std::fs::read_to_string(tmp.join("README.md")).unwrap(), "bbbb");
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("README.md")).unwrap(),
+            "bbbb"
+        );
         let argv = fake.argv();
         assert_eq!(argv[4][..2], ["git", "push"]);
         assert_eq!(argv[5][0], "gh");
@@ -718,7 +738,10 @@ mod tests {
             AutofixPrOutcome::BranchCreationFailed
         );
         // Nothing applied.
-        assert_eq!(std::fs::read_to_string(tmp.join("README.md")).unwrap(), "aaaa");
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("README.md")).unwrap(),
+            "aaaa"
+        );
     }
 
     #[test]
@@ -726,14 +749,17 @@ mod tests {
         let tmp = tmpdir("gh-commitfail");
         let pg = low_risk_generator(&tmp);
         let fake = FakeRunner::scripted(vec![
-            ok(""),            // checkout -b
-            ok(""),            // add
+            ok(""),             // checkout -b
+            ok(""),             // add
             RunOutcome::Failed, // commit
-            ok(""),            // cleanup: checkout base
-            ok(""),            // cleanup: branch -D
+            ok(""),             // cleanup: checkout base
+            ok(""),             // cleanup: branch -D
         ]);
         let gh = integration(&tmp, &fake);
-        assert_eq!(gh.create_autofix_pr(&pg, "main", None), AutofixPrOutcome::Failed);
+        assert_eq!(
+            gh.create_autofix_pr(&pg, "main", None),
+            AutofixPrOutcome::Failed
+        );
         let argv = fake.argv();
         assert_eq!(argv[3], vec!["git", "checkout", "main"]);
         assert_eq!(argv[4][..2], ["git", "branch"]);
@@ -752,7 +778,10 @@ mod tests {
             RunOutcome::Failed, // push
         ]);
         let gh = integration(&tmp, &fake);
-        assert_eq!(gh.create_autofix_pr(&pg, "main", None), AutofixPrOutcome::Failed);
+        assert_eq!(
+            gh.create_autofix_pr(&pg, "main", None),
+            AutofixPrOutcome::Failed
+        );
         assert!(!fake.argv().iter().any(|a| a[0] == "gh"));
 
         let tmp = tmpdir("gh-prfail");
@@ -766,7 +795,10 @@ mod tests {
             RunOutcome::Failed, // gh pr create
         ]);
         let gh = integration(&tmp, &fake);
-        assert_eq!(gh.create_autofix_pr(&pg, "main", None), AutofixPrOutcome::Failed);
+        assert_eq!(
+            gh.create_autofix_pr(&pg, "main", None),
+            AutofixPrOutcome::Failed
+        );
     }
 
     // ── Rendered PR text ─────────────────────────────────────────────
@@ -852,7 +884,10 @@ mod tests {
         git(&["git", "config", "user.email", "t@example.invalid"], &work);
         git(&["git", "config", "user.name", "Test"], &work);
         // The remote is a local path — no network, ever.
-        git(&["git", "remote", "add", "origin", remote.to_str().unwrap()], &work);
+        git(
+            &["git", "remote", "add", "origin", remote.to_str().unwrap()],
+            &work,
+        );
         std::fs::write(work.join("README.md"), "aaaa").unwrap();
         git(&["git", "add", "-A"], &work);
         git(&["git", "commit", "-m", "init"], &work);
@@ -871,15 +906,31 @@ mod tests {
         // gh disabled -> create_pull_request returns None -> Failed,
         // but the branch, commit and push all really happened.
         assert_eq!(outcome, AutofixPrOutcome::Failed);
-        assert_eq!(std::fs::read_to_string(work.join("README.md")).unwrap(), "bbbb");
+        assert_eq!(
+            std::fs::read_to_string(work.join("README.md")).unwrap(),
+            "bbbb"
+        );
         let branches = runner
-            .run(&["git", "branch", "--list", "autofix/*"], None, None, Some(&work))
+            .run(
+                &["git", "branch", "--list", "autofix/*"],
+                None,
+                None,
+                Some(&work),
+            )
             .stdout_text();
         assert!(branches.contains("autofix/"), "{branches}");
         let remote_branches = runner
-            .run(&["git", "branch", "--list", "autofix/*"], None, None, Some(&remote))
+            .run(
+                &["git", "branch", "--list", "autofix/*"],
+                None,
+                None,
+                Some(&remote),
+            )
             .stdout_text();
-        assert!(remote_branches.contains("autofix/"), "pushed: {remote_branches}");
+        assert!(
+            remote_branches.contains("autofix/"),
+            "pushed: {remote_branches}"
+        );
         assert!(!gh.is_clean_working_tree() || true);
     }
 }

@@ -20,7 +20,11 @@ pub fn py_splitlines(text: &str) -> Vec<&str> {
             }
             b'\r' => {
                 lines.push(&text[start..i]);
-                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
                 start = i;
             }
             _ => i += 1,

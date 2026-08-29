@@ -45,7 +45,9 @@ fn manifest_path() -> PathBuf {
 
 fn sha256_of(path: &PathBuf) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(std::fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display())));
+    hasher.update(
+        std::fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
+    );
     format!("{:x}", hasher.finalize())
 }
 
@@ -64,10 +66,17 @@ fn verify_manifest(require_pinned: bool) -> Vec<String> {
     .expect("grammar manifest is valid TOML");
     let grammar_root = path.parent().expect("manifest has a parent").to_path_buf();
 
-    if data.get("manifest_version").and_then(toml::Value::as_integer) != Some(1) {
+    if data
+        .get("manifest_version")
+        .and_then(toml::Value::as_integer)
+        != Some(1)
+    {
         errors.push("manifest_version must be 1".to_string());
     }
-    let Some(grammars) = data.get("grammar").and_then(toml::Value::as_array).filter(|entries| !entries.is_empty())
+    let Some(grammars) = data
+        .get("grammar")
+        .and_then(toml::Value::as_array)
+        .filter(|entries| !entries.is_empty())
     else {
         errors.push("manifest must define at least one [[grammar]] entry".to_string());
         return errors;
@@ -92,7 +101,10 @@ fn verify_manifest(require_pinned: bool) -> Vec<String> {
             .collect();
         if !missing.is_empty() {
             missing.sort_unstable();
-            errors.push(format!("{language}: missing fields: {}", missing.join(", ")));
+            errors.push(format!(
+                "{language}: missing fields: {}",
+                missing.join(", ")
+            ));
             continue;
         }
 
@@ -104,7 +116,10 @@ fn verify_manifest(require_pinned: bool) -> Vec<String> {
         let wasm_path = grammar_root.join(table["wasm"].as_str().unwrap_or_default());
         let query_path = grammar_root.join(table["queries"].as_str().unwrap_or_default());
         if !wasm_path.is_file() {
-            errors.push(format!("{language}: missing wasm file {}", wasm_path.display()));
+            errors.push(format!(
+                "{language}: missing wasm file {}",
+                wasm_path.display()
+            ));
         } else {
             match table["sha256"].as_str() {
                 Some(expected) if expected.len() == 64 => {
@@ -120,7 +135,10 @@ fn verify_manifest(require_pinned: bool) -> Vec<String> {
         }
 
         if !query_path.is_file() {
-            errors.push(format!("{language}: missing query file {}", query_path.display()));
+            errors.push(format!(
+                "{language}: missing query file {}",
+                query_path.display()
+            ));
         }
 
         if table["license"].as_str() != Some("MIT") {
@@ -135,9 +153,7 @@ fn verify_manifest(require_pinned: bool) -> Vec<String> {
                 errors.push(format!("{language}: source_ref is not pinned"));
             }
             if !is_pinned(table["tree_sitter_cli_version"].as_str()) {
-                errors.push(format!(
-                    "{language}: tree_sitter_cli_version is not pinned"
-                ));
+                errors.push(format!("{language}: tree_sitter_cli_version is not pinned"));
             }
         }
     }

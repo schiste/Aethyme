@@ -239,7 +239,14 @@ mod tests {
     #[test]
     fn can_fix_component_files() {
         let f = fixer();
-        for name in ["Button.tsx", "Form.jsx", "Component.vue", "a.ts", "a.js", "A.TSX"] {
+        for name in [
+            "Button.tsx",
+            "Form.jsx",
+            "Component.vue",
+            "a.ts",
+            "a.js",
+            "A.TSX",
+        ] {
             assert!(f.can_fix(Path::new(name)), "{name}");
         }
         for name in ["utils.py", "README.md", "a"] {
@@ -268,18 +275,27 @@ mod tests {
                 "\nexport function LoginForm() {\n  return <button type=\"submit\">Continue</button>;\n}\n",
             )
             .unwrap();
-        assert!(result.contains(r#"data-ui="login-form-button-submit""#), "{result}");
+        assert!(
+            result.contains(r#"data-ui="login-form-button-submit""#),
+            "{result}"
+        );
     }
 
     #[test]
     fn skips_elements_that_already_have_selectors() {
         let f = fixer();
         assert_eq!(
-            f.fix(Path::new("Button.tsx"), r#"<button data-ui="my-button">Click</button>"#),
+            f.fix(
+                Path::new("Button.tsx"),
+                r#"<button data-ui="my-button">Click</button>"#
+            ),
             None
         );
         assert_eq!(
-            f.fix(Path::new("Button.tsx"), r#"<button data-testid="my-button">Click</button>"#),
+            f.fix(
+                Path::new("Button.tsx"),
+                r#"<button data-testid="my-button">Click</button>"#
+            ),
             None
         );
     }
@@ -296,13 +312,18 @@ mod tests {
         let result = f
             .fix(Path::new("Panel.tsx"), "<Foo.Button>Go</Foo.Button>")
             .unwrap();
-        assert!(result.contains(r#"<Foo.Button data-ui="panel-button">"#), "{result}");
+        assert!(
+            result.contains(r#"<Foo.Button data-ui="panel-button">"#),
+            "{result}"
+        );
     }
 
     #[test]
     fn index_files_drop_the_component_segment() {
         let f = fixer();
-        let result = f.fix(Path::new("index.tsx"), "<button>Idx</button>").unwrap();
+        let result = f
+            .fix(Path::new("index.tsx"), "<button>Idx</button>")
+            .unwrap();
         // parts == ["button"] -> the "element" filler is appended.
         assert!(result.contains(r#"data-ui="button-element""#), "{result}");
     }
@@ -313,7 +334,10 @@ mod tests {
         let result = f
             .fix(Path::new("Form.tsx"), r#"<input name="email" />"#)
             .unwrap();
-        assert_eq!(result, r#"<input name="email" data-ui="form-input-email"/>"#);
+        assert_eq!(
+            result,
+            r#"<input name="email" data-ui="form-input-email"/>"#
+        );
     }
 
     #[test]
@@ -330,16 +354,25 @@ mod tests {
     fn class_values_drop_btn_prefixes_and_take_the_first_token() {
         let f = fixer();
         let result = f
-            .fix(Path::new("Bar.tsx"), r#"<button className="btn-primary large">Go</button>"#)
+            .fix(
+                Path::new("Bar.tsx"),
+                r#"<button className="btn-primary large">Go</button>"#,
+            )
             .unwrap();
-        assert!(result.contains(r#"data-ui="bar-button-primary""#), "{result}");
+        assert!(
+            result.contains(r#"data-ui="bar-button-primary""#),
+            "{result}"
+        );
     }
 
     #[test]
     fn selector_name_is_capped_at_three_segments() {
         let f = fixer();
         let result = f
-            .fix(Path::new("VeryLongComponentName.tsx"), r#"<button id="save">Go</button>"#)
+            .fix(
+                Path::new("VeryLongComponentName.tsx"),
+                r#"<button id="save">Go</button>"#,
+            )
             .unwrap();
         assert!(
             result.contains(r#"data-ui="very-long-component-name-button-save""#),
@@ -352,14 +385,20 @@ mod tests {
         // Python raises IndexError from value.split()[0]; process_file
         // swallows it and the file is skipped.
         let f = fixer();
-        assert_eq!(f.fix(Path::new("Bad.tsx"), "<button class=\" \">Go</button>"), None);
+        assert_eq!(
+            f.fix(Path::new("Bad.tsx"), "<button class=\" \">Go</button>"),
+            None
+        );
     }
 
     #[test]
     fn repeated_identical_elements_are_each_rewritten() {
         let f = fixer();
         let result = f
-            .fix(Path::new("Dup.jsx"), "<button>Same</button>\n<button>Same</button>\n")
+            .fix(
+                Path::new("Dup.jsx"),
+                "<button>Same</button>\n<button>Same</button>\n",
+            )
             .unwrap();
         assert_eq!(
             result,
@@ -386,7 +425,10 @@ mod tests {
     fn vue_without_a_template_block_is_untouched() {
         let f = fixer();
         assert_eq!(
-            f.fix(Path::new("NoTemplate.vue"), "<script>const a = <button>x</button></script>"),
+            f.fix(
+                Path::new("NoTemplate.vue"),
+                "<script>const a = <button>x</button></script>"
+            ),
             None
         );
     }

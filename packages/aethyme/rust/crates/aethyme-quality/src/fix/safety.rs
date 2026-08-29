@@ -219,7 +219,10 @@ impl GeneratedFileDetector {
     }
 
     /// Port of `get_safe_files`.
-    pub fn get_safe_files<'a>(&self, files: &'a [std::path::PathBuf]) -> Vec<&'a std::path::PathBuf> {
+    pub fn get_safe_files<'a>(
+        &self,
+        files: &'a [std::path::PathBuf],
+    ) -> Vec<&'a std::path::PathBuf> {
         files
             .iter()
             .filter(|path| !self.is_generated(path))
@@ -437,7 +440,10 @@ mod tests {
         for name in LOCK_FILES {
             let path = tmp.join(name);
             touch(&path);
-            assert!(detector.is_generated(&path), "lock file {name} not detected");
+            assert!(
+                detector.is_generated(&path),
+                "lock file {name} not detected"
+            );
         }
         // Same stem, different name → not a lock file.
         let path = tmp.join("package-lock.jsonx");
@@ -591,7 +597,10 @@ mod tests {
         let engine = SafetyEngine::new();
         let path = tmp.join("README.md");
         touch(&path);
-        assert_eq!(engine.assess_risk(&path, "docs_regen").unwrap(), RiskLevel::Low);
+        assert_eq!(
+            engine.assess_risk(&path, "docs_regen").unwrap(),
+            RiskLevel::Low
+        );
     }
 
     #[test]
@@ -665,7 +674,10 @@ mod tests {
         // the high list is consulted first.
         let path = tmp.join("api").join("package.json");
         touch(&path);
-        assert_eq!(engine.assess_risk(&path, "docs_regen").unwrap(), RiskLevel::High);
+        assert_eq!(
+            engine.assess_risk(&path, "docs_regen").unwrap(),
+            RiskLevel::High
+        );
     }
 
     #[test]
@@ -778,7 +790,10 @@ mod tests {
         let engine = SafetyEngine::new();
         let validation = engine.validate_changes("def function():\n    pass\n", "");
         assert!(!validation.safe);
-        assert_eq!(validation.warnings[0], "All content removed - blocking change");
+        assert_eq!(
+            validation.warnings[0],
+            "All content removed - blocking change"
+        );
         // The reduction warnings still accumulate after the blocker.
         assert!(
             validation
@@ -793,7 +808,10 @@ mod tests {
         let engine = SafetyEngine::new();
         let validation = engine.validate_changes("small", &"very large content".repeat(1000));
         assert!(!validation.safe);
-        assert_eq!(validation.warnings[0], "File size doubled - review recommended");
+        assert_eq!(
+            validation.warnings[0],
+            "File size doubled - review recommended"
+        );
     }
 
     #[test]
@@ -803,7 +821,10 @@ mod tests {
         let engine = SafetyEngine::new();
         let validation = engine.validate_changes("", "x");
         assert!(!validation.safe);
-        assert_eq!(validation.warnings, vec!["File size doubled - review recommended"]);
+        assert_eq!(
+            validation.warnings,
+            vec!["File size doubled - review recommended"]
+        );
         // Exactly-double is NOT a trip (strict `>`).
         let validation = engine.validate_changes("ab", "abcd");
         assert!(validation.safe);

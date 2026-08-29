@@ -35,16 +35,18 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let rest = &args[1..];
 
     let repo = {
-        let raw = opt(rest, "--repo")
-            .ok_or_else(|| "usage: aethyme analyze dead-code --repo <path> --scope <prefix>".to_string())?;
+        let raw = opt(rest, "--repo").ok_or_else(|| {
+            "usage: aethyme analyze dead-code --repo <path> --scope <prefix>".to_string()
+        })?;
         let path = PathBuf::from(&raw);
         if !path.is_dir() {
             return Err(format!("repository path is not a directory: {raw}"));
         }
         path.canonicalize().map_err(|e| e.to_string())?
     };
-    let scope = opt(rest, "--scope")
-        .ok_or_else(|| "usage: aethyme analyze dead-code --repo <path> --scope <prefix>".to_string())?;
+    let scope = opt(rest, "--scope").ok_or_else(|| {
+        "usage: aethyme analyze dead-code --repo <path> --scope <prefix>".to_string()
+    })?;
     let boundary = opt(rest, "--boundary").unwrap_or_else(|| "outside-directory".to_string());
     if boundary != "outside-directory" {
         return Err(format!("unsupported --boundary: {boundary}"));
@@ -73,8 +75,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
     match format.as_str() {
         "full-json" => {
-            let observability = observability_json(&repo, &scope, &roots, &boundary,
-                include_methods, "full-json", &payload);
+            let observability = observability_json(
+                &repo,
+                &scope,
+                &roots,
+                &boundary,
+                include_methods,
+                "full-json",
+                &payload,
+            );
             // Python appended command_observability to the answer dict,
             // and its size loop also stamped output_size_bytes into the
             // answer's own observability block (dict assignment appends
@@ -93,7 +102,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "eval-json" => {
             let mut parts: Vec<String> = Vec::new();
             let items = |key: &str, statuses: Option<&[&str]>| -> String {
-                let list = payload.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+                let list = payload
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
                 let rendered: Vec<String> = list
                     .iter()
                     .filter(|c| match statuses {
@@ -112,12 +125,22 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 "\"unused_functions\":{}",
                 items("candidates", Some(&["Unused", "Ambiguous"]))
             ));
-            parts.push(format!("\"excluded_functions\":{}", items("excluded", None)));
+            parts.push(format!(
+                "\"excluded_functions\":{}",
+                items("excluded", None)
+            ));
             if show_observability {
                 parts.push(format!(
                     "\"observability\":{}",
-                    observability_json(&repo, &scope, &roots, &boundary,
-                        include_methods, "eval-json", &payload)
+                    observability_json(
+                        &repo,
+                        &scope,
+                        &roots,
+                        &boundary,
+                        include_methods,
+                        "eval-json",
+                        &payload
+                    )
                 ));
             }
             let template = format!("{{{}}}", parts.join(","));
@@ -129,7 +152,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 payload["analyzer"].as_str().unwrap_or_default(),
                 payload["version"].as_str().unwrap_or_default(),
             );
-            println!("Scope: {}", payload["query"]["scope"].as_str().unwrap_or_default());
+            println!(
+                "Scope: {}",
+                payload["query"]["scope"].as_str().unwrap_or_default()
+            );
             let s = &payload["summary"];
             println!(
                 "Candidates: {} total, {} unused, {} ambiguous, {} used",
@@ -169,7 +195,9 @@ fn eval_item_json(candidate: &Value) -> String {
     let evidence = candidate.get("evidence").cloned().unwrap_or(Value::Null);
     let get = |v: &Value, key: &str| v.get(key).cloned().unwrap_or(Value::Null);
     let get_list = |v: &Value, key: &str| {
-        v.get(key).cloned().unwrap_or_else(|| Value::Array(Vec::new()))
+        v.get(key)
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()))
     };
     format!(
         "{{\"function_name\":{},\"defined_in\":{},\"status\":{},\"external_callers\":{},\"internal_callers\":{},\"evidence\":{{\"searched_roots\":{},\"external_callers\":{},\"internal_callers\":{},\"docs_config_references\":{},\"ambiguity\":{}}},\"confidence\":{},\"reason\":{}}}",
@@ -226,8 +254,12 @@ fn observability_json(
         jstr(&get_obj("graph_counts")),
         jstr(&get_obj("fact_counts")),
         jstr(&get_obj("confidence_summary")),
-        jstr(&rust_obs.get("degraded_reasons").cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new()))),
+        jstr(
+            &rust_obs
+                .get("degraded_reasons")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()))
+        ),
     )
 }
 
@@ -326,7 +358,7 @@ fn replace_output_size(text: &str, size: usize, which: Occurrence) -> (Option<us
 
 #[cfg(test)]
 mod tests {
-    use super::{fixed_point_output_size, replace_output_size, Occurrence};
+    use super::{Occurrence, fixed_point_output_size, replace_output_size};
 
     #[test]
     fn output_size_converges_like_python() {

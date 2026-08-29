@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 /// Outcome of one subprocess invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunOutcome {
-    Completed { code: i32, stdout: Vec<u8> },
+    Completed {
+        code: i32,
+        stdout: Vec<u8>,
+    },
     /// Spawn failure (`FileNotFoundError`) or timeout
     /// (`TimeoutExpired`) — both are caught in the Python.
     Failed,
@@ -30,9 +33,7 @@ impl RunOutcome {
     /// call sites, which only read git SHAs and PR URLs.
     pub fn stdout_text(&self) -> String {
         match self {
-            RunOutcome::Completed { stdout, .. } => {
-                String::from_utf8_lossy(stdout).to_string()
-            }
+            RunOutcome::Completed { stdout, .. } => String::from_utf8_lossy(stdout).to_string(),
             RunOutcome::Failed => String::new(),
         }
     }
@@ -189,7 +190,10 @@ mod tests {
             ),
             RunOutcome::Failed
         );
-        assert!(started.elapsed() < Duration::from_secs(5), "did not kill promptly");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "did not kill promptly"
+        );
         // No timeout: a short-lived child still completes normally.
         assert!(
             runner

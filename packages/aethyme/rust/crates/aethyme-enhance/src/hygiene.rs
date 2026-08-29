@@ -453,9 +453,7 @@ mod tests {
                 .iter()
                 .map(|policy| policy.commit_type)
                 .collect::<Vec<_>>(),
-            vec![
-                "fix", "feat", "refactor", "perf", "test", "docs", "build", "chore", "revert",
-            ]
+            vec!["fix", "feat", "refactor", "perf", "test", "docs", "build", "chore", "revert",]
         );
         for policy in &COMMIT_POLICIES[..4] {
             assert!(policy.body_required);
@@ -500,25 +498,24 @@ mod tests {
         assert_eq!(result.get("ok"), Some(&Value::Bool(true)));
         let subject = result.get("subject").unwrap();
         assert_eq!(subject.get("type").and_then(Value::as_str), Some("fix"));
-        assert_eq!(subject.get("scope").and_then(Value::as_str), Some("watchlist"));
+        assert_eq!(
+            subject.get("scope").and_then(Value::as_str),
+            Some("watchlist")
+        );
         assert_eq!(
             subject.get("summary").and_then(Value::as_str),
             Some("mark only viewed revision as seen")
         );
         let recognized = result.get("recognized_sections").unwrap();
-        assert!(
-            recognized
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| v.as_str() == Some("Decision"))
-        );
+        assert!(recognized
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("Decision")));
         let candidates = result.get("memory_candidates").unwrap().as_array().unwrap();
-        assert!(
-            candidates
-                .iter()
-                .any(|c| c.get("type").and_then(Value::as_str) == Some("decision"))
-        );
+        assert!(candidates
+            .iter()
+            .any(|c| c.get("type").and_then(Value::as_str) == Some("decision")));
     }
 
     #[test]
@@ -608,11 +605,9 @@ mod tests {
         let result = lint_commit_message(message);
         assert_eq!(result.get("ok"), Some(&Value::Bool(false)));
         let errors = result.get("errors").unwrap().as_array().unwrap();
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.as_str() == Some("Missing required section: Rationale."))
-        );
+        assert!(errors
+            .iter()
+            .any(|e| e.as_str() == Some("Missing required section: Rationale.")));
     }
 
     #[test]
@@ -647,14 +642,12 @@ mod tests {
         );
         assert_eq!(result.get("ok"), Some(&Value::Bool(true)));
         assert!(result.get("errors").unwrap().as_array().unwrap().is_empty());
-        assert!(
-            result
-                .get("required_sections")
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(result
+            .get("required_sections")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -670,14 +663,12 @@ mod tests {
                 "{} should allow a subject-only message",
                 policy.commit_type
             );
-            assert!(
-                result
-                    .get("required_sections")
-                    .unwrap()
-                    .as_array()
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(result
+                .get("required_sections")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty());
         }
     }
 
@@ -749,7 +740,10 @@ mod tests {
         );
         // Followed by the four missing-section errors, in order.
         assert_eq!(errors.len(), 5);
-        assert_eq!(errors[1].as_str(), Some("Missing required section: Problem."));
+        assert_eq!(
+            errors[1].as_str(),
+            Some("Missing required section: Problem.")
+        );
         assert_eq!(
             errors[4].as_str(),
             Some("Missing required section: Validation.")

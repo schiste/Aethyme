@@ -274,9 +274,7 @@ impl PatchGenerator {
             let requires_approval: Vec<&FilePatch> = self
                 .patches
                 .iter()
-                .filter(|patch| {
-                    matches!(patch.risk_level, RiskLevel::Medium | RiskLevel::High)
-                })
+                .filter(|patch| matches!(patch.risk_level, RiskLevel::Medium | RiskLevel::High))
                 .collect();
             if !requires_approval.is_empty() {
                 return ApplyOutcome::RequiresApproval {
@@ -301,7 +299,11 @@ impl PatchGenerator {
         }
 
         ApplyOutcome::Executed {
-            status: if failed.is_empty() { "success" } else { "partial" },
+            status: if failed.is_empty() {
+                "success"
+            } else {
+                "partial"
+            },
             applied,
             failed,
         }
@@ -438,7 +440,10 @@ mod tests {
         let mut pg = generator(&tmp);
         let file_path = tmp.join("test.py");
         fs::write(&file_path, "original").unwrap();
-        assert!(pg.add_patch(&file_path, "original", "modified", "test_fix").is_some());
+        assert!(
+            pg.add_patch(&file_path, "original", "modified", "test_fix")
+                .is_some()
+        );
         assert_eq!(pg.patches.len(), 1);
         // Stored relative to the repo root.
         assert_eq!(pg.patches[0].file_path, PathBuf::from("test.py"));
@@ -450,7 +455,10 @@ mod tests {
         let mut pg = generator(&tmp);
         let file_path = tmp.join("test.py");
         fs::write(&file_path, "content").unwrap();
-        assert!(pg.add_patch(&file_path, "content", "content", "test_fix").is_none());
+        assert!(
+            pg.add_patch(&file_path, "content", "content", "test_fix")
+                .is_none()
+        );
         assert!(pg.patches.is_empty());
     }
 
@@ -460,7 +468,10 @@ mod tests {
         let mut pg = generator(&tmp);
         let file_path = tmp.join("generated.gen.py");
         fs::write(&file_path, "original").unwrap();
-        assert!(pg.add_patch(&file_path, "original", "modified", "test_fix").is_none());
+        assert!(
+            pg.add_patch(&file_path, "original", "modified", "test_fix")
+                .is_none()
+        );
         assert!(pg.patches.is_empty());
     }
 
@@ -471,7 +482,10 @@ mod tests {
         let mut pg = generator(&tmp);
         let file_path = other.join("test.py");
         fs::write(&file_path, "original").unwrap();
-        assert!(pg.add_patch(&file_path, "original", "modified", "test_fix").is_none());
+        assert!(
+            pg.add_patch(&file_path, "original", "modified", "test_fix")
+                .is_none()
+        );
         assert!(pg.patches.is_empty());
     }
 
@@ -497,7 +511,8 @@ mod tests {
         let tmp = tmpdir("patch-low");
         let mut pg = generator(&tmp);
         let doc = tmp.join("README.md");
-        pg.add_patch(&doc, "aaaa\n", "bbbb\n", "docs_regen").unwrap();
+        pg.add_patch(&doc, "aaaa\n", "bbbb\n", "docs_regen")
+            .unwrap();
         assert_eq!(pg.patches[0].risk_level, RiskLevel::Low);
     }
 
@@ -505,8 +520,18 @@ mod tests {
     fn generates_a_joined_unified_diff() {
         let tmp = tmpdir("patch-joined");
         let mut pg = generator(&tmp);
-        pg.add_patch(&tmp.join("file1.py"), "content1\n", "modified1\n", "test_fix");
-        pg.add_patch(&tmp.join("file2.py"), "content2\n", "modified2\n", "test_fix");
+        pg.add_patch(
+            &tmp.join("file1.py"),
+            "content1\n",
+            "modified1\n",
+            "test_fix",
+        );
+        pg.add_patch(
+            &tmp.join("file2.py"),
+            "content2\n",
+            "modified2\n",
+            "test_fix",
+        );
         let diff = pg.generate_unified_diff();
         assert_eq!(
             diff,
@@ -558,7 +583,11 @@ mod tests {
         fs::write(&file_path, "original").unwrap();
         pg.add_patch(&file_path, "original", "modified", "docs_regen");
         match pg.apply(false) {
-            ApplyOutcome::Executed { status, applied, failed } => {
+            ApplyOutcome::Executed {
+                status,
+                applied,
+                failed,
+            } => {
                 assert_eq!(status, "success");
                 assert_eq!(applied, vec!["README.md".to_string()]);
                 assert!(failed.is_empty());
@@ -598,7 +627,10 @@ mod tests {
         fs::write(&risky_file, "original").unwrap();
         pg.add_patch(&safe_file, "original", "modified", "docs_regen");
         pg.add_patch(&risky_file, "original", "modified", "format_fix");
-        assert!(matches!(pg.apply(false), ApplyOutcome::RequiresApproval { .. }));
+        assert!(matches!(
+            pg.apply(false),
+            ApplyOutcome::RequiresApproval { .. }
+        ));
         assert_eq!(fs::read_to_string(&safe_file).unwrap(), "original");
         assert_eq!(fs::read_to_string(&risky_file).unwrap(), "original");
     }
@@ -611,7 +643,9 @@ mod tests {
         fs::write(&file_path, "original").unwrap();
         pg.add_patch(&file_path, "original", "modified", "format_fix");
         match pg.apply(true) {
-            ApplyOutcome::Executed { status, applied, .. } => {
+            ApplyOutcome::Executed {
+                status, applied, ..
+            } => {
                 assert_eq!(status, "success");
                 assert_eq!(applied.len(), 1);
             }
@@ -639,7 +673,11 @@ mod tests {
             "docs_regen",
         );
         match pg.apply(true) {
-            ApplyOutcome::Executed { status, applied, failed } => {
+            ApplyOutcome::Executed {
+                status,
+                applied,
+                failed,
+            } => {
                 assert_eq!(status, "partial");
                 assert_eq!(applied, vec!["README.md".to_string()]);
                 assert_eq!(failed, vec!["missing-dir/other.md".to_string()]);
@@ -655,7 +693,10 @@ mod tests {
         let pg = generator(&tmp);
         assert!(matches!(
             pg.apply(false),
-            ApplyOutcome::Executed { status: "success", .. }
+            ApplyOutcome::Executed {
+                status: "success",
+                ..
+            }
         ));
     }
 

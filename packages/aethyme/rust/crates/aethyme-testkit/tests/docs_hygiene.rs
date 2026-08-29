@@ -110,12 +110,19 @@ fn is_anchor(link: &str) -> bool {
 fn docs_directory_exists() {
     let dir = docs_dir();
     assert!(dir.exists(), "Docs directory not found: {}", dir.display());
-    assert!(dir.is_dir(), "Docs path is not a directory: {}", dir.display());
+    assert!(
+        dir.is_dir(),
+        "Docs path is not a directory: {}",
+        dir.display()
+    );
 }
 
 #[test]
 fn markdown_files_exist() {
-    assert!(!markdown_files(&docs_dir()).is_empty(), "No markdown files found in docs/");
+    assert!(
+        !markdown_files(&docs_dir()).is_empty(),
+        "No markdown files found in docs/"
+    );
 }
 
 /// Internal links in human-curated docs must resolve.
@@ -137,7 +144,10 @@ fn internal_links_valid() {
             if is_external(&link) || is_anchor(&link) {
                 continue;
             }
-            let target = md_file.parent().expect("markdown file has a parent").join(&link);
+            let target = md_file
+                .parent()
+                .expect("markdown file has a parent")
+                .join(&link);
             if !target.exists() {
                 broken.push(format!("  {}:{line} -> {link}", relative(&md_file)));
             }
@@ -199,7 +209,10 @@ fn runbooks_have_standard_sections() {
         let content = read(&runbook);
         let name = runbook.file_name().unwrap().to_string_lossy().into_owned();
         for section in ["## Overview", "## Symptoms"] {
-            assert!(content.contains(section), "Runbook {name} missing section: {section}");
+            assert!(
+                content.contains(section),
+                "Runbook {name} missing section: {section}"
+            );
         }
         assert!(
             ["## Diagnostic", "## Detection"]
@@ -253,7 +266,11 @@ fn find_code_blocks(text: &str) -> Vec<(String, String, usize)> {
                 .chars()
                 .take_while(|character| character.is_alphanumeric() || *character == '_')
                 .collect();
-            language = if tag.is_empty() { "text".to_string() } else { tag };
+            language = if tag.is_empty() {
+                "text".to_string()
+            } else {
+                tag
+            };
             current = Some(Vec::new());
             start_line = line_number;
         } else if line.trim() == "```" && current.is_some() {
@@ -362,12 +379,17 @@ fn sql_examples_basic_syntax() {
             continue;
         }
         let upper = code.to_uppercase();
-        if !["SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP"]
-            .iter()
-            .any(|keyword| upper.contains(keyword))
+        if ![
+            "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP",
+        ]
+        .iter()
+        .any(|keyword| upper.contains(keyword))
         {
             issues += 1;
-            eprintln!("SQL block missing SQL keywords: {}:{line}", relative(&md_file));
+            eprintln!(
+                "SQL block missing SQL keywords: {}:{line}",
+                relative(&md_file)
+            );
         }
     }
     if issues > 0 {
@@ -434,6 +456,9 @@ fn code_blocks_have_language() {
         .map(|(md_file, _, _, line)| format!("{}:{line}", relative(&md_file)))
         .collect();
     if !missing.is_empty() {
-        eprintln!("\nWarning: Found {} code blocks without language", missing.len());
+        eprintln!(
+            "\nWarning: Found {} code blocks without language",
+            missing.len()
+        );
     }
 }

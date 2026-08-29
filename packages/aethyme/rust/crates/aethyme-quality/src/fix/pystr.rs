@@ -130,7 +130,11 @@ pub fn as_posix(path: &Path) -> String {
         }
     }
     if parts.is_empty() {
-        return if absolute { "/".to_string() } else { ".".to_string() };
+        return if absolute {
+            "/".to_string()
+        } else {
+            ".".to_string()
+        };
     }
     let joined = parts.join("/");
     if absolute {

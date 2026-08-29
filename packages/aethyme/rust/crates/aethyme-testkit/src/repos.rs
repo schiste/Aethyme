@@ -27,8 +27,7 @@ pub fn write(path: impl AsRef<Path>, content: &str) {
 /// Read a UTF-8 file, panicking with the path on failure.
 pub fn read(path: impl AsRef<Path>) -> String {
     let path = path.as_ref();
-    std::fs::read_to_string(path)
-        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    std::fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
 }
 
 /// A repository that follows the documented AI-readiness rules.
@@ -38,7 +37,10 @@ pub fn build_good_scorecard_repo(tmp: &Path) -> PathBuf {
         repo.join("README.md"),
         "# Good Repository Example\n\nThis repository follows the documented AI-readiness rules.\n\nSee ./src/api/README.md for API details.\n",
     );
-    write(repo.join("src/FOLDER.md"), "# src\n\nCore application source code.\n");
+    write(
+        repo.join("src/FOLDER.md"),
+        "# src\n\nCore application source code.\n",
+    );
     write(
         repo.join("src/api/README.md"),
         "# API\n\nDocumented HTTP handlers and schemas.\n",
@@ -108,7 +110,10 @@ pub fn build_pnpm_demo_repo(root: &Path) -> PathBuf {
 /// the safety engine must refuse to patch.
 pub fn build_fixable_repo(tmp: &Path) -> PathBuf {
     let repo = tmp.join("autofix-repo");
-    write(repo.join("src/module.py"), "\"\"\"Module purpose.\"\"\"\n\nx = 1\n");
+    write(
+        repo.join("src/module.py"),
+        "\"\"\"Module purpose.\"\"\"\n\nx = 1\n",
+    );
     write(repo.join("docs/page.md"), "[Absolute](/src/module.py)\n");
     write(
         repo.join("ui/Panel.tsx"),
@@ -116,7 +121,10 @@ pub fn build_fixable_repo(tmp: &Path) -> PathBuf {
     );
     write(repo.join("package.json"), "{}\n");
     write(repo.join("Cargo.lock"), "# lock\n");
-    write(repo.join("node_modules/pkg/index.js"), "module.exports = 1;\n");
+    write(
+        repo.join("node_modules/pkg/index.js"),
+        "module.exports = 1;\n",
+    );
     repo
 }
 
@@ -135,7 +143,10 @@ pub fn build_demo_source_repo(root: &Path) -> PathBuf {
         root.join("src/main.py"),
         "from src.auth import validate_token\n\ndef main():\n    return validate_token()\n",
     );
-    write(root.join("src/auth.py"), "def validate_token():\n    return True\n");
+    write(
+        root.join("src/auth.py"),
+        "def validate_token():\n    return True\n",
+    );
     root.to_path_buf()
 }
 
@@ -164,7 +175,12 @@ pub fn bootstrap_repo_fragments(root: &Path) {
     );
 
     let indexed = std::process::Command::new(crate::bins::engine_bin())
-        .args(["index", "--repo", &root.to_string_lossy(), "--from-fragments"])
+        .args([
+            "index",
+            "--repo",
+            &root.to_string_lossy(),
+            "--from-fragments",
+        ])
         .output()
         .expect("spawn aethyme-engine-cli index");
     assert!(

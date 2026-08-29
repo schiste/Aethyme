@@ -29,7 +29,10 @@ pub fn build_good_scorecard_repo(tmp: &Path) -> PathBuf {
         &repo.join("README.md"),
         "# Good Repository Example\n\nThis repository follows the documented AI-readiness rules.\n\nSee ./src/api/README.md for API details.\n",
     );
-    write(&repo.join("src/FOLDER.md"), "# src\n\nCore application source code.\n");
+    write(
+        &repo.join("src/FOLDER.md"),
+        "# src\n\nCore application source code.\n",
+    );
     write(
         &repo.join("src/api/README.md"),
         "# API\n\nDocumented HTTP handlers and schemas.\n",

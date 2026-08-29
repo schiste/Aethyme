@@ -254,10 +254,10 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             }
             "--consumers-doc" => {
                 index += 1;
-                parsed.consumers_doc = Some(PathBuf::from(
-                    args.get(index)
-                        .ok_or_else(|| "--consumers-doc requires a value".to_string())?,
-                ));
+                parsed.consumers_doc =
+                    Some(PathBuf::from(args.get(index).ok_or_else(|| {
+                        "--consumers-doc requires a value".to_string()
+                    })?));
             }
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -271,8 +271,8 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
 /// gate inside their own worktree, where the diff under review lives.
 fn repo_root() -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let repo = crate::GitRepo::discover(&cwd)
-        .map_err(|e| format!("not inside a git repository: {e}"))?;
+    let repo =
+        crate::GitRepo::discover(&cwd).map_err(|e| format!("not inside a git repository: {e}"))?;
     Ok(repo.root().to_path_buf())
 }
 
@@ -395,7 +395,10 @@ pub fn find_touched_symbols(
         if let Some(body) = line.strip_prefix('-') {
             for symbol in tracked {
                 if body.contains(symbol.as_str()) {
-                    removed.entry(symbol.clone()).or_default().push(line.clone());
+                    removed
+                        .entry(symbol.clone())
+                        .or_default()
+                        .push(line.clone());
                 }
             }
         } else if let Some(body) = line.strip_prefix('+') {
@@ -500,7 +503,8 @@ fn checkbox_decisions(text: &str) -> Vec<Decision> {
             continue;
         }
         let start = cursor;
-        while cursor < chars.len() && (chars[cursor].is_ascii_alphabetic() || chars[cursor] == '-') {
+        while cursor < chars.len() && (chars[cursor].is_ascii_alphabetic() || chars[cursor] == '-')
+        {
             cursor += 1;
         }
         let label: String = chars[start..cursor].iter().collect();
@@ -828,8 +832,8 @@ mod tests {
         // including the high-blast-radius names. If this set is empty or
         // tiny the check silently no-ops in CI.
         let doc = repo_relative(DEFAULT_CONSUMERS_DOC);
-        let text = std::fs::read_to_string(&doc)
-            .unwrap_or_else(|e| panic!("read {}: {e}", doc.display()));
+        let text =
+            std::fs::read_to_string(&doc).unwrap_or_else(|e| panic!("read {}: {e}", doc.display()));
         let tracked = extract_tracked_symbols(&text);
         assert!(
             tracked.len() >= 20,

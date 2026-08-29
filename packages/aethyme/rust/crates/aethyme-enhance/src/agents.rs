@@ -582,11 +582,9 @@ mod tests {
             .first()
             .expect("at least one substantive commit policy")
             .required_sections;
-        assert!(
-            substantive
-                .iter()
-                .all(|policy| policy.required_sections == required_sections)
-        );
+        assert!(substantive
+            .iter()
+            .all(|policy| policy.required_sections == required_sections));
         for section in required_sections {
             assert!(doc.contains(&format!("  - `{section}`")));
         }
@@ -600,12 +598,10 @@ mod tests {
         assert!(doc.contains(&format!(
             "- Non-substantive commits ({non_substantive_types}) may use a subject-only message; structured bodies remain optional."
         )));
-        assert!(
-            COMMIT_POLICIES
-                .iter()
-                .filter(|policy| !policy.body_required)
-                .all(|policy| policy.required_sections.is_empty())
-        );
+        assert!(COMMIT_POLICIES
+            .iter()
+            .filter(|policy| !policy.body_required)
+            .all(|policy| policy.required_sections.is_empty()));
         assert!(doc.contains(
             "- Section content may start on the header line (`Problem: text`) or the following line (`Problem:` then `text`)."
         ));

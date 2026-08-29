@@ -94,7 +94,10 @@ fn compile_skills_renders_repo_specific_artifacts() {
     );
     assert_eq!(onboarding["primary_commands"]["fast_test"], "pnpm test");
     assert_eq!(onboarding["primary_commands"]["dev"], "pnpm dev");
-    assert_eq!(onboarding["primary_entrypoints"]["app"]["path"], "src/main.ts");
+    assert_eq!(
+        onboarding["primary_entrypoints"]["app"]["path"],
+        "src/main.ts"
+    );
     assert!(
         onboarding["areas"]
             .as_array()
@@ -102,16 +105,24 @@ fn compile_skills_renders_repo_specific_artifacts() {
             .iter()
             .any(|area| area["path"] == "src")
     );
-    assert!(!onboarding["summon"]["recommended_when"].as_array().unwrap().is_empty());
-    assert!(onboarding["telemetry"]["counts"]["commands"].as_i64().unwrap() >= 1);
+    assert!(
+        !onboarding["summon"]["recommended_when"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        onboarding["telemetry"]["counts"]["commands"]
+            .as_i64()
+            .unwrap()
+            >= 1
+    );
     assert_eq!(act["recommended_mode"], "repo-act");
     assert_eq!(act["commands"]["fast_test"], "pnpm test");
     assert_eq!(act["commands"]["dev"], "pnpm dev");
     assert_eq!(act["primary_entrypoints"]["app"]["path"], "src/main.ts");
     assert!(read(repo.join(".codex/skills/repo-onboarding/SKILL.md")).contains("Repo Onboarding"));
-    assert!(
-        read(repo.join(".codex/skills/repo-act/SKILL.md")).contains("## Debugging Checklist")
-    );
+    assert!(read(repo.join(".codex/skills/repo-act/SKILL.md")).contains("## Debugging Checklist"));
 }
 
 #[test]
@@ -216,20 +227,42 @@ fn onboarding_collects_ranked_primary_commands_from_multiple_sources() {
 
     assert_eq!(onboarding["primary_commands"]["install"], "just install");
     assert_eq!(onboarding["primary_commands"]["dev"], "pnpm dev");
-    assert_eq!(onboarding["primary_commands"]["fast_test"], "just test-fast");
-    assert_eq!(onboarding["primary_commands"]["full_test"], "just full-test");
+    assert_eq!(
+        onboarding["primary_commands"]["fast_test"],
+        "just test-fast"
+    );
+    assert_eq!(
+        onboarding["primary_commands"]["full_test"],
+        "just full-test"
+    );
     assert_eq!(onboarding["primary_commands"]["lint"], "pnpm lint");
     assert_eq!(onboarding["primary_commands"]["build"], "pnpm build");
-    assert_eq!(onboarding["primary_entrypoints"]["app"]["path"], "Procfile:web");
-    assert_eq!(onboarding["primary_entrypoints"]["worker"]["path"], "Procfile:worker");
-    let test_entrypoint = onboarding["primary_entrypoints"]["test"]["path"].as_str().unwrap();
+    assert_eq!(
+        onboarding["primary_entrypoints"]["app"]["path"],
+        "Procfile:web"
+    );
+    assert_eq!(
+        onboarding["primary_entrypoints"]["worker"]["path"],
+        "Procfile:worker"
+    );
+    let test_entrypoint = onboarding["primary_entrypoints"]["test"]["path"]
+        .as_str()
+        .unwrap();
     assert!(
         ["docker-compose.yml:test", "package.json:scripts.test"].contains(&test_entrypoint),
         "unexpected test entrypoint {test_entrypoint:?}"
     );
     let commands = onboarding["commands"].as_array().unwrap();
-    assert!(commands.iter().any(|command| command["source"] == "Procfile:web"));
-    assert!(commands.iter().any(|command| command["source"] == "docker-compose.yml"));
+    assert!(
+        commands
+            .iter()
+            .any(|command| command["source"] == "Procfile:web")
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|command| command["source"] == "docker-compose.yml")
+    );
     assert_eq!(act["commands"]["fast_test"], "just test-fast");
     assert_eq!(act["commands"]["full_test"], "just full-test");
     assert_eq!(act["commands"]["dev"], "pnpm dev");
@@ -266,10 +299,21 @@ fn onboarding_collects_ranked_primary_entrypoints_from_multiple_sources() {
     let onboarding = artifact(&repo, ".aethyme/generated/onboarding.json");
     let act = artifact(&repo, ".aethyme/generated/act-starter.json");
 
-    assert_eq!(onboarding["primary_entrypoints"]["app"]["path"], "src/server.ts");
-    assert_eq!(onboarding["primary_entrypoints"]["cli"]["path"], "bin/demo.js");
-    assert_eq!(onboarding["primary_entrypoints"]["worker"]["path"], "Procfile:worker");
-    let test_entrypoint = onboarding["primary_entrypoints"]["test"]["path"].as_str().unwrap();
+    assert_eq!(
+        onboarding["primary_entrypoints"]["app"]["path"],
+        "src/server.ts"
+    );
+    assert_eq!(
+        onboarding["primary_entrypoints"]["cli"]["path"],
+        "bin/demo.js"
+    );
+    assert_eq!(
+        onboarding["primary_entrypoints"]["worker"]["path"],
+        "Procfile:worker"
+    );
+    let test_entrypoint = onboarding["primary_entrypoints"]["test"]["path"]
+        .as_str()
+        .unwrap();
     assert!(
         ["Procfile:test", "package.json:scripts.test"].contains(&test_entrypoint),
         "unexpected test entrypoint {test_entrypoint:?}"

@@ -99,7 +99,11 @@ pub fn run(args: &[String]) -> u8 {
     for (group, scanning, noun) in [
         (FixSelection::Docs, "documentation issues", "documentation"),
         (FixSelection::Links, "link issues", "link"),
-        (FixSelection::Selectors, "missing test selectors", "selector"),
+        (
+            FixSelection::Selectors,
+            "missing test selectors",
+            "selector",
+        ),
         (FixSelection::I18n, "hardcoded strings", "i18n"),
         (FixSelection::Format, "formatting issues", "formatting"),
     ] {
@@ -203,7 +207,9 @@ fn run_apply(
             println!("Use --skip-approval to apply anyway (not recommended)");
             0
         }
-        ApplyOutcome::Executed { applied, failed, .. } => {
+        ApplyOutcome::Executed {
+            applied, failed, ..
+        } => {
             println!();
             println!("Applied {} files", applied.len());
             if !failed.is_empty() {
@@ -366,9 +372,15 @@ mod tests {
 
     #[test]
     fn flags_and_the_argument_may_be_interleaved() {
-        let parsed = parse(&["--dry-run", "/repo", "--fix-type", "docs", "--skip-approval"])
-            .unwrap()
-            .unwrap();
+        let parsed = parse(&[
+            "--dry-run",
+            "/repo",
+            "--fix-type",
+            "docs",
+            "--skip-approval",
+        ])
+        .unwrap()
+        .unwrap();
         assert_eq!(parsed.repo_path, "/repo");
         assert_eq!(parsed.fix_type, "docs");
         assert!(parsed.dry_run && parsed.skip_approval);
@@ -387,10 +399,7 @@ mod tests {
 
     #[test]
     fn usage_errors_use_click_wording() {
-        assert_eq!(
-            parse(&[]).unwrap_err(),
-            "Missing argument 'REPO_PATH'."
-        );
+        assert_eq!(parse(&[]).unwrap_err(), "Missing argument 'REPO_PATH'.");
         assert_eq!(
             parse(&["/repo", "--bogus"]).unwrap_err(),
             "No such option '--bogus'."
@@ -413,7 +422,10 @@ mod tests {
     fn every_fix_type_choice_is_accepted() {
         for choice in ["all", "docs", "links", "selectors", "i18n", "format"] {
             assert_eq!(
-                parse(&["/repo", "--fix-type", choice]).unwrap().unwrap().fix_type,
+                parse(&["/repo", "--fix-type", choice])
+                    .unwrap()
+                    .unwrap()
+                    .fix_type,
                 choice
             );
         }
@@ -421,7 +433,13 @@ mod tests {
 
     #[test]
     fn help_body_lists_every_flag() {
-        for flag in ["--dry-run", "--apply", "--pr", "--fix-type", "--skip-approval"] {
+        for flag in [
+            "--dry-run",
+            "--apply",
+            "--pr",
+            "--fix-type",
+            "--skip-approval",
+        ] {
             assert!(HELP.contains(flag), "{flag}");
         }
         assert!(HELP.starts_with("Usage: aethyme autofix [OPTIONS] REPO_PATH"));

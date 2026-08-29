@@ -66,9 +66,11 @@ fn dispatch(subcommand: &str, rest: &[String]) -> Result<(), String> {
 }
 
 fn build_map(repo: &Path) -> Result<RepositoryMap, String> {
-    Ok(RepositoryMap::build_with_fragment_preference(repo, false, |_| {})
-        .map_err(|e| e.to_string())?
-        .0)
+    Ok(
+        RepositoryMap::build_with_fragment_preference(repo, false, |_| {})
+            .map_err(|e| e.to_string())?
+            .0,
+    )
 }
 
 fn store_path(repo: &Path) -> PathBuf {
@@ -87,7 +89,11 @@ fn ingest(repo: &Path) -> Result<(), String> {
     let store = store_path(repo);
     println!(
         "Graph store: {}",
-        if store.is_file() { "present" } else { "missing (run aethyme-engine-cli index)" }
+        if store.is_file() {
+            "present"
+        } else {
+            "missing (run aethyme-engine-cli index)"
+        }
     );
     Ok(())
 }
@@ -130,7 +136,10 @@ fn inspect(repo: &Path, rest: &[String]) -> Result<(), String> {
             .unwrap_or_default()
     };
     println!("Languages: {}", join(&snapshot["languages"]));
-    println!("Top-level directories: {}", join(&snapshot["top_level_dirs"]));
+    println!(
+        "Top-level directories: {}",
+        join(&snapshot["top_level_dirs"])
+    );
     let file_count = snapshot
         .get("file_count")
         .and_then(Value::as_i64)
@@ -153,7 +162,10 @@ fn inspect(repo: &Path, rest: &[String]) -> Result<(), String> {
         println!("Symbols: {}", len("symbols"));
         println!("Edges: {}", len("edges"));
     }
-    for (key, label) in [("entrypoints", "Entrypoints"), ("key_configs", "Key configs")] {
+    for (key, label) in [
+        ("entrypoints", "Entrypoints"),
+        ("key_configs", "Key configs"),
+    ] {
         if let Some(items) = payload.get(key).and_then(Value::as_array) {
             if !items.is_empty() {
                 println!("{label}: {}", join(&payload[key]));
@@ -164,7 +176,9 @@ fn inspect(repo: &Path, rest: &[String]) -> Result<(), String> {
         if !signals.is_empty() {
             println!("Signals:");
             for name in object_key_order(&raw, "signals") {
-                let Some(signal) = signals.get(&name) else { continue };
+                let Some(signal) = signals.get(&name) else {
+                    continue;
+                };
                 println!(
                     "- {}: {} ({})",
                     name.replace('_', " "),
@@ -243,7 +257,14 @@ fn engine_info(rest: &[String]) -> Result<(), String> {
             if store_present { "present" } else { "missing" },
             store.display()
         );
-        println!("Daemon: {}", if daemon_running { "running" } else { "not running" });
+        println!(
+            "Daemon: {}",
+            if daemon_running {
+                "running"
+            } else {
+                "not running"
+            }
+        );
         println!("Ready: {}", if ready { "yes" } else { "no" });
     }
     if check && !ready {

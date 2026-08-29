@@ -93,7 +93,9 @@ pub fn run_facts(args: &[String]) -> Result<(), String> {
                 let payload: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
                 println!(
                     "Function: {}",
-                    payload["function"]["qualified_name"].as_str().unwrap_or_default()
+                    payload["function"]["qualified_name"]
+                        .as_str()
+                        .unwrap_or_default()
                 );
                 println!(
                     "Boundary: {}",
@@ -133,8 +135,8 @@ pub fn run_intents(args: &[String]) -> Result<(), String> {
             let body = catalog
                 .strip_suffix("\n}")
                 .ok_or_else(|| "intents catalog malformed".to_string())?;
-            let raw_value = serde_json::to_string(&Value::String(request))
-                .map_err(|e| e.to_string())?;
+            let raw_value =
+                serde_json::to_string(&Value::String(request)).map_err(|e| e.to_string())?;
             println!(
                 "{body},\n  \"request\": {{\n    \"raw\": {raw_value}\n  }},\n  \"selection_status\": \"default_available_choose_specialized_when_clear\"\n}}"
             );

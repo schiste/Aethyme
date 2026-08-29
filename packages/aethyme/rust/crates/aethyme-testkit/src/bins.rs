@@ -63,7 +63,11 @@ pub fn cargo_bin(name: &'static str) -> PathBuf {
     );
 
     let path = target_dir().join("debug").join(name);
-    assert!(path.is_file(), "{name} missing after build: {}", path.display());
+    assert!(
+        path.is_file(),
+        "{name} missing after build: {}",
+        path.display()
+    );
     cache.insert(name, path.clone());
     path
 }

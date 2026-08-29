@@ -14,7 +14,13 @@ use serde_json::Value;
 fn scan_good_repo_markdown() {
     let tmp = tmp_dir();
     let repo = build_good_scorecard_repo(tmp.path());
-    let result = invoke_aethyme(["ai-ready", "--repo", &repo.display().to_string(), "--format", "md"]);
+    let result = invoke_aethyme([
+        "ai-ready",
+        "--repo",
+        &repo.display().to_string(),
+        "--format",
+        "md",
+    ]);
     assert!(matches!(result.exit_code, 0 | 1), "{}", result.output);
     assert!(
         result.output.contains("AI-Readiness Scorecard Report") || result.output.contains("Score"),
@@ -97,7 +103,10 @@ fn both_formats_output() {
             name.ends_with(".json") || name.ends_with(".md")
         })
         .count();
-    assert!(produced > 0, "--format both wrote neither a .json nor a .md report");
+    assert!(
+        produced > 0,
+        "--format both wrote neither a .json nor a .md report"
+    );
 }
 
 #[test]
@@ -113,9 +122,15 @@ fn exit_codes() {
     let problematic = invoke_aethyme([
         "ai-ready",
         "--repo",
-        &build_problematic_scorecard_repo(tmp.path()).display().to_string(),
+        &build_problematic_scorecard_repo(tmp.path())
+            .display()
+            .to_string(),
     ]);
-    assert!(matches!(problematic.exit_code, 1 | 2), "{}", problematic.output);
+    assert!(
+        matches!(problematic.exit_code, 1 | 2),
+        "{}",
+        problematic.output
+    );
 }
 
 #[test]

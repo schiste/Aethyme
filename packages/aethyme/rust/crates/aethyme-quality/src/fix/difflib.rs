@@ -99,10 +99,7 @@ impl<'a> SequenceMatcher<'a> {
         // Extend by non-junk elements on each end. With isjunk=None
         // every element is non-junk, so the subsequent "suck up the
         // matching junk" passes in CPython are unreachable and omitted.
-        while besti > alo
-            && bestj > blo
-            && self.a[besti - 1] == self.b[bestj - 1]
-        {
+        while besti > alo && bestj > blo && self.a[besti - 1] == self.b[bestj - 1] {
             besti -= 1;
             bestj -= 1;
             bestsize += 1;
@@ -360,7 +357,11 @@ mod tests {
         // Verified against difflib on CPython: with lineterm="" the
         // header records run together in the joined output.
         assert_eq!(
-            diff("line1\nline2\nline3", "line1\nline2 modified\nline3", "test.py"),
+            diff(
+                "line1\nline2\nline3",
+                "line1\nline2 modified\nline3",
+                "test.py"
+            ),
             "--- a/test.py+++ b/test.py@@ -1,3 +1,3 @@ line1\n-line2\n+line2 modified\n line3"
         );
     }
@@ -419,7 +420,10 @@ mod tests {
         b[100] = "CHANGED\n".to_string();
         let rendered = diff(&a.concat(), &b.concat(), "big.py");
         assert!(rendered.contains("+CHANGED\n"), "{rendered}");
-        assert!(rendered.starts_with("--- a/big.py+++ b/big.py@@ "), "{rendered}");
+        assert!(
+            rendered.starts_with("--- a/big.py+++ b/big.py@@ "),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -431,9 +435,27 @@ mod tests {
         assert_eq!(
             codes,
             vec![
-                Opcode { tag: Tag::Equal, i1: 0, i2: 1, j1: 0, j2: 1 },
-                Opcode { tag: Tag::Replace, i1: 1, i2: 2, j1: 1, j2: 2 },
-                Opcode { tag: Tag::Equal, i1: 2, i2: 3, j1: 2, j2: 3 },
+                Opcode {
+                    tag: Tag::Equal,
+                    i1: 0,
+                    i2: 1,
+                    j1: 0,
+                    j2: 1
+                },
+                Opcode {
+                    tag: Tag::Replace,
+                    i1: 1,
+                    i2: 2,
+                    j1: 1,
+                    j2: 2
+                },
+                Opcode {
+                    tag: Tag::Equal,
+                    i1: 2,
+                    i2: 3,
+                    j1: 2,
+                    j2: 3
+                },
             ]
         );
     }

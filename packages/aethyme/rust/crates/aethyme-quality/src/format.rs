@@ -60,7 +60,10 @@ pub fn format_json(report: &ScorecardReport) -> String {
     root.set("detectors", Value::Array(detectors));
 
     let mut performance = Value::object();
-    performance.set("total_scan_time_ms", Value::Float(report.total_scan_time_ms));
+    performance.set(
+        "total_scan_time_ms",
+        Value::Float(report.total_scan_time_ms),
+    );
     performance.set("files_scanned", Value::int(report.files_scanned as i128));
     root.set("performance", performance);
 
@@ -117,7 +120,10 @@ pub fn format_markdown(report: &ScorecardReport) -> String {
     lines.push(format!("- **Warnings:** {} 🟡", report.warning_count));
     lines.push(format!("- **Info:** {} 🔵", report.info_count));
     lines.push(format!("- **Files Scanned:** {}", report.files_scanned));
-    lines.push(format!("- **Scan Time:** {:.0}ms", report.total_scan_time_ms));
+    lines.push(format!(
+        "- **Scan Time:** {:.0}ms",
+        report.total_scan_time_ms
+    ));
     lines.push(String::new());
 
     if !report.blockers.is_empty() {
@@ -134,9 +140,8 @@ pub fn format_markdown(report: &ScorecardReport) -> String {
     if !report.warnings.is_empty() {
         lines.push("## 🟡 Warnings".to_string());
         lines.push(String::new());
-        lines.push(
-            "These issues **should** be addressed for better agent performance:".to_string(),
-        );
+        lines
+            .push("These issues **should** be addressed for better agent performance:".to_string());
         lines.push(String::new());
         for finding in &report.warnings {
             format_finding(finding, &mut lines);
@@ -176,14 +181,17 @@ pub fn format_markdown(report: &ScorecardReport) -> String {
     if report.score >= 90 {
         lines.push("✨ **Excellent!** Your repository is well-prepared for AI agents.".to_string());
     } else if report.score >= 70 {
-        lines.push("👍 **Good** - Address the warnings to improve agent effectiveness.".to_string());
+        lines
+            .push("👍 **Good** - Address the warnings to improve agent effectiveness.".to_string());
     } else if report.score >= 50 {
         lines.push(
             "⚠️ **Needs Improvement** - Address blockers and warnings before deploying agents."
                 .to_string(),
         );
     } else {
-        lines.push("🚨 **Critical** - Significant issues detected. Fix blockers immediately.".to_string());
+        lines.push(
+            "🚨 **Critical** - Significant issues detected. Fix blockers immediately.".to_string(),
+        );
     }
     lines.push(String::new());
 
@@ -306,6 +314,8 @@ mod tests {
         assert!(out.contains("## 🔴 Blockers\n"));
         assert!(out.contains("- **Location:** `src/components/BadButton.tsx:2`\n"));
         assert!(out.contains("| data-ui-coverage | 1 | 2 | ✅ |\n"));
-        assert!(out.ends_with("👍 **Good** - Address the warnings to improve agent effectiveness.\n"));
+        assert!(
+            out.ends_with("👍 **Good** - Address the warnings to improve agent effectiveness.\n")
+        );
     }
 }

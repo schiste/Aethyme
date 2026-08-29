@@ -16,8 +16,8 @@ use crate::model::analysis::{AnswerStatus, DeadCodeCandidate};
 use crate::store::redb::graph_store::GraphStore;
 
 use super::{
-    bucket_confidence, graph_store_observability, AnswerItem, Confidence, ConfidenceSummary,
-    Evidence, ExploreError, ExploreRequest, ExploreResponse, TrustPolicy,
+    AnswerItem, Confidence, ConfidenceSummary, Evidence, ExploreError, ExploreRequest,
+    ExploreResponse, TrustPolicy, bucket_confidence, graph_store_observability,
 };
 
 /// Parameters for `usage_boundary_query` intent.

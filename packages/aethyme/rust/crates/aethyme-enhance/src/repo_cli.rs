@@ -26,9 +26,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::pyjson::{self, Value, py_bool};
+use crate::pyjson::{self, py_bool, Value};
 use crate::util::resolve_path;
-use crate::{AGENTS_OVERRIDE_PATH, agents, hygiene, onboarding, skills, telemetry};
+use crate::{agents, hygiene, onboarding, skills, telemetry, AGENTS_OVERRIDE_PATH};
 
 /// Result of dispatching a repo subcommand.
 pub enum Outcome {

@@ -4,13 +4,12 @@
 //! Aethyme itself. They exercise the production CLI path from source
 //! fragments through redb into `aethyme explore`.
 
-
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::time::Instant;
 
-use aethyme_graph_indexer::{index_repo_to_disk, IndexerContext, WalkOptions};
+use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk};
 use aethyme_graph_storage::bootstrap_repo;
 
 fn engine_bin() -> &'static str {
@@ -513,9 +512,11 @@ fn auth_surface_without_backend_validator_does_not_invent_backend_lane() {
         "proxy-only API-key evidence must not invent a backend validator lane: roles={roles:?}, subsystems={}",
         response["subsystems"]
     );
-    assert!(!response["subsystems"]
-        .to_string()
-        .contains("backend/api_keys"));
+    assert!(
+        !response["subsystems"]
+            .to_string()
+            .contains("backend/api_keys")
+    );
 }
 
 #[test]

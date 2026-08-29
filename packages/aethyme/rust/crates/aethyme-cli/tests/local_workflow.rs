@@ -36,14 +36,25 @@ fn local_repo_inspect_and_pack() {
     let payload = inspect.json();
     assert_eq!(payload["snapshot"]["readme_path"], "README.md");
     assert!(payload.get("signals").is_some());
-    assert!(payload["signals"]["boundary_clarity"]["score"].as_f64().unwrap() >= 0.0);
+    assert!(
+        payload["signals"]["boundary_clarity"]["score"]
+            .as_f64()
+            .unwrap()
+            >= 0.0
+    );
     assert!(!payload["symbols"].as_array().unwrap().is_empty());
     assert!(!payload["areas"].as_array().unwrap().is_empty());
     assert!(!payload["files"].as_array().unwrap().is_empty());
     assert!(!payload["graph"]["nodes"].as_array().unwrap().is_empty());
 
     let pack = invoke_aethyme([
-        "task", "pack", "--repo", &repo_arg, "--task", "Explain this repo", "--json-output",
+        "task",
+        "pack",
+        "--repo",
+        &repo_arg,
+        "--task",
+        "Explain this repo",
+        "--json-output",
     ]);
     pack.ok();
     let payload = pack.json();
@@ -77,7 +88,12 @@ fn local_graph_navigation_commands() {
     overview.ok();
     let payload = overview.json();
     assert!(payload.get("signals").is_some());
-    assert!(payload["signals"]["parser_visibility"]["score"].as_f64().unwrap() >= 0.0);
+    assert!(
+        payload["signals"]["parser_visibility"]["score"]
+            .as_f64()
+            .unwrap()
+            >= 0.0
+    );
 }
 
 /// Coverage for the redb deps/impact contract.
@@ -105,13 +121,25 @@ fn local_task_navigation_commands() {
     let task = "Update validate_token flow";
 
     let anchors = invoke_aethyme([
-        "task", "anchors", "--repo", &repo_arg, "--task", task, "--json-output",
+        "task",
+        "anchors",
+        "--repo",
+        &repo_arg,
+        "--task",
+        task,
+        "--json-output",
     ]);
     anchors.ok();
     assert!(!anchors.json()["anchors"].as_array().unwrap().is_empty());
 
     let scope = invoke_aethyme([
-        "task", "scope", "--repo", &repo_arg, "--task", task, "--json-output",
+        "task",
+        "scope",
+        "--repo",
+        &repo_arg,
+        "--task",
+        task,
+        "--json-output",
     ]);
     scope.ok();
     let payload = scope.json();
@@ -133,7 +161,13 @@ fn local_task_navigation_commands() {
     );
 
     let next = invoke_aethyme([
-        "task", "next", "--repo", &repo_arg, "--task", task, "--json-output",
+        "task",
+        "next",
+        "--repo",
+        &repo_arg,
+        "--task",
+        task,
+        "--json-output",
     ]);
     next.ok();
     let payload = next.json();
@@ -148,7 +182,13 @@ fn local_task_navigation_commands() {
     assert!(displays.contains(&"src/main.py"));
 
     let expand = invoke_aethyme([
-        "task", "expand", "--repo", &repo_arg, "--node", "src/auth.py", "--json-output",
+        "task",
+        "expand",
+        "--repo",
+        &repo_arg,
+        "--node",
+        "src/auth.py",
+        "--json-output",
     ]);
     expand.ok();
     assert!(expand.json().get("dependencies").is_some());

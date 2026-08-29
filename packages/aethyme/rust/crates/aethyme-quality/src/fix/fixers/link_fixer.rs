@@ -119,7 +119,11 @@ impl Fixer for LinkFixer {
             changes_made = true;
         }
 
-        if changes_made { Some(new_content) } else { None }
+        if changes_made {
+            Some(new_content)
+        } else {
+            None
+        }
     }
 }
 
@@ -147,7 +151,14 @@ mod tests {
     #[test]
     fn can_fix_text_documents_only() {
         let fixer = LinkFixer::new(Path::new("/repo"));
-        for name in ["README.md", "docs/guide.md", "a.mdx", "a.rst", "a.txt", "A.MD"] {
+        for name in [
+            "README.md",
+            "docs/guide.md",
+            "a.mdx",
+            "a.rst",
+            "a.txt",
+            "A.MD",
+        ] {
             assert!(fixer.can_fix(Path::new(name)), "{name}");
         }
         for name in ["script.py", "a.markdown", "a", "a.md.bak"] {

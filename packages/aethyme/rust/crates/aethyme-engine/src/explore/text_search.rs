@@ -17,7 +17,7 @@
 use std::ffi::OsStr;
 use std::path::Path;
 
-use super::{extract_symbol_queries, ranking, AnswerItem};
+use super::{AnswerItem, extract_symbol_queries, ranking};
 
 const RIPGREP_BIN: &str = "rg";
 const SOURCE_TEXT_FILE_SIZE_CAP_BYTES: u64 = 750_000;

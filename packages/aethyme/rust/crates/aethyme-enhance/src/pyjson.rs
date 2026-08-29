@@ -145,7 +145,11 @@ impl Value {
 
 /// Python `str(bool)`.
 pub fn py_bool(b: bool) -> &'static str {
-    if b { "True" } else { "False" }
+    if b {
+        "True"
+    } else {
+        "False"
+    }
 }
 
 // ── parsing ─────────────────────────────────────────────────────────────────
@@ -319,8 +323,7 @@ fn parse_string(text: &str, bytes: &[u8], pos: &mut usize) -> Result<String, Str
                                         + ((hi - 0xD800) << 10) as u32
                                         + (lo - 0xDC00) as u32;
                                     out.push(
-                                        char::from_u32(combined)
-                                            .ok_or("Invalid surrogate pair")?,
+                                        char::from_u32(combined).ok_or("Invalid surrogate pair")?,
                                     );
                                     continue;
                                 }
@@ -511,7 +514,12 @@ fn write_json_string(out: &mut String, s: &str) {
                 if code > 0xFFFF {
                     // Surrogate pair, as Python emits for astral chars.
                     let v = code - 0x10000;
-                    let _ = write!(out, "\\u{:04x}\\u{:04x}", 0xD800 + (v >> 10), 0xDC00 + (v & 0x3FF));
+                    let _ = write!(
+                        out,
+                        "\\u{:04x}\\u{:04x}",
+                        0xD800 + (v >> 10),
+                        0xDC00 + (v & 0x3FF)
+                    );
                 } else {
                     let _ = write!(out, "\\u{code:04x}");
                 }
@@ -556,7 +564,11 @@ pub fn py_float_repr(f: f64) -> String {
     } else {
         format_exponent(&digits, exp)
     };
-    if negative { format!("-{body}") } else { body }
+    if negative {
+        format!("-{body}")
+    } else {
+        body
+    }
 }
 
 fn format_fixed(digits: &str, exp: i32) -> String {
@@ -630,7 +642,10 @@ mod tests {
         assert_eq!(py_float_repr(1e-4), "0.0001");
         assert_eq!(py_float_repr(1e-5), "1e-05");
         assert_eq!(py_float_repr(-1753689600.123456), "-1753689600.123456");
-        assert_eq!(py_float_repr(1.2345678901234567e19), "1.2345678901234567e+19");
+        assert_eq!(
+            py_float_repr(1.2345678901234567e19),
+            "1.2345678901234567e+19"
+        );
         assert_eq!(py_float_repr(0.0), "0.0");
     }
 

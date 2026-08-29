@@ -107,10 +107,9 @@ mod tests {
             std::fs::read_to_string(repo.join(".codex/skills/aethyme/SKILL.md")).unwrap();
         assert!(skill_md.contains("AETHYME_BIN=\"${AETHYME_BIN:-aethyme}\""));
         assert!(!skill_md.contains("{{AETHYME_ROOT}}"));
-        assert!(
-            repo.join(".codex/skills/aethyme/references/explore.md")
-                .exists()
-        );
+        assert!(repo
+            .join(".codex/skills/aethyme/references/explore.md")
+            .exists());
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(repo.join(".codex/skills/aethyme/aethyme-explore"))
             .unwrap()

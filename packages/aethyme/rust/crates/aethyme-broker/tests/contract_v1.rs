@@ -477,12 +477,7 @@ fn merge_lifecycle_payload_field_names_are_frozen_on_the_wire() {
     let conflict_payload = payload_of("merge.conflict");
     assert_keys(
         conflict_payload,
-        &[
-            "base",
-            "blocking_sessions",
-            "conflict_details",
-            "conflicts",
-        ],
+        &["base", "blocking_sessions", "conflict_details", "conflicts"],
         "merge.conflict",
     );
     let conflict_value: serde_json::Value = serde_json::from_str(conflict_payload).unwrap();

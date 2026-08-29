@@ -15,8 +15,8 @@
 
 pub mod command;
 pub mod difflib;
-pub mod github;
 pub mod fixers;
+pub mod github;
 pub mod patch;
 pub mod pystr;
 pub mod safety;

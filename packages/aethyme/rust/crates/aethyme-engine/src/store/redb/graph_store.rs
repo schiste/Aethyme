@@ -5426,15 +5426,21 @@ mod tests {
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].id, route.id.as_str());
         let children = readonly.children(&file.id, None).expect("children");
-        assert!(children
-            .iter()
-            .any(|node| node.kind == StoredNodeKind::RouteSurface));
-        assert!(children
-            .iter()
-            .any(|node| node.kind == StoredNodeKind::MiddlewareInstallation));
-        assert!(children
-            .iter()
-            .any(|node| node.kind == StoredNodeKind::ProxySurface));
+        assert!(
+            children
+                .iter()
+                .any(|node| node.kind == StoredNodeKind::RouteSurface)
+        );
+        assert!(
+            children
+                .iter()
+                .any(|node| node.kind == StoredNodeKind::MiddlewareInstallation)
+        );
+        assert!(
+            children
+                .iter()
+                .any(|node| node.kind == StoredNodeKind::ProxySurface)
+        );
         assert_eq!(
             readonly
                 .overview_v2(OverviewV2Limits {
@@ -6662,10 +6668,12 @@ mod tests {
             StoredNode::Unresolved(got) => assert_eq!(got, fixture.unresolved),
             other => panic!("expected unresolved node, got {other:?}"),
         }
-        assert!(readonly
-            .get_node("unknown:Repo:x")
-            .expect("unknown")
-            .is_none());
+        assert!(
+            readonly
+                .get_node("unknown:Repo:x")
+                .expect("unknown")
+                .is_none()
+        );
     }
 
     #[test]
@@ -6713,14 +6721,18 @@ mod tests {
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].id, fixture.function.id.to_string());
         assert_eq!(symbols[0].kind, StoredNodeKind::Function);
-        assert!(readonly
-            .find_symbols("LoadToken", Some(StoredNodeKind::Class))
-            .expect("class filter")
-            .is_empty());
-        assert!(readonly
-            .find_symbols("missing_call", Some(StoredNodeKind::Unresolved))
-            .expect("unresolved filter")
-            .is_empty());
+        assert!(
+            readonly
+                .find_symbols("LoadToken", Some(StoredNodeKind::Class))
+                .expect("class filter")
+                .is_empty()
+        );
+        assert!(
+            readonly
+                .find_symbols("missing_call", Some(StoredNodeKind::Unresolved))
+                .expect("unresolved filter")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -6794,9 +6806,11 @@ mod tests {
             )
             .expect("class kind filter");
         assert!(!class_only.is_empty());
-        assert!(class_only
-            .iter()
-            .all(|candidate| candidate.symbol.kind == StoredNodeKind::Class));
+        assert!(
+            class_only
+                .iter()
+                .all(|candidate| candidate.symbol.kind == StoredNodeKind::Class)
+        );
     }
 
     #[test]
@@ -6872,14 +6886,18 @@ mod tests {
             .expect("resolve file")
             .expect("present");
         assert_eq!(resolved, fixture.file);
-        assert!(readonly
-            .resolve_file_path("src")
-            .expect("prefix is not exact")
-            .is_none());
-        assert!(readonly
-            .resolve_file_path("src/missing.rs")
-            .expect("missing")
-            .is_none());
+        assert!(
+            readonly
+                .resolve_file_path("src")
+                .expect("prefix is not exact")
+                .is_none()
+        );
+        assert!(
+            readonly
+                .resolve_file_path("src/missing.rs")
+                .expect("missing")
+                .is_none()
+        );
     }
 
     #[test]
@@ -6918,14 +6936,16 @@ mod tests {
             unresolved_imports[0].other.as_str(),
             fixture.unresolved.id.as_str()
         );
-        assert!(readonly
-            .neighbors(
-                fixture.function.id.as_str(),
-                NeighborDirection::Outgoing,
-                Some(EdgeKind::Imports),
-            )
-            .expect("wrong kind")
-            .is_empty());
+        assert!(
+            readonly
+                .neighbors(
+                    fixture.function.id.as_str(),
+                    NeighborDirection::Outgoing,
+                    Some(EdgeKind::Imports),
+                )
+                .expect("wrong kind")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -6983,9 +7003,11 @@ mod tests {
             .iter()
             .find(|candidate| candidate.node.id == fixture.function.id.to_string())
             .expect("function anchor");
-        assert!(function_anchor
-            .matched_tokens
-            .contains(&"token".to_string()));
+        assert!(
+            function_anchor
+                .matched_tokens
+                .contains(&"token".to_string())
+        );
         assert!(function_anchor.matched_tokens.contains(&"src".to_string()));
         assert!(anchors.len() <= 5);
 
@@ -7022,14 +7044,18 @@ mod tests {
             .iter()
             .find(|candidate| candidate.path == "src/lib.rs")
             .expect("src/lib.rs surface path");
-        assert!(src_path
-            .surfaces
-            .iter()
-            .any(|surface| surface.id == fixture.route.id.to_string()));
-        assert!(src_path
-            .relation_kinds
-            .iter()
-            .any(|kind| matches!(kind, EdgeKind::Exposes | EdgeKind::ValidatesCredential)));
+        assert!(
+            src_path
+                .surfaces
+                .iter()
+                .any(|surface| surface.id == fixture.route.id.to_string())
+        );
+        assert!(
+            src_path
+                .relation_kinds
+                .iter()
+                .any(|kind| matches!(kind, EdgeKind::Exposes | EdgeKind::ValidatesCredential))
+        );
 
         let credential = readonly
             .credential_flow_candidates(&["token"])
@@ -7038,19 +7064,25 @@ mod tests {
             .iter()
             .find(|candidate| candidate.node.id == fixture.credential.id.to_string())
             .expect("credential operation");
-        assert!(credential_candidate
-            .relation_kinds
-            .contains(&EdgeKind::IssuesCredential));
-        assert!(credential_candidate
-            .relation_kinds
-            .contains(&EdgeKind::StoresCredential));
+        assert!(
+            credential_candidate
+                .relation_kinds
+                .contains(&EdgeKind::IssuesCredential)
+        );
+        assert!(
+            credential_candidate
+                .relation_kinds
+                .contains(&EdgeKind::StoresCredential)
+        );
 
         let subsystems = readonly
             .subsystems_matching(&["token"])
             .expect("subsystems");
-        assert!(subsystems
-            .iter()
-            .any(|candidate| candidate.path_prefix == "src"));
+        assert!(
+            subsystems
+                .iter()
+                .any(|candidate| candidate.path_prefix == "src")
+        );
     }
 
     #[test]
@@ -7061,35 +7093,45 @@ mod tests {
         let middleware = readonly
             .middleware_chain_for_route(fixture.route.id.as_str())
             .expect("middleware chain");
-        assert!(middleware
-            .roots
-            .iter()
-            .any(|root| root.id == fixture.route.id.to_string()));
-        assert!(middleware
-            .steps
-            .iter()
-            .any(|step| step.edge_kind == EdgeKind::InstallsMiddleware
-                && step.to.id == fixture.middleware.id.to_string()));
-        assert!(middleware
-            .steps
-            .iter()
-            .any(|step| step.edge_kind == EdgeKind::ValidatesCredential
-                && step.to.id == fixture.credential.id.to_string()));
+        assert!(
+            middleware
+                .roots
+                .iter()
+                .any(|root| root.id == fixture.route.id.to_string())
+        );
+        assert!(
+            middleware
+                .steps
+                .iter()
+                .any(|step| step.edge_kind == EdgeKind::InstallsMiddleware
+                    && step.to.id == fixture.middleware.id.to_string())
+        );
+        assert!(
+            middleware
+                .steps
+                .iter()
+                .any(|step| step.edge_kind == EdgeKind::ValidatesCredential
+                    && step.to.id == fixture.credential.id.to_string())
+        );
         assert!(middleware.steps.len() <= FLOW_CHAIN_STEP_LIMIT);
 
         let forwarding = readonly
             .forwarding_chain_for_surface(fixture.route.id.as_str())
             .expect("forwarding chain");
-        assert!(forwarding
-            .steps
-            .iter()
-            .any(|step| step.edge_kind == EdgeKind::ForwardsTo
-                && step.to.id == fixture.proxy.id.to_string()));
-        assert!(forwarding
-            .steps
-            .iter()
-            .any(|step| step.edge_kind == EdgeKind::RewritesHeader
-                && step.to.id == fixture.credential.id.to_string()));
+        assert!(
+            forwarding
+                .steps
+                .iter()
+                .any(|step| step.edge_kind == EdgeKind::ForwardsTo
+                    && step.to.id == fixture.proxy.id.to_string())
+        );
+        assert!(
+            forwarding
+                .steps
+                .iter()
+                .any(|step| step.edge_kind == EdgeKind::RewritesHeader
+                    && step.to.id == fixture.credential.id.to_string())
+        );
 
         let tests = readonly
             .tests_for_surface_or_symbol(fixture.function.id.as_str())

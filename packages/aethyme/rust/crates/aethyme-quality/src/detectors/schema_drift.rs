@@ -119,7 +119,10 @@ impl SchemaDriftDetector {
                         in_model = false;
                         continue;
                     };
-                    model_name = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+                    model_name = caps
+                        .get(1)
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_default();
                     model_line = line_num;
                     has_fields = false;
                     has_validators = false;
@@ -129,9 +132,7 @@ impl SchemaDriftDetector {
                             findings.push(Finding {
                                 detector: "schema-drift".to_string(),
                                 severity: Severity::Info,
-                                message: format!(
-                                    "Pydantic model '{model_name}' has no validators"
-                                ),
+                                message: format!("Pydantic model '{model_name}' has no validators"),
                                 file_path: rel.clone(),
                                 line_number: Some(model_line as i64),
                                 evidence: None,
@@ -283,11 +284,7 @@ mod tests {
         )
         .unwrap();
         // 'any' after an interface: finding, evidence unstripped-length.
-        std::fs::write(
-            repo.join("post.ts"),
-            "interface Thing {\n  data: any;\n}\n",
-        )
-        .unwrap();
+        std::fs::write(repo.join("post.ts"), "interface Thing {\n  data: any;\n}\n").unwrap();
         let findings = SchemaDriftDetector.detect(&repo);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].file_path, "post.ts");

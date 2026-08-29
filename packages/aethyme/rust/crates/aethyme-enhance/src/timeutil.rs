@@ -50,8 +50,14 @@ mod tests {
     fn formats_known_instants() {
         assert_eq!(iso_utc_from_unix(0), "1970-01-01T00:00:00+00:00");
         // 2026-07-28T21:15:42Z
-        assert_eq!(iso_utc_from_unix(1_785_273_342), "2026-07-28T21:15:42+00:00");
+        assert_eq!(
+            iso_utc_from_unix(1_785_273_342),
+            "2026-07-28T21:15:42+00:00"
+        );
         // Leap-year boundary: 2024-02-29T23:59:59Z
-        assert_eq!(iso_utc_from_unix(1_709_251_199), "2024-02-29T23:59:59+00:00");
+        assert_eq!(
+            iso_utc_from_unix(1_709_251_199),
+            "2024-02-29T23:59:59+00:00"
+        );
     }
 }

@@ -206,10 +206,8 @@ impl DocsRegenerator {
                 let stripped: Vec<String> = doc
                     .split('\n')
                     .map(|line| {
-                        crate::util::py_strip(
-                            crate::util::py_strip(line).trim_start_matches('*'),
-                        )
-                        .to_string()
+                        crate::util::py_strip(crate::util::py_strip(line).trim_start_matches('*'))
+                            .to_string()
                     })
                     .collect();
                 return Some(first_line_truncated(&stripped.join("\n")));
@@ -381,10 +379,7 @@ mod tests {
         let content = fixer.generate_folder_doc(&tmp.join("pkg"));
         assert!(content.contains("This directory contains 4 files and 2 subdirectories."));
         // Extension headings sorted as strings: ".py" < ".ts" < "no extension".
-        let order: Vec<&str> = content
-            .lines()
-            .filter(|l| l.starts_with("### "))
-            .collect();
+        let order: Vec<&str> = content.lines().filter(|l| l.starts_with("### ")).collect();
         assert_eq!(order, vec!["### .py", "### .ts", "### no extension"]);
         assert!(content.contains("- `a.py`\n- `z.py`"));
         assert!(content.contains("## Subdirectories\n\n- `sub1/`\n- `sub2/`"));
@@ -395,15 +390,32 @@ mod tests {
     #[test]
     fn extracts_python_docstrings_and_js_docblocks() {
         let tmp = tmpdir("docs-purpose");
-        write(&tmp, "p/mod.py", "\"\"\"Module purpose here.\n\nMore.\n\"\"\"\nx = 1\n");
+        write(
+            &tmp,
+            "p/mod.py",
+            "\"\"\"Module purpose here.\n\nMore.\n\"\"\"\nx = 1\n",
+        );
         write(&tmp, "p/single.py", "'''Single quoted purpose.'''\nx = 1\n");
-        write(&tmp, "p/comp.ts", "/**\n * The component purpose.\n * More.\n */\nexport const a = 1;\n");
+        write(
+            &tmp,
+            "p/comp.ts",
+            "/**\n * The component purpose.\n * More.\n */\nexport const a = 1;\n",
+        );
         write(&tmp, "p/plain.py", "x = 1\n");
         let fixer = DocsRegenerator::new(&tmp);
         let content = fixer.generate_folder_doc(&tmp.join("p"));
-        assert!(content.contains("- `mod.py` - Module purpose here."), "{content}");
-        assert!(content.contains("- `single.py` - Single quoted purpose."), "{content}");
-        assert!(content.contains("- `comp.ts` - The component purpose."), "{content}");
+        assert!(
+            content.contains("- `mod.py` - Module purpose here."),
+            "{content}"
+        );
+        assert!(
+            content.contains("- `single.py` - Single quoted purpose."),
+            "{content}"
+        );
+        assert!(
+            content.contains("- `comp.ts` - The component purpose."),
+            "{content}"
+        );
         assert!(content.contains("- `plain.py`\n"), "{content}");
     }
 
@@ -422,7 +434,11 @@ mod tests {
     fn purpose_window_is_twenty_lines() {
         let tmp = tmpdir("docs-window");
         let padding = "# pad\n".repeat(20);
-        write(&tmp, "p/late.py", &format!("{padding}\"\"\"Too late.\"\"\"\nx = 1\n"));
+        write(
+            &tmp,
+            "p/late.py",
+            &format!("{padding}\"\"\"Too late.\"\"\"\nx = 1\n"),
+        );
         let fixer = DocsRegenerator::new(&tmp);
         let content = fixer.generate_folder_doc(&tmp.join("p"));
         assert!(content.contains("- `late.py`\n"), "{content}");

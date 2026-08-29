@@ -212,13 +212,10 @@ mod tests {
         // appears on the decorated def line, @router.post above it), plus
         // the no-central-definitions info finding.
         assert_eq!(findings.len(), 3);
-        assert!(
-            findings[..2]
-                .iter()
-                .all(|f| f.message == "Protected route missing explicit permission check"
-                    && f.severity == Severity::Warning
-                    && f.file_path == "src/api/routes.py")
-        );
+        assert!(findings[..2].iter().all(|f| f.message
+            == "Protected route missing explicit permission check"
+            && f.severity == Severity::Warning
+            && f.file_path == "src/api/routes.py"));
         let info = &findings[2];
         assert_eq!(info.severity, Severity::Info);
         assert_eq!(info.file_path, ".");

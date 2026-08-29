@@ -98,18 +98,34 @@ impl FormatFixer {
     fn run_formatter(&self, tool: &str, file_path: &Path, content: &str) -> Option<String> {
         let input = content.as_bytes();
         let outcome = match tool {
-            "black" => self.runner.run(&["black", "--quiet", "-"], Some(input), Some(FORMAT_TIMEOUT), None),
+            "black" => self.runner.run(
+                &["black", "--quiet", "-"],
+                Some(input),
+                Some(FORMAT_TIMEOUT),
+                None,
+            ),
             "prettier" => {
                 let parser = prettier_parser(file_path);
-                self.runner
-                    .run(&["prettier", "--parser", parser], Some(input), Some(FORMAT_TIMEOUT), None)
+                self.runner.run(
+                    &["prettier", "--parser", parser],
+                    Some(input),
+                    Some(FORMAT_TIMEOUT),
+                    None,
+                )
             }
-            "gofmt" => self.runner.run(&["gofmt"], Some(input), Some(FORMAT_TIMEOUT), None),
-            "rustfmt" => {
+            "gofmt" => self
+                .runner
+                .run(&["gofmt"], Some(input), Some(FORMAT_TIMEOUT), None),
+            "rustfmt" => self.runner.run(
+                &["rustfmt", "--emit", "stdout"],
+                Some(input),
+                Some(FORMAT_TIMEOUT),
+                None,
+            ),
+            "autopep8" => {
                 self.runner
-                    .run(&["rustfmt", "--emit", "stdout"], Some(input), Some(FORMAT_TIMEOUT), None)
+                    .run(&["autopep8", "-"], Some(input), Some(FORMAT_TIMEOUT), None)
             }
-            "autopep8" => self.runner.run(&["autopep8", "-"], Some(input), Some(FORMAT_TIMEOUT), None),
             _ => return None,
         };
         match outcome {
@@ -150,7 +166,8 @@ impl Fixer for FormatFixer {
         let Some(language) = language_for(file_path) else {
             return false;
         };
-        self.tools_for(language).is_some_and(|tools| !tools.is_empty())
+        self.tools_for(language)
+            .is_some_and(|tools| !tools.is_empty())
     }
 
     /// Port of `fix`: try each available tool in preference order and
@@ -376,12 +393,37 @@ mod tests {
         for (language, tool, file, expected) in [
             ("python", "black", "a.py", vec!["black", "--quiet", "-"]),
             ("python", "autopep8", "a.py", vec!["autopep8", "-"]),
-            ("javascript", "prettier", "a.js", vec!["prettier", "--parser", "babel"]),
-            ("javascript", "prettier", "a.jsx", vec!["prettier", "--parser", "babel"]),
-            ("typescript", "prettier", "a.ts", vec!["prettier", "--parser", "typescript"]),
-            ("typescript", "prettier", "a.tsx", vec!["prettier", "--parser", "typescript"]),
+            (
+                "javascript",
+                "prettier",
+                "a.js",
+                vec!["prettier", "--parser", "babel"],
+            ),
+            (
+                "javascript",
+                "prettier",
+                "a.jsx",
+                vec!["prettier", "--parser", "babel"],
+            ),
+            (
+                "typescript",
+                "prettier",
+                "a.ts",
+                vec!["prettier", "--parser", "typescript"],
+            ),
+            (
+                "typescript",
+                "prettier",
+                "a.tsx",
+                vec!["prettier", "--parser", "typescript"],
+            ),
             ("go", "gofmt", "a.go", vec!["gofmt"]),
-            ("rust", "rustfmt", "a.rs", vec!["rustfmt", "--emit", "stdout"]),
+            (
+                "rust",
+                "rustfmt",
+                "a.rs",
+                vec!["rustfmt", "--emit", "stdout"],
+            ),
         ] {
             let fake = FakeRunner::new(vec![]).formatting("out\n");
             let fixer = preloaded(vec![(language, vec![tool])], &fake);
@@ -393,7 +435,11 @@ mod tests {
             assert_eq!(fake.format_calls(), vec![expected], "{tool} on {file}");
             let recorded = fake.calls.lock().unwrap();
             assert_eq!(recorded[0].1.as_deref(), Some("in\n"), "{tool} stdin");
-            assert_eq!(recorded[0].2, Some(Duration::from_secs(30)), "{tool} timeout");
+            assert_eq!(
+                recorded[0].2,
+                Some(Duration::from_secs(30)),
+                "{tool} timeout"
+            );
         }
     }
 
@@ -417,7 +463,10 @@ mod tests {
             },
         ]);
         let fixer = preloaded(vec![("python", vec!["black", "autopep8"])], &fake);
-        assert_eq!(fixer.fix(Path::new("a.py"), "in\n"), Some("fixed\n".to_string()));
+        assert_eq!(
+            fixer.fix(Path::new("a.py"), "in\n"),
+            Some("fixed\n".to_string())
+        );
         assert_eq!(
             fake.format_calls(),
             vec![vec!["black", "--quiet", "-"], vec!["autopep8", "-"]]
@@ -428,7 +477,10 @@ mod tests {
     fn the_first_changing_tool_wins_and_later_tools_never_run() {
         let fake = FakeRunner::new(vec![]).formatting("fixed\n");
         let fixer = preloaded(vec![("python", vec!["black", "autopep8"])], &fake);
-        assert_eq!(fixer.fix(Path::new("a.py"), "in\n"), Some("fixed\n".to_string()));
+        assert_eq!(
+            fixer.fix(Path::new("a.py"), "in\n"),
+            Some("fixed\n".to_string())
+        );
         assert_eq!(fake.format_calls(), vec![vec!["black", "--quiet", "-"]]);
     }
 
@@ -485,5 +537,4 @@ mod tests {
         assert_eq!(prettier_parser(Path::new("a.TS")), "babel");
         assert_eq!(prettier_parser(Path::new("a.unknown")), "babel");
     }
-
 }

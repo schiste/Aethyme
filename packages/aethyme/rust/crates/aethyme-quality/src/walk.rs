@@ -283,9 +283,13 @@ mod tests {
         assert!(!should_skip_file(Path::new("/r/src/x.py")));
         assert!(!should_skip_file(Path::new("/r/.env.example")));
         // Full-path quirk: dotted ancestor outside the repo still skips.
-        assert!(should_skip_file(Path::new("/home/u/.claude/wt/repo/src/x.py")));
+        assert!(should_skip_file(Path::new(
+            "/home/u/.claude/wt/repo/src/x.py"
+        )));
         // Engine count variant has no hidden rule.
-        assert!(!count_files_skip(Path::new("/home/u/.claude/wt/repo/src/x.py")));
+        assert!(!count_files_skip(Path::new(
+            "/home/u/.claude/wt/repo/src/x.py"
+        )));
         assert!(count_files_skip(Path::new("/r/dist/x.py")));
     }
 

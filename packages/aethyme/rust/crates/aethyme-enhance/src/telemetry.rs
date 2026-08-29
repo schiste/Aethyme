@@ -28,7 +28,7 @@
 
 use std::path::Path;
 
-use crate::onboarding::{ACT_STARTER_JSON_PATH, ONBOARDING_JSON_PATH, override_freshness};
+use crate::onboarding::{override_freshness, ACT_STARTER_JSON_PATH, ONBOARDING_JSON_PATH};
 use crate::pyjson::{self, Value};
 use crate::timeutil::now_iso_utc;
 use crate::util::{py_splitlines, resolve_path};
@@ -42,7 +42,11 @@ fn obj(pairs: Vec<(&str, Value)>) -> Value {
 }
 
 fn py_yes_no(b: bool) -> &'static str {
-    if b { "yes" } else { "no" }
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 /// Append one telemetry event to the repo-local ledger.
@@ -53,7 +57,10 @@ pub fn append_event(repo_path: &Path, event_type: &str, payload: Value) -> Resul
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
     let event = obj(vec![
-        ("schema_version", Value::str("aethyme-experience-telemetry-v1")),
+        (
+            "schema_version",
+            Value::str("aethyme-experience-telemetry-v1"),
+        ),
         ("event_type", Value::str(event_type)),
         ("timestamp", Value::str(now_iso_utc())),
         ("repo_path", Value::str(repo_path.display().to_string())),
@@ -139,7 +146,12 @@ pub fn detailed_report(repo_path: &Path) -> Result<Value, String> {
     let summary = summarize_events(&repo_path)?;
     let freshness = override_freshness(&repo_path);
     if !log_path.exists() {
-        let kpis = derive_kpis(&Value::object(), &Value::object(), &Value::object(), &freshness);
+        let kpis = derive_kpis(
+            &Value::object(),
+            &Value::object(),
+            &Value::object(),
+            &freshness,
+        );
         let mut report = summary;
         report.set("recent_events", Value::Array(vec![]));
         report.set("wrapper_invocations", Value::object());
@@ -197,13 +209,7 @@ pub fn detailed_report(repo_path: &Path) -> Result<Value, String> {
 
     let by_type = summary.get("by_type").cloned().unwrap_or(Value::object());
     let kpis = derive_kpis(&latest_payloads, &wrapper_invocations, &by_type, &freshness);
-    let recent_tail: Vec<Value> = recent_events
-        .iter()
-        .rev()
-        .take(10)
-        .rev()
-        .cloned()
-        .collect();
+    let recent_tail: Vec<Value> = recent_events.iter().rev().take(10).rev().cloned().collect();
     let mut report = summary;
     report.set("recent_events", Value::Array(recent_tail));
     report.set("wrapper_invocations", wrapper_invocations);
@@ -240,15 +246,14 @@ pub fn event_payload_from_generated_artifacts(repo_path: &Path) -> Result<Value,
     if onboarding_path.exists() {
         let text = std::fs::read_to_string(&onboarding_path)
             .map_err(|e| format!("{}: {e}", onboarding_path.display()))?;
-        let onboarding = pyjson::loads(&text)
-            .map_err(|e| format!("{}: {e}", onboarding_path.display()))?;
+        let onboarding =
+            pyjson::loads(&text).map_err(|e| format!("{}: {e}", onboarding_path.display()))?;
         payload.set("onboarding", onboarding_summary_payload(&onboarding)?);
     }
     if act_path.exists() {
         let text = std::fs::read_to_string(&act_path)
             .map_err(|e| format!("{}: {e}", act_path.display()))?;
-        let act =
-            pyjson::loads(&text).map_err(|e| format!("{}: {e}", act_path.display()))?;
+        let act = pyjson::loads(&text).map_err(|e| format!("{}: {e}", act_path.display()))?;
         payload.set("act", act_summary_payload(&act)?);
     }
     Ok(payload)
@@ -415,9 +420,8 @@ pub fn render_status_markdown(status: &Value) -> Result<String, String> {
     let suggestions = req(status, "suggestions")?;
     let recommendation = req(status, "recommended_next_action")?;
 
-    let truthy_of = |value: &Value, key: &str| -> bool {
-        value.get(key).map(Value::truthy).unwrap_or(false)
-    };
+    let truthy_of =
+        |value: &Value, key: &str| -> bool { value.get(key).map(Value::truthy).unwrap_or(false) };
 
     let mut lines: Vec<String> = vec![
         "# Aethyme Experience Status".to_string(),
@@ -614,19 +618,14 @@ fn derive_kpis(
             ),
         ]));
     }
-    let act_has_fast_test = act
-        .get("has_fast_test")
-        .map(Value::truthy)
-        .unwrap_or(false);
+    let act_has_fast_test = act.get("has_fast_test").map(Value::truthy).unwrap_or(false);
     if onboarding.truthy() && !act_has_fast_test {
         signals.push(obj(vec![
             ("status", Value::str("attention")),
             ("code", Value::str("no_fast_test_detected")),
             (
                 "message",
-                Value::str(
-                    "Onboarding/Act artifacts exist but no fast test command was detected.",
-                ),
+                Value::str("Onboarding/Act artifacts exist but no fast test command was detected."),
             ),
         ]));
     }
@@ -677,10 +676,7 @@ fn derive_kpis(
         ("wrapper_total", Value::Int(wrapper_total)),
         (
             "onboarding_commands",
-            onboarding
-                .get("commands")
-                .cloned()
-                .unwrap_or(Value::Int(0)),
+            onboarding.get("commands").cloned().unwrap_or(Value::Int(0)),
         ),
         (
             "onboarding_notes",
@@ -823,7 +819,10 @@ fn recommended_next_action(report: &Value) -> Value {
     let has = |code: &str| suggestion_codes.iter().any(|c| c == code);
     if has("regenerate_onboarding_artifacts") {
         return obj(vec![
-            ("command", Value::str("aethyme enhance deploy --repo <repo>")),
+            (
+                "command",
+                Value::str("aethyme enhance deploy --repo <repo>"),
+            ),
             (
                 "reason",
                 Value::str("Override file is newer than generated onboarding/Act artifacts."),
@@ -852,9 +851,7 @@ fn recommended_next_action(report: &Value) -> Value {
             ),
             (
                 "reason",
-                Value::str(
-                    "Enhancement is installed but there is no wrapper usage recorded yet.",
-                ),
+                Value::str("Enhancement is installed but there is no wrapper usage recorded yet."),
             ),
         ]);
     }
@@ -998,14 +995,10 @@ mod tests {
         append_event(&repo, "enhance.deploy", payload).unwrap();
         let status = write_status_artifacts(&repo).unwrap();
         let signals = status.get("signals").unwrap().as_array().unwrap();
-        assert!(
-            signals
-                .iter()
-                .any(|s| s.get("code").and_then(Value::as_str)
-                    == Some("enhanced_but_no_wrapper_usage"))
-        );
-        let markdown =
-            std::fs::read_to_string(repo.join(STATUS_MARKDOWN_PATH)).unwrap();
+        assert!(signals.iter().any(
+            |s| s.get("code").and_then(Value::as_str) == Some("enhanced_but_no_wrapper_usage")
+        ));
+        let markdown = std::fs::read_to_string(repo.join(STATUS_MARKDOWN_PATH)).unwrap();
         assert!(markdown.contains("# Aethyme Experience Status"));
         assert!(markdown.contains("- Enhancement installed: `yes`"));
         std::fs::remove_dir_all(&repo).unwrap();

@@ -28,7 +28,10 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
             if path.is_dir() {
                 stack.push(path);
             } else {
-                files.insert(path.clone(), std::fs::read(&path).expect("read fixture file"));
+                files.insert(
+                    path.clone(),
+                    std::fs::read(&path).expect("read fixture file"),
+                );
             }
         }
     }
@@ -38,7 +41,10 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 #[test]
 fn dry_run_is_the_default_mode() {
     let tmp = tmp_dir();
-    let result = invoke_aethyme(["autofix", &build_fixable_repo(tmp.path()).display().to_string()]);
+    let result = invoke_aethyme([
+        "autofix",
+        &build_fixable_repo(tmp.path()).display().to_string(),
+    ]);
     result.ok();
     result.assert_contains("Mode: DRY RUN");
     result.assert_contains("Changes Preview (Dry Run)");
@@ -57,7 +63,10 @@ fn dry_run_writes_nothing() {
 #[test]
 fn summary_reports_risk_buckets() {
     let tmp = tmp_dir();
-    let result = invoke_aethyme(["autofix", &build_fixable_repo(tmp.path()).display().to_string()]);
+    let result = invoke_aethyme([
+        "autofix",
+        &build_fixable_repo(tmp.path()).display().to_string(),
+    ]);
     for line in ["Total files:", "Low risk:", "Medium risk:", "High risk:"] {
         result.assert_contains(line);
     }
@@ -66,7 +75,10 @@ fn summary_reports_risk_buckets() {
 #[test]
 fn clean_repo_reports_no_fixes() {
     let tmp = tmp_dir();
-    let result = invoke_aethyme(["autofix", &build_clean_repo(tmp.path()).display().to_string()]);
+    let result = invoke_aethyme([
+        "autofix",
+        &build_clean_repo(tmp.path()).display().to_string(),
+    ]);
     result.ok();
     result.assert_contains("No fixes needed!");
 }
@@ -87,7 +99,11 @@ fn every_fix_type_choice_runs() {
     let repo = build_fixable_repo(tmp.path());
     for choice in ["all", "docs", "links", "selectors", "i18n", "format"] {
         let result = invoke_aethyme(["autofix", &repo.display().to_string(), "--fix-type", choice]);
-        assert_eq!(result.exit_code, 0, "--fix-type {choice}:\n{}", result.output);
+        assert_eq!(
+            result.exit_code, 0,
+            "--fix-type {choice}:\n{}",
+            result.output
+        );
     }
 }
 
@@ -206,7 +222,13 @@ fn invalid_fix_type() {
 fn help_names_the_options() {
     let result = invoke_aethyme(["autofix", "--help"]);
     result.ok();
-    for flag in ["--dry-run", "--apply", "--pr", "--fix-type", "--skip-approval"] {
+    for flag in [
+        "--dry-run",
+        "--apply",
+        "--pr",
+        "--fix-type",
+        "--skip-approval",
+    ] {
         result.assert_contains(flag);
     }
 }

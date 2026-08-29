@@ -121,7 +121,6 @@ impl<P> OverlayFragment<P> {
     pub fn payload(&self) -> &P {
         &self.payload
     }
-
 }
 
 // ─── Bincode I/O ─────────────────────────────────────────────────────
