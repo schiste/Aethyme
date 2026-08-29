@@ -4,6 +4,31 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.4.2] - 2026-08-29
+
+### Added
+
+- Operators can inspect retained broker-owned worktrees with
+  `aethyme broker cleanup --all-cleaned` and explicitly apply the unchanged
+  sweep with `--apply`.
+- Cleanup plans expose per-worktree eligibility and estimated reclaimable
+  bytes in both text and JSON output.
+
+### Fixed
+
+- Cleanup safety now recognizes commits represented by local integration or
+  configured upstream, so a successfully promoted session is not retained
+  merely because the primary local main checkout has not been synchronized.
+- Bulk cleanup revalidates every candidate and leaves adopted, dirty,
+  symlinked, unsafe, uninspectable, or unrepresented worktrees untouched.
+- Broker status warns when safely reclaimable cleaned worktrees remain.
+
+### Upgrade notes
+
+Read [Upgrading to v0.4.2](packages/aethyme/docs/guides/upgrading-to-v0.4.2.md).
+Broker storage, engine protocol, and repository deployment schemas are
+unchanged; no repository migration is required.
+
 ## [0.4.1] - 2026-08-29
 
 ### Fixed
