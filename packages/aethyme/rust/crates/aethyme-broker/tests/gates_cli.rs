@@ -100,6 +100,84 @@ fn run_count(path: &Path) -> usize {
     std::fs::read_to_string(path).unwrap().lines().count()
 }
 
+fn submit_verification_case(gates: Option<&str>) -> (serde_json::Value, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    std::fs::write(tmp.path().join("tracked.txt"), "base\n").unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[promote]\nmode = 'manual'\n",
+    )
+    .unwrap();
+    if let Some(gates) = gates {
+        std::fs::write(tmp.path().join(".aethyme/gates.toml"), gates).unwrap();
+    }
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-qm", "fixture"]);
+
+    let worktree = tmp.path().join(".aethyme/worktrees/submit");
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    git(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/submit",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let adopted = stdout(run(
+        &worktree,
+        &["adopt", "--task", "gate evidence", "--json"],
+    ));
+    let adopted: serde_json::Value = serde_json::from_str(&adopted).unwrap();
+    let session = adopted["id"].as_i64().unwrap().to_string();
+    std::fs::create_dir_all(worktree.join("scripts")).unwrap();
+    std::fs::write(worktree.join("scripts/check.sh"), "true\n").unwrap();
+    git(&worktree, &["add", "scripts/check.sh"]);
+    git(&worktree, &["commit", "-qm", "add script"]);
+
+    let json = stdout(run(&worktree, &["submit", "--session", &session, "--json"]));
+    let json = serde_json::from_str(&json).unwrap();
+    let text = stdout(run(&worktree, &["submit", "--session", &session]));
+    (json, text)
+}
+
+#[test]
+fn submit_distinguishes_missing_unmatched_and_passing_gate_evidence() {
+    let (missing, missing_text) = submit_verification_case(None);
+    assert_eq!(missing["gate_verification"]["status"], "no_configuration");
+    assert_eq!(missing["gate_verification"]["selected_gates"], 0);
+    assert!(missing_text.contains("no .aethyme/gates.toml"));
+    assert!(missing_text.contains("conflict-checked"));
+    assert!(!missing_text.contains("→ verified"));
+
+    let (unmatched, unmatched_text) = submit_verification_case(Some(
+        "[[gate]]\nname = 'rust-only'\ncommand = 'true'\ntriggers = ['src/**/*.rs']\n",
+    ));
+    assert_eq!(
+        unmatched["gate_verification"]["status"],
+        "no_gates_triggered"
+    );
+    assert_eq!(unmatched["gate_verification"]["configured_gates"], 1);
+    assert_eq!(unmatched["gate_verification"]["selected_gates"], 0);
+    assert!(unmatched_text.contains("no gate matched this diff"));
+    assert!(unmatched_text.contains("conflict-checked"));
+    assert!(!unmatched_text.contains("→ verified"));
+
+    let (passed, passed_text) = submit_verification_case(Some(
+        "[[gate]]\nname = 'shell'\ncommand = 'true'\ntriggers = ['scripts/*.sh']\n",
+    ));
+    assert_eq!(passed["gate_verification"]["status"], "passed");
+    assert_eq!(passed["gate_verification"]["selected_gates"], 1);
+    assert!(passed_text.contains("1 selected gate(s) passed"));
+    assert!(passed_text.contains("→ verified"));
+}
+
 #[test]
 fn gate_cli_reports_tree_provenance_for_executed_and_cached_results() {
     let tmp = fixture();

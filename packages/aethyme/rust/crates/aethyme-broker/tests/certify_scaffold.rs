@@ -341,8 +341,37 @@ fn linked_worktree_setup_targets_that_checkout_and_keeps_runtime_state_shared() 
     let report = init::certify(&linked).unwrap();
     assert!(report.certified(), "linked checkout should certify cleanly");
     assert_eq!(status_of(&report, "certify.config"), CheckStatus::Pass);
-    assert_eq!(status_of(&report, "certify.gates"), CheckStatus::Pass);
+    assert_eq!(status_of(&report, "certify.gates"), CheckStatus::Warn);
     assert_eq!(status_of(&report, "certify.gitignore"), CheckStatus::Pass);
+}
+
+#[test]
+fn certify_warns_when_valid_gates_are_not_tracked() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/gates.toml"),
+        "[[gate]]\nname = 'unit'\ncommand = 'true'\n",
+    )
+    .unwrap();
+
+    let report = init::certify(tmp.path()).unwrap();
+    let gate_check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "certify.gates")
+        .unwrap();
+    assert_eq!(gate_check.status, CheckStatus::Warn);
+    assert!(gate_check.detail.contains("untracked"));
+    assert!(gate_check.detail.contains("spawned worktrees"));
+
+    sh(tmp.path(), &["add", ".aethyme/gates.toml"]);
+    sh(tmp.path(), &["commit", "-qm", "track gates"]);
+    assert_eq!(
+        status_of(&init::certify(tmp.path()).unwrap(), "certify.gates"),
+        CheckStatus::Pass
+    );
 }
 
 #[test]

@@ -1030,10 +1030,27 @@ fn protocol_detail(main_root: &Path) -> String {
 
 fn validate_gates(main_root: &Path) -> Check {
     match crate::gates::load_gates(main_root) {
-        Ok(gates) => Check {
-            id: "certify.gates",
-            status: CheckStatus::Pass,
-            detail: format!("gates.toml valid — {} gate(s), cheap-first", gates.len()),
+        Ok(gates) => match crate::GitRepo::discover(main_root)
+            .and_then(|repository| repository.is_tracked(".aethyme/gates.toml"))
+        {
+            Ok(true) => Check {
+                id: "certify.gates",
+                status: CheckStatus::Pass,
+                detail: format!("gates.toml valid — {} gate(s), cheap-first", gates.len()),
+            },
+            Ok(false) => Check {
+                id: "certify.gates",
+                status: CheckStatus::Warn,
+                detail: format!(
+                    "gates.toml valid — {} gate(s), but .aethyme/gates.toml is untracked and will be absent from spawned worktrees and submitted trees; review and commit it",
+                    gates.len()
+                ),
+            },
+            Err(error) => Check {
+                id: "certify.gates",
+                status: CheckStatus::Fail,
+                detail: format!("cannot determine whether gates.toml is tracked: {error}"),
+            },
         },
         Err(crate::gates::GateConfigError::Missing(_)) => Check {
             id: "certify.gates",

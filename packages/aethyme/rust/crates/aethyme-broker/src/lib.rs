@@ -70,8 +70,8 @@ pub use broker::{
     SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus,
     SemanticGateSuggestionChain, SessionCheckpointApplyReport, SessionCheckpointRecoveryPlan,
     SessionHandoffReport, SessionStartBase, SessionStartBaseEvidence, StartReport, StatusAdvice,
-    StatusAdviceSeverity, StatusIntegrationRelation, StatusSummary, StatusView, VersionRepairReport,
-    VersionRepairStep,
+    StatusAdviceSeverity, StatusIntegrationRelation, StatusSummary, StatusView,
+    VersionRepairReport, VersionRepairStep,
 };
 pub use error::BrokerError;
 pub use gates::{
@@ -102,7 +102,8 @@ pub use issue_form::{
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use merge::{
     ACTION_REQUIRED_RELPATH, PromoteConfig, SubmissionCommitOwnership, SubmissionCommitProvenance,
-    SubmissionConflict, SubmissionIntegrationState, SubmissionPlan, SubmitOutcome,
+    SubmissionConflict, SubmissionGateVerification, SubmissionGateVerificationStatus,
+    SubmissionIntegrationState, SubmissionPlan, SubmitOutcome,
 };
 pub use operations::{
     CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport,

@@ -4304,19 +4304,52 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         );
                     }
                 }
+                match outcome.gate_verification.status {
+                    crate::SubmissionGateVerificationStatus::NotRun => {}
+                    crate::SubmissionGateVerificationStatus::NoConfiguration => println!(
+                        "verification: conflict-only — no .aethyme/gates.toml exists in the submitted tree; 0 gates selected"
+                    ),
+                    crate::SubmissionGateVerificationStatus::NoGatesTriggered => println!(
+                        "verification: no gate matched this diff ({} configured, 0 selected); review triggers with `aethyme broker gates affected --session {}`",
+                        outcome.gate_verification.configured_gates, outcome.entry.session_id
+                    ),
+                    crate::SubmissionGateVerificationStatus::Passed => println!(
+                        "verification: {} selected gate(s) passed ({} executed, {} cached)",
+                        outcome.gate_verification.selected_gates,
+                        outcome.gate_verification.executed_gates,
+                        outcome.gate_verification.cached_gates
+                    ),
+                    crate::SubmissionGateVerificationStatus::Failed => println!(
+                        "verification: {} selected gate(s) did not all pass",
+                        outcome.gate_verification.selected_gates
+                    ),
+                }
                 if !outcome.no_changes {
                     println!("gate wall time: {}ms", gate_wall_ms);
                 }
-                println!(
-                    "entry {} → {}{}",
-                    outcome.entry.id,
-                    outcome.entry.status.as_str(),
-                    if outcome.promoted {
-                        " (auto-promoted)"
-                    } else {
-                        ""
-                    }
-                );
+                if outcome.entry.status.as_str() == "verified"
+                    && matches!(
+                        outcome.gate_verification.status,
+                        crate::SubmissionGateVerificationStatus::NoConfiguration
+                            | crate::SubmissionGateVerificationStatus::NoGatesTriggered
+                    )
+                {
+                    println!(
+                        "entry {} → conflict-checked (eligible for manual promotion; no gate verification)",
+                        outcome.entry.id
+                    );
+                } else {
+                    println!(
+                        "entry {} → {}{}",
+                        outcome.entry.id,
+                        outcome.entry.status.as_str(),
+                        if outcome.promoted {
+                            " (auto-promoted)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
                 if outcome.no_changes {
                     println!(
                         "What now: no pending session-owned content remains to integrate; \

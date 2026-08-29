@@ -164,6 +164,20 @@ Managed pre-commit hooks follow the same diagnostic principle. Successful
 cheap gates stay quiet. A failure replays complete standard output and error,
 prints the broker diagnosis, and preserves the failing exit code.
 
+Submit reports gate evidence separately from queue eligibility. Its JSON
+`gate_verification.status` is one of `no_configuration`,
+`no_gates_triggered`, `passed`, or `failed` (`not_run` is reserved for a
+conflict or content-empty submission). The accompanying counts distinguish
+configured, selected, freshly executed, and cached gates. In text mode a
+manual-mode entry with no gate proof is called `conflict-checked`, never simply
+`verified`.
+
+`gates validate` intentionally reads the checkout where it is invoked; submit
+loads `.aethyme/gates.toml` from the simulated submitted tree. Therefore a
+local untracked gates file cannot protect a spawned worktree or submission.
+`aethyme certify` warns about that state: review and commit the gate definition
+before relying on it.
+
 ## Understand Normalized Submission Planning
 
 Submit plans commit provenance before it simulates a merge. This matters when

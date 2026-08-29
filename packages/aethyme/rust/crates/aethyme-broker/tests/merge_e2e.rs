@@ -9,7 +9,7 @@ use aethyme_broker::{
     AdoptMode, Broker, EntryExposureState, FinishStatus, IntegrationDeliveryState,
     IntegrationReconcileClassification, IntegrationReconcileOptions, MergeStatus, NewSession,
     RepairAction, RepairSource, SessionOrigin, StatusAdviceSeverity, SubmissionCommitOwnership,
-    SubmissionIntegrationState,
+    SubmissionGateVerificationStatus, SubmissionIntegrationState,
 };
 
 fn sh(cwd: &Path, args: &[&str]) {
@@ -1191,6 +1191,10 @@ fn submission_with_unchanged_result_is_a_truthful_noop() {
     assert!(!outcome.promoted);
     assert_eq!(outcome.entry.status, MergeStatus::Superseded);
     assert!(outcome.gate_outcomes.is_empty());
+    assert_eq!(
+        outcome.gate_verification.status,
+        SubmissionGateVerificationStatus::NotRun
+    );
     assert_eq!(broker.integration_head().unwrap().1, integration_before);
     let details: serde_json::Value =
         serde_json::from_str(outcome.entry.details_json.as_deref().unwrap()).unwrap();
@@ -1446,6 +1450,10 @@ fn repo_without_gates_is_a_pure_conflict_manager() {
     let outcome = broker.submit(session.id).unwrap();
     assert_eq!(outcome.entry.status, MergeStatus::Promoted);
     assert!(outcome.gate_outcomes.is_empty());
+    assert_eq!(
+        outcome.gate_verification.status,
+        SubmissionGateVerificationStatus::NoConfiguration
+    );
 
     // Conflicts are still caught: a second session editing the same line.
     let wt_b = agent_worktree(tmp.path(), "rival");

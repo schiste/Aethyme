@@ -970,6 +970,12 @@ impl GitRepo {
         .collect())
     }
 
+    /// Whether one repository-relative path is present in the committed/staged
+    /// index. An untracked gate definition cannot exist in a spawned worktree.
+    pub fn is_tracked(&self, path: &str) -> Result<bool, GitError> {
+        Ok(!run_git(&self.root, &["ls-files", "--cached", "-z", "--", path])?.is_empty())
+    }
+
     /// Fetch a local commit object into this worktree's repository. Used
     /// by broker repair to apply the same no-network path written into
     /// `.aethyme/broker-action-required.md`.

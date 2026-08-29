@@ -137,6 +137,37 @@ impl PromoteConfig {
 
 /// Result of one submit: the queue entry after simulate (+ gates when
 /// clean, + promotion when auto mode and verified).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionGateVerificationStatus {
+    NotRun,
+    NoConfiguration,
+    NoGatesTriggered,
+    Passed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SubmissionGateVerification {
+    pub status: SubmissionGateVerificationStatus,
+    pub configured_gates: usize,
+    pub selected_gates: usize,
+    pub executed_gates: usize,
+    pub cached_gates: usize,
+}
+
+impl SubmissionGateVerification {
+    fn not_run() -> Self {
+        Self {
+            status: SubmissionGateVerificationStatus::NotRun,
+            configured_gates: 0,
+            selected_gates: 0,
+            executed_gates: 0,
+            cached_gates: 0,
+        }
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct SubmitOutcome {
     pub entry: MergeQueueEntry,
@@ -144,6 +175,9 @@ pub struct SubmitOutcome {
     pub conflicts: Vec<String>,
     pub conflict_details: Vec<SubmissionConflict>,
     pub gate_outcomes: Vec<GateRunOutcome>,
+    /// Queue status describes promotion eligibility; this field describes
+    /// whether gates actually supplied verification evidence.
+    pub gate_verification: SubmissionGateVerification,
     /// True when every pending session-owned commit is already represented
     /// by integration or produces no tree change. No gate or promotion runs
     /// for this outcome.
@@ -481,6 +515,7 @@ impl Broker {
                 conflicts: simulation.conflicts,
                 conflict_details: simulation.conflict_details,
                 gate_outcomes: Vec::new(),
+                gate_verification: SubmissionGateVerification::not_run(),
                 no_changes: false,
                 promoted: false,
             });
@@ -514,6 +549,7 @@ impl Broker {
                 conflicts: Vec::new(),
                 conflict_details: Vec::new(),
                 gate_outcomes: Vec::new(),
+                gate_verification: SubmissionGateVerification::not_run(),
                 no_changes: true,
                 promoted: false,
             });
@@ -552,11 +588,15 @@ impl Broker {
         // verification — recorded explicitly so nobody mistakes it for a
         // passing check run. A *malformed* gates.toml in the merged tree
         // stays a hard error (broken intent, not absent intent).
-        let gates = match self.load_and_sync_gates_from(sim_worktree.root()) {
-            Ok(gates) => gates,
-            Err(BrokerOpError::GateConfig(crate::gates::GateConfigError::Missing(_))) => Vec::new(),
-            Err(err) => return Err(err),
-        };
+        let (gates, gate_configuration_present) =
+            match self.load_and_sync_gates_from(sim_worktree.root()) {
+                Ok(gates) => (gates, true),
+                Err(BrokerOpError::GateConfig(crate::gates::GateConfigError::Missing(_))) => {
+                    (Vec::new(), false)
+                }
+                Err(err) => return Err(err),
+            };
+        let configured_gates = gates.len();
         let main_root = self.main_root_path();
         let gate_outcomes = crate::gates::run_affected(
             self.store(),
@@ -573,6 +613,27 @@ impl Broker {
         let all_pass = gate_outcomes
             .iter()
             .all(|o| o.status == crate::types::GateStatus::Pass);
+        let gate_verification = SubmissionGateVerification {
+            status: if !gate_configuration_present {
+                SubmissionGateVerificationStatus::NoConfiguration
+            } else if gate_outcomes.is_empty() {
+                SubmissionGateVerificationStatus::NoGatesTriggered
+            } else if all_pass {
+                SubmissionGateVerificationStatus::Passed
+            } else {
+                SubmissionGateVerificationStatus::Failed
+            },
+            configured_gates,
+            selected_gates: gate_outcomes.len(),
+            executed_gates: gate_outcomes
+                .iter()
+                .filter(|outcome| !outcome.cached)
+                .count(),
+            cached_gates: gate_outcomes
+                .iter()
+                .filter(|outcome| outcome.cached)
+                .count(),
+        };
         let details = serde_json::json!({
             "merge_commit": merge_commit,
             "base": base,
@@ -615,6 +676,7 @@ impl Broker {
             conflicts: Vec::new(),
             conflict_details: Vec::new(),
             gate_outcomes,
+            gate_verification,
             no_changes: false,
             promoted,
         })
