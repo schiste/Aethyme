@@ -249,7 +249,7 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker ship plan --entry <id> [--json]`
 - `aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--json]`
 - `aethyme broker integration status [--json]`
-- `aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--dry-run|--apply --confirm <sha256>] [--json]`
+- `aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--write-resolution-template <path>] [--dry-run|--apply --confirm <sha256>] [--json]`
 - `aethyme broker quick-test [--with-gate] [--json]`
 - `aethyme broker verify-loop [--json]`
 - `aethyme broker pr check [--target <branch>] [--pr <number>] [--agent <name>] [--dispatch] [--cmd <command>] [--json]`
@@ -716,6 +716,23 @@ for every unrecorded integration SHA: `preserve_and_replay`,
 must name one full SHA reachable from the bound upstream; dropping is accepted
 only when Git proves the commit tree is unchanged. There is deliberately no
 blanket discard option.
+
+The first blocked dry-run includes a `resolution_template` object in JSON. Its
+`document` is the complete schema-2 file: exact current refs, every unresolved
+recorded and unrecorded identifier, and any valid attestations already loaded
+from `--resolution-file`. New operator judgments and reasons are `null`, so the
+document deliberately fails validation until reviewed. Sibling
+`field_contract`, `recorded_evidence`, and `unrecorded_evidence` fields explain
+allowed values, full-SHA rules, conflicts, matching commits, changed paths, and
+whether Git proved a commit content-empty. Write only the ready-to-edit
+document atomically, without overwriting an existing review file, with:
+
+```bash
+aethyme broker integration reconcile \
+  --upstream origin/main \
+  --write-resolution-template reconciliation.json \
+  --dry-run
+```
 
 The file is single-use by construction: it binds the named ref's exact fetched
 commit, the old integration tip, each queue ID and original promoted merge

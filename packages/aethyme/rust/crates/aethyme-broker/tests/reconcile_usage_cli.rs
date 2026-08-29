@@ -9,7 +9,8 @@ const RESOURCES_USAGE: &str =
 const OPERATIONS_USAGE: &str = "usage: aethyme broker operations reconcile --operation <id> \
      --outcome <succeeded|failed> --reason <text> [--json]";
 const INTEGRATION_USAGE: &str = "usage: aethyme broker integration reconcile --upstream <ref> \
-     [--resolution-file <path>] [--dry-run | --apply --confirm <sha256>] [--json]";
+     [--resolution-file <path>] [--write-resolution-template <path>] \
+     [--dry-run | --apply --confirm <sha256>] [--json]";
 
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")

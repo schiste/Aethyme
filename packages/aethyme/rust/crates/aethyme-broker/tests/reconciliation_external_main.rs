@@ -380,6 +380,186 @@ fn reconciliation_plan_classifies_every_relevant_commit_with_full_provenance() {
 }
 
 #[test]
+fn first_blocked_report_templates_mixed_recorded_and_unrecorded_resolutions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let remote = tmp.path().join("remote.git");
+    let deploy = tmp.path().join("deploy");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir_all(&remote).unwrap();
+    git(&remote, &["init", "--bare", "-q", "-b", "main"]);
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join(".gitignore"), ".aethyme/\n").unwrap();
+    std::fs::write(repo.join("src/recorded.txt"), "base\n").unwrap();
+    std::fs::write(repo.join("src/unrecorded.txt"), "base\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "initial"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-qu", "origin", "main"]);
+
+    let mut broker = Broker::open(&repo).unwrap();
+    let session = broker.start_worktree("recorded local change").unwrap();
+    let worktree = PathBuf::from(&session.worktree_path);
+    commit(
+        &worktree,
+        "src/recorded.txt",
+        "integration\n",
+        "record local change",
+    );
+    let promoted = broker.submit(session.id).unwrap();
+    assert!(promoted.promoted);
+    let promoted_commit =
+        serde_json::from_str::<serde_json::Value>(promoted.entry.details_json.as_deref().unwrap())
+            .unwrap()["commit"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+    git(&repo, &["switch", "aethyme/integration"]);
+    let unrecorded_commit = commit(
+        &repo,
+        "src/unrecorded.txt",
+        "integration\n",
+        "unrecorded local change",
+    );
+    let old_integration = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["switch", "main"]);
+
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            remote.to_str().unwrap(),
+            deploy.to_str().unwrap(),
+        ],
+    );
+    commit(
+        &deploy,
+        "src/recorded.txt",
+        "upstream\n",
+        "conflicting recorded upstream change",
+    );
+    commit(
+        &deploy,
+        "src/unrecorded.txt",
+        "upstream\n",
+        "replace unrecorded change upstream",
+    );
+    git(&deploy, &["push", "-q", "origin", "main"]);
+    git(&repo, &["fetch", "-q", "origin", "main"]);
+    let upstream_head = git(&repo, &["rev-parse", "origin/main"]);
+
+    let first = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: None,
+            confirm: None,
+        })
+        .unwrap();
+    assert!(!first.safe, "{first:#?}");
+    let template = first.resolution_template.as_ref().unwrap();
+    assert!(!template.complete);
+    assert_eq!(template.document.schema_version, 2);
+    assert_eq!(template.document.upstream_commit, upstream_head);
+    assert_eq!(template.document.old_integration, old_integration);
+    assert!(template.document.operator.is_none());
+    assert_eq!(template.document.resolutions.len(), 1);
+    assert_eq!(
+        template.document.resolutions[0].queue_entry_id,
+        promoted.entry.id
+    );
+    assert_eq!(
+        template.document.resolutions[0].old_merge_commit,
+        promoted_commit
+    );
+    assert!(template.document.resolutions[0].classification.is_none());
+    assert!(template.document.resolutions[0].reason.is_none());
+    assert_eq!(template.document.unrecorded_resolutions.len(), 1);
+    assert_eq!(
+        template.document.unrecorded_resolutions[0].integration_commit,
+        unrecorded_commit
+    );
+    assert!(
+        template.document.unrecorded_resolutions[0]
+            .disposition
+            .is_none()
+    );
+    assert_eq!(template.recorded_evidence.len(), 1);
+    assert_eq!(template.unrecorded_evidence.len(), 1);
+    assert!(!template.unrecorded_evidence[0].content_empty);
+    assert_eq!(template.field_contract.unrecorded_dispositions.len(), 3);
+
+    let placeholder_path = repo.join("placeholder-resolution.json");
+    std::fs::write(
+        &placeholder_path,
+        serde_json::to_vec_pretty(&template.document).unwrap(),
+    )
+    .unwrap();
+    let placeholder_error = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: Some(placeholder_path),
+            confirm: None,
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(placeholder_error.contains("invalid JSON"));
+
+    let partial_path = repo.join("partial-resolution.json");
+    std::fs::write(
+        &partial_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 2,
+            "upstream_ref": "origin/main",
+            "upstream_commit": upstream_head,
+            "old_integration": old_integration,
+            "operator": "release-operator@example.test",
+            "unrecorded_resolutions": [{
+                "integration_commit": unrecorded_commit,
+                "disposition": "replaced_by_exact_upstream_sha",
+                "upstream_commit": upstream_head,
+                "reason": "reviewed exact upstream replacement"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let second = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: Some(partial_path),
+            confirm: None,
+        })
+        .unwrap();
+    let replacement = &second.resolution_template.as_ref().unwrap().document;
+    assert_eq!(
+        replacement.operator.as_deref(),
+        Some("release-operator@example.test")
+    );
+    assert_eq!(replacement.resolutions.len(), 1);
+    assert!(replacement.resolutions[0].classification.is_none());
+    assert_eq!(replacement.unrecorded_resolutions.len(), 1);
+    assert_eq!(
+        replacement.unrecorded_resolutions[0]
+            .disposition
+            .unwrap()
+            .as_str(),
+        "replaced_by_exact_upstream_sha"
+    );
+    assert_eq!(
+        replacement.unrecorded_resolutions[0].reason.as_deref(),
+        Some("reviewed exact upstream replacement")
+    );
+}
+
+#[test]
 fn reviewed_unrecorded_resolutions_are_commit_bound_and_never_blanket_discards() {
     let fixture = DeployDivergenceFixture::new();
     let resolution_path = fixture.repo.join("resolution.json");
@@ -778,7 +958,14 @@ fn deploy_written_main_divergence_is_blocked_by_unrecorded_integration_work() {
 
     assert!(!report.safe);
     assert!(!report.applied);
-    assert!(report.entries.is_empty());
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(
+        report.entries[0].classification,
+        IntegrationReconcileClassification::AlreadyLanded
+    );
+    let template = report.resolution_template.as_ref().unwrap();
+    assert!(template.document.resolutions.is_empty());
+    assert_eq!(template.document.unrecorded_resolutions.len(), 1);
     assert!(report.warnings.iter().any(|warning| {
         warning.contains("unrecorded work")
             || warning.contains("not a contiguous promoted queue layer")

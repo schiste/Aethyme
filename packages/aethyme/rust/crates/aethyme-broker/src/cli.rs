@@ -6,7 +6,7 @@
 //! rendering, and every command has a `--json` form whose shape comes
 //! from the library's serializable types (#32).
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use crate::broker::Broker;
@@ -19,7 +19,8 @@ const OPERATIONS_SHOW_USAGE: &str = "usage: aethyme broker operations show <id> 
 const ADVISORIES_SHOW_USAGE: &str = "usage: aethyme broker advisories show <id> [--json]";
 const ADVISORIES_ACK_USAGE: &str = "usage: aethyme broker advisories ack <id> [--json]";
 const INTEGRATION_RECONCILE_USAGE: &str = "usage: aethyme broker integration reconcile \
-     --upstream <ref> [--resolution-file <path>] [--dry-run | --apply --confirm <sha256>] [--json]";
+     --upstream <ref> [--resolution-file <path>] [--write-resolution-template <path>] \
+     [--dry-run | --apply --confirm <sha256>] [--json]";
 
 const USAGE: &str = "\
 aethyme broker — coordinate concurrent AI agent sessions on this repository
@@ -275,12 +276,14 @@ Usage:
       Sample integration, wait for a quiet window (default: 30s), then
       sample again. Fails if integration moved, printing the old and new
       tips so long checks are not mistaken for current-tip proof.
-  aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--dry-run|--apply --confirm <sha256>] [--json]
+  aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--write-resolution-template <path>] [--dry-run|--apply --confirm <sha256>] [--json]
       Compare already-fetched upstream with local main and promoted queue
       state. Dry-run is the default. --apply marks externally landed work,
       replays reviewed pending work, and rebuilds integration only when
       --confirm matches the dry-run plan digest. A resolution file binds
-      queue attestations and per-SHA unrecorded-commit dispositions.
+      queue attestations and per-SHA unrecorded-commit dispositions. The
+      template option atomically writes a no-clobber schema-v2 document with
+      exact identifiers and deliberately invalid null operator judgments.
   aethyme broker status [--json]
       The whole picture: agents, overlaps, promoted conflicts, merge
       queue, integration head.
@@ -911,6 +914,8 @@ mod tests {
             "origin/main".to_string(),
             "--resolution-file".to_string(),
             "reconciliation.json".to_string(),
+            "--write-resolution-template".to_string(),
+            "reconciliation-template.json".to_string(),
             "--apply".to_string(),
             "--confirm".to_string(),
             "a".repeat(64),
@@ -925,8 +930,38 @@ mod tests {
             parsed.resolution_file.as_deref(),
             Some(std::path::Path::new("reconciliation.json"))
         );
+        assert_eq!(
+            parsed.write_resolution_template.as_deref(),
+            Some(std::path::Path::new("reconciliation-template.json"))
+        );
         assert!(parsed.apply);
         assert_eq!(parsed.confirm, Some("a".repeat(64)));
+    }
+
+    #[test]
+    fn resolution_template_write_is_atomic_and_never_clobbers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("resolution.json");
+        let document = crate::IntegrationReconcileResolutionTemplateDocument {
+            schema_version: 2,
+            upstream_ref: "origin/main".into(),
+            upstream_commit: "a".repeat(40),
+            old_integration: "b".repeat(40),
+            operator: None,
+            resolutions: Vec::new(),
+            unrecorded_resolutions: Vec::new(),
+        };
+
+        assert!(super::write_reconciliation_resolution_template(&output, &document).is_ok());
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(value["schema_version"], 2);
+        assert!(value["operator"].is_null());
+        let error = match super::write_reconciliation_resolution_template(&output, &document) {
+            Err(super::UsageError::Message(error)) => error,
+            _ => panic!("second write should return a no-clobber usage error"),
+        };
+        assert!(error.contains("refusing to overwrite"), "{error}");
     }
 
     #[test]
@@ -1051,6 +1086,7 @@ struct Parsed {
     seconds: Option<u64>,
     upstream: Option<String>,
     resolution_file: Option<PathBuf>,
+    write_resolution_template: Option<PathBuf>,
     worktree: Option<PathBuf>,
     title: Option<String>,
     output: Option<PathBuf>,
@@ -1110,6 +1146,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         seconds: None,
         upstream: None,
         resolution_file: None,
+        write_resolution_template: None,
         worktree: None,
         title: None,
         output: None,
@@ -1256,6 +1293,11 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                         ))?
                         .clone(),
                 ))
+            }
+            "--write-resolution-template" => {
+                parsed.write_resolution_template = Some(PathBuf::from(iter.next().ok_or(
+                    UsageError::Message("--write-resolution-template requires a path".into()),
+                )?))
             }
             "--worktree" => {
                 parsed.worktree = Some(PathBuf::from(
@@ -2437,10 +2479,81 @@ fn render_integration_reconcile(
             println!("    conflicts: {}", capped_join(&entry.conflicts, 5));
         }
     }
+    if let Some(template) = &report.resolution_template {
+        println!(
+            "Resolution template: {} recorded, {} unrecorded ({})",
+            template.document.resolutions.len(),
+            template.document.unrecorded_resolutions.len(),
+            if template.complete {
+                "complete"
+            } else {
+                "operator input required"
+            }
+        );
+        println!(
+            "  recorded classification: {}",
+            template
+                .field_contract
+                .recorded_classification_allowed_values
+                .join(", ")
+        );
+        for rule in &template.field_contract.unrecorded_dispositions {
+            println!(
+                "  {}: upstream_commit {}; {}",
+                rule.value, rule.upstream_commit, rule.condition
+            );
+        }
+        println!("  operator: {}", template.field_contract.operator);
+        println!("  reason: {}", template.field_contract.reason);
+    }
     for warning in &report.warnings {
         println!("Warning: {warning}");
     }
     println!("Next action: {}", report.next_action);
+    Ok(())
+}
+
+fn write_reconciliation_resolution_template(
+    path: &std::path::Path,
+    document: &crate::IntegrationReconcileResolutionTemplateDocument,
+) -> Result<(), UsageError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| std::path::Path::new("."));
+    if !parent.is_dir() {
+        return Err(UsageError::Message(format!(
+            "resolution template parent directory does not exist: {}",
+            parent.display()
+        )));
+    }
+    let mut bytes = serde_json::to_vec_pretty(document)?;
+    bytes.push(b'\n');
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        UsageError::Message(format!(
+            "cannot create resolution template beside {}: {error}",
+            path.display()
+        ))
+    })?;
+    temporary.write_all(&bytes).map_err(|error| {
+        UsageError::Message(format!(
+            "cannot write resolution template {}: {error}",
+            path.display()
+        ))
+    })?;
+    temporary.as_file().sync_all().map_err(|error| {
+        UsageError::Message(format!(
+            "cannot sync resolution template {}: {error}",
+            path.display()
+        ))
+    })?;
+    temporary.persist_noclobber(path).map_err(|error| {
+        UsageError::Message(format!(
+            "refusing to overwrite resolution template {}: {}",
+            path.display(),
+            error.error
+        ))
+    })?;
     Ok(())
 }
 
@@ -4604,6 +4717,11 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     if parsed.apply && parsed.confirm.is_none() {
                         return Err(UsageError::Message(INTEGRATION_RECONCILE_USAGE.into()));
                     }
+                    if parsed.apply && parsed.write_resolution_template.is_some() {
+                        return Err(UsageError::Message(format!(
+                            "--write-resolution-template is a dry-run aid and cannot be combined with --apply; {INTEGRATION_RECONCILE_USAGE}"
+                        )));
+                    }
                     let mut broker = open_broker(parsed.read_only_snapshot)?;
                     let report =
                         broker.reconcile_integration(crate::IntegrationReconcileOptions {
@@ -4612,6 +4730,16 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             resolution_file: parsed.resolution_file.clone(),
                             confirm: parsed.confirm.clone(),
                         })?;
+                    if let Some(path) = parsed.write_resolution_template.as_deref() {
+                        let template = report.resolution_template.as_ref().ok_or_else(|| {
+                            UsageError::Message(
+                                "no reconciliation resolution template is required for this plan"
+                                    .into(),
+                            )
+                        })?;
+                        write_reconciliation_resolution_template(path, &template.document)?;
+                        eprintln!("Wrote resolution template to {}", path.display());
+                    }
                     render_integration_reconcile(&report, parsed.json)?;
                     if !report.safe {
                         return Err(UsageError::Message(

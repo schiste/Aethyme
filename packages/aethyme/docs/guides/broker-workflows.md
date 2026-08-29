@@ -65,6 +65,22 @@ upstream and integration tips, so it becomes stale when either moves. See the
 [CLI reference](../reference/cli.md) for the complete schema and queue-entry
 attestation fields.
 
+Do not transcribe that schema from diagnostics. Ask the first dry-run to write
+the complete, no-clobber review document:
+
+```bash
+aethyme broker integration reconcile \
+  --upstream origin/main \
+  --write-resolution-template reconciliation.json \
+  --dry-run
+```
+
+The generated `null` operator decisions and reasons cannot validate or apply.
+Fill them after reviewing the adjacent structured evidence, then pass the same
+file with `--resolution-file`. If a later dry-run discovers another blocked
+entry, its replacement template preserves already valid reviewed entries and
+adds the missing placeholders.
+
 When the dry-run is safe, review the complete report and copy its 64-character
 `plan_digest` into the apply command:
 

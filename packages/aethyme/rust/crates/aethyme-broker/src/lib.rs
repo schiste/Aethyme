@@ -122,9 +122,14 @@ pub use quick_test::{
 pub use reconciliation::{
     IntegrationReconcileClassification, IntegrationReconcileCommit,
     IntegrationReconcileCommitOrigin, IntegrationReconcileEntry, IntegrationReconcileEquivalence,
-    IntegrationReconcileOptions, IntegrationReconcilePlan, IntegrationReconcileReport,
-    IntegrationReconcileResolutionAudit, IntegrationReconcileUnrecordedDisposition,
-    IntegrationReconcileUnrecordedResolutionAudit,
+    IntegrationReconcileOptions, IntegrationReconcilePlan,
+    IntegrationReconcileRecordedResolutionEvidence, IntegrationReconcileRecordedResolutionTemplate,
+    IntegrationReconcileReport, IntegrationReconcileResolutionAudit,
+    IntegrationReconcileResolutionContract, IntegrationReconcileResolutionTemplate,
+    IntegrationReconcileResolutionTemplateDocument, IntegrationReconcileUnrecordedDisposition,
+    IntegrationReconcileUnrecordedDispositionRule, IntegrationReconcileUnrecordedResolutionAudit,
+    IntegrationReconcileUnrecordedResolutionEvidence,
+    IntegrationReconcileUnrecordedResolutionTemplate,
 };
 pub use release_compatibility::{
     BROKER_STORAGE_CURRENT_SCHEMA, BROKER_STORAGE_MINIMUM_SCHEMA, ENGINE_PROTOCOL_VERSION,
