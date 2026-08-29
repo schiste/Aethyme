@@ -4,6 +4,44 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.4.0] - 2026-08-29
+
+### Added
+
+- Rewritten session checkpoints have a digest-confirmed, preservation-first
+  recovery plan instead of requiring an unsafe baseline reset.
+- Blocked external-main reconciliation exposes a complete schema-2 resolution
+  template with exact identifiers, structured evidence, field rules, and an
+  atomic no-clobber writer.
+- Broker command failures persist in allowlist-only diagnostic reports without
+  command output, task text, diffs, file contents, or secrets.
+
+### Changed
+
+- Submission planning selects an explicit safe base, explains unsupported
+  owned merge commits, and removes failed planning entries instead of leaving
+  misleading submitted queue residue.
+- Submission verification distinguishes missing gate configuration, no
+  triggered gates, fresh execution, cache reuse, and failure.
+- Guarded execution attributes changes to already-dirty files as well as newly
+  dirty paths, so both remain subject to explicit lease ownership.
+
+### Fixed
+
+- Closed sessions can no longer authorize new coordinated Git or GitHub
+  operations.
+- External-main reconciliation recognizes stable patch-equivalent landings
+  when local main already equals upstream and avoids replaying an empty commit.
+- Session start refuses implicit or ambiguous bases rather than inheriting an
+  unsafe checkout position.
+
+### Upgrade notes
+
+Read [Upgrading to v0.4.0](packages/aethyme/docs/guides/upgrading-to-v0.4.0.md)
+before updating. Broker storage remains schema 17, engine protocol remains 1,
+and repository deployment remains schema 1, so v0.3.0 repositories do not
+require a mandatory policy migration.
+
 ## [0.3.0] - 2026-08-27
 
 ### Added

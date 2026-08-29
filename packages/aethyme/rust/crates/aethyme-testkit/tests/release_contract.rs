@@ -139,10 +139,11 @@ fn release_installer_delegates_pair_activation_to_the_native_transaction() {
 fn release_notes_publish_migration_compatibility_rollback_and_known_issues() {
     let root = aethyme_testkit::paths::repo_root();
     let workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
-    let guide_path = "packages/aethyme/docs/guides/upgrading-to-v0.3.0.md";
+    let version = product_version();
+    let guide_path = format!("packages/aethyme/docs/guides/upgrading-to-v{version}.md");
     assert!(workflow.contains(&format!("body_path: {guide_path}")));
 
-    let guide = std::fs::read_to_string(root.join(guide_path)).unwrap();
+    let guide = std::fs::read_to_string(root.join(&guide_path)).unwrap();
     for heading in [
         "## Compatibility",
         "## Before upgrading",
@@ -158,6 +159,6 @@ fn release_notes_publish_migration_compatibility_rollback_and_known_issues() {
     }
 
     let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
-    assert!(changelog.contains("## [0.3.0] - 2026-08-27"));
+    assert!(changelog.contains(&format!("## [{version}] - ")));
     assert!(changelog.contains("release-manifest.json"));
 }
