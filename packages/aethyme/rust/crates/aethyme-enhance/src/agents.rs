@@ -270,8 +270,14 @@ Follow this protocol:
    entry.
    Report the outcome (verified / rejected / conflict) in your summary.
    Afterwards, finish the session with
-   `aethyme broker close --session <id>` (state only), or point it at
-   a follow-up task with `aethyme broker adopt --reuse --task "..."`.
+   `aethyme broker finish --session <id>`, or point it at a follow-up task
+   with `aethyme broker adopt --reuse --task "..."`. `finish` closes broker
+   state but deliberately leaves the worktree available for review or reuse.
+   When it reports cleanup is safe, reclaim that exact worktree with
+   `aethyme broker cleanup <id>`. Operators can periodically review all
+   retained broker-owned worktrees with `aethyme broker cleanup --all-cleaned`
+   and apply the unchanged plan explicitly with
+   `aethyme broker cleanup --all-cleaned --apply`.
 
 7. **If a file named `.aethyme/broker-action-required.md` appears in your
    worktree**, read it immediately: your submission conflicted. It names
@@ -630,6 +636,8 @@ mod tests {
         ));
         assert!(doc.contains("Prefer this reviewed broker ship workflow over a raw push"));
         assert!(doc.contains("Without publication authority, stop after submit"));
+        assert!(doc.contains("aethyme broker finish --session <id>"));
+        assert!(doc.contains("aethyme broker cleanup --all-cleaned --apply"));
         assert!(doc.contains("Treat broker advisories as delivered work context, not as blockers"));
         assert!(doc.contains("after rebasing or reusing a worktree"));
         assert!(doc.contains("gitignored persistence projection"));

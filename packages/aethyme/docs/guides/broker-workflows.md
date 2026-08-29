@@ -344,6 +344,27 @@ not create a misleading completion record. A successful finish atomically
 closes the session and writes a redacted `session.finished` event, so the
 handoff survives lease cleanup and worktree removal.
 
+`finish` does not remove the worktree. This preserves the checkout for review
+or reuse and avoids deleting the directory from under a caller's shell. When
+the report says cleanup is safe, remove one exact broker-owned worktree with:
+
+```bash
+aethyme broker cleanup 111
+```
+
+For periodic reclamation, first inspect the dry-run plan, then apply it:
+
+```bash
+aethyme broker cleanup --all-cleaned
+aethyme broker cleanup --all-cleaned --apply
+```
+
+The plan lists each retained spawned worktree, its eligibility, and estimated
+bytes. Apply revalidates every candidate and never force-removes adopted
+worktrees, dirty paths, symlinked paths, or commits not represented by main,
+integration, or the configured upstream. `broker status` warns when eligible
+cleaned worktrees remain. Use `--json` for the stable plan or sweep report.
+
 Retrieve the latest completed handoff later with exactly one selector:
 
 ```bash
@@ -379,6 +400,7 @@ aethyme broker leases claim src/broker.rs --session 111
 aethyme broker gates run --session 111 --no-cache
 aethyme broker submit --session 111
 aethyme broker finish --session 111
+aethyme broker cleanup 111
 ```
 
 The new session ID may differ from the old one. Always use the ID printed by

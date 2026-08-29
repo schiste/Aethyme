@@ -240,6 +240,8 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
 - `aethyme broker repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
+- `aethyme broker cleanup <session-id> [--force] [--json]`
+- `aethyme broker cleanup --all-cleaned [--apply] [--json]`
 - `aethyme broker handoff (--session <id> | --worktree <path>) [--json]`
 - `aethyme broker report capture --kind <bug|improvement> --title <text> [--session <id>] [--include-task] [--stdout | --output <filename>] [--json]`
 - `aethyme broker report list [--json]`
@@ -472,6 +474,15 @@ action. A successful close persists the same operational fields in a redacted
 `session.finished` event atomically with `session.cleaned`, so the handoff
 survives lease cleanup and session closure. Refused and already-closed finishes
 do not emit a misleading or duplicate completion event.
+
+Finishing closes broker state but retains the worktree for review or reuse.
+`broker cleanup <session-id>` removes one exact session worktree after its
+safety checks. `broker cleanup --all-cleaned` is a read-only bulk plan by
+default; it reports eligible and refused broker-spawned worktrees plus estimated
+bytes. Add `--apply` to revalidate and remove only eligible candidates. Adopted
+worktrees are outside the sweep, and dirty, symlinked, unsafe-path, inspection-
+failed, and unrepresented-commit candidates remain untouched. `--force` is
+available only for exact-session cleanup and is rejected with `--all-cleaned`.
 
 Retrieve the newest persisted handoff without changing broker state:
 
