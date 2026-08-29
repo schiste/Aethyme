@@ -134,6 +134,10 @@ pub enum BrokerOpError {
     MissingExecCommand,
     #[error("invalid coordinated operation: {reason}")]
     InvalidCoordinatedOperation { reason: String },
+    #[error(
+        "session {session_id} is closed and cannot authorize coordinated operations; start a new session with `aethyme broker start --task <text>` or adopt an active worktree with `aethyme broker adopt --task <text>`"
+    )]
+    ClosedSessionOperation { session_id: i64 },
     #[error("{recovery}")]
     CoordinatedOperationBlocked {
         repository: String,

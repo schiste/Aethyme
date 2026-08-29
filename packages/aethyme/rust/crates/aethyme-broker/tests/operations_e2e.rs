@@ -184,6 +184,42 @@ fn successful_operation_is_durably_journaled_with_events() {
 }
 
 #[test]
+fn closed_and_missing_sessions_cannot_authorize_coordinated_operations() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let low_level_worktree = add_worktree(tmp.path(), "low-level-closed");
+    let finished_worktree = add_worktree(tmp.path(), "finished");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let low_level = broker.adopt(&low_level_worktree, None).unwrap();
+    let finished = broker.adopt(&finished_worktree, None).unwrap();
+
+    broker.close(low_level.id).unwrap();
+    broker.finish(finished.id).unwrap();
+
+    for session_id in [low_level.id, finished.id] {
+        let read = broker
+            .run_coordinated_operation(github_request(session_id, "owner/repo", &["issue", "list"]))
+            .unwrap_err();
+        assert!(read.to_string().contains("is closed"));
+        assert!(read.to_string().contains("aethyme broker start"));
+
+        let write = broker
+            .run_coordinated_operation(request(session_id, &["branch", "after-close"]))
+            .unwrap_err();
+        assert!(write.to_string().contains("is closed"));
+    }
+
+    let missing = broker
+        .run_coordinated_operation(request(i64::MAX, &["branch", "missing-session"]))
+        .unwrap_err();
+    assert!(matches!(
+        missing,
+        BrokerOpError::Store(aethyme_broker::BrokerError::SessionNotFound(_))
+    ));
+    assert!(broker.store().coordinated_operations().unwrap().is_empty());
+}
+
+#[test]
 fn destructive_and_ambiguous_operations_fail_closed() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
