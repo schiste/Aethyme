@@ -68,6 +68,18 @@ pub struct ShipPlan {
     pub target: ResolvedRemoteTarget,
     pub proposed_push: ShipPush,
     pub local_main_sync_safe: bool,
+    pub local_main_sync_assessment: ShipLocalMainSyncAssessment,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ShipLocalMainSyncAssessment {
+    pub safe: bool,
+    pub current_branch_matches: bool,
+    pub local_head_unchanged: bool,
+    pub fast_forward: bool,
+    pub tracked_dirty_paths: Vec<String>,
+    pub untracked_paths: Vec<String>,
+    pub conflicting_untracked_paths: Vec<String>,
 }
 
 fn ship_operation_failure(
@@ -280,12 +292,18 @@ impl Broker {
             refspec: refspec.clone(),
             command: vec!["git".into(), "push".into(), remote.clone(), refspec],
         };
-        let local_main_sync_safe = current_branch == default_branch
-            && self.repo_handle().head_commit()? == local_default_branch_sha
-            && !self.repo_handle().is_dirty()?
-            && self
-                .repo_handle()
-                .is_ancestor(&local_default_branch_sha, &publication_sha);
+        let local_main_sync_assessment = assess_local_main_sync(
+            self,
+            &default_branch,
+            &local_default_branch_ref,
+            &local_default_branch_sha,
+            &publication_sha,
+        )
+        .map_err(|reason| BrokerOpError::ShipPlanUnavailable {
+            what: "local-main synchronization",
+            reason,
+        })?;
+        let local_main_sync_safe = local_main_sync_assessment.safe;
 
         Ok(ShipPlan {
             queue_entry: entry,
@@ -310,6 +328,7 @@ impl Broker {
             target,
             proposed_push,
             local_main_sync_safe,
+            local_main_sync_assessment,
         })
     }
 
@@ -617,43 +636,122 @@ fn validate_local_main_sync(broker: &Broker, plan: &ShipPlan, confirm: &str) -> 
         .local_default_branch_ref
         .strip_prefix("refs/heads/")
         .unwrap_or(&plan.local_default_branch_ref);
+    let assessment = assess_local_main_sync(
+        broker,
+        default_branch,
+        &plan.local_default_branch_ref,
+        &plan.local_default_branch_sha,
+        confirm,
+    )?;
+    if !assessment.safe {
+        return Err(local_main_sync_refusal(&assessment, default_branch));
+    }
+    Ok(())
+}
+
+fn assess_local_main_sync(
+    broker: &Broker,
+    default_branch: &str,
+    default_branch_ref: &str,
+    expected_head: &str,
+    confirm: &str,
+) -> Result<ShipLocalMainSyncAssessment, String> {
     let current_branch = broker
         .repo_handle()
         .current_branch()
         .map_err(|error| error.to_string())?;
-    if current_branch != default_branch {
-        return Err(format!(
-            "primary checkout is on {current_branch}, expected {default_branch}"
-        ));
-    }
-    if broker
-        .repo_handle()
-        .is_dirty()
-        .map_err(|error| error.to_string())?
-    {
-        return Err("primary default-branch checkout is dirty".into());
-    }
     let current_head = broker
         .repo_handle()
         .head_commit()
         .map_err(|error| error.to_string())?;
     let current_ref = broker
         .repo_handle()
-        .resolve_ref(&plan.local_default_branch_ref)
-        .ok_or_else(|| format!("{} no longer resolves", plan.local_default_branch_ref))?;
-    if current_head != plan.local_default_branch_sha || current_ref != plan.local_default_branch_sha
-    {
-        return Err(format!(
-            "local main moved since planning: expected {}, observed HEAD {} and ref {}",
-            plan.local_default_branch_sha, current_head, current_ref
-        ));
+        .resolve_ref(default_branch_ref)
+        .ok_or_else(|| format!("{default_branch_ref} no longer resolves"))?;
+    let mut tracked_dirty_paths = broker
+        .repo_handle()
+        .tracked_dirty_paths()
+        .map_err(|error| error.to_string())?;
+    let mut untracked_paths = broker
+        .repo_handle()
+        .untracked_paths()
+        .map_err(|error| error.to_string())?;
+    tracked_dirty_paths.sort();
+    tracked_dirty_paths.dedup();
+    untracked_paths.sort();
+    untracked_paths.dedup();
+    let fast_forward = broker.repo_handle().is_ancestor(&current_head, confirm);
+    let incoming_paths = if fast_forward {
+        broker
+            .repo_handle()
+            .changed_between(&current_head, confirm)
+            .map_err(|error| error.to_string())?
+    } else {
+        Vec::new()
+    };
+    let mut conflicting_untracked_paths = untracked_paths
+        .iter()
+        .filter(|untracked| {
+            incoming_paths
+                .iter()
+                .any(|incoming| checkout_paths_collide(untracked, incoming))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    conflicting_untracked_paths.sort();
+    conflicting_untracked_paths.dedup();
+    let current_branch_matches = current_branch == default_branch;
+    let local_head_unchanged = current_head == expected_head && current_ref == expected_head;
+    let safe = current_branch_matches
+        && local_head_unchanged
+        && fast_forward
+        && tracked_dirty_paths.is_empty()
+        && conflicting_untracked_paths.is_empty();
+    Ok(ShipLocalMainSyncAssessment {
+        safe,
+        current_branch_matches,
+        local_head_unchanged,
+        fast_forward,
+        tracked_dirty_paths,
+        untracked_paths,
+        conflicting_untracked_paths,
+    })
+}
+
+fn checkout_paths_collide(a: &str, b: &str) -> bool {
+    a == b
+        || a.strip_prefix(b)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || b.strip_prefix(a)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn local_main_sync_refusal(
+    assessment: &ShipLocalMainSyncAssessment,
+    default_branch: &str,
+) -> String {
+    if !assessment.current_branch_matches {
+        return format!("primary checkout is not on expected default branch {default_branch}");
     }
-    if !broker.repo_handle().is_ancestor(&current_head, confirm) {
-        return Err(format!(
-            "local main {current_head} has diverged from confirmed integration {confirm}"
-        ));
+    if !assessment.local_head_unchanged {
+        return "local main moved since planning".into();
     }
-    Ok(())
+    if !assessment.fast_forward {
+        return "local main has diverged from the confirmed publication".into();
+    }
+    if !assessment.tracked_dirty_paths.is_empty() {
+        return format!(
+            "primary default-branch checkout has tracked changes: {}",
+            assessment.tracked_dirty_paths.join(", ")
+        );
+    }
+    if !assessment.conflicting_untracked_paths.is_empty() {
+        return format!(
+            "untracked paths would collide with the incoming fast-forward: {}",
+            assessment.conflicting_untracked_paths.join(", ")
+        );
+    }
+    "local-main synchronization is unsafe".into()
 }
 
 fn tracking_ref(plan: &ShipPlan) -> String {
@@ -672,4 +770,18 @@ fn ls_remote_sha(output: &str, ref_name: &str) -> Option<String> {
             && sha.chars().all(|character| character.is_ascii_hexdigit()))
         .then(|| sha.to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checkout_paths_collide;
+
+    #[test]
+    fn checkout_collision_covers_exact_and_file_directory_replacements() {
+        assert!(checkout_paths_collide("feature.txt", "feature.txt"));
+        assert!(checkout_paths_collide("feature/nested.txt", "feature"));
+        assert!(checkout_paths_collide("feature", "feature/nested.txt"));
+        assert!(!checkout_paths_collide(".codex/local.md", "src/main.rs"));
+        assert!(!checkout_paths_collide("feature-old", "feature"));
+    }
 }

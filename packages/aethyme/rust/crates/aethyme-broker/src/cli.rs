@@ -267,7 +267,9 @@ Usage:
   aethyme broker ship execute --entry <id> --confirm <full-publication-sha> [--sync-main] [--json]
       Fetch and revalidate the planned remote base, publish the exact confirmed
       promoted prefix with a non-force push, then verify the remote default ref.
-      --sync-main additionally fast-forwards a clean, unchanged primary checkout.
+      --sync-main additionally fast-forwards an unchanged primary checkout.
+      Tracked changes and incoming-path collisions block; unrelated untracked
+      files are preserved and reported.
   aethyme broker integration status [--json]
       Focused promoted-but-unmerged view: the local integration branch as
       a pending layer above main, with promoted entries, files changed,
@@ -2414,6 +2416,24 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool) -> Result<(), UsageErr
             "no"
         }
     );
+    let assessment = &report.local_main_sync_assessment;
+    if !assessment.tracked_dirty_paths.is_empty() {
+        println!(
+            "Blocking tracked paths: {}",
+            assessment.tracked_dirty_paths.join(", ")
+        );
+    }
+    if !assessment.conflicting_untracked_paths.is_empty() {
+        println!(
+            "Blocking untracked collisions: {}",
+            assessment.conflicting_untracked_paths.join(", ")
+        );
+    } else if !assessment.untracked_paths.is_empty() {
+        println!(
+            "Unrelated untracked paths preserved: {}",
+            assessment.untracked_paths.join(", ")
+        );
+    }
     println!(
         "Confirm with: aethyme broker ship execute --entry {} --confirm {}",
         report.queue_entry.id, report.publication_sha

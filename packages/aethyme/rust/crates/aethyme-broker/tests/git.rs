@@ -142,6 +142,8 @@ fn dirty_paths_reports_an_unstaged_modification() {
     // Mixed with an untracked file, both must survive.
     std::fs::write(tmp.path().join("new.rs"), "x\n").unwrap();
     assert_eq!(repo.dirty_paths().unwrap(), vec!["README.md", "new.rs"]);
+    assert_eq!(repo.tracked_dirty_paths().unwrap(), vec!["README.md"]);
+    assert_eq!(repo.untracked_paths().unwrap(), vec!["new.rs"]);
 }
 
 #[test]

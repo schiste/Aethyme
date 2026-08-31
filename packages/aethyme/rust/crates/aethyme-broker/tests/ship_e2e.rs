@@ -500,11 +500,50 @@ fn integration_status_routes_promoted_published_and_synchronized_states_through_
 }
 
 #[test]
-fn ship_execute_sync_main_refuses_a_dirty_primary_checkout_before_publish() {
+fn ship_execute_sync_main_preserves_disjoint_untracked_paths() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    std::fs::write(fixture.repo.join("dirty.txt"), "wip\n").unwrap();
+    std::fs::create_dir_all(fixture.repo.join(".codex")).unwrap();
+    std::fs::write(fixture.repo.join(".codex/local.md"), "local\n").unwrap();
+    let mut broker = fixture.broker();
+
+    let plan = broker.ship_plan(entry_id).unwrap();
+    assert!(plan.local_main_sync_safe);
+    assert_eq!(
+        plan.local_main_sync_assessment.untracked_paths,
+        vec![".codex/local.md", "dirty.txt"]
+    );
+    assert!(
+        plan.local_main_sync_assessment
+            .conflicting_untracked_paths
+            .is_empty()
+    );
+
+    broker
+        .ship_execute_with_sync(entry_id, &integration, true)
+        .unwrap();
+    assert_eq!(fixture.remote_main(), integration);
+    assert_eq!(
+        git_output(&fixture.repo, &["rev-parse", "main"]),
+        integration
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo.join("dirty.txt")).unwrap(),
+        "wip\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo.join(".codex/local.md")).unwrap(),
+        "local\n"
+    );
+}
+
+#[test]
+fn ship_execute_sync_main_refuses_tracked_changes_with_paths() {
     let fixture = Fixture::new();
     let (entry_id, _, integration) = fixture.promoted_entry();
     let remote_before = fixture.remote_main();
-    std::fs::write(fixture.repo.join("dirty.txt"), "wip\n").unwrap();
+    std::fs::write(fixture.repo.join("tracked.txt"), "tracked wip\n").unwrap();
     let mut broker = fixture.broker();
 
     let error = broker
@@ -512,7 +551,34 @@ fn ship_execute_sync_main_refuses_a_dirty_primary_checkout_before_publish() {
         .unwrap_err();
     assert!(matches!(
         error,
-        BrokerOpError::ShipLocalMainUnsafe { reason } if reason.contains("dirty")
+        BrokerOpError::ShipLocalMainUnsafe { reason }
+            if reason.contains("tracked changes") && reason.contains("tracked.txt")
+    ));
+    assert_eq!(fixture.remote_main(), remote_before);
+    assert!(broker.store().coordinated_operations().unwrap().is_empty());
+}
+
+#[test]
+fn ship_execute_sync_main_refuses_untracked_incoming_path_collisions() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    let remote_before = fixture.remote_main();
+    std::fs::write(fixture.repo.join("feature.txt"), "local collision\n").unwrap();
+    let mut broker = fixture.broker();
+
+    let plan = broker.ship_plan(entry_id).unwrap();
+    assert!(!plan.local_main_sync_safe);
+    assert_eq!(
+        plan.local_main_sync_assessment.conflicting_untracked_paths,
+        vec!["feature.txt"]
+    );
+    let error = broker
+        .ship_execute_with_sync(entry_id, &integration, true)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        BrokerOpError::ShipLocalMainUnsafe { reason }
+            if reason.contains("untracked paths") && reason.contains("feature.txt")
     ));
     assert_eq!(fixture.remote_main(), remote_before);
     assert!(broker.store().coordinated_operations().unwrap().is_empty());

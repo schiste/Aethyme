@@ -970,6 +970,20 @@ impl GitRepo {
         .collect())
     }
 
+    /// Tracked paths with staged or unstaged changes. Kept separate from
+    /// untracked paths for operations that can safely tolerate unrelated
+    /// local files while still refusing modifications to committed state.
+    pub fn tracked_dirty_paths(&self) -> Result<Vec<String>, GitError> {
+        Ok(parse_porcelain_entries(&run_git(
+            &self.root,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )?)
+        .into_iter()
+        .filter(|(xy, _path)| *xy != [b'?', b'?'])
+        .map(|(_xy, path)| path)
+        .collect())
+    }
+
     /// Whether one repository-relative path is present in the committed/staged
     /// index. An untracked gate definition cannot exist in a spawned worktree.
     pub fn is_tracked(&self, path: &str) -> Result<bool, GitError> {
