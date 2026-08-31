@@ -31,6 +31,10 @@ use crate::broker::{Broker, BrokerOpError};
 
 const PYTEST_SAFE_COMMAND: &str = "python3 -c \"import os, sys; sys.path = [p for p in sys.path if p not in ('', os.getcwd())]; import pytest; raise SystemExit(pytest.console_main())\" -q";
 
+pub const ACTIVATION_MARKER_RELPATH: &str = "aethyme-broker/enrollment.json";
+pub const ACTIVATION_MARKER_CONTENT: &str =
+    "{\"schema_version\":1,\"coordination\":\"required\"}\n";
+
 /// Machine-readable outcome of one certification check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -73,7 +77,7 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
 
     checks.push(check_git_version());
     checks.push(check_git_output());
-    let (checkout_root, main_root) = match crate::GitRepo::discover(repo_hint) {
+    let (repo, checkout_root, main_root) = match crate::GitRepo::discover(repo_hint) {
         Ok(repo) => {
             let checkout_root = repo.root().to_path_buf();
             let main_root = repo.main_root()?;
@@ -96,7 +100,7 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
                         .into(),
                 }),
             }
-            (checkout_root, main_root)
+            (repo, checkout_root, main_root)
         }
         Err(_) => {
             checks.push(Check {
@@ -126,6 +130,7 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
         }
     });
     checks.push(check_config_valid(&checkout_root));
+    checks.extend(check_enrollment_visibility(&repo, &checkout_root));
     checks.push(check_gitignore_contract(&checkout_root));
     checks.push(Check {
         id: "certify.agents-protocol",
@@ -197,6 +202,11 @@ pub fn scaffold(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
         "scaffold.config-toml",
         || CONFIG_TEMPLATE.to_string(),
     ));
+    checks.push(ensure_file(
+        &repo.git_common_dir()?.join(ACTIVATION_MARKER_RELPATH),
+        "scaffold.shared-activation",
+        || ACTIVATION_MARKER_CONTENT.to_string(),
+    ));
     checks.push(ensure_gitignore_block(&checkout_root));
 
     let db_existed = main_root.join(crate::BROKER_DB_RELPATH).exists();
@@ -236,6 +246,11 @@ pub fn scaffold_local(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
         &checkout_root.join(".aethyme/config.toml"),
         "scaffold-local.config-toml",
         || CONFIG_TEMPLATE.to_string(),
+    ));
+    checks.push(ensure_file(
+        &repo.git_common_dir()?.join(ACTIVATION_MARKER_RELPATH),
+        "scaffold-local.shared-activation",
+        || ACTIVATION_MARKER_CONTENT.to_string(),
     ));
 
     let db_existed = main_root.join(crate::BROKER_DB_RELPATH).exists();
@@ -363,6 +378,83 @@ pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 /// FAIL — configs written for a newer schema must keep working here.
 const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] =
     &[("promote", &["mode", "branch"]), ("leases", &["ignore"])];
+
+fn check_enrollment_visibility(repo: &crate::GitRepo, checkout_root: &Path) -> Vec<Check> {
+    let marker = repo
+        .git_common_dir()
+        .map(|common| common.join(ACTIVATION_MARKER_RELPATH));
+    let activation = match marker.as_ref().map(std::fs::read_to_string) {
+        Ok(Ok(content)) if content == ACTIVATION_MARKER_CONTENT => Check {
+            id: "certify.shared-activation",
+            status: CheckStatus::Pass,
+            detail: "shared Git metadata marks broker coordination as required".into(),
+        },
+        Ok(Ok(_)) => Check {
+            id: "certify.shared-activation",
+            status: CheckStatus::Fail,
+            detail: "shared enrollment marker is invalid; re-run `aethyme broker scaffold`"
+                .into(),
+        },
+        _ => Check {
+            id: "certify.shared-activation",
+            status: CheckStatus::Warn,
+            detail: "shared enrollment marker is absent; sibling worktrees cannot discover local enrollment until `aethyme broker scaffold` runs".into(),
+        },
+    };
+    let activated = activation.status == CheckStatus::Pass;
+    let checkout = Check {
+        id: "certify.checkout-enrollment",
+        status: if !activated || checkout_root.join(".aethyme/config.toml").exists() {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warn
+        },
+        detail: if !activated {
+            "repository is not activated in shared Git metadata".into()
+        } else if checkout_root.join(".aethyme/config.toml").exists() {
+            "this checkout contains the enrollment configuration".into()
+        } else {
+            "repository is enrolled locally, but this checkout does not contain the enrollment commit; do not commit or publish from this checkout"
+                .into()
+        },
+    };
+
+    let upstream_ref = repo
+        .symbolic_ref("refs/remotes/origin/HEAD")
+        .or_else(|| repo.tracking_upstream().map(|(name, _)| name));
+    let upstream = match (activated, upstream_ref) {
+        (false, _) => Check {
+            id: "certify.upstream-enrollment",
+            status: CheckStatus::Skipped,
+            detail: "shared enrollment is not active".into(),
+        },
+        (true, None) => Check {
+            id: "certify.upstream-enrollment",
+            status: CheckStatus::Warn,
+            detail: "no local remote-default ref is available; fetch and certify again before first publication".into(),
+        },
+        (true, Some(reference)) => match repo.path_exists_at(&reference, ".aethyme/config.toml") {
+            Ok(true) => Check {
+                id: "certify.upstream-enrollment",
+                status: CheckStatus::Pass,
+                detail: format!("{reference} contains the enrollment configuration"),
+            },
+            Ok(false) => Check {
+                id: "certify.upstream-enrollment",
+                status: CheckStatus::Warn,
+                detail: format!(
+                    "enrollment is absent from {reference}; sibling worktrees based on upstream remain unenrolled — submit and publish the enrollment through broker ship"
+                ),
+            },
+            Err(error) => Check {
+                id: "certify.upstream-enrollment",
+                status: CheckStatus::Warn,
+                detail: format!("cannot inspect {reference}: {error}"),
+            },
+        },
+    };
+    vec![activation, checkout, upstream]
+}
 
 fn check_config_valid(main_root: &Path) -> Check {
     let path = main_root.join(".aethyme/config.toml");

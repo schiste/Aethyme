@@ -123,6 +123,7 @@ fn certify_is_always_read_only_and_scaffold_rerun_is_byte_identical() {
     );
     for id in [
         "scaffold.config-toml",
+        "scaffold.shared-activation",
         "scaffold.gitignore",
         "scaffold.broker-db",
     ] {
@@ -140,6 +141,7 @@ fn certify_is_always_read_only_and_scaffold_rerun_is_byte_identical() {
     assert!(report.certified());
     for id in [
         "scaffold.config-toml",
+        "scaffold.shared-activation",
         "scaffold.gitignore",
         "scaffold.broker-db",
     ] {
@@ -160,8 +162,91 @@ fn certify_is_always_read_only_and_scaffold_rerun_is_byte_identical() {
     let report = init::certify(tmp.path()).unwrap();
     assert!(report.certified());
     assert_eq!(status_of(&report, "certify.config"), CheckStatus::Pass);
+    assert_eq!(
+        status_of(&report, "certify.shared-activation"),
+        CheckStatus::Pass
+    );
     assert_eq!(status_of(&report, "certify.gitignore"), CheckStatus::Pass);
     assert_eq!(snapshot(tmp.path()), first, "certify still wrote nothing");
+}
+
+#[test]
+fn shared_activation_reaches_pre_enrollment_worktrees_and_certifies_upstream_visibility() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    init::scaffold(tmp.path()).unwrap();
+
+    let marker = aethyme_broker::GitRepo::discover(tmp.path())
+        .unwrap()
+        .git_common_dir()
+        .unwrap()
+        .join(init::ACTIVATION_MARKER_RELPATH);
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap(),
+        init::ACTIVATION_MARKER_CONTENT
+    );
+
+    let sibling = tmp.path().join("sibling-before-enrollment");
+    sh(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "pre-enrollment",
+            sibling.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let sibling_report = init::certify(&sibling).unwrap();
+    assert_eq!(
+        status_of(&sibling_report, "certify.shared-activation"),
+        CheckStatus::Pass
+    );
+    assert_eq!(
+        status_of(&sibling_report, "certify.checkout-enrollment"),
+        CheckStatus::Warn
+    );
+    assert!(
+        sibling_report
+            .checks
+            .iter()
+            .find(|check| check.id == "certify.checkout-enrollment")
+            .unwrap()
+            .detail
+            .contains("does not contain the enrollment commit")
+    );
+
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(
+        tmp.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let unpublished = init::certify(tmp.path()).unwrap();
+    assert_eq!(
+        status_of(&unpublished, "certify.upstream-enrollment"),
+        CheckStatus::Warn
+    );
+
+    sh(tmp.path(), &["add", ".aethyme/config.toml", ".gitignore"]);
+    sh(tmp.path(), &["commit", "-qm", "enroll repository"]);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    let published = init::certify(tmp.path()).unwrap();
+    assert_eq!(
+        status_of(&published, "certify.upstream-enrollment"),
+        CheckStatus::Pass
+    );
 }
 
 #[test]

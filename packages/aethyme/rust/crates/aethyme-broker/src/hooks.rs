@@ -442,7 +442,11 @@ fn enforce_protected_branch_session(
     checkout: &GitRepo,
     main_root: &Path,
 ) -> Result<(), HooksError> {
-    if !main_root.join(crate::BROKER_DB_RELPATH).exists() {
+    let shared_activation = checkout
+        .git_common_dir()?
+        .join(crate::init::ACTIVATION_MARKER_RELPATH)
+        .is_file();
+    if !shared_activation && !main_root.join(crate::BROKER_DB_RELPATH).exists() {
         return Ok(());
     }
 

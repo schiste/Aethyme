@@ -253,6 +253,21 @@ impl GitRepo {
         run_git(&self.root, &["rev-parse", "HEAD"])
     }
 
+    /// Whether one repository-relative path exists in a local commit/ref.
+    /// This never fetches and is suitable for read-only certification.
+    pub fn path_exists_at(&self, revision: &str, path: &str) -> Result<bool, GitError> {
+        let object = format!("{revision}:{path}");
+        let output = Command::new("git")
+            .args(["cat-file", "-e", &object])
+            .current_dir(&self.root)
+            .output()
+            .map_err(|source| GitError::Spawn {
+                args: format!("cat-file -e {object}"),
+                source,
+            })?;
+        Ok(output.status.success())
+    }
+
     /// Resolve a ref (branch name, tag, ...) to a commit, `None` when it
     /// does not exist.
     /// Common ancestor of `a` and `b`. Re-added 2026-07-17: removed as
