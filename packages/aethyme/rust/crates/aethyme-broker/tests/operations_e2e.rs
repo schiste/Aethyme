@@ -258,6 +258,36 @@ fn destructive_and_ambiguous_operations_fail_closed() {
 }
 
 #[test]
+fn leading_git_directory_selects_a_linked_worktree_but_refuses_other_repositories() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let worktree = add_worktree(tmp.path(), "selected");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+
+    let selected_path = worktree.to_str().unwrap();
+    let report = broker
+        .run_coordinated_operation(request(
+            session.id,
+            &["-C", selected_path, "merge", "--ff-only", "HEAD"],
+        ))
+        .unwrap();
+    assert_eq!(report.operation.effect, OperationEffect::Write);
+    assert_eq!(report.operation.status, OperationStatus::Succeeded);
+
+    let unrelated = tmp.path().join("unrelated");
+    std::fs::create_dir(&unrelated).unwrap();
+    init_repo(&unrelated);
+    let error = broker
+        .run_coordinated_operation(request(
+            session.id,
+            &["-C", unrelated.to_str().unwrap(), "status"],
+        ))
+        .unwrap_err();
+    assert!(error.to_string().contains("outside this broker repository"));
+}
+
+#[test]
 fn remote_git_journals_resolved_identity_and_assertion_evidence() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

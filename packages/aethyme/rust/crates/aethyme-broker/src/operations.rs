@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde_json::json;
@@ -411,7 +411,46 @@ fn has_any(args: &[String], needles: &[&str]) -> bool {
     args.iter().any(|arg| needles.contains(&arg.as_str()))
 }
 
+fn git_subcommand_args(args: &[String]) -> Option<&[String]> {
+    let mut index = 0;
+    while args.get(index).is_some_and(|arg| arg == "-C") {
+        if args.get(index + 1).is_none_or(|path| path.is_empty()) {
+            return None;
+        }
+        index += 2;
+    }
+    args.get(index..).filter(|remaining| !remaining.is_empty())
+}
+
+fn git_explicit_directory(args: &[String], cwd: &Path) -> Result<Option<PathBuf>, BrokerOpError> {
+    let mut index = 0;
+    let mut directory = cwd.to_path_buf();
+    let mut explicit = false;
+    while args.get(index).is_some_and(|arg| arg == "-C") {
+        let path =
+            args.get(index + 1)
+                .ok_or_else(|| BrokerOpError::InvalidCoordinatedOperation {
+                    reason: "git -C requires a non-empty checkout path".into(),
+                })?;
+        if path.is_empty() {
+            return Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: "git -C requires a non-empty checkout path".into(),
+            });
+        }
+        let path = Path::new(path);
+        directory = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            directory.join(path)
+        };
+        explicit = true;
+        index += 2;
+    }
+    Ok(explicit.then_some(directory))
+}
+
 pub fn classify_git(args: &[String]) -> Option<OperationEffect> {
+    let args = git_subcommand_args(args)?;
     let command = args.first()?.as_str();
     match command {
         "status" | "diff" | "log" | "show" | "rev-parse" | "ls-files" | "ls-tree" | "cat-file"
@@ -879,6 +918,19 @@ impl Broker {
                 ),
             });
         }
+        if request.provider == OperationProvider::Git
+            && let Some(directory) = git_explicit_directory(&request.args, cwd)?
+        {
+            let selected = crate::GitRepo::discover(&directory)?;
+            if selected.git_common_dir()? != self.repo_handle().git_common_dir()? {
+                return Err(BrokerOpError::InvalidCoordinatedOperation {
+                    reason: format!(
+                        "git -C target {:?} is outside this broker repository; run the operation through that repository's broker",
+                        directory
+                    ),
+                });
+            }
+        }
         let github_target = if request.provider == OperationProvider::Github {
             request
                 .repository
@@ -1311,6 +1363,17 @@ mod tests {
             Some(OperationEffect::Destructive)
         );
         assert_eq!(classify_git(&args(&["unknown-extension"])), None);
+        assert_eq!(
+            classify_git(&args(&[
+                "-C",
+                "/tmp/linked-worktree",
+                "merge",
+                "--ff-only",
+                "abc123"
+            ])),
+            Some(OperationEffect::Write)
+        );
+        assert_eq!(classify_git(&args(&["-C"])), None);
 
         assert_eq!(
             classify_gh(&args(&["pr", "view", "12"])),
