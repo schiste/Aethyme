@@ -1056,6 +1056,26 @@ mod tests {
         assert!(parsed.dispatch);
         assert_eq!(parsed.cmd.as_deref(), Some("codex exec prompt"));
     }
+
+    #[test]
+    fn upstream_relation_names_both_sides_of_divergence() {
+        assert_eq!(
+            super::upstream_relation(35, 213),
+            "diverged: 35 local-only commits, 213 upstream-only commits"
+        );
+        assert_eq!(
+            super::upstream_relation(0, 1),
+            "local main behind by 1 commit"
+        );
+        assert_eq!(
+            super::upstream_relation(2, 0),
+            "local main ahead by 2 commits"
+        );
+        assert_eq!(
+            super::upstream_relation(0, 0),
+            "fetched upstream matches local main"
+        );
+    }
 }
 
 enum UsageError {
@@ -2234,6 +2254,25 @@ fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     if count == 1 { singular } else { plural }
 }
 
+fn upstream_relation(local_only: u64, upstream_only: u64) -> String {
+    match (local_only, upstream_only) {
+        (0, 0) => "fetched upstream matches local main".into(),
+        (local, 0) => format!(
+            "local main ahead by {local} {}",
+            plural(local as usize, "commit", "commits")
+        ),
+        (0, upstream) => format!(
+            "local main behind by {upstream} {}",
+            plural(upstream as usize, "commit", "commits")
+        ),
+        (local, upstream) => format!(
+            "diverged: {local} local-only {}, {upstream} upstream-only {}",
+            plural(local as usize, "commit", "commits"),
+            plural(upstream as usize, "commit", "commits")
+        ),
+    }
+}
+
 fn render_integration_status(
     report: &crate::IntegrationStatusView,
     json: bool,
@@ -2265,19 +2304,10 @@ fn render_integration_status(
     );
     if let (Some(upstream_ref), Some(upstream_head)) = (&report.upstream_ref, &report.upstream_head)
     {
-        let relation = if report.main_behind_upstream_commits > 0 {
-            format!(
-                "local main behind by {} {}",
-                report.main_behind_upstream_commits,
-                plural(
-                    report.main_behind_upstream_commits as usize,
-                    "commit",
-                    "commits"
-                )
-            )
-        } else {
-            "no fetched commits ahead of local main".into()
-        };
+        let relation = upstream_relation(
+            report.main_ahead_upstream_commits,
+            report.main_behind_upstream_commits,
+        );
         println!(
             "Upstream:    {} @ {} ({relation})",
             upstream_ref,
@@ -4881,10 +4911,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     (&status.upstream_ref, &status.upstream_head)
                 {
                     println!(
-                        "Upstream:    {} @ {} ({} commits ahead of local main)",
+                        "Upstream:    {} @ {} ({})",
                         upstream_ref,
                         short_commit(upstream_head),
-                        status.main_behind_upstream_commits
+                        upstream_relation(
+                            status.main_ahead_upstream_commits,
+                            status.main_behind_upstream_commits,
+                        )
                     );
                 }
                 println!("Summary: {}", status.summary.message);

@@ -3025,6 +3025,63 @@ fn status_warns_on_the_first_external_main_movement() {
 }
 
 #[test]
+fn status_reports_both_local_and_upstream_only_counts_after_divergence() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    sh(tmp.path(), &["switch", "-qc", "upstream-history", "main"]);
+    for index in 1..=2 {
+        std::fs::write(
+            tmp.path().join(format!("upstream-{index}.txt")),
+            format!("upstream {index}\n"),
+        )
+        .unwrap();
+        sh(tmp.path(), &["add", "."]);
+        sh(tmp.path(), &["commit", "-qm", &format!("upstream {index}")]);
+    }
+    let upstream = resolve(tmp.path(), "HEAD");
+
+    sh(tmp.path(), &["switch", "main"]);
+    std::fs::write(tmp.path().join("local-only.txt"), "local\n").unwrap();
+    sh(tmp.path(), &["add", "local-only.txt"]);
+    sh(tmp.path(), &["commit", "-qm", "local only"]);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", &upstream],
+    );
+    sh(tmp.path(), &["config", "remote.origin.url", "."]);
+    sh(
+        tmp.path(),
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    sh(tmp.path(), &["config", "branch.main.remote", "origin"]);
+    sh(
+        tmp.path(),
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let status = broker.status(0).unwrap();
+    assert_eq!(status.main_ahead_upstream_commits, 1);
+    assert_eq!(status.main_behind_upstream_commits, 2);
+    assert!(status.advice.iter().any(|advice| {
+        advice.id == "integration.upstream-main-ahead"
+            && advice.severity == StatusAdviceSeverity::Blocked
+    }));
+
+    let integration = broker.integration_status(0).unwrap();
+    assert_eq!(integration.main_ahead_upstream_commits, 1);
+    assert_eq!(integration.main_behind_upstream_commits, 2);
+    assert_eq!(
+        integration.next_action.state,
+        IntegrationDeliveryState::Blocked
+    );
+}
+
+#[test]
 fn status_warns_when_local_and_upstream_main_move_together_beyond_integration() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

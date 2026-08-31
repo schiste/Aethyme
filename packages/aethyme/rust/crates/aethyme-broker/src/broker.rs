@@ -620,6 +620,9 @@ pub struct StatusView {
     pub upstream_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_head: Option<String>,
+    /// Commits reachable from local main but not the fetched upstream.
+    pub main_ahead_upstream_commits: u64,
+    /// Commits reachable from the fetched upstream but not local main.
     pub main_behind_upstream_commits: u64,
     pub cleanup_retention: CleanupRetention,
 }
@@ -932,6 +935,9 @@ pub struct IntegrationStatusView {
     pub upstream_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_head: Option<String>,
+    /// Commits reachable from local main but not the fetched upstream.
+    pub main_ahead_upstream_commits: u64,
+    /// Commits reachable from the fetched upstream but not local main.
     pub main_behind_upstream_commits: u64,
     pub main_is_ancestor: bool,
     pub commits_ahead_main: u64,
@@ -3464,12 +3470,15 @@ impl Broker {
             .tracking_upstream()
             .map(|(name, commit)| (Some(name), Some(commit)))
             .unwrap_or((None, None));
-        let main_behind_upstream_commits = upstream_head
-            .as_deref()
-            .filter(|upstream| self.repo.is_ancestor(&main_head, upstream))
-            .map(|upstream| self.repo.commit_count_between(&main_head, upstream))
-            .transpose()?
-            .unwrap_or(0);
+        let (main_ahead_upstream_commits, main_behind_upstream_commits) =
+            if let Some(upstream) = upstream_head.as_deref() {
+                (
+                    self.repo.commit_count_between(upstream, &main_head)?,
+                    self.repo.commit_count_between(&main_head, upstream)?,
+                )
+            } else {
+                (0, 0)
+            };
         let comparison_head = upstream_head
             .as_deref()
             .filter(|_| main_behind_upstream_commits > 0)
@@ -3564,6 +3573,7 @@ impl Broker {
             main_head,
             upstream_ref,
             upstream_head,
+            main_ahead_upstream_commits,
             main_behind_upstream_commits,
             main_is_ancestor,
             commits_ahead_main,
@@ -3673,12 +3683,15 @@ impl Broker {
             .tracking_upstream()
             .map(|(name, commit)| (Some(name), Some(commit)))
             .unwrap_or((None, None));
-        let main_behind_upstream_commits = upstream_head
-            .as_deref()
-            .filter(|upstream| self.repo.is_ancestor(&main_head, upstream))
-            .map(|upstream| self.repo.commit_count_between(&main_head, upstream))
-            .transpose()?
-            .unwrap_or(0);
+        let (main_ahead_upstream_commits, main_behind_upstream_commits) =
+            if let Some(upstream) = upstream_head.as_deref() {
+                (
+                    self.repo.commit_count_between(upstream, &main_head)?,
+                    self.repo.commit_count_between(&main_head, upstream)?,
+                )
+            } else {
+                (0, 0)
+            };
         let (integration_relation, integration_ahead_main_commits) =
             if integration_head == main_head {
                 (StatusIntegrationRelation::CurrentWithMain, 0)
@@ -3785,6 +3798,7 @@ impl Broker {
             main_head,
             upstream_ref,
             upstream_head,
+            main_ahead_upstream_commits,
             main_behind_upstream_commits,
             cleanup_retention,
         })
