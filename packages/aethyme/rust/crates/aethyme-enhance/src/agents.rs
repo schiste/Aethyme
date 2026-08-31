@@ -4,9 +4,86 @@
 
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
+
 use crate::pyjson::{self, Value};
 use crate::templates;
 use crate::{AGENTS_OVERRIDE_PATH, BLOCK_BEGIN, BLOCK_END};
+
+pub const GENERATED_POLICY_PREFIX: &str = "<!-- AETHYME-GENERATED:";
+const GENERATED_POLICY_SUFFIX: &str = " -->";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedPolicyReceipt {
+    pub generator_version: String,
+    pub policy_sha256: String,
+    pub policy_body: String,
+}
+
+pub fn policy_sha256(content: &str) -> String {
+    format!("{:x}", Sha256::digest(content.as_bytes()))
+}
+
+fn normalized_policy_body(content: &str) -> String {
+    format!("{}\n", content.trim_end())
+}
+
+pub fn stamp_generated_policy(content: &str, generator_version: &str) -> String {
+    let body = normalized_policy_body(content);
+    let (first_line, remainder) = body.split_once('\n').unwrap_or((&body, ""));
+    format!(
+        "{first_line}\n{GENERATED_POLICY_PREFIX} version={generator_version}; policy-sha256={}{GENERATED_POLICY_SUFFIX}\n{remainder}",
+        policy_sha256(&body),
+    )
+}
+
+pub fn generated_policy_receipt(content: &str) -> Option<GeneratedPolicyReceipt> {
+    let absolute_marker_start = content.find(GENERATED_POLICY_PREFIX)?;
+    let (region_start, region_end) = match (
+        content[..absolute_marker_start].rfind(BLOCK_BEGIN),
+        content[absolute_marker_start..].find(BLOCK_END),
+    ) {
+        (Some(begin), Some(relative_end)) => {
+            let after_begin = content[begin..]
+                .find('\n')
+                .map(|offset| begin + offset + 1)
+                .unwrap_or(begin + BLOCK_BEGIN.len());
+            (after_begin, absolute_marker_start + relative_end)
+        }
+        _ => (0, content.len()),
+    };
+    let region = &content[region_start..region_end];
+    let marker_start = region.find(GENERATED_POLICY_PREFIX)?;
+    let marker_end = region[marker_start..].find('\n')? + marker_start;
+    let marker = region[marker_start..marker_end].trim_end_matches('\r');
+    let payload = marker
+        .strip_prefix(GENERATED_POLICY_PREFIX)?
+        .strip_suffix(GENERATED_POLICY_SUFFIX)?
+        .trim();
+    let mut generator_version = None;
+    let mut policy_hash = None;
+    for field in payload.split(';').map(str::trim) {
+        if let Some(value) = field.strip_prefix("version=") {
+            generator_version = Some(value.to_string());
+        } else if let Some(value) = field.strip_prefix("policy-sha256=") {
+            policy_hash = Some(value.to_string());
+        }
+    }
+    let marker_line_start = region[..marker_start]
+        .rfind('\n')
+        .map(|offset| offset + 1)
+        .unwrap_or(0);
+    let body = format!(
+        "{}{}",
+        &region[..marker_line_start],
+        &region[marker_end + 1..]
+    );
+    Some(GeneratedPolicyReceipt {
+        generator_version: generator_version?,
+        policy_sha256: policy_hash?,
+        policy_body: normalized_policy_body(&body),
+    })
+}
 
 /// `_load_agents_overrides`: missing → `{}`, unreadable/invalid/non-object
 /// → `{_invalid_override: true, _source: …}`, else payload + `_source`
@@ -172,7 +249,7 @@ pub fn render_agents_document(repo: Option<&Path>) -> Result<String, String> {
             content = format!("{}\n\n{override_sections}", content.trim_end());
         }
     }
-    Ok(format!("{}\n", content.trim_end()))
+    Ok(stamp_generated_policy(&content, env!("CARGO_PKG_VERSION")))
 }
 
 /// Agent-facing broker coordination protocol, rendered only when the repo

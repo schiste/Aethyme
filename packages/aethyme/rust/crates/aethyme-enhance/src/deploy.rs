@@ -5,8 +5,8 @@
 use std::path::Path;
 
 use crate::agents::{
-    extract_legacy_agents_content, load_agents_overrides, looks_like_generated_agents_document,
-    render_agents_document,
+    extract_legacy_agents_content, generated_policy_receipt, load_agents_overrides,
+    looks_like_generated_agents_document, policy_sha256, render_agents_document,
 };
 use crate::onboarding::{
     expected_onboarding_files, override_freshness, recommendation_summary, ACT_STARTER_JSON_PATH,
@@ -80,6 +80,16 @@ pub struct VerifyResult {
     pub exists: bool,
     pub placeholder_present: bool,
     pub matches_canonical: bool,
+    pub policy_provenance: Option<PolicyProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyProvenance {
+    Current,
+    StaleGenerated { generator_version: String },
+    ModifiedAfterGeneration { generator_version: String },
+    LegacyGenerated,
+    Unmanaged,
 }
 
 fn is_executable(relative_path: &str) -> bool {
@@ -477,6 +487,7 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
                 exists: false,
                 placeholder_present: false,
                 matches_canonical: false,
+                policy_provenance: None,
             });
             continue;
         }
@@ -486,16 +497,19 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
         } else {
             template.to_string()
         };
+        let (matches_canonical, policy_provenance) = if *relative_path == "CLAUDE.md" {
+            let (matches, provenance) = verify_policy_content(&actual, &canonical);
+            (matches, Some(provenance))
+        } else {
+            (actual == canonical, None)
+        };
         out.push(VerifyResult {
             relative_path: relative_path.to_string(),
             required: !relative_path.starts_with(".claude/"),
             exists: true,
             placeholder_present: actual.contains(PLACEHOLDER),
-            matches_canonical: if *relative_path == "CLAUDE.md" {
-                policy_matches_canonical(&actual, &canonical)
-            } else {
-                actual == canonical
-            },
+            matches_canonical,
+            policy_provenance,
         });
     }
 
@@ -509,6 +523,7 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
                 exists: false,
                 placeholder_present: false,
                 matches_canonical: false,
+                policy_provenance: None,
             });
             continue;
         }
@@ -519,6 +534,7 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
             exists: true,
             placeholder_present: actual.contains(PLACEHOLDER),
             matches_canonical: actual == content,
+            policy_provenance: None,
         });
     }
 
@@ -532,6 +548,7 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
             exists: false,
             placeholder_present: false,
             matches_canonical: false,
+            policy_provenance: None,
         });
     } else {
         let text = read_text(&settings_path)?;
@@ -542,6 +559,7 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
                 exists: true,
                 placeholder_present: false,
                 matches_canonical: false,
+                policy_provenance: None,
             }),
             Ok(settings) => {
                 let empty = Value::object();
@@ -560,6 +578,7 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
                     exists: settings_has_hook_entry(session_start),
                     placeholder_present: false,
                     matches_canonical: true,
+                    policy_provenance: None,
                 });
             }
         }
@@ -577,17 +596,55 @@ fn verify_agents_document(repo: &Path) -> Result<VerifyResult, String> {
             exists: false,
             placeholder_present: false,
             matches_canonical: false,
+            policy_provenance: None,
         });
     }
     let actual = read_text(&dest)?;
     let content = render_agents_document(Some(repo))?;
+    let (matches_canonical, policy_provenance) = verify_policy_content(&actual, &content);
     Ok(VerifyResult {
         relative_path: "AGENTS.md".to_string(),
         required: true,
         exists: true,
         placeholder_present: actual.contains(PLACEHOLDER),
-        matches_canonical: policy_matches_canonical(&actual, &content),
+        matches_canonical,
+        policy_provenance: Some(policy_provenance),
     })
+}
+
+fn verify_policy_content(actual: &str, canonical: &str) -> (bool, PolicyProvenance) {
+    if policy_matches_canonical(actual, canonical) {
+        return (true, PolicyProvenance::Current);
+    }
+    let canonical_receipt = generated_policy_receipt(canonical)
+        .expect("rendered canonical policy always carries provenance");
+    if let Some(receipt) = generated_policy_receipt(actual) {
+        if policy_sha256(&receipt.policy_body) != receipt.policy_sha256 {
+            return (
+                false,
+                PolicyProvenance::ModifiedAfterGeneration {
+                    generator_version: receipt.generator_version,
+                },
+            );
+        }
+        if receipt.policy_sha256 == canonical_receipt.policy_sha256 {
+            return (true, PolicyProvenance::Current);
+        }
+        return (
+            false,
+            PolicyProvenance::StaleGenerated {
+                generator_version: receipt.generator_version,
+            },
+        );
+    }
+    if looks_like_generated_agents_document(actual) {
+        let normalized = format!("{}\n", actual.trim_end());
+        return (
+            policy_sha256(&normalized) == canonical_receipt.policy_sha256,
+            PolicyProvenance::LegacyGenerated,
+        );
+    }
+    (false, PolicyProvenance::Unmanaged)
 }
 
 fn policy_matches_canonical(actual: &str, canonical: &str) -> bool {
@@ -850,5 +907,32 @@ mod tests {
         // Nothing else in the override file → deleted outright.
         assert!(!repo.join(AGENTS_OVERRIDE_PATH).exists());
         std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn policy_provenance_distinguishes_stale_generation_from_later_edits() {
+        let canonical = render_agents_document(None).unwrap();
+        let prior_body =
+            "This file is generated by Aethyme. Do not edit it directly.\n\nPrior policy.\n";
+        let prior = crate::agents::stamp_generated_policy(prior_body, "0.3.0");
+
+        let (matches, provenance) = verify_policy_content(&prior, &canonical);
+        assert!(!matches);
+        assert_eq!(
+            provenance,
+            PolicyProvenance::StaleGenerated {
+                generator_version: "0.3.0".into()
+            }
+        );
+
+        let edited = format!("{prior}\nManual direct edit.\n");
+        let (matches, provenance) = verify_policy_content(&edited, &canonical);
+        assert!(!matches);
+        assert_eq!(
+            provenance,
+            PolicyProvenance::ModifiedAfterGeneration {
+                generator_version: "0.3.0".into()
+            }
+        );
     }
 }

@@ -616,6 +616,32 @@ fn enhance_verify_fails_on_direct_agents_edit() {
     result.assert_contains("direct edits unsupported; use .aethyme/overrides/agents.json");
 }
 
+#[test]
+fn enhance_verify_does_not_call_legacy_generated_drift_a_direct_edit() {
+    let tmp = tmp_dir();
+    let repo = demo_repo(tmp.path());
+    deploy(&repo, false);
+
+    let agents = read(repo.join("AGENTS.md"));
+    let mut lines = agents.lines();
+    let heading = lines.next().expect("generated policy carries a heading");
+    let receipt = lines
+        .next()
+        .expect("generated policy carries a provenance line");
+    assert!(receipt.contains("AETHYME-GENERATED"));
+    let legacy_body = format!("{heading}\n{}\n", lines.collect::<Vec<_>>().join("\n"));
+    write(
+        repo.join("AGENTS.md"),
+        &format!("{legacy_body}\nPrior generated clause.\n"),
+    );
+
+    let result = invoke_aethyme(["enhance", "verify", "--repo", &repo.display().to_string()]);
+    result.expect_code(1);
+    result.assert_contains("deployment provenance is unavailable");
+    result.assert_contains("aethyme enhance deploy --repo <repo>");
+    result.assert_lacks("direct edits unsupported");
+}
+
 fn codes(values: &Value) -> Vec<String> {
     values
         .as_array()
