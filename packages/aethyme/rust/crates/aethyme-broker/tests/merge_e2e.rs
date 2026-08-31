@@ -1255,6 +1255,72 @@ fn patch_equivalent_supersession_checkpoints_the_submitted_head() {
     assert!(accepted.accepted_at.is_some());
 }
 
+fn exact_integration_sync_case(equal_parent_trees: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let integration_builder = agent_worktree(tmp.path(), "integration-builder");
+    if equal_parent_trees {
+        sh(
+            &integration_builder,
+            &["commit", "--allow-empty", "-qm", "integration identity"],
+        );
+    } else {
+        commit_edit(&integration_builder, "src/a.py", "a = 2\n");
+    }
+    sh(
+        &integration_builder,
+        &["branch", "-f", "aethyme/integration", "HEAD"],
+    );
+
+    let worktree = agent_worktree(tmp.path(), "exact-integration-sync");
+    let session = broker
+        .adopt(&worktree, Some("continue after synchronization"))
+        .unwrap();
+    sh(
+        &worktree,
+        &[
+            "merge",
+            "--no-ff",
+            "aethyme/integration",
+            "-m",
+            "sync exact integration",
+        ],
+    );
+    let sync_commit = resolve(&worktree, "HEAD");
+    assert_eq!(
+        resolve(&worktree, &format!("{sync_commit}^1^{{tree}}"))
+            == resolve(&worktree, &format!("{sync_commit}^2^{{tree}}")),
+        equal_parent_trees
+    );
+    assert_eq!(
+        resolve(&worktree, &format!("{sync_commit}^{{tree}}")),
+        resolve(&worktree, &format!("{sync_commit}^2^{{tree}}"))
+    );
+
+    commit_edit(&worktree, "src/b.py", "b = 2\n");
+    let outcome = broker.submit(session.id).unwrap();
+    let sync = outcome
+        .submission_plan
+        .commits
+        .iter()
+        .find(|commit| commit.commit == sync_commit)
+        .unwrap();
+    assert_eq!(sync.ownership, SubmissionCommitOwnership::SessionOwned);
+    assert_eq!(
+        sync.integration_state,
+        SubmissionIntegrationState::AlreadyIntegratedByAncestry
+    );
+    assert!(outcome.promoted);
+    assert_eq!(outcome.submission_plan.merged_tree_paths, vec!["src/b.py"]);
+}
+
+#[test]
+fn exact_content_neutral_integration_merges_ignore_parent_tree_equality() {
+    exact_integration_sync_case(false);
+    exact_integration_sync_case(true);
+}
+
 #[test]
 fn normalized_replay_refuses_missing_baseline_and_owned_merge_commits() {
     let missing_tmp = tempfile::tempdir().unwrap();

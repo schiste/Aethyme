@@ -1002,15 +1002,19 @@ impl Broker {
                 .and_then(|patch| integration_by_patch.get(patch))
                 .cloned()
                 .unwrap_or_default();
-            let integration_state = if repo.is_ancestor(&commit, integration_head) {
-                SubmissionIntegrationState::AlreadyIntegratedByAncestry
-            } else {
-                match matching_integration_commits.len() {
-                    0 => SubmissionIntegrationState::Pending,
-                    1 => SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity,
-                    _ => SubmissionIntegrationState::Ambiguous,
-                }
-            };
+            let exact_integration_sync = parents.len() == 2
+                && repo.is_ancestor(&parents[1], integration_head)
+                && repo.commit_tree_id(&commit)? == repo.commit_tree_id(&parents[1])?;
+            let integration_state =
+                if repo.is_ancestor(&commit, integration_head) || exact_integration_sync {
+                    SubmissionIntegrationState::AlreadyIntegratedByAncestry
+                } else {
+                    match matching_integration_commits.len() {
+                        0 => SubmissionIntegrationState::Pending,
+                        1 => SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity,
+                        _ => SubmissionIntegrationState::Ambiguous,
+                    }
+                };
             commits.push(SubmissionCommitProvenance {
                 commit,
                 parents,
