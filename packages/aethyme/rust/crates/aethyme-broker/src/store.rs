@@ -2192,11 +2192,27 @@ fn validate_planned_lease_conflicts(
             Some(lease.session_id) != owner_session_id
                 && crate::leases::paths_overlap(path, &lease.path)
         }) {
+            let (blocker_worktree, blocker_status): (String, String) = tx.query_row(
+                "SELECT worktree_path, status FROM sessions WHERE id = ?1",
+                [blocker.session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let blocker_status_value = SessionStatus::parse(&blocker_status)?;
+            let remediation = crate::leases::planned_lease_next_actions(
+                &blocker_worktree,
+                blocker.session_id,
+                blocker_status_value,
+                path,
+            )
+            .join("\n  ");
             return Err(BrokerError::PlannedLeaseConflict {
                 path: path.clone(),
                 blocker_session_id: blocker.session_id,
                 blocker_path: blocker.path.clone(),
                 blocker_kind: blocker.kind.as_str().to_string(),
+                blocker_status,
+                blocker_worktree,
+                remediation,
             });
         }
     }

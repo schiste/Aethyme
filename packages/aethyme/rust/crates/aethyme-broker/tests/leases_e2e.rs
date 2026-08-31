@@ -79,6 +79,14 @@ fn planned_start_claims_before_any_diff_and_refuses_a_second_rewrite() {
         .to_string();
     assert!(error.contains("planned lease"), "{error}");
     assert!(error.contains("generated/"), "{error}");
+    assert!(error.contains("(active)"), "{error}");
+    assert!(error.contains(&first.session.worktree_path), "{error}");
+    assert!(
+        error.contains("aethyme broker adopt")
+            && error.contains("--reuse --path generated/policy.md"),
+        "{error}"
+    );
+    assert!(!error.contains("--reuse --session"), "{error}");
     assert_eq!(broker.store().live_sessions().unwrap().len(), 1);
     assert_eq!(
         managed_worktree_names(tmp.path()),

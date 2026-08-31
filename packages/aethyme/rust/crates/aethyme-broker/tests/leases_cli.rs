@@ -111,6 +111,21 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
     assert_eq!(report["paths"][0]["conflicts"][0]["relation"], "exact");
     assert_eq!(report["paths"][0]["conflicts"][0]["session_id"], owner.id);
     assert_eq!(report["paths"][0]["conflicts"][0]["kind"], "implicit");
+    assert_eq!(report["paths"][0]["conflicts"][0]["owner_status"], "active");
+    assert_eq!(
+        report["paths"][0]["conflicts"][0]["owner_worktree"],
+        owner.worktree_path
+    );
+    assert!(
+        report["paths"][0]["conflicts"][0]["safe_next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action
+                .as_str()
+                .unwrap()
+                .contains("--reuse --path README.md"))
+    );
     assert_eq!(report["paths"][1]["path"], "src/new.rs");
     assert_eq!(report["paths"][1]["conflicts"][0]["relation"], "directory");
     assert_eq!(
@@ -134,6 +149,8 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
     assert!(text.contains("exact"), "{text}");
     assert!(text.contains("directory"), "{text}");
     assert!(text.contains("expires never"), "{text}");
+    assert!(text.contains("owner active at"), "{text}");
+    assert!(text.contains("next: aethyme broker adopt"), "{text}");
     assert!(
         text.contains(&format!("expires {}", directory.expires_at.unwrap())),
         "{text}"

@@ -117,7 +117,8 @@ Usage:
       Explicitly claim a path (end it with / for a directory claim).
   aethyme broker leases plan <paths...> [--session <id>] [--json]
       Read-only preflight for proposed claims. Reports exact and directory
-      overlaps, current ownership, expiry, and whether each claim conflicts.
+      overlaps, owner liveness and worktree, expiry, valid next actions, and
+      whether each claim conflicts.
       Does not create or refresh leases.
   aethyme broker leases release <path> --session <id> [--json]
       Release an explicit claim.
@@ -1537,7 +1538,7 @@ fn render_lease_plan(report: &crate::LeasePlan, json: bool) -> Result<(), UsageE
         for (label, overlaps) in [("owned", &path.owned), ("conflict", &path.conflicts)] {
             for overlap in overlaps {
                 println!(
-                    "  {label:<8} {:<9} session {:<4} {:<9} {} (expires {})",
+                    "  {label:<8} {:<9} session {:<4} {:<9} {} (expires {}; owner {} at {})",
                     match overlap.relation {
                         crate::LeaseOverlapRelation::Exact => "exact",
                         crate::LeaseOverlapRelation::Directory => "directory",
@@ -1549,7 +1550,14 @@ fn render_lease_plan(report: &crate::LeasePlan, json: bool) -> Result<(), UsageE
                         .expires_at
                         .map(|expiry| expiry.to_string())
                         .unwrap_or_else(|| "never".to_string()),
+                    overlap.owner_status.as_str(),
+                    overlap.owner_worktree,
                 );
+                if label == "conflict" {
+                    for action in &overlap.safe_next_actions {
+                        println!("    next: {action}");
+                    }
+                }
             }
         }
         if path.owned.is_empty() && path.conflicts.is_empty() {

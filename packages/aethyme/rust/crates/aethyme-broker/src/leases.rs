@@ -9,7 +9,43 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::types::Lease;
+use crate::types::{Lease, SessionStatus};
+
+/// Concrete, preservation-first commands for resolving a planned lease
+/// conflict in the worktree that already owns the path.
+pub(crate) fn planned_lease_next_actions(
+    worktree_path: &str,
+    session_id: i64,
+    status: SessionStatus,
+    requested_path: &str,
+) -> Vec<String> {
+    let worktree = shell_quote(worktree_path);
+    let path = shell_quote(requested_path);
+    let mut actions = vec![format!(
+        "aethyme broker adopt {worktree} --reuse --path {path}"
+    )];
+    if status == SessionStatus::Stale {
+        actions.push(format!(
+            "aethyme broker adopt {worktree} --replace-stale --path {path}"
+        ));
+    }
+    actions.push(format!(
+        "aethyme broker leases plan {path} --session {session_id} --json"
+    ));
+    actions
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b':' | b'@')
+        })
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
 
 /// Files whose concurrent modification is expected and harmless —
 /// lockfiles regenerate deterministically, so two sessions touching only
@@ -197,5 +233,34 @@ mod tests {
             lease(2, "src/auth.py"),
         ]);
         assert_eq!(overlaps.len(), 1);
+    }
+
+    #[test]
+    fn planned_conflict_actions_preserve_identity_and_replace_only_stale_sessions() {
+        let active = planned_lease_next_actions(
+            "/tmp/owner worktree",
+            5,
+            SessionStatus::Active,
+            "src/owned file.rs",
+        );
+        assert_eq!(active.len(), 2);
+        assert!(active[0].contains("adopt '/tmp/owner worktree' --reuse"));
+        assert!(active[0].contains("--path 'src/owned file.rs'"));
+        assert!(
+            active
+                .iter()
+                .all(|action| !action.contains("--replace-stale"))
+        );
+        assert!(
+            active
+                .iter()
+                .all(|action| !action.contains("--reuse --session"))
+        );
+
+        let stale =
+            planned_lease_next_actions("/tmp/owner", 5, SessionStatus::Stale, "src/owned.rs");
+        assert_eq!(stale.len(), 3);
+        assert!(stale[1].contains("adopt /tmp/owner --replace-stale"));
+        assert!(stale[2].contains("leases plan src/owned.rs --session 5 --json"));
     }
 }

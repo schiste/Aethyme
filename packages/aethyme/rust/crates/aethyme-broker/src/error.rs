@@ -76,13 +76,16 @@ pub enum BrokerError {
     WorktreeAlreadyRegistered(String),
 
     #[error(
-        "planned lease {path:?} overlaps active {blocker_kind} lease {blocker_path:?} held by session {blocker_session_id}"
+        "planned lease {path:?} overlaps {blocker_kind} lease {blocker_path:?} held by session {blocker_session_id} ({blocker_status}) at {blocker_worktree:?}\nSafe next actions:\n  {remediation}"
     )]
     PlannedLeaseConflict {
         path: String,
         blocker_session_id: i64,
         blocker_path: String,
         blocker_kind: String,
+        blocker_status: String,
+        blocker_worktree: String,
+        remediation: String,
     },
 
     #[error("invalid {field} value in broker db: {value:?}")]

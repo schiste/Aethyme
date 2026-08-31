@@ -697,6 +697,12 @@ pub struct LeasePlanOverlap {
     pub kind: LeaseKind,
     /// Unix epoch milliseconds; `None` means the lease does not expire.
     pub expires_at: Option<i64>,
+    pub owner_status: SessionStatus,
+    pub owner_worktree: String,
+    pub owner_activity_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_pid_alive: Option<bool>,
+    pub safe_next_actions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -2272,6 +2278,7 @@ impl Broker {
         normalized.dedup();
 
         let leases = self.store.active_leases()?;
+        let agents = self.agents_snapshot(now_ms())?;
         let mut planned = Vec::with_capacity(normalized.len());
         for path in normalized {
             let mut owned = Vec::new();
@@ -2280,6 +2287,11 @@ impl Broker {
                 .iter()
                 .filter(|lease| crate::leases::paths_overlap(&path, &lease.path))
             {
+                let owned_by_requester = Some(lease.session_id) == session_id;
+                let owner = agents
+                    .iter()
+                    .find(|agent| agent.session.id == lease.session_id)
+                    .ok_or(BrokerError::SessionNotFound(lease.session_id))?;
                 let overlap = LeasePlanOverlap {
                     relation: if path == lease.path {
                         LeaseOverlapRelation::Exact
@@ -2290,8 +2302,22 @@ impl Broker {
                     path: lease.path.clone(),
                     kind: lease.kind,
                     expires_at: lease.expires_at,
+                    owner_status: owner.derived_status,
+                    owner_worktree: owner.session.worktree_path.clone(),
+                    owner_activity_at: owner.activity_at,
+                    owner_pid_alive: owner.pid_alive,
+                    safe_next_actions: if owned_by_requester {
+                        Vec::new()
+                    } else {
+                        crate::leases::planned_lease_next_actions(
+                            &owner.session.worktree_path,
+                            owner.session.id,
+                            owner.derived_status,
+                            &path,
+                        )
+                    },
                 };
-                if Some(lease.session_id) == session_id {
+                if owned_by_requester {
                     owned.push(overlap);
                 } else {
                     conflicts.push(overlap);
@@ -2331,6 +2357,9 @@ impl Broker {
                 blocker_session_id: blocker.session_id,
                 blocker_path: blocker.path.clone(),
                 blocker_kind: blocker.kind.as_str().to_string(),
+                blocker_status: blocker.owner_status.as_str().to_string(),
+                blocker_worktree: blocker.owner_worktree.clone(),
+                remediation: blocker.safe_next_actions.join("\n  "),
             }
             .into());
         }
