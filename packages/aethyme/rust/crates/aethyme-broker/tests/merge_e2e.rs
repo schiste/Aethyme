@@ -599,6 +599,21 @@ fn follow_up_refuses_to_replace_a_rewritten_accepted_checkpoint_with_integration
         "follow-up ownership must remain {accepted_head}..{rewritten_head}"
     )));
     assert!(message.contains("cannot replace it as the ownership boundary"));
+    assert!(message.contains(&format!(
+        "aethyme broker checkpoint plan --session {}",
+        session.id
+    )));
+    let recovery_branch = format!(
+        "aethyme/recovery/session-{}-{}",
+        session.id,
+        &rewritten_head[..12]
+    );
+    assert!(message.contains(&format!("git branch {recovery_branch} {rewritten_head}")));
+    assert!(message.contains(&format!("git reset --hard {accepted_head}")));
+    assert!(message.contains(&format!(
+        "git diff --binary {accepted_head} {recovery_branch} | git apply --index"
+    )));
+    assert!(message.contains("Never reset before creating the preservation branch."));
     let persisted = broker.store().session(session.id).unwrap();
     assert_eq!(persisted.accepted_session_head, Some(accepted_head));
     assert!(

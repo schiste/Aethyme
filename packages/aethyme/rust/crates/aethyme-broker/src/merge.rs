@@ -714,13 +714,38 @@ impl Broker {
         plan: &SubmissionPlan,
     ) -> Result<SubmissionReplay, BrokerOpError> {
         if !plan.safe {
+            let mut reason = if plan.warnings.is_empty() {
+                "commit provenance is ambiguous".into()
+            } else {
+                plan.warnings.join("; ")
+            };
+            if plan
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("accepted session checkpoint "))
+                && let Some(recorded_baseline) = plan.recorded_baseline.as_deref()
+            {
+                let recovery_branch = format!(
+                    "aethyme/recovery/session-{}-{}",
+                    plan.session_id,
+                    plan.session_head.get(..12).unwrap_or(&plan.session_head)
+                );
+                reason.push_str(&format!(
+                    "\nSafe recovery:\n\
+                       1. Review `aethyme broker checkpoint plan --session {}` and apply its exact digest if the plan is safe.\n\
+                       2. If automatic recovery refuses an amended promoted commit, preserve it first:\n\
+                          git branch {recovery_branch} {}\n\
+                          git reset --hard {recorded_baseline}\n\
+                          git diff --binary {recorded_baseline} {recovery_branch} | git apply --index\n\
+                          git commit\n\
+                          aethyme broker submit --session {}\n\
+                     Never reset before creating the preservation branch.",
+                    plan.session_id, plan.session_head, plan.session_id
+                ));
+            }
             return Err(BrokerOpError::UnsafeSubmissionPlan {
                 session_id: plan.session_id,
-                reason: if plan.warnings.is_empty() {
-                    "commit provenance is ambiguous".into()
-                } else {
-                    plan.warnings.join("; ")
-                },
+                reason,
             });
         }
 
