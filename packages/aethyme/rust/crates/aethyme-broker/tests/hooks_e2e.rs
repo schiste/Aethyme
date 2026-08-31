@@ -77,14 +77,14 @@ fn install_status_uninstall_roundtrip() {
     let repo = GitRepo::discover(tmp.path()).unwrap();
     let dir = hooks::hooks_dir(&repo).unwrap();
 
-    // Before install: both absent.
+    // Before install: every managed hook is absent.
     let before = hooks::status(&repo).unwrap();
     assert!(before.iter().all(|r| r.state == HookState::Absent));
 
-    // Install writes both hooks: marker-delimited, executable, embedding
+    // Install writes every hook: marker-delimited, executable, embedding
     // the binary path captured at install time.
     let reports = hooks::install(&repo, Path::new(SHIM)).unwrap();
-    assert_eq!(reports.len(), 2);
+    assert_eq!(reports.len(), 3);
     assert!(reports.iter().all(|r| r.state == HookState::Installed));
     for hook in hooks::MANAGED_HOOKS {
         let path = dir.join(hook);
@@ -116,14 +116,17 @@ fn install_status_uninstall_roundtrip() {
     let removed = hooks::uninstall(&repo).unwrap();
     assert_eq!(removed[0].state, HookState::Removed, "user content kept");
     assert_eq!(removed[1].state, HookState::Deleted, "pure shim deleted");
+    assert_eq!(removed[2].state, HookState::Deleted, "pure shim deleted");
     let remainder = std::fs::read_to_string(&pre_commit).unwrap();
     assert!(remainder.contains("echo user-owned"));
     assert!(!remainder.contains(hooks::MARKER_BEGIN));
     assert!(!dir.join("post-commit").exists());
+    assert!(!dir.join("pre-push").exists());
 
     let after = hooks::status(&repo).unwrap();
     assert_eq!(after[0].state, HookState::Foreign, "leftover user hook");
     assert_eq!(after[1].state, HookState::Absent);
+    assert_eq!(after[2].state, HookState::Absent);
 }
 
 #[test]
@@ -148,6 +151,7 @@ fn foreign_hook_file_is_refused_untouched() {
         user_hook
     );
     assert!(!dir.join("post-commit").exists());
+    assert!(!dir.join("pre-push").exists());
 }
 
 #[test]
@@ -166,7 +170,9 @@ fn core_hooks_path_override_refuses_install() {
     );
     let dir = hooks::hooks_dir(&repo).unwrap();
     assert!(
-        !dir.join("pre-commit").exists() && !dir.join("post-commit").exists(),
+        !dir.join("pre-commit").exists()
+            && !dir.join("post-commit").exists()
+            && !dir.join("pre-push").exists(),
         "nothing written where git would ignore it"
     );
 
@@ -177,6 +183,82 @@ fn core_hooks_path_override_refuses_install() {
     );
     let reports = hooks::install(&repo, Path::new(SHIM)).unwrap();
     assert!(reports.iter().all(|r| r.state == HookState::Installed));
+}
+
+#[test]
+fn pre_push_blocks_direct_default_branch_updates_and_journals_break_glass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    sh(remote.path(), &["init", "-q", "--bare"]);
+    init_repo(tmp.path());
+    sh(
+        tmp.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    sh(tmp.path(), &["push", "-q", "origin", "main"]);
+
+    aethyme_broker::init::scaffold(tmp.path()).unwrap();
+    let repo = GitRepo::discover(tmp.path()).unwrap();
+    hooks::install(&repo, Path::new(SHIM)).unwrap();
+    sh(tmp.path(), &["switch", "-qc", "feature"]);
+    std::fs::write(tmp.path().join("feature.txt"), "one\n").unwrap();
+    sh(tmp.path(), &["add", "feature.txt"]);
+    sh(tmp.path(), &["commit", "-qm", "feature one"]);
+
+    let blocked = git_output(tmp.path(), &["push", "origin", "HEAD:main"]);
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(!blocked.status.success());
+    assert!(
+        stderr.contains("git push refused by Aethyme pre-push"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("broker ship plan"), "{stderr}");
+    assert!(
+        stderr.contains("AETHYME_BROKER_BREAK_GLASS_REASON"),
+        "{stderr}"
+    );
+
+    let break_glass_reason = "reviewed incident recovery 123";
+    let allowed = Command::new("git")
+        .args(["push", "origin", "HEAD:main"])
+        .current_dir(tmp.path())
+        .env("AETHYME_BROKER_BREAK_GLASS_REASON", break_glass_reason)
+        .output()
+        .unwrap();
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let event = broker
+        .store()
+        .events_after_filtered(0, 10, Some("hook.pre_push.break_glass"))
+        .unwrap()
+        .pop()
+        .unwrap();
+    let payload = event.payload_json.unwrap();
+    assert!(payload.contains("refs/heads/main"), "{payload}");
+    assert!(payload.contains("reason_digest"), "{payload}");
+    assert!(!payload.contains(break_glass_reason), "{payload}");
+    drop(broker);
+
+    std::fs::write(tmp.path().join("feature.txt"), "two\n").unwrap();
+    sh(tmp.path(), &["add", "feature.txt"]);
+    sh(tmp.path(), &["commit", "-qm", "feature two"]);
+    let coordinated = Command::new("git")
+        .args(["push", "origin", "HEAD:main"])
+        .current_dir(tmp.path())
+        .env("AETHYME_BROKER_SESSION_ID", "7")
+        .env("AETHYME_BROKER_OPERATION_ID", "11")
+        .output()
+        .unwrap();
+    assert!(
+        coordinated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&coordinated.stderr)
+    );
 }
 
 #[test]

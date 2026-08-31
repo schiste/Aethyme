@@ -1101,7 +1101,8 @@ impl Broker {
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("AETHYME_BROKER_SESSION_ID", request.session_id.to_string());
+            .env("AETHYME_BROKER_SESSION_ID", request.session_id.to_string())
+            .env("AETHYME_BROKER_OPERATION_ID", operation.id.to_string());
         if request.provider == OperationProvider::Github {
             command.env(
                 "GH_REPO",

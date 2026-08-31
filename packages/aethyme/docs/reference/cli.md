@@ -361,11 +361,11 @@ On the first normal open after the storage upgrade, currently promoted legacy
 entries are backfilled from their exact first-parent commit deltas; diagnostic
 snapshot opens remain non-mutating.
 
-`broker gates pre-push` is an opt-in adapter for repository-owned hooks; the
-managed hook installer never writes `pre-push`. It reads Git's ref-update lines
-from stdin, requires all non-deletion updates to name one clean checked-out
-`HEAD`, and runs the complete gate set. This makes the reported tree truthful
-and lets declared host resources coordinate concurrent clones. See
+`broker gates pre-push` remains an opt-in full-gate adapter for repositories
+that wire it into their own hook manager. It reads Git's ref-update lines from
+stdin, requires all non-deletion updates to name one clean checked-out `HEAD`,
+and runs the complete gate set. This makes the reported tree truthful and lets
+declared host resources coordinate concurrent clones. See
 [Concurrent Host Resource Coordination](../guides/host-resource-coordination.md)
 for the gate schema, repository-independent supervised runs, hook example,
 fallback contract, and quarantine recovery.
@@ -456,12 +456,27 @@ configured result/depth/node limits, visited-node count, and truncation state.
 Suggestion entries include the explainable changed-file → caller-file → gate
 chain when the graph provider supplied one.
 
-`broker hooks install` installs shared pre-commit and post-commit shims. The
+`broker hooks install` installs shared pre-commit, post-commit, and pre-push
+shims. The
 pre-commit hook runs matching cost-1 gates against the staged change and stays
 silent when they pass. If a gate fails, the hook replays its complete standard
 output and error, prints the broker diagnosis, returns the gate's non-zero exit
 code, and blocks the commit. The one-shot Git escape hatch remains
 `git commit --no-verify`.
+
+The managed pre-push shim is a publication guard, not the full-gate adapter.
+From an enrolled Git common directory it rejects updates to `main`, `master`,
+the advertised origin default branch, and `aethyme/integration` unless Git is
+running inside a broker-coordinated operation. Normal publication therefore
+uses `broker ship plan` followed by digest/SHA-confirmed `broker ship execute`;
+an explicitly authorized exceptional push uses `broker git`.
+
+For emergency recovery only, set
+`AETHYME_BROKER_BREAK_GLASS_REASON="<reviewed reason>"` on the one Git push.
+The hook records protected refs, reason byte count, and a SHA-256 reason digest
+in a local event, never the reason text. This is a cooperative local safety
+boundary—`--no-verify` still exists in Git—but the safe and exceptional paths
+are now explicit and auditable.
 
 `broker leases plan` is a read-only preflight for files or trailing-slash
 directory claims. It reports exact and directory overlaps with each active

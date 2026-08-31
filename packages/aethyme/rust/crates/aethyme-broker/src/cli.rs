@@ -206,10 +206,11 @@ Usage:
       Opt-in adapter for a repository-owned Git pre-push hook. Reads Git's
       ref-update protocol from stdin, requires one clean current-HEAD tip,
       then runs every gate with the same cache and host-resource lifecycle.
-      Deletion-only pushes need no content gates. Aethyme never installs or
-      replaces a pre-push hook.
+      Deletion-only pushes need no content gates. Wire this adapter manually
+      when a repository wants full pre-push gates in addition to the managed
+      publication guard.
   aethyme broker hooks install [--json]
-      Explicitly install the two managed git hooks into the shared
+      Explicitly install the three managed git hooks into the shared
       <git-common-dir>/hooks (all worktrees see them): pre-commit runs
       a fail-closed session/upstream guard on protected branches whenever
       local broker state exists, then the cost<=1 gates whose triggers match
@@ -218,7 +219,10 @@ Usage:
       gates are silent; a failure replays its complete stdout/stderr,
       reports the diagnosis, preserves its exit code, and blocks the
       commit. Post-commit warns when the new commit touches files another
-      live session is editing (informational — never blocks). Refuses to
+      live session is editing (informational — never blocks). Pre-push blocks
+      direct protected/default-branch publication unless it runs inside a
+      coordinated broker operation or carries an explicit journaled
+      AETHYME_BROKER_BREAK_GLASS_REASON. Refuses to
       touch a hook file it does not own (no aethyme
       marker); with the marker, only the marker block is replaced. The
       hook shims embed this binary's absolute path.
@@ -227,7 +231,7 @@ Usage:
       nothing but the shim remained. User content is preserved.
   aethyme broker hooks status [--json]
       Report installed/absent/foreign per managed hook.
-      (hooks pre-commit / hooks post-commit are the internal entry
+      (hooks pre-commit / hooks post-commit / hooks pre-push are internal entry
       points the installed shims call — not for direct use.)
   aethyme broker pr check [--target <branch>] [--pr <number>] [--agent <name>] [--dispatch] [--cmd <command>] [--json]
       Inspect the open PR for the current branch targeting <branch>
@@ -1765,7 +1769,7 @@ fn render_quick_test_report(report: &crate::QuickTestReport, json: bool) -> Resu
 }
 
 fn init_next_steps_message() -> &'static str {
-    "First-time flow: install -> `aethyme deploy --repo .` -> `aethyme broker quick-test` -> \
+    "First-time flow: install -> `aethyme deploy --repo .` -> `aethyme broker hooks install` -> `aethyme broker quick-test` -> \
      `aethyme broker start --task \"...\"` -> `aethyme broker submit --session <id>`.\n\
      This low-level init configured broker state only. Run `aethyme deploy --repo .` \
      now to install mandatory agent policy and certify the complete deployment."
@@ -4655,9 +4659,25 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     }
                 }
                 "post-commit" => crate::hooks::run_post_commit(&cwd),
+                "pre-push" => {
+                    if parsed.positional.len() > 3 {
+                        return Err(UsageError::Message(
+                            "hooks pre-push takes Git's remote name and optional URL only".into(),
+                        ));
+                    }
+                    let mut updates = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut updates).map_err(
+                        |error| {
+                            UsageError::Message(format!(
+                                "cannot read pre-push ref updates: {error}"
+                            ))
+                        },
+                    )?;
+                    crate::hooks::run_pre_push(&cwd, &updates)?;
+                }
                 other => {
                     return Err(UsageError::Message(format!(
-                        "unknown hooks action {other:?} — expected install, uninstall, or status"
+                        "unknown hooks action {other:?} — expected install, uninstall, status, pre-commit, post-commit, or pre-push"
                     )));
                 }
             }

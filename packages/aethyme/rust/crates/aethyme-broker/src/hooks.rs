@@ -18,6 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest as _, Sha256};
+
 use crate::error::BrokerError;
 use crate::gates::{GateConfigError, load_gates, select_gates};
 use crate::git::{GitError, GitRepo};
@@ -27,7 +29,7 @@ pub const MARKER_BEGIN: &str = "# >>> aethyme hooks >>>";
 pub const MARKER_END: &str = "# <<< aethyme hooks <<<";
 
 /// The hooks this module manages, in install/report order.
-pub const MANAGED_HOOKS: [&str; 2] = ["pre-commit", "post-commit"];
+pub const MANAGED_HOOKS: [&str; 3] = ["pre-commit", "post-commit", "pre-push"];
 
 /// Only gates this cheap run at commit time: the pre-commit hook must
 /// stay in the "instant feedback" budget, and everything heavier belongs
@@ -97,6 +99,14 @@ pub enum HooksError {
         behind: u64,
         session_id: i64,
     },
+    #[error(
+        "git push refused by Aethyme pre-push:\n\
+         enrolled repository is publishing protected ref(s): {refs}.\n\
+         Publish verified integration with: aethyme broker ship plan --entry <id>\n\
+         Or run an explicitly authorized push through: aethyme broker git --session <id> --reason \"<authorization>\" -- push ...\n\
+         Emergency break glass (journaled): AETHYME_BROKER_BREAK_GLASS_REASON=\"<reason>\" git push ..."
+    )]
+    ProtectedPush { refs: String },
 }
 
 impl HooksError {
@@ -195,6 +205,14 @@ fn hook_block(hook: &str, binary: &Path) -> String {
              echo \"aethyme hooks: $AETHYME missing — skipping pre-commit gates\" >&2\n\
          fi"
         .to_string()
+    } else if hook == "pre-push" {
+        "if [ -x \"$AETHYME\" ]; then\n    \
+             \"$AETHYME\" broker hooks pre-push \"$@\" || exit $?\n\
+         else\n    \
+             echo \"aethyme hooks: $AETHYME missing — refusing protected push until the paired binary is restored\" >&2\n    \
+             exit 1\n\
+         fi"
+            .to_string()
     } else {
         format!(
             "if [ -x \"$AETHYME\" ]; then\n    \
@@ -432,6 +450,64 @@ pub fn run_pre_commit(cwd: &Path) -> Result<(), HooksError> {
         }
     }
     Ok(())
+}
+
+/// Shared-metadata publication boundary. Git supplies one four-field line per
+/// ref update on stdin; only updates to configured/default shared branches are
+/// guarded. Coordinated broker operations carry both operation and session IDs.
+pub fn run_pre_push(cwd: &Path, updates: &str) -> Result<(), HooksError> {
+    let checkout = GitRepo::discover(cwd)?;
+    let main_root = checkout.main_root()?;
+    let activated = checkout
+        .git_common_dir()?
+        .join(crate::init::ACTIVATION_MARKER_RELPATH)
+        .is_file()
+        || main_root.join(crate::BROKER_DB_RELPATH).exists();
+    if !activated {
+        return Ok(());
+    }
+
+    let protected = protected_branches(&checkout);
+    let mut protected_updates = updates
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let remote_ref = fields.get(2)?.strip_prefix("refs/heads/")?;
+            protected
+                .contains(remote_ref)
+                .then(|| format!("refs/heads/{remote_ref}"))
+        })
+        .collect::<Vec<_>>();
+    protected_updates.sort();
+    protected_updates.dedup();
+    if protected_updates.is_empty() {
+        return Ok(());
+    }
+
+    let coordinated = std::env::var_os("AETHYME_BROKER_OPERATION_ID").is_some()
+        && std::env::var_os("AETHYME_BROKER_SESSION_ID").is_some();
+    if coordinated {
+        return Ok(());
+    }
+
+    if let Ok(reason) = std::env::var("AETHYME_BROKER_BREAK_GLASS_REASON")
+        && !reason.trim().is_empty()
+    {
+        let payload = serde_json::json!({
+            "protected_refs": protected_updates,
+            "reason_bytes": reason.len(),
+            "reason_digest": format!("{:x}", Sha256::digest(reason.as_bytes())),
+        })
+        .to_string();
+        if let Ok(mut store) = BrokerStore::open_in_repo(&main_root) {
+            let _ = store.append_event("hook.pre_push.break_glass", None, Some(&payload));
+        }
+        return Ok(());
+    }
+
+    Err(HooksError::ProtectedPush {
+        refs: protected_updates.join(", "),
+    })
 }
 
 /// Fail closed at Git's write boundary when this machine has opted into
