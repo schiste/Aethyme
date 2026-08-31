@@ -150,6 +150,14 @@ fn submit_verification_case(gates: Option<&str>) -> (serde_json::Value, String) 
 #[test]
 fn submit_distinguishes_missing_unmatched_and_passing_gate_evidence() {
     let (missing, missing_text) = submit_verification_case(None);
+    assert_eq!(
+        missing["submission_plan"]["merged_tree_paths"],
+        serde_json::json!(["scripts/check.sh"])
+    );
+    assert!(missing_text.contains("session-owned commits: 1"));
+    assert!(missing_text.contains("inherited baseline history (not replayed): 0"));
+    assert!(missing_text.contains("merged-tree delta: 1 file(s)"));
+    assert!(missing_text.contains("scripts/check.sh"));
     assert_eq!(missing["gate_verification"]["status"], "no_configuration");
     assert_eq!(missing["gate_verification"]["selected_gates"], 0);
     assert!(missing_text.contains("no .aethyme/gates.toml"));

@@ -3302,6 +3302,93 @@ fn render_host_lease(lease: &crate::HostResourceLease) {
     }
 }
 
+fn render_submission_plan(plan: &crate::SubmissionPlan, checkout: &crate::GitRepo) {
+    println!(
+        "Submitting session {} — HEAD {} onto integration {}",
+        plan.session_id,
+        short_sha(&plan.session_head),
+        short_sha(&plan.integration_head)
+    );
+    println!(
+        "  recorded baseline: {}",
+        plan.recorded_baseline
+            .as_deref()
+            .map(short_sha)
+            .unwrap_or("missing")
+    );
+
+    render_submission_group(
+        "session-owned commits",
+        plan.commits
+            .iter()
+            .filter(|commit| commit.ownership == crate::SubmissionCommitOwnership::SessionOwned),
+        checkout,
+    );
+    render_submission_group(
+        "inherited baseline history (not replayed)",
+        plan.commits.iter().filter(|commit| {
+            commit.ownership == crate::SubmissionCommitOwnership::InheritedFromRecordedBaseline
+        }),
+        checkout,
+    );
+    render_submission_group(
+        "ambiguous commits (submission refused)",
+        plan.commits.iter().filter(|commit| {
+            commit.ownership == crate::SubmissionCommitOwnership::Ambiguous
+                || commit.integration_state == crate::SubmissionIntegrationState::Ambiguous
+        }),
+        checkout,
+    );
+
+    println!(
+        "  merged-tree delta: {} file(s)",
+        plan.merged_tree_paths.len()
+    );
+    for path in plan.merged_tree_paths.iter().take(10) {
+        println!("    {path}");
+    }
+    if plan.merged_tree_paths.len() > 10 {
+        println!("    ... and {} more", plan.merged_tree_paths.len() - 10);
+    }
+    for warning in &plan.warnings {
+        println!("  warning: {warning}");
+    }
+}
+
+fn render_submission_group<'a>(
+    label: &str,
+    commits: impl Iterator<Item = &'a crate::SubmissionCommitProvenance>,
+    checkout: &crate::GitRepo,
+) {
+    let commits = commits.collect::<Vec<_>>();
+    println!("  {label}: {}", commits.len());
+    for commit in commits.iter().take(10) {
+        let subject = checkout
+            .commit_message(&commit.commit)
+            .ok()
+            .and_then(|message| message.lines().next().map(str::to_string))
+            .unwrap_or_else(|| "<subject unavailable>".into());
+        let state = match commit.integration_state {
+            crate::SubmissionIntegrationState::Pending => "pending replay",
+            crate::SubmissionIntegrationState::AlreadyIntegratedByAncestry => {
+                "already integrated by ancestry"
+            }
+            crate::SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity => {
+                "already integrated by patch identity"
+            }
+            crate::SubmissionIntegrationState::Ambiguous => "ambiguous integration identity",
+        };
+        println!("    {} {subject} [{state}]", short_sha(&commit.commit));
+    }
+    if commits.len() > 10 {
+        println!("    ... and {} more", commits.len() - 10);
+    }
+}
+
+fn short_sha(value: &str) -> &str {
+    &value[..12.min(value.len())]
+}
+
 fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
     let action = parsed
         .positional
@@ -4472,27 +4559,8 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 && let Ok(checkout) =
                     crate::GitRepo::discover(std::path::Path::new(&info.worktree_path))
             {
-                let head = checkout.head_commit().unwrap_or_default();
-                println!(
-                    "Submitting session {session} — HEAD {}",
-                    &head[..12.min(head.len())]
-                );
-                let base = broker
-                    .session_change_base(&checkout)
-                    .or_else(|| info.diff_base.clone());
-                if let Some(base) = base.as_deref()
-                    && let Ok(commits) = checkout.commit_summaries(base, "HEAD", 10)
-                {
-                    if commits.is_empty() {
-                        println!(
-                            "  no commits since the session baseline — \
-                             nothing new to integrate"
-                        );
-                    }
-                    for line in &commits {
-                        println!("  {line}");
-                    }
-                }
+                let plan = broker.submission_plan(session)?;
+                render_submission_plan(&plan, &checkout);
                 if let Ok(dirty) = checkout.dirty_paths()
                     && !dirty.is_empty()
                 {

@@ -234,6 +234,9 @@ pub struct SubmissionPlan {
     pub integration_head: String,
     pub safe: bool,
     pub commits: Vec<SubmissionCommitProvenance>,
+    /// Repository-relative paths whose final content would differ after
+    /// replaying the pending session-owned patches onto integration.
+    pub merged_tree_paths: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -328,6 +331,24 @@ struct SubmissionReplay {
 }
 
 impl Broker {
+    /// Build the exact plan used by submission before creating a queue entry
+    /// or running gates. Replaying patches can create unreachable Git objects,
+    /// but this operation changes neither refs nor worktrees.
+    pub fn submission_plan(&mut self, session_id: i64) -> Result<SubmissionPlan, BrokerOpError> {
+        let session = self.store().session(session_id)?;
+        let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+        let session_head = checkout.head_commit()?;
+        let (_, integration_head) = self.integration_head_snapshot()?;
+        let mut plan = self.build_submission_plan(&session, &session_head, &integration_head)?;
+        let replay = self.replay_submission_plan(&plan)?;
+        if replay.conflicts.is_empty() {
+            plan.merged_tree_paths = self
+                .repo_handle()
+                .changed_between(&integration_head, &replay.tree)?;
+        }
+        Ok(plan)
+    }
+
     /// Ensure the integration branch exists (created from the main
     /// checkout's HEAD with an explanatory event — issue #20) and return
     /// its current commit.
@@ -476,9 +497,15 @@ impl Broker {
             .find(|e| e.id == entry_id)
             .ok_or(crate::BrokerError::SessionNotFound(entry_id))?;
         let session = self.store().session(entry.session_id)?;
-        let submission_plan = self.build_submission_plan(&session, &entry.head_commit, &base)?;
+        let mut submission_plan =
+            self.build_submission_plan(&session, &entry.head_commit, &base)?;
 
         let simulation = self.replay_submission_plan(&submission_plan)?;
+        if simulation.conflicts.is_empty() {
+            submission_plan.merged_tree_paths = self
+                .repo_handle()
+                .changed_between(&base, &simulation.tree)?;
+        }
         let base_tree = self.repo_handle().commit_tree_id(&base)?;
         let main_checkout_session = Path::new(&session.worktree_path) == self.main_root_path();
         self.store()
@@ -840,6 +867,7 @@ impl Broker {
                 integration_head: integration_head.to_string(),
                 safe: false,
                 commits: Vec::new(),
+                merged_tree_paths: Vec::new(),
                 warnings: vec![
                     "session has no recorded baseline; commit ownership is ambiguous".into(),
                 ],
@@ -890,6 +918,7 @@ impl Broker {
                         })
                     })
                     .collect::<Result<Vec<_>, BrokerOpError>>()?,
+                merged_tree_paths: Vec::new(),
                 warnings: vec![format!(
                     "accepted session checkpoint {recorded_baseline} is not an ancestor of session HEAD {session_head}; follow-up ownership must remain {recorded_baseline}..{session_head}, so integration HEAD {integration_head} cannot replace it as the ownership boundary"
                 )],
@@ -924,6 +953,7 @@ impl Broker {
                         })
                     })
                     .collect::<Result<Vec<_>, BrokerOpError>>()?,
+                merged_tree_paths: Vec::new(),
                 warnings: vec![format!(
                     "recorded baseline {recorded_baseline} is not an ancestor of session HEAD {session_head}; commit ownership is ambiguous"
                 )],
@@ -1008,6 +1038,7 @@ impl Broker {
             integration_head: integration_head.to_string(),
             safe: !ambiguous,
             commits,
+            merged_tree_paths: Vec::new(),
             warnings,
         })
     }
