@@ -49,6 +49,9 @@ pub enum BrokerError {
     #[error("no advisory with id {0}")]
     AdvisoryNotFound(i64),
 
+    #[error("no session note with id {0}")]
+    SessionNoteNotFound(i64),
+
     #[error("advisory identity {0:?} already exists with different immutable data")]
     AdvisoryIdentityConflict(String),
 

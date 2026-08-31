@@ -220,6 +220,9 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker advisories list [--all] [--json]`
 - `aethyme broker advisories show <id> [--json]`
 - `aethyme broker advisories ack <id> [--json]`
+- `aethyme broker note send --session <sender> --to-session <recipient> --message <text> [--json]`
+- `aethyme broker note list --session <recipient> [--json]`
+- `aethyme broker note ack --session <recipient> --id <note-id> [--json]`
 - `aethyme broker resources plan <request.json> [--json]`
 - `aethyme broker resources acquire <request.json> [--wait <duration>] [--grant-out <path>] [--json]`
 - `aethyme broker resources run <request.json> [--wait <duration>] [--cleanup-command <shell>] [--json] -- <command> ...`
@@ -324,6 +327,20 @@ remains parseable. `broker status --json` includes both
 `outstanding_entry_exposures`; text status summarizes each exposed queue entry.
 Acknowledgement stops future session notices without deleting history or
 changing the underlying publication exposure.
+
+`broker note` is a deliberately small, repository-local coordination channel
+between live sessions. Messages are trimmed, limited to 1,000 UTF-8 bytes, and
+must be a single line without control characters. The recipient sees unread
+notes on stderr at the next session-associated broker command, while JSON
+stdout remains parseable. `note list` returns newest-first durable history and
+an `unread_count`; only the named recipient may acknowledge a note. Closing a
+session prevents new sends to or from it.
+
+Note text remains only in the repository's broker database. The append-only
+`session.note.sent` and `session.note.acknowledged` events contain routing IDs,
+timestamps, and the sent byte count, never message text. Notes are for terse
+handoffs such as “coordinate `src/router.rs` before editing”; they do not claim
+paths, refresh leases, alter gates, or replace task descriptions.
 
 Every promotion also creates one authoritative path exposure owned by its
 queue entry. It contains the exact promoted SHA and repository-relative path

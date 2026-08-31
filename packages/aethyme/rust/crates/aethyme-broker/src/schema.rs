@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 18;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -458,6 +458,24 @@ CREATE INDEX entry_path_exposures_by_state
     ON entry_path_exposures (state, id);
 ";
 
+const MIGRATION_V18: &str = "
+-- Session notes are repository-local coordination messages. Events retain
+-- only redacted routing metadata; message text lives solely in this table.
+CREATE TABLE session_notes (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_session_id    INTEGER NOT NULL REFERENCES sessions (id),
+    recipient_session_id INTEGER NOT NULL REFERENCES sessions (id),
+    message              TEXT NOT NULL,
+    created_at           INTEGER NOT NULL,
+    acknowledged_at      INTEGER
+);
+
+CREATE INDEX session_notes_by_recipient
+    ON session_notes (recipient_session_id, acknowledged_at, id DESC);
+CREATE INDEX session_notes_by_sender
+    ON session_notes (sender_session_id, id DESC);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -476,6 +494,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V15,
     MIGRATION_V16,
     MIGRATION_V17,
+    MIGRATION_V18,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -815,5 +834,43 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("adopted_head is immutable"));
+    }
+
+    #[test]
+    fn v18_adds_recipient_indexed_session_notes_without_rewriting_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS[..17].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+
+        migrate(&conn).unwrap();
+
+        let columns = conn
+            .prepare("PRAGMA table_info(session_notes)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            [
+                "id",
+                "sender_session_id",
+                "recipient_session_id",
+                "message",
+                "created_at",
+                "acknowledged_at",
+            ]
+        );
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 }

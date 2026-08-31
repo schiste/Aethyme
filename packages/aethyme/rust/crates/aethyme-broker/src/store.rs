@@ -23,7 +23,7 @@ use crate::types::{
     MergeQueueEntry, MergeStatus, NewAdvisory, NewCoordinatedOperation, NewGateResult,
     NewPrWatchState, NewSession, OperationEffect, OperationHistoryPage, OperationHistoryQuery,
     OperationIdentityProvenance, OperationProvider, OperationStatus, PrWatchState, Session,
-    SessionOrigin, SessionStatus,
+    SessionNote, SessionOrigin, SessionStatus,
 };
 
 /// Milliseconds a writer waits on a locked database before erroring.
@@ -1834,6 +1834,109 @@ impl BrokerStore {
         self.advisory(id)?.ok_or(BrokerError::AdvisoryNotFound(id))
     }
 
+    // ── local session notes ─────────────────────────────────────────
+
+    pub fn record_session_note(
+        &mut self,
+        sender_session_id: i64,
+        recipient_session_id: i64,
+        message: &str,
+    ) -> Result<SessionNote, BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO session_notes (
+                 sender_session_id, recipient_session_id, message, created_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![sender_session_id, recipient_session_id, message, now],
+        )?;
+        let id = tx.last_insert_rowid();
+        let payload = serde_json::json!({
+            "note_id": id,
+            "sender_session_id": sender_session_id,
+            "recipient_session_id": recipient_session_id,
+            "message_bytes": message.len(),
+        })
+        .to_string();
+        insert_event(
+            &tx,
+            now,
+            "session.note.sent",
+            Some(recipient_session_id),
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        self.session_note(id)?
+            .ok_or(BrokerError::SessionNoteNotFound(id))
+    }
+
+    pub fn session_note(&self, id: i64) -> Result<Option<SessionNote>, BrokerError> {
+        self.conn
+            .query_row(
+                &(SESSION_NOTE_SELECT.to_owned() + " WHERE id = ?1"),
+                [id],
+                session_note_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn session_notes(
+        &self,
+        recipient_session_id: i64,
+    ) -> Result<Vec<SessionNote>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SESSION_NOTE_SELECT} WHERE recipient_session_id = ?1 ORDER BY id DESC"
+        ))?;
+        let rows = stmt.query_map([recipient_session_id], session_note_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn unread_session_notes(
+        &self,
+        recipient_session_id: i64,
+    ) -> Result<Vec<SessionNote>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SESSION_NOTE_SELECT}
+             WHERE recipient_session_id = ?1 AND acknowledged_at IS NULL
+             ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([recipient_session_id], session_note_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn acknowledge_session_note(&mut self, id: i64) -> Result<SessionNote, BrokerError> {
+        let existing = self
+            .session_note(id)?
+            .ok_or(BrokerError::SessionNoteNotFound(id))?;
+        if existing.acknowledged_at.is_some() {
+            return Ok(existing);
+        }
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE session_notes SET acknowledged_at = ?2
+             WHERE id = ?1 AND acknowledged_at IS NULL",
+            params![id, now],
+        )?;
+        let payload = serde_json::json!({
+            "note_id": id,
+            "sender_session_id": existing.sender_session_id,
+            "recipient_session_id": existing.recipient_session_id,
+        })
+        .to_string();
+        insert_event(
+            &tx,
+            now,
+            "session.note.acknowledged",
+            Some(existing.recipient_session_id),
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        self.session_note(id)?
+            .ok_or(BrokerError::SessionNoteNotFound(id))
+    }
+
     // ── promoted entry path exposures ────────────────────────────────
 
     /// Exact durable exposure for one promoted queue entry.
@@ -2274,6 +2377,9 @@ const ADVISORY_SELECT: &str = "SELECT id, identity, session_id, severity, queue_
      resolved_at, resolution_evidence \
      FROM advisories";
 
+const SESSION_NOTE_SELECT: &str = "SELECT id, sender_session_id, recipient_session_id, message, \
+     created_at, acknowledged_at FROM session_notes";
+
 const ENTRY_PATH_EXPOSURE_SELECT: &str = "SELECT id, queue_entry_id, promotion_sha, paths_json, \
      created_at, state, resolved_at, resolution_kind, resolution_sha, resolution_evidence \
      FROM entry_path_exposures";
@@ -2470,6 +2576,17 @@ fn advisory_from_row(row: &rusqlite::Row<'_>) -> RowResult<Advisory> {
             resolution_evidence: row.get(12)?,
         })
     })())
+}
+
+fn session_note_from_row(row: &rusqlite::Row<'_>) -> Result<SessionNote, rusqlite::Error> {
+    Ok(SessionNote {
+        id: row.get(0)?,
+        sender_session_id: row.get(1)?,
+        recipient_session_id: row.get(2)?,
+        message: row.get(3)?,
+        created_at: row.get(4)?,
+        acknowledged_at: row.get(5)?,
+    })
 }
 
 fn entry_path_exposure_from_row(row: &rusqlite::Row<'_>) -> RowResult<EntryPathExposure> {

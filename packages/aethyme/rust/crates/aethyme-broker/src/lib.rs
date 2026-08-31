@@ -68,10 +68,10 @@ pub use broker::{
     IntegrationStabilityReport, IntegrationStatusView, LeaseBlocker, LeaseClaimReport,
     LeaseOverlapRelation, LeasePathPlan, LeasePlan, LeasePlanOverlap, OwnershipAuditReport,
     PromotedConflict, PromotedIntegrationEntry, RepairAction, RepairGateSelection, RepairReport,
-    RepairSource, SemanticGateAdvice, SemanticGateSelection, SemanticGateSource,
-    SemanticGateSourceStatus, SemanticGateSuggestionChain, SessionCheckpointApplyReport,
-    SessionCheckpointRecoveryPlan, SessionHandoffReport, SessionStartBase,
-    SessionStartBaseEvidence, StartReport, StatusAdvice, StatusAdviceSeverity,
+    RepairSource, SESSION_NOTE_MAX_BYTES, SemanticGateAdvice, SemanticGateSelection,
+    SemanticGateSource, SemanticGateSourceStatus, SemanticGateSuggestionChain,
+    SessionCheckpointApplyReport, SessionCheckpointRecoveryPlan, SessionHandoffReport,
+    SessionStartBase, SessionStartBaseEvidence, StartReport, StatusAdvice, StatusAdviceSeverity,
     StatusIntegrationRelation, StatusSummary, StatusView, VersionRepairReport, VersionRepairStep,
 };
 pub use error::BrokerError;
@@ -184,7 +184,8 @@ pub use types::{
     GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT, MergeQueueEntry, MergeStatus,
     NewAdvisory, NewCoordinatedOperation, NewGateResult, NewPrWatchState, NewSession,
     OperationEffect, OperationHistoryPage, OperationHistoryQuery, OperationIdentityProvenance,
-    OperationProvider, OperationStatus, PrWatchState, Session, SessionOrigin, SessionStatus,
+    OperationProvider, OperationStatus, PrWatchState, Session, SessionNote, SessionNoteList,
+    SessionOrigin, SessionStatus,
 };
 pub use update::{
     INSTALL_RECEIPT_FILENAME, INSTALL_RECEIPT_SCHEMA_VERSION, InstallReceipt, InstallationMethod,

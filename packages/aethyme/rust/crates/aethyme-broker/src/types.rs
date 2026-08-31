@@ -206,6 +206,24 @@ pub struct AdvisoryList {
     pub includes_acknowledged: bool,
 }
 
+/// One bounded local message between two broker sessions in this repository.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionNote {
+    pub id: i64,
+    pub sender_session_id: i64,
+    pub recipient_session_id: i64,
+    pub message: String,
+    pub created_at: i64,
+    pub acknowledged_at: Option<i64>,
+}
+
+/// Stable JSON envelope for `note list`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionNoteList {
+    pub notes: Vec<SessionNote>,
+    pub unread_count: usize,
+}
+
 /// Durable intent recorded before a coordinated command starts.
 #[derive(Debug, Clone)]
 pub struct NewCoordinatedOperation {

@@ -21,7 +21,7 @@ use crate::graph_impact::{
 use crate::store::BrokerStore;
 use crate::types::{
     Advisory, AdvisoryList, GateStatus, LeaseKind, MergeQueueEntry, MergeStatus, NewAdvisory,
-    NewSession, Session, SessionOrigin, SessionStatus,
+    NewSession, Session, SessionNote, SessionNoteList, SessionOrigin, SessionStatus,
 };
 use crate::version::{VersionDriftReport, VersionDriftStatus};
 
@@ -30,6 +30,7 @@ use crate::version::{VersionDriftReport, VersionDriftStatus};
 /// for now, chosen so an agent "thinking" for a few minutes stays active.
 const IDLE_AFTER_MS: i64 = 10 * 60 * 1000;
 const STALE_AFTER_MS: i64 = 2 * 60 * 60 * 1000;
+pub const SESSION_NOTE_MAX_BYTES: usize = 1_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerOpError {
@@ -121,6 +122,16 @@ pub enum BrokerOpError {
     InvalidLeasePath { path: String, reason: String },
     #[error("invalid advisory: {reason}")]
     InvalidAdvisory { reason: String },
+    #[error("invalid broker note: {reason}")]
+    InvalidSessionNote { reason: String },
+    #[error(
+        "session {session_id} cannot acknowledge note {note_id}, which belongs to session {recipient_session_id}"
+    )]
+    SessionNoteRecipientMismatch {
+        session_id: i64,
+        note_id: i64,
+        recipient_session_id: i64,
+    },
     #[error("cannot project broker advisories at {path}: {source}")]
     AdvisoryProjectionIo {
         path: PathBuf,
@@ -1522,6 +1533,93 @@ impl Broker {
         let advisory = self.store.acknowledge_advisory(id)?;
         self.refresh_advisory_projection()?;
         Ok(advisory)
+    }
+
+    pub fn send_session_note(
+        &mut self,
+        sender_session_id: i64,
+        recipient_session_id: i64,
+        message: &str,
+    ) -> Result<SessionNote, BrokerOpError> {
+        if sender_session_id == recipient_session_id {
+            return Err(BrokerOpError::InvalidSessionNote {
+                reason: "sender and recipient must be different live sessions".into(),
+            });
+        }
+        let message = message.trim();
+        if message.is_empty() {
+            return Err(BrokerOpError::InvalidSessionNote {
+                reason: "message must not be empty".into(),
+            });
+        }
+        if message.len() > SESSION_NOTE_MAX_BYTES {
+            return Err(BrokerOpError::InvalidSessionNote {
+                reason: format!(
+                    "message is {} bytes; maximum is {SESSION_NOTE_MAX_BYTES}",
+                    message.len()
+                ),
+            });
+        }
+        if message.chars().any(char::is_control) {
+            return Err(BrokerOpError::InvalidSessionNote {
+                reason: "message must be one line of plain text without control characters".into(),
+            });
+        }
+        for (role, id) in [
+            ("sender", sender_session_id),
+            ("recipient", recipient_session_id),
+        ] {
+            let session = self.store.session(id)?;
+            if session.status == SessionStatus::Cleaned {
+                return Err(BrokerOpError::InvalidSessionNote {
+                    reason: format!("{role} session {id} is closed"),
+                });
+            }
+        }
+        Ok(self
+            .store
+            .record_session_note(sender_session_id, recipient_session_id, message)?)
+    }
+
+    pub fn session_note_list(
+        &self,
+        recipient_session_id: i64,
+    ) -> Result<SessionNoteList, BrokerOpError> {
+        self.store.session(recipient_session_id)?;
+        let notes = self.store.session_notes(recipient_session_id)?;
+        let unread_count = notes
+            .iter()
+            .filter(|note| note.acknowledged_at.is_none())
+            .count();
+        Ok(SessionNoteList {
+            notes,
+            unread_count,
+        })
+    }
+
+    pub fn acknowledge_session_note(
+        &mut self,
+        recipient_session_id: i64,
+        note_id: i64,
+    ) -> Result<SessionNote, BrokerOpError> {
+        let recipient = self.store.session(recipient_session_id)?;
+        if recipient.status == SessionStatus::Cleaned {
+            return Err(BrokerOpError::InvalidSessionNote {
+                reason: format!("recipient session {recipient_session_id} is closed"),
+            });
+        }
+        let note = self
+            .store
+            .session_note(note_id)?
+            .ok_or(BrokerError::SessionNoteNotFound(note_id))?;
+        if note.recipient_session_id != recipient_session_id {
+            return Err(BrokerOpError::SessionNoteRecipientMismatch {
+                session_id: recipient_session_id,
+                note_id,
+                recipient_session_id: note.recipient_session_id,
+            });
+        }
+        Ok(self.store.acknowledge_session_note(note_id)?)
     }
 
     pub fn refresh_advisory_projection(&mut self) -> Result<PathBuf, BrokerOpError> {

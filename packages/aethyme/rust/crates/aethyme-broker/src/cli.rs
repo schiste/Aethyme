@@ -175,6 +175,12 @@ Usage:
       Promotion/lease advisories repeat on session commands, after
       post-commit, and before uncached gates whose cost exceeds 1; they
       remain informational and never alter command or promotion outcomes.
+  aethyme broker note send --session <sender> --to-session <recipient> --message <text> [--json]
+  aethyme broker note list --session <recipient> [--json]
+  aethyme broker note ack --session <recipient> --id <note-id> [--json]
+      Send, inspect, and acknowledge bounded repository-local coordination
+      notes between live sessions. Unread notes surface on the recipient's
+      next broker command; event payloads never contain message text.
   aethyme broker gates validate [--json]
       Parse and validate .aethyme/gates.toml.
   aethyme broker gates affected --session <id> [--json]
@@ -413,6 +419,10 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "gh",
     "operations",
     "advisories",
+    "note",
+    "send",
+    "list",
+    "ack",
     "reconcile",
     "agents",
     "leases",
@@ -1105,6 +1115,9 @@ struct Parsed {
     agent: Option<String>,
     pr_number: Option<i64>,
     session: Option<i64>,
+    to_session: Option<i64>,
+    note_id: Option<i64>,
+    message: Option<String>,
     entry: Option<i64>,
     confirm: Option<String>,
     operation: Option<i64>,
@@ -1166,6 +1179,9 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         agent: None,
         pr_number: None,
         session: None,
+        to_session: None,
+        note_id: None,
+        message: None,
         entry: None,
         confirm: None,
         operation: None,
@@ -1456,6 +1472,30 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 parsed.session = Some(value.parse().map_err(|_| {
                     UsageError::Message("--session must be an integer session id".into())
                 })?);
+            }
+            "--to-session" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--to-session requires a value".into()))?;
+                parsed.to_session = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--to-session must be an integer session id".into())
+                })?);
+            }
+            "--id" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--id requires a value".into()))?;
+                parsed.note_id =
+                    Some(value.parse().map_err(|_| {
+                        UsageError::Message("--id must be an integer note id".into())
+                    })?);
+            }
+            "--message" => {
+                parsed.message = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--message requires a value".into()))?
+                        .clone(),
+                );
             }
             "--entry" => {
                 let value = iter
@@ -4100,6 +4140,82 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
             }
         }
+        "note" => {
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            match parsed.positional.first().map(String::as_str) {
+                Some("send") if parsed.positional.len() == 1 => {
+                    let sender = parsed.session.ok_or_else(|| {
+                        UsageError::Message("note send requires --session <sender>".into())
+                    })?;
+                    let recipient = parsed.to_session.ok_or_else(|| {
+                        UsageError::Message("note send requires --to-session <recipient>".into())
+                    })?;
+                    let message = parsed.message.as_deref().ok_or_else(|| {
+                        UsageError::Message("note send requires --message <text>".into())
+                    })?;
+                    let note = broker.send_session_note(sender, recipient, message)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&note)?);
+                    } else {
+                        println!(
+                            "Sent broker note {} from session {} to session {}.",
+                            note.id, note.sender_session_id, note.recipient_session_id
+                        );
+                    }
+                }
+                Some("list") if parsed.positional.len() == 1 => {
+                    let recipient = parsed.session.ok_or_else(|| {
+                        UsageError::Message("note list requires --session <recipient>".into())
+                    })?;
+                    let list = broker.session_note_list(recipient)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&list)?);
+                    } else if list.notes.is_empty() {
+                        println!("No broker notes for session {recipient}.");
+                    } else {
+                        println!("{:<5} {:<8} {:<14} MESSAGE", "ID", "FROM", "STATE");
+                        for note in &list.notes {
+                            println!(
+                                "{:<5} {:<8} {:<14} {}",
+                                note.id,
+                                note.sender_session_id,
+                                if note.acknowledged_at.is_some() {
+                                    "acknowledged"
+                                } else {
+                                    "unread"
+                                },
+                                note.message
+                            );
+                        }
+                        println!("Unread: {}", list.unread_count);
+                    }
+                }
+                Some("ack") if parsed.positional.len() == 1 => {
+                    let recipient = parsed.session.ok_or_else(|| {
+                        UsageError::Message("note ack requires --session <recipient>".into())
+                    })?;
+                    let note_id = parsed.note_id.ok_or_else(|| {
+                        UsageError::Message("note ack requires --id <note-id>".into())
+                    })?;
+                    let note = broker.acknowledge_session_note(recipient, note_id)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&note)?);
+                    } else {
+                        println!("Acknowledged broker note {}.", note.id);
+                    }
+                }
+                Some(other) => {
+                    return Err(UsageError::Message(format!(
+                        "unknown note action {other:?} — expected send, list, or ack"
+                    )));
+                }
+                None => {
+                    return Err(UsageError::Message(
+                        "note requires an action: send, list, or ack".into(),
+                    ));
+                }
+            }
+        }
         "operations" => {
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             match parsed.positional.first().map(String::as_str) {
@@ -5547,9 +5663,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
 }
 
 /// Every broker invocation associated with a live session surfaces its
-/// outstanding durable advisories on stderr. Stdout remains untouched so all
-/// existing `--json` contracts stay parseable. This is best effort and
-/// read-only: a notification failure must never change command behavior.
+/// outstanding durable advisories and unread local notes on stderr. Stdout
+/// remains untouched so all existing `--json` contracts stay parseable. This
+/// is best effort and read-only: notification failure never changes behavior.
 fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
     // Internal hooks are not interactive broker commands. Pre-commit remains
     // quiet on success, while post-commit surfaces through run_post_commit
@@ -5584,5 +5700,18 @@ fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
     };
     for line in crate::advisories::session_notice_lines(&advisories) {
         eprintln!("{line}");
+    }
+    let Ok(notes) = store.unread_session_notes(session_id) else {
+        return;
+    };
+    for note in notes {
+        eprintln!(
+            "Unread broker note {} from session {}: {}",
+            note.id, note.sender_session_id, note.message
+        );
+        eprintln!(
+            "  acknowledge: aethyme broker note ack --session {} --id {}",
+            session_id, note.id
+        );
     }
 }
