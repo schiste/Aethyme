@@ -1,4 +1,6 @@
 #[cfg(unix)]
+use std::io::BufRead as _;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -167,7 +169,7 @@ fn supervised_run_forwards_termination_to_the_child_group_and_releases() {
         .unwrap(),
     )
     .unwrap();
-    let child = Command::new(CLI)
+    let mut child = Command::new(CLI)
         .args([
             "resources",
             "run",
@@ -176,30 +178,23 @@ fn supervised_run_forwards_termination_to_the_child_group_and_releases() {
             "--",
             "sh",
             "-c",
-            "trap 'exit 42' TERM; while :; do sleep 1; done",
+            "trap 'exit 42' TERM; printf 'child-ready\\n'; while :; do sleep 1; done",
         ])
         .current_dir(temp.path())
         .env("AETHYME_HOST_STATE_DIR", &state)
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        let listed = run(temp.path(), &state, &["resources", "list", "--json"]);
-        if serde_json::from_slice::<serde_json::Value>(&listed.stdout)
-            .ok()
-            .and_then(|value| value.as_array().map(Vec::len))
-            == Some(1)
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "supervised lease was not acquired"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    let mut readiness = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut readiness)
+        .unwrap();
+    assert_eq!(readiness, "child-ready\n");
+
+    let listed = run(temp.path(), &state, &["resources", "list", "--json"]);
+    let leases: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(leases.as_array().map(Vec::len), Some(1));
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);
     }
