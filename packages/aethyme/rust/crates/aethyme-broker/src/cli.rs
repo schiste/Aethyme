@@ -189,12 +189,12 @@ Usage:
       Advisory semantic gate-selection report: shows enforced path-triggered
       gates plus caller-edge suggestion status. Never changes what submit,
       CI, or gates run execute.
-  aethyme broker gates run --session <id> [--no-cache] [--json]
+  aethyme broker gates run --session <id> [--only <gate>] [--no-cache] [--json]
       Run affected gates cheap-first with tree-hash caching; cancels this
       session's obsolete in-flight runs; stops at first failure. Text
       abbreviates each proven tree hash; JSON includes the full hash.
       --no-cache executes fresh, then stores the new result normally.
-  aethyme broker gates run --all [--no-cache] [--json]
+  aethyme broker gates run --all [--only <gate>] [--no-cache] [--json]
       Run EVERY gate in cost order against the current worktree — no
       diff selection, no session. Same runner, streaming, and tree-hash
       result cache as session runs; stops at first failure and exits
@@ -1162,6 +1162,7 @@ struct Parsed {
     sync_main: bool,
     sync_integration: bool,
     no_cache: bool,
+    only: Option<String>,
     stdout: bool,
     include_task: bool,
     planned_paths: Vec<String>,
@@ -1226,6 +1227,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         sync_main: false,
         sync_integration: false,
         no_cache: false,
+        only: None,
         stdout: false,
         include_task: false,
         planned_paths: Vec::new(),
@@ -1279,6 +1281,13 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--sync-main" => parsed.sync_main = true,
             "--sync-integration" => parsed.sync_integration = true,
             "--no-cache" => parsed.no_cache = true,
+            "--only" => {
+                parsed.only = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--only requires a gate name".into()))?
+                        .clone(),
+                )
+            }
             "--stdout" => parsed.stdout = true,
             "--wait" => {
                 parsed.wait = Some(
@@ -1572,6 +1581,40 @@ fn gate_status_label(
     match failure_class {
         Some(class) => format!("{}/{}", status.as_str(), class.as_str()),
         None => status.as_str().to_string(),
+    }
+}
+
+const GATE_FAILURE_TAIL_LINES: usize = 20;
+const GATE_FAILURE_TAIL_BYTES: usize = 16 * 1024;
+
+fn render_gate_failure_tail(outcome: &crate::gates::GateRunOutcome) {
+    if outcome.status == crate::GateStatus::Pass {
+        return;
+    }
+    let Some(path) = outcome.log_path.as_deref() else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let start = bytes.len().saturating_sub(GATE_FAILURE_TAIL_BYTES);
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    let mut lines = text
+        .lines()
+        .rev()
+        .take(GATE_FAILURE_TAIL_LINES)
+        .collect::<Vec<_>>();
+    lines.reverse();
+    if lines.is_empty() {
+        return;
+    }
+    eprintln!(
+        "gate {} output (last {} line(s)):",
+        outcome.gate,
+        lines.len()
+    );
+    for line in lines {
+        eprintln!("  {line}");
     }
 }
 
@@ -4432,14 +4475,16 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     let cwd = std::env::current_dir()
                         .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
                     let mut broker = open_broker(parsed.read_only_snapshot)?;
-                    let outcomes = broker.run_all_gates_with_policy(
-                        &cwd,
-                        if parsed.no_cache {
-                            crate::CachePolicy::Bypass
-                        } else {
-                            crate::CachePolicy::Use
-                        },
-                    )?;
+                    let policy = if parsed.no_cache {
+                        crate::CachePolicy::Bypass
+                    } else {
+                        crate::CachePolicy::Use
+                    };
+                    let outcomes = if let Some(gate) = parsed.only.as_deref() {
+                        broker.run_named_gate_for_checkout_with_policy(&cwd, gate, policy)?
+                    } else {
+                        broker.run_all_gates_with_policy(&cwd, policy)?
+                    };
                     if parsed.json {
                         println!("{}", serde_json::to_string_pretty(&outcomes)?);
                     } else {
@@ -4455,6 +4500,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                                     .unwrap_or_default(),
                                 short_commit(&outcome.tree_hash),
                             );
+                            render_gate_failure_tail(outcome);
                         }
                     }
                     // Unlike --session runs, --all is the CI entrypoint:
@@ -4471,14 +4517,16 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         "gates run requires --session <id> (or --all)".into(),
                     ))?;
                     let mut broker = open_broker(parsed.read_only_snapshot)?;
-                    let outcomes = broker.run_gates_with_policy(
-                        session,
-                        if parsed.no_cache {
-                            crate::CachePolicy::Bypass
-                        } else {
-                            crate::CachePolicy::Use
-                        },
-                    )?;
+                    let policy = if parsed.no_cache {
+                        crate::CachePolicy::Bypass
+                    } else {
+                        crate::CachePolicy::Use
+                    };
+                    let outcomes = if let Some(gate) = parsed.only.as_deref() {
+                        broker.run_named_gate_with_policy(session, gate, policy)?
+                    } else {
+                        broker.run_gates_with_policy(session, policy)?
+                    };
                     if parsed.json {
                         println!("{}", serde_json::to_string_pretty(&outcomes)?);
                     } else if outcomes.is_empty() {
@@ -4497,6 +4545,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                                     .unwrap_or_default(),
                                 short_commit(&outcome.tree_hash),
                             );
+                            render_gate_failure_tail(outcome);
                             failed |= outcome.status.as_str() != "pass";
                         }
                         if failed {
@@ -4768,6 +4817,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             short_commit(&gate.tree_hash),
                         );
                     }
+                    render_gate_failure_tail(gate);
                 }
                 match outcome.gate_verification.status {
                     crate::SubmissionGateVerificationStatus::NotRun => {}

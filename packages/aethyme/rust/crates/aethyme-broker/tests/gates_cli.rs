@@ -730,3 +730,88 @@ max_bytes = 3
     assert_eq!(second[0]["managed_cache"]["bytes_after"], 4);
     assert_eq!(second[0]["managed_cache"]["rotated_before_run"], true);
 }
+
+#[test]
+fn named_gate_rerun_executes_only_that_gate_and_replays_failure_tail() {
+    let repo = fixture();
+    std::fs::write(
+        repo.path().join(".aethyme/gates.toml"),
+        r#"
+[[gate]]
+name = "unrelated"
+command = "printf unrelated >> gate-runs.txt"
+
+[[gate]]
+name = "spelling"
+command = "printf 'diagnostic-one\ndiagnostic-two\n' >&2; exit 7"
+"#,
+    )
+    .unwrap();
+
+    let failed = run(
+        repo.path(),
+        &["gates", "run", "--all", "--only", "spelling", "--no-cache"],
+    );
+    assert!(!failed.status.success());
+    let stdout = String::from_utf8(failed.stdout).unwrap();
+    let stderr = String::from_utf8(failed.stderr).unwrap();
+    assert!(stdout.contains("spelling"));
+    assert!(!stdout.contains("unrelated"));
+    assert!(stderr.contains("gate spelling output (last 2 line(s))"));
+    assert!(stderr.contains("diagnostic-one"));
+    assert!(stderr.contains("diagnostic-two"));
+    assert!(!repo.path().join("gate-runs.txt").exists());
+
+    let unknown = run(repo.path(), &["gates", "run", "--all", "--only", "missing"]);
+    assert!(!unknown.status.success());
+    assert!(
+        String::from_utf8(unknown.stderr)
+            .unwrap()
+            .contains("no configured gate named")
+    );
+}
+
+#[test]
+fn submit_replays_a_bounded_gate_failure_tail() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    std::fs::write(tmp.path().join("tracked.txt"), "base\n").unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/gates.toml"),
+        "[[gate]]\nname = 'failure'\ncommand = \"printf 'submit-diagnostic\\n' >&2; exit 1\"\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-qm", "fixture"]);
+
+    let worktree = tmp.path().join(".aethyme/worktrees/submit-failure");
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    git(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/submit-failure",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let adopted: serde_json::Value = serde_json::from_str(&stdout(run(
+        &worktree,
+        &["adopt", "--task", "failure output", "--json"],
+    )))
+    .unwrap();
+    let session = adopted["id"].as_i64().unwrap().to_string();
+    std::fs::write(worktree.join("tracked.txt"), "changed\n").unwrap();
+    git(&worktree, &["add", "tracked.txt"]);
+    git(&worktree, &["commit", "-qm", "change"]);
+
+    let failed = run(&worktree, &["submit", "--session", &session]);
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8(failed.stderr).unwrap();
+    assert!(stderr.contains("gate failure output (last 1 line(s))"));
+    assert!(stderr.contains("submit-diagnostic"));
+}

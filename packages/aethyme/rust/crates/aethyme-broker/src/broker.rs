@@ -46,6 +46,8 @@ pub enum BrokerOpError {
     RemoteTarget(#[from] crate::RemoteTargetError),
     #[error(transparent)]
     HostOperation(#[from] crate::HostOperationError),
+    #[error("no configured gate named {name:?}")]
+    UnknownGate { name: String },
     #[error("refusing to clean session {id}: {reason} (use --force to discard)")]
     DirtyWorktree { id: i64, reason: String },
     #[error(
@@ -3352,6 +3354,29 @@ impl Broker {
         )
     }
 
+    /// Run one configured gate for a session, regardless of whether its
+    /// path triggers match the current diff. This is the targeted rerun lane
+    /// after a gate failure; resource ownership still uses matching changed
+    /// paths when they are available.
+    pub fn run_named_gate_with_policy(
+        &mut self,
+        session_id: i64,
+        gate_name: &str,
+        cache_policy: crate::gates::CachePolicy,
+    ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
+        let (checkout, gates, changed) = self.gate_inputs(session_id)?;
+        crate::gates::run_named(
+            &mut self.store,
+            &self.main_root,
+            &checkout,
+            &gates,
+            &changed,
+            gate_name,
+            Some(session_id),
+            cache_policy,
+        )
+    }
+
     /// Test/non-CLI entrypoint for gate runs with injectable progress
     /// reporting. The default [`Self::run_gates`] sink writes to stderr.
     pub fn run_gates_with_progress(
@@ -3433,6 +3458,28 @@ impl Broker {
             &self.main_root,
             &checkout,
             &gates,
+            None,
+            cache_policy,
+        )
+    }
+
+    /// Run one configured gate against the checkout containing `dir`.
+    pub fn run_named_gate_for_checkout_with_policy(
+        &mut self,
+        dir: &Path,
+        gate_name: &str,
+        cache_policy: crate::gates::CachePolicy,
+    ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
+        let checkout = GitRepo::discover(dir)?;
+        let config_root = checkout.root().to_path_buf();
+        let gates = self.load_and_sync_gates_from(&config_root)?;
+        crate::gates::run_named(
+            &mut self.store,
+            &self.main_root,
+            &checkout,
+            &gates,
+            &[],
+            gate_name,
             None,
             cache_policy,
         )

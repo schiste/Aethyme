@@ -233,8 +233,13 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker gates validate [--json]`
 - `aethyme broker gates affected --session <id> [--why] [--json]`
 - `aethyme broker gates semantic --session <id> [--json]`
-- `aethyme broker gates run --session <id> [--no-cache] [--json]`
-- `aethyme broker gates run --all [--no-cache] [--json]`
+- `aethyme broker gates run --session <id> [--only <gate>] [--no-cache] [--json]`
+- `aethyme broker gates run --all [--only <gate>] [--no-cache] [--json]`
+
+`--only <gate>` runs exactly one configured gate, regardless of its path
+triggers, for focused diagnosis after a failure. Text-mode failures replay the
+last 20 captured output lines (bounded to 16 KiB); JSON remains structured and
+continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker gates pre-push <remote-name> [<remote-url>] [--no-cache] [--json]`
 - `aethyme broker hooks install [--json]`
 - `aethyme broker hooks uninstall [--json]`

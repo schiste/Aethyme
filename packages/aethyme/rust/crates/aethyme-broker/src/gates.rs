@@ -698,6 +698,44 @@ pub(crate) fn run_all_with_progress(
     )
 }
 
+/// Run one explicitly selected gate. Unlike affected selection, an exact
+/// name is authoritative even when its path triggers do not match the diff.
+pub(crate) fn run_named(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gates: &[Gate],
+    changed: &[String],
+    name: &str,
+    session_id: Option<i64>,
+    cache_policy: CachePolicy,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    let gate = gates.iter().find(|gate| gate.name == name).ok_or_else(|| {
+        crate::broker::BrokerOpError::UnknownGate {
+            name: name.to_string(),
+        }
+    })?;
+    let owner_paths = changed
+        .iter()
+        .filter(|path| gate.matches(path))
+        .cloned()
+        .collect();
+    let progress = StderrGateProgressSink;
+    run_selections(
+        store,
+        main_root,
+        checkout,
+        vec![Selection {
+            gate,
+            triggered_by: None,
+            owner_paths,
+        }],
+        session_id,
+        cache_policy,
+        &progress,
+    )
+}
+
 struct GateOwnerLocks {
     _files: Vec<std::fs::File>,
 }
