@@ -636,3 +636,69 @@ fn rebase_onto_integration_does_not_inflate_leases() {
          phantom lease (#41): {s2_paths:?}"
     );
 }
+
+#[test]
+fn equivalent_tree_publication_starts_from_integration_without_phantom_leases() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+
+    let integration_builder = add_worktree(tmp.path(), "equivalent-integration");
+    std::fs::create_dir_all(integration_builder.join("gadget")).unwrap();
+    std::fs::write(integration_builder.join("gadget/wait.js"), "ready\n").unwrap();
+    sh(&integration_builder, &["add", "gadget/wait.js"]);
+    sh(
+        &integration_builder,
+        &["commit", "-qm", "integration identity"],
+    );
+    sh(
+        tmp.path(),
+        &[
+            "branch",
+            "-f",
+            "aethyme/integration",
+            "agent/equivalent-integration",
+        ],
+    );
+
+    std::fs::create_dir_all(tmp.path().join("gadget")).unwrap();
+    std::fs::write(tmp.path().join("gadget/wait.js"), "ready\n").unwrap();
+    sh(tmp.path(), &["add", "gadget/wait.js"]);
+    sh(tmp.path(), &["commit", "-qm", "published identity"]);
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let repository = aethyme_broker::GitRepo::discover(tmp.path()).unwrap();
+    let main = repository.resolve_ref("main").unwrap();
+    let integration = repository.resolve_ref("aethyme/integration").unwrap();
+    assert_ne!(main, integration);
+    assert_eq!(
+        repository.commit_tree_id(&main).unwrap(),
+        repository.commit_tree_id(&integration).unwrap()
+    );
+
+    let started = broker.start_worktree("disjoint proxy change").unwrap();
+    assert_eq!(started.diff_base, Some(integration.clone()));
+    let started_checkout =
+        aethyme_broker::GitRepo::discover(Path::new(&started.worktree_path)).unwrap();
+    assert_eq!(started_checkout.head_commit().unwrap(), integration);
+    let worktree = Path::new(&started.worktree_path);
+    std::fs::create_dir_all(worktree.join("proxy")).unwrap();
+    std::fs::write(worktree.join("proxy/app.py"), "proxy = True\n").unwrap();
+    sh(worktree, &["add", "proxy/app.py"]);
+    sh(worktree, &["commit", "-qm", "proxy change"]);
+
+    broker.refresh_leases().unwrap();
+    let session_paths = broker
+        .store()
+        .active_leases()
+        .unwrap()
+        .into_iter()
+        .filter(|lease| lease.session_id == started.id)
+        .map(|lease| lease.path)
+        .collect::<Vec<_>>();
+    assert_eq!(session_paths, vec!["proxy/app.py"]);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!(broker.status(now_ms).unwrap().promoted_conflicts.is_empty());
+}
