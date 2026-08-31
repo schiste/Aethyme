@@ -867,6 +867,14 @@ fn conflicting_submission_rejected_pre_gate_with_instruction_drop() {
             .any(|command| command.contains("broker-action-required.md")),
         "{advice:?}"
     );
+    assert!(!advice.summary.contains("stash"), "{advice:?}");
+    assert!(
+        advice
+            .commands
+            .iter()
+            .all(|command| !command.contains("stash")),
+        "{advice:?}"
+    );
 
     let err = broker.repair(b.id).unwrap_err().to_string();
     assert!(
@@ -1816,6 +1824,12 @@ fn repair_rebases_promoted_conflict_and_reports_affected_gates() {
 
     let before = broker.status(0).unwrap();
     assert_eq!(before.promoted_conflicts.len(), 1);
+
+    std::fs::write(wt_live.join("dirty.txt"), "preserve me\n").unwrap();
+    let dirty_error = broker.repair(live.id).unwrap_err().to_string();
+    assert!(dirty_error.contains("managed pre-commit lane"));
+    assert!(!dirty_error.contains("stash"));
+    std::fs::remove_file(wt_live.join("dirty.txt")).unwrap();
 
     let report = broker.repair(live.id).unwrap();
     assert_eq!(report.source, RepairSource::PromotedConflict);

@@ -3038,7 +3038,7 @@ impl Broker {
                 return Err(BrokerOpError::DirtyWorktree {
                     id: session_id,
                     reason: format!(
-                        "worktree has uncommitted changes; commit or stash before repair, e.g. {}",
+                        "worktree has uncommitted changes; commit through the managed pre-commit lane before repair, e.g. {}",
                         dirty.first().map(String::as_str).unwrap_or("-")
                     ),
                 });
@@ -4643,7 +4643,7 @@ impl Broker {
 
         if !report.dirty_paths.is_empty() {
             report.warnings.push(format!(
-                "worktree has {} uncommitted or untracked {}; commit or stash before finish",
+                "worktree has {} uncommitted or untracked {}; commit through the managed pre-commit lane before finish",
                 report.dirty_paths.len(),
                 plural_word(report.dirty_paths.len(), "path", "paths")
             ));
@@ -4656,9 +4656,6 @@ impl Broker {
             report
                 .next_commands
                 .push(format!("git -C {} commit", session.worktree_path));
-            report
-                .next_commands
-                .push(format!("git -C {} stash push", session.worktree_path));
             self.finalize_finish_report(&mut report);
             return Ok(report);
         }
@@ -5209,7 +5206,7 @@ fn status_summary(
     let mut notes = Vec::new();
     if dirty_sessions > 0 {
         notes.push(format!(
-            "{} dirty {} need commit/stash before submit",
+            "{} dirty {} need commit before submit",
             dirty_sessions,
             plural_word(dirty_sessions, "session", "sessions")
         ));
@@ -5499,7 +5496,7 @@ fn integration_live_sessions(sessions: Vec<Session>) -> Vec<IntegrationLiveSessi
 
 fn dirty_worktree_advice(agent: &AgentView, dirty: &[String]) -> StatusAdvice {
     let summary = format!(
-        "session {} has {} uncommitted change(s); commit or stash before submit because only committed work integrates",
+        "session {} has {} uncommitted change(s); commit through the managed pre-commit lane before submit because only committed work integrates",
         agent.session.id,
         dirty.len()
     );
@@ -5516,7 +5513,6 @@ fn dirty_worktree_advice(agent: &AgentView, dirty: &[String]) -> StatusAdvice {
             format!("git -C {worktree} status --short"),
             format!("git -C {worktree} add ..."),
             format!("git -C {worktree} commit"),
-            format!("git -C {worktree} stash push"),
         ],
     }
 }

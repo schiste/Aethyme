@@ -161,3 +161,17 @@ fn finish_cli_text_summarizes_the_structured_handoff() {
         "{text}"
     );
 }
+
+#[test]
+fn dirty_finish_guidance_is_stash_free() {
+    let (tmp, session_id) = promoted_fixture();
+    let worktree = tmp.path().join(".aethyme/worktrees/finish-cli");
+    std::fs::write(worktree.join("dirty.txt"), "keep me\n").unwrap();
+    let session = session_id.to_string();
+    let output = run(tmp.path(), &["finish", "--session", &session, "--json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rendered = report.to_string();
+    assert!(rendered.contains("managed pre-commit lane"), "{rendered}");
+    assert!(!rendered.contains("stash"), "{rendered}");
+}
