@@ -180,6 +180,126 @@ fn core_hooks_path_override_refuses_install() {
 }
 
 #[test]
+fn protected_branch_commit_requires_a_live_local_session_when_broker_is_deployed() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let _broker = Broker::open(tmp.path()).unwrap();
+    let repo = GitRepo::discover(tmp.path()).unwrap();
+    hooks::install(&repo, Path::new(SHIM)).unwrap();
+
+    std::fs::write(tmp.path().join("docs.md"), "staged work\n").unwrap();
+    sh(tmp.path(), &["add", "docs.md"]);
+    let head_before = head_commit(tmp.path());
+    let blocked = git_output(tmp.path(), &["commit", "-qm", "uncoordinated"]);
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+
+    assert!(
+        !blocked.status.success(),
+        "protected commit must be refused"
+    );
+    assert!(stderr.contains("not owned by a live session"), "{stderr}");
+    assert!(stderr.contains("aethyme broker status --json"), "{stderr}");
+    assert!(stderr.contains("aethyme broker adopt"), "{stderr}");
+    assert!(stderr.contains("--path 'docs.md'"), "{stderr}");
+    assert!(!stderr.contains("--session"), "{stderr}");
+    assert_eq!(head_commit(tmp.path()), head_before);
+    let staged = git_output(tmp.path(), &["diff", "--cached", "--name-only"]);
+    assert_eq!(String::from_utf8_lossy(&staged.stdout).trim(), "docs.md");
+}
+
+#[test]
+fn protected_branch_commit_passes_after_adopting_the_exact_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("coordinated docs")).unwrap();
+    assert_eq!(session.branch, "main");
+    let repo = GitRepo::discover(tmp.path()).unwrap();
+    hooks::install(&repo, Path::new(SHIM)).unwrap();
+
+    std::fs::write(tmp.path().join("docs.md"), "coordinated work\n").unwrap();
+    sh(tmp.path(), &["add", "docs.md"]);
+    let committed = git_output(tmp.path(), &["commit", "-qm", "coordinated"]);
+    assert!(
+        committed.status.success(),
+        "active exact-worktree session should pass: {}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+}
+
+#[test]
+fn contributors_without_local_broker_state_and_unprotected_branches_remain_unblocked() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let repo = GitRepo::discover(tmp.path()).unwrap();
+    hooks::install(&repo, Path::new(SHIM)).unwrap();
+    std::fs::write(tmp.path().join("docs.md"), "no local broker\n").unwrap();
+    sh(tmp.path(), &["add", "docs.md"]);
+    sh(tmp.path(), &["commit", "-qm", "ordinary contributor"]);
+
+    let _broker = Broker::open(tmp.path()).unwrap();
+    sh(tmp.path(), &["switch", "-qc", "human-feature"]);
+    std::fs::write(tmp.path().join("docs.md"), "feature work\n").unwrap();
+    sh(tmp.path(), &["add", "docs.md"]);
+    let feature = git_output(tmp.path(), &["commit", "-qm", "feature contributor"]);
+    assert!(
+        feature.status.success(),
+        "unprotected feature branch remains usable"
+    );
+}
+
+#[test]
+fn protected_branch_commit_refuses_behind_or_diverged_fetched_upstream() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    sh(tmp.path(), &["switch", "-qc", "upstream-change"]);
+    std::fs::write(tmp.path().join("upstream.txt"), "upstream\n").unwrap();
+    sh(tmp.path(), &["add", "upstream.txt"]);
+    sh(tmp.path(), &["commit", "-qm", "upstream"]);
+    let upstream = head_commit(tmp.path());
+
+    sh(tmp.path(), &["switch", "main"]);
+    std::fs::write(tmp.path().join("local.txt"), "local\n").unwrap();
+    sh(tmp.path(), &["add", "local.txt"]);
+    sh(tmp.path(), &["commit", "-qm", "local"]);
+    sh(tmp.path(), &["remote", "add", "origin", "."]);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", &upstream],
+    );
+    sh(tmp.path(), &["config", "branch.main.remote", "origin"]);
+    sh(
+        tmp.path(),
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("stale main work")).unwrap();
+    let repo = GitRepo::discover(tmp.path()).unwrap();
+    hooks::install(&repo, Path::new(SHIM)).unwrap();
+    std::fs::write(tmp.path().join("docs.md"), "unsafe follow-up\n").unwrap();
+    sh(tmp.path(), &["add", "docs.md"]);
+
+    let head_before = head_commit(tmp.path());
+    let blocked = git_output(tmp.path(), &["commit", "-qm", "unsafe"]);
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(!blocked.status.success());
+    assert!(
+        stderr.contains("1 commit(s) ahead and 1 commit(s) behind"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("session {} remains active", session.id)),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("integration reconcile --upstream origin/main --dry-run"),
+        "{stderr}"
+    );
+    assert_eq!(head_commit(tmp.path()), head_before);
+}
+
+#[test]
 fn pre_commit_gate_blocks_failing_commit_and_passes_clean_one() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

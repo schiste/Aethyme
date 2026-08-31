@@ -71,6 +71,32 @@ pub enum HooksError {
          with `git commit --no-verify`."
     )]
     GateFailed { gate: String, code: i32 },
+    #[error(
+        "git commit refused by Aethyme pre-commit:\n\
+         broker coordination is active, but protected branch {branch:?} in {worktree:?} is not owned by a live session.\n\
+         Your staged changes remain unchanged.\n\
+         Inspect: aethyme broker status --json\n\
+         Preserve and attribute this work: {adopt_command}"
+    )]
+    SessionRequired {
+        branch: String,
+        worktree: String,
+        adopt_command: String,
+    },
+    #[error(
+        "git commit refused by Aethyme pre-commit:\n\
+         protected branch {branch:?} is {ahead} commit(s) ahead and {behind} commit(s) behind {upstream}; committing on this stale history is unsafe.\n\
+         Your staged changes remain unchanged and session {session_id} remains active.\n\
+         Inspect: aethyme broker status --json\n\
+         Plan recovery: aethyme broker integration reconcile --upstream {upstream} --dry-run"
+    )]
+    ProtectedBranchDiverged {
+        branch: String,
+        upstream: String,
+        ahead: u64,
+        behind: u64,
+        session_id: i64,
+    },
 }
 
 impl HooksError {
@@ -376,6 +402,7 @@ pub fn status(repo: &GitRepo) -> Result<Vec<HookReport>, HooksError> {
 pub fn run_pre_commit(cwd: &Path) -> Result<(), HooksError> {
     let checkout = GitRepo::discover(cwd)?;
     let main_root = checkout.main_root()?;
+    enforce_protected_branch_session(&checkout, &main_root)?;
     let gates = match load_gates(&main_root) {
         // No config = no commit-time policy. A *broken* config still
         // blocks: silently skipping validation would be worse.
@@ -405,6 +432,81 @@ pub fn run_pre_commit(cwd: &Path) -> Result<(), HooksError> {
         }
     }
     Ok(())
+}
+
+/// Fail closed at Git's write boundary when this machine has opted into
+/// broker coordination. Repositories without local broker state retain the
+/// cheap no-op behavior expected by contributors who have not deployed
+/// Aethyme locally.
+fn enforce_protected_branch_session(
+    checkout: &GitRepo,
+    main_root: &Path,
+) -> Result<(), HooksError> {
+    if !main_root.join(crate::BROKER_DB_RELPATH).exists() {
+        return Ok(());
+    }
+
+    let branch = checkout.current_branch()?;
+    if !protected_branches(checkout).contains(&branch) {
+        return Ok(());
+    }
+
+    let store = BrokerStore::open_snapshot_in_repo(main_root)?;
+    let worktree = checkout.root().to_string_lossy().into_owned();
+    let session = store
+        .session_for_worktree(&worktree)?
+        .filter(|session| session.branch == branch)
+        .ok_or_else(|| HooksError::SessionRequired {
+            branch: branch.clone(),
+            worktree: worktree.clone(),
+            adopt_command: adopt_command(&worktree, &checkout.staged_files().unwrap_or_default()),
+        })?;
+
+    if let Some((upstream, upstream_head)) = checkout.tracking_upstream() {
+        let head = checkout.head_commit()?;
+        let ahead = checkout.commit_count_between(&upstream_head, &head)?;
+        let behind = checkout.commit_count_between(&head, &upstream_head)?;
+        if behind > 0 {
+            return Err(HooksError::ProtectedBranchDiverged {
+                branch,
+                upstream,
+                ahead,
+                behind,
+                session_id: session.id,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn protected_branches(checkout: &GitRepo) -> BTreeSet<String> {
+    let mut branches = BTreeSet::from(["aethyme/integration".to_string()]);
+    if let Some(remote_head) = checkout.symbolic_ref("refs/remotes/origin/HEAD")
+        && let Some(branch) = remote_head.strip_prefix("refs/remotes/origin/")
+    {
+        branches.insert(branch.to_string());
+    }
+    for conventional in ["main", "master"] {
+        if checkout
+            .resolve_ref(&format!("refs/heads/{conventional}"))
+            .is_some()
+        {
+            branches.insert(conventional.to_string());
+        }
+    }
+    branches
+}
+
+fn adopt_command(worktree: &str, staged: &[String]) -> String {
+    let mut command = format!(
+        "aethyme broker adopt {} --task \"<task>\"",
+        sh_quote(worktree)
+    );
+    for path in staged {
+        command.push_str(" --path ");
+        command.push_str(&sh_quote(path));
+    }
+    command
 }
 
 fn replay_gate_output(output: &std::process::Output) -> Result<(), HooksError> {

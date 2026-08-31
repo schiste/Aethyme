@@ -267,6 +267,15 @@ check the paired runtime with `aethyme --version` and
 `aethyme-engine-cli --version`.
 Follow this protocol:
 
+When `aethyme broker hooks install` is active (or its pre-commit command is
+wired into an existing hook manager), Git enforces the session boundary on
+protected branches: local broker state requires the exact worktree to belong
+to a live session, and fetched upstream divergence blocks the commit before
+Git writes it. Staged changes remain intact and the refusal prints a valid
+adoption or reconciliation command. This enforcement is local-only; without a
+local broker database, contributors who have not deployed Aethyme are not
+blocked.
+
 1. **Broker entry point, before editing**: check current activity, create an
    isolated broker worktree, and work from that checkout:
 
@@ -699,6 +708,8 @@ mod tests {
         std::fs::write(repo.join(".aethyme/gates.toml"), "[[gate]]\n").unwrap();
         let doc = render_agents_document(Some(&repo)).unwrap();
         assert!(doc.contains("## Broker Coordination (multi-agent repository)"));
+        assert!(doc.contains("Git enforces the session boundary on\nprotected branches"));
+        assert!(doc.contains("This enforcement is local-only"));
         assert!(doc.contains("aethyme broker submit --session"));
         assert!(doc.contains("single-parent patch\n   series"));
         assert!(doc.contains("preserve the current HEAD on the named recovery branch"));

@@ -205,7 +205,10 @@ Usage:
   aethyme broker hooks install [--json]
       Explicitly install the two managed git hooks into the shared
       <git-common-dir>/hooks (all worktrees see them): pre-commit runs
-      the cost<=1 gates whose triggers match the staged files. Successful
+      a fail-closed session/upstream guard on protected branches whenever
+      local broker state exists, then the cost<=1 gates whose triggers match
+      the staged files. Repositories without local broker state remain a
+      no-op for contributors who have not deployed Aethyme. Successful
       gates are silent; a failure replays its complete stdout/stderr,
       reports the diagnosis, preserves its exit code, and blocks the
       commit. Post-commit warns when the new commit touches files another
@@ -383,7 +386,12 @@ pub fn run_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
         }
         Err(UsageError::SilentExit(code)) => (code, true),
     };
-    if mode == CompatibilityMode::Normal {
+    let internal_hook = args.first().map(String::as_str) == Some("hooks")
+        && matches!(
+            args.get(1).map(String::as_str),
+            Some("pre-commit" | "post-commit")
+        );
+    if mode == CompatibilityMode::Normal && !internal_hook {
         if record_outcome {
             record_command_outcome(args, code);
         }
