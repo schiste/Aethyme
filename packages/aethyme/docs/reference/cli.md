@@ -223,6 +223,10 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker note send --session <sender> --to-session <recipient> --message <text> [--json]`
 - `aethyme broker note list --session <recipient> [--json]`
 - `aethyme broker note ack --session <recipient> --id <note-id> [--json]`
+
+Text status renders current merge-queue entries individually and collapses
+terminal history into counts; use `aethyme broker queue` for the complete
+history. JSON status retains the complete structured queue for compatibility.
 - `aethyme broker resources plan <request.json> [--json]`
 - `aethyme broker resources acquire <request.json> [--wait <duration>] [--grant-out <path>] [--json]`
 - `aethyme broker resources run <request.json> [--wait <duration>] [--cleanup-command <shell>] [--json] -- <command> ...`

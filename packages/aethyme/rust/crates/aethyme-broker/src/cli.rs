@@ -624,6 +624,26 @@ mod tests {
     }
 
     #[test]
+    fn status_queue_projection_separates_current_from_terminal_states() {
+        for status in [
+            crate::MergeStatus::Submitted,
+            crate::MergeStatus::Simulating,
+            crate::MergeStatus::Conflict,
+            crate::MergeStatus::Verified,
+        ] {
+            assert!(super::queue_status_is_current(status));
+        }
+        for status in [
+            crate::MergeStatus::Promoted,
+            crate::MergeStatus::ExternallyLanded,
+            crate::MergeStatus::Rejected,
+            crate::MergeStatus::Superseded,
+        ] {
+            assert!(!super::queue_status_is_current(status));
+        }
+    }
+
+    #[test]
     fn telemetry_classification_tracks_semantic_mutability() {
         for command in [
             args(&["certify"]),
@@ -1856,6 +1876,34 @@ fn render_status_advice(advice: &[crate::StatusAdvice]) {
             println!("     run: {command}");
         }
     }
+}
+
+fn queue_status_is_current(status: crate::MergeStatus) -> bool {
+    matches!(
+        status,
+        crate::MergeStatus::Submitted
+            | crate::MergeStatus::Simulating
+            | crate::MergeStatus::Conflict
+            | crate::MergeStatus::Verified
+    )
+}
+
+fn terminal_queue_counts(entries: &[crate::MergeQueueEntry]) -> Vec<(crate::MergeStatus, usize)> {
+    [
+        crate::MergeStatus::Promoted,
+        crate::MergeStatus::ExternallyLanded,
+        crate::MergeStatus::Rejected,
+        crate::MergeStatus::Superseded,
+    ]
+    .into_iter()
+    .filter_map(|status| {
+        let count = entries
+            .iter()
+            .filter(|entry| entry.status == status)
+            .count();
+        (count > 0).then_some((status, count))
+    })
+    .collect()
 }
 
 fn render_repair_report(report: &crate::RepairReport) {
@@ -5208,10 +5256,16 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         println!("  session {}: {}", lease.session_id, lease.path);
                     }
                 }
-                if !status.queue.is_empty() {
+                let current_queue = status
+                    .queue
+                    .iter()
+                    .filter(|entry| queue_status_is_current(entry.status))
+                    .collect::<Vec<_>>();
+                if !current_queue.is_empty() {
                     println!();
+                    println!("Current merge queue:");
                     println!("{:<4} {:<4} {:<11} HEAD", "QID", "SID", "QSTATUS");
-                    for entry in &status.queue {
+                    for entry in current_queue {
                         println!(
                             "{:<4} {:<4} {:<11} {}",
                             entry.id,
@@ -5220,6 +5274,24 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             &entry.head_commit[..12.min(entry.head_commit.len())]
                         );
                     }
+                }
+                let terminal_counts = terminal_queue_counts(&status.queue);
+                if !terminal_counts.is_empty() {
+                    let total = terminal_counts
+                        .iter()
+                        .map(|(_, count)| count)
+                        .sum::<usize>();
+                    let summary = terminal_counts
+                        .iter()
+                        .map(|(status, count)| format!("{} {count}", status.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!();
+                    println!(
+                        "Queue history: {total} terminal {} ({summary}).",
+                        plural(total, "entry", "entries")
+                    );
+                    println!("  inspect: aethyme broker queue");
                 }
                 if !status.outstanding_entry_exposures.is_empty() {
                     println!();
