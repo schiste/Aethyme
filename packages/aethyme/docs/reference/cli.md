@@ -263,7 +263,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
 - `aethyme broker cleanup <session-id> [--force] [--json]`
-- `aethyme broker cleanup --all-cleaned [--apply] [--json]`
+- `aethyme broker cleanup --all-cleaned [--apply --confirm <sha256>] [--json]`
 - `aethyme broker handoff (--session <id> | --worktree <path>) [--json]`
 - `aethyme broker report capture --kind <bug|improvement> --title <text> [--session <id>] [--include-task] [--stdout | --output <filename>] [--json]`
 - `aethyme broker report list [--json]`
@@ -529,11 +529,17 @@ do not emit a misleading or duplicate completion event.
 Finishing closes broker state but retains the worktree for review or reuse.
 `broker cleanup <session-id>` removes one exact session worktree after its
 safety checks. `broker cleanup --all-cleaned` is a read-only bulk plan by
-default; it reports eligible and refused broker-spawned worktrees plus estimated
-bytes. Add `--apply` to revalidate and remove only eligible candidates. Adopted
-worktrees are outside the sweep, and dirty, symlinked, unsafe-path, inspection-
-failed, and unrepresented-commit candidates remain untouched. `--force` is
-available only for exact-session cleanup and is rejected with `--all-cleaned`.
+default. It classifies each retained worktree and branch as represented,
+pending, or unproven from the accepted session checkpoint, queue entry, promoted
+integration commit/tree, and current delivery refs. The plan includes exact
+inspection commands, byte estimates, branch tips, and a SHA-256 digest. Apply
+the reviewed plan with `--apply --confirm <sha256>`; apply rebuilds the plan and
+revalidates every candidate before removing the worktree and its exact checked
+session branch. An interruption after worktree removal leaves the branch in the
+next plan for safe recovery. Adopted worktrees are outside the sweep, and dirty,
+symlinked, unsafe-path, pending, unproven, or inspection-failed candidates remain
+untouched. `--force` is available only for one exact session and is rejected
+with `--all-cleaned`; there is no blanket discard authorization.
 
 Retrieve the newest persisted handoff without changing broker state:
 

@@ -340,7 +340,7 @@ Usage:
       Aethyme source checkout, then fail if integration moved during the
       run so the result cannot be mistaken for current-tip proof.
   aethyme broker cleanup <session-id> [--force] [--json]
-  aethyme broker cleanup --all-cleaned [--apply] [--json]
+  aethyme broker cleanup --all-cleaned [--apply --confirm <sha256>] [--json]
       Remove one session worktree, or inventory all retained broker-owned
       worktrees from already-closed sessions. Bulk cleanup is a read-only plan
       by default; --apply revalidates and removes only clean worktrees whose
@@ -2087,10 +2087,13 @@ fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport) {
         report.plan.eligible_worktree_count,
     );
     println!(
-        "  retained: {}; reclaimable now: {}",
+        "  retained: {}; reclaimable now: {}; branches: {} retained, {} eligible",
         human_bytes(report.plan.estimated_retained_bytes),
         human_bytes(report.plan.estimated_reclaimable_bytes),
+        report.plan.retained_branch_count,
+        report.plan.eligible_branch_count,
     );
+    println!("  reviewed plan digest: {}", report.plan.digest);
     for item in &report.plan.worktrees {
         println!(
             "  session {}: {} ({}) — {}",
@@ -2102,6 +2105,15 @@ fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport) {
             item.reason,
         );
         println!("    {}", item.worktree_path);
+        if let Some(branch_tip) = &item.branch_tip {
+            println!("    {} at {}", item.branch_ref, branch_tip);
+        }
+        for command in &item.inspection_commands {
+            println!("    inspect: {command}");
+        }
+        if !item.eligible() {
+            println!("    explicit discard: {}", item.force_cleanup_command);
+        }
     }
     if report.applied {
         println!(
@@ -2123,8 +2135,11 @@ fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport) {
                 failure.session_id, failure.reason
             );
         }
-    } else if report.plan.eligible_worktree_count > 0 {
-        println!("  apply: aethyme broker cleanup --all-cleaned --apply");
+    } else if report.plan.eligible_worktree_count > 0 || report.plan.eligible_branch_count > 0 {
+        println!(
+            "  apply: aethyme broker cleanup --all-cleaned --apply --confirm {}",
+            report.plan.digest
+        );
     }
 }
 
@@ -5864,7 +5879,14 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             .into(),
                     ));
                 }
-                let report = broker.cleanup_cleaned_worktrees(parsed.apply)?;
+                if !parsed.apply && parsed.confirm.is_some() {
+                    return Err(UsageError::Message(
+                        "cleanup --all-cleaned --confirm requires --apply; review the current plan first"
+                            .into(),
+                    ));
+                }
+                let report =
+                    broker.cleanup_cleaned_worktrees(parsed.apply, parsed.confirm.as_deref())?;
                 if parsed.json {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 } else {

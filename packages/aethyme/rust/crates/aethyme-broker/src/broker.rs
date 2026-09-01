@@ -50,6 +50,10 @@ pub enum BrokerOpError {
     UnknownGate { name: String },
     #[error("refusing to clean session {id}: {reason} (use --force to discard)")]
     DirtyWorktree { id: i64, reason: String },
+    #[error("bulk cleanup confirmation must be a full SHA-256 digest")]
+    CleanupConfirmationNotSha256,
+    #[error("bulk cleanup confirmation mismatch: expected {expected}, received {actual}")]
+    CleanupConfirmationMismatch { expected: String, actual: String },
     #[error(
         "repair paused during rebase for session {id} onto {base}: {message}\n\
          Resolve conflicts in the session worktree, then run \
@@ -572,7 +576,8 @@ pub struct VersionRepairStep {
 pub enum CleanupDisposition {
     Eligible,
     Dirty,
-    UnrepresentedCommits,
+    PendingCommits,
+    UnprovenProvenance,
     UnsafePath,
     InspectionFailed,
 }
@@ -582,21 +587,51 @@ impl CleanupDisposition {
         match self {
             Self::Eligible => "eligible",
             Self::Dirty => "dirty",
-            Self::UnrepresentedCommits => "unrepresented_commits",
+            Self::PendingCommits => "pending_commits",
+            Self::UnprovenProvenance => "unproven_provenance",
             Self::UnsafePath => "unsafe_path",
             Self::InspectionFailed => "inspection_failed",
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupRepresentation {
+    Represented,
+    Pending,
+    Unproven,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CleanupProvenance {
+    pub representation: CleanupRepresentation,
+    pub session_head: String,
+    pub adopted_head: Option<String>,
+    pub accepted_session_head: Option<String>,
+    pub accepted_integration_commit: Option<String>,
+    pub accepted_integration_tree: Option<String>,
+    pub accepted_queue_entry_id: Option<i64>,
+    pub accepted_queue_status: Option<MergeStatus>,
+    pub represented_on: Option<String>,
+    pub pending_commit_count: u64,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CleanupWorktreePlan {
     pub session_id: i64,
     pub worktree_path: String,
+    pub worktree_present: bool,
+    pub branch_ref: String,
+    pub branch_tip: Option<String>,
+    pub delete_branch: bool,
     pub origin: SessionOrigin,
     pub disposition: CleanupDisposition,
+    pub provenance: Option<CleanupProvenance>,
     pub estimated_bytes: Option<u64>,
     pub reason: String,
+    pub inspection_commands: Vec<String>,
+    pub force_cleanup_command: String,
 }
 
 impl CleanupWorktreePlan {
@@ -605,13 +640,35 @@ impl CleanupWorktreePlan {
     }
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize)]
+pub const CLEANUP_PLAN_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CleanupPlan {
+    pub schema_version: u32,
+    pub digest: String,
     pub retained_worktree_count: usize,
     pub eligible_worktree_count: usize,
+    pub retained_branch_count: usize,
+    pub eligible_branch_count: usize,
     pub estimated_retained_bytes: u64,
     pub estimated_reclaimable_bytes: u64,
     pub worktrees: Vec<CleanupWorktreePlan>,
+}
+
+impl Default for CleanupPlan {
+    fn default() -> Self {
+        Self {
+            schema_version: CLEANUP_PLAN_SCHEMA_VERSION,
+            digest: String::new(),
+            retained_worktree_count: 0,
+            eligible_worktree_count: 0,
+            retained_branch_count: 0,
+            eligible_branch_count: 0,
+            estimated_retained_bytes: 0,
+            estimated_reclaimable_bytes: 0,
+            worktrees: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -4785,7 +4842,7 @@ impl Broker {
         }
         Ok(matches!(
             self.cleanup_eligibility(session_id, worktree_path)?,
-            (CleanupDisposition::Eligible, _)
+            (CleanupDisposition::Eligible, _, _)
         ))
     }
 
@@ -4821,21 +4878,26 @@ impl Broker {
         let Ok(root) = self.broker_worktree_root().canonicalize() else {
             return false;
         };
-        let Ok(path) = path.canonicalize() else {
-            return false;
-        };
-        path.starts_with(root)
+        if path.exists() {
+            return path
+                .canonicalize()
+                .is_ok_and(|path| path.starts_with(&root));
+        }
+        path.parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .is_some_and(|parent| parent == root)
     }
 
     fn cleanup_eligibility(
         &self,
         session_id: i64,
         worktree_path: &Path,
-    ) -> Result<(CleanupDisposition, String), BrokerOpError> {
+    ) -> Result<(CleanupDisposition, String, Option<CleanupProvenance>), BrokerOpError> {
         if worktree_path == self.main_root.as_path() {
             return Ok((
                 CleanupDisposition::UnsafePath,
                 "the primary checkout is never removable by broker cleanup".into(),
+                None,
             ));
         }
         let metadata =
@@ -4847,6 +4909,7 @@ impl Broker {
             return Ok((
                 CleanupDisposition::UnsafePath,
                 "worktree path is a symlink".into(),
+                None,
             ));
         }
 
@@ -4855,10 +4918,12 @@ impl Broker {
             return Ok((
                 CleanupDisposition::Dirty,
                 "worktree has uncommitted or untracked changes".into(),
+                None,
             ));
         }
 
         let session_head = checkout.head_commit()?;
+        let session = self.store.session(session_id)?;
         let mut delivery_targets = vec![self.repo.head_commit()?];
         if let Some(integration) = self.integration_tip() {
             delivery_targets.push(integration);
@@ -4868,26 +4933,271 @@ impl Broker {
         }
         delivery_targets.sort();
         delivery_targets.dedup();
+        let (provenance, reason) =
+            self.cleanup_provenance(&session, &session_head, &delivery_targets)?;
+        let disposition = match provenance.representation {
+            CleanupRepresentation::Represented => CleanupDisposition::Eligible,
+            CleanupRepresentation::Pending => CleanupDisposition::PendingCommits,
+            CleanupRepresentation::Unproven => CleanupDisposition::UnprovenProvenance,
+        };
+        Ok((disposition, reason, Some(provenance)))
+    }
 
-        for target in &delivery_targets {
-            if checkout.unmerged_commit_count(target)? == 0
-                || self.submitted_head_is_represented_on(session_id, &session_head, target)?
-            {
+    fn cleanup_provenance(
+        &self,
+        session: &Session,
+        session_head: &str,
+        delivery_targets: &[String],
+    ) -> Result<(CleanupProvenance, String), BrokerOpError> {
+        let mut provenance = CleanupProvenance {
+            representation: CleanupRepresentation::Unproven,
+            session_head: session_head.into(),
+            adopted_head: session.adopted_head.clone(),
+            accepted_session_head: session.accepted_session_head.clone(),
+            accepted_integration_commit: session.accepted_integration_commit.clone(),
+            accepted_integration_tree: session.accepted_integration_tree.clone(),
+            accepted_queue_entry_id: session.accepted_queue_entry_id,
+            accepted_queue_status: None,
+            represented_on: None,
+            pending_commit_count: 0,
+        };
+
+        let Some(accepted_head) = session.accepted_session_head.as_deref() else {
+            let adopted_head = session
+                .adopted_head
+                .as_deref()
+                .or(session.adoption_base.as_deref())
+                .or(session.diff_base.as_deref());
+            if adopted_head == Some(session_head) {
+                let represented_on = delivery_targets
+                    .iter()
+                    .find(|target| self.repo.is_ancestor(session_head, target))
+                    .cloned();
+                if let Some(represented_on) = represented_on {
+                    provenance.representation = CleanupRepresentation::Represented;
+                    provenance.represented_on = Some(represented_on.clone());
+                    return Ok((
+                        provenance,
+                        format!(
+                            "unchanged adoption boundary is represented on delivery target {}",
+                            short_commit(&represented_on)
+                        ),
+                    ));
+                }
                 return Ok((
-                    CleanupDisposition::Eligible,
+                    provenance,
+                    "unchanged adoption boundary is not represented on any delivery target".into(),
+                ));
+            }
+            if let Some(adopted_head) = adopted_head
+                && self.repo.is_ancestor(adopted_head, session_head)
+            {
+                let pending = self.repo.commit_count_between(adopted_head, session_head)?;
+                provenance.representation = CleanupRepresentation::Pending;
+                provenance.pending_commit_count = pending;
+                return Ok((
+                    provenance,
                     format!(
-                        "clean session HEAD is represented on delivery target {}",
-                        short_commit(target)
+                        "{pending} session commit(s) after the adoption boundary have never been accepted"
                     ),
                 ));
             }
+            return Ok((
+                provenance,
+                "session HEAD cannot be related safely to its recorded adoption boundary".into(),
+            ));
+        };
+
+        if accepted_head != session_head {
+            if self.repo.is_ancestor(accepted_head, session_head) {
+                let pending = self
+                    .repo
+                    .commit_count_between(accepted_head, session_head)?;
+                provenance.representation = CleanupRepresentation::Pending;
+                provenance.pending_commit_count = pending;
+                return Ok((
+                    provenance,
+                    format!(
+                        "{pending} session commit(s) remain after the last accepted checkpoint"
+                    ),
+                ));
+            }
+            return Ok((
+                provenance,
+                "session HEAD rewrites or diverges from the last accepted checkpoint".into(),
+            ));
         }
 
+        let (Some(queue_entry_id), Some(integration_commit), Some(integration_tree)) = (
+            session.accepted_queue_entry_id,
+            session.accepted_integration_commit.as_deref(),
+            session.accepted_integration_tree.as_deref(),
+        ) else {
+            return Ok((
+                provenance,
+                "accepted checkpoint is missing queue, integration commit, or integration tree provenance"
+                    .into(),
+            ));
+        };
+        let entry = self
+            .store
+            .merge_queue()?
+            .into_iter()
+            .find(|entry| entry.id == queue_entry_id);
+        let Some(entry) = entry else {
+            return Ok((
+                provenance,
+                format!("accepted queue entry {queue_entry_id} is missing"),
+            ));
+        };
+        provenance.accepted_queue_status = Some(entry.status);
+        if entry.session_id != session.id
+            || entry.head_commit != accepted_head
+            || !matches!(
+                entry.status,
+                MergeStatus::Promoted | MergeStatus::ExternallyLanded | MergeStatus::Superseded
+            )
+        {
+            return Ok((
+                provenance,
+                format!(
+                    "accepted queue entry {queue_entry_id} does not prove this session checkpoint"
+                ),
+            ));
+        }
+        if self.repo.commit_tree_id(integration_commit).ok().as_deref() != Some(integration_tree) {
+            return Ok((
+                provenance,
+                "accepted integration commit and tree provenance do not match".into(),
+            ));
+        }
+        let represented_on = delivery_targets
+            .iter()
+            .find(|target| self.repo.is_ancestor(integration_commit, target))
+            .cloned();
+        let Some(represented_on) = represented_on else {
+            return Ok((
+                provenance,
+                "accepted integration commit is not represented on local main, integration, or configured upstream"
+                    .into(),
+            ));
+        };
+        provenance.representation = CleanupRepresentation::Represented;
+        provenance.represented_on = Some(represented_on.clone());
         Ok((
-            CleanupDisposition::UnrepresentedCommits,
-            "session commits are not represented on local main, integration, or configured upstream"
-                .into(),
+            provenance,
+            format!(
+                "accepted checkpoint is represented on delivery target {}",
+                short_commit(&represented_on)
+            ),
         ))
+    }
+
+    fn cleanup_item(
+        &self,
+        session: &Session,
+    ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
+        let worktree_path = PathBuf::from(&session.worktree_path);
+        let worktree_present = worktree_path.exists();
+        let branch_ref = format!("refs/heads/{}", session.branch);
+        let branch_tip = self.repo.resolve_ref(&branch_ref);
+        if !worktree_present && branch_tip.is_none() {
+            return Ok(None);
+        }
+        let estimated_bytes = if worktree_present {
+            directory_size_without_following_links(&worktree_path).ok()
+        } else {
+            Some(0)
+        };
+        let (mut disposition, mut reason, provenance) = if !self
+            .is_broker_owned_worktree(session, &worktree_path)
+        {
+            (
+                CleanupDisposition::UnsafePath,
+                "spawned session path is outside the broker-owned worktree directory".into(),
+                None,
+            )
+        } else if worktree_present {
+            match self.cleanup_eligibility(session.id, &worktree_path) {
+                Ok(result) => result,
+                Err(error) => (
+                    CleanupDisposition::InspectionFailed,
+                    format!("cleanup inspection failed: {error}"),
+                    None,
+                ),
+            }
+        } else {
+            let session_head = branch_tip
+                .as_deref()
+                .expect("missing worktree entries are retained only when their branch exists");
+            let mut delivery_targets = vec![self.repo.head_commit()?];
+            if let Some(integration) = self.integration_tip() {
+                delivery_targets.push(integration);
+            }
+            if let Some((_upstream, head)) = self.repo.tracking_upstream() {
+                delivery_targets.push(head);
+            }
+            delivery_targets.sort();
+            delivery_targets.dedup();
+            match self.cleanup_provenance(session, session_head, &delivery_targets) {
+                Ok((provenance, reason)) => {
+                    let disposition = match provenance.representation {
+                        CleanupRepresentation::Represented => CleanupDisposition::Eligible,
+                        CleanupRepresentation::Pending => CleanupDisposition::PendingCommits,
+                        CleanupRepresentation::Unproven => CleanupDisposition::UnprovenProvenance,
+                    };
+                    (disposition, reason, Some(provenance))
+                }
+                Err(error) => (
+                    CleanupDisposition::InspectionFailed,
+                    format!("cleanup inspection failed: {error}"),
+                    None,
+                ),
+            }
+        };
+        if worktree_present
+            && provenance.is_some()
+            && branch_tip.as_deref()
+                != provenance
+                    .as_ref()
+                    .map(|provenance| provenance.session_head.as_str())
+        {
+            disposition = CleanupDisposition::UnprovenProvenance;
+            reason =
+                "session branch ref is missing or does not match the retained worktree HEAD".into();
+        }
+        let session_head = provenance
+            .as_ref()
+            .map(|provenance| provenance.session_head.as_str())
+            .or(branch_tip.as_deref());
+        let mut inspection_commands = Vec::new();
+        if let Some(session_head) = session_head {
+            inspection_commands.push(format!("git show --stat --oneline {session_head}"));
+        }
+        if let Some(provenance) = provenance.as_ref()
+            && let Some(accepted_head) = provenance.accepted_session_head.as_deref()
+            && accepted_head != provenance.session_head
+        {
+            inspection_commands.push(format!(
+                "git log --oneline {accepted_head}..{}",
+                provenance.session_head
+            ));
+        }
+        Ok(Some(CleanupWorktreePlan {
+            session_id: session.id,
+            worktree_path: session.worktree_path.clone(),
+            worktree_present,
+            branch_ref,
+            branch_tip: branch_tip.clone(),
+            delete_branch: branch_tip.is_some(),
+            origin: session.origin,
+            disposition,
+            provenance,
+            estimated_bytes,
+            reason,
+            inspection_commands,
+            force_cleanup_command: format!("aethyme broker cleanup {} --force", session.id),
+        }))
     }
 
     /// Read-only inventory of retained broker-owned worktrees belonging to
@@ -4895,47 +5205,36 @@ impl Broker {
     pub fn cleanup_plan(&self) -> Result<CleanupPlan, BrokerOpError> {
         let mut plan = CleanupPlan::default();
         for session in self.store.cleaned_sessions()? {
-            let worktree_path = PathBuf::from(&session.worktree_path);
-            if session.origin != SessionOrigin::Spawned || !worktree_path.exists() {
+            if session.origin != SessionOrigin::Spawned {
                 continue;
             }
-
-            let estimated_bytes = directory_size_without_following_links(&worktree_path).ok();
-            let (disposition, reason) = if !self.is_broker_owned_worktree(&session, &worktree_path)
-            {
-                (
-                    CleanupDisposition::UnsafePath,
-                    "spawned session path is outside the broker-owned worktree directory".into(),
-                )
-            } else {
-                match self.cleanup_eligibility(session.id, &worktree_path) {
-                    Ok(result) => result,
-                    Err(error) => (
-                        CleanupDisposition::InspectionFailed,
-                        format!("cleanup inspection failed: {error}"),
-                    ),
-                }
+            let Some(item) = self.cleanup_item(&session)? else {
+                continue;
             };
-            let item = CleanupWorktreePlan {
-                session_id: session.id,
-                worktree_path: session.worktree_path,
-                origin: session.origin,
-                disposition,
-                estimated_bytes,
-                reason,
-            };
-            plan.retained_worktree_count += 1;
+            if item.worktree_present {
+                plan.retained_worktree_count += 1;
+            }
+            if item.branch_tip.is_some() {
+                plan.retained_branch_count += 1;
+            }
             plan.estimated_retained_bytes = plan
                 .estimated_retained_bytes
                 .saturating_add(item.estimated_bytes.unwrap_or(0));
             if item.eligible() {
-                plan.eligible_worktree_count += 1;
+                if item.worktree_present {
+                    plan.eligible_worktree_count += 1;
+                }
+                if item.branch_tip.is_some() {
+                    plan.eligible_branch_count += 1;
+                }
                 plan.estimated_reclaimable_bytes = plan
                     .estimated_reclaimable_bytes
                     .saturating_add(item.estimated_bytes.unwrap_or(0));
             }
             plan.worktrees.push(item);
         }
+        let bytes = serde_json::to_vec(&plan)?;
+        plan.digest = format!("{:x}", Sha256::digest(bytes));
         Ok(plan)
     }
 
@@ -4945,11 +5244,22 @@ impl Broker {
     pub fn cleanup_cleaned_worktrees(
         &mut self,
         apply: bool,
+        confirm: Option<&str>,
     ) -> Result<CleanupSweepReport, BrokerOpError> {
         let plan = self.cleanup_plan()?;
         let mut removed_session_ids = Vec::new();
         let mut failures = Vec::new();
         if apply {
+            let confirm = confirm.ok_or(BrokerOpError::CleanupConfirmationNotSha256)?;
+            if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(BrokerOpError::CleanupConfirmationNotSha256);
+            }
+            if confirm != plan.digest {
+                return Err(BrokerOpError::CleanupConfirmationMismatch {
+                    expected: plan.digest.clone(),
+                    actual: confirm.into(),
+                });
+            }
             for item in plan.worktrees.iter().filter(|item| item.eligible()) {
                 match self.cleanup(item.session_id, false) {
                     Ok(()) => removed_session_ids.push(item.session_id),
@@ -4989,18 +5299,54 @@ impl Broker {
     pub fn cleanup(&mut self, session_id: i64, force: bool) -> Result<(), BrokerOpError> {
         let session = self.store.session(session_id)?;
         let worktree_path = PathBuf::from(&session.worktree_path);
+        if session.origin == SessionOrigin::Adopted {
+            if worktree_path.exists() {
+                if !force {
+                    let (disposition, reason, _) =
+                        self.cleanup_eligibility(session_id, &worktree_path)?;
+                    if disposition != CleanupDisposition::Eligible {
+                        return Err(BrokerOpError::DirtyWorktree {
+                            id: session_id,
+                            reason,
+                        });
+                    }
+                }
+                self.repo.worktree_remove(&worktree_path, force)?;
+            }
+            self.store
+                .set_session_status(session_id, SessionStatus::Cleaned, None)?;
+            return Ok(());
+        }
+        let item = self.cleanup_item(&session)?;
+        if !force
+            && let Some(item) = item.as_ref()
+            && !item.eligible()
+        {
+            let inspection = if item.inspection_commands.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; inspect first with: {}",
+                    item.inspection_commands.join("; ")
+                )
+            };
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session_id,
+                reason: format!(
+                    "{}{}; exact discard command: {}",
+                    item.reason, inspection, item.force_cleanup_command
+                ),
+            });
+        }
 
         if worktree_path.exists() {
-            if !force {
-                let (disposition, reason) = self.cleanup_eligibility(session_id, &worktree_path)?;
-                if disposition != CleanupDisposition::Eligible {
-                    return Err(BrokerOpError::DirtyWorktree {
-                        id: session_id,
-                        reason,
-                    });
-                }
-            }
             self.repo.worktree_remove(&worktree_path, force)?;
+        }
+        if let Some(branch_tip) = item.and_then(|item| item.branch_tip)
+            && session.origin == SessionOrigin::Spawned
+        {
+            self.repo
+                .delete_branch_ref_checked(&session.branch, &branch_tip)?;
         }
         self.store
             .set_session_status(session_id, SessionStatus::Cleaned, None)?;

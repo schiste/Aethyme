@@ -7,9 +7,9 @@ use std::process::Command;
 
 use aethyme_broker::{
     AdoptIntegrationRelation, AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, Broker,
-    BrokerOpError, CleanupDisposition, FinishGateCacheSource, FinishLeaseState, FinishStatus,
-    GateStatus, NewGateResult, NewSession, SessionOrigin, SessionStatus, VersionDriftStatus,
-    events,
+    BrokerOpError, CleanupDisposition, CleanupRepresentation, FinishGateCacheSource,
+    FinishLeaseState, FinishStatus, GateStatus, NewGateResult, NewSession, SessionOrigin,
+    SessionStatus, VersionDriftStatus, events,
 };
 
 fn sh(cwd: &Path, args: &[&str]) {
@@ -34,6 +34,16 @@ fn rev(cwd: &Path, reference: &str) -> String {
         .unwrap();
     assert!(output.status.success());
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn ref_exists(cwd: &Path, reference: &str) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .current_dir(cwd)
+        .output()
+        .unwrap()
+        .status
+        .success()
 }
 
 fn init_repo(root: &Path) {
@@ -333,7 +343,7 @@ fn cleanup_refuses_dirty_and_unmerged_then_force_discards() {
     sh(&wt, &["add", "-A"]);
     sh(&wt, &["commit", "-qm", "wip"]);
     let err = broker.cleanup(session.id, false).unwrap_err();
-    assert!(err.to_string().contains("not represented"));
+    assert!(err.to_string().contains("never been accepted"));
 
     // Force discards, marks cleaned, frees the worktree slot.
     broker.cleanup(session.id, true).unwrap();
@@ -383,7 +393,7 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
             .any(|advice| advice.id == "cleanup.retained-worktrees")
     );
 
-    let dry_run = broker.cleanup_cleaned_worktrees(false).unwrap();
+    let dry_run = broker.cleanup_cleaned_worktrees(false, None).unwrap();
     assert!(!dry_run.applied);
     assert_eq!(dry_run.plan.retained_worktree_count, 2);
     assert_eq!(dry_run.plan.eligible_worktree_count, 1);
@@ -391,6 +401,27 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
     assert!(dry_run.removed_session_ids.is_empty());
     assert!(safe_path.exists());
     assert!(dirty_path.exists());
+    let safe_item = dry_run
+        .plan
+        .worktrees
+        .iter()
+        .find(|item| item.session_id == safe.id)
+        .unwrap();
+    let safe_provenance = safe_item.provenance.as_ref().unwrap();
+    assert_eq!(
+        safe_provenance.representation,
+        CleanupRepresentation::Represented
+    );
+    assert_eq!(
+        safe_provenance.accepted_session_head,
+        broker
+            .store()
+            .session(safe.id)
+            .unwrap()
+            .accepted_session_head
+    );
+    assert!(safe_provenance.accepted_queue_entry_id.is_some());
+    assert!(safe_provenance.represented_on.is_some());
     assert_eq!(
         dry_run
             .plan
@@ -402,12 +433,133 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
         CleanupDisposition::Dirty
     );
 
-    let applied = broker.cleanup_cleaned_worktrees(true).unwrap();
+    let digest = dry_run.plan.digest.clone();
+    let applied = broker
+        .cleanup_cleaned_worktrees(true, Some(&digest))
+        .unwrap();
     assert!(applied.applied);
     assert_eq!(applied.removed_session_ids, vec![safe.id]);
     assert!(applied.failures.is_empty());
     assert!(!safe_path.exists());
+    assert!(!ref_exists(
+        tmp.path(),
+        &format!("refs/heads/{}", safe.branch)
+    ));
     assert!(dirty_path.exists());
+    assert!(ref_exists(
+        tmp.path(),
+        &format!("refs/heads/{}", dirty.branch)
+    ));
+}
+
+#[test]
+fn cleanup_recovers_after_worktree_removal_and_prunes_only_the_exact_branch_tip() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let session = broker.start_worktree("interrupted cleanup").unwrap();
+    let worktree = std::path::PathBuf::from(&session.worktree_path);
+    std::fs::write(worktree.join("renamed.bin"), [0_u8, 7, 255]).unwrap();
+    sh(&worktree, &["add", "renamed.bin"]);
+    sh(&worktree, &["commit", "-qm", "represented binary"]);
+    assert!(broker.submit(session.id).unwrap().promoted);
+    assert!(broker.finish(session.id).unwrap().closed);
+    let branch_ref = format!("refs/heads/{}", session.branch);
+    let branch_tip = rev(tmp.path(), &branch_ref);
+
+    sh(
+        tmp.path(),
+        &["worktree", "remove", worktree.to_str().unwrap()],
+    );
+    assert!(!worktree.exists());
+    assert_eq!(rev(tmp.path(), &branch_ref), branch_tip);
+
+    let plan = broker.cleanup_plan().unwrap();
+    assert_eq!(plan.retained_worktree_count, 0);
+    assert_eq!(plan.retained_branch_count, 1);
+    let item = plan
+        .worktrees
+        .iter()
+        .find(|item| item.session_id == session.id)
+        .unwrap();
+    assert!(!item.worktree_present);
+    assert_eq!(item.branch_tip.as_deref(), Some(branch_tip.as_str()));
+    assert!(item.delete_branch);
+    assert!(item.eligible());
+
+    broker.cleanup(session.id, false).unwrap();
+    assert!(!ref_exists(tmp.path(), &branch_ref));
+    assert!(broker.cleanup_plan().unwrap().worktrees.is_empty());
+}
+
+#[test]
+fn cleanup_distinguishes_pending_commits_from_missing_acceptance_provenance() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let pending = broker.start_worktree("pending cleanup").unwrap();
+    let pending_path = std::path::PathBuf::from(&pending.worktree_path);
+    std::fs::write(pending_path.join("pending.bin"), [0_u8, 255, 17]).unwrap();
+    sh(&pending_path, &["add", "pending.bin"]);
+    sh(&pending_path, &["commit", "-qm", "pending binary"]);
+    broker.close(pending.id).unwrap();
+
+    let unproven = broker.start_worktree("unproven cleanup").unwrap();
+    let unproven_path = std::path::PathBuf::from(&unproven.worktree_path);
+    std::fs::write(unproven_path.join("renamed-before.txt"), "accepted\n").unwrap();
+    sh(&unproven_path, &["add", "renamed-before.txt"]);
+    sh(&unproven_path, &["commit", "-qm", "accepted rename source"]);
+    assert!(broker.submit(unproven.id).unwrap().promoted);
+    broker.close(unproven.id).unwrap();
+    drop(broker);
+
+    let database = tmp.path().join(aethyme_broker::BROKER_DB_RELPATH);
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET accepted_queue_entry_id = NULL WHERE id = ?1",
+            [unproven.id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let broker = Broker::open(tmp.path()).unwrap();
+    let plan = broker.cleanup_plan().unwrap();
+    let pending_item = plan
+        .worktrees
+        .iter()
+        .find(|item| item.session_id == pending.id)
+        .unwrap();
+    assert_eq!(pending_item.disposition, CleanupDisposition::PendingCommits);
+    assert_eq!(
+        pending_item.provenance.as_ref().unwrap().representation,
+        CleanupRepresentation::Pending
+    );
+    assert_eq!(
+        pending_item
+            .provenance
+            .as_ref()
+            .unwrap()
+            .pending_commit_count,
+        1
+    );
+
+    let unproven_item = plan
+        .worktrees
+        .iter()
+        .find(|item| item.session_id == unproven.id)
+        .unwrap();
+    assert_eq!(
+        unproven_item.disposition,
+        CleanupDisposition::UnprovenProvenance
+    );
+    assert_eq!(
+        unproven_item.provenance.as_ref().unwrap().representation,
+        CleanupRepresentation::Unproven
+    );
+    assert!(unproven_item.reason.contains("missing queue"));
 }
 
 #[test]

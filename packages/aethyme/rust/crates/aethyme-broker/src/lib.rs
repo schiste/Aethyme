@@ -61,7 +61,8 @@ mod version;
 pub use broker::{
     AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
     AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, AdoptOutcome, AdoptReport, AgentView,
-    Broker, BrokerOpError, CleanupDisposition, CleanupPlan, CleanupRetention, CleanupSweepFailure,
+    Broker, BrokerOpError, CLEANUP_PLAN_SCHEMA_VERSION, CleanupDisposition, CleanupPlan,
+    CleanupProvenance, CleanupRepresentation, CleanupRetention, CleanupSweepFailure,
     CleanupSweepReport, CleanupWorktreePlan, DoctorRepairStatus, DoctorReport, FinishDelivery,
     FinishGateCacheSource, FinishGateRun, FinishHandoff, FinishLease, FinishLeaseState,
     FinishPendingWork, FinishReport, FinishStatus, GuardedExecReport, IntegrationDeliveryState,
