@@ -27,6 +27,7 @@ pub mod contract_check;
 mod error;
 pub mod events;
 mod exposures;
+mod external_events;
 mod gates;
 mod gc;
 mod git;
@@ -84,6 +85,13 @@ pub use error::BrokerError;
 pub use exposures::{
     AdvisoryReconciliationItem, EXPOSURE_RECONCILIATION_SCHEMA_VERSION,
     ExposureReconciliationApplyReport, ExposureReconciliationPlan, ExposureRemainingItem,
+};
+pub use external_events::{
+    EXTERNAL_EVENT_MAX_AGE_MS, EXTERNAL_EVENT_SCHEMA_VERSION, ExternalEventEnvelope,
+    ExternalEventError, ExternalEventIngestReport, ExternalEventKind,
+    ExternalEventOwnershipCandidate, ExternalEventProvider, ExternalEventReconcileReport,
+    ExternalEventReconciliation, ExternalEventRecord, ExternalEventStatus,
+    ExternalVerificationMethod, VerifiedExternalSource, external_event_digest,
 };
 pub use gates::{
     CachePolicy, GATE_SCOPE_MANIFEST_SCHEMA_VERSION, GATES_CONFIG_RELPATH, Gate, GateConfigError,

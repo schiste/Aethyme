@@ -55,6 +55,14 @@ pub enum BrokerError {
     #[error("advisory identity {0:?} already exists with different immutable data")]
     AdvisoryIdentityConflict(String),
 
+    #[error("no external coordination event with id {0}")]
+    ExternalEventNotFound(i64),
+
+    #[error(
+        "external event {provider}/{event_id} was already received with a different normalized digest"
+    )]
+    ExternalEventIdentityConflict { provider: String, event_id: String },
+
     #[error("entry path exposure for queue entry {0} already exists with different immutable data")]
     EntryExposureIdentityConflict(i64),
 

@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -529,6 +529,51 @@ CREATE INDEX advisory_delivery_by_action
     ON advisory_delivery_metrics (acted_at, advisory_id);
 ";
 
+const MIGRATION_V23: &str = "
+-- Authenticated provider adapters submit only a strict normalized envelope.
+-- Raw webhook bodies, comments, credentials, diffs, and task text have no
+-- columns and therefore cannot enter broker storage accidentally.
+CREATE TABLE external_coordination_events (
+    id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider                     TEXT NOT NULL CHECK (provider IN ('github')),
+    provider_event_id            TEXT NOT NULL,
+    event_type                   TEXT NOT NULL,
+    repository                   TEXT NOT NULL,
+    target_branch                TEXT NOT NULL,
+    pr_number                    INTEGER NOT NULL,
+    commit_sha                   TEXT NOT NULL,
+    occurred_at                  INTEGER NOT NULL,
+    verification_method          TEXT NOT NULL CHECK (verification_method IN (
+                                     'webhook_signature', 'authenticated_poll'
+                                 )),
+    verified_at                  INTEGER NOT NULL,
+    normalized_digest            TEXT NOT NULL,
+    status                       TEXT NOT NULL CHECK (status IN (
+                                     'pending_advisory', 'advisory_created',
+                                     'unknown_event_type', 'unknown_pull_request',
+                                     'owner_not_found', 'ambiguous_owner',
+                                     'repository_mismatch', 'stale', 'ignored'
+                                 )),
+    session_id                   INTEGER REFERENCES sessions(id),
+    queue_entry_id               INTEGER REFERENCES merge_queue(id),
+    advisory_id                  INTEGER REFERENCES advisories(id),
+    received_at                  INTEGER NOT NULL,
+    reconciled_at                INTEGER,
+    reconciliation_kind          TEXT CHECK (reconciliation_kind IN ('assigned', 'ignored')),
+    reconciliation_reason_digest TEXT,
+    UNIQUE (provider, provider_event_id)
+);
+
+CREATE INDEX external_events_by_status
+    ON external_coordination_events (status, id DESC);
+CREATE INDEX external_events_by_session
+    ON external_coordination_events (session_id, id DESC);
+CREATE INDEX external_events_by_pr
+    ON external_coordination_events (target_branch, pr_number, id DESC);
+CREATE INDEX external_events_by_commit
+    ON external_coordination_events (commit_sha, id DESC);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -552,6 +597,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V20,
     MIGRATION_V21,
     MIGRATION_V22,
+    MIGRATION_V23,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1055,5 +1101,63 @@ mod tests {
                 "action",
             ]
         );
+    }
+
+    #[test]
+    fn v23_adds_redacted_external_event_storage_without_rewriting_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS[..22].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO events (schema_version, ts, kind) VALUES (1, 10, 'legacy')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let columns = conn
+            .prepare("PRAGMA table_info(external_coordination_events)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for expected in [
+            "provider_event_id",
+            "normalized_digest",
+            "status",
+            "session_id",
+            "advisory_id",
+            "reconciliation_reason_digest",
+        ] {
+            assert!(
+                columns.iter().any(|column| column == expected),
+                "{expected}"
+            );
+        }
+        for forbidden in ["payload", "body", "comment", "diff", "credential", "task"] {
+            assert!(
+                columns.iter().all(|column| !column.contains(forbidden)),
+                "forbidden storage column {forbidden}"
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT kind FROM events WHERE id = 1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "legacy"
+        );
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 }

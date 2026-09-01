@@ -224,6 +224,10 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker advisories show <id> [--json]`
 - `aethyme broker advisories ack <id> [--json]`
 - `aethyme broker advisories metrics [--json]`
+- `aethyme broker external-events ingest <normalized.json> [--json]`
+- `aethyme broker external-events list [--all] [--json]`
+- `aethyme broker external-events show <id> [--json]`
+- `aethyme broker external-events reconcile <id> --outcome <assign|ignore> --reason <text> [--session <id>] [--json]`
 - `aethyme broker queue history [--limit <n>] [--before <id>] [--json]`
 - `aethyme broker queue [--json]` (compatibility full-inventory view)
 - `aethyme broker exposures plan [--json]`
@@ -367,6 +371,32 @@ pre-expensive-gate boundary deliver outstanding notices. Generated AGENTS and
 CLAUDE guidance tells agents to inspect `broker status --json` when a notice
 appears and after rebase or worktree reuse, then read the projection when a
 delivery surface points to it.
+
+`broker external-events` is the bounded handoff from authenticated provider
+adapters into that advisory model. Aethyme does not run a webhook listener or
+poll a provider in the background. The adapter must first authenticate its
+source, then write one strict schema-1 JSON envelope containing only the
+provider event ID, supported event type, canonical repository, target branch,
+pull-request number, exact full commit SHA, event and verification times,
+verification method, and a SHA-256 over those normalized fields. Payloads,
+comments, review bodies, diffs, credentials, and arbitrary metadata are
+rejected rather than retained. Input must be a regular, non-symlink file no
+larger than 64 KiB.
+
+The supported event types are `review-changes-requested`, `review-approved`,
+`queue-ejected`, and `validation-failed`. Resolution requires an existing PR
+watch and exact durable session or queue provenance for the named commit;
+rewritten and closed sessions remain discoverable through those records.
+Provider plus event ID is the deduplication key. Redelivery with the same
+normalized digest is idempotent, while a changed digest is refused.
+
+Unknown event types, unknown PRs, repository mismatches, stale deliveries,
+missing owners, and ambiguous owners are retained as typed unresolved records
+and never guessed into a session. Inspect them with `list` and `show`, then
+either assign a verified session or ignore the event explicitly. Reconciliation
+stores only a digest of the operator reason. Every resulting advisory is
+ordinary and non-blocking: it cannot select gates, stop promotion, or authorize
+publication.
 
 When a verified promotion changes a path covered by another live session's
 explicit or implicit lease, the broker records one deterministic warning for

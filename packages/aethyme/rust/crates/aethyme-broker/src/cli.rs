@@ -100,6 +100,18 @@ Usage:
       required fields. Successful issue URL/number metadata is journaled and
       recorded locally; ambiguous outcomes require explicit reconciliation and
       are never retried automatically.
+  aethyme broker external-events ingest <normalized.json> [--json]
+      Ingest one adapter-verified, digest-bound normalized event. The strict
+      schema rejects provider payload fields and stores only allowlisted
+      repository/PR/commit provenance. No listener or poller is started.
+  aethyme broker external-events list [--all] [--json]
+      List unresolved events newest-first (or the bounded full history).
+  aethyme broker external-events show <id> [--json]
+      Inspect one exact redacted event and its resolution state.
+  aethyme broker external-events reconcile <id> --outcome <assign|ignore> --reason <text> [--session <id>] [--json]
+      Resolve retained ambiguity explicitly. Assignment requires --session;
+      unsupported or repository-mismatched events can only be ignored. The
+      reason is stored as a SHA-256 digest, never as text.
   aethyme broker start --task <text> [--path <repo-path>]... [--json]
       Create a broker-managed worktree + branch and register a session,
       atomically claiming every reviewed --path, but do not spawn a process.
@@ -504,6 +516,8 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "finish",
     "handoff",
     "report",
+    "external-events",
+    "ingest",
     "capture",
     "cleanup",
     "gc",
@@ -623,6 +637,10 @@ fn command_records_metric(args: &[String]) -> bool {
         Some("advisories") => args.get(1).map(String::as_str) == Some("ack"),
         Some("exposures") => args.get(1).map(String::as_str) == Some("apply"),
         Some("report") => args.get(1).map(String::as_str) == Some("file"),
+        Some("external-events") => matches!(
+            args.get(1).map(String::as_str),
+            Some("ingest" | "reconcile")
+        ),
         Some("ship") => args.get(1).map(String::as_str) != Some("plan"),
         Some("checkpoint") => args.get(1).map(String::as_str) == Some("apply"),
         Some("gc") => args.get(1).map(String::as_str) == Some("apply"),
@@ -704,6 +722,8 @@ mod tests {
             args(&["operations"]),
             args(&["advisories", "list"]),
             args(&["advisories", "show", "1"]),
+            args(&["external-events", "list"]),
+            args(&["external-events", "show", "1"]),
             args(&["git", "--session", "7", "--", "status"]),
             args(&[
                 "gh",
@@ -744,6 +764,16 @@ mod tests {
             args(&["integration", "status"]),
             args(&["operations", "reconcile", "--operation", "1"]),
             args(&["advisories", "ack", "1"]),
+            args(&["external-events", "ingest", "event.json"]),
+            args(&[
+                "external-events",
+                "reconcile",
+                "1",
+                "--outcome",
+                "ignore",
+                "--reason",
+                "not-applicable",
+            ]),
             args(&["git", "--session", "7", "--", "push"]),
             args(&[
                 "gh",
@@ -3286,6 +3316,198 @@ fn render_coordinated_operation(
     Ok(())
 }
 
+fn run_external_events(parsed: Parsed) -> Result<(), UsageError> {
+    const MAX_INPUT_BYTES: u64 = 64 * 1024;
+    let action = parsed
+        .positional
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| {
+            UsageError::Message("external-events requires ingest, list, show, or reconcile".into())
+        })?;
+    match action {
+        "ingest" => {
+            let path = parsed.positional.get(1).ok_or_else(|| {
+                UsageError::Message("external-events ingest requires <normalized.json>".into())
+            })?;
+            if parsed.positional.len() != 2 {
+                return Err(UsageError::Message(
+                    "external-events ingest accepts exactly one normalized JSON path".into(),
+                ));
+            }
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(UsageError::Message(
+                    "external event input must be a regular non-symlink file".into(),
+                ));
+            }
+            if metadata.len() > MAX_INPUT_BYTES {
+                return Err(UsageError::Message(format!(
+                    "external event input exceeds {MAX_INPUT_BYTES} bytes"
+                )));
+            }
+            let bytes = std::fs::read(path)?;
+            let envelope: crate::ExternalEventEnvelope =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    UsageError::Message(format!("invalid external event JSON: {error}"))
+                })?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            let report = broker.ingest_external_event(envelope, now_ms())?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "External event {}: {}{}",
+                    report.event.id,
+                    report.event.status.as_str(),
+                    if report.deduplicated {
+                        " (idempotent redelivery)"
+                    } else {
+                        ""
+                    }
+                );
+                if let Some(session_id) = report.event.session_id {
+                    println!("  owner session: {session_id}");
+                }
+                if let Some(remediation) = report.remediation {
+                    println!("  reconcile: {remediation}");
+                }
+                println!("  policy effect: advisory only; no gate or submit state changed");
+            }
+        }
+        "list" => {
+            if parsed.positional.len() != 1 {
+                return Err(UsageError::Message(
+                    "external-events list accepts no positional arguments".into(),
+                ));
+            }
+            let mut broker = open_broker(true)?;
+            let events = broker.store().external_events(parsed.all)?;
+            if parsed.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": crate::EXTERNAL_EVENT_SCHEMA_VERSION,
+                        "events": events,
+                        "includes_terminal": parsed.all,
+                        "limit": 500,
+                    }))?
+                );
+            } else if events.is_empty() {
+                println!("No matching external coordination events.");
+            } else {
+                println!("{:<5} {:<24} {:<22} OWNER", "ID", "TYPE", "STATUS");
+                for event in events {
+                    println!(
+                        "{:<5} {:<24} {:<22} {}",
+                        event.id,
+                        event.event_type,
+                        event.status.as_str(),
+                        event
+                            .session_id
+                            .map(|session| format!("session {session}"))
+                            .unwrap_or_else(|| "unresolved".into())
+                    );
+                }
+            }
+        }
+        "show" => {
+            let id = external_event_positional_id(&parsed, "show")?;
+            let mut broker = open_broker(true)?;
+            let event = broker
+                .store()
+                .external_event(id)?
+                .ok_or(crate::BrokerError::ExternalEventNotFound(id))?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&event)?);
+            } else {
+                println!("External event {}:", event.id);
+                println!(
+                    "  type/status: {} / {}",
+                    event.event_type,
+                    event.status.as_str()
+                );
+                println!("  repository: {}", event.repository);
+                println!("  PR/commit: #{} / {}", event.pr_number, event.commit_sha);
+                println!(
+                    "  owner: {}",
+                    event
+                        .session_id
+                        .map(|session| format!("session {session}"))
+                        .unwrap_or_else(|| "unresolved".into())
+                );
+                println!("  policy effect: advisory only");
+            }
+        }
+        "reconcile" => {
+            let id = external_event_positional_id(&parsed, "reconcile")?;
+            let outcome = parsed.outcome.as_deref().ok_or_else(|| {
+                UsageError::Message(
+                    "external-events reconcile requires --outcome <assign|ignore> --reason <text> and --session <id> when assigning"
+                        .into(),
+                )
+            })?;
+            let reason = parsed.reason.as_deref().ok_or_else(|| {
+                UsageError::Message(
+                    "external-events reconcile requires --outcome <assign|ignore> --reason <text> and --session <id> when assigning"
+                        .into(),
+                )
+            })?;
+            let resolution = match outcome {
+                "assign" => crate::ExternalEventReconciliation::Assign {
+                    session_id: parsed.session.ok_or_else(|| {
+                        UsageError::Message(
+                            "external-events reconcile --outcome assign requires --session <id>"
+                                .into(),
+                        )
+                    })?,
+                },
+                "ignore" if parsed.session.is_none() => crate::ExternalEventReconciliation::Ignore,
+                "ignore" => {
+                    return Err(UsageError::Message(
+                        "external-events reconcile --outcome ignore does not accept --session"
+                            .into(),
+                    ));
+                }
+                _ => {
+                    return Err(UsageError::Message(
+                        "external-events reconcile --outcome must be assign or ignore".into(),
+                    ));
+                }
+            };
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            let report = broker.reconcile_external_event(id, resolution, reason, now_ms())?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "External event {} reconciled as {} (reason stored as SHA-256 only).",
+                    report.event.id,
+                    report.event.status.as_str()
+                );
+                println!("Policy effect: advisory only; no gate or submit state changed.");
+            }
+        }
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown external-events action {other:?}; expected ingest, list, show, or reconcile"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn external_event_positional_id(parsed: &Parsed, action: &str) -> Result<i64, UsageError> {
+    if parsed.positional.len() != 2 {
+        return Err(UsageError::Message(format!(
+            "external-events {action} requires exactly one event id"
+        )));
+    }
+    parsed.positional[1]
+        .parse()
+        .map_err(|_| UsageError::Message("external event id must be an integer".into()))
+}
+
 fn run_report(parsed: Parsed) -> Result<(), UsageError> {
     match parsed.positional.first().map(String::as_str) {
         Some("capture") if parsed.positional.len() == 1 => {
@@ -4184,6 +4406,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             }
         }
         "report" => run_report(parsed)?,
+        "external-events" => run_external_events(parsed)?,
         "resources" => run_resources(parsed)?,
         "agents" => {
             let mut broker = open_broker(parsed.read_only_snapshot)?;

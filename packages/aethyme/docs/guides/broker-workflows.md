@@ -136,6 +136,39 @@ choosing the new diff baseline. It refuses dirty or diverged worktrees and
 leaves them unchanged. If the report says the session is ahead or diverged,
 follow its `safe_next_action`; do not force the worktree onto integration.
 
+## Deliver Authenticated Provider Events
+
+Keep provider authentication outside the broker. After a webhook receiver or
+explicit authenticated poll verifies one GitHub fact, normalize the allowlisted
+provenance fields, compute the envelope digest, and deliver the local file:
+
+```bash
+aethyme broker external-events ingest verified-event.json --json
+aethyme broker external-events list --json
+```
+
+There is no Aethyme listener, polling loop, or payload archive. Ingestion is
+idempotent by provider and event ID, and the strict envelope excludes review
+bodies, comments, diffs, credentials, and arbitrary metadata. A supported
+event becomes an ordinary non-blocking advisory only when the canonical
+repository, watched pull request, and exact commit identify one durable owner.
+
+Uncertain events remain visible without being assigned. Reconcile only after
+checking the provider and broker provenance:
+
+```bash
+aethyme broker external-events show 17 --json
+aethyme broker external-events reconcile 17 --outcome assign \
+  --session 111 --reason "verified exact commit ownership"
+# Or retain the audit fact without an advisory:
+aethyme broker external-events reconcile 17 --outcome ignore \
+  --reason "provider event does not apply to this repository"
+```
+
+The broker stores a digest, not the reconciliation reason. Reconciliation
+never grants publication authority and advisories never expand gate selection
+or block submit.
+
 ## Choose Gate Cache Policy Deliberately
 
 Gate results prove an exact Git tree. Normal gate runs use the cache when the

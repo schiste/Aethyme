@@ -15,6 +15,10 @@ use rusqlite::{
 };
 
 use crate::error::BrokerError;
+use crate::external_events::{
+    ExternalEventRecord, ExternalEventStatus, NewExternalEventRecord,
+    aggregate_ownership_candidates,
+};
 use crate::schema::{self, EVENTS_SCHEMA_VERSION};
 use crate::types::{
     Advisory, AdvisoryResolutionState, AdvisorySeverity, CoordinatedOperation,
@@ -2073,6 +2077,223 @@ impl BrokerStore {
             .map_err(Into::into)
     }
 
+    // ── authenticated external coordination events ─────────────────
+
+    /// Insert one strict normalized event idempotently. The provider/event ID
+    /// pair is immutable; a different digest is an identity conflict.
+    pub(crate) fn record_external_event(
+        &mut self,
+        event: &NewExternalEventRecord,
+    ) -> Result<(ExternalEventRecord, bool), BrokerError> {
+        let tx = self.conn.transaction()?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO external_coordination_events (
+                 provider, provider_event_id, event_type, repository,
+                 target_branch, pr_number, commit_sha, occurred_at,
+                 verification_method, verified_at, normalized_digest, status,
+                 session_id, queue_entry_id, received_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                       ?13, ?14, ?15)",
+            params![
+                event.envelope.provider.as_str(),
+                event.envelope.provider_event_id,
+                event.envelope.event_type,
+                event.envelope.repository,
+                event.envelope.target_branch,
+                event.envelope.pr_number,
+                event.envelope.commit_sha,
+                event.envelope.occurred_at,
+                event.envelope.verified_source.method.as_str(),
+                event.envelope.verified_source.verified_at,
+                event.envelope.normalized_digest,
+                event.status.as_str(),
+                event.session_id,
+                event.queue_entry_id,
+                event.received_at,
+            ],
+        )?;
+        if inserted > 0 {
+            let payload = serde_json::json!({
+                "external_event_id": tx.last_insert_rowid(),
+                "event_type": event.envelope.event_type,
+                "status": event.status.as_str(),
+            })
+            .to_string();
+            insert_event(
+                &tx,
+                event.received_at,
+                "external_event.ingested",
+                event.session_id,
+                Some(&payload),
+            )?;
+        }
+        tx.commit()?;
+        let stored = self
+            .external_event_by_identity(
+                event.envelope.provider.as_str(),
+                &event.envelope.provider_event_id,
+            )?
+            .expect("inserted or existing external event identity must resolve");
+        if stored.normalized_digest != event.envelope.normalized_digest {
+            return Err(BrokerError::ExternalEventIdentityConflict {
+                provider: event.envelope.provider.as_str().into(),
+                event_id: event.envelope.provider_event_id.clone(),
+            });
+        }
+        Ok((stored, inserted == 0))
+    }
+
+    pub fn external_event(&self, id: i64) -> Result<Option<ExternalEventRecord>, BrokerError> {
+        self.conn
+            .query_row(
+                &(EXTERNAL_EVENT_SELECT.to_owned() + " WHERE id = ?1"),
+                [id],
+                external_event_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    fn external_event_by_identity(
+        &self,
+        provider: &str,
+        provider_event_id: &str,
+    ) -> Result<Option<ExternalEventRecord>, BrokerError> {
+        self.conn
+            .query_row(
+                &(EXTERNAL_EVENT_SELECT.to_owned()
+                    + " WHERE provider = ?1 AND provider_event_id = ?2"),
+                params![provider, provider_event_id],
+                external_event_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    pub fn external_events(
+        &self,
+        include_all: bool,
+    ) -> Result<Vec<ExternalEventRecord>, BrokerError> {
+        let sql = if include_all {
+            EXTERNAL_EVENT_SELECT.to_owned() + " ORDER BY id DESC LIMIT 500"
+        } else {
+            EXTERNAL_EVENT_SELECT.to_owned()
+                + " WHERE status NOT IN ('advisory_created', 'ignored') ORDER BY id DESC LIMIT 500"
+        };
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map([], external_event_from_row)?;
+        rows.map(|row| row?).collect()
+    }
+
+    pub(crate) fn complete_external_event_advisory(
+        &mut self,
+        event_id: i64,
+        advisory_id: i64,
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE external_coordination_events
+             SET status = 'advisory_created', advisory_id = ?2
+             WHERE id = ?1 AND status = 'pending_advisory'
+               AND (advisory_id IS NULL OR advisory_id = ?2)",
+            params![event_id, advisory_id],
+        )?;
+        let session_id = tx.query_row(
+            "SELECT session_id FROM external_coordination_events WHERE id = ?1",
+            [event_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        let payload = serde_json::json!({
+            "external_event_id": event_id,
+            "advisory_id": advisory_id,
+        })
+        .to_string();
+        insert_event(
+            &tx,
+            now,
+            "external_event.advisory_created",
+            session_id,
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn prepare_external_event_assignment(
+        &mut self,
+        event_id: i64,
+        session_id: i64,
+        reason_digest: &str,
+        now: i64,
+    ) -> Result<(), BrokerError> {
+        let changed = self.conn.execute(
+            "UPDATE external_coordination_events
+             SET status = 'pending_advisory', session_id = ?2,
+                 queue_entry_id = NULL, reconciled_at = ?3,
+                 reconciliation_kind = 'assigned',
+                 reconciliation_reason_digest = ?4
+             WHERE id = ?1 AND status NOT IN ('advisory_created', 'ignored')",
+            params![event_id, session_id, now, reason_digest],
+        )?;
+        if changed == 0 {
+            return Err(BrokerError::ExternalEventNotFound(event_id));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ignore_external_event(
+        &mut self,
+        event_id: i64,
+        reason_digest: &str,
+        now: i64,
+    ) -> Result<(), BrokerError> {
+        let changed = self.conn.execute(
+            "UPDATE external_coordination_events
+             SET status = 'ignored', reconciled_at = ?2,
+                 reconciliation_kind = 'ignored',
+                 reconciliation_reason_digest = ?3
+             WHERE id = ?1 AND status NOT IN ('advisory_created', 'ignored')",
+            params![event_id, now, reason_digest],
+        )?;
+        if changed == 0 {
+            return Err(BrokerError::ExternalEventNotFound(event_id));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn external_event_ownership_candidates(
+        &self,
+        commit_sha: &str,
+    ) -> Result<Vec<crate::ExternalEventOwnershipCandidate>, BrokerError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, NULL, 'adopted_head' FROM sessions WHERE adopted_head = ?1
+             UNION ALL
+             SELECT id, accepted_queue_entry_id, 'accepted_session_head'
+               FROM sessions WHERE accepted_session_head = ?1
+             UNION ALL
+             SELECT id, accepted_queue_entry_id, 'accepted_integration_commit'
+               FROM sessions WHERE accepted_integration_commit = ?1
+             UNION ALL
+             SELECT session_id, id, 'queue_head' FROM merge_queue WHERE head_commit = ?1
+             UNION ALL
+             SELECT q.session_id, x.queue_entry_id, 'promotion_commit'
+               FROM entry_path_exposures x
+               JOIN merge_queue q ON q.id = x.queue_entry_id
+              WHERE x.promotion_sha = ?1
+             ORDER BY 1, 2, 3",
+        )?;
+        let rows = statement.query_map([commit_sha], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let rows = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(aggregate_ownership_candidates(rows))
+    }
+
     /// Outstanding advisories for one session, oldest first so repeated
     /// command-boundary notices stay deterministic and preserve chronology.
     pub fn outstanding_advisories_for_session(
@@ -2917,6 +3138,12 @@ const ENTRY_PATH_EXPOSURE_SELECT: &str = "SELECT id, queue_entry_id, promotion_s
      created_at, state, resolved_at, resolution_kind, resolution_sha, resolution_evidence \
      FROM entry_path_exposures";
 
+const EXTERNAL_EVENT_SELECT: &str = "SELECT id, provider, provider_event_id, event_type, \
+     repository, target_branch, pr_number, commit_sha, occurred_at, verification_method, \
+     verified_at, normalized_digest, status, session_id, queue_entry_id, advisory_id, \
+     received_at, reconciled_at, reconciliation_kind, reconciliation_reason_digest \
+     FROM external_coordination_events";
+
 type RowResult<T> = Result<Result<T, BrokerError>, rusqlite::Error>;
 
 fn event_from_row(row: &rusqlite::Row<'_>) -> Result<Event, rusqlite::Error> {
@@ -3180,6 +3407,36 @@ fn entry_path_exposure_from_row(row: &rusqlite::Row<'_>) -> RowResult<EntryPathE
                 .transpose()?,
             resolution_sha: row.get(8)?,
             resolution_evidence: row.get(9)?,
+        })
+    })())
+}
+
+fn external_event_from_row(row: &rusqlite::Row<'_>) -> RowResult<ExternalEventRecord> {
+    let provider = row.get::<_, String>(1)?;
+    let verification_method = row.get::<_, String>(9)?;
+    let status = row.get::<_, String>(12)?;
+    Ok((|| {
+        Ok(ExternalEventRecord {
+            id: row.get(0)?,
+            provider: crate::ExternalEventProvider::parse(&provider)?,
+            provider_event_id: row.get(2)?,
+            event_type: row.get(3)?,
+            repository: row.get(4)?,
+            target_branch: row.get(5)?,
+            pr_number: row.get(6)?,
+            commit_sha: row.get(7)?,
+            occurred_at: row.get(8)?,
+            verification_method: crate::ExternalVerificationMethod::parse(&verification_method)?,
+            verified_at: row.get(10)?,
+            normalized_digest: row.get(11)?,
+            status: ExternalEventStatus::parse(&status)?,
+            session_id: row.get(13)?,
+            queue_entry_id: row.get(14)?,
+            advisory_id: row.get(15)?,
+            received_at: row.get(16)?,
+            reconciled_at: row.get(17)?,
+            reconciliation_kind: row.get(18)?,
+            reconciliation_reason_digest: row.get(19)?,
         })
     })())
 }
