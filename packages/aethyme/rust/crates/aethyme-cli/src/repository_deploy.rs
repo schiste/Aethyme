@@ -17,6 +17,9 @@ struct Options {
 }
 
 pub fn run(args: &[String]) -> u8 {
+    if matches!(args.first().map(String::as_str), Some("plan" | "execute")) {
+        return crate::repository_enrollment::run(args);
+    }
     if args
         .iter()
         .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
@@ -195,6 +198,8 @@ fn in_repo(repo: &Path, operation: impl FnOnce() -> u8) -> u8 {
 
 fn print_usage() {
     println!("Usage:");
+    println!("  aethyme deploy plan [--repo <path>] [--diff|--json]");
+    println!("  aethyme deploy execute [--repo <path>] --confirm <plan-sha256> [--json]");
     println!("  aethyme deploy [--repo <path>] [--force]");
     println!("  aethyme deploy bridge [--repo <path>]");
     println!("  aethyme deploy --local-only [--repo <path>] [--force]");

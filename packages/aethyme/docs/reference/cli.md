@@ -86,6 +86,8 @@ product surface.
 - `aethyme update check`
 - `aethyme update plan`
 - `aethyme update execute`
+- `aethyme deploy plan`
+- `aethyme deploy execute`
 - `aethyme upgrade plan`
 - `aethyme upgrade apply`
 - `aethyme explore`
@@ -1154,6 +1156,8 @@ docs(cli): clarify commit hygiene examples
 
 ### Local Discoverability
 - `aethyme deploy --repo /path/to/repo`
+- `aethyme deploy plan --repo /path/to/repo --diff`
+- `aethyme deploy execute --repo /path/to/repo --confirm <plan-sha256>`
 - `aethyme deploy verify --repo /path/to/repo`
 - `aethyme enhance deploy --repo /path/to/repo`
 - `aethyme enhance verify --repo /path/to/repo`
@@ -1161,11 +1165,26 @@ docs(cli): clarify commit hygiene examples
 - `aethyme query deps /path/to/repo src/main.py`
 - `aethyme query impact /path/to/repo src/main.py`
 
-`deploy` is the canonical repository-enrollment path. It runs broker scaffold,
-gate drafting, embedded agent-policy deployment, verification, and
-certification as one command. `deploy verify` performs the verification and
-certification checks without writing. Repositories should retain this command
-as a required CI check.
+`deploy plan` is the read-only first-enrollment path. It derives the proposed
+tree from the exact fetched remote default SHA in a disposable checkout and
+binds generated hashes and modes, local/integration state, dirty overlap, live
+broker state, hook ownership, activation state, and preservation refs into a
+SHA-256. `--diff` renders the content inventory locally; `--json` is the stable
+automation form.
+
+`deploy execute` requires that full digest. It creates preservation refs before
+mutation, applies only the reviewed outputs in an isolated leased session,
+submits and publishes the promoted SHA, verifies the remote, and synchronizes
+local main only by a verified clean fast-forward. Its Git-common-dir journal
+makes the same command resumable across interruption. Remote movement,
+ambiguous history, foreign hook ownership, overlapping dirty policy, or live
+coordination work causes a refusal and requires a new plan or explicit cleanup.
+
+The bare `deploy` command remains the offline/manual preparation path. It runs
+broker scaffold, gate drafting, embedded agent-policy deployment, verification,
+and certification without committing or publishing. `deploy verify` performs
+the verification and certification checks without writing. Repositories should
+retain this command as a required CI check.
 
 For staged team adoption, `deploy bridge` appends an inert managed block to
 `AGENTS.md` and `CLAUDE.md`; review and commit those two files. Individual

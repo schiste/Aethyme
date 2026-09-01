@@ -1,6 +1,6 @@
 # Repository deployment contract
 
-Last Updated: 2026-08-24
+Last Updated: 2026-09-01
 
 Aethyme has two distinct installation scopes:
 
@@ -8,20 +8,46 @@ Aethyme has two distinct installation scopes:
 - deploy and commit Aethyme policy separately in every repository where agents
   must use the broker.
 
-From the target repository, run:
+For the first shared enrollment, review the exact remote-based plan and then
+authorize that plan by digest:
 
 ```bash
-aethyme deploy --repo .
+aethyme deploy plan --repo . --diff
+aethyme deploy execute --repo . --confirm <plan-sha256>
 ```
 
-This canonical command scaffolds broker configuration, drafts applicable
-gates, deploys agent instructions and skills, verifies their shape, and
-certifies the complete repository contract. It does not install another copy
-of the executable inside the repository.
+`plan` is read-only. It fetches the current remote default branch into a
+disposable checkout and proposes the complete tracked policy tree from that
+exact commit, without reading ignored or untracked content from the active
+checkout. Its digest binds the remote and local refs, generated file hashes and
+modes, dirty overlap, live broker state, shared hook state, local activation,
+and exact preservation refs. A foreign `core.hooksPath`, overlapping dirty
+policy, active session, nonterminal queue entry, ambiguous integration history,
+or remote movement blocks execution instead of being overwritten.
 
-## Commit the policy
+`execute` first creates the reviewed preservation refs. It then prepares the
+ignored runtime boundary, activates shared hooks, creates an isolated broker
+session with exact path leases, applies and commits only the reviewed outputs,
+submits them through the broker, publishes the exact promoted SHA, and verifies
+the remote. The primary default branch is synchronized only when it is clean,
+unchanged since planning, and fast-forwardable; otherwise publication remains
+successful and the report gives the unsynchronized state. It does not install
+another copy of the executable inside the repository.
 
-Review and commit:
+Execution is phase-journaled under the Git common directory. Repeating the same
+confirmed command resumes after interruption and does not duplicate an
+already-verified publication. A changed plan digest or remote default SHA is a
+hard refusal: re-plan and review the new state. Preservation refs and the
+completed journal remain as local evidence.
+
+For an intentionally offline/manual enrollment, `aethyme deploy --repo .`
+continues to scaffold, draft, deploy, verify, and certify the working tree
+without publishing it. The operator is then responsible for reviewing,
+committing, and publishing that tree.
+
+## Review the policy
+
+The plan and its local diff cover the files that execution will commit:
 
 - `.gitignore`;
 - `.aethyme/config.toml` and `.aethyme/gates.toml` when generated;
@@ -37,6 +63,10 @@ support, but canonical verification does not require them in every clone.
 `.claude/settings.local.json` is always machine-local: it can contain private
 permission history and absolute paths, must not be committed, and is installed
 best-effort by `aethyme deploy` in each checkout.
+
+Confirmed execution commits exactly this reviewed write set. If maintainers
+need to customize generated policy, stop before execution, add the supported
+override, and create a new plan rather than editing the proposed output.
 
 The two JSON artifacts under `.aethyme/generated/` are portable canonical
 inputs, not caches. They use repository-relative identity and allow another

@@ -277,8 +277,12 @@ fn top_level_help_exposes_the_canonical_deployment_surface() {
         .output()
         .unwrap();
     assert!(deploy_help.status.success());
-    assert!(String::from_utf8_lossy(&deploy_help.stdout).contains("aethyme deploy verify"));
-    assert!(String::from_utf8_lossy(&deploy_help.stdout).contains("--local-only"));
+    let deploy_help = String::from_utf8_lossy(&deploy_help.stdout);
+    assert!(deploy_help.contains("aethyme deploy plan"));
+    assert!(deploy_help.contains("aethyme deploy execute"));
+    assert!(deploy_help.contains("--confirm <plan-sha256>"));
+    assert!(deploy_help.contains("aethyme deploy verify"));
+    assert!(deploy_help.contains("--local-only"));
 }
 
 #[test]

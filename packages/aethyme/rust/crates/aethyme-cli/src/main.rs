@@ -28,6 +28,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod repository_deploy;
+mod repository_enrollment;
 mod repository_upgrade;
 
 /// Upper bound for waiting on a freshly-spawned engine daemon. The socket

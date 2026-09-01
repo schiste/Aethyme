@@ -144,7 +144,7 @@ pub struct RepositoryResolution {
     pub choice: RepositoryResolutionChoice,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryCustomizationClassification {
     Missing,
@@ -176,7 +176,7 @@ pub enum RepositoryTreeAction {
     Unchanged,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryPathOwnership {
     AethymeOwned,
@@ -184,7 +184,7 @@ pub enum RepositoryPathOwnership {
     RepositoryOwned,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepositoryTreeChange {
     pub path: String,
     pub action: RepositoryTreeAction,
@@ -2097,6 +2097,7 @@ fn set_file_mode(_path: &Path, _mode: Option<&str>) -> Result<(), String> {
 
 fn active_session_preconditions(
     repo: &Path,
+    excluded_session_id: Option<i64>,
 ) -> Result<Vec<UpgradeActiveSessionPrecondition>, String> {
     let checkout = aethyme_broker::GitRepo::discover(repo).map_err(|error| error.to_string())?;
     let main_root = checkout.main_root().map_err(|error| error.to_string())?;
@@ -2110,6 +2111,7 @@ fn active_session_preconditions(
         .live_sessions()
         .map_err(|error| error.to_string())?
         .into_iter()
+        .filter(|session| Some(session.id) != excluded_session_id)
         .filter(|session| {
             matches!(
                 session.status,
@@ -2184,6 +2186,7 @@ fn paths_overlap(left: &str, right: &str) -> bool {
 fn relevant_leases(
     repo: &Path,
     planned_paths: &[String],
+    excluded_session_id: Option<i64>,
 ) -> Result<Vec<UpgradeRelevantLease>, String> {
     let checkout = aethyme_broker::GitRepo::discover(repo).map_err(|error| error.to_string())?;
     let main_root = checkout.main_root().map_err(|error| error.to_string())?;
@@ -2197,6 +2200,7 @@ fn relevant_leases(
         .active_leases()
         .map_err(|error| error.to_string())?
         .into_iter()
+        .filter(|lease| Some(lease.session_id) != excluded_session_id)
         .filter_map(|lease| {
             let overlapping_planned_paths = planned_paths
                 .iter()
@@ -2231,6 +2235,7 @@ fn build_plan(
     repo_hint: &Path,
     requested_mode: Option<RepositoryMode>,
     resolution_file: Option<&Path>,
+    excluded_session_id: Option<i64>,
 ) -> Result<BuiltUpgradePlan, String> {
     let repo = git_root(repo_hint)?;
     let requested_resolutions = load_resolution_file(&repo, resolution_file)?;
@@ -2315,8 +2320,23 @@ fn build_plan(
             surface: InvocationSurface::UpgradeCommand,
         },
     )
+    .or_else(|| {
+        (detected.is_none() && requested_mode == Some(RepositoryMode::Canonical)).then(|| {
+            CompatibilityDecision {
+                repository: RepositoryCompatibility::UpgradeRequired,
+                repository_schema: Some(0),
+                capability: CommandCapability::Upgrade,
+                surface: InvocationSurface::UpgradeCommand,
+                allowed: true,
+                severity: CompatibilitySeverity::Info,
+                execution: CompatibilityExecution::Normal,
+                reason: "repository is ready for reviewed first enrollment".into(),
+                remediation: None,
+            }
+        })
+    })
     .ok_or_else(|| "cannot determine repository upgrade compatibility".to_string())?;
-    let active_sessions = active_session_preconditions(&repo)?;
+    let active_sessions = active_session_preconditions(&repo, excluded_session_id)?;
     let before_tree = snapshot_paths(proposed_repo, &examined_paths)?;
     if blockers.is_empty() && !migrations.is_empty() {
         write_pending_marker(proposed_repo, mode)?;
@@ -2369,7 +2389,7 @@ fn build_plan(
                 .iter()
                 .any(|planned| paths_overlap(dirty, planned))
         });
-    let relevant_leases = relevant_leases(&repo, &planned_paths)?;
+    let relevant_leases = relevant_leases(&repo, &planned_paths, excluded_session_id)?;
     let shared_policy_or_gate_migration = changes.iter().any(is_shared_policy_or_gate_change);
     let mut warnings = Vec::new();
     if !disjoint_dirty_paths.is_empty() {
@@ -2479,7 +2499,23 @@ pub fn plan(
     repo_hint: &Path,
     requested_mode: Option<RepositoryMode>,
 ) -> Result<RepositoryUpgradePlan, String> {
-    build_plan(repo_hint, requested_mode, None).map(|built| built.report)
+    build_plan(repo_hint, requested_mode, None, None).map(|built| built.report)
+}
+
+/// Build the exact tracked tree for first canonical enrollment. The optional
+/// session is the isolated enrollment worker itself; excluding it prevents
+/// that worker from making its own reviewed migration appear unsafe.
+pub fn initial_enrollment_plan(
+    repo_hint: &Path,
+    enrollment_session_id: Option<i64>,
+) -> Result<RepositoryUpgradePlan, String> {
+    build_plan(
+        repo_hint,
+        Some(RepositoryMode::Canonical),
+        None,
+        enrollment_session_id,
+    )
+    .map(|built| built.report)
 }
 
 pub fn apply(
@@ -2488,6 +2524,20 @@ pub fn apply(
     confirmation: &str,
 ) -> Result<RepositoryUpgradePlan, String> {
     apply_with_resolution_file(repo_hint, requested_mode, confirmation, None)
+}
+
+pub fn apply_initial_enrollment(
+    repo_hint: &Path,
+    enrollment_session_id: i64,
+    confirmation: &str,
+) -> Result<RepositoryUpgradePlan, String> {
+    apply_with_resolution_file_excluding_session(
+        repo_hint,
+        Some(RepositoryMode::Canonical),
+        confirmation,
+        None,
+        Some(enrollment_session_id),
+    )
 }
 
 fn refuse_unjournaled_in_progress_marker(
@@ -2515,12 +2565,33 @@ fn apply_with_resolution_file(
     confirmation: &str,
     resolution_file: Option<&Path>,
 ) -> Result<RepositoryUpgradePlan, String> {
+    apply_with_resolution_file_excluding_session(
+        repo_hint,
+        requested_mode,
+        confirmation,
+        resolution_file,
+        None,
+    )
+}
+
+fn apply_with_resolution_file_excluding_session(
+    repo_hint: &Path,
+    requested_mode: Option<RepositoryMode>,
+    confirmation: &str,
+    resolution_file: Option<&Path>,
+    excluded_session_id: Option<i64>,
+) -> Result<RepositoryUpgradePlan, String> {
     validate_plan_digest(confirmation)
         .map_err(|_| "--confirm must be the full 64-character plan SHA-256".to_string())?;
     let repo = git_root(repo_hint)?;
     let _lock = acquire_upgrade_lock(&repo)?;
     refuse_unjournaled_in_progress_marker(&repo, requested_mode)?;
-    let built = build_plan(repo_hint, requested_mode, resolution_file)?;
+    let built = build_plan(
+        repo_hint,
+        requested_mode,
+        resolution_file,
+        excluded_session_id,
+    )?;
     let proposed_outputs = built.proposed_outputs;
     let mut before = built.report;
     if !before.safe {
@@ -2539,7 +2610,7 @@ fn apply_with_resolution_file(
         return Ok(before);
     }
 
-    ensure_apply_worktree_safe(&repo, &before)?;
+    ensure_apply_worktree_safe(&repo, &before, excluded_session_id)?;
     execute_upgrade_transaction(&repo, &before, &proposed_outputs, &before.customizations)?;
     before.applied = true;
     before.next_action = match before.mode {
@@ -2700,7 +2771,11 @@ fn managed_path_blocker(repo: &Path, relative: &str) -> Result<Option<String>, S
     Ok(None)
 }
 
-fn ensure_apply_worktree_safe(repo: &Path, plan: &RepositoryUpgradePlan) -> Result<(), String> {
+fn ensure_apply_worktree_safe(
+    repo: &Path,
+    plan: &RepositoryUpgradePlan,
+    excluded_session_id: Option<i64>,
+) -> Result<(), String> {
     let current_head = git(repo, &["rev-parse", "HEAD"])?;
     if current_head != plan.repository_head {
         return Err(format!(
@@ -2721,7 +2796,7 @@ fn ensure_apply_worktree_safe(repo: &Path, plan: &RepositoryUpgradePlan) -> Resu
             plan.overlapping_dirty_paths.join(", ")
         ));
     }
-    let current_sessions = active_session_preconditions(repo)?;
+    let current_sessions = active_session_preconditions(repo, excluded_session_id)?;
     if current_sessions != plan.active_sessions {
         return Err(
             "live broker sessions changed after review; regenerate the upgrade plan before applying"
@@ -2734,7 +2809,7 @@ fn ensure_apply_worktree_safe(repo: &Path, plan: &RepositoryUpgradePlan) -> Resu
                 .into(),
         );
     }
-    let current_leases = relevant_leases(repo, &plan.planned_paths)?;
+    let current_leases = relevant_leases(repo, &plan.planned_paths, excluded_session_id)?;
     if current_leases != plan.relevant_leases {
         return Err(
             "relevant broker leases changed after review; regenerate the upgrade plan before applying"
@@ -2957,7 +3032,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     let mut migration_diff = None;
     let report = match action {
         "plan" => {
-            let built = build_plan(&repo, mode, resolution_file.as_deref())?;
+            let built = build_plan(&repo, mode, resolution_file.as_deref(), None)?;
             if diff {
                 migration_diff = Some(built.migration_diff);
             }
@@ -3119,12 +3194,69 @@ fn print_usage() {
 
 #[cfg(test)]
 mod compatibility_tests {
+    use std::process::Command;
+
     use super::{
         CommandCapability, CompatibilityContext, CompatibilityExecution, CompatibilitySeverity,
         InvocationSurface, MIGRATION_ID, MIGRATION_IN_PROGRESS, REPOSITORY_SCHEMA_VERSION,
         RepositoryCompatibility, RepositoryMarker, acquire_upgrade_lock, classify_marker,
-        decide_compatibility,
+        decide_compatibility, initial_enrollment_plan,
     };
+
+    #[test]
+    fn first_enrollment_is_planned_from_schema_zero_without_writing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = temporary.path().join("repo");
+        let init = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&repo)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+        for args in [
+            vec!["add", "README.md"],
+            vec![
+                "-c",
+                "user.name=Aethyme Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "initial",
+            ],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let before = Command::new("git")
+            .args(["status", "--short"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        let plan = initial_enrollment_plan(&repo, None).unwrap();
+        assert_eq!(plan.from_schema, 0);
+        assert!(plan.safe, "{:?}", plan.blockers);
+        assert!(plan.planned_paths.iter().any(|path| path == "AGENTS.md"));
+        assert!(
+            plan.planned_paths
+                .iter()
+                .any(|path| path == ".aethyme/repository.json")
+        );
+        let after = Command::new("git")
+            .args(["status", "--short"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert_eq!(before.stdout, after.stdout);
+    }
 
     #[cfg(unix)]
     #[test]

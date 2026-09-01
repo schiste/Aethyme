@@ -139,28 +139,34 @@ contributors and unsupported targets, not as the primary quickstart. See the
 [v0.2.2 upgrade and rollback guide](packages/aethyme/docs/guides/upgrading-to-v0.2.2.md)
 for signature verification, source installation, migrations, and rollback.
 
-**2. Deploy Aethyme into each target repository:**
+**2. Enroll each target repository:**
 
 ```bash
 cd /path/to/your-repo
-aethyme deploy --repo .
+aethyme deploy plan --repo . --diff
+aethyme deploy execute --repo . --confirm <plan-sha256>
 ```
 
-This is the mandatory per-repository enrollment step. It scaffolds broker
-configuration and gates, installs the agent protocol and repository skills,
-then verifies and certifies the complete deployment. The globally installed
-binaries provide the executable; the committed repository policy makes every
-agent in this repository use it. Re-check the committed state locally and in
-CI with `aethyme deploy verify --repo .`.
+This is the reviewed, atomic first-enrollment path. `plan` reads the remote
+default branch into a disposable checkout and binds the exact generated files,
+dirty-path and session preconditions, local and integration refs, hook state,
+and preservation refs into a SHA-256. `execute` preserves the pre-enrollment
+refs first, creates an isolated broker session, commits and verifies the exact
+reviewed outputs, publishes the promoted commit, verifies the remote, and only
+fast-forwards a clean local default branch. An interrupted execution resumes
+from its private journal; it never guesses that a push failed or succeeded.
+
+The globally installed binaries provide the executable; the committed
+repository policy makes every agent in this repository use it. Re-check the
+committed state locally and in CI with `aethyme deploy verify --repo .`.
 
 (On a repo with a `Cargo.toml`, `go.mod`, `package.json` scripts, or a
 `pyproject.toml` mentioning pytest/ruff, phase 3 drafts a `gates.toml` for
-you to review.) Commit the repository deployment:
-
-```bash
-git add .gitignore .aethyme AGENTS.md CLAUDE.md .codex .claude
-git commit -m "chore: deploy aethyme repository policy"
-```
+you to review.) For an intentionally offline/manual enrollment,
+`aethyme deploy --repo .` still prepares and verifies the files without
+publishing them; the operator then owns the Git review and publication steps.
+The reviewed canonical write set still includes the generated `AGENTS.md` and
+`CLAUDE.md` policy surfaces alongside `.aethyme/` and the agent skills.
 
 The deploy command prints the exact tracked-policy/runtime-state boundary.
 See the [repository deployment contract](packages/aethyme/docs/guides/repository-deployment.md)

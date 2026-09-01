@@ -152,7 +152,8 @@ Runtime notes:
 - the Python layer now executes a built Rust binary rather than `cargo run` for every call
 - local repo artifacts are cached by snapshot key under `AETHYME_CACHE_DIR` or `/tmp/aethyme-cache`
 - Git repositories use commit plus dirty-state metadata for cache keys instead of a full recursive fingerprint on every call
-- `aethyme deploy --repo <path>` is the canonical mandatory repository-enrollment path; it composes broker scaffold, gate drafting, agent-policy deployment, verification, and certification
+- `aethyme deploy plan --repo <path> --diff` plus digest-confirmed `deploy execute` is the atomic public first-enrollment path; it plans from the exact remote default tree, preserves pre-enrollment refs, uses isolated broker submission and ship, verifies publication, and synchronizes local main only by a clean fast-forward
+- `aethyme deploy --repo <path>` remains the offline/manual repository-enrollment preparation path; it composes broker scaffold, gate drafting, agent-policy deployment, verification, and certification without publishing
 - `aethyme deploy verify --repo <path>` is its read-only local and CI contract; `aethyme enhance deploy/verify` remain lower-level discoverability operations
 - binary installation and repository migration are separate: after updating the paired binaries, `aethyme upgrade plan` reviews embedded repository-policy migrations one repository at a time, `upgrade apply` requires the plan digest and uses a rollback journal, and an interrupted transaction is restored explicitly with `upgrade recover --plan <digest>`
 - canonical deployments track `.aethyme/repository.json`; local-only deployments keep the equivalent marker ignored, and enrolled repositories fail closed on broker use when their policy schema is stale or newer than the installed binary
