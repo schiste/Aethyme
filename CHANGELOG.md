@@ -4,6 +4,38 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.6.0] - 2026-09-01
+
+### Added
+
+- `aethyme broker worktree-root` provides a read-only, structured placement
+  plan with the canonical checkout identity, clone-specific key, preferred
+  external root, and constrained fallback.
+- Session-start reports now retain the selected worktree root, its source, the
+  scanner boundary, and any fallback reason in text and JSON.
+
+### Changed
+
+- Broker-managed worktrees now live in private per-user host state outside the
+  repository by default. Independent same-named clones receive distinct roots,
+  and starts invoked from a broker worktree create siblings rather than nested
+  checkouts.
+- Existing `.aethyme/worktrees/` sessions remain cleanup-compatible and serve
+  only as a reported fallback when the platform host-state root is unavailable.
+
+### Fixed
+
+- Repository-wide scanners no longer traverse broker-managed nested checkouts,
+  preventing duplicate findings and runaway recursive work.
+- Explicit roots inside the repository or another linked worktree are refused,
+  while private ownership markers keep external cleanup fail-closed.
+
+### Upgrade notes
+
+Read [Upgrading to v0.6.0](packages/aethyme/docs/guides/upgrading-to-v0.6.0.md)
+before updating. Broker storage, repository deployment, and engine protocol
+schemas are unchanged from v0.5.0; no migration is required.
+
 ## [0.5.0] - 2026-09-01
 
 ### Added

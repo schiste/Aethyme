@@ -79,8 +79,10 @@ pub use broker::{
     RepairSource, SESSION_NOTE_MAX_BYTES, SemanticGateAdvice, SemanticGateSelection,
     SemanticGateSource, SemanticGateSourceStatus, SemanticGateSuggestionChain,
     SessionCheckpointApplyReport, SessionCheckpointRecoveryPlan, SessionHandoffReport,
-    SessionStartBase, SessionStartBaseEvidence, StartReport, StatusAdvice, StatusAdviceSeverity,
-    StatusIntegrationRelation, StatusSummary, StatusView, VersionRepairReport, VersionRepairStep,
+    SessionStartBase, SessionStartBaseEvidence, StartAgentReport, StartReport, StatusAdvice,
+    StatusAdviceSeverity, StatusIntegrationRelation, StatusSummary, StatusView,
+    VersionRepairReport, VersionRepairStep, WORKTREE_ROOT_SCHEMA_VERSION, WorktreePlacement,
+    WorktreeRootPlan, WorktreeRootSource,
 };
 pub use error::BrokerError;
 pub use exposures::{

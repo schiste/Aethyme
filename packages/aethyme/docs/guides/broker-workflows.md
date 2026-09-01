@@ -104,6 +104,12 @@ it only when the old tip remains, and otherwise requests explicit recovery.
 
 ## Reuse A Worktree Safely
 
+Before starting work, `aethyme broker worktree-root --json` shows the exact
+clone-specific root without changing state. A normal `broker start` creates a
+sibling beneath that external root even when invoked from an existing broker
+worktree; it never nests the new checkout below the invoking worktree. Start
+output records the selected root and reports any legacy fallback reason.
+
 Use reuse when a dedicated broker worktree should continue with a follow-up
 task. Start by checking whether integration advanced while the session was
 working:

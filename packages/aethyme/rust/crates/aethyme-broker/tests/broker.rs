@@ -82,7 +82,10 @@ fn adopted_hand_made_worktree_and_spawned_session_are_indistinguishable() {
 
     // Broker opened from INSIDE the hand-made worktree still resolves to
     // the main checkout's database (attach-first, one shared db).
-    let mut broker = Broker::open(&hand_made).unwrap();
+    let external_root = tempfile::tempdir().unwrap();
+    let mut broker = Broker::open(&hand_made)
+        .unwrap()
+        .with_worktree_root(external_root.path());
     assert_eq!(
         broker.main_root().canonicalize().unwrap(),
         tmp.path().canonicalize().unwrap()
@@ -98,11 +101,12 @@ fn adopted_hand_made_worktree_and_spawned_session_are_indistinguishable() {
         .unwrap();
     assert_eq!(spawned.origin, SessionOrigin::Spawned);
     assert!(spawned.pid.is_some());
-    assert!(
-        spawned
-            .worktree_path
-            .contains(".aethyme/worktrees/spawned-task")
+    let spawned_path = std::path::PathBuf::from(&spawned.worktree_path);
+    assert_eq!(
+        spawned_path.parent(),
+        Some(external_root.path().canonicalize().unwrap().as_path())
     );
+    assert!(spawned_path.ends_with("spawned-task"));
 
     // Downstream (agents view) treats both identically.
     let views = broker.agents(now_ms()).unwrap();
@@ -124,8 +128,11 @@ fn adopted_hand_made_worktree_and_spawned_session_are_indistinguishable() {
 #[test]
 fn start_worktree_creates_broker_managed_session_without_process() {
     let tmp = tempfile::tempdir().unwrap();
+    let external_root = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = Broker::open(tmp.path())
+        .unwrap()
+        .with_worktree_root(external_root.path());
 
     let session = broker.start_worktree("isolated edits").unwrap();
     let wt = std::path::PathBuf::from(&session.worktree_path);
@@ -134,7 +141,11 @@ fn start_worktree_creates_broker_managed_session_without_process() {
     assert!(session.pid.is_none());
     assert_eq!(session.branch, "agent/isolated-edits");
     assert!(wt.exists());
-    assert!(wt.ends_with(".aethyme/worktrees/isolated-edits"));
+    assert_eq!(
+        wt.parent(),
+        Some(external_root.path().canonicalize().unwrap().as_path())
+    );
+    assert!(wt.ends_with("isolated-edits"));
     assert!(
         broker
             .store()

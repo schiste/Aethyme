@@ -7,7 +7,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::{fs::File, io::Read};
+use std::{
+    fs::File,
+    io::{Read, Write},
+};
 
 use sha2::{Digest, Sha256};
 
@@ -31,6 +34,8 @@ use crate::version::{VersionDriftReport, VersionDriftStatus};
 const IDLE_AFTER_MS: i64 = 10 * 60 * 1000;
 const STALE_AFTER_MS: i64 = 2 * 60 * 60 * 1000;
 pub const SESSION_NOTE_MAX_BYTES: usize = 1_000;
+pub const WORKTREE_ROOT_SCHEMA_VERSION: u32 = 1;
+const WORKTREE_ROOT_MARKER: &str = ".aethyme-worktree-root.json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerOpError {
@@ -129,6 +134,10 @@ pub enum BrokerOpError {
     },
     #[error("cannot select a safe base for broker start: {reason}")]
     StartBaseUnavailable { reason: String },
+    #[error("cannot prepare broker worktree root {path}: {reason}")]
+    WorktreeRootUnavailable { path: PathBuf, reason: String },
+    #[error("refusing nested broker worktree path {path}: it is inside linked worktree {owner}")]
+    NestedWorktreePath { path: PathBuf, owner: PathBuf },
     #[error("cannot capture repository contract at {path}: {reason}")]
     RepositoryContract { path: String, reason: String },
     #[error(
@@ -454,7 +463,66 @@ pub struct StartReport {
     #[serde(flatten)]
     pub session: Session,
     pub start_base: SessionStartBase,
+    pub worktree_placement: WorktreePlacement,
     pub planned_explicit_leases: Vec<crate::Lease>,
+}
+
+/// Result of starting a detached agent process, including where its checkout
+/// was placed. Kept separate from [`StartReport`] because detached starts do
+/// not accept planned path leases.
+#[derive(Debug, serde::Serialize)]
+pub struct StartAgentReport {
+    #[serde(flatten)]
+    pub session: Session,
+    pub start_base: SessionStartBase,
+    pub worktree_placement: WorktreePlacement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeRootSource {
+    HostState,
+    EnvironmentOverride,
+    LibraryOverride,
+    RepositoryFallback,
+}
+
+impl WorktreeRootSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HostState => "host state",
+            Self::EnvironmentOverride => "environment override",
+            Self::LibraryOverride => "library override",
+            Self::RepositoryFallback => "repository fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WorktreeRootPlan {
+    pub schema_version: u32,
+    pub repository_root: PathBuf,
+    pub repository_key: String,
+    pub preferred_root: Option<PathBuf>,
+    pub preferred_source: Option<WorktreeRootSource>,
+    pub legacy_fallback_root: PathBuf,
+    pub preferred_outside_repository: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WorktreePlacement {
+    pub root: PathBuf,
+    pub source: WorktreeRootSource,
+    pub outside_repository: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct WorktreeRootMarker {
+    schema_version: u32,
+    repository_key: String,
+    repository_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -1509,6 +1577,7 @@ pub struct Broker {
     main_root: PathBuf,
     graph_impact_provider: Box<dyn GraphImpactProvider>,
     host_operation_db_path: Option<PathBuf>,
+    worktree_root_override: Option<PathBuf>,
 }
 
 impl Broker {
@@ -1531,6 +1600,7 @@ impl Broker {
             main_root,
             graph_impact_provider: Box::new(GraphStoreImpactProvider),
             host_operation_db_path: None,
+            worktree_root_override: None,
         })
     }
 
@@ -1550,6 +1620,7 @@ impl Broker {
             main_root,
             graph_impact_provider: Box::new(GraphStoreImpactProvider),
             host_operation_db_path: None,
+            worktree_root_override: None,
         };
         broker.backfill_live_repository_contracts()?;
         Ok(broker)
@@ -1571,6 +1642,7 @@ impl Broker {
             main_root,
             graph_impact_provider: Box::new(graph_impact_provider),
             host_operation_db_path: None,
+            worktree_root_override: None,
         };
         broker.backfill_live_repository_contracts()?;
         broker.recover_interrupted_promotion()?;
@@ -1594,6 +1666,17 @@ impl Broker {
     #[doc(hidden)]
     pub fn with_host_operation_database(mut self, path: impl Into<PathBuf>) -> Self {
         self.host_operation_db_path = Some(path.into());
+        self
+    }
+
+    /// Override the exact broker worktree root.
+    ///
+    /// Production callers should use host-state placement. Tests and
+    /// constrained embedders can inject an isolated root without changing
+    /// process-wide environment variables.
+    #[doc(hidden)]
+    pub fn with_worktree_root(mut self, path: impl Into<PathBuf>) -> Self {
+        self.worktree_root_override = Some(path.into());
         self
     }
 
@@ -2210,7 +2293,8 @@ impl Broker {
     ) -> Result<StartReport, BrokerOpError> {
         let planned_paths = normalize_planned_paths(paths)?;
         self.ensure_planned_paths_available(&planned_paths, None)?;
-        let (_slug, branch, start_base, worktree) = self.create_session_worktree(task)?;
+        let (_slug, branch, start_base, worktree, worktree_placement) =
+            self.create_session_worktree(task)?;
         let base = start_base.commit.clone();
         let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
         let new_session = NewSession {
@@ -2243,6 +2327,7 @@ impl Broker {
         Ok(StartReport {
             session,
             start_base,
+            worktree_placement,
             planned_explicit_leases,
         })
     }
@@ -2252,8 +2337,17 @@ impl Broker {
     /// the child runs detached (the broker never owns the process beyond
     /// recording its PID).
     pub fn start_agent(&mut self, task: &str, command: &str) -> Result<Session, BrokerOpError> {
-        let (slug, branch, start_base, worktree) = self.create_session_worktree(task)?;
-        let base = start_base.commit;
+        Ok(self.start_agent_report(task, command)?.session)
+    }
+
+    pub fn start_agent_report(
+        &mut self,
+        task: &str,
+        command: &str,
+    ) -> Result<StartAgentReport, BrokerOpError> {
+        let (slug, branch, start_base, worktree, worktree_placement) =
+            self.create_session_worktree(task)?;
+        let base = start_base.commit.clone();
         let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
 
         let log_dir = self.main_root.join(".aethyme/logs");
@@ -2298,21 +2392,282 @@ impl Broker {
             log_path: Some(log_path.to_string_lossy().into_owned()),
         })?;
         self.store.set_session_foreign_files(session.id, &[])?;
-        Ok(session)
+        Ok(StartAgentReport {
+            session,
+            start_base,
+            worktree_placement,
+        })
     }
 
     fn create_session_worktree(
         &mut self,
         task: &str,
-    ) -> Result<(String, String, SessionStartBase, GitRepo), BrokerOpError> {
-        let slug = self.next_worktree_slug(task);
-        let worktree_path = self.main_root.join(".aethyme/worktrees").join(&slug);
+    ) -> Result<(String, String, SessionStartBase, GitRepo, WorktreePlacement), BrokerOpError> {
+        let placement = self.prepare_broker_worktree_root()?;
+        let slug = self.next_worktree_slug(task, &placement.root);
+        let worktree_path = placement.root.join(&slug);
+        self.refuse_nested_worktree_path(&worktree_path)?;
         let branch = format!("agent/{slug}");
         let start_base = self.select_session_start_base()?;
         let worktree = self
             .repo
             .worktree_add(&worktree_path, &branch, &start_base.commit)?;
-        Ok((slug, branch, start_base, worktree))
+        Ok((slug, branch, start_base, worktree, placement))
+    }
+
+    pub fn worktree_root_plan(&self) -> Result<WorktreeRootPlan, BrokerOpError> {
+        let repository_key = self.repository_worktree_key()?;
+        let (preferred_root, preferred_source) = if let Some(root) = &self.worktree_root_override {
+            (
+                Some(self.absolute_worktree_root(root)),
+                Some(WorktreeRootSource::LibraryOverride),
+            )
+        } else if let Some(base) =
+            std::env::var_os("AETHYME_WORKTREE_ROOT").filter(|value| !value.is_empty())
+        {
+            (
+                Some(
+                    self.absolute_worktree_root(&PathBuf::from(base))
+                        .join(&repository_key),
+                ),
+                Some(WorktreeRootSource::EnvironmentOverride),
+            )
+        } else if let Some(base) = crate::host_state::default_host_state_dir() {
+            (
+                Some(base.join("worktrees").join(&repository_key)),
+                Some(WorktreeRootSource::HostState),
+            )
+        } else {
+            (None, None)
+        };
+        let preferred_outside_repository = preferred_root
+            .as_deref()
+            .is_some_and(|root| !self.path_is_inside_repository(root));
+        Ok(WorktreeRootPlan {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_root: self.main_root.clone(),
+            repository_key,
+            preferred_root,
+            preferred_source,
+            legacy_fallback_root: self.legacy_broker_worktree_root(),
+            preferred_outside_repository,
+        })
+    }
+
+    fn prepare_broker_worktree_root(&self) -> Result<WorktreePlacement, BrokerOpError> {
+        let plan = self.worktree_root_plan()?;
+        if let (Some(root), Some(source)) = (&plan.preferred_root, plan.preferred_source) {
+            match self.prepare_worktree_root(root, source, true) {
+                Ok(root) => {
+                    return Ok(WorktreePlacement {
+                        root,
+                        source,
+                        outside_repository: true,
+                        fallback_reason: None,
+                    });
+                }
+                Err(error)
+                    if matches!(
+                        source,
+                        WorktreeRootSource::EnvironmentOverride
+                            | WorktreeRootSource::LibraryOverride
+                    ) =>
+                {
+                    return Err(error);
+                }
+                Err(error) => {
+                    let fallback_reason = error.to_string();
+                    let root = self.prepare_worktree_root(
+                        &plan.legacy_fallback_root,
+                        WorktreeRootSource::RepositoryFallback,
+                        false,
+                    )?;
+                    return Ok(WorktreePlacement {
+                        root,
+                        source: WorktreeRootSource::RepositoryFallback,
+                        outside_repository: false,
+                        fallback_reason: Some(fallback_reason),
+                    });
+                }
+            }
+        }
+
+        let root = self.prepare_worktree_root(
+            &plan.legacy_fallback_root,
+            WorktreeRootSource::RepositoryFallback,
+            false,
+        )?;
+        Ok(WorktreePlacement {
+            root,
+            source: WorktreeRootSource::RepositoryFallback,
+            outside_repository: false,
+            fallback_reason: Some(
+                "no per-user host-state directory is available; set AETHYME_WORKTREE_ROOT to a writable external base"
+                    .into(),
+            ),
+        })
+    }
+
+    fn prepare_worktree_root(
+        &self,
+        path: &Path,
+        source: WorktreeRootSource,
+        require_external: bool,
+    ) -> Result<PathBuf, BrokerOpError> {
+        std::fs::create_dir_all(path).map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        })?;
+        let root = path
+            .canonicalize()
+            .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            })?;
+        if require_external && self.path_is_inside_repository(&root) {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: root,
+                reason: format!(
+                    "{} must resolve outside repository {}; choose an external AETHYME_WORKTREE_ROOT",
+                    source.as_str(),
+                    self.main_root.display()
+                ),
+            });
+        }
+        crate::host_state::protect_host_state_path(&root, true).map_err(|error| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: format!("cannot apply private directory permissions: {error}"),
+            }
+        })?;
+        self.write_or_verify_worktree_root_marker(&root)?;
+        Ok(root)
+    }
+
+    fn write_or_verify_worktree_root_marker(&self, root: &Path) -> Result<(), BrokerOpError> {
+        let marker_path = root.join(WORKTREE_ROOT_MARKER);
+        let expected = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: self.repository_worktree_key()?,
+            repository_root: self.main_root.clone(),
+        };
+        if marker_path.exists() {
+            return self.verify_worktree_root_marker(&marker_path, &expected);
+        }
+        let mut bytes = serde_json::to_vec_pretty(&expected).map_err(|error| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: marker_path.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+        bytes.push(b'\n');
+        let temporary = root.join(format!(
+            ".aethyme-worktree-root.{}.{}.tmp",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+                path: temporary.clone(),
+                reason: error.to_string(),
+            })?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+                path: temporary.clone(),
+                reason: error.to_string(),
+            })?;
+        crate::host_state::protect_host_state_path(&temporary, false).map_err(|error| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: temporary.clone(),
+                reason: format!("cannot apply private marker permissions: {error}"),
+            }
+        })?;
+        match std::fs::rename(&temporary, &marker_path) {
+            Ok(()) => Ok(()),
+            Err(_error) if marker_path.exists() => {
+                let _ = std::fs::remove_file(&temporary);
+                self.verify_worktree_root_marker(&marker_path, &expected)
+            }
+            Err(error) => Err(BrokerOpError::WorktreeRootUnavailable {
+                path: marker_path,
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    fn verify_worktree_root_marker(
+        &self,
+        marker_path: &Path,
+        expected: &WorktreeRootMarker,
+    ) -> Result<(), BrokerOpError> {
+        let bytes =
+            std::fs::read(marker_path).map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+                path: marker_path.to_path_buf(),
+                reason: error.to_string(),
+            })?;
+        let actual: WorktreeRootMarker = serde_json::from_slice(&bytes).map_err(|error| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: marker_path.to_path_buf(),
+                reason: format!("invalid ownership marker: {error}"),
+            }
+        })?;
+        if &actual != expected {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: marker_path.to_path_buf(),
+                reason: "ownership marker belongs to a different repository checkout".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn repository_worktree_key(&self) -> Result<String, BrokerOpError> {
+        let common_dir = self.repo.git_common_dir()?;
+        let canonical = common_dir.canonicalize().unwrap_or(common_dir);
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.to_string_lossy().as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        let name = self
+            .main_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(slugify)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "repository".into());
+        Ok(format!("{name}-{}", &digest[..16]))
+    }
+
+    fn absolute_worktree_root(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.main_root.join(path)
+        }
+    }
+
+    fn path_is_inside_repository(&self, path: &Path) -> bool {
+        let repository = self
+            .main_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.main_root.clone());
+        let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        candidate.starts_with(repository)
+    }
+
+    fn refuse_nested_worktree_path(&self, path: &Path) -> Result<(), BrokerOpError> {
+        for owner in self.repo.worktree_paths()? {
+            let owner = owner.canonicalize().unwrap_or(owner);
+            if path.starts_with(&owner) {
+                return Err(BrokerOpError::NestedWorktreePath {
+                    path: path.to_path_buf(),
+                    owner,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn select_session_start_base(&self) -> Result<SessionStartBase, BrokerOpError> {
@@ -2361,7 +2716,7 @@ impl Broker {
         }
     }
 
-    fn next_worktree_slug(&self, task: &str) -> String {
+    fn next_worktree_slug(&self, task: &str, worktree_root: &Path) -> String {
         let base = slugify(task);
         for attempt in 0..1000 {
             let slug = if attempt == 0 {
@@ -2370,7 +2725,7 @@ impl Broker {
                 format!("{base}-{}", attempt + 1)
             };
             let branch = format!("refs/heads/agent/{slug}");
-            let worktree_path = self.main_root.join(".aethyme/worktrees").join(&slug);
+            let worktree_path = worktree_root.join(&slug);
             if !worktree_path.exists() && self.repo.resolve_ref(&branch).is_none() {
                 return slug;
             }
@@ -5163,7 +5518,7 @@ impl Broker {
 
     // ── cleanup ───────────────────────────────────────────────────────
 
-    fn broker_worktree_root(&self) -> PathBuf {
+    fn legacy_broker_worktree_root(&self) -> PathBuf {
         self.main_root.join(".aethyme/worktrees")
     }
 
@@ -5171,17 +5526,50 @@ impl Broker {
         if session.origin != SessionOrigin::Spawned || path == self.main_root.as_path() {
             return false;
         }
-        let Ok(root) = self.broker_worktree_root().canonicalize() else {
+        let Some(parent) = path.parent() else {
             return false;
         };
-        if path.exists() {
-            return path
-                .canonicalize()
-                .is_ok_and(|path| path.starts_with(&root));
+        let parent = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
+        let legacy = self
+            .legacy_broker_worktree_root()
+            .canonicalize()
+            .unwrap_or_else(|_| self.legacy_broker_worktree_root());
+        let owned_root = parent == legacy || self.worktree_root_marker_matches(&parent);
+        if !owned_root {
+            return false;
         }
-        path.parent()
-            .and_then(|parent| parent.canonicalize().ok())
-            .is_some_and(|parent| parent == root)
+        if !path.exists() {
+            return true;
+        }
+        let Ok(canonical_path) = path.canonicalize() else {
+            return false;
+        };
+        if canonical_path.parent() != Some(parent.as_path()) {
+            return false;
+        }
+        let Ok(checkout) = GitRepo::discover(&canonical_path) else {
+            return false;
+        };
+        match (checkout.git_common_dir(), self.repo.git_common_dir()) {
+            (Ok(actual), Ok(expected)) => actual == expected,
+            _ => false,
+        }
+    }
+
+    fn worktree_root_marker_matches(&self, root: &Path) -> bool {
+        let Ok(bytes) = std::fs::read(root.join(WORKTREE_ROOT_MARKER)) else {
+            return false;
+        };
+        let Ok(marker) = serde_json::from_slice::<WorktreeRootMarker>(&bytes) else {
+            return false;
+        };
+        marker.schema_version == WORKTREE_ROOT_SCHEMA_VERSION
+            && self
+                .repository_worktree_key()
+                .is_ok_and(|key| marker.repository_key == key)
+            && marker.repository_root == self.main_root
     }
 
     fn cleanup_eligibility(

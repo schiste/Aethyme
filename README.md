@@ -219,9 +219,17 @@ aethyme broker start --task "Add a farewell function"
 ```
 
 ```text
-Started session 1 — worktree /private/tmp/demo-app/.aethyme/worktrees/add-a-farewell-function on branch agent/add-a-farewell-function
-Next: cd /private/tmp/demo-app/.aethyme/worktrees/add-a-farewell-function
+Started session 1 — worktree /Users/me/Library/Application Support/Aethyme/worktrees/demo-app-a10b2c3d4e5f6789/add-a-farewell-function on branch agent/add-a-farewell-function
+Worktree root: /Users/me/Library/Application Support/Aethyme/worktrees/demo-app-a10b2c3d4e5f6789 (host state, outside the repository)
+Next: cd /Users/me/Library/Application Support/Aethyme/worktrees/demo-app-a10b2c3d4e5f6789/add-a-farewell-function
 ```
+
+Broker-managed worktrees live in private per-user host state by default, not
+beneath the repository, so repository-wide scanners cannot descend into a
+nested checkout. Inspect the resolved location without creating it with
+`aethyme broker worktree-root --json`. `AETHYME_WORKTREE_ROOT` can select an
+external base; an explicit override that resolves inside this repository or
+another linked worktree is refused.
 
 `broker adopt --task "..."` is still available when you have already created
 a dedicated worktree yourself.

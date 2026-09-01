@@ -51,7 +51,7 @@ fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
 }
 
 fn managed_worktree_names(root: &Path) -> Vec<String> {
-    let mut names = std::fs::read_dir(root.join(".aethyme/worktrees"))
+    let mut names = std::fs::read_dir(root)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
@@ -71,7 +71,7 @@ fn planned_start_claims_before_any_diff_and_refuses_a_second_rewrite() {
     assert_eq!(first.planned_explicit_leases.len(), 1);
     assert_eq!(first.planned_explicit_leases[0].path, "generated/");
     assert_eq!(first.planned_explicit_leases[0].kind, LeaseKind::Explicit);
-    let worktrees_before = managed_worktree_names(tmp.path());
+    let worktrees_before = managed_worktree_names(&first.worktree_placement.root);
 
     let error = broker
         .start_worktree_with_planned_paths("second rewrite", &["generated/policy.md".into()])
@@ -89,7 +89,7 @@ fn planned_start_claims_before_any_diff_and_refuses_a_second_rewrite() {
     assert!(!error.contains("--reuse --session"), "{error}");
     assert_eq!(broker.store().live_sessions().unwrap().len(), 1);
     assert_eq!(
-        managed_worktree_names(tmp.path()),
+        managed_worktree_names(&first.worktree_placement.root),
         worktrees_before,
         "a refused plan must not leave a worktree behind"
     );

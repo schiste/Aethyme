@@ -87,6 +87,13 @@ The managed `.gitignore` block excludes machine-local broker state:
 These files describe one checkout or active broker process. They are rebuilt
 locally and must not travel between clones.
 
+`.aethyme/worktrees/` remains ignored for backward-compatible cleanup and the
+reported constrained fallback. New broker-managed sessions normally live in a
+private, clone-keyed per-user host-state directory outside the checkout. Use
+`aethyme broker worktree-root --json` to inspect that decision without creating
+the directory. This placement keeps broad repository scanners from traversing
+another complete checkout.
+
 ## Enforce deployment in CI
 
 After committing the policy, make this a required check:

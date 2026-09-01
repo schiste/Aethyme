@@ -120,6 +120,10 @@ Usage:
   aethyme broker start-agent --task <text> --cmd <command> [--json]
       Create a worktree + branch and spawn <command> in it (sh -c),
       logging to .aethyme/logs/.
+  aethyme broker worktree-root [--json]
+      Resolve the scanner-safe external root used by future broker starts.
+      Read-only: reports the preferred per-user location, repository key,
+      and constrained legacy fallback without creating either directory.
   aethyme broker agents [--json]
       List live sessions with activity-derived liveness, refreshing
       diff-derived leases and warning on overlapping edits.
@@ -473,6 +477,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "adopt",
     "start",
     "start-agent",
+    "worktree-root",
     "exec",
     "git",
     "gh",
@@ -651,7 +656,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
 /// repository, or installation state remain observable.
 fn command_records_metric(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        Some("certify" | "queue" | "metrics" | "handoff") => false,
+        Some("certify" | "queue" | "metrics" | "handoff" | "worktree-root") => false,
         Some("advisories") => args.get(1).map(String::as_str) == Some("ack"),
         Some("exposures") => args.get(1).map(String::as_str) == Some("apply"),
         Some("report") => args.get(1).map(String::as_str) == Some("file"),
@@ -1882,6 +1887,22 @@ fn render_planned_explicit_leases(leases: &[crate::Lease]) {
     println!("Planned explicit leases:");
     for lease in leases {
         println!("  {}", lease.path);
+    }
+}
+
+fn render_worktree_placement(placement: &crate::WorktreePlacement) {
+    let boundary = if placement.outside_repository {
+        "outside the repository"
+    } else {
+        "inside the repository fallback"
+    };
+    println!(
+        "Worktree root: {} ({}, {boundary})",
+        placement.root.display(),
+        placement.source.as_str()
+    );
+    if let Some(reason) = &placement.fallback_reason {
+        println!("Warning: external worktree placement was unavailable: {reason}");
     }
 }
 
@@ -4501,6 +4522,42 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
     surface_command_advisories(subcommand, &parsed);
 
     match subcommand.as_str() {
+        "worktree-root" => {
+            if !parsed.positional.is_empty() {
+                return Err(UsageError::Message(
+                    "worktree-root does not accept positional arguments".into(),
+                ));
+            }
+            let broker = open_broker(parsed.read_only_snapshot)?;
+            let plan = broker.worktree_root_plan()?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                println!("Repository: {}", plan.repository_root.display());
+                println!("Repository key: {}", plan.repository_key);
+                if let (Some(root), Some(source)) = (&plan.preferred_root, plan.preferred_source) {
+                    println!(
+                        "Preferred worktree root: {} ({})",
+                        root.display(),
+                        source.as_str()
+                    );
+                    println!(
+                        "Scanner boundary: {}",
+                        if plan.preferred_outside_repository {
+                            "outside the repository"
+                        } else {
+                            "invalid: preferred root resolves inside the repository"
+                        }
+                    );
+                } else {
+                    println!("Preferred worktree root: unavailable");
+                }
+                println!(
+                    "Legacy fallback: {} (used only when host state is unavailable)",
+                    plan.legacy_fallback_root.display()
+                );
+            }
+        }
         "adopt" => {
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             let path = parsed.positional.first().map(PathBuf::from).unwrap_or(
@@ -4612,6 +4669,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     short_commit(&report.start_base.commit),
                     report.start_base.evidence.as_str()
                 );
+                render_worktree_placement(&report.worktree_placement);
                 render_planned_explicit_leases(&report.planned_explicit_leases);
                 println!("Next: cd {}", session.worktree_path);
             }
@@ -4624,9 +4682,10 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .cmd
                 .ok_or(UsageError::Message("start-agent requires --cmd".into()))?;
             let mut broker = open_broker(parsed.read_only_snapshot)?;
-            let session = broker.start_agent(&task, &cmd)?;
+            let report = broker.start_agent_report(&task, &cmd)?;
+            let session = &report.session;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&session)?);
+                println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!(
                     "Started session {} (pid {}) — worktree {} on branch {}\nLog: {}",
@@ -4636,6 +4695,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     session.branch,
                     session.log_path.as_deref().unwrap_or("-"),
                 );
+                render_worktree_placement(&report.worktree_placement);
             }
         }
         "report" => run_report(parsed)?,

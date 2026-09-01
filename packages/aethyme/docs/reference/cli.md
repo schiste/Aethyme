@@ -208,9 +208,26 @@ For task-oriented examples that connect session reuse, gate cache policy,
 lease planning, and durable finish handoffs, see the
 [broker follow-up workflows guide](../guides/broker-workflows.md).
 
+`broker worktree-root` is a strictly read-only placement plan. It reports the
+canonical checkout identity, the preferred private host-state root, whether
+that root is outside the repository, and the legacy fallback. Normal starts
+use a clone-specific key derived from the canonical Git common directory, so
+same-named independent clones do not share worktrees. macOS uses
+`~/Library/Application Support/Aethyme/worktrees/`; other supported Unix hosts
+use their configured Aethyme/XDG state directory. Set `AETHYME_WORKTREE_ROOT`
+to choose another external base. The broker appends the clone key, writes a
+private ownership marker, and refuses a root inside this repository or any
+linked worktree.
+
+If the platform host-state root cannot be prepared, `broker start` uses the
+legacy `.aethyme/worktrees/` location and reports the exact fallback reason in
+text and JSON. Explicit environment overrides fail closed instead of silently
+falling back. Existing legacy sessions remain cleanup-compatible.
+
 - `aethyme init`
 - `aethyme certify`
 - `aethyme broker status [--json]`
+- `aethyme broker worktree-root [--json]`
 - `aethyme broker start --task "..." [--path <repo-path>]... [--json]`
 - `aethyme broker adopt [<path>] --task "..." [--path <repo-path>]... [--reuse [--sync-integration]] [--json]`
 - `aethyme broker exec --session <id> -- <command> [--json]`
@@ -706,7 +723,7 @@ Retrieve the newest persisted handoff without changing broker state:
 
 ```bash
 aethyme broker handoff --session 110
-aethyme broker handoff --worktree .aethyme/worktrees/my-task --json
+aethyme broker handoff --worktree /path/to/former-session-worktree --json
 ```
 
 Exactly one selector is required. Session lookup returns that session's latest
