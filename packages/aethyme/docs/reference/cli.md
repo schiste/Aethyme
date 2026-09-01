@@ -266,6 +266,8 @@ until an explicit fetch makes ancestry verification possible.
 - `aethyme broker resources list [--all] [--json]`
 - `aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]`
 - `aethyme broker gates validate [--json]`
+- `aethyme broker gates manifest [--head <ref>] [--json]`
+- `aethyme broker gates scope --base <ref> --head <ref> [--json]`
 - `aethyme broker gates affected --session <id> [--why] [--json]`
 - `aethyme broker gates semantic --session <id> [--json]`
 - `aethyme broker gates run --session <id> [--only <gate>] [--no-cache] [--json]`
@@ -460,6 +462,25 @@ the full hash in `tree_hash` for both executed and cached results.
 Pass `--no-cache` to either gate-run form or submit to require fresh gate
 execution. Bypass skips cache lookup only: the fresh result is stored normally
 and is available to a subsequent run using the default cache policy.
+
+`broker gates manifest` is the portable, content-free policy export for CI and
+merge-queue consumers. It reads `.aethyme/gates.toml` from the exact committed
+`--head` (default `HEAD`), not from dirty or ignored checkout content. JSON
+contains the normalized triggers, cost, cache policy, resource requirements,
+managed-cache policy, opaque execution-definition hash, semantic-advice bounds,
+schema version, and manifest SHA-256. It never contains gate commands,
+environment values, credentials, diffs, or absolute paths. Consumers must
+reject unsupported schema versions, unknown fields, and digest drift.
+
+`broker gates scope` evaluates that same committed policy with the same
+`select_gates` implementation used by broker execution. It resolves both refs
+to full commit SHAs and returns sorted repository-relative changed paths,
+selected gates, first triggering path, and reason. Rename detection is
+deliberately disabled for the path inventory so both old and new trigger
+surfaces remain visible; deletions, binary files, and empty commits retain
+deterministic behavior. The exact evaluator does not consult a local graph:
+semantic suggestions are explicitly reported as advisory, unenforced, and not
+included.
 
 `broker gates semantic` is a separate, strictly advisory read surface:
 

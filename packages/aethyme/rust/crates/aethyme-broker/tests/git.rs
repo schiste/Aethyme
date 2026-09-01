@@ -100,6 +100,34 @@ fn changed_files_covers_committed_staged_unstaged_and_untracked() {
 }
 
 #[test]
+fn exact_commit_file_reads_and_rename_scope_are_observational_and_complete() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let repo = GitRepo::discover(tmp.path()).unwrap();
+    let base = repo.head_commit().unwrap();
+    assert_eq!(
+        repo.file_at_commit(&base, "README.md").unwrap().as_deref(),
+        Some("hello")
+    );
+    assert_eq!(repo.file_at_commit(&base, "missing.txt").unwrap(), None);
+
+    sh(tmp.path(), "git", &["mv", "README.md", "GUIDE.md"]);
+    sh(tmp.path(), "git", &["commit", "-qm", "rename"]);
+    let head = repo.head_commit().unwrap();
+    assert_eq!(
+        repo.gate_scope_changed_between(&base, &head).unwrap(),
+        vec!["GUIDE.md", "README.md"],
+        "scope evaluation deliberately disables rename collapsing so both trigger surfaces remain visible"
+    );
+    assert_eq!(
+        repo.file_at_commit(&head, "GUIDE.md").unwrap().as_deref(),
+        Some("hello")
+    );
+    assert_eq!(repo.file_at_commit(&head, "README.md").unwrap(), None);
+    assert!(repo.file_at_commit(&head, "../outside").is_err());
+}
+
+#[test]
 fn working_tree_hash_uses_worktree_invisible_private_index() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

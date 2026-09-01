@@ -1,6 +1,6 @@
 # Broker Follow-Up Workflows
 
-Last Updated: 2026-08-23
+Last Updated: 2026-09-01
 
 This guide covers broker workflows that matter after the basic
 start-edit-submit loop: reusing a session worktree, choosing fresh or cached
@@ -21,6 +21,7 @@ Each workflow separates observation from mutation:
 | --- | --- | --- | --- |
 | Continue in an existing worktree | `broker integration status` | `adopt --reuse`, optionally with `--sync-integration` | synchronization requires a clean, fast-forwardable worktree |
 | Prove the current tree | default gate run and its tree provenance | rerun with `--no-cache` | a bypass never substitutes an older cached result |
+| Share gate scope with CI | `gates manifest` and `gates scope` | none | unsupported schema, digest drift, missing refs, or invalid committed policy fail closed |
 | Inspect graph-derived gate hints | `gates semantic` | none; suggestions remain advisory | only changed-path triggers reach `gates run` and `submit` |
 | Recover external main movement | `integration reconcile --dry-run` | `--apply --confirm <plan-digest>` | every unrecorded SHA needs a reviewed disposition; drift invalidates confirmation |
 | Reserve paths | `leases plan` | `leases claim` | the claim, not the plan, decides whether a conflict exists now |
@@ -193,6 +194,29 @@ loads `.aethyme/gates.toml` from the simulated submitted tree. Therefore a
 local untracked gates file cannot protect a spawned worktree or submission.
 `aethyme certify` warns about that state: review and commit the gate definition
 before relying on it.
+
+## Share Exact Gate Scope With External Validators
+
+CI and path-scoped merge queues should consume the broker contract instead of
+reimplementing glob parsing or diff classification:
+
+```bash
+aethyme broker gates manifest --head <head-sha> --json
+aethyme broker gates scope --base <base-sha> --head <head-sha> --json
+```
+
+The manifest is normalized and versioned. Its digest changes when execution
+policy changes, but its JSON omits the executable command and all runtime
+values. The scope report binds full resolved SHAs, the manifest digest, the
+complete sorted changed-path surface, and deterministic path-selection reasons.
+Both commands are read-only and load policy from the exact committed head, so
+untracked or dirty local configuration cannot alter their answer.
+
+Use the scope result for enforced validation routing. Semantic graph advice is
+not part of this exact evaluator and is explicitly marked unenforced; inspect
+it separately with `gates semantic`. This preserves the invariant that a warm,
+cold, stale, corrupted, or truncated graph never silently changes what local
+submit or external CI must run.
 
 ## Understand Normalized Submission Planning
 

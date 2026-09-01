@@ -36,6 +36,7 @@ use crate::store::BrokerStore;
 use crate::types::{GateFailureClass, GateStatus, NewGateResult};
 
 pub const GATES_CONFIG_RELPATH: &str = ".aethyme/gates.toml";
+pub const GATE_SCOPE_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// Whether a gate run may reuse a conclusive result for the same tree.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -79,6 +80,84 @@ pub struct Gate {
     matcher: Option<GlobSet>,
 }
 
+/// Redacted, portable gate definition for selection and routing consumers.
+/// The executable command is deliberately excluded; its opaque definition
+/// hash still lets consumers detect drift from the broker's execution policy.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GateScopeDefinition {
+    pub name: String,
+    pub cost: i64,
+    pub triggers: Vec<String>,
+    pub cache: bool,
+    pub resources: Vec<crate::HostResourceRequirement>,
+    pub resource_ttl_seconds: u64,
+    pub resource_wait_seconds: u64,
+    pub managed_cache: Option<ManagedGateCache>,
+    pub execution_definition_hash: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticGateScopeContract {
+    pub mode: String,
+    pub enforced: bool,
+    pub frontier_max_depth: usize,
+    pub frontier_max_nodes: usize,
+    pub result_limit: usize,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GateScopeManifest {
+    pub schema_version: u32,
+    pub manifest_sha256: String,
+    pub gates: Vec<GateScopeDefinition>,
+    pub semantic_advice: SemanticGateScopeContract,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GateScopeSelection {
+    pub gate: String,
+    pub triggered_by: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GateScopeEvaluation {
+    pub schema_version: u32,
+    pub manifest_sha256: String,
+    pub base_sha: String,
+    pub head_sha: String,
+    pub changed_paths: Vec<String>,
+    pub selected_gates: Vec<GateScopeSelection>,
+    pub semantic_suggestions_enforced: bool,
+    pub semantic_suggestions_included: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GateScopeError {
+    #[error("cannot resolve {role} ref {reference:?} to a commit")]
+    MissingRef {
+        role: &'static str,
+        reference: String,
+    },
+    #[error("exact head {head_sha} has no {path}")]
+    MissingConfiguration { head_sha: String, path: String },
+    #[error(
+        "gate scope manifest schema {actual} is newer or unsupported; this binary reads schema {supported}"
+    )]
+    UnsupportedManifestSchema { actual: u32, supported: u32 },
+    #[error("gate scope manifest digest does not match its normalized contents")]
+    ManifestDigestMismatch,
+    #[error(transparent)]
+    Config(#[from] GateConfigError),
+    #[error(transparent)]
+    Git(#[from] crate::GitError),
+}
+
 /// A broker-owned, repository-scoped artifact cache used by one gate.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -104,6 +183,12 @@ pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
     let path = main_root.join(GATES_CONFIG_RELPATH);
     let text =
         std::fs::read_to_string(&path).map_err(|_| GateConfigError::Missing(path.clone()))?;
+    parse_gates(&text)
+}
+
+/// Parse and normalize gate configuration already read from an exact source
+/// tree. This is shared by ordinary checkout loading and exact-ref evaluation.
+pub fn parse_gates(text: &str) -> Result<Vec<Gate>, GateConfigError> {
     let value: toml::Value = text
         .parse()
         .map_err(|err: toml::de::Error| GateConfigError::Parse(err.to_string()))?;
@@ -244,6 +329,140 @@ pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
     }
     gates.sort_by(|a, b| a.cost.cmp(&b.cost).then(a.name.cmp(&b.name)));
     Ok(gates)
+}
+
+/// Load the selection policy from an exact committed head. This keeps the
+/// external evaluator independent of dirty or ignored checkout content.
+pub fn load_gates_at_commit(
+    repo: &GitRepo,
+    head: &str,
+) -> Result<(String, Vec<Gate>), GateScopeError> {
+    let head_sha = repo
+        .resolve_ref(head)
+        .ok_or_else(|| GateScopeError::MissingRef {
+            role: "head",
+            reference: head.into(),
+        })?;
+    let text = repo
+        .file_at_commit(&head_sha, GATES_CONFIG_RELPATH)?
+        .ok_or_else(|| GateScopeError::MissingConfiguration {
+            head_sha: head_sha.clone(),
+            path: GATES_CONFIG_RELPATH.into(),
+        })?;
+    Ok((head_sha, parse_gates(&text)?))
+}
+
+/// Build the content-free portable manifest consumed by external validators.
+pub fn gate_scope_manifest(gates: &[Gate]) -> GateScopeManifest {
+    let definitions = gates
+        .iter()
+        .map(|gate| GateScopeDefinition {
+            name: gate.name.clone(),
+            cost: gate.cost,
+            triggers: gate.triggers.clone(),
+            cache: gate.cache,
+            resources: gate.resources.clone(),
+            resource_ttl_seconds: gate.resource_ttl_seconds,
+            resource_wait_seconds: gate.resource_wait_seconds,
+            managed_cache: gate.managed_cache.clone(),
+            execution_definition_hash: gate.definition_hash.clone(),
+        })
+        .collect::<Vec<_>>();
+    let semantic_advice = SemanticGateScopeContract {
+        mode: "incoming_calls_frontier".into(),
+        enforced: false,
+        frontier_max_depth: crate::GRAPH_IMPACT_MAX_DEPTH,
+        frontier_max_nodes: crate::GRAPH_IMPACT_MAX_NODES,
+        result_limit: crate::GRAPH_IMPACT_RESULT_LIMIT,
+    };
+    let manifest_sha256 = gate_scope_manifest_digest(&definitions, &semantic_advice);
+    GateScopeManifest {
+        schema_version: GATE_SCOPE_MANIFEST_SCHEMA_VERSION,
+        manifest_sha256,
+        gates: definitions,
+        semantic_advice,
+    }
+}
+
+fn gate_scope_manifest_digest(
+    definitions: &[GateScopeDefinition],
+    semantic_advice: &SemanticGateScopeContract,
+) -> String {
+    let digest_payload = serde_json::json!({
+        "schema_version": GATE_SCOPE_MANIFEST_SCHEMA_VERSION,
+        "gates": definitions,
+        "semantic_advice": semantic_advice,
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&digest_payload)
+                .expect("gate scope manifest contains only serializable fields")
+        )
+    )
+}
+
+/// Verify a deserialized manifest before an external consumer trusts it.
+pub fn verify_gate_scope_manifest(manifest: &GateScopeManifest) -> Result<(), GateScopeError> {
+    if manifest.schema_version != GATE_SCOPE_MANIFEST_SCHEMA_VERSION {
+        return Err(GateScopeError::UnsupportedManifestSchema {
+            actual: manifest.schema_version,
+            supported: GATE_SCOPE_MANIFEST_SCHEMA_VERSION,
+        });
+    }
+    let expected = gate_scope_manifest_digest(&manifest.gates, &manifest.semantic_advice);
+    if manifest.manifest_sha256 != expected {
+        return Err(GateScopeError::ManifestDigestMismatch);
+    }
+    Ok(())
+}
+
+/// Evaluate the same deterministic path selector used by local gate runs for
+/// an exact pair of commits. Ref spellings are resolved and never echoed.
+pub fn evaluate_gate_scope(
+    repo: &GitRepo,
+    gates: &[Gate],
+    base: &str,
+    head: &str,
+) -> Result<GateScopeEvaluation, GateScopeError> {
+    let base_sha = repo
+        .resolve_ref(base)
+        .ok_or_else(|| GateScopeError::MissingRef {
+            role: "base",
+            reference: base.into(),
+        })?;
+    let head_sha = repo
+        .resolve_ref(head)
+        .ok_or_else(|| GateScopeError::MissingRef {
+            role: "head",
+            reference: head.into(),
+        })?;
+    let mut changed_paths = repo.gate_scope_changed_between(&base_sha, &head_sha)?;
+    changed_paths.sort();
+    changed_paths.dedup();
+    let selected_gates = select_gates(gates, &changed_paths)
+        .into_iter()
+        .map(|selection| GateScopeSelection {
+            gate: selection.gate.name.clone(),
+            reason: if selection.triggered_by.is_some() {
+                "path_trigger".into()
+            } else {
+                "always".into()
+            },
+            triggered_by: selection.triggered_by,
+        })
+        .collect();
+    let manifest = gate_scope_manifest(gates);
+    Ok(GateScopeEvaluation {
+        schema_version: GATE_SCOPE_MANIFEST_SCHEMA_VERSION,
+        manifest_sha256: manifest.manifest_sha256,
+        base_sha,
+        head_sha,
+        changed_paths,
+        selected_gates,
+        semantic_suggestions_enforced: false,
+        semantic_suggestions_included: false,
+    })
 }
 
 fn gate_definition_hash(
@@ -1799,6 +2018,81 @@ command = "true"
             load_gates(tmp.path()),
             Err(GateConfigError::BadResources { .. })
         ));
+    }
+
+    #[test]
+    fn scope_manifest_is_deterministic_redacted_and_command_drift_bound() {
+        let first = parse_gates(
+            r#"
+[[gate]]
+name = "backend"
+command = "SECRET_TOKEN=hidden /private/operator/run-tests"
+cost = 3
+triggers = ["backend/**", "Cargo.toml"]
+cache = false
+
+[[gate.resources]]
+key = "database_port"
+kind = "tcp_port"
+start = 55000
+end = 55999
+"#,
+        )
+        .unwrap();
+        let first_manifest = gate_scope_manifest(&first);
+        let repeated = gate_scope_manifest(&first);
+        assert_eq!(first_manifest, repeated);
+        verify_gate_scope_manifest(&first_manifest).unwrap();
+        assert_eq!(
+            first_manifest.schema_version,
+            GATE_SCOPE_MANIFEST_SCHEMA_VERSION
+        );
+        assert!(!first_manifest.semantic_advice.enforced);
+        assert_eq!(first_manifest.gates[0].name, "backend");
+        assert_eq!(first_manifest.gates[0].triggers[0], "backend/**");
+
+        let encoded = serde_json::to_string(&first_manifest).unwrap();
+        assert!(!encoded.contains("SECRET_TOKEN"), "{encoded}");
+        assert!(!encoded.contains("/private/operator"), "{encoded}");
+        assert!(!encoded.contains("run-tests"), "{encoded}");
+
+        let second = parse_gates(
+            r#"
+[[gate]]
+name = "backend"
+command = "different-command"
+cost = 3
+triggers = ["backend/**", "Cargo.toml"]
+cache = false
+
+[[gate.resources]]
+key = "database_port"
+kind = "tcp_port"
+start = 55000
+end = 55999
+"#,
+        )
+        .unwrap();
+        assert_ne!(
+            first_manifest.manifest_sha256,
+            gate_scope_manifest(&second).manifest_sha256
+        );
+
+        let mut newer = first_manifest.clone();
+        newer.schema_version += 1;
+        assert!(matches!(
+            verify_gate_scope_manifest(&newer),
+            Err(GateScopeError::UnsupportedManifestSchema { .. })
+        ));
+        let mut corrupted = first_manifest.clone();
+        corrupted.gates[0].triggers.push("other/**".into());
+        assert!(matches!(
+            verify_gate_scope_manifest(&corrupted),
+            Err(GateScopeError::ManifestDigestMismatch)
+        ));
+        let mut unknown = serde_json::to_value(&first_manifest).unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<GateScopeManifest>(unknown).is_err());
     }
 
     #[test]

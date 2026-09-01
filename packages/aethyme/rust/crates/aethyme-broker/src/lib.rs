@@ -85,9 +85,12 @@ pub use exposures::{
     ExposureReconciliationApplyReport, ExposureReconciliationPlan, ExposureRemainingItem,
 };
 pub use gates::{
-    CachePolicy, GATES_CONFIG_RELPATH, Gate, GateConfigError, GateProgressSink,
-    GateResourceProvenance, GateRunOutcome, PrePushPlan, PrePushReport, PrePushUpdate,
-    PrePushValidationError, load_gates, plan_pre_push, select_gates,
+    CachePolicy, GATE_SCOPE_MANIFEST_SCHEMA_VERSION, GATES_CONFIG_RELPATH, Gate, GateConfigError,
+    GateProgressSink, GateResourceProvenance, GateRunOutcome, GateScopeDefinition, GateScopeError,
+    GateScopeEvaluation, GateScopeManifest, GateScopeSelection, PrePushPlan, PrePushReport,
+    PrePushUpdate, PrePushValidationError, SemanticGateScopeContract, evaluate_gate_scope,
+    gate_scope_manifest, load_gates, load_gates_at_commit, parse_gates, plan_pre_push,
+    select_gates, verify_gate_scope_manifest,
 };
 pub use gc::GC_PLAN_SCHEMA_VERSION;
 pub use git::{GitError, GitRepo, MergeSimulation, RemoteDefaultBranch};

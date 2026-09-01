@@ -605,7 +605,7 @@ impl Broker {
         let verify_base = pre_refresh.as_deref().unwrap_or(&base);
         let changed = self
             .repo_handle()
-            .changed_between(verify_base, &merge_commit)?;
+            .gate_scope_changed_between(verify_base, &merge_commit)?;
         let mut verification_slot = MergeVerificationSlot::acquire(&self.main_root_path())?;
         let sim_worktree = verification_slot.materialize(self.repo_handle(), &merge_commit)?;
         // Conflict-only brokering is valid: a repo with no gates.toml gets

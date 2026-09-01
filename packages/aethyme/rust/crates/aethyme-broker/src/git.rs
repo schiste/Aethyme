@@ -466,6 +466,35 @@ impl GitRepo {
         .ok()
     }
 
+    /// Read one repository-relative UTF-8 file from an exact commit without
+    /// checking it out or mutating refs, indexes, or worktree state.
+    pub fn file_at_commit(&self, commit: &str, path: &str) -> Result<Option<String>, GitError> {
+        let path_value = Path::new(path);
+        if path_value.is_absolute()
+            || path_value.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                )
+            })
+            || path.contains(':')
+        {
+            return Err(GitError::Git {
+                args: "show <commit>:<path>".into(),
+                stderr: "file path must be repository-relative and cannot contain ':'".into(),
+            });
+        }
+        let Some(exact) = self.resolve_ref(commit) else {
+            return Ok(None);
+        };
+        let object = format!("{exact}:{path}");
+        match run_git(&self.root, &["cat-file", "-e", &object]) {
+            Ok(_) => run_git(&self.root, &["show", &object]).map(Some),
+            Err(GitError::Git { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Human-readable description of `rev` using the repository's tags
     /// when available, falling back to an abbreviated commit.
     pub fn describe_ref(&self, rev: &str) -> Option<String> {
@@ -841,6 +870,19 @@ impl GitRepo {
         Ok(parse_nul_paths(&run_git(
             &self.root,
             &["diff", "--name-only", "-z", from, to],
+        )?))
+    }
+
+    /// Changed files for gate trigger evaluation. Rename collapsing is
+    /// disabled so both the removed and added path can select relevant gates.
+    pub fn gate_scope_changed_between(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<String>, GitError> {
+        Ok(parse_nul_paths(&run_git(
+            &self.root,
+            &["diff", "--name-only", "--no-renames", "-z", from, to],
         )?))
     }
 

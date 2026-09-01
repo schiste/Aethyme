@@ -89,6 +89,157 @@ fn fixture() -> tempfile::TempDir {
     tmp
 }
 
+#[test]
+fn exact_gate_scope_manifest_is_redacted_deterministic_and_selector_complete() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("backend")).unwrap();
+    std::fs::write(tmp.path().join("backend/old.rs"), "old\n").unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/gates.toml"),
+        r#"
+[[gate]]
+name = "backend"
+command = "SECRET_TOKEN=hidden /private/operator/backend-test"
+cost = 2
+triggers = ["backend/**"]
+
+[[gate]]
+name = "frontend"
+command = "frontend-test"
+cost = 1
+triggers = ["frontend/**"]
+
+[[gate]]
+name = "always"
+command = "true"
+cost = 0
+"#,
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-qm", "base"]);
+    let base = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+
+    std::fs::create_dir_all(tmp.path().join("frontend")).unwrap();
+    git(tmp.path(), &["mv", "backend/old.rs", "frontend/moved.rs"]);
+    std::fs::create_dir_all(tmp.path().join("assets")).unwrap();
+    std::fs::write(tmp.path().join("assets/blob.bin"), [0_u8, 159, 146, 150]).unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-qm", "rename and binary"]);
+    let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+
+    // Incidental checkout policy is not an input when an exact head is named.
+    std::fs::write(
+        tmp.path().join(".aethyme/gates.toml"),
+        "[[gate]]\nname='dirty-only'\ncommand='DIRTY_SECRET'\n",
+    )
+    .unwrap();
+
+    let manifest = stdout(run(
+        tmp.path(),
+        &["gates", "manifest", "--head", &head, "--json"],
+    ));
+    let repeated = stdout(run(
+        tmp.path(),
+        &["gates", "manifest", "--head", &head, "--json"],
+    ));
+    assert_eq!(manifest, repeated);
+    assert!(!manifest.contains("SECRET_TOKEN"), "{manifest}");
+    assert!(!manifest.contains("/private/operator"), "{manifest}");
+    assert!(!manifest.contains("DIRTY_SECRET"), "{manifest}");
+    assert!(
+        !manifest.contains(&tmp.path().display().to_string()),
+        "{manifest}"
+    );
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+    assert_eq!(manifest["policy_head_sha"], head);
+    assert_eq!(manifest["manifest"]["schema_version"], 1);
+    assert_eq!(manifest["manifest"]["semantic_advice"]["enforced"], false);
+    assert_eq!(
+        manifest["manifest"]["gates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|gate| gate["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["always", "frontend", "backend"]
+    );
+
+    let scope = stdout(run(
+        tmp.path(),
+        &["gates", "scope", "--base", &base, "--head", &head, "--json"],
+    ));
+    assert!(
+        !scope.contains(&tmp.path().display().to_string()),
+        "{scope}"
+    );
+    let scope: serde_json::Value = serde_json::from_str(&scope).unwrap();
+    assert_eq!(scope["base_sha"], base);
+    assert_eq!(scope["head_sha"], head);
+    assert_eq!(
+        scope["changed_paths"],
+        serde_json::json!(["assets/blob.bin", "backend/old.rs", "frontend/moved.rs"])
+    );
+    assert_eq!(
+        scope["selected_gates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|gate| gate["gate"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["always", "frontend", "backend"]
+    );
+    assert_eq!(scope["semantic_suggestions_enforced"], false);
+    assert_eq!(scope["semantic_suggestions_included"], false);
+
+    git(tmp.path(), &["commit", "--allow-empty", "-qm", "empty"]);
+    let empty = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    let empty_scope = stdout(run(
+        tmp.path(),
+        &[
+            "gates", "scope", "--base", &head, "--head", &empty, "--json",
+        ],
+    ));
+    let empty_scope: serde_json::Value = serde_json::from_str(&empty_scope).unwrap();
+    assert_eq!(empty_scope["changed_paths"], serde_json::json!([]));
+    assert_eq!(empty_scope["selected_gates"][0]["gate"], "always");
+
+    std::fs::write(tmp.path().join(".aethyme/gates.toml"), "not = [valid").unwrap();
+    git(tmp.path(), &["add", ".aethyme/gates.toml"]);
+    git(tmp.path(), &["commit", "-qm", "corrupted policy"]);
+    let before = git_output(tmp.path(), &["status", "--porcelain=v1"]);
+    let corrupted = run(
+        tmp.path(),
+        &["gates", "manifest", "--head", "HEAD", "--json"],
+    );
+    assert!(!corrupted.status.success());
+    assert!(
+        String::from_utf8_lossy(&corrupted.stderr).contains("gates.toml"),
+        "{}",
+        String::from_utf8_lossy(&corrupted.stderr)
+    );
+    let missing = run(
+        tmp.path(),
+        &[
+            "gates",
+            "scope",
+            "--base",
+            "missing-base",
+            "--head",
+            &head,
+            "--json",
+        ],
+    );
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("cannot resolve base ref"));
+    assert_eq!(
+        git_output(tmp.path(), &["status", "--porcelain=v1"]),
+        before
+    );
+}
+
 fn tree_hash(repo: &Path) -> String {
     GitRepo::discover(repo)
         .unwrap()

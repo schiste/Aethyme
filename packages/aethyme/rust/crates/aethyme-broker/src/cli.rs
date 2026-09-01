@@ -192,6 +192,12 @@ Usage:
       next broker command; event payloads never contain message text.
   aethyme broker gates validate [--json]
       Parse and validate .aethyme/gates.toml.
+  aethyme broker gates manifest [--head <ref>] [--json]
+      Emit a versioned content-free gate-selection manifest from exact
+      committed policy (default head: HEAD). Commands are never included.
+  aethyme broker gates scope --base <ref> --head <ref> [--json]
+      Evaluate the shared path selector for two exact commits using the
+      gates.toml committed at head. Read-only; semantic hints stay advisory.
   aethyme broker gates affected --session <id> [--json]
       Show which gates the session's diff selects and why.
   aethyme broker gates semantic --session <id> [--json]
@@ -455,6 +461,8 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "gates",
     "draft",
     "validate",
+    "manifest",
+    "scope",
     "affected",
     "semantic",
     "run",
@@ -632,7 +640,7 @@ fn command_records_metric(args: &[String]) -> bool {
         Some("events") => args.get(1).map(String::as_str) == Some("prune"),
         Some("gates") => !matches!(
             args.get(1).map(String::as_str),
-            Some("validate" | "affected" | "semantic")
+            Some("validate" | "manifest" | "scope" | "affected" | "semantic")
         ),
         Some("doctor") => args.iter().any(|arg| arg == "--fix-version"),
         _ => true,
@@ -748,6 +756,32 @@ mod tests {
                 "stateful command should record telemetry: {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_accepts_read_only_exact_gate_scope_evaluation() {
+        let parsed = match super::parse(&args(&[
+            "gates",
+            "scope",
+            "--base",
+            "refs/heads/main",
+            "--head",
+            "feature",
+            "--json",
+        ])) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("exact gate scope should parse"),
+        };
+        assert_eq!(parsed.positional, vec!["gates", "scope"]);
+        assert_eq!(parsed.base.as_deref(), Some("refs/heads/main"));
+        assert_eq!(parsed.head.as_deref(), Some("feature"));
+        assert!(parsed.json);
+        assert!(!super::command_records_metric(&args(&[
+            "gates", "scope", "--base", "main", "--head", "feature"
+        ])));
+        assert!(!super::command_records_metric(&args(&[
+            "gates", "manifest", "--head", "feature"
+        ])));
     }
 
     #[test]
@@ -1195,6 +1229,8 @@ struct Parsed {
     keep_days: Option<i64>,
     seconds: Option<u64>,
     upstream: Option<String>,
+    base: Option<String>,
+    head: Option<String>,
     resolution_file: Option<PathBuf>,
     write_resolution_template: Option<PathBuf>,
     worktree: Option<PathBuf>,
@@ -1261,6 +1297,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         keep_days: None,
         seconds: None,
         upstream: None,
+        base: None,
+        head: None,
         resolution_file: None,
         write_resolution_template: None,
         worktree: None,
@@ -1410,6 +1448,20 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 parsed.upstream = Some(
                     iter.next()
                         .ok_or(UsageError::Message("--upstream requires a ref".into()))?
+                        .clone(),
+                )
+            }
+            "--base" => {
+                parsed.base = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--base requires a ref".into()))?
+                        .clone(),
+                )
+            }
+            "--head" => {
+                parsed.head = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--head requires a ref".into()))?
                         .clone(),
                 )
             }
@@ -4732,9 +4784,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .first()
                 .map(String::as_str)
                 .ok_or(UsageError::Message(
-                "gates requires an action: draft, validate, affected, semantic, run, or pre-push"
-                    .into(),
-            ))?;
+                    "gates requires an action: draft, validate, manifest, scope, affected, semantic, run, or pre-push"
+                        .into(),
+                ))?;
             match action {
                 "draft" => {
                     let cwd = std::env::current_dir()
@@ -4792,6 +4844,82 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                                 &gate.definition_hash[..12],
                             );
                         }
+                    }
+                }
+                "manifest" => {
+                    let cwd = std::env::current_dir()
+                        .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
+                    let checkout = crate::GitRepo::discover(&cwd)?;
+                    let head = parsed.head.as_deref().unwrap_or("HEAD");
+                    let (head_sha, gates) = crate::load_gates_at_commit(&checkout, head)?;
+                    let manifest = crate::gate_scope_manifest(&gates);
+                    if parsed.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "policy_head_sha": head_sha,
+                                "manifest": manifest,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "Gate scope manifest {} at {}",
+                            &manifest.manifest_sha256[..12],
+                            &head_sha[..12]
+                        );
+                        println!("  schema: {}", manifest.schema_version);
+                        println!("  gates: {}", manifest.gates.len());
+                        println!("  semantic suggestions enforced: false");
+                        for gate in manifest.gates {
+                            println!(
+                                "  [{}] {} (triggers: {}; cache: {}; resources: {})",
+                                gate.cost,
+                                gate.name,
+                                if gate.triggers.is_empty() {
+                                    "always".into()
+                                } else {
+                                    gate.triggers.join(", ")
+                                },
+                                if gate.cache { "use" } else { "disabled" },
+                                gate.resources.len()
+                            );
+                        }
+                    }
+                }
+                "scope" => {
+                    let base = parsed.base.as_deref().ok_or(UsageError::Message(
+                        "gates scope requires --base <ref> and --head <ref>".into(),
+                    ))?;
+                    let head = parsed.head.as_deref().ok_or(UsageError::Message(
+                        "gates scope requires --base <ref> and --head <ref>".into(),
+                    ))?;
+                    let cwd = std::env::current_dir()
+                        .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
+                    let checkout = crate::GitRepo::discover(&cwd)?;
+                    let (_, gates) = crate::load_gates_at_commit(&checkout, head)?;
+                    let report = crate::evaluate_gate_scope(&checkout, &gates, base, head)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!(
+                            "Gate scope {}..{} (manifest {})",
+                            &report.base_sha[..12],
+                            &report.head_sha[..12],
+                            &report.manifest_sha256[..12]
+                        );
+                        println!("  changed paths: {}", report.changed_paths.len());
+                        if report.selected_gates.is_empty() {
+                            println!("  selected gates: none");
+                        } else {
+                            println!("  selected gates:");
+                            for selection in report.selected_gates {
+                                match selection.triggered_by {
+                                    Some(path) => println!("    {} ({path})", selection.gate),
+                                    None => println!("    {} (always)", selection.gate),
+                                }
+                            }
+                        }
+                        println!("  semantic suggestions: advisory, not included");
                     }
                 }
                 "affected" => {
@@ -4991,7 +5119,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
                 other => {
                     return Err(UsageError::Message(format!(
-                        "unknown gates action {other:?} — expected draft, validate, affected, semantic, run, or pre-push"
+                        "unknown gates action {other:?} — expected draft, validate, manifest, scope, affected, semantic, run, or pre-push"
                     )));
                 }
             }
