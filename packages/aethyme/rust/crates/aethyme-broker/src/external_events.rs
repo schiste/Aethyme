@@ -377,6 +377,16 @@ impl Broker {
                 .advisory_id
                 .and_then(|id| self.store().advisory(id).ok().flatten())
         };
+        if event.status == ExternalEventStatus::AdvisoryCreated {
+            self.apply_review_event(
+                &event.repository,
+                event.pr_number,
+                &event.commit_sha,
+                &event.event_type,
+                &event.normalized_digest,
+                received_at,
+            )?;
+        }
         Ok(ExternalEventIngestReport {
             remediation: remediation(&event),
             event,
@@ -442,6 +452,16 @@ impl Broker {
             .store()
             .external_event(event_id)?
             .ok_or(BrokerError::ExternalEventNotFound(event_id))?;
+        if event.status == ExternalEventStatus::AdvisoryCreated {
+            self.apply_review_event(
+                &event.repository,
+                event.pr_number,
+                &event.commit_sha,
+                &event.event_type,
+                &event.normalized_digest,
+                now,
+            )?;
+        }
         Ok(ExternalEventReconcileReport {
             event,
             advisory,

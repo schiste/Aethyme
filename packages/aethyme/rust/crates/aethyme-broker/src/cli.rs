@@ -7,7 +7,7 @@
 //! from the library's serializable types (#32).
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::broker::Broker;
 
@@ -273,6 +273,17 @@ Usage:
       activity prepares a Push2prod prompt. With --dispatch, the broker
       attaches that prompt to an existing matching session when possible
       or spawns a Codex agent command.
+  aethyme broker review register --session <id> --repo <owner/name> --pr <number> [--json]
+      Opt an exact live session and open draft PR into the configured review
+      lifecycle after verifying repository, base, and full head SHA evidence.
+  aethyme broker review show --session <id> [--json]
+      Read the exact persisted review state and next action without provider I/O.
+  aethyme broker review request --session <id> [--json]
+      After a successful broker submission, revalidate GitHub evidence and
+      coordinate the idempotent ready-for-review write.
+  aethyme broker review unlock --session <id> [--json]
+      After review is satisfied, revalidate approval/head/base/open evidence
+      and run the configured validation-unlock adapter exactly once.
   aethyme broker submit --session <id> [--no-cache] [--json]
       Submit the session's head commit: simulate the merge onto the local
       integration branch, run affected gates on the merged tree, and
@@ -517,6 +528,10 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "handoff",
     "report",
     "external-events",
+    "review",
+    "register",
+    "request",
+    "unlock",
     "ingest",
     "capture",
     "cleanup",
@@ -641,6 +656,7 @@ fn command_records_metric(args: &[String]) -> bool {
             args.get(1).map(String::as_str),
             Some("ingest" | "reconcile")
         ),
+        Some("review") => !matches!(args.get(1).map(String::as_str), Some("show")),
         Some("ship") => args.get(1).map(String::as_str) != Some("plan"),
         Some("checkpoint") => args.get(1).map(String::as_str) == Some("apply"),
         Some("gc") => args.get(1).map(String::as_str) == Some("apply"),
@@ -724,6 +740,7 @@ mod tests {
             args(&["advisories", "show", "1"]),
             args(&["external-events", "list"]),
             args(&["external-events", "show", "1"]),
+            args(&["review", "show", "--session", "7"]),
             args(&["git", "--session", "7", "--", "status"]),
             args(&[
                 "gh",
@@ -774,6 +791,18 @@ mod tests {
                 "--reason",
                 "not-applicable",
             ]),
+            args(&[
+                "review",
+                "register",
+                "--session",
+                "7",
+                "--repo",
+                "o/r",
+                "--pr",
+                "1",
+            ]),
+            args(&["review", "request", "--session", "7"]),
+            args(&["review", "unlock", "--session", "7"]),
             args(&["git", "--session", "7", "--", "push"]),
             args(&[
                 "gh",
@@ -3316,6 +3345,164 @@ fn render_coordinated_operation(
     Ok(())
 }
 
+fn run_review(parsed: Parsed) -> Result<(), UsageError> {
+    let action = parsed
+        .positional
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| {
+            UsageError::Message("review requires register, show, request, or unlock".into())
+        })?;
+    if parsed.positional.len() != 1 {
+        return Err(UsageError::Message(format!(
+            "review {action} accepts no positional arguments"
+        )));
+    }
+    let session_id = parsed
+        .session
+        .ok_or_else(|| UsageError::Message(format!("review {action} requires --session <id>")))?;
+    match action {
+        "register" => {
+            let repository = parsed.repository.as_deref().ok_or_else(|| {
+                UsageError::Message(
+                    "review register requires --session <id> --repo <owner/name> --pr <number>"
+                        .into(),
+                )
+            })?;
+            let pr_number = parsed.pr_number.ok_or_else(|| {
+                UsageError::Message(
+                    "review register requires --session <id> --repo <owner/name> --pr <number>"
+                        .into(),
+                )
+            })?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            let session = broker.store().session(session_id)?;
+            let snapshot = crate::load_review_provider_snapshot(
+                Path::new(&session.worktree_path),
+                repository,
+                pr_number,
+            )?;
+            let report =
+                broker.register_review_lifecycle(session_id, repository, &snapshot, now_ms())?;
+            render_review_report(&report, parsed.json)?;
+        }
+        "show" => {
+            let mut broker = open_broker(true)?;
+            let lifecycle = broker
+                .store()
+                .review_lifecycle_for_session(session_id)?
+                .ok_or(crate::BrokerError::ReviewLifecycleNotFound(session_id))?;
+            let policy = crate::ReviewPolicy::load(broker.main_root())?;
+            let report = crate::ReviewLifecycleReport {
+                next_action: review_next_action(&lifecycle),
+                policy,
+                lifecycle,
+                changed: false,
+                operation_id: None,
+                non_blocking_feedback: true,
+            };
+            render_review_report(&report, parsed.json)?;
+        }
+        "request" | "unlock" => {
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            let lifecycle = broker
+                .store()
+                .review_lifecycle_for_session(session_id)?
+                .ok_or(crate::BrokerError::ReviewLifecycleNotFound(session_id))?;
+            let session = broker.store().session(session_id)?;
+            let repository = lifecycle
+                .repository
+                .strip_prefix("github.com/")
+                .unwrap_or(&lifecycle.repository);
+            let snapshot = crate::load_review_provider_snapshot(
+                Path::new(&session.worktree_path),
+                repository,
+                lifecycle.pr_number,
+            )?;
+            let report = if action == "request" {
+                broker.request_review(session_id, &snapshot, now_ms())?
+            } else {
+                broker.unlock_review_validation(session_id, &snapshot, now_ms())?
+            };
+            render_review_report(&report, parsed.json)?;
+        }
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown review action {other:?}; expected register, show, request, or unlock"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn render_review_report(
+    report: &crate::ReviewLifecycleReport,
+    json: bool,
+) -> Result<(), UsageError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        println!(
+            "Review lifecycle {}: {}{}",
+            report.lifecycle.id,
+            report.lifecycle.state.as_str(),
+            if report.changed { " (advanced)" } else { "" }
+        );
+        println!(
+            "  session/queue: {} / {}",
+            report.lifecycle.session_id,
+            report
+                .lifecycle
+                .queue_entry_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "not yet verified".into())
+        );
+        println!(
+            "  repository/PR: {} / #{}",
+            report.lifecycle.repository, report.lifecycle.pr_number
+        );
+        println!("  commit: {}", report.lifecycle.commit_sha);
+        if let Some(operation_id) = report.operation_id {
+            println!("  coordinated operation: {operation_id}");
+        }
+        println!("  next: {}", report.next_action);
+    }
+    Ok(())
+}
+
+fn review_next_action(lifecycle: &crate::ReviewLifecycle) -> String {
+    match lifecycle.state {
+        crate::ReviewLifecycleState::DraftOpened => {
+            format!("aethyme broker submit --session {}", lifecycle.session_id)
+        }
+        crate::ReviewLifecycleState::LocalSubmissionVerified
+        | crate::ReviewLifecycleState::ReplacementCommitSubmitted => {
+            format!(
+                "aethyme broker review request --session {}",
+                lifecycle.session_id
+            )
+        }
+        crate::ReviewLifecycleState::ReviewRequested => {
+            format!(
+                "aethyme broker review show --session {}",
+                lifecycle.session_id
+            )
+        }
+        crate::ReviewLifecycleState::ChangesRequested => {
+            "commit the replacement through the accepted session, then submit it".into()
+        }
+        crate::ReviewLifecycleState::ReviewSatisfied => {
+            format!(
+                "aethyme broker review unlock --session {}",
+                lifecycle.session_id
+            )
+        }
+        crate::ReviewLifecycleState::ValidationUnlocked => {
+            "validation is explicitly unlocked".into()
+        }
+    }
+}
+
 fn run_external_events(parsed: Parsed) -> Result<(), UsageError> {
     const MAX_INPUT_BYTES: u64 = 64 * 1024;
     let action = parsed
@@ -4407,6 +4594,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         }
         "report" => run_report(parsed)?,
         "external-events" => run_external_events(parsed)?,
+        "review" => run_review(parsed)?,
         "resources" => run_resources(parsed)?,
         "agents" => {
             let mut broker = open_broker(parsed.read_only_snapshot)?;

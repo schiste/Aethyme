@@ -46,6 +46,8 @@ pub enum BrokerOpError {
     RemoteTarget(#[from] crate::RemoteTargetError),
     #[error(transparent)]
     HostOperation(#[from] crate::HostOperationError),
+    #[error("review lifecycle: {reason}")]
+    ReviewLifecycle { reason: String },
     #[error("no configured gate named {name:?}")]
     UnknownGate { name: String },
     #[error("refusing to clean session {id}: {reason} (use --force to discard)")]

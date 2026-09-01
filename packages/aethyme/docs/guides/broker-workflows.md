@@ -169,6 +169,40 @@ The broker stores a digest, not the reconciliation reason. Reconciliation
 never grants publication authority and advisories never expand gate selection
 or block submit.
 
+## Coordinate Review Before Expensive Validation
+
+Review coordination is opt-in through `[review]` in `.aethyme/config.toml`.
+With no section, submission and gate behavior is unchanged. In an opted-in
+repository, create the draft PR through the repository's normal authenticated
+workflow, then bind it to the live session:
+
+```bash
+aethyme broker review register --session 111 \
+  --repo owner/name --pr 42
+aethyme broker submit --session 111
+aethyme broker review request --session 111
+```
+
+The first command proves that the open draft's full head SHA equals the session
+HEAD. Submission supplies the queue provenance. The ready-for-review write is
+therefore unavailable until local submission has passed. Provider review
+events arrive through `external-events ingest`; matching changes requested
+becomes a typed advisory and matching approval satisfies review. An older-commit
+approval cannot advance a replacement generation.
+
+Inspect state locally and unlock only after review evidence is current:
+
+```bash
+aethyme broker review show --session 111 --json
+aethyme broker review unlock --session 111
+```
+
+Every GitHub write uses the coordinated operation journal. A failed or
+crash-ambiguous transition leaves lifecycle state unchanged and blocks blind
+retry until `broker operations reconcile` resolves the external outcome.
+Cloud Build remains an external manual-trigger adapter boundary; the core
+state machine stores no GCP credential and performs no background polling.
+
 ## Choose Gate Cache Policy Deliberately
 
 Gate results prove an exact Git tree. Normal gate runs use the cache when the

@@ -54,6 +54,7 @@ mod report_filing;
 mod repository_contract;
 mod resources;
 mod retention;
+mod review;
 mod schema;
 mod ship;
 mod store;
@@ -204,6 +205,11 @@ pub use retention::{
     BROKER_CONFIG_RELPATH, GcApplyReport, GcBlocker, GcFileAction, GcFileCandidate, GcHealth,
     GcPlan, GcRowCandidate, GcRowKind, GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION,
     RetentionConfigError, RetentionPolicy, load_retention_policy,
+};
+pub use review::{
+    REVIEW_POLICY_SCHEMA_VERSION, ReviewLifecycle, ReviewLifecycleReport, ReviewLifecycleState,
+    ReviewPolicy, ReviewProvider, ReviewProviderSnapshot, ValidationUnlockAdapter,
+    load_review_provider_snapshot,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use ship::{

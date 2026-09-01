@@ -108,6 +108,9 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         (Some("external-events"), Some("ingest" | "reconcile")) => {
             CommandCapability::SharedMutation
         }
+        (Some("review"), Some("register" | "request" | "unlock")) => {
+            CommandCapability::SharedMutation
+        }
         (Some("integration"), Some("reconcile")) if args.iter().any(|arg| arg == "--apply") => {
             CommandCapability::RecoveryWrite
         }
@@ -122,6 +125,7 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         | (Some("operations"), _)
         | (Some("advisories"), Some("list" | "show"))
         | (Some("external-events"), Some("list" | "show"))
+        | (Some("review"), Some("show"))
         | (Some("handoff" | "queue" | "status" | "agents" | "metrics" | "certify"), _)
         | (Some("events"), _)
             if nested != Some("prune") =>

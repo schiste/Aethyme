@@ -19,6 +19,7 @@ use crate::external_events::{
     ExternalEventRecord, ExternalEventStatus, NewExternalEventRecord,
     aggregate_ownership_candidates,
 };
+use crate::review::{NewReviewLifecycle, ReviewLifecycle, ReviewLifecycleState};
 use crate::schema::{self, EVENTS_SCHEMA_VERSION};
 use crate::types::{
     Advisory, AdvisoryResolutionState, AdvisorySeverity, CoordinatedOperation,
@@ -1664,6 +1665,216 @@ impl BrokerStore {
             .expect("upserted pr_watch_state row should be readable"))
     }
 
+    // ── review lifecycle ─────────────────────────────────────────────
+
+    pub(crate) fn create_review_lifecycle(
+        &mut self,
+        lifecycle: &NewReviewLifecycle,
+        now: i64,
+    ) -> Result<(ReviewLifecycle, bool), BrokerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = tx
+            .query_row(
+                &format!("{REVIEW_LIFECYCLE_SELECT} WHERE session_id = ?1"),
+                [lifecycle.session_id],
+                review_lifecycle_from_row,
+            )
+            .optional()?
+            .transpose()?;
+        if let Some(existing) = existing {
+            let same = existing.repository == lifecycle.repository
+                && existing.target_branch == lifecycle.target_branch
+                && existing.pr_number == lifecycle.pr_number
+                && existing.commit_sha == lifecycle.commit_sha;
+            if !same {
+                return Err(BrokerError::ReviewLifecycleIdentityConflict);
+            }
+            tx.execute(
+                "INSERT INTO pr_watch_state (
+                     target_branch, pr_number, activity_fingerprint, marker,
+                     last_agent_session_id, updated_at
+                 ) VALUES (?1, ?2, ?3, 'review_lifecycle', ?4, ?5)
+                 ON CONFLICT(target_branch, pr_number) DO UPDATE SET
+                     activity_fingerprint = excluded.activity_fingerprint,
+                     marker = excluded.marker,
+                     last_agent_session_id = excluded.last_agent_session_id,
+                     updated_at = excluded.updated_at",
+                params![
+                    lifecycle.target_branch,
+                    lifecycle.pr_number,
+                    lifecycle.evidence_digest,
+                    lifecycle.session_id,
+                    now,
+                ],
+            )?;
+            tx.commit()?;
+            return Ok((existing, false));
+        }
+        tx.execute(
+            "INSERT INTO review_lifecycles (
+                 session_id, repository, target_branch, pr_number, commit_sha,
+                 state, generation, evidence_digest, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'draft_opened', 0, ?6, ?7, ?7)",
+            params![
+                lifecycle.session_id,
+                lifecycle.repository,
+                lifecycle.target_branch,
+                lifecycle.pr_number,
+                lifecycle.commit_sha,
+                lifecycle.evidence_digest,
+                now,
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO pr_watch_state (
+                 target_branch, pr_number, activity_fingerprint, marker,
+                 last_agent_session_id, updated_at
+             ) VALUES (?1, ?2, ?3, 'review_lifecycle', ?4, ?5)
+             ON CONFLICT(target_branch, pr_number) DO UPDATE SET
+                 activity_fingerprint = excluded.activity_fingerprint,
+                 marker = excluded.marker,
+                 last_agent_session_id = excluded.last_agent_session_id,
+                 updated_at = excluded.updated_at",
+            params![
+                lifecycle.target_branch,
+                lifecycle.pr_number,
+                lifecycle.evidence_digest,
+                lifecycle.session_id,
+                now,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO review_lifecycle_transitions (
+                 lifecycle_id, from_state, to_state, commit_sha,
+                 evidence_digest, created_at
+             ) VALUES (?1, NULL, 'draft_opened', ?2, ?3, ?4)",
+            params![id, lifecycle.commit_sha, lifecycle.evidence_digest, now],
+        )?;
+        tx.commit()?;
+        Ok((
+            self.review_lifecycle_by_id(id)?
+                .expect("inserted review lifecycle should be readable"),
+            true,
+        ))
+    }
+
+    pub fn review_lifecycle_for_session(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<ReviewLifecycle>, BrokerError> {
+        self.conn
+            .query_row(
+                &format!("{REVIEW_LIFECYCLE_SELECT} WHERE session_id = ?1"),
+                [session_id],
+                review_lifecycle_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    pub fn review_lifecycle_for_pr(
+        &self,
+        repository: &str,
+        pr_number: i64,
+    ) -> Result<Option<ReviewLifecycle>, BrokerError> {
+        self.conn
+            .query_row(
+                &format!("{REVIEW_LIFECYCLE_SELECT} WHERE repository = ?1 AND pr_number = ?2"),
+                params![repository, pr_number],
+                review_lifecycle_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    fn review_lifecycle_by_id(&self, id: i64) -> Result<Option<ReviewLifecycle>, BrokerError> {
+        self.conn
+            .query_row(
+                &format!("{REVIEW_LIFECYCLE_SELECT} WHERE id = ?1"),
+                [id],
+                review_lifecycle_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn transition_review_lifecycle(
+        &mut self,
+        id: i64,
+        expected: ReviewLifecycleState,
+        next: ReviewLifecycleState,
+        queue_entry_id: Option<i64>,
+        commit_sha: &str,
+        evidence_digest: Option<&str>,
+        operation_id: Option<i64>,
+        now: i64,
+    ) -> Result<ReviewLifecycle, BrokerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE review_lifecycles
+             SET queue_entry_id = ?2, commit_sha = ?3, state = ?4,
+                 generation = generation + 1,
+                 evidence_digest = COALESCE(?5, evidence_digest),
+                 unlock_operation_id = CASE WHEN ?4 = 'validation_unlocked'
+                                            THEN ?6 ELSE unlock_operation_id END,
+                 updated_at = ?7
+             WHERE id = ?1 AND state = ?8",
+            params![
+                id,
+                queue_entry_id,
+                commit_sha,
+                next.as_str(),
+                evidence_digest,
+                operation_id,
+                now,
+                expected.as_str(),
+            ],
+        )?;
+        if changed != 1 {
+            let actual: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM review_lifecycles WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            return Err(match actual {
+                Some(actual) => BrokerError::ReviewLifecycleStateChanged {
+                    id,
+                    expected: expected.as_str().into(),
+                    actual,
+                },
+                None => BrokerError::ReviewLifecycleNotFound(id),
+            });
+        }
+        tx.execute(
+            "INSERT INTO review_lifecycle_transitions (
+                 lifecycle_id, from_state, to_state, commit_sha,
+                 queue_entry_id, evidence_digest, operation_id, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id,
+                expected.as_str(),
+                next.as_str(),
+                commit_sha,
+                queue_entry_id,
+                evidence_digest,
+                operation_id,
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(self
+            .review_lifecycle_by_id(id)?
+            .expect("transitioned review lifecycle should be readable"))
+    }
+
     // ── coordinated operations ───────────────────────────────────────
 
     pub fn create_coordinated_operation(
@@ -3281,6 +3492,33 @@ fn pr_watch_from_row(row: &rusqlite::Row<'_>) -> RowResult<PrWatchState> {
         last_agent_session_id: row.get(6)?,
         updated_at: row.get(7)?,
     }))
+}
+
+const REVIEW_LIFECYCLE_SELECT: &str =
+    "SELECT id, session_id, queue_entry_id, repository, target_branch,
+            pr_number, commit_sha, state, generation, evidence_digest,
+            unlock_operation_id, created_at, updated_at
+     FROM review_lifecycles";
+
+fn review_lifecycle_from_row(row: &rusqlite::Row<'_>) -> RowResult<ReviewLifecycle> {
+    let state: String = row.get(7)?;
+    Ok((|| {
+        Ok(ReviewLifecycle {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            queue_entry_id: row.get(2)?,
+            repository: row.get(3)?,
+            target_branch: row.get(4)?,
+            pr_number: row.get(5)?,
+            commit_sha: row.get(6)?,
+            state: ReviewLifecycleState::parse(&state)?,
+            generation: row.get(8)?,
+            evidence_digest: row.get(9)?,
+            unlock_operation_id: row.get(10)?,
+            created_at: row.get(11)?,
+            updated_at: row.get(12)?,
+        })
+    })())
 }
 
 fn coordinated_operation_from_row(row: &rusqlite::Row<'_>) -> RowResult<CoordinatedOperation> {

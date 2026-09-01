@@ -677,6 +677,8 @@ impl Broker {
                 Some(&simulation.tree),
                 Some(&details.to_string()),
             )?;
+            let verified_entry = self.queue_entry(entry.id)?;
+            self.record_review_submission(&verified_entry)?;
         } else {
             self.store().set_merge_status(
                 entry.id,

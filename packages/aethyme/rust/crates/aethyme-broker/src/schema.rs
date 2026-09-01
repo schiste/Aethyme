@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -574,6 +574,52 @@ CREATE INDEX external_events_by_commit
     ON external_coordination_events (commit_sha, id DESC);
 ";
 
+const MIGRATION_V24: &str = "
+-- Opt-in review coordination is repository policy, but its accepted
+-- session/queue/commit/PR provenance and every state transition are durable.
+CREATE TABLE review_lifecycles (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          INTEGER NOT NULL UNIQUE REFERENCES sessions(id),
+    queue_entry_id      INTEGER REFERENCES merge_queue(id),
+    repository          TEXT NOT NULL,
+    target_branch       TEXT NOT NULL,
+    pr_number           INTEGER NOT NULL,
+    commit_sha          TEXT NOT NULL,
+    state               TEXT NOT NULL CHECK (state IN (
+                            'draft_opened', 'local_submission_verified',
+                            'review_requested', 'changes_requested',
+                            'replacement_commit_submitted', 'review_satisfied',
+                            'validation_unlocked'
+                        )),
+    generation          INTEGER NOT NULL DEFAULT 0,
+    evidence_digest     TEXT,
+    unlock_operation_id INTEGER REFERENCES coordinated_operations(id),
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    UNIQUE (repository, pr_number)
+);
+
+CREATE INDEX review_lifecycles_by_queue
+    ON review_lifecycles (queue_entry_id);
+CREATE INDEX review_lifecycles_by_commit
+    ON review_lifecycles (commit_sha);
+
+CREATE TABLE review_lifecycle_transitions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    lifecycle_id    INTEGER NOT NULL REFERENCES review_lifecycles(id),
+    from_state      TEXT,
+    to_state        TEXT NOT NULL,
+    commit_sha      TEXT NOT NULL,
+    queue_entry_id  INTEGER REFERENCES merge_queue(id),
+    evidence_digest TEXT,
+    operation_id    INTEGER REFERENCES coordinated_operations(id),
+    created_at      INTEGER NOT NULL
+);
+
+CREATE INDEX review_transitions_by_lifecycle
+    ON review_lifecycle_transitions (lifecycle_id, id);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -598,6 +644,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V21,
     MIGRATION_V22,
     MIGRATION_V23,
+    MIGRATION_V24,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1158,6 +1205,57 @@ mod tests {
             .unwrap(),
             "legacy"
         );
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v24_adds_review_provenance_and_transition_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS[..23].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+
+        migrate(&conn).unwrap();
+
+        let lifecycle_columns = conn
+            .prepare("PRAGMA table_info(review_lifecycles)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for expected in [
+            "session_id",
+            "queue_entry_id",
+            "repository",
+            "target_branch",
+            "pr_number",
+            "commit_sha",
+            "state",
+            "generation",
+            "evidence_digest",
+            "unlock_operation_id",
+        ] {
+            assert!(lifecycle_columns.iter().any(|column| column == expected));
+        }
+        let transition_columns = conn
+            .prepare("PRAGMA table_info(review_lifecycle_transitions)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for expected in ["from_state", "to_state", "commit_sha", "operation_id"] {
+            assert!(transition_columns.iter().any(|column| column == expected));
+        }
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 }

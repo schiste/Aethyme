@@ -228,6 +228,10 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker external-events list [--all] [--json]`
 - `aethyme broker external-events show <id> [--json]`
 - `aethyme broker external-events reconcile <id> --outcome <assign|ignore> --reason <text> [--session <id>] [--json]`
+- `aethyme broker review register --session <id> --repo <owner/name> --pr <number> [--json]`
+- `aethyme broker review show --session <id> [--json]`
+- `aethyme broker review request --session <id> [--json]`
+- `aethyme broker review unlock --session <id> [--json]`
 - `aethyme broker queue history [--limit <n>] [--before <id>] [--json]`
 - `aethyme broker queue [--json]` (compatibility full-inventory view)
 - `aethyme broker exposures plan [--json]`
@@ -1048,6 +1052,69 @@ Marker behavior:
 The activity fingerprint is deterministic over observed comments, reviews, and
 status-check rollup. Re-running the command against unchanged PR activity will
 report `new_activity: false` and will not dispatch again.
+
+### Opt-In Review Lifecycle
+
+The ordinary broker profile is unchanged. A repository that deliberately
+delays expensive validation until review is complete may add:
+
+```toml
+[review]
+schema_version = 1
+enabled = true
+provider = "github"
+required_approvals = 1
+unlock_adapter = "github_label"
+unlock_label = "aethyme-validation-ready"
+```
+
+Schema 1 accepts exactly one required approval because the redacted external
+event contract does not claim distinct reviewer identity. Higher thresholds
+are refused rather than approximated. `github_workflow` is also available with
+an explicit `workflow` value. `cloud_build_manual_trigger` is a declared
+adapter boundary only: the core broker refuses to execute it and never asks
+for GCP credentials. A repository-owned authenticated adapter may perform that
+provider-specific action after inspecting the broker state.
+
+Register only after the draft PR exists and its head is the live session HEAD:
+
+```bash
+aethyme broker review register --session 111 \
+  --repo owner/name --pr 42 --json
+aethyme broker submit --session 111
+aethyme broker review request --session 111
+```
+
+Registration reads live GitHub evidence and binds the canonical repository,
+base branch, PR number, full head SHA, and session. Successful `broker submit`
+adds the exact queue entry and changes `draft_opened` to
+`local_submission_verified`; no ready transition is possible before that
+checkpoint. `review request` revalidates open/base/head/draft evidence, then
+runs `gh pr ready` through the coordinated operation layer. A replacement
+submission after `changes_requested` binds the new exact commit and restarts
+review without pretending the already-ready PR became draft again.
+
+Authenticated `review_changes_requested` and `review_approved` external events
+advance the same lifecycle only when their repository, PR, and commit match.
+Feedback still creates an ordinary typed session advisory and never embeds
+task text, review bodies, or diffs. A changes-requested event wins over an
+approval for the same generation; approvals for an older SHA are stale and do
+nothing.
+
+After `review_satisfied`, unlock explicitly:
+
+```bash
+aethyme broker review show --session 111 --json
+aethyme broker review unlock --session 111 --json
+```
+
+Unlock re-fetches evidence and refuses a changed base or head, draft/closed PR,
+dismissed approval, or provider outage before mutation. The configured label
+or workflow write is coordinated and journaled. Only proven success records
+`validation_unlocked`; an unknown outcome activates the existing host-wide
+write barrier and blind retry remains forbidden. Repeated proven transitions
+are idempotent. This lifecycle unlocks validation only—it does not authorize
+publication.
 
 Provisional JSON shape:
 

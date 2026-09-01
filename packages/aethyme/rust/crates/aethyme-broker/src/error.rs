@@ -63,6 +63,22 @@ pub enum BrokerError {
     )]
     ExternalEventIdentityConflict { provider: String, event_id: String },
 
+    #[error("no review lifecycle for session {0}")]
+    ReviewLifecycleNotFound(i64),
+
+    #[error("invalid persisted review lifecycle state {0:?}")]
+    InvalidReviewLifecycleState(String),
+
+    #[error("review lifecycle identity already belongs to different immutable provenance")]
+    ReviewLifecycleIdentityConflict,
+
+    #[error("review lifecycle {id} changed concurrently: expected {expected}, found {actual}")]
+    ReviewLifecycleStateChanged {
+        id: i64,
+        expected: String,
+        actual: String,
+    },
+
     #[error("entry path exposure for queue entry {0} already exists with different immutable data")]
     EntryExposureIdentityConflict(i64),
 
