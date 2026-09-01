@@ -346,6 +346,12 @@ Usage:
       by default; --apply revalidates and removes only clean worktrees whose
       session work is represented on main, integration, or configured upstream.
       Adopted worktrees are never included in the bulk sweep.
+  aethyme broker gc plan [--json]
+      Report exact retention-eligible rows, runtime files, represented
+      worktrees/refs, estimated bytes, blockers, and a stable plan digest.
+  aethyme broker gc apply --confirm <sha256> [--json]
+      Apply or resume the exact reviewed plan under an exclusive lock. A
+      recovery journal makes interrupted row, file, and worktree cleanup safe.
   aethyme broker check-contract [--base <ref>] [--pr-body <file>]
       Cross-process contract gate: refuse a diff that removes symbols
       listed in the consumers registry unless the PR body or commit
@@ -480,6 +486,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "report",
     "capture",
     "cleanup",
+    "gc",
     "certify",
     "scaffold",
     "init",
@@ -598,6 +605,7 @@ fn command_records_metric(args: &[String]) -> bool {
         Some("report") => args.get(1).map(String::as_str) == Some("file"),
         Some("ship") => args.get(1).map(String::as_str) != Some("plan"),
         Some("checkpoint") => args.get(1).map(String::as_str) == Some("apply"),
+        Some("gc") => args.get(1).map(String::as_str) == Some("apply"),
         Some("operations") => args.get(1).map(String::as_str) == Some("reconcile"),
         Some("git" | "gh") => {
             let command = args
@@ -672,6 +680,7 @@ mod tests {
             args(&["gates", "affected", "--session", "7"]),
             args(&["gates", "semantic", "--session", "7"]),
             args(&["doctor"]),
+            args(&["gc", "plan"]),
             args(&["operations"]),
             args(&["advisories", "list"]),
             args(&["advisories", "show", "1"]),
@@ -699,6 +708,7 @@ mod tests {
             args(&["events", "prune", "--keep-days", "7"]),
             args(&["gates", "run", "--session", "7"]),
             args(&["doctor", "--fix-version"]),
+            args(&["gc", "apply", "--confirm", "digest"]),
             args(&["report", "file", "reviewed.issue.md"]),
             args(&[
                 "checkpoint",
@@ -732,6 +742,21 @@ mod tests {
                 "stateful command should record telemetry: {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_accepts_gc_plan_and_confirmed_apply() {
+        let Ok(plan) = super::parse(&args(&["plan", "--json"])) else {
+            panic!("gc plan should parse");
+        };
+        assert_eq!(plan.positional, vec!["plan"]);
+        assert!(plan.json);
+
+        let Ok(apply) = super::parse(&args(&["apply", "--confirm", "aabb"])) else {
+            panic!("gc apply should parse");
+        };
+        assert_eq!(apply.positional, vec!["apply"]);
+        assert_eq!(apply.confirm.as_deref(), Some("aabb"));
     }
 
     #[test]
@@ -2180,6 +2205,74 @@ fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport) {
             "  apply: aethyme broker cleanup --all-cleaned --apply --confirm {}",
             report.plan.digest
         );
+    }
+}
+
+fn render_gc_plan(plan: &crate::GcPlan) {
+    println!(
+        "GC plan {}: {} rows, {} files, {} represented worktrees, {} reclaimable",
+        plan.digest,
+        plan.rows.len(),
+        plan.files.len(),
+        plan.worktrees.len(),
+        human_bytes(plan.estimated_reclaimable_bytes),
+    );
+    for row in &plan.rows {
+        println!(
+            "  row: {:?} {} at {} ({} bytes)",
+            row.kind, row.id, row.recorded_at, row.estimated_bytes
+        );
+    }
+    for file in &plan.files {
+        println!(
+            "  file: {:?} {} ({} -> {} bytes; before {})",
+            file.action, file.path, file.bytes_before, file.bytes_after, file.before_sha256
+        );
+    }
+    for worktree in &plan.worktrees {
+        println!(
+            "  worktree: session {} {} ({} bytes)",
+            worktree.session_id, worktree.worktree_path, worktree.estimated_bytes
+        );
+        println!(
+            "    ref: {} at {}",
+            worktree.branch_ref,
+            worktree.branch_tip.as_deref().unwrap_or("missing")
+        );
+    }
+    for blocker in &plan.blockers {
+        println!(
+            "  protected: {}{} — {}",
+            blocker.kind,
+            blocker.id.map(|id| format!(" {id}")).unwrap_or_default(),
+            blocker.reason
+        );
+    }
+    if plan.rows.is_empty() && plan.files.is_empty() && plan.worktrees.is_empty() {
+        println!("  apply: nothing eligible");
+    } else {
+        println!("  apply: aethyme broker gc apply --confirm {}", plan.digest);
+    }
+}
+
+fn render_gc_apply(report: &crate::GcApplyReport) {
+    println!(
+        "GC apply {}: {} rows, {} files, {} worktrees, {} reclaimed",
+        if report.complete {
+            "complete"
+        } else {
+            "paused"
+        },
+        report.rows_removed,
+        report.files_completed.len(),
+        report.sessions_cleaned.len(),
+        human_bytes(report.reclaimed_bytes),
+    );
+    for failure in &report.failures {
+        println!("  retained: {failure}");
+    }
+    if let Some(action) = &report.recovery_action {
+        println!("  recovery: {action}");
     }
 }
 
@@ -5728,6 +5821,17 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         println!("gate runs: orphaned pidfile removed: {name}");
                     }
                 }
+                println!(
+                    "retention: {} rows, {} files, {} worktrees, {} reclaimable; {} protected findings",
+                    report.retention.candidate_rows,
+                    report.retention.candidate_files,
+                    report.retention.candidate_worktrees,
+                    human_bytes(report.retention.estimated_reclaimable_bytes),
+                    report.retention.blockers,
+                );
+                if let Some(digest) = &report.retention.pending_recovery_digest {
+                    println!("  recovery pending: aethyme broker gc apply --confirm {digest}");
+                }
                 if report.healthy() {
                     println!("doctor: healthy");
                 } else {
@@ -5913,6 +6017,61 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     "Session {session} closed (state only — worktree untouched). \
                      Next task on the same worktree: `aethyme broker adopt --task \"...\"`."
                 );
+            }
+        }
+        "gc" => {
+            let action = parsed
+                .positional
+                .first()
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    UsageError::Message("gc requires `plan` or `apply --confirm <sha256>`".into())
+                })?;
+            if parsed.positional.len() != 1 {
+                return Err(UsageError::Message(
+                    "gc accepts exactly one action: `plan` or `apply --confirm <sha256>`".into(),
+                ));
+            }
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            match action {
+                "plan" => {
+                    if parsed.confirm.is_some() {
+                        return Err(UsageError::Message(
+                            "gc plan does not accept --confirm; review its emitted digest".into(),
+                        ));
+                    }
+                    let plan = broker.gc_plan()?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&plan)?);
+                    } else {
+                        render_gc_plan(&plan);
+                    }
+                }
+                "apply" => {
+                    let confirm = parsed.confirm.as_deref().ok_or_else(|| {
+                        UsageError::Message("gc apply requires --confirm <sha256>".into())
+                    })?;
+                    let report = broker.gc_apply(confirm)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        render_gc_apply(&report);
+                    }
+                    if !report.complete {
+                        return Err(UsageError::Message(
+                            report.recovery_action.unwrap_or_else(|| {
+                                format!(
+                                    "GC paused; resume with `aethyme broker gc apply --confirm {confirm}`"
+                                )
+                            }),
+                        ));
+                    }
+                }
+                other => {
+                    return Err(UsageError::Message(format!(
+                        "unknown gc action {other:?}; expected `plan` or `apply`"
+                    )));
+                }
             }
         }
         "cleanup" => {

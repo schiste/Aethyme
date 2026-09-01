@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 20;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -490,6 +490,17 @@ SET cleanup_state = 'closed', closed_at = updated_at
 WHERE status = 'cleaned';
 ";
 
+const MIGRATION_V20: &str = "
+-- Retention planning walks age cutoffs and terminal status without scanning
+-- the append-only tables from the beginning on every bounded maintenance run.
+CREATE INDEX events_by_retention_age ON events (ts, id);
+CREATE INDEX gate_results_by_retention_age ON gate_results (created_at, id);
+CREATE INDEX merge_queue_by_retention_status_age
+    ON merge_queue (status, updated_at, id);
+CREATE INDEX sessions_by_cleanup_age
+    ON sessions (cleanup_state, closed_at, id);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -510,6 +521,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V17,
     MIGRATION_V18,
     MIGRATION_V19,
+    MIGRATION_V20,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -939,5 +951,27 @@ mod tests {
             .unwrap();
         assert_eq!(live, ("open".into(), None, None));
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v20_indexes_every_retention_age_walk() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        for (table, expected) in [
+            ("events", "events_by_retention_age"),
+            ("gate_results", "gate_results_by_retention_age"),
+            ("merge_queue", "merge_queue_by_retention_status_age"),
+            ("sessions", "sessions_by_cleanup_age"),
+        ] {
+            let mut statement = conn
+                .prepare(&format!("PRAGMA index_list('{table}')"))
+                .unwrap();
+            let indexes = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(indexes.iter().any(|index| index == expected), "{table}");
+        }
     }
 }

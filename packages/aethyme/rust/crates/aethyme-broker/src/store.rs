@@ -2228,6 +2228,206 @@ impl BrokerStore {
         Ok(removed)
     }
 
+    /// Exact database rows eligible under the retention cutoffs. Protection
+    /// predicates live in SQL so planning and apply can share one definition.
+    pub fn gc_row_candidates(
+        &self,
+        event_cutoff: i64,
+        gate_cutoff: i64,
+        queue_cutoff: i64,
+    ) -> Result<Vec<crate::GcRowCandidate>, BrokerError> {
+        use crate::{GcRowCandidate, GcRowKind};
+
+        let mut candidates = Vec::new();
+        let unresolved_advisories: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM advisories WHERE resolution_state != 'resolved'",
+            [],
+            |row| row.get(0),
+        )?;
+        let outstanding_exposures: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM entry_path_exposures WHERE state = 'outstanding'",
+            [],
+            |row| row.get(0),
+        )?;
+        let unresolved_operations: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM coordinated_operations
+             WHERE status IN ('prepared', 'running', 'outcome_unknown')",
+            [],
+            |row| row.get(0),
+        )?;
+        let unresolved_queue: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM merge_queue
+             WHERE status IN ('submitted', 'simulating', 'conflict', 'verified')",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let mut events = self.conn.prepare(
+            "SELECT e.id, e.ts,
+                    length(e.kind) + COALESCE(length(e.payload_json), 0) + 32
+             FROM events e
+             WHERE e.ts < ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM sessions s
+                   WHERE s.id = e.session_id AND s.cleanup_state = 'open'
+               )
+               AND (?2 = 0 OR e.kind NOT LIKE 'advisory.%')
+               AND (?3 = 0 OR e.kind NOT LIKE 'exposure.%')
+               AND (?4 = 0 OR e.kind NOT LIKE 'operation.%')
+               AND (?5 = 0 OR e.kind NOT LIKE 'merge.%')
+             ORDER BY e.id",
+        )?;
+        let rows = events.query_map(
+            params![
+                event_cutoff,
+                unresolved_advisories,
+                outstanding_exposures,
+                unresolved_operations,
+                unresolved_queue
+            ],
+            |row| {
+                Ok(GcRowCandidate {
+                    kind: GcRowKind::Event,
+                    id: row.get(0)?,
+                    recorded_at: row.get(1)?,
+                    estimated_bytes: row.get::<_, i64>(2)?.max(0) as u64,
+                    gate_log_path: None,
+                })
+            },
+        )?;
+        candidates.extend(rows.collect::<Result<Vec<_>, _>>()?);
+
+        let mut gates = self.conn.prepare(
+            "SELECT r.id, r.created_at,
+                    length(r.gate_name) + length(r.tree_hash)
+                      + COALESCE(length(r.definition_hash), 0)
+                      + COALESCE(length(r.log_path), 0) + 96,
+                    r.log_path
+             FROM gate_results r
+             WHERE r.created_at < ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM sessions s
+                   WHERE s.id = r.session_id AND s.cleanup_state = 'open'
+               )
+             ORDER BY r.id",
+        )?;
+        let rows = gates.query_map([gate_cutoff], |row| {
+            Ok(GcRowCandidate {
+                kind: GcRowKind::GateResult,
+                id: row.get(0)?,
+                recorded_at: row.get(1)?,
+                estimated_bytes: row.get::<_, i64>(2)?.max(0) as u64,
+                gate_log_path: row.get(3)?,
+            })
+        })?;
+        candidates.extend(rows.collect::<Result<Vec<_>, _>>()?);
+
+        let mut queue = self.conn.prepare(
+            "WITH eligible_queue AS (
+            SELECT q.* FROM merge_queue q
+            WHERE q.updated_at < ?1
+              AND q.status IN ('promoted', 'externally_landed', 'rejected', 'superseded')
+              AND NOT EXISTS (
+                  SELECT 1 FROM sessions s
+                  WHERE s.id = q.session_id AND s.cleanup_state = 'open'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM sessions s
+                  WHERE s.accepted_queue_entry_id = q.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM entry_path_exposures x
+                  WHERE x.queue_entry_id = q.id AND x.state = 'outstanding'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM advisories a
+                  WHERE a.queue_entry_id = q.id AND a.resolution_state != 'resolved'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM integration_reconciliation_intent_entries i
+                  WHERE i.queue_entry_id = q.id
+              )
+            )
+            SELECT 'merge_queue', q.id, q.updated_at,
+                   length(q.head_commit) + length(q.base_commit)
+                     + COALESCE(length(q.merged_tree), 0)
+                     + COALESCE(length(q.details_json), 0) + 96
+            FROM eligible_queue q
+            UNION ALL
+            SELECT 'advisory', a.id, q.updated_at,
+                   length(a.identity) + length(a.paths_json) + length(a.evidence_json)
+                     + COALESCE(length(a.resolution_evidence), 0) + 96
+            FROM advisories a
+            JOIN eligible_queue q ON q.id = a.queue_entry_id
+            UNION ALL
+            SELECT 'entry_exposure', x.id, q.updated_at,
+                   length(x.promotion_sha) + length(x.paths_json)
+                     + COALESCE(length(x.resolution_evidence), 0) + 96
+            FROM entry_path_exposures x
+            JOIN eligible_queue q ON q.id = x.queue_entry_id
+            UNION ALL
+            SELECT 'integration_reconciliation_entry', i.id, q.updated_at,
+                   length(i.details_json) + length(i.old_merge_commit)
+                     + COALESCE(length(i.upstream_landing), 0)
+                     + COALESCE(length(i.replayed_commit), 0) + 64
+            FROM integration_reconciliation_entries i
+            JOIN eligible_queue q ON q.id = i.queue_entry_id
+            ORDER BY 1, 2",
+        )?;
+        let rows = queue.query_map([queue_cutoff], |row| {
+            let kind = match row.get_ref(0)?.as_str()? {
+                "merge_queue" => GcRowKind::MergeQueue,
+                "advisory" => GcRowKind::Advisory,
+                "entry_exposure" => GcRowKind::EntryExposure,
+                "integration_reconciliation_entry" => GcRowKind::IntegrationReconciliationEntry,
+                value => {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        std::io::Error::other(format!("unknown GC row kind {value}")).into(),
+                    ));
+                }
+            };
+            Ok(GcRowCandidate {
+                kind,
+                id: row.get(1)?,
+                recorded_at: row.get(2)?,
+                estimated_bytes: row.get::<_, i64>(3)?.max(0) as u64,
+                gate_log_path: None,
+            })
+        })?;
+        candidates.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        candidates.sort_by_key(|row| (row.kind, row.id));
+        Ok(candidates)
+    }
+
+    /// Delete one reviewed GC batch atomically. Child rows sort before their
+    /// merge-queue parent; missing rows are accepted for crash-idempotent
+    /// journal replay and primary keys are never reused.
+    pub fn delete_gc_rows(&mut self, rows: &[crate::GcRowCandidate]) -> Result<usize, BrokerError> {
+        let mut rows = rows.to_vec();
+        rows.sort_by_key(|row| (row.kind, row.id));
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut removed = 0_usize;
+        for row in rows {
+            let table = match row.kind {
+                crate::GcRowKind::Event => "events",
+                crate::GcRowKind::GateResult => "gate_results",
+                crate::GcRowKind::Advisory => "advisories",
+                crate::GcRowKind::EntryExposure => "entry_path_exposures",
+                crate::GcRowKind::IntegrationReconciliationEntry => {
+                    "integration_reconciliation_entries"
+                }
+                crate::GcRowKind::MergeQueue => "merge_queue",
+            };
+            removed += tx.execute(&format!("DELETE FROM {table} WHERE id = ?1"), [row.id])?;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// Events with id > `after_id`, oldest first, up to `limit`. This is
     /// the tail/replay cursor API (`events --follow` polls it).
     pub fn events_after(&self, after_id: i64, limit: i64) -> Result<Vec<Event>, BrokerError> {

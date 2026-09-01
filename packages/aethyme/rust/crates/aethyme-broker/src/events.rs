@@ -21,6 +21,7 @@ pub const SESSION_FINISHED: &str = "session.finished";
 pub const SESSION_FINISH_CLEANUP_STARTED: &str = "session.finish_cleanup_started";
 pub const SESSION_CHECKPOINT_REANCHORED: &str = "session.checkpoint_reanchored";
 pub const BROKER_COMMAND_FAILED: &str = "broker.command.failed";
+pub const BROKER_GC_APPLIED: &str = "broker.gc.applied";
 pub const BROKER_COMMAND_SUCCEEDED: &str = "broker.command.succeeded";
 // session.<status> transition kinds are derived from SessionStatus::as_str
 // (active/idle/stale/exited/cleaned) by the store.

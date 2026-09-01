@@ -369,6 +369,24 @@ worktrees, dirty paths, symlinked paths, or commits not represented by main,
 integration, or the configured upstream. `broker status` warns when eligible
 cleaned worktrees remain. Use `--json` for the stable plan or sweep report.
 
+The cleanup sweep above is limited to represented session worktrees. For the
+complete bounded retention lifecycle—including terminal database history,
+gate logs, command metrics, and the same represented worktrees—review and
+confirm a unified GC plan:
+
+```bash
+aethyme broker gc plan --json
+aethyme broker gc apply --confirm <sha256>
+```
+
+The digest binds the exact rows, files, refs, hashes, byte estimates, policy,
+and blockers. Apply is crash-resumable and refuses changed artifacts. A later
+broker command may advance only an already-confirmed recovery journal for at
+most `[retention].startup_budget_ms`; no startup path silently approves new
+deletions. Check `aethyme broker doctor` or `aethyme certify` for pending
+recovery and retention health. Keep the shipped defaults unless repository
+history or storage constraints justify an explicit `.aethyme/broker.toml`.
+
 Retrieve the latest completed handoff later with exactly one selector:
 
 ```bash

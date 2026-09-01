@@ -264,6 +264,8 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker finish --session <id> [--json]`
 - `aethyme broker cleanup <session-id> [--force] [--json]`
 - `aethyme broker cleanup --all-cleaned [--apply --confirm <sha256>] [--json]`
+- `aethyme broker gc plan [--json]`
+- `aethyme broker gc apply --confirm <sha256> [--json]`
 - `aethyme broker handoff (--session <id> | --worktree <path>) [--json]`
 - `aethyme broker report capture --kind <bug|improvement> --title <text> [--session <id>] [--include-task] [--stdout | --output <filename>] [--json]`
 - `aethyme broker report list [--json]`
@@ -546,6 +548,45 @@ next plan for safe recovery. Adopted worktrees are outside the sweep, and dirty,
 symlinked, unsafe-path, pending, unproven, or inspection-failed candidates remain
 untouched. `--force` is available only for one exact session and is rejected
 with `--all-cleaned`; there is no blanket discard authorization.
+
+`broker gc` applies one declared retention policy across terminal events,
+gate results and their broker-owned logs, terminal merge-queue history,
+command metrics, and closed represented worktrees. The optional
+`.aethyme/broker.toml` file overrides conservative defaults:
+
+```toml
+[retention]
+schema_version = 1
+terminal_events_days = 180
+gate_results_days = 30
+terminal_merge_queue_days = 180
+command_metrics_days = 30
+closed_worktrees_days = 7
+startup_budget_ms = 25
+```
+
+Run `aethyme broker gc plan` first. Its text and stable JSON enumerate every
+eligible database row, runtime file, represented worktree and exact branch ref,
+estimated bytes, protected finding, and the SHA-256 authorization digest. GC
+never ages out live sessions, outstanding or acknowledged advisories,
+unpublished exposures, unresolved coordinated operations, accepted
+checkpoints, or unproven contributions.
+
+Apply only the reviewed plan:
+
+```bash
+aethyme broker gc apply --confirm <sha256>
+```
+
+Application uses an exclusive stale-owner-aware lock, transactional row
+batches, exact before-hash checks for files, and provenance-safe worktree/ref
+cleanup. Progress is journaled atomically in `.aethyme/gc-journal.json`.
+Subsequent broker startup may spend only the configured monotonic time budget
+resuming that already-confirmed journal; startup never authorizes a fresh plan.
+If a file changed or remains locked, it is retained and the exact recovery
+command remains available. Event IDs and operation cursors are not reused.
+`broker doctor` and `aethyme certify` report policy validity, eligible counts,
+bytes, blockers, and pending recovery without embedding retained content.
 
 Retrieve the newest persisted handoff without changing broker state:
 

@@ -130,6 +130,7 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
         }
     });
     checks.push(check_config_valid(&checkout_root));
+    checks.push(check_retention_policy(&checkout_root));
     checks.extend(check_enrollment_visibility(&repo, &checkout_root));
     checks.push(check_gitignore_contract(&checkout_root));
     checks.push(Check {
@@ -166,6 +167,32 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
             },
             detail: format!("integrity: {}", report.integrity),
         });
+        let retention = &report.retention;
+        let pending = retention.pending_recovery_digest.is_some();
+        let eligible =
+            retention.candidate_rows + retention.candidate_files + retention.candidate_worktrees;
+        checks.push(Check {
+            id: "certify.retention",
+            status: if pending || eligible > 0 {
+                CheckStatus::Warn
+            } else {
+                CheckStatus::Pass
+            },
+            detail: if let Some(digest) = &retention.pending_recovery_digest {
+                format!(
+                    "confirmed GC recovery is pending; resume with `aethyme broker gc apply --confirm {digest}`"
+                )
+            } else {
+                format!(
+                    "{} eligible rows, {} files, {} worktrees; {} reclaimable bytes; {} protected findings",
+                    retention.candidate_rows,
+                    retention.candidate_files,
+                    retention.candidate_worktrees,
+                    retention.estimated_reclaimable_bytes,
+                    retention.blockers,
+                )
+            },
+        });
         for id in &report.missing_worktrees {
             checks.push(Check {
                 id: "certify.missing-worktree",
@@ -185,6 +212,24 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
         check_mode: true,
         checks,
     })
+}
+
+fn check_retention_policy(main_root: &Path) -> Check {
+    match crate::load_retention_policy(main_root) {
+        Ok(policy) => Check {
+            id: "certify.retention-policy",
+            status: CheckStatus::Pass,
+            detail: format!(
+                "retention schema {} valid; startup recovery budget {}ms",
+                policy.schema_version, policy.startup_budget_ms
+            ),
+        },
+        Err(error) => Check {
+            id: "certify.retention-policy",
+            status: CheckStatus::Fail,
+            detail: error.to_string(),
+        },
+    }
 }
 
 /// Deterministic scaffolding: ONLY what the broker needs to work, and

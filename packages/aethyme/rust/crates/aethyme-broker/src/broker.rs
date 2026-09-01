@@ -54,6 +54,20 @@ pub enum BrokerOpError {
     CleanupConfirmationNotSha256,
     #[error("bulk cleanup confirmation mismatch: expected {expected}, received {actual}")]
     CleanupConfirmationMismatch { expected: String, actual: String },
+    #[error("GC confirmation must be a full SHA-256 digest")]
+    GcConfirmationNotSha256,
+    #[error("GC confirmation mismatch: expected {expected}, received {actual}")]
+    GcConfirmationMismatch { expected: String, actual: String },
+    #[error("GC is already running under process {pid}; wait or inspect .aethyme/gc.lock")]
+    GcLocked { pid: String },
+    #[error("GC recovery journal is invalid: {reason}")]
+    InvalidGcJournal { reason: String },
+    #[error("GC reviewed artifact drifted at {path}: expected {expected}, observed {actual}")]
+    GcArtifactDrift {
+        path: String,
+        expected: String,
+        actual: String,
+    },
     #[error(
         "repair paused during rebase for session {id} onto {base}: {message}\n\
          Resolve conflicts in the session worktree, then run \
@@ -182,6 +196,8 @@ pub enum BrokerOpError {
     InvalidHandoffEvent { event_id: i64, reason: String },
     #[error(transparent)]
     GateConfig(#[from] crate::gates::GateConfigError),
+    #[error(transparent)]
+    RetentionConfig(#[from] crate::RetentionConfigError),
     #[error(transparent)]
     PrePush(#[from] crate::gates::PrePushValidationError),
     #[error("queue entry {entry} is not verified (status: {status}) — submit/simulate first")]
@@ -499,6 +515,8 @@ pub struct DoctorReport {
     /// Lease rows of already-cleaned sessions found (and removed) —
     /// retention for databases written before leases were purged on clean.
     pub purged_stale_leases: usize,
+    /// Read-only retention candidates and any already-authorized recovery.
+    pub retention: crate::GcHealth,
     /// Present when live sessions can still submit and move integration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration_movement: Option<IntegrationMovementNotice>,
@@ -1536,6 +1554,9 @@ impl Broker {
         broker.recover_interrupted_promotion()?;
         broker.recover_prepared_reconciliation()?;
         broker.backfill_promoted_path_exposures()?;
+        // Best effort and silent: only an already-confirmed journal may be
+        // resumed here. Doctor exposes any remaining work or artifact drift.
+        let _ = broker.resume_gc_maintenance();
         Ok(broker)
     }
 
@@ -4217,6 +4238,7 @@ impl Broker {
         }
 
         let purged_stale_leases = self.store.purge_leases_of_cleaned_sessions()?;
+        let retention = self.gc_health()?;
         let version = crate::version::inspect_version(&self.main_root);
         let version_repair = fix_version.then(|| self.repair_local_cli_version(&version));
         let integration_movement =
@@ -4229,6 +4251,7 @@ impl Broker {
             missing_worktrees,
             orphaned_pidfiles,
             purged_stale_leases,
+            retention,
             integration_movement,
         })
     }
@@ -6391,7 +6414,7 @@ fn worktree_activity_ms(main_root: &Path, session: &Session) -> Option<i64> {
 /// True when the PID exists and is not a zombie (macOS/Linux — the v0
 /// platforms). `kill -0` alone is wrong here: it succeeds on zombies,
 /// and an exited-but-unreaped agent must read as dead.
-fn pid_alive(pid: i64) -> bool {
+pub(crate) fn pid_alive(pid: i64) -> bool {
     match Command::new("ps")
         .args(["-o", "state=", "-p", &pid.to_string()])
         .stderr(Stdio::null())
@@ -6661,6 +6684,15 @@ mod tests {
             missing_worktrees: Vec::new(),
             orphaned_pidfiles: Vec::new(),
             purged_stale_leases: 0,
+            retention: crate::GcHealth {
+                policy: crate::RetentionPolicy::default(),
+                pending_recovery_digest: None,
+                candidate_rows: 0,
+                candidate_files: 0,
+                candidate_worktrees: 0,
+                estimated_reclaimable_bytes: 0,
+                blockers: 0,
+            },
             integration_movement: None,
         }
     }

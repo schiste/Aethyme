@@ -28,6 +28,7 @@ mod error;
 pub mod events;
 mod exposures;
 mod gates;
+mod gc;
 mod git;
 mod github_target;
 mod graph_impact;
@@ -50,6 +51,7 @@ mod report;
 mod report_filing;
 mod repository_contract;
 mod resources;
+mod retention;
 mod schema;
 mod ship;
 mod store;
@@ -87,6 +89,7 @@ pub use gates::{
     GateResourceProvenance, GateRunOutcome, PrePushPlan, PrePushReport, PrePushUpdate,
     PrePushValidationError, load_gates, plan_pre_push, select_gates,
 };
+pub use gc::GC_PLAN_SCHEMA_VERSION;
 pub use git::{GitError, GitRepo, MergeSimulation, RemoteDefaultBranch};
 pub use github_target::{
     GithubApiTargetEvidence, GithubTargetError, ResolvedGithubTarget, resolve_github_target,
@@ -178,6 +181,11 @@ pub use resources::{
     HostResourceGrant, HostResourceKind, HostResourceLease, HostResourcePlan, HostResourceRequest,
     HostResourceRequirement, HostResourceRunError, HostResourceRunReport,
     default_host_resource_db_path, resource_environment_key, validate_host_resource_requirements,
+};
+pub use retention::{
+    BROKER_CONFIG_RELPATH, GcApplyReport, GcBlocker, GcFileAction, GcFileCandidate, GcHealth,
+    GcPlan, GcRowCandidate, GcRowKind, GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION,
+    RetentionConfigError, RetentionPolicy, load_retention_policy,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use ship::{
