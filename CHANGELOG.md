@@ -4,6 +4,48 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.5.0] - 2026-09-01
+
+### Added
+
+- Gate scope manifests, authenticated external event ingestion, review
+  lifecycles, lease-routing exports, and reviewed publication policies provide
+  auditable coordination without making repository-specific integrations part
+  of the broker core.
+- Broker retention and garbage-collection policies bound historical state and
+  safely reclaim represented session worktrees, branches, events, operations,
+  advisories, and expired resource leases.
+- Atomic first enrollment publishes the complete repository contract or leaves
+  the repository unchanged.
+
+### Changed
+
+- Publication evidence now controls exposure resolution: promoted paths remain
+  visible until the exact entry is verified on remote main or is explicitly
+  reconciled as an equivalent landing.
+- Status, finish, cleanup, gate diagnostics, checkpoint recovery, and planned
+  lease conflicts now report bounded, preservation-first next actions.
+- Shared remote publication can require configured reviews and policy evidence;
+  the default remains backward-compatible until those controls are enabled.
+
+### Fixed
+
+- Submission provenance, equivalent-tree leases, divergent upstream counts,
+  amended promoted checkpoints, and `git -C` operations are classified from
+  their actual Git evidence instead of inferred wording or commit identity.
+- Protected-branch commits require an active broker session, while ship can
+  synchronize a clean main checkout without rejecting unrelated untracked
+  files.
+- Enhance verification reports the exact tracked provenance used to generate
+  onboarding, avoiding false freshness claims.
+
+### Upgrade notes
+
+Read [Upgrading to v0.5.0](packages/aethyme/docs/guides/upgrading-to-v0.5.0.md)
+before updating. Repository deployment stays at schema 1 and engine protocol
+stays at 1. Broker storage advances to schema 24 and migrates automatically;
+review the rollback limitation before first opening an existing broker database.
+
 ## [0.4.2] - 2026-08-29
 
 ### Added
