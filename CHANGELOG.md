@@ -4,6 +4,39 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.0] - 2026-09-01
+
+### Added
+
+- Review policies can opt into `github_check_run` evidence with an exact check
+  name and trusted GitHub App slug, while formal GitHub approval remains the
+  default.
+- Sanitized evidence records the selected check ID, status, conclusion, app,
+  and exact head SHA without retaining review comments or arbitrary provider
+  payloads.
+
+### Changed
+
+- `broker review unlock` polls configured review evidence and can advance a
+  check-backed lifecycle directly from `review_requested`; comment-only
+  reviewers no longer require a synthetic approval webhook.
+- Review-gated publication revalidates the configured evidence adapter against
+  the exact pull-request head immediately before publishing.
+
+### Fixed
+
+- Automated reviewers that report through comments and a repository-owned
+  check are no longer permanently excluded by the hardcoded
+  `reviewDecision == APPROVED` condition.
+- Wrong-app, stale-head, unsuccessful, unavailable, and truncated check-run
+  evidence fails closed without running the validation-unlock mutation.
+
+### Upgrade notes
+
+Read [Upgrading to v0.7.0](packages/aethyme/docs/guides/upgrading-to-v0.7.0.md)
+before updating. Broker storage, repository deployment, and engine protocol
+schemas are unchanged from v0.6.0; no mandatory migration is required.
+
 ## [0.6.0] - 2026-09-01
 
 ### Added
