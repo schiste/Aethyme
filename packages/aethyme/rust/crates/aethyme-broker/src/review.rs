@@ -6,6 +6,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 use crate::broker::{Broker, BrokerOpError};
 use crate::operations::CoordinatedCommand;
 use crate::types::{MergeQueueEntry, OperationEffect, OperationProvider, OperationStatus};
@@ -249,6 +251,9 @@ pub struct ReviewLifecycle {
     pub generation: i64,
     pub evidence_digest: Option<String>,
     pub unlock_operation_id: Option<i64>,
+    pub active: bool,
+    pub abandoned_at: Option<i64>,
+    pub abandon_reason_digest: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -270,6 +275,13 @@ pub struct ReviewLifecycleReport {
     pub changed: bool,
     pub operation_id: Option<i64>,
     pub non_blocking_feedback: bool,
+    pub next_action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReviewLifecycleAbandonReport {
+    pub lifecycle: ReviewLifecycle,
+    pub abandoned: bool,
     pub next_action: String,
 }
 
@@ -546,6 +558,83 @@ impl Broker {
         Ok(report(policy, lifecycle, changed, None))
     }
 
+    pub fn reassign_review_lifecycle(
+        &mut self,
+        from_session_id: i64,
+        to_session_id: i64,
+        reason: &str,
+        now: i64,
+    ) -> Result<ReviewLifecycleReport, BrokerOpError> {
+        let policy = ReviewPolicy::load(&self.main_root_path())?;
+        require_enabled(&policy)?;
+        if from_session_id == to_session_id {
+            return review_error("review reassignment requires two different session ids");
+        }
+        let reason_digest = review_recovery_reason_digest(reason)?;
+        let current = required_lifecycle(self, from_session_id)?;
+        let from_session = self.store().session(from_session_id)?;
+        if !from_session.status.is_closed() {
+            return review_error(
+                "review reassignment is only allowed from a closed session; finish the live owner or continue using it",
+            );
+        }
+        let to_session = self.store().session(to_session_id)?;
+        if to_session.status.is_closed() {
+            return review_error("review reassignment requires a live destination session");
+        }
+        if let Some(existing) = self.store().review_lifecycle_for_session(to_session_id)? {
+            return review_error(&format!(
+                "destination session {to_session_id} already owns review lifecycle {} for {} PR #{}",
+                existing.id, existing.repository, existing.pr_number
+            ));
+        }
+        let checkout = crate::GitRepo::discover(Path::new(&to_session.worktree_path))?;
+        let destination_head = checkout.head_commit()?;
+        if destination_head != current.commit_sha {
+            return review_error(&format!(
+                "destination session HEAD {destination_head} does not equal lifecycle commit {}; preserve or submit the intended replacement before reassignment",
+                current.commit_sha
+            ));
+        }
+        let lifecycle = self.store().reassign_review_lifecycle(
+            current.id,
+            from_session_id,
+            to_session_id,
+            &reason_digest,
+            now,
+        )?;
+        Ok(report(policy, lifecycle, true, None))
+    }
+
+    pub fn abandon_review_lifecycle(
+        &mut self,
+        session_id: i64,
+        reason: &str,
+        now: i64,
+    ) -> Result<ReviewLifecycleAbandonReport, BrokerOpError> {
+        let policy = ReviewPolicy::load(&self.main_root_path())?;
+        require_enabled(&policy)?;
+        let reason_digest = review_recovery_reason_digest(reason)?;
+        let current = required_lifecycle(self, session_id)?;
+        let lifecycle =
+            self.store()
+                .abandon_review_lifecycle(current.id, session_id, &reason_digest, now)?;
+        Ok(ReviewLifecycleAbandonReport {
+            next_action: format!(
+                "register {} PR #{} under a live session with `aethyme broker review register --session <id> --repo {} --pr {}`",
+                lifecycle.repository,
+                lifecycle.pr_number,
+                lifecycle
+                    .repository
+                    .strip_prefix("github.com/")
+                    .unwrap_or(&lifecycle.repository),
+                lifecycle.pr_number
+            ),
+            lifecycle,
+            abandoned: true,
+        })
+    }
+
     pub(crate) fn record_review_submission(
         &mut self,
         entry: &MergeQueueEntry,
@@ -813,6 +902,14 @@ fn required_lifecycle(
         .ok_or_else(|| BrokerOpError::ReviewLifecycle {
             reason: format!("session {session_id} has no review lifecycle"),
         })
+}
+
+fn review_recovery_reason_digest(reason: &str) -> Result<String, BrokerOpError> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() || trimmed.len() > 500 {
+        return review_error("review recovery --reason must contain 1 to 500 characters");
+    }
+    Ok(format!("{:x}", Sha256::digest(trimmed.as_bytes())))
 }
 
 fn require_enabled(policy: &ReviewPolicy) -> Result<(), BrokerOpError> {

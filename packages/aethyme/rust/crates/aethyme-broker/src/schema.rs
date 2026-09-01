@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 25;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -620,6 +620,76 @@ CREATE INDEX review_transitions_by_lifecycle
     ON review_lifecycle_transitions (lifecycle_id, id);
 ";
 
+const MIGRATION_V25: &str = "
+-- Review lifecycles remain auditable after explicit abandonment while the
+-- active session and PR identities become reusable. Rebuild both parent and
+-- child tables so foreign-key integrity is preserved throughout migration.
+CREATE TABLE review_lifecycles_v25 (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          INTEGER NOT NULL REFERENCES sessions(id),
+    queue_entry_id      INTEGER REFERENCES merge_queue(id),
+    repository          TEXT NOT NULL,
+    target_branch       TEXT NOT NULL,
+    pr_number           INTEGER NOT NULL,
+    commit_sha          TEXT NOT NULL,
+    state               TEXT NOT NULL CHECK (state IN (
+                            'draft_opened', 'local_submission_verified',
+                            'review_requested', 'changes_requested',
+                            'replacement_commit_submitted', 'review_satisfied',
+                            'validation_unlocked'
+                        )),
+    generation          INTEGER NOT NULL DEFAULT 0,
+    evidence_digest     TEXT,
+    unlock_operation_id INTEGER REFERENCES coordinated_operations(id),
+    active              INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    abandoned_at        INTEGER,
+    abandon_reason_digest TEXT,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+);
+
+INSERT INTO review_lifecycles_v25 (
+    id, session_id, queue_entry_id, repository, target_branch, pr_number,
+    commit_sha, state, generation, evidence_digest, unlock_operation_id,
+    active, abandoned_at, abandon_reason_digest, created_at, updated_at
+)
+SELECT id, session_id, queue_entry_id, repository, target_branch, pr_number,
+       commit_sha, state, generation, evidence_digest, unlock_operation_id,
+       1, NULL, NULL, created_at, updated_at
+FROM review_lifecycles;
+
+CREATE TABLE review_lifecycle_transitions_v25 (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    lifecycle_id    INTEGER NOT NULL REFERENCES review_lifecycles_v25(id),
+    from_state      TEXT,
+    to_state        TEXT NOT NULL,
+    commit_sha      TEXT NOT NULL,
+    queue_entry_id  INTEGER REFERENCES merge_queue(id),
+    evidence_digest TEXT,
+    operation_id    INTEGER REFERENCES coordinated_operations(id),
+    created_at      INTEGER NOT NULL
+);
+
+INSERT INTO review_lifecycle_transitions_v25
+SELECT * FROM review_lifecycle_transitions;
+
+DROP TABLE review_lifecycle_transitions;
+DROP TABLE review_lifecycles;
+ALTER TABLE review_lifecycles_v25 RENAME TO review_lifecycles;
+ALTER TABLE review_lifecycle_transitions_v25 RENAME TO review_lifecycle_transitions;
+
+CREATE UNIQUE INDEX review_lifecycles_active_session
+    ON review_lifecycles (session_id) WHERE active = 1;
+CREATE UNIQUE INDEX review_lifecycles_active_pr
+    ON review_lifecycles (repository, pr_number) WHERE active = 1;
+CREATE INDEX review_lifecycles_by_queue
+    ON review_lifecycles (queue_entry_id);
+CREATE INDEX review_lifecycles_by_commit
+    ON review_lifecycles (commit_sha);
+CREATE INDEX review_transitions_by_lifecycle
+    ON review_lifecycle_transitions (lifecycle_id, id);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -645,6 +715,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V22,
     MIGRATION_V23,
     MIGRATION_V24,
+    MIGRATION_V25,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1256,6 +1327,88 @@ mod tests {
         for expected in ["from_state", "to_state", "commit_sha", "operation_id"] {
             assert!(transition_columns.iter().any(|column| column == expected));
         }
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v25_preserves_review_history_and_makes_only_active_owners_unique() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS[..24].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sessions (
+                 id, worktree_path, branch, origin, status,
+                 created_at, updated_at, last_activity_at
+             ) VALUES (1, '/tmp/old', 'agent/old', 'spawned', 'cleaned', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO review_lifecycles (
+                 session_id, repository, target_branch, pr_number, commit_sha,
+                 state, generation, created_at, updated_at
+             ) VALUES (1, 'github.com/acme/product', 'main', 42,
+                       'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                       'review_requested', 3, 1, 1)",
+            [],
+        )
+        .unwrap();
+        let lifecycle_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO review_lifecycle_transitions (
+                 lifecycle_id, from_state, to_state, commit_sha, created_at
+             ) VALUES (?1, 'local_submission_verified', 'review_requested',
+                       'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1)",
+            [lifecycle_id],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT active, generation FROM review_lifecycles WHERE id = ?1",
+                [lifecycle_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+            (1, 3)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM review_lifecycle_transitions WHERE lifecycle_id = ?1",
+                [lifecycle_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        let indexes = conn
+            .prepare("PRAGMA index_list('review_lifecycles')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            indexes
+                .iter()
+                .any(|name| name == "review_lifecycles_active_session")
+        );
+        assert!(
+            indexes
+                .iter()
+                .any(|name| name == "review_lifecycles_active_pr")
+        );
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 }

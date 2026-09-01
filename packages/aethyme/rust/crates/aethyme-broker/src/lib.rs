@@ -209,9 +209,10 @@ pub use retention::{
     RetentionConfigError, RetentionPolicy, load_retention_policy,
 };
 pub use review::{
-    REVIEW_POLICY_SCHEMA_VERSION, ReviewEvidenceAdapter, ReviewLifecycle, ReviewLifecycleReport,
-    ReviewLifecycleState, ReviewPolicy, ReviewProvider, ReviewProviderSnapshot,
-    ReviewSatisfactionEvidence, ValidationUnlockAdapter, load_review_provider_snapshot,
+    REVIEW_POLICY_SCHEMA_VERSION, ReviewEvidenceAdapter, ReviewLifecycle,
+    ReviewLifecycleAbandonReport, ReviewLifecycleReport, ReviewLifecycleState, ReviewPolicy,
+    ReviewProvider, ReviewProviderSnapshot, ReviewSatisfactionEvidence, ValidationUnlockAdapter,
+    load_review_provider_snapshot,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use ship::{

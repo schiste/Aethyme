@@ -1677,7 +1677,7 @@ impl BrokerStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = tx
             .query_row(
-                &format!("{REVIEW_LIFECYCLE_SELECT} WHERE session_id = ?1"),
+                &format!("{REVIEW_LIFECYCLE_SELECT} WHERE session_id = ?1 AND active = 1"),
                 [lifecycle.session_id],
                 review_lifecycle_from_row,
             )
@@ -1711,6 +1711,23 @@ impl BrokerStore {
             )?;
             tx.commit()?;
             return Ok((existing, false));
+        }
+        let existing_pr = tx
+            .query_row(
+                &format!(
+                    "{REVIEW_LIFECYCLE_SELECT} WHERE repository = ?1 AND pr_number = ?2 AND active = 1"
+                ),
+                params![lifecycle.repository, lifecycle.pr_number],
+                review_lifecycle_from_row,
+            )
+            .optional()?
+            .transpose()?;
+        if let Some(existing) = existing_pr {
+            return Err(BrokerError::ReviewLifecyclePrOwned {
+                repository: existing.repository,
+                pr_number: existing.pr_number,
+                session_id: existing.session_id,
+            });
         }
         tx.execute(
             "INSERT INTO review_lifecycles (
@@ -1761,13 +1778,110 @@ impl BrokerStore {
         ))
     }
 
+    pub(crate) fn reassign_review_lifecycle(
+        &mut self,
+        lifecycle_id: i64,
+        from_session_id: i64,
+        to_session_id: i64,
+        reason_digest: &str,
+        now: i64,
+    ) -> Result<ReviewLifecycle, BrokerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let lifecycle = tx.query_row(
+            &format!("{REVIEW_LIFECYCLE_SELECT} WHERE id = ?1 AND active = 1"),
+            [lifecycle_id],
+            review_lifecycle_from_row,
+        )??;
+        let changed = tx.execute(
+            "UPDATE review_lifecycles
+             SET session_id = ?2, generation = generation + 1, updated_at = ?3
+             WHERE id = ?1 AND session_id = ?4 AND active = 1",
+            params![lifecycle_id, to_session_id, now, from_session_id],
+        )?;
+        if changed != 1 {
+            return Err(BrokerError::ReviewLifecycleIdentityConflict);
+        }
+        tx.execute(
+            "UPDATE pr_watch_state
+             SET last_agent_session_id = ?1, updated_at = ?2
+             WHERE target_branch = ?3 AND pr_number = ?4",
+            params![
+                to_session_id,
+                now,
+                lifecycle.target_branch,
+                lifecycle.pr_number
+            ],
+        )?;
+        insert_event(
+            &tx,
+            now,
+            crate::events::REVIEW_LIFECYCLE_REASSIGNED,
+            Some(to_session_id),
+            Some(&crate::events::review_lifecycle_reassigned_payload(
+                lifecycle_id,
+                from_session_id,
+                to_session_id,
+                &lifecycle.repository,
+                lifecycle.pr_number,
+                reason_digest,
+            )),
+        )?;
+        tx.commit()?;
+        self.review_lifecycle_by_id(lifecycle_id)?
+            .ok_or(BrokerError::ReviewLifecycleNotFound(to_session_id))
+    }
+
+    pub(crate) fn abandon_review_lifecycle(
+        &mut self,
+        lifecycle_id: i64,
+        session_id: i64,
+        reason_digest: &str,
+        now: i64,
+    ) -> Result<ReviewLifecycle, BrokerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let lifecycle = tx.query_row(
+            &format!("{REVIEW_LIFECYCLE_SELECT} WHERE id = ?1 AND active = 1"),
+            [lifecycle_id],
+            review_lifecycle_from_row,
+        )??;
+        let changed = tx.execute(
+            "UPDATE review_lifecycles
+             SET active = 0, abandoned_at = ?2, abandon_reason_digest = ?3,
+                 generation = generation + 1, updated_at = ?2
+             WHERE id = ?1 AND session_id = ?4 AND active = 1",
+            params![lifecycle_id, now, reason_digest, session_id],
+        )?;
+        if changed != 1 {
+            return Err(BrokerError::ReviewLifecycleIdentityConflict);
+        }
+        insert_event(
+            &tx,
+            now,
+            crate::events::REVIEW_LIFECYCLE_ABANDONED,
+            Some(session_id),
+            Some(&crate::events::review_lifecycle_abandoned_payload(
+                lifecycle_id,
+                &lifecycle.repository,
+                lifecycle.pr_number,
+                reason_digest,
+            )),
+        )?;
+        tx.commit()?;
+        self.review_lifecycle_by_id(lifecycle_id)?
+            .ok_or(BrokerError::ReviewLifecycleNotFound(session_id))
+    }
+
     pub fn review_lifecycle_for_session(
         &self,
         session_id: i64,
     ) -> Result<Option<ReviewLifecycle>, BrokerError> {
         self.conn
             .query_row(
-                &format!("{REVIEW_LIFECYCLE_SELECT} WHERE session_id = ?1"),
+                &format!("{REVIEW_LIFECYCLE_SELECT} WHERE session_id = ?1 AND active = 1"),
                 [session_id],
                 review_lifecycle_from_row,
             )
@@ -1782,7 +1896,9 @@ impl BrokerStore {
     ) -> Result<Option<ReviewLifecycle>, BrokerError> {
         self.conn
             .query_row(
-                &format!("{REVIEW_LIFECYCLE_SELECT} WHERE repository = ?1 AND pr_number = ?2"),
+                &format!(
+                    "{REVIEW_LIFECYCLE_SELECT} WHERE repository = ?1 AND pr_number = ?2 AND active = 1"
+                ),
                 params![repository, pr_number],
                 review_lifecycle_from_row,
             )
@@ -3497,7 +3613,8 @@ fn pr_watch_from_row(row: &rusqlite::Row<'_>) -> RowResult<PrWatchState> {
 const REVIEW_LIFECYCLE_SELECT: &str =
     "SELECT id, session_id, queue_entry_id, repository, target_branch,
             pr_number, commit_sha, state, generation, evidence_digest,
-            unlock_operation_id, created_at, updated_at
+            unlock_operation_id, active, abandoned_at, abandon_reason_digest,
+            created_at, updated_at
      FROM review_lifecycles";
 
 fn review_lifecycle_from_row(row: &rusqlite::Row<'_>) -> RowResult<ReviewLifecycle> {
@@ -3515,8 +3632,11 @@ fn review_lifecycle_from_row(row: &rusqlite::Row<'_>) -> RowResult<ReviewLifecyc
             generation: row.get(8)?,
             evidence_digest: row.get(9)?,
             unlock_operation_id: row.get(10)?,
-            created_at: row.get(11)?,
-            updated_at: row.get(12)?,
+            active: row.get::<_, i64>(11)? != 0,
+            abandoned_at: row.get(12)?,
+            abandon_reason_digest: row.get(13)?,
+            created_at: row.get(14)?,
+            updated_at: row.get(15)?,
         })
     })())
 }

@@ -1028,3 +1028,186 @@ fn unknown_ready_outcome_preserves_state_and_blocks_blind_retry() {
         1
     );
 }
+
+#[test]
+fn closed_review_lifecycle_can_be_reassigned_or_abandoned_without_losing_audit_history() {
+    let fixture = Fixture::new();
+    let head = git(fixture.root.path(), &["rev-parse", "HEAD"]);
+
+    let start = fixture.run(
+        &["start", "--task", "original review owner", "--json"],
+        &head,
+        true,
+        None,
+    );
+    assert!(start.status.success());
+    let original: serde_json::Value = serde_json::from_slice(&start.stdout).unwrap();
+    let original_id = original["id"].as_i64().unwrap().to_string();
+    let register = fixture.run(
+        &[
+            "review",
+            "register",
+            "--session",
+            &original_id,
+            "--repo",
+            "acme/product",
+            "--pr",
+            "42",
+            "--json",
+        ],
+        &head,
+        true,
+        None,
+    );
+    assert!(
+        register.status.success(),
+        "{}",
+        String::from_utf8_lossy(&register.stderr)
+    );
+    let close = fixture.run(
+        &["close", "--session", &original_id, "--json"],
+        &head,
+        true,
+        None,
+    );
+    assert!(close.status.success());
+
+    let replacement = fixture.run(
+        &["start", "--task", "replacement review owner", "--json"],
+        &head,
+        true,
+        None,
+    );
+    assert!(replacement.status.success());
+    let replacement: serde_json::Value = serde_json::from_slice(&replacement.stdout).unwrap();
+    let replacement_id = replacement["id"].as_i64().unwrap().to_string();
+
+    let duplicate = fixture.run(
+        &[
+            "review",
+            "register",
+            "--session",
+            &replacement_id,
+            "--repo",
+            "acme/product",
+            "--pr",
+            "42",
+            "--json",
+        ],
+        &head,
+        true,
+        None,
+    );
+    assert!(!duplicate.status.success());
+    let duplicate_error = String::from_utf8_lossy(&duplicate.stderr);
+    assert!(
+        duplicate_error.contains("already owned by session"),
+        "{duplicate_error}"
+    );
+    assert!(
+        !duplicate_error.contains("UNIQUE constraint"),
+        "{duplicate_error}"
+    );
+
+    let reassign = fixture.run(
+        &[
+            "review",
+            "reassign",
+            "--session",
+            &original_id,
+            "--to-session",
+            &replacement_id,
+            "--reason",
+            "continue the same reviewed commit",
+            "--json",
+        ],
+        &head,
+        true,
+        None,
+    );
+    assert!(
+        reassign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reassign.stderr)
+    );
+    let reassigned: serde_json::Value = serde_json::from_slice(&reassign.stdout).unwrap();
+    assert_eq!(
+        reassigned["lifecycle"]["session_id"],
+        replacement_id.parse::<i64>().unwrap()
+    );
+    assert_eq!(reassigned["lifecycle"]["active"], true);
+    assert_eq!(reassigned["lifecycle"]["generation"], 1);
+
+    let abandon = fixture.run(
+        &[
+            "review",
+            "abandon",
+            "--session",
+            &replacement_id,
+            "--reason",
+            "restart review coordination under a fresh session",
+            "--json",
+        ],
+        &head,
+        true,
+        None,
+    );
+    assert!(
+        abandon.status.success(),
+        "{}",
+        String::from_utf8_lossy(&abandon.stderr)
+    );
+    let abandoned: serde_json::Value = serde_json::from_slice(&abandon.stdout).unwrap();
+    assert_eq!(abandoned["abandoned"], true);
+    assert_eq!(abandoned["lifecycle"]["active"], false);
+    assert_eq!(
+        abandoned["lifecycle"]["abandon_reason_digest"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+
+    let fresh = fixture.run(
+        &["start", "--task", "fresh review registration", "--json"],
+        &head,
+        true,
+        None,
+    );
+    assert!(fresh.status.success());
+    let fresh: serde_json::Value = serde_json::from_slice(&fresh.stdout).unwrap();
+    let fresh_id = fresh["id"].as_i64().unwrap().to_string();
+    let fresh_register = fixture.run(
+        &[
+            "review",
+            "register",
+            "--session",
+            &fresh_id,
+            "--repo",
+            "acme/product",
+            "--pr",
+            "42",
+            "--json",
+        ],
+        &head,
+        true,
+        None,
+    );
+    assert!(
+        fresh_register.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fresh_register.stderr)
+    );
+
+    let events = fixture.run(
+        &["events", "--kind", "review.lifecycle", "--json"],
+        &head,
+        true,
+        None,
+    );
+    let events = String::from_utf8(events.stdout).unwrap();
+    assert!(events.contains("review.lifecycle_reassigned"));
+    assert!(events.contains("review.lifecycle_abandoned"));
+    assert!(!events.contains("continue the same reviewed commit"));
+    assert!(!events.contains("restart review coordination"));
+}

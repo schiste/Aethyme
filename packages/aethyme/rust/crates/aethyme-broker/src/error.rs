@@ -72,6 +72,15 @@ pub enum BrokerError {
     #[error("review lifecycle identity already belongs to different immutable provenance")]
     ReviewLifecycleIdentityConflict,
 
+    #[error(
+        "review lifecycle for {repository} PR #{pr_number} is already owned by session {session_id}; inspect it with `aethyme broker review show --session {session_id}`, then reassign or abandon it explicitly"
+    )]
+    ReviewLifecyclePrOwned {
+        repository: String,
+        pr_number: i64,
+        session_id: i64,
+    },
+
     #[error("review lifecycle {id} changed concurrently: expected {expected}, found {actual}")]
     ReviewLifecycleStateChanged {
         id: i64,

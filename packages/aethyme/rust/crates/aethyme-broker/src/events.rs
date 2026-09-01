@@ -20,6 +20,8 @@ pub const SESSION_REUSED: &str = "session.reused";
 pub const SESSION_FINISHED: &str = "session.finished";
 pub const SESSION_FINISH_CLEANUP_STARTED: &str = "session.finish_cleanup_started";
 pub const SESSION_CHECKPOINT_REANCHORED: &str = "session.checkpoint_reanchored";
+pub const REVIEW_LIFECYCLE_REASSIGNED: &str = "review.lifecycle_reassigned";
+pub const REVIEW_LIFECYCLE_ABANDONED: &str = "review.lifecycle_abandoned";
 pub const BROKER_COMMAND_FAILED: &str = "broker.command.failed";
 pub const BROKER_GC_APPLIED: &str = "broker.gc.applied";
 pub const BROKER_COMMAND_SUCCEEDED: &str = "broker.command.succeeded";
@@ -72,6 +74,40 @@ pub fn session_checkpoint_reanchored_payload(
         "session_head": session_head,
         "plan_digest": plan_digest,
         "preservation_ref": preservation_ref,
+    })
+    .to_string()
+}
+
+pub fn review_lifecycle_reassigned_payload(
+    lifecycle_id: i64,
+    from_session_id: i64,
+    to_session_id: i64,
+    repository: &str,
+    pr_number: i64,
+    reason_digest: &str,
+) -> String {
+    json!({
+        "lifecycle_id": lifecycle_id,
+        "from_session_id": from_session_id,
+        "to_session_id": to_session_id,
+        "repository": repository,
+        "pr_number": pr_number,
+        "reason_digest": reason_digest,
+    })
+    .to_string()
+}
+
+pub fn review_lifecycle_abandoned_payload(
+    lifecycle_id: i64,
+    repository: &str,
+    pr_number: i64,
+    reason_digest: &str,
+) -> String {
+    json!({
+        "lifecycle_id": lifecycle_id,
+        "repository": repository,
+        "pr_number": pr_number,
+        "reason_digest": reason_digest,
     })
     .to_string()
 }

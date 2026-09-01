@@ -288,6 +288,13 @@ Usage:
   aethyme broker review unlock --session <id> [--json]
       Poll and revalidate configured review/head/base/open evidence, then
       and run the configured validation-unlock adapter exactly once.
+  aethyme broker review reassign --session <closed-id> --to-session <live-id> --reason <text> [--json]
+      Move an active lifecycle from its closed owner to a live session whose
+      HEAD exactly matches the lifecycle commit. State and evidence remain intact;
+      only a SHA-256 digest of the reason is retained.
+  aethyme broker review abandon --session <id> --reason <text> [--json]
+      Explicitly retire a stuck lifecycle without deleting its audit history,
+      freeing the PR for fresh registration. Only the reason digest is stored.
   aethyme broker submit --session <id> [--no-cache] [--json]
       Submit the session's head commit: simulate the merge onto the local
       integration branch, run affected gates on the merged tree, and
@@ -540,6 +547,8 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "register",
     "request",
     "unlock",
+    "reassign",
+    "abandon",
     "ingest",
     "capture",
     "cleanup",
@@ -3418,7 +3427,9 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
         .first()
         .map(String::as_str)
         .ok_or_else(|| {
-            UsageError::Message("review requires register, show, request, or unlock".into())
+            UsageError::Message(
+                "review requires register, show, request, unlock, reassign, or abandon".into(),
+            )
         })?;
     if parsed.positional.len() != 1 {
         return Err(UsageError::Message(format!(
@@ -3497,9 +3508,42 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
             };
             render_review_report(&report, parsed.json)?;
         }
+        "reassign" => {
+            let to_session_id = parsed.to_session.ok_or_else(|| {
+                UsageError::Message(
+                    "review reassign requires --session <closed-id> --to-session <live-id> --reason <text>"
+                        .into(),
+                )
+            })?;
+            let reason = parsed.reason.as_deref().ok_or_else(|| {
+                UsageError::Message(
+                    "review reassign requires --session <closed-id> --to-session <live-id> --reason <text>"
+                        .into(),
+                )
+            })?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            let report =
+                broker.reassign_review_lifecycle(session_id, to_session_id, reason, now_ms())?;
+            render_review_report(&report, parsed.json)?;
+        }
+        "abandon" => {
+            let reason = parsed.reason.as_deref().ok_or_else(|| {
+                UsageError::Message("review abandon requires --session <id> --reason <text>".into())
+            })?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            let report = broker.abandon_review_lifecycle(session_id, reason, now_ms())?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Review lifecycle {} abandoned; {}",
+                    report.lifecycle.id, report.next_action
+                );
+            }
+        }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown review action {other:?}; expected register, show, request, or unlock"
+                "unknown review action {other:?}; expected register, show, request, unlock, reassign, or abandon"
             )));
         }
     }
