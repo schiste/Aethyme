@@ -13,6 +13,81 @@ use crate::types::{
     MergeStatus, OperationEffect, OperationProvider, Session,
 };
 
+pub const PUBLICATION_POLICY_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShipPublicationMode {
+    Direct,
+    ReviewGated,
+}
+
+impl Default for ShipPublicationMode {
+    fn default() -> Self {
+        Self::Direct
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShipPublicationPolicy {
+    pub schema_version: u32,
+    pub mode: ShipPublicationMode,
+    pub allow_break_glass: bool,
+}
+
+impl Default for ShipPublicationPolicy {
+    fn default() -> Self {
+        Self {
+            schema_version: PUBLICATION_POLICY_SCHEMA_VERSION,
+            mode: ShipPublicationMode::Direct,
+            allow_break_glass: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ShipReviewEvidence {
+    pub queue_entry_id: i64,
+    pub session_id: i64,
+    pub covered: bool,
+    pub lifecycle_id: Option<i64>,
+    pub reviewed_queue_entry_id: Option<i64>,
+    pub repository: Option<String>,
+    pub pr_number: Option<i64>,
+    pub target_branch: Option<String>,
+    pub reviewed_commit_sha: Option<String>,
+    pub lifecycle_state: Option<String>,
+    pub lifecycle_generation: Option<i64>,
+    pub evidence_digest: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ShipPublicationAssessment {
+    pub policy: ShipPublicationPolicy,
+    pub source_commit: String,
+    pub satisfied: bool,
+    pub evidence: Vec<ShipReviewEvidence>,
+    pub remediation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShipPublicationAuthorizationKind {
+    Direct,
+    Reviewed,
+    BreakGlass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ShipPublicationAuthorization {
+    pub kind: ShipPublicationAuthorizationKind,
+    pub policy_source_commit: String,
+    pub live_evidence_revalidated: bool,
+    pub reason_digest: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShipFreshnessResult {
@@ -67,6 +142,7 @@ pub struct ShipPlan {
     pub freshness: ShipFreshness,
     pub target: ResolvedRemoteTarget,
     pub proposed_push: ShipPush,
+    pub publication_policy: ShipPublicationAssessment,
     pub local_main_sync_safe: bool,
     pub local_main_sync_assessment: ShipLocalMainSyncAssessment,
 }
@@ -108,6 +184,7 @@ pub struct ShipExecutionReport {
     pub push_operation: CoordinatedOperation,
     pub verify_operation: CoordinatedOperation,
     pub published_sha: String,
+    pub publication_authorization: ShipPublicationAuthorization,
     pub verified_remote_sha: String,
     pub resolved_exposures: Vec<EntryPathExposure>,
     pub resolved_advisories: Vec<crate::Advisory>,
@@ -205,7 +282,6 @@ impl Broker {
         }
         included_entries.sort_by_key(|item| item.queue_entry_id);
         excluded_entries.sort_by_key(|item| item.queue_entry_id);
-
         let current_branch = self.repo_handle().current_branch()?;
         let remote = self
             .repo_handle()
@@ -230,6 +306,14 @@ impl Broker {
                     remote_default.ref_name
                 ),
             })?;
+        let publication_policy = publication_assessment(
+            self,
+            &publication_sha,
+            &included_entries,
+            &queue,
+            &target.coordination_key,
+            default_branch,
+        )?;
         let local_default_branch_ref = format!("refs/heads/{default_branch}");
         let local_default_branch_sha = self
             .repo_handle()
@@ -328,6 +412,7 @@ impl Broker {
             },
             target,
             proposed_push,
+            publication_policy,
             local_main_sync_safe,
             local_main_sync_assessment,
         })
@@ -342,7 +427,7 @@ impl Broker {
         entry_id: i64,
         confirm: &str,
     ) -> Result<ShipExecutionReport, BrokerOpError> {
-        self.ship_execute_with_sync(entry_id, confirm, false)
+        self.ship_execute_with_policy(entry_id, confirm, false, false, None)
     }
 
     pub fn ship_execute_with_sync(
@@ -350,6 +435,17 @@ impl Broker {
         entry_id: i64,
         confirm: &str,
         sync_main: bool,
+    ) -> Result<ShipExecutionReport, BrokerOpError> {
+        self.ship_execute_with_policy(entry_id, confirm, sync_main, false, None)
+    }
+
+    pub fn ship_execute_with_policy(
+        &mut self,
+        entry_id: i64,
+        confirm: &str,
+        sync_main: bool,
+        break_glass: bool,
+        break_glass_reason: Option<&str>,
     ) -> Result<ShipExecutionReport, BrokerOpError> {
         if confirm.len() != 40
             || !confirm
@@ -365,6 +461,8 @@ impl Broker {
                 actual: confirm.into(),
             });
         }
+        let publication_authorization =
+            authorize_publication(self, &plan, break_glass, break_glass_reason)?;
         if sync_main {
             validate_local_main_sync(self, &plan, confirm)
                 .map_err(|reason| BrokerOpError::ShipLocalMainUnsafe { reason })?;
@@ -453,8 +551,9 @@ impl Broker {
                 declared_effect: None,
                 destructive_confirmed: false,
                 authorization_reason: Some(format!(
-                    "confirmed broker ship for queue entry {} at {confirm}",
-                    plan.queue_entry.id
+                    "{}; confirmed broker ship for queue entry {} at {confirm}",
+                    publication_authorization_label(&publication_authorization),
+                    plan.queue_entry.id,
                 )),
                 args: vec![
                     "push".into(),
@@ -625,12 +724,303 @@ impl Broker {
             push_operation: push.operation,
             verify_operation: verify.operation,
             published_sha: confirm.into(),
+            publication_authorization,
             verified_remote_sha,
             resolved_exposures,
             resolved_advisories,
             sync_operation,
             local_main_sync,
         })
+    }
+}
+
+fn publication_assessment(
+    broker: &mut Broker,
+    publication_sha: &str,
+    included_entries: &[ShipPromotedEntry],
+    queue: &[MergeQueueEntry],
+    target_repository: &str,
+    target_branch: &str,
+) -> Result<ShipPublicationAssessment, BrokerOpError> {
+    let policy = publication_policy_at(broker, publication_sha)?;
+    if policy.mode == ShipPublicationMode::Direct {
+        return Ok(ShipPublicationAssessment {
+            policy,
+            source_commit: publication_sha.into(),
+            satisfied: true,
+            evidence: Vec::new(),
+            remediation: None,
+        });
+    }
+
+    let included_ids = included_entries
+        .iter()
+        .map(|entry| entry.queue_entry_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut evidence = Vec::with_capacity(included_entries.len());
+    for included in included_entries {
+        let queue_entry = queue
+            .iter()
+            .find(|entry| entry.id == included.queue_entry_id)
+            .expect("included entry came from queue");
+        let lifecycle = broker
+            .store()
+            .review_lifecycle_for_session(included.session_id)?;
+        let Some(lifecycle) = lifecycle else {
+            evidence.push(ShipReviewEvidence {
+                queue_entry_id: included.queue_entry_id,
+                session_id: included.session_id,
+                covered: false,
+                lifecycle_id: None,
+                reviewed_queue_entry_id: None,
+                repository: None,
+                pr_number: None,
+                target_branch: None,
+                reviewed_commit_sha: None,
+                lifecycle_state: None,
+                lifecycle_generation: None,
+                evidence_digest: None,
+                reason: "session has no registered review lifecycle".into(),
+            });
+            continue;
+        };
+        let reviewed_entry = lifecycle
+            .queue_entry_id
+            .and_then(|id| queue.iter().find(|entry| entry.id == id));
+        let reviewed_entry_in_prefix = lifecycle
+            .queue_entry_id
+            .is_some_and(|id| included_ids.contains(&id));
+        let reviewed_entry_matches = reviewed_entry.is_some_and(|entry| {
+            entry.session_id == lifecycle.session_id
+                && entry.head_commit == lifecycle.commit_sha
+                && entry.status == MergeStatus::Promoted
+        });
+        let target_matches =
+            lifecycle.repository == target_repository && lifecycle.target_branch == target_branch;
+        let includes_entry_commit = broker
+            .repo_handle()
+            .is_ancestor(&queue_entry.head_commit, &lifecycle.commit_sha);
+        let covered = lifecycle.state == crate::ReviewLifecycleState::ValidationUnlocked
+            && target_matches
+            && reviewed_entry_in_prefix
+            && reviewed_entry_matches
+            && includes_entry_commit;
+        let reason = if lifecycle.state != crate::ReviewLifecycleState::ValidationUnlocked {
+            format!("review lifecycle is {}", lifecycle.state.as_str())
+        } else if !target_matches {
+            "review lifecycle repository or base does not match the publication target".into()
+        } else if !reviewed_entry_in_prefix {
+            "reviewed queue entry is outside the selected publication prefix".into()
+        } else if !reviewed_entry_matches {
+            "review lifecycle queue and commit provenance do not match a promoted entry".into()
+        } else if !includes_entry_commit {
+            "reviewed session commit does not contain this included entry commit".into()
+        } else {
+            "covered by exact validation-unlocked review provenance".into()
+        };
+        evidence.push(ShipReviewEvidence {
+            queue_entry_id: included.queue_entry_id,
+            session_id: included.session_id,
+            covered,
+            lifecycle_id: Some(lifecycle.id),
+            reviewed_queue_entry_id: lifecycle.queue_entry_id,
+            repository: Some(lifecycle.repository),
+            pr_number: Some(lifecycle.pr_number),
+            target_branch: Some(lifecycle.target_branch),
+            reviewed_commit_sha: Some(lifecycle.commit_sha),
+            lifecycle_state: Some(lifecycle.state.as_str().into()),
+            lifecycle_generation: Some(lifecycle.generation),
+            evidence_digest: lifecycle.evidence_digest,
+            reason,
+        });
+    }
+    let satisfied = !evidence.is_empty() && evidence.iter().all(|item| item.covered);
+    let remediation = (!satisfied).then(|| {
+        "complete and unlock review for every included session, then rebuild broker ship plan"
+            .into()
+    });
+    Ok(ShipPublicationAssessment {
+        policy,
+        source_commit: publication_sha.into(),
+        satisfied,
+        evidence,
+        remediation,
+    })
+}
+
+fn publication_policy_at(
+    broker: &Broker,
+    source_commit: &str,
+) -> Result<ShipPublicationPolicy, BrokerOpError> {
+    let Some(text) = broker
+        .repo_handle()
+        .file_at_commit(source_commit, ".aethyme/config.toml")?
+    else {
+        return Ok(ShipPublicationPolicy::default());
+    };
+    let value =
+        text.parse::<toml::Value>()
+            .map_err(|error| BrokerOpError::ShipPublicationPolicy {
+                reason: format!("committed .aethyme/config.toml is invalid: {error}"),
+                remediation: "fix and submit the committed publication policy".into(),
+            })?;
+    let Some(publication) = value.get("publication") else {
+        return Ok(ShipPublicationPolicy::default());
+    };
+    let policy: ShipPublicationPolicy =
+        publication
+            .clone()
+            .try_into()
+            .map_err(|error| BrokerOpError::ShipPublicationPolicy {
+                reason: format!("committed [publication] policy is invalid: {error}"),
+                remediation: "fix and submit the committed publication policy".into(),
+            })?;
+    if policy.schema_version != PUBLICATION_POLICY_SCHEMA_VERSION {
+        return Err(BrokerOpError::ShipPublicationPolicy {
+            reason: format!(
+                "publication policy schema {} is unsupported; expected {}",
+                policy.schema_version, PUBLICATION_POLICY_SCHEMA_VERSION
+            ),
+            remediation: "upgrade Aethyme or use a supported committed policy schema".into(),
+        });
+    }
+    Ok(policy)
+}
+
+fn authorize_publication(
+    broker: &mut Broker,
+    plan: &ShipPlan,
+    break_glass: bool,
+    break_glass_reason: Option<&str>,
+) -> Result<ShipPublicationAuthorization, BrokerOpError> {
+    if break_glass {
+        if plan.publication_policy.policy.mode != ShipPublicationMode::ReviewGated {
+            return Err(BrokerOpError::ShipPublicationPolicy {
+                reason: "--break-glass is not valid for the direct publication profile".into(),
+                remediation: "execute the confirmed direct ship without --break-glass".into(),
+            });
+        }
+        if !plan.publication_policy.policy.allow_break_glass {
+            return Err(BrokerOpError::ShipPublicationPolicy {
+                reason: "the committed review-gated policy does not allow break-glass publication"
+                    .into(),
+                remediation: "complete review evidence or submit a reviewed policy change".into(),
+            });
+        }
+        let reason = break_glass_reason.unwrap_or_default();
+        if reason.is_empty() || reason.len() > 500 || reason.chars().any(char::is_control) {
+            return Err(BrokerOpError::ShipPublicationPolicy {
+                reason: "--break-glass requires --reason with 1..=500 non-control characters"
+                    .into(),
+                remediation: "provide the separately authorized emergency reason".into(),
+            });
+        }
+        return Ok(ShipPublicationAuthorization {
+            kind: ShipPublicationAuthorizationKind::BreakGlass,
+            policy_source_commit: plan.publication_policy.source_commit.clone(),
+            live_evidence_revalidated: false,
+            reason_digest: Some(crate::sha256_bytes(reason.as_bytes())),
+        });
+    }
+    if break_glass_reason.is_some() {
+        return Err(BrokerOpError::ShipPublicationPolicy {
+            reason: "--reason for ship publication is accepted only with --break-glass".into(),
+            remediation: "remove --reason or add the separately authorized --break-glass flag"
+                .into(),
+        });
+    }
+    if plan.publication_policy.policy.mode == ShipPublicationMode::Direct {
+        return Ok(ShipPublicationAuthorization {
+            kind: ShipPublicationAuthorizationKind::Direct,
+            policy_source_commit: plan.publication_policy.source_commit.clone(),
+            live_evidence_revalidated: false,
+            reason_digest: None,
+        });
+    }
+    if !plan.publication_policy.satisfied {
+        return Err(BrokerOpError::ShipPublicationPolicy {
+            reason: "the selected promoted prefix is not covered by review evidence".into(),
+            remediation: plan
+                .publication_policy
+                .remediation
+                .clone()
+                .unwrap_or_else(|| "rebuild broker ship plan after review".into()),
+        });
+    }
+
+    let mut validated = std::collections::BTreeSet::new();
+    for evidence in &plan.publication_policy.evidence {
+        let lifecycle_id = evidence
+            .lifecycle_id
+            .expect("satisfied evidence has lifecycle");
+        if !validated.insert(lifecycle_id) {
+            continue;
+        }
+        let session_id = evidence.session_id;
+        let lifecycle = broker
+            .store()
+            .review_lifecycle_for_session(session_id)?
+            .ok_or_else(|| BrokerOpError::ShipPublicationPolicy {
+                reason: format!("review lifecycle {lifecycle_id} disappeared"),
+                remediation: "rebuild broker ship plan".into(),
+            })?;
+        let unchanged = lifecycle.id == lifecycle_id
+            && Some(lifecycle.generation) == evidence.lifecycle_generation
+            && lifecycle.state == crate::ReviewLifecycleState::ValidationUnlocked
+            && lifecycle.queue_entry_id == evidence.reviewed_queue_entry_id
+            && Some(lifecycle.commit_sha.as_str()) == evidence.reviewed_commit_sha.as_deref()
+            && lifecycle.evidence_digest == evidence.evidence_digest;
+        if !unchanged {
+            return Err(BrokerOpError::ShipPublicationPolicy {
+                reason: format!("review lifecycle {lifecycle_id} changed since planning"),
+                remediation: "rebuild broker ship plan and review its exact evidence".into(),
+            });
+        }
+        let repository = lifecycle
+            .repository
+            .strip_prefix("github.com/")
+            .unwrap_or(&lifecycle.repository);
+        let snapshot = crate::load_review_provider_snapshot(
+            broker.main_root(),
+            repository,
+            lifecycle.pr_number,
+        )?;
+        let live_valid = snapshot.repository == lifecycle.repository
+            && snapshot.pr_number == lifecycle.pr_number
+            && snapshot.target_branch == lifecycle.target_branch
+            && snapshot.head_sha == lifecycle.commit_sha
+            && snapshot.state == "OPEN"
+            && !snapshot.is_draft
+            && snapshot.review_decision.as_deref() == Some("APPROVED");
+        if !live_valid {
+            return Err(BrokerOpError::ShipPublicationPolicy {
+                reason: format!(
+                    "live review evidence for PR #{} no longer matches its approved exact commit and base",
+                    lifecycle.pr_number
+                ),
+                remediation: format!(
+                    "inspect PR #{} and rebuild broker ship plan after evidence is current",
+                    lifecycle.pr_number
+                ),
+            });
+        }
+    }
+    Ok(ShipPublicationAuthorization {
+        kind: ShipPublicationAuthorizationKind::Reviewed,
+        policy_source_commit: plan.publication_policy.source_commit.clone(),
+        live_evidence_revalidated: true,
+        reason_digest: None,
+    })
+}
+
+fn publication_authorization_label(authorization: &ShipPublicationAuthorization) -> String {
+    match authorization.kind {
+        ShipPublicationAuthorizationKind::Direct => "direct publication policy".into(),
+        ShipPublicationAuthorizationKind::Reviewed => "live review evidence revalidated".into(),
+        ShipPublicationAuthorizationKind::BreakGlass => format!(
+            "explicit break-glass authorization reason SHA-256 {}",
+            authorization.reason_digest.as_deref().unwrap_or("missing")
+        ),
     }
 }
 

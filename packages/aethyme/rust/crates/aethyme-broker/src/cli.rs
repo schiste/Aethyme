@@ -324,10 +324,13 @@ Usage:
       Read-only publication plan through an exact promoted entry: resolve the
       selected prefix SHA, included and excluded later entries, current
       integration tip, remote freshness, proposed push, and local-main safety.
-  aethyme broker ship execute --entry <id> --confirm <full-publication-sha> [--sync-main] [--json]
+  aethyme broker ship execute --entry <id> --confirm <full-publication-sha> [--sync-main] [--break-glass --reason <authorization>] [--json]
       Fetch and revalidate the planned remote base, publish the exact confirmed
       promoted prefix with a non-force push, then verify the remote default ref.
       --sync-main additionally fast-forwards an unchanged primary checkout.
+      A committed review-gated policy requires live exact-review evidence.
+      Break-glass is available only when that committed policy opts in; the
+      journal retains the reason digest, never the reason text.
       Tracked changes and incoming-path collisions block; unrelated untracked
       files are preserved and reported.
   aethyme broker integration status [--json]
@@ -1018,6 +1021,9 @@ mod tests {
             "--confirm",
             &sha,
             "--sync-main",
+            "--break-glass",
+            "--reason",
+            "approved emergency publication",
         ])) {
             Ok(parsed) => parsed,
             Err(_) => panic!("ship execute should parse"),
@@ -1026,6 +1032,11 @@ mod tests {
         assert_eq!(parsed.entry, Some(42));
         assert_eq!(parsed.confirm.as_deref(), Some(sha.as_str()));
         assert!(parsed.sync_main);
+        assert!(parsed.break_glass);
+        assert_eq!(
+            parsed.reason.as_deref(),
+            Some("approved emergency publication")
+        );
         assert!(super::command_records_metric(&args(&[
             "ship",
             "execute",
@@ -1320,6 +1331,7 @@ struct Parsed {
     apply: bool,
     dry_run: bool,
     destructive: bool,
+    break_glass: bool,
     sync_main: bool,
     sync_integration: bool,
     no_cache: bool,
@@ -1388,6 +1400,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         apply: false,
         dry_run: false,
         destructive: false,
+        break_glass: false,
         sync_main: false,
         sync_integration: false,
         no_cache: false,
@@ -1443,6 +1456,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--apply" => parsed.apply = true,
             "--dry-run" => parsed.dry_run = true,
             "--destructive" => parsed.destructive = true,
+            "--break-glass" => parsed.break_glass = true,
             "--sync-main" => parsed.sync_main = true,
             "--sync-integration" => parsed.sync_integration = true,
             "--no-cache" => parsed.no_cache = true,
@@ -2881,6 +2895,31 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool) -> Result<(), UsageErr
     println!("Freshness: {:?}", report.freshness.result);
     println!("Proposed push: {}", report.proposed_push.command.join(" "));
     println!(
+        "Publication policy: {:?} (evidence {})",
+        report.publication_policy.policy.mode,
+        if report.publication_policy.satisfied {
+            "satisfied"
+        } else {
+            "missing or stale"
+        }
+    );
+    for evidence in &report.publication_policy.evidence {
+        println!(
+            "  q{} session {}: {} ({})",
+            evidence.queue_entry_id,
+            evidence.session_id,
+            if evidence.covered {
+                "covered"
+            } else {
+                "not covered"
+            },
+            evidence.reason
+        );
+    }
+    if let Some(remediation) = &report.publication_policy.remediation {
+        println!("Publication remediation: {remediation}");
+    }
+    println!(
         "Local-main synchronization safe now: {}",
         if report.local_main_sync_safe {
             "yes"
@@ -2926,6 +2965,13 @@ fn render_ship_execution(
         report.published_sha, report.plan.target.remote_name, report.plan.remote_default_branch_ref
     );
     println!("Verified remote SHA: {}", report.verified_remote_sha);
+    println!(
+        "Publication authorization: {:?}",
+        report.publication_authorization.kind
+    );
+    if let Some(digest) = &report.publication_authorization.reason_digest {
+        println!("Break-glass reason SHA-256: {digest}");
+    }
     println!(
         "Operations: fetch {}, push {}, verify {}",
         report.fetch_operation.id, report.push_operation.id, report.verify_operation.id
@@ -6046,7 +6092,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         "ship execute requires --confirm <full-integration-sha>".into(),
                     ))?;
                     let mut broker = open_broker(parsed.read_only_snapshot)?;
-                    let report = broker.ship_execute_with_sync(entry, confirm, parsed.sync_main)?;
+                    let report = broker.ship_execute_with_policy(
+                        entry,
+                        confirm,
+                        parsed.sync_main,
+                        parsed.break_glass,
+                        parsed.reason.as_deref(),
+                    )?;
                     render_ship_execution(&report, parsed.json)?;
                 }
                 other => {

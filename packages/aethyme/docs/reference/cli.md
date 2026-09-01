@@ -305,7 +305,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker report render <filename> --form <form.yml> [--output <name>.issue.md] [--json]`
 - `aethyme broker report file <path> --repo <owner/name> --confirm <sha256> [--json]`
 - `aethyme broker ship plan --entry <id> [--json]`
-- `aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--json]`
+- `aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--break-glass --reason <authorization>] [--json]`
 - `aethyme broker integration status [--json]`
 - `aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--write-resolution-template <path>] [--dry-run|--apply --confirm <sha256>] [--json]`
 - `aethyme broker quick-test [--with-gate] [--json]`
@@ -874,6 +874,38 @@ default branch. `broker integration status` reports whether the integration tip
 is promoted, published, or locally synchronized and routes its next action
 through this ship lane.
 
+Publication authorization is independently opt-in. The default remains the
+direct, full-SHA-confirmed lane above. A repository that requires reviewed
+publication commits this policy before the promoted prefix is created:
+
+```toml
+[publication]
+schema_version = 1
+mode = "review_gated"
+allow_break_glass = false
+```
+
+For `review_gated`, plan JSON contains a `publication_policy` assessment for
+every included queue entry. Each entry must be covered by a
+`validation_unlocked` lifecycle for the same canonical repository, default
+branch, promoted session commit, and selected prefix. Execute re-fetches the
+live PR and refuses an older head, changed base, closed or draft PR, dismissed
+approval, provider outage, lifecycle drift, or partial prefix coverage. Review
+evidence never broadens the confirmed SHA and does not bypass freshness,
+fast-forward, unknown-outcome, or exact-push checks.
+
+Emergency publication is unavailable unless the committed policy sets
+`allow_break_glass = true`. It is then a separate explicit action:
+
+```bash
+aethyme broker ship execute --entry 42 \
+  --confirm 0123456789abcdef0123456789abcdef01234567 \
+  --break-glass --reason "incident authorization reference"
+```
+
+The reason must be supplied at execution time. Only its SHA-256 is retained in
+the report and coordinated-operation journal; the text is not persisted.
+
 Frozen broker JSON contracts are limited to the commands listed in
 [`../../../../docs/json-contracts.md`](../../../../docs/json-contracts.md).
 Other `--json` outputs are useful but provisional.
@@ -1113,8 +1145,9 @@ dismissed approval, or provider outage before mutation. The configured label
 or workflow write is coordinated and journaled. Only proven success records
 `validation_unlocked`; an unknown outcome activates the existing host-wide
 write barrier and blind retry remains forbidden. Repeated proven transitions
-are idempotent. This lifecycle unlocks validation only—it does not authorize
-publication.
+are idempotent. This lifecycle authorizes publication only when the exact
+promoted prefix commits the opt-in `[publication]` policy described in the
+ship section; the default direct profile is unchanged.
 
 Provisional JSON shape:
 

@@ -253,6 +253,8 @@ pub enum BrokerOpError {
     },
     #[error("ship cannot resolve {what}: {reason}")]
     ShipPlanUnavailable { what: &'static str, reason: String },
+    #[error("ship publication policy refused: {reason}. Next: {remediation}")]
+    ShipPublicationPolicy { reason: String, remediation: String },
     #[error("ship confirmation must be the full 40-character integration SHA")]
     ShipConfirmationNotFullSha,
     #[error("ship confirmation mismatch: expected integration {expected}, received {actual}")]

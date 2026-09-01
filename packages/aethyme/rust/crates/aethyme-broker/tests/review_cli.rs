@@ -31,6 +31,7 @@ fn git(repo: &Path, args: &[&str]) -> String {
 
 struct Fixture {
     root: tempfile::TempDir,
+    remote: PathBuf,
     fake_bin: PathBuf,
     writes: PathBuf,
     host_state: PathBuf,
@@ -43,21 +44,33 @@ impl Fixture {
         std::fs::create_dir_all(root.path().join(".aethyme")).unwrap();
         std::fs::write(
             root.path().join(".aethyme/config.toml"),
-            "[review]\nenabled = true\nrequired_approvals = 1\nunlock_adapter = \"github_label\"\nunlock_label = \"validation-ready\"\n",
+            "[review]\nenabled = true\nrequired_approvals = 1\nunlock_adapter = \"github_label\"\nunlock_label = \"validation-ready\"\n\n[publication]\nmode = \"review_gated\"\nallow_break_glass = true\n",
         )
         .unwrap();
-        std::fs::write(root.path().join(".gitignore"), "/.aethyme/broker.db*\n").unwrap();
+        std::fs::write(
+            root.path().join(".gitignore"),
+            "/.aethyme/broker.db*\n/remote.git/\n/fake-bin/\n/gh-writes\n/host-state/\n",
+        )
+        .unwrap();
         std::fs::write(root.path().join("README.md"), "initial\n").unwrap();
         git(root.path(), &["add", "-A"]);
         git(root.path(), &["commit", "-qm", "initial"]);
         git(
             root.path(),
-            &[
-                "remote",
-                "add",
-                "origin",
-                "https://github.com/acme/product.git",
-            ],
+            &["remote", "add", "origin", "git@github.com:acme/product.git"],
+        );
+
+        let remote = root.path().join("remote.git");
+        std::fs::create_dir(&remote).unwrap();
+        git(&remote, &["init", "--bare", "-q", "-b", "main"]);
+        git(
+            root.path(),
+            &["push", "-q", remote.to_str().unwrap(), "main:main"],
+        );
+        let initial = git(root.path(), &["rev-parse", "main"]);
+        git(
+            root.path(),
+            &["update-ref", "refs/remotes/origin/main", &initial],
         );
 
         let fake_bin = root.path().join("fake-bin");
@@ -86,10 +99,34 @@ exit 0
         let mut permissions = std::fs::metadata(&gh).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&gh, permissions).unwrap();
+        let ssh = fake_bin.join("ssh");
+        std::fs::write(
+            &ssh,
+            r#"#!/bin/sh
+case "$*" in
+  *git-upload-pack*)
+    exec git-upload-pack "$AETHYME_TEST_GIT_REMOTE"
+    ;;
+  *git-receive-pack*)
+    exec git-receive-pack "$AETHYME_TEST_GIT_REMOTE"
+    ;;
+esac
+exit 64
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&ssh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&ssh, permissions).unwrap();
+        git(
+            root.path(),
+            &["config", "core.sshCommand", ssh.to_str().unwrap()],
+        );
         let writes = root.path().join("gh-writes");
         let host_state = root.path().join("host-state");
         Self {
             root,
+            remote,
             fake_bin,
             writes,
             host_state,
@@ -97,6 +134,19 @@ exit 0
     }
 
     fn run(&self, args: &[&str], head: &str, draft: bool, decision: Option<&str>) -> Output {
+        self.run_with_evidence(args, head, "main", "OPEN", draft, decision, None)
+    }
+
+    fn run_with_evidence(
+        &self,
+        args: &[&str],
+        head: &str,
+        base: &str,
+        state: &str,
+        draft: bool,
+        decision: Option<&str>,
+        mode: Option<&str>,
+    ) -> Output {
         let path = format!(
             "{}:{}",
             self.fake_bin.display(),
@@ -105,21 +155,31 @@ exit 0
         let decision = decision
             .map(|value| format!("\"{value}\""))
             .unwrap_or_else(|| "null".into());
-        Command::new(CLI)
+        let mut command = Command::new(CLI);
+        command
             .args(args)
             .current_dir(self.root.path())
             .env("PATH", path)
             .env("AETHYME_HOST_STATE_DIR", &self.host_state)
             .env("AETHYME_REVIEW_WRITES", &self.writes)
+            .env("AETHYME_TEST_GIT_REMOTE", &self.remote)
             .env("AETHYME_REVIEW_HEAD", head)
+            .env("AETHYME_REVIEW_BASE", base)
+            .env("AETHYME_REVIEW_STATE", state)
             .env("AETHYME_REVIEW_DRAFT", draft.to_string())
-            .env("AETHYME_REVIEW_DECISION", decision)
-            .output()
-            .unwrap()
+            .env("AETHYME_REVIEW_DECISION", decision);
+        if let Some(mode) = mode {
+            command.env("AETHYME_FAKE_GH_MODE", mode);
+        }
+        command.output().unwrap()
     }
 
     fn writes(&self) -> String {
         std::fs::read_to_string(&self.writes).unwrap_or_default()
+    }
+
+    fn remote_main(&self) -> String {
+        git(&self.remote, &["rev-parse", "refs/heads/main"])
     }
 }
 
@@ -146,6 +206,347 @@ fn envelope(id: &str, event_type: &str, commit: &str) -> ExternalEventEnvelope {
     };
     envelope.normalized_digest = external_event_digest(&envelope);
     envelope
+}
+
+fn promoted_review_candidate(fixture: &Fixture) -> (String, String, i64) {
+    let start = fixture.run(
+        &["start", "--task", "reviewed ship", "--json"],
+        "",
+        true,
+        None,
+    );
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let session: serde_json::Value = serde_json::from_slice(&start.stdout).unwrap();
+    let session_id = session["id"].as_i64().unwrap().to_string();
+    let worktree = PathBuf::from(session["worktree_path"].as_str().unwrap());
+    std::fs::write(worktree.join("README.md"), "reviewed candidate\n").unwrap();
+    git(&worktree, &["add", "README.md"]);
+    git(&worktree, &["commit", "-qm", "reviewed candidate"]);
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+    let register = fixture.run(
+        &[
+            "review",
+            "register",
+            "--session",
+            &session_id,
+            "--repo",
+            "acme/product",
+            "--pr",
+            "42",
+            "--json",
+        ],
+        &head,
+        true,
+        None,
+    );
+    assert!(
+        register.status.success(),
+        "{}",
+        String::from_utf8_lossy(&register.stderr)
+    );
+    let submit = fixture.run(
+        &["submit", "--session", &session_id, "--json"],
+        &head,
+        true,
+        None,
+    );
+    assert!(
+        submit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&submit.stderr)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&submit.stdout).unwrap();
+    let entry_id = outcome["entry"]["id"].as_i64().unwrap();
+    (session_id, head, entry_id)
+}
+
+fn unlock_review(fixture: &Fixture, session_id: &str, head: &str) {
+    let request = fixture.run(
+        &["review", "request", "--session", session_id, "--json"],
+        head,
+        true,
+        None,
+    );
+    assert!(
+        request.status.success(),
+        "{}",
+        String::from_utf8_lossy(&request.stderr)
+    );
+    let event_path = fixture.root.path().join("ship-approved.json");
+    std::fs::write(
+        &event_path,
+        serde_json::to_vec(&envelope("ship-approval", "review_approved", head)).unwrap(),
+    )
+    .unwrap();
+    let ingest = fixture.run(
+        &[
+            "external-events",
+            "ingest",
+            event_path.to_str().unwrap(),
+            "--json",
+        ],
+        head,
+        false,
+        Some("APPROVED"),
+    );
+    assert!(
+        ingest.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ingest.stderr)
+    );
+    let unlock = fixture.run(
+        &["review", "unlock", "--session", session_id, "--json"],
+        head,
+        false,
+        Some("APPROVED"),
+    );
+    assert!(
+        unlock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unlock.stderr)
+    );
+}
+
+#[test]
+fn review_gated_ship_requires_every_entry_and_revalidates_live_evidence() {
+    let fixture = Fixture::new();
+    let (session_id, head, entry_id) = promoted_review_candidate(&fixture);
+    let entry = entry_id.to_string();
+    let remote_before = fixture.remote_main();
+
+    let missing = fixture.run(
+        &["ship", "plan", "--entry", &entry, "--json"],
+        &head,
+        true,
+        None,
+    );
+    assert!(
+        missing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    let missing_plan: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(
+        missing_plan["publication_policy"]["policy"]["mode"],
+        "review_gated"
+    );
+    assert_eq!(missing_plan["publication_policy"]["satisfied"], false);
+    assert_eq!(
+        missing_plan["publication_policy"]["evidence"][0]["covered"],
+        false
+    );
+    let publication_sha = missing_plan["publication_sha"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let config_path = fixture.root.path().join(".aethyme/config.toml");
+    let committed_config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        &config_path,
+        committed_config.replace("mode = \"review_gated\"", "mode = \"direct\""),
+    )
+    .unwrap();
+    let dirty_bypass = fixture.run(
+        &["ship", "plan", "--entry", &entry, "--json"],
+        &head,
+        true,
+        None,
+    );
+    assert!(dirty_bypass.status.success());
+    let dirty_plan: serde_json::Value = serde_json::from_slice(&dirty_bypass.stdout).unwrap();
+    assert_eq!(
+        dirty_plan["publication_policy"]["policy"]["mode"], "review_gated",
+        "an uncommitted checkout edit must not weaken the promoted policy"
+    );
+    std::fs::write(&config_path, committed_config).unwrap();
+    let refused = fixture.run(
+        &[
+            "ship",
+            "execute",
+            "--entry",
+            &entry,
+            "--confirm",
+            &publication_sha,
+        ],
+        &head,
+        false,
+        Some("APPROVED"),
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not covered by review evidence"));
+    assert_eq!(fixture.remote_main(), remote_before);
+
+    unlock_review(&fixture, &session_id, &head);
+    let planned = fixture.run(
+        &["ship", "plan", "--entry", &entry, "--json"],
+        &head,
+        false,
+        Some("APPROVED"),
+    );
+    assert!(
+        planned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&planned.stdout).unwrap();
+    assert_eq!(plan["publication_policy"]["satisfied"], true);
+    assert_eq!(plan["publication_policy"]["source_commit"], publication_sha);
+    assert_eq!(
+        plan["publication_policy"]["evidence"][0]["queue_entry_id"],
+        entry_id
+    );
+    assert_eq!(
+        plan["publication_policy"]["evidence"][0]["reviewed_commit_sha"],
+        head
+    );
+
+    for (base, state, live_head, decision, mode, expected) in [
+        (
+            "release",
+            "OPEN",
+            head.as_str(),
+            "APPROVED",
+            None,
+            "no longer matches",
+        ),
+        (
+            "main",
+            "CLOSED",
+            head.as_str(),
+            "APPROVED",
+            None,
+            "no longer matches",
+        ),
+        (
+            "main",
+            "OPEN",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "APPROVED",
+            None,
+            "no longer matches",
+        ),
+        (
+            "main",
+            "OPEN",
+            head.as_str(),
+            "CHANGES_REQUESTED",
+            None,
+            "no longer matches",
+        ),
+        (
+            "main",
+            "OPEN",
+            head.as_str(),
+            "APPROVED",
+            Some("outage"),
+            "review lifecycle",
+        ),
+    ] {
+        let drifted = fixture.run_with_evidence(
+            &[
+                "ship",
+                "execute",
+                "--entry",
+                &entry,
+                "--confirm",
+                &publication_sha,
+            ],
+            live_head,
+            base,
+            state,
+            false,
+            Some(decision),
+            mode,
+        );
+        assert!(!drifted.status.success());
+        assert!(
+            String::from_utf8_lossy(&drifted.stderr).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&drifted.stderr)
+        );
+        assert_eq!(fixture.remote_main(), remote_before);
+    }
+
+    let shipped = fixture.run(
+        &[
+            "ship",
+            "execute",
+            "--entry",
+            &entry,
+            "--confirm",
+            &publication_sha,
+            "--json",
+        ],
+        &head,
+        false,
+        Some("APPROVED"),
+    );
+    assert!(
+        shipped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shipped.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&shipped.stdout).unwrap();
+    assert_eq!(report["publication_authorization"]["kind"], "reviewed");
+    assert_eq!(
+        report["publication_authorization"]["live_evidence_revalidated"],
+        true
+    );
+    assert_eq!(fixture.remote_main(), publication_sha);
+}
+
+#[test]
+fn break_glass_requires_committed_opt_in_and_journals_only_a_reason_digest() {
+    let fixture = Fixture::new();
+    let (_, head, entry_id) = promoted_review_candidate(&fixture);
+    let entry = entry_id.to_string();
+    let plan = fixture.run(
+        &["ship", "plan", "--entry", &entry, "--json"],
+        &head,
+        true,
+        None,
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let publication_sha = plan["publication_sha"].as_str().unwrap().to_string();
+    let secret_reason = "incident-authority-token-should-never-be-stored";
+    let shipped = fixture.run(
+        &[
+            "ship",
+            "execute",
+            "--entry",
+            &entry,
+            "--confirm",
+            &publication_sha,
+            "--break-glass",
+            "--reason",
+            secret_reason,
+            "--json",
+        ],
+        &head,
+        true,
+        None,
+    );
+    assert!(
+        shipped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shipped.stderr)
+    );
+    let serialized = String::from_utf8(shipped.stdout).unwrap();
+    assert!(!serialized.contains(secret_reason));
+    let report: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(report["publication_authorization"]["kind"], "break_glass");
+    assert_eq!(
+        report["publication_authorization"]["reason_digest"],
+        aethyme_broker::sha256_bytes(secret_reason.as_bytes())
+    );
+    let operations = fixture.run(&["operations", "list", "--json"], "", true, None);
+    assert!(operations.status.success());
+    assert!(!String::from_utf8_lossy(&operations.stdout).contains(secret_reason));
+    assert_eq!(fixture.remote_main(), publication_sha);
 }
 
 #[test]

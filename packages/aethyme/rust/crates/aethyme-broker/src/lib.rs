@@ -213,7 +213,10 @@ pub use review::{
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use ship::{
-    ShipExecutionReport, ShipFreshness, ShipFreshnessResult, ShipLocalMainSync, ShipPlan, ShipPush,
+    PUBLICATION_POLICY_SCHEMA_VERSION, ShipExecutionReport, ShipFreshness, ShipFreshnessResult,
+    ShipLocalMainSync, ShipPlan, ShipPublicationAssessment, ShipPublicationAuthorization,
+    ShipPublicationAuthorizationKind, ShipPublicationMode, ShipPublicationPolicy, ShipPush,
+    ShipReviewEvidence,
 };
 pub use store::BrokerStore;
 pub use types::{

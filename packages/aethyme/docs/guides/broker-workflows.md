@@ -203,6 +203,33 @@ retry until `broker operations reconcile` resolves the external outcome.
 Cloud Build remains an external manual-trigger adapter boundary; the core
 state machine stores no GCP credential and performs no background polling.
 
+## Require Review Evidence at Publication
+
+Review coordination and publication authorization are separate controls. The
+default ship lane remains direct and requires the exact planned SHA. To make
+unlocked review evidence mandatory, commit the policy in the promoted series:
+
+```toml
+[publication]
+schema_version = 1
+mode = "review_gated"
+allow_break_glass = false
+```
+
+`broker ship plan --entry <id> --json` then explains coverage for every queue
+entry included in the selected prefix. Coverage binds the registered canonical
+repository, target branch, session commit, promoted queue entry, and review
+lifecycle. `broker ship execute` revalidates the provider evidence immediately
+before its normal fetch, fast-forward, exact-push, and verify sequence. Missing,
+stale, mismatched, ambiguous, or unavailable evidence refuses publication; it
+never silently falls back to direct publication.
+
+For repositories that explicitly permit an emergency lane, set
+`allow_break_glass = true`, review the normal ship plan, and execute with both
+`--break-glass` and `--reason`. This is a separately authorized action. The
+broker persists only the reason digest and still enforces the full confirmed
+SHA, remote freshness, non-force push, and unknown-outcome barriers.
+
 ## Choose Gate Cache Policy Deliberately
 
 Gate results prove an exact Git tree. Normal gate runs use the cache when the
