@@ -249,6 +249,8 @@ falling back. Existing legacy sessions remain cleanup-compatible.
 - `aethyme broker review show --session <id> [--json]`
 - `aethyme broker review request --session <id> [--json]`
 - `aethyme broker review unlock --session <id> [--json]`
+- `aethyme broker review reassign --session <closed-id> --to-session <live-id> --reason <text> [--json]`
+- `aethyme broker review abandon --session <id> --reason <text> [--json]`
 - `aethyme broker queue history [--limit <n>] [--before <id>] [--json]`
 - `aethyme broker queue [--json]` (compatibility full-inventory view)
 - `aethyme broker exposures plan [--json]`
@@ -485,6 +487,13 @@ baseline. Reuse may update its task and activity, but cannot absorb pending
 commits into a new baseline. Close the completed session before adopting a new
 identity when a genuinely fresh ownership boundary is required.
 
+Closed sessions remain available to diagnostic reads, including `status`,
+`handoff`, and `review show`. They cannot claim leases or run review mutations.
+If a closed session still owns a review lifecycle, either reassign it to a live
+session at the exact lifecycle commit or abandon it explicitly. Both commands
+require a reason, retain the lifecycle audit history, and persist only the
+reason digest.
+
 `broker submit` builds a normalized commit-provenance plan before gate
 selection. It replays only pending `session_owned` single-parent patches onto
 the exact integration tip, in order. Patch-equivalent history already present
@@ -507,6 +516,15 @@ and warnings. On rejection, `conflict_details` supplements the compatible
 integration-side commits, remediation text, and ordered commands. A blocking
 session is reported only when its current active lease overlaps a surviving
 replay conflict.
+
+`broker checkpoint plan --session <id> --json` exposes stable
+`refusal_codes` and ordered `next_actions`. A safe plan can be applied only by
+rebuilding it and confirming its digest with `checkpoint apply`. An unsafe
+plan begins by preserving the exact session tip and directs the operator to
+inspect and replay pending commits from a clean session. It never recommends a
+blanket rebase onto integration. `broker repair` applies only to a recorded
+submit or promoted-path conflict; otherwise it refuses immediately and points
+to the checkpoint planner.
 
 Gate-run and submit outcomes identify the exact Git tree each result proves.
 Human-readable output abbreviates the tree hash to 12 characters; JSON retains
@@ -1173,6 +1191,13 @@ checkpoint. `review request` revalidates open/base/head/draft evidence, then
 runs `gh pr ready` through the coordinated operation layer. A replacement
 submission after `changes_requested` binds the new exact commit and restarts
 review without pretending the already-ready PR became draft again.
+
+If the owning session closes mid-lifecycle, diagnostic `review show` remains
+available but mutations fail before provider access. Continue with
+`review reassign --session <closed-id> --to-session <live-id> --reason <text>`
+only when the live session is at the exact bound commit. Otherwise use
+`review abandon --session <closed-id> --reason <text>` to retain the audit
+record while freeing the pull request for a fresh registration.
 
 Authenticated `review_changes_requested` and `review_approved` external events
 advance the approval-backed lifecycle only when their repository, PR, and

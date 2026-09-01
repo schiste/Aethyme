@@ -26,6 +26,8 @@ Each workflow separates observation from mutation:
 | Recover external main movement | `integration reconcile --dry-run` | `--apply --confirm <plan-digest>` | every unrecorded SHA needs a reviewed disposition; drift invalidates confirmation |
 | Reserve paths | `leases plan` | `leases claim` | the claim, not the plan, decides whether a conflict exists now |
 | Route external path queues | `leases export --session/--entry` | none | committed routing config and bounded redacted output are authoritative |
+| Recover a closed review owner | `review show` | `review reassign` or `review abandon` with a reason | only an exact-head live session can inherit; abandonment is explicit and audited |
+| Recover a rewritten checkpoint | `checkpoint plan --json` | `checkpoint apply --confirm <digest>` when the plan is safe | unsafe plans preserve the exact tip before directing a clean replay; they never recommend a blanket integration rebase |
 | End or recover a session | `finish` report | successful `finish` closes and records the handoff | dirty or unsubmitted work refuses the finish |
 
 These commands coordinate local repository state. Submission promotes only to
@@ -237,6 +239,29 @@ retry until `broker operations reconcile` resolves the external outcome.
 Cloud Build remains an external manual-trigger adapter boundary; the core
 state machine stores no GCP credential and performs no background polling.
 
+### Recover review ownership after a session closes
+
+Closing a session does not erase its review evidence. `review show` remains
+available for diagnosis, while `review request`, `review unlock`, and new
+leases refuse before provider or database mutation. Choose one explicit
+recovery:
+
+```bash
+# Continue the same exact-head review from a live replacement session.
+aethyme broker review reassign --session <closed-id> \
+  --to-session <live-id> --reason "reviewed ownership transfer"
+
+# Retire the lifecycle while retaining its audit and generation history.
+aethyme broker review abandon --session <closed-id> \
+  --reason "pull request superseded"
+```
+
+Reassignment requires the destination session to be live and at the exact
+commit already bound to the lifecycle. It retains state, evidence, and
+generation history. Abandonment makes the lifecycle inactive so a later
+session can register a fresh lifecycle for the same pull request. Reason text
+is not persisted; the broker records only its digest in a redacted event.
+
 ## Require Review Evidence at Publication
 
 Review coordination and publication authorization are separate controls. The
@@ -402,6 +427,15 @@ plan, requires the exact digest, refuses dirty or divergent work, creates the
 recovery ref first, and then atomically journals the checkpoint update. It
 never rebases or resets the worktree. After a successful apply, submit normally;
 only commits after the reviewed integration checkpoint are session-owned.
+
+JSON includes stable `refusal_codes` and ordered `next_actions`. When recovery
+is unsafe, the first action preserves the full session tip on the named
+recovery branch, followed by graph inspection and a clean replay-session
+workflow. Do not blanket-rebase a session onto `aethyme/integration`: that ref
+can contain unrelated promoted work and is a replay target, not an ownership
+boundary. `broker repair` is narrower still—it repairs a recorded submit or
+promoted-path conflict. With no such conflict it refuses immediately and
+points to `checkpoint plan` instead of repeating a non-progressing repair.
 
 On a real conflict, `conflict_details` binds each surviving path to its full
 originating session commit, ownership, known integration-side commits, and
