@@ -96,6 +96,10 @@ pub enum BrokerOpError {
         commits: String,
         guidance: String,
     },
+    #[error(
+        "broker repair is not applicable to session {id}: no conflicted submission or promoted-path conflict was found; repair does not rewrite checkpoint divergence\nnext: aethyme broker checkpoint plan --session {id}"
+    )]
+    RepairNotApplicable { id: i64 },
     #[error("session checkpoint recovery is not safe: {reasons}")]
     UnsafeCheckpointRecovery { reasons: String },
     #[error("session checkpoint recovery confirmation must be a full SHA-256 digest")]
@@ -1224,7 +1228,32 @@ pub struct SessionCheckpointRecoveryPlan {
     pub clean_worktree: bool,
     pub safe: bool,
     pub refusals: Vec<String>,
+    pub refusal_codes: Vec<CheckpointRefusalCode>,
+    pub next_actions: Vec<CheckpointRecoveryAction>,
     pub digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointRefusalCode {
+    DirtyWorktree,
+    MissingAcceptedCheckpoint,
+    MissingAcceptedCheckpointObject,
+    NoReanchorRequired,
+    IntegrationNotAncestor,
+    MissingAcceptedIntegrationProof,
+    AcceptedIntegrationNotContained,
+    SubmissionProvenanceUnsafe,
+    SubmissionProvenanceUnavailable,
+    MissingIntegrationRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CheckpointRecoveryAction {
+    pub kind: String,
+    pub command: String,
+    pub description: String,
+    pub mutates_repository: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1235,13 +1264,77 @@ pub struct SessionCheckpointApplyReport {
     pub preservation_ref: String,
 }
 
+fn record_checkpoint_refusal(
+    refusals: &mut Vec<String>,
+    refusal_codes: &mut Vec<CheckpointRefusalCode>,
+    code: CheckpointRefusalCode,
+    message: impl Into<String>,
+) {
+    refusals.push(message.into());
+    refusal_codes.push(code);
+}
+
 fn finish_checkpoint_recovery_plan(
     mut plan: SessionCheckpointRecoveryPlan,
 ) -> Result<SessionCheckpointRecoveryPlan, BrokerOpError> {
+    if plan.next_actions.is_empty() {
+        plan.next_actions = checkpoint_recovery_actions(&plan);
+    }
     plan.digest.clear();
     let bytes = serde_json::to_vec(&plan)?;
     plan.digest = format!("{:x}", Sha256::digest(bytes));
     Ok(plan)
+}
+
+fn checkpoint_recovery_actions(
+    plan: &SessionCheckpointRecoveryPlan,
+) -> Vec<CheckpointRecoveryAction> {
+    if plan.safe {
+        return vec![CheckpointRecoveryAction {
+            kind: "apply_reviewed_plan".into(),
+            command: format!(
+                "aethyme broker checkpoint apply --session {} --confirm <plan-digest>",
+                plan.session_id
+            ),
+            description: "Apply only after reviewing this exact digest-bound plan.".into(),
+            mutates_repository: true,
+        }];
+    }
+
+    let mut actions = vec![CheckpointRecoveryAction {
+        kind: "preserve_session_tip".into(),
+        command: format!(
+            "git branch {} {}",
+            plan.preservation_branch, plan.session_head
+        ),
+        description: "Preserve the complete session tip before any history rewrite.".into(),
+        mutates_repository: true,
+    }];
+    if let Some(integration) = plan.integration_head.as_deref() {
+        actions.push(CheckpointRecoveryAction {
+            kind: "inspect_divergence".into(),
+            command: format!(
+                "git log --graph --oneline --decorate --boundary {integration}...{}",
+                plan.preservation_branch
+            ),
+            description:
+                "Review both histories; do not blanket-rebase onto integration because it may contain unrelated promoted work."
+                    .into(),
+            mutates_repository: false,
+        });
+    }
+    actions.push(CheckpointRecoveryAction {
+        kind: "start_clean_replay_session".into(),
+        command: format!(
+            "aethyme broker start --task \"recover session {} from {}\"",
+            plan.session_id, plan.preservation_branch
+        ),
+        description:
+            "Replay only reviewed session-owned commits into the new worktree, then submit normally."
+                .into(),
+        mutates_repository: true,
+    });
+    actions
 }
 
 /// Outcome class for `broker finish --session`: a human lifecycle helper
@@ -3362,7 +3455,7 @@ impl Broker {
         Ok(conflicts.into_iter().collect())
     }
 
-    // ── repair (one-command recovery) ─────────────────────────────────
+    // ── checkpoint recovery and conflict-scoped repair ────────────────
 
     /// Recover a blocked session by applying the documented local rebase
     /// path when there is an actionable conflict, then refresh leases and
@@ -3384,11 +3477,22 @@ impl Broker {
         );
         let clean_worktree = !checkout.is_dirty()?;
         let mut refusals = Vec::new();
+        let mut refusal_codes = Vec::new();
         if !clean_worktree {
-            refusals.push("session worktree is dirty; commit through the managed hook before planning recovery".into());
+            record_checkpoint_refusal(
+                &mut refusals,
+                &mut refusal_codes,
+                CheckpointRefusalCode::DirtyWorktree,
+                "session worktree is dirty; commit through the managed hook before planning recovery",
+            );
         }
         let Some(old) = old_checkpoint.as_deref() else {
-            refusals.push("session has no accepted checkpoint to re-anchor".into());
+            record_checkpoint_refusal(
+                &mut refusals,
+                &mut refusal_codes,
+                CheckpointRefusalCode::MissingAcceptedCheckpoint,
+                "session has no accepted checkpoint to re-anchor",
+            );
             return finish_checkpoint_recovery_plan(SessionCheckpointRecoveryPlan {
                 session_id,
                 old_checkpoint,
@@ -3405,15 +3509,27 @@ impl Broker {
                 clean_worktree,
                 safe: false,
                 refusals,
+                refusal_codes,
+                next_actions: Vec::new(),
                 digest: String::new(),
             });
         };
         if checkout.resolve_ref(old).is_none() {
-            refusals.push(format!("accepted checkpoint {old} is missing"));
+            record_checkpoint_refusal(
+                &mut refusals,
+                &mut refusal_codes,
+                CheckpointRefusalCode::MissingAcceptedCheckpointObject,
+                format!("accepted checkpoint {old} is missing"),
+            );
         } else if checkout.is_ancestor(old, &session_head) {
-            refusals.push(format!(
-                "accepted checkpoint {old} is still an ancestor of session HEAD; no re-anchor is required"
-            ));
+            record_checkpoint_refusal(
+                &mut refusals,
+                &mut refusal_codes,
+                CheckpointRefusalCode::NoReanchorRequired,
+                format!(
+                    "accepted checkpoint {old} is still an ancestor of session HEAD; no re-anchor is required"
+                ),
+            );
         }
 
         let mut relation = None;
@@ -3435,30 +3551,47 @@ impl Broker {
                 current_relation,
                 AdoptIntegrationRelation::Current | AdoptIntegrationRelation::Ahead
             ) {
-                refusals.push(format!(
-                    "session HEAD is {} relative to {integration_branch}; recovery requires integration to be an ancestor of the session",
-                    current_relation.as_str()
-                ));
+                record_checkpoint_refusal(
+                    &mut refusals,
+                    &mut refusal_codes,
+                    CheckpointRefusalCode::IntegrationNotAncestor,
+                    format!(
+                        "session HEAD is {} relative to {integration_branch}; recovery requires integration to be an ancestor of the session",
+                        current_relation.as_str()
+                    ),
+                );
             }
 
             match session.accepted_integration_commit.as_deref() {
                 Some(accepted_integration)
                     if checkout.resolve_ref(accepted_integration).is_none() =>
                 {
-                    refusals.push(format!(
-                        "recorded accepted integration commit {accepted_integration} is missing"
-                    ));
+                    record_checkpoint_refusal(
+                        &mut refusals,
+                        &mut refusal_codes,
+                        CheckpointRefusalCode::MissingAcceptedIntegrationProof,
+                        format!(
+                            "recorded accepted integration commit {accepted_integration} is missing"
+                        ),
+                    );
                 }
                 Some(accepted_integration)
                     if !checkout.is_ancestor(accepted_integration, integration) =>
                 {
-                    refusals.push(format!(
-                        "current integration {integration} does not contain the recorded accepted integration commit {accepted_integration}"
-                    ));
+                    record_checkpoint_refusal(
+                        &mut refusals,
+                        &mut refusal_codes,
+                        CheckpointRefusalCode::AcceptedIntegrationNotContained,
+                        format!(
+                            "current integration {integration} does not contain the recorded accepted integration commit {accepted_integration}"
+                        ),
+                    );
                 }
-                None => refusals.push(
-                    "session has no recorded accepted integration commit proving the old contribution was preserved"
-                        .into(),
+                None => record_checkpoint_refusal(
+                    &mut refusals,
+                    &mut refusal_codes,
+                    CheckpointRefusalCode::MissingAcceptedIntegrationProof,
+                    "session has no recorded accepted integration commit proving the old contribution was preserved",
                 ),
                 Some(_) => {}
             }
@@ -3474,21 +3607,32 @@ impl Broker {
                     Ok(plan) => {
                         pending_commits = plan.pending_owned_commit_ids();
                         if let Err(error) = self.validate_submission_plan(&plan) {
-                            refusals.push(format!(
-                                "normalized submission provenance is not executable: {error}"
-                            ));
+                            record_checkpoint_refusal(
+                                &mut refusals,
+                                &mut refusal_codes,
+                                CheckpointRefusalCode::SubmissionProvenanceUnsafe,
+                                format!(
+                                    "normalized submission provenance is not executable: {error}"
+                                ),
+                            );
                         }
                         submission_plan = Some(plan);
                     }
-                    Err(error) => refusals.push(format!(
-                        "normalized submission provenance could not be built: {error}"
-                    )),
+                    Err(error) => record_checkpoint_refusal(
+                        &mut refusals,
+                        &mut refusal_codes,
+                        CheckpointRefusalCode::SubmissionProvenanceUnavailable,
+                        format!("normalized submission provenance could not be built: {error}"),
+                    ),
                 }
             }
         } else {
-            refusals.push(format!(
-                "integration ref refs/heads/{integration_branch} is missing"
-            ));
+            record_checkpoint_refusal(
+                &mut refusals,
+                &mut refusal_codes,
+                CheckpointRefusalCode::MissingIntegrationRef,
+                format!("integration ref refs/heads/{integration_branch} is missing"),
+            );
         }
 
         let safe = refusals.is_empty();
@@ -3508,6 +3652,8 @@ impl Broker {
             clean_worktree,
             safe,
             refusals,
+            refusal_codes,
+            next_actions: Vec::new(),
             digest: String::new(),
         })
     }
@@ -3586,6 +3732,9 @@ impl Broker {
         let worktree_path = session.worktree_path.clone();
         let checkout = GitRepo::discover(Path::new(&worktree_path))?;
         let (source, base) = self.repair_target(session_id)?;
+        if source == RepairSource::None {
+            return Err(BrokerOpError::RepairNotApplicable { id: session_id });
+        }
         let plan_base = match base.as_deref() {
             Some(base) => base.to_string(),
             None => self.integration_head()?.1,

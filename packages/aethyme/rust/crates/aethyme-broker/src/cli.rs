@@ -308,9 +308,10 @@ Usage:
       --no-cache bypasses merged-tree cache lookup for this submission,
       but stores each fresh result for later normal reuse.
   aethyme broker repair --session <id> [--json]
-      One-command recovery for a blocked session: apply the documented
-      local rebase path for the latest submit conflict, or rebase onto
-      promoted integration work when status reports that conflict surface.
+      Conflict-scoped recovery: apply the documented local rebase path for
+      the latest submit conflict, or rebase onto promoted integration work
+      when status reports that conflict surface. Checkpoint divergence is
+      handled by `broker checkpoint plan`, never by an implicit broad rebase.
       Then refresh leases and show affected gates. Never submits or
       promotes; run submit when the report is clean.
   aethyme broker checkpoint plan --session <id> [--json]
@@ -6095,6 +6096,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         println!("  preservation branch: {}", report.preservation_branch);
                         for refusal in &report.refusals {
                             println!("  refusal: {refusal}");
+                        }
+                        if !report.next_actions.is_empty() {
+                            println!("  recovery actions:");
+                            for action in &report.next_actions {
+                                println!("    {}: {}", action.kind, action.command);
+                                println!("      {}", action.description);
+                            }
                         }
                         println!("Plan digest: {}", report.digest);
                         if report.safe {

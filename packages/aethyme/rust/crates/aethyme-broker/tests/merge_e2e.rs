@@ -6,10 +6,10 @@ use std::path::Path;
 use std::process::Command;
 
 use aethyme_broker::{
-    AdoptMode, Broker, EntryExposureState, FinishStatus, IntegrationDeliveryState,
-    IntegrationReconcileClassification, IntegrationReconcileOptions, MergeStatus, NewSession,
-    RepairAction, RepairSource, SessionOrigin, StatusAdviceSeverity, SubmissionCommitOwnership,
-    SubmissionGateVerificationStatus, SubmissionIntegrationState,
+    AdoptMode, Broker, CheckpointRefusalCode, EntryExposureState, FinishStatus,
+    IntegrationDeliveryState, IntegrationReconcileClassification, IntegrationReconcileOptions,
+    MergeStatus, NewSession, RepairAction, RepairSource, SessionOrigin, StatusAdviceSeverity,
+    SubmissionCommitOwnership, SubmissionGateVerificationStatus, SubmissionIntegrationState,
 };
 
 fn sh(cwd: &Path, args: &[&str]) {
@@ -770,6 +770,10 @@ fn checkpoint_recovery_refuses_divergence_and_sessions_without_acceptance_proof(
             .iter()
             .any(|reason| reason.contains("no accepted checkpoint"))
     );
+    assert_eq!(
+        missing.refusal_codes,
+        vec![CheckpointRefusalCode::MissingAcceptedCheckpoint]
+    );
     broker.close(fresh.id).unwrap();
 
     let worktree = agent_worktree(tmp.path(), "diverged-checkpoint");
@@ -790,6 +794,28 @@ fn checkpoint_recovery_refuses_divergence_and_sessions_without_acceptance_proof(
             .iter()
             .any(|reason| reason.contains("recovery requires integration to be an ancestor"))
     );
+    assert!(
+        plan.refusal_codes
+            .contains(&CheckpointRefusalCode::IntegrationNotAncestor)
+    );
+    assert_eq!(plan.next_actions[0].kind, "preserve_session_tip");
+    assert_eq!(plan.next_actions[1].kind, "inspect_divergence");
+    assert!(
+        plan.next_actions[1]
+            .description
+            .contains("do not blanket-rebase")
+    );
+    assert_eq!(plan.next_actions[2].kind, "start_clean_replay_session");
+    let repair_error = broker.repair(session.id).unwrap_err().to_string();
+    assert!(
+        repair_error.contains("repair is not applicable"),
+        "{repair_error}"
+    );
+    assert!(repair_error.contains(&format!(
+        "aethyme broker checkpoint plan --session {}",
+        session.id
+    )));
+    assert!(!repair_error.contains("git reset"));
     let error = broker
         .apply_session_checkpoint_recovery(session.id, &plan.digest)
         .unwrap_err();
