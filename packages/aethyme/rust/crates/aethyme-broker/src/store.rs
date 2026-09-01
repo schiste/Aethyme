@@ -735,7 +735,12 @@ impl BrokerStore {
     /// belonging to a session that is not cleaned/exited. Overlap detection
     /// (Phase 3) is computed over this set.
     pub fn active_leases(&self) -> Result<Vec<Lease>, BrokerError> {
-        let now = now_ms();
+        self.active_leases_at(now_ms())
+    }
+
+    /// Live leases at one caller-supplied snapshot time. Read-only exports use
+    /// this so lease state and conflict classification share one time boundary.
+    pub fn active_leases_at(&self, now: i64) -> Result<Vec<Lease>, BrokerError> {
         let mut stmt = self.conn.prepare(&format!(
             "{LEASE_SELECT}
              WHERE released_at IS NULL
@@ -1143,6 +1148,18 @@ impl BrokerStore {
             entries.push(row??);
         }
         Ok(entries)
+    }
+
+    /// One exact merge queue entry for read-only projections.
+    pub fn merge_queue_entry(&self, entry_id: i64) -> Result<MergeQueueEntry, BrokerError> {
+        self.conn
+            .query_row(
+                &format!("{MERGE_SELECT} WHERE id = ?1"),
+                [entry_id],
+                merge_from_row,
+            )
+            .optional()?
+            .ok_or(BrokerError::SessionNotFound(entry_id))?
     }
 
     pub fn current_merge_queue(&self) -> Result<Vec<MergeQueueEntry>, BrokerError> {

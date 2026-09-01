@@ -421,8 +421,10 @@ pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 /// The known schema-1 surface: (section, keys). Anything outside this
 /// list (or the top-level `schema` key) certifies with a WARN, never a
 /// FAIL — configs written for a newer schema must keep working here.
-const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] =
-    &[("promote", &["mode", "branch"]), ("leases", &["ignore"])];
+const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
+    ("promote", &["mode", "branch"]),
+    ("leases", &["ignore", "routing"]),
+];
 
 fn check_enrollment_visibility(repo: &crate::GitRepo, checkout_root: &Path) -> Vec<Check> {
     let marker = repo
@@ -967,6 +969,7 @@ const CONFIG_TEMPLATE: &str = "\
 #   [promote] mode    \"auto\" | \"manual\"
 #   [promote] branch  integration branch name
 #   [leases]  ignore  paths never leased (trailing / = directory prefix)
+#   [leases.routing] category = [\"path/\", \"exact/file\"]
 # Unknown keys are ignored at runtime; `aethyme certify` warns on them.
 
 schema = 1
@@ -979,6 +982,10 @@ mode = \"auto\"
 
 # [leases]
 # ignore = [\"generated/\"]   # entries ending in / are directory prefixes
+#
+# [leases.routing]
+# backend = [\"backend/\", \"db/schema.sql\"]
+# frontend = [\"frontend/\"]
 ";
 
 /// Deterministic gates.toml draft from manifest sniffing. Detectors run

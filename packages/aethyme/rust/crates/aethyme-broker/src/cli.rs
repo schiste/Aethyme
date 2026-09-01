@@ -120,6 +120,11 @@ Usage:
       overlaps, owner liveness and worktree, expiry, valid next actions, and
       whether each claim conflicts.
       Does not create or refresh leases.
+  aethyme broker leases export (--session <id> | --entry <id>) [--limit <n>] [--json]
+      Export bounded, redacted lease ownership and deterministic routing
+      categories from committed [leases.routing] configuration. Includes
+      historical released and expired rows for the selected session. Never
+      refreshes leases or writes broker state or command telemetry.
   aethyme broker leases release <path> --session <id> [--json]
       Release an explicit claim.
   aethyme broker resources plan <request.json> [--json]
@@ -455,6 +460,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "reconcile",
     "agents",
     "leases",
+    "export",
     "resources",
     "claim",
     "release",
@@ -635,7 +641,7 @@ fn command_records_metric(args: &[String]) -> bool {
             effect != Some(crate::OperationEffect::Read)
         }
         Some("hooks") => args.get(1).map(String::as_str) != Some("status"),
-        Some("leases") => args.get(1).map(String::as_str) != Some("plan"),
+        Some("leases") => !matches!(args.get(1).map(String::as_str), Some("plan" | "export")),
         Some("resources") => !matches!(args.get(1).map(String::as_str), Some("plan" | "list")),
         Some("events") => args.get(1).map(String::as_str) == Some("prune"),
         Some("gates") => !matches!(
@@ -4218,7 +4224,8 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             }
         }
         "leases" => {
-            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            let export = parsed.positional.first().map(String::as_str) == Some("export");
+            let mut broker = open_broker(parsed.read_only_snapshot || export)?;
             match parsed.positional.first().map(String::as_str) {
                 None => {
                     let overlaps = if parsed.read_only_snapshot {
@@ -4276,6 +4283,65 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     let report = broker.plan_leases(paths, parsed.session)?;
                     render_lease_plan(&report, parsed.json)?;
                 }
+                Some("export") => {
+                    let limit = parsed
+                        .limit
+                        .map(|value| value as usize)
+                        .unwrap_or(crate::DEFAULT_LEASE_ROUTING_EXPORT_LIMIT);
+                    let report = broker.export_lease_routing(
+                        crate::LeaseRoutingExportOptions {
+                            session_id: parsed.session,
+                            queue_entry_id: parsed.entry,
+                            limit,
+                        },
+                        now_ms(),
+                    )?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!(
+                            "Lease routing for {} (session {}, {} of {} rows):",
+                            report.repository.display_slug,
+                            report.selector.session_id,
+                            report.leases.len(),
+                            report.total_matching
+                        );
+                        for lease in &report.leases {
+                            let routes = if lease.routing_categories.is_empty() {
+                                "unrouted".into()
+                            } else {
+                                lease.routing_categories.join(",")
+                            };
+                            println!(
+                                "  {} [{} / {} / {}] routes={}{}",
+                                lease.path,
+                                lease.path_kind.as_str(),
+                                lease.lease_kind.as_str(),
+                                lease.state.as_str(),
+                                routes,
+                                if lease.conflicting_session_ids.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " conflicts=s{}",
+                                        lease
+                                            .conflicting_session_ids
+                                            .iter()
+                                            .map(i64::to_string)
+                                            .collect::<Vec<_>>()
+                                            .join(",s")
+                                    )
+                                }
+                            );
+                        }
+                        if report.truncated {
+                            println!(
+                                "  truncated: increase --limit up to {}",
+                                crate::MAX_LEASE_ROUTING_EXPORT_LIMIT
+                            );
+                        }
+                    }
+                }
                 Some("release") => {
                     let path = parsed
                         .positional
@@ -4293,7 +4359,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
                 Some(other) => {
                     return Err(UsageError::Message(format!(
-                        "unknown leases action {other:?} — expected claim, plan, or release"
+                        "unknown leases action {other:?} — expected claim, plan, export, or release"
                     )));
                 }
             }

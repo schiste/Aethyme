@@ -6,7 +6,7 @@ This guide covers broker workflows that matter after the basic
 start-edit-submit loop: reusing a session worktree, choosing fresh or cached
 gate evidence, understanding normalized submission planning, inspecting
 advisory semantic gate suggestions, planning leases before claiming them, and
-leaving or retrieving a durable finish handoff. For the complete flag
+exporting redacted routing metadata, and leaving or retrieving a durable finish handoff. For the complete flag
 inventory, see the [CLI reference](../reference/cli.md).
 
 For concurrent validation that needs ports, Docker namespaces, databases, or
@@ -25,6 +25,7 @@ Each workflow separates observation from mutation:
 | Inspect graph-derived gate hints | `gates semantic` | none; suggestions remain advisory | only changed-path triggers reach `gates run` and `submit` |
 | Recover external main movement | `integration reconcile --dry-run` | `--apply --confirm <plan-digest>` | every unrecorded SHA needs a reviewed disposition; drift invalidates confirmation |
 | Reserve paths | `leases plan` | `leases claim` | the claim, not the plan, decides whether a conflict exists now |
+| Route external path queues | `leases export --session/--entry` | none | committed routing config and bounded redacted output are authoritative |
 | End or recover a session | `finish` report | successful `finish` closes and records the handoff | dirty or unsubmitted work refuses the finish |
 
 These commands coordinate local repository state. Submission promotes only to
@@ -344,6 +345,31 @@ aethyme broker leases release src/broker.rs --session 111
 
 Planning does not append broker events or command telemetry. Claiming and
 releasing do mutate broker state and are recorded normally.
+
+## Export Lease Routing Without Sharing Authority
+
+External queues can ask which category owns a selected session's current and
+historical lease rows without learning task text or machine layout:
+
+```bash
+aethyme broker leases export --session 111 --json
+aethyme broker leases export --entry 320 --limit 100 --json
+```
+
+Define categories explicitly in committed repository policy:
+
+```toml
+[leases.routing]
+broker = ["packages/aethyme/rust/crates/aethyme-broker/"]
+docs = ["packages/aethyme/docs/"]
+```
+
+The export is a point-in-time, read-only projection. It identifies the
+canonical remote without exposing its URL, distinguishes lease lifetime and
+overlap states, reports truncation, and ignores dirty configuration. Repeating
+it cannot refresh an expiry or acknowledge ownership. Keep provider-specific
+labels and queue payloads in adapters; use the exported schema as their
+idempotent input rather than extending the broker's lease storage.
 
 ## Finish With A Durable Handoff
 

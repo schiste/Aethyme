@@ -38,6 +38,7 @@ mod host_operations;
 mod host_state;
 pub mod init;
 mod issue_form;
+mod lease_export;
 mod leases;
 mod merge;
 mod operations;
@@ -112,6 +113,12 @@ pub use issue_form::{
     ISSUE_FORM_RENDER_SCHEMA_VERSION, ISSUE_REVIEW_ARTIFACT_SCHEMA_VERSION, IssueFormFieldKind,
     IssueFormFieldStatus, IssueFormRenderResult, IssueFormRenderedField, IssueFormWriteResult,
     render_issue_form, write_issue_form_render_atomic,
+};
+pub use lease_export::{
+    DEFAULT_LEASE_ROUTING_EXPORT_LIMIT, LEASE_ROUTING_EXPORT_SCHEMA_VERSION,
+    LeaseExportConflictState, LeaseExportPathKind, LeaseExportRepository, LeaseExportSelector,
+    LeaseExportState, LeaseRoutingConfiguration, LeaseRoutingExport, LeaseRoutingExportError,
+    LeaseRoutingExportOptions, LeaseRoutingItem, MAX_LEASE_ROUTING_EXPORT_LIMIT,
 };
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use merge::{

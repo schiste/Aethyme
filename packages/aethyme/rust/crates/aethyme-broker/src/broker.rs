@@ -851,7 +851,7 @@ pub struct LeasePlan {
     pub would_conflict: bool,
 }
 
-fn normalize_lease_path(path: &str) -> Result<String, BrokerOpError> {
+pub(crate) fn normalize_lease_path(path: &str) -> Result<String, BrokerOpError> {
     let invalid = |reason: &str| BrokerOpError::InvalidLeasePath {
         path: path.to_string(),
         reason: reason.to_string(),
@@ -1602,6 +1602,21 @@ impl Broker {
 
     pub fn store(&mut self) -> &mut BrokerStore {
         &mut self.store
+    }
+
+    /// Build a bounded, allowlist-only lease routing snapshot without
+    /// refreshing leases, events, sessions, or command telemetry.
+    pub fn export_lease_routing(
+        &self,
+        options: crate::LeaseRoutingExportOptions,
+        source_time: i64,
+    ) -> Result<crate::LeaseRoutingExport, crate::LeaseRoutingExportError> {
+        crate::lease_export::build_lease_routing_export(
+            &self.repo,
+            &self.store,
+            options,
+            source_time,
+        )
     }
 
     /// Persist an immutable non-blocking advisory and refresh the generated

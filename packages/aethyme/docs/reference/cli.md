@@ -282,6 +282,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker hooks uninstall [--json]`
 - `aethyme broker hooks status [--json]`
 - `aethyme broker leases plan <paths...> [--session <id>] [--json]`
+- `aethyme broker leases export (--session <id> | --entry <id>) [--limit <n>] [--json]`
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
 - `aethyme broker repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
@@ -558,6 +559,34 @@ conflicts; without it, every overlap is a potential conflict. Planning neither
 claims nor refreshes leases and does not append broker events or command
 telemetry. Paths are sorted deterministically and must be unambiguous,
 repository-relative spellings without `.` or `..` components.
+
+`broker leases export` is the stable integration boundary for external
+path-scoped queues. It selects one session directly or through a merge-queue
+entry and returns schema version 1 with a source timestamp, credential-free
+canonical repository identity, and at most 200 lease rows by default (1,000
+maximum). Every row distinguishes exact/directory, implicit/explicit,
+active/expired/released/inactive-owner, and non-conflicting/overlapping state.
+Truncated output reports both the selected limit and total matching rows.
+
+Routing is explicit repository policy in the committed `.aethyme/config.toml`:
+
+```toml
+[leases.routing]
+backend = ["backend/", "db/schema.sql"]
+frontend = ["frontend/"]
+```
+
+Category and path ordering is deterministic. Directory spellings end in `/`;
+the same exact/directory overlap rules used by lease claims determine category
+membership. The export reads config from the exact committed main-checkout
+HEAD, so dirty or ignored local files cannot change an adapter decision.
+
+The JSON allowlist contains no remote URLs, credentials, task text, worktree or
+host paths, commands, diffs, or ownership tokens. Export opens a read-only
+broker snapshot: it does not refresh or extend leases, append events, or write
+command telemetry. GitHub-label and merge-queue adapters should retry this
+read-only projection and treat their own delivery as idempotent; they must not
+write adapter state into the lease registry.
 
 `broker start` and `broker adopt` accept repeatable `--path` declarations for
 work known before a diff exists. The broker validates the complete normalized
