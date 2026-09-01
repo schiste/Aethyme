@@ -18,6 +18,7 @@ use serde_json::json;
 pub const SESSION_REGISTERED: &str = "session.registered";
 pub const SESSION_REUSED: &str = "session.reused";
 pub const SESSION_FINISHED: &str = "session.finished";
+pub const SESSION_FINISH_CLEANUP_STARTED: &str = "session.finish_cleanup_started";
 pub const SESSION_CHECKPOINT_REANCHORED: &str = "session.checkpoint_reanchored";
 pub const BROKER_COMMAND_FAILED: &str = "broker.command.failed";
 pub const BROKER_COMMAND_SUCCEEDED: &str = "broker.command.succeeded";
@@ -44,6 +45,17 @@ pub fn session_registered_payload(origin: &str, branch: &str, worktree_path: &st
 
 pub fn session_reused_payload(task: Option<&str>, diff_base: Option<&str>) -> String {
     json!({ "task": task, "diff_base": diff_base }).to_string()
+}
+
+pub fn session_finish_cleanup_started_payload(
+    worktree_present: bool,
+    branch_present: bool,
+) -> String {
+    json!({
+        "worktree_present": worktree_present,
+        "branch_present": branch_present,
+    })
+    .to_string()
 }
 
 pub fn session_checkpoint_reanchored_payload(

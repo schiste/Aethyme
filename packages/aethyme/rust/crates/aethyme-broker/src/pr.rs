@@ -459,7 +459,7 @@ fn find_existing_agent(
         SessionStatus::Idle => 1,
         SessionStatus::Stale => 2,
         SessionStatus::Exited => 3,
-        SessionStatus::Cleaned => 4,
+        SessionStatus::Closed | SessionStatus::Cleaned => 4,
     });
     Ok(agents.into_iter().find(|agent| {
         matches!(

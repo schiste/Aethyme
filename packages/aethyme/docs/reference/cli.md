@@ -520,16 +520,22 @@ intent alongside task text before either session creates a diff.
 `broker finish` returns a structured handoff covering the latest queue and
 submitted/promoted/published delivery state, pending work, every recorded
 active/released/expired lease, the latest executed or cache-resolved gate with
-its full tree hash and event time, cleanup safety, and one recommended next
-action. A successful close persists the same operational fields in a redacted
-`session.finished` event atomically with `session.cleaned`, so the handoff
-survives lease cleanup and session closure. Refused and already-closed finishes
-do not emit a misleading or duplicate completion event.
+its full tree hash and event time, cleanup safety, physical cleanup outcome,
+and one recommended next action. A successful finish closes broker state first,
+then reclaims a represented broker-owned spawned worktree and its exact checked
+branch by default. It reports exact reclaimed bytes and whether each artifact
+was removed. Use `--keep-worktree` to close the session without physical
+cleanup; `broker close` also remains state-only.
 
-Finishing closes broker state but retains the worktree for review or reuse.
-`broker cleanup <session-id>` removes one exact session worktree after its
-safety checks. `broker cleanup --all-cleaned` is a read-only bulk plan by
-default. It classifies each retained worktree and branch as represented,
+The redacted `session.finished` handoff survives both state closure and physical
+cleanup. If cleanup stops part-way, the session remains closed, retained
+artifacts remain represented, and the report gives the exact
+`broker cleanup <session-id>` recovery action. Running `finish` again resumes
+that cleanup idempotently. Refused finishes do not emit a misleading handoff.
+
+`broker cleanup <session-id>` explicitly removes one exact session worktree
+after the same safety checks. `broker cleanup --all-cleaned` is a read-only
+bulk plan by default. It classifies each retained worktree and branch as represented,
 pending, or unproven from the accepted session checkpoint, queue entry, promoted
 integration commit/tree, and current delivery refs. The plan includes exact
 inspection commands, byte estimates, branch tips, and a SHA-256 digest. Apply

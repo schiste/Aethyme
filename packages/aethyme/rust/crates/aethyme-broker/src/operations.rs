@@ -18,7 +18,7 @@ use serde_json::json;
 use crate::broker::{Broker, BrokerOpError};
 use crate::types::{
     CoordinatedOperation, NewCoordinatedOperation, OperationEffect, OperationIdentityProvenance,
-    OperationProvider, OperationStatus, SessionStatus,
+    OperationProvider, OperationStatus,
 };
 
 #[derive(Debug, Clone)]
@@ -880,7 +880,7 @@ impl Broker {
         request: CoordinatedCommand,
     ) -> Result<CoordinatedOperationReport, BrokerOpError> {
         let session = self.store().session(request.session_id)?;
-        if session.status == SessionStatus::Cleaned {
+        if session.status.is_closed() {
             return Err(BrokerOpError::ClosedSessionOperation {
                 session_id: session.id,
             });

@@ -1143,7 +1143,9 @@ fn finish_checkpoint_recovery_plan(
 pub enum FinishStatus {
     Blocked,
     Closed,
+    Cleaned,
     AlreadyClosed,
+    AlreadyCleaned,
 }
 
 impl FinishStatus {
@@ -1151,9 +1153,31 @@ impl FinishStatus {
         match self {
             Self::Blocked => "blocked",
             Self::Closed => "closed",
+            Self::Cleaned => "cleaned",
             Self::AlreadyClosed => "already_closed",
+            Self::AlreadyCleaned => "already_cleaned",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FinishOptions {
+    pub keep_worktree: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct FinishCleanupReport {
+    pub requested: bool,
+    pub kept: bool,
+    pub attempted: bool,
+    pub completed: bool,
+    pub reclaimed_bytes: u64,
+    pub worktree_removed: bool,
+    pub branch_removed: bool,
+    pub branch_ref: Option<String>,
+    pub branch_tip: Option<String>,
+    pub failure: Option<String>,
+    pub recovery_action: Option<String>,
 }
 
 /// Report from `broker finish --session`: close when safe, otherwise
@@ -1173,6 +1197,7 @@ pub struct FinishReport {
     pub leases_held: Vec<FinishLease>,
     pub last_gate: Option<FinishGateRun>,
     pub cleanup_safe: bool,
+    pub cleanup: FinishCleanupReport,
     pub recommended_next_action: Option<String>,
     pub summary: String,
     pub warnings: Vec<String>,
@@ -1243,7 +1268,21 @@ pub struct FinishHandoff {
     pub leases_held: Vec<FinishLease>,
     pub last_gate: Option<FinishGateRun>,
     pub cleanup_safe: bool,
+    #[serde(default)]
+    pub cleanup: FinishCleanupHandoff,
     pub recommended_next_action: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct FinishCleanupHandoff {
+    pub requested: bool,
+    pub kept: bool,
+    pub attempted: bool,
+    pub completed: bool,
+    pub reclaimed_bytes: u64,
+    pub worktree_removed: bool,
+    pub branch_removed: bool,
+    pub recovery_action: Option<String>,
 }
 
 impl From<&FinishReport> for FinishHandoff {
@@ -1258,6 +1297,16 @@ impl From<&FinishReport> for FinishHandoff {
             leases_held: report.leases_held.clone(),
             last_gate: report.last_gate.clone(),
             cleanup_safe: report.cleanup_safe,
+            cleanup: FinishCleanupHandoff {
+                requested: report.cleanup.requested,
+                kept: report.cleanup.kept,
+                attempted: report.cleanup.attempted,
+                completed: report.cleanup.completed,
+                reclaimed_bytes: report.cleanup.reclaimed_bytes,
+                worktree_removed: report.cleanup.worktree_removed,
+                branch_removed: report.cleanup.branch_removed,
+                recovery_action: report.cleanup.recovery_action.clone(),
+            },
             recommended_next_action: report.recommended_next_action.clone(),
         }
     }
@@ -1650,7 +1699,7 @@ impl Broker {
             ("recipient", recipient_session_id),
         ] {
             let session = self.store.session(id)?;
-            if session.status == SessionStatus::Cleaned {
+            if session.status.is_closed() {
                 return Err(BrokerOpError::InvalidSessionNote {
                     reason: format!("{role} session {id} is closed"),
                 });
@@ -1683,7 +1732,7 @@ impl Broker {
         note_id: i64,
     ) -> Result<SessionNote, BrokerOpError> {
         let recipient = self.store.session(recipient_session_id)?;
-        if recipient.status == SessionStatus::Cleaned {
+        if recipient.status.is_closed() {
             return Err(BrokerOpError::InvalidSessionNote {
                 reason: format!("recipient session {recipient_session_id} is closed"),
             });
@@ -2058,12 +2107,11 @@ impl Broker {
         })
     }
 
-    /// Mark a session finished without touching its worktree — the right
-    /// verb for adopted sessions, whose checkout the broker never owns
-    /// (`cleanup` removes worktrees and refuses on the main checkout).
+    /// Close broker state without touching the worktree. Physical cleanup is
+    /// a separate transition and remains available for exact later recovery.
     pub fn close(&mut self, session_id: i64) -> Result<(), BrokerOpError> {
         self.store
-            .set_session_status(session_id, SessionStatus::Cleaned, None)?;
+            .set_session_status(session_id, SessionStatus::Closed, None)?;
         Ok(())
     }
 
@@ -4578,7 +4626,9 @@ impl Broker {
             unsubmitted_commits: report.unsubmitted_commits,
             worktree_missing: report.pending_work.worktree_missing,
         };
-        report.recommended_next_action = if report.delivery.promoted && !report.delivery.published {
+        report.recommended_next_action = if report.cleanup.attempted && !report.cleanup.completed {
+            report.cleanup.recovery_action.clone()
+        } else if report.delivery.promoted && !report.delivery.published {
             report
                 .latest_queue_entry_id
                 .map(|entry| format!("aethyme broker ship plan --entry {entry}"))
@@ -4596,10 +4646,118 @@ impl Broker {
         Ok(())
     }
 
+    fn record_finished_handoff(&mut self, report: &FinishReport) -> Result<(), BrokerOpError> {
+        let payload = crate::events::session_finished_payload(report);
+        self.store
+            .record_finished_handoff(report.session_id, &payload)?;
+        Ok(())
+    }
+
+    fn run_finish_cleanup(
+        &mut self,
+        report: &mut FinishReport,
+        session: &Session,
+    ) -> Result<(), BrokerOpError> {
+        let worktree_path = PathBuf::from(&session.worktree_path);
+        let item = self.cleanup_item(session)?;
+        report.cleanup_safe = item.as_ref().is_none_or(|item| item.eligible());
+        if !report.cleanup_safe {
+            report.status = FinishStatus::Closed;
+            report.cleanup.requested = true;
+            report.cleanup.recovery_action =
+                item.as_ref().map(|item| item.force_cleanup_command.clone());
+            report.summary = format!(
+                "session {} is closed, but physical cleanup is not proven safe",
+                report.session_id
+            );
+            report.warnings.push(
+                "retained artifacts are not fully represented; inspect the cleanup plan before any force cleanup"
+                    .into(),
+            );
+            self.finalize_finish_report(report);
+            self.record_finished_handoff(report)?;
+            return Ok(());
+        }
+        let worktree_present = worktree_path.exists();
+        let branch_present = item
+            .as_ref()
+            .and_then(|item| item.branch_tip.as_ref())
+            .is_some();
+        report.cleanup.requested = true;
+        report.cleanup.attempted = true;
+        report.cleanup.reclaimed_bytes = item
+            .as_ref()
+            .and_then(|item| item.estimated_bytes)
+            .unwrap_or(0);
+        report.cleanup.branch_ref = item.as_ref().map(|item| item.branch_ref.clone());
+        report.cleanup.branch_tip = item.as_ref().and_then(|item| item.branch_tip.clone());
+        report.cleanup.recovery_action =
+            Some(format!("aethyme broker cleanup {}", report.session_id));
+
+        let start_payload =
+            crate::events::session_finish_cleanup_started_payload(worktree_present, branch_present);
+        self.store
+            .begin_finish_cleanup(report.session_id, &start_payload)?;
+        match self.cleanup(report.session_id, false) {
+            Ok(()) => {
+                report.status = FinishStatus::Cleaned;
+                report.cleanup.completed = true;
+                report.cleanup.worktree_removed = worktree_present && !worktree_path.exists();
+                report.cleanup.branch_removed = branch_present
+                    && report
+                        .cleanup
+                        .branch_ref
+                        .as_deref()
+                        .is_some_and(|branch| self.repo.resolve_ref(branch).is_none());
+                report.cleanup.failure = None;
+                report.cleanup.recovery_action = None;
+                report.summary = format!(
+                    "session {} closed and reclaimed {} bytes",
+                    report.session_id, report.cleanup.reclaimed_bytes
+                );
+                report.next_commands.clear();
+            }
+            Err(error) => {
+                report.status = FinishStatus::Closed;
+                report.cleanup.completed = false;
+                report.cleanup.worktree_removed = worktree_present && !worktree_path.exists();
+                report.cleanup.branch_removed = branch_present
+                    && report
+                        .cleanup
+                        .branch_ref
+                        .as_deref()
+                        .is_some_and(|branch| self.repo.resolve_ref(branch).is_none());
+                report.cleanup.failure = Some(error.to_string());
+                report.summary = format!(
+                    "session {} closed; physical cleanup needs recovery",
+                    report.session_id
+                );
+                report.warnings.push(format!(
+                    "physical cleanup did not complete: {error}; retained artifacts remain represented"
+                ));
+                report.next_commands.clear();
+                report
+                    .next_commands
+                    .push(format!("aethyme broker cleanup {}", report.session_id));
+            }
+        }
+        self.finalize_finish_report(report);
+        self.record_finished_handoff(report)?;
+        Ok(())
+    }
+
     /// Finish a session at the operator level: close it when there is no
     /// dirty work and no committed work waiting for submit/promotion;
     /// otherwise return actionable guidance without mutating state.
     pub fn finish(&mut self, session_id: i64) -> Result<FinishReport, BrokerOpError> {
+        self.finish_with_options(session_id, FinishOptions::default())
+    }
+
+    pub fn finish_with_options(
+        &mut self,
+        session_id: i64,
+        options: FinishOptions,
+    ) -> Result<FinishReport, BrokerOpError> {
         let session = self.store.session(session_id)?;
         let worktree_path = PathBuf::from(&session.worktree_path);
         let at_ms = now_ms();
@@ -4622,30 +4780,61 @@ impl Broker {
             leases_held: self.finish_leases(session_id, at_ms)?,
             last_gate: self.finish_last_gate(session_id)?,
             cleanup_safe: false,
+            cleanup: FinishCleanupReport::default(),
             recommended_next_action: None,
             summary: format!("session {session_id} is not finished yet"),
             warnings: Vec::new(),
             next_commands: Vec::new(),
         };
 
+        if session.status == SessionStatus::Cleaned {
+            report.status = FinishStatus::AlreadyCleaned;
+            report.closed = true;
+            report.cleanup.completed = true;
+            report.cleanup.worktree_removed = !worktree_path.exists();
+            report.summary = format!("session {session_id} is already physically cleaned");
+            self.finalize_finish_report(&mut report);
+            return Ok(report);
+        }
+        if session.status == SessionStatus::Closed {
+            report.status = FinishStatus::AlreadyClosed;
+            report.closed = true;
+            if options.keep_worktree || session.origin != SessionOrigin::Spawned {
+                report.cleanup.kept = options.keep_worktree;
+                report.summary = format!("session {session_id} is already closed");
+                report.cleanup_safe = self
+                    .cleanup_item(&session)?
+                    .is_some_and(|item| item.eligible());
+                if report.cleanup_safe {
+                    report
+                        .next_commands
+                        .push(format!("aethyme broker cleanup {session_id}"));
+                }
+                self.finalize_finish_report(&mut report);
+                return Ok(report);
+            }
+            self.run_finish_cleanup(&mut report, &session)?;
+            return Ok(report);
+        }
+
         if !worktree_path.exists() {
             report.pending_work.worktree_missing = true;
-            if session.status == SessionStatus::Cleaned {
-                report.status = FinishStatus::AlreadyClosed;
-                report.summary = format!("session {session_id} is already closed");
-            } else {
-                report.status = FinishStatus::Closed;
-                report.closed = true;
-                report.summary =
-                    format!("session {session_id} closed in broker state; worktree is missing");
+            report.status = FinishStatus::Closed;
+            report.closed = true;
+            if session.origin == SessionOrigin::Spawned && !options.keep_worktree {
+                self.run_finish_cleanup(&mut report, &session)?;
+                return Ok(report);
             }
-            report
-                .warnings
-                .push("worktree path does not exist; cleanup is not applicable".into());
+            report.cleanup.kept = options.keep_worktree;
+            report.summary = format!(
+                "session {session_id} closed in broker state; worktree was already missing"
+            );
+            report.warnings.push(
+                "worktree path was already absent; no broker-owned physical cleanup was attempted"
+                    .into(),
+            );
             self.finalize_finish_report(&mut report);
-            if report.status == FinishStatus::Closed {
-                self.persist_finish_report(&report)?;
-            }
+            self.persist_finish_report(&report)?;
             return Ok(report);
         }
 
@@ -4698,26 +4887,6 @@ impl Broker {
                 checkout.commit_count_between(&base, "HEAD")?
             }
         };
-
-        if session.status == SessionStatus::Cleaned {
-            report.status = FinishStatus::AlreadyClosed;
-            report.summary = format!("session {session_id} is already closed");
-            report.cleanup_safe =
-                self.finish_cleanup_safe(session_id, &worktree_path, &report.dirty_paths)?;
-            if report.cleanup_safe {
-                report
-                    .next_commands
-                    .push(format!("aethyme broker cleanup {session_id}"));
-            } else if !report.dirty_paths.is_empty() {
-                report.warnings.push(format!(
-                    "worktree still has {} uncommitted or untracked {}; cleanup is not safe",
-                    report.dirty_paths.len(),
-                    plural_word(report.dirty_paths.len(), "path", "paths")
-                ));
-            }
-            self.finalize_finish_report(&mut report);
-            return Ok(report);
-        }
 
         if !report.dirty_paths.is_empty() {
             report.warnings.push(format!(
@@ -4809,10 +4978,18 @@ impl Broker {
 
         report.status = FinishStatus::Closed;
         report.closed = true;
-        report.summary = format!("session {session_id} closed; worktree untouched");
+        report.summary = format!("session {session_id} closed; worktree retained");
         report.cleanup_safe =
             self.finish_cleanup_safe(session_id, &worktree_path, &report.dirty_paths)?;
-        if report.cleanup_safe {
+        let broker_owned = session.origin == SessionOrigin::Spawned
+            && self.is_broker_owned_worktree(&session, &worktree_path);
+        if options.keep_worktree {
+            report.cleanup.kept = true;
+        }
+        if report.cleanup_safe && broker_owned && !options.keep_worktree {
+            self.run_finish_cleanup(&mut report, &session)?;
+            return Ok(report);
+        } else if report.cleanup_safe {
             report
                 .next_commands
                 .push(format!("aethyme broker cleanup {session_id}"));
@@ -6523,6 +6700,9 @@ mod tests {
             branch: format!("agent/session-{id}"),
             origin: SessionOrigin::Adopted,
             status: SessionStatus::Active,
+            cleanup_state: crate::SessionCleanupState::Open,
+            closed_at: None,
+            cleanup_completed_at: None,
             task: Some("test".into()),
             diff_base: Some("HEAD".into()),
             adoption_base: Some("HEAD".into()),

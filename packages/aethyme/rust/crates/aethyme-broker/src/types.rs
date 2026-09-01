@@ -58,6 +58,19 @@ text_enum!(SessionStatus, "sessions.status", {
     Idle => "idle",
     Stale => "stale",
     Exited => "exited",
+    Closed => "closed",
+    Cleaned => "cleaned",
+});
+
+impl SessionStatus {
+    pub fn is_closed(self) -> bool {
+        matches!(self, Self::Closed | Self::Cleaned)
+    }
+}
+
+text_enum!(SessionCleanupState, "sessions.cleanup_state", {
+    Open => "open",
+    Closed => "closed",
     Cleaned => "cleaned",
 });
 
@@ -329,6 +342,9 @@ pub struct Session {
     pub branch: String,
     pub origin: SessionOrigin,
     pub status: SessionStatus,
+    pub cleanup_state: SessionCleanupState,
+    pub closed_at: Option<i64>,
+    pub cleanup_completed_at: Option<i64>,
     pub task: Option<String>,
     pub diff_base: Option<String>,
     pub adoption_base: Option<String>,

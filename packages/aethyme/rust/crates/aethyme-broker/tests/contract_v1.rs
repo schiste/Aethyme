@@ -12,10 +12,10 @@ use std::path::Path;
 use std::process::Command;
 
 use aethyme_broker::{
-    Broker, EVENTS_SCHEMA_VERSION, Event, FinishDelivery, FinishGateCacheSource, FinishGateRun,
-    FinishHandoff, FinishLease, FinishLeaseState, FinishPendingWork, FinishReport, FinishStatus,
-    GateStatus, LeaseKind, MergeStatus, OperationEffect, OperationProvider, OperationStatus,
-    Overlap, SessionStatus, events,
+    Broker, EVENTS_SCHEMA_VERSION, Event, FinishCleanupReport, FinishDelivery,
+    FinishGateCacheSource, FinishGateRun, FinishHandoff, FinishLease, FinishLeaseState,
+    FinishPendingWork, FinishReport, FinishStatus, GateStatus, LeaseKind, MergeStatus,
+    OperationEffect, OperationProvider, OperationStatus, Overlap, SessionStatus, events,
 };
 
 /// The complete v1 kind catalog. Additions append here (additive change);
@@ -48,7 +48,9 @@ const V1_KINDS: &[&str] = &[
     "operation.succeeded",
     "session.active",
     "session.cleaned",
+    "session.closed",
     "session.exited",
+    "session.finish_cleanup_started",
     "session.finished",
     "session.idle",
     "session.registered",
@@ -112,6 +114,7 @@ fn v1_kind_catalog_is_frozen() {
         events::SESSION_REGISTERED.into(),
         events::SESSION_REUSED.into(),
         events::SESSION_FINISHED.into(),
+        events::SESSION_FINISH_CLEANUP_STARTED.into(),
         events::LEASE_CLAIMED.into(),
         events::LEASE_RELEASED.into(),
         events::LEASE_OVERLAP.into(),
@@ -124,6 +127,7 @@ fn v1_kind_catalog_is_frozen() {
         SessionStatus::Idle,
         SessionStatus::Stale,
         SessionStatus::Exited,
+        SessionStatus::Closed,
         SessionStatus::Cleaned,
     ] {
         actual.push(format!("session.{}", status.as_str()));
@@ -216,6 +220,7 @@ fn v1_constructor_payload_field_names_are_frozen() {
             cache_source: FinishGateCacheSource::Executed,
         }),
         cleanup_safe: false,
+        cleanup: FinishCleanupReport::default(),
         recommended_next_action: Some("next".into()),
         summary: "secret summary".into(),
         warnings: vec!["secret warning".into()],
@@ -225,6 +230,7 @@ fn v1_constructor_payload_field_names_are_frozen() {
     assert_keys(
         &finished_payload,
         &[
+            "cleanup",
             "cleanup_safe",
             "delivery",
             "last_gate",
@@ -263,6 +269,20 @@ fn v1_constructor_payload_field_names_are_frozen() {
         &finished["last_gate"].to_string(),
         &["cache_source", "gate", "recorded_at", "status", "tree_hash"],
         "session.finished last_gate",
+    );
+    assert_keys(
+        &finished["cleanup"].to_string(),
+        &[
+            "attempted",
+            "branch_removed",
+            "completed",
+            "kept",
+            "reclaimed_bytes",
+            "recovery_action",
+            "requested",
+            "worktree_removed",
+        ],
+        "session.finished cleanup",
     );
     assert!(!finished_payload.contains("/secret/worktree"));
     assert!(!finished_payload.contains("secret summary"));

@@ -329,6 +329,7 @@ session:
 ```bash
 aethyme broker finish --session 111
 aethyme broker finish --session 111 --json
+aethyme broker finish --session 111 --keep-worktree
 ```
 
 The report snapshots:
@@ -337,16 +338,19 @@ The report snapshots:
 - dirty paths and unsubmitted commits;
 - active, released, and expired leases;
 - the latest gate, full tree hash, event time, and executed/cache-hit source;
-- cleanup safety and one recommended next action.
+- cleanup safety, exact physical cleanup outcome, and one recommended next
+  action.
 
 If dirty or unsubmitted work makes closure unsafe, `finish` refuses and does
-not create a misleading completion record. A successful finish atomically
-closes the session and writes a redacted `session.finished` event, so the
-handoff survives lease cleanup and worktree removal.
+not create a misleading completion record. Otherwise it closes broker state,
+writes a redacted handoff, and by default reclaims a represented broker-owned
+spawned worktree plus its exact checked branch. The command can safely remove
+the checkout it was invoked from after startup. Use `--keep-worktree` when the
+checkout must remain available for review or reuse; use `close` when only the
+broker state should close.
 
-`finish` does not remove the worktree. This preserves the checkout for review
-or reuse and avoids deleting the directory from under a caller's shell. When
-the report says cleanup is safe, remove one exact broker-owned worktree with:
+An interrupted or refused physical cleanup leaves the session closed and
+prints its recovery command. Resume it with:
 
 ```bash
 aethyme broker cleanup 111

@@ -8,8 +8,8 @@ use std::process::Command;
 use aethyme_broker::{
     AdoptIntegrationRelation, AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, Broker,
     BrokerOpError, CleanupDisposition, CleanupRepresentation, FinishGateCacheSource,
-    FinishLeaseState, FinishStatus, GateStatus, NewGateResult, NewSession, SessionOrigin,
-    SessionStatus, VersionDriftStatus, events,
+    FinishLeaseState, FinishOptions, FinishStatus, GateStatus, NewGateResult, NewSession,
+    SessionOrigin, SessionStatus, VersionDriftStatus, events,
 };
 
 fn sh(cwd: &Path, args: &[&str]) {
@@ -367,7 +367,14 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
     sh(&safe_path, &["add", "safe.txt"]);
     sh(&safe_path, &["commit", "-qm", "safe work"]);
     assert!(broker.submit(safe.id).unwrap().promoted);
-    let finished = broker.finish(safe.id).unwrap();
+    let finished = broker
+        .finish_with_options(
+            safe.id,
+            FinishOptions {
+                keep_worktree: true,
+            },
+        )
+        .unwrap();
     assert!(finished.cleanup_safe);
     std::fs::create_dir_all(safe_path.join("target/debug")).unwrap();
     std::fs::write(safe_path.join("target/debug/cache.bin"), vec![7_u8; 4096]).unwrap();
@@ -379,7 +386,15 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
     sh(&dirty_path, &["commit", "-qm", "delivered work"]);
     assert!(broker.submit(dirty.id).unwrap().promoted);
     assert_eq!(
-        broker.finish(dirty.id).unwrap().status,
+        broker
+            .finish_with_options(
+                dirty.id,
+                FinishOptions {
+                    keep_worktree: true,
+                },
+            )
+            .unwrap()
+            .status,
         FinishStatus::Closed
     );
     std::fs::write(dirty_path.join("untracked.txt"), "keep me\n").unwrap();
@@ -464,7 +479,17 @@ fn cleanup_recovers_after_worktree_removal_and_prunes_only_the_exact_branch_tip(
     sh(&worktree, &["add", "renamed.bin"]);
     sh(&worktree, &["commit", "-qm", "represented binary"]);
     assert!(broker.submit(session.id).unwrap().promoted);
-    assert!(broker.finish(session.id).unwrap().closed);
+    assert!(
+        broker
+            .finish_with_options(
+                session.id,
+                FinishOptions {
+                    keep_worktree: true,
+                },
+            )
+            .unwrap()
+            .closed
+    );
     let branch_ref = format!("refs/heads/{}", session.branch);
     let branch_tip = rev(tmp.path(), &branch_ref);
 
@@ -650,10 +675,16 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
     assert_eq!(reused.adoption_base, first.adoption_base);
     assert_eq!(reused.repository_contract, first.repository_contract);
 
-    // close is state-only: session cleaned, worktree untouched.
+    // close is state-only: session closed, worktree untouched.
     broker.close(first.id).unwrap();
     let closed = broker.store().session(first.id).unwrap();
-    assert_eq!(closed.status, SessionStatus::Cleaned);
+    assert_eq!(closed.status, SessionStatus::Closed);
+    assert_eq!(
+        closed.cleanup_state,
+        aethyme_broker::SessionCleanupState::Closed
+    );
+    assert!(closed.closed_at.is_some());
+    assert!(closed.cleanup_completed_at.is_none());
     assert!(tmp.path().join("README.md").exists());
 
     // After close, --reuse creates a fresh session because no live identity remains.
@@ -978,7 +1009,7 @@ fn finish_blocks_dirty_then_unsubmitted_commits() {
     );
     assert_ne!(
         broker.store().session(session.id).unwrap().status,
-        SessionStatus::Cleaned
+        SessionStatus::Closed
     );
     assert!(
         broker
@@ -1147,7 +1178,7 @@ fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains
     assert_eq!(last_gate.cache_source, FinishGateCacheSource::CacheHit);
     assert_eq!(
         broker.store().session(session.id).unwrap().status,
-        SessionStatus::Cleaned
+        SessionStatus::Closed
     );
     assert!(
         broker
@@ -1162,16 +1193,16 @@ fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains
         .filter(|event| event.kind == events::SESSION_FINISHED)
         .collect::<Vec<_>>();
     assert_eq!(finished.len(), 1);
-    let cleaned_index = events
+    let closed_index = events
         .iter()
-        .position(|event| event.kind == "session.cleaned")
+        .position(|event| event.kind == "session.closed")
         .unwrap();
     let finished_index = events
         .iter()
         .position(|event| event.kind == events::SESSION_FINISHED)
         .unwrap();
-    assert_eq!(finished_index, cleaned_index + 1);
-    assert_eq!(events[cleaned_index].ts, events[finished_index].ts);
+    assert_eq!(finished_index, closed_index + 1);
+    assert_eq!(events[closed_index].ts, events[finished_index].ts);
     let payload = finished[0].payload_json.as_deref().unwrap();
     let handoff: serde_json::Value = serde_json::from_str(payload).unwrap();
     assert_eq!(handoff["session_id"], session.id);
@@ -1186,11 +1217,8 @@ fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains
     sh(tmp.path(), &["merge", "--ff-only", "aethyme/integration"]);
     let already = broker.finish(session.id).unwrap();
     assert_eq!(already.status, FinishStatus::AlreadyClosed);
-    assert!(already.cleanup_safe);
-    assert_eq!(
-        already.next_commands,
-        vec![format!("aethyme broker cleanup {}", session.id)]
-    );
+    assert!(!already.cleanup_safe);
+    assert!(already.next_commands.is_empty());
     assert_eq!(
         broker
             .store()

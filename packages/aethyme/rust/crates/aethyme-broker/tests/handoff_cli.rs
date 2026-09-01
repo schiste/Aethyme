@@ -127,6 +127,7 @@ fn handoff_json_by_session_has_a_stable_read_only_contract() {
     assert_eq!(
         sorted_keys(&report),
         [
+            "cleanup",
             "cleanup_safe",
             "delivery",
             "event_id",

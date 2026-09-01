@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use aethyme_broker::Broker;
+use aethyme_broker::{Broker, FinishOptions};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -46,7 +46,17 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
     git(&worktree, &["add", "done.txt"]);
     git(&worktree, &["commit", "-qm", "done"]);
     assert!(broker.submit(session.id).unwrap().promoted);
-    assert!(broker.finish(session.id).unwrap().closed);
+    assert!(
+        broker
+            .finish_with_options(
+                session.id,
+                FinishOptions {
+                    keep_worktree: true,
+                },
+            )
+            .unwrap()
+            .closed
+    );
     std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
     std::fs::write(worktree.join("target/debug/cache.bin"), vec![3_u8; 2048]).unwrap();
     drop(broker);
@@ -148,7 +158,17 @@ fn bulk_cleanup_confirmation_binds_the_exact_reviewed_branch_tip() {
     git(&worktree, &["add", "done.txt"]);
     git(&worktree, &["commit", "-qm", "done"]);
     assert!(broker.submit(session.id).unwrap().promoted);
-    assert!(broker.finish(session.id).unwrap().closed);
+    assert!(
+        broker
+            .finish_with_options(
+                session.id,
+                FinishOptions {
+                    keep_worktree: true,
+                },
+            )
+            .unwrap()
+            .closed
+    );
     drop(broker);
 
     let plan = run(tmp.path(), &["cleanup", "--all-cleaned", "--json"]);

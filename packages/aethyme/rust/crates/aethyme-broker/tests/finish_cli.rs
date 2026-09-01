@@ -31,7 +31,7 @@ fn run(repo: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-fn promoted_fixture() -> (tempfile::TempDir, i64) {
+fn promoted_fixture() -> (tempfile::TempDir, i64, std::path::PathBuf, String) {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
@@ -39,22 +39,9 @@ fn promoted_fixture() -> (tempfile::TempDir, i64) {
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
 
-    let worktree = tmp.path().join(".aethyme/worktrees/finish-cli");
-    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
-    git(
-        tmp.path(),
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "agent/finish-cli",
-            worktree.to_str().unwrap(),
-            "main",
-        ],
-    );
     let mut broker = Broker::open(tmp.path()).unwrap();
-    let session = broker.adopt(&worktree, Some("finish CLI fixture")).unwrap();
+    let session = broker.start_worktree("finish CLI fixture").unwrap();
+    let worktree = std::path::PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
     git(&worktree, &["add", "-A"]);
     git(&worktree, &["commit", "-qm", "done"]);
@@ -81,12 +68,14 @@ fn promoted_fixture() -> (tempfile::TempDir, i64) {
             session_id: Some(session.id),
         })
         .unwrap();
-    (tmp, session.id)
+    let session_id = session.id;
+    let branch = session.branch;
+    (tmp, session_id, worktree, branch)
 }
 
 #[test]
 fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
-    let (tmp, session_id) = promoted_fixture();
+    let (tmp, session_id, worktree, branch) = promoted_fixture();
     let session = session_id.to_string();
     let output = run(tmp.path(), &["finish", "--session", &session, "--json"]);
     assert!(
@@ -95,7 +84,7 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["status"], "closed");
+    assert_eq!(report["status"], "cleaned");
     assert_eq!(report["delivery"]["submitted"], true);
     assert_eq!(report["delivery"]["promoted"], true);
     assert_eq!(report["delivery"]["published"], false);
@@ -112,6 +101,26 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
     assert!(report["last_gate"]["recorded_at"].is_i64());
     assert!(report["last_gate"]["tree_hash"].is_string());
     assert_eq!(report["cleanup_safe"], true);
+    assert_eq!(report["cleanup"]["requested"], true);
+    assert_eq!(report["cleanup"]["attempted"], true);
+    assert_eq!(report["cleanup"]["completed"], true);
+    assert_eq!(report["cleanup"]["worktree_removed"], true);
+    assert_eq!(report["cleanup"]["branch_removed"], true);
+    assert!(!worktree.exists());
+    assert!(
+        !Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}")
+            ])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
     assert!(
         report["recommended_next_action"]
             .as_str()
@@ -134,7 +143,7 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
 
 #[test]
 fn finish_cli_text_summarizes_the_structured_handoff() {
-    let (tmp, session_id) = promoted_fixture();
+    let (tmp, session_id, worktree, _) = promoted_fixture();
     let session = session_id.to_string();
     let output = run(tmp.path(), &["finish", "--session", &session]);
     assert!(output.status.success());
@@ -155,7 +164,10 @@ fn finish_cli_text_summarizes_the_structured_handoff() {
     );
     assert!(text.contains("(executed)"), "{text}");
     assert!(text.contains("cleanup safe: yes"), "{text}");
-    assert!(text.contains("aethyme broker cleanup"), "{text}");
+    assert!(text.contains("physical cleanup: requested=true"), "{text}");
+    assert!(text.contains("attempted=true, completed=true"), "{text}");
+    assert!(text.contains("(removed)"), "{text}");
+    assert!(!worktree.exists());
     assert!(
         text.contains("recommended next: aethyme broker ship plan --entry"),
         "{text}"
@@ -164,8 +176,7 @@ fn finish_cli_text_summarizes_the_structured_handoff() {
 
 #[test]
 fn dirty_finish_guidance_is_stash_free() {
-    let (tmp, session_id) = promoted_fixture();
-    let worktree = tmp.path().join(".aethyme/worktrees/finish-cli");
+    let (tmp, session_id, worktree, _) = promoted_fixture();
     std::fs::write(worktree.join("dirty.txt"), "keep me\n").unwrap();
     let session = session_id.to_string();
     let output = run(tmp.path(), &["finish", "--session", &session, "--json"]);
@@ -174,4 +185,162 @@ fn dirty_finish_guidance_is_stash_free() {
     let rendered = report.to_string();
     assert!(rendered.contains("managed pre-commit lane"), "{rendered}");
     assert!(!rendered.contains("stash"), "{rendered}");
+}
+
+#[test]
+fn finish_cli_keep_worktree_closes_state_without_reclaiming_artifacts() {
+    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    let output = run(
+        tmp.path(),
+        &[
+            "finish",
+            "--session",
+            &session_id.to_string(),
+            "--keep-worktree",
+            "--json",
+        ],
+    );
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "closed");
+    assert_eq!(report["cleanup"]["kept"], true);
+    assert_eq!(report["cleanup"]["attempted"], false);
+    assert!(worktree.exists());
+    assert!(
+        Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}")
+            ])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn finish_cli_reports_partial_cleanup_and_resumes_idempotently() {
+    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    git(
+        tmp.path(),
+        &["worktree", "lock", worktree.to_str().unwrap()],
+    );
+
+    let first = run(
+        tmp.path(),
+        &["finish", "--session", &session_id.to_string(), "--json"],
+    );
+    assert!(first.status.success());
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["status"], "closed");
+    assert_eq!(first["cleanup"]["attempted"], true);
+    assert_eq!(first["cleanup"]["completed"], false);
+    assert!(first["cleanup"]["failure"].is_string());
+    assert_eq!(
+        first["cleanup"]["recovery_action"],
+        format!("aethyme broker cleanup {session_id}")
+    );
+    assert!(worktree.exists());
+
+    git(
+        tmp.path(),
+        &["worktree", "unlock", worktree.to_str().unwrap()],
+    );
+    let resumed = run(
+        tmp.path(),
+        &["finish", "--session", &session_id.to_string(), "--json"],
+    );
+    assert!(resumed.status.success());
+    let resumed: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(resumed["status"], "cleaned");
+    assert_eq!(resumed["cleanup"]["completed"], true);
+    assert!(!worktree.exists());
+    assert!(
+        !Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}")
+            ])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn finish_cli_can_remove_its_current_worktree_after_the_command_starts() {
+    let (_tmp, session_id, worktree, _) = promoted_fixture();
+    let output = run(
+        &worktree,
+        &["finish", "--session", &session_id.to_string(), "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "cleaned");
+    assert_eq!(report["cleanup"]["worktree_removed"], true);
+    assert!(!worktree.exists());
+}
+
+#[test]
+fn finish_cli_recovers_a_branch_only_interruption_after_branch_deletion_fails() {
+    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    git(
+        tmp.path(),
+        &["worktree", "remove", worktree.to_str().unwrap()],
+    );
+    let branch_lock = tmp
+        .path()
+        .join(".git/refs/heads")
+        .join(format!("{branch}.lock"));
+    std::fs::create_dir_all(branch_lock.parent().unwrap()).unwrap();
+    std::fs::write(&branch_lock, "held by test\n").unwrap();
+
+    let first = run(
+        tmp.path(),
+        &["finish", "--session", &session_id.to_string(), "--json"],
+    );
+    assert!(first.status.success());
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["status"], "closed");
+    assert_eq!(first["pending_work"]["worktree_missing"], true);
+    assert_eq!(first["cleanup"]["attempted"], true);
+    assert_eq!(first["cleanup"]["completed"], false);
+    assert!(first["cleanup"]["failure"].is_string());
+    assert!(branch_lock.exists());
+
+    std::fs::remove_file(&branch_lock).unwrap();
+    let resumed = run(
+        tmp.path(),
+        &["finish", "--session", &session_id.to_string(), "--json"],
+    );
+    assert!(resumed.status.success());
+    let resumed: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(resumed["status"], "cleaned");
+    assert_eq!(resumed["cleanup"]["completed"], true);
+    assert!(
+        !Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}")
+            ])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
 }

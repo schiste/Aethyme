@@ -23,7 +23,7 @@ use crate::types::{
     MergeQueueEntry, MergeStatus, NewAdvisory, NewCoordinatedOperation, NewGateResult,
     NewPrWatchState, NewSession, OperationEffect, OperationHistoryPage, OperationHistoryQuery,
     OperationIdentityProvenance, OperationProvider, OperationStatus, PrWatchState, Session,
-    SessionNote, SessionOrigin, SessionStatus,
+    SessionCleanupState, SessionNote, SessionOrigin, SessionStatus,
 };
 
 /// Milliseconds a writer waits on a locked database before erroring.
@@ -339,7 +339,9 @@ impl BrokerStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_planned_lease_conflicts(&tx, Some(replaced_id), planned_paths, now)?;
         let changed = tx.execute(
-            "UPDATE sessions SET status = 'cleaned', updated_at = ?2
+            "UPDATE sessions
+             SET status = 'cleaned', cleanup_state = 'cleaned', closed_at = ?2,
+                 cleanup_completed_at = ?2, updated_at = ?2
              WHERE id = ?1 AND status != 'cleaned'",
             params![replaced_id, now],
         )?;
@@ -434,11 +436,26 @@ impl BrokerStore {
     ) -> Result<(), BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
+        let (stored_status, cleanup_state, closed_at, cleanup_completed_at) = match status {
+            SessionStatus::Closed => ("cleaned", "closed", Some(now), None),
+            SessionStatus::Cleaned => ("cleaned", "cleaned", Some(now), Some(now)),
+            _ => (status.as_str(), "open", None, None),
+        };
         let changed = tx.execute(
             "UPDATE sessions SET status = ?2, exit_code = COALESCE(?3, exit_code),
-                                 updated_at = ?4
+                                 updated_at = ?4, cleanup_state = ?5,
+                                 closed_at = COALESCE(?6, closed_at),
+                                 cleanup_completed_at = ?7
              WHERE id = ?1",
-            params![id, status.as_str(), exit_code, now],
+            params![
+                id,
+                stored_status,
+                exit_code,
+                now,
+                cleanup_state,
+                closed_at,
+                cleanup_completed_at
+            ],
         )?;
         if changed == 0 {
             return Err(BrokerError::SessionNotFound(id));
@@ -448,7 +465,7 @@ impl BrokerStore {
         // transaction. Without this every cleaned session leaves its last
         // implicit-lease snapshot behind forever (722 orphaned rows for
         // ~25 sessions observed in the 2026-07-17 dogfood database).
-        if status == SessionStatus::Cleaned {
+        if status.is_closed() {
             tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
             tx.execute(
                 "DELETE FROM session_foreign_files WHERE session_id = ?1",
@@ -474,8 +491,10 @@ impl BrokerStore {
         let now = now_ms();
         let tx = self.conn.transaction()?;
         let changed = tx.execute(
-            "UPDATE sessions SET status = 'cleaned', updated_at = ?2
-             WHERE id = ?1 AND status <> 'cleaned'",
+            "UPDATE sessions
+             SET status = 'cleaned', cleanup_state = 'closed', closed_at = ?2,
+                 cleanup_completed_at = NULL, updated_at = ?2
+             WHERE id = ?1 AND cleanup_state = 'open'",
             params![id, now],
         )?;
         if changed == 0 {
@@ -497,10 +516,85 @@ impl BrokerStore {
         insert_event(
             &tx,
             now,
-            &format!("session.{}", SessionStatus::Cleaned.as_str()),
+            &format!("session.{}", SessionStatus::Closed.as_str()),
             Some(id),
             None,
         )?;
+        insert_event(
+            &tx,
+            now,
+            crate::events::SESSION_FINISHED,
+            Some(id),
+            Some(handoff_payload),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Durably close a session and journal that physical cleanup is about to
+    /// begin. The final redacted handoff is appended separately after the Git
+    /// outcome is known, so a crash leaves an explicit recoverable boundary.
+    pub fn begin_finish_cleanup(
+        &mut self,
+        id: i64,
+        cleanup_payload: &str,
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let state: Option<String> = tx
+            .query_row(
+                "SELECT cleanup_state FROM sessions WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(state) = state else {
+            return Err(BrokerError::SessionNotFound(id));
+        };
+        if state == "cleaned" {
+            return Ok(());
+        }
+        if state == "open" {
+            tx.execute(
+                "UPDATE sessions
+                 SET status = 'cleaned', cleanup_state = 'closed', closed_at = ?2,
+                     cleanup_completed_at = NULL, updated_at = ?2
+                 WHERE id = ?1",
+                params![id, now],
+            )?;
+            tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
+            tx.execute(
+                "DELETE FROM session_foreign_files WHERE session_id = ?1",
+                [id],
+            )?;
+            insert_event(&tx, now, "session.closed", Some(id), None)?;
+        }
+        insert_event(
+            &tx,
+            now,
+            crate::events::SESSION_FINISH_CLEANUP_STARTED,
+            Some(id),
+            Some(cleanup_payload),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn record_finished_handoff(
+        &mut self,
+        id: i64,
+        handoff_payload: &str,
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(BrokerError::SessionNotFound(id));
+        }
         insert_event(
             &tx,
             now,
@@ -2400,7 +2494,8 @@ const SESSION_SELECT: &str = "SELECT id, worktree_path, branch, origin, status, 
      accepted_integration_commit, accepted_integration_tree, accepted_queue_entry_id, \
      accepted_at, repository_schema, deployment_state_digest, aethyme_version, \
      gate_definition_digest, repository_contract_backfilled, pid, command, log_path, \
-     exit_code, created_at, updated_at, last_activity_at \
+     exit_code, created_at, updated_at, last_activity_at, cleanup_state, closed_at, \
+     cleanup_completed_at \
      FROM sessions";
 
 const LEASE_SELECT: &str =
@@ -2443,7 +2538,9 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> Result<Event, rusqlite::Error> {
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> RowResult<Session> {
     let origin: String = row.get(3)?;
-    let status: String = row.get(4)?;
+    let stored_status: String = row.get(4)?;
+    let cleanup_state: String = row.get(26)?;
+    let cleanup_state = SessionCleanupState::parse(&cleanup_state);
     let repository_schema: Option<u32> = row.get(14)?;
     let deployment_state_digest: Option<String> = row.get(15)?;
     let aethyme_version: Option<String> = row.get(16)?;
@@ -2459,12 +2556,20 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> RowResult<Session> {
         },
     );
     Ok((|| {
+        let cleanup_state = cleanup_state?;
         Ok(Session {
             id: row.get(0)?,
             worktree_path: row.get(1)?,
             branch: row.get(2)?,
             origin: SessionOrigin::parse(&origin)?,
-            status: SessionStatus::parse(&status)?,
+            status: match cleanup_state {
+                SessionCleanupState::Closed => SessionStatus::Closed,
+                SessionCleanupState::Cleaned => SessionStatus::Cleaned,
+                SessionCleanupState::Open => SessionStatus::parse(&stored_status)?,
+            },
+            cleanup_state,
+            closed_at: row.get(27)?,
+            cleanup_completed_at: row.get(28)?,
             task: row.get(5)?,
             diff_base: row.get(6)?,
             adoption_base: row.get(7)?,

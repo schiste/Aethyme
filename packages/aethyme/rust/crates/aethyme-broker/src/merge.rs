@@ -26,9 +26,7 @@ use std::path::{Path, PathBuf};
 use crate::broker::{Broker, BrokerOpError};
 use crate::gates::GateRunOutcome;
 use crate::git::GitRepo;
-use crate::types::{
-    AdvisoryEvidence, AdvisorySeverity, MergeQueueEntry, MergeStatus, NewAdvisory, SessionStatus,
-};
+use crate::types::{AdvisoryEvidence, AdvisorySeverity, MergeQueueEntry, MergeStatus, NewAdvisory};
 
 pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
@@ -1254,7 +1252,7 @@ impl Broker {
             let Ok(stale_session) = self.store().session(stale_entry.session_id) else {
                 continue;
             };
-            if stale_session.status == SessionStatus::Cleaned {
+            if stale_session.status.is_closed() {
                 let _ = self.store().set_merge_status(
                     stale_id,
                     MergeStatus::Superseded,

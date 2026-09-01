@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 19;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -476,6 +476,20 @@ CREATE INDEX session_notes_by_sender
     ON session_notes (sender_session_id, id DESC);
 ";
 
+const MIGRATION_V19: &str = "
+-- Logical closure and physical artifact reclamation are separate lifecycle
+-- transitions. Existing terminal sessions are conservatively backfilled as
+-- closed: cleanup can prove and complete absent/retained artifacts later.
+ALTER TABLE sessions ADD COLUMN cleanup_state TEXT NOT NULL DEFAULT 'open'
+    CHECK (cleanup_state IN ('open', 'closed', 'cleaned'));
+ALTER TABLE sessions ADD COLUMN closed_at INTEGER;
+ALTER TABLE sessions ADD COLUMN cleanup_completed_at INTEGER;
+
+UPDATE sessions
+SET cleanup_state = 'closed', closed_at = updated_at
+WHERE status = 'cleaned';
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -495,6 +509,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V16,
     MIGRATION_V17,
     MIGRATION_V18,
+    MIGRATION_V19,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -871,6 +886,58 @@ mod tests {
                 "acknowledged_at",
             ]
         );
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v19_separates_logical_closure_from_physical_cleanup() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS[..18].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sessions (
+                 id, worktree_path, branch, origin, status,
+                 created_at, updated_at, last_activity_at
+             ) VALUES (1, '/tmp/retained', 'agent/retained', 'spawned', 'cleaned', 10, 20, 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (
+                 id, worktree_path, branch, origin, status,
+                 created_at, updated_at, last_activity_at
+             ) VALUES (2, '/tmp/live', 'agent/live', 'spawned', 'active', 10, 20, 10)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let retained: (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT cleanup_state, closed_at, cleanup_completed_at FROM sessions WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, ("closed".into(), Some(20), None));
+        let live: (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT cleanup_state, closed_at, cleanup_completed_at FROM sessions WHERE id = 2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(live, ("open".into(), None, None));
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 }

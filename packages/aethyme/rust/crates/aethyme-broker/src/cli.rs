@@ -60,7 +60,7 @@ Usage:
       Low-level state-only close. Never touches the worktree and does
       not check whether commits were submitted. Prefer finish for normal
       lifecycle use.
-  aethyme broker finish --session <id> [--json]
+  aethyme broker finish --session <id> [--keep-worktree] [--json]
       Higher-level lifecycle close: closes only when the session has no
       dirty WIP and no committed work waiting for submit/promotion. If it
       is not safe, prints the next command; suggests cleanup only when
@@ -1181,6 +1181,7 @@ struct Parsed {
     replace_stale: bool,
     all: bool,
     all_cleaned: bool,
+    keep_worktree: bool,
     chau7: bool,
     fix_version: bool,
     with_gate: bool,
@@ -1246,6 +1247,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         replace_stale: false,
         all: false,
         all_cleaned: false,
+        keep_worktree: false,
         chau7: false,
         fix_version: false,
         with_gate: false,
@@ -1300,6 +1302,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--reuse" => parsed.reuse = true,
             "--all" => parsed.all = true,
             "--all-cleaned" => parsed.all_cleaned = true,
+            "--keep-worktree" => parsed.keep_worktree = true,
             "--chau7" => parsed.chau7 = true,
             "--fix-version" => parsed.fix_version = true,
             "--with-gate" => parsed.with_gate = true,
@@ -2047,6 +2050,43 @@ fn render_finish_report(report: &crate::FinishReport) {
         "  cleanup safe: {}",
         if report.cleanup_safe { "yes" } else { "no" }
     );
+    println!(
+        "  physical cleanup: requested={}, kept={}, attempted={}, completed={}, reclaimed={} bytes",
+        report.cleanup.requested,
+        report.cleanup.kept,
+        report.cleanup.attempted,
+        report.cleanup.completed,
+        report.cleanup.reclaimed_bytes,
+    );
+    println!(
+        "    worktree: {} ({})",
+        report.worktree_path,
+        if report.cleanup.worktree_removed {
+            "removed"
+        } else {
+            "retained"
+        }
+    );
+    if let Some(branch) = &report.cleanup.branch_ref {
+        println!(
+            "    branch: {}{} ({})",
+            branch,
+            report
+                .cleanup
+                .branch_tip
+                .as_deref()
+                .map(|tip| format!(" at {tip}"))
+                .unwrap_or_default(),
+            if report.cleanup.branch_removed {
+                "removed"
+            } else {
+                "retained"
+            }
+        );
+    }
+    if let Some(action) = &report.cleanup.recovery_action {
+        println!("    recovery: {action}");
+    }
     for warning in &report.warnings {
         println!("  warning: {warning}");
     }
@@ -5845,7 +5885,12 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .session
                 .ok_or(UsageError::Message("finish requires --session <id>".into()))?;
             let mut broker = open_broker(parsed.read_only_snapshot)?;
-            let report = broker.finish(session)?;
+            let report = broker.finish_with_options(
+                session,
+                crate::FinishOptions {
+                    keep_worktree: parsed.keep_worktree,
+                },
+            )?;
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
