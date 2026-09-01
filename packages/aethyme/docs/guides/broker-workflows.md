@@ -196,12 +196,40 @@ events arrive through `external-events ingest`; matching changes requested
 becomes a typed advisory and matching approval satisfies review. An older-commit
 approval cannot advance a replacement generation.
 
+Formal GitHub approval is the default evidence adapter. For a reviewer that
+comments but never submits `APPROVED`, configure `github_check_run` instead:
+
+```toml
+[review]
+enabled = true
+evidence_adapter = "github_check_run"
+required_approvals = 0
+evidence_check_name = "review-gate/codex"
+evidence_app_slug = "github-actions"
+unlock_adapter = "github_label"
+unlock_label = "aethyme-validation-ready"
+```
+
+The named check must be a trusted repository control that translates the
+reviewer's native evidence. A robust adapter verifies the reviewer identity,
+binds its structured status to the full current head SHA, and refuses while
+that reviewer owns any unresolved thread on the head. Aethyme then verifies
+the resulting check's exact name, app, head, status, and conclusion. It never
+parses review comment bodies or treats a reaction as authorization. Prefer a
+dedicated GitHub App; when using `github-actions`, ensure pull requests cannot
+replace or spoof the workflow that creates the check.
+
 Inspect state locally and unlock only after review evidence is current:
 
 ```bash
 aethyme broker review show --session 111 --json
 aethyme broker review unlock --session 111
 ```
+
+`review unlock` polls live evidence. A successful trusted check can advance
+directly from `review_requested`, which covers reviewers whose all-clear signal
+has no webhook. Wrong-actor, stale-head, unsuccessful, missing, truncated, and
+unavailable evidence fails closed without running the unlock mutation.
 
 Every GitHub write uses the coordinated operation journal. A failed or
 crash-ambiguous transition leaves lifecycle state unchanged and blocks blind

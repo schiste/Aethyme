@@ -26,6 +26,19 @@ impl Default for ReviewProvider {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ReviewEvidenceAdapter {
+    GithubApproval,
+    GithubCheckRun,
+}
+
+impl Default for ReviewEvidenceAdapter {
+    fn default() -> Self {
+        Self::GithubApproval
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ValidationUnlockAdapter {
     GithubLabel,
     GithubWorkflow,
@@ -44,7 +57,10 @@ pub struct ReviewPolicy {
     pub schema_version: u32,
     pub enabled: bool,
     pub provider: ReviewProvider,
+    pub evidence_adapter: ReviewEvidenceAdapter,
     pub required_approvals: u32,
+    pub evidence_check_name: Option<String>,
+    pub evidence_app_slug: Option<String>,
     pub unlock_adapter: ValidationUnlockAdapter,
     pub unlock_label: String,
     pub workflow: Option<String>,
@@ -56,7 +72,10 @@ impl Default for ReviewPolicy {
             schema_version: REVIEW_POLICY_SCHEMA_VERSION,
             enabled: false,
             provider: ReviewProvider::Github,
+            evidence_adapter: ReviewEvidenceAdapter::GithubApproval,
             required_approvals: 1,
+            evidence_check_name: None,
+            evidence_app_slug: None,
             unlock_adapter: ValidationUnlockAdapter::GithubLabel,
             unlock_label: "aethyme-validation-ready".into(),
             workflow: None,
@@ -106,11 +125,37 @@ impl ReviewPolicy {
                 ),
             });
         }
-        if self.required_approvals != 1 {
-            return Err(BrokerOpError::ReviewLifecycle {
-                reason: "the schema-1 GitHub evidence adapter requires review.required_approvals = 1; do not approximate distinct-reviewer evidence"
-                    .into(),
-            });
+        match self.evidence_adapter {
+            ReviewEvidenceAdapter::GithubApproval => {
+                if self.required_approvals != 1 {
+                    return Err(BrokerOpError::ReviewLifecycle {
+                        reason: "the github_approval evidence adapter requires review.required_approvals = 1; do not approximate distinct-reviewer evidence"
+                            .into(),
+                    });
+                }
+                if self.evidence_check_name.is_some() || self.evidence_app_slug.is_some() {
+                    return Err(BrokerOpError::ReviewLifecycle {
+                        reason: "review.evidence_check_name and review.evidence_app_slug are valid only with github_check_run evidence"
+                            .into(),
+                    });
+                }
+            }
+            ReviewEvidenceAdapter::GithubCheckRun => {
+                if self.required_approvals != 0 {
+                    return Err(BrokerOpError::ReviewLifecycle {
+                        reason: "the github_check_run evidence adapter requires review.required_approvals = 0"
+                            .into(),
+                    });
+                }
+                validate_policy_token(
+                    "review.evidence_check_name",
+                    self.evidence_check_name.as_deref(),
+                )?;
+                validate_policy_token(
+                    "review.evidence_app_slug",
+                    self.evidence_app_slug.as_deref(),
+                )?;
+            }
         }
         if self.unlock_label.is_empty()
             || self.unlock_label.len() > 100
@@ -136,6 +181,18 @@ impl ReviewPolicy {
             _ => Ok(()),
         }
     }
+}
+
+fn validate_policy_token(name: &str, value: Option<&str>) -> Result<(), BrokerOpError> {
+    let Some(value) = value else {
+        return review_error(&format!("{name} is required"));
+    };
+    if value.is_empty() || value.len() > 100 || value.chars().any(char::is_control) {
+        return review_error(&format!(
+            "{name} must contain 1..=100 non-control characters"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -216,7 +273,35 @@ pub struct ReviewLifecycleReport {
     pub next_action: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "adapter", rename_all = "snake_case")]
+pub enum ReviewSatisfactionEvidence {
+    GithubApproval {
+        satisfied: bool,
+        review_decision: Option<String>,
+    },
+    GithubCheckRun {
+        satisfied: bool,
+        check_name: String,
+        app_slug: String,
+        check_run_id: Option<u64>,
+        status: Option<String>,
+        conclusion: Option<String>,
+        head_sha: String,
+    },
+}
+
+impl ReviewSatisfactionEvidence {
+    pub fn is_satisfied(&self) -> bool {
+        match self {
+            Self::GithubApproval { satisfied, .. } | Self::GithubCheckRun { satisfied, .. } => {
+                *satisfied
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ReviewProviderSnapshot {
     pub repository: String,
     pub pr_number: i64,
@@ -225,12 +310,14 @@ pub struct ReviewProviderSnapshot {
     pub state: String,
     pub is_draft: bool,
     pub review_decision: Option<String>,
+    pub satisfaction_evidence: ReviewSatisfactionEvidence,
 }
 
 pub fn load_review_provider_snapshot(
     cwd: &Path,
     repository: &str,
     pr_number: i64,
+    policy: &ReviewPolicy,
 ) -> Result<ReviewProviderSnapshot, BrokerOpError> {
     if pr_number <= 0 {
         return review_error("pull request number must be positive");
@@ -272,6 +359,29 @@ pub fn load_review_provider_snapshot(
         return review_error("GitHub review evidence returned a different pull request number");
     }
     validate_full_sha(head_sha)?;
+    let review_decision = value
+        .get("reviewDecision")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let satisfaction_evidence = match policy.evidence_adapter {
+        ReviewEvidenceAdapter::GithubApproval => ReviewSatisfactionEvidence::GithubApproval {
+            satisfied: review_decision.as_deref() == Some("APPROVED"),
+            review_decision: review_decision.clone(),
+        },
+        ReviewEvidenceAdapter::GithubCheckRun => load_check_run_evidence(
+            cwd,
+            &target.display_slug,
+            head_sha,
+            policy
+                .evidence_check_name
+                .as_deref()
+                .expect("validated check name"),
+            policy
+                .evidence_app_slug
+                .as_deref()
+                .expect("validated app slug"),
+        )?,
+    };
     Ok(ReviewProviderSnapshot {
         repository: target.coordination_key,
         pr_number,
@@ -279,11 +389,116 @@ pub fn load_review_provider_snapshot(
         head_sha: head_sha.into(),
         state: state.into(),
         is_draft,
-        review_decision: value
-            .get("reviewDecision")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
+        review_decision,
+        satisfaction_evidence,
     })
+}
+
+fn load_check_run_evidence(
+    cwd: &Path,
+    repository: &str,
+    head_sha: &str,
+    check_name: &str,
+    app_slug: &str,
+) -> Result<ReviewSatisfactionEvidence, BrokerOpError> {
+    let endpoint = format!(
+        "repos/{repository}/commits/{head_sha}/check-runs?check_name={}&filter=latest&per_page=100",
+        percent_encode_query(check_name)
+    );
+    let output = Command::new("gh")
+        .args([
+            "api",
+            "--method",
+            "GET",
+            "-H",
+            "Accept: application/vnd.github+json",
+            &endpoint,
+        ])
+        .current_dir(cwd)
+        .output()
+        .map_err(|_| BrokerOpError::ReviewLifecycle {
+            reason: "GitHub check-run review evidence is unavailable".into(),
+        })?;
+    if !output.status.success() {
+        return review_error(
+            "GitHub check-run review evidence is unavailable; no transition was attempted",
+        );
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|_| BrokerOpError::ReviewLifecycle {
+            reason: "GitHub returned invalid check-run review evidence".into(),
+        })?;
+    parse_check_run_evidence(&value, head_sha, check_name, app_slug)
+}
+
+fn parse_check_run_evidence(
+    value: &serde_json::Value,
+    head_sha: &str,
+    check_name: &str,
+    app_slug: &str,
+) -> Result<ReviewSatisfactionEvidence, BrokerOpError> {
+    let total_count = value
+        .get("total_count")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| BrokerOpError::ReviewLifecycle {
+            reason: "GitHub check-run evidence omitted total_count".into(),
+        })?;
+    let runs = value
+        .get("check_runs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| BrokerOpError::ReviewLifecycle {
+            reason: "GitHub check-run evidence omitted check_runs".into(),
+        })?;
+    if total_count > runs.len() as u64 {
+        return review_error("GitHub check-run evidence was truncated; refusing partial evidence");
+    }
+    let selected = runs
+        .iter()
+        .filter(|run| {
+            run.get("name").and_then(serde_json::Value::as_str) == Some(check_name)
+                && run.get("head_sha").and_then(serde_json::Value::as_str) == Some(head_sha)
+                && run
+                    .get("app")
+                    .and_then(|app| app.get("slug"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(app_slug)
+        })
+        .max_by_key(|run| {
+            run.get("id")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        });
+    let check_run_id = selected.and_then(|run| run.get("id")?.as_u64());
+    let status = selected
+        .and_then(|run| run.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let conclusion = selected
+        .and_then(|run| run.get("conclusion"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    Ok(ReviewSatisfactionEvidence::GithubCheckRun {
+        satisfied: status.as_deref() == Some("completed")
+            && conclusion.as_deref() == Some("success"),
+        check_name: check_name.into(),
+        app_slug: app_slug.into(),
+        check_run_id,
+        status,
+        conclusion,
+        head_sha: head_sha.into(),
+    })
+}
+
+fn percent_encode_query(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
 }
 
 impl Broker {
@@ -456,25 +671,32 @@ impl Broker {
     ) -> Result<ReviewLifecycleReport, BrokerOpError> {
         let policy = ReviewPolicy::load(&self.main_root_path())?;
         require_enabled(&policy)?;
-        let current = required_lifecycle(self, session_id)?;
+        let mut current = required_lifecycle(self, session_id)?;
         if current.state == ReviewLifecycleState::ValidationUnlocked {
             validate_snapshot(&current, snapshot, false)?;
-            if snapshot.review_decision.as_deref() != Some("APPROVED") {
-                return review_error(
-                    "current provider evidence does not report an approved review decision",
-                );
-            }
+            require_satisfied_evidence(snapshot)?;
             return Ok(report(policy, current, false, None));
         }
-        if current.state != ReviewLifecycleState::ReviewSatisfied {
-            return review_error("validation unlock requires review_satisfied state");
-        }
-        validate_snapshot(&current, snapshot, false)?;
-        if snapshot.review_decision.as_deref() != Some("APPROVED") {
+        if current.state == ReviewLifecycleState::ReviewRequested {
+            validate_snapshot(&current, snapshot, false)?;
+            require_satisfied_evidence(snapshot)?;
+            current = self.store().transition_review_lifecycle(
+                current.id,
+                current.state,
+                ReviewLifecycleState::ReviewSatisfied,
+                current.queue_entry_id,
+                &current.commit_sha,
+                Some(&snapshot_digest(snapshot)),
+                None,
+                now,
+            )?;
+        } else if current.state != ReviewLifecycleState::ReviewSatisfied {
             return review_error(
-                "current provider evidence does not report an approved review decision",
+                "validation unlock requires review_requested or review_satisfied state",
             );
         }
+        validate_snapshot(&current, snapshot, false)?;
+        require_satisfied_evidence(snapshot)?;
         let args = match policy.unlock_adapter {
             ValidationUnlockAdapter::GithubLabel => vec![
                 "pr".into(),
@@ -559,7 +781,10 @@ impl Broker {
             {
                 ReviewLifecycleState::ChangesRequested
             }
-            "review_approved" if current.state == ReviewLifecycleState::ReviewRequested => {
+            "review_approved"
+                if policy.evidence_adapter == ReviewEvidenceAdapter::GithubApproval
+                    && current.state == ReviewLifecycleState::ReviewRequested =>
+            {
                 ReviewLifecycleState::ReviewSatisfied
             }
             _ => return Ok(()),
@@ -638,6 +863,24 @@ fn validate_snapshot_identity(
     Ok(())
 }
 
+fn require_satisfied_evidence(snapshot: &ReviewProviderSnapshot) -> Result<(), BrokerOpError> {
+    if snapshot.satisfaction_evidence.is_satisfied() {
+        return Ok(());
+    }
+    match &snapshot.satisfaction_evidence {
+        ReviewSatisfactionEvidence::GithubApproval { .. } => {
+            review_error("current provider evidence does not report an approved review decision")
+        }
+        ReviewSatisfactionEvidence::GithubCheckRun {
+            check_name,
+            app_slug,
+            ..
+        } => review_error(&format!(
+            "current provider evidence does not report a successful {check_name:?} check from GitHub App {app_slug:?} on the exact pull request head"
+        )),
+    }
+}
+
 fn validate_full_sha(value: &str) -> Result<(), BrokerOpError> {
     if value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
@@ -647,19 +890,21 @@ fn validate_full_sha(value: &str) -> Result<(), BrokerOpError> {
 }
 
 fn snapshot_digest(snapshot: &ReviewProviderSnapshot) -> String {
-    crate::sha256_bytes(
-        format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}",
-            snapshot.repository,
-            snapshot.pr_number,
-            snapshot.target_branch,
-            snapshot.head_sha,
-            snapshot.state,
-            snapshot.is_draft,
-            snapshot.review_decision.as_deref().unwrap_or("")
-        )
-        .as_bytes(),
+    let evidence = serde_json::to_vec(&snapshot.satisfaction_evidence)
+        .expect("review satisfaction evidence is serializable");
+    let mut bytes = format!(
+        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0",
+        snapshot.repository,
+        snapshot.pr_number,
+        snapshot.target_branch,
+        snapshot.head_sha,
+        snapshot.state,
+        snapshot.is_draft,
+        snapshot.review_decision.as_deref().unwrap_or("")
     )
+    .into_bytes();
+    bytes.extend(evidence);
+    crate::sha256_bytes(&bytes)
 }
 
 fn display_slug(repository: &str) -> String {
@@ -777,6 +1022,7 @@ mod tests {
     }
 
     fn snapshot(head: &str) -> ReviewProviderSnapshot {
+        let review_decision = None;
         ReviewProviderSnapshot {
             repository: "github.com/acme/product".into(),
             pr_number: 42,
@@ -784,7 +1030,11 @@ mod tests {
             head_sha: head.into(),
             state: "OPEN".into(),
             is_draft: true,
-            review_decision: None,
+            review_decision: review_decision.clone(),
+            satisfaction_evidence: ReviewSatisfactionEvidence::GithubApproval {
+                satisfied: false,
+                review_decision,
+            },
         }
     }
 
@@ -811,6 +1061,85 @@ mod tests {
         assert!(policy.enabled);
         assert_eq!(policy.required_approvals, 1);
         assert_eq!(policy.unlock_adapter, ValidationUnlockAdapter::GithubLabel);
+    }
+
+    #[test]
+    fn review_evidence_policy_is_explicit_and_adapter_specific() {
+        let default = ReviewPolicy::default();
+        assert_eq!(
+            default.evidence_adapter,
+            ReviewEvidenceAdapter::GithubApproval
+        );
+        default.validate().unwrap();
+
+        let check_run = ReviewPolicy {
+            evidence_adapter: ReviewEvidenceAdapter::GithubCheckRun,
+            required_approvals: 0,
+            evidence_check_name: Some("review-gate/codex".into()),
+            evidence_app_slug: Some("github-actions".into()),
+            ..ReviewPolicy::default()
+        };
+        check_run.validate().unwrap();
+
+        let missing_actor = ReviewPolicy {
+            evidence_app_slug: None,
+            ..check_run.clone()
+        };
+        assert!(
+            missing_actor
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("evidence_app_slug is required")
+        );
+        let mixed = ReviewPolicy {
+            evidence_adapter: ReviewEvidenceAdapter::GithubApproval,
+            required_approvals: 1,
+            ..check_run
+        };
+        assert!(
+            mixed
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("valid only with github_check_run")
+        );
+    }
+
+    #[test]
+    fn check_run_evidence_is_exact_head_actor_bounded_and_deterministic() {
+        let head = "a".repeat(40);
+        let other = "b".repeat(40);
+        let value = serde_json::json!({
+            "total_count": 4,
+            "check_runs": [
+                {"id": 8, "name": "review-gate/codex", "head_sha": head, "status": "completed", "conclusion": "success", "app": {"slug": "untrusted"}},
+                {"id": 9, "name": "review-gate/codex", "head_sha": other, "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}},
+                {"id": 10, "name": "review-gate/codex", "head_sha": head, "status": "completed", "conclusion": "failure", "app": {"slug": "github-actions"}},
+                {"id": 11, "name": "review-gate/codex", "head_sha": head, "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}}
+            ]
+        });
+        let evidence =
+            parse_check_run_evidence(&value, &head, "review-gate/codex", "github-actions").unwrap();
+        assert!(evidence.is_satisfied());
+        assert!(matches!(
+            evidence,
+            ReviewSatisfactionEvidence::GithubCheckRun {
+                check_run_id: Some(11),
+                ..
+            }
+        ));
+
+        let truncated = serde_json::json!({
+            "total_count": 101,
+            "check_runs": []
+        });
+        assert!(
+            parse_check_run_evidence(&truncated, &head, "review-gate/codex", "github-actions")
+                .unwrap_err()
+                .to_string()
+                .contains("truncated")
+        );
     }
 
     #[test]

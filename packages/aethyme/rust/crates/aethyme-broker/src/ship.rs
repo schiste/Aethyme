@@ -980,10 +980,12 @@ fn authorize_publication(
             .repository
             .strip_prefix("github.com/")
             .unwrap_or(&lifecycle.repository);
+        let review_policy = crate::ReviewPolicy::load(broker.main_root())?;
         let snapshot = crate::load_review_provider_snapshot(
             broker.main_root(),
             repository,
             lifecycle.pr_number,
+            &review_policy,
         )?;
         let live_valid = snapshot.repository == lifecycle.repository
             && snapshot.pr_number == lifecycle.pr_number
@@ -991,11 +993,11 @@ fn authorize_publication(
             && snapshot.head_sha == lifecycle.commit_sha
             && snapshot.state == "OPEN"
             && !snapshot.is_draft
-            && snapshot.review_decision.as_deref() == Some("APPROVED");
+            && snapshot.satisfaction_evidence.is_satisfied();
         if !live_valid {
             return Err(BrokerOpError::ShipPublicationPolicy {
                 reason: format!(
-                    "live review evidence for PR #{} no longer matches its approved exact commit and base",
+                    "live review evidence for PR #{} no longer matches its satisfied exact commit and base",
                     lifecycle.pr_number
                 ),
                 remediation: format!(

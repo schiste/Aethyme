@@ -1112,18 +1112,49 @@ delays expensive validation until review is complete may add:
 schema_version = 1
 enabled = true
 provider = "github"
+evidence_adapter = "github_approval"
 required_approvals = 1
 unlock_adapter = "github_label"
 unlock_label = "aethyme-validation-ready"
 ```
 
-Schema 1 accepts exactly one required approval because the redacted external
-event contract does not claim distinct reviewer identity. Higher thresholds
-are refused rather than approximated. `github_workflow` is also available with
+The default `github_approval` evidence adapter accepts exactly one required
+approval because the redacted external event contract does not claim distinct
+reviewer identity. Higher thresholds are refused rather than approximated.
+`github_workflow` is also available with
 an explicit `workflow` value. `cloud_build_manual_trigger` is a declared
 adapter boundary only: the core broker refuses to execute it and never asks
 for GCP credentials. A repository-owned authenticated adapter may perform that
 provider-specific action after inspecting the broker state.
+
+Comment-only reviewers can be integrated through a repository-owned check
+that converts their provider-specific result into GitHub-native, head-bound
+evidence:
+
+```toml
+[review]
+schema_version = 1
+enabled = true
+provider = "github"
+evidence_adapter = "github_check_run"
+required_approvals = 0
+evidence_check_name = "review-gate/codex"
+evidence_app_slug = "github-actions"
+unlock_adapter = "github_label"
+unlock_label = "aethyme-validation-ready"
+```
+
+This adapter is explicit and does not treat comments, reactions, timestamps,
+or arbitrary checks as approvals. It queries at most 100 latest runs with the
+exact configured name, then requires `completed`/`success`, the current full
+PR head SHA, and the exact GitHub App slug. Truncated or unavailable results
+are refused. The repository-owned check remains responsible for interpreting
+the reviewer's native signals—for example, verifying a trusted comment author,
+matching structured completion rows to the current head, and counting no
+unresolved actor-owned threads. Protect that workflow from pull-request
+modification, or use a dedicated GitHub App; the broad `github-actions` App
+identity is safe only when the workflow producing the named check is itself a
+trusted repository control.
 
 Register only after the draft PR exists and its head is the live session HEAD:
 
@@ -1144,7 +1175,8 @@ submission after `changes_requested` binds the new exact commit and restarts
 review without pretending the already-ready PR became draft again.
 
 Authenticated `review_changes_requested` and `review_approved` external events
-advance the same lifecycle only when their repository, PR, and commit match.
+advance the approval-backed lifecycle only when their repository, PR, and
+commit match. An approval event does not satisfy a check-run-backed policy.
 Feedback still creates an ordinary typed session advisory and never embeds
 task text, review bodies, or diffs. A changes-requested event wins over an
 approval for the same generation; approvals for an older SHA are stale and do
@@ -1157,9 +1189,11 @@ aethyme broker review show --session 111 --json
 aethyme broker review unlock --session 111 --json
 ```
 
-Unlock re-fetches evidence and refuses a changed base or head, draft/closed PR,
-dismissed approval, or provider outage before mutation. The configured label
-or workflow write is coordinated and journaled. Only proven success records
+Unlock polls the configured evidence and refuses a changed base or head,
+draft/closed PR, dismissed approval, unsuccessful/wrong-app check, truncated
+result, or provider outage before mutation. A satisfied exact-head check can
+advance `review_requested` without a webhook. The configured label or workflow
+write is coordinated and journaled. Only proven success records
 `validation_unlocked`; an unknown outcome activates the existing host-wide
 write barrier and blind retry remains forbidden. Repeated proven transitions
 are idempotent. This lifecycle authorizes publication only when the exact

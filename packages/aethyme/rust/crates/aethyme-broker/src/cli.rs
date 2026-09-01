@@ -286,7 +286,7 @@ Usage:
       After a successful broker submission, revalidate GitHub evidence and
       coordinate the idempotent ready-for-review write.
   aethyme broker review unlock --session <id> [--json]
-      After review is satisfied, revalidate approval/head/base/open evidence
+      Poll and revalidate configured review/head/base/open evidence, then
       and run the configured validation-unlock adapter exactly once.
   aethyme broker submit --session <id> [--no-cache] [--json]
       Submit the session's head commit: simulate the merge onto the local
@@ -3443,11 +3443,13 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
                 )
             })?;
             let mut broker = open_broker(parsed.read_only_snapshot)?;
+            let policy = crate::ReviewPolicy::load(broker.main_root())?;
             let session = broker.store().session(session_id)?;
             let snapshot = crate::load_review_provider_snapshot(
                 Path::new(&session.worktree_path),
                 repository,
                 pr_number,
+                &policy,
             )?;
             let report =
                 broker.register_review_lifecycle(session_id, repository, &snapshot, now_ms())?;
@@ -3477,6 +3479,7 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
                 .review_lifecycle_for_session(session_id)?
                 .ok_or(crate::BrokerError::ReviewLifecycleNotFound(session_id))?;
             let session = broker.store().session(session_id)?;
+            let policy = crate::ReviewPolicy::load(broker.main_root())?;
             let repository = lifecycle
                 .repository
                 .strip_prefix("github.com/")
@@ -3485,6 +3488,7 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
                 Path::new(&session.worktree_path),
                 repository,
                 lifecycle.pr_number,
+                &policy,
             )?;
             let report = if action == "request" {
                 broker.request_review(session_id, &snapshot, now_ms())?

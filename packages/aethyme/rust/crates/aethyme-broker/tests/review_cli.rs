@@ -39,14 +39,16 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::new_with_policy(
+            "[review]\nenabled = true\nrequired_approvals = 1\nunlock_adapter = \"github_label\"\nunlock_label = \"validation-ready\"\n\n[publication]\nmode = \"review_gated\"\nallow_break_glass = true\n",
+        )
+    }
+
+    fn new_with_policy(policy: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         git(root.path(), &["init", "-q", "-b", "main"]);
         std::fs::create_dir_all(root.path().join(".aethyme")).unwrap();
-        std::fs::write(
-            root.path().join(".aethyme/config.toml"),
-            "[review]\nenabled = true\nrequired_approvals = 1\nunlock_adapter = \"github_label\"\nunlock_label = \"validation-ready\"\n\n[publication]\nmode = \"review_gated\"\nallow_break_glass = true\n",
-        )
-        .unwrap();
+        std::fs::write(root.path().join(".aethyme/config.toml"), policy).unwrap();
         std::fs::write(
             root.path().join(".gitignore"),
             "/.aethyme/broker.db*\n/remote.git/\n/fake-bin/\n/gh-writes\n/host-state/\n",
@@ -86,6 +88,13 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   printf '{"number":42,"baseRefName":"%s","headRefOid":"%s","state":"%s","isDraft":%s,"reviewDecision":%s}\n' \
     "${AETHYME_REVIEW_BASE:-main}" "$AETHYME_REVIEW_HEAD" "${AETHYME_REVIEW_STATE:-OPEN}" \
     "${AETHYME_REVIEW_DRAFT:-true}" "${AETHYME_REVIEW_DECISION:-null}"
+  exit 0
+fi
+if [ "$1" = "api" ]; then
+  if [ "$AETHYME_FAKE_GH_MODE" = "check-outage" ]; then
+    exit 1
+  fi
+  printf '%s\n' "$AETHYME_CHECK_RUNS"
   exit 0
 fi
 printf '%s %s\n' "$1" "$2" >> "$AETHYME_REVIEW_WRITES"
@@ -147,6 +156,36 @@ exit 64
         decision: Option<&str>,
         mode: Option<&str>,
     ) -> Output {
+        self.command_with_evidence(args, head, base, state, draft, decision, mode)
+            .output()
+            .unwrap()
+    }
+
+    fn run_with_check(
+        &self,
+        args: &[&str],
+        head: &str,
+        draft: bool,
+        check_runs: &str,
+        mode: Option<&str>,
+    ) -> Output {
+        self.command_with_evidence(args, head, "main", "OPEN", draft, None, mode)
+            .env("AETHYME_CHECK_RUNS", check_runs)
+            .output()
+            .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn command_with_evidence(
+        &self,
+        args: &[&str],
+        head: &str,
+        base: &str,
+        state: &str,
+        draft: bool,
+        decision: Option<&str>,
+        mode: Option<&str>,
+    ) -> Command {
         let path = format!(
             "{}:{}",
             self.fake_bin.display(),
@@ -171,7 +210,7 @@ exit 64
         if let Some(mode) = mode {
             command.env("AETHYME_FAKE_GH_MODE", mode);
         }
-        command.output().unwrap()
+        command
     }
 
     fn writes(&self) -> String {
@@ -206,6 +245,21 @@ fn envelope(id: &str, event_type: &str, commit: &str) -> ExternalEventEnvelope {
     };
     envelope.normalized_digest = external_event_digest(&envelope);
     envelope
+}
+
+fn check_run_evidence(head: &str, app_slug: &str, conclusion: &str) -> String {
+    serde_json::json!({
+        "total_count": 1,
+        "check_runs": [{
+            "id": 91,
+            "name": "review-gate/codex",
+            "head_sha": head,
+            "status": "completed",
+            "conclusion": conclusion,
+            "app": {"slug": app_slug}
+        }]
+    })
+    .to_string()
 }
 
 fn promoted_review_candidate(fixture: &Fixture) -> (String, String, i64) {
@@ -761,6 +815,137 @@ fn review_cli_default_profile_and_provider_outage_do_not_mutate_state() {
     assert!(!show.status.success());
     assert!(String::from_utf8_lossy(&show.stderr).contains("no review lifecycle"));
     assert!(fixture.writes().is_empty());
+}
+
+#[test]
+fn trusted_check_run_can_satisfy_review_without_an_approval_webhook() {
+    let fixture = Fixture::new_with_policy(
+        "[review]\nenabled = true\nevidence_adapter = \"github_check_run\"\nrequired_approvals = 0\nevidence_check_name = \"review-gate/codex\"\nevidence_app_slug = \"github-actions\"\nunlock_adapter = \"github_label\"\nunlock_label = \"validation-ready\"\n\n[publication]\nmode = \"review_gated\"\nallow_break_glass = true\n",
+    );
+    let adopt = fixture.run(&["adopt", "--task", "bot review", "--json"], "", true, None);
+    assert!(adopt.status.success());
+    let session: serde_json::Value = serde_json::from_slice(&adopt.stdout).unwrap();
+    let id = session["id"].as_i64().unwrap().to_string();
+    std::fs::write(fixture.root.path().join("README.md"), "candidate\n").unwrap();
+    git(fixture.root.path(), &["add", "README.md"]);
+    git(fixture.root.path(), &["commit", "-qm", "candidate"]);
+    let head = git(fixture.root.path(), &["rev-parse", "HEAD"]);
+    let empty = r#"{"total_count":0,"check_runs":[]}"#;
+
+    for args in [
+        vec![
+            "review",
+            "register",
+            "--session",
+            &id,
+            "--repo",
+            "acme/product",
+            "--pr",
+            "42",
+            "--json",
+        ],
+        vec!["submit", "--session", &id, "--json"],
+        vec!["review", "request", "--session", &id, "--json"],
+    ] {
+        let output = fixture.run_with_check(&args, &head, true, empty, None);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let approval_path = fixture.root.path().join("formal-approval.json");
+    std::fs::write(
+        &approval_path,
+        serde_json::to_vec(&envelope("ignored-approval", "review_approved", &head)).unwrap(),
+    )
+    .unwrap();
+    let ignored = fixture.run_with_check(
+        &[
+            "external-events",
+            "ingest",
+            approval_path.to_str().unwrap(),
+            "--json",
+        ],
+        &head,
+        false,
+        empty,
+        None,
+    );
+    assert!(ignored.status.success());
+    let shown = fixture.run(
+        &["review", "show", "--session", &id, "--json"],
+        "",
+        false,
+        None,
+    );
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["lifecycle"]["state"], "review_requested");
+
+    let wrong_actor = check_run_evidence(&head, "untrusted", "success");
+    let refused = fixture.run_with_check(
+        &["review", "unlock", "--session", &id, "--json"],
+        &head,
+        false,
+        &wrong_actor,
+        None,
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("exact pull request head"));
+
+    let truncated = r#"{"total_count":101,"check_runs":[]}"#;
+    let refused = fixture.run_with_check(
+        &["review", "unlock", "--session", &id, "--json"],
+        &head,
+        false,
+        truncated,
+        None,
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("truncated"));
+
+    let satisfied = check_run_evidence(&head, "github-actions", "success");
+    let unlocked = fixture.run_with_check(
+        &["review", "unlock", "--session", &id, "--json"],
+        &head,
+        false,
+        &satisfied,
+        None,
+    );
+    assert!(
+        unlocked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unlocked.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&unlocked.stdout).unwrap();
+    assert_eq!(report["lifecycle"]["state"], "validation_unlocked");
+    assert_eq!(report["policy"]["evidence_adapter"], "github_check_run");
+    assert_eq!(
+        fixture
+            .writes()
+            .lines()
+            .filter(|line| *line == "pr edit")
+            .count(),
+        1
+    );
+
+    let repeated = fixture.run_with_check(
+        &["review", "unlock", "--session", &id, "--json"],
+        &head,
+        false,
+        &satisfied,
+        None,
+    );
+    assert!(repeated.status.success());
+    assert_eq!(
+        fixture
+            .writes()
+            .lines()
+            .filter(|line| *line == "pr edit")
+            .count(),
+        1
+    );
 }
 
 #[test]
