@@ -4,6 +4,40 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.1] - 2026-09-01
+
+### Added
+
+- Closed review lifecycles can be reassigned to an exact-head live session or
+  explicitly abandoned without deleting state, evidence, or generation
+  history.
+- Checkpoint recovery plans expose stable refusal codes and ordered,
+  preservation-first next actions in JSON.
+
+### Changed
+
+- Closed sessions remain available for diagnostics but cannot claim leases or
+  run review mutations.
+- `broker repair` is limited to recorded submit and promoted-path conflicts;
+  checkpoint drift now routes directly to the dedicated checkpoint planner.
+- The maintainer release contract now records patch increments as the default;
+  changing either leading version component requires explicit maintainer
+  authorization.
+
+### Fixed
+
+- A session closed during draft/review coordination no longer leaves its pull
+  request identity permanently locked without a supported recovery path.
+- Rejected closed-session lease claims no longer persist phantom ownership.
+- Unsafe checkpoint recovery no longer recommends repeatedly rebasing onto an
+  integration history that can contain unrelated promoted work.
+
+### Upgrade notes
+
+Read [Upgrading to v0.7.1](packages/aethyme/docs/guides/upgrading-to-v0.7.1.md)
+before updating. Broker storage migrates from schema 24 to 25; repository
+deployment and engine protocol remain unchanged.
+
 ## [0.7.0] - 2026-09-01
 
 ### Added
