@@ -178,6 +178,45 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
 }
 
 #[test]
+fn closed_session_lease_claim_fails_without_persisting_a_phantom_lease() {
+    let tmp = fixture();
+    let worktree = add_worktree(tmp.path(), "closed-owner");
+    let session_id = {
+        let mut broker = Broker::open(tmp.path()).unwrap();
+        let session = broker.adopt(&worktree, None).unwrap();
+        broker.close(session.id).unwrap();
+        session.id
+    };
+
+    let output = run(
+        tmp.path(),
+        &[
+            "leases",
+            "claim",
+            "src/owned.rs",
+            "--session",
+            &session_id.to_string(),
+            "--json",
+        ],
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("is closed and cannot authorize coordinated operations"),
+        "{error}"
+    );
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    assert!(
+        broker
+            .store()
+            .session_leases(session_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn lease_plan_cli_requires_paths_and_rejects_ambiguous_spelling() {
     let tmp = fixture();
     Broker::open(tmp.path()).unwrap();

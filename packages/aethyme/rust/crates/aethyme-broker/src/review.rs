@@ -688,7 +688,7 @@ impl Broker {
     ) -> Result<ReviewLifecycleReport, BrokerOpError> {
         let policy = ReviewPolicy::load(&self.main_root_path())?;
         require_enabled(&policy)?;
-        let current = required_lifecycle(self, session_id)?;
+        let current = required_live_lifecycle(self, session_id)?;
         if matches!(
             current.state,
             ReviewLifecycleState::ReviewRequested
@@ -760,7 +760,7 @@ impl Broker {
     ) -> Result<ReviewLifecycleReport, BrokerOpError> {
         let policy = ReviewPolicy::load(&self.main_root_path())?;
         require_enabled(&policy)?;
-        let mut current = required_lifecycle(self, session_id)?;
+        let mut current = required_live_lifecycle(self, session_id)?;
         if current.state == ReviewLifecycleState::ValidationUnlocked {
             validate_snapshot(&current, snapshot, false)?;
             require_satisfied_evidence(snapshot)?;
@@ -902,6 +902,20 @@ fn required_lifecycle(
         .ok_or_else(|| BrokerOpError::ReviewLifecycle {
             reason: format!("session {session_id} has no review lifecycle"),
         })
+}
+
+fn required_live_lifecycle(
+    broker: &mut Broker,
+    session_id: i64,
+) -> Result<ReviewLifecycle, BrokerOpError> {
+    let lifecycle = required_lifecycle(broker, session_id)?;
+    let session = broker.store().session(session_id)?;
+    if session.status.is_closed() {
+        return review_error(&format!(
+            "session {session_id} is closed; `review show` remains available for diagnostics, but review mutations require `aethyme broker review reassign --session {session_id} --to-session <live-id> --reason <text>` or `aethyme broker review abandon --session {session_id} --reason <text>`"
+        ));
+    }
+    Ok(lifecycle)
 }
 
 fn review_recovery_reason_digest(reason: &str) -> Result<String, BrokerOpError> {

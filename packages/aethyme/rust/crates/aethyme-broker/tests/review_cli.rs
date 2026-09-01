@@ -1071,6 +1071,28 @@ fn closed_review_lifecycle_can_be_reassigned_or_abandoned_without_losing_audit_h
         None,
     );
     assert!(close.status.success());
+    let show_closed = fixture.run(
+        &["review", "show", "--session", &original_id, "--json"],
+        &head,
+        true,
+        None,
+    );
+    assert!(show_closed.status.success());
+    let mutate_closed = fixture.run_with_evidence(
+        &["review", "request", "--session", &original_id, "--json"],
+        &head,
+        "main",
+        "OPEN",
+        true,
+        None,
+        Some("outage"),
+    );
+    assert!(!mutate_closed.status.success());
+    let closed_error = String::from_utf8_lossy(&mutate_closed.stderr);
+    assert!(closed_error.contains("session") && closed_error.contains("is closed"));
+    assert!(closed_error.contains("review reassign"));
+    assert!(closed_error.contains("review abandon"));
+    assert!(!closed_error.contains("evidence is unavailable"));
 
     let replacement = fixture.run(
         &["start", "--task", "replacement review owner", "--json"],

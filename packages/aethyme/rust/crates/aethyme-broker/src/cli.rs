@@ -3490,6 +3490,11 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
                 .review_lifecycle_for_session(session_id)?
                 .ok_or(crate::BrokerError::ReviewLifecycleNotFound(session_id))?;
             let session = broker.store().session(session_id)?;
+            if session.status.is_closed() {
+                return Err(UsageError::Message(format!(
+                    "session {session_id} is closed; `review show` remains available for diagnostics, but review mutations require `aethyme broker review reassign --session {session_id} --to-session <live-id> --reason <text>` or `aethyme broker review abandon --session {session_id} --reason <text>`"
+                )));
+            }
             let policy = crate::ReviewPolicy::load(broker.main_root())?;
             let repository = lifecycle
                 .repository

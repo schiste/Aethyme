@@ -2902,7 +2902,10 @@ impl Broker {
         path: &str,
         ttl_ms: Option<i64>,
     ) -> Result<LeaseClaimReport, BrokerOpError> {
-        self.store.session(session_id)?;
+        let session = self.store.session(session_id)?;
+        if session.status.is_closed() {
+            return Err(BrokerOpError::ClosedSessionOperation { session_id });
+        }
         let path = normalize_lease_path(path)?;
         self.refresh_leases()?;
         let blockers = self.lease_blockers(session_id, &path, false)?;
